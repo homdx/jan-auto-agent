@@ -133,7 +133,12 @@ class Orchestrator:
             return
 
         ext = Path(parsed.file_path).suffix
-        source = file_reader.read_file(target_path)
+
+        try:
+            source = file_reader.read_file(target_path)
+        except Exception as e:
+            logger.error(f"Execution failed while reading targets: {e}")
+            return
         
         imports = block_extractor.extract_imports(source, ext)
         block = block_extractor.extract_block(source, parsed.target_name, ext)
@@ -145,7 +150,7 @@ class Orchestrator:
         search_result: Dict[str, Any] = {"found": {}, "not_found": [], "searched_files": []}
 
         # --- VALIDATION LOOP (Only if not a simple 'show' intent) ---
-        if parsed.intent not in ("show", "explain"):
+        if parsed.intent not in ("show", "show_imports"):
             while iteration <= self.max_iterations:
                 elapsed = time.time() - start_time
                 if elapsed >= self.timeout_seconds:
