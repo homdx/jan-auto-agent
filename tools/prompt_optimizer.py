@@ -1,0 +1,111 @@
+import json
+import urllib.request
+import logging
+from typing import Optional
+
+logger = logging.getLogger(__name__)
+
+# Meta-prompt template — {current_prompt} and {failure_summary} are injected at call time.
+OPTIMIZER_META_PROMPT = (
+    "You are a prompt engineering agent. You will be given:\n"
+    "1. A current system prompt used by an AI agent\n"
+    "2. A summary of recent failures when using that prompt\n"
+    "\n"
+    "Rewrite the prompt to fix the identified failure patterns.\n"
+    "Keep the same JSON output format requirements.\n"
+    "Return only the new prompt text, nothing else.\n"
+    "\n"
+    "CURRENT PROMPT:\n"
+    "{current_prompt}\n"
+    "\n"
+    "FAILURE SUMMARY:\n"
+    "{failure_summary}\n"
+)
+
+
+class PromptOptimizer:
+    """
+    Calls the local LLM with a meta-prompt to generate an improved candidate prompt
+    from real failure data collected by MetricsCollector.summarize_failures().
+
+    Config keys read from agents.ini [prompt_optimizer]:
+      trigger_after_failures    (int,   default 5)
+      min_runs_before_optimize  (int,   default 3)
+    """
+
+    def __init__(
+        self,
+        model: str = "qwen2.5-14b-instruct",
+        base_url: str = "http://localhost:1337/v1",
+        api_key: str = "jan",
+        timeout: int = 120,
+    ):
+        self.model = model
+        self.base_url = base_url
+        self.api_key = api_key
+        self.timeout = timeout
+
+    def generate_candidate(
+        self,
+        agent_name: str,
+        current_prompt: str,
+        failure_summary: dict,
+    ) -> str:
+        """
+        Send the meta-prompt to the LLM and return the raw text response —
+        the new candidate prompt.  No JSON parsing is performed here.
+
+        Args:
+            agent_name:      Name of the agent whose prompt is being optimised
+                             (used only for logging).
+            current_prompt:  The prompt currently active for that agent.
+            failure_summary: Dict returned by MetricsCollector.summarize_failures().
+
+        Returns:
+            Candidate prompt string as returned by the model.
+            Returns current_prompt unchanged on any API/network error so the
+            caller always gets a usable string.
+        """
+        url = f"{self.base_url.rstrip('/')}/chat/completions"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+        }
+
+        meta_prompt = OPTIMIZER_META_PROMPT.format(
+            current_prompt=current_prompt,
+            failure_summary=json.dumps(failure_summary, indent=2),
+        )
+
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": meta_prompt}],
+            "temperature": 0.4,
+        }
+
+        logger.info(f"PromptOptimizer: generating candidate for '{agent_name}'")
+
+        try:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers=headers,
+                method="POST",
+            )
+            with urllib.request.urlopen(req, timeout=self.timeout) as response:
+                raw = json.loads(response.read().decode("utf-8"))
+                candidate = raw["choices"][0]["message"]["content"].strip()
+                logger.info(
+                    f"PromptOptimizer: candidate generated for '{agent_name}' "
+                    f"({len(candidate)} chars)"
+                )
+                return candidate
+
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            logger.error(f"PromptOptimizer HTTP {e.code} for '{agent_name}': {body}")
+            return current_prompt
+
+        except Exception as e:
+            logger.error(f"PromptOptimizer failed for '{agent_name}': {e}")
+            return current_prompt

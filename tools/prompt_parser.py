@@ -52,7 +52,7 @@ def _parse_via_regex(raw: str) -> Optional[ParsedPrompt]:
             target_name = from_match.group(2)
         else:
             # Strategy C: Fallback to the remaining single standalone identifier word
-            clean_rem = re.sub(r'\b(show|improve|explain|find|view|display|me|the|in|from)\b', ' ', remainder, flags=re.IGNORECASE).strip()
+            clean_rem = re.sub(r'\b(show|improve|explain|find|view|display|me|the|in|from|optimize|fix|refactor|correct|get|read|describe|understand|doc)\b', ' ', remainder, flags=re.IGNORECASE).strip()
             words = clean_rem.split()
             valid_identifiers = [w for w in words if re.match(r'^[A-Za-z_][\w]*$', w)]
             if valid_identifiers:
@@ -79,7 +79,9 @@ def _parse_via_regex(raw: str) -> Optional[ParsedPrompt]:
 
     # 4. Enforce Empty Target Rules
     if not target_name:
-        intent = "show_imports"
+        if intent in ("show", "show_and_improve"):
+            intent = "show_imports"
+        # For improve/explain with no named target, keep intent — whole file is the target
 
     return ParsedPrompt(
         file_path=file_path,
