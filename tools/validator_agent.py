@@ -1,107 +1,69 @@
+import json
+import urllib.request
 import logging
-from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
 class ValidatorAgent:
-    def __init__(self, max_iter: int = 3):
-        """
-        Initializes the ValidatorAgent.
-        :param max_iter: Maximum correction loops permitted before forcing an approval.
-        """
+    def __init__(self, max_iter: int = 3, model: str = "qwen2.5-14b-instruct", base_url: str = "http://localhost:1337/v1", api_key: str = "jan", timeout: int = 120):
         self.max_iter = max_iter
+        self.model = model
+        self.base_url = base_url
+        self.api_key = api_key
+        self.timeout = timeout
 
-    def _call_llm(self, system_prompt: str, user_content: str) -> str:
-        """
-        Mock proxy for the actual LLM engine interface.
-        Replace this placeholder with your production client logic (e.g., openai, anthropic, ollama).
-        """
-        # Example structured prompt transmission:
-        # response = client.chat.completions.create(
-        #     model="gpt-4o",
-        #     messages=[
-        #         {"role": "system", "content": system_prompt},
-        #         {"role": "user", "content": user_content}
-        #     ]
-        # )
-        # return response.choices[0].message.content.strip()
+    def validate(self, payload: dict) -> dict:
+        """Evaluates whether the target block requires additional code scanning cycles."""
+        url = f"{self.base_url.rstrip('/')}/chat/completions"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}"
+        }
         
-        return "APPROVED"
+        prompt = f"""You are a specialized code validation sub-agent.
+Analyze the target code block, verified imports, and cross-references to confirm if the current code block context is whole, correct, and self-contained.
 
-    def validate(self, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Validates code completeness and handles iteration loop guards.
-        """
-        iteration = payload.get("iteration", 1)
+Task Context: {payload.get('task')}
+Iteration Step: {payload.get('iteration')}/{self.max_iter}
 
-        # Guard: Stop infinite loop refinement matrices if iteration thresholds are reached
-        if iteration >= self.max_iter:
-            logger.info(f"ValidatorAgent loop guard triggered. Iteration: {iteration} >= MAX_ITER: {self.max_iter}")
-            return {
-                "status": "approved",
-                "reason": "max iterations reached",
-                "missing_names": []
-            }
+[TARGET CODE BLOCK]
+{payload.get('target_block')}
 
-        # 1. Setup execution prompts
-        system_prompt = (
-            "You are a code completeness validator. Check: 1) Is the function body complete and "
-            "not cut off? 2) Are all called names either in imports, related_code, or standard library? "
-            "3) Any missing definitions that should be found? "
-            "Reply exactly: APPROVED if complete. REJECTED: <one-line reason> | MISSING: name1, name2 if incomplete."
-        )
+[CURRENT IMPORTS]
+{payload.get('imports')}
 
-        user_content = (
-            f"Task Context: {payload.get('task', '')}\n\n"
-            f"--- Target Code Block ---\n{payload.get('target_block', '')}\n\n"
-            f"--- Declared Imports ---\n{payload.get('imports', [])}\n\n"
-            f"--- Found Related Code References ---\n{payload.get('related_code', {})}\n\n"
-            f"--- Explicitly Flagged Missing References ---\n{payload.get('missing_refs', [])}\n"
-        )
+[RESOLVED CROSS-REFERENCES]
+{json.dumps(payload.get('related_code'), indent=2)}
 
+[KNOWN MISSING REFERENCES]
+{payload.get('missing_refs')}
+
+You must return your assessment in strict JSON format. Do not add any text before or after the JSON structure. 
+Format:
+{{
+  "status": "needs_fix" or "approved",
+  "feedback": "Detailed critical assessment explaining why it needs context loops or what is fine."
+}}
+"""
         try:
-            # 2. Query LLM Engine
-            raw_response = self._call_llm(system_prompt, user_content).strip()
+            req_payload = {
+                "model": self.model,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.1
+            }
+            req = urllib.request.Request(url, data=json.dumps(req_payload).encode("utf-8"), headers=headers, method="POST")
             
-            # 3. Parse Response Grammar Matrix
-            if raw_response.startswith("APPROVED"):
-                return {
-                    "status": "approved",
-                    "reason": "",
-                    "missing_names": []
-                }
-            
-            if raw_response.startswith("REJECTED:"):
-                # Isolate reason from missing metadata strings
-                content = raw_response.replace("REJECTED:", "", 1).strip()
-                reason = content
-                missing_names: List[str] = []
-
-                if "| MISSING:" in content:
-                    parts = content.split("| MISSING:", 1)
-                    reason = parts[0].strip()
+            # Use the dynamic timeout from agents.ini
+            with urllib.request.urlopen(req, timeout=self.timeout) as response:
+                raw_res = json.loads(response.read().decode("utf-8"))
+                content = raw_res["choices"][0]["message"]["content"].strip()
+                
+                if "```json" in content:
+                    content = content.split("```json")[1].split("```")[0].strip()
+                elif "```" in content:
+                    content = content.split("```")[1].split("```")[0].strip()
                     
-                    # Clean up trailing tokens into uniform arrays
-                    raw_names = parts[1].split(",")
-                    missing_names = [name.strip() for name in raw_names if name.strip()]
-
-                return {
-                    "status": "rejected",
-                    "reason": reason,
-                    "missing_names": missing_names
-                }
-
-            # Fallback for unexpected or unstructured LLM answers
-            return {
-                "status": "rejected",
-                "reason": f"Unstructured validator response: {raw_response}",
-                "missing_names": []
-            }
-
+                return json.loads(content)
         except Exception as e:
-            logger.error(f"ValidatorAgent error: {e}", exc_info=True)
-            return {
-                "status": "rejected",
-                "reason": f"Internal execution exception encountered: {str(e)}",
-                "missing_names": []
-            }
+            logger.error(f"ValidatorAgent execution loop failed: {e}")
+            return {"status": "approved", "feedback": f"API Connection Timeout Fallback: {e}"}

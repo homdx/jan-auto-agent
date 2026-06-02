@@ -1,191 +1,246 @@
-"""
-multi_agent_jan.py
-──────────────────
-Multi-agent pipeline using Jan local API (OpenAI-compatible).
-Config is read from agents.ini in the same directory.
-
-Commands during chat:
-  /new   — start fresh (clear conversation history)
-  /exit  — quit
-"""
-
-import configparser
-import time
 import os
-from datetime import datetime
-from openai import OpenAI
+import sys
+import time
+import json
+import logging
+import configparser
+import urllib.request
+from pathlib import Path
+from typing import Dict, Any, List
 
-# ── Load config ──────────────────────────────────────────────────────
+# ────────────────────────────────────────────────────────────────────────
+# DYNAMIC PATH RESOLUTION
+# ────────────────────────────────────────────────────────────────────────
+current_dir = Path(__file__).resolve().parent
+parent_dir = current_dir.parent
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(BASE_DIR, "agents.ini")
+for path_dir in [current_dir, parent_dir]:
+    if str(path_dir) not in sys.path:
+        sys.path.insert(0, str(path_dir))
 
-cfg = configparser.ConfigParser()
-cfg.read(CONFIG_PATH)
+from tools.prompt_parser import parse_prompt, ParsedPrompt
+from tools.formatter import OutputFormatter
+from tools.search_agent import SearchAgent
+from tools.validator_agent import ValidatorAgent
+from tools.improvement_agent import ImprovementAgent
 
-# API
-BASE_URL   = cfg.get("api", "base_url",  fallback="http://localhost:1337/v1")
-API_KEY    = cfg.get("api", "api_key",   fallback="jan")
-MODEL      = cfg.get("api", "model",     fallback="qwen2.5-14b-instruct")
-
-# Agent prompts
-MAIN_DELEGATE = cfg.get("main_agent", "system_delegate")
-MAIN_ASSEMBLE = cfg.get("main_agent", "system_assemble")
-SUB_SYSTEM    = cfg.get("sub_agent",  "system")
-VAL_SYSTEM    = cfg.get("validator_agent", "system")
-
-# Agent temperatures
-MAIN_TEMP = cfg.getfloat("main_agent",      "temperature", fallback=0.3)
-SUB_TEMP  = cfg.getfloat("sub_agent",       "temperature", fallback=0.5)
-VAL_TEMP  = cfg.getfloat("validator_agent", "temperature", fallback=0.2)
-
-# Chat
-NEW_CHAT_KEY  = cfg.get("chat", "new_chat_key",  fallback="/new")
-EXIT_KEY      = cfg.get("chat", "exit_key",      fallback="/exit")
-USE_CONTEXT   = cfg.getboolean("chat", "use_context", fallback=True)
-
-client = OpenAI(base_url=BASE_URL, api_key=API_KEY)
-
-# ── Conversation history (for multi-turn context) ────────────────────
-
-conversation_history: list[dict] = []
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
 
 
-# ── Helpers ──────────────────────────────────────────────────────────
-
-def fmt_duration(seconds: float) -> str:
-    """Format elapsed seconds as MM:SS (or HH:MM:SS if >= 1 hour)."""
-    total = int(seconds)
-    hours, rem = divmod(total, 3600)
-    mins, secs = divmod(rem, 60)
-    if hours:
-        return f"{hours:02d}:{mins:02d}:{secs:02d}"
-    return f"{mins:02d}:{secs:02d}"
+class MockFileUtilities:
+    def read_file(self, path: str) -> str:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    def extract_imports(self, source: str, ext: str) -> List[str]: return []
+    def extract_block(self, source: str, name: str, ext: str) -> str: return source
+    def find_references(self, block: str, ext: str) -> List[str]: return []
+    def get_context_lines(self, source: str, name: str) -> str: return ""
 
 
-def timestamp() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+try:
+    import utils.file_reader as file_reader
+    import utils.block_extractor as block_extractor
+except ImportError:
+    file_util = MockFileUtilities()
+    file_reader = file_util
+    block_extractor = file_util
 
 
-def print_separator():
-    print("─" * 60)
+class Orchestrator:
+    def __init__(self, config_path: str = "agents.ini"):
+        self.config = configparser.ConfigParser()
+        self.load_config(config_path)
+        
+        # Core components instantiation with passed API configurations
+        self.search_agent = SearchAgent()
+        self.validator_agent = ValidatorAgent(
+            max_iter=self.max_iterations,
+            model=self.model,
+            base_url=self.base_url,
+            api_key=self.api_key,
+            timeout=self.timeout_seconds  # <-- Pass INI timeout here
+        )
+        self.improvement_agent = ImprovementAgent(
+            model=self.model,
+            base_url=self.base_url,
+            api_key=self.api_key,
+            timeout=self.timeout_seconds  # <-- Pass INI timeout here
+        )
 
+    def load_config(self, config_path: str) -> None:
+        if os.path.exists(config_path):
+            self.config.read(config_path)
+        
+        self.max_iterations = self.config.getint("loop", "max_iterations", fallback=3)
+        self.timeout_seconds = self.config.getint("loop", "timeout_seconds", fallback=240)
+        self.use_context = self.config.getboolean("chat", "use_context", fallback=True)
+        self.new_chat_key = self.config.get("chat", "new_chat_key", fallback="/new").strip()
+        self.exit_key = self.config.get("chat", "exit_key", fallback="/exit").strip()
+        
+        self.model = self.config.get("api", "model", fallback="qwen2.5-14b-instruct")
+        self.base_url = self.config.get("api", "base_url", fallback="http://localhost:1337/v1")
+        self.api_key = self.config.get("api", "api_key", fallback="jan")
 
-# ── Core LLM call ────────────────────────────────────────────────────
+    def execute_direct_chat(self, user_input: str) -> None:
+        """Routes conversational queries to local model with configured timeout allowances."""
+        url = f"{self.base_url.rstrip('/')}/chat/completions"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}"
+        }
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": "You are a helpful assistant integrated into an offline DevOps pipeline environment."},
+                {"role": "user", "content": user_input}
+            ],
+            "temperature": 0.3
+        }
+        
+        print(f" -> Querying local model [{self.model}]...")
+        try:
+            req = urllib.request.Request(
+                url, 
+                data=json.dumps(payload).encode("utf-8"), 
+                headers=headers, 
+                method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=self.timeout_seconds) as response:
+                res_body = json.loads(response.read().decode("utf-8"))
+                answer = res_body["choices"][0]["message"]["content"]
+                
+                timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+                print(f"\n[RESPONSE - {timestamp}]:")
+                print(f"{answer.strip()}\n")
+        except Exception as e:
+            logger.error(f"Failed to communicate with local Jan engine endpoint: {e}")
 
-def call_agent(system: str, messages: list, temperature: float = 0.3) -> str:
-    response = client.chat.completions.create(
-        model=MODEL,
-        messages=[{"role": "system", "content": system}] + messages,
-        temperature=temperature,
-    )
-    return response.choices[0].message.content.strip()
+    def run_pipeline(self, user_input: str, base_dir: str) -> None:
+        """Executes pipelines and timestamps the structural layout stream."""
+        start_time = time.time()
+        
+        parsed: ParsedPrompt = parse_prompt(user_input)
+        
+        if not parsed.file_path:
+            self.execute_direct_chat(user_input)
+            return
 
+        target_path = os.path.normpath(os.path.join(base_dir, parsed.file_path))
+        if not os.path.exists(target_path) or not os.path.isfile(target_path):
+            timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            print(f"[{timestamp}] -> Error: Target path is not a valid file: '{parsed.file_path}'\n")
+            return
 
-# ── Agents ───────────────────────────────────────────────────────────
+        ext = Path(parsed.file_path).suffix
 
-def sub_agent(task: str) -> str:
-    t0 = time.time()
-    print(f"\n  [{timestamp()}] 🔧 SUB AGENT  — task received")
-    print(f"  Task: {task}")
-    result = call_agent(SUB_SYSTEM, [{"role": "user", "content": f"Task: {task}"}], SUB_TEMP)
-    print(f"  Done in {fmt_duration(time.time() - t0)}  |  result: {result[:120]}{'...' if len(result)>120 else ''}")
-    return result
+        try:
+            source = file_reader.read_file(target_path)
+        except Exception as e:
+            logger.error(f"Execution failed while reading targets: {e}")
+            return
 
+        imports = block_extractor.extract_imports(source, ext)
+        block = block_extractor.extract_block(source, parsed.target_name, ext)
+        refs = block_extractor.find_references(block, ext)
+        context_lines = block_extractor.get_context_lines(source, parsed.target_name)
 
-def validator_agent(task: str, result: str) -> str:
-    t0 = time.time()
-    print(f"\n  [{timestamp()}] ✅ VALIDATOR  — checking result")
-    validated = call_agent(
-        VAL_SYSTEM,
-        [{"role": "user", "content": f"Original task: {task}\n\nWorker result:\n{result}"}],
-        VAL_TEMP,
-    )
-    verdict = validated.split(":")[0] if ":" in validated else "?"
-    print(f"  Done in {fmt_duration(time.time() - t0)}  |  verdict: {verdict}")
-    return validated
+        iteration = 1
+        already_searched = [parsed.file_path]
+        search_result: Dict[str, Any] = {"found": {}, "not_found": [], "searched_files": []}
 
+        # The multi-agent assessment evaluation loop
+        while iteration <= self.max_iterations:
+            elapsed = time.time() - start_time
+            if elapsed >= self.timeout_seconds:
+                logger.warning("Pipeline execution hit defined timeout threshold bounds.")
+                break
 
-def main_agent(user_request: str) -> str:
-    global conversation_history
+            search_result = self.search_agent.run(
+                references=refs,
+                base_dir=base_dir,
+                already_searched=already_searched,
+                file_ext_hint=ext
+            )
 
-    total_start = time.time()
-    print_separator()
-    print(f"[{timestamp()}] 🧠 MAIN AGENT — request received")
+            aggregated_refs = {}
+            for k, v in search_result.get("found", {}).items():
+                aggregated_refs[k] = v.get("code", "")
 
-    # Build message list: with or without history
-    if USE_CONTEXT:
-        conversation_history.append({"role": "user", "content": user_request})
-        messages_for_delegate = list(conversation_history)
-    else:
-        messages_for_delegate = [{"role": "user", "content": user_request}]
+            validation_payload = {
+                "task": user_input,
+                "target_block": block,
+                "imports": imports,
+                "related_code": aggregated_refs,
+                "missing_refs": search_result.get("not_found", []),
+                "iteration": iteration
+            }
+            
+            # Connected Validation Call
+            validation = self.validator_agent.validate(validation_payload)
 
-    # Step 1 — delegate: formulate task for sub agent
-    t0 = time.time()
-    task_for_sub = call_agent(MAIN_DELEGATE, messages_for_delegate, MAIN_TEMP)
-    print(f"  [{timestamp()}] 📋 Delegating ({fmt_duration(time.time()-t0)}): {task_for_sub[:100]}")
+            if validation.get("status") == "approved" or iteration >= self.max_iterations or (time.time() - start_time) >= self.timeout_seconds:
+                break
+            else:
+                already_searched.extend(search_result.get("searched_files", []))
+                iteration += 1
 
-    # Step 2 — sub agent executes
-    raw_result = sub_agent(task_for_sub)
+        # Connected Optimization Processing Call
+        improvement_context = {
+            "target_block": block,
+            "imports": imports,
+            "related_code": {k: v.get("code", "") for k, v in search_result.get("found", {}).items()},
+            "context_lines": context_lines
+        }
+        improvement = self.improvement_agent.process(parsed.intent, improvement_context)
 
-    # Step 3 — validator checks
-    validated_result = validator_agent(task_for_sub, raw_result)
+        total_elapsed = time.time() - start_time
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        
+        print(f"\n[PIPELINE COMPLETED - {timestamp}]")
+        
+        output_config = {
+            "show_timing": self.config.getboolean("output", "show_timing", fallback=True),
+            "show_iteration_count": self.config.getboolean("output", "show_iteration_count", fallback=True),
+            "max_iterations": self.max_iterations
+        }
+        
+        OutputFormatter.render(
+            parsed=parsed,
+            imports=imports,
+            block=block,
+            search_result=search_result,
+            improvement=improvement,
+            elapsed_time=total_elapsed,
+            iteration=iteration,
+            output_config=output_config
+        )
 
-    # Step 4 — main agent assembles final answer
-    t0 = time.time()
-    print(f"\n  [{timestamp()}] 📝 MAIN AGENT — assembling final answer")
-    final = call_agent(
-        MAIN_ASSEMBLE,
-        [{"role": "user", "content":
-            f"User's original request: {user_request}\n\n"
-            f"Validated result from team:\n{validated_result}"
-        }],
-        MAIN_TEMP,
-    )
-    print(f"  Done in {fmt_duration(time.time()-t0)}")
-
-    # Save assistant reply to history
-    if USE_CONTEXT:
-        conversation_history.append({"role": "assistant", "content": final})
-
-    total_elapsed = time.time() - total_start
-    print_separator()
-    print(f"⏱  Total time: {fmt_duration(total_elapsed)}")
-    print_separator()
-    return final
-
-
-# ── Main loop ────────────────────────────────────────────────────────
 
 def main():
-    global conversation_history
+    base_dir = os.getcwd() if len(sys.argv) < 2 else sys.argv[1]
+    orchestrator = Orchestrator()
 
-    print("╔══════════════════════════════════════════════════════════╗")
-    print("║  Multi-Agent Chat  •  model:", MODEL[:28].ljust(28), "║")
-    print(f"║  context: {'ON ' if USE_CONTEXT else 'OFF'}  │  {NEW_CHAT_KEY} = new chat  │  {EXIT_KEY} = quit".ljust(61) + "║")
-    print("╚══════════════════════════════════════════════════════════╝")
+    print(f"Entering core orchestration shell context: {base_dir}")
+    print(f"Commands -> Exit: '{orchestrator.exit_key}' | Reset Workspace: '{orchestrator.new_chat_key}'\n")
 
     while True:
         try:
-            user_input = input("\nYou: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\nBye!")
+            user_input = input("prompt> ").strip()
+            if not user_input:
+                continue
+            if user_input == orchestrator.exit_key:
+                print("Exiting lifecycle orchestrator run loop.")
+                break
+            if user_input == orchestrator.new_chat_key:
+                print("Session reset completed.")
+                continue
+
+            orchestrator.run_pipeline(user_input, base_dir)
+
+        except (KeyboardInterrupt, EOFError):
+            print("\nShutting down runtime session shell.")
             break
-
-        if not user_input:
-            continue
-
-        if user_input.lower() == EXIT_KEY:
-            print("Bye!")
-            break
-
-        if user_input.lower() == NEW_CHAT_KEY:
-            conversation_history = []
-            print(f"[{timestamp()}] 🗑  History cleared — new chat started.")
-            continue
-
-        answer = main_agent(user_input)
-        print(f"\nAssistant: {answer}\n")
 
 
 if __name__ == "__main__":
