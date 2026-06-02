@@ -4,6 +4,8 @@ import urllib.error
 import logging
 from typing import Optional
 
+from tools.agent_trace import tracer
+
 logger = logging.getLogger(__name__)
 
 # STORY-2.1: Hardcoded prompt extracted to a named module-level constant.
@@ -117,30 +119,40 @@ class ImprovementAgent:
                 "max_tokens": self.max_tokens,
             }
             req = urllib.request.Request(url, data=json.dumps(req_payload).encode("utf-8"), headers=headers, method="POST")
+            tracer.event("improvement_agent", "llm", "llm_request",
+                         content=prompt, model=self.model,
+                         temperature=self.temperature, max_tokens=self.max_tokens)
 
             # Use the dynamic timeout from agents.ini
             with urllib.request.urlopen(req, timeout=self.timeout) as response:
                 raw_res = json.loads(response.read().decode("utf-8"))
                 content = raw_res["choices"][0]["message"]["content"].strip()
+                tracer.event("llm", "improvement_agent", "llm_response", content=content)
 
                 if "```json" in content:
                     content = content.split("```json")[1].split("```")[0].strip()
                 elif "```" in content:
                     content = content.split("```")[1].split("```")[0].strip()
 
-                return json.loads(content)
+                parsed_result = json.loads(content)
+                tracer.event("improvement_agent", "orchestrator", "result", content=parsed_result)
+                return parsed_result
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="replace")
             logger.error(f"ImprovementAgent HTTP {e.code}: {body}")
-            return {
+            _err = {
                 "explanation": f"HTTP {e.code} from API: {body}",
                 "issues": [], "improved_code": "", "changes": []
             }
+            tracer.event("improvement_agent", "orchestrator", "error", content=_err)
+            return _err
         except Exception as e:
             logger.error(f"ImprovementAgent processing thread failed: {e}")
-            return {
+            _err = {
                 "explanation": f"Failed to execute local optimization pipeline context: {e}",
                 "issues": ["Connection validation boundary errors detected."],
                 "improved_code": "",
                 "changes": []
             }
+            tracer.event("improvement_agent", "orchestrator", "error", content=_err)
+            return _err

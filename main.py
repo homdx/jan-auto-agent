@@ -29,6 +29,7 @@ from tools.prompt_store import PromptStore
 from tools.prompt_optimizer import PromptOptimizer
 from tools.prompt_evaluator import PromptEvaluator
 from tools.ui import Spinner
+from tools.agent_trace import tracer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -128,6 +129,13 @@ class Orchestrator:
         self.optimizer_trigger_avg_iter= self.config.getfloat  ("prompt_optimizer", "trigger_avg_iterations",   fallback=2.0)
         self.optimizer_trigger_json_fail=self.config.getfloat  ("prompt_optimizer", "trigger_json_fail_rate",   fallback=0.30)
 
+        # Inter-agent trace configuration
+        tracer.configure(
+            enabled=self.config.getboolean("trace", "enabled", fallback=False),
+            path=self.config.get("trace", "path", fallback="agent_trace.jsonl"),
+            max_field_chars=self.config.getint("trace", "max_field_chars", fallback=4000),
+        )
+
     def execute_direct_chat(self, user_input: str) -> None:
         """Routes conversational queries to local model with streaming output."""
         url = f"{self.base_url.rstrip('/')}/chat/completions"
@@ -180,6 +188,7 @@ class Orchestrator:
     def run_pipeline(self, user_input: str, base_dir: str) -> None:
         """Executes pipelines with adaptive search, validation loops, and visual feedback."""
         start_time = time.time()
+        tracer.start_run(user_input)
         
         # Parse intent and target
         parsed: ParsedPrompt = parse_prompt(user_input)
@@ -222,6 +231,10 @@ class Orchestrator:
                     break
 
                 print(f"🔍 Searching for references (iter {iteration})...")
+                tracer.event("orchestrator", "search_agent", "call",
+                             params={"references": refs, "base_dir": base_dir,
+                                     "already_searched": already_searched,
+                                     "file_ext_hint": ext, "iteration": iteration})
                 search_result = self.search_agent.run(
                     references=refs,
                     base_dir=base_dir,
@@ -232,15 +245,17 @@ class Orchestrator:
                 aggregated_refs = {k: v.get("code", "") for k, v in search_result.get("found", {}).items()}
                 
                 print(f"🤖 Validating block with LLM ({iteration}/{self.max_iterations})...")
+                _val_payload = {
+                    "task": user_input,
+                    "target_block": block,
+                    "imports": imports,
+                    "related_code": aggregated_refs,
+                    "missing_refs": search_result.get("not_found", []),
+                    "iteration": iteration
+                }
+                tracer.event("orchestrator", "validator_agent", "call", params=_val_payload)
                 with Spinner(f"Validator iter {iteration}/{self.max_iterations}"):
-                    validation = self.validator_agent.validate({
-                        "task": user_input,
-                        "target_block": block,
-                        "imports": imports,
-                        "related_code": aggregated_refs,
-                        "missing_refs": search_result.get("not_found", []),
-                        "iteration": iteration
-                    })
+                    validation = self.validator_agent.validate(_val_payload)
 
                 if validation.get("status") == "approved":
                     break
@@ -270,6 +285,8 @@ class Orchestrator:
                 "related_code": {k: v.get("code", "") for k, v in search_result.get("found", {}).items()},
                 "context_lines": context_lines
             }
+            tracer.event("orchestrator", "improvement_agent", "call",
+                         params={"intent": parsed.intent, **improvement_context})
             with Spinner("Improvement agent"):
                 improvement = self.improvement_agent.process(parsed.intent, improvement_context)
         else:
@@ -314,13 +331,20 @@ class Orchestrator:
             )
             if should_optimize:
                 print("🧠 Optimizer triggered — generating candidate prompt for validator_agent...")
+                tracer.event("orchestrator", "prompt_optimizer", "call",
+                             params={"agent_name": "validator_agent", "failure_summary": summary})
                 candidate = self.prompt_optimizer.generate_candidate(
                     agent_name="validator_agent",
                     current_prompt=self.prompt_store.get_current("validator_agent"),
                     failure_summary=summary,
                 )
                 # STORY-4.2: evaluate candidate, promote if it clears the threshold
+                tracer.event("orchestrator", "prompt_evaluator", "call",
+                             params={"agent_name": "validator_agent"}, content=candidate)
                 result = self.prompt_evaluator.evaluate("validator_agent", candidate)
+                tracer.event("prompt_evaluator", "orchestrator", "decision",
+                             params={"promoted": result.promoted, "score": result.score,
+                                     "reason": result.reason})
                 if result.promoted:
                     self.prompt_store.push("validator_agent", candidate, result.score)
                     print(f"✅ Prompt promoted (score {result.score:.2f}) — {result.reason}")
@@ -344,12 +368,34 @@ class Orchestrator:
         )
 
 
+HELP_TEXT = """\
+Available commands
+  /help, /?            Show this help
+  /prompts             Show active prompt version + rollback chain for each agent
+  /rollback [agent]    Roll back one prompt version (default: validator_agent)
+  /trace               Show inter-agent trace status and file path
+  /new                 Reset the session
+  /exit                Quit
+
+How to ask for work (anything not starting with '/')
+  <action> <symbol> in <file>        e.g.  improve handler in app.py
+  <action> <symbol> from <file>      e.g.  explain parse_data from utils.py
+  show <file>                        e.g.  show app.py        (imports only)
+
+  Actions:
+    show / view / get        -> display the target block + imports
+    improve / fix / optimize / refactor / correct  -> review + suggest improved code
+    explain / describe       -> explanation only, no code changes
+  A request with no file path is sent straight to the model as a chat message.
+"""
+
+
 def main():
     base_dir = os.getcwd() if len(sys.argv) < 2 else sys.argv[1]
     orchestrator = Orchestrator()
 
     print(f"Entering core orchestration shell context: {base_dir}")
-    print(f"Commands -> Exit: '{orchestrator.exit_key}' | Reset Workspace: '{orchestrator.new_chat_key}'\n")
+    print(f"Commands -> Exit: '{orchestrator.exit_key}' | Reset Workspace: '{orchestrator.new_chat_key}' | Help: '/help'\n")
 
     while True:
         try:
@@ -361,6 +407,20 @@ def main():
                 break
             if user_input == orchestrator.new_chat_key:
                 print("Session reset completed.")
+                continue
+
+            # /help — list every command and how to phrase a request
+            if user_input in ("/help", "/?", "/commands"):
+                print(HELP_TEXT)
+                continue
+
+            # /trace — show where the inter-agent trace is written
+            if user_input == "/trace":
+                if tracer.enabled:
+                    print(f"Trace ON  -> {tracer.path}\n"
+                          f"  read it: python view_trace.py {tracer.path} --full")
+                else:
+                    print("Trace OFF (set [trace] enabled = true in agents.ini)")
                 continue
 
             # STORY-5.3: /prompts — introspect current prompt versions for all agents
@@ -376,6 +436,11 @@ def main():
                 agent = parts[1] if len(parts) > 1 else "validator_agent"
                 ok = orchestrator.prompt_store.rollback(agent)
                 print(f"↩️  Rolled back {agent}" if ok else f"Already at hardcoded fallback for {agent}")
+                continue
+
+            # Guard: an unrecognized slash-command should NOT be sent to the model.
+            if user_input.startswith("/"):
+                print(f"Unknown command: {user_input.split()[0]}  —  type /help for the command list.")
                 continue
 
             orchestrator.run_pipeline(user_input, base_dir)

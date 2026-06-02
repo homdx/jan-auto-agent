@@ -4,6 +4,8 @@ import urllib.error
 import logging
 from typing import Optional
 
+from tools.agent_trace import tracer
+
 logger = logging.getLogger(__name__)
 
 # STORY-2.1: Hardcoded prompt extracted to a named module-level constant.
@@ -105,26 +107,35 @@ class ValidatorAgent:
                 "messages": [{"role": "user", "content": prompt}],
                 "temperature": 0.1
             }
+            tracer.event("validator_agent", "llm", "llm_request",
+                         content=prompt, model=self.model, temperature=0.1)
             req = urllib.request.Request(url, data=json.dumps(req_payload).encode("utf-8"), headers=headers, method="POST")
 
             # Use the dynamic timeout from agents.ini
             with urllib.request.urlopen(req, timeout=self.timeout) as response:
                 raw_res = json.loads(response.read().decode("utf-8"))
                 content = raw_res["choices"][0]["message"]["content"].strip()
+                tracer.event("llm", "validator_agent", "llm_response", content=content)
 
                 if "```json" in content:
                     content = content.split("```json")[1].split("```")[0].strip()
                 elif "```" in content:
                     content = content.split("```")[1].split("```")[0].strip()
 
-                return json.loads(content)
+                parsed_result = json.loads(content)
+                tracer.event("validator_agent", "orchestrator", "result", content=parsed_result)
+                return parsed_result
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="replace")
             logger.error(f"ValidatorAgent HTTP {e.code}: {body}")
             # Bug #7 fix: errors must NOT be treated as approved — use needs_fix.
             # _api_error sentinel lets prompt_evaluator exclude this from scoring.
-            return {"status": "needs_fix", "feedback": f"HTTP {e.code} from API: {body}", "_api_error": True}
+            _err = {"status": "needs_fix", "feedback": f"HTTP {e.code} from API: {body}", "_api_error": True}
+            tracer.event("validator_agent", "orchestrator", "error", content=_err)
+            return _err
         except Exception as e:
             logger.error(f"ValidatorAgent execution loop failed: {e}")
             # Bug #7 fix: same — fail-closed, not fail-open.
-            return {"status": "needs_fix", "feedback": f"API Connection Timeout Fallback: {e}", "_api_error": True}
+            _err = {"status": "needs_fix", "feedback": f"API Connection Timeout Fallback: {e}", "_api_error": True}
+            tracer.event("validator_agent", "orchestrator", "error", content=_err)
+            return _err

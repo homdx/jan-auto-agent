@@ -4,6 +4,8 @@ import urllib.error
 import logging
 from typing import Optional
 
+from tools.agent_trace import tracer
+
 logger = logging.getLogger(__name__)
 
 # Meta-prompt template — {current_prompt} and {failure_summary} are injected at call time.
@@ -93,6 +95,8 @@ class PromptOptimizer:
                 headers=headers,
                 method="POST",
             )
+            tracer.event("prompt_optimizer", "llm", "llm_request",
+                         content=meta_prompt, model=self.model, temperature=0.4)
             with urllib.request.urlopen(req, timeout=self.timeout) as response:
                 raw = json.loads(response.read().decode("utf-8"))
                 candidate = raw["choices"][0]["message"]["content"].strip()
@@ -100,13 +104,18 @@ class PromptOptimizer:
                     f"PromptOptimizer: candidate generated for '{agent_name}' "
                     f"({len(candidate)} chars)"
                 )
+                tracer.event("llm", "prompt_optimizer", "llm_response", content=candidate)
                 return candidate
 
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="replace")
             logger.error(f"PromptOptimizer HTTP {e.code} for '{agent_name}': {body}")
+            tracer.event("prompt_optimizer", "orchestrator", "error",
+                         content=f"HTTP {e.code}; returning unchanged current_prompt")
             return current_prompt
 
         except Exception as e:
             logger.error(f"PromptOptimizer failed for '{agent_name}': {e}")
+            tracer.event("prompt_optimizer", "orchestrator", "error",
+                         content=f"{e}; returning unchanged current_prompt")
             return current_prompt

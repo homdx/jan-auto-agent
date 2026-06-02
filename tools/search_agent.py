@@ -5,6 +5,8 @@ from typing import List, Dict, Any, Set, Optional
 
 logger = logging.getLogger(__name__)
 
+from tools.agent_trace import tracer
+
 from tools.file_reader import list_py_files as _list_py_files
 from tools.block_extractor import extract_block as _extract_block_from_source
 
@@ -159,4 +161,8 @@ class SearchAgent:
             unprocessed = set(references) - processed_refs
             result["not_found"].extend(list(unprocessed))
 
+        tracer.event("search_agent", "orchestrator", "result",
+                     params={"found": list(result["found"].keys()),
+                             "not_found": result["not_found"],
+                             "searched_files": result["searched_files"]})
         return result
