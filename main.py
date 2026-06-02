@@ -35,6 +35,11 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 
+def _ts() -> str:
+    """Return the current local time as HH:MM:SS — used to prefix every status line."""
+    return time.strftime("%H:%M:%S")
+
+
 from tools.file_reader import read_file, list_py_files
 from tools.block_extractor import extract_block, extract_imports, find_references, get_context_lines
 
@@ -139,6 +144,8 @@ class Orchestrator:
             enabled=self.config.getboolean("trace", "enabled", fallback=False),
             path=self.config.get("trace", "path", fallback="agent_trace.jsonl"),
             max_field_chars=self.config.getint("trace", "max_field_chars", fallback=4000),
+            console_echo=self.config.getboolean("trace", "console_echo", fallback=True),
+            console_preview_chars=self.config.getint("trace", "console_preview_chars", fallback=600),
         )
 
     def execute_direct_chat(self, user_input: str) -> None:
@@ -159,7 +166,7 @@ class Orchestrator:
         }
 
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-        print(f"\n[RESPONSE - {timestamp}]:")
+        print(f"\n[{_ts()}] RESPONSE (direct-chat):")
         try:
             req = urllib.request.Request(
                 url,
@@ -235,7 +242,7 @@ class Orchestrator:
                 if elapsed >= self.timeout_seconds:
                     break
 
-                print(f"🔍 Searching for references (iter {iteration})...")
+                print(f"[{_ts()}] 🔍 Searching for references (iter {iteration})...")
                 tracer.event("orchestrator", "search_agent", "call",
                              params={"references": refs, "base_dir": base_dir,
                                      "already_searched": already_searched,
@@ -249,7 +256,7 @@ class Orchestrator:
 
                 aggregated_refs = {k: v.get("code", "") for k, v in search_result.get("found", {}).items()}
                 
-                print(f"🤖 Validating block with LLM ({iteration}/{self.max_iterations})...")
+                print(f"[{_ts()}] 🤖 Validating block with LLM ({iteration}/{self.max_iterations})...")
                 _val_payload = {
                     "task": user_input,
                     "target_block": block,
@@ -270,7 +277,7 @@ class Orchestrator:
 
                 feedback = validation.get("feedback", "").strip()
                 if feedback:
-                    print(f"❗ Validation – {feedback}")
+                    print(f"[{_ts()}] ❗ Validation feedback: {feedback}")
 
                 # Adaptive Scope: Expand search for next iteration
                 already_searched.extend(search_result.get("searched_files", []))
@@ -286,7 +293,7 @@ class Orchestrator:
         # --- IMPROVEMENT AGENT (Intent-based) ---
         improvement: Dict[str, Any] = {}
         if parsed.intent in ("optimize", "fix", "improve", "explain", "show_and_improve"):
-            print("⚡ Processing improvements...")
+            print(f"[{_ts()}] ⚡ Processing improvements...")
             improvement_context = {
                 "target_block": block,
                 "imports": imports,
@@ -307,7 +314,7 @@ class Orchestrator:
         total_elapsed = time.time() - start_time
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
         
-        print(f"\n[PIPELINE COMPLETED - {timestamp}]")
+        print(f"\n[{_ts()}] PIPELINE COMPLETED  ({total_elapsed:.1f}s total)")
 
         # STORY-1.1: Record run metrics
         last_validation = validation if parsed.intent not in ("show", "show_imports") else {}
@@ -341,7 +348,7 @@ class Orchestrator:
                 )
             )
             if should_optimize:
-                print("🧠 Optimizer triggered — generating candidate prompt for validator_agent...")
+                print(f"[{_ts()}] 🧠 Optimizer triggered — generating candidate prompt for validator_agent...")
                 tracer.event("orchestrator", "prompt_optimizer", "call",
                              params={"agent_name": "validator_agent", "failure_summary": summary})
                 candidate = self.prompt_optimizer.generate_candidate(
@@ -358,9 +365,9 @@ class Orchestrator:
                                      "reason": result.reason})
                 if result.promoted:
                     self.prompt_store.push("validator_agent", candidate, result.score)
-                    print(f"✅ Prompt promoted (score {result.score:.2f}) — {result.reason}")
+                    print(f"[{_ts()}] ✅ Prompt promoted (score {result.score:.2f}) — {result.reason}")
                 else:
-                    print(f"⚠️  Candidate discarded — {result.reason}")
+                    print(f"[{_ts()}] ⚠️  Candidate discarded — {result.reason}")
 
         OutputFormatter.render(
             parsed=parsed,

@@ -1,4 +1,5 @@
 import sys
+import time
 import json
 import urllib.request
 import urllib.error
@@ -14,9 +15,27 @@ logger = logging.getLogger(__name__)
 # This is the canonical fallback that PromptStore will always be able to return to.
 # Runtime values are injected via .format() in validate() — do not use f-string here.
 VALIDATOR_PROMPT_HARDCODED = (
-    "You are a specialized code validation sub-agent.\n"
-    "Analyze the target code block, verified imports, and cross-references to confirm "
-    "if the current code block context is whole, correct, and self-contained.\n"
+    "You are a code completeness validator. Your job is to check whether a code block "
+    "has all the definitions it needs — nothing more.\n"
+    "\n"
+    "STDLIB RULE (highest priority): The following are Python standard library modules "
+    "and builtins. They are ALWAYS considered resolved. NEVER flag them as missing, "
+    "irrelevant, or suspicious under any circumstances: "
+    "sys, os, re, io, time, json, math, copy, enum, uuid, abc, ast, dis, csv, gzip, "
+    "zlib, hmac, glob, shlex, stat, fcntl, signal, struct, array, queue, heapq, bisect, "
+    "textwrap, fnmatch, hashlib, secrets, base64, codecs, locale, getpass, pathlib, "
+    "logging, inspect, typing, functools, itertools, operator, datetime, calendar, "
+    "decimal, fractions, random, string, pprint, dataclasses, contextlib, threading, "
+    "multiprocessing, subprocess, socket, select, ssl, http, urllib, urllib.request, "
+    "urllib.error, urllib.parse, email, html, xml, sqlite3, configparser, argparse, "
+    "traceback, warnings, weakref, gc, platform, resource, tempfile, shutil, fileinput, "
+    "collections, collections.abc.\n"
+    "\n"
+    "CHECKS TO PERFORM:\n"
+    "1. Is the function or class body syntactically complete and not cut off mid-way?\n"
+    "2. Are all non-stdlib names that are called or referenced either present in "
+    "[CURRENT IMPORTS] or [RESOLVED CROSS-REFERENCES]?\n"
+    "3. Are there genuinely missing local/project-level definitions that should be searched for?\n"
     "\n"
     "Task Context: {task}\n"
     "Iteration Step: {iteration}/{max_iter}\n"
@@ -33,13 +52,9 @@ VALIDATOR_PROMPT_HARDCODED = (
     "[KNOWN MISSING REFERENCES]\n"
     "{missing_refs}\n"
     "\n"
-    "You must return your assessment in strict JSON format. Do not add any text before or after the JSON structure. \n"
-    "Format:\n"
-    "{{\n"
-    '  "status": "needs_fix" or "approved",\n'
-    '  "feedback": "Detailed critical assessment...",\n'
-    '  "suggested_searches": ["list", "of", "missing", "module", "names", "or", "functions", "to", "find"]\n'
-    "}}\n"
+    "Return your answer as strict JSON only — no text before or after:\n"
+    '{{"status": "approved" | "needs_fix", "feedback": "one concise sentence", '
+    '"suggested_searches": ["only_local_names_to_find"]}}\n'
 )
 
 
@@ -115,14 +130,18 @@ class ValidatorAgent:
                          content=prompt, model=self.model, temperature=0.1)
 
             if self.stream:
-                print(f"\n[validator_agent → model, iter {payload.get('iteration')}]:")
+                ts = time.strftime("%H:%M:%S")
+                print(f"\n[{ts}] validator_agent → llm  (iter {payload.get('iteration')}/{self.max_iter}):")
                 content = request_completion(
                     url, headers, req_payload, self.timeout,
                     stream=True,
                     on_token=lambda t: (sys.stdout.write(t), sys.stdout.flush()),
                 )
-                print()  # newline after the streamed answer
+                ts_done = time.strftime("%H:%M:%S")
+                print(f"\n[{ts_done}] validator_agent ← llm  (response received)")
             else:
+                ts = time.strftime("%H:%M:%S")
+                print(f"[{ts}] validator_agent → llm  (iter {payload.get('iteration')}/{self.max_iter})  waiting…")
                 content = request_completion(url, headers, req_payload, self.timeout)
 
             tracer.event("llm", "validator_agent", "llm_response", content=content)

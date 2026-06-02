@@ -1,4 +1,5 @@
 import sys
+import time
 import json
 import urllib.request
 import urllib.error
@@ -131,14 +132,18 @@ class ImprovementAgent:
                          temperature=self.temperature, max_tokens=self.max_tokens)
 
             if self.stream:
-                print(f"\n[improvement_agent → model, intent={intent}]:")
+                ts = time.strftime("%H:%M:%S")
+                print(f"\n[{ts}] improvement_agent → llm  (intent={intent}):")
                 content = request_completion(
                     url, headers, req_payload, self.timeout,
                     stream=True,
                     on_token=lambda t: (sys.stdout.write(t), sys.stdout.flush()),
                 )
-                print()
+                ts_done = time.strftime("%H:%M:%S")
+                print(f"\n[{ts_done}] improvement_agent ← llm  (response received)")
             else:
+                ts = time.strftime("%H:%M:%S")
+                print(f"[{ts}] improvement_agent → llm  (intent={intent})  waiting…")
                 content = request_completion(url, headers, req_payload, self.timeout)
 
             tracer.event("llm", "improvement_agent", "llm_response", content=content)
