@@ -30,7 +30,8 @@ class OutputFormatter:
         improvement: Dict[str, Any],
         elapsed_time: float,
         iteration: int,
-        output_config: Dict[str, Any]
+        output_config: Dict[str, Any],
+        prompt_version: str = "hardcoded",   # STORY-5.2
     ) -> None:
         """
         Renders the formatted evaluation report output to stdout.
@@ -55,7 +56,7 @@ class OutputFormatter:
             target_display = "File Imports Only"
 
         print(divider)
-        print(f"Source: {parsed.file_path:<25} Target: {target_display}")
+        print(f"Source: {parsed.file_path:<25} Target: {target_display:<20} Prompt: {prompt_version}")
         
         # Build performance metrics evaluation matrix row
         metrics_line: List[str] = []

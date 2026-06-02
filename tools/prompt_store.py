@@ -80,6 +80,65 @@ class PromptStore:
         """Always return the original hardcoded constant — bypasses the store."""
         return _get_hardcoded(agent_name)
 
+    def get_store_summary(self, agent_names: list) -> str:
+        """Return a formatted /prompts introspection table for the given agents.
+
+        Example output::
+
+            validator_agent    v2  (score 0.87)  rollback: v1, hardcoded
+            improvement_agent  hardcoded          rollback: —
+        """
+        data = self._load()
+        rows = []
+        for name in agent_names:
+            entry = data.get(name, {})
+            stack = entry.get("stack", [])
+
+            # Current version label + score
+            if stack:
+                current_version = entry.get("current_version", stack[-1]["version"])
+                current = next(
+                    (item for item in reversed(stack) if item["version"] == current_version),
+                    stack[-1],
+                )
+                label = f"v{current['version']}"
+                score_str = f"(score {current['score']:.2f})"
+            else:
+                label = "hardcoded"
+                score_str = ""
+
+            # Rollback chain: everything below the top, then "hardcoded"
+            below = stack[:-1] if stack else []
+            rollback_parts = [f"v{item['version']}" for item in reversed(below)]
+            rollback_parts.append("hardcoded")
+            rollback_str = "rollback: " + ", ".join(rollback_parts)
+
+            rows.append((name, label, score_str, rollback_str))
+
+        if not rows:
+            return "(no agents registered)"
+
+        col0 = max(len(r[0]) for r in rows)
+        col1 = max(len(r[1]) for r in rows)
+        col2 = max(len(r[2]) for r in rows)
+        lines = [
+            f"{r[0]:<{col0}}  {r[1]:<{col1}}  {r[2]:<{col2}}  {r[3]}"
+            for r in rows
+        ]
+        return "\n".join(lines)
+
+    def get_version_label(self, agent_name: str) -> str:
+        """Return a short display label for the active prompt version.
+
+        Returns ``'v{n}'`` when a versioned prompt is active, or
+        ``'hardcoded'`` when the stack is empty / agent is unknown.
+        """
+        data = self._load()
+        entry = data.get(agent_name)
+        if not entry or not entry.get("stack"):
+            return "hardcoded"
+        return f"v{entry['current_version']}"
+
     def push(self, agent_name: str, new_prompt: str, score: float) -> None:
         """
         Add a new prompt version to the stack for agent_name.

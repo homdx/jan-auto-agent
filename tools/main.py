@@ -25,6 +25,8 @@ from tools.validator_agent import ValidatorAgent
 from tools.improvement_agent import ImprovementAgent
 from tools.metrics_collector import MetricsCollector, RunRecord
 from tools.prompt_store import PromptStore
+from tools.prompt_optimizer import PromptOptimizer
+from tools.prompt_evaluator import PromptEvaluator
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -57,6 +59,12 @@ class Orchestrator:
         # Core components instantiation with passed API configurations
         self.metrics_collector = MetricsCollector()
         self.prompt_store = PromptStore(config=self.config)  # STORY-2.3
+        self.prompt_optimizer = PromptOptimizer(         # STORY-3.2
+            model=self.model,
+            base_url=self.base_url,
+            api_key=self.api_key,
+            timeout=self.timeout_seconds,
+        )
         self.search_agent = SearchAgent()
         self.validator_agent = ValidatorAgent(
             max_iter=self.max_iterations,
@@ -65,6 +73,11 @@ class Orchestrator:
             api_key=self.api_key,
             timeout=self.timeout_seconds,  # <-- Pass INI timeout here
             prompt_store=self.prompt_store,  # STORY-2.3
+        )
+        self.prompt_evaluator = PromptEvaluator(      # STORY-4.2
+            prompt_store=self.prompt_store,
+            metrics_collector=self.metrics_collector,
+            validator_agent=self.validator_agent,
         )
         self.improvement_agent = ImprovementAgent(
             model=self.model,
@@ -87,6 +100,12 @@ class Orchestrator:
         self.model = self.config.get("api", "model", fallback="qwen2.5-14b-instruct")
         self.base_url = self.config.get("api", "base_url", fallback="http://localhost:1337/v1")
         self.api_key = self.config.get("api", "api_key", fallback="jan")
+
+        # STORY-3.2: optimizer gate thresholds (read from agents.ini)
+        self.optimizer_enabled         = self.config.getboolean("prompt_optimizer", "enabled",                  fallback=True)
+        self.optimizer_min_runs        = self.config.getint    ("prompt_optimizer", "min_runs_before_optimize",  fallback=3)
+        self.optimizer_trigger_avg_iter= self.config.getfloat  ("prompt_optimizer", "trigger_avg_iterations",   fallback=2.0)
+        self.optimizer_trigger_json_fail=self.config.getfloat  ("prompt_optimizer", "trigger_json_fail_rate",   fallback=0.30)
 
     def execute_direct_chat(self, user_input: str) -> None:
         """Routes conversational queries to local model with streaming output."""
@@ -248,6 +267,31 @@ class Orchestrator:
             improvement_json_ok=improvement_json_ok,
             elapsed_seconds=total_elapsed,
         ))
+
+        # STORY-3.2: Trigger prompt optimization when failure signal is strong enough
+        if self.optimizer_enabled:
+            summary = self.metrics_collector.summarize_failures(n=10)
+            should_optimize = (
+                summary["total_runs"] >= self.optimizer_min_runs
+                and (
+                    summary["avg_iterations"]        > self.optimizer_trigger_avg_iter
+                    or summary["json_parse_failure_rate"] > self.optimizer_trigger_json_fail
+                )
+            )
+            if should_optimize:
+                print("🧠 Optimizer triggered — generating candidate prompt for validator_agent...")
+                candidate = self.prompt_optimizer.generate_candidate(
+                    agent_name="validator_agent",
+                    current_prompt=self.prompt_store.get_current("validator_agent"),
+                    failure_summary=summary,
+                )
+                # STORY-4.2: evaluate candidate, promote if it clears the threshold
+                result = self.prompt_evaluator.evaluate("validator_agent", candidate)
+                if result.promoted:
+                    self.prompt_store.push("validator_agent", candidate, result.score)
+                    print(f"✅ Prompt promoted (score {result.score:.2f}) — {result.reason}")
+                else:
+                    print(f"⚠️  Candidate discarded — {result.reason}")
 
         OutputFormatter.render(
             parsed=parsed,

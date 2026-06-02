@@ -26,6 +26,7 @@ from tools.improvement_agent import ImprovementAgent
 from tools.metrics_collector import MetricsCollector, RunRecord
 from tools.prompt_store import PromptStore
 from tools.prompt_optimizer import PromptOptimizer
+from tools.prompt_evaluator import PromptEvaluator
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -72,6 +73,11 @@ class Orchestrator:
             api_key=self.api_key,
             timeout=self.timeout_seconds,  # <-- Pass INI timeout here
             prompt_store=self.prompt_store,  # STORY-2.3
+        )
+        self.prompt_evaluator = PromptEvaluator(      # STORY-4.2
+            prompt_store=self.prompt_store,
+            metrics_collector=self.metrics_collector,
+            validator_agent=self.validator_agent,
         )
         self.improvement_agent = ImprovementAgent(
             model=self.model,
@@ -254,7 +260,7 @@ class Orchestrator:
         self.metrics_collector.record(RunRecord(
             timestamp=timestamp,
             intent=parsed.intent,
-            prompt_version="hardcoded",
+            prompt_version=self.prompt_store.get_version_label("validator_agent"),
             iterations_used=iteration,
             validator_status=last_validation.get("status", "skipped"),
             validator_feedback=last_validation.get("feedback", ""),
@@ -279,11 +285,13 @@ class Orchestrator:
                     current_prompt=self.prompt_store.get_current("validator_agent"),
                     failure_summary=summary,
                 )
-                # Candidate is handed off to PromptEvaluator in EPIC-4.
-                # Stored on self so STORY-4.2 can wire evaluation + promotion.
-                self._pending_candidate = ("validator_agent", candidate)
-            else:
-                self._pending_candidate = None
+                # STORY-4.2: evaluate candidate, promote if it clears the threshold
+                result = self.prompt_evaluator.evaluate("validator_agent", candidate)
+                if result.promoted:
+                    self.prompt_store.push("validator_agent", candidate, result.score)
+                    print(f"✅ Prompt promoted (score {result.score:.2f}) — {result.reason}")
+                else:
+                    print(f"⚠️  Candidate discarded — {result.reason}")
 
         OutputFormatter.render(
             parsed=parsed,
@@ -297,7 +305,8 @@ class Orchestrator:
                 "show_timing": self.config.getboolean("output", "show_timing", fallback=True),
                 "show_iteration_count": self.config.getboolean("output", "show_iteration_count", fallback=True),
                 "max_iterations": self.max_iterations
-            }
+            },
+            prompt_version=self.prompt_store.get_version_label("validator_agent"),  # STORY-5.2
         )
 
 
@@ -318,6 +327,21 @@ def main():
                 break
             if user_input == orchestrator.new_chat_key:
                 print("Session reset completed.")
+                continue
+
+            # STORY-5.3: /prompts — introspect current prompt versions for all agents
+            if user_input == "/prompts":
+                print(orchestrator.prompt_store.get_store_summary(
+                    ["validator_agent", "improvement_agent"]
+                ))
+                continue
+
+            # STORY-4.3: /rollback [agent_name] — instant prompt version rollback
+            if user_input.startswith("/rollback"):
+                parts = user_input.split()
+                agent = parts[1] if len(parts) > 1 else "validator_agent"
+                ok = orchestrator.prompt_store.rollback(agent)
+                print(f"↩️  Rolled back {agent}" if ok else f"Already at hardcoded fallback for {agent}")
                 continue
 
             orchestrator.run_pipeline(user_input, base_dir)
