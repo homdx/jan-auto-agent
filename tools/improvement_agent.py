@@ -1,3 +1,4 @@
+import sys
 import json
 import urllib.request
 import urllib.error
@@ -5,6 +6,7 @@ import logging
 from typing import Optional
 
 from tools.agent_trace import tracer
+from tools.llm_stream import request_completion
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +78,12 @@ class ImprovementAgent:
             self._system_improve = None
             self._system_explain = None
 
+        # Echo the model's answer live (like direct chat) when [output] stream_agents = true.
+        if config is not None and config.has_section("output"):
+            self.stream = config.getboolean("output", "stream_agents", fallback=False)
+        else:
+            self.stream = False
+
     def process(self, intent: str, context: dict) -> dict:
         """Generates analytical code evaluations and refactoring patterns."""
         url = f"{self.base_url.rstrip('/')}/chat/completions"
@@ -118,25 +126,31 @@ class ImprovementAgent:
                 "temperature": self.temperature,
                 "max_tokens": self.max_tokens,
             }
-            req = urllib.request.Request(url, data=json.dumps(req_payload).encode("utf-8"), headers=headers, method="POST")
             tracer.event("improvement_agent", "llm", "llm_request",
                          content=prompt, model=self.model,
                          temperature=self.temperature, max_tokens=self.max_tokens)
 
-            # Use the dynamic timeout from agents.ini
-            with urllib.request.urlopen(req, timeout=self.timeout) as response:
-                raw_res = json.loads(response.read().decode("utf-8"))
-                content = raw_res["choices"][0]["message"]["content"].strip()
-                tracer.event("llm", "improvement_agent", "llm_response", content=content)
+            if self.stream:
+                print(f"\n[improvement_agent → model, intent={intent}]:")
+                content = request_completion(
+                    url, headers, req_payload, self.timeout,
+                    stream=True,
+                    on_token=lambda t: (sys.stdout.write(t), sys.stdout.flush()),
+                )
+                print()
+            else:
+                content = request_completion(url, headers, req_payload, self.timeout)
 
-                if "```json" in content:
-                    content = content.split("```json")[1].split("```")[0].strip()
-                elif "```" in content:
-                    content = content.split("```")[1].split("```")[0].strip()
+            tracer.event("llm", "improvement_agent", "llm_response", content=content)
 
-                parsed_result = json.loads(content)
-                tracer.event("improvement_agent", "orchestrator", "result", content=parsed_result)
-                return parsed_result
+            if "```json" in content:
+                content = content.split("```json")[1].split("```")[0].strip()
+            elif "```" in content:
+                content = content.split("```")[1].split("```")[0].strip()
+
+            parsed_result = json.loads(content)
+            tracer.event("improvement_agent", "orchestrator", "result", content=parsed_result)
+            return parsed_result
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="replace")
             logger.error(f"ImprovementAgent HTTP {e.code}: {body}")

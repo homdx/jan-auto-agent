@@ -1,3 +1,4 @@
+import sys
 import json
 import urllib.request
 import urllib.error
@@ -5,6 +6,7 @@ import logging
 from typing import Optional
 
 from tools.agent_trace import tracer
+from tools.llm_stream import request_completion
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +52,7 @@ class ValidatorAgent:
         api_key: str = "jan",
         timeout: int = 120,
         prompt_store=None,   # STORY-2.3: injected PromptStore (Optional[PromptStore])
+        stream: bool = False,  # echo the model's answer live, like direct chat
     ):
         self.max_iter = max_iter
         self.model = model
@@ -57,6 +60,7 @@ class ValidatorAgent:
         self.api_key = api_key
         self.timeout = timeout
         self.prompt_store = prompt_store  # None → always use hardcoded constant
+        self.stream = stream
 
     def validate(self, payload: dict) -> dict:
         """Evaluates whether the target block requires additional code scanning cycles."""
@@ -109,22 +113,28 @@ class ValidatorAgent:
             }
             tracer.event("validator_agent", "llm", "llm_request",
                          content=prompt, model=self.model, temperature=0.1)
-            req = urllib.request.Request(url, data=json.dumps(req_payload).encode("utf-8"), headers=headers, method="POST")
 
-            # Use the dynamic timeout from agents.ini
-            with urllib.request.urlopen(req, timeout=self.timeout) as response:
-                raw_res = json.loads(response.read().decode("utf-8"))
-                content = raw_res["choices"][0]["message"]["content"].strip()
-                tracer.event("llm", "validator_agent", "llm_response", content=content)
+            if self.stream:
+                print(f"\n[validator_agent → model, iter {payload.get('iteration')}]:")
+                content = request_completion(
+                    url, headers, req_payload, self.timeout,
+                    stream=True,
+                    on_token=lambda t: (sys.stdout.write(t), sys.stdout.flush()),
+                )
+                print()  # newline after the streamed answer
+            else:
+                content = request_completion(url, headers, req_payload, self.timeout)
 
-                if "```json" in content:
-                    content = content.split("```json")[1].split("```")[0].strip()
-                elif "```" in content:
-                    content = content.split("```")[1].split("```")[0].strip()
+            tracer.event("llm", "validator_agent", "llm_response", content=content)
 
-                parsed_result = json.loads(content)
-                tracer.event("validator_agent", "orchestrator", "result", content=parsed_result)
-                return parsed_result
+            if "```json" in content:
+                content = content.split("```json")[1].split("```")[0].strip()
+            elif "```" in content:
+                content = content.split("```")[1].split("```")[0].strip()
+
+            parsed_result = json.loads(content)
+            tracer.event("validator_agent", "orchestrator", "result", content=parsed_result)
+            return parsed_result
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="replace")
             logger.error(f"ValidatorAgent HTTP {e.code}: {body}")

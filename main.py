@@ -93,6 +93,7 @@ class Orchestrator:
             api_key=self.api_key,
             timeout=self.timeout_seconds,  # <-- Pass INI timeout here
             prompt_store=self.prompt_store,  # STORY-2.3
+            stream=self.stream_agents,       # live token echo when enabled
         )
         self.prompt_evaluator = PromptEvaluator(      # STORY-4.2
             prompt_store=self.prompt_store,
@@ -122,6 +123,10 @@ class Orchestrator:
         self.model = self.config.get("api", "model", fallback="qwen2.5-14b-instruct")
         self.base_url = self.config.get("api", "base_url", fallback="http://localhost:1337/v1")
         self.api_key = self.config.get("api", "api_key", fallback="jan")
+
+        # When true, validator/improvement agents echo the model's answer live
+        # (token by token) instead of showing only a spinner.
+        self.stream_agents = self.config.getboolean("output", "stream_agents", fallback=False)
 
         # STORY-3.2: optimizer gate thresholds (read from agents.ini)
         self.optimizer_enabled         = self.config.getboolean("prompt_optimizer", "enabled",                  fallback=True)
@@ -254,8 +259,11 @@ class Orchestrator:
                     "iteration": iteration
                 }
                 tracer.event("orchestrator", "validator_agent", "call", params=_val_payload)
-                with Spinner(f"Validator iter {iteration}/{self.max_iterations}"):
+                if self.stream_agents:
                     validation = self.validator_agent.validate(_val_payload)
+                else:
+                    with Spinner(f"Validator iter {iteration}/{self.max_iterations}"):
+                        validation = self.validator_agent.validate(_val_payload)
 
                 if validation.get("status") == "approved":
                     break
@@ -287,8 +295,11 @@ class Orchestrator:
             }
             tracer.event("orchestrator", "improvement_agent", "call",
                          params={"intent": parsed.intent, **improvement_context})
-            with Spinner("Improvement agent"):
+            if self.stream_agents:
                 improvement = self.improvement_agent.process(parsed.intent, improvement_context)
+            else:
+                with Spinner("Improvement agent"):
+                    improvement = self.improvement_agent.process(parsed.intent, improvement_context)
         else:
             improvement = {"explanation": "", "issues": [], "improved_code": "", "changes": []}
 
