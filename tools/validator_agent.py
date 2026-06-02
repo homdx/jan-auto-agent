@@ -42,7 +42,8 @@ You must return your assessment in strict JSON format. Do not add any text befor
 Format:
 {{
   "status": "needs_fix" or "approved",
-  "feedback": "Detailed critical assessment explaining why it needs context loops or what is fine."
+  "feedback": "Detailed critical assessment...",
+  "suggested_searches": ["list", "of", "missing", "module", "names", "or", "functions", "to", "find"]
 }}
 """
         try:

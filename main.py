@@ -117,9 +117,10 @@ class Orchestrator:
             logger.error(f"Failed to communicate with local Jan engine endpoint: {e}")
 
     def run_pipeline(self, user_input: str, base_dir: str) -> None:
-        """Executes pipelines and timestamps the structural layout stream."""
+        """Executes pipelines with adaptive search, validation loops, and visual feedback."""
         start_time = time.time()
         
+        # Parse intent and target
         parsed: ParsedPrompt = parse_prompt(user_input)
         
         if not parsed.file_path:
@@ -128,18 +129,12 @@ class Orchestrator:
 
         target_path = os.path.normpath(os.path.join(base_dir, parsed.file_path))
         if not os.path.exists(target_path) or not os.path.isfile(target_path):
-            timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-            print(f"[{timestamp}] -> Error: Target path is not a valid file: '{parsed.file_path}'\n")
+            print(f"Error: Target path is not a valid file: '{parsed.file_path}'")
             return
 
         ext = Path(parsed.file_path).suffix
-
-        try:
-            source = file_reader.read_file(target_path)
-        except Exception as e:
-            logger.error(f"Execution failed while reading targets: {e}")
-            return
-
+        source = file_reader.read_file(target_path)
+        
         imports = block_extractor.extract_imports(source, ext)
         block = block_extractor.extract_block(source, parsed.target_name, ext)
         refs = block_extractor.find_references(block, ext)
@@ -149,62 +144,66 @@ class Orchestrator:
         already_searched = [parsed.file_path]
         search_result: Dict[str, Any] = {"found": {}, "not_found": [], "searched_files": []}
 
-        # The multi-agent assessment evaluation loop
-        while iteration <= self.max_iterations:
-            elapsed = time.time() - start_time
-            if elapsed >= self.timeout_seconds:
-                logger.warning("Pipeline execution hit defined timeout threshold bounds.")
-                break
+        # --- VALIDATION LOOP (Only if not a simple 'show' intent) ---
+        if parsed.intent not in ("show", "explain"):
+            while iteration <= self.max_iterations:
+                elapsed = time.time() - start_time
+                if elapsed >= self.timeout_seconds:
+                    break
 
-            search_result = self.search_agent.run(
-                references=refs,
-                base_dir=base_dir,
-                already_searched=already_searched,
-                file_ext_hint=ext
-            )
+                print(f"🔍 Searching for references (iter {iteration})...")
+                search_result = self.search_agent.run(
+                    references=refs,
+                    base_dir=base_dir,
+                    already_searched=already_searched,
+                    file_ext_hint=ext
+                )
 
-            aggregated_refs = {}
-            for k, v in search_result.get("found", {}).items():
-                aggregated_refs[k] = v.get("code", "")
+                aggregated_refs = {k: v.get("code", "") for k, v in search_result.get("found", {}).items()}
+                
+                print(f"🤖 Validating block with LLM ({iteration}/{self.max_iterations})...")
+                validation = self.validator_agent.validate({
+                    "task": user_input,
+                    "target_block": block,
+                    "imports": imports,
+                    "related_code": aggregated_refs,
+                    "missing_refs": search_result.get("not_found", []),
+                    "iteration": iteration
+                })
 
-            validation_payload = {
-                "task": user_input,
+                if validation.get("status") == "approved":
+                    break
+                
+                # Adaptive Scope: Expand search for next iteration
+                already_searched.extend(search_result.get("searched_files", []))
+                new_suggestions = validation.get("suggested_searches", [])
+                if isinstance(new_suggestions, list):
+                    for suggestion in new_suggestions:
+                        if suggestion not in refs:
+                            refs.append(suggestion)
+                iteration += 1
+        else:
+            print("ℹ️ Intent is 'show'. Skipping agent validation pipeline.")
+
+        # --- IMPROVEMENT AGENT (Intent-based) ---
+        improvement: Dict[str, Any] = {}
+        if parsed.intent in ("optimize", "fix", "improve", "explain"):
+            print("⚡ Processing improvements...")
+            improvement_context = {
                 "target_block": block,
                 "imports": imports,
-                "related_code": aggregated_refs,
-                "missing_refs": search_result.get("not_found", []),
-                "iteration": iteration
+                "related_code": {k: v.get("code", "") for k, v in search_result.get("found", {}).items()},
+                "context_lines": context_lines
             }
-            
-            # Connected Validation Call
-            validation = self.validator_agent.validate(validation_payload)
+            improvement = self.improvement_agent.process(parsed.intent, improvement_context)
+        else:
+            improvement = {"explanation": "", "issues": [], "improved_code": "", "changes": []}
 
-            if validation.get("status") == "approved" or iteration >= self.max_iterations or (time.time() - start_time) >= self.timeout_seconds:
-                break
-            else:
-                already_searched.extend(search_result.get("searched_files", []))
-                iteration += 1
-
-        # Connected Optimization Processing Call
-        improvement_context = {
-            "target_block": block,
-            "imports": imports,
-            "related_code": {k: v.get("code", "") for k, v in search_result.get("found", {}).items()},
-            "context_lines": context_lines
-        }
-        improvement = self.improvement_agent.process(parsed.intent, improvement_context)
-
+        # --- FINAL RENDER ---
         total_elapsed = time.time() - start_time
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
         
         print(f"\n[PIPELINE COMPLETED - {timestamp}]")
-        
-        output_config = {
-            "show_timing": self.config.getboolean("output", "show_timing", fallback=True),
-            "show_iteration_count": self.config.getboolean("output", "show_iteration_count", fallback=True),
-            "max_iterations": self.max_iterations
-        }
-        
         OutputFormatter.render(
             parsed=parsed,
             imports=imports,
@@ -213,7 +212,11 @@ class Orchestrator:
             improvement=improvement,
             elapsed_time=total_elapsed,
             iteration=iteration,
-            output_config=output_config
+            output_config={
+                "show_timing": self.config.getboolean("output", "show_timing", fallback=True),
+                "show_iteration_count": self.config.getboolean("output", "show_iteration_count", fallback=True),
+                "max_iterations": self.max_iterations
+            }
         )
 
 

@@ -53,8 +53,11 @@ Return your analytical metrics strictly as a valid JSON block matching the struc
         try:
             req_payload = {
                 "model": self.model,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.3
+                "messages": [
+                    {"role": "system", "content": "You are a code assistant. Respond only in valid JSON."},
+                    {"role": "user", "content": prompt}
+                ],
+                "temperature": 0.1
             }
             req = urllib.request.Request(url, data=json.dumps(req_payload).encode("utf-8"), headers=headers, method="POST")
             
