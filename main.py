@@ -5,6 +5,7 @@ import json
 import logging
 import configparser
 import urllib.request
+import urllib.error
 from pathlib import Path
 from typing import Dict, Any, List
 
@@ -27,28 +28,40 @@ from tools.metrics_collector import MetricsCollector, RunRecord
 from tools.prompt_store import PromptStore
 from tools.prompt_optimizer import PromptOptimizer
 from tools.prompt_evaluator import PromptEvaluator
+from tools.ui import Spinner
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 
-class MockFileUtilities:
+from tools.file_reader import read_file, list_py_files
+from tools.block_extractor import extract_block, extract_imports, find_references, get_context_lines
+
+
+class _FileReaderAdapter:
+    """Thin adapter so the rest of main.py can call file_reader.read_file() unchanged."""
     def read_file(self, path: str) -> str:
-        with open(path, "r", encoding="utf-8") as f:
-            return f.read()
-    def extract_imports(self, source: str, ext: str) -> List[str]: return []
-    def extract_block(self, source: str, name: str, ext: str) -> str: return source
-    def find_references(self, block: str, ext: str) -> List[str]: return []
-    def get_context_lines(self, source: str, name: str) -> str: return ""
+        return read_file(path)
 
 
-try:
-    import utils.file_reader as file_reader
-    import utils.block_extractor as block_extractor
-except ImportError:
-    file_util = MockFileUtilities()
-    file_reader = file_util
-    block_extractor = file_util
+class _BlockExtractorAdapter:
+    """Thin adapter bridging the tools.block_extractor API to the call sites below."""
+    def extract_imports(self, source: str, ext: str) -> List[str]:
+        return extract_imports(source, ext)
+
+    def extract_block(self, source: str, name: str, ext: str) -> str:
+        result = extract_block(source, name, ext)
+        return result if result is not None else source
+
+    def find_references(self, block: str, ext: str) -> List[str]:
+        return find_references(block, ext)
+
+    def get_context_lines(self, source: str, name: str) -> str:
+        return get_context_lines(source, name)
+
+
+file_reader = _FileReaderAdapter()
+block_extractor = _BlockExtractorAdapter()
 
 
 class Orchestrator:
@@ -65,7 +78,13 @@ class Orchestrator:
             api_key=self.api_key,
             timeout=self.timeout_seconds,
         )
-        self.search_agent = SearchAgent()
+        _raw_skip = self.config.get("search", "skip_dirs", fallback="")
+        _skip_dirs = [d.strip() for d in _raw_skip.split(",") if d.strip()] or None
+        self.search_agent = SearchAgent(
+            max_file_kb=self.config.getint("search", "max_file_kb", fallback=500),
+            skip_dirs=_skip_dirs,   # None → SearchAgent uses its built-in default list
+            max_depth=self.config.getint("search", "max_depth", fallback=2),
+        )
         self.validator_agent = ValidatorAgent(
             max_iter=self.max_iterations,
             model=self.model,
@@ -78,6 +97,7 @@ class Orchestrator:
             prompt_store=self.prompt_store,
             metrics_collector=self.metrics_collector,
             validator_agent=self.validator_agent,
+            max_iter=self.max_iterations,   # Bug #9: pass real config value
         )
         self.improvement_agent = ImprovementAgent(
             model=self.model,
@@ -85,6 +105,7 @@ class Orchestrator:
             api_key=self.api_key,
             timeout=self.timeout_seconds,  # <-- Pass INI timeout here
             prompt_store=self.prompt_store,  # STORY-2.3
+            config=self.config,              # Bug #12: temperature/max_tokens/system prompts
         )
 
     def load_config(self, config_path: str) -> None:
@@ -179,12 +200,16 @@ class Orchestrator:
         except Exception as e:
             logger.error(f"Execution failed while reading targets: {e}")
             return
-        
+
+        # Bug #13 fix: re-parse now that we have the source so Strategy-C can
+        # verify the candidate target symbol actually exists in the file instead
+        # of grabbing the first stray identifier (e.g. "bug" in "fix the bug in x.py").
+        parsed = parse_prompt(user_input, source=source)
+
         imports = block_extractor.extract_imports(source, ext)
         block = block_extractor.extract_block(source, parsed.target_name, ext)
         refs = block_extractor.find_references(block, ext)
         context_lines = block_extractor.get_context_lines(source, parsed.target_name)
-
         iteration = 1
         already_searched = [parsed.file_path]
         search_result: Dict[str, Any] = {"found": {}, "not_found": [], "searched_files": []}
@@ -207,14 +232,15 @@ class Orchestrator:
                 aggregated_refs = {k: v.get("code", "") for k, v in search_result.get("found", {}).items()}
                 
                 print(f"🤖 Validating block with LLM ({iteration}/{self.max_iterations})...")
-                validation = self.validator_agent.validate({
-                    "task": user_input,
-                    "target_block": block,
-                    "imports": imports,
-                    "related_code": aggregated_refs,
-                    "missing_refs": search_result.get("not_found", []),
-                    "iteration": iteration
-                })
+                with Spinner(f"Validator iter {iteration}/{self.max_iterations}"):
+                    validation = self.validator_agent.validate({
+                        "task": user_input,
+                        "target_block": block,
+                        "imports": imports,
+                        "related_code": aggregated_refs,
+                        "missing_refs": search_result.get("not_found", []),
+                        "iteration": iteration
+                    })
 
                 if validation.get("status") == "approved":
                     break
@@ -236,7 +262,7 @@ class Orchestrator:
 
         # --- IMPROVEMENT AGENT (Intent-based) ---
         improvement: Dict[str, Any] = {}
-        if parsed.intent in ("optimize", "fix", "improve", "explain"):
+        if parsed.intent in ("optimize", "fix", "improve", "explain", "show_and_improve"):
             print("⚡ Processing improvements...")
             improvement_context = {
                 "target_block": block,
@@ -244,7 +270,8 @@ class Orchestrator:
                 "related_code": {k: v.get("code", "") for k, v in search_result.get("found", {}).items()},
                 "context_lines": context_lines
             }
-            improvement = self.improvement_agent.process(parsed.intent, improvement_context)
+            with Spinner("Improvement agent"):
+                improvement = self.improvement_agent.process(parsed.intent, improvement_context)
         else:
             improvement = {"explanation": "", "issues": [], "improved_code": "", "changes": []}
 
@@ -256,7 +283,14 @@ class Orchestrator:
 
         # STORY-1.1: Record run metrics
         last_validation = validation if parsed.intent not in ("show", "show_imports") else {}
-        improvement_json_ok = bool(improvement.get("improved_code") or improvement.get("explanation"))
+        # Bug #8 fix: record None (not False) when the improvement agent was never
+        # invoked — False would inflate json_parse_failure_rate and trigger the
+        # optimizer for reasons unrelated to validator quality.
+        _improvement_intents = ("optimize", "fix", "improve", "explain", "show_and_improve")
+        if parsed.intent in _improvement_intents:
+            improvement_json_ok = bool(improvement.get("improved_code") or improvement.get("explanation"))
+        else:
+            improvement_json_ok = None
         self.metrics_collector.record(RunRecord(
             timestamp=timestamp,
             intent=parsed.intent,

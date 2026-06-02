@@ -1,5 +1,6 @@
 import json
 import urllib.request
+import urllib.error
 import logging
 from typing import Optional
 

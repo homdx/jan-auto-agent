@@ -14,7 +14,7 @@ class ParsedPrompt:
     raw: str              # Original prompt
 
 
-def _parse_via_regex(raw: str) -> Optional[ParsedPrompt]:
+def _parse_via_regex(raw: str, source: str = "") -> Optional[ParsedPrompt]:
     """
     Attempts to break down the natural language prompt into structured tokens
     using high-predictability regex patterns. Returns None if a file path
@@ -51,12 +51,21 @@ def _parse_via_regex(raw: str) -> Optional[ParsedPrompt]:
         if from_match:
             target_name = from_match.group(2)
         else:
-            # Strategy C: Fallback to the remaining single standalone identifier word
+            # Strategy C: Fallback to the remaining single standalone identifier word.
+            # Only accept it if the symbol actually exists somewhere in the source file
+            # (def/class declaration or bare reference) to avoid grabbing prose words like
+            # "bug" from "fix the bug in app.py".
             clean_rem = re.sub(r'\b(show|improve|explain|find|view|display|me|the|in|from|optimize|fix|refactor|correct|get|read|describe|understand|doc)\b', ' ', remainder, flags=re.IGNORECASE).strip()
             words = clean_rem.split()
             valid_identifiers = [w for w in words if re.match(r'^[A-Za-z_][\w]*$', w)]
-            if valid_identifiers:
-                target_name = valid_identifiers[0]
+            for candidate in valid_identifiers:
+                # Accept only when the symbol is actually defined or referenced in source.
+                if source and not re.search(
+                    r'\b' + re.escape(candidate) + r'\b', source
+                ):
+                    continue
+                target_name = candidate
+                break
 
     # 3. Determine Intent Matrix
     intent = "show_and_improve"  # Default fallback condition
@@ -92,12 +101,13 @@ def _parse_via_regex(raw: str) -> Optional[ParsedPrompt]:
     )
 
 
-def parse_prompt(raw: str, llm_fallback_fn: Optional[Callable[[str], ParsedPrompt]] = None) -> ParsedPrompt:
+def parse_prompt(raw: str, llm_fallback_fn: Optional[Callable[[str], ParsedPrompt]] = None, source: str = "") -> ParsedPrompt:
     """
     Main orchestrator endpoint for parsing user intents.
     Tries fast deterministic regex matching first; falls back to an LLM agent call if inconclusive.
+    Pass `source` (file contents) so Strategy-C can verify a candidate symbol actually exists.
     """
-    parsed = _parse_via_regex(raw)
+    parsed = _parse_via_regex(raw, source=source)
     if parsed is not None:
         return parsed
 

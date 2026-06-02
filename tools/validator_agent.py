@@ -1,5 +1,6 @@
 import json
 import urllib.request
+import urllib.error
 import logging
 from typing import Optional
 
@@ -71,15 +72,32 @@ class ValidatorAgent:
             else VALIDATOR_PROMPT_HARDCODED
         )
 
-        prompt = template.format(
-            task=payload.get("task"),
-            iteration=payload.get("iteration"),
-            max_iter=self.max_iter,
-            target_block=payload.get("target_block"),
-            imports=payload.get("imports"),
-            related_code=json.dumps(payload.get("related_code"), indent=2),
-            missing_refs=payload.get("missing_refs"),
-        )
+        # Bug #5 fix: build prompt inside try so a malformed candidate template
+        # (stray braces / missing placeholders) is caught rather than aborting the run.
+        try:
+            prompt = template.format(
+                task=payload.get("task"),
+                iteration=payload.get("iteration"),
+                max_iter=self.max_iter,
+                target_block=payload.get("target_block"),
+                imports=payload.get("imports"),
+                related_code=json.dumps(payload.get("related_code"), indent=2),
+                missing_refs=payload.get("missing_refs"),
+            )
+        except (KeyError, ValueError) as fmt_err:
+            logger.error(
+                "ValidatorAgent: prompt template has invalid placeholders (%s) — "
+                "rolling back to hardcoded prompt for this call", fmt_err
+            )
+            prompt = VALIDATOR_PROMPT_HARDCODED.format(
+                task=payload.get("task"),
+                iteration=payload.get("iteration"),
+                max_iter=self.max_iter,
+                target_block=payload.get("target_block"),
+                imports=payload.get("imports"),
+                related_code=json.dumps(payload.get("related_code"), indent=2),
+                missing_refs=payload.get("missing_refs"),
+            )
 
         try:
             req_payload = {
@@ -103,7 +121,10 @@ class ValidatorAgent:
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="replace")
             logger.error(f"ValidatorAgent HTTP {e.code}: {body}")
-            return {"status": "approved", "feedback": f"HTTP {e.code} from API: {body}"}
+            # Bug #7 fix: errors must NOT be treated as approved — use needs_fix.
+            # _api_error sentinel lets prompt_evaluator exclude this from scoring.
+            return {"status": "needs_fix", "feedback": f"HTTP {e.code} from API: {body}", "_api_error": True}
         except Exception as e:
             logger.error(f"ValidatorAgent execution loop failed: {e}")
-            return {"status": "approved", "feedback": f"API Connection Timeout Fallback: {e}"}
+            # Bug #7 fix: same — fail-closed, not fail-open.
+            return {"status": "needs_fix", "feedback": f"API Connection Timeout Fallback: {e}", "_api_error": True}

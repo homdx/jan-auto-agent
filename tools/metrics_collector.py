@@ -4,7 +4,7 @@ import re
 from collections import Counter
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +19,7 @@ class RunRecord:
     iterations_used: int
     validator_status: str
     validator_feedback: str
-    improvement_json_ok: bool
+    improvement_json_ok: Optional[bool]  # None = not applicable (show/show_imports); excluded from rate
     elapsed_seconds: float
 
 
@@ -69,8 +69,16 @@ class MetricsCollector:
 
         avg_iterations = sum(r["iterations_used"] for r in window) / total
 
-        json_failures = sum(1 for r in window if not r["improvement_json_ok"])
-        json_parse_failure_rate = round(json_failures / total, 4)
+        # Bug #8 fix: only count runs where improvement was actually attempted
+        # (improvement_json_ok is None for show/show_imports — exclude them so
+        # non-improvement intents don't inflate the failure rate and trigger
+        # the optimizer spuriously).
+        improvement_runs = [r for r in window if r.get("improvement_json_ok") is not None]
+        if improvement_runs:
+            json_failures = sum(1 for r in improvement_runs if not r["improvement_json_ok"])
+            json_parse_failure_rate = round(json_failures / len(improvement_runs), 4)
+        else:
+            json_parse_failure_rate = 0.0
 
         # Word-frequency count over all non-empty feedback strings
         all_feedback = " ".join(

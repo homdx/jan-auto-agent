@@ -1,5 +1,6 @@
 import json
 import urllib.request
+import urllib.error
 import logging
 from typing import Optional
 
@@ -52,12 +53,26 @@ class ImprovementAgent:
         api_key: str = "jan",
         timeout: int = 120,
         prompt_store=None,   # STORY-2.3: injected PromptStore (Optional[PromptStore])
+        config=None,         # configparser.ConfigParser — carries temperature/max_tokens/system prompts
     ):
         self.model = model
         self.base_url = base_url
         self.api_key = api_key
         self.timeout = timeout
         self.prompt_store = prompt_store  # None → always use hardcoded constant
+
+        # Read temperature and max_tokens from [improvement_agent] in agents.ini.
+        # Fall back to the values the original code hardcoded if the section is absent.
+        if config is not None and config.has_section("improvement_agent"):
+            self.temperature = config.getfloat("improvement_agent", "temperature", fallback=0.4)
+            self.max_tokens  = config.getint  ("improvement_agent", "max_tokens",  fallback=2000)
+            self._system_improve = config.get("improvement_agent", "system_improve", fallback=None)
+            self._system_explain = config.get("improvement_agent", "system_explain", fallback=None)
+        else:
+            self.temperature = 0.4
+            self.max_tokens  = 2000
+            self._system_improve = None
+            self._system_explain = None
 
     def process(self, intent: str, context: dict) -> dict:
         """Generates analytical code evaluations and refactoring patterns."""
@@ -83,11 +98,23 @@ class ImprovementAgent:
             context_lines=context.get("context_lines"),
         )
 
+        # Select the per-intent system prompt from agents.ini when available.
+        if intent == "explain" and self._system_explain:
+            system_content = self._system_explain
+        elif self._system_improve:
+            system_content = self._system_improve
+        else:
+            system_content = "You are a senior codebase refactoring agent."
+
         try:
             req_payload = {
                 "model": self.model,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.3
+                "messages": [
+                    {"role": "system", "content": system_content},
+                    {"role": "user", "content": prompt},
+                ],
+                "temperature": self.temperature,
+                "max_tokens": self.max_tokens,
             }
             req = urllib.request.Request(url, data=json.dumps(req_payload).encode("utf-8"), headers=headers, method="POST")
 

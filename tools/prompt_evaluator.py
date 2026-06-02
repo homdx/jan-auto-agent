@@ -91,7 +91,8 @@ class PromptEvaluator:
 
     Usage::
 
-        evaluator = PromptEvaluator(prompt_store, metrics_collector, validator_agent)
+        evaluator = PromptEvaluator(prompt_store, metrics_collector, validator_agent,
+                                    max_iter=config_max_iterations)
         result = evaluator.evaluate("validator_agent", candidate_prompt)
         if result.promoted:
             prompt_store.push("validator_agent", candidate_prompt, result.score)
@@ -102,10 +103,12 @@ class PromptEvaluator:
         prompt_store: "PromptStore",
         metrics_collector: MetricsCollector,
         validator_agent: Optional["ValidatorAgent"] = None,
+        max_iter: int = _MAX_ITER_ASSUMED,   # Bug #9: caller should pass config max_iterations
     ) -> None:
         self.prompt_store = prompt_store
         self.metrics_collector = metrics_collector
-        self.validator_agent = validator_agent  # None → projection fallback
+        self.validator_agent = validator_agent
+        self.max_iter = max_iter             # used for iter_score normalisation
 
     # ------------------------------------------------------------------ #
     # Public API                                                           #
@@ -116,10 +119,24 @@ class PromptEvaluator:
         Evaluate *candidate_prompt* for *agent_name*.
 
         Steps:
-        1. Load last 5 production runs → compute current_score.
-        2. Shadow-run the candidate (or project) → compute candidate_score.
-        3. Promote iff candidate_score > current_score + 0.05.
+        1. Validate the candidate has all required placeholders and no stray braces.
+        2. Load last 5 production runs → compute current_score.
+        3. Shadow-run the candidate (or project) → compute candidate_score.
+        4. Promote iff candidate_score > current_score + 0.05.
         """
+        # Bug #6 fix: reject candidates that would crash .format() before any LLM call.
+        validation_error = _validate_candidate_placeholders(candidate_prompt)
+        if validation_error:
+            logger.warning(
+                "PromptEvaluator: candidate for '%s' rejected — %s",
+                agent_name, validation_error,
+            )
+            return EvalResult(
+                promoted=False,
+                reason=f"Candidate rejected (malformed template): {validation_error}",
+                score=0.0,
+            )
+
         recent: List[RunRecord] = self.metrics_collector.load_recent(5)
 
         if not recent:
@@ -171,8 +188,8 @@ class PromptEvaluator:
             return 0.0
 
         avg_iter = sum(r.iterations_used for r in records) / n
-        # 1 iteration → 1.0; _MAX_ITER_ASSUMED iterations → 0.0
-        iter_score = max(0.0, 1.0 - (avg_iter - 1.0) / max(1, _MAX_ITER_ASSUMED - 1))
+        # 1 iteration → 1.0; self.max_iter iterations → 0.0
+        iter_score = max(0.0, 1.0 - (avg_iter - 1.0) / max(1, self.max_iter - 1))
 
         json_ok_rate = sum(1 for r in records if r.improvement_json_ok) / n
 
@@ -205,7 +222,11 @@ class PromptEvaluator:
 
         results: List[dict] = []
         original_store = self.validator_agent.prompt_store
+        original_max_iter = self.validator_agent.max_iter
         self.validator_agent.prompt_store = _FixedPromptStore(candidate_prompt)
+        # Bug #9: use the same max_iter the real pipeline uses so shadow payloads
+        # produce iteration/max_iter values comparable to baseline records.
+        self.validator_agent.max_iter = self.max_iter
 
         try:
             for payload in _SHADOW_PAYLOADS:
@@ -219,8 +240,9 @@ class PromptEvaluator:
                         exc,
                     )
         finally:
-            # Always restore the original store — even on unexpected exception
+            # Always restore the original store and max_iter — even on unexpected exception
             self.validator_agent.prompt_store = original_store
+            self.validator_agent.max_iter = original_max_iter
 
         if not results:
             logger.warning(
@@ -233,10 +255,12 @@ class PromptEvaluator:
         # Shadow runs are single-shot: approved → 1 iteration simulated; else 2
         sim_iters = [1 if r.get("status") == "approved" else 2 for r in results]
         avg_iter = sum(sim_iters) / n
-        iter_score = max(0.0, 1.0 - (avg_iter - 1.0) / max(1, _MAX_ITER_ASSUMED - 1))
+        iter_score = max(0.0, 1.0 - (avg_iter - 1.0) / max(1, self.max_iter - 1))
 
-        # If validate() returned a dict (no exception), JSON round-trip was clean
-        json_ok_rate = 1.0
+        # Bug #6 fix: do NOT hardcode json_ok_rate=1.0.
+        # A broken candidate will cause validate() to return {"_api_error": True};
+        # only count calls that reached the LLM and returned parseable JSON as successes.
+        json_ok_rate = sum(1 for r in results if not r.get("_api_error")) / n
 
         approved_rate = (
             sum(1 for r in results if r.get("status") == "approved") / n
@@ -289,6 +313,36 @@ class PromptEvaluator:
             projected,
         )
         return projected
+
+
+# Required placeholders that every validator_agent prompt must contain.
+_REQUIRED_PLACEHOLDERS = frozenset([
+    "{task}", "{iteration}", "{max_iter}",
+    "{target_block}", "{imports}", "{related_code}", "{missing_refs}",
+])
+
+
+def _validate_candidate_placeholders(candidate: str) -> Optional[str]:
+    """
+    Check that *candidate* contains all required placeholders and has no
+    unmatched/stray curly braces that would crash str.format().
+
+    Returns None if valid, or a human-readable error string if not.
+    """
+    import string
+    # Check all required keys are present
+    missing = [p for p in _REQUIRED_PLACEHOLDERS if p not in candidate]
+    if missing:
+        return f"missing required placeholders: {', '.join(sorted(missing))}"
+
+    # Check brace balance — str.format() raises ValueError on lone { or }
+    try:
+        # Parse with string.Formatter to catch unmatched braces
+        list(string.Formatter().parse(candidate))
+    except (ValueError, KeyError) as exc:
+        return f"unmatched or invalid braces: {exc}"
+
+    return None
 
 
 # ------------------------------------------------------------------ #

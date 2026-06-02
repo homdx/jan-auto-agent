@@ -5,20 +5,47 @@ from typing import List, Dict, Any, Set, Optional
 
 logger = logging.getLogger(__name__)
 
-# Assuming these are implemented in TASK-01 and TASK-02
-try:
-    from utils.fs import list_py_files
-    from utils.parser import extract_block
-except ImportError:
-    # Placeholders for linter/standalone structural reference
-    def list_py_files(base_dir: str, skip_dirs: List[str] = None) -> List[str]: return []
-    def extract_block(filepath: str, target_name: str) -> Optional[str]: return None
+from tools.file_reader import list_py_files as _list_py_files
+from tools.block_extractor import extract_block as _extract_block_from_source
+
+
+def list_py_files(base_dir: str, skip_dirs: List[str] = None) -> List[str]:
+    """Delegates to tools.file_reader.list_py_files."""
+    return _list_py_files(base_dir, skip_dirs or [])
+
+
+def extract_block(filepath: str, target_name: str) -> Optional[str]:
+    """
+    Path-based wrapper that bridges the search_agent's 2-arg call site to the
+    real 3-arg tools.block_extractor.extract_block(source, name, ext).
+    Returns None if the file cannot be read or the block is not found.
+    """
+    try:
+        ext = Path(filepath).suffix
+        with open(filepath, "r", encoding="utf-8", errors="replace") as fh:
+            source = fh.read()
+        result = _extract_block_from_source(source, target_name, ext)
+        return result if result else None
+    except Exception:
+        return None
+
+
+_DEFAULT_SKIP_DIRS = [
+    ".git", "__pycache__", "venv", ".venv", ".tox",
+    "node_modules", "dist", "build", ".mypy_cache", ".pytest_cache",
+]
 
 
 class SearchAgent:
-    def __init__(self, max_file_kb: int = 500):
+    def __init__(
+        self,
+        max_file_kb: int = 500,
+        skip_dirs: List[str] = None,   # Bug #10: configurable, not hardcoded
+        max_depth: int = 2,            # Bug #10: configurable, was hardcoded in run()
+    ):
         self.max_file_kb = max_file_kb
-        # Dependency injection for the LLM client could go here
+        self.skip_dirs = skip_dirs if skip_dirs is not None else _DEFAULT_SKIP_DIRS
+        self.max_depth = max_depth
         
     def _evaluate_with_llm(self, found_refs: Dict[str, Dict[str, str]]) -> List[str]:
         """
@@ -58,8 +85,8 @@ class SearchAgent:
             "searched_files": []
         }
 
-        # Guard: Max depth 2
-        if current_depth > 2:
+        # Guard: Max depth uses config value
+        if current_depth > self.max_depth:
             logger.warning("SearchAgent hit max depth limit (2). Stopping recursion.")
             result["not_found"] = references
             return result
@@ -71,7 +98,7 @@ class SearchAgent:
                 return result
 
             # 1. Gather Candidate Files
-            raw_candidates = list_py_files(base_dir, skip_dirs=[".git", "__pycache__", "venv", ".tox"])
+            raw_candidates = list_py_files(base_dir, skip_dirs=self.skip_dirs)
             valid_candidates = []
             
             for file_path in raw_candidates:
