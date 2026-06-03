@@ -65,47 +65,51 @@ class RunLimits:
     Parameters
     ----------
     max_runtime_sec:
-        Maximum wall-clock seconds for this run.  ``0`` (or negative) means
-        no cap.
+        Maximum wall-clock seconds for this run.  0 (or negative) means no cap.
     max_tasks_per_run:
-        Maximum number of tasks to execute in this session.  ``0`` (or
-        negative) means no cap.
+        Maximum number of tasks to execute in this session.  0 (or negative) means no cap.
+    exec_timeout_sec:
+        Maximum time (seconds) allowed for a single task execution block (AUTO-C).
     """
 
     def __init__(
         self,
         max_runtime_sec: float = 0,
         max_tasks_per_run: int = 0,
+        exec_timeout_sec: int = 60,
     ) -> None:
         self.max_runtime_sec   = max(0.0, float(max_runtime_sec))
         self.max_tasks_per_run = max(0, int(max_tasks_per_run))
+        self.exec_timeout_sec  = max(0, int(exec_timeout_sec))
 
     @classmethod
     def from_config(cls, config: configparser.ConfigParser) -> "RunLimits":
-        """Read limits from a ``ConfigParser`` instance ([auto] section)."""
+        """Read limits from a ConfigParser instance ([auto] section)."""
         max_min   = config.getfloat("auto", "max_runtime_min",   fallback=0)
         max_tasks = config.getint  ("auto", "max_tasks_per_run", fallback=0)
+        exec_to   = config.getint  ("auto", "exec_timeout_sec",  fallback=60)
         return cls(
             max_runtime_sec   = max_min * 60,
             max_tasks_per_run = max_tasks,
+            exec_timeout_sec  = exec_to,
         )
 
     @property
     def runtime_capped(self) -> bool:
-        """``True`` if a wall-clock cap is active (non-zero)."""
+        """True if a wall-clock cap is active (non-zero)."""
         return self.max_runtime_sec > 0
 
     @property
     def task_capped(self) -> bool:
-        """``True`` if a task cap is active (non-zero)."""
+        """True if a task cap is active (non-zero)."""
         return self.max_tasks_per_run > 0
 
     def __repr__(self) -> str:
         return (
             f"RunLimits(max_runtime_sec={self.max_runtime_sec}, "
-            f"max_tasks_per_run={self.max_tasks_per_run})"
+            f"max_tasks_per_run={self.max_tasks_per_run}, "
+            f"exec_timeout_sec={self.exec_timeout_sec})"
         )
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # AutoController
@@ -349,6 +353,9 @@ class AutoController:
             parts.append(f"max_runtime={self.limits.max_runtime_sec:.1f}s")
         if self.limits.task_capped:
             parts.append(f"max_tasks={self.limits.max_tasks_per_run}")
+        if self.limits.exec_timeout_sec > 0:
+            parts.append(f"exec_timeout={self.limits.exec_timeout_sec}s")
+            
         if parts:
             self.state.log(f"run limits active: {', '.join(parts)}")
         else:
