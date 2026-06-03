@@ -5,6 +5,7 @@ import json
 import logging
 import configparser
 import ssl
+import textwrap
 import urllib.request
 from pathlib import Path
 from typing import Dict, Any, List
@@ -390,10 +391,51 @@ Text / documentation files (.txt, .md, …)
 """
 
 
-def main():
-    base_dir = os.getcwd() if len(sys.argv) < 2 else sys.argv[1]
-    orchestrator = Orchestrator()
+def _parse_args():
+    import argparse
+    parser = argparse.ArgumentParser(
+        prog="main.py",
+        description="Code agent pipeline — interactive or one-shot mode.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""\
+            Examples:
+              python main.py                                    # interactive, cwd
+              python main.py /home/user/project                 # interactive, custom base
+              python main.py --once "show def load in p.py"     # one-shot, cwd
+              python main.py --once "/search topic in qa.md" --base /srv/app
+              python main.py --once "/edit fix grammar in readme.md" --base /srv/app
+        """),
+    )
+    parser.add_argument("base_dir_positional", nargs="?", default=None, metavar="base_dir",
+                        help="Project root (default: cwd). Overridden by --base if both given.")
+    parser.add_argument("--once", metavar="QUERY", default=None,
+                        help="Run a single query, print the result, and exit (0 ok / 1 error).")
+    parser.add_argument("--base", metavar="DIR", default=None,
+                        help="Project root directory (overrides positional base_dir).")
+    parser.add_argument("--config", metavar="FILE", default="agents.ini",
+                        help="Path to agents.ini (default: agents.ini).")
+    return parser.parse_args()
 
+
+def main():
+    args = _parse_args()
+    base_dir = os.path.abspath(args.base or args.base_dir_positional or os.getcwd())
+    orchestrator = Orchestrator(config_path=args.config)
+
+    # ── ONE-SHOT MODE ──────────────────────────────────────────────────
+    if args.once is not None:
+        query = args.once.strip()
+        if not query:
+            print("Error: --once requires a non-empty query string.", file=sys.stderr)
+            sys.exit(1)
+        try:
+            orchestrator.run_pipeline(query, base_dir)
+            sys.exit(0)
+        except Exception as e:
+            logger.error("One-shot pipeline failed: %s", e)
+            sys.exit(1)
+
+    # ── INTERACTIVE MODE ───────────────────────────────────────────────
     print(f"Entering core orchestration shell context: {base_dir}")
     print(f"Commands -> Exit: '{orchestrator.exit_key}' | Reset: '{orchestrator.new_chat_key}' | Help: '/help'\n")
 
