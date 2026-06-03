@@ -1,6 +1,6 @@
 """tools/auto/state.py — AUTO-A2: Persistent state store for autonomous runs.
 
-Owns all I/O under .agent/:
+Owns all I/O under .agent/
 
     .agent/
     ├── plan.json        — task backlog (schema enforced)
@@ -15,6 +15,7 @@ Public surface consumed by controller.py:
     is_fresh = store.initialise(goal, base_dir)
     info     = store.resume_info()          # -> {done_ids, pending, in_progress}
     store.update_progress(status="running")
+    store.update_progress(status="capped", stop_reason="runtime_cap")   # AUTO-A4
     store.upsert_task(make_task(...))
     store.set_task_status("AUTO-T1", STATUS_DONE, commit="abc123")
     store.log("something happened")
@@ -287,10 +288,37 @@ class StateStore:
                 return
         raise ValueError(f"Task '{task_id}' not found in plan")
 
-    def update_progress(self, status: str) -> None:
-        """Set the run-level status and recalculate counters, then persist."""
+    def update_progress(
+        self,
+        status: str,
+        stop_reason: str | None = None,
+        **extra: Any,
+    ) -> None:
+        """Set the run-level status and recalculate counters, then persist.
+
+        Parameters
+        ----------
+        status:
+            New run-level status string (e.g. ``"running"``, ``"idle"``,
+            ``"capped"``).
+        stop_reason:
+            Optional reason the run was stopped early — one of
+            ``"runtime_cap"`` or ``"task_cap"``.  Written to progress.json
+            so a resumed run can report why it stopped last time.
+            Pass ``None`` to clear a previously recorded stop_reason.
+        **extra:
+            Any additional key/value pairs to merge into progress.json.
+        """
         self._progress["status"]     = status
         self._progress["updated_at"] = _ts()
+        
+        # FIX: Actually clear the stop_reason if it is None
+        if stop_reason is not None:
+            self._progress["stop_reason"] = stop_reason
+        else:
+            self._progress.pop("stop_reason", None)
+            
+        self._progress.update(extra)
         self._refresh_progress(write=False)   # recalculates counts
         self._save_progress()
 
