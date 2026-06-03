@@ -12,6 +12,7 @@ in real time while still receiving the complete text to json.loads() at the end.
 
 import json
 import re
+import ssl
 import urllib.request
 import urllib.error
 
@@ -78,8 +79,16 @@ def _build_payload(payload: dict, api_format: str, stream: bool) -> dict:
     return body
 
 
+def make_unverified_context() -> ssl.SSLContext:
+    """Return an SSLContext that skips certificate verification."""
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
 def request_completion(url, headers, payload, timeout, stream=False, on_token=None,
-                       api_format: str = "openai"):
+                       api_format: str = "openai", ssl_context: ssl.SSLContext = None):
     """
     POST a chat-completions request and return the assistant message text.
 
@@ -103,7 +112,7 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
 
     def _open():
         try:
-            return urllib.request.urlopen(req, timeout=timeout)
+            return urllib.request.urlopen(req, timeout=timeout, context=ssl_context)
         except urllib.error.HTTPError as e:
             detail = ""
             try:

@@ -1,4 +1,5 @@
 import json
+import ssl
 import urllib.request
 import urllib.error
 import logging
@@ -42,11 +43,13 @@ class PromptOptimizer:
         base_url: str = "http://localhost:1337/v1",
         api_key: str = "jan",
         timeout: int = 120,
+        ssl_context: ssl.SSLContext = None,
     ):
         self.model = model
         self.base_url = base_url
         self.api_key = api_key
         self.timeout = timeout
+        self.ssl_context = ssl_context
 
     def generate_candidate(
         self,
@@ -97,7 +100,7 @@ class PromptOptimizer:
             )
             tracer.event("prompt_optimizer", "llm", "llm_request",
                          content=meta_prompt, model=self.model, temperature=0.4)
-            with urllib.request.urlopen(req, timeout=self.timeout) as response:
+            with urllib.request.urlopen(req, timeout=self.timeout, context=self.ssl_context) as response:
                 raw = json.loads(response.read().decode("utf-8"))
                 candidate = raw["choices"][0]["message"]["content"].strip()
                 logger.info(

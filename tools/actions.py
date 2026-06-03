@@ -4,10 +4,12 @@ Orchestrator action handlers — extracted from main.py to keep it lighter.
 OrchestratorActions is a mixin; Orchestrator inherits from it and supplies:
   self.model, self.base_url, self.api_key, self.timeout_seconds,
   self.max_iterations, self.stream_agents, self.search_full_file_max_chars,
+  self.ssl_context (ssl.SSLContext | None),
   tracer (module-level), logger (module-level).
 """
 import os
 import re
+import ssl
 import sys
 import json
 import time
@@ -61,7 +63,7 @@ class OrchestratorActions:
                 headers=headers,
                 method="POST"
             )
-            with urllib.request.urlopen(req, timeout=self.timeout_seconds) as response:
+            with urllib.request.urlopen(req, timeout=self.timeout_seconds, context=self.ssl_context) as response:
                 for raw_line in response:
                     line = raw_line.decode("utf-8").strip()
                     if not line.startswith("data:"):
@@ -155,6 +157,7 @@ class OrchestratorActions:
                 url, headers, payload, self.timeout_seconds,
                 stream=True,
                 on_token=lambda t: (sys.stdout.write(t), sys.stdout.flush()),
+                ssl_context=self.ssl_context,
             )
             print()
             tracer.event("search_fullfile", "orchestrator", "llm_response", content=answer)
@@ -279,6 +282,7 @@ class OrchestratorActions:
                 url, headers, payload, self.timeout_seconds,
                 stream=True,
                 on_token=lambda t: (sys.stdout.write(t), sys.stdout.flush()),
+                ssl_context=self.ssl_context,
             )
             print()
             tracer.event("text_answerer", "orchestrator", "llm_response", content=ans)
@@ -315,7 +319,8 @@ class OrchestratorActions:
                      params={"question": question}, content=user,
                      model=self.model, temperature=0.1)
         try:
-            content = request_completion(url, headers, payload, self.timeout_seconds)
+            content = request_completion(url, headers, payload, self.timeout_seconds,
+                                         ssl_context=self.ssl_context)
             tracer.event("text_validator", "orchestrator", "llm_response", content=content)
             content = strip_think(content)
             if "```json" in content:
@@ -459,6 +464,7 @@ class OrchestratorActions:
                 url, headers, payload, self.timeout_seconds,
                 stream=True,
                 on_token=lambda t: (sys.stdout.write(t), sys.stdout.flush()),
+                ssl_context=self.ssl_context,
             )
             print()
             out = self._strip_code_fence(strip_think(out))
@@ -491,7 +497,8 @@ class OrchestratorActions:
                      params={"instruction": instruction}, content=user,
                      model=self.model, temperature=0.1)
         try:
-            content = strip_think(request_completion(url, headers, payload, self.timeout_seconds))
+            content = strip_think(request_completion(url, headers, payload, self.timeout_seconds,
+                                                      ssl_context=self.ssl_context))
             tracer.event("edit_validator", "orchestrator", "llm_response", content=content)
             if "```json" in content:
                 content = content.split("```json")[1].split("```")[0].strip()

@@ -4,6 +4,7 @@ import time
 import json
 import logging
 import configparser
+import ssl
 import urllib.request
 from pathlib import Path
 from typing import Dict, Any, List
@@ -64,6 +65,7 @@ class Orchestrator:
             base_url=self.base_url,
             api_key=self.api_key,
             timeout=self.timeout_seconds,
+            ssl_context=self.ssl_context,
         )
         self.search_agent = SearchAgent()
         self.validator_agent = ValidatorAgent(
@@ -76,6 +78,7 @@ class Orchestrator:
             stream=self.config.getboolean("output", "stream_agents", fallback=False),
             api_format=self.api_format,
             num_ctx=self.num_ctx,
+            ssl_context=self.ssl_context,
         )
         self.prompt_evaluator = PromptEvaluator(      # STORY-4.2
             prompt_store=self.prompt_store,
@@ -90,6 +93,7 @@ class Orchestrator:
             prompt_store=self.prompt_store,
             api_format=self.api_format,
             num_ctx=self.num_ctx,
+            ssl_context=self.ssl_context,
         )
 
     def load_config(self, config_path: str) -> None:
@@ -113,6 +117,18 @@ class Orchestrator:
         self.api_key    = self.config.get(section, "api_key",    fallback="jan")
         self.api_format = self.config.get(section, "api_format", fallback="openai")
         self.num_ctx    = self.config.getint(section, "num_ctx",  fallback=0)
+
+        # SSL verification — set verify_ssl = false in [api] to skip cert checks.
+        # Applies to all HTTPS API calls (agents, optimizer, direct chat).
+        verify_ssl = self.config.getboolean("api", "verify_ssl", fallback=True)
+        if not verify_ssl:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            self.ssl_context = ctx
+            logger.warning("SSL certificate verification DISABLED (verify_ssl = false in agents.ini)")
+        else:
+            self.ssl_context = None  # urllib default: full verification
 
         logger.info(f"API profile: [{section}] format={self.api_format} url={self.base_url}")
 
@@ -153,7 +169,8 @@ class Orchestrator:
                 sys.stdout.flush()
             request_completion(url, headers, payload, self.timeout_seconds,
                                stream=True, on_token=on_token,
-                               api_format=self.api_format)
+                               api_format=self.api_format,
+                               ssl_context=self.ssl_context)
             print("\n")
         except Exception as e:
             logger.error(f"Failed to communicate with endpoint: {e}")

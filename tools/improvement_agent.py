@@ -1,6 +1,7 @@
 import sys
 import time
 import json
+import ssl
 import urllib.request
 import urllib.error
 import logging
@@ -57,18 +58,20 @@ class ImprovementAgent:
         base_url: str = "http://localhost:1337/v1",
         api_key: str = "jan",
         timeout: int = 120,
-        prompt_store=None,   # STORY-2.3: injected PromptStore (Optional[PromptStore])
-        config=None,         # configparser.ConfigParser — carries temperature/max_tokens/system prompts
+        prompt_store=None,
+        config=None,
         api_format: str = "openai",
         num_ctx: int = 0,
+        ssl_context: ssl.SSLContext = None,
     ):
         self.model = model
         self.base_url = base_url
         self.api_key = api_key
         self.timeout = timeout
-        self.prompt_store = prompt_store  # None → always use hardcoded constant
+        self.prompt_store = prompt_store
         self.api_format = api_format
         self.num_ctx = num_ctx
+        self.ssl_context = ssl_context
 
         # Read temperature and max_tokens from [improvement_agent] in agents.ini.
         # Fall back to the values the original code hardcoded if the section is absent.
@@ -148,13 +151,16 @@ class ImprovementAgent:
                     stream=True,
                     on_token=lambda t: (sys.stdout.write(t), sys.stdout.flush()),
                     api_format=self.api_format,
+                    ssl_context=self.ssl_context,
                 )
                 ts_done = time.strftime("%H:%M:%S")
                 print(f"\n[{ts_done}] improvement_agent ← llm  (response received)")
             else:
                 ts = time.strftime("%H:%M:%S")
                 print(f"[{ts}] improvement_agent → llm  (intent={intent})  waiting…")
-                content = request_completion(url, headers, req_payload, self.timeout, api_format=self.api_format)
+                content = request_completion(url, headers, req_payload, self.timeout,
+                                             api_format=self.api_format,
+                                             ssl_context=self.ssl_context)
 
             tracer.event("llm", "improvement_agent", "llm_response", content=content)
             content = strip_think(content)
