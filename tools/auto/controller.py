@@ -1,27 +1,35 @@
-"""tools/auto/controller.py — AUTO-A1: Autonomous mode controller.
+"""tools/auto/controller.py — AUTO-A1 / AUTO-A2: Autonomous mode controller.
 
-Entry point for the autonomous improvement mode.  All epic AUTO-A through
-AUTO-F work will be built here.  This file provides the public surface that
-main.py imports:
+Entry point for the autonomous improvement mode.  Provides the public surface
+that main.py imports:
 
     from tools.auto.controller import AutoController, run_auto
 
-Phase 1 (AUTO-A1 skeleton):
+AUTO-A1 (entry point):
   * Validates inputs (non-empty goal, existing base_dir).
-  * Prints the start banner echoing goal and base_dir.
-  * Creates the .agent/ directory structure (AUTO-A2 will expand this).
-  * Returns exit code 0 on success.
+  * Prints start banner echoing goal and base_dir.
+  * Routes --auto / /auto to this module; interactive/one-shot paths untouched.
+
+AUTO-A2 (state store + resume):
+  * Delegates all .agent/ I/O to StateStore (tools/auto/state.py).
+  * On start: loads existing state and resumes (skips DONE tasks,
+    continues IN_PROGRESS tasks) — kill mid-run, restart → no repeated work.
+  * plan.json schema enforced via make_task() / _validate_task_schema().
+  * progress.json updated after every logical step.
 """
 
 from __future__ import annotations
 
-import os
-import json
 import logging
+import os
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+from tools.auto.state import StateStore, STATUS_DONE, STATUS_IN_PROGRESS
+
 logger = logging.getLogger(__name__)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # AutoController
@@ -63,10 +71,13 @@ class AutoController:
         if not base_path.exists():
             raise FileNotFoundError(f"base_dir does not exist: {base_path}")
 
-        self.goal = goal
-        self.base_dir = base_path
+        self.goal        = goal
+        self.base_dir    = base_path
         self.config_path = config_path
-        self.agent_dir = base_path / ".agent"
+        self.agent_dir   = base_path / ".agent"
+
+        # AUTO-A2: StateStore owns all .agent/ I/O
+        self.state = StateStore(self.agent_dir)
 
     # ------------------------------------------------------------------
     # Public API
@@ -75,7 +86,22 @@ class AutoController:
     def run(self) -> int:
         """Execute the autonomous run and return an exit code (0 = success)."""
         self._print_banner()
-        self._init_state()
+
+        # AUTO-A2: initialise (fresh) or resume (existing state)
+        is_fresh = self.state.initialise(self.goal, self.base_dir)
+
+        resume_info = self.state.resume_info()
+        if not is_fresh:
+            self._print_resume_summary(resume_info)
+
+        # Update progress to "running"
+        self.state.update_progress(status="running")
+
+        # ── Future epics (AUTO-B Architect, AUTO-C Coder loop, …) hook in here ──
+        # Each step will call self.state.upsert_task / set_task_status / log / etc.
+
+        self.state.update_progress(status="idle")
+        self.state.log("run finished (AUTO-A2 skeleton — no tasks yet)")
         return 0
 
     # ------------------------------------------------------------------
@@ -83,40 +109,25 @@ class AutoController:
     # ------------------------------------------------------------------
 
     def _print_banner(self) -> None:
-        """Print the start banner echoing goal and base_dir (required by AC)."""
-        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        ts = _ts()
         print(f"[{ts}] 🤖 Autonomous mode starting")
         print(f"[{ts}]    goal     : {self.goal}")
         print(f"[{ts}]    base_dir : {self.base_dir}")
         print(f"[{ts}]    config   : {self.config_path}")
 
-    def _init_state(self) -> None:
-        """Create .agent/ directory skeleton (AUTO-A2 will expand this)."""
-        # Core directories
-        for subdir in ("tasks", "tickets"):
-            (self.agent_dir / subdir).mkdir(parents=True, exist_ok=True)
+    def _print_resume_summary(self, info: dict) -> None:
+        done    = len(info["done_ids"])
+        pending = len(info["pending"])
+        ts = _ts()
+        print(f"[{ts}] ♻️  Resuming existing run — "
+              f"{done} done, {pending} pending, "
+              f"{len(info['done_ids'])} skipped")
+        if info["done_ids"]:
+            print(f"[{ts}]    skipping: {', '.join(sorted(info['done_ids']))}")
 
-        # progress.json — tracks overall run state
-        progress_path = self.agent_dir / "progress.json"
-        if not progress_path.exists():
-            progress = {
-                "goal": self.goal,
-                "base_dir": str(self.base_dir),
-                "started_at": datetime.now(timezone.utc).isoformat(),
-                "status": "initialised",
-                "architecture_done": False,
-                "tasks_total": 0,
-                "tasks_done": 0,
-            }
-            progress_path.write_text(json.dumps(progress, indent=2), encoding="utf-8")
-            logger.debug("Created %s", progress_path)
 
-        # run.log — append-mode high-level event log
-        log_path = self.agent_dir / "run.log"
-        with log_path.open("a", encoding="utf-8") as fh:
-            fh.write(
-                f"[{datetime.now(timezone.utc).isoformat()}] run started  goal={self.goal!r}\n"
-            )
+def _ts() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -131,11 +142,7 @@ def run_auto(
     """Create an :class:`AutoController` and run it.
 
     Returns the integer exit code (0 on success, non-zero on error).
-    Errors are printed to stderr so the caller can ``sys.exit(code)``
-    directly.
     """
-    import sys
-
     try:
         controller = AutoController(goal=goal, base_dir=base_dir, config_path=config_path)
     except (ValueError, FileNotFoundError) as exc:
