@@ -34,13 +34,20 @@ class OrchestratorActions:
     """Mixin that adds execute_direct_chat, run_search, run_text_qa, and run_edit
     to the Orchestrator without cluttering its core orchestration logic."""
 
+    def _chat_url(self) -> str:
+        """Return the correct chat completions URL for the active api_format."""
+        base = self.base_url.rstrip("/")
+        if getattr(self, "api_format", "openai") == "ollama":
+            return f"{base}/api/chat"
+        return f"{base}/chat/completions"
+
     # ------------------------------------------------------------------ #
     # Direct chat                                                          #
     # ------------------------------------------------------------------ #
 
     def execute_direct_chat(self, user_input: str) -> None:
         """Routes conversational queries to local model with streaming output."""
-        url = f"{self.base_url.rstrip('/')}/chat/completions"
+        url = self._chat_url()
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}"
@@ -141,7 +148,7 @@ class OrchestratorActions:
                 "If the answer is not present in this content, reply with exactly: NONE"
             )
         user = f"FILE: {file_label}{where}\n-----\n{text}\n-----\nQUESTION: {query}"
-        url = f"{self.base_url.rstrip('/')}/chat/completions"
+        url = self._chat_url()
         headers = {"Content-Type": "application/json",
                    "Authorization": f"Bearer {self.api_key}"}
         payload = {"model": self.model,
@@ -265,7 +272,7 @@ class OrchestratorActions:
         fb = ("\n\nA previous answer was rejected by the validator. "
               f"Address this feedback and try again:\n{feedback}") if feedback else ""
         user = f"DOCUMENT: {file_label}\n-----\n{knowledge}\n-----\nQUESTION: {question}{fb}"
-        url = f"{self.base_url.rstrip('/')}/chat/completions"
+        url = self._chat_url()
         headers = {"Content-Type": "application/json",
                    "Authorization": f"Bearer {self.api_key}"}
         payload = {"model": self.model,
@@ -308,7 +315,7 @@ class OrchestratorActions:
         )
         user = (f"DOCUMENT:\n{knowledge}\n\nQUESTION:\n{question}\n\n"
                 f"PROPOSED ANSWER:\n{answer}")
-        url = f"{self.base_url.rstrip('/')}/chat/completions"
+        url = self._chat_url()
         headers = {"Content-Type": "application/json",
                    "Authorization": f"Bearer {self.api_key}"}
         payload = {"model": self.model,
@@ -446,7 +453,7 @@ class OrchestratorActions:
         fb = (f"\n\nThe previous edit was rejected: {feedback}\nProduce a corrected "
               "full file.") if feedback else ""
         user = f"DOCUMENT ({file_label}):\n-----\n{source}\n-----\nINSTRUCTION: {instruction}{fb}"
-        url = f"{self.base_url.rstrip('/')}/chat/completions"
+        url = self._chat_url()
         headers = {"Content-Type": "application/json",
                    "Authorization": f"Bearer {self.api_key}"}
         payload = {"model": self.model,
@@ -486,7 +493,7 @@ class OrchestratorActions:
         )
         user = (f"ORIGINAL:\n{original}\n\nINSTRUCTION:\n{instruction}\n\n"
                 f"REVISED:\n{revised}")
-        url = f"{self.base_url.rstrip('/')}/chat/completions"
+        url = self._chat_url()
         headers = {"Content-Type": "application/json",
                    "Authorization": f"Bearer {self.api_key}"}
         payload = {"model": self.model,

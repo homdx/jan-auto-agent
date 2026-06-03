@@ -154,10 +154,7 @@ class Orchestrator(OrchestratorActions):
 
     def execute_direct_chat(self, user_input: str) -> None:
         """Routes conversational queries to local model with streaming output."""
-        if self.api_format == "ollama":
-            url = f"{self.base_url.rstrip('/')}/api/chat"
-        else:
-            url = f"{self.base_url.rstrip('/')}/chat/completions"
+        url = self._chat_url()
 
         headers = {
             "Content-Type": "application/json",
