@@ -549,7 +549,7 @@ class Orchestrator:
             iteration += 1
 
         total = time.time() - start
-        print(f"\n[{_ts()}] ── FINAL ANSWER ({file_path}) ──")
+        print(f"\n[{_ts()}] ── FINAL ANSWER ({file_path}) — {total:.1f}s from request ──")
         print(answer if answer else "(no answer produced)")
         _status = validation.get("status", "unknown")
         if validation.get("_api_error"):
@@ -557,11 +557,189 @@ class Orchestrator:
         print(f"\n[{_ts()}] status={_status}  "
               f"iterations={min(iteration, self.max_iterations)}  ({total:.1f}s)")
 
+    # ------------------------------------------------------------------ #
+    # In-place file editing (/edit) — writes the file, with backup + diff  #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _parse_edit_command(user_input: str):
+        """Parse '/edit <instruction> in <file>' (or '/edit <file> :: <instruction>')."""
+        body = user_input.strip()[len("/edit"):].strip()
+        if not body:
+            return None, None
+        if "::" in body:
+            file_path, instr = body.split("::", 1)
+            return instr.strip(), file_path.strip()
+        if " in " in body:
+            instr, file_path = body.rsplit(" in ", 1)
+            return instr.strip(), file_path.strip()
+        parts = body.split(None, 1)
+        if len(parts) == 2:
+            return parts[1].strip(), parts[0].strip()
+        return None, None
+
+    @staticmethod
+    def _strip_code_fence(text: str) -> str:
+        """If the model wrapped the whole file in a ``` fence, return the inside."""
+        t = text.strip()
+        if t.startswith("```"):
+            t = t.split("\n", 1)[1] if "\n" in t else ""
+            if t.rstrip().endswith("```"):
+                t = t.rstrip()[:-3]
+        return t.rstrip("\n") + "\n"
+
+    def _edit_file_content(self, instruction: str, file_label: str,
+                           source: str, feedback: str = None) -> str:
+        """Ask the model for the COMPLETE revised file content (no commentary)."""
+        system = (
+            "You are a precise text/file editor. Apply the INSTRUCTION to the DOCUMENT. "
+            "Output ONLY the complete, updated file content — no explanations, no "
+            "commentary, no markdown code fences. Preserve everything that should not "
+            "change; fix what the instruction asks; if asked to add a question or note, "
+            "append it as plain text in the file."
+        )
+        fb = (f"\n\nThe previous edit was rejected: {feedback}\nProduce a corrected "
+              "full file.") if feedback else ""
+        user = f"DOCUMENT ({file_label}):\n-----\n{source}\n-----\nINSTRUCTION: {instruction}{fb}"
+        url = f"{self.base_url.rstrip('/')}/chat/completions"
+        headers = {"Content-Type": "application/json",
+                   "Authorization": f"Bearer {self.api_key}"}
+        payload = {"model": self.model,
+                   "messages": [{"role": "system", "content": system},
+                                {"role": "user", "content": user}],
+                   "temperature": 0.2}
+        print(f"\n[{_ts()}] ✏️  edit → model:")
+        tracer.event("orchestrator", "file_editor", "llm_request",
+                     params={"file": file_label, "instruction": instruction},
+                     content=user, model=self.model, temperature=0.2)
+        try:
+            out = request_completion(
+                url, headers, payload, self.timeout_seconds,
+                stream=True,
+                on_token=lambda t: (sys.stdout.write(t), sys.stdout.flush()),
+            )
+            print()
+            out = self._strip_code_fence(strip_think(out))
+            tracer.event("file_editor", "orchestrator", "llm_response", content=out)
+            return out
+        except Exception as e:
+            logger.error(f"file edit call failed: {e}")
+            print(f"[{_ts()}] edit generation failed: {e}")
+            return ""
+
+    def _validate_edit(self, instruction: str, original: str, revised: str) -> dict:
+        """Validate that `revised` correctly applies `instruction` to `original`."""
+        system = (
+            "You are an edit QA validator. Given ORIGINAL, INSTRUCTION and REVISED file "
+            "content, decide whether REVISED correctly applies the instruction, fixes the "
+            "stated errors, preserves content that should stay, and is not truncated or "
+            "corrupted. Return STRICT JSON only: "
+            '{"status":"approved" or "needs_fix","feedback":"what is wrong, empty if ok"}'
+        )
+        user = (f"ORIGINAL:\n{original}\n\nINSTRUCTION:\n{instruction}\n\n"
+                f"REVISED:\n{revised}")
+        url = f"{self.base_url.rstrip('/')}/chat/completions"
+        headers = {"Content-Type": "application/json",
+                   "Authorization": f"Bearer {self.api_key}"}
+        payload = {"model": self.model,
+                   "messages": [{"role": "system", "content": system},
+                                {"role": "user", "content": user}],
+                   "temperature": 0.1}
+        tracer.event("orchestrator", "edit_validator", "llm_request",
+                     params={"instruction": instruction}, content=user,
+                     model=self.model, temperature=0.1)
+        try:
+            content = strip_think(request_completion(url, headers, payload, self.timeout_seconds))
+            tracer.event("edit_validator", "orchestrator", "llm_response", content=content)
+            if "```json" in content:
+                content = content.split("```json")[1].split("```")[0].strip()
+            elif "```" in content:
+                content = content.split("```")[1].split("```")[0].strip()
+            return json.loads(content)
+        except Exception as e:
+            logger.error(f"edit validator failed: {e}")
+            return {"status": "needs_fix", "feedback": f"validator unavailable: {e}",
+                    "_api_error": True}
+
+    def run_edit(self, user_input: str, base_dir: str) -> None:
+        """
+        /edit — apply an instruction to a file AND WRITE IT BACK.
+        Generates the full revised content, validates it (retry up to
+        max_iterations), backs up the original to <file>.bak, writes the new
+        content, and prints a unified diff. Reversible via the .bak file.
+        """
+        import difflib
+        instruction, file_path = self._parse_edit_command(user_input)
+        if not instruction or not file_path:
+            print("Usage: /edit <instruction> in <file>   (or: /edit <file> :: <instruction>)")
+            return
+        target = file_path if os.path.isabs(file_path) else os.path.join(base_dir, file_path)
+        if not os.path.isfile(target):
+            print(f"[{_ts()}] Not a file: {target}")
+            return
+        start = time.time()
+        tracer.start_run(f"/edit {instruction} in {file_path}")
+        try:
+            original = read_file(target)
+        except Exception as e:
+            print(f"[{_ts()}] Could not read {target}: {e}")
+            return
+
+        revised, validation, feedback = "", {}, None
+        for iteration in range(1, self.max_iterations + 1):
+            if time.time() - start >= self.timeout_seconds:
+                print(f"[{_ts()}] ⏳ timeout; using best edit so far.")
+                break
+            revised = self._edit_file_content(instruction, file_path, original, feedback)
+            if not revised.strip():
+                print(f"[{_ts()}] No content produced — file left unchanged.")
+                return
+            print(f"[{_ts()}] 🤖 Validating edit ({iteration}/{self.max_iterations})...")
+            if self.stream_agents:
+                validation = self._validate_edit(instruction, original, revised)
+            else:
+                with Spinner(f"Edit validator {iteration}/{self.max_iterations}"):
+                    validation = self._validate_edit(instruction, original, revised)
+            if validation.get("status") == "approved":
+                print(f"[{_ts()}] ✅ Edit approved by validator.")
+                break
+            if validation.get("_api_error"):
+                print(f"[{_ts()}] ⚠️  Edit validator unavailable — writing best effort "
+                      f"(backup kept). ({validation.get('feedback','')})")
+                break
+            feedback = (validation.get("feedback") or "").strip()
+            if feedback:
+                print(f"[{_ts()}] ❗ Edit feedback: {feedback}")
+
+        # Write: back up original, then overwrite. Fully reversible via .bak.
+        backup = target + ".bak"
+        try:
+            with open(backup, "w", encoding="utf-8") as b:
+                b.write(original)
+            with open(target, "w", encoding="utf-8") as f:
+                f.write(revised)
+        except Exception as e:
+            print(f"[{_ts()}] ❌ Failed to write {target}: {e}")
+            return
+
+        total = time.time() - start
+        diff = "".join(difflib.unified_diff(
+            original.splitlines(keepends=True), revised.splitlines(keepends=True),
+            fromfile=f"{file_path} (before)", tofile=f"{file_path} (after)"))
+        print(f"\n[{_ts()}] ── FILE EDITED: {file_path} — {total:.1f}s from request ──")
+        print(diff if diff.strip() else "(no textual changes)")
+        print(f"\n[{_ts()}] status={validation.get('status','unknown')}  "
+              f"backup={os.path.basename(backup)}  (restore with: mv {backup} {target})")
+
     def run_pipeline(self, user_input: str, base_dir: str) -> None:
         """Executes pipelines with adaptive search, validation loops, and visual feedback."""
         # Full-file search mode: bypass AST block-extraction entirely.
         if user_input.strip().startswith("/search"):
             self.run_search(user_input.strip(), base_dir)
+            return
+        # In-place edit mode: write the file back (with backup + diff).
+        if user_input.strip().startswith("/edit"):
+            self.run_edit(user_input.strip(), base_dir)
             return
 
         start_time = time.time()
@@ -772,6 +950,9 @@ Available commands
   /search <q> in <f>   Answer a question using the WHOLE file (no block extraction)
                        and WITHOUT validation. Large files are auto-split into chunks.
                        Also accepts:  /search <file> :: <question>
+  /edit <instr> in <f> Apply an instruction to a file and WRITE IT BACK (validated;
+                       saves <file>.bak first; prints a diff). e.g.
+                       /edit fix the typo and add a greeting in hello.txt
   /prompts             Show active prompt version + rollback chain for each agent
   /rollback [agent]    Roll back one prompt version (default: validator_agent)
   /reload              Re-read agents.ini and rebuild all agents (no restart)
@@ -871,6 +1052,11 @@ def main():
 
             # /search — full-file Q&A (handled inside run_pipeline)
             if user_input.startswith("/search"):
+                orchestrator.run_pipeline(user_input, base_dir)
+                continue
+
+            # /edit — modify a file in place (writes file + .bak backup)
+            if user_input.startswith("/edit"):
                 orchestrator.run_pipeline(user_input, base_dir)
                 continue
 
