@@ -22,16 +22,23 @@ def strip_think(text: str) -> str:
     """
     Remove reasoning-model <think>…</think> blocks from model output.
 
-    Handles well-formed blocks, a dangling close tag with no open (keep text
-    after the last </think>), and stray tags. Returns the cleaned, stripped text.
+    Handles four cases:
+      1. Well-formed  <think>…</think>answer  → strips the block, keeps answer.
+      2. Dangling </think> with no open tag   → keeps text after last </think>.
+      3. Unclosed <think> with no close tag   → discards everything from <think>
+         onward (the model truncated mid-think; there is no usable answer after).
+      4. Stray lone tags after the above       → stripped with replace().
+    Returns the cleaned, stripped text.
     Needed because models like qwen3 wrap their JSON / answer in <think> tags,
     which otherwise breaks json.loads and pollutes rendered answers.
     """
     if not text:
         return text
     out = _THINK_RE.sub("", text)
-    if "</think>" in out:                       # unclosed open tag case
+    if "</think>" in out:                       # dangling close tag — keep tail
         out = out.rsplit("</think>", 1)[-1]
+    elif "<think>" in out:                      # unclosed open tag — discard from here
+        out = out.split("<think>", 1)[0]
     out = out.replace("<think>", "").replace("</think>", "")
     return out.strip()
 
