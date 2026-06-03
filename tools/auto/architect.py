@@ -1,0 +1,524 @@
+"""tools/auto/architect.py — AUTO-B2: Cluster review → candidate tasks.
+
+For each repo cluster produced by AUTO-B1 (RepoIngestor), sends one Architect
+LLM call that returns a list of candidate improvement tasks.  Every candidate
+MUST cite a concrete file + symbol/line range; candidates without grounding are
+rejected at parse time before they ever reach Gate 1 (AUTO-B3).
+
+Public surface consumed by controller.py / the Architect stage:
+
+    from tools.auto.architect import ClusterReviewer, CandidateTask
+
+    reviewer = ClusterReviewer(config, base_url, api_key, model)
+    candidates = reviewer.review_clusters(clusters, base_dir)
+    # candidates: list[CandidateTask] — pre-filtered, grounded
+
+Each call is traced via agent_trace and uses strip_think so reasoning-model
+<think> blocks are silently discarded before JSON parsing.  The call is
+fail-closed: a bad/missing JSON response is logged and produces zero candidates
+for that cluster rather than crashing the run.
+
+Configuration (agents.ini [architect])
+---------------------------------------
+temperature      — sampling temperature (default 0.2)
+max_tokens       — token cap (default 2048)
+system           — override the built-in system prompt (optional)
+
+agents.ini [api] / [api_local] / [api_remote] supply base_url, api_key, model,
+api_format, verify_ssl — same pattern as every other agent in this codebase.
+"""
+
+from __future__ import annotations
+
+import configparser
+import json
+import logging
+import os
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+from tools.agent_trace import tracer
+from tools.auto.repo_ingest import RepoCluster
+from tools.llm_stream import request_completion, strip_think
+
+logger = logging.getLogger(__name__)
+
+# ── Architect system prompt ───────────────────────────────────────────────────
+# Injected as the system role.  Can be overridden via agents.ini [architect] system.
+
+_SYSTEM_PROMPT = (
+    "You are a senior software architect performing a targeted code review. "
+    "Your job is to identify concrete, actionable improvements in the files "
+    "provided. Each improvement you suggest MUST be grounded in a real location "
+    "in the code — you MUST cite the exact file path and either a symbol name "
+    "(function, class, method) or a line range. "
+    "Do NOT invent problems that are not actually present in the provided code. "
+    "Return ONLY a JSON array — no prose, no markdown fences, no preamble."
+)
+
+# ── Per-cluster user prompt template ─────────────────────────────────────────
+# {goal}        — the user's overall improvement goal
+# {cluster}     — cluster name
+# {file_listing}— newline-separated list of relative paths in this cluster
+# {file_contents}—concatenated, annotated file contents
+
+_USER_PROMPT_TMPL = """\
+Goal: {goal}
+
+You are reviewing the "{cluster}" cluster of the repository.
+
+Files in this cluster:
+{file_listing}
+
+File contents:
+{file_contents}
+
+Identify up to 5 concrete improvement tasks for files in this cluster that \
+are relevant to the goal above.
+
+STRICT RULES:
+1. Every task MUST cite the exact file path and a symbol name OR line range \
+   where the issue lives.  Tasks without a cited_location are invalid.
+2. Only report problems that are actually present in the code shown above.
+3. Keep each task small enough to be implemented and tested independently.
+
+Return ONLY a JSON array.  Each element must match this schema exactly \
+(no extra keys):
+
+[
+  {{
+    "title": "<short imperative phrase>",
+    "instruction": "<detailed instruction for the coder agent>",
+    "target_files": ["<relative/path.py>"],
+    "acceptance_check": "<shell command that exits 0 when the task is done>",
+    "cited_location": {{
+      "file": "<relative/path.py>",
+      "symbol": "<function or class name, or null>",
+      "line_start": <integer or null>,
+      "line_end":   <integer or null>
+    }}
+  }}
+]
+
+If you find no valid improvements for this cluster, return an empty array: []
+"""
+
+# Maximum characters of a single file's content to include in the prompt.
+# Avoids blowing up the context window on large files.
+_MAX_FILE_CHARS = 6000
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Data model
+# ─────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class CitedLocation:
+    """Grounding reference: where in the codebase the candidate applies."""
+    file: str
+    symbol: str | None = None
+    line_start: int | None = None
+    line_end: int | None = None
+
+    def is_valid(self) -> bool:
+        """A location is valid when it has a file AND at least one anchor."""
+        return bool(self.file) and (
+            bool(self.symbol) or self.line_start is not None
+        )
+
+
+@dataclass
+class CandidateTask:
+    """A single improvement candidate produced by the Architect for one cluster.
+
+    Attributes
+    ----------
+    title:
+        Short imperative phrase, e.g. "Add input validation to parse_config".
+    instruction:
+        Full instruction string for the Coder agent (AUTO-C2).
+    target_files:
+        List of relative paths that the task will touch.
+    acceptance_check:
+        Shell command whose exit-0 signals task completion.
+    cited_location:
+        Grounding reference.  Candidates where ``cited_location.is_valid()``
+        returns False are rejected at parse time.
+    cluster:
+        Name of the cluster this candidate came from (set by ClusterReviewer).
+    raw:
+        Original parsed dict from the LLM (kept for debugging / Gate 1).
+    """
+
+    title: str
+    instruction: str
+    target_files: list[str]
+    acceptance_check: str
+    cited_location: CitedLocation
+    cluster: str = ""
+    raw: dict = field(default_factory=dict, compare=False, repr=False)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ClusterReviewer
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ClusterReviewer:
+    """Sends one Architect LLM call per cluster and returns grounded candidates.
+
+    Parameters
+    ----------
+    config:
+        Parsed ``agents.ini``.
+    base_url:
+        API endpoint (e.g. ``http://localhost:1337/v1``).
+    api_key:
+        Authentication token.
+    model:
+        Model name string.
+    api_format:
+        ``"openai"`` or ``"ollama"`` — forwarded to ``request_completion``.
+    verify_ssl:
+        Whether to verify the server's TLS certificate.
+    """
+
+    def __init__(
+        self,
+        config: configparser.ConfigParser,
+        base_url: str,
+        api_key: str,
+        model: str,
+        api_format: str = "openai",
+        verify_ssl: bool = True,
+    ) -> None:
+        self._config     = config
+        self._base_url   = base_url.rstrip("/")
+        self._api_key    = api_key
+        self._model      = model
+        self._api_format = api_format
+        self._verify_ssl = verify_ssl
+
+        arch = "architect"
+        self._temperature = float(config.get(arch, "temperature", fallback="0.2"))
+        self._max_tokens  = int(config.get(arch, "max_tokens",  fallback="2048"))
+        self._system      = config.get(arch, "system", fallback=_SYSTEM_PROMPT).strip()
+        self._timeout     = float(config.get("loop", "timeout_seconds", fallback="300"))
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def review_clusters(
+        self,
+        clusters: list[RepoCluster],
+        base_dir: str | Path,
+        goal: str = "improve current code",
+    ) -> list[CandidateTask]:
+        """Review every non-empty cluster and return all grounded candidates.
+
+        Parameters
+        ----------
+        clusters:
+            Output of :func:`tools.auto.repo_ingest.ingest_repo`.
+        base_dir:
+            Root directory of the repository (used to read file contents).
+        goal:
+            The user-supplied improvement goal string.
+
+        Returns
+        -------
+        list[CandidateTask]
+            All candidates whose ``cited_location.is_valid()`` returned True,
+            in cluster order.  Ungrounded candidates are logged and dropped.
+        """
+        base_dir = Path(base_dir)
+        all_candidates: list[CandidateTask] = []
+
+        for cluster in clusters:
+            if not cluster.files:
+                logger.debug("review_clusters: skipping empty cluster %r", cluster.name)
+                continue
+
+            print(f"\n🔍 Architect reviewing cluster: [{cluster.name}] ({len(cluster.files)} files)")
+            candidates = self._review_one_cluster(cluster, base_dir, goal)
+            print(f"   → {len(candidates)} grounded candidate(s)")
+            all_candidates.extend(candidates)
+
+        print(f"\n✅ Architect done — {len(all_candidates)} total candidate(s) across all clusters\n")
+        return all_candidates
+
+    # ── Private helpers ───────────────────────────────────────────────────────
+
+    def _review_one_cluster(
+        self,
+        cluster: RepoCluster,
+        base_dir: Path,
+        goal: str,
+    ) -> list[CandidateTask]:
+        """Send one LLM call for *cluster* and return grounded candidates.
+
+        Fail-closed: any parse/network error returns an empty list so the run
+        continues with the remaining clusters.
+        """
+        file_listing = "\n".join(f"  - {f}" for f in cluster.files)
+        file_contents = self._build_file_contents(cluster.files, base_dir)
+
+        user_msg = _USER_PROMPT_TMPL.format(
+            goal=goal,
+            cluster=cluster.name,
+            file_listing=file_listing,
+            file_contents=file_contents,
+        )
+
+        payload: dict[str, Any] = {
+            "model":       self._model,
+            "temperature": self._temperature,
+            "max_tokens":  self._max_tokens,
+            "messages": [
+                {"role": "system", "content": self._system},
+                {"role": "user",   "content": user_msg},
+            ],
+        }
+
+        headers = {
+            "Content-Type":  "application/json",
+            "Authorization": f"Bearer {self._api_key}",
+        }
+        url = f"{self._base_url}/chat/completions"
+
+        # Trace the outgoing call.
+        tracer.log(
+            source="architect",
+            target="llm",
+            kind="llm_request",
+            content=user_msg,
+            params={"model": self._model, "temperature": self._temperature,
+                    "cluster": cluster.name},
+        )
+
+        try:
+            raw_text = request_completion(
+                url=url,
+                headers=headers,
+                payload=payload,
+                timeout=self._timeout,
+                stream=False,
+                api_format=self._api_format,
+                verify_ssl=self._verify_ssl,
+            )
+        except Exception as exc:
+            logger.warning(
+                "review_one_cluster: LLM call failed for cluster %r: %s",
+                cluster.name, exc,
+            )
+            tracer.log(
+                source="architect", target="llm", kind="llm_response",
+                content=f"[ERROR] {exc}", params={"cluster": cluster.name},
+            )
+            return []
+
+        # Strip reasoning tokens before JSON parsing.
+        cleaned = strip_think(raw_text)
+
+        tracer.log(
+            source="llm",
+            target="architect",
+            kind="llm_response",
+            content=cleaned,
+            params={"cluster": cluster.name},
+        )
+
+        return self._parse_candidates(cleaned, cluster.name)
+
+    def _parse_candidates(self, text: str, cluster_name: str) -> list[CandidateTask]:
+        """Parse the LLM's JSON array into :class:`CandidateTask` objects.
+
+        Ungrounded candidates (missing file, missing symbol AND line_start) are
+        logged and dropped.  Any parse error is logged and returns [].
+
+        Fail-closed: never returns a partially-constructed candidate on error.
+        """
+        # Strip optional markdown code fences the model may emit despite instructions.
+        stripped = text.strip()
+        if stripped.startswith("```"):
+            lines = stripped.splitlines()
+            # Drop first line (```json or ```) and last line (```)
+            inner_lines = lines[1:] if len(lines) > 1 else lines
+            if inner_lines and inner_lines[-1].strip() == "```":
+                inner_lines = inner_lines[:-1]
+            stripped = "\n".join(inner_lines).strip()
+
+        try:
+            data = json.loads(stripped)
+        except json.JSONDecodeError as exc:
+            logger.warning(
+                "_parse_candidates [%s]: JSON decode failed: %s\nRaw text: %.400s",
+                cluster_name, exc, text,
+            )
+            return []
+
+        if not isinstance(data, list):
+            logger.warning(
+                "_parse_candidates [%s]: expected JSON array, got %s",
+                cluster_name, type(data).__name__,
+            )
+            return []
+
+        candidates: list[CandidateTask] = []
+        for i, item in enumerate(data):
+            if not isinstance(item, dict):
+                logger.debug("_parse_candidates [%s]: item %d is not a dict — skipped", cluster_name, i)
+                continue
+
+            # --- Validate required scalar fields ---
+            title       = (item.get("title") or "").strip()
+            instruction = (item.get("instruction") or "").strip()
+            acceptance  = (item.get("acceptance_check") or "").strip()
+
+            if not title or not instruction or not acceptance:
+                logger.warning(
+                    "_parse_candidates [%s]: item %d missing title/instruction/"
+                    "acceptance_check — rejected",
+                    cluster_name, i,
+                )
+                continue
+
+            # --- Validate target_files ---
+            target_files = item.get("target_files")
+            if not isinstance(target_files, list) or not target_files:
+                logger.warning(
+                    "_parse_candidates [%s]: item %d has empty/missing target_files — rejected",
+                    cluster_name, i,
+                )
+                continue
+
+            # --- Validate and build cited_location (grounding gate) ---
+            loc_raw = item.get("cited_location")
+            if not isinstance(loc_raw, dict):
+                logger.warning(
+                    "_parse_candidates [%s]: item %d missing cited_location — rejected",
+                    cluster_name, i,
+                )
+                continue
+
+            cited = CitedLocation(
+                file       = (loc_raw.get("file") or "").strip(),
+                symbol     = (loc_raw.get("symbol") or None),
+                line_start = _to_int_or_none(loc_raw.get("line_start")),
+                line_end   = _to_int_or_none(loc_raw.get("line_end")),
+            )
+
+            if not cited.is_valid():
+                logger.warning(
+                    "_parse_candidates [%s]: item %d cited_location lacks file "
+                    "and/or anchor (symbol/line_start) — rejected. loc=%r",
+                    cluster_name, i, loc_raw,
+                )
+                continue
+
+            candidates.append(CandidateTask(
+                title            = title,
+                instruction      = instruction,
+                target_files     = [str(p) for p in target_files],
+                acceptance_check = acceptance,
+                cited_location   = cited,
+                cluster          = cluster_name,
+                raw              = item,
+            ))
+
+        rejected = len(data) - len(candidates)
+        if rejected:
+            logger.info(
+                "_parse_candidates [%s]: %d/%d candidate(s) rejected (ungrounded/malformed)",
+                cluster_name, rejected, len(data),
+            )
+
+        return candidates
+
+    @staticmethod
+    def _build_file_contents(files: list[str], base_dir: Path) -> str:
+        """Read and annotate file contents for the prompt.
+
+        Each file is prefixed with a ``### path/to/file.py`` header.
+        Content is truncated to ``_MAX_FILE_CHARS`` with a notice so the model
+        knows the file continues beyond the excerpt.
+        """
+        parts: list[str] = []
+        for rel_path in files:
+            abs_path = base_dir / rel_path
+            try:
+                content = abs_path.read_text(encoding="utf-8", errors="replace")
+            except OSError as exc:
+                logger.debug("_build_file_contents: cannot read %s: %s", rel_path, exc)
+                content = f"[unreadable: {exc}]"
+
+            if len(content) > _MAX_FILE_CHARS:
+                content = content[:_MAX_FILE_CHARS] + f"\n... [truncated — {len(content) - _MAX_FILE_CHARS} more chars]"
+
+            parts.append(f"### {rel_path}\n{content}")
+
+        return "\n\n".join(parts)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Convenience factory
+# ─────────────────────────────────────────────────────────────────────────────
+
+def review_clusters(
+    clusters: list[RepoCluster],
+    base_dir: str | Path,
+    config: configparser.ConfigParser,
+    goal: str = "improve current code",
+) -> list[CandidateTask]:
+    """One-call entry point for ``AutoController``.
+
+    Reads API settings from *config* (same ``[api]`` / ``[api_local]`` /
+    ``[api_remote]`` convention used throughout this codebase) and delegates to
+    :class:`ClusterReviewer`.
+
+    Parameters
+    ----------
+    clusters:
+        Output of :func:`tools.auto.repo_ingest.ingest_repo`.
+    base_dir:
+        Root of the project being reviewed.
+    config:
+        Parsed ``agents.ini``.
+    goal:
+        The user's improvement goal string.
+
+    Returns
+    -------
+    list[CandidateTask]
+        Grounded candidates, ready for Gate 1 (AUTO-B3).
+    """
+    active    = config.get("api", "active", fallback="local")
+    section   = f"api_{active}"
+    base_url  = config.get(section, "base_url")
+    api_key   = config.get(section, "api_key",    fallback="")
+    model     = config.get(section, "model")
+    api_fmt   = config.get(section, "api_format", fallback="openai")
+    verify_ssl = config.getboolean("api", "verify_ssl", fallback=True)
+
+    reviewer = ClusterReviewer(
+        config=config,
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        api_format=api_fmt,
+        verify_ssl=verify_ssl,
+    )
+    return reviewer.review_clusters(clusters, base_dir, goal)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Internal utilities
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _to_int_or_none(val: Any) -> int | None:
+    """Coerce *val* to int, returning None on failure."""
+    if val is None:
+        return None
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return None
