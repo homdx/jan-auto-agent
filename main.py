@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import textwrap
 import json
 import logging
 import configparser
@@ -29,6 +30,7 @@ from tools.prompt_store import PromptStore
 from tools.prompt_optimizer import PromptOptimizer
 from tools.prompt_evaluator import PromptEvaluator
 from tools.ui import Spinner
+from tools.llm_stream import request_completion
 from tools.agent_trace import tracer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -72,12 +74,33 @@ block_extractor = _BlockExtractorAdapter()
 
 class Orchestrator:
     def __init__(self, config_path: str = "agents.ini"):
+        self._config_path = config_path
         self.config = configparser.ConfigParser()
-        self.load_config(config_path)
-        
-        # Core components instantiation with passed API configurations
+
+        # Persistent components — created ONCE; they own on-disk data
+        # (prompts.json / metrics.json) and must survive reloads.
         self.metrics_collector = MetricsCollector()
-        self.prompt_store = PromptStore(config=self.config)  # STORY-2.3
+        self.prompt_store = PromptStore(config=None)  # store_path/max_versions set in _build_agents
+
+        self._build_agents()
+
+    def _build_agents(self) -> None:
+        """
+        (Re)read agents.ini and (re)create all agent instances.
+
+        Called once at __init__ and again by reload_agents() after a prompt is
+        promoted, so new system prompts / temperatures / model settings take
+        effect on the next run with no restart. PromptStore and MetricsCollector
+        are NOT recreated (they hold persistent data); their config-derived
+        settings are refreshed in place.
+        """
+        self.load_config(self._config_path)
+
+        # Refresh PromptStore settings from the (possibly changed) config
+        # without dropping its data.
+        self.prompt_store.store_path   = Path(self.config.get("prompt_store", "store_path", fallback="prompts.json"))
+        self.prompt_store.max_versions = self.config.getint("prompt_store", "max_versions", fallback=3)
+
         self.prompt_optimizer = PromptOptimizer(         # STORY-3.2
             model=self.model,
             base_url=self.base_url,
@@ -115,7 +138,16 @@ class Orchestrator:
             config=self.config,              # Bug #12: temperature/max_tokens/system prompts
         )
 
+    def reload_agents(self) -> None:
+        """Re-read agents.ini and rebuild all agents mid-session (no restart).
+        PromptStore/MetricsCollector data is preserved."""
+        logger.info("reload_agents: re-reading %s …", self._config_path)
+        self._build_agents()
+        print(f"[{_ts()}] 🔄 Agents reloaded from {self._config_path} "
+              f"(model={self.model}, max_iter={self.max_iterations})")
+
     def load_config(self, config_path: str) -> None:
+        self.config = configparser.ConfigParser()
         if os.path.exists(config_path):
             self.config.read(config_path)
         
@@ -132,6 +164,9 @@ class Orchestrator:
         # When true, validator/improvement agents echo the model's answer live
         # (token by token) instead of showing only a spinner.
         self.stream_agents = self.config.getboolean("output", "stream_agents", fallback=False)
+
+        # /search: max file size (chars) sent whole before splitting into chunks.
+        self.search_full_file_max_chars = self.config.getint("search", "full_file_max_chars", fallback=12000)
 
         # STORY-3.2: optimizer gate thresholds (read from agents.ini)
         self.optimizer_enabled         = self.config.getboolean("prompt_optimizer", "enabled",                  fallback=True)
@@ -197,8 +232,133 @@ class Orchestrator:
         except Exception as e:
             logger.error(f"Failed to communicate with local Jan engine endpoint: {e}")
 
+    # ------------------------------------------------------------------ #
+    # Full-file search (/search)                                          #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _parse_search_command(user_input: str):
+        """
+        Parse '/search <query> in <file>'  (also accepts '<file> :: <query>').
+        Returns (query, file_path) or (None, None) if it can't be parsed.
+        """
+        body = user_input.strip()[len("/search"):].strip()
+        if not body:
+            return None, None
+        if "::" in body:                       # /search <file> :: <query>
+            file_path, query = body.split("::", 1)
+            return query.strip(), file_path.strip()
+        if " in " in body:                     # /search <query> in <file>
+            query, file_path = body.rsplit(" in ", 1)
+            return query.strip(), file_path.strip()
+        # Fallback: first token is the file, the rest is the query.
+        parts = body.split(None, 1)
+        if len(parts) == 2:
+            return parts[1].strip(), parts[0].strip()
+        return None, None
+
+    def _ask_over_text(self, query: str, file_label: str, text: str,
+                       chunk_label: str = None) -> str:
+        """
+        Send the whole `text` plus the question to the model and stream the
+        answer. Returns the assistant's full reply (stripped). The model is told
+        to answer ONLY from the provided text and to reply exactly 'NONE' if the
+        answer is not present (used by chunk mode to decide whether to continue).
+        """
+        where = f" (chunk {chunk_label})" if chunk_label else ""
+        system = (
+            "You are a retrieval assistant. Answer the user's question using ONLY "
+            "the file content provided. Quote the relevant question/answer text. "
+            "If the answer is not present in this content, reply with exactly: NONE"
+        )
+        user = f"FILE: {file_label}{where}\n-----\n{text}\n-----\nQUESTION: {query}"
+        url = f"{self.base_url.rstrip('/')}/chat/completions"
+        headers = {"Content-Type": "application/json",
+                   "Authorization": f"Bearer {self.api_key}"}
+        payload = {"model": self.model,
+                   "messages": [{"role": "system", "content": system},
+                                {"role": "user", "content": user}],
+                   "temperature": 0.2}
+        print(f"\n[{_ts()}] 🔎 search → model{where}:")
+        tracer.event("orchestrator", "search_fullfile", "llm_request",
+                     params={"file": file_label, "chunk": chunk_label, "query": query},
+                     content=user, model=self.model, temperature=0.2)
+        try:
+            answer = request_completion(
+                url, headers, payload, self.timeout_seconds,
+                stream=True,
+                on_token=lambda t: (sys.stdout.write(t), sys.stdout.flush()),
+            )
+            print()
+            tracer.event("search_fullfile", "orchestrator", "llm_response", content=answer)
+            return answer.strip()
+        except Exception as e:
+            logger.error(f"/search model call failed: {e}")
+            print(f"[{_ts()}] search failed: {e}")
+            return ""
+
+    @staticmethod
+    def _split_text(text: str, budget: int, overlap: int = 200):
+        """Split text into <=budget-char chunks on line boundaries, with overlap."""
+        overlap = min(overlap, max(0, budget // 4))   # keep overlap < budget
+        lines = text.splitlines(keepends=True)
+        chunks, cur = [], ""
+        for ln in lines:
+            if len(cur) + len(ln) > budget and cur:
+                chunks.append(cur)
+                cur = cur[-overlap:] + ln if overlap else ln
+            else:
+                cur += ln
+        if cur:
+            chunks.append(cur)
+        return chunks
+
+    def run_search(self, user_input: str, base_dir: str) -> None:
+        """
+        /search — answer a question against the WHOLE file, no AST extraction.
+
+        If the file fits within [search] full_file_max_chars, the entire file is
+        sent in one shot. If it is larger, the file is split into chunks (the
+        'agent/validator may split if required' path) and each chunk is queried
+        in turn until one answers.
+        """
+        query, file_path = self._parse_search_command(user_input)
+        if not query or not file_path:
+            print("Usage: /search <query> in <file>   (or: /search <file> :: <query>)")
+            return
+
+        target = file_path if os.path.isabs(file_path) else os.path.join(base_dir, file_path)
+        tracer.start_run(f"/search {query} in {file_path}")
+        try:
+            source = read_file(target)
+        except Exception as e:
+            print(f"[{_ts()}] Could not read {target}: {e}")
+            return
+
+        budget = self.search_full_file_max_chars
+        if len(source) <= budget:
+            print(f"[{_ts()}] Full-file search over {file_path} ({len(source)} chars).")
+            self._ask_over_text(query, file_path, source)
+            return
+
+        # File too large for one context → allowed to split.
+        chunks = self._split_text(source, budget)
+        print(f"[{_ts()}] {file_path} is {len(source)} chars > budget {budget}; "
+              f"splitting into {len(chunks)} chunks and searching each.")
+        for i, ch in enumerate(chunks, 1):
+            ans = self._ask_over_text(query, file_path, ch, chunk_label=f"{i}/{len(chunks)}")
+            if ans and ans.strip().upper() != "NONE":
+                print(f"[{_ts()}] ✅ Answer found in chunk {i}/{len(chunks)}.")
+                return
+        print(f"[{_ts()}] No chunk contained an answer to: {query}")
+
     def run_pipeline(self, user_input: str, base_dir: str) -> None:
         """Executes pipelines with adaptive search, validation loops, and visual feedback."""
+        # Full-file search mode: bypass AST block-extraction entirely.
+        if user_input.strip().startswith("/search"):
+            self.run_search(user_input.strip(), base_dir)
+            return
+
         start_time = time.time()
         tracer.start_run(user_input)
         
@@ -366,6 +526,9 @@ class Orchestrator:
                 if result.promoted:
                     self.prompt_store.push("validator_agent", candidate, result.score)
                     print(f"[{_ts()}] ✅ Prompt promoted (score {result.score:.2f}) — {result.reason}")
+                    # Rebuild agents so the promoted prompt + any config edits take
+                    # effect immediately on the next run (no restart needed).
+                    self.reload_agents()
                 else:
                     print(f"[{_ts()}] ⚠️  Candidate discarded — {result.reason}")
 
@@ -389,8 +552,12 @@ class Orchestrator:
 HELP_TEXT = """\
 Available commands
   /help, /?            Show this help
+  /search <q> in <f>   Answer a question using the WHOLE file (no block extraction).
+                       Large files are auto-split into chunks and searched in turn.
+                       Also accepts:  /search <file> :: <question>
   /prompts             Show active prompt version + rollback chain for each agent
   /rollback [agent]    Roll back one prompt version (default: validator_agent)
+  /reload              Re-read agents.ini and rebuild all agents (no restart)
   /trace               Show inter-agent trace status and file path
   /new                 Reset the session
   /exit                Quit
@@ -405,15 +572,61 @@ How to ask for work (anything not starting with '/')
     improve / fix / optimize / refactor / correct  -> review + suggest improved code
     explain / describe       -> explanation only, no code changes
   A request with no file path is sent straight to the model as a chat message.
+
+CLI / automation
+  python main.py [base_dir]                  interactive
+  python main.py --once "<query>" [--base D] [--config F]   run once and exit
+  one-shot also accepts a /search query:
+  python main.py --once "/search how to X in qa.md" --base .
 """
 
 
-def main():
-    base_dir = os.getcwd() if len(sys.argv) < 2 else sys.argv[1]
-    orchestrator = Orchestrator()
+def _parse_args():
+    import argparse
+    parser = argparse.ArgumentParser(
+        prog="main.py",
+        description="Code agent pipeline — interactive or one-shot mode.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""\
+            Examples:
+              python main.py                                    # interactive, cwd
+              python main.py /home/user/project                 # interactive, custom base
+              python main.py --once "show def load in p.py"     # one-shot, cwd
+              python main.py --once "/search topic in qa.md" --base /srv/app
+        """),
+    )
+    parser.add_argument("base_dir_positional", nargs="?", default=None, metavar="base_dir",
+                        help="Project root (default: cwd). Overridden by --base if both given.")
+    parser.add_argument("--once", metavar="QUERY", default=None,
+                        help="Run a single query, print the result, and exit (0 ok / 1 error).")
+    parser.add_argument("--base", metavar="DIR", default=None,
+                        help="Project root directory (overrides positional base_dir).")
+    parser.add_argument("--config", metavar="FILE", default="agents.ini",
+                        help="Path to agents.ini (default: agents.ini).")
+    return parser.parse_args()
 
+
+def main():
+    args = _parse_args()
+    base_dir = os.path.abspath(args.base or args.base_dir_positional or os.getcwd())
+    orchestrator = Orchestrator(config_path=args.config)
+
+    # ── ONE-SHOT MODE ──────────────────────────────────────────────────
+    if args.once is not None:
+        query = args.once.strip()
+        if not query:
+            print("Error: --once requires a non-empty query string.", file=sys.stderr)
+            sys.exit(1)
+        try:
+            orchestrator.run_pipeline(query, base_dir)
+            sys.exit(0)
+        except Exception as e:
+            logger.error("One-shot pipeline failed: %s", e)
+            sys.exit(1)
+
+    # ── INTERACTIVE MODE ───────────────────────────────────────────────
     print(f"Entering core orchestration shell context: {base_dir}")
-    print(f"Commands -> Exit: '{orchestrator.exit_key}' | Reset Workspace: '{orchestrator.new_chat_key}' | Help: '/help'\n")
+    print(f"Commands -> Exit: '{orchestrator.exit_key}' | Reset: '{orchestrator.new_chat_key}' | Help: '/help'\n")
 
     while True:
         try:
@@ -430,6 +643,16 @@ def main():
             # /help — list every command and how to phrase a request
             if user_input in ("/help", "/?", "/commands"):
                 print(HELP_TEXT)
+                continue
+
+            # /search — full-file Q&A (handled inside run_pipeline)
+            if user_input.startswith("/search"):
+                orchestrator.run_pipeline(user_input, base_dir)
+                continue
+
+            # /reload — re-read agents.ini and rebuild agents
+            if user_input == "/reload":
+                orchestrator.reload_agents()
                 continue
 
             # /trace — show where the inter-agent trace is written
@@ -454,6 +677,8 @@ def main():
                 agent = parts[1] if len(parts) > 1 else "validator_agent"
                 ok = orchestrator.prompt_store.rollback(agent)
                 print(f"↩️  Rolled back {agent}" if ok else f"Already at hardcoded fallback for {agent}")
+                if ok:
+                    orchestrator.reload_agents()
                 continue
 
             # Guard: an unrecognized slash-command should NOT be sent to the model.
