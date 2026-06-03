@@ -59,7 +59,9 @@ class _BlockExtractorAdapter:
 
     def extract_block(self, source: str, name: str, ext: str) -> str:
         result = extract_block(source, name, ext)
-        return result if result is not None else source
+        # extract_block returns "" (not None) when the target is not found —
+        # fall back to the full source so the validator receives real content.
+        return result if result else source
 
     def find_references(self, block: str, ext: str) -> List[str]:
         return find_references(block, ext)
@@ -72,6 +74,15 @@ file_reader = _FileReaderAdapter()
 block_extractor = _BlockExtractorAdapter()
 
 
+# Extensions that support AST/block extraction and code validation.
+# Everything else is treated as plain text and routed directly to the LLM.
+_CODE_EXTENSIONS = {
+    ".py", ".js", ".ts", ".jsx", ".tsx",
+    ".go", ".java", ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp",
+    ".rs", ".rb", ".php", ".cs", ".swift", ".kt", ".scala",
+}
+
+
 class Orchestrator:
     def __init__(self, config_path: str = "agents.ini"):
         self._config_path = config_path
@@ -80,7 +91,7 @@ class Orchestrator:
         # Persistent components — created ONCE; they own on-disk data
         # (prompts.json / metrics.json) and must survive reloads.
         self.metrics_collector = MetricsCollector()
-        self.prompt_store = PromptStore(config=None)  # store_path/max_versions set in _build_agents
+        self.prompt_store = PromptStore(config=self.config)
 
         self._build_agents()
 
@@ -258,19 +269,34 @@ class Orchestrator:
         return None, None
 
     def _ask_over_text(self, query: str, file_label: str, text: str,
-                       chunk_label: str = None) -> str:
+                       chunk_label: str = None, generative: bool = False) -> str:
         """
         Send the whole `text` plus the question to the model and stream the
-        answer. Returns the assistant's full reply (stripped). The model is told
-        to answer ONLY from the provided text and to reply exactly 'NONE' if the
-        answer is not present (used by chunk mode to decide whether to continue).
+        answer. Returns the assistant's full reply (stripped).
+
+        generative=False (default, used by /search and show intents): retrieval-only
+          mode — the model is told to answer strictly from the provided content and
+          reply 'NONE' when the answer is absent (lets chunk mode decide to continue).
+
+        generative=True (used by improve/fix/optimize/explain on non-code files):
+          the model is allowed — and encouraged — to suggest new or rewritten content.
+          The 'NONE' sentinel is not used here because there is always something to say.
         """
         where = f" (chunk {chunk_label})" if chunk_label else ""
-        system = (
-            "You are a retrieval assistant. Answer the user's question using ONLY "
-            "the file content provided. Quote the relevant question/answer text. "
-            "If the answer is not present in this content, reply with exactly: NONE"
-        )
+        if generative:
+            system = (
+                "You are an expert writing and content assistant. "
+                "The user will show you a file and ask you to improve, fix, explain, or "
+                "optimise it. Use the file content as the primary context, but you are "
+                "free — and expected — to suggest rewritten passages, new structure, or "
+                "concrete fixes. Be specific and actionable."
+            )
+        else:
+            system = (
+                "You are a retrieval assistant. Answer the user's question using ONLY "
+                "the file content provided. Quote the relevant question/answer text. "
+                "If the answer is not present in this content, reply with exactly: NONE"
+            )
         user = f"FILE: {file_label}{where}\n-----\n{text}\n-----\nQUESTION: {query}"
         url = f"{self.base_url.rstrip('/')}/chat/completions"
         headers = {"Content-Type": "application/json",
@@ -387,16 +413,45 @@ class Orchestrator:
         # of grabbing the first stray identifier (e.g. "bug" in "fix the bug in x.py").
         parsed = parse_prompt(user_input, source=source)
 
-        imports = block_extractor.extract_imports(source, ext)
-        block = block_extractor.extract_block(source, parsed.target_name, ext)
-        refs = block_extractor.find_references(block, ext)
-        context_lines = block_extractor.get_context_lines(source, parsed.target_name)
-        iteration = 1
-        already_searched = [parsed.file_path]
-        search_result: Dict[str, Any] = {"found": {}, "not_found": [], "searched_files": []}
+        # Non-code files (.txt, .md, .ini, .yaml, …) have no AST, no imports,
+        # and no cross-references.  Skip block extraction and the validation loop
+        # (code-specific; produces nonsense like "not valid Python" on text files).
+        #
+        # show / show_imports → answer directly via _ask_over_text and return.
+        # Generative intents (improve / fix / explain / …) → fall through to the
+        # ImprovementAgent + OutputFormatter + MetricsCollector with the whole file
+        # as the "block" so the run is rendered and recorded like a normal code run.
+        _generative_intents = {"improve", "fix", "optimize", "explain", "show_and_improve"}
+        _is_text_file = ext not in _CODE_EXTENSIONS
 
-        # --- VALIDATION LOOP (Only if not a simple 'show' intent) ---
-        if parsed.intent not in ("show", "show_imports"):
+        if _is_text_file and parsed.intent not in _generative_intents:
+            # Pure retrieval on a text file: show/show_imports → answer and done.
+            self._ask_over_text(user_input, parsed.file_path, source, generative=False)
+            return
+
+        if _is_text_file:
+            # Generative intent on a text file: stub out code-only fields,
+            # use the whole file as the target block, skip validation below.
+            imports = []
+            block = source
+            refs = []
+            context_lines = ""
+            already_searched = [parsed.file_path]
+            search_result: Dict[str, Any] = {"found": {}, "not_found": [], "searched_files": []}
+            iteration = 1
+            validation: Dict[str, Any] = {}
+            print(f"[{_ts()}] 📄 Non-code file — skipping validation, running improvement agent.")
+        else:
+            imports = block_extractor.extract_imports(source, ext)
+            block = block_extractor.extract_block(source, parsed.target_name, ext)
+            refs = block_extractor.find_references(block, ext)
+            context_lines = block_extractor.get_context_lines(source, parsed.target_name)
+            iteration = 1
+            already_searched = [parsed.file_path]
+            search_result: Dict[str, Any] = {"found": {}, "not_found": [], "searched_files": []}
+
+        # --- VALIDATION LOOP (Only if not a simple 'show' intent AND not a text file) ---
+        if not _is_text_file and parsed.intent not in ("show", "show_imports"):
             while iteration <= self.max_iterations:
                 elapsed = time.time() - start_time
                 if elapsed >= self.timeout_seconds:
@@ -448,7 +503,8 @@ class Orchestrator:
                             refs.append(suggestion)
                 iteration += 1
         else:
-            print("ℹ️ Intent is 'show'. Skipping agent validation pipeline.")
+            if not _is_text_file:
+                print("ℹ️ Intent is 'show'. Skipping agent validation pipeline.")
 
         # --- IMPROVEMENT AGENT (Intent-based) ---
         improvement: Dict[str, Any] = {}

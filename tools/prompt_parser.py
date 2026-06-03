@@ -69,13 +69,19 @@ def _parse_via_regex(raw: str, source: str = "") -> Optional[ParsedPrompt]:
 
     # 3. Determine Intent Matrix
     intent = "show_and_improve"  # Default fallback condition
-    
+
     normalized_remainder = remainder.lower()
     normalized_raw = cleaned_raw.lower()
 
-    has_show = any(w in normalized_remainder or w in normalized_raw for w in ["show", "find", "view", "display", "get", "read"])
-    has_improve = any(w in normalized_remainder or w in normalized_raw for w in ["improve", "fix", "refactor", "optimize", "correct"])
-    has_explain = any(w in normalized_remainder or w in normalized_raw for w in ["explain", "describe", "understand", "doc"])
+    # Use word-boundary regex so a keyword like 'read' does not spuriously match
+    # inside a file name such as 'README.md' or 'thread.py'.
+    def _has_kw(words: list[str]) -> bool:
+        pattern = re.compile(r'\b(?:' + '|'.join(re.escape(w) for w in words) + r')\b')
+        return bool(pattern.search(normalized_remainder) or pattern.search(normalized_raw))
+
+    has_show    = _has_kw(["show", "find", "view", "display", "get", "read"])
+    has_improve = _has_kw(["improve", "fix", "refactor", "optimize", "correct"])
+    has_explain = _has_kw(["explain", "describe", "understand", "doc"])
 
     if has_show and has_improve:
         intent = "show_and_improve"
