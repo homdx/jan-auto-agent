@@ -47,6 +47,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from tools.auto.state import StateStore, STATUS_DONE, STATUS_IN_PROGRESS
+from tools.auto.git_manager import make_git_manager, GitError
 
 logger = logging.getLogger(__name__)
 
@@ -70,24 +71,34 @@ class RunLimits:
     max_tasks_per_run:
         Maximum number of tasks to execute in this session.  ``0`` (or
         negative) means no cap.
+    exec_timeout_sec:
+        Per-execution wall-clock timeout (seconds) handed to the executor
+        (AUTO-C1) when it runs generated code / acceptance checks.  This is an
+        *execution constraint* (how long a single ``python``/test run may take),
+        distinct from the whole-session ``max_runtime_sec`` cap.  ``0`` (or
+        negative) means no per-execution timeout.  Default is 120s.
     """
 
     def __init__(
         self,
         max_runtime_sec: float = 0,
         max_tasks_per_run: int = 0,
+        exec_timeout_sec: float = 120,
     ) -> None:
         self.max_runtime_sec   = max(0.0, float(max_runtime_sec))
         self.max_tasks_per_run = max(0, int(max_tasks_per_run))
+        self.exec_timeout_sec  = max(0.0, float(exec_timeout_sec))
 
     @classmethod
     def from_config(cls, config: configparser.ConfigParser) -> "RunLimits":
         """Read limits from a ``ConfigParser`` instance ([auto] section)."""
         max_min   = config.getfloat("auto", "max_runtime_min",   fallback=0)
         max_tasks = config.getint  ("auto", "max_tasks_per_run", fallback=0)
+        exec_to   = config.getfloat("auto", "exec_timeout_sec",  fallback=120)
         return cls(
             max_runtime_sec   = max_min * 60,
             max_tasks_per_run = max_tasks,
+            exec_timeout_sec  = exec_to,
         )
 
     @property
@@ -100,10 +111,16 @@ class RunLimits:
         """``True`` if a task cap is active (non-zero)."""
         return self.max_tasks_per_run > 0
 
+    @property
+    def exec_timeout_active(self) -> bool:
+        """``True`` if a per-execution timeout is active (non-zero)."""
+        return self.exec_timeout_sec > 0
+
     def __repr__(self) -> str:
         return (
             f"RunLimits(max_runtime_sec={self.max_runtime_sec}, "
-            f"max_tasks_per_run={self.max_tasks_per_run})"
+            f"max_tasks_per_run={self.max_tasks_per_run}, "
+            f"exec_timeout_sec={self.exec_timeout_sec})"
         )
 
 
@@ -156,6 +173,8 @@ class AutoController:
         self.base_dir    = base_path
         self.config_path = config_path
         self.agent_dir   = base_path / ".agent"
+        # AUTO-A4: execution working dir (executor/AUTO-C1 runs code here)
+        self.workspace_dir = self.agent_dir / "workspace"
 
         # AUTO-A4: monotonic clock — injectable for unit tests
         self._time_fn: Callable[[], float] = _time_fn or time.monotonic
@@ -165,6 +184,9 @@ class AutoController:
 
         # AUTO-A2: StateStore owns all .agent/ I/O
         self.state = StateStore(self.agent_dir)
+
+        # AUTO-A3: git manager wired at run start (None until run())
+        self.git = None
 
         # Set at the start of run(); used by is_runtime_exceeded()
         self._start_time: float = 0.0
@@ -237,6 +259,9 @@ class AutoController:
 
         # AUTO-A2: initialise (fresh) or resume (existing state)
         is_fresh = self.state.initialise(self.goal, self.base_dir)
+
+        # AUTO-A3: ensure the target folder is a git repo with agent identity.
+        self._setup_git()
 
         resume_info = self.state.resume_info()
         if not is_fresh:
@@ -325,6 +350,27 @@ class AutoController:
                 f"{tasks_done} completed) — "
                 f"state saved, run is resumable."
             )
+
+    def _setup_git(self) -> None:
+        """AUTO-A3: ensure the base dir is a git repo and apply agent identity.
+
+        Guarded: a git failure (e.g. git not installed) is logged but does NOT
+        abort the run — Epic A stays usable without git, and commits (AUTO-C5)
+        simply won't happen until git is available.
+        """
+        try:
+            cfg = configparser.ConfigParser()
+            if Path(self.config_path).exists():
+                cfg.read(self.config_path)
+            self.git = make_git_manager(self.base_dir, cfg)
+            self.workspace_dir.mkdir(parents=True, exist_ok=True)
+            self.state.log(
+                f"git ready (user={self.git.git_user} <{self.git.git_email}>)"
+            )
+        except (GitError, OSError) as exc:
+            self.git = None
+            logger.warning("git setup failed (continuing without git): %s", exc)
+            self.state.log(f"git setup failed: {exc}")
 
     def _print_banner(self) -> None:
         ts = _ts()

@@ -286,7 +286,7 @@ class ClusterReviewer:
         url = f"{self._base_url}/chat/completions"
 
         # Trace the outgoing call.
-        tracer.log(
+        tracer.event(
             source="architect",
             target="llm",
             kind="llm_request",
@@ -310,7 +310,7 @@ class ClusterReviewer:
                 "review_one_cluster: LLM call failed for cluster %r: %s",
                 cluster.name, exc,
             )
-            tracer.log(
+            tracer.event(
                 source="architect", target="llm", kind="llm_response",
                 content=f"[ERROR] {exc}", params={"cluster": cluster.name},
             )
@@ -319,7 +319,7 @@ class ClusterReviewer:
         # Strip reasoning tokens before JSON parsing.
         cleaned = strip_think(raw_text)
 
-        tracer.log(
+        tracer.event(
             source="llm",
             target="architect",
             kind="llm_response",

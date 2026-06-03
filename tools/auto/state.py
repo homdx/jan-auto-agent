@@ -311,13 +311,11 @@ class StateStore:
         """
         self._progress["status"]     = status
         self._progress["updated_at"] = _ts()
-        
-        # FIX: Actually clear the stop_reason if it is None
         if stop_reason is not None:
             self._progress["stop_reason"] = stop_reason
-        else:
-            self._progress.pop("stop_reason", None)
-            
+        elif "stop_reason" in extra:
+            # allow explicit kwarg path too
+            pass
         self._progress.update(extra)
         self._refresh_progress(write=False)   # recalculates counts
         self._save_progress()

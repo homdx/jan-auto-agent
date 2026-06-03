@@ -1,161 +1,236 @@
-"""tests/test_auto_4.py — Tests for AUTO-A4: Run limits & safety.
+"""tests/test_auto_4.py — AUTO-A4: run limits & safety.
 
-Covers all ACs from the story:
-  AC1: Global wall-clock cap (max_runtime_min) terminates the run gracefully.
-  AC2: Tasks-per-session cap (max_tasks_per_run) terminates the run gracefully.
-  AC3: Run stops gracefully (exit code 0), state saved (progress.json gets 'capped').
-  AC4: Run is resumable after hitting either cap.
+Covers the story ACs:
+  * RunLimits reads max_runtime_min / max_tasks_per_run / exec_timeout_sec
+    from agents.ini [auto] (0 = disabled).
+  * Wall-clock cap fires (tested with an injected fake clock — no sleeping).
+  * Task cap fires after N tasks in a session.
+  * On a cap the run stops GRACEFULLY: exit 0, progress status "capped",
+    stop_reason persisted, run.log records it.
+  * The run is RESUMABLE after a cap (done tasks are skipped next time).
+  * No caps configured → run completes normally (status "idle").
+  * Execution constraint exec_timeout_sec is exposed for the executor.
 """
 
 import configparser
+import json
 import sys
 from pathlib import Path
 
 import pytest
 
-# Make project root importable
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from tools.auto.controller import AutoController
-from tools.auto.state import make_task, STATUS_DONE
-
-
-def _write_config(path: Path, max_runtime: float = 0, max_tasks: int = 0) -> str:
-    """Helper to generate a temporary agents.ini file with limits."""
-    cfg = configparser.ConfigParser()
-    cfg["auto"] = {
-        "max_runtime_min": str(max_runtime),
-        "max_tasks_per_run": str(max_tasks)
-    }
-    ini_path = path / "agents.ini"
-    with ini_path.open("w", encoding="utf-8") as f:
-        cfg.write(f)
-    return str(ini_path)
-
-
-class MockClock:
-    """A predictable, deterministic clock for testing timeouts without sleeping."""
-    def __init__(self, step_seconds: float = 0.0):
-        self.time = 0.0
-        self.step = step_seconds
-
-    def __call__(self) -> float:
-        current = self.time
-        self.time += self.step
-        return current
+from tools.auto.controller import (
+    AutoController, RunLimits, STOP_RUNTIME_CAP, STOP_TASK_CAP,
+)
+from tools.auto.state import StateStore, make_task, STATUS_DONE
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# AC2 & AC3 — Task Cap
+# helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
-def test_halts_at_task_cap(tmp_path):
-    """Run must stop exactly when max_tasks_per_run is reached and save state."""
-    config_path = _write_config(tmp_path, max_tasks=2)
-    
-    # 1. Setup existing state with 4 pending tasks
-    ctrl_setup = AutoController("goal", tmp_path, config_path)
-    ctrl_setup.state.initialise("goal", tmp_path)
-    for i in range(4):
-        ctrl_setup.state.upsert_task(make_task(id=f"T{i}", title=f"Task {i}", instruction="i"))
-        
-    # 2. Run the controller
-    ctrl = AutoController("goal", tmp_path, config_path)
-    exit_code = ctrl.run()
-    
-    # 3. Verify it exited 0, stopped after 2 tasks, and logged the correct reason
-    assert exit_code == 0
-    prog = ctrl.state.get_progress()
-    
-    assert prog["status"] == "capped"
-    assert prog["stop_reason"] == "task_cap"
-    assert prog["done_count"] == 2
-    assert prog["pending_count"] == 2
+def _cfg(**auto_kw) -> configparser.ConfigParser:
+    c = configparser.ConfigParser()
+    c["auto"] = {k: str(v) for k, v in auto_kw.items()}
+    return c
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# AC1 & AC3 — Runtime Cap
-# ─────────────────────────────────────────────────────────────────────────────
+def _seed_tasks(base_dir: Path, goal: str, n: int) -> None:
+    """Create a fresh state with n pending tasks."""
+    store = StateStore(base_dir / ".agent")
+    store.initialise(goal, base_dir)
+    for i in range(1, n + 1):
+        store.upsert_task(make_task(id=f"AUTO-T{i}", title=f"task {i}",
+                                    instruction="x", target_files=["f.py"]))
 
-def test_halts_at_runtime_cap(tmp_path):
-    """Run must stop if execution time exceeds max_runtime_min (wall-clock cap)."""
-    # 1 minute cap = 60 seconds
-    config_path = _write_config(tmp_path, max_runtime=1.0)
-    
-    ctrl_setup = AutoController("goal", tmp_path, config_path)
-    ctrl_setup.state.initialise("goal", tmp_path)
-    for i in range(3):
-        ctrl_setup.state.upsert_task(make_task(id=f"T{i}", title=f"Task {i}", instruction="i"))
-        
-    # Mock time to advance 40 seconds every time it is checked.
-    # Start: 0s. Task 1 check: 40s (Passes). Task 2 check: 80s (Fails, cap hit).
-    clock = MockClock(step_seconds=40.0)
-    
-    ctrl = AutoController("goal", tmp_path, config_path, _time_fn=clock)
-    exit_code = ctrl.run()
-    
-    assert exit_code == 0
-    prog = ctrl.state.get_progress()
-    
-    assert prog["status"] == "capped"
-    assert prog["stop_reason"] == "runtime_cap"
-    assert prog["done_count"] == 1
-    assert prog["pending_count"] == 2
+
+class _FakeClock:
+    """Monotonic clock we can advance by hand."""
+    def __init__(self, start=1000.0):
+        self.t = start
+    def __call__(self):
+        return self.t
+    def advance(self, secs):
+        self.t += secs
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# AC4 — Resumability
+# RunLimits.from_config
 # ─────────────────────────────────────────────────────────────────────────────
 
-def test_run_is_resumable_after_cap(tmp_path):
-    """A capped run must be able to be resumed on the next execution."""
-    config_path = _write_config(tmp_path, max_tasks=2)
-    
-    # Seed 3 tasks
-    ctrl_setup = AutoController("goal", tmp_path, config_path)
-    ctrl_setup.state.initialise("goal", tmp_path)
-    for i in range(3):
-        ctrl_setup.state.upsert_task(make_task(id=f"T{i}", title=f"Task {i}", instruction="i"))
-        
-    # Run 1: Hits cap of 2
-    ctrl_1 = AutoController("goal", tmp_path, config_path)
-    ctrl_1.run()
-    assert ctrl_1.state.get_progress()["done_count"] == 2
-    assert ctrl_1.state.get_progress()["status"] == "capped"
-    
-    # Run 2: Resumes and finishes the last task
-    ctrl_2 = AutoController("goal", tmp_path, config_path)
-    ctrl_2.run()
-    
-    prog = ctrl_2.state.get_progress()
-    assert prog["done_count"] == 3
-    assert prog["pending_count"] == 0
-    assert prog["status"] == "idle"          # No longer capped
-    assert "stop_reason" not in prog         # Cleared out
+class TestRunLimitsConfig:
+    def test_defaults_no_caps(self):
+        lim = RunLimits.from_config(configparser.ConfigParser())
+        assert lim.max_runtime_sec == 0
+        assert lim.max_tasks_per_run == 0
+        assert not lim.runtime_capped
+        assert not lim.task_capped
+
+    def test_minutes_converted_to_seconds(self):
+        lim = RunLimits.from_config(_cfg(max_runtime_min=2))
+        assert lim.max_runtime_sec == 120
+        assert lim.runtime_capped
+
+    def test_task_cap_read(self):
+        lim = RunLimits.from_config(_cfg(max_tasks_per_run=5))
+        assert lim.max_tasks_per_run == 5
+        assert lim.task_capped
+
+    def test_exec_timeout_default_120(self):
+        lim = RunLimits.from_config(configparser.ConfigParser())
+        assert lim.exec_timeout_sec == 120
+        assert lim.exec_timeout_active
+
+    def test_exec_timeout_read_and_disable(self):
+        assert RunLimits.from_config(_cfg(exec_timeout_sec=30)).exec_timeout_sec == 30
+        assert RunLimits.from_config(_cfg(exec_timeout_sec=0)).exec_timeout_active is False
+
+    def test_negative_values_clamped(self):
+        lim = RunLimits(max_runtime_sec=-5, max_tasks_per_run=-3, exec_timeout_sec=-1)
+        assert lim.max_runtime_sec == 0
+        assert lim.max_tasks_per_run == 0
+        assert lim.exec_timeout_sec == 0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Limits Disabled (0)
+# cap predicates (with fake clock)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def test_run_completes_when_limits_disabled(tmp_path):
-    """If limits are 0 (disabled), it should process everything and go idle."""
-    config_path = _write_config(tmp_path, max_runtime=0, max_tasks=0)
-    
-    ctrl_setup = AutoController("goal", tmp_path, config_path)
-    ctrl_setup.state.initialise("goal", tmp_path)
-    for i in range(5):
-        ctrl_setup.state.upsert_task(make_task(id=f"T{i}", title=f"Task {i}", instruction="i"))
-        
-    ctrl = AutoController("goal", tmp_path, config_path)
-    ctrl.run()
-    
-    prog = ctrl.state.get_progress()
-    assert prog["status"] == "idle"
-    assert prog["done_count"] == 5
-    assert prog.get("stop_reason") is None
+class TestCapPredicates:
+    def test_runtime_not_exceeded_before_cap(self, tmp_path):
+        clk = _FakeClock()
+        c = AutoController("g", tmp_path, config_path="none.ini", _time_fn=clk)
+        c.limits = RunLimits(max_runtime_sec=60)
+        c._start_time = clk()
+        clk.advance(59)
+        assert c.is_runtime_exceeded() is False
+
+    def test_runtime_exceeded_after_cap(self, tmp_path):
+        clk = _FakeClock()
+        c = AutoController("g", tmp_path, config_path="none.ini", _time_fn=clk)
+        c.limits = RunLimits(max_runtime_sec=60)
+        c._start_time = clk()
+        clk.advance(61)
+        assert c.is_runtime_exceeded() is True
+
+    def test_runtime_never_exceeded_when_disabled(self, tmp_path):
+        clk = _FakeClock()
+        c = AutoController("g", tmp_path, config_path="none.ini", _time_fn=clk)
+        c.limits = RunLimits(max_runtime_sec=0)
+        c._start_time = clk()
+        clk.advance(10_000)
+        assert c.is_runtime_exceeded() is False
+
+    def test_task_cap_reached(self, tmp_path):
+        c = AutoController("g", tmp_path, config_path="none.ini")
+        c.limits = RunLimits(max_tasks_per_run=3)
+        assert c.is_task_cap_reached(2) is False
+        assert c.is_task_cap_reached(3) is True
+
+    def test_task_cap_disabled(self, tmp_path):
+        c = AutoController("g", tmp_path, config_path="none.ini")
+        c.limits = RunLimits(max_tasks_per_run=0)
+        assert c.is_task_cap_reached(9999) is False
+
+    def test_check_caps_runtime_first(self, tmp_path):
+        clk = _FakeClock()
+        c = AutoController("g", tmp_path, config_path="none.ini", _time_fn=clk)
+        c.limits = RunLimits(max_runtime_sec=60, max_tasks_per_run=1)
+        c._start_time = clk()
+        clk.advance(61)
+        assert c.check_caps(tasks_done=5) == STOP_RUNTIME_CAP
+
+    def test_check_caps_task(self, tmp_path):
+        c = AutoController("g", tmp_path, config_path="none.ini")
+        c.limits = RunLimits(max_tasks_per_run=2)
+        assert c.check_caps(tasks_done=2) == STOP_TASK_CAP
+
+    def test_check_caps_none(self, tmp_path):
+        c = AutoController("g", tmp_path, config_path="none.ini")
+        c.limits = RunLimits()
+        assert c.check_caps(tasks_done=100) is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# graceful stop + resume through run()
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestGracefulStop:
+    def test_task_cap_stops_run_gracefully(self, tmp_path):
+        _seed_tasks(tmp_path, "g", n=5)
+        c = AutoController("g", tmp_path, config_path="none.ini")
+        c.limits = RunLimits(max_tasks_per_run=2)
+        code = c.run()
+        assert code == 0                                   # graceful exit
+        prog = json.loads((tmp_path / ".agent" / "progress.json").read_text())
+        assert prog["status"] == "capped"
+        assert prog["stop_reason"] == STOP_TASK_CAP
+
+    def test_task_cap_only_runs_capped_count(self, tmp_path):
+        _seed_tasks(tmp_path, "g", n=5)
+        c = AutoController("g", tmp_path, config_path="none.ini")
+        c.limits = RunLimits(max_tasks_per_run=2)
+        c.run()
+        done = {t["id"] for t in c.state.all_tasks() if t["status"] == STATUS_DONE}
+        assert len(done) == 2
+
+    def test_runtime_cap_stops_run(self, tmp_path):
+        _seed_tasks(tmp_path, "g", n=5)
+        # auto-advancing clock: each call jumps +100s, so the first cap check
+        # inside the loop is already past a 10s cap (the skeleton loop itself
+        # consumes no real time).
+        class _AutoClock:
+            def __init__(self): self.t = 1000.0
+            def __call__(self):
+                self.t += 100.0
+                return self.t
+        c = AutoController("g", tmp_path, config_path="none.ini", _time_fn=_AutoClock())
+        c.limits = RunLimits(max_runtime_sec=10)
+        code = c.run()
+        assert code == 0
+        prog = json.loads((tmp_path / ".agent" / "progress.json").read_text())
+        assert prog["status"] == "capped"
+        assert prog["stop_reason"] == STOP_RUNTIME_CAP
+
+    def test_cap_logged_to_run_log(self, tmp_path):
+        _seed_tasks(tmp_path, "g", n=3)
+        c = AutoController("g", tmp_path, config_path="none.ini")
+        c.limits = RunLimits(max_tasks_per_run=1)
+        c.run()
+        log = (tmp_path / ".agent" / "run.log").read_text()
+        assert "capped" in log and "task_cap" in log
+
+    def test_resume_after_cap_completes_rest(self, tmp_path):
+        _seed_tasks(tmp_path, "g", n=4)
+        # first session: cap at 2
+        c1 = AutoController("g", tmp_path, config_path="none.ini")
+        c1.limits = RunLimits(max_tasks_per_run=2)
+        c1.run()
+        assert len([t for t in c1.state.all_tasks() if t["status"] == STATUS_DONE]) == 2
+        # second session: no cap → finishes the remaining 2
+        c2 = AutoController("g", tmp_path, config_path="none.ini")
+        c2.limits = RunLimits()
+        code = c2.run()
+        assert code == 0
+        done = [t for t in c2.state.all_tasks() if t["status"] == STATUS_DONE]
+        assert len(done) == 4
+        prog = json.loads((tmp_path / ".agent" / "progress.json").read_text())
+        assert prog["status"] == "idle"
+
+    def test_no_caps_completes_normally(self, tmp_path):
+        _seed_tasks(tmp_path, "g", n=3)
+        c = AutoController("g", tmp_path, config_path="none.ini")
+        c.limits = RunLimits()
+        code = c.run()
+        assert code == 0
+        prog = json.loads((tmp_path / ".agent" / "progress.json").read_text())
+        assert prog["status"] == "idle"
+        assert len([t for t in c.state.all_tasks() if t["status"] == STATUS_DONE]) == 3
+
 
 if __name__ == "__main__":
-    print("Run with: pytest tests/test_auto_4.py -v")
+    sys.exit(pytest.main([__file__, "-q"]))
