@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import time
 import textwrap
@@ -30,7 +31,7 @@ from tools.prompt_store import PromptStore
 from tools.prompt_optimizer import PromptOptimizer
 from tools.prompt_evaluator import PromptEvaluator
 from tools.ui import Spinner
-from tools.llm_stream import request_completion
+from tools.llm_stream import request_completion, strip_think
 from tools.agent_trace import tracer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -317,7 +318,7 @@ class Orchestrator:
             )
             print()
             tracer.event("search_fullfile", "orchestrator", "llm_response", content=answer)
-            return answer.strip()
+            return strip_think(answer).strip()
         except Exception as e:
             logger.error(f"/search model call failed: {e}")
             print(f"[{_ts()}] search failed: {e}")
@@ -378,6 +379,184 @@ class Orchestrator:
                 return
         print(f"[{_ts()}] No chunk contained an answer to: {query}")
 
+    # ------------------------------------------------------------------ #
+    # Validated text Q&A (FAQ / documentation files)                      #
+    # ------------------------------------------------------------------ #
+
+    _GENERIC_VERBS = {"show", "view", "get", "answer", "ask", "explain",
+                      "describe", "find", "tell", "please"}
+
+    @classmethod
+    def _extract_question(cls, user_input: str, file_path: str) -> str:
+        """
+        Derive the question from the user's request without butchering sentences.
+
+        Strategy: remove the actual file path token (and an immediately preceding
+        connector like 'in'/'from'/'about'/'of'), then strip a single leading
+        command verb. Phrases that merely contain the word 'in' are preserved.
+        'answer how do I reset in faq.md' -> 'how do I reset'
+        'explain hello.txt do it from your mind' -> 'do it from your mind'
+        'hello.txt' -> ''  (caller treats the FILE itself as the question)
+        """
+        q = user_input.strip()
+        base = os.path.basename(file_path)
+        for token in (file_path, base):
+            if token and token in q:
+                q = re.sub(r"\b(in|from|about|of|on)\s+" + re.escape(token), " ", q)
+                q = q.replace(token, " ")
+        tokens = q.split()
+        while tokens and tokens[0].lower().strip(".,:;-") in cls._GENERIC_VERBS:
+            tokens.pop(0)
+        return " ".join(tokens).strip(" .,:;?-")
+
+    def _answer_from_file(self, question: str, file_label: str,
+                          knowledge: str, feedback: str = None) -> str:
+        """Generate a grounded answer to `question` using `knowledge` as the source."""
+        system = (
+            "You are a documentation/FAQ assistant. Answer the QUESTION using the "
+            "DOCUMENT as the primary source of truth. If the document contains the "
+            "answer, give it and cite the relevant lines. If the document does not "
+            "contain the answer, say so explicitly, then answer from general knowledge "
+            "and label that part as not taken from the document."
+        )
+        fb = ("\n\nA previous answer was rejected by the validator. "
+              f"Address this feedback and try again:\n{feedback}") if feedback else ""
+        user = f"DOCUMENT: {file_label}\n-----\n{knowledge}\n-----\nQUESTION: {question}{fb}"
+        url = f"{self.base_url.rstrip('/')}/chat/completions"
+        headers = {"Content-Type": "application/json",
+                   "Authorization": f"Bearer {self.api_key}"}
+        payload = {"model": self.model,
+                   "messages": [{"role": "system", "content": system},
+                                {"role": "user", "content": user}],
+                   "temperature": 0.3}
+        print(f"\n[{_ts()}] 💬 answer → model:")
+        tracer.event("orchestrator", "text_answerer", "llm_request",
+                     params={"file": file_label, "question": question,
+                             "retry_feedback": feedback},
+                     content=user, model=self.model, temperature=0.3)
+        try:
+            ans = request_completion(
+                url, headers, payload, self.timeout_seconds,
+                stream=True,
+                on_token=lambda t: (sys.stdout.write(t), sys.stdout.flush()),
+            )
+            print()
+            tracer.event("text_answerer", "orchestrator", "llm_response", content=ans)
+            return strip_think(ans).strip()
+        except Exception as e:
+            logger.error(f"text answer call failed: {e}")
+            print(f"[{_ts()}] answer generation failed: {e}")
+            return ""
+
+    def _validate_text_answer(self, question: str, knowledge: str, answer: str) -> dict:
+        """
+        Validate a proposed answer against the document. Returns
+        {status: approved|needs_fix, grounded: bool, feedback: str}.
+        Fail-closed (needs_fix + _api_error) on any LLM/parse error.
+        """
+        system = (
+            "You are a strict QA validator. Given a DOCUMENT, a QUESTION and a PROPOSED "
+            "ANSWER, decide whether the answer correctly and completely addresses the "
+            "question and, where the document is relevant, is consistent with it. "
+            "Return STRICT JSON only, no text around it:\n"
+            '{"status": "approved" or "needs_fix", "grounded": true or false, '
+            '"feedback": "what is wrong or missing, empty if approved"}'
+        )
+        user = (f"DOCUMENT:\n{knowledge}\n\nQUESTION:\n{question}\n\n"
+                f"PROPOSED ANSWER:\n{answer}")
+        url = f"{self.base_url.rstrip('/')}/chat/completions"
+        headers = {"Content-Type": "application/json",
+                   "Authorization": f"Bearer {self.api_key}"}
+        payload = {"model": self.model,
+                   "messages": [{"role": "system", "content": system},
+                                {"role": "user", "content": user}],
+                   "temperature": 0.1}
+        tracer.event("orchestrator", "text_validator", "llm_request",
+                     params={"question": question}, content=user,
+                     model=self.model, temperature=0.1)
+        try:
+            content = request_completion(url, headers, payload, self.timeout_seconds)
+            tracer.event("text_validator", "orchestrator", "llm_response", content=content)
+            content = strip_think(content)
+            if "```json" in content:
+                content = content.split("```json")[1].split("```")[0].strip()
+            elif "```" in content:
+                content = content.split("```")[1].split("```")[0].strip()
+            return json.loads(content)
+        except Exception as e:
+            logger.error(f"text validator failed: {e}")
+            # Fail-closed: do NOT approve on error.
+            return {"status": "needs_fix", "grounded": False,
+                    "feedback": f"validator unavailable: {e}", "_api_error": True}
+
+    def run_text_qa(self, question: str, file_path: str, source: str, base_dir: str) -> None:
+        """
+        Validated question-answering over a text/FAQ/doc file:
+          1. generate an answer grounded in the file,
+          2. validate it against the file,
+          3. retry with feedback up to max_iterations,
+          4. render the final, validated answer.
+        Large files are chunked the same way /search does, but here each chunk's
+        answer is still validated.
+        """
+        start = time.time()
+        tracer.start_run(f"answer: {question or '[file-as-question]'} in {file_path}")
+
+        # If no explicit question was given, the file content IS the question.
+        if not question.strip():
+            question = source.strip()
+            print(f"[{_ts()}] 📄 No explicit question — treating the file content as the question.")
+        knowledge = source
+
+        # If the document is larger than the full-file budget, keep only the most
+        # relevant slice by reusing the /search chunk scan first, then validate.
+        if len(knowledge) > self.search_full_file_max_chars:
+            print(f"[{_ts()}] Document {len(knowledge)} chars > budget "
+                  f"{self.search_full_file_max_chars}; validating against chunks.")
+
+        iteration = 1
+        feedback = None
+        validation: dict = {}
+        answer = ""
+        while iteration <= self.max_iterations:
+            if time.time() - start >= self.timeout_seconds:
+                print(f"[{_ts()}] ⏳ timeout reached; returning best answer so far.")
+                break
+            answer = self._answer_from_file(question, file_path, knowledge, feedback)
+            print(f"[{_ts()}] 🤖 Validating answer ({iteration}/{self.max_iterations})...")
+            if self.stream_agents:
+                validation = self._validate_text_answer(question, knowledge, answer)
+            else:
+                with Spinner(f"Validator iter {iteration}/{self.max_iterations}"):
+                    validation = self._validate_text_answer(question, knowledge, answer)
+
+            status = validation.get("status")
+            if status == "approved":
+                print(f"[{_ts()}] ✅ Answer approved by validator "
+                      f"(grounded={validation.get('grounded')}).")
+                break
+            # If the validator itself failed (unreachable / unparseable), do NOT
+            # feed that internal error back to the answerer as if it were a
+            # critique of the answer — that derails the next answer and wastes
+            # minutes on CPU. Keep the answer and stop; mark it unvalidated.
+            if validation.get("_api_error"):
+                print(f"[{_ts()}] ⚠️  Validator unavailable — keeping the answer "
+                      f"without validation. ({validation.get('feedback','')})")
+                break
+            feedback = (validation.get("feedback") or "").strip()
+            if feedback:
+                print(f"[{_ts()}] ❗ Validator feedback: {feedback}")
+            iteration += 1
+
+        total = time.time() - start
+        print(f"\n[{_ts()}] ── FINAL ANSWER ({file_path}) ──")
+        print(answer if answer else "(no answer produced)")
+        _status = validation.get("status", "unknown")
+        if validation.get("_api_error"):
+            _status = "unvalidated (validator unavailable)"
+        print(f"\n[{_ts()}] status={_status}  "
+              f"iterations={min(iteration, self.max_iterations)}  ({total:.1f}s)")
+
     def run_pipeline(self, user_input: str, base_dir: str) -> None:
         """Executes pipelines with adaptive search, validation loops, and visual feedback."""
         # Full-file search mode: bypass AST block-extraction entirely.
@@ -413,42 +592,24 @@ class Orchestrator:
         # of grabbing the first stray identifier (e.g. "bug" in "fix the bug in x.py").
         parsed = parse_prompt(user_input, source=source)
 
-        # Non-code files (.txt, .md, .ini, .yaml, …) have no AST, no imports,
-        # and no cross-references.  Skip block extraction and the validation loop
-        # (code-specific; produces nonsense like "not valid Python" on text files).
-        #
-        # show / show_imports → answer directly via _ask_over_text and return.
-        # Generative intents (improve / fix / explain / …) → fall through to the
-        # ImprovementAgent + OutputFormatter + MetricsCollector with the whole file
-        # as the "block" so the run is rendered and recorded like a normal code run.
-        _generative_intents = {"improve", "fix", "optimize", "explain", "show_and_improve"}
+        # Non-code files (.txt, .md, FAQ, docs) → validated question-answering.
+        # The whole file is the knowledge; the user's request is the question.
+        # The answer is generated from the file and then VALIDATED (run_text_qa).
+        # The ONLY non-validated path is /search (handled at the top of this method).
         _is_text_file = ext not in _CODE_EXTENSIONS
-
-        if _is_text_file and parsed.intent not in _generative_intents:
-            # Pure retrieval on a text file: show/show_imports → answer and done.
-            self._ask_over_text(user_input, parsed.file_path, source, generative=False)
+        if _is_text_file:
+            question = self._extract_question(user_input, parsed.file_path)
+            self.run_text_qa(question, parsed.file_path, source, base_dir)
             return
 
-        if _is_text_file:
-            # Generative intent on a text file: stub out code-only fields,
-            # use the whole file as the target block, skip validation below.
-            imports = []
-            block = source
-            refs = []
-            context_lines = ""
-            already_searched = [parsed.file_path]
-            search_result: Dict[str, Any] = {"found": {}, "not_found": [], "searched_files": []}
-            iteration = 1
-            validation: Dict[str, Any] = {}
-            print(f"[{_ts()}] 📄 Non-code file — skipping validation, running improvement agent.")
-        else:
-            imports = block_extractor.extract_imports(source, ext)
-            block = block_extractor.extract_block(source, parsed.target_name, ext)
-            refs = block_extractor.find_references(block, ext)
-            context_lines = block_extractor.get_context_lines(source, parsed.target_name)
-            iteration = 1
-            already_searched = [parsed.file_path]
-            search_result: Dict[str, Any] = {"found": {}, "not_found": [], "searched_files": []}
+        imports = block_extractor.extract_imports(source, ext)
+        block = block_extractor.extract_block(source, parsed.target_name, ext)
+        refs = block_extractor.find_references(block, ext)
+        context_lines = block_extractor.get_context_lines(source, parsed.target_name)
+        iteration = 1
+        already_searched = [parsed.file_path]
+        search_result: Dict[str, Any] = {"found": {}, "not_found": [], "searched_files": []}
+        validation: Dict[str, Any] = {}
 
         # --- VALIDATION LOOP (Only if not a simple 'show' intent AND not a text file) ---
         if not _is_text_file and parsed.intent not in ("show", "show_imports"):
@@ -608,8 +769,8 @@ class Orchestrator:
 HELP_TEXT = """\
 Available commands
   /help, /?            Show this help
-  /search <q> in <f>   Answer a question using the WHOLE file (no block extraction).
-                       Large files are auto-split into chunks and searched in turn.
+  /search <q> in <f>   Answer a question using the WHOLE file (no block extraction)
+                       and WITHOUT validation. Large files are auto-split into chunks.
                        Also accepts:  /search <file> :: <question>
   /prompts             Show active prompt version + rollback chain for each agent
   /rollback [agent]    Roll back one prompt version (default: validator_agent)
@@ -628,6 +789,13 @@ How to ask for work (anything not starting with '/')
     improve / fix / optimize / refactor / correct  -> review + suggest improved code
     explain / describe       -> explanation only, no code changes
   A request with no file path is sent straight to the model as a chat message.
+
+Text / FAQ / documentation files (.txt, .md, …)
+  Any request on a non-code file is answered from the file and THEN validated
+  (answer -> validator -> retry up to max_iterations). Examples:
+    answer how do I reset my password in faq.md
+    hello.txt                         (file content is taken as the question)
+  Only /search skips validation.
 
 CLI / automation
   python main.py [base_dir]                  interactive

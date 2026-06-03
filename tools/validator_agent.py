@@ -7,7 +7,7 @@ import logging
 from typing import Optional
 
 from tools.agent_trace import tracer
-from tools.llm_stream import request_completion
+from tools.llm_stream import request_completion, strip_think
 
 logger = logging.getLogger(__name__)
 
@@ -145,6 +145,7 @@ class ValidatorAgent:
                 content = request_completion(url, headers, req_payload, self.timeout)
 
             tracer.event("llm", "validator_agent", "llm_response", content=content)
+            content = strip_think(content)
 
             if "```json" in content:
                 content = content.split("```json")[1].split("```")[0].strip()
