@@ -399,6 +399,8 @@ class Orchestrator(OrchestratorActions):
 HELP_TEXT = """\
 Available commands
   /help, /?            Show this help
+  /auto <goal>         Run autonomous improvement mode (AUTO-A1).
+                       e.g. /auto improve current code
   /search <q> in <f>   Answer a question using the WHOLE file (no block extraction).
                        Also accepts:  /search <file> :: <question>
   /edit <instr> in <f> Apply an instruction to a file and WRITE IT BACK (validated;
@@ -452,6 +454,10 @@ def _parse_args():
                         help="Project root directory (overrides positional base_dir).")
     parser.add_argument("--config", metavar="FILE", default="agents.ini",
                         help="Path to agents.ini (default: agents.ini).")
+    # AUTO-A1: autonomous mode flag
+    parser.add_argument("--auto", metavar="GOAL", default=None,
+                        help="Run in autonomous mode with the given goal, then exit. "
+                             "e.g. --auto \"improve current code\"")
     return parser.parse_args()
 
 
@@ -459,6 +465,16 @@ def main():
     args = _parse_args()
     base_dir = os.path.abspath(args.base or args.base_dir_positional or os.getcwd())
     orchestrator = Orchestrator(config_path=args.config)
+
+    # ── AUTONOMOUS MODE (AUTO-A1) ──────────────────────────────────────
+    if args.auto is not None:
+        goal = args.auto.strip()
+        if not goal:
+            print("Error: --auto requires a non-empty goal string.", file=sys.stderr)
+            sys.exit(1)
+        from tools.auto.controller import run_auto
+        exit_code = run_auto(goal=goal, base_dir=base_dir, config_path=args.config)
+        sys.exit(exit_code)
 
     # ── ONE-SHOT MODE ──────────────────────────────────────────────────
     if args.once is not None:
@@ -510,6 +526,16 @@ def main():
 
             if user_input == "/reload":
                 orchestrator.reload_agents()
+                continue
+
+            # AUTO-A1: /auto <goal> — launch autonomous mode from the interactive shell
+            if user_input.startswith("/auto"):
+                goal = user_input[len("/auto"):].strip()
+                if not goal:
+                    print("Usage: /auto <goal>   e.g.  /auto improve current code")
+                else:
+                    from tools.auto.controller import run_auto
+                    run_auto(goal=goal, base_dir=base_dir, config_path=args.config)
                 continue
 
             # Guard: unrecognized slash-commands should NOT be sent to the model.
