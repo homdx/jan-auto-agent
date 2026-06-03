@@ -28,6 +28,15 @@ from tools.metrics_collector import MetricsCollector, RunRecord
 from tools.prompt_store import PromptStore
 from tools.prompt_optimizer import PromptOptimizer
 from tools.prompt_evaluator import PromptEvaluator
+from tools.actions import OrchestratorActions
+
+# Extensions that support AST/block extraction and code validation.
+# Everything else is treated as plain text and routed to run_text_qa.
+_CODE_EXTENSIONS = {
+    ".py", ".js", ".ts", ".jsx", ".tsx",
+    ".go", ".java", ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp",
+    ".rs", ".rb", ".php", ".cs", ".swift", ".kt", ".scala",
+}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -52,7 +61,7 @@ except ImportError:
     block_extractor = file_util
 
 
-class Orchestrator:
+class Orchestrator(OrchestratorActions):
     def __init__(self, config_path: str = "agents.ini"):
         self.config = configparser.ConfigParser()
         self.load_config(config_path)
@@ -138,6 +147,11 @@ class Orchestrator:
         self.optimizer_trigger_avg_iter= self.config.getfloat  ("prompt_optimizer", "trigger_avg_iterations",   fallback=2.0)
         self.optimizer_trigger_json_fail=self.config.getfloat  ("prompt_optimizer", "trigger_json_fail_rate",   fallback=0.30)
 
+        # Agent streaming and search budget (used by OrchestratorActions mixin)
+        self.stream_agents = self.config.getboolean("output", "stream_agents", fallback=False)
+        self.search_full_file_max_chars = self.config.getint("search", "full_file_max_chars", fallback=12000)
+        self.file_editor_max_tokens = self.config.getint("file_editor", "max_tokens", fallback=0)
+
     def execute_direct_chat(self, user_input: str) -> None:
         """Routes conversational queries to local model with streaming output."""
         if self.api_format == "ollama":
@@ -178,7 +192,16 @@ class Orchestrator:
     def run_pipeline(self, user_input: str, base_dir: str) -> None:
         """Executes pipelines with adaptive search, validation loops, and visual feedback."""
         start_time = time.time()
-        
+
+        # Full-file search mode: bypass AST block-extraction entirely.
+        if user_input.strip().startswith("/search"):
+            self.run_search(user_input.strip(), base_dir)
+            return
+        # In-place edit mode: write the file back (with backup + diff).
+        if user_input.strip().startswith("/edit"):
+            self.run_edit(user_input.strip(), base_dir)
+            return
+
         # Parse intent and target
         parsed: ParsedPrompt = parse_prompt(user_input)
         
@@ -197,6 +220,16 @@ class Orchestrator:
             source = file_reader.read_file(target_path)
         except Exception as e:
             logger.error(f"Execution failed while reading targets: {e}")
+            return
+
+        # Re-parse with source so parse_prompt can verify the target symbol exists.
+        parsed = parse_prompt(user_input, source=source) if hasattr(parse_prompt, '__code__') and parse_prompt.__code__.co_varnames.__contains__('source') else parsed
+
+        # Non-code files (.txt, .md, etc.) → validated question-answering.
+        _is_text_file = ext not in _CODE_EXTENSIONS
+        if _is_text_file:
+            question = self._extract_question(user_input, parsed.file_path)
+            self.run_text_qa(question, parsed.file_path, source, base_dir)
             return
         
         imports = block_extractor.extract_imports(source, ext)
@@ -328,12 +361,44 @@ class Orchestrator:
         )
 
 
+HELP_TEXT = """\
+Available commands
+  /help, /?            Show this help
+  /search <q> in <f>   Answer a question using the WHOLE file (no block extraction).
+                       Also accepts:  /search <file> :: <question>
+  /edit <instr> in <f> Apply an instruction to a file and WRITE IT BACK (validated;
+                       saves <file>.bak first; prints a diff). e.g.
+                       /edit fix grammar in hello.txt
+  /prompts             Show active prompt version + rollback chain for each agent
+  /rollback [agent]    Roll back one prompt version (default: validator_agent)
+  /new                 Reset the session
+  /exit                Quit
+
+How to ask for work (anything not starting with '/')
+  <action> <symbol> in <file>        e.g.  improve handler in app.py
+  show <file>                        e.g.  show app.py
+
+  Actions:
+    show / view / get        -> display the target block + imports
+    improve / fix / optimize -> review + suggest improved code
+    explain / describe       -> explanation only, no code changes
+  A request with no file path is sent straight to the model as a chat message.
+
+Text / documentation files (.txt, .md, …)
+  Any request on a non-code file is answered from the file and validated.
+  Examples:
+    answer how do I reset in faq.md
+    hello.txt
+  Use /edit to actually modify the file in place.
+"""
+
+
 def main():
     base_dir = os.getcwd() if len(sys.argv) < 2 else sys.argv[1]
     orchestrator = Orchestrator()
 
     print(f"Entering core orchestration shell context: {base_dir}")
-    print(f"Commands -> Exit: '{orchestrator.exit_key}' | Reset Workspace: '{orchestrator.new_chat_key}'\n")
+    print(f"Commands -> Exit: '{orchestrator.exit_key}' | Reset: '{orchestrator.new_chat_key}' | Help: '/help'\n")
 
     while True:
         try:
@@ -345,6 +410,28 @@ def main():
                 break
             if user_input == orchestrator.new_chat_key:
                 print("Session reset completed.")
+                continue
+
+            if user_input in ("/help", "/?", "/commands"):
+                print(HELP_TEXT)
+                continue
+
+            if user_input.startswith("/prompts"):
+                print(orchestrator.prompt_store.get_store_summary(
+                    ["validator_agent", "improvement_agent"]
+                ))
+                continue
+
+            if user_input.startswith("/rollback"):
+                parts = user_input.split()
+                agent = parts[1] if len(parts) > 1 else "validator_agent"
+                ok = orchestrator.prompt_store.rollback(agent)
+                print(f"↩️  Rolled back {agent}" if ok else f"Already at hardcoded fallback for {agent}")
+                continue
+
+            # Guard: unrecognized slash-commands should NOT be sent to the model.
+            if user_input.startswith("/") and not user_input.startswith(("/edit", "/search")):
+                print(f"Unknown command: {user_input.split()[0]}  —  type /help for the command list.")
                 continue
 
             orchestrator.run_pipeline(user_input, base_dir)
