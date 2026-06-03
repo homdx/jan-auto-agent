@@ -29,7 +29,7 @@ from tools.metrics_collector import MetricsCollector, RunRecord
 from tools.prompt_store import PromptStore
 from tools.prompt_optimizer import PromptOptimizer
 from tools.prompt_evaluator import PromptEvaluator
-from tools.actions import OrchestratorActions
+from tools.actions import OrchestratorActions, _ts
 
 # Extensions that support AST/block extraction and code validation.
 # Everything else is treated as plain text and routed to run_text_qa.
@@ -44,6 +44,9 @@ logger = logging.getLogger(__name__)
 
 
 class MockFileUtilities:
+    """Last-resort fallback only. The real implementations live in tools/ and are
+    imported below; this is kept solely so the app degrades instead of crashing if
+    those modules are ever missing."""
     def read_file(self, path: str) -> str:
         with open(path, "r", encoding="utf-8") as f:
             return f.read()
@@ -53,10 +56,16 @@ class MockFileUtilities:
     def get_context_lines(self, source: str, name: str) -> str: return ""
 
 
+# Real AST/text analysis lives in tools/. Import directly so block extraction,
+# imports, and cross-reference detection actually work (NOT the Mock stub).
 try:
-    import utils.file_reader as file_reader
-    import utils.block_extractor as block_extractor
-except ImportError:
+    from tools import file_reader as file_reader
+    from tools import block_extractor as block_extractor
+    # sanity: the real block module must expose the analysis API
+    assert hasattr(block_extractor, "extract_block") and hasattr(file_reader, "read_file")
+except Exception:
+    logger.warning("tools.file_reader / tools.block_extractor unavailable — "
+                   "falling back to MockFileUtilities (block extraction disabled).")
     file_util = MockFileUtilities()
     file_reader = file_util
     block_extractor = file_util
@@ -64,12 +73,24 @@ except ImportError:
 
 class Orchestrator(OrchestratorActions):
     def __init__(self, config_path: str = "agents.ini"):
+        self._config_path = config_path
         self.config = configparser.ConfigParser()
-        self.load_config(config_path)
-        
-        # Core components instantiation with passed API configurations
+
+        # Persistent components — created ONCE; they own on-disk state
+        # (prompts.json / metrics.json) and survive reloads.
         self.metrics_collector = MetricsCollector()
-        self.prompt_store = PromptStore(config=self.config)  # STORY-2.3
+        self.prompt_store = PromptStore(config=None)
+
+        self._build_agents()
+
+    def _build_agents(self) -> None:
+        """(Re)read config and (re)create all agents. Called at init and on reload,
+        so a promoted prompt / edited config takes effect with no restart.
+        PromptStore + MetricsCollector are preserved."""
+        self.load_config(self._config_path)
+        self.prompt_store.store_path   = Path(self.config.get("prompt_store", "store_path", fallback="prompts.json"))
+        self.prompt_store.max_versions = self.config.getint("prompt_store", "max_versions", fallback=3)
+
         self.prompt_optimizer = PromptOptimizer(         # STORY-3.2
             model=self.model,
             base_url=self.base_url,
@@ -77,7 +98,13 @@ class Orchestrator(OrchestratorActions):
             timeout=self.timeout_seconds,
             ssl_context=self.ssl_context,
         )
-        self.search_agent = SearchAgent()
+        _raw_skip = self.config.get("search", "skip_dirs", fallback="")
+        _skip_dirs = [d.strip() for d in _raw_skip.split(",") if d.strip()] or None
+        self.search_agent = SearchAgent(                 # Bug #10: pass search config
+            max_file_kb=self.config.getint("search", "max_file_kb", fallback=500),
+            skip_dirs=_skip_dirs,
+            max_depth=self.config.getint("search", "max_depth", fallback=2),
+        )
         self.validator_agent = ValidatorAgent(
             max_iter=self.max_iterations,
             model=self.model,
@@ -94,6 +121,7 @@ class Orchestrator(OrchestratorActions):
             prompt_store=self.prompt_store,
             metrics_collector=self.metrics_collector,
             validator_agent=self.validator_agent,
+            max_iter=self.max_iterations,             # Bug #9: pass real config value
         )
         self.improvement_agent = ImprovementAgent(
             model=self.model,
@@ -104,7 +132,15 @@ class Orchestrator(OrchestratorActions):
             api_format=self.api_format,
             num_ctx=self.num_ctx,
             ssl_context=self.ssl_context,
+            config=self.config,
         )
+
+    def reload_agents(self) -> None:
+        """Re-read agents.ini and rebuild all agents mid-session (no restart)."""
+        logger.info("reload_agents: re-reading %s …", self._config_path)
+        self._build_agents()
+        print(f"[{_ts()}] 🔄 Agents reloaded from {self._config_path} "
+              f"(model={self.model}, api_format={self.api_format}, max_iter={self.max_iterations})")
 
     def load_config(self, config_path: str) -> None:
         if os.path.exists(config_path):
@@ -340,6 +376,7 @@ class Orchestrator(OrchestratorActions):
                 if result.promoted:
                     self.prompt_store.push("validator_agent", candidate, result.score)
                     print(f"✅ Prompt promoted (score {result.score:.2f}) — {result.reason}")
+                    self.reload_agents()  # apply the promoted prompt immediately
                 else:
                     print(f"⚠️  Candidate discarded — {result.reason}")
 
@@ -369,6 +406,7 @@ Available commands
                        /edit fix grammar in hello.txt
   /prompts             Show active prompt version + rollback chain for each agent
   /rollback [agent]    Roll back one prompt version (default: validator_agent)
+  /reload              Re-read agents.ini and rebuild all agents (no restart)
   /new                 Reset the session
   /exit                Quit
 
@@ -466,6 +504,12 @@ def main():
                 agent = parts[1] if len(parts) > 1 else "validator_agent"
                 ok = orchestrator.prompt_store.rollback(agent)
                 print(f"↩️  Rolled back {agent}" if ok else f"Already at hardcoded fallback for {agent}")
+                if ok:
+                    orchestrator.reload_agents()
+                continue
+
+            if user_input == "/reload":
+                orchestrator.reload_agents()
                 continue
 
             # Guard: unrecognized slash-commands should NOT be sent to the model.
