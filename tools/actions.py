@@ -163,6 +163,7 @@ class OrchestratorActions:
             answer = request_completion(
                 url, headers, payload, self.timeout_seconds,
                 stream=True,
+                api_format=self.api_format,
                 on_token=lambda t: (sys.stdout.write(t), sys.stdout.flush()),
                 ssl_context=self.ssl_context,
             )
@@ -288,6 +289,7 @@ class OrchestratorActions:
             ans = request_completion(
                 url, headers, payload, self.timeout_seconds,
                 stream=True,
+                api_format=self.api_format,
                 on_token=lambda t: (sys.stdout.write(t), sys.stdout.flush()),
                 ssl_context=self.ssl_context,
             )
@@ -327,6 +329,7 @@ class OrchestratorActions:
                      model=self.model, temperature=0.1)
         try:
             content = request_completion(url, headers, payload, self.timeout_seconds,
+                                         api_format=self.api_format,
                                          ssl_context=self.ssl_context)
             tracer.event("text_validator", "orchestrator", "llm_response", content=content)
             content = strip_think(content)
@@ -470,6 +473,7 @@ class OrchestratorActions:
             out = request_completion(
                 url, headers, payload, self.timeout_seconds,
                 stream=True,
+                api_format=self.api_format,
                 on_token=lambda t: (sys.stdout.write(t), sys.stdout.flush()),
                 ssl_context=self.ssl_context,
             )
@@ -505,6 +509,7 @@ class OrchestratorActions:
                      model=self.model, temperature=0.1)
         try:
             content = strip_think(request_completion(url, headers, payload, self.timeout_seconds,
+                                                      api_format=self.api_format,
                                                       ssl_context=self.ssl_context))
             tracer.event("edit_validator", "orchestrator", "llm_response", content=content)
             if "```json" in content:
