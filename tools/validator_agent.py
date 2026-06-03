@@ -68,6 +68,8 @@ class ValidatorAgent:
         timeout: int = 120,
         prompt_store=None,   # STORY-2.3: injected PromptStore (Optional[PromptStore])
         stream: bool = False,  # echo the model's answer live, like direct chat
+        api_format: str = "openai",
+        num_ctx: int = 0,
     ):
         self.max_iter = max_iter
         self.model = model
@@ -76,10 +78,15 @@ class ValidatorAgent:
         self.timeout = timeout
         self.prompt_store = prompt_store  # None → always use hardcoded constant
         self.stream = stream
+        self.api_format = api_format
+        self.num_ctx = num_ctx
 
     def validate(self, payload: dict) -> dict:
         """Evaluates whether the target block requires additional code scanning cycles."""
-        url = f"{self.base_url.rstrip('/')}/chat/completions"
+        if self.api_format == "ollama":
+            url = f"{self.base_url.rstrip('/')}/api/chat"
+        else:
+            url = f"{self.base_url.rstrip('/')}/chat/completions"
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}"
@@ -124,8 +131,10 @@ class ValidatorAgent:
             req_payload = {
                 "model": self.model,
                 "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.1
+                "temperature": 0.1,
             }
+            if self.num_ctx:
+                req_payload["num_ctx"] = self.num_ctx
             tracer.event("validator_agent", "llm", "llm_request",
                          content=prompt, model=self.model, temperature=0.1)
 
@@ -136,13 +145,14 @@ class ValidatorAgent:
                     url, headers, req_payload, self.timeout,
                     stream=True,
                     on_token=lambda t: (sys.stdout.write(t), sys.stdout.flush()),
+                    api_format=self.api_format,
                 )
                 ts_done = time.strftime("%H:%M:%S")
                 print(f"\n[{ts_done}] validator_agent ← llm  (response received)")
             else:
                 ts = time.strftime("%H:%M:%S")
                 print(f"[{ts}] validator_agent → llm  (iter {payload.get('iteration')}/{self.max_iter})  waiting…")
-                content = request_completion(url, headers, req_payload, self.timeout)
+                content = request_completion(url, headers, req_payload, self.timeout, api_format=self.api_format)
 
             tracer.event("llm", "validator_agent", "llm_response", content=content)
             content = strip_think(content)

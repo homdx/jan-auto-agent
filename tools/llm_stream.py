@@ -43,20 +43,56 @@ def strip_think(text: str) -> str:
     return out.strip()
 
 
-def request_completion(url, headers, payload, timeout, stream=False, on_token=None):
+def _extract_content(raw: dict, api_format: str) -> str:
+    """Extract assistant message text from a non-streaming response dict."""
+    if api_format == "ollama":
+        return raw["message"]["content"].strip()
+    # openai (default)
+    return raw["choices"][0]["message"]["content"].strip()
+
+
+def _build_payload(payload: dict, api_format: str, stream: bool) -> dict:
+    """
+    Return a copy of payload shaped for the target API format.
+
+    openai : top-level temperature, stream flag, standard messages array.
+    ollama : temperature moves into options{}, num_ctx added if present,
+             /api/chat expects {"model", "messages", "stream", "options"}.
+    """
+    body = dict(payload)
+    if api_format == "ollama":
+        options = {}
+        if "temperature" in body:
+            options["temperature"] = body.pop("temperature")
+        if "num_ctx" in body:
+            options["num_ctx"] = body.pop("num_ctx")
+        if options:
+            body["options"] = options
+        body["stream"] = stream
+        # /api/chat does not use a separate system message list entry —
+        # system content is passed as a messages entry with role "system",
+        # which is already the format callers use, so nothing extra needed.
+    else:
+        if stream:
+            body["stream"] = True
+    return body
+
+
+def request_completion(url, headers, payload, timeout, stream=False, on_token=None,
+                       api_format: str = "openai"):
     """
     POST a chat-completions request and return the assistant message text.
 
-    stream=False : normal blocking request, returns the full content string.
-    stream=True  : reads the SSE token stream; calls on_token(tok) for each
-                   token (if provided) and returns the accumulated content.
+    api_format : "openai"  → /v1/chat/completions  (SSE streaming, choices[])
+                 "ollama"  → /api/chat              (NDJSON streaming, message{})
 
-    Raises urllib errors / network exceptions to the caller, which keeps each
-    agent's existing fail-closed handling intact.
+    stream=False : normal blocking request, returns the full content string.
+    stream=True  : reads the token stream; calls on_token(tok) for each token
+                   (if provided) and returns the accumulated content.
+
+    Raises urllib errors / network exceptions to the caller.
     """
-    body = dict(payload)
-    if stream:
-        body["stream"] = True
+    body = _build_payload(payload, api_format, stream)
 
     req = urllib.request.Request(
         url,
@@ -66,8 +102,6 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
     )
 
     def _open():
-        # Surface the server's error body (Jan often explains WHY in the 500 body:
-        # model not loaded, out of memory, context length exceeded, etc.).
         try:
             return urllib.request.urlopen(req, timeout=timeout)
         except urllib.error.HTTPError as e:
@@ -81,25 +115,44 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
     if not stream:
         with _open() as response:
             raw = json.loads(response.read().decode("utf-8"))
-            return raw["choices"][0]["message"]["content"].strip()
+            return _extract_content(raw, api_format)
 
-    # Streaming path: echo + accumulate.
+    # ── Streaming ────────────────────────────────────────────────────────
     parts = []
     with _open() as response:
         for raw_line in response:
             line = raw_line.decode("utf-8").strip()
-            if not line.startswith("data:"):
+            if not line:
                 continue
-            data = line[len("data:"):].strip()
-            if data == "[DONE]":
-                break
-            try:
-                chunk = json.loads(data)
-                token = chunk["choices"][0]["delta"].get("content", "")
-            except (json.JSONDecodeError, KeyError):
-                continue
+
+            if api_format == "ollama":
+                # Ollama streams newline-delimited JSON objects
+                # {"message": {"role": "assistant", "content": "tok"}, "done": false}
+                try:
+                    chunk = json.loads(line)
+                    token = chunk.get("message", {}).get("content", "")
+                    done  = chunk.get("done", False)
+                except json.JSONDecodeError:
+                    continue
+            else:
+                # OpenAI SSE: "data: {...}" lines
+                if not line.startswith("data:"):
+                    continue
+                data = line[len("data:"):].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data)
+                    token = chunk["choices"][0]["delta"].get("content", "")
+                    done  = False
+                except (json.JSONDecodeError, KeyError):
+                    continue
+
             if token:
                 parts.append(token)
                 if on_token is not None:
                     on_token(token)
+            if done:
+                break
+
     return "".join(parts).strip()

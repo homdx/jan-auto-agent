@@ -59,12 +59,16 @@ class ImprovementAgent:
         timeout: int = 120,
         prompt_store=None,   # STORY-2.3: injected PromptStore (Optional[PromptStore])
         config=None,         # configparser.ConfigParser — carries temperature/max_tokens/system prompts
+        api_format: str = "openai",
+        num_ctx: int = 0,
     ):
         self.model = model
         self.base_url = base_url
         self.api_key = api_key
         self.timeout = timeout
         self.prompt_store = prompt_store  # None → always use hardcoded constant
+        self.api_format = api_format
+        self.num_ctx = num_ctx
 
         # Read temperature and max_tokens from [improvement_agent] in agents.ini.
         # Fall back to the values the original code hardcoded if the section is absent.
@@ -87,7 +91,10 @@ class ImprovementAgent:
 
     def process(self, intent: str, context: dict) -> dict:
         """Generates analytical code evaluations and refactoring patterns."""
-        url = f"{self.base_url.rstrip('/')}/chat/completions"
+        if self.api_format == "ollama":
+            url = f"{self.base_url.rstrip('/')}/api/chat"
+        else:
+            url = f"{self.base_url.rstrip('/')}/chat/completions"
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}"
@@ -127,6 +134,8 @@ class ImprovementAgent:
                 "temperature": self.temperature,
                 "max_tokens": self.max_tokens,
             }
+            if self.num_ctx:
+                req_payload["num_ctx"] = self.num_ctx
             tracer.event("improvement_agent", "llm", "llm_request",
                          content=prompt, model=self.model,
                          temperature=self.temperature, max_tokens=self.max_tokens)
@@ -138,13 +147,14 @@ class ImprovementAgent:
                     url, headers, req_payload, self.timeout,
                     stream=True,
                     on_token=lambda t: (sys.stdout.write(t), sys.stdout.flush()),
+                    api_format=self.api_format,
                 )
                 ts_done = time.strftime("%H:%M:%S")
                 print(f"\n[{ts_done}] improvement_agent ← llm  (response received)")
             else:
                 ts = time.strftime("%H:%M:%S")
                 print(f"[{ts}] improvement_agent → llm  (intent={intent})  waiting…")
-                content = request_completion(url, headers, req_payload, self.timeout)
+                content = request_completion(url, headers, req_payload, self.timeout, api_format=self.api_format)
 
             tracer.event("llm", "improvement_agent", "llm_response", content=content)
             content = strip_think(content)
