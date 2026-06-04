@@ -252,23 +252,35 @@ class Coder:
         # ── Build and send the prompt ─────────────────────────────────────────
         user_msg = self._build_prompt(task, base_dir, prior_feedback or [])
 
-        payload: dict[str, Any] = {
-            "model":       self._model,
-            "temperature": self._temperature,
-            "max_tokens":  self._max_tokens,
-            "messages": [
-                {"role": "system", "content": self._system},
-                {"role": "user",   "content": user_msg},
-            ],
-        }
         headers = {
             "Content-Type":  "application/json",
             "Authorization": f"Bearer {self._api_key}",
         }
+        
         if self._api_format == "ollama":
             url = f"{self._base_url}/api/chat"
+            payload: dict[str, Any] = {
+                "model":       self._model,
+                "messages": [
+                    {"role": "system", "content": self._system},
+                    {"role": "user",   "content": user_msg},
+                ],
+                "options": {
+                    "temperature": self._temperature,
+                    "num_predict": self._max_tokens
+                }
+            }
         else:
             url = f"{self._base_url}/chat/completions"
+            payload: dict[str, Any] = {
+                "model":       self._model,
+                "temperature": self._temperature,
+                "max_tokens":  self._max_tokens,
+                "messages": [
+                    {"role": "system", "content": self._system},
+                    {"role": "user",   "content": user_msg},
+                ],
+            }
 
         tracer.event(
             source="coder", target="llm", kind="llm_request",

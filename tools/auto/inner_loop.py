@@ -143,17 +143,24 @@ class LLMGate2Validator:
             f"ACCEPTANCE CHECK: {task.get('acceptance_check','')}\n"
             f"ACCEPTANCE OUTPUT (exit 0):\n{stdout}\n"
         )
-        if self._api_format == "ollama":
-            url = f"{self._base_url}/api/chat"
-        else:
-            url = f"{self._base_url}/chat/completions"
-
         headers = {"Content-Type": "application/json",
                    "Authorization": f"Bearer {self._api_key}"}
-        payload = {"model": self._model,
-                   "messages": [{"role": "system", "content": system},
-                                {"role": "user", "content": user}],
-                   "temperature": 0.1}
+        if self._api_format == "ollama":
+            url = f"{self._base_url}/api/chat"
+            payload = {"model": self._model,
+                       "messages": [{"role": "system", "content": system},
+                                    {"role": "user", "content": user}],
+                       "options": {
+                           "temperature": 0.1
+                       }}
+        else:
+            url = f"{self._base_url}/chat/completions"
+            
+            payload = {"model": self._model,
+                       "messages": [{"role": "system", "content": system},
+                                    {"role": "user", "content": user}],
+                       "temperature": 0.1}
+
         tracer.event("inner_loop", "gate2_validator", "llm_request",
                      params={"task": task.get("id")}, content=user,
                      model=self._model, temperature=0.1)
