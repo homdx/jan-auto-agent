@@ -64,10 +64,17 @@ from typing import Optional
 
 from tools.agent_trace import tracer
 from tools.auto.state import StateStore, STATUS_BLOCKED
+from tools.auto.ticket_store import (
+    TicketStore,
+    make_ticket,
+    make_ticket_store,
+    TICKET_TYPES,
+    TICKET_STATUSES,
+)
 
 logger = logging.getLogger(__name__)
 
-# ── Ticket field constants ────────────────────────────────────────────────────
+# ── Ticket field constants (re-exported for backward compat) ─────────────────
 TICKET_TYPE_INVESTIGATION = "investigation"
 TICKET_STATUS_OPEN        = "open"
 
@@ -150,8 +157,8 @@ class ExhaustionHandler:
         kpath = self._state.write_task_file(task_id, "knowledge.md", knowledge_text)
         logger.info("ExhaustionHandler: wrote knowledge note → %s", kpath)
 
-        # 4. Write .agent/tickets/<ticket_id>.json
-        tpath = self._write_ticket(ticket_id, task_id, title, knowledge_text)
+        # 4. Write .agent/tickets/<ticket_id>.json via TicketStore (AUTO-D1)
+        tpath = self._open_ticket(ticket_id, task_id, title, knowledge_text)
         logger.info("ExhaustionHandler: opened ticket %s → %s", ticket_id, tpath)
 
         # 5. Log to run.log
@@ -223,31 +230,28 @@ class ExhaustionHandler:
 
         return "\n".join(sections) + "\n"
 
-    def _write_ticket(
+    def _open_ticket(
         self,
         ticket_id: str,
         linked_task: str,
         title: str,
         body: str,
     ) -> Path:
-        """Write a ticket JSON file and return its path."""
-        tickets_dir = self._state.agent_dir / "tickets"
-        tickets_dir.mkdir(parents=True, exist_ok=True)
-
-        ticket = {
-            "id":          ticket_id,
-            "type":        TICKET_TYPE_INVESTIGATION,
-            "status":      TICKET_STATUS_OPEN,
-            "linked_task": linked_task,
-            "title":       f"Deferred: {title}",
-            "body":        body,
-            "created_at":  _ts(),
-        }
-
-        path = tickets_dir / f"{ticket_id}.json"
-        path.write_text(json.dumps(ticket, indent=2, ensure_ascii=False),
-                        encoding="utf-8")
-        return path
+        """Create a ticket via TicketStore (AUTO-D1) and return its path."""
+        ts = make_ticket_store(self._state.agent_dir)
+        ticket = make_ticket(
+            id=ticket_id,
+            type=TICKET_TYPE_INVESTIGATION,
+            linked_task=linked_task,
+            title=f"Deferred: {title}",
+            body=body,
+        )
+        # Idempotent: if a ticket already exists (e.g. resume), skip creation.
+        if ts.exists(ticket_id):
+            logger.debug("_open_ticket: %s already exists — skipping create", ticket_id)
+        else:
+            ts.create(ticket)
+        return ts._path(ticket_id)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
