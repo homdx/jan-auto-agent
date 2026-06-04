@@ -72,6 +72,7 @@ class ValidatorAgent:
         api_format: str = "openai",
         num_ctx: int = 0,
         ssl_context: ssl.SSLContext = None,
+        temperature: float = 0.1,
     ):
         self.max_iter = max_iter
         self.model = model
@@ -83,6 +84,7 @@ class ValidatorAgent:
         self.api_format = api_format
         self.num_ctx = num_ctx
         self.ssl_context = ssl_context
+        self.temperature = temperature
 
     def validate(self, payload: dict) -> dict:
         """Evaluates whether the target block requires additional code scanning cycles."""
@@ -134,12 +136,12 @@ class ValidatorAgent:
             req_payload = {
                 "model": self.model,
                 "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.1,
+                "temperature": self.temperature,
             }
             if self.num_ctx:
                 req_payload["num_ctx"] = self.num_ctx
             tracer.event("validator_agent", "llm", "llm_request",
-                         content=prompt, model=self.model, temperature=0.1)
+                         content=prompt, model=self.model, temperature=self.temperature)
 
             if self.stream:
                 ts = time.strftime("%H:%M:%S")

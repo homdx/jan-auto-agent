@@ -34,6 +34,18 @@ class OrchestratorActions:
     """Mixin that adds execute_direct_chat, run_search, run_text_qa, and run_edit
     to the Orchestrator without cluttering its core orchestration logic."""
 
+    def _cfg_temp(self, section: str, default: float) -> float:
+        """Read a temperature from agents.ini [section], falling back to the
+        historical literal if config is unavailable or the key is absent.
+        Keeps behavior identical unless the operator overrides it."""
+        cfg = getattr(self, "config", None)
+        if cfg is None:
+            return default
+        try:
+            return cfg.getfloat(section, "temperature", fallback=default)
+        except Exception:
+            return default
+
     def _chat_url(self) -> str:
         """Return the correct chat completions URL for the active api_format."""
         base = self.base_url.rstrip("/")
@@ -58,7 +70,7 @@ class OrchestratorActions:
                 {"role": "system", "content": "You are a helpful assistant integrated into an offline DevOps pipeline environment."},
                 {"role": "user", "content": user_input}
             ],
-            "temperature": 0.3,
+            "temperature": self._cfg_temp("direct_chat", 0.3),
             "stream": True
         }
 
@@ -154,11 +166,11 @@ class OrchestratorActions:
         payload = {"model": self.model,
                    "messages": [{"role": "system", "content": system},
                                 {"role": "user", "content": user}],
-                   "temperature": 0.2}
+                   "temperature": self._cfg_temp("search_agent", 0.2)}
         print(f"\n[{_ts()}] 🔎 search → model{where}:")
         tracer.event("orchestrator", "search_fullfile", "llm_request",
                      params={"file": file_label, "chunk": chunk_label, "query": query},
-                     content=user, model=self.model, temperature=0.2)
+                     content=user, model=self.model, temperature=self._cfg_temp("search_agent", 0.2))
         try:
             answer = request_completion(
                 url, headers, payload, self.timeout_seconds,
@@ -279,12 +291,12 @@ class OrchestratorActions:
         payload = {"model": self.model,
                    "messages": [{"role": "system", "content": system},
                                 {"role": "user", "content": user}],
-                   "temperature": 0.3}
+                   "temperature": self._cfg_temp("main_agent", 0.3)}
         print(f"\n[{_ts()}] 💬 answer → model:")
         tracer.event("orchestrator", "text_answerer", "llm_request",
                      params={"file": file_label, "question": question,
                              "retry_feedback": feedback},
-                     content=user, model=self.model, temperature=0.3)
+                     content=user, model=self.model, temperature=self._cfg_temp("main_agent", 0.3))
         try:
             ans = request_completion(
                 url, headers, payload, self.timeout_seconds,
@@ -323,10 +335,10 @@ class OrchestratorActions:
         payload = {"model": self.model,
                    "messages": [{"role": "system", "content": system},
                                 {"role": "user", "content": user}],
-                   "temperature": 0.1}
+                   "temperature": self._cfg_temp("validator_agent", 0.1)}
         tracer.event("orchestrator", "text_validator", "llm_request",
                      params={"question": question}, content=user,
-                     model=self.model, temperature=0.1)
+                     model=self.model, temperature=self._cfg_temp("validator_agent", 0.1))
         try:
             content = request_completion(url, headers, payload, self.timeout_seconds,
                                          api_format=self.api_format,
@@ -462,13 +474,13 @@ class OrchestratorActions:
         payload = {"model": self.model,
                    "messages": [{"role": "system", "content": system},
                                 {"role": "user", "content": user}],
-                   "temperature": 0.2}
+                   "temperature": self._cfg_temp("file_editor", 0.2)}
         if getattr(self, "file_editor_max_tokens", 0):
             payload["max_tokens"] = self.file_editor_max_tokens
         print(f"\n[{_ts()}] ✏️  edit → model:")
         tracer.event("orchestrator", "file_editor", "llm_request",
                      params={"file": file_label, "instruction": instruction},
-                     content=user, model=self.model, temperature=0.2)
+                     content=user, model=self.model, temperature=self._cfg_temp("file_editor", 0.2))
         try:
             out = request_completion(
                 url, headers, payload, self.timeout_seconds,
@@ -503,10 +515,10 @@ class OrchestratorActions:
         payload = {"model": self.model,
                    "messages": [{"role": "system", "content": system},
                                 {"role": "user", "content": user}],
-                   "temperature": 0.1}
+                   "temperature": self._cfg_temp("validator_agent", 0.1)}
         tracer.event("orchestrator", "edit_validator", "llm_request",
                      params={"instruction": instruction}, content=user,
-                     model=self.model, temperature=0.1)
+                     model=self.model, temperature=self._cfg_temp("validator_agent", 0.1))
         try:
             content = strip_think(request_completion(url, headers, payload, self.timeout_seconds,
                                                       api_format=self.api_format,

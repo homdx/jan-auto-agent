@@ -93,6 +93,7 @@ class Orchestrator(OrchestratorActions):
 
         self.prompt_optimizer = PromptOptimizer(         # STORY-3.2
             model=self.model,
+            temperature=self.config.getfloat("prompt_optimizer", "temperature", fallback=0.4),
             base_url=self.base_url,
             api_key=self.api_key,
             timeout=self.timeout_seconds,
@@ -107,6 +108,7 @@ class Orchestrator(OrchestratorActions):
         )
         self.validator_agent = ValidatorAgent(
             max_iter=self.max_iterations,
+            temperature=self.config.getfloat("validator_agent", "temperature", fallback=0.1),
             model=self.model,
             base_url=self.base_url,
             api_key=self.api_key,
@@ -203,7 +205,7 @@ class Orchestrator(OrchestratorActions):
                 {"role": "system", "content": "You are a helpful assistant integrated into an offline DevOps pipeline environment."},
                 {"role": "user", "content": user_input}
             ],
-            "temperature": 0.3,
+            "temperature": self.config.getfloat("direct_chat", "temperature", fallback=0.3),
         }
         if self.num_ctx:
             payload["num_ctx"] = self.num_ctx

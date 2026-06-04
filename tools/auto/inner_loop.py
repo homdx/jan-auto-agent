@@ -109,6 +109,7 @@ class LLMGate2Validator:
         api_format: str = "openai",
         verify_ssl: bool = True,
         timeout: float = 120,
+        temperature: float = 0.1,
     ) -> None:
         self._base_url   = base_url.rstrip("/")
         self._api_key    = api_key
@@ -124,6 +125,7 @@ class LLMGate2Validator:
             self._ssl_context = ctx
             
         self._timeout    = timeout
+        self._temperature = temperature
 
     def approve(self, task: dict, exec_result, coder_result) -> Tuple[bool, str]:
         system = (
@@ -151,7 +153,7 @@ class LLMGate2Validator:
                        "messages": [{"role": "system", "content": system},
                                     {"role": "user", "content": user}],
                        "options": {
-                           "temperature": 0.1
+                           "temperature": self._temperature
                        }}
         else:
             url = f"{self._base_url}/chat/completions"
@@ -159,11 +161,11 @@ class LLMGate2Validator:
             payload = {"model": self._model,
                        "messages": [{"role": "system", "content": system},
                                     {"role": "user", "content": user}],
-                       "temperature": 0.1}
+                       "temperature": self._temperature}
 
         tracer.event("inner_loop", "gate2_validator", "llm_request",
                      params={"task": task.get("id")}, content=user,
-                     model=self._model, temperature=0.1)
+                     model=self._model, temperature=self._temperature)
         try:
             raw = _llm_stream.request_completion(
                 url=url, headers=headers, payload=payload, timeout=self._timeout,
@@ -312,6 +314,7 @@ def make_inner_loop(
             model      = config.get(section, "model", fallback=""),
             api_format = config.get(section, "api_format", fallback="openai"),
             verify_ssl = config.getboolean("api", "verify_ssl", fallback=True),
+            temperature = config.getfloat("inner_loop", "temperature", fallback=0.1),
             timeout    = config.getfloat("auto", "llm_timeout_sec", fallback=120),
         )
 
