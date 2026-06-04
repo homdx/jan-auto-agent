@@ -64,12 +64,13 @@ _MAX_FEEDBACK_CHARS = 800        # keep each round file compact
 @dataclass
 class OuterLoopResult:
     """Aggregate result of the outer round loop for one task."""
-    task_id:        str
-    passed:         bool
-    rounds_used:    int
-    exhausted:      bool
-    feedback_files: list[str] = field(default_factory=list)
-    inner_results:  list = field(default_factory=list)   # list[InnerLoopResult]
+    task_id:             str
+    passed:              bool
+    rounds_used:         int
+    exhausted:           bool
+    feedback_files:      list[str] = field(default_factory=list)
+    inner_results:       list = field(default_factory=list)   # list[InnerLoopResult]
+    impl_versions_used:  list = field(default_factory=list)   # list[int] — LOOP-3
 
     def summary(self) -> str:
         if self.passed:
@@ -123,6 +124,9 @@ class OuterLoop:
 
         # LOOP-2: rewrite tracking (per run_task call, not per instance)
         rewrites_done = 0
+        # LOOP-3: impl_version tracking — starts at 1, bumped on each rewrite
+        impl_version = task.get("impl_version", 1)
+        impl_versions_used: list[int] = []
 
         if start_round > self.max_rounds:
             # Already exhausted in a prior session.
@@ -133,12 +137,14 @@ class OuterLoop:
         self.state.set_task_status(task_id, STATUS_IN_PROGRESS)
         tracer.event("controller", "outer_loop", "run_start",
                      params={"task": task_id, "start_round": start_round,
-                             "max_rounds": self.max_rounds})
+                             "max_rounds": self.max_rounds,
+                             "impl_version": impl_version})
 
         for rnd in range(start_round, self.max_rounds + 1):
             # Fresh context: seed ONLY with the compact prior-round summaries.
             prior = self._read_round_feedback(task_id)
             self.state.set_task_status(task_id, STATUS_IN_PROGRESS, round=rnd)
+            impl_versions_used.append(impl_version)
 
             res = self.inner_loop.run_task(task, base_dir, prior_feedback=prior)
             inner_results.append(res)
@@ -153,12 +159,14 @@ class OuterLoop:
                 self.state.log(f"{task_id}: passed in round {rnd} "
                                f"({getattr(res, 'attempts_used', '?')} attempts)")
                 tracer.event("outer_loop", "controller", "result",
-                             params={"task": task_id, "passed": True, "round": rnd})
+                             params={"task": task_id, "passed": True, "round": rnd,
+                                     "impl_version": impl_version})
                 return OuterLoopResult(task_id, True, rnd, False,
-                                       feedback_files, inner_results)
+                                       feedback_files, inner_results,
+                                       impl_versions_used)
 
             # Failed round → write ONE compact feedback file, then fresh round.
-            fpath = self._write_round_feedback(task_id, rnd, res)
+            fpath = self._write_round_feedback(task_id, rnd, res, impl_version)
             feedback_files.append(str(fpath))
             self.state.log(f"{task_id}: round {rnd} failed — wrote {fpath.name}")
 
@@ -185,9 +193,15 @@ class OuterLoop:
 
                 new_task = self.task_rewriter.rewrite(task, failure_history)
                 if new_task is not task:
-                    # A genuine rewrite was produced — record it on disk.
+                    # A genuine rewrite was produced — record it on disk and
+                    # bump the impl_version counter in state (LOOP-3).
+                    try:
+                        impl_version = self.state.increment_impl_version(task_id)
+                    except Exception:
+                        impl_version = impl_num   # fallback: derive from rewrites_done
+
                     rewrite_body = (
-                        f"# Rewrite after round {rnd} — impl v{impl_num} — "
+                        f"# Rewrite after round {rnd} — impl v{impl_version} — "
                         f"task {task_id}\n\n"
                         f"## New instruction\n{new_task.get('instruction', '')}\n\n"
                         f"## Acceptance check\n{new_task.get('acceptance_check', '')}\n"
@@ -205,7 +219,7 @@ class OuterLoop:
                         params={
                             "task": task_id,
                             "round": rnd,
-                            "impl_version": impl_num,
+                            "impl_version": impl_version,
                             "rewrites_done": rewrites_done,
                         },
                     )
@@ -220,9 +234,10 @@ class OuterLoop:
         self.state.set_task_status(task_id, STATUS_BLOCKED)
         tracer.event("outer_loop", "controller", "result",
                      params={"task": task_id, "passed": False,
-                             "rounds": self.max_rounds, "exhausted": True})
+                             "rounds": self.max_rounds, "exhausted": True,
+                             "impl_version": impl_version})
         return OuterLoopResult(task_id, False, self.max_rounds, True,
-                               feedback_files, inner_results)
+                               feedback_files, inner_results, impl_versions_used)
 
     # ── private ──────────────────────────────────────────────────────────────
 
@@ -251,12 +266,14 @@ class OuterLoop:
                 continue
         return out
 
-    def _write_round_feedback(self, task_id: str, rnd: int, res) -> Path:
+    def _write_round_feedback(
+        self, task_id: str, rnd: int, res, impl_version: int = 1
+    ) -> Path:
         """Distil a failed round into ONE compact markdown file."""
         last = _truncate(getattr(res, "last_feedback", "") or "", _MAX_FEEDBACK_CHARS)
         attempts = getattr(res, "attempts_used", "?")
         body = (
-            f"# Round {rnd} — task {task_id}\n"
+            f"# Round {rnd} — impl v{impl_version} — task {task_id}\n"
             f"{attempts} attempt(s), all failed.\n\n"
             f"Final issue to fix next round:\n{last}\n"
         )
