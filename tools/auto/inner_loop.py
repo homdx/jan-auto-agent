@@ -113,6 +113,7 @@ class LLMGate2Validator:
         timeout:    int  = 120,
         max_hints:  int  = 3,
         ssl_context = None,
+        base_dir:   str  = ".",
     ):
         self.base_url    = base_url
         self.model       = model
@@ -122,8 +123,32 @@ class LLMGate2Validator:
         self.timeout     = timeout
         self.max_hints   = max(1, int(max_hints))
         self.ssl_context = ssl_context
+        self.base_dir    = Path(base_dir)
 
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+
+    def _read_changed_content(self, coder_result) -> str:
+        """Read the post-edit content of the files the coder wrote, so the
+        validator judges the ACTUAL code (not just file names).  The Gate-2
+        system prompt promises 'the generated code' and asks for line/pattern
+        specific hints, so the code must be present in the prompt."""
+        files = list(getattr(coder_result, "files_written", []) or [])
+        if not files:
+            return "(the coder reported NO files written — nothing changed)"
+        budget = max(800, 6000 // len(files))
+        blocks = []
+        for rel in files:
+            try:
+                content = (self.base_dir / rel).read_text(
+                    encoding="utf-8", errors="replace")
+            except OSError as exc:
+                content = f"(could not read {rel}: {exc})"
+            if len(content) > budget:
+                content = content[:budget] + f"\n… [+{len(content) - budget} chars truncated]"
+            blocks.append(f"--- {rel} ---\n{content}")
+        return "\n\n".join(blocks)
 
     def approve(
         self,
@@ -150,10 +175,8 @@ class LLMGate2Validator:
                 f"Task: {task.get('instruction', '')}\n\n"
                 f"Acceptance check exit code: {getattr(exec_result, 'exit_code', 0)}\n"
                 f"stdout:\n{getattr(exec_result, 'stdout', '')[:2000]}\n\n"
-                f"Generated files:\n"
-                + "\n".join(
-                    getattr(coder_result, "files_written", []) or []
-                )
+                f"Generated files (CHANGED FILE CONTENT after the coder's edit):\n"
+                + self._read_changed_content(coder_result)
             )
 
             payload = {
@@ -423,6 +446,7 @@ def make_inner_loop(
             timeout=120,
             max_hints=max_hints,
             ssl_context=ssl_context,
+            base_dir=str(base_dir),
         )
 
     return InnerLoop(coder, executor, validator, max_attempts=max_attempts)
