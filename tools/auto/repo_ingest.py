@@ -124,6 +124,16 @@ _BINARY_EXTENSIONS: frozenset[str] = frozenset(
     }
 )
 
+# Backup / patch / editor-temp files: present in working trees but not real
+# source. Reviewing them wastes prompt budget and their near-duplicate names
+# (e.g. angie_ops.py.old) confuse the model into emitting non-verbatim paths.
+_BACKUP_EXTENSIONS: frozenset[str] = frozenset(
+    {
+        ".old", ".orig", ".rej", ".bak", ".patch", ".diff",
+        ".tmp", ".temp", ".swp", ".swo", ".save", "~",
+    }
+)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Data model
@@ -233,7 +243,9 @@ class RepoIngestor:
                 if fname.startswith("."):
                     continue
                 ext = Path(fname).suffix.lower()
-                if ext in _BINARY_EXTENSIONS:
+                if ext in _BINARY_EXTENSIONS or ext in _BACKUP_EXTENSIONS:
+                    continue
+                if fname.endswith("~"):        # emacs/vim backup
                     continue
 
                 abs_path = Path(dirpath) / fname

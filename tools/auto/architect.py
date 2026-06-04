@@ -106,12 +106,24 @@ Return ONLY a JSON array.  Each element must match this schema exactly \
   }}
 ]
 
+REMINDER — the ONLY file paths you may put in "target_files" or \
+"cited_location.file" are these, copied character-for-character. \
+Any other path will be rejected:
+{file_listing}
+
 If you find no valid improvements for this cluster, return an empty array: []
 """
 
 # Maximum characters of a single file's content to include in the prompt.
-# Avoids blowing up the context window on large files.
-_MAX_FILE_CHARS = 6000
+# Kept small so a multi-file cluster prompt stays inside a local model's
+# context window — overflow makes the model ignore the exact-path rule and
+# emit hallucinated/simplified paths (e.g. angie_ops.py -> ops.py).
+_MAX_FILE_CHARS = 2500
+
+# Maximum files reviewed in a single LLM call.  Larger clusters are split into
+# batches so each prompt stays small enough for the model to follow the
+# verbatim-path instruction.
+_MAX_FILES_PER_REVIEW = 8
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -257,10 +269,30 @@ class ClusterReviewer:
                 _fire_callback(on_cluster_done)
                 continue
 
-            print(f"\n🔍 Architect reviewing cluster: [{cluster.name}] ({len(cluster.files)} files)")
-            candidates = self._review_one_cluster(cluster, base_dir, goal)
-            print(f"   → {len(candidates)} grounded candidate(s)")
-            all_candidates.extend(candidates)
+            # Split large clusters into batches so each LLM prompt stays within
+            # a local model's context window (overflow => hallucinated paths).
+            files = cluster.files
+            batches = [
+                files[i:i + _MAX_FILES_PER_REVIEW]
+                for i in range(0, len(files), _MAX_FILES_PER_REVIEW)
+            ]
+            extra = f", {len(batches)} batches" if len(batches) > 1 else ""
+            print(f"\n🔍 Architect reviewing cluster: [{cluster.name}] "
+                  f"({len(files)} files{extra})")
+
+            cluster_candidates: list[CandidateTask] = []
+            for bi, batch_files in enumerate(batches, 1):
+                sub = cluster if len(batches) == 1 else RepoCluster(
+                    name=f"{cluster.name} (batch {bi}/{len(batches)})",
+                    patterns=cluster.patterns,
+                    files=batch_files,
+                )
+                cluster_candidates.extend(
+                    self._review_one_cluster(sub, base_dir, goal)
+                )
+
+            print(f"   → {len(cluster_candidates)} grounded candidate(s)")
+            all_candidates.extend(cluster_candidates)
             _fire_callback(on_cluster_done)
 
         print(f"\n✅ Architect done — {len(all_candidates)} total candidate(s) across all clusters\n")
