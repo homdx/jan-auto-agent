@@ -275,7 +275,7 @@ class Executor:
         Path
             The workspace directory (guaranteed to exist).
         """
-        workspace = self._workspace_root / task_id
+        workspace = self._workspace_root / _safe_dir_name(task_id)
         # Wipe and recreate for a clean run.
         if workspace.exists():
             shutil.rmtree(workspace)
@@ -297,6 +297,39 @@ class Executor:
 
     # ── Command resolution ────────────────────────────────────────────────────
 
+    # Shell tokens that are never safe in an LLM-generated acceptance_check.
+    # This is a defence-in-depth blocklist, not a complete sandbox — the check
+    # catches obvious mistakes/injections from a hallucinating model.
+    _BLOCKED_COMMAND_PATTERNS: tuple[str, ...] = (
+        "rm ",  "rm\t",              # file deletion (rm -rf /, rm -rf ~, …)
+        "rmdir",                     # directory removal
+        "sudo",                      # privilege escalation
+        "chmod", "chown",            # permission changes
+        "dd ",  "dd\t",              # disk writes (dd if=/dev/zero …)
+        "mkfs",                      # filesystem formatting
+        "> /",  ">/",                # redirect to absolute path
+        "curl ", "wget ",            # outbound network (proxy-bypass, exfil)
+        "nc ", "netcat",             # raw network
+        ":(){:|:&};:",               # fork bomb
+        "shutdown", "reboot", "halt",# system control
+        "systemctl",                 # service control
+    )
+
+    @staticmethod
+    def _check_command_safety(command: str) -> tuple[bool, str]:
+        """Return *(safe, reason)* — ``safe=False`` blocks execution.
+
+        Scans for shell tokens that should never appear in an acceptance-check
+        command.  This is a best-effort defence against an LLM-generated
+        command that would delete files, escalate privileges, or exfiltrate data.
+        It does NOT replace a proper sandbox; it catches common cases fast.
+        """
+        lower = command.lower()
+        for pattern in Executor._BLOCKED_COMMAND_PATTERNS:
+            if pattern in lower:
+                return False, f"blocked pattern {pattern!r} in acceptance_check"
+        return True, ""
+
     def _resolve_command(
         self,
         acceptance_check: str,
@@ -307,7 +340,7 @@ class Executor:
 
         Rules (in priority order):
 
-        1. If *acceptance_check* is non-empty, use it verbatim.
+        1. If *acceptance_check* is non-empty, validate it and use it.
         2. If *target_files* has exactly one ``.py`` file, fall back to
            ``python <file>``.
         3. Otherwise fall back to ``pytest`` (runs the full test suite).
@@ -316,6 +349,12 @@ class Executor:
         ``self._python_bin`` so the same interpreter as the agent is used.
         """
         if acceptance_check:
+            safe, reason = self._check_command_safety(acceptance_check)
+            if not safe:
+                logger.error(
+                    "_resolve_command: [SAFETY] %s — falling back to pytest", reason
+                )
+                return "pytest"
             return self._rewrite_python(acceptance_check)
 
         py_files = [f for f in target_files if f.endswith(".py")]
@@ -437,6 +476,17 @@ class Executor:
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _safe_dir_name(name: str) -> str:
+    """Strip path-traversal characters from *name* before use as a directory component.
+
+    Keeps only alphanumeric chars, hyphens, and underscores so a task id
+    like ``"../../evil"`` cannot escape the workspace root.
+    """
+    import re as _re
+    safe = _re.sub(r"[^A-Za-z0-9_\-]", "_", name)
+    return safe.strip("_") or "task"
+
 
 def _truncate(text: str, max_chars: int) -> str:
     """Return *text* truncated to *max_chars*, appending a notice if cut."""

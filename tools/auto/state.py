@@ -326,9 +326,22 @@ class StateStore:
         with self._log_path.open("a", encoding="utf-8") as fh:
             fh.write(line)
 
+    @staticmethod
+    def _safe_task_id(task_id: str) -> str:
+        """Return a filesystem-safe version of *task_id*.
+
+        Strips path separators and leading dots so a task id like
+        ``"../../evil"`` cannot escape the tasks directory.  The canonical
+        form keeps only alphanumeric characters, hyphens, and underscores.
+        """
+        import re as _re
+        safe = _re.sub(r"[^A-Za-z0-9_\-]", "_", task_id)
+        safe = safe.strip("_") or "task"
+        return safe
+
     def task_dir(self, task_id: str) -> Path:
         """Return (and create) the per-task artefact directory."""
-        d = self._tasks_dir / task_id
+        d = self._tasks_dir / self._safe_task_id(task_id)
         d.mkdir(parents=True, exist_ok=True)
         return d
 

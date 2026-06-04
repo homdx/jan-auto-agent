@@ -82,6 +82,13 @@ class GitManager:
 
     # ── Public API ───────────────────────────────────────────────────────────
 
+    # Lines that must be present in the repo's .gitignore so the agent never
+    # accidentally commits internal state files or coder backup artefacts.
+    _GITIGNORE_ENTRIES: tuple[str, ...] = (
+        ".agent/",       # all agent state (plan.json, run.log, trace files, …)
+        "*.coder.bak",   # per-file backups written by Coder before each edit
+    )
+
     def ensure_repo(self) -> bool:
         """Ensure *repo_dir* is a git repository.
 
@@ -101,6 +108,52 @@ class GitManager:
         self._run(["git", "init"], "git init failed")
         logger.info("ensure_repo: initialised new git repo at %s", self.repo_dir)
         return True
+
+    def ensure_gitignore_committed(self) -> None:
+        """Add missing safety entries to .gitignore and commit the change.
+
+        Call this *after* :meth:`configure_identity` so git has a user name
+        for the commit.  Only writes and commits lines that are not already
+        present, so existing ``.gitignore`` content is preserved.  Skips the
+        commit if nothing new was added (idempotent across runs).
+        """
+        gi_path = self.repo_dir / ".gitignore"
+        existing_lines: set[str] = set()
+        if gi_path.exists():
+            try:
+                existing_lines = set(gi_path.read_text(encoding="utf-8").splitlines())
+            except OSError as exc:
+                logger.warning("ensure_gitignore_committed: cannot read .gitignore: %s", exc)
+
+        missing = [e for e in self._GITIGNORE_ENTRIES if e not in existing_lines]
+        if not missing:
+            logger.debug("ensure_gitignore_committed: all entries already present")
+            return
+
+        try:
+            with gi_path.open("a", encoding="utf-8") as fh:
+                fh.write("\n# auto-agent safety entries\n")
+                for entry in missing:
+                    fh.write(entry + "\n")
+        except OSError as exc:
+            logger.warning("ensure_gitignore_committed: cannot write .gitignore: %s", exc)
+            return
+
+        # Stage only .gitignore and commit immediately so stage_all() later
+        # never sees it as a pending change.
+        try:
+            self._run(["git", "add", ".gitignore"], "git add .gitignore failed")
+            self._run(
+                ["git", "commit", "-m", "chore: add auto-agent safety .gitignore"],
+                "git commit .gitignore failed",
+            )
+            logger.info(
+                "ensure_gitignore_committed: committed .gitignore with entries: %s", missing
+            )
+        except GitError as exc:
+            # Non-fatal: the file was written; future commits may pick it up,
+            # but the entries are at least present for git to honour.
+            logger.warning("ensure_gitignore_committed: commit failed: %s", exc)
 
     def configure_identity(self) -> None:
         """Set ``user.name`` and ``user.email`` locally in the repo.
@@ -236,12 +289,13 @@ def make_git_manager(
     repo_dir: str | Path,
     config: Optional[configparser.ConfigParser] = None,
 ) -> GitManager:
-    """Create a :class:`GitManager`, ensure the repo exists, and configure
-    the agent identity in one call.
+    """Create a :class:`GitManager`, ensure the repo exists, configure the
+    agent identity, and guarantee a safety ``.gitignore`` is committed.
 
     This is the preferred entry-point for ``AutoController``.
     """
     gm = GitManager(repo_dir, config)
     gm.ensure_repo()
     gm.configure_identity()
+    gm.ensure_gitignore_committed()
     return gm
