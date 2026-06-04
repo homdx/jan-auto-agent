@@ -17,7 +17,7 @@ import logging
 import urllib.request
 import urllib.error
 
-from tools.llm_stream import request_completion, strip_think
+from tools.llm_stream import request_completion, strip_think, ollama_chat_url
 from tools.agent_trace import tracer
 from tools.file_reader import read_file
 from tools.ui import Spinner
@@ -38,7 +38,7 @@ class OrchestratorActions:
         """Return the correct chat completions URL for the active api_format."""
         base = self.base_url.rstrip("/")
         if getattr(self, "api_format", "openai") == "ollama":
-            return f"{base}/api/chat"
+            return ollama_chat_url(base)
         return f"{base}/chat/completions"
 
     # ------------------------------------------------------------------ #

@@ -8,7 +8,7 @@ import logging
 from typing import Optional
 
 from tools.agent_trace import tracer
-from tools.llm_stream import request_completion, strip_think
+from tools.llm_stream import request_completion, strip_think, ollama_chat_url
 
 logger = logging.getLogger(__name__)
 
@@ -87,7 +87,7 @@ class ValidatorAgent:
     def validate(self, payload: dict) -> dict:
         """Evaluates whether the target block requires additional code scanning cycles."""
         if self.api_format == "ollama":
-            url = f"{self.base_url.rstrip('/')}/api/chat"
+            url = ollama_chat_url(self.base_url)
         else:
             url = f"{self.base_url.rstrip('/')}/chat/completions"
         headers = {

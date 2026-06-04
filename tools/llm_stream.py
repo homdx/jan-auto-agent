@@ -82,13 +82,16 @@ def _build_payload(payload: dict, api_format: str, stream: bool) -> dict:
 def ollama_chat_url(base_url: str) -> str:
     """Return the correct Ollama /api/chat URL from *base_url*.
 
-    Strips a trailing ``/api`` segment if present so that callers whose
-    ``base_url`` already ends with ``/api`` (e.g. ``https://host/api``)
-    do not produce the doubled path ``/api/api/chat``.
+    Handles two conventions:
+      - base_url already ends with ``/api``  → append ``/chat`` only
+      - base_url does not end with ``/api``  → append ``/api/chat``
+
+    This avoids both the doubled ``/api/api/chat`` and the broken
+    ``/chat`` that stripping produced for non-auto callers.
     """
     base = base_url.rstrip("/")
     if base.endswith("/api"):
-        base = base[:-4]  # remove the trailing /api
+        return f"{base}/chat"
     return f"{base}/api/chat"
 
 
