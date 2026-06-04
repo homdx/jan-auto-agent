@@ -143,9 +143,6 @@ class LLMGate2Validator:
             f"ACCEPTANCE CHECK: {task.get('acceptance_check','')}\n"
             f"ACCEPTANCE OUTPUT (exit 0):\n{stdout}\n"
         )
-        url = f"{self._base_url}/chat/completions"
-
-        # Match OrchestratorActions._chat_url() behaviour.
         if self._api_format == "ollama":
             url = f"{self._base_url}/api/chat"
         else:

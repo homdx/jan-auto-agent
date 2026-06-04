@@ -299,8 +299,6 @@ class ClusterReviewer:
             "Content-Type":  "application/json",
             "Authorization": f"Bearer {self._api_key}",
         }
-
-        # Match OrchestratorActions._chat_url() behaviour.
         if self._api_format == "ollama":
             url = f"{self._base_url}/api/chat"
         else:
