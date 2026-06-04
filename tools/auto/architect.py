@@ -77,28 +77,34 @@ File contents:
 {file_contents}
 
 Identify up to 5 concrete improvement tasks for files in this cluster that \
-are relevant to the goal above.
+are relevant to the goal above.  Look in particular for: missing or weak tests, \
+missing error handling, unvalidated inputs, missing timeouts on network calls, \
+duplicated logic, and unclear naming.
 
 STRICT RULES:
 1. Every task MUST cite the exact file path and a symbol name OR line range \
    where the issue lives.  Tasks without a cited_location are invalid.
 2. The "file" field in cited_location and every entry in target_files MUST \
-   be copied EXACTLY from the list above — character for character. \
-   Do NOT invent new paths, add directory prefixes, or modify the paths in any way.
+   be copied EXACTLY from the list below — character for character. \
+   Do NOT invent new paths, add directory prefixes, or modify the paths in any way. \
+   To add new tests, target an EXISTING test file from the list and add test \
+   functions to it.
 3. Only report problems that are actually present in the code shown above.
 4. Keep each task small enough to be implemented and tested independently.
+5. Returning an empty array [] is allowed ONLY if the code is genuinely clean; \
+   most real source files have at least one concrete improvement, so look \
+   carefully before returning [].
 
-Return ONLY a JSON array.  Each element must match this schema exactly \
-(no extra keys):
+Each element of the JSON array must match this schema exactly (no extra keys):
 
 [
   {{
     "title": "<short imperative phrase>",
     "instruction": "<detailed instruction for the coder agent>",
-    "target_files": ["<exact path from the list above>"],
+    "target_files": ["<exact path from the list below>"],
     "acceptance_check": "<shell command that exits 0 when the task is done>",
     "cited_location": {{
-      "file": "<exact path from the list above>",
+      "file": "<exact path from the list below>",
       "symbol": "<function or class name, or null>",
       "line_start": <integer or null>,
       "line_end":   <integer or null>
@@ -111,19 +117,19 @@ REMINDER — the ONLY file paths you may put in "target_files" or \
 Any other path will be rejected:
 {file_listing}
 
-If you find no valid improvements for this cluster, return an empty array: []
+Now review the code above against the goal "{goal}" and output ONLY the JSON \
+array of up to 5 improvement tasks (no prose, no markdown fences):
 """
 
 # Maximum characters of a single file's content to include in the prompt.
-# Kept small so a multi-file cluster prompt stays inside a local model's
-# context window — overflow makes the model ignore the exact-path rule and
-# emit hallucinated/simplified paths (e.g. angie_ops.py -> ops.py).
-_MAX_FILE_CHARS = 2500
+# Batching keeps the file COUNT per call small, so we can afford fuller content
+# per file — too-aggressive truncation hides the code and the model returns [].
+_MAX_FILE_CHARS = 4000
 
 # Maximum files reviewed in a single LLM call.  Larger clusters are split into
 # batches so each prompt stays small enough for the model to follow the
-# verbatim-path instruction.
-_MAX_FILES_PER_REVIEW = 8
+# verbatim-path instruction while still seeing enough code to find issues.
+_MAX_FILES_PER_REVIEW = 6
 
 
 # ─────────────────────────────────────────────────────────────────────────────
