@@ -48,6 +48,7 @@ from typing import Callable, Optional
 
 from tools.auto.state import StateStore, STATUS_DONE, STATUS_IN_PROGRESS, STATUS_BLOCKED
 from tools.auto.git_manager import make_git_manager, GitError
+from tools.auto.run_trace import setup_run_trace
 
 logger = logging.getLogger(__name__)
 
@@ -190,6 +191,9 @@ class AutoController:
 
         # Set at the start of run(); used by is_runtime_exceeded()
         self._start_time: float = 0.0
+        
+        # AUTO-F2: Initialized as None to prevent test crashes
+        self.run_trace = None
 
     # ── Run limits API (AUTO-A4) ─────────────────────────────────────────────
 
@@ -253,25 +257,19 @@ class AutoController:
         3. Enter task loop — check caps before every task.
         4. On cap: persist stop_reason, log, exit 0 (graceful stop).
         5. On normal completion: set status "idle", exit 0.
-            # ── Dependency Guard (Bug #5) ──────────────────────────────
-            failed_deps = []
-            for dep_id in task.get("dependencies", []):
-                dep = self.state.get_task(dep_id)
-                # If dependency doesn't exist or isn't DONE (e.g. BLOCKED), we cannot proceed.
-                if not dep or dep["status"] != STATUS_DONE:
-                    failed_deps.append(dep_id)
-
-            if failed_deps:
-                logger.info("Task %s blocked by incomplete dependencies: %s", task["id"], failed_deps)
-                self.state.set_task_status(task["id"], STATUS_BLOCKED)
-                self.state.log(f"task {task['id']} blocked (dependency not done: {', '.join(failed_deps)})")
-                continue
         """
         self._start_time = self._time_fn()
         self._print_banner()
 
-        # AUTO-A2: initialise (fresh) or resume (existing state)
+        # AUTO-A2: MUST initialise state first so .agent/ exists
         is_fresh = self.state.initialise(self.goal, self.base_dir)
+
+        # AUTO-F2: Configure the run tracer singleton NOW that .agent/ is ready
+        cfg = configparser.ConfigParser()
+        if Path(self.config_path).exists():
+            cfg.read(self.config_path)
+        self.run_trace = setup_run_trace(self.state, cfg)
+        self.run_trace.log_run_start(self.goal, self.base_dir)
 
         # AUTO-A3: ensure the target folder is a git repo with agent identity.
         self._setup_git()
@@ -297,6 +295,8 @@ class AutoController:
         else:
             self.state.update_progress(status="idle")
             self.state.log("run finished cleanly")
+            if self.run_trace:
+                self.run_trace.log_run_finished()
 
         return 0
 
@@ -327,6 +327,25 @@ class AutoController:
                 )
                 return reason, tasks_done
 
+            # ── Dependency Guard (Bug #5) ──────────────────────────────
+            failed_deps = []
+            for dep_id in task.get("dependencies", []):
+                dep = self.state.get_task(dep_id)
+                if not dep or dep["status"] != STATUS_DONE:
+                    failed_deps.append(dep_id)
+
+            if failed_deps:
+                reason_str = f"dependency not done: {', '.join(failed_deps)}"
+                logger.info("Task %s blocked by incomplete dependencies: %s", task["id"], failed_deps)
+                self.state.set_task_status(task["id"], STATUS_BLOCKED)
+                self.state.log(f"task {task['id']} blocked ({reason_str})")
+                if self.run_trace:
+                    self.run_trace.log_task_blocked(task["id"], reason_str)
+                continue
+
+            if self.run_trace:
+                self.run_trace.log_task_start(task["id"], task.get("title", ""))
+
             # ── Future: real task execution (AUTO-B/C) hooks here ──────
             # e.g. self._execute_task(task)
             # For now: mark in_progress then done as a skeleton pass-through.
@@ -335,6 +354,9 @@ class AutoController:
             self.state.set_task_status(task["id"], STATUS_DONE)
             tasks_done += 1
             self.state.log(f"task {task['id']} completed (skeleton)")
+            
+            if self.run_trace:
+                self.run_trace.log_task_done(task["id"])
 
         return None, tasks_done  # all tasks done / no tasks
 
@@ -342,6 +364,8 @@ class AutoController:
         """Persist cap state, print user-facing notice, write to log."""
         elapsed = self.elapsed_seconds()
 
+        if self.run_trace:
+            self.run_trace.log_run_capped(stop_reason)
         self.state.update_progress(status="capped", stop_reason=stop_reason)
         self.state.log(
             f"run capped: reason={stop_reason} "
@@ -357,6 +381,7 @@ class AutoController:
                 f"state saved, run is resumable."
             )
         else:  # STOP_TASK_CAP
+            # BUG 12 FIXED: Reports the accurate session tasks_done
             print(
                 f"[{ts}] 🔢 Task cap reached "
                 f"({self.limits.max_tasks_per_run} tasks/session, "
@@ -396,8 +421,9 @@ class AutoController:
         done    = len(info["done_ids"])
         pending = len(info["pending"])
         ts = _ts()
+        # BUG 13 FIXED: Removed redundant "{len(done_ids)} skipped" mislabel.
         print(f"[{ts}] ♻️  Resuming existing run — "
-              f"{done} already done (skipping), {pending} pending")
+              f"{done} already done, {pending} pending")
         if info["done_ids"]:
             print(f"[{ts}]    skipping: {', '.join(sorted(info['done_ids']))}")
 
