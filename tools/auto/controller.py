@@ -48,7 +48,12 @@ from typing import Callable, Optional
 
 from tools.auto.state import StateStore, STATUS_DONE, STATUS_IN_PROGRESS, STATUS_BLOCKED
 from tools.auto.git_manager import make_git_manager, GitError
+
+# Epic G Integrations
 from tools.auto.run_trace import setup_run_trace
+from tools.auto.progress_display import ProgressDisplay, make_progress_display
+from tools.auto.auto_metrics import AutoMetricsStream
+from tools.auto.auto_tuner import AutoTuner, make_auto_tuner
 
 logger = logging.getLogger(__name__)
 
@@ -192,8 +197,11 @@ class AutoController:
         # Set at the start of run(); used by is_runtime_exceeded()
         self._start_time: float = 0.0
         
-        # AUTO-F2: Initialized as None to prevent test crashes
+        # Epic G sub-systems: Initialized as None to prevent test crashes
         self.run_trace = None
+        self.progress_display: Optional[ProgressDisplay] = None
+        self.metrics_stream: Optional[AutoMetricsStream] = None
+        self.auto_tuner: Optional[AutoTuner] = None
 
     # ── Run limits API (AUTO-A4) ─────────────────────────────────────────────
 
@@ -264,12 +272,25 @@ class AutoController:
         # AUTO-A2: MUST initialise state first so .agent/ exists
         is_fresh = self.state.initialise(self.goal, self.base_dir)
 
-        # AUTO-F2: Configure the run tracer singleton NOW that .agent/ is ready
         cfg = configparser.ConfigParser()
         if Path(self.config_path).exists():
             cfg.read(self.config_path)
+
+        # ── Epic G Initialization ─────────────────────────────────────────
+
+        # AUTO-F2: Configure the run tracer singleton
         self.run_trace = setup_run_trace(self.state, cfg)
         self.run_trace.log_run_start(self.goal, self.base_dir)
+
+        # AUTO-F1: Setup progress display
+        self.progress_display = make_progress_display(self.state, cfg)
+        self.progress_display.code_total = len(self.state.all_tasks())
+
+        # AUTO-E1/E2: Setup metrics stream and auto tuner
+        self.metrics_stream = AutoMetricsStream(self.agent_dir)
+        self.auto_tuner = make_auto_tuner(cfg, self.agent_dir)
+
+        # ──────────────────────────────────────────────────────────────────
 
         # AUTO-A3: ensure the target folder is a git repo with agent identity.
         self._setup_git()
@@ -346,6 +367,14 @@ class AutoController:
             if self.run_trace:
                 self.run_trace.log_task_start(task["id"], task.get("title", ""))
 
+            # AUTO-F1: Update display for task start
+            if self.progress_display:
+                self.progress_display.set_task(
+                    task_num=tasks_done + 1,
+                    attempt=task.get("attempt", 1) or 1,
+                    round_num=task.get("round", 1) or 1,
+                )
+
             # ── Future: real task execution (AUTO-B/C) hooks here ──────
             # e.g. self._execute_task(task)
             # For now: mark in_progress then done as a skeleton pass-through.
@@ -357,6 +386,23 @@ class AutoController:
             
             if self.run_trace:
                 self.run_trace.log_task_done(task["id"])
+
+            # AUTO-F1: Tick progress upon task completion
+            if self.progress_display:
+                self.progress_display.tick_code()
+
+            # AUTO-E1/E2: Record metric and maybe tune
+            if self.metrics_stream and self.auto_tuner:
+                self.metrics_stream.record_gate2(
+                    task["id"],
+                    approved=True,
+                    feedback="skeleton pass",
+                    attempts=1,
+                    prompt_store=self.auto_tuner.prompt_store
+                )
+                outcome = self.auto_tuner.maybe_tune()
+                if outcome.promoted:
+                    self.state.log(f"[AUTO-E1] auto_tuner promoted validator prompt: score={outcome.new_prompt_score:.2f}")
 
         return None, tasks_done  # all tasks done / no tasks
 

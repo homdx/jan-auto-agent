@@ -465,7 +465,6 @@ def _parse_args():
 def main():
     args = _parse_args()
     base_dir = os.path.abspath(args.base or args.base_dir_positional or os.getcwd())
-    orchestrator = Orchestrator(config_path=args.config)
 
     # ── AUTONOMOUS MODE (AUTO-A1) ──────────────────────────────────────
     if args.auto is not None:
@@ -477,6 +476,7 @@ def main():
         exit_code = run_auto(goal=goal, base_dir=base_dir, config_path=args.config)
         sys.exit(exit_code)
 
+    orchestrator = Orchestrator(config_path=args.config)
     # ── ONE-SHOT MODE ──────────────────────────────────────────────────
     if args.once is not None:
         query = args.once.strip()
