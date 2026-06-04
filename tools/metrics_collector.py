@@ -69,10 +69,6 @@ class MetricsCollector:
 
         avg_iterations = sum(r["iterations_used"] for r in window) / total
 
-        # Bug #8 fix: only count runs where improvement was actually attempted
-        # (improvement_json_ok is None for show/show_imports — exclude them so
-        # non-improvement intents don't inflate the failure rate and trigger
-        # the optimizer spuriously).
         improvement_runs = [r for r in window if r.get("improvement_json_ok") is not None]
         if improvement_runs:
             json_failures = sum(1 for r in improvement_runs if not r["improvement_json_ok"])

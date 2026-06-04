@@ -101,7 +101,7 @@ class Orchestrator(OrchestratorActions):
         )
         _raw_skip = self.config.get("search", "skip_dirs", fallback="")
         _skip_dirs = [d.strip() for d in _raw_skip.split(",") if d.strip()] or None
-        self.search_agent = SearchAgent(                 # Bug #10: pass search config
+        self.search_agent = SearchAgent(
             max_file_kb=self.config.getint("search", "max_file_kb", fallback=500),
             skip_dirs=_skip_dirs,
             max_depth=self.config.getint("search", "max_depth", fallback=2),
@@ -124,7 +124,7 @@ class Orchestrator(OrchestratorActions):
             prompt_store=self.prompt_store,
             metrics_collector=self.metrics_collector,
             validator_agent=self.validator_agent,
-            max_iter=self.max_iterations,             # Bug #9: pass real config value
+            max_iter=self.max_iterations,
         )
         self.improvement_agent = ImprovementAgent(
             model=self.model,

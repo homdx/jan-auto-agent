@@ -29,8 +29,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Normalisation ceiling for iteration count (matches typical max_iter default)
+# Sentinel used to detect when max_iter is not explicitly passed by the caller.
+# Using a sentinel instead of a plain default means callers that omit max_iter
+# get a loud warning rather than silently scoring against the wrong ceiling.
 _MAX_ITER_ASSUMED = 3
+_UNSET = object()
 
 # Synthetic payloads for shadow evaluation.
 # These exercise the full validator prompt format without needing stored inputs.
@@ -103,12 +106,21 @@ class PromptEvaluator:
         prompt_store: "PromptStore",
         metrics_collector: MetricsCollector,
         validator_agent: Optional["ValidatorAgent"] = None,
-        max_iter: int = _MAX_ITER_ASSUMED,   # Bug #9: caller should pass config max_iterations
+        max_iter: int = _UNSET,  # type: ignore[assignment]
     ) -> None:
         self.prompt_store = prompt_store
         self.metrics_collector = metrics_collector
         self.validator_agent = validator_agent
-        self.max_iter = max_iter             # used for iter_score normalisation
+        if max_iter is _UNSET:
+            logger.warning(
+                "PromptEvaluator: max_iter not supplied — falling back to %d. "
+                "Pass max_iter=config max_iterations so iteration scores are "
+                "comparable to baseline records.",
+                _MAX_ITER_ASSUMED,
+            )
+            self.max_iter: int = _MAX_ITER_ASSUMED
+        else:
+            self.max_iter = max_iter  # used for iter_score normalisation
 
     # ------------------------------------------------------------------ #
     # Public API                                                           #
@@ -124,7 +136,6 @@ class PromptEvaluator:
         3. Shadow-run the candidate (or project) → compute candidate_score.
         4. Promote iff candidate_score > current_score + 0.05.
         """
-        # Bug #6 fix: reject candidates that would crash .format() before any LLM call.
         validation_error = _validate_candidate_placeholders(candidate_prompt)
         if validation_error:
             logger.warning(
@@ -224,8 +235,6 @@ class PromptEvaluator:
         original_store = self.validator_agent.prompt_store
         original_max_iter = self.validator_agent.max_iter
         self.validator_agent.prompt_store = _FixedPromptStore(candidate_prompt)
-        # Bug #9: use the same max_iter the real pipeline uses so shadow payloads
-        # produce iteration/max_iter values comparable to baseline records.
         self.validator_agent.max_iter = self.max_iter
 
         try:
@@ -257,9 +266,6 @@ class PromptEvaluator:
         avg_iter = sum(sim_iters) / n
         iter_score = max(0.0, 1.0 - (avg_iter - 1.0) / max(1, self.max_iter - 1))
 
-        # Bug #6 fix: do NOT hardcode json_ok_rate=1.0.
-        # A broken candidate will cause validate() to return {"_api_error": True};
-        # only count calls that reached the LLM and returned parseable JSON as successes.
         json_ok_rate = sum(1 for r in results if not r.get("_api_error")) / n
 
         approved_rate = (

@@ -55,7 +55,19 @@ VALIDATOR_PROMPT_HARDCODED = (
     "\n"
     "Return your answer as strict JSON only — no text before or after:\n"
     '{{"status": "approved" | "needs_fix", "feedback": "one concise sentence", '
-    '"suggested_searches": ["only_local_names_to_find"]}}\n'
+    '"suggested_searches": ["only_local_names_to_find"], '
+    '"hints": ["<up to {max_hints} actionable hints — only when status is needs_fix>"], '
+    '"suggested_approach": "<optional one-sentence alternative strategy, or omit>"}}\n'
+    "\n"
+    "HINTS RULES (only populate when status is needs_fix):\n"
+    "  - Each hint MUST point to a specific name, line number, or pattern visible in the target block.\n"
+    "  - Good examples: \"rename _load to load_config to match the caller in line 34\", "
+    "\"the method receives a Path but open() is called on it directly — convert with str() first\", "
+    "\"import re is used on line 12 but not present in the imports block\".\n"
+    "  - Bad examples (do NOT produce): \"make sure the code is correct\", \"check the logic\".\n"
+    "  - Maximum {max_hints} hint items. Omit the array entirely (or use []) when status is approved.\n"
+    "  - suggested_approach is optional: only fill it when you have a concrete one-sentence alternative "
+    "strategy, e.g. 'consider using a context manager instead of manual try/finally here'.\n"
 )
 
 
@@ -112,6 +124,7 @@ class ValidatorAgent:
                 task=payload.get("task"),
                 iteration=payload.get("iteration"),
                 max_iter=self.max_iter,
+                max_hints=self.max_hints,
                 target_block=payload.get("target_block"),
                 imports=payload.get("imports"),
                 related_code=json.dumps(payload.get("related_code"), indent=2),
@@ -126,6 +139,7 @@ class ValidatorAgent:
                 task=payload.get("task"),
                 iteration=payload.get("iteration"),
                 max_iter=self.max_iter,
+                max_hints=self.max_hints,
                 target_block=payload.get("target_block"),
                 imports=payload.get("imports"),
                 related_code=json.dumps(payload.get("related_code"), indent=2),

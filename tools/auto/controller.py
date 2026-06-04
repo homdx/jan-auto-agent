@@ -389,7 +389,6 @@ class AutoController:
                 )
                 return reason, tasks_done
 
-            # ── Dependency Guard (Bug #5) ──────────────────────────────────
             failed_deps = []
             for dep_id in task.get("dependencies", []):
                 dep = self.state.get_task(dep_id)
