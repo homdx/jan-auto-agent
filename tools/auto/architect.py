@@ -219,6 +219,8 @@ class ClusterReviewer:
         clusters: list[RepoCluster],
         base_dir: str | Path,
         goal: str = "improve current code",
+        *,
+        on_cluster_done=None,
     ) -> list[CandidateTask]:
         """Review every non-empty cluster and return all grounded candidates.
 
@@ -230,6 +232,10 @@ class ClusterReviewer:
             Root directory of the repository (used to read file contents).
         goal:
             The user-supplied improvement goal string.
+        on_cluster_done:
+            Optional zero-argument callable invoked after each cluster is
+            processed (including empty/skipped ones).  Exceptions raised by
+            the callback are swallowed so they cannot abort the run.
 
         Returns
         -------
@@ -243,12 +249,14 @@ class ClusterReviewer:
         for cluster in clusters:
             if not cluster.files:
                 logger.debug("review_clusters: skipping empty cluster %r", cluster.name)
+                _fire_callback(on_cluster_done)
                 continue
 
             print(f"\n🔍 Architect reviewing cluster: [{cluster.name}] ({len(cluster.files)} files)")
             candidates = self._review_one_cluster(cluster, base_dir, goal)
             print(f"   → {len(candidates)} grounded candidate(s)")
             all_candidates.extend(candidates)
+            _fire_callback(on_cluster_done)
 
         print(f"\n✅ Architect done — {len(all_candidates)} total candidate(s) across all clusters\n")
         return all_candidates
@@ -491,6 +499,8 @@ def review_clusters(
     base_dir: str | Path,
     config: configparser.ConfigParser,
     goal: str = "improve current code",
+    *,
+    on_cluster_done=None,
 ) -> list[CandidateTask]:
     """One-call entry point for ``AutoController``.
 
@@ -530,12 +540,22 @@ def review_clusters(
         api_format=api_fmt,
         verify_ssl=verify_ssl,
     )
-    return reviewer.review_clusters(clusters, base_dir, goal)
+    return reviewer.review_clusters(clusters, base_dir, goal, on_cluster_done=on_cluster_done)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Internal utilities
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _fire_callback(cb) -> None:
+    """Call *cb* if not None; swallow any exception it raises."""
+    if cb is None:
+        return
+    try:
+        cb()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("on_cluster_done callback raised (ignored): %s", exc)
+
 
 def _to_int_or_none(val: Any) -> int | None:
     """Coerce *val* to int, returning None on failure."""

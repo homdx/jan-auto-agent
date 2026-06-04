@@ -193,6 +193,10 @@ class PrioritisedBacklog:
         )
 
 
+# Alias for backward compatibility / test imports
+Backlog = PrioritisedBacklog
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # BacklogPrioritiser
 # ─────────────────────────────────────────────────────────────────────────────

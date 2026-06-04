@@ -82,6 +82,19 @@ def run_pipeline(controller: "AutoController") -> tuple[Optional[str], int]:
     # ── PLAN phase ────────────────────────────────────────────────────────────
     _run_plan_phase(controller, cfg)
 
+    # ── Pre-seed progress counters for resume runs ────────────────────────────
+    # If this is a resume (plan phase was skipped), code_done must reflect tasks
+    # that were already DONE in a previous session so the banner is correct.
+    if controller.progress_display:
+        from tools.auto.state import STATUS_DONE as _STATUS_DONE
+        already_done = sum(
+            1 for t in controller.state.all_tasks()
+            if t.get("status") == _STATUS_DONE
+        )
+        if already_done > controller.progress_display.code_done:
+            controller.progress_display.code_done = already_done
+            controller.progress_display.refresh()
+
     # ── EXECUTE phase (G2 will replace _run_task_loop delegation) ─────────────
     return controller._run_task_loop()
 
@@ -129,15 +142,22 @@ def _run_plan_phase(controller: "AutoController", cfg: configparser.ConfigParser
 
     if controller.progress_display:
         controller.progress_display.arch_total = len(clusters)
+        controller.progress_display.refresh()
 
     # ── Step 2: Architect review ──────────────────────────────────────────────
     logger.info("plan_phase: architect reviewing %d cluster(s)", len(clusters))
-    candidates = review_clusters(clusters, controller.base_dir, cfg, goal=controller.goal)
+
+    def _on_cluster_done():
+        if controller.progress_display:
+            controller.progress_display.tick_arch()
+
+    candidates = review_clusters(
+        clusters, controller.base_dir, cfg,
+        goal=controller.goal,
+        on_cluster_done=_on_cluster_done,
+    )
     logger.info("plan_phase: architect produced %d candidate(s)", len(candidates))
     controller.state.log(f"plan phase: architect produced {len(candidates)} candidate(s)")
-
-    if controller.progress_display:
-        controller.progress_display.arch_total = len(clusters)
 
     # ── Step 3: Gate 1 filter ─────────────────────────────────────────────────
     logger.info("plan_phase: gate1 filtering %d candidate(s)", len(candidates))

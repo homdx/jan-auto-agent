@@ -356,6 +356,8 @@ class AutoController:
         from tools.auto.outer_loop import make_outer_loop
         from tools.auto.commit_on_success import CommitOnSuccess
         from tools.auto.exhaustion_handler import make_exhaustion_handler
+        from tools.auto.executor import make_executor
+        from tools.auto.bug_fix_loop import make_bug_fix_loop
 
         outer_loop = make_outer_loop(cfg, self.base_dir, self.state)
         commit_helper = (
@@ -363,6 +365,17 @@ class AutoController:
             if self.git is not None else None
         )
         exhaustion_handler = make_exhaustion_handler(self.state)
+
+        # AUTO-G5: executor + bug_fix_loop for post-commit regression checks
+        executor = make_executor(
+            self.base_dir,
+            timeout_sec=self.limits.exec_timeout_sec,
+        )
+        bug_fix_loop = make_bug_fix_loop(
+            cfg, self.base_dir, self.state,
+            outer_loop=outer_loop,
+            commit_on_success=commit_helper,
+        )
 
         for task in pending:
             # AUTO-A4: check caps BEFORE executing each task
@@ -423,6 +436,9 @@ class AutoController:
                 if self.run_trace:
                     self.run_trace.log_task_done(task["id"], commit_hash)
 
+                # ── AUTO-G5: post-commit regression check ──────────────────
+                self._check_regressions(task["id"], executor, bug_fix_loop)
+
             else:
                 # ── AUTO-G4: exhaustion → knowledge note + ticket ──────────
                 ex_outcome = exhaustion_handler.handle(task, result)
@@ -462,6 +478,53 @@ class AutoController:
                     )
 
         return None, tasks_done  # all tasks done / no tasks
+
+    def _check_regressions(
+        self,
+        just_committed_id: str,
+        executor,
+        bug_fix_loop,
+    ) -> None:
+        """AUTO-G5: re-run acceptance checks for all previously-DONE tasks.
+
+        Called immediately after a task is committed.  Any task whose check
+        now fails is treated as a regression and routed through BugFixLoop.
+
+        Parameters
+        ----------
+        just_committed_id:
+            The task that was just committed — excluded from re-checking
+            because its check was validated moments ago by outer_loop.
+        executor:
+            Ready :class:`~tools.auto.executor.Executor` instance.
+        bug_fix_loop:
+            Ready :class:`~tools.auto.bug_fix_loop.BugFixLoop` instance.
+        """
+        done_tasks = [
+            t for t in self.state.all_tasks()
+            if t["status"] == STATUS_DONE
+            and t["id"] != just_committed_id
+            and t.get("acceptance_check", "").strip()
+        ]
+        for done_task in done_tasks:
+            exec_result = executor.run(done_task)
+            if not exec_result.passed:
+                logger.warning(
+                    "_check_regressions: task %s regressed (rc=%s) — "
+                    "running bug fix loop",
+                    done_task["id"], exec_result.exit_code,
+                )
+                self.state.log(
+                    f"regression detected in task {done_task['id']} "
+                    f"after commit of {just_committed_id} "
+                    f"(rc={exec_result.exit_code})"
+                )
+                bfl_result = bug_fix_loop.handle_regression(
+                    done_task, exec_result, self.base_dir
+                )
+                self.state.log(
+                    f"bug fix loop: {bfl_result.summary()}"
+                )
 
     def _handle_cap(self, stop_reason: str, tasks_done: int) -> None:
         """Persist cap state, print user-facing notice, write to log."""
