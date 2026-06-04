@@ -56,6 +56,9 @@ _FEEDBACK_GLOB = "feedback_round_*.md"
 _FEEDBACK_RE = re.compile(r"feedback_round_(\d+)\.md$")
 _MAX_FEEDBACK_CHARS = 800        # keep each round file compact
 
+# LOOP-4: regex to extract impl version from file headers
+_IMPL_HEADER_RE = re.compile(r"impl v(\d+)")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Result
@@ -116,6 +119,9 @@ class OuterLoop:
         round if feedback files already exist.  Never raises."""
         task_id = task.get("id", "?")
 
+        # LOOP-4: save original instruction before any rewrite may change task
+        original_instruction: str = task.get("instruction", "")
+
         # ── Resume: existing feedback files mean prior rounds already ran ──
         done_rounds = self._existing_rounds(task_id)
         start_round = done_rounds + 1
@@ -146,7 +152,17 @@ class OuterLoop:
             self.state.set_task_status(task_id, STATUS_IN_PROGRESS, round=rnd)
             impl_versions_used.append(impl_version)
 
-            res = self.inner_loop.run_task(task, base_dir, prior_feedback=prior)
+            # LOOP-4: build prior implementation history so the coder knows
+            # which strategies already failed and must not be repeated.
+            prior_impls = self._build_impl_history(
+                task_id, impl_version, original_instruction
+            )
+
+            res = self.inner_loop.run_task(
+                task, base_dir,
+                prior_feedback=prior,
+                prior_implementations=prior_impls or None,
+            )
             inner_results.append(res)
             # round is set authoritatively above via set_task_status(round=rnd);
             # here we only accumulate the attempt count.
@@ -278,6 +294,76 @@ class OuterLoop:
             f"Final issue to fix next round:\n{last}\n"
         )
         return self.state.write_task_file(task_id, f"feedback_round_{rnd}.md", body)
+
+    def _build_impl_history(
+        self,
+        task_id: str,
+        current_impl_version: int,
+        original_instruction: str,
+    ) -> list[dict]:
+        """Return one entry per impl version < current_impl_version (LOOP-4).
+
+        Each entry has keys:
+          version          — int, e.g. 1
+          strategy_summary — first line of the instruction used for that version
+          why_failed       — first line of the last failure for that version
+
+        Reads rewrite_round_*.md for instructions and feedback_round_*.md for
+        failures so it works correctly on resumed runs too.
+        """
+        if current_impl_version <= 1:
+            return []
+
+        d = self.state.task_dir(task_id)
+
+        # ── instruction per impl version ─────────────────────────────────────
+        impl_instruction: dict[int, str] = {1: original_instruction}
+        for rpath in sorted(d.glob("rewrite_round_*.md")):
+            try:
+                text = rpath.read_text(encoding="utf-8")
+                first_line = text.splitlines()[0] if text else ""
+                m = _IMPL_HEADER_RE.search(first_line)
+                if not m:
+                    continue
+                ver = int(m.group(1))
+                if "## New instruction\n" in text:
+                    instr = text.split("## New instruction\n", 1)[1]
+                    if "## Acceptance check" in instr:
+                        instr = instr.split("## Acceptance check")[0]
+                    impl_instruction[ver] = instr.strip()
+            except (OSError, ValueError):
+                continue
+
+        # ── last failure per impl version ─────────────────────────────────────
+        impl_last_failure: dict[int, str] = {}
+        for fpath in self._feedback_paths(task_id):
+            try:
+                text = fpath.read_text(encoding="utf-8")
+                first_line = text.splitlines()[0] if text else ""
+                m = _IMPL_HEADER_RE.search(first_line)
+                if not m:
+                    continue
+                ver = int(m.group(1))
+                if "Final issue to fix next round:\n" in text:
+                    issue = text.split("Final issue to fix next round:\n", 1)[1].strip()
+                    impl_last_failure[ver] = issue   # last file wins → highest round
+            except (OSError, ValueError):
+                continue
+
+        # ── assemble one entry per previous version ───────────────────────────
+        result: list[dict] = []
+        for ver in range(1, current_impl_version):
+            raw_instr   = impl_instruction.get(ver, "(unknown strategy)")
+            raw_failure = impl_last_failure.get(ver, "(reason not recorded)")
+            # Keep each entry to one compact line so coder context stays short.
+            summary = raw_instr.splitlines()[0][:160] if raw_instr else ""
+            failure = raw_failure.splitlines()[0][:200] if raw_failure else ""
+            result.append({
+                "version":          ver,
+                "strategy_summary": summary,
+                "why_failed":       failure,
+            })
+        return result
 
 
 def _truncate(text: str, max_chars: int) -> str:

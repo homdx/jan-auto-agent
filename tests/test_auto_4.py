@@ -65,7 +65,7 @@ def mock_inner_loop_pipeline(monkeypatch):
     class FakeInnerLoop:
         def __init__(self, config, base_dir):
             pass
-        def run_task(self, task, base_dir, prior_feedback=None):
+        def run_task(self, task, base_dir, prior_feedback=None, prior_implementations=None):
             return InnerLoopResult(
                 task_id=task["id"], passed=True, attempts_used=1,
                 records=[AttemptRecord(1, True, True, True, "")]
