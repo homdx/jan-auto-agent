@@ -179,7 +179,7 @@ def _make_fake_llm(candidates: list) -> callable:
             # Gate-1 LLM stage — always confirm
             return json.dumps({"verdict": "confirmed", "reason": "Valid improvement"})
 
-        if "strict code-change validator" in system:
+        if "code-change validator" in system:
             # Gate-2 validator — always approve
             return json.dumps({"approved": True, "feedback": ""})
 

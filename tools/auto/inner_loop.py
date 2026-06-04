@@ -110,6 +110,7 @@ class LLMGate2Validator:
         verify_ssl: bool = True,
         timeout: float = 120,
         temperature: float = 0.1,
+        base_dir: str = ".",
     ) -> None:
         self._base_url   = base_url.rstrip("/")
         self._api_key    = api_key
@@ -126,24 +127,45 @@ class LLMGate2Validator:
             
         self._timeout    = timeout
         self._temperature = temperature
+        self._base_dir   = Path(base_dir)
+
+    def _read_changed_content(self, coder_result) -> str:
+        """Read the post-edit content of the files the coder wrote, so the
+        validator has the actual change to judge (not just file names)."""
+        files = list(getattr(coder_result, "files_written", []) or [])
+        if not files:
+            return "(the coder reported NO files written — nothing changed)"
+        budget = max(800, 6000 // len(files))
+        blocks = []
+        for rel in files:
+            try:
+                content = (self._base_dir / rel).read_text(
+                    encoding="utf-8", errors="replace")
+            except OSError as exc:
+                content = f"(could not read {rel}: {exc})"
+            blocks.append(f"--- {rel} ---\n{_truncate(content, budget)}")
+        return "\n\n".join(blocks)
 
     def approve(self, task: dict, exec_result, coder_result) -> Tuple[bool, str]:
         system = (
-            "You are a strict code-change validator. You are given a TASK, the "
-            "files a coder wrote, and the ACCEPTANCE CHECK output (which already "
-            "exited 0). Decide whether the change correctly and completely "
-            "implements the task without introducing an obvious regression. "
+            "You are a code-change validator. The acceptance check has ALREADY "
+            "passed (exited 0). Using the CHANGED FILE CONTENT below, confirm the "
+            "change plausibly implements the TASK and introduces no obvious "
+            "regression. Bias toward approving: approve unless you can point to a "
+            "CONCRETE problem visible in the code shown — a real bug, a required "
+            "part of the task that is clearly missing, or a clear regression. Do "
+            "not reject for style, formatting, or things not visible here. "
             'Return STRICT JSON only: {"approved": true or false, '
-            '"feedback": "what is wrong or missing; empty if approved"}'
+            '"feedback": "the concrete problem to fix; empty if approved"}'
         )
-        files = ", ".join(getattr(coder_result, "files_written", []) or [])
         stdout = _truncate(getattr(exec_result, "stdout", "") or "", _MAX_DETAIL_CHARS)
+        changed = self._read_changed_content(coder_result)
         user = (
             f"TASK: {task.get('title','')}\n"
             f"INSTRUCTION: {task.get('instruction','')}\n"
-            f"FILES WRITTEN: {files}\n"
-            f"ACCEPTANCE CHECK: {task.get('acceptance_check','')}\n"
-            f"ACCEPTANCE OUTPUT (exit 0):\n{stdout}\n"
+            f"ACCEPTANCE CHECK (passed, exit 0): {task.get('acceptance_check','')}\n"
+            f"ACCEPTANCE OUTPUT:\n{stdout}\n\n"
+            f"CHANGED FILE CONTENT (after the coder's edit):\n{changed}\n"
         )
         headers = {"Content-Type": "application/json",
                    "Authorization": f"Bearer {self._api_key}"}
@@ -315,6 +337,7 @@ def make_inner_loop(
             api_format = config.get(section, "api_format", fallback="openai"),
             verify_ssl = config.getboolean("api", "verify_ssl", fallback=True),
             temperature = config.getfloat("inner_loop", "temperature", fallback=0.1),
+            base_dir   = str(base_dir),
             timeout    = config.getfloat("auto", "llm_timeout_sec", fallback=120),
         )
 

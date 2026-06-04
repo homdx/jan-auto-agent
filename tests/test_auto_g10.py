@@ -153,7 +153,7 @@ def _make_fake_llm(candidates: list):
             return json.dumps(candidates)
         if "static code reviewer" in system:
             return json.dumps({"verdict": "confirmed", "reason": "Valid improvement"})
-        if "strict code-change validator" in system:
+        if "code-change validator" in system:
             return json.dumps({"approved": True, "feedback": ""})
         return json.dumps({
             "files": [{"path": "hello.py", "content": _HELLO_PY_IMPROVED}]
