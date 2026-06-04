@@ -604,6 +604,223 @@ def review_clusters(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# TaskRewriter  (LOOP-2)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_REWRITER_SYSTEM_DEFAULT = (
+    "You are an architect who has reviewed failed implementation attempts. "
+    "Your job is to propose a genuinely different technical approach. "
+    "Do not suggest the same solution with minor changes. "
+    "If the previous approach used class inheritance, consider composition. "
+    "If it used a loop, consider a generator. "
+    "If it modified data in place, consider returning a new object. "
+    "Think about what assumption the previous approach made that might be wrong, "
+    "and start from a different assumption. "
+    "Return ONLY a JSON object — no prose, no markdown fences, no preamble."
+)
+
+_REWRITER_USER_TMPL = """\
+The following task has failed multiple implementation rounds. You must produce \
+a completely different implementation strategy — repeating the same approach is \
+not acceptable.
+
+Original task title: {title}
+
+Original instruction:
+{instruction}
+
+Failure history (one entry per failed round):
+{failure_history}
+
+Return a JSON object with exactly these fields:
+{{
+  "title": "<keep original or append '— alternative approach'>",
+  "instruction": "<new implementation strategy written for the coder agent>",
+  "acceptance_check": "<keep original if still valid, or update if the new strategy changes what done means>"
+}}
+"""
+
+
+class TaskRewriter:
+    """Rewrites a repeatedly-failing task with a new implementation strategy.
+
+    Mirrors the constructor signature of :class:`ClusterReviewer` so
+    ``make_outer_loop`` can build it with the same config block.
+
+    Parameters
+    ----------
+    config:
+        Parsed ``agents.ini``.
+    base_url, api_key, model, api_format, verify_ssl:
+        Same meaning as in :class:`ClusterReviewer`.
+    """
+
+    def __init__(
+        self,
+        config: configparser.ConfigParser,
+        base_url: str,
+        api_key: str,
+        model: str,
+        api_format: str = "openai",
+        verify_ssl: bool = True,
+    ) -> None:
+        self._config     = config
+        self._base_url   = base_url.rstrip("/")
+        self._api_key    = api_key
+        self._model      = model
+        self._api_format = api_format
+
+        import ssl
+        self._ssl_context = None
+        if not verify_ssl:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            self._ssl_context = ctx
+
+        arch = "architect"
+        self._max_tokens  = int(config.get(arch, "rewrite_max_tokens",  fallback="512"))
+        self._temperature = float(config.get(arch, "rewrite_temperature", fallback="0.4"))
+        raw_system        = config.get(arch, "rewrite_system", fallback="").strip()
+        self._system      = raw_system or _REWRITER_SYSTEM_DEFAULT
+        self._timeout     = float(config.get("loop", "timeout_seconds", fallback="300"))
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def rewrite(self, task: dict, failure_history: list[str]) -> dict:
+        """Return a new task dict with a different implementation strategy.
+
+        On any failure (network error, bad JSON, missing fields) logs a warning
+        and returns the *original* task dict unchanged.  Never raises.
+        """
+        title       = task.get("title", "")
+        instruction = task.get("instruction", "")
+
+        history_text = "\n\n".join(
+            f"--- Round {i + 1} ---\n{entry}"
+            for i, entry in enumerate(failure_history)
+        ) if failure_history else "(no failure history available)"
+
+        user_msg = _REWRITER_USER_TMPL.format(
+            title=title,
+            instruction=instruction,
+            failure_history=history_text,
+        )
+
+        headers = {
+            "Content-Type":  "application/json",
+            "Authorization": f"Bearer {self._api_key}",
+        }
+
+        if self._api_format == "ollama":
+            url = _llm_stream.ollama_chat_url(self._base_url)
+            payload: dict[str, Any] = {
+                "model":   self._model,
+                "messages": [
+                    {"role": "system", "content": self._system},
+                    {"role": "user",   "content": user_msg},
+                ],
+                "options": {
+                    "temperature": self._temperature,
+                    "num_predict": self._max_tokens,
+                },
+            }
+        else:
+            url = f"{self._base_url}/chat/completions"
+            payload: dict[str, Any] = {
+                "model":       self._model,
+                "temperature": self._temperature,
+                "max_tokens":  self._max_tokens,
+                "messages": [
+                    {"role": "system", "content": self._system},
+                    {"role": "user",   "content": user_msg},
+                ],
+            }
+
+        tracer.event(
+            source="task_rewriter",
+            target="llm",
+            kind="llm_request",
+            content=user_msg,
+            params={"model": self._model, "task": task.get("id", "?")},
+        )
+
+        try:
+            raw = _llm_stream.request_completion(
+                url=url,
+                headers=headers,
+                payload=payload,
+                timeout=self._timeout,
+                api_format=self._api_format,
+                ssl_context=self._ssl_context,
+            )
+        except Exception as exc:
+            logger.warning("TaskRewriter: LLM call failed for task %r: %s",
+                           task.get("id", "?"), exc)
+            return task
+
+        cleaned = strip_think(raw or "")
+        tracer.event(
+            source="llm",
+            target="task_rewriter",
+            kind="llm_response",
+            content=cleaned,
+            params={"task": task.get("id", "?")},
+        )
+
+        return self._parse_rewrite(cleaned, task)
+
+    # ── Private helpers ───────────────────────────────────────────────────────
+
+    def _parse_rewrite(self, text: str, original_task: dict) -> dict:
+        """Parse the rewrite JSON and merge it into a copy of *original_task*.
+
+        Returns *original_task* unchanged on any parse error.
+        """
+        stripped = text.strip()
+        if stripped.startswith("```"):
+            lines = stripped.splitlines()
+            inner = lines[1:] if len(lines) > 1 else lines
+            if inner and inner[-1].strip() == "```":
+                inner = inner[:-1]
+            stripped = "\n".join(inner).strip()
+
+        try:
+            data = json.loads(stripped)
+        except json.JSONDecodeError as exc:
+            logger.warning(
+                "TaskRewriter._parse_rewrite: JSON decode failed: %s\nRaw: %.400s",
+                exc, text,
+            )
+            return original_task
+
+        if not isinstance(data, dict):
+            logger.warning(
+                "TaskRewriter._parse_rewrite: expected JSON object, got %s",
+                type(data).__name__,
+            )
+            return original_task
+
+        new_title       = (data.get("title") or "").strip()
+        new_instruction = (data.get("instruction") or "").strip()
+        new_acceptance  = (data.get("acceptance_check") or "").strip()
+
+        if not new_instruction:
+            logger.warning(
+                "TaskRewriter._parse_rewrite: rewrite produced empty instruction — "
+                "keeping original task"
+            )
+            return original_task
+
+        # Merge into a shallow copy so the original dict is never mutated.
+        rewritten = dict(original_task)
+        rewritten["title"]            = new_title or original_task.get("title", "")
+        rewritten["instruction"]      = new_instruction
+        rewritten["acceptance_check"] = new_acceptance or original_task.get("acceptance_check", "")
+        return rewritten
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Internal utilities
 # ─────────────────────────────────────────────────────────────────────────────
 

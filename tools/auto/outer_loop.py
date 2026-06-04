@@ -101,12 +101,14 @@ class OuterLoop:
         max_rounds: int = _DEFAULT_MAX_ROUNDS,
         rewrite_every_n_rounds: int = 2,
         max_rewrites: int = 5,
+        task_rewriter=None,
     ) -> None:
         self.inner_loop             = inner_loop
         self.state                  = state
         self.max_rounds             = max(1, int(max_rounds))
         self.rewrite_every_n_rounds = max(1, int(rewrite_every_n_rounds))
         self.max_rewrites           = max(0, int(max_rewrites))
+        self.task_rewriter          = task_rewriter  # optional; None disables rewriting
 
     def run_task(self, task: dict, base_dir: str | Path) -> OuterLoopResult:
         """Run the outer loop for *task*.  Resumes from the next unfinished
@@ -118,6 +120,9 @@ class OuterLoop:
         start_round = done_rounds + 1
         feedback_files = [str(p) for p in self._feedback_paths(task_id)]
         inner_results: list = []
+
+        # LOOP-2: rewrite tracking (per run_task call, not per instance)
+        rewrites_done = 0
 
         if start_round > self.max_rounds:
             # Already exhausted in a prior session.
@@ -156,6 +161,60 @@ class OuterLoop:
             fpath = self._write_round_feedback(task_id, rnd, res)
             feedback_files.append(str(fpath))
             self.state.log(f"{task_id}: round {rnd} failed — wrote {fpath.name}")
+
+            # LOOP-2: check whether a rewrite is due.
+            # Condition: rnd >= 3, (rnd-1) % rewrite_every_n_rounds == 0,
+            #            rewrites_done < max_rewrites, and a rewriter is wired up.
+            if (
+                self.task_rewriter is not None
+                and self.max_rewrites > 0
+                and rnd >= 3
+                and (rnd - 1) % self.rewrite_every_n_rounds == 0
+                and rewrites_done < self.max_rewrites
+            ):
+                failure_history = self._read_round_feedback(task_id)
+                impl_num = rewrites_done + 2  # v1 → first rewrite → v2, etc.
+                logger.info(
+                    "round %d failed — architect rewriting task (impl v%d)",
+                    rnd, impl_num,
+                )
+                self.state.log(
+                    f"{task_id}: round {rnd} failed — architect rewriting task "
+                    f"(impl v{impl_num})"
+                )
+
+                new_task = self.task_rewriter.rewrite(task, failure_history)
+                if new_task is not task:
+                    # A genuine rewrite was produced — record it on disk.
+                    rewrite_body = (
+                        f"# Rewrite after round {rnd} — impl v{impl_num} — "
+                        f"task {task_id}\n\n"
+                        f"## New instruction\n{new_task.get('instruction', '')}\n\n"
+                        f"## Acceptance check\n{new_task.get('acceptance_check', '')}\n"
+                    )
+                    self.state.write_task_file(
+                        task_id,
+                        f"rewrite_round_{rnd}.md",
+                        rewrite_body,
+                    )
+                    task = new_task
+                    rewrites_done += 1
+                    tracer.event(
+                        "outer_loop", "task_rewriter", "rewrite",
+                        content=new_task.get("instruction", ""),
+                        params={
+                            "task": task_id,
+                            "round": rnd,
+                            "impl_version": impl_num,
+                            "rewrites_done": rewrites_done,
+                        },
+                    )
+                else:
+                    logger.warning(
+                        "TaskRewriter returned original task unchanged for %r "
+                        "(parse/network error) — continuing with current strategy",
+                        task_id,
+                    )
 
         # All rounds exhausted → BLOCKED (AUTO-C6 will write knowledge + ticket).
         self.state.set_task_status(task_id, STATUS_BLOCKED)
@@ -231,10 +290,41 @@ def make_outer_loop(
         from tools.auto.inner_loop import make_inner_loop
         inner_loop = make_inner_loop(config, base_dir)
 
+    # LOOP-2: build a TaskRewriter if the config has the rewrite keys and
+    # max_rewrites > 0.  If anything is missing the outer loop just runs
+    # without rewriting.
+    task_rewriter = None
+    if max_rewrites > 0:
+        try:
+            from tools.auto.architect import TaskRewriter
+
+            active     = config.get("api", "active", fallback="local")
+            section    = f"api_{active}"
+            base_url   = config.get(section, "base_url")
+            api_key    = config.get(section, "api_key",    fallback="")
+            model      = config.get(section, "model")
+            api_fmt    = config.get(section, "api_format", fallback="openai")
+            verify_ssl = config.getboolean("api", "verify_ssl", fallback=True)
+
+            task_rewriter = TaskRewriter(
+                config=config,
+                base_url=base_url,
+                api_key=api_key,
+                model=model,
+                api_format=api_fmt,
+                verify_ssl=verify_ssl,
+            )
+        except Exception as exc:
+            logger.warning(
+                "make_outer_loop: could not build TaskRewriter — rewriting disabled: %s",
+                exc,
+            )
+
     return OuterLoop(
         inner_loop,
         state,
         max_rounds=max_rounds,
         rewrite_every_n_rounds=rewrite_every_n_rounds,
         max_rewrites=max_rewrites,
+        task_rewriter=task_rewriter,
     )
