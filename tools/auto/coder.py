@@ -297,7 +297,11 @@ class Coder:
             return CoderResult(task_id=task_id, error=parse_error, raw_response=cleaned)
 
         # ── Write files to disk ───────────────────────────────────────────────
-        written, write_error = self._write_files(parsed_files, base_dir, task_id)
+        target_files = task.get("target_files") or []
+        allowed = frozenset(target_files) if target_files else None
+        written, write_error = self._write_files(
+            parsed_files, base_dir, task_id, allowed_paths=allowed
+        )
         if write_error and not written:
             return CoderResult(
                 task_id=task_id, error=write_error, raw_response=cleaned
@@ -462,13 +466,53 @@ class Coder:
 
         return parsed, ""
 
+    @staticmethod
+    def _safe_dest(base_dir: Path, rel: str) -> tuple["Path | None", str]:
+        """Resolve *rel* relative to *base_dir* and verify it stays inside.
+
+        Prevents path traversal (``../../etc/passwd``) and absolute-path
+        injection from LLM responses.  Returns ``(resolved_path, "")`` on
+        success or ``(None, error_message)`` on violation.
+        """
+        # Reject obviously absolute paths before Path() normalises them.
+        if rel.startswith("/") or (len(rel) > 1 and rel[1:3] == ":\\"):
+            return None, f"rejected absolute path from LLM: {rel!r}"
+        try:
+            dest = (base_dir / rel).resolve()
+        except (OSError, ValueError) as exc:
+            return None, f"path resolution error for {rel!r}: {exc}"
+        try:
+            dest.relative_to(base_dir)
+        except ValueError:
+            return None, f"path escapes base_dir: {rel!r} → {dest}"
+        return dest, ""
+
     def _write_files(
-        self, parsed_files: list[dict], base_dir: Path, task_id: str
+        self,
+        parsed_files: list[dict],
+        base_dir: Path,
+        task_id: str,
+        allowed_paths: "frozenset[str] | None" = None,
     ) -> tuple[list[str], str]:
         """Write parsed files to *base_dir*.
 
-        Each original file is backed up as ``<file>.coder.bak`` before overwriting
-        (mirrors the ``/edit`` backup pattern).  New files are created directly.
+        Only paths listed in *allowed_paths* (the task's ``target_files``) are
+        written.  Paths that escape *base_dir* (traversal / absolute) are
+        rejected.  Each original file is backed up as ``<file>.coder.bak``
+        before overwriting so changes are reversible without git.
+
+        Parameters
+        ----------
+        parsed_files:
+            List of ``{path, content}`` dicts from the LLM response.
+        base_dir:
+            Repo root — all writes must remain inside this directory.
+        task_id:
+            Used only for log messages.
+        allowed_paths:
+            Normalised relative paths the task declared as ``target_files``.
+            When not ``None``, any path outside this set is skipped with a
+            warning so the LLM cannot silently touch unrelated files.
 
         Returns
         -------
@@ -481,9 +525,32 @@ class Coder:
         first_error = ""
 
         for item in parsed_files:
-            rel   = item["path"]
+            rel     = item["path"]
             content = item["content"]
-            dest  = base_dir / rel
+
+            # ── Guard 1: path must not escape base_dir ─────────────────────
+            dest, path_err = self._safe_dest(base_dir, rel)
+            if path_err:
+                msg = f"[SAFETY] {path_err}"
+                logger.error("coder._write_files [%s]: %s", task_id, msg)
+                if not first_error:
+                    first_error = msg
+                continue
+
+            # ── Guard 2: path must be in the task's approved target_files ──
+            if allowed_paths is not None:
+                # Normalise to forward-slash for comparison.
+                norm = rel.replace("\\", "/").lstrip("./")
+                allowed_norm = {p.replace("\\", "/").lstrip("./") for p in allowed_paths}
+                if norm not in allowed_norm:
+                    msg = (
+                        f"[SAFETY] LLM tried to write {rel!r} which is not in "
+                        f"target_files — skipped to protect unrelated files"
+                    )
+                    logger.warning("coder._write_files [%s]: %s", task_id, msg)
+                    if not first_error:
+                        first_error = msg
+                    continue
 
             try:
                 dest.parent.mkdir(parents=True, exist_ok=True)
