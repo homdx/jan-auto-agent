@@ -274,6 +274,7 @@ class Orchestrator(OrchestratorActions):
         iteration = 1
         already_searched = [parsed.file_path]
         search_result: Dict[str, Any] = {"found": {}, "not_found": [], "searched_files": []}
+        validation: Dict[str, Any] = {}
 
         # --- VALIDATION LOOP (Only if not a simple 'show' intent) ---
         if parsed.intent not in ("show", "show_imports"):

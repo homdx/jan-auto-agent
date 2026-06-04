@@ -316,6 +316,8 @@ class StateStore:
         elif "stop_reason" in extra:
             # allow explicit kwarg path too
             pass
+        else:
+            self._progress.pop("stop_reason", None)
         self._progress.update(extra)
         self._refresh_progress(write=False)   # recalculates counts
         self._save_progress()

@@ -297,7 +297,7 @@ def make_inner_loop(
             model      = config.get(section, "model", fallback=""),
             api_format = config.get(section, "api_format", fallback="openai"),
             verify_ssl = config.getboolean("api", "verify_ssl", fallback=True),
-            timeout    = config.getfloat("auto", "exec_timeout_sec", fallback=120),
+            timeout    = config.getfloat("auto", "llm_timeout_sec", fallback=120),
         )
 
     return InnerLoop(coder, executor, validator, max_attempts=max_attempts)

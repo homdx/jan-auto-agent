@@ -46,7 +46,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
-from tools.auto.state import StateStore, STATUS_DONE, STATUS_IN_PROGRESS
+from tools.auto.state import StateStore, STATUS_DONE, STATUS_IN_PROGRESS, STATUS_BLOCKED
 from tools.auto.git_manager import make_git_manager, GitError
 
 logger = logging.getLogger(__name__)
@@ -253,6 +253,19 @@ class AutoController:
         3. Enter task loop — check caps before every task.
         4. On cap: persist stop_reason, log, exit 0 (graceful stop).
         5. On normal completion: set status "idle", exit 0.
+            # ── Dependency Guard (Bug #5) ──────────────────────────────
+            failed_deps = []
+            for dep_id in task.get("dependencies", []):
+                dep = self.state.get_task(dep_id)
+                # If dependency doesn't exist or isn't DONE (e.g. BLOCKED), we cannot proceed.
+                if not dep or dep["status"] != STATUS_DONE:
+                    failed_deps.append(dep_id)
+
+            if failed_deps:
+                logger.info("Task %s blocked by incomplete dependencies: %s", task["id"], failed_deps)
+                self.state.set_task_status(task["id"], STATUS_BLOCKED)
+                self.state.log(f"task {task['id']} blocked (dependency not done: {', '.join(failed_deps)})")
+                continue
         """
         self._start_time = self._time_fn()
         self._print_banner()
