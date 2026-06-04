@@ -1,9 +1,12 @@
 """
-tools/auto/auto_tuner.py — AUTO-E1 / AUTO-E2
+tools/auto/auto_tuner.py — AUTO-E1
 
 Wire the existing prompt_optimizer / prompt_evaluator / prompt_store into
-autonomous mode.  Auto metrics go to <agent_dir>/metrics.json, keeping them
-isolated from the interactive metrics stream (AUTO-E2).
+autonomous mode.
+
+AUTO-E2 isolation (separate metrics stream) is owned by
+tools/auto/auto_metrics.py.  The ``record_gate2_result`` helper is imported
+from there so callers can use either module as an entry point.
 """
 
 from __future__ import annotations
@@ -15,8 +18,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional, TYPE_CHECKING
 
-from tools.metrics_collector import MetricsCollector, RunRecord
+from tools.metrics_collector import MetricsCollector
 from tools.prompt_store import PromptStore
+from tools.auto.auto_metrics import record_gate2_result  # noqa: F401 — re-exported for back-compat
 
 if TYPE_CHECKING:
     from tools.prompt_optimizer import PromptOptimizer
@@ -241,43 +245,5 @@ def make_auto_tuner(
     )
 
 
-# ── record_gate2_result ───────────────────────────────────────────────────────
-
-def record_gate2_result(
-    mc: MetricsCollector,
-    task_id: str,
-    *,
-    approved: bool,
-    feedback: str,
-    attempts_used: int,
-    prompt_store: Optional[PromptStore] = None,
-) -> None:
-    """
-    Write a Gate-2 validation outcome to the auto metrics stream.
-
-    improvement_json_ok is always None for auto-mode records so they do not
-    pollute the interactive json_ok_rate signal (AUTO-E2 isolation).
-
-    Never raises — errors are logged and swallowed.
-    """
-    try:
-        prompt_version = "auto"
-        if prompt_store is not None:
-            try:
-                prompt_version = prompt_store.get_version_label("validator")
-            except Exception:
-                pass
-
-        record = RunRecord(
-            timestamp=datetime.now(timezone.utc).isoformat(),
-            intent=task_id,
-            prompt_version=prompt_version,
-            iterations_used=attempts_used,
-            validator_status="approved" if approved else "rejected",
-            validator_feedback=feedback,
-            improvement_json_ok=None,
-            elapsed_seconds=0.0,
-        )
-        mc.record(record)
-    except Exception as exc:
-        logger.error("record_gate2_result: failed to record metric — %s", exc)
+# record_gate2_result is imported from tools.auto.auto_metrics (AUTO-E2) and
+# re-exported above via the import line.  Canonical implementation lives there.
