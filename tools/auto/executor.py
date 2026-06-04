@@ -470,6 +470,14 @@ class Executor:
             env.pop(var, None)
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         env["PYTHONUNBUFFERED"] = "1"
+        
+        base_dir_str = str(self._base_dir)
+        existing_pythonpath = env.get("PYTHONPATH", "")
+        if existing_pythonpath:
+            env["PYTHONPATH"] = f"{base_dir_str}{os.pathsep}{existing_pythonpath}"
+        else:
+            env["PYTHONPATH"] = base_dir_str
+            
         return env
 
 

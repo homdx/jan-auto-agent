@@ -58,6 +58,21 @@ class _FakeClock:
         self.t += secs
 
 
+@pytest.fixture(autouse=True)
+def mock_inner_loop_pipeline(monkeypatch):
+    """Fixture to mock out real LLM API loops during safety/limit rule testing."""
+    from tools.auto.inner_loop import InnerLoopResult, AttemptRecord
+    class FakeInnerLoop:
+        def __init__(self, config, base_dir):
+            pass
+        def run_task(self, task, base_dir, prior_feedback=None):
+            return InnerLoopResult(
+                task_id=task["id"], passed=True, attempts_used=1,
+                records=[AttemptRecord(1, True, True, True, "")]
+            )
+    monkeypatch.setattr("tools.auto.inner_loop.make_inner_loop", lambda config, base_dir: FakeInnerLoop(config, base_dir))
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # RunLimits.from_config
 # ─────────────────────────────────────────────────────────────────────────────

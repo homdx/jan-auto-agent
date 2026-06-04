@@ -113,7 +113,15 @@ class LLMGate2Validator:
         self._api_key    = api_key
         self._model      = model
         self._api_format = api_format
-        self._verify_ssl = verify_ssl
+        
+        import ssl
+        self._ssl_context = None
+        if not verify_ssl:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            self._ssl_context = ctx
+            
         self._timeout    = timeout
 
     def approve(self, task: dict, exec_result, coder_result) -> Tuple[bool, str]:
@@ -147,7 +155,7 @@ class LLMGate2Validator:
         try:
             raw = request_completion(
                 url=url, headers=headers, payload=payload, timeout=self._timeout,
-                stream=False, api_format=self._api_format, verify_ssl=self._verify_ssl,
+                stream=False, api_format=self._api_format, ssl_context=self._ssl_context,
             )
             cleaned = strip_think(raw)
             tracer.event("gate2_validator", "inner_loop", "llm_response", content=cleaned)
@@ -269,12 +277,7 @@ def make_inner_loop(
     executor=None,
     validator: Optional[Gate2Validator] = None,
 ) -> InnerLoop:
-    """Build an :class:`InnerLoop` with real Coder/Executor/validator from config.
-
-    Any of *coder*, *executor*, *validator* may be supplied to override the
-    default (used by tests and by the controller, which already owns an
-    executor configured with the AUTO-A4 exec timeout / workspace).
-    """
+    """Build an :class:`InnerLoop` with real Coder/Executor/validator from config."""
     from tools.auto.coder import make_coder
     from tools.auto.executor import make_executor
 

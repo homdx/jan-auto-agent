@@ -165,7 +165,14 @@ class Gate1Filter:
         self._api_key    = api_key
         self._model      = model
         self._api_format = api_format
-        self._verify_ssl = verify_ssl
+
+        import ssl
+        self._ssl_context = None
+        if not verify_ssl:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            self._ssl_context = ctx
 
         sec = "gate1"
         self._temperature = float(config.get(sec, "temperature", fallback="0.0"))
@@ -381,7 +388,7 @@ class Gate1Filter:
                 timeout=self._timeout,
                 stream=False,
                 api_format=self._api_format,
-                verify_ssl=self._verify_ssl,
+                ssl_context=self._ssl_context,
             )
         except Exception as exc:
             reason = f"LLM call failed: {exc}"
