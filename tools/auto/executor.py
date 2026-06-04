@@ -25,7 +25,7 @@ Public surface consumed by the Coder loop (AUTO-C2/C3)::
     executor = Executor(
         base_dir        = Path("."),          # repo root
         workspace_root  = Path(".agent/workspace"),
-        timeout_sec     = 120,                # 0 = no timeout
+        timeout_sec     = 120,                # 0 = disabled (infinite hang risk — see below)
     )
 
     result: ExecutionResult = executor.run(task)
@@ -43,8 +43,10 @@ Public surface consumed by the Coder loop (AUTO-C2/C3)::
 
 Configuration (agents.ini [auto])
 -----------------------------------
-exec_timeout_sec   — per-execution wall-clock cap in seconds (default 120,
-                     0 = no timeout).  Also readable from RunLimits.
+exec_timeout_sec   — per-execution wall-clock cap in seconds (default 120).
+                     0 disables the timeout entirely — the subprocess runs
+                     forever if it blocks (e.g. a script that prompts for
+                     console input).  Only set to 0 intentionally.
 """
 
 from __future__ import annotations
@@ -161,8 +163,11 @@ class Executor:
         Parent directory under which per-task subdirectories are created.
         Defaults to ``<base_dir>/.agent/workspace``.
     timeout_sec:
-        Wall-clock limit for each subprocess invocation.  ``0`` (or
-        negative) means no timeout.
+        Wall-clock limit for each subprocess invocation.  ``0`` disables
+        the timeout — the child process can run forever (dangerous if the
+        acceptance_check script blocks waiting for console input).  Any
+        positive value is enforced; ``subprocess.TimeoutExpired`` is caught
+        and mapped to ``ExecutionResult.timed_out = True``.
     python_bin:
         Python interpreter used when the acceptance check is a bare
         ``pytest`` or starts with ``python``.  Defaults to ``sys.executable``
@@ -476,7 +481,13 @@ class Executor:
             and mapped to the result fields.
         """
         env = self._build_env()
-        timeout = self._timeout_sec or None  # None = no timeout for Popen
+        # Use explicit comparison instead of `or None` — 0.0 is falsy in Python,
+        # so `0.0 or None` evaluates to None (= no timeout), which is the intended
+        # meaning of 0.  But the `or` form is a silent footgun: any future reader
+        # or config author who sets exec_timeout_sec = 0 expecting "no timeout"
+        # gets it, while someone who sets it accidentally gets an infinite hang
+        # with no warning.  The explicit form below makes the intent unmistakable.
+        timeout = self._timeout_sec if self._timeout_sec > 0 else None
 
         try:
             proc = subprocess.run(
