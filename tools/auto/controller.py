@@ -305,24 +305,14 @@ class AutoController:
         # Update progress to "running"
         self.state.update_progress(status="running")
 
-        # ── Planning Phase for Fresh Runs (Bug #2) ─────────────────────────
-        if is_fresh:
-            from tools.auto.repo_ingest import ingest_repo
-            from tools.auto.architect import review_clusters
-            from tools.auto.gate1_filter import filter_candidates
-            from tools.auto.state import make_task
-
-            clusters = ingest_repo(self.base_dir, cfg)
-            candidates = review_clusters(clusters, self.base_dir, cfg, goal=self.goal)
-            accepted, rejected = filter_candidates(candidates, self.base_dir, cfg)
-
-            for idx, c in enumerate(accepted, 1):
-                t = make_task(id=f"TASK-{idx}", title=c.title, instruction=c.instruction, target_files=c.target_files, acceptance_check=c.acceptance_check)
-                t["cited_location"] = {"file": c.cited_location.file, "symbol": c.cited_location.symbol, "line_start": c.cited_location.line_start, "line_end": c.cited_location.line_end}
-                self.state.upsert_task(t)
-        # Iterates pending tasks; checks both caps before each execution.
-        # Real task execution (AUTO-B Architect, AUTO-C Coder) hooks in here.
-        stop_reason, session_tasks_done = self._run_task_loop()
+        # ── AUTO-G0: Delegate to pipeline ─────────────────────────────────
+        # pipeline.run_pipeline() handles:
+        #   G1 — PLAN phase (ingest → architect → gate1 → prioritise → emit)
+        #   G2+ — EXECUTE phase (outer_loop per task, commit, exhaustion)
+        # controller.run() stays thin; all orchestration is unit-testable via
+        # tools/auto/pipeline.py in isolation.
+        from tools.auto.pipeline import run_pipeline
+        stop_reason, session_tasks_done = run_pipeline(self)
 
         # ── Finalise ──────────────────────────────────────────────────────
         if stop_reason:

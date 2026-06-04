@@ -1,0 +1,231 @@
+"""tools/auto/pipeline.py — AUTO-G0 / AUTO-G1: Controller orchestration pipeline.
+
+AUTO-G0 — Pipeline skeleton
+    Defines ``run_pipeline(controller)`` as the single entry point the controller
+    calls, keeping ``controller.run()`` thin and the orchestration unit-testable
+    in isolation.  The shared *run context* is the controller itself (config,
+    state, git, base_dir, limits, tracer, progress), so no extra object is needed.
+
+AUTO-G1 — PLAN phase wiring
+    When no plan exists yet (fresh run):
+        repo_ingest → architect → gate1_filter → backlog_prioritiser → plan_emitter
+
+    The plan is then committed to git.  On a resume run the PLAN phase is skipped
+    entirely.  Changed-cluster detection (``PlanEmitter.changed_clusters``) is
+    available for future partial-replan support but is not yet wired into the
+    main path (the priority is correctness, not speed, on the first working run).
+
+Phase order (to be filled in by G2–G8):
+    1. PLAN   — ingest → architect → gate1 → prioritise → emit (G1)
+    2. EXECUTE — outer_loop per task → commit_on_success / exhaustion (G2–G5)
+    3. OBS    — progress_display, run_trace, auto_tuner already wired in controller
+
+Public surface::
+
+    from tools.auto.pipeline import run_pipeline
+
+    # Inside AutoController.run():
+    stop_reason, tasks_done = run_pipeline(self)
+
+The return signature matches ``_run_task_loop`` so the existing finalise code in
+``controller.run()`` requires no changes.
+"""
+
+from __future__ import annotations
+
+import configparser
+import logging
+from pathlib import Path
+from typing import TYPE_CHECKING, Optional
+
+if TYPE_CHECKING:  # avoid circular imports at runtime
+    from tools.auto.controller import AutoController
+
+logger = logging.getLogger(__name__)
+
+# ── PLAN phase module imports ─────────────────────────────────────────────────
+# Imported at module level so test suites can patch via
+# ``patch("tools.auto.pipeline.<name>")``.
+from tools.auto.repo_ingest import ingest_repo
+from tools.auto.architect import review_clusters
+from tools.auto.gate1_filter import filter_candidates
+from tools.auto.backlog_prioritiser import build_backlog, to_improvements_md
+from tools.auto.plan_emitter import PlanEmitter, IMPROVEMENTS_FILENAME
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Public entry point
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def run_pipeline(controller: "AutoController") -> tuple[Optional[str], int]:
+    """Run the full autonomous pipeline; return (stop_reason, tasks_done).
+
+    Parameters
+    ----------
+    controller:
+        The live :class:`~tools.auto.controller.AutoController` instance.
+        All shared state (goal, base_dir, config_path, state, git, limits,
+        run_trace, progress_display, metrics_stream, auto_tuner) is read
+        from it.
+
+    Returns
+    -------
+    (stop_reason, tasks_done)
+        Mirrors the return signature of ``_run_task_loop`` so the
+        finalise block in ``controller.run()`` requires no changes.
+        ``stop_reason`` is ``"runtime_cap"`` / ``"task_cap"`` / ``None``.
+        ``tasks_done`` is the count of tasks completed this session.
+    """
+    cfg = _load_config(controller)
+
+    # ── PLAN phase ────────────────────────────────────────────────────────────
+    _run_plan_phase(controller, cfg)
+
+    # ── EXECUTE phase (G2 will replace _run_task_loop delegation) ─────────────
+    return controller._run_task_loop()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PLAN phase — AUTO-G1
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _run_plan_phase(controller: "AutoController", cfg: configparser.ConfigParser) -> None:
+    """Build and emit the plan when none exists yet; skip on resume.
+
+    AUTO-G1 ACs
+    -----------
+    * Fresh ``--auto`` run produces a non-empty ``plan.json`` and a committed
+      ``IMPROVEMENTS.md``.
+    * Re-running skips the plan phase (resume path — ``plan.json`` already
+      exists, tasks are loaded from it by ``StateStore.initialise``).
+    * Check-less tasks land in the "Manual suggestions" section, excluded from
+      auto-run (handled by ``BacklogPrioritiser`` — no extra logic needed here).
+
+    The controller's ``state.all_tasks()`` is the authoritative indicator:
+    if it is empty the plan has not been built yet (fresh) even if the file
+    exists but is empty (edge case from interrupted very-first run).
+    """
+    has_plan = bool(controller.state.all_tasks())
+
+    if has_plan:
+        logger.info("plan_phase: plan already exists — skipping (resume)")
+        controller.state.log("plan phase: skipped (plan already present)")
+        if controller.run_trace:
+            controller.run_trace.log_phase("plan", "skipped")
+        return
+
+    logger.info("plan_phase: no plan found — running PLAN phase")
+    controller.state.log("plan phase: starting")
+    if controller.run_trace:
+        controller.run_trace.log_phase("plan", "started")
+
+    # ── Step 1: Repo ingest ───────────────────────────────────────────────────
+    logger.info("plan_phase: ingesting repo at %s", controller.base_dir)
+    clusters = ingest_repo(controller.base_dir, cfg)
+    logger.info("plan_phase: produced %d cluster(s)", len(clusters))
+    controller.state.log(f"plan phase: ingested {len(clusters)} cluster(s)")
+
+    if controller.progress_display:
+        controller.progress_display.arch_total = len(clusters)
+
+    # ── Step 2: Architect review ──────────────────────────────────────────────
+    logger.info("plan_phase: architect reviewing %d cluster(s)", len(clusters))
+    candidates = review_clusters(clusters, controller.base_dir, cfg, goal=controller.goal)
+    logger.info("plan_phase: architect produced %d candidate(s)", len(candidates))
+    controller.state.log(f"plan phase: architect produced {len(candidates)} candidate(s)")
+
+    if controller.progress_display:
+        controller.progress_display.arch_total = len(clusters)
+
+    # ── Step 3: Gate 1 filter ─────────────────────────────────────────────────
+    logger.info("plan_phase: gate1 filtering %d candidate(s)", len(candidates))
+    accepted, rejected = filter_candidates(candidates, controller.base_dir, cfg)
+    logger.info(
+        "plan_phase: gate1 accepted=%d rejected=%d",
+        len(accepted), len(rejected),
+    )
+    controller.state.log(
+        f"plan phase: gate1 accepted={len(accepted)} rejected={len(rejected)}"
+    )
+
+    if controller.run_trace:
+        for r in rejected:
+            controller.run_trace.log_gate1_rejected(
+                getattr(r, "candidate", None) and getattr(r.candidate, "title", "?"),
+                getattr(r, "reason", ""),
+            )
+
+    # ── Step 4: Backlog prioritise ────────────────────────────────────────────
+    task_id_prefix = cfg.get("auto", "task_id_prefix", fallback="AUTO-T")
+    backlog = build_backlog(accepted, task_id_prefix=task_id_prefix)
+    logger.info(
+        "plan_phase: backlog built — %d auto, %d manual",
+        len(backlog.auto_tasks), len(backlog.manual_suggestions),
+    )
+    controller.state.log(
+        f"plan phase: backlog — {len(backlog.auto_tasks)} auto task(s), "
+        f"{len(backlog.manual_suggestions)} manual suggestion(s)"
+    )
+
+    if controller.progress_display:
+        controller.progress_display.code_total = len(backlog.auto_tasks)
+
+    # ── Step 5: Plan emit + git commit ────────────────────────────────────────
+    if controller.git is None:
+        # Git not available — still upsert tasks and write IMPROVEMENTS.md
+        # but skip the commit step.  A subsequent run with git will commit.
+        logger.warning("plan_phase: git not available — emitting without commit")
+        _emit_without_git(controller, backlog, clusters)
+    else:
+        emitter = PlanEmitter(
+            base_dir=controller.base_dir,
+            state=controller.state,
+            git=controller.git,
+        )
+        commit_hash = emitter.emit(backlog, clusters)
+        if commit_hash:
+            controller.state.log(f"plan phase: committed plan ({commit_hash[:12]})")
+            logger.info("plan_phase: plan committed — %s", commit_hash[:12])
+        else:
+            controller.state.log("plan phase: plan unchanged — no new commit")
+            logger.info("plan_phase: plan unchanged — nothing to commit")
+
+    controller.state.log("plan phase: complete")
+    logger.info("plan_phase: done")
+    if controller.run_trace:
+        controller.run_trace.log_phase("plan", "done")
+
+
+def _emit_without_git(
+    controller: "AutoController",
+    backlog,
+    clusters,
+) -> None:
+    """Fallback: upsert tasks + write IMPROVEMENTS.md when git is unavailable."""
+    md_content = to_improvements_md(backlog)
+    md_path = controller.base_dir / IMPROVEMENTS_FILENAME
+    md_path.write_text(md_content, encoding="utf-8")
+    logger.info("_emit_without_git: wrote %s", md_path)
+
+    for task in backlog.to_state_tasks():
+        controller.state.upsert_task(task)
+    logger.info(
+        "_emit_without_git: upserted %d task(s) into plan.json",
+        len(backlog.auto_tasks),
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _load_config(controller: "AutoController") -> configparser.ConfigParser:
+    """Load agents.ini from the controller's config_path."""
+    cfg = configparser.ConfigParser()
+    p = Path(controller.config_path)
+    if p.exists():
+        cfg.read(p)
+    return cfg

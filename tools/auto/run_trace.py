@@ -150,6 +150,45 @@ class RunTrace:
         """Convenience alias for :meth:`log_run_finished` with a stop reason."""
         self.log_run_finished(stop_reason=stop_reason)
 
+    def log_phase(self, phase: str, status: str) -> None:
+        """Record a pipeline phase transition (AUTO-G0/G1).
+
+        Parameters
+        ----------
+        phase:
+            Name of the pipeline phase, e.g. ``"plan"`` or ``"execute"``.
+        status:
+            Lifecycle status: ``"started"``, ``"skipped"``, or ``"done"``.
+        """
+        tracer.event(
+            source=_SOURCE,
+            target="auto_run",
+            kind="phase_transition",
+            params={"run_id": self.run_id, "phase": phase, "status": status},
+        )
+        self._state.log(f"[AUTO-F2] phase {phase} {status}  run_id={self.run_id}")
+
+    def log_gate1_rejected(self, title: str, reason: str) -> None:
+        """Record a Gate-1 rejection (AUTO-G1).
+
+        Parameters
+        ----------
+        title:
+            Candidate task title (may be None for malformed candidates).
+        reason:
+            Human-readable rejection reason from the filter.
+        """
+        tracer.event(
+            source=_SOURCE,
+            target="gate1_filter",
+            kind="rejected",
+            params={
+                "run_id": self.run_id,
+                "title": title or "<unknown>",
+                "reason": reason or "",
+            },
+        )
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Factory
