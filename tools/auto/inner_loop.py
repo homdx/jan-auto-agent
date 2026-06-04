@@ -146,7 +146,7 @@ class LLMGate2Validator:
         headers = {"Content-Type": "application/json",
                    "Authorization": f"Bearer {self._api_key}"}
         if self._api_format == "ollama":
-            url = f"{self._base_url}/api/chat"
+            url = _llm_stream.ollama_chat_url(self._base_url)
             payload = {"model": self._model,
                        "messages": [{"role": "system", "content": system},
                                     {"role": "user", "content": user}],

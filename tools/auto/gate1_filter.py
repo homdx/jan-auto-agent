@@ -365,7 +365,7 @@ class Gate1Filter:
         }
 
         if self._api_format == "ollama":
-            url = f"{self._base_url}/api/chat"
+            url = _llm_stream.ollama_chat_url(self._base_url)
             payload: dict[str, Any] = {
                 "model":       self._model,
                 "messages": [
