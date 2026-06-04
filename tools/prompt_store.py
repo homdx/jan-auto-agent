@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 # circular imports if agent modules ever import from prompt_store in the future.
 def _get_hardcoded(agent_name: str) -> str:
     """Return the module-level hardcoded constant for the given agent."""
-    if agent_name == "validator_agent":
+    if agent_name in ("validator_agent", "validator"):
         from tools.validator_agent import VALIDATOR_PROMPT_HARDCODED
         return VALIDATOR_PROMPT_HARDCODED
     if agent_name == "improvement_agent":
