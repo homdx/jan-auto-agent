@@ -76,10 +76,13 @@ and target_files — do NOT invent, shorten, or add prefixes):
 File contents:
 {file_contents}
 
-Identify up to 5 concrete improvement tasks for files in this cluster that \
-are relevant to the goal above.  Look in particular for: missing or weak tests, \
-missing error handling, unvalidated inputs, missing timeouts on network calls, \
-duplicated logic, and unclear naming.
+Produce up to 5 concrete tasks for files in this cluster that ACHIEVE THE GOAL \
+above.  The goal may ask you to ADD or CHANGE functionality (new command-line \
+arguments, new behavior, new output) — not only to fix bugs.  Treat behavior the \
+goal requires but the code does not yet have as the work to be done.  If the goal \
+lists explicit items (e.g. "Task 1: ...", "Task 2: ..."), produce ONE task per \
+requested item.  You may also include genuine improvements (missing tests, error \
+handling, input validation) when they serve the goal.
 
 STRICT RULES:
 1. Every task MUST cite the exact file path and a symbol name OR line range \
@@ -89,11 +92,13 @@ STRICT RULES:
    Do NOT invent new paths, add directory prefixes, or modify the paths in any way. \
    To add new tests, target an EXISTING test file from the list and add test \
    functions to it.
-3. Only report problems that are actually present in the code shown above.
+3. Ground every task in the actual code shown (cite a real file and the symbol \
+   or line range where the change belongs), but a task MAY add behavior the code \
+   does not yet have — that is expected when the goal asks for new features.
 4. Keep each task small enough to be implemented and tested independently.
-5. Returning an empty array [] is allowed ONLY if the code is genuinely clean; \
-   most real source files have at least one concrete improvement, so look \
-   carefully before returning [].
+5. Return an empty array [] ONLY if the goal is ALREADY fully implemented in the \
+   code shown.  If the goal asks for behavior the code does not yet have, that \
+   absence IS the work — do not return [].
 
 Each element of the JSON array must match this schema exactly (no extra keys):
 
@@ -117,8 +122,8 @@ REMINDER — the ONLY file paths you may put in "target_files" or \
 Any other path will be rejected:
 {file_listing}
 
-Now review the code above against the goal "{goal}" and output ONLY the JSON \
-array of up to 5 improvement tasks (no prose, no markdown fences):
+Now produce ONLY the JSON array of up to 5 concrete tasks that IMPLEMENT the \
+goal "{goal}" against the files above (no prose, no markdown fences):
 """
 
 # _MAX_FILE_CHARS and _MAX_FILES_PER_REVIEW are now read from [architect] in
