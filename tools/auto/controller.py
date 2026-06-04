@@ -276,11 +276,11 @@ class AutoController:
         # ── Task execution loop ────────────────────────────────────────────
         # Iterates pending tasks; checks both caps before each execution.
         # Real task execution (AUTO-B Architect, AUTO-C Coder) hooks in here.
-        stop_reason = self._run_task_loop()
+        stop_reason, session_tasks_done = self._run_task_loop()
 
         # ── Finalise ──────────────────────────────────────────────────────
         if stop_reason:
-            self._handle_cap(stop_reason)
+            self._handle_cap(stop_reason, session_tasks_done)
         else:
             self.state.update_progress(status="idle")
             self.state.log("run finished cleanly")
@@ -291,14 +291,15 @@ class AutoController:
     # Private helpers
     # ------------------------------------------------------------------
 
-    def _run_task_loop(self) -> Optional[str]:
+    def _run_task_loop(self) -> tuple[Optional[str], int]:
         """Iterate pending tasks, check caps, execute (stub), return stop reason.
 
         Returns
         -------
-        str or None
-            Stop reason (``"runtime_cap"`` / ``"task_cap"``) if a cap fired,
+        (stop_reason, tasks_done)
+            stop_reason is ``"runtime_cap"`` / ``"task_cap"`` if a cap fired,
             or ``None`` if all pending tasks were processed.
+            tasks_done is the count of tasks completed in *this session only*.
         """
         pending = self.state.resume_info()["pending"]
         tasks_done = 0
@@ -311,7 +312,7 @@ class AutoController:
                     "_run_task_loop: cap fired (%s) after %d task(s) — stopping",
                     reason, tasks_done,
                 )
-                return reason
+                return reason, tasks_done
 
             # ── Future: real task execution (AUTO-B/C) hooks here ──────
             # e.g. self._execute_task(task)
@@ -322,12 +323,11 @@ class AutoController:
             tasks_done += 1
             self.state.log(f"task {task['id']} completed (skeleton)")
 
-        return None  # all tasks done / no tasks
+        return None, tasks_done  # all tasks done / no tasks
 
-    def _handle_cap(self, stop_reason: str) -> None:
+    def _handle_cap(self, stop_reason: str, tasks_done: int) -> None:
         """Persist cap state, print user-facing notice, write to log."""
         elapsed = self.elapsed_seconds()
-        tasks_done = self.state.get_progress().get("done_count", 0)
 
         self.state.update_progress(status="capped", stop_reason=stop_reason)
         self.state.log(
@@ -384,8 +384,7 @@ class AutoController:
         pending = len(info["pending"])
         ts = _ts()
         print(f"[{ts}] ♻️  Resuming existing run — "
-              f"{done} done, {pending} pending, "
-              f"{len(info['done_ids'])} skipped")
+              f"{done} already done (skipping), {pending} pending")
         if info["done_ids"]:
             print(f"[{ts}]    skipping: {', '.join(sorted(info['done_ids']))}")
 

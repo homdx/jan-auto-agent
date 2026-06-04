@@ -182,12 +182,12 @@ class StateStore:
         dict with keys:
             done_ids    — set of task ids with status DONE
             in_progress — list of task dicts with status IN_PROGRESS
-            pending     — list of task dicts not yet DONE (todo + in_progress + blocked)
+            pending     — list of task dicts that are actionable (todo + in_progress)
         """
         tasks = self._plan.get("tasks", [])
         done_ids    = {t["id"] for t in tasks if t["status"] == STATUS_DONE}
         in_progress = [t for t in tasks if t["status"] == STATUS_IN_PROGRESS]
-        pending     = [t for t in tasks if t["status"] != STATUS_DONE]
+        pending     = [t for t in tasks if t["status"] not in (STATUS_DONE, STATUS_BLOCKED)]
         return {
             "done_ids":    done_ids,
             "in_progress": in_progress,
@@ -394,7 +394,7 @@ class StateStore:
         """Recalculate done/pending counts from current plan; optionally persist."""
         tasks = self._plan.get("tasks", [])
         self._progress["done_count"]    = sum(1 for t in tasks if t["status"] == STATUS_DONE)
-        self._progress["pending_count"] = sum(1 for t in tasks if t["status"] != STATUS_DONE)
+        self._progress["pending_count"] = sum(1 for t in tasks if t["status"] not in (STATUS_DONE, STATUS_BLOCKED))
         self._progress["updated_at"]    = _ts()
         if write:
             self._save_progress()

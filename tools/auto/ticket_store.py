@@ -353,6 +353,15 @@ class TicketStore:
         logger.debug("TicketStore.delete: removed %s", ticket_id)
         return True
 
+    def path(self, ticket_id: str) -> Path:
+        """Return the filesystem path for *ticket_id* (file may not yet exist).
+
+        This is the public equivalent of the private ``_path`` helper and
+        provides a stable API contract for callers that need the ticket path
+        (e.g. exhaustion_handler) without coupling to internal naming.
+        """
+        return self._path(ticket_id)
+
     # ── Private ──────────────────────────────────────────────────────────────
 
     def _path(self, ticket_id: str) -> Path:

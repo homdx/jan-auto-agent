@@ -251,7 +251,7 @@ class ExhaustionHandler:
             logger.debug("_open_ticket: %s already exists — skipping create", ticket_id)
         else:
             ts.create(ticket)
-        return ts._path(ticket_id)
+        return ts.path(ticket_id)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

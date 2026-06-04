@@ -492,12 +492,12 @@ class TestResumeInfo:
         assert "T1" not in pending_ids
         assert "T2" in pending_ids
 
-    def test_blocked_tasks_appear_in_pending(self, tmp_agent):
+    def test_blocked_tasks_do_not_appear_in_pending(self, tmp_agent):
         store, _ = tmp_agent
         store.upsert_task(make_task(id="T1", title="t", instruction="i"))
         store.set_task_status("T1", STATUS_BLOCKED)
         info = store.resume_info()
-        assert any(t["id"] == "T1" for t in info["pending"])
+        assert not any(t["id"] == "T1" for t in info["pending"])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
