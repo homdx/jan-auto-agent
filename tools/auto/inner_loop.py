@@ -44,7 +44,8 @@ from pathlib import Path
 from typing import Optional, Protocol, Tuple
 
 from tools.agent_trace import tracer
-from tools.llm_stream import request_completion, strip_think
+import tools.llm_stream as _llm_stream
+from tools.llm_stream import strip_think
 
 logger = logging.getLogger(__name__)
 
@@ -153,7 +154,7 @@ class LLMGate2Validator:
                      params={"task": task.get("id")}, content=user,
                      model=self._model, temperature=0.1)
         try:
-            raw = request_completion(
+            raw = _llm_stream.request_completion(
                 url=url, headers=headers, payload=payload, timeout=self._timeout,
                 stream=True, api_format=self._api_format, ssl_context=self._ssl_context,
             )

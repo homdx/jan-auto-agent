@@ -66,7 +66,8 @@ from pathlib import Path
 from typing import Any, Optional
 
 from tools.agent_trace import tracer
-from tools.llm_stream import request_completion, strip_think
+import tools.llm_stream as _llm_stream
+from tools.llm_stream import strip_think
 
 logger = logging.getLogger(__name__)
 
@@ -274,7 +275,7 @@ class Coder:
         )
 
         try:
-            raw_text = request_completion(
+            raw_text = _llm_stream.request_completion(
                 url=url,
                 headers=headers,
                 payload=payload,

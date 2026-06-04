@@ -271,7 +271,7 @@ class TestResponseParsing:
         base_dir.mkdir(parents=True, exist_ok=True)
         coder = _make_coder()
         task = _task()
-        with patch("tools.auto.coder.request_completion", return_value=llm_text):
+        with patch("tools.llm_stream.request_completion", return_value=llm_text):
             return coder.generate(task, base_dir)
 
     def test_valid_single_file(self, tmp_path: Path) -> None:
@@ -287,7 +287,7 @@ class TestResponseParsing:
         base_dir.mkdir(parents=True, exist_ok=True)
         coder = _make_coder()
         task = _task(target_files=["tools/a.py", "tools/b.py"])
-        with patch("tools.auto.coder.request_completion", return_value=response):
+        with patch("tools.llm_stream.request_completion", return_value=response):
             r = coder.generate(task, base_dir)
         assert r.succeeded
         assert "tools/a.py" in r.files_written
@@ -343,7 +343,7 @@ class TestOutputCleanliness:
         base_dir.mkdir(parents=True, exist_ok=True)
         coder = _make_coder()
         task = _task()
-        with patch("tools.auto.coder.request_completion", return_value=llm_text):
+        with patch("tools.llm_stream.request_completion", return_value=llm_text):
             coder.generate(task, base_dir)
         return (base_dir / "tools" / "module.py").read_text()
 
@@ -389,7 +389,7 @@ class TestFileWriting:
         coder = _make_coder()
         task = _task(target_files=["module.py"])
         response = json.dumps({"files": [{"path": "module.py", "content": "pass\n"}]})
-        with patch("tools.auto.coder.request_completion", return_value=response):
+        with patch("tools.llm_stream.request_completion", return_value=response):
             r = coder.generate(task, base_dir)
         assert r.succeeded
         assert (base_dir / "module.py").read_text() == "pass\n"
@@ -401,7 +401,7 @@ class TestFileWriting:
         coder = _make_coder()
         task = _task(target_files=["module.py"])
         response = json.dumps({"files": [{"path": "module.py", "content": "revised\n"}]})
-        with patch("tools.auto.coder.request_completion", return_value=response):
+        with patch("tools.llm_stream.request_completion", return_value=response):
             coder.generate(task, base_dir)
         backup = base_dir / "module.py.coder.bak"
         assert backup.exists()
@@ -413,7 +413,7 @@ class TestFileWriting:
         coder = _make_coder()
         task = _task(target_files=["new_file.py"])
         response = json.dumps({"files": [{"path": "new_file.py", "content": "# new\n"}]})
-        with patch("tools.auto.coder.request_completion", return_value=response):
+        with patch("tools.llm_stream.request_completion", return_value=response):
             coder.generate(task, base_dir)
         assert not (base_dir / "new_file.py.coder.bak").exists()
         assert (base_dir / "new_file.py").read_text() == "# new\n"
@@ -424,7 +424,7 @@ class TestFileWriting:
         coder = _make_coder()
         task = _task(target_files=["tools/sub/module.py"])
         response = json.dumps({"files": [{"path": "tools/sub/module.py", "content": "x=1\n"}]})
-        with patch("tools.auto.coder.request_completion", return_value=response):
+        with patch("tools.llm_stream.request_completion", return_value=response):
             r = coder.generate(task, base_dir)
         assert (base_dir / "tools" / "sub" / "module.py").exists()
 
@@ -450,7 +450,7 @@ class TestFileWriting:
             return original_write_text(self, content, **kwargs)
 
         with (
-            patch("tools.auto.coder.request_completion", return_value=response),
+            patch("tools.llm_stream.request_completion", return_value=response),
             patch.object(Path, "write_text", patched_write_text),
         ):
             r = coder.generate(task, base_dir)
@@ -471,7 +471,7 @@ class TestFileWriting:
             captured_prompts.append(payload["messages"][1]["content"])
             return json.dumps({"files": [{"path": "brand_new.py", "content": "pass\n"}]})
 
-        with patch("tools.auto.coder.request_completion", side_effect=fake_completion):
+        with patch("tools.llm_stream.request_completion", side_effect=fake_completion):
             coder.generate(task, base_dir)
 
         assert "[new file" in captured_prompts[0]
@@ -503,7 +503,7 @@ class TestGroundedPrompt:
             return _valid_llm_response()
 
         coder = _make_coder()
-        with patch("tools.auto.coder.request_completion", side_effect=fake_completion):
+        with patch("tools.llm_stream.request_completion", side_effect=fake_completion):
             coder.generate(task, base_dir, prior_feedback=prior_feedback)
 
         return captured[0] if captured else ""
@@ -600,7 +600,7 @@ class TestLLMFailure:
         coder = _make_coder()
         task = _task()
         with patch(
-            "tools.auto.coder.request_completion",
+            "tools.llm_stream.request_completion",
             side_effect=RuntimeError("connection refused"),
         ):
             r = coder.generate(task, base_dir)
@@ -613,7 +613,7 @@ class TestLLMFailure:
         base_dir.mkdir()
         coder = _make_coder()
         with patch(
-            "tools.auto.coder.request_completion",
+            "tools.llm_stream.request_completion",
             side_effect=RuntimeError("HTTP 500"),
         ):
             r = coder.generate(_task(), base_dir)
@@ -690,7 +690,7 @@ class TestIntegration:
         response = json.dumps(
             {"files": [{"path": "tools/module.py", "content": "def parse(x): return x\n"}]}
         )
-        with patch("tools.auto.coder.request_completion", return_value=response):
+        with patch("tools.llm_stream.request_completion", return_value=response):
             r = coder.generate(task, base_dir)
 
         assert r.succeeded
@@ -707,7 +707,7 @@ class TestIntegration:
             + json.dumps({"files": [{"path": "fix.py", "content": new_content}]})
         )
         task = _task(target_files=["fix.py"])
-        with patch("tools.auto.coder.request_completion", return_value=think_wrapped):
+        with patch("tools.llm_stream.request_completion", return_value=think_wrapped):
             r = _make_coder().generate(task, base_dir)
 
         assert r.succeeded
@@ -726,7 +726,7 @@ class TestIntegration:
             prompts_captured.append(payload["messages"][1]["content"])
             return _valid_llm_response()
 
-        with patch("tools.auto.coder.request_completion", side_effect=capture):
+        with patch("tools.llm_stream.request_completion", side_effect=capture):
             _make_coder().generate(task, base_dir, prior_feedback=[feedback_round1])
 
         assert feedback_round1 in prompts_captured[0]
@@ -742,7 +742,7 @@ class TestIntegration:
             payloads.append(payload)
             return _valid_llm_response()
 
-        with patch("tools.auto.coder.request_completion", side_effect=capture):
+        with patch("tools.llm_stream.request_completion", side_effect=capture):
             _make_coder().generate(_task(), base_dir)
 
         assert payloads[0]["messages"][0]["role"] == "system"

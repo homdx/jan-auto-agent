@@ -173,8 +173,8 @@ class TestPriorFeedback:
 class TestFailClosedValidator:
     def test_llm_validator_fail_closed_on_network_error(self, monkeypatch):
         # request_completion raising → approve() must return (False, …), never True
-        import tools.auto.inner_loop as il
-        monkeypatch.setattr(il, "request_completion",
+        import tools.llm_stream as _ls
+        monkeypatch.setattr(_ls, "request_completion",
                             lambda **kw: (_ for _ in ()).throw(RuntimeError("conn refused")))
         v = LLMGate2Validator(base_url="http://x/v1", model="m")
         approved, fb = v.approve(TASK, FakeExecResult(), FakeCoderResult())
@@ -182,16 +182,16 @@ class TestFailClosedValidator:
         assert "validator unavailable" in fb
 
     def test_llm_validator_fail_closed_on_bad_json(self, monkeypatch):
-        import tools.auto.inner_loop as il
-        monkeypatch.setattr(il, "request_completion", lambda **kw: "not json")
+        import tools.llm_stream as _ls
+        monkeypatch.setattr(_ls, "request_completion", lambda **kw: "not json")
         v = LLMGate2Validator(base_url="http://x/v1", model="m")
         approved, _ = v.approve(TASK, FakeExecResult(), FakeCoderResult())
         assert approved is False
 
     def test_llm_validator_strips_think_and_fence(self, monkeypatch):
-        import tools.auto.inner_loop as il
+        import tools.llm_stream as _ls
         monkeypatch.setattr(
-            il, "request_completion",
+            _ls, "request_completion",
             lambda **kw: '<think>ok</think>\n```json\n{"approved": true, "feedback": ""}\n```')
         v = LLMGate2Validator(base_url="http://x/v1", model="m")
         approved, _ = v.approve(TASK, FakeExecResult(), FakeCoderResult())

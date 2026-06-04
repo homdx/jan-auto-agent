@@ -190,7 +190,7 @@ class TestBogusCandidateDropped:
         c = _make_candidate(symbol="parse_config")
 
         with patch(
-            "tools.auto.gate1_filter.request_completion",
+            "tools.llm_stream.request_completion",
             return_value=_rejected_response("The TODO comment is just a note, no bug present"),
         ):
             accepted, rejected = filt.filter([c], repo)
@@ -209,7 +209,7 @@ class TestBogusCandidateDropped:
         c = _make_candidate(symbol="parse_config")
 
         with patch(
-            "tools.auto.gate1_filter.request_completion",
+            "tools.llm_stream.request_completion",
             return_value=_confirmed_response("parse_config lacks input validation"),
         ):
             accepted, rejected = filt.filter([c], repo)
@@ -245,7 +245,7 @@ class TestDuplicateMerging:
         c2 = _make_candidate(title="Add input validation", symbol="parse_config")
 
         with patch(
-            "tools.auto.gate1_filter.request_completion",
+            "tools.llm_stream.request_completion",
             return_value=_confirmed_response(),
         ):
             accepted, rejected = filt.filter([c1, c2], repo)
@@ -261,7 +261,7 @@ class TestDuplicateMerging:
         c2 = _make_candidate(title="Task Beta", symbol="parse_config")
 
         with patch(
-            "tools.auto.gate1_filter.request_completion",
+            "tools.llm_stream.request_completion",
             return_value=_confirmed_response(),
         ):
             accepted, rejected = filt.filter([c1, c2], repo)
@@ -276,7 +276,7 @@ class TestDuplicateMerging:
         c2 = _make_candidate(title="Same title", symbol="another_func")
 
         with patch(
-            "tools.auto.gate1_filter.request_completion",
+            "tools.llm_stream.request_completion",
             return_value=_confirmed_response(),
         ):
             accepted, rejected = filt.filter([c1, c2], repo)
@@ -291,7 +291,7 @@ class TestDuplicateMerging:
         c2 = _make_candidate(title="add input validation", symbol="parse_config")
 
         with patch(
-            "tools.auto.gate1_filter.request_completion",
+            "tools.llm_stream.request_completion",
             return_value=_confirmed_response(),
         ):
             accepted, rejected = filt.filter([c1, c2], repo)
@@ -351,7 +351,7 @@ class TestExistenceChecks:
         """Existence failure short-circuits; Stage B LLM is never called."""
         c = _make_candidate(file="tools/missing.py", symbol="func")
 
-        with patch("tools.auto.gate1_filter.request_completion") as mock_llm:
+        with patch("tools.llm_stream.request_completion") as mock_llm:
             filt.filter([c], repo)
 
         mock_llm.assert_not_called()
@@ -367,7 +367,7 @@ class TestPresenceChecks:
     ) -> None:
         c = _make_candidate(symbol="parse_config")
         with patch(
-            "tools.auto.gate1_filter.request_completion",
+            "tools.llm_stream.request_completion",
             return_value=_confirmed_response("validation gap confirmed"),
         ):
             accepted, rejected = filt.filter([c], repo)
@@ -380,7 +380,7 @@ class TestPresenceChecks:
     ) -> None:
         c = _make_candidate(symbol="parse_config")
         with patch(
-            "tools.auto.gate1_filter.request_completion",
+            "tools.llm_stream.request_completion",
             return_value=_rejected_response("already handles dict check"),
         ):
             accepted, rejected = filt.filter([c], repo)
@@ -393,7 +393,7 @@ class TestPresenceChecks:
     ) -> None:
         c = _make_candidate(symbol="parse_config")
         with patch(
-            "tools.auto.gate1_filter.request_completion",
+            "tools.llm_stream.request_completion",
             return_value="not json at all",
         ):
             accepted, rejected = filt.filter([c], repo)
@@ -406,7 +406,7 @@ class TestPresenceChecks:
     ) -> None:
         c = _make_candidate(symbol="parse_config")
         with patch(
-            "tools.auto.gate1_filter.request_completion",
+            "tools.llm_stream.request_completion",
             return_value=json.dumps({"verdict": "maybe", "reason": "not sure"}),
         ):
             accepted, rejected = filt.filter([c], repo)
@@ -419,7 +419,7 @@ class TestPresenceChecks:
     ) -> None:
         c = _make_candidate(symbol="parse_config")
         with patch(
-            "tools.auto.gate1_filter.request_completion",
+            "tools.llm_stream.request_completion",
             side_effect=ConnectionError("refused"),
         ):
             accepted, rejected = filt.filter([c], repo)
@@ -436,7 +436,7 @@ class TestPresenceChecks:
         wrapped = f"<think>Internal reasoning…</think>\n{inner}"
 
         with patch(
-            "tools.auto.gate1_filter.request_completion",
+            "tools.llm_stream.request_completion",
             return_value=wrapped,
         ):
             accepted, rejected = filt.filter([c], repo)
@@ -451,7 +451,7 @@ class TestPresenceChecks:
         fenced = f"```json\n{inner}\n```"
 
         with patch(
-            "tools.auto.gate1_filter.request_completion",
+            "tools.llm_stream.request_completion",
             return_value=fenced,
         ):
             accepted, rejected = filt.filter([c], repo)
@@ -464,7 +464,7 @@ class TestPresenceChecks:
         """skip_llm=True: Stage B is skipped; all existence-passing candidates accepted."""
         c = _make_candidate(symbol="parse_config")
 
-        with patch("tools.auto.gate1_filter.request_completion") as mock_llm:
+        with patch("tools.llm_stream.request_completion") as mock_llm:
             accepted, rejected = skip_llm_filt.filter([c], repo)
 
         mock_llm.assert_not_called()
@@ -488,7 +488,7 @@ class TestIntegration:
         ])
 
         with patch(
-            "tools.auto.gate1_filter.request_completion",
+            "tools.llm_stream.request_completion",
             side_effect=list(llm_responses),
         ):
             accepted, rejected = filt.filter([good, no_file, bad_llm], repo)
@@ -505,7 +505,7 @@ class TestIntegration:
         c2 = _make_candidate(title="Task Two", symbol="another_func")
 
         with patch(
-            "tools.auto.gate1_filter.request_completion",
+            "tools.llm_stream.request_completion",
             return_value=_confirmed_response(),
         ):
             accepted, rejected = filt.filter([c1, c2], repo)
@@ -530,7 +530,7 @@ class TestFilterCandidatesFactory:
         c = _make_candidate(symbol="parse_config")
 
         with patch(
-            "tools.auto.gate1_filter.request_completion",
+            "tools.llm_stream.request_completion",
             return_value=_confirmed_response(),
         ):
             accepted, rejected = filter_candidates([c], repo, minimal_config)
@@ -543,7 +543,7 @@ class TestFilterCandidatesFactory:
         minimal_config.set("gate1", "skip_llm", "true")
         c = _make_candidate(symbol="parse_config")
 
-        with patch("tools.auto.gate1_filter.request_completion") as mock_llm:
+        with patch("tools.llm_stream.request_completion") as mock_llm:
             accepted, rejected = filter_candidates([c], repo, minimal_config)
 
         mock_llm.assert_not_called()

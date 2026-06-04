@@ -124,7 +124,7 @@ class TestWellFormedResponse:
         cluster, base_dir = single_file_cluster
         payload = _make_llm_response([_grounded_item()])
 
-        with patch("tools.auto.architect.request_completion", return_value=payload):
+        with patch("tools.llm_stream.request_completion", return_value=payload):
             results = reviewer.review_clusters([cluster], base_dir, goal="improve code")
 
         assert len(results) == 1
@@ -141,7 +141,7 @@ class TestWellFormedResponse:
         cluster, base_dir = single_file_cluster
         payload = _make_llm_response([_grounded_item()])
 
-        with patch("tools.auto.architect.request_completion", return_value=payload):
+        with patch("tools.llm_stream.request_completion", return_value=payload):
             results = reviewer.review_clusters([cluster], base_dir)
 
         loc = results[0].cited_location
@@ -164,7 +164,7 @@ class TestWellFormedResponse:
         ]
         payload = _make_llm_response(items)
 
-        with patch("tools.auto.architect.request_completion", return_value=payload):
+        with patch("tools.llm_stream.request_completion", return_value=payload):
             results = reviewer.review_clusters([cluster], base_dir)
 
         assert len(results) == 2
@@ -184,7 +184,7 @@ class TestGroundingRejection:
         del bad["cited_location"]
         payload = _make_llm_response([bad])
 
-        with patch("tools.auto.architect.request_completion", return_value=payload):
+        with patch("tools.llm_stream.request_completion", return_value=payload):
             results = reviewer.review_clusters([single_file_cluster[0]], single_file_cluster[1])
 
         assert results == []
@@ -198,7 +198,7 @@ class TestGroundingRejection:
         })
         payload = _make_llm_response([bad])
 
-        with patch("tools.auto.architect.request_completion", return_value=payload):
+        with patch("tools.llm_stream.request_completion", return_value=payload):
             results = reviewer.review_clusters([single_file_cluster[0]], single_file_cluster[1])
 
         assert results == []
@@ -215,7 +215,7 @@ class TestGroundingRejection:
         })
         payload = _make_llm_response([bad])
 
-        with patch("tools.auto.architect.request_completion", return_value=payload):
+        with patch("tools.llm_stream.request_completion", return_value=payload):
             results = reviewer.review_clusters([single_file_cluster[0]], single_file_cluster[1])
 
         assert results == []
@@ -233,7 +233,7 @@ class TestGroundingRejection:
         ]
         payload = _make_llm_response(items)
 
-        with patch("tools.auto.architect.request_completion", return_value=payload):
+        with patch("tools.llm_stream.request_completion", return_value=payload):
             results = reviewer.review_clusters([single_file_cluster[0]], single_file_cluster[1])
 
         assert len(results) == 1
@@ -252,7 +252,7 @@ class TestStripThink:
         inner = _make_llm_response([_grounded_item()])
         wrapped = f"<think>Let me reason about this cluster…</think>\n{inner}"
 
-        with patch("tools.auto.architect.request_completion", return_value=wrapped):
+        with patch("tools.llm_stream.request_completion", return_value=wrapped):
             results = reviewer.review_clusters([single_file_cluster[0]], single_file_cluster[1])
 
         assert len(results) == 1
@@ -263,7 +263,7 @@ class TestStripThink:
         inner = _make_llm_response([_grounded_item(title="After think")])
         wrapped = "<think>\nLine 1\nLine 2\n</think>" + inner
 
-        with patch("tools.auto.architect.request_completion", return_value=wrapped):
+        with patch("tools.llm_stream.request_completion", return_value=wrapped):
             results = reviewer.review_clusters([single_file_cluster[0]], single_file_cluster[1])
 
         assert results[0].title == "After think"
@@ -277,7 +277,7 @@ class TestFailClosed:
     def test_invalid_json_returns_empty(
         self, reviewer: ClusterReviewer, single_file_cluster
     ) -> None:
-        with patch("tools.auto.architect.request_completion", return_value="not json at all"):
+        with patch("tools.llm_stream.request_completion", return_value="not json at all"):
             results = reviewer.review_clusters([single_file_cluster[0]], single_file_cluster[1])
 
         assert results == []
@@ -285,7 +285,7 @@ class TestFailClosed:
     def test_json_object_not_array_returns_empty(
         self, reviewer: ClusterReviewer, single_file_cluster
     ) -> None:
-        with patch("tools.auto.architect.request_completion", return_value='{"oops": true}'):
+        with patch("tools.llm_stream.request_completion", return_value='{"oops": true}'):
             results = reviewer.review_clusters([single_file_cluster[0]], single_file_cluster[1])
 
         assert results == []
@@ -294,7 +294,7 @@ class TestFailClosed:
         self, reviewer: ClusterReviewer, single_file_cluster
     ) -> None:
         with patch(
-            "tools.auto.architect.request_completion",
+            "tools.llm_stream.request_completion",
             side_effect=ConnectionError("refused"),
         ):
             results = reviewer.review_clusters([single_file_cluster[0]], single_file_cluster[1])
@@ -309,7 +309,7 @@ class TestFailClosed:
         del bad["instruction"]
         payload = _make_llm_response([bad])
 
-        with patch("tools.auto.architect.request_completion", return_value=payload):
+        with patch("tools.llm_stream.request_completion", return_value=payload):
             results = reviewer.review_clusters([single_file_cluster[0]], single_file_cluster[1])
 
         assert results == []
@@ -326,7 +326,7 @@ class TestMarkdownFenceStripping:
         inner = _make_llm_response([_grounded_item()])
         fenced = f"```json\n{inner}\n```"
 
-        with patch("tools.auto.architect.request_completion", return_value=fenced):
+        with patch("tools.llm_stream.request_completion", return_value=fenced):
             results = reviewer.review_clusters([single_file_cluster[0]], single_file_cluster[1])
 
         assert len(results) == 1
@@ -337,7 +337,7 @@ class TestMarkdownFenceStripping:
         inner = _make_llm_response([_grounded_item(title="Fenced")])
         fenced = f"```\n{inner}\n```"
 
-        with patch("tools.auto.architect.request_completion", return_value=fenced):
+        with patch("tools.llm_stream.request_completion", return_value=fenced):
             results = reviewer.review_clusters([single_file_cluster[0]], single_file_cluster[1])
 
         assert results[0].title == "Fenced"
@@ -354,7 +354,7 @@ class TestEmptyClusterSkipped:
         empty_cluster = RepoCluster(name="support", patterns=["*"], files=[])
 
         with patch(
-            "tools.auto.architect.request_completion"
+            "tools.llm_stream.request_completion"
         ) as mock_llm:
             results = reviewer.review_clusters([empty_cluster], tmp_path)
 
@@ -369,7 +369,7 @@ class TestEmptyClusterSkipped:
         payload = _make_llm_response([_grounded_item()])
 
         with patch(
-            "tools.auto.architect.request_completion", return_value=payload
+            "tools.llm_stream.request_completion", return_value=payload
         ) as mock_llm:
             results = reviewer.review_clusters([empty, cluster], base_dir)
 
