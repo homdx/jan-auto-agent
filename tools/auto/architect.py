@@ -69,32 +69,42 @@ Goal: {goal}
 
 You are reviewing the "{cluster}" cluster of the repository.
 
-Files in this cluster:
+Files in this cluster (EXACT paths you MUST use verbatim in cited_location.file \
+and target_files — do NOT invent, shorten, or add prefixes):
 {file_listing}
 
 File contents:
 {file_contents}
 
 Identify up to 5 concrete improvement tasks for files in this cluster that \
-are relevant to the goal above.
+are relevant to the goal above.  Look in particular for: missing or weak tests, \
+missing error handling, unvalidated inputs, missing timeouts on network calls, \
+duplicated logic, and unclear naming.
 
 STRICT RULES:
 1. Every task MUST cite the exact file path and a symbol name OR line range \
    where the issue lives.  Tasks without a cited_location are invalid.
-2. Only report problems that are actually present in the code shown above.
-3. Keep each task small enough to be implemented and tested independently.
+2. The "file" field in cited_location and every entry in target_files MUST \
+   be copied EXACTLY from the list below — character for character. \
+   Do NOT invent new paths, add directory prefixes, or modify the paths in any way. \
+   To add new tests, target an EXISTING test file from the list and add test \
+   functions to it.
+3. Only report problems that are actually present in the code shown above.
+4. Keep each task small enough to be implemented and tested independently.
+5. Returning an empty array [] is allowed ONLY if the code is genuinely clean; \
+   most real source files have at least one concrete improvement, so look \
+   carefully before returning [].
 
-Return ONLY a JSON array.  Each element must match this schema exactly \
-(no extra keys):
+Each element of the JSON array must match this schema exactly (no extra keys):
 
 [
   {{
     "title": "<short imperative phrase>",
     "instruction": "<detailed instruction for the coder agent>",
-    "target_files": ["<relative/path.py>"],
+    "target_files": ["<exact path from the list below>"],
     "acceptance_check": "<shell command that exits 0 when the task is done>",
     "cited_location": {{
-      "file": "<relative/path.py>",
+      "file": "<exact path from the list below>",
       "symbol": "<function or class name, or null>",
       "line_start": <integer or null>,
       "line_end":   <integer or null>
@@ -102,12 +112,24 @@ Return ONLY a JSON array.  Each element must match this schema exactly \
   }}
 ]
 
-If you find no valid improvements for this cluster, return an empty array: []
+REMINDER — the ONLY file paths you may put in "target_files" or \
+"cited_location.file" are these, copied character-for-character. \
+Any other path will be rejected:
+{file_listing}
+
+Now review the code above against the goal "{goal}" and output ONLY the JSON \
+array of up to 5 improvement tasks (no prose, no markdown fences):
 """
 
 # Maximum characters of a single file's content to include in the prompt.
-# Avoids blowing up the context window on large files.
-_MAX_FILE_CHARS = 6000
+# Batching keeps the file COUNT per call small, so we can afford fuller content
+# per file — too-aggressive truncation hides the code and the model returns [].
+_MAX_FILE_CHARS = 4000
+
+# Maximum files reviewed in a single LLM call.  Larger clusters are split into
+# batches so each prompt stays small enough for the model to follow the
+# verbatim-path instruction while still seeing enough code to find issues.
+_MAX_FILES_PER_REVIEW = 6
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -253,10 +275,30 @@ class ClusterReviewer:
                 _fire_callback(on_cluster_done)
                 continue
 
-            print(f"\n🔍 Architect reviewing cluster: [{cluster.name}] ({len(cluster.files)} files)")
-            candidates = self._review_one_cluster(cluster, base_dir, goal)
-            print(f"   → {len(candidates)} grounded candidate(s)")
-            all_candidates.extend(candidates)
+            # Split large clusters into batches so each LLM prompt stays within
+            # a local model's context window (overflow => hallucinated paths).
+            files = cluster.files
+            batches = [
+                files[i:i + _MAX_FILES_PER_REVIEW]
+                for i in range(0, len(files), _MAX_FILES_PER_REVIEW)
+            ]
+            extra = f", {len(batches)} batches" if len(batches) > 1 else ""
+            print(f"\n🔍 Architect reviewing cluster: [{cluster.name}] "
+                  f"({len(files)} files{extra})")
+
+            cluster_candidates: list[CandidateTask] = []
+            for bi, batch_files in enumerate(batches, 1):
+                sub = cluster if len(batches) == 1 else RepoCluster(
+                    name=f"{cluster.name} (batch {bi}/{len(batches)})",
+                    patterns=cluster.patterns,
+                    files=batch_files,
+                )
+                cluster_candidates.extend(
+                    self._review_one_cluster(sub, base_dir, goal)
+                )
+
+            print(f"   → {len(cluster_candidates)} grounded candidate(s)")
+            all_candidates.extend(cluster_candidates)
             _fire_callback(on_cluster_done)
 
         print(f"\n✅ Architect done — {len(all_candidates)} total candidate(s) across all clusters\n")

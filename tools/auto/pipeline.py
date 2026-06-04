@@ -171,7 +171,13 @@ def _run_plan_phase(controller: "AutoController", cfg: configparser.ConfigParser
 
     # ── Step 3: Gate 1 filter ─────────────────────────────────────────────────
     logger.info("plan_phase: gate1 filtering %d candidate(s)", len(candidates))
-    accepted, rejected = filter_candidates(candidates, controller.base_dir, cfg)
+    # Build cluster → file-set mapping so Gate 1 can detect hallucinated paths.
+    cluster_files: dict[str, set[str]] = {
+        c.name: set(c.files) for c in clusters
+    }
+    accepted, rejected = filter_candidates(
+        candidates, controller.base_dir, cfg, cluster_files=cluster_files,
+    )
     logger.info(
         "plan_phase: gate1 accepted=%d rejected=%d",
         len(accepted), len(rejected),

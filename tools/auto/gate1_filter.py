@@ -188,6 +188,7 @@ class Gate1Filter:
         self,
         candidates: list[CandidateTask],
         base_dir: str | Path,
+        cluster_files: "dict[str, set[str]] | None" = None,
     ) -> tuple[list[CandidateTask], list[FilterResult]]:
         """Run Gate 1 over every candidate and split into accepted / rejected.
 
@@ -198,6 +199,12 @@ class Gate1Filter:
         base_dir:
             Root directory of the repository; all cited file paths are resolved
             relative to this.
+        cluster_files:
+            Optional mapping of cluster name → set of known relative file paths
+            produced by the ingestor.  When provided, a candidate whose
+            ``cited_location.file`` is not in its cluster's file set is rejected
+            immediately with a clear "hallucinated path" message — before any
+            filesystem I/O.  Pass ``None`` to skip this check (e.g. in tests).
 
         Returns
         -------
@@ -213,7 +220,7 @@ class Gate1Filter:
         existence_passed: list[tuple[CandidateTask, str]] = []  # (task, code_block)
 
         for c in candidates:
-            ok, reason, block = self._check_existence(c, base_dir)
+            ok, reason, block = self._check_existence(c, base_dir, cluster_files)
             if ok:
                 existence_passed.append((c, block))
             else:
@@ -284,6 +291,7 @@ class Gate1Filter:
         self,
         candidate: CandidateTask,
         base_dir: Path,
+        cluster_files: "dict[str, set[str]] | None" = None,
     ) -> tuple[bool, str, str]:
         """Return (ok, reason, code_block).
 
@@ -291,6 +299,19 @@ class Gate1Filter:
         on failure).
         """
         loc = candidate.cited_location
+
+        # 0. Cluster membership check — catch hallucinated paths before filesystem I/O.
+        if cluster_files is not None:
+            known = cluster_files.get(candidate.cluster, set())
+            if known and loc.file not in known:
+                return (
+                    False,
+                    f"cited file {loc.file!r} was not in the ingested file list "
+                    f"for cluster {candidate.cluster!r} (likely a hallucinated path). "
+                    f"Known files: {sorted(known)}",
+                    "",
+                )
+
         abs_path = base_dir / loc.file
 
         # 1. File must exist.
@@ -480,6 +501,7 @@ def filter_candidates(
     candidates: list[CandidateTask],
     base_dir: str | Path,
     config: configparser.ConfigParser,
+    cluster_files: "dict[str, set[str]] | None" = None,
 ) -> tuple[list[CandidateTask], list[FilterResult]]:
     """One-call entry point for ``AutoController``.
 
@@ -494,6 +516,10 @@ def filter_candidates(
         Root of the project being reviewed.
     config:
         Parsed ``agents.ini``.
+    cluster_files:
+        Optional mapping of cluster name → set of known relative file paths.
+        Built from the ingestor clusters and passed through to Gate1Filter so
+        hallucinated paths are caught before any filesystem I/O.
 
     Returns
     -------
@@ -518,7 +544,7 @@ def filter_candidates(
         api_format=api_fmt,
         verify_ssl=verify_ssl,
     )
-    return filt.filter(candidates, base_dir)
+    return filt.filter(candidates, base_dir, cluster_files=cluster_files)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
