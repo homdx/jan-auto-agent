@@ -460,6 +460,10 @@ def _parse_args():
     parser.add_argument("--auto", metavar="GOAL", default=None,
                         help="Run in autonomous mode with the given goal, then exit. "
                              "e.g. --auto \"improve current code\"")
+    # AUTO-G10: dry-run flag — plan only (review + emit IMPROVEMENTS.md), no code, no commits
+    parser.add_argument("--dry-run", action="store_true", default=False,
+                        help="With --auto: build the plan and emit IMPROVEMENTS.md, "
+                             "but do not execute any tasks or make any commits.")
     return parser.parse_args()
 
 
@@ -474,7 +478,12 @@ def main():
             print("Error: --auto requires a non-empty goal string.", file=sys.stderr)
             sys.exit(1)
         from tools.auto.controller import run_auto
-        exit_code = run_auto(goal=goal, base_dir=base_dir, config_path=args.config)
+        exit_code = run_auto(
+            goal=goal,
+            base_dir=base_dir,
+            config_path=args.config,
+            dry_run=args.dry_run,
+        )
         sys.exit(exit_code)
 
     orchestrator = Orchestrator(config_path=args.config)

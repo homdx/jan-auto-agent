@@ -165,6 +165,7 @@ class AutoController:
         goal: str,
         base_dir: str | os.PathLike = ".",
         config_path: str = "agents.ini",
+        dry_run: bool = False,
         _time_fn: Optional[Callable[[], float]] = None,
     ) -> None:
         goal = goal.strip() if goal else ""
@@ -178,6 +179,7 @@ class AutoController:
         self.goal        = goal
         self.base_dir    = base_path
         self.config_path = config_path
+        self.dry_run     = dry_run
         self.agent_dir   = base_path / ".agent"
         # AUTO-A4: execution working dir (executor/AUTO-C1 runs code here)
         self.workspace_dir = self.agent_dir / "workspace"
@@ -624,13 +626,19 @@ def run_auto(
     goal: str,
     base_dir: str | os.PathLike = ".",
     config_path: str = "agents.ini",
+    dry_run: bool = False,
 ) -> int:
     """Create an :class:`AutoController` and run it.
 
     Returns the integer exit code (0 on success, non-zero on error).
     """
     try:
-        controller = AutoController(goal=goal, base_dir=base_dir, config_path=config_path)
+        controller = AutoController(
+            goal=goal,
+            base_dir=base_dir,
+            config_path=config_path,
+            dry_run=dry_run,
+        )
     except (ValueError, FileNotFoundError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1

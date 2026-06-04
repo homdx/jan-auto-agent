@@ -82,6 +82,16 @@ def run_pipeline(controller: "AutoController") -> tuple[Optional[str], int]:
     # ── PLAN phase ────────────────────────────────────────────────────────────
     _run_plan_phase(controller, cfg)
 
+    # ── DRY-RUN: plan only, no code execution, no commits ─────────────────────
+    # AUTO-G10: --dry-run exits here after writing IMPROVEMENTS.md + plan.json.
+    # The return value mirrors _run_task_loop so the finalise block is unchanged.
+    if getattr(controller, "dry_run", False):
+        logger.info("run_pipeline: dry-run mode — skipping execution phase")
+        controller.state.log("dry-run: plan phase complete; execution skipped")
+        if controller.run_trace:
+            controller.run_trace.log_phase("execute", "skipped (dry-run)")
+        return None, 0  # clean finish, zero tasks executed
+
     # ── Pre-seed progress counters for resume runs ────────────────────────────
     # If this is a resume (plan phase was skipped), code_done must reflect tasks
     # that were already DONE in a previous session so the banner is correct.
