@@ -144,6 +144,13 @@ class LLMGate2Validator:
             f"ACCEPTANCE OUTPUT (exit 0):\n{stdout}\n"
         )
         url = f"{self._base_url}/chat/completions"
+
+        # Match OrchestratorActions._chat_url() behaviour.
+        if self._api_format == "ollama":
+            url = f"{self._base_url}/api/chat"
+        else:
+            url = f"{self._base_url}/chat/completions"
+
         headers = {"Content-Type": "application/json",
                    "Authorization": f"Bearer {self._api_key}"}
         payload = {"model": self._model,

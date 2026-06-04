@@ -371,7 +371,29 @@ class Gate1Filter:
             "Content-Type":  "application/json",
             "Authorization": f"Bearer {self._api_key}",
         }
-        url = f"{self._base_url}/chat/completions"
+        # Add this helper inside or above the method to handle URLs dynamically
+        def _chat_url(base_url: str, api_format: str) -> str:
+            base = base_url.rstrip("/")
+            if api_format == "ollama":
+                return f"{base}/chat" if base.endswith("/api") else f"{base}/api/chat"
+            return base if base.endswith("/chat/completions") else f"{base}/chat/completions"
+
+        payload: dict[str, Any] = {
+            "model":       self._model,
+            "temperature": self._temperature,
+            "max_tokens":  self._max_tokens,
+            "messages": [
+                {"role": "system", "content": self._system},
+                {"role": "user",   "content": user_msg},
+            ],
+        }
+        headers = {
+            "Content-Type":  "application/json",
+            "Authorization": f"Bearer {self._api_key}",
+        }
+        # CHANGE THIS LINE:
+        url = _chat_url(self._base_url, self._api_format)
+
 
         tracer.event(
             source="gate1",
