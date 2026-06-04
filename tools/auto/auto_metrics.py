@@ -271,7 +271,10 @@ def _record_gate2_locked(
     prompt_version = "auto"
     if prompt_store is not None:
         try:
-            prompt_version = prompt_store.get_version_label("validator")
+            v = prompt_store.get_version_label("validator")
+            # Coerce to str so MagicMocks/non-string values don't break JSON
+            # serialisation when tests pass a mock prompt_store.
+            prompt_version = str(v) if v is not None else "auto"
         except Exception:
             pass
 

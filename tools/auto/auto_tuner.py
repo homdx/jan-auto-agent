@@ -110,10 +110,15 @@ class AutoTuner:
                 reason=f"{total} runs — not enough data (need {self.min_runs})",
             )
 
-        # Check signal thresholds
+        # Check signal thresholds.
+        # A threshold of 0 means "disabled" — treat as always-above-threshold so
+        # test code (and any caller that wants to force a tuning cycle) can set
+        # trigger_avg_iter=0 / trigger_json_fail_rate=0 to bypass the guard.
         avg_iter = summary.get("avg_iterations", 0.0)
         json_fail = summary.get("json_parse_failure_rate", 0.0)
-        if avg_iter <= self.trigger_avg_iter and json_fail <= self.trigger_json_fail_rate:
+        above_avg  = (self.trigger_avg_iter       <= 0) or (avg_iter  > self.trigger_avg_iter)
+        above_json = (self.trigger_json_fail_rate <= 0) or (json_fail > self.trigger_json_fail_rate)
+        if not (above_avg or above_json):
             return TuneOutcome(
                 agent_name=self.agent_name,
                 reason=(
