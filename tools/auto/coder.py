@@ -71,8 +71,9 @@ from tools.llm_stream import strip_think
 
 logger = logging.getLogger(__name__)
 
-# ── Maximum file content characters sent in the prompt (per file). ───────────
-_MAX_FILE_CHARS = 8_000
+# _MAX_FILE_CHARS is now read from [coder] max_file_chars in agents.ini.
+# This default is used only when the key is absent.
+_DEFAULT_MAX_FILE_CHARS = 8_000
 
 # ── Coder system prompt ───────────────────────────────────────────────────────
 _SYSTEM_PROMPT = (
@@ -211,6 +212,7 @@ class Coder:
         self._max_tokens  = int(config.get(sec, "max_tokens",   fallback="16384"))
         self._system      = config.get(sec, "system", fallback=_SYSTEM_PROMPT).strip()
         self._timeout     = float(config.get("loop", "timeout_seconds", fallback="300"))
+        self._max_file_chars = int(config.get(sec, "max_file_chars", fallback=str(_DEFAULT_MAX_FILE_CHARS)))
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -402,7 +404,8 @@ class Coder:
         """Read and annotate file contents for the prompt.
 
         Each file is prefixed with a ``### path/to/file.py`` header.  Content
-        is truncated to ``_MAX_FILE_CHARS`` with a notice.  Files that don't
+        is truncated to ``self._max_file_chars`` (configured via ``max_file_chars``
+        in the ``[coder]`` section of agents.ini) with a notice.  Files that don't
         exist yet are labelled as ``[new file — no existing content]`` so the
         model knows it must create them from scratch.
         """
@@ -416,10 +419,10 @@ class Coder:
                     content = abs_path.read_text(encoding="utf-8", errors="replace")
                 except OSError as exc:
                     content = f"[unreadable: {exc}]"
-                if len(content) > _MAX_FILE_CHARS:
+                if len(content) > self._max_file_chars:
                     content = (
-                        content[:_MAX_FILE_CHARS]
-                        + f"\n... [truncated — {len(content) - _MAX_FILE_CHARS} more chars]"
+                        content[:self._max_file_chars]
+                        + f"\n... [truncated — {len(content) - self._max_file_chars} more chars]"
                     )
             parts.append(f"### {rel}\n{content}")
         return "\n\n".join(parts) if parts else "(no target files)"

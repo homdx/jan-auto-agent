@@ -93,10 +93,11 @@ Return ONLY this JSON (no extra keys):
 {{"verdict": "confirmed" | "rejected", "reason": "<one sentence explaining your decision>"}}
 """
 
-# How many lines of context to include when only a line range is cited.
-_MAX_CONTEXT_LINES = 60
-# Maximum characters of a code block sent to the LLM.
-_MAX_BLOCK_CHARS = 4000
+# _MAX_CONTEXT_LINES and _MAX_BLOCK_CHARS are now read from [gate1] in
+# agents.ini (max_context_lines / max_block_chars).
+# These defaults apply only when the keys are absent from the config.
+_DEFAULT_MAX_CONTEXT_LINES = 60
+_DEFAULT_MAX_BLOCK_CHARS   = 4000
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -176,11 +177,13 @@ class Gate1Filter:
             self._ssl_context = ctx
 
         sec = "gate1"
-        self._temperature = float(config.get(sec, "temperature", fallback="0.0"))
-        self._max_tokens  = int(config.get(sec, "max_tokens",   fallback="256"))
-        self._system      = config.get(sec, "system", fallback=_SYSTEM_PROMPT).strip()
-        self._skip_llm    = config.getboolean(sec, "skip_llm", fallback=False)
-        self._timeout     = float(config.get("loop", "timeout_seconds", fallback="300"))
+        self._temperature    = float(config.get(sec, "temperature", fallback="0.0"))
+        self._max_tokens     = int(config.get(sec, "max_tokens",   fallback="256"))
+        self._system         = config.get(sec, "system", fallback=_SYSTEM_PROMPT).strip()
+        self._skip_llm       = config.getboolean(sec, "skip_llm", fallback=False)
+        self._timeout        = float(config.get("loop", "timeout_seconds", fallback="300"))
+        self._max_context_lines = int(config.get(sec, "max_context_lines", fallback=str(_DEFAULT_MAX_CONTEXT_LINES)))
+        self._max_block_chars   = int(config.get(sec, "max_block_chars",   fallback=str(_DEFAULT_MAX_BLOCK_CHARS)))
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -334,7 +337,7 @@ class Gate1Filter:
                     f"symbol {loc.symbol!r} not found in {loc.file!r}",
                     "",
                 )
-            return True, "symbol found", _truncate(block)
+            return True, "symbol found", _truncate(block, self._max_block_chars)
 
         # 3. Line range anchor: lines must exist in the file.
         lines = source.splitlines()
@@ -352,11 +355,11 @@ class Gate1Filter:
             # Clamp end rather than reject — a slightly-off end line is still useful.
             end = min(end, total)
 
-        # Include some context around the cited range.
+        # Include some context around the cited range, capped to max_context_lines.
         ctx_start = max(0, start - 1)
-        ctx_end   = min(total, end + 5)
+        ctx_end   = min(total, ctx_start + self._max_context_lines)
         block = "\n".join(lines[ctx_start:ctx_end])
-        return True, "line range found", _truncate(block)
+        return True, "line range found", _truncate(block, self._max_block_chars)
 
     # ── Stage B helpers ───────────────────────────────────────────────────────
 
@@ -572,7 +575,7 @@ def _location_str(loc: Any) -> str:
     return ", ".join(parts)
 
 
-def _truncate(text: str, max_chars: int = _MAX_BLOCK_CHARS) -> str:
+def _truncate(text: str, max_chars: int = _DEFAULT_MAX_BLOCK_CHARS) -> str:
     """Truncate *text* to *max_chars*, appending a notice when clipped."""
     if len(text) <= max_chars:
         return text

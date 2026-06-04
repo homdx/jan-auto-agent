@@ -121,15 +121,11 @@ Now review the code above against the goal "{goal}" and output ONLY the JSON \
 array of up to 5 improvement tasks (no prose, no markdown fences):
 """
 
-# Maximum characters of a single file's content to include in the prompt.
-# Batching keeps the file COUNT per call small, so we can afford fuller content
-# per file — too-aggressive truncation hides the code and the model returns [].
-_MAX_FILE_CHARS = 4000
-
-# Maximum files reviewed in a single LLM call.  Larger clusters are split into
-# batches so each prompt stays small enough for the model to follow the
-# verbatim-path instruction while still seeing enough code to find issues.
-_MAX_FILES_PER_REVIEW = 6
+# _MAX_FILE_CHARS and _MAX_FILES_PER_REVIEW are now read from [architect] in
+# agents.ini (max_file_chars / max_files_per_review).
+# The fallback values below apply only when the keys are absent from the config.
+_DEFAULT_MAX_FILE_CHARS    = 4000
+_DEFAULT_MAX_FILES_PER_REVIEW = 6
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -231,9 +227,11 @@ class ClusterReviewer:
 
         arch = "architect"
         self._temperature = float(config.get(arch, "temperature", fallback="0.2"))
-        self._max_tokens  = int(config.get(arch, "max_tokens",  fallback="2048"))
-        self._system      = config.get(arch, "system", fallback=_SYSTEM_PROMPT).strip()
-        self._timeout     = float(config.get("loop", "timeout_seconds", fallback="300"))
+        self._max_tokens         = int(config.get(arch, "max_tokens",        fallback="2048"))
+        self._system             = config.get(arch, "system", fallback=_SYSTEM_PROMPT).strip()
+        self._timeout            = float(config.get("loop", "timeout_seconds", fallback="300"))
+        self._max_file_chars     = int(config.get(arch, "max_file_chars",     fallback=str(_DEFAULT_MAX_FILE_CHARS)))
+        self._max_files_per_review = int(config.get(arch, "max_files_per_review", fallback=str(_DEFAULT_MAX_FILES_PER_REVIEW)))
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -279,8 +277,8 @@ class ClusterReviewer:
             # a local model's context window (overflow => hallucinated paths).
             files = cluster.files
             batches = [
-                files[i:i + _MAX_FILES_PER_REVIEW]
-                for i in range(0, len(files), _MAX_FILES_PER_REVIEW)
+                files[i:i + self._max_files_per_review]
+                for i in range(0, len(files), self._max_files_per_review)
             ]
             extra = f", {len(batches)} batches" if len(batches) > 1 else ""
             print(f"\n🔍 Architect reviewing cluster: [{cluster.name}] "
@@ -523,13 +521,13 @@ class ClusterReviewer:
 
         return candidates
 
-    @staticmethod
-    def _build_file_contents(files: list[str], base_dir: Path) -> str:
+    def _build_file_contents(self, files: list[str], base_dir: Path) -> str:
         """Read and annotate file contents for the prompt.
 
         Each file is prefixed with a ``### path/to/file.py`` header.
-        Content is truncated to ``_MAX_FILE_CHARS`` with a notice so the model
-        knows the file continues beyond the excerpt.
+        Content is truncated to ``self._max_file_chars`` (configured via
+        ``max_file_chars`` in the ``[architect]`` section of agents.ini) with a
+        notice so the model knows the file continues beyond the excerpt.
         """
         parts: list[str] = []
         for rel_path in files:
@@ -540,8 +538,8 @@ class ClusterReviewer:
                 logger.debug("_build_file_contents: cannot read %s: %s", rel_path, exc)
                 content = f"[unreadable: {exc}]"
 
-            if len(content) > _MAX_FILE_CHARS:
-                content = content[:_MAX_FILE_CHARS] + f"\n... [truncated — {len(content) - _MAX_FILE_CHARS} more chars]"
+            if len(content) > self._max_file_chars:
+                content = content[:self._max_file_chars] + f"\n... [truncated — {len(content) - self._max_file_chars} more chars]"
 
             parts.append(f"### {rel_path}\n{content}")
 
