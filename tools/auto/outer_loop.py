@@ -99,10 +99,14 @@ class OuterLoop:
         inner_loop,
         state: StateStore,
         max_rounds: int = _DEFAULT_MAX_ROUNDS,
+        rewrite_every_n_rounds: int = 2,
+        max_rewrites: int = 5,
     ) -> None:
-        self.inner_loop = inner_loop
-        self.state      = state
-        self.max_rounds = max(1, int(max_rounds))
+        self.inner_loop             = inner_loop
+        self.state                  = state
+        self.max_rounds             = max(1, int(max_rounds))
+        self.rewrite_every_n_rounds = max(1, int(rewrite_every_n_rounds))
+        self.max_rewrites           = max(0, int(max_rewrites))
 
     def run_task(self, task: dict, base_dir: str | Path) -> OuterLoopResult:
         """Run the outer loop for *task*.  Resumes from the next unfinished
@@ -218,9 +222,19 @@ def make_outer_loop(
 ) -> OuterLoop:
     """Build an :class:`OuterLoop`, constructing the inner loop from config
     unless one is injected (tests / the controller may supply their own)."""
-    max_rounds = config.getint("auto", "max_rounds_per_task",
-                               fallback=_DEFAULT_MAX_ROUNDS)
+    max_rounds             = config.getint("auto", "max_rounds_per_task",
+                                           fallback=_DEFAULT_MAX_ROUNDS)
+    rewrite_every_n_rounds = config.getint("auto", "rewrite_every_n_rounds", fallback=2)
+    max_rewrites           = config.getint("auto", "max_rewrites",           fallback=5)
+
     if inner_loop is None:
         from tools.auto.inner_loop import make_inner_loop
         inner_loop = make_inner_loop(config, base_dir)
-    return OuterLoop(inner_loop, state, max_rounds=max_rounds)
+
+    return OuterLoop(
+        inner_loop,
+        state,
+        max_rounds=max_rounds,
+        rewrite_every_n_rounds=rewrite_every_n_rounds,
+        max_rewrites=max_rewrites,
+    )

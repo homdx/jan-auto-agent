@@ -73,18 +73,20 @@ class ValidatorAgent:
         num_ctx: int = 0,
         ssl_context: ssl.SSLContext = None,
         temperature: float = 0.1,
+        max_hints: int = 3,
     ):
-        self.max_iter = max_iter
-        self.model = model
-        self.base_url = base_url
-        self.api_key = api_key
-        self.timeout = timeout
+        self.max_iter     = max_iter
+        self.model        = model
+        self.base_url     = base_url
+        self.api_key      = api_key
+        self.timeout      = timeout
         self.prompt_store = prompt_store
-        self.stream = stream
-        self.api_format = api_format
-        self.num_ctx = num_ctx
-        self.ssl_context = ssl_context
-        self.temperature = temperature
+        self.stream       = stream
+        self.api_format   = api_format
+        self.num_ctx      = num_ctx
+        self.ssl_context  = ssl_context
+        self.temperature  = temperature
+        self.max_hints    = max(1, int(max_hints))
 
     def validate(self, payload: dict) -> dict:
         """Evaluates whether the target block requires additional code scanning cycles."""

@@ -118,6 +118,7 @@ class Orchestrator(OrchestratorActions):
             api_format=self.api_format,
             num_ctx=self.num_ctx,
             ssl_context=self.ssl_context,
+            max_hints=self.config.getint("validator_agent", "max_hints", fallback=3),
         )
         self.prompt_evaluator = PromptEvaluator(      # STORY-4.2
             prompt_store=self.prompt_store,

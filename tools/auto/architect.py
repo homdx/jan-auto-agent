@@ -226,12 +226,16 @@ class ClusterReviewer:
             self._ssl_context = ctx
 
         arch = "architect"
-        self._temperature = float(config.get(arch, "temperature", fallback="0.2"))
-        self._max_tokens         = int(config.get(arch, "max_tokens",        fallback="2048"))
-        self._system             = config.get(arch, "system", fallback=_SYSTEM_PROMPT).strip()
-        self._timeout            = float(config.get("loop", "timeout_seconds", fallback="300"))
-        self._max_file_chars     = int(config.get(arch, "max_file_chars",     fallback=str(_DEFAULT_MAX_FILE_CHARS)))
-        self._max_files_per_review = int(config.get(arch, "max_files_per_review", fallback=str(_DEFAULT_MAX_FILES_PER_REVIEW)))
+        self._temperature            = float(config.get(arch, "temperature",         fallback="0.2"))
+        self._max_tokens             = int(config.get(arch,   "max_tokens",          fallback="2048"))
+        self._system                 = config.get(arch, "system", fallback=_SYSTEM_PROMPT).strip()
+        self._timeout                = float(config.get("loop", "timeout_seconds",   fallback="300"))
+        self._max_file_chars         = int(config.get(arch,   "max_file_chars",      fallback=str(_DEFAULT_MAX_FILE_CHARS)))
+        self._max_files_per_review   = int(config.get(arch,   "max_files_per_review", fallback=str(_DEFAULT_MAX_FILES_PER_REVIEW)))
+        # ── TaskRewriter config (LOOP-5) ──────────────────────────────────────
+        self._rewrite_max_tokens     = int(config.get(arch,   "rewrite_max_tokens",  fallback="512"))
+        self._rewrite_temperature    = float(config.get(arch, "rewrite_temperature", fallback="0.4"))
+        self._rewrite_system         = config.get(arch, "rewrite_system", fallback="").strip()
 
     # ── Public API ────────────────────────────────────────────────────────────
 
