@@ -303,15 +303,28 @@ class ClusterReviewer:
         )
 
         try:
-            raw_text = request_completion(
+            import sys
+            tokens_list = []
+            def streaming_callback(token: str):
+               sys.stdout.write(token)
+               sys.stdout.flush()
+               tokens_list.append(token)
+
+            print(f"\n🧠 [LIVE ARCHITECT STREAMING THINKING & RESPONSE]:")
+            returned = request_completion(
                 url=url,
                 headers=headers,
                 payload=payload,
                 timeout=self._timeout,
-                stream=False,
+                stream=True,
+                on_token=streaming_callback,
                 api_format=self._api_format,
                 ssl_context=self._ssl_context,
             )
+            # request_completion returns the full accumulated response; prefer it
+            # and fall back to the streamed tokens if the return is empty.
+            raw_text = returned or "".join(tokens_list)
+            print(f"\n" + "═" * 80 + "\n")
         except Exception as exc:
             logger.warning(
                 "review_one_cluster: LLM call failed for cluster %r: %s",
@@ -322,6 +335,9 @@ class ClusterReviewer:
                 content=f"[ERROR] {exc}", params={"cluster": cluster.name},
             )
             return []
+        print(f"\n🧠 [LIVE ARCHITECT THINKING CHAIN & RESPONSE]:")
+        print(raw_text)
+        print(f"═" * 80 + "\n")
 
         # Strip reasoning tokens before JSON parsing.
         cleaned = strip_think(raw_text)

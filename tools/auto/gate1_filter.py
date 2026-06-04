@@ -386,7 +386,7 @@ class Gate1Filter:
                 headers=headers,
                 payload=payload,
                 timeout=self._timeout,
-                stream=False,
+                stream=True,
                 api_format=self._api_format,
                 ssl_context=self._ssl_context,
             )

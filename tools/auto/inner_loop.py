@@ -155,7 +155,7 @@ class LLMGate2Validator:
         try:
             raw = request_completion(
                 url=url, headers=headers, payload=payload, timeout=self._timeout,
-                stream=False, api_format=self._api_format, ssl_context=self._ssl_context,
+                stream=True, api_format=self._api_format, ssl_context=self._ssl_context,
             )
             cleaned = strip_think(raw)
             tracer.event("gate2_validator", "inner_loop", "llm_response", content=cleaned)
