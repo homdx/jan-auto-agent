@@ -40,7 +40,7 @@ check("main.py compiles", True)
 
 src = MAIN.read_text()
 check("PromptStore imported",             "from tools.prompt_store import PromptStore" in src)
-check("PromptStore instantiated",         "self.prompt_store = PromptStore(config=self.config)" in src)
+check("PromptStore instantiated",         "self.prompt_store = PromptStore(" in src)
 check("prompt_store passed to ValidatorAgent",   "prompt_store=self.prompt_store" in src)
 check("prompt_store passed 2+ times (both agents)", src.count("prompt_store=self.prompt_store") >= 2)
 

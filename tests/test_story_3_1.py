@@ -106,7 +106,7 @@ check("enabled = true",                  cfg.getboolean("prompt_optimizer","enab
 
 print("\n[8] Request shape")
 captured = {}
-def _cap(req, timeout):
+def _cap(req, timeout, context=None):
     captured["url"]    = req.full_url
     captured["method"] = req.method
     captured["body"]   = json.loads(req.data.decode())
