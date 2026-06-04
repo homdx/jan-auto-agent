@@ -510,6 +510,85 @@ class Coder:
 
         return parsed, ""
 
+    # ── Content safety ────────────────────────────────────────────────────────
+
+    # Patterns that should never appear in LLM-generated file content.
+    # Keyed by a short label (used in the rejection message) → substring/regex.
+    # This is defence-in-depth, not a complete sandbox; it catches the most
+    # dangerous accidental or injected payloads before they reach disk.
+    _BLOCKED_CONTENT_PATTERNS: tuple[tuple[str, str], ...] = (
+        # Destructive filesystem operations
+        ("shutil.rmtree",       "shutil.rmtree"),
+        ("os.remove",           "os.remove("),
+        ("os.unlink",           "os.unlink("),
+        ("rm -rf",              "rm -rf"),
+        ("rm -f /",             "rm -f /"),
+        # Shell injection via subprocess / os.system with dangerous args
+        ("subprocess rm",       "subprocess"),          # too broad? — see note below
+        ("os.system rm",        'os.system('),
+        # Privilege escalation
+        ("sudo invocation",     "sudo"),             # space or quoted: sudo, 'sudo', "sudo"
+        # Outbound data exfiltration via common tools
+        ("curl exfil",          "curl "),
+        ("wget exfil",          "wget "),
+        # Fork bomb (shell and Python variants)
+        ("fork bomb shell",     ":|:&"),
+        ("fork bomb py",        "os.fork()"),
+        # Overwrite root / system paths via open()
+        ("open root write",     'open("/'),
+        # Shutdown / reboot
+        ("shutdown cmd",        "shutdown"),
+        ("reboot cmd",          "reboot"),
+    )
+
+    # subprocess is legitimate in many generated files; only flag it when
+    # combined with a shell-deletion token so we avoid false positives.
+    _SUBPROCESS_DANGER_TOKENS: tuple[str, ...] = (
+        "rm ", "rm\t", '"rm"', "'rm'",  # rm with space, tab, or as a quoted list arg
+        "rmdir", "rm -rf", "shutil.rmtree",
+        "dd ", "mkfs",
+        "sudo ", '"sudo"', "'sudo'",    # privilege escalation in any invocation form
+        "shutdown", "reboot",
+    )
+
+    @classmethod
+    def _check_content_safety(cls, content: str) -> tuple[bool, str]:
+        """Return *(safe, reason)* — ``safe=False`` blocks the write.
+
+        Scans generated file content for patterns that would be dangerous
+        when the file is later executed by the Executor.  This mirrors the
+        command-level ``_BLOCKED_COMMAND_PATTERNS`` check in Executor but
+        operates on the *source text* before it reaches disk.
+
+        The check is intentionally conservative: false positives (blocking a
+        legitimately safe file) are far preferable to false negatives (writing
+        and executing a destructive payload).  Operators who need to generate
+        files that legitimately use these patterns should extend the allowlist
+        rather than relaxing this guard.
+        """
+        lower = content.lower()
+
+        for label, pattern in cls._BLOCKED_CONTENT_PATTERNS:
+            pat_lower = pattern.lower()
+
+            # Special case: subprocess alone is fine; only block when paired
+            # with a shell-deletion token in the same file.
+            if pat_lower == "subprocess":
+                if "subprocess" in lower:
+                    for danger in cls._SUBPROCESS_DANGER_TOKENS:
+                        if danger.lower() in lower:
+                            return (
+                                False,
+                                f"blocked content: subprocess combined with "
+                                f"dangerous token {danger!r} ({label})",
+                            )
+                continue
+
+            if pat_lower in lower:
+                return False, f"blocked content pattern {pattern!r} ({label})"
+
+        return True, ""
+
     @staticmethod
     def _safe_dest(base_dir: Path, rel: str) -> tuple["Path | None", str]:
         """Resolve *rel* relative to *base_dir* and verify it stays inside.
@@ -595,6 +674,15 @@ class Coder:
                     if not first_error:
                         first_error = msg
                     continue
+
+            # ── Guard 3: scan file content for dangerous patterns ──────────
+            content_safe, content_reason = self._check_content_safety(content)
+            if not content_safe:
+                msg = f"[SAFETY] {content_reason} in file {rel!r} — write blocked"
+                logger.error("coder._write_files [%s]: %s", task_id, msg)
+                if not first_error:
+                    first_error = msg
+                continue
 
             try:
                 dest.parent.mkdir(parents=True, exist_ok=True)
