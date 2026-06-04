@@ -69,7 +69,8 @@ Goal: {goal}
 
 You are reviewing the "{cluster}" cluster of the repository.
 
-Files in this cluster:
+Files in this cluster (EXACT paths you MUST use verbatim in cited_location.file \
+and target_files — do NOT invent, shorten, or add prefixes):
 {file_listing}
 
 File contents:
@@ -81,8 +82,11 @@ are relevant to the goal above.
 STRICT RULES:
 1. Every task MUST cite the exact file path and a symbol name OR line range \
    where the issue lives.  Tasks without a cited_location are invalid.
-2. Only report problems that are actually present in the code shown above.
-3. Keep each task small enough to be implemented and tested independently.
+2. The "file" field in cited_location and every entry in target_files MUST \
+   be copied EXACTLY from the list above — character for character. \
+   Do NOT invent new paths, add directory prefixes, or modify the paths in any way.
+3. Only report problems that are actually present in the code shown above.
+4. Keep each task small enough to be implemented and tested independently.
 
 Return ONLY a JSON array.  Each element must match this schema exactly \
 (no extra keys):
@@ -91,10 +95,10 @@ Return ONLY a JSON array.  Each element must match this schema exactly \
   {{
     "title": "<short imperative phrase>",
     "instruction": "<detailed instruction for the coder agent>",
-    "target_files": ["<relative/path.py>"],
+    "target_files": ["<exact path from the list above>"],
     "acceptance_check": "<shell command that exits 0 when the task is done>",
     "cited_location": {{
-      "file": "<relative/path.py>",
+      "file": "<exact path from the list above>",
       "symbol": "<function or class name, or null>",
       "line_start": <integer or null>,
       "line_end":   <integer or null>
