@@ -208,7 +208,7 @@ class Coder:
 
         sec = "coder"
         self._temperature = float(config.get(sec, "temperature", fallback="0.2"))
-        self._max_tokens  = int(config.get(sec, "max_tokens",   fallback="4096"))
+        self._max_tokens  = int(config.get(sec, "max_tokens",   fallback="16384"))
         self._system      = config.get(sec, "system", fallback=_SYSTEM_PROMPT).strip()
         self._timeout     = float(config.get("loop", "timeout_seconds", fallback="300"))
 
@@ -441,7 +441,22 @@ class Coder:
         try:
             data = json.loads(stripped)
         except json.JSONDecodeError as exc:
-            msg = f"JSON decode failed: {exc} — raw[:200]={text[:200]!r}"
+            # Distinguish a TRUNCATED response (ran out of output tokens mid-file)
+            # from genuinely malformed JSON, so the retry feedback is actionable.
+            truncated = (
+                "Unterminated string" in str(exc)
+                or "Expecting" in str(exc)
+            ) and not stripped.rstrip().endswith("}")
+            if truncated:
+                msg = (
+                    "LLM response was cut off before the JSON was complete — the "
+                    "revised file was too long for the output token budget. Emit "
+                    "the COMPLETE file content and keep the response minimal (only "
+                    "the required files), or raise [coder] max_tokens. "
+                    f"(decode error: {exc})"
+                )
+            else:
+                msg = f"JSON decode failed: {exc} — raw[:200]={text[:200]!r}"
             logger.warning("coder._parse_response [%s]: %s", task_id, msg)
             return [], msg
 

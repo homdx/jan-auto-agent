@@ -657,7 +657,7 @@ class TestMakeCoder:
         )
         c = make_coder(cfg)
         assert c._temperature == pytest.approx(0.2)
-        assert c._max_tokens == 4096
+        assert c._max_tokens == 16384
 
     def test_custom_system_prompt_from_config(self) -> None:
         cfg = _minimal_config(extra_coder={"system": "You are a robot."})
