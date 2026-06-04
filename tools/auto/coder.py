@@ -97,7 +97,10 @@ _SYSTEM_PROMPT = (
     "2. Only include files that require changes; omit files left unchanged.\n"
     "3. Paths must be relative (matching the target_files list).\n"
     "4. Do NOT wrap the file content inside inner code fences.\n"
-    "5. Do NOT add any explanation or commentary outside the JSON."
+    "5. Do NOT add any explanation or commentary outside the JSON.\n"
+    "6. The 'files' array MUST NEVER be empty. The task always requires at least one "
+    "file change — if you think nothing needs changing, re-read the instruction and "
+    "produce the correct implementation. An empty files array is always wrong."
 )
 
 # ── Per-task user prompt template ─────────────────────────────────────────────

@@ -324,10 +324,21 @@ class InnerLoop:
             if not getattr(exec_result, "passed", False):
                 tb  = getattr(exec_result, "traceback", "") or ""
                 out = getattr(exec_result, "stdout",    "") or ""
+                err = getattr(exec_result, "stderr",    "") or ""
                 ec  = getattr(exec_result, "exit_code", 1)
+                cmd = getattr(exec_result, "command",   "") or ""
+                # Include stderr so argparse / runtime error messages reach the coder.
+                # Priority: traceback > stderr > stdout (most diagnostic first).
+                if tb:
+                    detail = f"traceback:\n{tb}"
+                elif err:
+                    detail = f"stderr:\n{err[:400]}"
+                else:
+                    detail = f"stdout:\n{out[:400]}"
                 fb  = (
-                    f"attempt {attempt}: exec failed (exit {ec})\n"
-                    + (f"traceback:\n{tb}" if tb else f"stdout:\n{out[:400]}")
+                    f"attempt {attempt}: exec failed (exit {ec})"
+                    + (f"  cmd={cmd!r}" if cmd else "")
+                    + f"\n{detail}"
                 )
                 feedback.append(fb)
                 records.append(AttemptRecord(attempt, True, False, False, fb))

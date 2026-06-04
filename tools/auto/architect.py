@@ -99,6 +99,12 @@ STRICT RULES:
 5. Return an empty array [] ONLY if the goal is ALREADY fully implemented in the \
    code shown.  If the goal asks for behavior the code does not yet have, that \
    absence IS the work — do not return [].
+6. The "acceptance_check" MUST be a real shell command (not a description or sentence). \
+   It must start with an executable token such as "python", "pytest", "bash", "node", etc. \
+   When the task adds an optional CLI argument (e.g. --name), the check MUST call the \
+   script with that flag using the double-dash form: "python main.py --name Alice" — \
+   never use a positional argument form ("python main.py Alice") unless the instruction \
+   explicitly defines a positional argument.
 
 Each element of the JSON array must match this schema exactly (no extra keys):
 
@@ -107,7 +113,7 @@ Each element of the JSON array must match this schema exactly (no extra keys):
     "title": "<short imperative phrase>",
     "instruction": "<detailed instruction for the coder agent>",
     "target_files": ["<exact path from the list below>"],
-    "acceptance_check": "<shell command that exits 0 when the task is done>",
+    "acceptance_check": "<shell command that exits 0 when the task is done — MUST be a real runnable command, e.g. 'python main.py --name Alice' or 'pytest tests/test_foo.py'. If the task adds a CLI flag --flag, the check MUST call the script with that exact flag using the optional-argument syntax (e.g. 'python script.py --flag value'), NOT a positional argument>",
     "cited_location": {{
       "file": "<exact path from the list below>",
       "symbol": "<function or class name, or null>",
@@ -641,7 +647,7 @@ Return a JSON object with exactly these fields:
 {{
   "title": "<keep original or append '— alternative approach'>",
   "instruction": "<new implementation strategy written for the coder agent>",
-  "acceptance_check": "<keep original if still valid, or update if the new strategy changes what done means>"
+  "acceptance_check": "<MUST be a real runnable shell command that exits 0 when done — keep the original command unchanged unless the new strategy genuinely requires a different invocation. Do NOT replace with a prose description.>"
 }}
 """
 
@@ -817,6 +823,21 @@ class TaskRewriter:
             )
             return original_task
 
+        # Guard: reject acceptance_check values that look like prose rather than
+        # a real shell command.  A valid check starts with a known executable token
+        # and is short enough to be a single command.  When the LLM drifts and
+        # writes a sentence (e.g. "The script must run without errors …"), the
+        # executor runs it as a shell command, bash cannot find "The" as a binary,
+        # and every subsequent attempt fails with exit 127 — even when the generated
+        # code is correct.  Falling back to the original command is always safer.
+        if new_acceptance and not _looks_like_shell_command(new_acceptance):
+            logger.warning(
+                "TaskRewriter._parse_rewrite: acceptance_check looks like prose, "
+                "not a shell command — keeping original: %r -> %r",
+                new_acceptance[:120], original_task.get("acceptance_check", ""),
+            )
+            new_acceptance = ""   # force fallback to original below
+
         # Merge into a shallow copy so the original dict is never mutated.
         rewritten = dict(original_task)
         rewritten["title"]            = new_title or original_task.get("title", "")
@@ -828,6 +849,43 @@ class TaskRewriter:
 # ─────────────────────────────────────────────────────────────────────────────
 # Internal utilities
 # ─────────────────────────────────────────────────────────────────────────────
+
+# Known executable tokens that legitimately start an acceptance_check command.
+_SHELL_COMMAND_PREFIXES: tuple[str, ...] = (
+    "python", "python3", "pytest", "bash", "sh", "node", "npm", "npx",
+    "make", "cargo", "go ", "ruby", "rspec", "php", "java ", "mvn",
+    "./", "/",
+)
+
+# Heuristic upper bound: real commands are short; prose descriptions are long.
+_MAX_ACCEPTANCE_CHECK_CHARS = 300
+
+import re as _re
+_SENTENCE_END_RE = _re.compile(r"\.\s+[A-Z]")
+
+
+def _looks_like_shell_command(text: str) -> bool:
+    """Return True when *text* looks like a real shell command.
+
+    A shell command:
+    - starts with a known executable token (python, pytest, bash, …)
+    - is short (< 300 chars — prose descriptions are typically longer)
+    - does not contain multiple sentences (". Capital" pattern)
+
+    Used by TaskRewriter._parse_rewrite to reject LLM-generated prose that
+    accidentally replaces a valid acceptance_check, which would cause the
+    executor to fail with exit 127 ("command not found") on every attempt.
+    """
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if len(stripped) > _MAX_ACCEPTANCE_CHECK_CHARS:
+        return False
+    if _SENTENCE_END_RE.search(stripped):
+        return False
+    lower = stripped.lower()
+    return any(lower.startswith(prefix) for prefix in _SHELL_COMMAND_PREFIXES)
+
 
 def _fire_callback(cb) -> None:
     """Call *cb* if not None; swallow any exception it raises."""
