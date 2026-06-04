@@ -347,6 +347,13 @@ class Executor:
 
         The ``python`` token at the start of a command is rewritten to use
         ``self._python_bin`` so the same interpreter as the agent is used.
+
+        Additionally, if the first argument of the acceptance_check is a bare
+        filename (no directory separator) and that basename matches the basename
+        of exactly one target file, the bare name is replaced with the full
+        workspace-relative path.  This fixes the case where the Architect
+        writes ``bash generateAllureReport.sh`` but the file was copied into a
+        subdirectory (e.g. ``dockerfiles/allure-generator/generateAllureReport.sh``).
         """
         if acceptance_check:
             safe, reason = self._check_command_safety(acceptance_check)
@@ -355,13 +362,84 @@ class Executor:
                     "_resolve_command: [SAFETY] %s — falling back to pytest", reason
                 )
                 return "pytest"
-            return self._rewrite_python(acceptance_check)
+            resolved = self._resolve_bare_filename(acceptance_check, target_files)
+            return self._rewrite_python(resolved)
 
         py_files = [f for f in target_files if f.endswith(".py")]
         if len(py_files) == 1:
             return f"{self._python_bin} {py_files[0]}"
 
         return "pytest"
+
+    @staticmethod
+    def _resolve_bare_filename(command: str, target_files: list[str]) -> str:
+        """Replace a bare filename argument with the matching target-file path.
+
+        When the acceptance_check's *first non-flag token* is a plain filename
+        (contains no ``/`` or ``\\``), look for a target file whose basename
+        matches it.  If exactly one match is found, rewrite that token to the
+        full relative path so the command resolves correctly inside the
+        workspace (where files land at their repo-relative sub-paths, not at
+        the workspace root).
+
+        Example::
+
+            command      = "bash generateAllureReport.sh"
+            target_files = ["dockerfiles/allure-generator/generateAllureReport.sh"]
+            → returns   "bash dockerfiles/allure-generator/generateAllureReport.sh"
+
+        No rewrite is done when:
+        - The token already contains a path separator (already qualified).
+        - Zero or multiple target files share that basename (ambiguous).
+        - The command has no recognisable bare-filename token.
+        """
+        try:
+            parts = shlex.split(command)
+        except ValueError:
+            return command  # un-parseable shell quoting — leave untouched
+
+        # Walk parts to find the first *argument* token that looks like a plain
+        # filename (not a flag and not already path-qualified).  idx==0 is the
+        # executable itself (bash, python, …) — always skip it.
+        _SHELL_OPS = frozenset({"&&", "||", ";", "|", "&"})
+        for idx, part in enumerate(parts):
+            if idx == 0:
+                continue  # executable — never a filename target
+            if part.startswith("-"):
+                continue  # flag — skip
+            if "/" in part or "\\" in part:
+                return command  # already has a path component — nothing to do
+            if part in _SHELL_OPS:
+                return command  # compound command — stop scanning; no safe rewrite
+            # `part` is a bare argument token.  Check whether its basename
+            # matches exactly one target file.
+            basename = part
+            matches = [tf for tf in target_files if Path(tf).name == basename]
+            if len(matches) == 1:
+                full_path = matches[0]
+                if "&&" in command or "||" in command or ";" in command:
+                    # The original command contains shell operators; shlex.join
+                    # would misquote them.  Do a safe word-boundary string
+                    # substitution on the original command string instead.
+                    import re as _re_local
+                    rewritten = _re_local.sub(
+                        r"(?<!\S)" + _re_local.escape(basename) + r"(?!\S)",
+                        full_path,
+                        command,
+                        count=1,
+                    )
+                else:
+                    parts[idx] = full_path
+                    rewritten = shlex.join(parts)
+                logger.debug(
+                    "_resolve_bare_filename: rewrote %r → %r (matched target %r)",
+                    command, rewritten, full_path,
+                )
+                return rewritten
+            # Zero or multiple matches — leave command unchanged.
+            return command
+
+        return command
 
     def _rewrite_python(self, command: str) -> str:
         """Replace a leading ``python`` / ``python3`` token with the real interpreter path.

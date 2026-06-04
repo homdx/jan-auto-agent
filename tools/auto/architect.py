@@ -838,11 +838,31 @@ class TaskRewriter:
             )
             new_acceptance = ""   # force fallback to original below
 
+        # Guard: if the rewriter produced the same instruction and acceptance_check
+        # as the original (semantic identity — same string content), return the
+        # *original_task object* unchanged.  outer_loop.py checks `new_task is not
+        # task` for object identity; returning a new dict with identical values would
+        # pass that check, waste a rewrites_done slot, and leave the coder cycling
+        # through the same strategy forever.
+        orig_instruction = original_task.get("instruction", "").strip()
+        orig_acceptance  = original_task.get("acceptance_check", "").strip()
+        effective_acceptance = new_acceptance or orig_acceptance
+        if (
+            _normalise(new_instruction) == _normalise(orig_instruction)
+            and _normalise(effective_acceptance) == _normalise(orig_acceptance)
+        ):
+            logger.warning(
+                "TaskRewriter._parse_rewrite: rewrite is semantically identical "
+                "to the original task — returning original object so outer_loop "
+                "identity check short-circuits correctly"
+            )
+            return original_task
+
         # Merge into a shallow copy so the original dict is never mutated.
         rewritten = dict(original_task)
         rewritten["title"]            = new_title or original_task.get("title", "")
         rewritten["instruction"]      = new_instruction
-        rewritten["acceptance_check"] = new_acceptance or original_task.get("acceptance_check", "")
+        rewritten["acceptance_check"] = effective_acceptance
         return rewritten
 
 
@@ -885,6 +905,19 @@ def _looks_like_shell_command(text: str) -> bool:
         return False
     lower = stripped.lower()
     return any(lower.startswith(prefix) for prefix in _SHELL_COMMAND_PREFIXES)
+
+
+def _normalise(text: str) -> str:
+    """Collapse whitespace for semantic-identity comparison.
+
+    Strips leading/trailing whitespace and compresses internal runs of
+    whitespace (including newlines) to a single space.  Used by
+    ``TaskRewriter._parse_rewrite`` to detect when a rewrite produced the
+    same instruction/acceptance_check content as the original task, even
+    if the LLM emitted different surrounding whitespace.
+    """
+    import re as _re2
+    return _re2.sub(r"\s+", " ", text.strip())
 
 
 def _fire_callback(cb) -> None:
