@@ -330,7 +330,13 @@ class AutoController:
     # ------------------------------------------------------------------
 
     def _run_task_loop(self) -> tuple[Optional[str], int]:
-        """Iterate pending tasks, check caps, execute, return stop reason.
+        """Iterate pending tasks, check caps, execute via outer_loop, return stop reason.
+
+        AUTO-G2: replaces the inner_loop skeleton with the real pipeline:
+            outer_loop.run_task(task) → passed   → commit_on_success  (G3)
+                                      → exhausted → exhaustion_handler (G4)
+        A4 caps, dependency guard, progress display, run_trace, and auto_tuner
+        wiring are all preserved unchanged.
 
         Returns
         -------
@@ -342,6 +348,22 @@ class AutoController:
         pending = self.state.resume_info()["pending"]
         tasks_done = 0
 
+        # ── Build execution helpers once per loop ──────────────────────────
+        cfg = configparser.ConfigParser()
+        if Path(self.config_path).exists():
+            cfg.read(self.config_path)
+
+        from tools.auto.outer_loop import make_outer_loop
+        from tools.auto.commit_on_success import CommitOnSuccess
+        from tools.auto.exhaustion_handler import make_exhaustion_handler
+
+        outer_loop = make_outer_loop(cfg, self.base_dir, self.state)
+        commit_helper = (
+            CommitOnSuccess(self.git, self.state)
+            if self.git is not None else None
+        )
+        exhaustion_handler = make_exhaustion_handler(self.state)
+
         for task in pending:
             # AUTO-A4: check caps BEFORE executing each task
             reason = self.check_caps(tasks_done)
@@ -352,7 +374,7 @@ class AutoController:
                 )
                 return reason, tasks_done
 
-            # ── Dependency Guard (Bug #5) ──────────────────────────────
+            # ── Dependency Guard (Bug #5) ──────────────────────────────────
             failed_deps = []
             for dep_id in task.get("dependencies", []):
                 dep = self.state.get_task(dep_id)
@@ -361,7 +383,8 @@ class AutoController:
 
             if failed_deps:
                 reason_str = f"dependency not done: {', '.join(failed_deps)}"
-                logger.info("Task %s blocked by incomplete dependencies: %s", task["id"], failed_deps)
+                logger.info("Task %s blocked by incomplete dependencies: %s",
+                            task["id"], failed_deps)
                 self.state.set_task_status(task["id"], STATUS_BLOCKED)
                 self.state.log(f"task {task['id']} blocked ({reason_str})")
                 if self.run_trace:
@@ -379,44 +402,64 @@ class AutoController:
                     round_num=task.get("round", 1) or 1,
                 )
 
-            self.state.set_task_status(task["id"], STATUS_IN_PROGRESS)
-
-            cfg = configparser.ConfigParser()
-            if Path(self.config_path).exists():
-                cfg.read(self.config_path)
-
-            from tools.auto.inner_loop import make_inner_loop
-            inner_loop = make_inner_loop(cfg, self.base_dir)
-            result = inner_loop.run_task(task, self.base_dir)
+            # ── AUTO-G2: outer_loop execution ──────────────────────────────
+            result = outer_loop.run_task(task, self.base_dir)
 
             if result.passed:
-                self.state.set_task_status(task["id"], STATUS_DONE)
-                tasks_done += 1
-                self.state.log(f"task {task['id']} completed successfully")
-                if self.run_trace:
-                    self.run_trace.log_task_done(task["id"])
-            else:
-                self.state.set_task_status(task["id"], STATUS_BLOCKED)
-                self.state.log(f"task {task['id']} failed: {result.last_feedback}")
-                if self.run_trace:
-                    self.run_trace.log_task_blocked(task["id"], result.last_feedback)
+                # ── AUTO-G3: commit on success ─────────────────────────────
+                commit_hash: Optional[str] = None
+                if commit_helper is not None:
+                    commit_hash = commit_helper.commit(task, result)
+                else:
+                    # No git: mark DONE manually
+                    self.state.set_task_status(task["id"], STATUS_DONE)
 
-            # AUTO-F1: Tick progress upon task completion
+                tasks_done += 1
+                self.state.log(
+                    f"task {task['id']} completed — "
+                    f"rounds={result.rounds_used} "
+                    f"commit={commit_hash[:12] if commit_hash else 'none'}"
+                )
+                if self.run_trace:
+                    self.run_trace.log_task_done(task["id"], commit_hash)
+
+            else:
+                # ── AUTO-G4: exhaustion → knowledge note + ticket ──────────
+                ex_outcome = exhaustion_handler.handle(task, result)
+                self.state.log(
+                    f"task {task['id']} exhausted — "
+                    f"rounds={result.rounds_used} "
+                    f"ticket={ex_outcome.ticket_id}"
+                )
+                if self.run_trace:
+                    feedback_snippet = result.knowledge()[:200] if result.feedback_files else ""
+                    self.run_trace.log_task_blocked(task["id"], feedback_snippet)
+
+            # AUTO-F1: Tick progress upon task completion / exhaustion
             if self.progress_display:
                 self.progress_display.tick_code()
 
             # AUTO-E1/E2: Record metric and maybe tune
             if self.metrics_stream and self.auto_tuner:
+                total_attempts = sum(
+                    getattr(r, "attempts_used", 0) for r in result.inner_results
+                )
+                last_feedback = ""
+                if result.inner_results:
+                    last_feedback = getattr(result.inner_results[-1], "last_feedback", "")
                 self.metrics_stream.record_gate2(
                     task["id"],
                     approved=result.passed,
-                    feedback=result.last_feedback,
-                    attempts=result.attempts_used,
-                    prompt_store=self.auto_tuner.prompt_store
+                    feedback=last_feedback,
+                    attempts=total_attempts,
+                    prompt_store=self.auto_tuner.prompt_store,
                 )
-                outcome = self.auto_tuner.maybe_tune()
-                if outcome.promoted:
-                    self.state.log(f"[AUTO-E1] auto_tuner promoted validator prompt: score={outcome.new_prompt_score:.2f}")
+                tune_outcome = self.auto_tuner.maybe_tune()
+                if tune_outcome.promoted:
+                    self.state.log(
+                        f"[AUTO-E1] auto_tuner promoted validator prompt: "
+                        f"score={tune_outcome.new_prompt_score:.2f}"
+                    )
 
         return None, tasks_done  # all tasks done / no tasks
 
