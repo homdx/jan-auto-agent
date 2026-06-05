@@ -53,18 +53,26 @@ class SearchAgent:
         
     def _evaluate_with_llm(self, found_refs: Dict[str, Dict[str, str]]) -> List[str]:
         """
-        Mock for the single-batch LLM call to filter out noise like stdlib wrappers.
-        In production, this submits the keys and code snippets to the LLM and 
-        returns a list of 'approved' reference names.
+        LLM noise-filter for discovered references.
+
+        NOTE: LLM filtering is not yet implemented — SearchAgent has no wired
+        LLM client.  All found references are approved as-is.  This means
+        stdlib wrappers and false-positive matches will be passed to the
+        validator unchanged, consuming extra context tokens.
+
+        To implement: inject a request_completion callable at construction time
+        and replace this method body with a single-batch LLM call that returns
+        only the names that are genuine project-level dependencies.
         """
         if not found_refs:
             return []
-            
-        # Example pseudo-implementation:
-        # prompt = f"Analyze these code blocks and return a JSON list of names that are NOT just standard library wrappers: {found_refs}"
-        # response = llm_client.generate(prompt)
-        # return response.json_list
-        
+
+        logger.debug(
+            "_evaluate_with_llm: LLM filtering not implemented — "
+            "passing all %d found reference(s) through unfiltered: %s",
+            len(found_refs),
+            list(found_refs.keys()),
+        )
         return list(found_refs.keys())
 
     def run(

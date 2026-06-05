@@ -96,6 +96,7 @@ class Orchestrator(OrchestratorActions):
             api_key=self.api_key,
             timeout=self.timeout_seconds,
             ssl_context=self.ssl_context,
+            api_format=self.api_format,
         )
         _raw_skip = self.config.get("search", "skip_dirs", fallback="")
         _skip_dirs = [d.strip() for d in _raw_skip.split(",") if d.strip()] or None
@@ -270,7 +271,7 @@ class Orchestrator(OrchestratorActions):
         imports = block_extractor.extract_imports(source, ext)
         block = block_extractor.extract_block(source, parsed.target_name, ext)
         refs = block_extractor.find_references(block, ext)
-        context_lines = block_extractor.get_context_lines(source, parsed.target_name)
+        context_lines = block_extractor.get_context_lines(source, parsed.target_name, file_ext=ext)
 
         iteration = 1
         validation: Dict[str, Any] = {}

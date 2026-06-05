@@ -578,9 +578,6 @@ class ClusterReviewer:
             # "call succeeded but LLM produced no valid candidates".  The checkpoint
             # must NOT record a failed batch; returning None signals that.
             return None
-        print("\n🧠 [LIVE ARCHITECT THINKING CHAIN & RESPONSE]:")
-        print(raw_text)
-        print("═" * 80 + "\n")
 
         # Strip reasoning tokens before JSON parsing.
         cleaned = strip_think(raw_text)

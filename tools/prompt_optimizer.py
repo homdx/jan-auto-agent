@@ -45,6 +45,7 @@ class PromptOptimizer:
         timeout: int = 120,
         ssl_context: ssl.SSLContext = None,
         temperature: float = 0.4,
+        api_format: str = "openai",
     ):
         self.model = model
         self.base_url = base_url
@@ -52,6 +53,7 @@ class PromptOptimizer:
         self.timeout = timeout
         self.ssl_context = ssl_context
         self.temperature = temperature
+        self.api_format = api_format
 
     def generate_candidate(
         self,
@@ -74,7 +76,13 @@ class PromptOptimizer:
             Returns current_prompt unchanged on any API/network error so the
             caller always gets a usable string.
         """
-        url = f"{self.base_url.rstrip('/')}/chat/completions"
+        from tools.llm_stream import request_completion, ollama_chat_url
+
+        if self.api_format == "ollama":
+            url = ollama_chat_url(self.base_url.rstrip("/"))
+        else:
+            url = f"{self.base_url.rstrip('/')}/chat/completions"
+
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",
@@ -94,30 +102,19 @@ class PromptOptimizer:
         logger.info(f"PromptOptimizer: generating candidate for '{agent_name}'")
 
         try:
-            req = urllib.request.Request(
-                url,
-                data=json.dumps(payload).encode("utf-8"),
-                headers=headers,
-                method="POST",
-            )
             tracer.event("prompt_optimizer", "llm", "llm_request",
                          content=meta_prompt, model=self.model, temperature=self.temperature)
-            with urllib.request.urlopen(req, timeout=self.timeout, context=self.ssl_context) as response:
-                raw = json.loads(response.read().decode("utf-8"))
-                candidate = raw["choices"][0]["message"]["content"].strip()
-                logger.info(
-                    f"PromptOptimizer: candidate generated for '{agent_name}' "
-                    f"({len(candidate)} chars)"
-                )
-                tracer.event("llm", "prompt_optimizer", "llm_response", content=candidate)
-                return candidate
-
-        except urllib.error.HTTPError as e:
-            body = e.read().decode("utf-8", errors="replace")
-            logger.error(f"PromptOptimizer HTTP {e.code} for '{agent_name}': {body}")
-            tracer.event("prompt_optimizer", "orchestrator", "error",
-                         content=f"HTTP {e.code}; returning unchanged current_prompt")
-            return current_prompt
+            candidate = request_completion(
+                url, headers, payload, self.timeout,
+                api_format=self.api_format,
+                ssl_context=self.ssl_context,
+            ).strip()
+            logger.info(
+                f"PromptOptimizer: candidate generated for '{agent_name}' "
+                f"({len(candidate)} chars)"
+            )
+            tracer.event("llm", "prompt_optimizer", "llm_response", content=candidate)
+            return candidate
 
         except Exception as e:
             logger.error(f"PromptOptimizer failed for '{agent_name}': {e}")
