@@ -102,6 +102,12 @@ class Orchestrator(OrchestratorActions):
         _skip_dirs = [d.strip() for d in _raw_skip.split(",") if d.strip()] or None
         self.search_agent = SearchAgent(
             max_file_kb=self.config.getint("search", "max_file_kb", fallback=500),
+            model=self.model,
+            base_url=self.base_url,
+            api_key=self.api_key,
+            api_format=self.api_format,
+            timeout=self.timeout_seconds,
+            ssl_context=self.ssl_context,
             skip_dirs=_skip_dirs,
             max_depth=self.config.getint("search", "max_depth", fallback=2),
         )

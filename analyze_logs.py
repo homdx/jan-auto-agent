@@ -22,6 +22,7 @@ import argparse
 import difflib
 import json
 import sys
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -531,7 +532,7 @@ def render_tasks(run: dict) -> None:
         elif status in ("BLOCKED", "FAIL"):
             status_str = red(f"✗ {status}")
         elif status == "in_progress":
-            status_str = yellow("◌ IN_PROGRESS")
+            status_str = yellow(f"◌ IN_PROGRESS")
         else:
             status_str = yellow(f"● {status}")
 
