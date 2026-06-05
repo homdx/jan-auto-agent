@@ -381,8 +381,14 @@ class Gate1Filter:
         # 3. Line range anchor: lines must exist in the file.
         lines = source.splitlines()
         total = len(lines)
-        start = loc.line_start  # already validated non-None by CitedLocation.is_valid()
+        start = loc.line_start  # may be None in docs/creative mode (file-only citation)
         end   = loc.line_end if loc.line_end is not None else start
+
+        # docs/creative: file-only citation — no symbol, no line range.
+        # Return a truncated head of the file so Stage B still has context.
+        if start is None:
+            block = "\n".join(lines[: self._max_context_lines])
+            return True, "file-only citation (no line range)", _truncate(block, self._max_block_chars)
 
         if start < 1 or start > total:
             return (
