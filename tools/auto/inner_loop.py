@@ -78,7 +78,7 @@ class InnerLoopResult:
 # LLM-backed Gate-2 validator  (LOOP-1)
 # ─────────────────────────────────────────────────────────────────────────────
 
-_GATE2_SYSTEM = (
+_GATE2_SYSTEM_CODE = (
     "You are a code-change validator. "
     "Given a task description, execution output, and the generated code, "
     "decide whether the implementation is complete and correct.\n"
@@ -93,6 +93,38 @@ _GATE2_SYSTEM = (
     "  - Omit the hints array (or use []) when approved=true.\n"
     "  - suggested_approach is optional — only fill it with a concrete alternative."
 )
+
+_GATE2_SYSTEM_DOCS = (
+    "You are a documentation change validator. "
+    "Given a task description and the revised file content, decide whether "
+    "the documentation improvement is complete and accurate. "
+    "Return ONLY a JSON object — no text before or after:\n"
+    '{"approved": true|false, "feedback": "<one sentence>", '
+    '"hints": ["<specific hint>", ...], "suggested_approach": "<optional>"}\n'
+    "HINTS RULES:\n"
+    "  - Each hint MUST point to a specific section, heading, or line.\n"
+    "  - Good: 'The installation section on line 42 still uses the old command'.\n"
+    "  - Bad: 'make sure the docs are clear'.\n"
+    "  - Omit hints (or use []) when approved=true."
+)
+
+_GATE2_SYSTEM_CREATIVE = (
+    "You are a creative writing editor validating a revision. "
+    "Given a task description and the revised text, decide whether "
+    "the creative improvement is complete and faithful to the task. "
+    "Return ONLY a JSON object:\n"
+    '{"approved": true|false, "feedback": "<one sentence>", '
+    '"hints": ["<specific hint>"], "suggested_approach": "<optional>"}'
+)
+
+# Backward-compatibility alias
+_GATE2_SYSTEM = _GATE2_SYSTEM_CODE
+
+_GATE2_SYSTEMS: dict[str, str] = {
+    "code":     _GATE2_SYSTEM_CODE,
+    "docs":     _GATE2_SYSTEM_DOCS,
+    "creative": _GATE2_SYSTEM_CREATIVE,
+}
 
 
 class LLMGate2Validator:
@@ -115,6 +147,8 @@ class LLMGate2Validator:
         base_dir:   str  = ".",
         num_ctx:    int  = 0,
         max_tokens: int  = 512,
+        task_mode:  str  = "code",
+        config = None,
     ):
         self.base_url    = base_url
         self.model       = model
@@ -127,6 +161,13 @@ class LLMGate2Validator:
         self.base_dir    = Path(base_dir)
         self.num_ctx     = int(num_ctx)
         self.max_tokens  = int(max_tokens)
+        self.task_mode   = str(task_mode)
+        # AUTO-DM-5: select system prompt — agents.ini override wins over built-in
+        _builtin = _GATE2_SYSTEMS.get(self.task_mode, _GATE2_SYSTEM_CODE)
+        if config is not None:
+            self._system = config.get("validator_agent", "system", fallback=_builtin)
+        else:
+            self._system = _builtin
 
     # ------------------------------------------------------------------
 
@@ -189,7 +230,7 @@ class LLMGate2Validator:
                 payload = {
                     "model": self.model,
                     "messages": [
-                        {"role": "system",  "content": _GATE2_SYSTEM},
+                        {"role": "system",  "content": self._system},
                         {"role": "user",    "content": user_msg},
                     ],
                     "options": _val_opts,
@@ -198,7 +239,7 @@ class LLMGate2Validator:
                 payload = {
                     "model": self.model,
                     "messages": [
-                        {"role": "system",  "content": _GATE2_SYSTEM},
+                        {"role": "system",  "content": self._system},
                         {"role": "user",    "content": user_msg},
                     ],
                     "temperature": self.temperature,
@@ -411,11 +452,17 @@ def make_inner_loop(
     coder=None,
     executor=None,
     validator=None,
+    task_mode: str = "code",
 ) -> InnerLoop:
     """Construct an :class:`InnerLoop` with real agents from *config*.
 
     Any agent may be injected (useful for tests); omitted agents are
     constructed from the config's API / model settings.
+
+    AUTO-DM-1: ``task_mode`` is accepted and stored for forwarding to
+    ``LLMGate2Validator`` (DM-5 will use it to select domain-appropriate
+    system prompts).  Defaults to ``"code"`` — no behavioural change for
+    existing call sites.
     """
     max_attempts = config.getint("auto", "max_attempts_per_task",
                                  fallback=_DEFAULT_MAX_ATTEMPTS)
@@ -476,6 +523,8 @@ def make_inner_loop(
             base_dir=str(base_dir),
             num_ctx=num_ctx,
             max_tokens=config.getint("validator_agent", "max_tokens", fallback=512),
+            task_mode=task_mode,
+            config=config,  # AUTO-DM-5: for system prompt override lookup
         )
 
     return InnerLoop(coder, executor, validator, max_attempts=max_attempts)

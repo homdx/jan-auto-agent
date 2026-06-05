@@ -195,6 +195,7 @@ class Coder:
         model: str,
         api_format: str = "openai",
         verify_ssl: bool = True,
+        task_mode: str = "code",
     ) -> None:
         self._config     = config
         self._base_url   = base_url.rstrip("/")
@@ -210,6 +211,7 @@ class Coder:
             ctx.verify_mode = ssl.CERT_NONE
             self._ssl_context = ctx
 
+        self._task_mode = task_mode
         sec = "coder"
         self._temperature = float(config.get(sec, "temperature", fallback="0.2"))
         self._max_tokens  = int(config.get(sec, "max_tokens",   fallback="16384"))
@@ -522,7 +524,20 @@ class Coder:
     # Keyed by a short label (used in the rejection message) → substring/regex.
     # This is defence-in-depth, not a complete sandbox; it catches the most
     # dangerous accidental or injected payloads before they reach disk.
-    _BLOCKED_CONTENT_PATTERNS: tuple[tuple[str, str], ...] = (
+
+    # Patterns always checked regardless of task_mode: catastrophic payloads
+    # with no legitimate false-positive risk in any document or creative context.
+    _BLOCKED_ALWAYS: tuple[tuple[str, str], ...] = (
+        ("fork bomb shell",     ":|:&"),
+        ("fork bomb py",        "os.fork()"),
+    )
+
+    # Patterns checked only in code mode.  These have high false-positive rates
+    # in documentation or creative writing:
+    #   - A tutorial might teach "sudo apt install nginx"
+    #   - A story character might "curl the data"
+    #   - A poem about wounds could contain 'open("'
+    _BLOCKED_CODE_ONLY: tuple[tuple[str, str], ...] = (
         # Destructive filesystem operations
         ("shutil.rmtree",       "shutil.rmtree"),
         ("os.remove",           "os.remove("),
@@ -537,14 +552,16 @@ class Coder:
         # Outbound data exfiltration via common tools
         ("curl exfil",          "curl "),
         ("wget exfil",          "wget "),
-        # Fork bomb (shell and Python variants)
-        ("fork bomb shell",     ":|:&"),
-        ("fork bomb py",        "os.fork()"),
         # Overwrite root / system paths via open()
         ("open root write",     'open("/'),
         # Shutdown / reboot
         ("shutdown cmd",        "shutdown"),
         ("reboot cmd",          "reboot"),
+    )
+
+    # Union of both sets — kept for backward compatibility; code mode uses this.
+    _BLOCKED_CONTENT_PATTERNS: tuple[tuple[str, str], ...] = (
+        _BLOCKED_ALWAYS + _BLOCKED_CODE_ONLY
     )
 
     # subprocess is legitimate in many generated files; only flag it when
@@ -558,7 +575,7 @@ class Coder:
     )
 
     @classmethod
-    def _check_content_safety(cls, content: str) -> tuple[bool, str]:
+    def _check_content_safety(cls, content: str, task_mode: str = "code") -> tuple[bool, str]:
         """Return *(safe, reason)* — ``safe=False`` blocks the write.
 
         Scans generated file content for patterns that would be dangerous
@@ -566,15 +583,26 @@ class Coder:
         command-level ``_BLOCKED_COMMAND_PATTERNS`` check in Executor but
         operates on the *source text* before it reaches disk.
 
+        For ``task_mode="code"`` (the default), all patterns are checked.
+        For ``task_mode="docs"`` or ``task_mode="creative"``, only
+        ``_BLOCKED_ALWAYS`` patterns are checked — prose content legitimately
+        contains words like "sudo", "curl", and 'open("/' that would be
+        false positives in code mode.
+
         The check is intentionally conservative: false positives (blocking a
         legitimately safe file) are far preferable to false negatives (writing
-        and executing a destructive payload).  Operators who need to generate
-        files that legitimately use these patterns should extend the allowlist
-        rather than relaxing this guard.
+        and executing a destructive payload).
         """
         lower = content.lower()
 
-        for label, pattern in cls._BLOCKED_CONTENT_PATTERNS:
+        # Select the active pattern set based on task_mode.
+        if task_mode == "code":
+            active_patterns = cls._BLOCKED_ALWAYS + cls._BLOCKED_CODE_ONLY
+        else:
+            # docs / creative: only block truly catastrophic payloads
+            active_patterns = cls._BLOCKED_ALWAYS
+
+        for label, pattern in active_patterns:
             pat_lower = pattern.lower()
 
             # Special case: subprocess alone is fine; only block when paired
@@ -682,7 +710,7 @@ class Coder:
                     continue
 
             # ── Guard 3: scan file content for dangerous patterns ──────────
-            content_safe, content_reason = self._check_content_safety(content)
+            content_safe, content_reason = self._check_content_safety(content, self._task_mode)
             if not content_safe:
                 msg = f"[SAFETY] {content_reason} in file {rel!r} — write blocked"
                 logger.error("coder._write_files [%s]: %s", task_id, msg)
@@ -763,7 +791,7 @@ def _strip_code_fence(text: str) -> str:
 # Convenience factory — mirrors make_executor / review_clusters pattern
 # ─────────────────────────────────────────────────────────────────────────────
 
-def make_coder(config: configparser.ConfigParser) -> Coder:
+def make_coder(config: configparser.ConfigParser, task_mode: str = "code") -> Coder:
     """Create a :class:`Coder` from *config* (agents.ini).
 
     Reads the active API section (``[api_local]`` / ``[api_remote]``) using
@@ -794,4 +822,5 @@ def make_coder(config: configparser.ConfigParser) -> Coder:
         model      = model,
         api_format = api_fmt,
         verify_ssl = verify_ssl,
+        task_mode  = task_mode,
     )

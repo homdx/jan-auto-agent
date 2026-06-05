@@ -583,6 +583,14 @@ class OrchestratorActions:
             if feedback:
                 print(f"[{_ts()}] ❗ Edit feedback: {feedback}")
 
+        # Guard: if the loop never ran (max_iterations=0) or every iteration
+        # returned empty content, revised is still "" — do NOT write an empty
+        # file.  The inner-loop guard catches empty content mid-run; this one
+        # covers the edge case where the loop body was never entered at all.
+        if not revised.strip():
+            print(f"[{_ts()}] No content produced — file left unchanged.")
+            return
+
         # Write: back up original, then overwrite. Fully reversible via .bak.
         backup = target + ".bak"
         try:

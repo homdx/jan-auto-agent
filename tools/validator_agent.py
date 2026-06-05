@@ -173,6 +173,11 @@ class ValidatorAgent:
                 content = content.split("```")[1].split("```")[0].strip()
 
             parsed_result = json.loads(content)
+            # Enforce max_hints: cap the suggested_searches list so the outer
+            # loop does not expand search scope beyond the configured limit.
+            if isinstance(parsed_result.get("suggested_searches"), list):
+                parsed_result["suggested_searches"] = \
+                    parsed_result["suggested_searches"][:self.max_hints]
             tracer.event("validator_agent", "orchestrator", "result", content=parsed_result)
             return parsed_result
         except urllib.error.HTTPError as e:

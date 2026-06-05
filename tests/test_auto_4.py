@@ -70,7 +70,7 @@ def mock_inner_loop_pipeline(monkeypatch):
                 task_id=task["id"], passed=True, attempts_used=1,
                 records=[AttemptRecord(1, True, True, True, "")]
             )
-    monkeypatch.setattr("tools.auto.inner_loop.make_inner_loop", lambda config, base_dir: FakeInnerLoop(config, base_dir))
+    monkeypatch.setattr("tools.auto.outer_loop.make_inner_loop", lambda config, base_dir, **kwargs: FakeInnerLoop(config, base_dir))
 
 
 # ─────────────────────────────────────────────────────────────────────────────

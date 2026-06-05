@@ -343,7 +343,7 @@ class TestResume:
 
         # Patch _run_task_loop to return immediately — simulates process killed
         # right after the plan phase completed.
-        def _no_execute(self_ctrl):
+        def _no_execute(self_ctrl, **kwargs):
             return None, 0
 
         with patch("tools.llm_stream.request_completion",

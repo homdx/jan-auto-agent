@@ -202,7 +202,13 @@ class PromptEvaluator:
         # 1 iteration → 1.0; self.max_iter iterations → 0.0
         iter_score = max(0.0, 1.0 - (avg_iter - 1.0) / max(1, self.max_iter - 1))
 
-        json_ok_rate = sum(1 for r in records if r.improvement_json_ok) / n
+        # Exclude records where improvement_json_ok is None (auto-mode records)
+        # so the denominator matches MetricsCollector.summarize_failures behaviour.
+        json_applicable = [r for r in records if r.improvement_json_ok is not None]
+        json_ok_rate = (
+            sum(1 for r in json_applicable if r.improvement_json_ok) / len(json_applicable)
+            if json_applicable else 0.0
+        )
 
         approved_rate = (
             sum(1 for r in records if r.validator_status == "approved") / n

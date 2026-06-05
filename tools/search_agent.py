@@ -8,6 +8,20 @@ from tools.agent_trace import tracer
 
 from tools.file_reader import list_py_files as _list_py_files
 from tools.block_extractor import extract_block as _extract_block_from_source
+import json
+from tools.llm_stream import (
+    request_completion as _request_completion,
+    ollama_chat_url as _ollama_chat_url,
+    strip_think as _strip_think,
+)
+
+_FILTER_SNIPPET_CHARS = 800
+_FILTER_SYSTEM = (
+    "You are a code-reference noise filter. Given reference names and their "
+    "code, return only the names that are genuine project-level dependencies, "
+    "excluding standard-library wrappers and false positives. "
+    "Respond with STRICT JSON: a list of approved names. No prose."
+)
 
 
 def list_py_files(base_dir: str, skip_dirs: List[str] = None) -> List[str]:
@@ -43,6 +57,13 @@ class SearchAgent:
         max_file_kb: int = 500,
         skip_dirs: Optional[List[str]] = None,
         max_depth: int = 2,
+        *,
+        model: Optional[str] = None,
+        base_url: Optional[str] = None,
+        api_key: str = "",
+        api_format: str = "openai",
+        timeout: int = 120,
+        ssl_context=None,
     ):
         self.max_file_kb = max_file_kb
         # None  → use the project-wide defaults
@@ -50,22 +71,111 @@ class SearchAgent:
         # [...]  → use exactly what the caller passed
         self.skip_dirs: List[str] = _DEFAULT_SKIP_DIRS if skip_dirs is None else skip_dirs
         self.max_depth = max_depth
+        # LLM noise-filter config. When model/base_url are absent the filter is
+        # disabled and every reference is approved (backward-compatible no-LLM mode).
+        self.model = model
+        self.base_url = base_url.rstrip("/") if base_url else None
+        self.api_key = api_key
+        self.api_format = api_format
+        self.timeout = timeout
+        self.ssl_context = ssl_context
         
     def _evaluate_with_llm(self, found_refs: Dict[str, Dict[str, str]]) -> List[str]:
-        """
-        Mock for the single-batch LLM call to filter out noise like stdlib wrappers.
-        In production, this submits the keys and code snippets to the LLM and 
-        returns a list of 'approved' reference names.
+        """Filter discovered references down to genuine project-level dependencies.
+
+        Submits the reference names and their code snippets to the LLM in a
+        single batch and returns only the names the model approves (dropping
+        stdlib wrappers and false-positive matches).
+
+        Fail-open: if the LLM is not configured, or the call/parse fails for
+        any reason, every found reference is approved — SearchAgent is a
+        best-effort context gatherer and must never break the run.
         """
         if not found_refs:
             return []
-            
-        # Example pseudo-implementation:
-        # prompt = f"Analyze these code blocks and return a JSON list of names that are NOT just standard library wrappers: {found_refs}"
-        # response = llm_client.generate(prompt)
-        # return response.json_list
-        
-        return list(found_refs.keys())
+
+        all_names = list(found_refs.keys())
+
+        # No LLM wired in → approve everything (backward-compatible behaviour).
+        if not self.model or not self.base_url:
+            logger.debug(
+                "_evaluate_with_llm: no LLM configured — approving all %d ref(s): %s",
+                len(all_names), all_names,
+            )
+            return all_names
+
+        # Build a single-batch prompt: name + a bounded code snippet per ref.
+        blocks = []
+        for name, data in found_refs.items():
+            snippet = (data.get("code") or "")[:_FILTER_SNIPPET_CHARS]
+            blocks.append(f"### {name}\n{snippet}")
+        user_msg = (
+            "Below are code references discovered in a project. Return ONLY the "
+            "names that are genuine project-level dependencies worth including as "
+            "context. EXCLUDE standard-library wrappers, trivial built-in usage, "
+            "and false-positive matches.\n\n"
+            "Reference names (you may only return names from this exact list):\n"
+            f"{', '.join(all_names)}\n\n"
+            + "\n\n".join(blocks)
+            + '\n\nReturn STRICT JSON only: a list of approved names, e.g. '
+              '["foo", "bar"]. No prose, no markdown fences.'
+        )
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+        }
+        if self.api_format == "ollama":
+            url = _ollama_chat_url(self.base_url)
+            payload: Dict[str, Any] = {
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": _FILTER_SYSTEM},
+                    {"role": "user", "content": user_msg},
+                ],
+                "options": {"temperature": 0.0},
+            }
+        else:
+            url = f"{self.base_url}/chat/completions"
+            payload = {
+                "model": self.model,
+                "temperature": 0.0,
+                "messages": [
+                    {"role": "system", "content": _FILTER_SYSTEM},
+                    {"role": "user", "content": user_msg},
+                ],
+            }
+
+        try:
+            tracer.event("search_agent", "llm", "llm_request",
+                         content=user_msg, model=self.model)
+            raw = _request_completion(
+                url, headers, payload, self.timeout,
+                api_format=self.api_format, ssl_context=self.ssl_context,
+            )
+            cleaned = _strip_think(raw or "").strip()
+            if cleaned.startswith("```"):
+                cleaned = cleaned.split("```", 2)[1]
+                if cleaned.lstrip().lower().startswith("json"):
+                    cleaned = cleaned.lstrip()[4:]
+            approved = json.loads(cleaned)
+            if not isinstance(approved, list):
+                raise ValueError(f"expected a JSON list, got {type(approved).__name__}")
+            # Keep only names that were actually in the input (guard against
+            # the model inventing names), preserving the original order.
+            approved_set = {str(a) for a in approved}
+            result = [n for n in all_names if n in approved_set]
+            tracer.event("llm", "search_agent", "llm_response",
+                         content=f"approved {len(result)}/{len(all_names)}: {result}")
+            logger.info("_evaluate_with_llm: approved %d/%d reference(s)",
+                        len(result), len(all_names))
+            return result
+        except Exception as exc:
+            logger.warning(
+                "_evaluate_with_llm: LLM filter failed (%s) — approving all "
+                "%d ref(s) [fail-open]", exc, len(all_names),
+            )
+            return all_names
 
     def run(
         self,
