@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import List, Optional
+
 
 
 def resolve_path(path: str, base_dir: str | None = None) -> str:

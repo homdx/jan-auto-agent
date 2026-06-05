@@ -97,7 +97,10 @@ _SYSTEM_PROMPT = (
     "2. Only include files that require changes; omit files left unchanged.\n"
     "3. Paths must be relative (matching the target_files list).\n"
     "4. Do NOT wrap the file content inside inner code fences.\n"
-    "5. Do NOT add any explanation or commentary outside the JSON."
+    "5. Do NOT add any explanation or commentary outside the JSON.\n"
+    "6. The 'files' array MUST NEVER be empty. The task always requires at least one "
+    "file change — if you think nothing needs changing, re-read the instruction and "
+    "produce the correct implementation. An empty files array is always wrong."
 )
 
 # ── Per-task user prompt template ─────────────────────────────────────────────
@@ -213,6 +216,9 @@ class Coder:
         self._system      = config.get(sec, "system", fallback=_SYSTEM_PROMPT).strip()
         self._timeout     = float(config.get("loop", "timeout_seconds", fallback="300"))
         self._max_file_chars = int(config.get(sec, "max_file_chars", fallback=str(_DEFAULT_MAX_FILE_CHARS)))
+        active_profile = config.get("api", "active", fallback="local")
+        # num_ctx controls the total context window on Ollama; 0 means "use server default".
+        self._num_ctx = config.getint(f"api_{active_profile}", "num_ctx", fallback=0)
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -261,16 +267,19 @@ class Coder:
         
         if self._api_format == "ollama":
             url = _llm_stream.ollama_chat_url(self._base_url)
+            _ollama_opts: dict[str, Any] = {
+                "temperature": self._temperature,
+                "num_predict": self._max_tokens,
+            }
+            if self._num_ctx:
+                _ollama_opts["num_ctx"] = self._num_ctx
             payload: dict[str, Any] = {
                 "model":       self._model,
                 "messages": [
                     {"role": "system", "content": self._system},
                     {"role": "user",   "content": user_msg},
                 ],
-                "options": {
-                    "temperature": self._temperature,
-                    "num_predict": self._max_tokens
-                }
+                "options": _ollama_opts,
             }
         else:
             url = f"{self._base_url}/chat/completions"
@@ -507,6 +516,85 @@ class Coder:
 
         return parsed, ""
 
+    # ── Content safety ────────────────────────────────────────────────────────
+
+    # Patterns that should never appear in LLM-generated file content.
+    # Keyed by a short label (used in the rejection message) → substring/regex.
+    # This is defence-in-depth, not a complete sandbox; it catches the most
+    # dangerous accidental or injected payloads before they reach disk.
+    _BLOCKED_CONTENT_PATTERNS: tuple[tuple[str, str], ...] = (
+        # Destructive filesystem operations
+        ("shutil.rmtree",       "shutil.rmtree"),
+        ("os.remove",           "os.remove("),
+        ("os.unlink",           "os.unlink("),
+        ("rm -rf",              "rm -rf"),
+        ("rm -f /",             "rm -f /"),
+        # Shell injection via subprocess / os.system with dangerous args
+        ("subprocess rm",       "subprocess"),          # too broad? — see note below
+        ("os.system rm",        'os.system('),
+        # Privilege escalation
+        ("sudo invocation",     "sudo"),             # space or quoted: sudo, 'sudo', "sudo"
+        # Outbound data exfiltration via common tools
+        ("curl exfil",          "curl "),
+        ("wget exfil",          "wget "),
+        # Fork bomb (shell and Python variants)
+        ("fork bomb shell",     ":|:&"),
+        ("fork bomb py",        "os.fork()"),
+        # Overwrite root / system paths via open()
+        ("open root write",     'open("/'),
+        # Shutdown / reboot
+        ("shutdown cmd",        "shutdown"),
+        ("reboot cmd",          "reboot"),
+    )
+
+    # subprocess is legitimate in many generated files; only flag it when
+    # combined with a shell-deletion token so we avoid false positives.
+    _SUBPROCESS_DANGER_TOKENS: tuple[str, ...] = (
+        "rm ", "rm\t", '"rm"', "'rm'",  # rm with space, tab, or as a quoted list arg
+        "rmdir", "rm -rf", "shutil.rmtree",
+        "dd ", "mkfs",
+        "sudo ", '"sudo"', "'sudo'",    # privilege escalation in any invocation form
+        "shutdown", "reboot",
+    )
+
+    @classmethod
+    def _check_content_safety(cls, content: str) -> tuple[bool, str]:
+        """Return *(safe, reason)* — ``safe=False`` blocks the write.
+
+        Scans generated file content for patterns that would be dangerous
+        when the file is later executed by the Executor.  This mirrors the
+        command-level ``_BLOCKED_COMMAND_PATTERNS`` check in Executor but
+        operates on the *source text* before it reaches disk.
+
+        The check is intentionally conservative: false positives (blocking a
+        legitimately safe file) are far preferable to false negatives (writing
+        and executing a destructive payload).  Operators who need to generate
+        files that legitimately use these patterns should extend the allowlist
+        rather than relaxing this guard.
+        """
+        lower = content.lower()
+
+        for label, pattern in cls._BLOCKED_CONTENT_PATTERNS:
+            pat_lower = pattern.lower()
+
+            # Special case: subprocess alone is fine; only block when paired
+            # with a shell-deletion token in the same file.
+            if pat_lower == "subprocess":
+                if "subprocess" in lower:
+                    for danger in cls._SUBPROCESS_DANGER_TOKENS:
+                        if danger.lower() in lower:
+                            return (
+                                False,
+                                f"blocked content: subprocess combined with "
+                                f"dangerous token {danger!r} ({label})",
+                            )
+                continue
+
+            if pat_lower in lower:
+                return False, f"blocked content pattern {pattern!r} ({label})"
+
+        return True, ""
+
     @staticmethod
     def _safe_dest(base_dir: Path, rel: str) -> tuple["Path | None", str]:
         """Resolve *rel* relative to *base_dir* and verify it stays inside.
@@ -592,6 +680,15 @@ class Coder:
                     if not first_error:
                         first_error = msg
                     continue
+
+            # ── Guard 3: scan file content for dangerous patterns ──────────
+            content_safe, content_reason = self._check_content_safety(content)
+            if not content_safe:
+                msg = f"[SAFETY] {content_reason} in file {rel!r} — write blocked"
+                logger.error("coder._write_files [%s]: %s", task_id, msg)
+                if not first_error:
+                    first_error = msg
+                continue
 
             try:
                 dest.parent.mkdir(parents=True, exist_ok=True)

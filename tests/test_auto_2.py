@@ -275,6 +275,7 @@ class TestTaskSchema:
             "id": "X", "title": "t", "instruction": "i",
             "target_files": [], "acceptance_check": "",
             "status": STATUS_TODO, "round": 0, "attempt": 0,
+            "impl_version": 1,
             "cited_locations": [],
             # 'dependencies' intentionally omitted
         }

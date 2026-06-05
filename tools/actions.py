@@ -9,7 +9,6 @@ OrchestratorActions is a mixin; Orchestrator inherits from it and supplies:
 """
 import os
 import re
-import ssl
 import sys
 import json
 import time

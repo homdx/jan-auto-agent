@@ -55,21 +55,16 @@ Ticket schema (compatible with future AUTO-D1 CRUD helpers):
 
 from __future__ import annotations
 
-import json
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
 
 from tools.agent_trace import tracer
 from tools.auto.state import StateStore, STATUS_BLOCKED
 from tools.auto.ticket_store import (
-    TicketStore,
     make_ticket,
     make_ticket_store,
-    TICKET_TYPES,
-    TICKET_STATUSES,
 )
 
 logger = logging.getLogger(__name__)

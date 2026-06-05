@@ -44,7 +44,6 @@ import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 from tools.agent_trace import tracer
 from tools.auto.state import StateStore, STATUS_IN_PROGRESS, STATUS_DONE, STATUS_BLOCKED
@@ -56,6 +55,9 @@ _FEEDBACK_GLOB = "feedback_round_*.md"
 _FEEDBACK_RE = re.compile(r"feedback_round_(\d+)\.md$")
 _MAX_FEEDBACK_CHARS = 800        # keep each round file compact
 
+# LOOP-4: regex to extract impl version from file headers
+_IMPL_HEADER_RE = re.compile(r"impl v(\d+)")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Result
@@ -64,12 +66,13 @@ _MAX_FEEDBACK_CHARS = 800        # keep each round file compact
 @dataclass
 class OuterLoopResult:
     """Aggregate result of the outer round loop for one task."""
-    task_id:        str
-    passed:         bool
-    rounds_used:    int
-    exhausted:      bool
-    feedback_files: list[str] = field(default_factory=list)
-    inner_results:  list = field(default_factory=list)   # list[InnerLoopResult]
+    task_id:             str
+    passed:              bool
+    rounds_used:         int
+    exhausted:           bool
+    feedback_files:      list[str] = field(default_factory=list)
+    inner_results:       list = field(default_factory=list)   # list[InnerLoopResult]
+    impl_versions_used:  list = field(default_factory=list)   # list[int] — LOOP-3
 
     def summary(self) -> str:
         if self.passed:
@@ -99,21 +102,36 @@ class OuterLoop:
         inner_loop,
         state: StateStore,
         max_rounds: int = _DEFAULT_MAX_ROUNDS,
+        rewrite_every_n_rounds: int = 2,
+        max_rewrites: int = 5,
+        task_rewriter=None,
     ) -> None:
-        self.inner_loop = inner_loop
-        self.state      = state
-        self.max_rounds = max(1, int(max_rounds))
+        self.inner_loop             = inner_loop
+        self.state                  = state
+        self.max_rounds             = max(1, int(max_rounds))
+        self.rewrite_every_n_rounds = max(1, int(rewrite_every_n_rounds))
+        self.max_rewrites           = max(0, int(max_rewrites))
+        self.task_rewriter          = task_rewriter  # optional; None disables rewriting
 
     def run_task(self, task: dict, base_dir: str | Path) -> OuterLoopResult:
         """Run the outer loop for *task*.  Resumes from the next unfinished
         round if feedback files already exist.  Never raises."""
         task_id = task.get("id", "?")
 
+        # LOOP-4: save original instruction before any rewrite may change task
+        original_instruction: str = task.get("instruction", "")
+
         # ── Resume: existing feedback files mean prior rounds already ran ──
         done_rounds = self._existing_rounds(task_id)
         start_round = done_rounds + 1
         feedback_files = [str(p) for p in self._feedback_paths(task_id)]
         inner_results: list = []
+
+        # LOOP-2: rewrite tracking (per run_task call, not per instance)
+        rewrites_done = 0
+        # LOOP-3: impl_version tracking — starts at 1, bumped on each rewrite
+        impl_version = task.get("impl_version", 1)
+        impl_versions_used: list[int] = []
 
         if start_round > self.max_rounds:
             # Already exhausted in a prior session.
@@ -124,14 +142,26 @@ class OuterLoop:
         self.state.set_task_status(task_id, STATUS_IN_PROGRESS)
         tracer.event("controller", "outer_loop", "run_start",
                      params={"task": task_id, "start_round": start_round,
-                             "max_rounds": self.max_rounds})
+                             "max_rounds": self.max_rounds,
+                             "impl_version": impl_version})
 
         for rnd in range(start_round, self.max_rounds + 1):
             # Fresh context: seed ONLY with the compact prior-round summaries.
             prior = self._read_round_feedback(task_id)
             self.state.set_task_status(task_id, STATUS_IN_PROGRESS, round=rnd)
+            impl_versions_used.append(impl_version)
 
-            res = self.inner_loop.run_task(task, base_dir, prior_feedback=prior)
+            # LOOP-4: build prior implementation history so the coder knows
+            # which strategies already failed and must not be repeated.
+            prior_impls = self._build_impl_history(
+                task_id, impl_version, original_instruction
+            )
+
+            res = self.inner_loop.run_task(
+                task, base_dir,
+                prior_feedback=prior,
+                prior_implementations=prior_impls or None,
+            )
             inner_results.append(res)
             # round is set authoritatively above via set_task_status(round=rnd);
             # here we only accumulate the attempt count.
@@ -144,22 +174,85 @@ class OuterLoop:
                 self.state.log(f"{task_id}: passed in round {rnd} "
                                f"({getattr(res, 'attempts_used', '?')} attempts)")
                 tracer.event("outer_loop", "controller", "result",
-                             params={"task": task_id, "passed": True, "round": rnd})
+                             params={"task": task_id, "passed": True, "round": rnd,
+                                     "impl_version": impl_version})
                 return OuterLoopResult(task_id, True, rnd, False,
-                                       feedback_files, inner_results)
+                                       feedback_files, inner_results,
+                                       impl_versions_used)
 
             # Failed round → write ONE compact feedback file, then fresh round.
-            fpath = self._write_round_feedback(task_id, rnd, res)
+            fpath = self._write_round_feedback(task_id, rnd, res, impl_version)
             feedback_files.append(str(fpath))
             self.state.log(f"{task_id}: round {rnd} failed — wrote {fpath.name}")
+
+            # LOOP-2: check whether a rewrite is due.
+            # Condition: rnd >= 3, (rnd-1) % rewrite_every_n_rounds == 0,
+            #            rewrites_done < max_rewrites, and a rewriter is wired up.
+            if (
+                self.task_rewriter is not None
+                and self.max_rewrites > 0
+                and rnd >= 3
+                and (rnd - 1) % self.rewrite_every_n_rounds == 0
+                and rewrites_done < self.max_rewrites
+            ):
+                failure_history = self._read_round_feedback(task_id)
+                impl_num = rewrites_done + 2  # v1 → first rewrite → v2, etc.
+                logger.info(
+                    "round %d failed — architect rewriting task (impl v%d)",
+                    rnd, impl_num,
+                )
+                self.state.log(
+                    f"{task_id}: round {rnd} failed — architect rewriting task "
+                    f"(impl v{impl_num})"
+                )
+
+                new_task = self.task_rewriter.rewrite(task, failure_history)
+                if new_task is not task:
+                    # A genuine rewrite was produced — record it on disk and
+                    # bump the impl_version counter in state (LOOP-3).
+                    try:
+                        impl_version = self.state.increment_impl_version(task_id)
+                    except Exception:
+                        impl_version = impl_num   # fallback: derive from rewrites_done
+
+                    rewrite_body = (
+                        f"# Rewrite after round {rnd} — impl v{impl_version} — "
+                        f"task {task_id}\n\n"
+                        f"## New instruction\n{new_task.get('instruction', '')}\n\n"
+                        f"## Acceptance check\n{new_task.get('acceptance_check', '')}\n"
+                    )
+                    self.state.write_task_file(
+                        task_id,
+                        f"rewrite_round_{rnd}.md",
+                        rewrite_body,
+                    )
+                    task = new_task
+                    rewrites_done += 1
+                    tracer.event(
+                        "outer_loop", "task_rewriter", "rewrite",
+                        content=new_task.get("instruction", ""),
+                        params={
+                            "task": task_id,
+                            "round": rnd,
+                            "impl_version": impl_version,
+                            "rewrites_done": rewrites_done,
+                        },
+                    )
+                else:
+                    logger.warning(
+                        "TaskRewriter returned original task unchanged for %r "
+                        "(parse/network error) — continuing with current strategy",
+                        task_id,
+                    )
 
         # All rounds exhausted → BLOCKED (AUTO-C6 will write knowledge + ticket).
         self.state.set_task_status(task_id, STATUS_BLOCKED)
         tracer.event("outer_loop", "controller", "result",
                      params={"task": task_id, "passed": False,
-                             "rounds": self.max_rounds, "exhausted": True})
+                             "rounds": self.max_rounds, "exhausted": True,
+                             "impl_version": impl_version})
         return OuterLoopResult(task_id, False, self.max_rounds, True,
-                               feedback_files, inner_results)
+                               feedback_files, inner_results, impl_versions_used)
 
     # ── private ──────────────────────────────────────────────────────────────
 
@@ -188,16 +281,88 @@ class OuterLoop:
                 continue
         return out
 
-    def _write_round_feedback(self, task_id: str, rnd: int, res) -> Path:
+    def _write_round_feedback(
+        self, task_id: str, rnd: int, res, impl_version: int = 1
+    ) -> Path:
         """Distil a failed round into ONE compact markdown file."""
         last = _truncate(getattr(res, "last_feedback", "") or "", _MAX_FEEDBACK_CHARS)
         attempts = getattr(res, "attempts_used", "?")
         body = (
-            f"# Round {rnd} — task {task_id}\n"
+            f"# Round {rnd} — impl v{impl_version} — task {task_id}\n"
             f"{attempts} attempt(s), all failed.\n\n"
             f"Final issue to fix next round:\n{last}\n"
         )
         return self.state.write_task_file(task_id, f"feedback_round_{rnd}.md", body)
+
+    def _build_impl_history(
+        self,
+        task_id: str,
+        current_impl_version: int,
+        original_instruction: str,
+    ) -> list[dict]:
+        """Return one entry per impl version < current_impl_version (LOOP-4).
+
+        Each entry has keys:
+          version          — int, e.g. 1
+          strategy_summary — first line of the instruction used for that version
+          why_failed       — first line of the last failure for that version
+
+        Reads rewrite_round_*.md for instructions and feedback_round_*.md for
+        failures so it works correctly on resumed runs too.
+        """
+        if current_impl_version <= 1:
+            return []
+
+        d = self.state.task_dir(task_id)
+
+        # ── instruction per impl version ─────────────────────────────────────
+        impl_instruction: dict[int, str] = {1: original_instruction}
+        for rpath in sorted(d.glob("rewrite_round_*.md")):
+            try:
+                text = rpath.read_text(encoding="utf-8")
+                first_line = text.splitlines()[0] if text else ""
+                m = _IMPL_HEADER_RE.search(first_line)
+                if not m:
+                    continue
+                ver = int(m.group(1))
+                if "## New instruction\n" in text:
+                    instr = text.split("## New instruction\n", 1)[1]
+                    if "## Acceptance check" in instr:
+                        instr = instr.split("## Acceptance check")[0]
+                    impl_instruction[ver] = instr.strip()
+            except (OSError, ValueError):
+                continue
+
+        # ── last failure per impl version ─────────────────────────────────────
+        impl_last_failure: dict[int, str] = {}
+        for fpath in self._feedback_paths(task_id):
+            try:
+                text = fpath.read_text(encoding="utf-8")
+                first_line = text.splitlines()[0] if text else ""
+                m = _IMPL_HEADER_RE.search(first_line)
+                if not m:
+                    continue
+                ver = int(m.group(1))
+                if "Final issue to fix next round:\n" in text:
+                    issue = text.split("Final issue to fix next round:\n", 1)[1].strip()
+                    impl_last_failure[ver] = issue   # last file wins → highest round
+            except (OSError, ValueError):
+                continue
+
+        # ── assemble one entry per previous version ───────────────────────────
+        result: list[dict] = []
+        for ver in range(1, current_impl_version):
+            raw_instr   = impl_instruction.get(ver, "(unknown strategy)")
+            raw_failure = impl_last_failure.get(ver, "(reason not recorded)")
+            # Keep each entry to one compact line so coder context stays short.
+            summary = raw_instr.splitlines()[0][:160] if raw_instr else ""
+            failure = raw_failure.splitlines()[0][:200] if raw_failure else ""
+            result.append({
+                "version":          ver,
+                "strategy_summary": summary,
+                "why_failed":       failure,
+            })
+        return result
 
 
 def _truncate(text: str, max_chars: int) -> str:
@@ -218,9 +383,50 @@ def make_outer_loop(
 ) -> OuterLoop:
     """Build an :class:`OuterLoop`, constructing the inner loop from config
     unless one is injected (tests / the controller may supply their own)."""
-    max_rounds = config.getint("auto", "max_rounds_per_task",
-                               fallback=_DEFAULT_MAX_ROUNDS)
+    max_rounds             = config.getint("auto", "max_rounds_per_task",
+                                           fallback=_DEFAULT_MAX_ROUNDS)
+    rewrite_every_n_rounds = config.getint("auto", "rewrite_every_n_rounds", fallback=2)
+    max_rewrites           = config.getint("auto", "max_rewrites",           fallback=5)
+
     if inner_loop is None:
         from tools.auto.inner_loop import make_inner_loop
         inner_loop = make_inner_loop(config, base_dir)
-    return OuterLoop(inner_loop, state, max_rounds=max_rounds)
+
+    # LOOP-2: build a TaskRewriter if the config has the rewrite keys and
+    # max_rewrites > 0.  If anything is missing the outer loop just runs
+    # without rewriting.
+    task_rewriter = None
+    if max_rewrites > 0:
+        try:
+            from tools.auto.architect import TaskRewriter
+
+            active     = config.get("api", "active", fallback="local")
+            section    = f"api_{active}"
+            base_url   = config.get(section, "base_url")
+            api_key    = config.get(section, "api_key",    fallback="")
+            model      = config.get(section, "model")
+            api_fmt    = config.get(section, "api_format", fallback="openai")
+            verify_ssl = config.getboolean("api", "verify_ssl", fallback=True)
+
+            task_rewriter = TaskRewriter(
+                config=config,
+                base_url=base_url,
+                api_key=api_key,
+                model=model,
+                api_format=api_fmt,
+                verify_ssl=verify_ssl,
+            )
+        except Exception as exc:
+            logger.warning(
+                "make_outer_loop: could not build TaskRewriter — rewriting disabled: %s",
+                exc,
+            )
+
+    return OuterLoop(
+        inner_loop,
+        state,
+        max_rounds=max_rounds,
+        rewrite_every_n_rounds=rewrite_every_n_rounds,
+        max_rewrites=max_rewrites,
+        task_rewriter=task_rewriter,
+    )

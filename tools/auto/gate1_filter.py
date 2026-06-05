@@ -49,8 +49,7 @@ from __future__ import annotations
 import configparser
 import json
 import logging
-import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -184,6 +183,9 @@ class Gate1Filter:
         self._timeout        = float(config.get("loop", "timeout_seconds", fallback="300"))
         self._max_context_lines = int(config.get(sec, "max_context_lines", fallback=str(_DEFAULT_MAX_CONTEXT_LINES)))
         self._max_block_chars   = int(config.get(sec, "max_block_chars",   fallback=str(_DEFAULT_MAX_BLOCK_CHARS)))
+        # num_ctx controls the total context window on Ollama; 0 means "use server default".
+        _active = config.get("api", "active", fallback="local")
+        self._num_ctx = config.getint(f"api_{_active}", "num_ctx", fallback=0)
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -390,16 +392,19 @@ class Gate1Filter:
 
         if self._api_format == "ollama":
             url = _llm_stream.ollama_chat_url(self._base_url)
+            _gate1_opts: dict[str, Any] = {
+                "temperature": self._temperature,
+                "num_predict": self._max_tokens,
+            }
+            if self._num_ctx:
+                _gate1_opts["num_ctx"] = self._num_ctx
             payload: dict[str, Any] = {
                 "model":       self._model,
                 "messages": [
                     {"role": "system", "content": self._system},
                     {"role": "user",   "content": user_msg},
                 ],
-                "options": {
-                    "temperature": self._temperature,
-                    "num_predict": self._max_tokens
-                }
+                "options": _gate1_opts,
             }
         else:
             url = f"{self._base_url}/chat/completions"

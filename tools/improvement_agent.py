@@ -5,7 +5,7 @@ import ssl
 import urllib.request
 import urllib.error
 import logging
-from typing import Optional
+
 
 from tools.agent_trace import tracer
 from tools.llm_stream import request_completion, strip_think, ollama_chat_url

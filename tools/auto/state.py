@@ -61,6 +61,7 @@ _REQUIRED_TASK_FIELDS: dict[str, type] = {
     "status":           str,
     "round":            int,
     "attempt":          int,
+    "impl_version":     int,
     "cited_locations":  list,
     "dependencies":     list,
 }
@@ -79,6 +80,7 @@ def make_task(
     status: str = STATUS_TODO,
     round: int = 0,
     attempt: int = 0,
+    impl_version: int = 1,
     cited_locations: list[dict] | None = None,
     dependencies: list[str] | None = None,
     **extra: Any,
@@ -93,6 +95,7 @@ def make_task(
         "status":           status,
         "round":            round,
         "attempt":          attempt,
+        "impl_version":     impl_version,
         "cited_locations":  cited_locations or [],
         "dependencies":     dependencies or [],
     }
@@ -103,6 +106,10 @@ def make_task(
 
 def _validate_task_schema(task: dict) -> None:
     """Raise ValueError if *task* violates the plan.json task schema."""
+    # LOOP-3: backfill impl_version for tasks created before this field existed
+    # (existing plan.json files on disk, hand-rolled dicts in tests, etc.).
+    if "impl_version" not in task:
+        task["impl_version"] = 1
     for field, expected_type in _REQUIRED_TASK_FIELDS.items():
         if field not in task:
             raise ValueError(f"Task schema violation: missing field '{field}'")
@@ -286,6 +293,21 @@ class StateStore:
                 t["round"]   = t.get("round", 0)   + round_delta
                 self._save_plan()
                 return
+        raise ValueError(f"Task '{task_id}' not found in plan")
+
+    def increment_impl_version(self, task_id: str) -> int:
+        """Bump the impl_version counter for *task_id* and return the new value.
+
+        Starts at 1 (set by make_task); each call increments by 1 and persists
+        to plan.json so the version survives a resume.
+        """
+        tasks = self._plan.get("tasks", [])
+        for t in tasks:
+            if t["id"] == task_id:
+                new_ver = t.get("impl_version", 1) + 1
+                t["impl_version"] = new_ver
+                self._save_plan()
+                return new_ver
         raise ValueError(f"Task '{task_id}' not found in plan")
 
     def update_progress(

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import sys
 from typing import Any, Dict, List, TYPE_CHECKING
 
 # Prevent circular imports if ParsedPrompt type hints are resolved statically

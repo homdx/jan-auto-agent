@@ -1,4 +1,3 @@
-import os
 import logging
 from pathlib import Path
 from typing import List, Dict, Any, Set, Optional
@@ -42,11 +41,14 @@ class SearchAgent:
     def __init__(
         self,
         max_file_kb: int = 500,
-        skip_dirs: List[str] = None,   # Bug #10: configurable, not hardcoded
-        max_depth: int = 2,            # Bug #10: configurable, was hardcoded in run()
+        skip_dirs: Optional[List[str]] = None,
+        max_depth: int = 2,
     ):
         self.max_file_kb = max_file_kb
-        self.skip_dirs = skip_dirs if skip_dirs is not None else _DEFAULT_SKIP_DIRS
+        # None  → use the project-wide defaults
+        # []    → skip nothing (caller explicitly wants no exclusions)
+        # [...]  → use exactly what the caller passed
+        self.skip_dirs: List[str] = _DEFAULT_SKIP_DIRS if skip_dirs is None else skip_dirs
         self.max_depth = max_depth
         
     def _evaluate_with_llm(self, found_refs: Dict[str, Dict[str, str]]) -> List[str]:
@@ -89,7 +91,10 @@ class SearchAgent:
 
         # Guard: Max depth uses config value
         if current_depth > self.max_depth:
-            logger.warning("SearchAgent hit max depth limit (2). Stopping recursion.")
+            logger.warning(
+                "SearchAgent hit max depth limit (%d). Stopping recursion.",
+                self.max_depth,
+            )
             result["not_found"] = references
             return result
 

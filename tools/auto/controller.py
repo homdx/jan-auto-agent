@@ -46,7 +46,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
-from tools.auto.state import StateStore, STATUS_DONE, STATUS_IN_PROGRESS, STATUS_BLOCKED
+from tools.auto.state import StateStore, STATUS_DONE, STATUS_BLOCKED
 from tools.auto.git_manager import make_git_manager, GitError
 
 # Epic G Integrations
@@ -389,7 +389,6 @@ class AutoController:
                 )
                 return reason, tasks_done
 
-            # ── Dependency Guard (Bug #5) ──────────────────────────────────
             failed_deps = []
             for dep_id in task.get("dependencies", []):
                 dep = self.state.get_task(dep_id)

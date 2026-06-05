@@ -33,7 +33,6 @@ from __future__ import annotations
 import configparser
 import json
 import logging
-import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -76,10 +75,13 @@ and target_files — do NOT invent, shorten, or add prefixes):
 File contents:
 {file_contents}
 
-Identify up to 5 concrete improvement tasks for files in this cluster that \
-are relevant to the goal above.  Look in particular for: missing or weak tests, \
-missing error handling, unvalidated inputs, missing timeouts on network calls, \
-duplicated logic, and unclear naming.
+Produce up to 5 concrete tasks for files in this cluster that ACHIEVE THE GOAL \
+above.  The goal may ask you to ADD or CHANGE functionality (new command-line \
+arguments, new behavior, new output) — not only to fix bugs.  Treat behavior the \
+goal requires but the code does not yet have as the work to be done.  If the goal \
+lists explicit items (e.g. "Task 1: ...", "Task 2: ..."), produce ONE task per \
+requested item.  You may also include genuine improvements (missing tests, error \
+handling, input validation) when they serve the goal.
 
 STRICT RULES:
 1. Every task MUST cite the exact file path and a symbol name OR line range \
@@ -89,11 +91,19 @@ STRICT RULES:
    Do NOT invent new paths, add directory prefixes, or modify the paths in any way. \
    To add new tests, target an EXISTING test file from the list and add test \
    functions to it.
-3. Only report problems that are actually present in the code shown above.
+3. Ground every task in the actual code shown (cite a real file and the symbol \
+   or line range where the change belongs), but a task MAY add behavior the code \
+   does not yet have — that is expected when the goal asks for new features.
 4. Keep each task small enough to be implemented and tested independently.
-5. Returning an empty array [] is allowed ONLY if the code is genuinely clean; \
-   most real source files have at least one concrete improvement, so look \
-   carefully before returning [].
+5. Return an empty array [] ONLY if the goal is ALREADY fully implemented in the \
+   code shown.  If the goal asks for behavior the code does not yet have, that \
+   absence IS the work — do not return [].
+6. The "acceptance_check" MUST be a real shell command (not a description or sentence). \
+   It must start with an executable token such as "python", "pytest", "bash", "node", etc. \
+   When the task adds an optional CLI argument (e.g. --name), the check MUST call the \
+   script with that flag using the double-dash form: "python main.py --name Alice" — \
+   never use a positional argument form ("python main.py Alice") unless the instruction \
+   explicitly defines a positional argument.
 
 Each element of the JSON array must match this schema exactly (no extra keys):
 
@@ -102,7 +112,7 @@ Each element of the JSON array must match this schema exactly (no extra keys):
     "title": "<short imperative phrase>",
     "instruction": "<detailed instruction for the coder agent>",
     "target_files": ["<exact path from the list below>"],
-    "acceptance_check": "<shell command that exits 0 when the task is done>",
+    "acceptance_check": "<shell command that exits 0 when the task is done — MUST be a real runnable command, e.g. 'python main.py --name Alice' or 'pytest tests/test_foo.py'. If the task adds a CLI flag --flag, the check MUST call the script with that exact flag using the optional-argument syntax (e.g. 'python script.py --flag value'), NOT a positional argument>",
     "cited_location": {{
       "file": "<exact path from the list below>",
       "symbol": "<function or class name, or null>",
@@ -117,8 +127,8 @@ REMINDER — the ONLY file paths you may put in "target_files" or \
 Any other path will be rejected:
 {file_listing}
 
-Now review the code above against the goal "{goal}" and output ONLY the JSON \
-array of up to 5 improvement tasks (no prose, no markdown fences):
+Now produce ONLY the JSON array of up to 5 concrete tasks that IMPLEMENT the \
+goal "{goal}" against the files above (no prose, no markdown fences):
 """
 
 # _MAX_FILE_CHARS and _MAX_FILES_PER_REVIEW are now read from [architect] in
@@ -226,12 +236,19 @@ class ClusterReviewer:
             self._ssl_context = ctx
 
         arch = "architect"
-        self._temperature = float(config.get(arch, "temperature", fallback="0.2"))
-        self._max_tokens         = int(config.get(arch, "max_tokens",        fallback="2048"))
-        self._system             = config.get(arch, "system", fallback=_SYSTEM_PROMPT).strip()
-        self._timeout            = float(config.get("loop", "timeout_seconds", fallback="300"))
-        self._max_file_chars     = int(config.get(arch, "max_file_chars",     fallback=str(_DEFAULT_MAX_FILE_CHARS)))
-        self._max_files_per_review = int(config.get(arch, "max_files_per_review", fallback=str(_DEFAULT_MAX_FILES_PER_REVIEW)))
+        self._temperature            = float(config.get(arch, "temperature",         fallback="0.2"))
+        self._max_tokens             = int(config.get(arch,   "max_tokens",          fallback="2048"))
+        self._system                 = config.get(arch, "system", fallback=_SYSTEM_PROMPT).strip()
+        self._timeout                = float(config.get("loop", "timeout_seconds",   fallback="300"))
+        self._max_file_chars         = int(config.get(arch,   "max_file_chars",      fallback=str(_DEFAULT_MAX_FILE_CHARS)))
+        self._max_files_per_review   = int(config.get(arch,   "max_files_per_review", fallback=str(_DEFAULT_MAX_FILES_PER_REVIEW)))
+        # num_ctx controls the total context window on Ollama; 0 means "use server default".
+        active_profile               = config.get("api", "active", fallback="local")
+        self._num_ctx                = config.getint(f"api_{active_profile}", "num_ctx", fallback=0)
+        # ── TaskRewriter config (LOOP-5) ──────────────────────────────────────
+        self._rewrite_max_tokens     = int(config.get(arch,   "rewrite_max_tokens",  fallback="512"))
+        self._rewrite_temperature    = float(config.get(arch, "rewrite_temperature", fallback="0.4"))
+        self._rewrite_system         = config.get(arch, "rewrite_system", fallback="").strip()
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -333,16 +350,19 @@ class ClusterReviewer:
 
         if self._api_format == "ollama":
             url = _llm_stream.ollama_chat_url(self._base_url)
+            _ollama_opts: dict[str, Any] = {
+                "temperature": self._temperature,
+                "num_predict": self._max_tokens,
+            }
+            if self._num_ctx:
+                _ollama_opts["num_ctx"] = self._num_ctx
             payload: dict[str, Any] = {
                 "model":       self._model,
                 "messages": [
                     {"role": "system", "content": self._system},
                     {"role": "user",   "content": user_msg},
                 ],
-                "options": {
-                    "temperature": self._temperature,
-                    "num_predict": self._max_tokens
-                }
+                "options": _ollama_opts,
             }
         else:
             url = f"{self._base_url}/chat/completions"
@@ -374,7 +394,7 @@ class ClusterReviewer:
                sys.stdout.flush()
                tokens_list.append(token)
 
-            print(f"\n🧠 [LIVE ARCHITECT STREAMING THINKING & RESPONSE]:")
+            print("\n🧠 [LIVE ARCHITECT STREAMING THINKING & RESPONSE]:")
             returned = _llm_stream.request_completion(
                 url=url,
                 headers=headers,
@@ -388,7 +408,7 @@ class ClusterReviewer:
             # request_completion returns the full accumulated response; prefer it
             # and fall back to the streamed tokens if the return is empty.
             raw_text = returned or "".join(tokens_list)
-            print(f"\n" + "═" * 80 + "\n")
+            print("\n" + "═" * 80 + "\n")
         except Exception as exc:
             logger.warning(
                 "review_one_cluster: LLM call failed for cluster %r: %s",
@@ -399,9 +419,9 @@ class ClusterReviewer:
                 content=f"[ERROR] {exc}", params={"cluster": cluster.name},
             )
             return []
-        print(f"\n🧠 [LIVE ARCHITECT THINKING CHAIN & RESPONSE]:")
+        print("\n🧠 [LIVE ARCHITECT THINKING CHAIN & RESPONSE]:")
         print(raw_text)
-        print(f"═" * 80 + "\n")
+        print("═" * 80 + "\n")
 
         # Strip reasoning tokens before JSON parsing.
         cleaned = strip_think(raw_text)
@@ -600,8 +620,315 @@ def review_clusters(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# TaskRewriter  (LOOP-2)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_REWRITER_SYSTEM_DEFAULT = (
+    "You are an architect who has reviewed failed implementation attempts. "
+    "Your job is to propose a genuinely different technical approach. "
+    "Do not suggest the same solution with minor changes. "
+    "If the previous approach used class inheritance, consider composition. "
+    "If it used a loop, consider a generator. "
+    "If it modified data in place, consider returning a new object. "
+    "Think about what assumption the previous approach made that might be wrong, "
+    "and start from a different assumption. "
+    "Return ONLY a JSON object — no prose, no markdown fences, no preamble."
+)
+
+_REWRITER_USER_TMPL = """\
+The following task has failed multiple implementation rounds. You must produce \
+a completely different implementation strategy — repeating the same approach is \
+not acceptable.
+
+Original task title: {title}
+
+Original instruction:
+{instruction}
+
+Failure history (one entry per failed round):
+{failure_history}
+
+Return a JSON object with exactly these fields:
+{{
+  "title": "<keep original or append '— alternative approach'>",
+  "instruction": "<new implementation strategy written for the coder agent>",
+  "acceptance_check": "<MUST be a real runnable shell command that exits 0 when done — keep the original command unchanged unless the new strategy genuinely requires a different invocation. Do NOT replace with a prose description.>"
+}}
+"""
+
+
+class TaskRewriter:
+    """Rewrites a repeatedly-failing task with a new implementation strategy.
+
+    Mirrors the constructor signature of :class:`ClusterReviewer` so
+    ``make_outer_loop`` can build it with the same config block.
+
+    Parameters
+    ----------
+    config:
+        Parsed ``agents.ini``.
+    base_url, api_key, model, api_format, verify_ssl:
+        Same meaning as in :class:`ClusterReviewer`.
+    """
+
+    def __init__(
+        self,
+        config: configparser.ConfigParser,
+        base_url: str,
+        api_key: str,
+        model: str,
+        api_format: str = "openai",
+        verify_ssl: bool = True,
+    ) -> None:
+        self._config     = config
+        self._base_url   = base_url.rstrip("/")
+        self._api_key    = api_key
+        self._model      = model
+        self._api_format = api_format
+
+        import ssl
+        self._ssl_context = None
+        if not verify_ssl:
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            self._ssl_context = ctx
+
+        arch = "architect"
+        self._max_tokens  = int(config.get(arch, "rewrite_max_tokens",  fallback="512"))
+        self._temperature = float(config.get(arch, "rewrite_temperature", fallback="0.4"))
+        raw_system        = config.get(arch, "rewrite_system", fallback="").strip()
+        self._system      = raw_system or _REWRITER_SYSTEM_DEFAULT
+        self._timeout     = float(config.get("loop", "timeout_seconds", fallback="300"))
+        active_profile    = config.get("api", "active", fallback="local")
+        self._num_ctx     = config.getint(f"api_{active_profile}", "num_ctx", fallback=0)
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def rewrite(self, task: dict, failure_history: list[str]) -> dict:
+        """Return a new task dict with a different implementation strategy.
+
+        On any failure (network error, bad JSON, missing fields) logs a warning
+        and returns the *original* task dict unchanged.  Never raises.
+        """
+        title       = task.get("title", "")
+        instruction = task.get("instruction", "")
+
+        history_text = "\n\n".join(
+            f"--- Round {i + 1} ---\n{entry}"
+            for i, entry in enumerate(failure_history)
+        ) if failure_history else "(no failure history available)"
+
+        user_msg = _REWRITER_USER_TMPL.format(
+            title=title,
+            instruction=instruction,
+            failure_history=history_text,
+        )
+
+        headers = {
+            "Content-Type":  "application/json",
+            "Authorization": f"Bearer {self._api_key}",
+        }
+
+        if self._api_format == "ollama":
+            url = _llm_stream.ollama_chat_url(self._base_url)
+            _rewriter_opts: dict[str, Any] = {
+                "temperature": self._temperature,
+                "num_predict": self._max_tokens,
+            }
+            if self._num_ctx:
+                _rewriter_opts["num_ctx"] = self._num_ctx
+            payload: dict[str, Any] = {
+                "model":   self._model,
+                "messages": [
+                    {"role": "system", "content": self._system},
+                    {"role": "user",   "content": user_msg},
+                ],
+                "options": _rewriter_opts,
+            }
+        else:
+            url = f"{self._base_url}/chat/completions"
+            payload: dict[str, Any] = {
+                "model":       self._model,
+                "temperature": self._temperature,
+                "max_tokens":  self._max_tokens,
+                "messages": [
+                    {"role": "system", "content": self._system},
+                    {"role": "user",   "content": user_msg},
+                ],
+            }
+
+        tracer.event(
+            source="task_rewriter",
+            target="llm",
+            kind="llm_request",
+            content=user_msg,
+            params={"model": self._model, "task": task.get("id", "?")},
+        )
+
+        try:
+            raw = _llm_stream.request_completion(
+                url=url,
+                headers=headers,
+                payload=payload,
+                timeout=self._timeout,
+                api_format=self._api_format,
+                ssl_context=self._ssl_context,
+            )
+        except Exception as exc:
+            logger.warning("TaskRewriter: LLM call failed for task %r: %s",
+                           task.get("id", "?"), exc)
+            return task
+
+        cleaned = strip_think(raw or "")
+        tracer.event(
+            source="llm",
+            target="task_rewriter",
+            kind="llm_response",
+            content=cleaned,
+            params={"task": task.get("id", "?")},
+        )
+
+        return self._parse_rewrite(cleaned, task)
+
+    # ── Private helpers ───────────────────────────────────────────────────────
+
+    def _parse_rewrite(self, text: str, original_task: dict) -> dict:
+        """Parse the rewrite JSON and merge it into a copy of *original_task*.
+
+        Returns *original_task* unchanged on any parse error.
+        """
+        stripped = text.strip()
+        if stripped.startswith("```"):
+            lines = stripped.splitlines()
+            inner = lines[1:] if len(lines) > 1 else lines
+            if inner and inner[-1].strip() == "```":
+                inner = inner[:-1]
+            stripped = "\n".join(inner).strip()
+
+        try:
+            data = json.loads(stripped)
+        except json.JSONDecodeError as exc:
+            logger.warning(
+                "TaskRewriter._parse_rewrite: JSON decode failed: %s\nRaw: %.400s",
+                exc, text,
+            )
+            return original_task
+
+        if not isinstance(data, dict):
+            logger.warning(
+                "TaskRewriter._parse_rewrite: expected JSON object, got %s",
+                type(data).__name__,
+            )
+            return original_task
+
+        new_title       = (data.get("title") or "").strip()
+        new_instruction = (data.get("instruction") or "").strip()
+        new_acceptance  = (data.get("acceptance_check") or "").strip()
+
+        if not new_instruction:
+            logger.warning(
+                "TaskRewriter._parse_rewrite: rewrite produced empty instruction — "
+                "keeping original task"
+            )
+            return original_task
+
+        # Guard: reject acceptance_check values that look like prose rather than
+        # a real shell command.  A valid check starts with a known executable token
+        # and is short enough to be a single command.  When the LLM drifts and
+        # writes a sentence (e.g. "The script must run without errors …"), the
+        # executor runs it as a shell command, bash cannot find "The" as a binary,
+        # and every subsequent attempt fails with exit 127 — even when the generated
+        # code is correct.  Falling back to the original command is always safer.
+        if new_acceptance and not _looks_like_shell_command(new_acceptance):
+            logger.warning(
+                "TaskRewriter._parse_rewrite: acceptance_check looks like prose, "
+                "not a shell command — keeping original: %r -> %r",
+                new_acceptance[:120], original_task.get("acceptance_check", ""),
+            )
+            new_acceptance = ""   # force fallback to original below
+
+        # Guard: if the rewriter produced the same instruction and acceptance_check
+        # as the original (semantic identity — same string content), return the
+        # *original_task object* unchanged.  outer_loop.py checks `new_task is not
+        # task` for object identity; returning a new dict with identical values would
+        # pass that check, waste a rewrites_done slot, and leave the coder cycling
+        # through the same strategy forever.
+        orig_instruction = original_task.get("instruction", "").strip()
+        orig_acceptance  = original_task.get("acceptance_check", "").strip()
+        effective_acceptance = new_acceptance or orig_acceptance
+        if (
+            _normalise(new_instruction) == _normalise(orig_instruction)
+            and _normalise(effective_acceptance) == _normalise(orig_acceptance)
+        ):
+            logger.warning(
+                "TaskRewriter._parse_rewrite: rewrite is semantically identical "
+                "to the original task — returning original object so outer_loop "
+                "identity check short-circuits correctly"
+            )
+            return original_task
+
+        # Merge into a shallow copy so the original dict is never mutated.
+        rewritten = dict(original_task)
+        rewritten["title"]            = new_title or original_task.get("title", "")
+        rewritten["instruction"]      = new_instruction
+        rewritten["acceptance_check"] = effective_acceptance
+        return rewritten
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Internal utilities
 # ─────────────────────────────────────────────────────────────────────────────
+
+# Known executable tokens that legitimately start an acceptance_check command.
+_SHELL_COMMAND_PREFIXES: tuple[str, ...] = (
+    "python", "python3", "pytest", "bash", "sh", "node", "npm", "npx",
+    "make", "cargo", "go ", "ruby", "rspec", "php", "java ", "mvn",
+    "./", "/",
+)
+
+# Heuristic upper bound: real commands are short; prose descriptions are long.
+_MAX_ACCEPTANCE_CHECK_CHARS = 300
+
+import re as _re
+_SENTENCE_END_RE = _re.compile(r"\.\s+[A-Z]")
+
+
+def _looks_like_shell_command(text: str) -> bool:
+    """Return True when *text* looks like a real shell command.
+
+    A shell command:
+    - starts with a known executable token (python, pytest, bash, …)
+    - is short (< 300 chars — prose descriptions are typically longer)
+    - does not contain multiple sentences (". Capital" pattern)
+
+    Used by TaskRewriter._parse_rewrite to reject LLM-generated prose that
+    accidentally replaces a valid acceptance_check, which would cause the
+    executor to fail with exit 127 ("command not found") on every attempt.
+    """
+    stripped = text.strip()
+    if not stripped:
+        return False
+    if len(stripped) > _MAX_ACCEPTANCE_CHECK_CHARS:
+        return False
+    if _SENTENCE_END_RE.search(stripped):
+        return False
+    lower = stripped.lower()
+    return any(lower.startswith(prefix) for prefix in _SHELL_COMMAND_PREFIXES)
+
+
+def _normalise(text: str) -> str:
+    """Collapse whitespace for semantic-identity comparison.
+
+    Strips leading/trailing whitespace and compresses internal runs of
+    whitespace (including newlines) to a single space.  Used by
+    ``TaskRewriter._parse_rewrite`` to detect when a rewrite produced the
+    same instruction/acceptance_check content as the original task, even
+    if the LLM emitted different surrounding whitespace.
+    """
+    import re as _re2
+    return _re2.sub(r"\s+", " ", text.strip())
+
 
 def _fire_callback(cb) -> None:
     """Call *cb* if not None; swallow any exception it raises."""

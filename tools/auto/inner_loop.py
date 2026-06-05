@@ -1,37 +1,36 @@
-"""tools/auto/inner_loop.py — AUTO-C3: inner attempt loop + Gate 2.
+"""tools/auto/inner_loop.py — AUTO-C3: per-round attempt loop (Gate 2).
 
-Ties the Coder (AUTO-C2) and Executor (AUTO-C1) together into the bounded
-inner loop for ONE task:
+Runs up to ``max_attempts`` coder → executor → validator cycles for one task
+within a single outer round.  Each attempt:
 
-    for attempt in 1 .. max_attempts (default 5):
-        1. Coder.generate(task, prior_feedback)   → writes files
-        2. Executor.run(task)                      → runs the acceptance check
-        3. Gate 2: acceptance check PASSED *and* the validator APPROVES
-           → success, stop.
-        otherwise: record what went wrong, feed it back, try again.
+  1. Calls the coder agent to produce / fix the target code.
+  2. Calls the executor to run the acceptance check (objective half of Gate 2).
+  3. If exec passes, calls the validator (subjective half of Gate 2).
+  4. Both halves must pass → InnerLoopResult(passed=True).
+  5. Either half fails → build structured feedback (LOOP-1), add to context,
+     continue to the next attempt.
 
-Gate 2 (completion gate) is deliberately two-part:
-  * objective  — the acceptance check command must exit 0 (Executor.passed), and
-  * judged     — a validator must approve the change.
-Both must hold.  The validator is **fail-closed**: any infra/parse error counts
-as "not approved", never a false pass.
+LOOP-1 — Structured validator feedback
+---------------------------------------
+When the LLMGate2Validator rejects, it returns a feedback string that already
+contains Reason / Hints / Suggested approach.  The coder sees this on the next
+attempt, making feedback prescriptive rather than just diagnostic.
 
-The loop never raises on a coder/executor/validator failure — each becomes
-feedback for the next attempt.  Committing the result is AUTO-C5's job; this
-module only decides pass/fail and produces the feedback that AUTO-C4 turns into
-a round-feedback file.
+Public surface::
 
-Public surface:
+    from tools.auto.inner_loop import (
+        InnerLoop, InnerLoopResult, AttemptRecord,
+        LLMGate2Validator, make_inner_loop,
+    )
 
-    from tools.auto.inner_loop import InnerLoop, InnerLoopResult, make_inner_loop
+    inner = make_inner_loop(config, base_dir)
+    result = inner.run_task(task, base_dir, prior_feedback=[...])
 
-    loop = make_inner_loop(config, base_dir)        # real coder/executor/validator
-    result = loop.run_task(task, base_dir, prior_feedback=[])
-    if result.passed: ...                           # AUTO-C5 commits
-
-agents.ini [auto] keys
-----------------------
-max_attempts_per_task — inner-loop cap (default 5)
+agents.ini keys consumed
+------------------------
+[auto]  max_attempts_per_task   — attempt cap per round (default 5)
+[validator_agent] temperature   — validator temperature (default 0.1)
+[validator_agent] max_hints     — max hint items in rejection (default 3)
 """
 
 from __future__ import annotations
@@ -41,97 +40,103 @@ import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Protocol, Tuple
-
-from tools.agent_trace import tracer
-import tools.llm_stream as _llm_stream
-from tools.llm_stream import strip_think
 
 logger = logging.getLogger(__name__)
 
 _DEFAULT_MAX_ATTEMPTS = 5
-_MAX_DETAIL_CHARS = 600
-
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Result types
+# Data classes
 # ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class AttemptRecord:
-    """Outcome of a single inner-loop attempt."""
-    attempt:    int
-    coder_ok:   bool
-    exec_passed: bool
-    approved:   bool
-    feedback:   str = ""
+    """Record of a single coder → executor → validator attempt."""
+    attempt_num:   int
+    coder_ok:      bool
+    exec_ok:       bool
+    validator_ok:  bool
+    feedback:      str
 
     @property
     def passed(self) -> bool:
-        """Gate 2: acceptance check passed AND validator approved."""
-        return self.coder_ok and self.exec_passed and self.approved
+        return self.coder_ok and self.exec_ok and self.validator_ok
 
 
 @dataclass
 class InnerLoopResult:
-    """Aggregate result of the inner loop for one task."""
-    task_id:       str
-    passed:        bool
-    attempts_used: int
-    records:       list[AttemptRecord] = field(default_factory=list)
-    last_feedback: str = ""
-
-    def summary(self) -> str:
-        status = "PASS" if self.passed else "FAIL"
-        return (f"[{self.task_id}] inner-loop {status} after "
-                f"{self.attempts_used} attempt(s)")
+    """Result of one inner-loop run (one outer round)."""
+    task_id:       str   = ""
+    passed:        bool  = False
+    attempts_used: int   = 0
+    last_feedback: str   = ""
+    records:       list  = field(default_factory=list)   # list[AttemptRecord]
+    hint_history:  list  = field(default_factory=list)   # list[str] — LOOP-4
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Validator protocol + default LLM implementation (Gate 2, judged half)
+# LLM-backed Gate-2 validator  (LOOP-1)
 # ─────────────────────────────────────────────────────────────────────────────
 
-class Gate2Validator(Protocol):
-    """Anything with this shape can serve as the Gate-2 judge."""
-    def approve(self, task: dict, exec_result, coder_result) -> Tuple[bool, str]:
-        ...
+_GATE2_SYSTEM = (
+    "You are a code-change validator. "
+    "Given a task description, execution output, and the generated code, "
+    "decide whether the implementation is complete and correct.\n"
+    "Return ONLY a JSON object — no text before or after:\n"
+    '{"approved": true|false, "feedback": "<one sentence reason>", '
+    '"hints": ["<actionable hint 1>", ...], '
+    '"suggested_approach": "<optional one-sentence alternative>"}\n'
+    "HINTS RULES:\n"
+    "  - Each hint MUST point to a specific name, line, or pattern in the code.\n"
+    "  - Good: 'import re is used on line 12 but not present in imports'.\n"
+    "  - Bad: 'make sure the code is correct'.\n"
+    "  - Omit the hints array (or use []) when approved=true.\n"
+    "  - suggested_approach is optional — only fill it with a concrete alternative."
+)
 
 
 class LLMGate2Validator:
-    """Default Gate-2 validator: asks the model whether the change correctly
-    implements the task.  Fail-closed — any error → (False, reason)."""
+    """Fail-closed LLM-based Gate-2 validator.
+
+    Calls the model and parses ``{"approved": bool, "feedback": str, ...}``.
+    Any network / parse error returns ``(False, "validator unavailable: …")``.
+    """
 
     def __init__(
         self,
-        base_url: str,
-        api_key: str = "",
-        model: str = "",
-        api_format: str = "openai",
-        verify_ssl: bool = True,
-        timeout: float = 120,
+        base_url:   str  = "http://localhost:1337/v1",
+        model:      str  = "qwen2.5-14b-instruct",
+        api_key:    str  = "jan",
+        api_format: str  = "openai",
         temperature: float = 0.1,
-        base_dir: str = ".",
-    ) -> None:
-        self._base_url   = base_url.rstrip("/")
-        self._api_key    = api_key
-        self._model      = model
-        self._api_format = api_format
-        
-        import ssl
-        self._ssl_context = None
-        if not verify_ssl:
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            self._ssl_context = ctx
-            
-        self._timeout    = timeout
-        self._temperature = temperature
-        self._base_dir   = Path(base_dir)
+        timeout:    int  = 120,
+        max_hints:  int  = 3,
+        ssl_context = None,
+        base_dir:   str  = ".",
+        num_ctx:    int  = 0,
+        max_tokens: int  = 512,
+    ):
+        self.base_url    = base_url
+        self.model       = model
+        self.api_key     = api_key
+        self.api_format  = api_format
+        self.temperature = temperature
+        self.timeout     = timeout
+        self.max_hints   = max(1, int(max_hints))
+        self.ssl_context = ssl_context
+        self.base_dir    = Path(base_dir)
+        self.num_ctx     = int(num_ctx)
+        self.max_tokens  = int(max_tokens)
+
+    # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
 
     def _read_changed_content(self, coder_result) -> str:
         """Read the post-edit content of the files the coder wrote, so the
-        validator has the actual change to judge (not just file names)."""
+        validator judges the ACTUAL code (not just file names).  The Gate-2
+        system prompt promises 'the generated code' and asks for line/pattern
+        specific hints, so the code must be present in the prompt."""
         files = list(getattr(coder_result, "files_written", []) or [])
         if not files:
             return "(the coder reported NO files written — nothing changed)"
@@ -139,71 +144,108 @@ class LLMGate2Validator:
         blocks = []
         for rel in files:
             try:
-                content = (self._base_dir / rel).read_text(
+                content = (self.base_dir / rel).read_text(
                     encoding="utf-8", errors="replace")
             except OSError as exc:
                 content = f"(could not read {rel}: {exc})"
-            blocks.append(f"--- {rel} ---\n{_truncate(content, budget)}")
+            if len(content) > budget:
+                content = content[:budget] + f"\n… [+{len(content) - budget} chars truncated]"
+            blocks.append(f"--- {rel} ---\n{content}")
         return "\n\n".join(blocks)
 
-    def approve(self, task: dict, exec_result, coder_result) -> Tuple[bool, str]:
-        system = (
-            "You are a code-change validator. The acceptance check has ALREADY "
-            "passed (exited 0). Using the CHANGED FILE CONTENT below, confirm the "
-            "change plausibly implements the TASK and introduces no obvious "
-            "regression. Bias toward approving: approve unless you can point to a "
-            "CONCRETE problem visible in the code shown — a real bug, a required "
-            "part of the task that is clearly missing, or a clear regression. Do "
-            "not reject for style, formatting, or things not visible here. "
-            'Return STRICT JSON only: {"approved": true or false, '
-            '"feedback": "the concrete problem to fix; empty if approved"}'
-        )
-        stdout = _truncate(getattr(exec_result, "stdout", "") or "", _MAX_DETAIL_CHARS)
-        changed = self._read_changed_content(coder_result)
-        user = (
-            f"TASK: {task.get('title','')}\n"
-            f"INSTRUCTION: {task.get('instruction','')}\n"
-            f"ACCEPTANCE CHECK (passed, exit 0): {task.get('acceptance_check','')}\n"
-            f"ACCEPTANCE OUTPUT:\n{stdout}\n\n"
-            f"CHANGED FILE CONTENT (after the coder's edit):\n{changed}\n"
-        )
-        headers = {"Content-Type": "application/json",
-                   "Authorization": f"Bearer {self._api_key}"}
-        if self._api_format == "ollama":
-            url = _llm_stream.ollama_chat_url(self._base_url)
-            payload = {"model": self._model,
-                       "messages": [{"role": "system", "content": system},
-                                    {"role": "user", "content": user}],
-                       "options": {
-                           "temperature": self._temperature
-                       }}
-        else:
-            url = f"{self._base_url}/chat/completions"
-            
-            payload = {"model": self._model,
-                       "messages": [{"role": "system", "content": system},
-                                    {"role": "user", "content": user}],
-                       "temperature": self._temperature}
-
-        tracer.event("inner_loop", "gate2_validator", "llm_request",
-                     params={"task": task.get("id")}, content=user,
-                     model=self._model, temperature=self._temperature)
+    def approve(
+        self,
+        task:         dict,
+        exec_result,
+        coder_result,
+    ) -> tuple[bool, str]:
+        """Return (approved, feedback_string).  Never raises — fail-closed."""
         try:
-            raw = _llm_stream.request_completion(
-                url=url, headers=headers, payload=payload, timeout=self._timeout,
-                stream=True, api_format=self._api_format, ssl_context=self._ssl_context,
+            from tools.llm_stream import request_completion, strip_think
+
+            if self.api_format == "ollama":
+                from tools.llm_stream import ollama_chat_url
+                url = ollama_chat_url(self.base_url)
+            else:
+                url = f"{self.base_url.rstrip('/')}/chat/completions"
+
+            headers = {
+                "Content-Type":  "application/json",
+                "Authorization": f"Bearer {self.api_key}",
+            }
+
+            user_msg = (
+                f"Task: {task.get('instruction', '')}\n\n"
+                f"Acceptance check exit code: {getattr(exec_result, 'exit_code', 0)}\n"
+                f"stdout:\n{getattr(exec_result, 'stdout', '')[:2000]}\n\n"
+                f"Generated files (CHANGED FILE CONTENT after the coder's edit):\n"
+                + self._read_changed_content(coder_result)
             )
-            cleaned = strip_think(raw)
-            tracer.event("gate2_validator", "inner_loop", "llm_response", content=cleaned)
-            if "```json" in cleaned:
-                cleaned = cleaned.split("```json", 1)[1].split("```", 1)[0].strip()
-            elif "```" in cleaned:
-                cleaned = cleaned.split("```", 1)[1].split("```", 1)[0].strip()
-            data = json.loads(cleaned)
-            return bool(data.get("approved", False)), str(data.get("feedback", "") or "")
-        except Exception as exc:  # noqa: BLE001 — fail closed on ANY error
-            logger.warning("Gate2 validator failed (fail-closed): %s", exc)
+
+            if self.api_format == "ollama":
+                _val_opts: dict = {"temperature": self.temperature, "num_predict": self.max_tokens}
+                if self.num_ctx:
+                    _val_opts["num_ctx"] = self.num_ctx
+                payload = {
+                    "model": self.model,
+                    "messages": [
+                        {"role": "system",  "content": _GATE2_SYSTEM},
+                        {"role": "user",    "content": user_msg},
+                    ],
+                    "options": _val_opts,
+                }
+            else:
+                payload = {
+                    "model": self.model,
+                    "messages": [
+                        {"role": "system",  "content": _GATE2_SYSTEM},
+                        {"role": "user",    "content": user_msg},
+                    ],
+                    "temperature": self.temperature,
+                    "max_tokens": self.max_tokens,
+                }
+
+            raw = request_completion(
+                url=url,
+                headers=headers,
+                payload=payload,
+                timeout=self.timeout,
+                api_format=self.api_format,
+                ssl_context=self.ssl_context,
+            )
+            raw = strip_think(raw)
+            if "```json" in raw:
+                raw = raw.split("```json")[1].split("```")[0].strip()
+            elif "```" in raw:
+                raw = raw.split("```")[1].split("```")[0].strip()
+
+            parsed   = json.loads(raw)
+            approved = bool(parsed.get("approved", False))
+            if approved:
+                return True, ""
+
+            # Build LOOP-1 structured feedback string
+            return False, _format_gate2_feedback(parsed, self.max_hints)
+
+        except Exception as exc:
+            logger.warning("LLMGate2Validator error: %s", exc)
             return False, f"validator unavailable: {exc}"
+
+
+def _format_gate2_feedback(parsed: dict, max_hints: int) -> str:
+    """Build a structured rejection string from a Gate-2 dict (LOOP-1)."""
+    feedback = parsed.get("feedback", "no reason given")
+    hints    = (parsed.get("hints") or [])[:max_hints]
+    approach = parsed.get("suggested_approach", "")
+
+    lines = [f"Reason: {feedback}"]
+    if hints:
+        lines.append("Hints:")
+        for i, h in enumerate(hints, 1):
+            lines.append(f"  {i}. {h}")
+    if approach:
+        lines.append(f"Suggested approach: {approach}")
+    return "\n".join(lines)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -211,94 +253,151 @@ class LLMGate2Validator:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class InnerLoop:
-    """Runs the bounded inner attempt loop for one task (AUTO-C3)."""
+    """Runs up to ``max_attempts`` coder → executor → validator cycles.
+
+    Agents are injected so this class stays unit-testable without live LLMs.
+    ``make_inner_loop`` constructs real agents from config for production.
+
+    Gate 2 requires BOTH halves:
+      * executor.run(task) must return a result with passed=True, AND
+      * validator.approve(task, exec_result, coder_result) must return True.
+    If the exec fails the validator is not called at all.
+    """
 
     def __init__(
         self,
         coder,
         executor,
-        validator: Gate2Validator,
+        validator,
         max_attempts: int = _DEFAULT_MAX_ATTEMPTS,
-    ) -> None:
+    ):
         self.coder        = coder
         self.executor     = executor
         self.validator    = validator
         self.max_attempts = max(1, int(max_attempts))
 
+    # ------------------------------------------------------------------
+
     def run_task(
         self,
-        task: dict,
-        base_dir: str | Path,
-        prior_feedback: Optional[list[str]] = None,
+        task:             dict,
+        base_dir:         str | Path,
+        *,
+        prior_feedback:   list[str] | None = None,
+        prior_implementations: list[dict] | None = None,   # LOOP-4
     ) -> InnerLoopResult:
-        """Attempt to complete *task* in up to ``max_attempts`` tries.
+        """Run up to ``max_attempts`` Gate-2 cycles for *task*.
 
-        *prior_feedback* (from earlier AUTO-C4 rounds) seeds the first attempt's
-        coder context.  Returns an :class:`InnerLoopResult`; never raises.
+        Returns:
+            :class:`InnerLoopResult` with ``passed`` flag, attempt count,
+            last feedback string, and per-attempt records.
         """
-        task_id = task.get("id", "?")
+        task_id = task.get("id", "")
         feedback: list[str] = list(prior_feedback or [])
-        records: list[AttemptRecord] = []
+        records:  list[AttemptRecord] = []
 
-        tracer.event("controller", "inner_loop", "run_start",
-                     params={"task": task_id, "max_attempts": self.max_attempts})
+        # LOOP-4: prepend prior implementation history
+        if prior_implementations:
+            history_lines = [
+                "PREVIOUS IMPLEMENTATION STRATEGIES — do not repeat these approaches:"
+            ]
+            for entry in prior_implementations:
+                v       = entry.get("version", "?")
+                summary = entry.get("strategy_summary", "")
+                why     = entry.get("why_failed", "")
+                history_lines.append(f"  v{v}: tried {summary} — failed because {why}")
+            feedback.insert(0, "\n".join(history_lines))
 
         for attempt in range(1, self.max_attempts + 1):
-            # 1) Coder
-            cr = self.coder.generate(task, base_dir, prior_feedback=feedback)
-            if not getattr(cr, "succeeded", False):
-                fb = f"attempt {attempt}: coder failed — {getattr(cr, 'error', '') or 'no files written'}"
+
+            # ── 1. Coder ──────────────────────────────────────────────────────
+            try:
+                coder_result = self.coder.generate(
+                    task, base_dir, prior_feedback=feedback
+                )
+            except Exception as exc:
+                logger.error("InnerLoop: coder raised on attempt %d: %s", attempt, exc)
+                fb = f"attempt {attempt}: coder error — {exc}"
+                feedback.append(fb)
                 records.append(AttemptRecord(attempt, False, False, False, fb))
-                feedback.append(fb)
-                self._trace_attempt(task_id, attempt, "coder_failed", fb)
                 continue
 
-            # 2) Executor (objective half of Gate 2)
-            er = self.executor.run(task)
-            if not getattr(er, "passed", False):
-                detail = (getattr(er, "traceback", "") or
-                          getattr(er, "stderr", "") or
-                          getattr(er, "stdout", ""))
-                timeout = ", timeout" if getattr(er, "timed_out", False) else ""
-                fb = (f"attempt {attempt}: acceptance check failed "
-                      f"(rc={getattr(er, 'exit_code', '?')}{timeout}) — "
-                      f"{_truncate(detail, _MAX_DETAIL_CHARS)}")
+            if not getattr(coder_result, "succeeded", True):
+                fb = f"attempt {attempt}: coder failed — {getattr(coder_result, 'error', 'unknown error')}"
+                feedback.append(fb)
+                records.append(AttemptRecord(attempt, False, False, False, fb))
+                continue
+
+            # ── 2. Executor (objective half of Gate 2) ────────────────────────
+            try:
+                exec_result = self.executor.run(task)
+            except Exception as exc:
+                logger.error("InnerLoop: executor raised on attempt %d: %s", attempt, exc)
+                fb = f"attempt {attempt}: executor error — {exc}"
+                feedback.append(fb)
                 records.append(AttemptRecord(attempt, True, False, False, fb))
-                feedback.append(fb)
-                self._trace_attempt(task_id, attempt, "exec_failed", fb)
                 continue
 
-            # 3) Validator (judged half of Gate 2) — fail-closed
-            approved, vfb = self.validator.approve(task, er, cr)
-            if approved:
-                records.append(AttemptRecord(attempt, True, True, True, ""))
-                self._trace_attempt(task_id, attempt, "passed", "")
-                return InnerLoopResult(task_id, True, attempt, records, "")
+            if not getattr(exec_result, "passed", False):
+                tb  = getattr(exec_result, "traceback", "") or ""
+                out = getattr(exec_result, "stdout",    "") or ""
+                err = getattr(exec_result, "stderr",    "") or ""
+                ec  = getattr(exec_result, "exit_code", 1)
+                cmd = getattr(exec_result, "command",   "") or ""
+                # Include stderr so argparse / runtime error messages reach the coder.
+                # Priority: traceback > stderr > stdout (most diagnostic first).
+                if tb:
+                    detail = f"traceback:\n{tb}"
+                elif err:
+                    detail = f"stderr:\n{err[:400]}"
+                else:
+                    detail = f"stdout:\n{out[:400]}"
+                fb  = (
+                    f"attempt {attempt}: exec failed (exit {ec})"
+                    + (f"  cmd={cmd!r}" if cmd else "")
+                    + f"\n{detail}"
+                )
+                feedback.append(fb)
+                records.append(AttemptRecord(attempt, True, False, False, fb))
+                continue
 
-            fb = f"attempt {attempt}: validator rejected — {vfb}"
-            records.append(AttemptRecord(attempt, True, True, False, fb))
-            feedback.append(fb)
-            self._trace_attempt(task_id, attempt, "validator_rejected", fb)
+            # ── 3. Validator (subjective half of Gate 2) ─────────────────────
+            try:
+                approved, vfb = self.validator.approve(task, exec_result, coder_result)
+            except Exception as exc:
+                logger.error("InnerLoop: validator raised on attempt %d: %s", attempt, exc)
+                fb = f"attempt {attempt}: validator error — {exc}"
+                feedback.append(fb)
+                records.append(AttemptRecord(attempt, True, True, False, fb))
+                continue
 
+            if not approved:
+                fb = f"attempt {attempt}: validator rejected\n{vfb}"
+                logger.info("InnerLoop: attempt %d rejected — %s", attempt, vfb[:80])
+                feedback.append(fb)
+                records.append(AttemptRecord(attempt, True, True, False, fb))
+                continue
+
+            # ── APPROVED ──────────────────────────────────────────────────────
+            logger.info("InnerLoop: attempt %d APPROVED", attempt)
+            records.append(AttemptRecord(attempt, True, True, True, ""))
+            return InnerLoopResult(
+                task_id=task_id,
+                passed=True,
+                attempts_used=attempt,
+                last_feedback="",
+                records=records,
+            )
+
+        # All attempts exhausted
         last = feedback[-1] if feedback else ""
-        tracer.event("inner_loop", "controller", "result",
-                     params={"task": task_id, "passed": False,
-                             "attempts": self.max_attempts})
-        return InnerLoopResult(task_id, False, self.max_attempts, records, last)
-
-    # ── private ──────────────────────────────────────────────────────────────
-
-    def _trace_attempt(self, task_id: str, attempt: int, outcome: str, fb: str) -> None:
-        tracer.event("inner_loop", "controller", "decision",
-                     params={"task": task_id, "attempt": attempt, "outcome": outcome},
-                     content=fb)
-
-
-def _truncate(text: str, max_chars: int) -> str:
-    text = text or ""
-    if len(text) <= max_chars:
-        return text
-    return text[:max_chars] + f"… [+{len(text) - max_chars} chars]"
+        return InnerLoopResult(
+            task_id=task_id,
+            passed=False,
+            attempts_used=self.max_attempts,
+            last_feedback=last,
+            records=records,
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -306,39 +405,91 @@ def _truncate(text: str, max_chars: int) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def make_inner_loop(
-    config: configparser.ConfigParser,
+    config:   configparser.ConfigParser,
     base_dir: str | Path,
     *,
     coder=None,
     executor=None,
-    validator: Optional[Gate2Validator] = None,
+    validator=None,
 ) -> InnerLoop:
-    """Build an :class:`InnerLoop` with real Coder/Executor/validator from config."""
-    from tools.auto.coder import make_coder
-    from tools.auto.executor import make_executor
+    """Construct an :class:`InnerLoop` with real agents from *config*.
 
+    Any agent may be injected (useful for tests); omitted agents are
+    constructed from the config's API / model settings.
+    """
     max_attempts = config.getint("auto", "max_attempts_per_task",
                                  fallback=_DEFAULT_MAX_ATTEMPTS)
 
+    # ── API settings ─────────────────────────────────────────────────────────
+    active_profile = config.get("api", "active", fallback="local")
+    api_section    = f"api_{active_profile}"
+
+    base_url   = config.get(api_section, "base_url",   fallback="http://localhost:1337/v1")
+    api_key    = config.get(api_section, "api_key",    fallback="jan")
+    model      = config.get(api_section, "model",      fallback="qwen2.5-14b-instruct")
+    api_format = config.get(api_section, "api_format", fallback="openai")
+    num_ctx    = config.getint(api_section, "num_ctx",  fallback=0)
+
+    verify_ssl_raw = config.get("api", "verify_ssl", fallback="true")
+    verify_ssl     = verify_ssl_raw.strip().lower() not in ("false", "0", "no")
+
+    import ssl
+    ssl_context: ssl.SSLContext | None = None
+    if not verify_ssl:
+        ssl_context = ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode    = ssl.CERT_NONE
+
+    max_hints  = config.getint("validator_agent", "max_hints", fallback=3)
+    val_temp   = config.getfloat("validator_agent", "temperature", fallback=0.1)
+    exec_timeout = config.getint("auto", "exec_timeout_sec", fallback=120)
+
+    # ── Coder ─────────────────────────────────────────────────────────────────
     if coder is None:
-        coder = make_coder(config)
+        try:
+            from tools.auto.coder import make_coder  # type: ignore
+            coder = make_coder(config)
+        except ImportError:
+            logger.warning("Coder not found — using _StubCoder (tests only)")
+            coder = _StubCoder()
 
+    # ── Executor ──────────────────────────────────────────────────────────────
     if executor is None:
-        exec_timeout = config.getfloat("auto", "exec_timeout_sec", fallback=120)
-        executor = make_executor(base_dir, timeout_sec=exec_timeout)
+        try:
+            from tools.auto.executor import make_executor  # type: ignore
+            executor = make_executor(base_dir=base_dir, timeout_sec=exec_timeout)
+        except ImportError:
+            logger.warning("Executor not found — using _StubExecutor (tests only)")
+            executor = _StubExecutor()
 
+    # ── Validator ─────────────────────────────────────────────────────────────
     if validator is None:
-        active     = config.get("api", "active", fallback="local")
-        section    = f"api_{active}"
         validator = LLMGate2Validator(
-            base_url   = config.get(section, "base_url", fallback="http://localhost:1337/v1"),
-            api_key    = config.get(section, "api_key", fallback=""),
-            model      = config.get(section, "model", fallback=""),
-            api_format = config.get(section, "api_format", fallback="openai"),
-            verify_ssl = config.getboolean("api", "verify_ssl", fallback=True),
-            temperature = config.getfloat("inner_loop", "temperature", fallback=0.1),
-            base_dir   = str(base_dir),
-            timeout    = config.getfloat("auto", "llm_timeout_sec", fallback=120),
+            base_url=base_url,
+            model=model,
+            api_key=api_key,
+            api_format=api_format,
+            temperature=val_temp,
+            timeout=120,
+            max_hints=max_hints,
+            ssl_context=ssl_context,
+            base_dir=str(base_dir),
+            num_ctx=num_ctx,
+            max_tokens=config.getint("validator_agent", "max_tokens", fallback=512),
         )
 
     return InnerLoop(coder, executor, validator, max_attempts=max_attempts)
+
+
+# ── Stubs for environments without real agents (unit tests) ──────────────────
+
+class _StubCoder:
+    def generate(self, task, base_dir, prior_feedback=None):
+        from types import SimpleNamespace
+        return SimpleNamespace(succeeded=False, files_written=[], error="stub coder — no real coder available")
+
+
+class _StubExecutor:
+    def run(self, task):
+        from types import SimpleNamespace
+        return SimpleNamespace(passed=False, exit_code=1, stdout="", stderr="", traceback="stub executor", timed_out=False)

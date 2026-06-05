@@ -44,7 +44,7 @@ class FakeInnerLoop:
     def __init__(self, results):
         self._results = list(results)
         self.seen_prior = []        # list of prior_feedback lists, one per round
-    def run_task(self, task, base_dir, prior_feedback=None):
+    def run_task(self, task, base_dir, prior_feedback=None, prior_implementations=None):
         self.seen_prior.append(list(prior_feedback or []))
         return self._results.pop(0) if self._results else FakeInnerResult()
 

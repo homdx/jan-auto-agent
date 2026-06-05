@@ -56,8 +56,6 @@ import logging
 import re
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any
 
 from tools.auto.architect import CandidateTask
 from tools.auto.state import make_task
@@ -289,10 +287,6 @@ class BacklogPrioritiser:
         2. Cross-file symbol reference: if B's instruction mentions A's
            cited symbol by name, and they don't share a target file, add A → B.
         """
-        # Build lookup structures.
-        id_by_index = {t.original_index: t.task_id for t in tasks}
-        task_by_id  = {t.task_id: t for t in tasks}
-
         for i, task_b in enumerate(tasks):
             for j, task_a in enumerate(tasks):
                 if i == j:
