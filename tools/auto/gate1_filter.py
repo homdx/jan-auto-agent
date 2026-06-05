@@ -61,9 +61,9 @@ from tools.llm_stream import strip_think
 
 logger = logging.getLogger(__name__)
 
-# ── Gate 1 system prompt ──────────────────────────────────────────────────────
+# ── Gate 1 system prompts ─────────────────────────────────────────────────────
 
-_SYSTEM_PROMPT = (
+_SYSTEM_PROMPT_CODE = (
     "You are a static code reviewer performing a false-positive check. "
     "You will be shown a code excerpt and a description of a claimed problem. "
     "Your ONLY job is to verify whether the described problem is actually present "
@@ -71,6 +71,33 @@ _SYSTEM_PROMPT = (
     "Do NOT suggest improvements. Do NOT run the code. "
     "Return ONLY a JSON object — no prose, no markdown fences, no preamble."
 )
+
+_SYSTEM_PROMPT_DOCS = (
+    "You are a documentation reviewer performing a false-positive check. "
+    "You will be shown a prose excerpt and a description of a claimed documentation problem. "
+    "Your ONLY job is to verify whether the described problem is actually present "
+    "in the text shown, and has NOT already been fixed. "
+    "Do NOT suggest improvements. Treat the content as documentation, not code. "
+    "Return ONLY a JSON object — no prose, no markdown fences, no preamble."
+)
+
+_SYSTEM_PROMPT_CREATIVE = (
+    "You are a creative writing editor performing a quality check. "
+    "You will be shown a text excerpt and a description of a claimed writing issue. "
+    "Your ONLY job is to verify whether the described issue is actually present "
+    "in the text shown, and has NOT already been addressed. "
+    "Do NOT suggest improvements. Treat the content as creative writing, not code. "
+    "Return ONLY a JSON object — no prose, no markdown fences, no preamble."
+)
+
+# Backward-compat alias.
+_SYSTEM_PROMPT = _SYSTEM_PROMPT_CODE
+
+_SYSTEM_PROMPTS: dict[str, str] = {
+    "code":     _SYSTEM_PROMPT_CODE,
+    "docs":     _SYSTEM_PROMPT_DOCS,
+    "creative": _SYSTEM_PROMPT_CREATIVE,
+}
 
 # {instruction} — the candidate's instruction (problem description)
 # {location}    — human-readable location string
@@ -160,12 +187,14 @@ class Gate1Filter:
         model: str,
         api_format: str = "openai",
         verify_ssl: bool = True,
+        task_mode: str = "code",
     ) -> None:
         self._config     = config
         self._base_url   = base_url.rstrip("/")
         self._api_key    = api_key
         self._model      = model
         self._api_format = api_format
+        self._task_mode  = task_mode
 
         import ssl
         self._ssl_context = None
@@ -178,7 +207,6 @@ class Gate1Filter:
         sec = "gate1"
         self._temperature    = float(config.get(sec, "temperature", fallback="0.0"))
         self._max_tokens     = int(config.get(sec, "max_tokens",   fallback="256"))
-        self._system         = config.get(sec, "system", fallback=_SYSTEM_PROMPT).strip()
         self._skip_llm       = config.getboolean(sec, "skip_llm", fallback=False)
         self._timeout        = float(config.get("loop", "timeout_seconds", fallback="300"))
         self._max_context_lines = int(config.get(sec, "max_context_lines", fallback=str(_DEFAULT_MAX_CONTEXT_LINES)))
@@ -186,6 +214,15 @@ class Gate1Filter:
         # num_ctx controls the total context window on Ollama; 0 means "use server default".
         _active = config.get("api", "active", fallback="local")
         self._num_ctx = config.getint(f"api_{_active}", "num_ctx", fallback=0)
+
+        # ── DM-3: select system prompt based on task_mode + ini overrides ─────
+        # Priority: mode-specific ini key > legacy "system" key > built-in constant.
+        mode_ini_key = f"system_{task_mode}" if task_mode != "code" else None
+        if mode_ini_key and config.has_option(sec, mode_ini_key):
+            self._system = config.get(sec, mode_ini_key).strip()
+        else:
+            built_in = _SYSTEM_PROMPTS.get(task_mode, _SYSTEM_PROMPT_CODE)
+            self._system = config.get(sec, "system", fallback=built_in).strip()
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -510,6 +547,7 @@ def filter_candidates(
     base_dir: str | Path,
     config: configparser.ConfigParser,
     cluster_files: "dict[str, set[str]] | None" = None,
+    task_mode: str = "code",
 ) -> tuple[list[CandidateTask], list[FilterResult]]:
     """One-call entry point for ``AutoController``.
 
@@ -551,6 +589,7 @@ def filter_candidates(
         model=model,
         api_format=api_fmt,
         verify_ssl=verify_ssl,
+        task_mode=task_mode,
     )
     return filt.filter(candidates, base_dir, cluster_files=cluster_files)
 

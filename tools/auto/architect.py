@@ -44,10 +44,10 @@ from tools.llm_stream import strip_think
 
 logger = logging.getLogger(__name__)
 
-# ── Architect system prompt ───────────────────────────────────────────────────
+# ── Architect system prompts ──────────────────────────────────────────────────
 # Injected as the system role.  Can be overridden via agents.ini [architect] system.
 
-_SYSTEM_PROMPT = (
+_SYSTEM_PROMPT_CODE = (
     "You are a senior software architect performing a targeted code review. "
     "Your job is to identify concrete, actionable improvements in the files "
     "provided. Each improvement you suggest MUST be grounded in a real location "
@@ -56,6 +56,38 @@ _SYSTEM_PROMPT = (
     "Do NOT invent problems that are not actually present in the provided code. "
     "Return ONLY a JSON array — no prose, no markdown fences, no preamble."
 )
+
+_SYSTEM_PROMPT_DOCS = (
+    "You are a senior technical writer performing a documentation review. "
+    "Your job is to identify concrete, actionable improvements in the documentation "
+    "files provided. Each improvement MUST be grounded in a real location — "
+    "cite the exact file path and the line range where the issue lives. "
+    "symbol may be null. "
+    "acceptance_check must be a shell command such as "
+    "'grep -q \"expected heading\" file.md' or 'true' if not checkable. "
+    "Do NOT invent problems that are not actually present in the provided docs. "
+    "Return ONLY a JSON array — no prose, no markdown fences, no preamble."
+)
+
+_SYSTEM_PROMPT_CREATIVE = (
+    "You are a creative writing editor reviewing drafts for improvement. "
+    "Your job is to identify concrete, actionable improvements in the creative "
+    "writing files provided. Each improvement MUST be grounded in a real location "
+    "— cite the exact file path and a line range where the issue lives. "
+    "cited_location.symbol must be null; cite line range only. "
+    "acceptance_check should be 'true' or a word-count sanity check. "
+    "Do NOT invent problems that are not actually present in the provided text. "
+    "Return ONLY a JSON array — no prose, no markdown fences, no preamble."
+)
+
+# Backward-compat alias — existing code that references _SYSTEM_PROMPT still works.
+_SYSTEM_PROMPT = _SYSTEM_PROMPT_CODE
+
+_SYSTEM_PROMPTS: dict[str, str] = {
+    "code":     _SYSTEM_PROMPT_CODE,
+    "docs":     _SYSTEM_PROMPT_DOCS,
+    "creative": _SYSTEM_PROMPT_CREATIVE,
+}
 
 # ── Per-cluster user prompt template ─────────────────────────────────────────
 # {goal}        — the user's overall improvement goal
@@ -150,11 +182,18 @@ class CitedLocation:
     line_start: int | None = None
     line_end: int | None = None
 
-    def is_valid(self) -> bool:
-        """A location is valid when it has a file AND at least one anchor."""
-        return bool(self.file) and (
-            bool(self.symbol) or self.line_start is not None
-        )
+    def is_valid(self, task_mode: str = "code") -> bool:
+        """A location is valid when it has a file AND at least one anchor.
+
+        For docs/creative modes, a file alone is sufficient grounding —
+        no symbol or line range is required.
+        """
+        if not self.file:
+            return False
+        if task_mode == "code":
+            return bool(self.symbol) or self.line_start is not None
+        # docs / creative: file alone is sufficient grounding
+        return True
 
 
 @dataclass
@@ -220,12 +259,14 @@ class ClusterReviewer:
         model: str,
         api_format: str = "openai",
         verify_ssl: bool = True,
+        task_mode: str = "code",
     ) -> None:
         self._config     = config
         self._base_url   = base_url.rstrip("/")
         self._api_key    = api_key
         self._model      = model
         self._api_format = api_format
+        self._task_mode  = task_mode
 
         import ssl
         self._ssl_context = None
@@ -238,7 +279,6 @@ class ClusterReviewer:
         arch = "architect"
         self._temperature            = float(config.get(arch, "temperature",         fallback="0.2"))
         self._max_tokens             = int(config.get(arch,   "max_tokens",          fallback="2048"))
-        self._system                 = config.get(arch, "system", fallback=_SYSTEM_PROMPT).strip()
         self._timeout                = float(config.get("loop", "timeout_seconds",   fallback="300"))
         self._max_file_chars         = int(config.get(arch,   "max_file_chars",      fallback=str(_DEFAULT_MAX_FILE_CHARS)))
         self._max_files_per_review   = int(config.get(arch,   "max_files_per_review", fallback=str(_DEFAULT_MAX_FILES_PER_REVIEW)))
@@ -249,6 +289,15 @@ class ClusterReviewer:
         self._rewrite_max_tokens     = int(config.get(arch,   "rewrite_max_tokens",  fallback="512"))
         self._rewrite_temperature    = float(config.get(arch, "rewrite_temperature", fallback="0.4"))
         self._rewrite_system         = config.get(arch, "rewrite_system", fallback="").strip()
+
+        # ── DM-2: select system prompt based on task_mode + ini overrides ─────
+        # Priority: mode-specific ini key > legacy "system" key > built-in constant.
+        mode_ini_key = f"system_{task_mode}" if task_mode != "code" else None
+        if mode_ini_key and config.has_option(arch, mode_ini_key):
+            self._system = config.get(arch, mode_ini_key).strip()
+        else:
+            built_in = _SYSTEM_PROMPTS.get(task_mode, _SYSTEM_PROMPT_CODE)
+            self._system = config.get(arch, "system", fallback=built_in).strip()
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -481,7 +530,8 @@ class ClusterReviewer:
             instruction = (item.get("instruction") or "").strip()
             acceptance  = (item.get("acceptance_check") or "").strip()
 
-            if not title or not instruction or not acceptance:
+            # In creative mode, empty acceptance_check is allowed (handled below).
+            if not title or not instruction or (not acceptance and self._task_mode != "creative"):
                 logger.warning(
                     "_parse_candidates [%s]: item %d missing title/instruction/"
                     "acceptance_check — rejected",
@@ -514,13 +564,24 @@ class ClusterReviewer:
                 line_end   = _to_int_or_none(loc_raw.get("line_end")),
             )
 
-            if not cited.is_valid():
+            if not cited.is_valid(self._task_mode):
                 logger.warning(
                     "_parse_candidates [%s]: item %d cited_location lacks file "
                     "and/or anchor (symbol/line_start) — rejected. loc=%r",
                     cluster_name, i, loc_raw,
                 )
                 continue
+
+            # DM-2: in creative mode, empty acceptance_check is allowed (default to 'true').
+            if not acceptance:
+                if self._task_mode == "creative":
+                    acceptance = "true"
+                else:
+                    logger.warning(
+                        "_parse_candidates [%s]: item %d missing acceptance_check — rejected",
+                        cluster_name, i,
+                    )
+                    continue
 
             candidates.append(CandidateTask(
                 title            = title,
@@ -576,6 +637,7 @@ def review_clusters(
     config: configparser.ConfigParser,
     goal: str = "improve current code",
     *,
+    task_mode: str = "code",
     on_cluster_done=None,
 ) -> list[CandidateTask]:
     """One-call entry point for ``AutoController``.
@@ -615,6 +677,7 @@ def review_clusters(
         model=model,
         api_format=api_fmt,
         verify_ssl=verify_ssl,
+        task_mode=task_mode,
     )
     return reviewer.review_clusters(clusters, base_dir, goal, on_cluster_done=on_cluster_done)
 
