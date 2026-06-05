@@ -38,10 +38,13 @@ from __future__ import annotations
 import configparser
 import json
 import logging
+from tools.auto.context_broker import ContextBroker
+
 from dataclasses import dataclass, field
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
 
 _DEFAULT_MAX_ATTEMPTS = 5
 
@@ -72,6 +75,15 @@ class InnerLoopResult:
     last_feedback: str   = ""
     records:       list  = field(default_factory=list)   # list[AttemptRecord]
     hint_history:  list  = field(default_factory=list)   # list[str] — LOOP-4
+    context_satisfied: bool = True   # pull-model: last attempt had all context it asked for
+    context_satisfied: bool = True   # pull-model: False ⇒ last attempt still needed context
+    context_satisfied: bool = True   # LOOP-5: False ⇒ last attempt still needed context
+    context_satisfied: bool = True   # False when the last attempt still requested unmet context (pull-model)
+    context_satisfied: bool = True   # False => last attempt still requested context (pull-model)
+    context_satisfied: bool = True   # False ⇒ last attempt still needed context (pull-model)
+    context_satisfied: bool = True   # False ⇒ last attempt still requested context (pull-model)
+    context_satisfied: bool = True   # pull-model: False if last attempt still needed context
+    context_satisfied: bool = True   # pull-model: False if last attempt still wanted context
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -85,7 +97,10 @@ _GATE2_SYSTEM_CODE = (
     "Return ONLY a JSON object — no text before or after:\n"
     '{"approved": true|false, "feedback": "<one sentence reason>", '
     '"hints": ["<actionable hint 1>", ...], '
-    '"suggested_approach": "<optional one-sentence alternative>"}\n'
+    '"suggested_approach": "<optional one-sentence alternative>", '
+    '"missing_context": ["<symbol you needed to see but were not shown>", ...]}\n'
+    "Use missing_context ONLY when you cannot verify correctness because a "
+    "referenced symbol's definition was not provided; otherwise omit it.\n"
     "HINTS RULES:\n"
     "  - Each hint MUST point to a specific name, line, or pattern in the code.\n"
     "  - Good: 'import re is used on line 12 but not present in imports'.\n"
@@ -157,8 +172,17 @@ class LLMGate2Validator:
         self.temperature = temperature
         self.timeout     = timeout
         self.max_hints   = max(1, int(max_hints))
+        self.last_missing_context: list[str] = []
+        self.last_missing_context: list[str] = []
         self.ssl_context = ssl_context
         self.base_dir    = Path(base_dir)
+        self.last_missing_context: list[str] = []
+        self.last_missing_context: list[str] = []
+        self.last_missing_context: list[str] = []
+        self.last_missing_context: list[str] = []
+        self.last_missing_context: list[str] = []
+        self.last_missing_context: list[str] = []
+        self.last_missing_context: list[str] = []
         self.num_ctx     = int(num_ctx)
         self.max_tokens  = int(max_tokens)
         self.task_mode   = str(task_mode)
@@ -200,7 +224,12 @@ class LLMGate2Validator:
         exec_result,
         coder_result,
     ) -> tuple[bool, str]:
-        """Return (approved, feedback_string).  Never raises — fail-closed."""
+        """Return (approved, feedback_string).  Never raises — fail-closed.
+
+        Side channel: ``self.last_missing_context`` is set to any symbol names
+        the validator reported as needed (pull-model); InnerLoop reads it.
+        """
+        self.last_missing_context = []
         try:
             from tools.llm_stream import request_completion, strip_think
 
@@ -261,6 +290,10 @@ class LLMGate2Validator:
                 raw = raw.split("```")[1].split("```")[0].strip()
 
             parsed   = json.loads(raw)
+            self.last_missing_context = [
+                str(x).strip() for x in (parsed.get("missing_context") or [])
+                if str(x).strip()
+            ]
             approved = bool(parsed.get("approved", False))
             if approved:
                 return True, ""
@@ -270,6 +303,7 @@ class LLMGate2Validator:
 
         except Exception as exc:
             logger.warning("LLMGate2Validator error: %s", exc)
+            self.last_missing_context = []
             return False, f"validator unavailable: {exc}"
 
 
@@ -311,11 +345,14 @@ class InnerLoop:
         executor,
         validator,
         max_attempts: int = _DEFAULT_MAX_ATTEMPTS,
+        context_broker=None,
     ):
         self.coder        = coder
         self.executor     = executor
         self.validator    = validator
         self.max_attempts = max(1, int(max_attempts))
+        self._broker      = context_broker or ContextBroker()
+        self._broker      = ContextBroker()
 
     # ------------------------------------------------------------------
 
@@ -336,6 +373,19 @@ class InnerLoop:
         task_id = task.get("id", "")
         feedback: list[str] = list(prior_feedback or [])
         records:  list[AttemptRecord] = []
+        prefetched_context: str = ""
+        final_missing: list[str] = []
+        base_dir_path = Path(base_dir)
+        target_files  = task.get("target_files", []) or []
+        prefetched_context: str = ""   # pull-model: context the previous attempt asked for
+        final_missing: list[str] = []  # outstanding requests from the most recent attempt
+        prefetched_context = ""          # pull-model: symbols resolved for next attempt
+        final_missing: list[str] = []    # outstanding context after the latest attempt
+        # Pull-model state (carried across attempts within this round)
+        prefetched_context: str = ""
+        final_missing: list[str] = []
+        _bdir = Path(base_dir)
+        _targets = task.get("target_files", []) or []
 
         # LOOP-4: prepend prior implementation history
         if prior_implementations:
@@ -349,12 +399,24 @@ class InnerLoop:
                 history_lines.append(f"  v{v}: tried {summary} — failed because {why}")
             feedback.insert(0, "\n".join(history_lines))
 
+        prefetched_context = ""
+        final_missing: list[str] = []
+
+        prefetched_context: str = ""
+        final_missing: list[str] = []
+
+        prefetched_context: str = ""
+        final_missing: list[str] = []
+        _bdir = Path(base_dir)
+        _targets = task.get("target_files", []) or []
+
         for attempt in range(1, self.max_attempts + 1):
 
             # ── 1. Coder ──────────────────────────────────────────────────────
             try:
                 coder_result = self.coder.generate(
-                    task, base_dir, prior_feedback=feedback
+                    task, base_dir, prior_feedback=feedback,
+                    prefetched_context=prefetched_context,
                 )
             except Exception as exc:
                 logger.error("InnerLoop: coder raised on attempt %d: %s", attempt, exc)
@@ -362,6 +424,61 @@ class InnerLoop:
                 feedback.append(fb)
                 records.append(AttemptRecord(attempt, False, False, False, fb))
                 continue
+
+            # Pull-model: resolve any context the coder asked for, for the NEXT attempt.
+            coder_missing = list(getattr(coder_result, "missing_context", []) or [])
+            final_missing = coder_missing
+            if coder_missing:
+                prefetched_context = self._broker.fetch(
+                    coder_missing, task.get("target_files", []) or [], Path(base_dir)
+                )
+
+            # Pull-model: resolve any context the coder asked for, for the next attempt.
+            coder_missing = list(getattr(coder_result, "missing_context", []) or [])
+            final_missing = coder_missing
+            if coder_missing:
+                prefetched_context = self._broker.fetch(coder_missing, _targets, _bdir)
+                logger.info("InnerLoop: attempt %d coder requested context %s",
+                            attempt, coder_missing)
+
+            # Pull-model: resolve any context the coder requested for the next attempt.
+            coder_missing = list(getattr(coder_result, "missing_context", []) or [])
+            final_missing = coder_missing
+            if coder_missing:
+                prefetched_context = self._broker.fetch(
+                    coder_missing, task.get("target_files", []) or [], Path(base_dir)
+                )
+
+            # ── Pull-model: resolve any context the coder asked for ───────────
+            coder_missing = list(getattr(coder_result, "missing_context", []) or [])
+            final_missing = coder_missing
+            if coder_missing:
+                prefetched_context = self._broker.fetch(
+                    coder_missing, task.get("target_files", []) or [], Path(base_dir)
+                )
+                logger.info("InnerLoop: coder requested context %s — prefetched for next attempt",
+                            coder_missing)
+
+            # Pull-model: resolve any context the coder requested for the NEXT attempt.
+            coder_missing = list(getattr(coder_result, "missing_context", []) or [])
+            final_missing = coder_missing
+            if coder_missing:
+                prefetched_context = self._broker.fetch(coder_missing, target_files, base_dir_path)
+                logger.info("InnerLoop: coder requested context %s — prefetched for next attempt", coder_missing)
+
+            # Pull-model: prefetch any context the coder asked for (next attempt).
+            coder_missing = list(getattr(coder_result, "missing_context", []) or [])
+            final_missing = coder_missing
+            if coder_missing:
+                prefetched_context = self._broker.fetch(
+                    coder_missing, task.get("target_files", []) or [], Path(base_dir)
+                )
+
+            coder_missing = list(getattr(coder_result, "missing_context", []) or [])
+            final_missing = coder_missing
+            if coder_missing:
+                prefetched_context = self._broker.fetch(coder_missing, _targets, _bdir)
+                logger.info("InnerLoop: coder requested context %s — prefetched for next attempt", coder_missing)
 
             if not getattr(coder_result, "succeeded", True):
                 fb = f"attempt {attempt}: coder failed — {getattr(coder_result, 'error', 'unknown error')}"
@@ -417,6 +534,12 @@ class InnerLoop:
                 logger.info("InnerLoop: attempt %d rejected — %s", attempt, vfb[:80])
                 feedback.append(fb)
                 records.append(AttemptRecord(attempt, True, True, False, fb))
+                val_missing = list(getattr(self.validator, "last_missing_context", []) or [])
+                if val_missing:
+                    final_missing = val_missing
+                    prefetched_context = self._broker.fetch(
+                        val_missing, task.get("target_files", []) or [], Path(base_dir)
+                    )
                 continue
 
             # ── APPROVED ──────────────────────────────────────────────────────
@@ -428,6 +551,7 @@ class InnerLoop:
                 attempts_used=attempt,
                 last_feedback="",
                 records=records,
+                context_satisfied=True,
             )
 
         # All attempts exhausted
@@ -438,6 +562,7 @@ class InnerLoop:
             attempts_used=self.max_attempts,
             last_feedback=last,
             records=records,
+            context_satisfied=not final_missing,
         )
 
 

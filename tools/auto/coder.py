@@ -100,7 +100,13 @@ _SYSTEM_PROMPT = (
     "5. Do NOT add any explanation or commentary outside the JSON.\n"
     "6. The 'files' array MUST NEVER be empty. The task always requires at least one "
     "file change — if you think nothing needs changing, re-read the instruction and "
-    "produce the correct implementation. An empty files array is always wrong."
+    "produce the correct implementation. An empty files array is always wrong.\n"
+    "7. If a symbol you must use (a class, function, or constant) is referenced but its "
+    "definition is NOT shown to you, do not guess — add a top-level \"context_request\" "
+    "array naming the exact symbols you need, e.g. "
+    '{"files": [...], "context_request": ["Config", "_resolve_path"]}. '
+    "The names you request are resolved and provided on the next attempt. Omit "
+    "context_request (or use []) when you already have everything you need."
 )
 
 # ── Per-task user prompt template ─────────────────────────────────────────────
@@ -151,6 +157,7 @@ class CoderResult:
     files_written: list[str] = field(default_factory=list)
     error:         str = ""
     raw_response:  str = field(default="", repr=False)
+    missing_context: list[str] = field(default_factory=list)
 
     @property
     def succeeded(self) -> bool:
@@ -229,6 +236,7 @@ class Coder:
         task: dict,
         base_dir: str | Path,
         prior_feedback: Optional[list[str]] = None,
+        prefetched_context: str = "",
     ) -> CoderResult:
         """Generate and write code changes for *task*.
 
@@ -260,7 +268,7 @@ class Coder:
         base_dir = Path(base_dir).resolve()
 
         # ── Build and send the prompt ─────────────────────────────────────────
-        user_msg = self._build_prompt(task, base_dir, prior_feedback or [])
+        user_msg = self._build_prompt(task, base_dir, prior_feedback or [], prefetched_context)
 
         headers = {
             "Content-Type":  "application/json",
@@ -323,6 +331,8 @@ class Coder:
 
         # ── Strip think blocks + outer fences, then parse JSON ────────────────
         cleaned = strip_think(raw_text)
+        # Pull-model: capture any symbols the coder asked for (context_request).
+        missing_ctx = self._extract_context_request(cleaned)
         tracer.event(
             source="llm", target="coder", kind="llm_response",
             content=cleaned, params={"task_id": task_id},
@@ -330,7 +340,8 @@ class Coder:
 
         parsed_files, parse_error = self._parse_response(cleaned, task_id)
         if parse_error:
-            return CoderResult(task_id=task_id, error=parse_error, raw_response=cleaned)
+            return CoderResult(task_id=task_id, error=parse_error,
+                               raw_response=cleaned, missing_context=missing_ctx)
 
         # ── Write files to disk ───────────────────────────────────────────────
         target_files = task.get("target_files") or []
@@ -340,7 +351,8 @@ class Coder:
         )
         if write_error and not written:
             return CoderResult(
-                task_id=task_id, error=write_error, raw_response=cleaned
+                task_id=task_id, error=write_error, raw_response=cleaned,
+                missing_context=missing_ctx,
             )
 
         result = CoderResult(
@@ -348,6 +360,7 @@ class Coder:
             files_written=written,
             error=write_error,
             raw_response=cleaned,
+            missing_context=missing_ctx,
         )
         logger.info("coder.generate: %s", result.summary())
         return result
@@ -359,6 +372,7 @@ class Coder:
         task: dict,
         base_dir: Path,
         prior_feedback: list[str],
+        prefetched_context: str = "",
     ) -> str:
         """Construct the user-role prompt for this task."""
         task_id      = task.get("id", "")
@@ -389,6 +403,9 @@ class Coder:
 
         # ── File contents ─────────────────────────────────────────────────────
         file_contents = self._read_file_contents(target_files, base_dir)
+        # Pull-model: prepend any context the previous attempt requested.
+        if prefetched_context:
+            file_contents = prefetched_context.rstrip() + "\n\n" + file_contents
 
         # ── Prior feedback section ────────────────────────────────────────────
         if prior_feedback:
@@ -410,6 +427,21 @@ class Coder:
             file_contents         = file_contents,
             feedback_section      = feedback_section,
         )
+
+    @staticmethod
+    def _extract_context_request(text: str) -> list[str]:
+        """Extract a top-level 'context_request' list of symbol names from the LLM
+        JSON response. Returns [] on absence or any parse error (fail-safe)."""
+        try:
+            data = json.loads(_strip_outer_fence(text))
+        except Exception:
+            return []
+        if not isinstance(data, dict):
+            return []
+        req = data.get("context_request")
+        if not isinstance(req, list):
+            return []
+        return [str(s).strip() for s in req if str(s).strip()]
 
     def _read_file_contents(self, target_files: list[str], base_dir: Path) -> str:
         """Read and annotate file contents for the prompt.
