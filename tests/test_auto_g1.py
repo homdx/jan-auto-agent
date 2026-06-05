@@ -122,7 +122,7 @@ class _FakeController:
         self.progress_display = None
         self.git = None
 
-    def _run_task_loop(self):
+    def _run_task_loop(self, **kwargs):
         """Stand-in execution loop — returns immediately (no tasks to run)."""
         return None, 0
 
@@ -150,7 +150,7 @@ class TestG0Delegation:
         def fake_plan_phase(c, cfg):
             plan_phase_called.append(True)
 
-        def fake_task_loop():
+        def fake_task_loop(**kwargs):
             task_loop_called.append(True)
             return None, 0
 
@@ -167,7 +167,7 @@ class TestG0Delegation:
     def test_run_pipeline_returns_task_loop_result(self, tmp_path: Path) -> None:
         """run_pipeline propagates whatever (stop_reason, tasks_done) the loop returns."""
         ctrl = _FakeController(tmp_path)
-        ctrl._run_task_loop = lambda: ("task_cap", 3)
+        ctrl._run_task_loop = lambda **kwargs: ("task_cap", 3)
 
         with patch("tools.auto.pipeline._run_plan_phase", lambda c, cfg: None):
             stop, done = run_pipeline(ctrl)

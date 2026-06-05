@@ -52,6 +52,7 @@ from typing import Callable, Optional
 
 from tools.auto.state import StateStore, STATUS_DONE, STATUS_BLOCKED
 from tools.auto.git_manager import make_git_manager, GitError
+from tools.auto.outer_loop import make_outer_loop  # noqa: F401 — re-exported as a patch target for tests
 
 # Epic G Integrations
 from tools.auto.run_trace import setup_run_trace
@@ -381,7 +382,7 @@ class AutoController:
         from tools.auto.bug_fix_loop import make_bug_fix_loop
 
         outer_loop = make_outer_loop(cfg, self.base_dir, self.state,
-                                       task_mode=self.task_mode)
+                                       task_mode=task_mode)
         commit_helper = (
             CommitOnSuccess(self.git, self.state)
             if self.git is not None else None
@@ -603,7 +604,7 @@ class AutoController:
         print(f"[{ts}]    goal      : {self.goal}")
         print(f"[{ts}]    base_dir  : {self.base_dir}")
         print(f"[{ts}]    config    : {self.config_path}")
-        print(f"[{ts}]    task_mode : {self.task_mode}")
+        print(f"[{ts}]    task_mode : {getattr(self, 'task_mode', 'code')}")
 
     def _print_resume_summary(self, info: dict) -> None:
         done    = len(info["done_ids"])

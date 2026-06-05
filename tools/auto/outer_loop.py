@@ -47,6 +47,7 @@ from pathlib import Path
 
 from tools.agent_trace import tracer
 from tools.auto.state import StateStore, STATUS_IN_PROGRESS, STATUS_DONE, STATUS_BLOCKED
+from tools.auto.inner_loop import make_inner_loop
 
 logger = logging.getLogger(__name__)
 
@@ -395,7 +396,6 @@ def make_outer_loop(
     max_rewrites           = config.getint("auto", "max_rewrites",           fallback=5)
 
     if inner_loop is None:
-        from tools.auto.inner_loop import make_inner_loop
         inner_loop = make_inner_loop(config, base_dir, task_mode=task_mode)  # AUTO-DM-1
 
     # LOOP-2: build a TaskRewriter if the config has the rewrite keys and

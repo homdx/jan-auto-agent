@@ -112,7 +112,7 @@ def run_pipeline(controller: "AutoController") -> tuple[Optional[str], int]:
             controller.progress_display.refresh()
 
     # ── EXECUTE phase (G2 will replace _run_task_loop delegation) ─────────────
-    return controller._run_task_loop(task_mode=controller.task_mode)  # AUTO-DM-1
+    return controller._run_task_loop(task_mode=getattr(controller, "task_mode", "code"))  # AUTO-DM-1
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -171,7 +171,7 @@ def _run_plan_phase(controller: "AutoController", cfg: configparser.ConfigParser
         clusters, controller.base_dir, cfg,
         goal=controller.goal,
         on_cluster_done=_on_cluster_done,
-        task_mode=controller.task_mode,   # AUTO-DM-1
+        task_mode=getattr(controller, "task_mode", "code"),   # AUTO-DM-1
     )
     logger.info("plan_phase: architect produced %d candidate(s)", len(candidates))
     controller.state.log(f"plan phase: architect produced {len(candidates)} candidate(s)")
@@ -185,7 +185,7 @@ def _run_plan_phase(controller: "AutoController", cfg: configparser.ConfigParser
     accepted, rejected = filter_candidates(
         candidates, controller.base_dir, cfg,
         cluster_files=cluster_files,
-        task_mode=controller.task_mode,   # AUTO-DM-1
+        task_mode=getattr(controller, "task_mode", "code"),   # AUTO-DM-1
     )
     logger.info(
         "plan_phase: gate1 accepted=%d rejected=%d",
