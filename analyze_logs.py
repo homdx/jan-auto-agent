@@ -10,6 +10,7 @@ Usage:
 
 What it shows:
     • Summary: total tasks, iterations, approve/reject counts, prompt changes
+    • Applied tasks: every completed task with commit hash and iteration count
     • Per-task breakdown: status, iteration count, approve/reject per task
     • Prompt changes: when, which agent, old→new diff
     • Timeline: human-readable event flow
@@ -118,6 +119,67 @@ def elapsed(ts_start: str, ts_end: str) -> str:
         return ""
 
 
+# ── Validator verdict helper ──────────────────────────────────────────────────
+
+def _parse_validator_verdict(content) -> Optional[bool]:
+    """
+    Parse a validator result event's content and return:
+        True  — approved
+        False — rejected
+        None  — could not determine (treat as rejected, don't count)
+
+    validator_agent emits kind="result" with content = a dict (serialised to a
+    JSON string by the tracer).  The dict is either:
+        {"approved": true|false, "feedback": "...", ...}   ← autonomous mode
+        {"status": "approved"|"needs_fix", ...}            ← interactive mode
+        {"status": "APPROVED"|"REJECTED", ...}             ← plain-text verdict
+    """
+    if content is None:
+        return None
+
+    # Tracer._truncate converts dicts to JSON strings before writing to JSONL.
+    # json.loads() on the event record gives us the string back, so we re-parse it.
+    data: dict | None = None
+    if isinstance(content, dict):
+        data = content
+    elif isinstance(content, str):
+        # Skip truncation marker — can't parse a cut-off JSON blob
+        if "…[+" in content:
+            return None
+        try:
+            parsed = json.loads(content)
+            if isinstance(parsed, dict):
+                data = parsed
+            else:
+                # Bare string verdict e.g. "APPROVED" / "REJECTED"
+                upper = str(parsed).strip().upper()
+                return upper in ("APPROVED", "PASS", "OK", "YES")
+        except (json.JSONDecodeError, ValueError):
+            # Plain text fallback: "APPROVED" / "REJECTED: ..."
+            upper = content.strip().upper()
+            if upper.startswith("APPROVED") or upper in ("PASS", "OK", "YES"):
+                return True
+            if upper.startswith("REJECTED") or upper in ("FAIL", "NO", "BLOCKED"):
+                return False
+            return None
+
+    if data is None:
+        return None
+
+    # Auto mode: {"approved": true, ...}
+    if "approved" in data:
+        return bool(data["approved"])
+
+    # Interactive mode: {"status": "approved" | "needs_fix" | ...}
+    status = str(data.get("status", "")).strip().lower()
+    if status in ("approved", "pass", "ok"):
+        return True
+    if status in ("needs_fix", "rejected", "fail", "blocked"):
+        return False
+
+    return None
+
+
 # ── Core analysis ─────────────────────────────────────────────────────────────
 
 def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
@@ -125,39 +187,39 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
     Walk events and build an analytics structure:
     {
         runs: {run_id: { tasks, events, prompt_changes, start_ts, end_ts }},
-        prompt_changes: [ { ts, agent, old_prompt, new_prompt, run_id } ],
     }
     """
     if run_id_filter:
         events = [e for e in events if e.get("run_id") == run_id_filter]
 
-    # Group events by run_id (None = ungrouped / legacy)
     runs: dict[str, dict] = {}
 
     def get_run(rid: str) -> dict:
         if rid not in runs:
             runs[rid] = {
-                "run_id":        rid,
-                "start_ts":      None,
-                "end_ts":        None,
-                "stop_reason":   None,
-                "goal":          None,
-                "tasks":         {},        # task_id -> task_info
+                "run_id":         rid,
+                "start_ts":       None,
+                "end_ts":         None,
+                "stop_reason":    None,
+                "goal":           None,
+                "tasks":          {},        # task_id -> task_info
                 "prompt_changes": [],
-                "events":        [],
-                "llm_calls":     0,
-                "total_events":  0,
+                "events":         [],
+                "llm_calls":      0,
+                "total_events":   0,
+                # Internal tracking — not rendered directly
+                "_current_task":  None,      # task_id of the task currently in the loop
             }
         return runs[rid]
 
     for evt in events:
-        rid   = evt.get("run_id") or "__ungrouped__"
-        run   = get_run(rid)
-        kind  = evt.get("kind", "")
-        src   = evt.get("source", "")
-        tgt   = evt.get("target", "")
-        ts    = evt.get("ts", "")
-        params = evt.get("params") or {}
+        rid     = evt.get("run_id") or "__ungrouped__"
+        run     = get_run(rid)
+        kind    = evt.get("kind", "")
+        src     = evt.get("source", "")
+        tgt     = evt.get("target", "")
+        ts      = evt.get("ts", "")
+        params  = evt.get("params") or {}
         content = evt.get("content", "")
 
         run["events"].append(evt)
@@ -165,8 +227,17 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
 
         # ── run lifecycle ──────────────────────────────────────────────────
         if kind == "run_start":
-            run["start_ts"] = ts
-            run["goal"] = params.get("goal") or params.get("prompt", "")
+            # FIX: outer_loop.py also emits kind="run_start" once per task with
+            # params like {"task": task_id, "start_round": ...} — no "goal" key.
+            # Only treat this as a real run-level start when the params carry a
+            # "goal" or "prompt" key, so per-task run_start events don't clobber
+            # the run's goal or timestamp.
+            has_goal = bool(params.get("goal") or params.get("prompt"))
+            if has_goal or run["start_ts"] is None:
+                if run["start_ts"] is None:
+                    run["start_ts"] = ts
+                if has_goal and not run["goal"]:
+                    run["goal"] = params.get("goal") or params.get("prompt", "")
 
         elif kind in ("run_finished", "run_capped"):
             run["end_ts"] = ts
@@ -174,9 +245,11 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
 
         # ── task lifecycle ─────────────────────────────────────────────────
         elif kind == "call" and tgt == "outer_loop":
+            # run_trace.log_task_start() → source="controller", target="outer_loop",
+            # kind="call", params={"task_id": ..., "title": ...}
             task_id = params.get("task_id", "?")
             title   = params.get("title", "")
-            task    = run["tasks"].setdefault(task_id, {
+            task = run["tasks"].setdefault(task_id, {
                 "task_id":    task_id,
                 "title":      title,
                 "start_ts":   ts,
@@ -189,27 +262,61 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
             })
             task["start_ts"] = ts
             task["title"]    = task["title"] or title
+            task["status"]   = "in_progress"
+            # Track which task is currently in the loop for validator association.
+            run["_current_task"] = task_id
 
         elif kind == "result" and src == "outer_loop":
-            task_id = params.get("task_id", "?")
-            task = run["tasks"].setdefault(task_id, {"task_id": task_id})
+            # run_trace.log_task_done() → params={"task_id": ..., "commit": ...}, content="DONE"
+            # outer_loop.py result    → params={"task": ..., "passed": True/False, ...}
+            # Handle both param key names.
+            task_id = params.get("task_id") or params.get("task", "?")
+            if task_id == "?":
+                # Skip malformed / internal outer_loop events with no identifiable task.
+                continue
+            task = run["tasks"].setdefault(task_id, {"task_id": task_id,
+                                                      "status": "in_progress",
+                                                      "iterations": 0,
+                                                      "approved": 0,
+                                                      "rejected": 0,
+                                                      "commit": None})
             task["end_ts"] = ts
-            task["status"] = str(content).strip().upper() if content else "DONE"
+            # Determine status: prefer content string, fall back to params["passed"].
+            if content:
+                task["status"] = str(content).strip().upper()
+            elif "passed" in params:
+                task["status"] = "DONE" if params["passed"] else "BLOCKED"
+            else:
+                task["status"] = "DONE"
+
             if params.get("commit"):
                 task["commit"] = params["commit"]
+            # Clear current task tracker when done.
+            if run["_current_task"] == task_id:
+                run["_current_task"] = None
 
         elif kind == "decision" and src == "outer_loop":
-            task_id = params.get("task_id", "?")
-            task = run["tasks"].setdefault(task_id, {"task_id": task_id})
+            # run_trace.log_task_blocked() → params={"task_id": ..., "reason": ...}, content="BLOCKED"
+            task_id = params.get("task_id") or params.get("task", "?")
+            if task_id == "?":
+                continue
+            task = run["tasks"].setdefault(task_id, {"task_id": task_id,
+                                                      "status": "in_progress",
+                                                      "iterations": 0,
+                                                      "approved": 0,
+                                                      "rejected": 0,
+                                                      "commit": None})
             task["end_ts"] = ts
             task["status"] = str(content).strip().upper() if content else "BLOCKED"
+            if run["_current_task"] == task_id:
+                run["_current_task"] = None
 
-        # Gate-1 rejection (pre-task filter)
+        # Gate-1 rejection (pre-execution filter)
         elif kind == "rejected":
-            task_id = params.get("title", "?")
-            task = run["tasks"].setdefault(f"gate1:{task_id}", {
-                "task_id":    f"gate1:{task_id}",
-                "title":      task_id,
+            g1_key = f"gate1:{params.get('title', '?')}"
+            run["tasks"].setdefault(g1_key, {
+                "task_id":    g1_key,
+                "title":      params.get("title", "?"),
                 "start_ts":   ts,
                 "end_ts":     ts,
                 "status":     "GATE1_REJECTED",
@@ -221,18 +328,29 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
             })
 
         # ── validator decisions ────────────────────────────────────────────
-        elif kind == "decision" and "validator" in src:
-            verdict = str(content).strip().upper() if content else ""
-            # Find which task this belongs to — heuristic: last active task in this run
-            active = [t for t in run["tasks"].values() if t.get("status") == "in_progress"]
-            target_task = active[-1] if active else None
+        #
+        # FIX: validator_agent emits kind="result" (NOT kind="decision").
+        # The content is a JSON-encoded dict, not a plain "APPROVED"/"REJECTED"
+        # string, so it must be parsed via _parse_validator_verdict().
+        elif kind == "result" and "validator" in src:
+            # Associate with the tracked current task first; fall back to
+            # heuristic scan of in-progress tasks if the tracker is empty.
+            current_id = run.get("_current_task")
+            if current_id and current_id in run["tasks"]:
+                target_task = run["tasks"][current_id]
+            else:
+                active = [t for t in run["tasks"].values()
+                          if t.get("status") == "in_progress"]
+                target_task = active[-1] if active else None
 
             if target_task:
                 target_task["iterations"] = target_task.get("iterations", 0) + 1
-                if verdict in ("APPROVED", "PASS", "OK", "YES"):
+                verdict = _parse_validator_verdict(content)
+                if verdict is True:
                     target_task["approved"] = target_task.get("approved", 0) + 1
-                elif verdict in ("REJECTED", "FAIL", "NO", "BLOCKED"):
+                elif verdict is False:
                     target_task["rejected"] = target_task.get("rejected", 0) + 1
+                # verdict is None → count the iteration but don't skew either bucket
 
         # ── llm calls ─────────────────────────────────────────────────────
         elif kind == "llm_request":
@@ -240,17 +358,16 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
 
         # ── prompt changes ─────────────────────────────────────────────────
         elif kind in ("prompt_updated", "prompt_push", "prompt_change"):
-            agent_name  = params.get("agent") or params.get("agent_name") or src
-            old_prompt  = params.get("old_prompt") or params.get("before", "")
-            new_prompt  = params.get("new_prompt") or params.get("after") or str(content or "")
-            change = {
+            agent_name = params.get("agent") or params.get("agent_name") or src
+            old_prompt = params.get("old_prompt") or params.get("before", "")
+            new_prompt = params.get("new_prompt") or params.get("after") or str(content or "")
+            run["prompt_changes"].append({
                 "ts":         ts,
                 "agent":      agent_name,
                 "old_prompt": old_prompt,
                 "new_prompt": new_prompt,
                 "run_id":     rid,
-            }
-            run["prompt_changes"].append(change)
+            })
 
     return runs
 
@@ -318,7 +435,6 @@ def print_section(title: str) -> None:
 
 def render_run_summary(run: dict) -> None:
     tasks  = run["tasks"]
-    # Count only real tasks (not gate1 rejections for summary denominator)
     real   = {k: v for k, v in tasks.items() if not k.startswith("gate1:")}
     gate1r = {k: v for k, v in tasks.items() if k.startswith("gate1:")}
 
@@ -326,7 +442,7 @@ def render_run_summary(run: dict) -> None:
     blocked_tasks = [t for t in real.values() if t.get("status") in ("BLOCKED", "FAIL")]
     other_tasks   = [t for t in real.values() if t not in done_tasks and t not in blocked_tasks]
 
-    total_iters   = sum(t.get("iterations", 0) for t in real.values())
+    total_iters    = sum(t.get("iterations", 0) for t in real.values())
     total_approved = sum(t.get("approved", 0) for t in real.values())
     total_rejected = sum(t.get("rejected", 0) for t in real.values())
     prompt_changes = len(run["prompt_changes"])
@@ -359,15 +475,53 @@ def render_run_summary(run: dict) -> None:
     print(f"  {bold('Total events')}:    {run['total_events']}")
 
 
+def render_applied_tasks(run: dict) -> None:
+    """Show every completed task — the things that were actually applied/done."""
+    tasks = run["tasks"]
+    done = [
+        v for k, v in tasks.items()
+        if not k.startswith("gate1:")
+        and v.get("status") in ("DONE", "APPROVED", "PASS")
+    ]
+
+    print_section(f"APPLIED / COMPLETED TASKS  ({len(done)} total)")
+
+    if not done:
+        print(dim("  (no completed tasks recorded in this run)"))
+        return
+
+    for t in done:
+        title    = t.get("title") or t.get("task_id", "?")
+        task_id  = t.get("task_id", "?")
+        commit   = t.get("commit") or ""
+        iters    = t.get("iterations", 0)
+        approved = t.get("approved", 0)
+        rejected = t.get("rejected", 0)
+        dur      = elapsed(t.get("start_ts", ""), t.get("end_ts", ""))
+
+        print()
+        print(f"  {green('✓')} {bold(truncate(title, 65))}")
+        print(f"    {dim('id:')}       {dim(task_id)}")
+        if commit:
+            print(f"    {dim('commit:')}   {cyan(commit[:12])}")
+        if dur:
+            print(f"    {dim('duration:')} {dur}")
+        if iters:
+            attempt_str = (
+                f"  ({green(str(approved))} approved"
+                f" / {red(str(rejected))} rejected)"
+            )
+            print(f"    {dim('attempts:')} {iters}{attempt_str}")
+
+
 def render_tasks(run: dict) -> None:
     tasks = run["tasks"]
     if not tasks:
         print(dim("  (no tasks recorded)"))
         return
 
-    print_section("TASKS")
+    print_section("ALL TASKS")
 
-    # Separate real tasks from gate-1 rejections
     real  = [(k, v) for k, v in tasks.items() if not k.startswith("gate1:")]
     gate1 = [(k, v) for k, v in tasks.items() if k.startswith("gate1:")]
 
@@ -377,6 +531,8 @@ def render_tasks(run: dict) -> None:
             status_str = green(f"✓ {status}")
         elif status in ("BLOCKED", "FAIL"):
             status_str = red(f"✗ {status}")
+        elif status == "in_progress":
+            status_str = yellow(f"◌ IN_PROGRESS")
         else:
             status_str = yellow(f"● {status}")
 
@@ -422,7 +578,6 @@ def render_prompt_changes(run: dict) -> None:
         print()
         print(f"  {bold(magenta(f'Change #{i}'))}  —  agent: {cyan(ch.get('agent', '?'))}  —  {fmt_ts(ch.get('ts', ''))}")
         diff_text = render_prompt_diff(ch.get("old_prompt", ""), ch.get("new_prompt", ""))
-        # Indent diff lines
         for line in diff_text.splitlines():
             print(f"    {line}")
 
@@ -432,7 +587,6 @@ def render_timeline(run: dict, max_events: int = 40) -> None:
     if not events:
         return
 
-    # Filter to interesting high-level events only
     INTERESTING = {
         "run_start", "run_finished", "run_capped",
         "call", "result", "decision", "error",
@@ -454,7 +608,7 @@ def render_timeline(run: dict, max_events: int = 40) -> None:
         params  = evt.get("params") or {}
         content = str(evt.get("content") or "").strip()
 
-        if kind == "run_start":
+        if kind == "run_start" and (params.get("goal") or params.get("prompt")):
             goal = truncate(params.get("goal") or params.get("prompt", ""), 60)
             print(f"  {dim(ts)}  {bold(cyan('▶ RUN START'))}  {dim(goal)}")
 
@@ -469,17 +623,30 @@ def render_timeline(run: dict, max_events: int = 40) -> None:
             print(f"  {dim(ts)}  {bold('→ task start')}  {title}")
 
         elif kind == "result" and src == "outer_loop":
-            verdict = content or "DONE"
-            task_id = params.get("task_id", "")
-            col = green if verdict in ("DONE", "APPROVED") else red
-            print(f"  {dim(ts)}  {col(bold(f'✓ task {verdict}'))}  {dim(task_id)}")
+            verdict  = content or params.get("status", "DONE")
+            task_id  = params.get("task_id") or params.get("task", "")
+            col      = green if verdict in ("DONE", "APPROVED") else red
+            commit   = params.get("commit", "")
+            extra    = f"  {dim('commit:')} {dim(commit[:8])}" if commit else ""
+            print(f"  {dim(ts)}  {col(bold(f'✓ task {verdict}'))}  {dim(task_id)}{extra}")
+
+        # FIX: validator now correctly emits kind="result" — show it in the timeline
+        elif kind == "result" and "validator" in src:
+            verdict_bool = _parse_validator_verdict(evt.get("content"))
+            if verdict_bool is True:
+                verdict_str = green(bold("validator: APPROVED"))
+            elif verdict_bool is False:
+                verdict_str = red(bold("validator: REJECTED"))
+            else:
+                verdict_str = yellow(bold("validator: ?"))
+            print(f"  {dim(ts)}  {verdict_str}  {dim(src)}")
 
         elif kind == "decision":
-            verdict = content or ""
+            verdict   = content or ""
             is_reject = verdict.upper() in ("REJECTED", "BLOCKED", "FAIL", "NO")
-            col = red if is_reject else green
-            task_id = params.get("task_id", "")
-            extra = truncate(params.get("reason", ""), 50)
+            col       = red if is_reject else green
+            task_id   = params.get("task_id", "")
+            extra     = truncate(params.get("reason", ""), 50)
             print(f"  {dim(ts)}  {col(bold(f'decision: {verdict}'))}  {dim(src)} → {dim(tgt)}  {dim(extra)}")
 
         elif kind == "rejected":
@@ -506,6 +673,7 @@ def render_timeline(run: dict, max_events: int = 40) -> None:
 def render_run(run: dict, show_timeline: bool = True, show_diff: bool = True) -> None:
     print_header(f"Run Analysis  [{run['run_id']}]")
     render_run_summary(run)
+    render_applied_tasks(run)   # NEW: show what was actually applied/done
     render_tasks(run)
     if show_diff:
         render_prompt_changes(run)
@@ -520,10 +688,10 @@ def render_multi_run_overview(runs: dict) -> None:
 
     rows = []
     for run in runs.values():
-        tasks  = {k: v for k, v in run["tasks"].items() if not k.startswith("gate1:")}
-        done   = sum(1 for t in tasks.values() if t.get("status") in ("DONE","APPROVED","PASS"))
-        blocked= sum(1 for t in tasks.values() if t.get("status") in ("BLOCKED","FAIL"))
-        iters  = sum(t.get("iterations", 0) for t in tasks.values())
+        tasks   = {k: v for k, v in run["tasks"].items() if not k.startswith("gate1:")}
+        done    = sum(1 for t in tasks.values() if t.get("status") in ("DONE","APPROVED","PASS"))
+        blocked = sum(1 for t in tasks.values() if t.get("status") in ("BLOCKED","FAIL"))
+        iters   = sum(t.get("iterations", 0) for t in tasks.values())
         rows.append((run["run_id"], run.get("start_ts",""), len(tasks), done, blocked, iters,
                      len(run["prompt_changes"]), run.get("stop_reason",""), run.get("goal","")))
 
