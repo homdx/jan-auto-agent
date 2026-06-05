@@ -75,15 +75,7 @@ class InnerLoopResult:
     last_feedback: str   = ""
     records:       list  = field(default_factory=list)   # list[AttemptRecord]
     hint_history:  list  = field(default_factory=list)   # list[str] — LOOP-4
-    context_satisfied: bool = True   # pull-model: last attempt had all context it asked for
     context_satisfied: bool = True   # pull-model: False ⇒ last attempt still needed context
-    context_satisfied: bool = True   # LOOP-5: False ⇒ last attempt still needed context
-    context_satisfied: bool = True   # False when the last attempt still requested unmet context (pull-model)
-    context_satisfied: bool = True   # False => last attempt still requested context (pull-model)
-    context_satisfied: bool = True   # False ⇒ last attempt still needed context (pull-model)
-    context_satisfied: bool = True   # False ⇒ last attempt still requested context (pull-model)
-    context_satisfied: bool = True   # pull-model: False if last attempt still needed context
-    context_satisfied: bool = True   # pull-model: False if last attempt still wanted context
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -172,16 +164,8 @@ class LLMGate2Validator:
         self.temperature = temperature
         self.timeout     = timeout
         self.max_hints   = max(1, int(max_hints))
-        self.last_missing_context: list[str] = []
-        self.last_missing_context: list[str] = []
         self.ssl_context = ssl_context
         self.base_dir    = Path(base_dir)
-        self.last_missing_context: list[str] = []
-        self.last_missing_context: list[str] = []
-        self.last_missing_context: list[str] = []
-        self.last_missing_context: list[str] = []
-        self.last_missing_context: list[str] = []
-        self.last_missing_context: list[str] = []
         self.last_missing_context: list[str] = []
         self.num_ctx     = int(num_ctx)
         self.max_tokens  = int(max_tokens)
@@ -352,7 +336,6 @@ class InnerLoop:
         self.validator    = validator
         self.max_attempts = max(1, int(max_attempts))
         self._broker      = context_broker or ContextBroker()
-        self._broker      = ContextBroker()
 
     # ------------------------------------------------------------------
 
@@ -373,19 +356,11 @@ class InnerLoop:
         task_id = task.get("id", "")
         feedback: list[str] = list(prior_feedback or [])
         records:  list[AttemptRecord] = []
+        # Pull-model state (carried across attempts within this round)
         prefetched_context: str = ""
         final_missing: list[str] = []
         base_dir_path = Path(base_dir)
         target_files  = task.get("target_files", []) or []
-        prefetched_context: str = ""   # pull-model: context the previous attempt asked for
-        final_missing: list[str] = []  # outstanding requests from the most recent attempt
-        prefetched_context = ""          # pull-model: symbols resolved for next attempt
-        final_missing: list[str] = []    # outstanding context after the latest attempt
-        # Pull-model state (carried across attempts within this round)
-        prefetched_context: str = ""
-        final_missing: list[str] = []
-        _bdir = Path(base_dir)
-        _targets = task.get("target_files", []) or []
 
         # LOOP-4: prepend prior implementation history
         if prior_implementations:
@@ -398,17 +373,6 @@ class InnerLoop:
                 why     = entry.get("why_failed", "")
                 history_lines.append(f"  v{v}: tried {summary} — failed because {why}")
             feedback.insert(0, "\n".join(history_lines))
-
-        prefetched_context = ""
-        final_missing: list[str] = []
-
-        prefetched_context: str = ""
-        final_missing: list[str] = []
-
-        prefetched_context: str = ""
-        final_missing: list[str] = []
-        _bdir = Path(base_dir)
-        _targets = task.get("target_files", []) or []
 
         for attempt in range(1, self.max_attempts + 1):
 
@@ -429,56 +393,9 @@ class InnerLoop:
             coder_missing = list(getattr(coder_result, "missing_context", []) or [])
             final_missing = coder_missing
             if coder_missing:
-                prefetched_context = self._broker.fetch(
-                    coder_missing, task.get("target_files", []) or [], Path(base_dir)
-                )
-
-            # Pull-model: resolve any context the coder asked for, for the next attempt.
-            coder_missing = list(getattr(coder_result, "missing_context", []) or [])
-            final_missing = coder_missing
-            if coder_missing:
-                prefetched_context = self._broker.fetch(coder_missing, _targets, _bdir)
-                logger.info("InnerLoop: attempt %d coder requested context %s",
-                            attempt, coder_missing)
-
-            # Pull-model: resolve any context the coder requested for the next attempt.
-            coder_missing = list(getattr(coder_result, "missing_context", []) or [])
-            final_missing = coder_missing
-            if coder_missing:
-                prefetched_context = self._broker.fetch(
-                    coder_missing, task.get("target_files", []) or [], Path(base_dir)
-                )
-
-            # ── Pull-model: resolve any context the coder asked for ───────────
-            coder_missing = list(getattr(coder_result, "missing_context", []) or [])
-            final_missing = coder_missing
-            if coder_missing:
-                prefetched_context = self._broker.fetch(
-                    coder_missing, task.get("target_files", []) or [], Path(base_dir)
-                )
-                logger.info("InnerLoop: coder requested context %s — prefetched for next attempt",
-                            coder_missing)
-
-            # Pull-model: resolve any context the coder requested for the NEXT attempt.
-            coder_missing = list(getattr(coder_result, "missing_context", []) or [])
-            final_missing = coder_missing
-            if coder_missing:
                 prefetched_context = self._broker.fetch(coder_missing, target_files, base_dir_path)
-                logger.info("InnerLoop: coder requested context %s — prefetched for next attempt", coder_missing)
-
-            # Pull-model: prefetch any context the coder asked for (next attempt).
-            coder_missing = list(getattr(coder_result, "missing_context", []) or [])
-            final_missing = coder_missing
-            if coder_missing:
-                prefetched_context = self._broker.fetch(
-                    coder_missing, task.get("target_files", []) or [], Path(base_dir)
-                )
-
-            coder_missing = list(getattr(coder_result, "missing_context", []) or [])
-            final_missing = coder_missing
-            if coder_missing:
-                prefetched_context = self._broker.fetch(coder_missing, _targets, _bdir)
-                logger.info("InnerLoop: coder requested context %s — prefetched for next attempt", coder_missing)
+                logger.info("InnerLoop: attempt %d coder requested context %s — prefetched for next attempt",
+                            attempt, coder_missing)
 
             if not getattr(coder_result, "succeeded", True):
                 fb = f"attempt {attempt}: coder failed — {getattr(coder_result, 'error', 'unknown error')}"
