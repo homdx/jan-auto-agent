@@ -46,7 +46,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
-from tools.auto.state import StateStore, STATUS_DONE, STATUS_IN_PROGRESS, STATUS_BLOCKED
+from tools.auto.state import StateStore, STATUS_DONE, STATUS_BLOCKED
 from tools.auto.git_manager import make_git_manager, GitError
 
 # Epic G Integrations

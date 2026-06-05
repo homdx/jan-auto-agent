@@ -3,7 +3,7 @@ import ssl
 import urllib.request
 import urllib.error
 import logging
-from typing import Optional
+
 
 from tools.agent_trace import tracer
 

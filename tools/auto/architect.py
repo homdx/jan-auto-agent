@@ -33,7 +33,6 @@ from __future__ import annotations
 import configparser
 import json
 import logging
-import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -243,6 +242,9 @@ class ClusterReviewer:
         self._timeout                = float(config.get("loop", "timeout_seconds",   fallback="300"))
         self._max_file_chars         = int(config.get(arch,   "max_file_chars",      fallback=str(_DEFAULT_MAX_FILE_CHARS)))
         self._max_files_per_review   = int(config.get(arch,   "max_files_per_review", fallback=str(_DEFAULT_MAX_FILES_PER_REVIEW)))
+        # num_ctx controls the total context window on Ollama; 0 means "use server default".
+        active_profile               = config.get("api", "active", fallback="local")
+        self._num_ctx                = config.getint(f"api_{active_profile}", "num_ctx", fallback=0)
         # ── TaskRewriter config (LOOP-5) ──────────────────────────────────────
         self._rewrite_max_tokens     = int(config.get(arch,   "rewrite_max_tokens",  fallback="512"))
         self._rewrite_temperature    = float(config.get(arch, "rewrite_temperature", fallback="0.4"))
@@ -348,16 +350,19 @@ class ClusterReviewer:
 
         if self._api_format == "ollama":
             url = _llm_stream.ollama_chat_url(self._base_url)
+            _ollama_opts: dict[str, Any] = {
+                "temperature": self._temperature,
+                "num_predict": self._max_tokens,
+            }
+            if self._num_ctx:
+                _ollama_opts["num_ctx"] = self._num_ctx
             payload: dict[str, Any] = {
                 "model":       self._model,
                 "messages": [
                     {"role": "system", "content": self._system},
                     {"role": "user",   "content": user_msg},
                 ],
-                "options": {
-                    "temperature": self._temperature,
-                    "num_predict": self._max_tokens
-                }
+                "options": _ollama_opts,
             }
         else:
             url = f"{self._base_url}/chat/completions"
@@ -389,7 +394,7 @@ class ClusterReviewer:
                sys.stdout.flush()
                tokens_list.append(token)
 
-            print(f"\n🧠 [LIVE ARCHITECT STREAMING THINKING & RESPONSE]:")
+            print("\n🧠 [LIVE ARCHITECT STREAMING THINKING & RESPONSE]:")
             returned = _llm_stream.request_completion(
                 url=url,
                 headers=headers,
@@ -403,7 +408,7 @@ class ClusterReviewer:
             # request_completion returns the full accumulated response; prefer it
             # and fall back to the streamed tokens if the return is empty.
             raw_text = returned or "".join(tokens_list)
-            print(f"\n" + "═" * 80 + "\n")
+            print("\n" + "═" * 80 + "\n")
         except Exception as exc:
             logger.warning(
                 "review_one_cluster: LLM call failed for cluster %r: %s",
@@ -414,9 +419,9 @@ class ClusterReviewer:
                 content=f"[ERROR] {exc}", params={"cluster": cluster.name},
             )
             return []
-        print(f"\n🧠 [LIVE ARCHITECT THINKING CHAIN & RESPONSE]:")
+        print("\n🧠 [LIVE ARCHITECT THINKING CHAIN & RESPONSE]:")
         print(raw_text)
-        print(f"═" * 80 + "\n")
+        print("═" * 80 + "\n")
 
         # Strip reasoning tokens before JSON parsing.
         cleaned = strip_think(raw_text)
@@ -695,6 +700,8 @@ class TaskRewriter:
         raw_system        = config.get(arch, "rewrite_system", fallback="").strip()
         self._system      = raw_system or _REWRITER_SYSTEM_DEFAULT
         self._timeout     = float(config.get("loop", "timeout_seconds", fallback="300"))
+        active_profile    = config.get("api", "active", fallback="local")
+        self._num_ctx     = config.getint(f"api_{active_profile}", "num_ctx", fallback=0)
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -725,16 +732,19 @@ class TaskRewriter:
 
         if self._api_format == "ollama":
             url = _llm_stream.ollama_chat_url(self._base_url)
+            _rewriter_opts: dict[str, Any] = {
+                "temperature": self._temperature,
+                "num_predict": self._max_tokens,
+            }
+            if self._num_ctx:
+                _rewriter_opts["num_ctx"] = self._num_ctx
             payload: dict[str, Any] = {
                 "model":   self._model,
                 "messages": [
                     {"role": "system", "content": self._system},
                     {"role": "user",   "content": user_msg},
                 ],
-                "options": {
-                    "temperature": self._temperature,
-                    "num_predict": self._max_tokens,
-                },
+                "options": _rewriter_opts,
             }
         else:
             url = f"{self._base_url}/chat/completions"

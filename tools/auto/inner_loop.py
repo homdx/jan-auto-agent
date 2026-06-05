@@ -40,7 +40,6 @@ import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -114,6 +113,8 @@ class LLMGate2Validator:
         max_hints:  int  = 3,
         ssl_context = None,
         base_dir:   str  = ".",
+        num_ctx:    int  = 0,
+        max_tokens: int  = 512,
     ):
         self.base_url    = base_url
         self.model       = model
@@ -124,6 +125,8 @@ class LLMGate2Validator:
         self.max_hints   = max(1, int(max_hints))
         self.ssl_context = ssl_context
         self.base_dir    = Path(base_dir)
+        self.num_ctx     = int(num_ctx)
+        self.max_tokens  = int(max_tokens)
 
     # ------------------------------------------------------------------
 
@@ -179,14 +182,28 @@ class LLMGate2Validator:
                 + self._read_changed_content(coder_result)
             )
 
-            payload = {
-                "model": self.model,
-                "messages": [
-                    {"role": "system",  "content": _GATE2_SYSTEM},
-                    {"role": "user",    "content": user_msg},
-                ],
-                "temperature": self.temperature,
-            }
+            if self.api_format == "ollama":
+                _val_opts: dict = {"temperature": self.temperature, "num_predict": self.max_tokens}
+                if self.num_ctx:
+                    _val_opts["num_ctx"] = self.num_ctx
+                payload = {
+                    "model": self.model,
+                    "messages": [
+                        {"role": "system",  "content": _GATE2_SYSTEM},
+                        {"role": "user",    "content": user_msg},
+                    ],
+                    "options": _val_opts,
+                }
+            else:
+                payload = {
+                    "model": self.model,
+                    "messages": [
+                        {"role": "system",  "content": _GATE2_SYSTEM},
+                        {"role": "user",    "content": user_msg},
+                    ],
+                    "temperature": self.temperature,
+                    "max_tokens": self.max_tokens,
+                }
 
             raw = request_completion(
                 url=url,
@@ -423,7 +440,6 @@ def make_inner_loop(
         ssl_context.check_hostname = False
         ssl_context.verify_mode    = ssl.CERT_NONE
 
-    stream     = config.getboolean("output", "stream_agents", fallback=False)
     max_hints  = config.getint("validator_agent", "max_hints", fallback=3)
     val_temp   = config.getfloat("validator_agent", "temperature", fallback=0.1)
     exec_timeout = config.getint("auto", "exec_timeout_sec", fallback=120)
@@ -458,6 +474,8 @@ def make_inner_loop(
             max_hints=max_hints,
             ssl_context=ssl_context,
             base_dir=str(base_dir),
+            num_ctx=num_ctx,
+            max_tokens=config.getint("validator_agent", "max_tokens", fallback=512),
         )
 
     return InnerLoop(coder, executor, validator, max_attempts=max_attempts)

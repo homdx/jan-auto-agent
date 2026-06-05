@@ -1,12 +1,10 @@
 import os
 import sys
 import time
-import json
 import logging
 import configparser
 import ssl
 import textwrap
-import urllib.request
 from pathlib import Path
 from typing import Dict, Any, List
 

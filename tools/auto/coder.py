@@ -216,6 +216,9 @@ class Coder:
         self._system      = config.get(sec, "system", fallback=_SYSTEM_PROMPT).strip()
         self._timeout     = float(config.get("loop", "timeout_seconds", fallback="300"))
         self._max_file_chars = int(config.get(sec, "max_file_chars", fallback=str(_DEFAULT_MAX_FILE_CHARS)))
+        active_profile = config.get("api", "active", fallback="local")
+        # num_ctx controls the total context window on Ollama; 0 means "use server default".
+        self._num_ctx = config.getint(f"api_{active_profile}", "num_ctx", fallback=0)
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -264,16 +267,19 @@ class Coder:
         
         if self._api_format == "ollama":
             url = _llm_stream.ollama_chat_url(self._base_url)
+            _ollama_opts: dict[str, Any] = {
+                "temperature": self._temperature,
+                "num_predict": self._max_tokens,
+            }
+            if self._num_ctx:
+                _ollama_opts["num_ctx"] = self._num_ctx
             payload: dict[str, Any] = {
                 "model":       self._model,
                 "messages": [
                     {"role": "system", "content": self._system},
                     {"role": "user",   "content": user_msg},
                 ],
-                "options": {
-                    "temperature": self._temperature,
-                    "num_predict": self._max_tokens
-                }
+                "options": _ollama_opts,
             }
         else:
             url = f"{self._base_url}/chat/completions"
