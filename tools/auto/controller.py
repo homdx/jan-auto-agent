@@ -435,6 +435,8 @@ class AutoController:
                     task_num=tasks_done + 1,
                     attempt=task.get("attempt", 1) or 1,
                     round_num=task.get("round", 1) or 1,
+                    task_id=task.get("id", ""),
+                    title=task.get("title", ""),
                 )
 
             # ── AUTO-G2: outer_loop execution ──────────────────────────────
@@ -475,6 +477,7 @@ class AutoController:
 
             # AUTO-F1: Tick progress upon task completion / exhaustion
             if self.progress_display:
+                self.progress_display.record_result(passed=result.passed)
                 self.progress_display.tick_code()
 
             # AUTO-E1/E2: Record metric and maybe tune
