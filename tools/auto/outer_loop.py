@@ -380,9 +380,15 @@ def make_outer_loop(
     state: StateStore,
     *,
     inner_loop=None,
+    task_mode: str = "code",
 ) -> OuterLoop:
     """Build an :class:`OuterLoop`, constructing the inner loop from config
-    unless one is injected (tests / the controller may supply their own)."""
+    unless one is injected (tests / the controller may supply their own).
+
+    AUTO-DM-1: ``task_mode`` is forwarded to ``make_inner_loop`` and stored
+    on the constructed inner loop's validator so domain-aware prompts are used.
+    Defaults to ``"code"`` — no behavioural change for existing call sites.
+    """
     max_rounds             = config.getint("auto", "max_rounds_per_task",
                                            fallback=_DEFAULT_MAX_ROUNDS)
     rewrite_every_n_rounds = config.getint("auto", "rewrite_every_n_rounds", fallback=2)
@@ -390,7 +396,7 @@ def make_outer_loop(
 
     if inner_loop is None:
         from tools.auto.inner_loop import make_inner_loop
-        inner_loop = make_inner_loop(config, base_dir)
+        inner_loop = make_inner_loop(config, base_dir, task_mode=task_mode)  # AUTO-DM-1
 
     # LOOP-2: build a TaskRewriter if the config has the rewrite keys and
     # max_rewrites > 0.  If anything is missing the outer loop just runs

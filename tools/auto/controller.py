@@ -33,6 +33,10 @@ agents.ini [auto] keys (AUTO-A4)
 ---------------------------------
 max_runtime_min   — wall-clock cap in minutes (float; 0 = disabled)
 max_tasks_per_run — maximum tasks to execute this session (int; 0 = disabled)
+
+agents.ini [auto] keys (AUTO-DM-1)
+-----------------------------------
+task_mode — domain mode: code (default) | docs | creative
 """
 
 from __future__ import annotations
@@ -181,6 +185,14 @@ class AutoController:
         self.config_path = config_path
         self.dry_run     = dry_run
         self.agent_dir   = base_path / ".agent"
+
+        # AUTO-DM-1: read task_mode once at startup; forwarded to pipeline and
+        # all downstream factory calls.  Defaults to "code" so existing configs
+        # and call sites are completely unaffected.
+        _cfg_dm = configparser.ConfigParser()
+        if Path(config_path).exists():
+            _cfg_dm.read(config_path)
+        self.task_mode: str = _cfg_dm.get("auto", "task_mode", fallback="code")
         # AUTO-A4: execution working dir (executor/AUTO-C1 runs code here)
         self.workspace_dir = self.agent_dir / "workspace"
 
@@ -331,7 +343,11 @@ class AutoController:
     # Private helpers
     # ------------------------------------------------------------------
 
-    def _run_task_loop(self) -> tuple[Optional[str], int]:
+    def _run_task_loop(
+        self,
+        *,
+        task_mode: str = "code",
+    ) -> tuple[Optional[str], int]:
         """Iterate pending tasks, check caps, execute via outer_loop, return stop reason.
 
         AUTO-G2: replaces the inner_loop skeleton with the real pipeline:
@@ -339,6 +355,9 @@ class AutoController:
                                       → exhausted → exhaustion_handler (G4)
         A4 caps, dependency guard, progress display, run_trace, and auto_tuner
         wiring are all preserved unchanged.
+
+        AUTO-DM-1: ``task_mode`` is forwarded to ``make_outer_loop`` so all
+        downstream agents (coder, inner_loop, validator) receive the mode.
 
         Returns
         -------
@@ -361,7 +380,8 @@ class AutoController:
         from tools.auto.executor import make_executor
         from tools.auto.bug_fix_loop import make_bug_fix_loop
 
-        outer_loop = make_outer_loop(cfg, self.base_dir, self.state)
+        outer_loop = make_outer_loop(cfg, self.base_dir, self.state,
+                                       task_mode=self.task_mode)
         commit_helper = (
             CommitOnSuccess(self.git, self.state)
             if self.git is not None else None
@@ -580,9 +600,10 @@ class AutoController:
     def _print_banner(self) -> None:
         ts = _ts()
         print(f"[{ts}] 🤖 Autonomous mode starting")
-        print(f"[{ts}]    goal     : {self.goal}")
-        print(f"[{ts}]    base_dir : {self.base_dir}")
-        print(f"[{ts}]    config   : {self.config_path}")
+        print(f"[{ts}]    goal      : {self.goal}")
+        print(f"[{ts}]    base_dir  : {self.base_dir}")
+        print(f"[{ts}]    config    : {self.config_path}")
+        print(f"[{ts}]    task_mode : {self.task_mode}")
 
     def _print_resume_summary(self, info: dict) -> None:
         done    = len(info["done_ids"])

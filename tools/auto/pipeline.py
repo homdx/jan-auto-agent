@@ -6,6 +6,12 @@ AUTO-G0 — Pipeline skeleton
     in isolation.  The shared *run context* is the controller itself (config,
     state, git, base_dir, limits, tracer, progress), so no extra object is needed.
 
+AUTO-DM-1 — task_mode threading
+    ``controller.task_mode`` is forwarded from here to every downstream
+    factory that needs it: ``review_clusters``, ``filter_candidates``, and
+    ``controller._run_task_loop``.  The value defaults to ``"code"`` and
+    is a pure no-op when that default is in effect.
+
 AUTO-G1 — PLAN phase wiring
     When no plan exists yet (fresh run):
         repo_ingest → architect → gate1_filter → backlog_prioritiser → plan_emitter
@@ -106,7 +112,7 @@ def run_pipeline(controller: "AutoController") -> tuple[Optional[str], int]:
             controller.progress_display.refresh()
 
     # ── EXECUTE phase (G2 will replace _run_task_loop delegation) ─────────────
-    return controller._run_task_loop()
+    return controller._run_task_loop(task_mode=controller.task_mode)  # AUTO-DM-1
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -165,6 +171,7 @@ def _run_plan_phase(controller: "AutoController", cfg: configparser.ConfigParser
         clusters, controller.base_dir, cfg,
         goal=controller.goal,
         on_cluster_done=_on_cluster_done,
+        task_mode=controller.task_mode,   # AUTO-DM-1
     )
     logger.info("plan_phase: architect produced %d candidate(s)", len(candidates))
     controller.state.log(f"plan phase: architect produced {len(candidates)} candidate(s)")
@@ -176,7 +183,9 @@ def _run_plan_phase(controller: "AutoController", cfg: configparser.ConfigParser
         c.name: set(c.files) for c in clusters
     }
     accepted, rejected = filter_candidates(
-        candidates, controller.base_dir, cfg, cluster_files=cluster_files,
+        candidates, controller.base_dir, cfg,
+        cluster_files=cluster_files,
+        task_mode=controller.task_mode,   # AUTO-DM-1
     )
     logger.info(
         "plan_phase: gate1 accepted=%d rejected=%d",

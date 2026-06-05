@@ -115,6 +115,7 @@ class LLMGate2Validator:
         base_dir:   str  = ".",
         num_ctx:    int  = 0,
         max_tokens: int  = 512,
+        task_mode:  str  = "code",
     ):
         self.base_url    = base_url
         self.model       = model
@@ -127,6 +128,8 @@ class LLMGate2Validator:
         self.base_dir    = Path(base_dir)
         self.num_ctx     = int(num_ctx)
         self.max_tokens  = int(max_tokens)
+        # AUTO-DM-1: stored; DM-5 will use to select domain-appropriate system prompt
+        self.task_mode   = str(task_mode)
 
     # ------------------------------------------------------------------
 
@@ -411,11 +414,17 @@ def make_inner_loop(
     coder=None,
     executor=None,
     validator=None,
+    task_mode: str = "code",
 ) -> InnerLoop:
     """Construct an :class:`InnerLoop` with real agents from *config*.
 
     Any agent may be injected (useful for tests); omitted agents are
     constructed from the config's API / model settings.
+
+    AUTO-DM-1: ``task_mode`` is accepted and stored for forwarding to
+    ``LLMGate2Validator`` (DM-5 will use it to select domain-appropriate
+    system prompts).  Defaults to ``"code"`` — no behavioural change for
+    existing call sites.
     """
     max_attempts = config.getint("auto", "max_attempts_per_task",
                                  fallback=_DEFAULT_MAX_ATTEMPTS)
@@ -476,6 +485,7 @@ def make_inner_loop(
             base_dir=str(base_dir),
             num_ctx=num_ctx,
             max_tokens=config.getint("validator_agent", "max_tokens", fallback=512),
+            task_mode=task_mode,  # AUTO-DM-1: stored; DM-5 will use for prompt selection
         )
 
     return InnerLoop(coder, executor, validator, max_attempts=max_attempts)
