@@ -172,6 +172,7 @@ def _run_plan_phase(controller: "AutoController", cfg: configparser.ConfigParser
         goal=controller.goal,
         on_cluster_done=_on_cluster_done,
         task_mode=getattr(controller, "task_mode", "code"),   # AUTO-DM-1
+        checkpoint_path=controller.state.agent_dir / "architect_checkpoint.json",
     )
     logger.info("plan_phase: architect produced %d candidate(s)", len(candidates))
     controller.state.log(f"plan phase: architect produced {len(candidates)} candidate(s)")

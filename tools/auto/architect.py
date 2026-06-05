@@ -308,6 +308,7 @@ class ClusterReviewer:
         goal: str = "improve current code",
         *,
         on_cluster_done=None,
+        checkpoint_path: "Path | None" = None,
     ) -> list[CandidateTask]:
         """Review every non-empty cluster and return all grounded candidates.
 
@@ -323,6 +324,13 @@ class ClusterReviewer:
             Optional zero-argument callable invoked after each cluster is
             processed (including empty/skipped ones).  Exceptions raised by
             the callback are swallowed so they cannot abort the run.
+        checkpoint_path:
+            Optional path to a JSON file used to persist per-cluster results.
+            When provided, successfully-reviewed clusters are written here
+            immediately after each batch so that an LLM crash or HTTP 500
+            storm does not force a full re-review on restart.  Clusters whose
+            batch keys are already present in the checkpoint are skipped and
+            their previously-saved candidates are re-used directly.
 
         Returns
         -------
@@ -332,6 +340,27 @@ class ClusterReviewer:
         """
         base_dir = Path(base_dir)
         all_candidates: list[CandidateTask] = []
+
+        # ── Load checkpoint (if any) ──────────────────────────────────────────
+        checkpoint: dict[str, list[dict]] = {}
+        if checkpoint_path is not None:
+            checkpoint_path = Path(checkpoint_path)
+            if checkpoint_path.exists():
+                try:
+                    checkpoint = json.loads(
+                        checkpoint_path.read_text(encoding="utf-8")
+                    )
+                    logger.info(
+                        "review_clusters: loaded architect checkpoint from %s "
+                        "(%d batch key(s) cached)",
+                        checkpoint_path, len(checkpoint),
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "review_clusters: could not read checkpoint %s: %s — starting fresh",
+                        checkpoint_path, exc,
+                    )
+                    checkpoint = {}
 
         for cluster in clusters:
             if not cluster.files:
@@ -357,9 +386,44 @@ class ClusterReviewer:
                     patterns=cluster.patterns,
                     files=batch_files,
                 )
-                cluster_candidates.extend(
-                    self._review_one_cluster(sub, base_dir, goal)
-                )
+                batch_key = f"{sub.name}||{goal}"
+
+                # ── Checkpoint hit: skip LLM call, reuse saved candidates ────
+                if checkpoint_path is not None and batch_key in checkpoint:
+                    saved = checkpoint[batch_key]
+                    restored = _deserialise_candidates(saved)
+                    print(f"   ♻️  Cluster/batch '{sub.name}' restored from checkpoint "
+                          f"({len(restored)} candidate(s)) — skipping LLM call")
+                    cluster_candidates.extend(restored)
+                    continue
+
+                # ── Live LLM call ─────────────────────────────────────────────
+                batch_results = self._review_one_cluster(sub, base_dir, goal)
+                # None means the LLM call failed outright (all retries exhausted).
+                # Do NOT checkpoint a failure — the batch must be retried on next run.
+                if batch_results is None:
+                    continue
+                cluster_candidates.extend(batch_results)
+
+                # ── Checkpoint save: persist immediately after each batch ─────
+                # Only reached when the LLM call succeeded (batch_results is a list,
+                # possibly empty if the LLM returned no valid candidates).
+                if checkpoint_path is not None:
+                    checkpoint[batch_key] = _serialise_candidates(batch_results)
+                    try:
+                        checkpoint_path.write_text(
+                            json.dumps(checkpoint, indent=2, ensure_ascii=False),
+                            encoding="utf-8",
+                        )
+                        logger.debug(
+                            "review_clusters: checkpoint saved — %d batch key(s) total",
+                            len(checkpoint),
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "review_clusters: could not write checkpoint %s: %s",
+                            checkpoint_path, exc,
+                        )
 
             print(f"   → {len(cluster_candidates)} grounded candidate(s)")
             all_candidates.extend(cluster_candidates)
@@ -375,11 +439,16 @@ class ClusterReviewer:
         cluster: RepoCluster,
         base_dir: Path,
         goal: str,
-    ) -> list[CandidateTask]:
+    ) -> "list[CandidateTask] | None":
         """Send one LLM call for *cluster* and return grounded candidates.
 
-        Fail-closed: any parse/network error returns an empty list so the run
-        continues with the remaining clusters.
+        Returns
+        -------
+        list[CandidateTask]
+            Grounded candidates.  May be empty if the LLM produced nothing valid.
+        None
+            The LLM call failed after all retries (transient server error).
+            The caller must NOT checkpoint this result.
         """
         file_listing = "\n".join(f"  - {f}" for f in cluster.files)
         file_contents = self._build_file_contents(cluster.files, base_dir)
@@ -435,39 +504,80 @@ class ClusterReviewer:
                     "cluster": cluster.name},
         )
 
-        try:
-            import sys
-            tokens_list = []
-            def streaming_callback(token: str):
-               sys.stdout.write(token)
-               sys.stdout.flush()
-               tokens_list.append(token)
+        import sys
+        import time
 
-            print("\n🧠 [LIVE ARCHITECT STREAMING THINKING & RESPONSE]:")
-            returned = _llm_stream.request_completion(
-                url=url,
-                headers=headers,
-                payload=payload,
-                timeout=self._timeout,
-                stream=True,
-                on_token=streaming_callback,
-                api_format=self._api_format,
-                ssl_context=self._ssl_context,
-            )
-            # request_completion returns the full accumulated response; prefer it
-            # and fall back to the streamed tokens if the return is empty.
-            raw_text = returned or "".join(tokens_list)
-            print("\n" + "═" * 80 + "\n")
-        except Exception as exc:
+        _RETRY_DELAYS = [5, 15, 30]   # seconds between attempts (3 retries)
+
+        raw_text = ""
+        last_exc: Exception | None = None
+
+        for _attempt, _delay in enumerate([0] + _RETRY_DELAYS, start=1):
+            if _delay:
+                logger.warning(
+                    "review_one_cluster: retrying cluster %r in %ds "
+                    "(attempt %d/%d) after: %s",
+                    cluster.name, _delay, _attempt, 1 + len(_RETRY_DELAYS), last_exc,
+                )
+                time.sleep(_delay)
+
+            try:
+                tokens_list: list[str] = []
+
+                def streaming_callback(token: str) -> None:
+                    sys.stdout.write(token)
+                    sys.stdout.flush()
+                    tokens_list.append(token)
+
+                print("\n🧠 [LIVE ARCHITECT STREAMING THINKING & RESPONSE]:")
+                returned = _llm_stream.request_completion(
+                    url=url,
+                    headers=headers,
+                    payload=payload,
+                    timeout=self._timeout,
+                    stream=True,
+                    on_token=streaming_callback,
+                    api_format=self._api_format,
+                    ssl_context=self._ssl_context,
+                )
+                # request_completion returns the full accumulated response; prefer it
+                # and fall back to the streamed tokens if the return is empty.
+                raw_text = returned or "".join(tokens_list)
+                print("\n" + "═" * 80 + "\n")
+                last_exc = None
+                break  # success — exit retry loop
+
+            except Exception as exc:
+                last_exc = exc
+                exc_str = str(exc)
+                # Only retry on transient server-side errors (5xx) or connection
+                # failures.  Client errors (4xx) are deterministic — no point retrying.
+                _is_transient = (
+                    "500" in exc_str
+                    or "502" in exc_str
+                    or "503" in exc_str
+                    or "504" in exc_str
+                    or "ConnectionRefused" in exc_str
+                    or "Connection refused" in exc_str
+                    or "timed out" in exc_str.lower()
+                    or "timeout" in exc_str.lower()
+                )
+                if not _is_transient or _attempt > len(_RETRY_DELAYS):
+                    break  # non-retryable or retries exhausted — fall through
+
+        if last_exc is not None:
             logger.warning(
-                "review_one_cluster: LLM call failed for cluster %r: %s",
-                cluster.name, exc,
+                "review_one_cluster: LLM call failed for cluster %r after %d attempt(s): %s",
+                cluster.name, _attempt, last_exc,
             )
             tracer.event(
                 source="architect", target="llm", kind="llm_response",
-                content=f"[ERROR] {exc}", params={"cluster": cluster.name},
+                content=f"[ERROR] {last_exc}", params={"cluster": cluster.name},
             )
-            return []
+            # Return None (not []) so callers can distinguish "call failed" from
+            # "call succeeded but LLM produced no valid candidates".  The checkpoint
+            # must NOT record a failed batch; returning None signals that.
+            return None
         print("\n🧠 [LIVE ARCHITECT THINKING CHAIN & RESPONSE]:")
         print(raw_text)
         print("═" * 80 + "\n")
@@ -631,6 +741,49 @@ class ClusterReviewer:
 # Convenience factory
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _serialise_candidates(candidates: list[CandidateTask]) -> list[dict]:
+    """Convert CandidateTask objects to plain dicts for JSON checkpoint storage."""
+    out = []
+    for c in candidates:
+        out.append({
+            "title":            c.title,
+            "instruction":      c.instruction,
+            "target_files":     c.target_files,
+            "acceptance_check": c.acceptance_check,
+            "cluster":          c.cluster,
+            "cited_location": {
+                "file":       c.cited_location.file,
+                "symbol":     c.cited_location.symbol,
+                "line_start": c.cited_location.line_start,
+                "line_end":   c.cited_location.line_end,
+            },
+            "raw": c.raw,
+        })
+    return out
+
+
+def _deserialise_candidates(data: list[dict]) -> list[CandidateTask]:
+    """Reconstruct CandidateTask objects from a JSON checkpoint list."""
+    result = []
+    for item in data:
+        loc = item.get("cited_location", {})
+        result.append(CandidateTask(
+            title            = item.get("title", ""),
+            instruction      = item.get("instruction", ""),
+            target_files     = item.get("target_files", []),
+            acceptance_check = item.get("acceptance_check", ""),
+            cluster          = item.get("cluster", ""),
+            cited_location   = CitedLocation(
+                file       = loc.get("file", ""),
+                symbol     = loc.get("symbol"),
+                line_start = loc.get("line_start"),
+                line_end   = loc.get("line_end"),
+            ),
+            raw = item.get("raw", {}),
+        ))
+    return result
+
+
 def review_clusters(
     clusters: list[RepoCluster],
     base_dir: str | Path,
@@ -639,6 +792,7 @@ def review_clusters(
     *,
     task_mode: str = "code",
     on_cluster_done=None,
+    checkpoint_path: "Path | str | None" = None,
 ) -> list[CandidateTask]:
     """One-call entry point for ``AutoController``.
 
@@ -656,6 +810,10 @@ def review_clusters(
         Parsed ``agents.ini``.
     goal:
         The user's improvement goal string.
+    checkpoint_path:
+        Optional path to a JSON file used to persist per-cluster results.
+        Pass ``agent_dir / "architect_checkpoint.json"`` from the controller
+        to survive LLM crashes and HTTP 500 storms across restarts.
 
     Returns
     -------
@@ -679,7 +837,11 @@ def review_clusters(
         verify_ssl=verify_ssl,
         task_mode=task_mode,
     )
-    return reviewer.review_clusters(clusters, base_dir, goal, on_cluster_done=on_cluster_done)
+    return reviewer.review_clusters(
+        clusters, base_dir, goal,
+        on_cluster_done=on_cluster_done,
+        checkpoint_path=Path(checkpoint_path) if checkpoint_path else None,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
