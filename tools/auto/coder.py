@@ -122,6 +122,32 @@ _SYSTEM_PROMPT = (
     "Do not include it as an empty list."
 )
 
+# Backward-compat alias — "code" is the default persona.
+_SYSTEM_PROMPT_CODE = _SYSTEM_PROMPT
+
+# Docs/creative reuse the IDENTICAL JSON contract + rules above; only the writing
+# persona and the "code improvement" framing change. This mirrors the architect
+# (_SYSTEM_PROMPTS) and Gate-2 validator (_GATE2_SYSTEMS), which already switch
+# persona by task_mode — the coder was previously the only stage that did not.
+_SYSTEM_PROMPT_DOCS = _SYSTEM_PROMPT_CODE.replace(
+    "You are a senior software engineer implementing a targeted code improvement. ",
+    "You are a senior technical writer implementing a targeted documentation "
+    "improvement. You produce clear, accurate prose — not code. ",
+    1,
+)
+_SYSTEM_PROMPT_CREATIVE = _SYSTEM_PROMPT_CODE.replace(
+    "You are a senior software engineer implementing a targeted code improvement. ",
+    "You are a creative writing editor implementing a targeted revision to a piece "
+    "of creative writing. You produce polished, engaging prose — not code. ",
+    1,
+)
+
+_CODER_SYSTEM_PROMPTS: dict[str, str] = {
+    "code":     _SYSTEM_PROMPT_CODE,
+    "docs":     _SYSTEM_PROMPT_DOCS,
+    "creative": _SYSTEM_PROMPT_CREATIVE,
+}
+
 # ── Per-task user prompt template ─────────────────────────────────────────────
 _USER_PROMPT_TMPL = """\
 TASK ID:    {task_id}
@@ -236,7 +262,14 @@ class Coder:
         sec = "coder"
         self._temperature = float(config.get(sec, "temperature", fallback="0.2"))
         self._max_tokens  = int(config.get(sec, "max_tokens",   fallback="16384"))
-        self._system      = config.get(sec, "system", fallback=_SYSTEM_PROMPT).strip()
+        # Select system prompt by task_mode (mirrors architect / validator).
+        # Priority: mode-specific ini key > legacy "system" key > built-in constant.
+        _mode_key = f"system_{self._task_mode}" if self._task_mode != "code" else None
+        if _mode_key and config.has_option(sec, _mode_key):
+            self._system  = config.get(sec, _mode_key).strip()
+        else:
+            _builtin      = _CODER_SYSTEM_PROMPTS.get(self._task_mode, _SYSTEM_PROMPT_CODE)
+            self._system  = config.get(sec, "system", fallback=_builtin).strip()
         self._timeout     = float(config.get("loop", "timeout_seconds", fallback="300"))
         self._max_file_chars = int(config.get(sec, "max_file_chars", fallback=str(_DEFAULT_MAX_FILE_CHARS)))
         active_profile = config.get("api", "active", fallback="local")
