@@ -249,6 +249,87 @@ class TestCheckContentSafety:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# False-positive regression — patterns that must NOT be blocked after fix
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestFalsePositiveRegression:
+    """Patterns that were blocked before the HIGH fix but should now pass."""
+
+    # ── open() — safe write destinations ─────────────────────────────────────
+
+    def test_open_tmp_path_is_safe(self) -> None:
+        """/tmp is a legitimate temp-file destination; must not be blocked."""
+        code = 'with open("/tmp/output.txt", "w") as f:\n    f.write(data)\n'
+        safe, reason = _check(code)
+        assert safe is True, f"unexpected block: {reason}"
+
+    def test_open_var_log_is_safe(self) -> None:
+        """/var/log is a standard log directory; must not be blocked."""
+        code = 'handler = open("/var/log/app.log", "a")\n'
+        safe, reason = _check(code)
+        assert safe is True, f"unexpected block: {reason}"
+
+    def test_open_home_path_is_safe(self) -> None:
+        """/home paths are user-space; must not be blocked."""
+        code = 'f = open("/home/user/config.json", "w")\n'
+        safe, reason = _check(code)
+        assert safe is True, f"unexpected block: {reason}"
+
+    # ── reboot in identifier — word-boundary fix ──────────────────────────────
+
+    def test_reboot_in_function_name_is_safe(self) -> None:
+        """Function name test_reboot_gracefully must not trip the reboot guard."""
+        code = "def test_reboot_gracefully():\n    assert system.can_recover()\n"
+        safe, reason = _check(code)
+        assert safe is True, f"unexpected block: {reason}"
+
+    def test_reboot_in_class_name_is_safe(self) -> None:
+        code = "class MockRebootHandler:\n    def handle(self): pass\n"
+        safe, reason = _check(code)
+        assert safe is True, f"unexpected block: {reason}"
+
+    def test_shutdown_in_method_name_is_safe(self) -> None:
+        """mock_shutdown_handler must not be blocked by the shutdown guard."""
+        code = "def mock_shutdown_handler(sig, frame):\n    pass\n"
+        safe, reason = _check(code)
+        assert safe is True, f"unexpected block: {reason}"
+
+    # ── open() bypass now closed — single quotes must still be blocked ────────
+
+    def test_open_etc_single_quote_is_blocked(self) -> None:
+        """open('/etc/passwd', 'w') via single quotes was previously a bypass."""
+        code = "with open('/etc/passwd', 'w') as f:\n    f.write('evil')\n"
+        safe, reason = _check(code)
+        assert safe is False
+        assert "open" in reason.lower()
+
+    def test_open_etc_double_quote_still_blocked(self) -> None:
+        """Existing double-quote form must continue to be blocked."""
+        code = 'with open("/etc/hosts", "w") as f:\n    f.write("evil")\n'
+        safe, reason = _check(code)
+        assert safe is False
+        assert "open" in reason.lower()
+
+    def test_open_usr_single_quote_blocked(self) -> None:
+        code = "open('/usr/lib/python3/bad.py', 'w')\n"
+        safe, _ = _check(code)
+        assert safe is False
+
+    # ── standalone dangerous words still blocked ──────────────────────────────
+
+    def test_bare_reboot_command_still_blocked(self) -> None:
+        """A bare 'reboot' shell command must still be caught."""
+        script = "reboot\n"
+        safe, _ = _check(script)
+        assert safe is False
+
+    def test_bare_shutdown_command_still_blocked(self) -> None:
+        script = "import os\nos.system('shutdown -h now')\n"
+        safe, _ = _check(script)
+        assert safe is False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Integration — _write_files honours the content guard
 # ─────────────────────────────────────────────────────────────────────────────
 

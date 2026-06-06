@@ -797,16 +797,44 @@ class Coder:
         # Shell injection via subprocess / os.system with dangerous args
         ("subprocess rm",       "subprocess"),          # too broad? — see note below
         ("os.system rm",        'os.system('),
-        # Privilege escalation
-        ("sudo invocation",     "sudo"),             # space or quoted: sudo, 'sudo', "sudo"
         # Outbound data exfiltration via common tools
         ("curl exfil",          "curl "),
-        ("wget exfil",          "wget "),
-        # Overwrite root / system paths via open()
-        ("open root write",     'open("/'),
-        # Shutdown / reboot
-        ("shutdown cmd",        "shutdown"),
-        ("reboot cmd",          "reboot"),
+    )
+
+    # Patterns requiring \b word-boundary matching to avoid false positives
+    # in identifiers (e.g. test_reboot_gracefully, mock_shutdown_handler,
+    # sudo_required).  Substring matching would fire inside function names
+    # and class names, causing the LLM to silently rename or strip them.
+    _BLOCKED_CODE_WORD_BOUNDARY: tuple[tuple[str, str], ...] = (
+        ("sudo invocation", "sudo"),
+        ("wget exfil",      "wget"),
+        ("shutdown cmd",    "shutdown"),
+        ("reboot cmd",      "reboot"),
+    )
+
+    # Dangerous absolute path prefixes for open() calls.  Paths outside this
+    # list (/tmp, /var/tmp, /home, /Users, /var/log, …) are legitimate
+    # destinations for temp files, logs, and user-space exports.
+    _DANGEROUS_OPEN_PREFIXES: tuple[str, ...] = (
+        "/etc/",    # system configuration
+        "/bin/",    # system binaries
+        "/sbin/",   # system-admin binaries
+        "/usr/",    # unix system resources
+        "/lib/",    # system libraries
+        "/lib64/",
+        "/boot/",   # bootloader / kernel images
+        "/sys/",    # kernel / sysfs
+        "/proc/",   # procfs
+        "/dev/",    # device files
+        "/root/",   # root's home directory
+        "/run/",    # runtime state
+    )
+
+    # Matches open("/ or open('/ in either quote style so single-quote
+    # bypasses (open('/etc/passwd', 'w')) are caught alongside double-quote.
+    _OPEN_WRITE_RE: re.Pattern = re.compile(
+        r"""open\s*\(\s*['"](?P<path>/[^'"]+)""",
+        re.IGNORECASE,
     )
 
     # Union of both sets — kept for backward compatibility; code mode uses this.
@@ -870,6 +898,26 @@ class Coder:
 
             if pat_lower in lower:
                 return False, f"blocked content pattern {pattern!r} ({label})"
+
+        if task_mode == "code":
+            # Word-boundary patterns: avoids false positives in identifiers
+            # (test_reboot_gracefully, mock_shutdown_handler, sudo_required)
+            # while still catching standalone command usage.
+            for label, pattern in cls._BLOCKED_CODE_WORD_BOUNDARY:
+                if re.search(r"\b" + re.escape(pattern) + r"\b", lower):
+                    return False, f"blocked content pattern {pattern!r} ({label})"
+
+            # open() targeting dangerous system paths — both single and double
+            # quote styles.  Legitimate write destinations (/tmp, /home,
+            # /var/log, …) are intentionally excluded from _DANGEROUS_OPEN_PREFIXES.
+            for m in cls._OPEN_WRITE_RE.finditer(content):
+                path = m.group("path").lower()
+                if any(path.startswith(pfx) for pfx in cls._DANGEROUS_OPEN_PREFIXES):
+                    return (
+                        False,
+                        f"blocked content: open() targeting system path"
+                        f" {path!r} (open root write)",
+                    )
 
         return True, ""
 
