@@ -9,7 +9,7 @@ if TYPE_CHECKING:
 
 class OutputFormatter:
     """
-    TASK-08 — Final Output Formatter
+    Final Output Formatter
     Handles formatting, visual presentation, and filtering of the pipeline outputs.
     """
 
@@ -30,7 +30,7 @@ class OutputFormatter:
         elapsed_time: float,
         iteration: int,
         output_config: Dict[str, Any],
-        prompt_version: str = "hardcoded",   # STORY-5.2
+        prompt_version: str = "hardcoded",
     ) -> None:
         """
         Renders the formatted evaluation report output to stdout.
