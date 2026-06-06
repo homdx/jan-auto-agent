@@ -89,7 +89,7 @@ class Orchestrator(OrchestratorActions):
         self.prompt_store.store_path   = Path(self.config.get("prompt_store", "store_path", fallback="prompts.json"))
         self.prompt_store.max_versions = self.config.getint("prompt_store", "max_versions", fallback=3)
 
-        self.prompt_optimizer = PromptOptimizer(         # STORY-3.2
+        self.prompt_optimizer = PromptOptimizer(
             model=self.model,
             temperature=self.config.getfloat("prompt_optimizer", "temperature", fallback=0.4),
             base_url=self.base_url,
@@ -125,7 +125,7 @@ class Orchestrator(OrchestratorActions):
             ssl_context=self.ssl_context,
             max_hints=self.config.getint("validator_agent", "max_hints", fallback=3),
         )
-        self.prompt_evaluator = PromptEvaluator(      # STORY-4.2
+        self.prompt_evaluator = PromptEvaluator(
             prompt_store=self.prompt_store,
             metrics_collector=self.metrics_collector,
             validator_agent=self.validator_agent,
@@ -186,7 +186,7 @@ class Orchestrator(OrchestratorActions):
 
         logger.info(f"API profile: [{section}] format={self.api_format} url={self.base_url}")
 
-        # STORY-3.2: optimizer gate thresholds (read from agents.ini)
+        # Optimizer gate thresholds (read from agents.ini)
         self.optimizer_enabled         = self.config.getboolean("prompt_optimizer", "enabled",                  fallback=True)
         self.optimizer_min_runs        = self.config.getint    ("prompt_optimizer", "min_runs_before_optimize",  fallback=3)
         self.optimizer_trigger_avg_iter= self.config.getfloat  ("prompt_optimizer", "trigger_avg_iterations",   fallback=2.0)
@@ -196,40 +196,6 @@ class Orchestrator(OrchestratorActions):
         self.stream_agents = self.config.getboolean("output", "stream_agents", fallback=False)
         self.search_full_file_max_chars = self.config.getint("search", "full_file_max_chars", fallback=12000)
         self.file_editor_max_tokens = self.config.getint("file_editor", "max_tokens", fallback=0)
-
-    def execute_direct_chat(self, user_input: str) -> None:
-        """Routes conversational queries to local model with streaming output."""
-        url = self._chat_url()
-
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}"
-        }
-        payload = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": "You are a helpful assistant integrated into an offline DevOps pipeline environment."},
-                {"role": "user", "content": user_input}
-            ],
-            "temperature": self.config.getfloat("direct_chat", "temperature", fallback=0.3),
-        }
-        if self.num_ctx:
-            payload["num_ctx"] = self.num_ctx
-
-        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-        print(f"\n[RESPONSE - {timestamp}]:")
-        try:
-            from tools.llm_stream import request_completion
-            def on_token(tok):
-                sys.stdout.write(tok)
-                sys.stdout.flush()
-            request_completion(url, headers, payload, self.timeout_seconds,
-                               stream=True, on_token=on_token,
-                               api_format=self.api_format,
-                               ssl_context=self.ssl_context)
-            print("\n")
-        except Exception as e:
-            logger.error(f"Failed to communicate with endpoint: {e}")
 
     def run_pipeline(self, user_input: str, base_dir: str) -> None:
         """Executes pipelines with adaptive search, validation loops, and visual feedback."""
@@ -349,7 +315,7 @@ class Orchestrator(OrchestratorActions):
         
         print(f"\n[PIPELINE COMPLETED - {timestamp}]")
 
-        # STORY-1.1: Record run metrics
+        # Record run metrics
         last_validation = validation if parsed.intent not in ("show", "show_imports") else {}
         improvement_json_ok = bool(improvement.get("improved_code") or improvement.get("explanation"))
         self.metrics_collector.record(RunRecord(
@@ -363,7 +329,7 @@ class Orchestrator(OrchestratorActions):
             elapsed_seconds=total_elapsed,
         ))
 
-        # STORY-3.2: Trigger prompt optimization when failure signal is strong enough
+        # Trigger prompt optimization when failure signal is strong enough
         if self.optimizer_enabled:
             summary = self.metrics_collector.summarize_failures(n=10)
             should_optimize = (
@@ -380,7 +346,7 @@ class Orchestrator(OrchestratorActions):
                     current_prompt=self.prompt_store.get_current("validator_agent"),
                     failure_summary=summary,
                 )
-                # STORY-4.2: evaluate candidate, promote if it clears the threshold
+                # Evaluate candidate, promote if it clears the threshold
                 result = self.prompt_evaluator.evaluate("validator_agent", candidate)
                 if result.promoted:
                     self.prompt_store.push("validator_agent", candidate, result.score)
@@ -401,7 +367,8 @@ class Orchestrator(OrchestratorActions):
                 "show_timing": self.config.getboolean("output", "show_timing", fallback=True),
                 "show_iteration_count": self.config.getboolean("output", "show_iteration_count", fallback=True),
                 "max_iterations": self.max_iterations
-            }
+            },
+            prompt_version=self.prompt_store.get_version_label("validator_agent")
         )
 
 

@@ -197,8 +197,6 @@ class LLMGate2Validator:
 
     # ------------------------------------------------------------------
 
-    # ------------------------------------------------------------------
-
     def _read_changed_content(self, coder_result, task: dict | None = None) -> str:
         """Read the post-edit content of the files the coder wrote, so the
         validator judges the ACTUAL code (not just file names).  The Gate-2
