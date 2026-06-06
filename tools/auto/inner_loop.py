@@ -451,7 +451,7 @@ class InnerLoop:
             # Pull-model: resolve any context the coder asked for, for the NEXT attempt.
             coder_missing = list(getattr(coder_result, "missing_context", []) or [])
             final_missing = coder_missing
-            if not getattr(coder_result, "context_satisfied", True):
+            if coder_missing or not getattr(coder_result, "context_satisfied", True):
                 _any_missing = True
             if coder_missing:
                 prefetched_context = self._broker.fetch(coder_missing, target_files, base_dir_path)
