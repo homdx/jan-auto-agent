@@ -68,6 +68,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from tools.block_extractor import extract_block as _block_extractor_extract_block
+# SearchAgent is imported lazily inside Coder._fetch_needed
 
 from tools.agent_trace import tracer
 import tools.llm_stream as _llm_stream
@@ -111,6 +112,14 @@ _SYSTEM_PROMPT = (
     '{"files": [...], "context_request": ["Config", "_resolve_path"]}. '
     "The names you request are resolved and provided on the next attempt. Omit "
     "context_request (or use []) when you already have everything you need."
+    "\n"
+    "8. If the provided file contents are insufficient to complete the task — "
+    "for example, a referenced class or function is not shown — add a top-level "
+    "\"missing_context\" key to your JSON response listing the symbol names you "
+    "needed but did not receive. "
+    "Format: \"missing_context\": [\"ClassName\", \"function_name\"] "
+    "Omit the key entirely if context was sufficient. "
+    "Do not include it as an empty list."
 )
 
 # ── Per-task user prompt template ─────────────────────────────────────────────
@@ -162,6 +171,7 @@ class CoderResult:
     error:         str = ""
     raw_response:  str = field(default="", repr=False)
     missing_context: list[str] = field(default_factory=list)
+    context_satisfied: bool = True  # False when the LLM reported missing_context
 
     @property
     def succeeded(self) -> bool:
@@ -232,6 +242,10 @@ class Coder:
         active_profile = config.get("api", "active", fallback="local")
         # num_ctx controls the total context window on Ollama; 0 means "use server default".
         self._num_ctx = config.getint(f"api_{active_profile}", "num_ctx", fallback=0)
+        # Context-probe: fetch missing symbols on first LLM response, then retry once.
+        self._context_probe_enabled = config.getboolean(sec, "context_probe", fallback=True)
+        self._max_chars_per_dep     = config.getint(sec, "max_chars_per_dep", fallback=2000)
+        self._max_dep_chars         = config.getint(sec, "max_dep_chars",     fallback=6000)
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -333,10 +347,43 @@ class Coder:
             )
             return CoderResult(task_id=task_id, error=msg)
 
-        # ── Strip think blocks + outer fences, then parse JSON ────────────────
+        # ── Strip think blocks; check for missing-context signal ─────────────
         cleaned = strip_think(raw_text)
         # Pull-model: capture any symbols the coder asked for (context_request).
         missing_ctx = self._extract_context_request(cleaned)
+
+        # ── Context probe: if the LLM reported missing_context, fetch once ───
+        _missing = self._extract_missing_context(cleaned)
+        context_satisfied = not bool(_missing)
+
+        if _missing and self._context_probe_enabled:
+            dep_ctx = self._fetch_needed(
+                _missing, base_dir,
+                max_chars_per_dep=self._max_chars_per_dep,
+                max_total_dep_chars=self._max_dep_chars,
+            )
+            if dep_ctx:
+                user_msg += f"\n\n## Fetched context (requested)\n{dep_ctx}"
+                # Mutate payload in-place — messages[-1] is always the user role.
+                payload["messages"][-1]["content"] = user_msg
+                try:
+                    raw_text = _llm_stream.request_completion(
+                        url=url,
+                        headers=headers,
+                        payload=payload,
+                        timeout=self._timeout,
+                        stream=True,
+                        api_format=self._api_format,
+                        ssl_context=self._ssl_context,
+                    )
+                    cleaned = strip_think(raw_text)
+                except Exception as exc:
+                    logger.warning(
+                        "coder.generate [%s]: context-probe second call failed: %s "
+                        "— using first response", task_id, exc,
+                    )
+                    # cleaned already holds the first response; carry on.
+
         tracer.event(
             source="llm", target="coder", kind="llm_response",
             content=cleaned, params={"task_id": task_id},
@@ -344,8 +391,11 @@ class Coder:
 
         parsed_files, parse_error = self._parse_response(cleaned, task_id)
         if parse_error:
-            return CoderResult(task_id=task_id, error=parse_error,
-                               raw_response=cleaned, missing_context=missing_ctx)
+            return CoderResult(
+                task_id=task_id, error=parse_error,
+                raw_response=cleaned, missing_context=missing_ctx,
+                context_satisfied=context_satisfied,
+            )
 
         # ── Write files to disk ───────────────────────────────────────────────
         target_files = task.get("target_files") or []
@@ -356,7 +406,7 @@ class Coder:
         if write_error and not written:
             return CoderResult(
                 task_id=task_id, error=write_error, raw_response=cleaned,
-                missing_context=missing_ctx,
+                missing_context=missing_ctx, context_satisfied=context_satisfied,
             )
 
         result = CoderResult(
@@ -365,6 +415,7 @@ class Coder:
             error=write_error,
             raw_response=cleaned,
             missing_context=missing_ctx,
+            context_satisfied=context_satisfied,
         )
         logger.info("coder.generate: %s", result.summary())
         return result
@@ -406,10 +457,9 @@ class Coder:
         target_files_listing = "\n".join(f"  - {f}" for f in target_files) or "  (none)"
 
         # ── File contents ─────────────────────────────────────────────────────
-        # Pass cited_symbol so _read_file_contents can pin the relevant chunk.
-        _cited_sym_for_chunks = loc.get("symbol") or None
+        # Pass task so _read_file_contents can resolve cited_symbol itself.
         file_contents = self._read_file_contents(
-            target_files, base_dir, cited_symbol=_cited_sym_for_chunks
+            target_files, base_dir, task=task
         )
         # Pull-model: prepend any context the previous attempt requested.
         if prefetched_context:
@@ -451,40 +501,158 @@ class Coder:
             return []
         return [str(s).strip() for s in req if str(s).strip()]
 
+    def _extract_missing_context(self, text: str) -> list[str]:
+        """Extract the top-level ``missing_context`` list from the LLM response.
+
+        Returns up to 8 symbol names; returns ``[]`` on absence or any parse
+        error so callers can treat it as fail-safe.
+        """
+        try:
+            data = json.loads(_strip_outer_fence(text))
+            missing = data.get("missing_context")
+            if isinstance(missing, list):
+                return [str(s).strip() for s in missing if s][:8]
+        except Exception:
+            pass
+        return []
+
+    def _fetch_needed(
+        self,
+        symbols: list[str],
+        base_dir: Path,
+        max_chars_per_dep: int,
+        max_total_dep_chars: int,
+    ) -> str:
+        """Search *base_dir* for the source blocks of *symbols* and return them
+        formatted as prompt context.
+
+        Each found block is trimmed to *max_chars_per_dep* and prefixed with::
+
+            ### dep: SymbolName  (from path/to/file.py)
+
+        Accumulation stops once the total reaches *max_total_dep_chars*.
+        Symbols that cannot be found are skipped with a DEBUG log entry.
+        Returns ``""`` when nothing was found.  Never raises.
+        """
+        try:
+            from tools.search_agent import SearchAgent as _SearchAgent  # lazy import
+            active  = self._config.get("api", "active", fallback="local")
+            section = f"api_{active}"
+            agent = _SearchAgent(
+                model      = self._config.get(section, "model",      fallback=None),
+                base_url   = self._config.get(section, "base_url",   fallback=None),
+                api_key    = self._config.get(section, "api_key",    fallback=""),
+                api_format = self._config.get(section, "api_format", fallback="openai"),
+                timeout    = int(self._config.get("loop", "timeout_seconds", fallback="120")),
+                ssl_context = self._ssl_context,
+            )
+        except Exception as exc:
+            logger.warning("coder._fetch_needed: could not create SearchAgent: %s", exc)
+            return ""
+
+        parts: list[str] = []
+        total = 0
+
+        for symbol in symbols:
+            if total >= max_total_dep_chars:
+                break
+            try:
+                result = agent.run(references=[symbol], base_dir=str(base_dir))
+                found  = result.get("found", {})
+                if symbol not in found:
+                    logger.debug("coder._fetch_needed: symbol %r not found", symbol)
+                    continue
+                entry = found[symbol]
+                block = (entry.get("code") or "").strip()
+                file_path = entry.get("file", "")
+                if not block:
+                    logger.debug("coder._fetch_needed: empty block for %r", symbol)
+                    continue
+                # Trim individual block to budget.
+                if len(block) > max_chars_per_dep:
+                    block = block[:max_chars_per_dep] + "\n... [trimmed]"
+                header = f"### dep: {symbol}  (from {file_path})"
+                entry_text = f"{header}\n{block}"
+                # Check total budget.
+                if total + len(entry_text) > max_total_dep_chars:
+                    remaining = max_total_dep_chars - total
+                    if remaining < len(header) + 20:
+                        break  # not worth including a stub
+                    entry_text = entry_text[:remaining] + "\n... [trimmed]"
+                parts.append(entry_text)
+                total += len(entry_text)
+            except Exception as exc:
+                logger.debug("coder._fetch_needed: error fetching %r: %s", symbol, exc)
+                continue
+
+        return "\n\n".join(parts)
+
     def _read_file_contents(
         self,
         target_files: list[str],
         base_dir: Path,
         cited_symbol: str | None = None,
+        task: "dict | None" = None,
     ) -> str:
         """Read and annotate file contents for the prompt.
 
-        Each file is prefixed with a ``### path/to/file.py`` header.  Instead
-        of blind character truncation, large files are split into symbol-aware
-        chunks via :func:`_chunk_file` and then assembled with
-        :func:`_select_relevant_chunks` so that the *cited_symbol* and import
-        block are always present.  Files that don't exist yet are labelled as
-        ``[new file — no existing content]``.
+        Each file is prefixed with a ``### path/to/file.py`` header.
+
+        Small files (≤ ``max_file_chars``) are included byte-for-byte.  Larger
+        files are split into symbol-aware chunks via :func:`_chunk_file` and
+        assembled with :func:`_select_relevant_chunks`, guaranteeing that the
+        import block and the *cited_symbol* are always present.  Any exception
+        in the smart path falls back to plain character truncation so the caller
+        always receives something useful.
+
+        Parameters
+        ----------
+        task:
+            When provided, the cited symbol is extracted from
+            ``task["cited_locations"][0]["symbol"]`` (takes priority over the
+            *cited_symbol* keyword argument).
         """
+        # Resolve cited_symbol: explicit kwarg first, then task dict.
+        if task is not None:
+            locs = task.get("cited_locations") or []
+            if locs and isinstance(locs[0], dict):
+                _sym = locs[0].get("symbol")
+                if _sym:
+                    cited_symbol = _sym
+
         parts: list[str] = []
         for rel in target_files:
             abs_path = base_dir / rel
             if not abs_path.exists():
-                content = "[new file — no existing content]"
-            else:
-                try:
-                    raw = abs_path.read_text(encoding="utf-8", errors="replace")
-                except OSError as exc:
-                    parts.append(f"### {rel}\n[unreadable: {exc}]")
-                    continue
+                parts.append(f"### {rel}\n[new file — no existing content]")
+                continue
 
-                file_ext = Path(rel).suffix
-                chunks = _chunk_file(raw, file_ext, self._max_file_chars)
-                content = _select_relevant_chunks(
-                    chunks, cited_symbol, self._max_file_chars
+            try:
+                content = abs_path.read_text(encoding="utf-8", errors="replace")
+            except OSError as exc:
+                parts.append(f"### {rel}\n[unreadable: {exc}]")
+                continue
+
+            ext = Path(rel).suffix.lower()
+
+            if len(content) <= self._max_file_chars:
+                parts.append(f"### {rel}\n{content}")
+                continue
+
+            try:
+                chunks   = _chunk_file(content, ext, self._max_file_chars)
+                assembled = _select_relevant_chunks(chunks, cited_symbol, self._max_file_chars)
+                parts.append(f"### {rel}\n{assembled}")
+            except Exception as exc:
+                logger.warning(
+                    "coder: smart context failed for %s: %s — falling back", rel, exc
                 )
+                truncated = (
+                    content[:self._max_file_chars]
+                    + f"\n... [truncated — {len(content) - self._max_file_chars} more chars]"
+                )
+                parts.append(f"### {rel}\n{truncated}")
 
-            parts.append(f"### {rel}\n{content}")
         return "\n\n".join(parts) if parts else "(no target files)"
 
     def _parse_response(
