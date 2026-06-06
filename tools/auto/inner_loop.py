@@ -177,30 +177,88 @@ class LLMGate2Validator:
         else:
             self._system = _builtin
 
-    # ------------------------------------------------------------------
+        # Task 3 — smart context additions
+        from tools.search_agent import make_search_agent
+        self._search_agent = make_search_agent(config, base_dir) if config else None
+        self._context_probe_enabled = (
+            config.getboolean("coder", "context_probe", fallback=True) if config else True
+        )
+        self._max_chars_per_dep = (
+            config.getint("coder", "max_chars_per_dep", fallback=2000) if config else 2000
+        )
 
     # ------------------------------------------------------------------
 
-    def _read_changed_content(self, coder_result) -> str:
+    # ------------------------------------------------------------------
+
+    def _read_changed_content(self, coder_result, task: dict | None = None) -> str:
         """Read the post-edit content of the files the coder wrote, so the
         validator judges the ACTUAL code (not just file names).  The Gate-2
         system prompt promises 'the generated code' and asks for line/pattern
         specific hints, so the code must be present in the prompt."""
+        from pathlib import Path as _Path
         files = list(getattr(coder_result, "files_written", []) or [])
         if not files:
             return "(the coder reported NO files written — nothing changed)"
-        budget = max(800, 6000 // len(files))
+        budget = max(800, 6000 // max(len(files), 1))
         blocks = []
         for rel in files:
             try:
                 content = (self.base_dir / rel).read_text(
                     encoding="utf-8", errors="replace")
             except OSError as exc:
-                content = f"(could not read {rel}: {exc})"
-            if len(content) > budget:
+                blocks.append(f"--- {rel} ---\n(could not read {rel}: {exc})")
+                continue
+
+            if len(content) <= budget:
+                blocks.append(f"--- {rel} ---\n{content}")
+                continue
+
+            ext = _Path(rel).suffix.lower()
+            cited_symbol = None
+            if task:
+                locs = task.get("cited_locations") or []
+                if locs and isinstance(locs[0], dict):
+                    cited_symbol = locs[0].get("symbol")
+
+            try:
+                from tools.auto.coder import _chunk_file, _select_relevant_chunks
+                chunks = _chunk_file(content, ext, budget)
+                content = _select_relevant_chunks(chunks, cited_symbol, budget)
+            except Exception as exc:
+                logger.warning("validator: smart chunk failed for %s: %s", rel, exc)
                 content = content[:budget] + f"\n… [+{len(content) - budget} chars truncated]"
+
+            # blind dep fetch — no probe LLM call
+            if self._context_probe_enabled and self._search_agent:
+                try:
+                    from tools.block_extractor import extract_imports
+                    dep_ctx = self._fetch_needed_flat(
+                        extract_imports(content, ext)[:4], budget_per=400
+                    )
+                    if dep_ctx:
+                        content += "\n\n## Interfaces and callers\n" + dep_ctx
+                except Exception as exc:
+                    logger.debug("validator: dep fetch skipped for %s: %s", rel, exc)
+
             blocks.append(f"--- {rel} ---\n{content}")
         return "\n\n".join(blocks)
+
+    def _fetch_needed_flat(self, symbols: list[str], budget_per: int) -> str:
+        """Fetch short snippets for the given symbol names via the search agent."""
+        if not self._search_agent or not symbols:
+            return ""
+        parts = []
+        for sym in symbols:
+            try:
+                result = self._search_agent.run(references=[sym], base_dir=self.base_dir)
+                found = result.get("found", {})
+                if found:
+                    block = next(iter(found.values())).get("code", "")[:budget_per]
+                    parts.append(f"### {sym}\n{block}")
+            except Exception:
+                pass
+        return "\n\n".join(parts)
 
     def approve(
         self,
@@ -233,7 +291,7 @@ class LLMGate2Validator:
                 f"Acceptance check exit code: {getattr(exec_result, 'exit_code', 0)}\n"
                 f"stdout:\n{getattr(exec_result, 'stdout', '')[:2000]}\n\n"
                 f"Generated files (CHANGED FILE CONTENT after the coder's edit):\n"
-                + self._read_changed_content(coder_result)
+                + self._read_changed_content(coder_result, task=task)
             )
 
             if self.api_format == "ollama":
