@@ -170,10 +170,18 @@ class LLMGate2Validator:
         self.num_ctx     = int(num_ctx)
         self.max_tokens  = int(max_tokens)
         self.task_mode   = str(task_mode)
-        # AUTO-DM-5: select system prompt — agents.ini override wins over built-in
+        # AUTO-DM-5: select system prompt — agents.ini override wins over built-in.
+        # Priority (mirrors Coder/Architect): mode-specific key (system_docs /
+        # system_creative) > legacy "system" key > built-in constant.
+        # This allows independent per-mode validator prompt overrides without
+        # clobbering the other modes, which a single "system" key cannot do.
         _builtin = _GATE2_SYSTEMS.get(self.task_mode, _GATE2_SYSTEM_CODE)
         if config is not None:
-            self._system = config.get("validator_agent", "system", fallback=_builtin)
+            _mode_key = f"system_{self.task_mode}" if self.task_mode != "code" else None
+            if _mode_key and config.has_option("validator_agent", _mode_key):
+                self._system = config.get("validator_agent", _mode_key).strip()
+            else:
+                self._system = config.get("validator_agent", "system", fallback=_builtin).strip()
         else:
             self._system = _builtin
 
@@ -598,7 +606,7 @@ def make_inner_loop(
     if coder is None:
         try:
             from tools.auto.coder import make_coder  # type: ignore
-            coder = make_coder(config)
+            coder = make_coder(config, task_mode=task_mode)
         except ImportError:
             logger.warning("Coder not found — using _StubCoder (tests only)")
             coder = _StubCoder()
@@ -636,7 +644,7 @@ def make_inner_loop(
 # ── Stubs for environments without real agents (unit tests) ──────────────────
 
 class _StubCoder:
-    def generate(self, task, base_dir, prior_feedback=None):
+    def generate(self, task, base_dir, prior_feedback=None, prefetched_context=""):
         from types import SimpleNamespace
         return SimpleNamespace(succeeded=False, files_written=[], error="stub coder — no real coder available")
 

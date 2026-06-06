@@ -256,6 +256,14 @@ class TestMakeInnerLoopTaskMode:
         il = make_inner_loop(cfg, tmp_path, coder=coder, executor=executor)
         assert il is not None
 
+    def test_task_mode_forwarded_to_coder(self, tmp_path):
+        """make_inner_loop must forward task_mode to the Coder, not only the Validator."""
+        from tools.auto.inner_loop import make_inner_loop
+        cfg = self._base_config()
+        executor = MagicMock()
+        il = make_inner_loop(cfg, tmp_path, executor=executor, task_mode="docs")
+        assert il.coder._task_mode == "docs"
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 6 — LLMGate2Validator accepts and stores task_mode
@@ -286,3 +294,38 @@ class TestLLMGate2ValidatorTaskMode:
             api_key="x",
         )
         assert v.task_mode == "code"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Medium #1 — _StubCoder.generate() accepts prefetched_context kwarg
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestStubCoderSignature:
+    """_StubCoder must accept prefetched_context so broken-env failures are clean."""
+
+    def test_generate_accepts_prefetched_context_kwarg(self):
+        """Must not raise TypeError when called the same way InnerLoop.run_task() does."""
+        from tools.auto.inner_loop import _StubCoder
+        stub = _StubCoder()
+        result = stub.generate(
+            task={},
+            base_dir="/tmp",
+            prior_feedback=None,
+            prefetched_context="some context",
+        )
+        assert result.succeeded is False
+
+    def test_generate_prefetched_context_defaults_to_empty_string(self):
+        """Omitting prefetched_context must still work (backward compat)."""
+        from tools.auto.inner_loop import _StubCoder
+        stub = _StubCoder()
+        result = stub.generate(task={}, base_dir="/tmp")
+        assert result.succeeded is False
+
+    def test_generate_returns_error_message(self):
+        """Stub must communicate that no real coder is available."""
+        from tools.auto.inner_loop import _StubCoder
+        stub = _StubCoder()
+        result = stub.generate(task={}, base_dir="/tmp", prefetched_context="ctx")
+        assert result.error
+        assert result.files_written == []

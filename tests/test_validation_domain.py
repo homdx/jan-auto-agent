@@ -184,6 +184,97 @@ class TestValidatorSystemPromptSelection:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Medium #2 — mode-specific ini keys (system_docs / system_creative)
+# mirrors Coder / Architect: each mode can be overridden independently
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _cfg_mode_keys(
+    system_docs: str | None = None,
+    system_creative: str | None = None,
+    system_legacy: str | None = None,
+) -> configparser.ConfigParser:
+    """Build a config that may have any combination of validator_agent keys."""
+    cfg = configparser.ConfigParser()
+    cfg.read_dict({
+        "api":            {"active": "local"},
+        "api_local":      {"base_url": "http://localhost:1337/v1",
+                           "api_key": "jan", "model": "test-model",
+                           "api_format": "openai"},
+        "validator_agent": {},
+    })
+    if system_docs is not None:
+        cfg.set("validator_agent", "system_docs", system_docs)
+    if system_creative is not None:
+        cfg.set("validator_agent", "system_creative", system_creative)
+    if system_legacy is not None:
+        cfg.set("validator_agent", "system", system_legacy)
+    return cfg
+
+
+class TestValidatorModeSpecificIniKeys:
+    """system_docs / system_creative take priority over legacy 'system' key."""
+
+    def test_system_docs_key_used_for_docs_mode(self) -> None:
+        cfg = _cfg_mode_keys(system_docs="validator for documentation")
+        v = _validator("docs", config=cfg)
+        assert v._system == "validator for documentation"
+
+    def test_system_creative_key_used_for_creative_mode(self) -> None:
+        cfg = _cfg_mode_keys(system_creative="validator for creative writing")
+        v = _validator("creative", config=cfg)
+        assert v._system == "validator for creative writing"
+
+    def test_system_docs_does_not_affect_code_mode(self) -> None:
+        """system_docs must only activate for docs mode, not bleed into code."""
+        from tools.auto.inner_loop import _GATE2_SYSTEM_CODE
+        cfg = _cfg_mode_keys(system_docs="docs-only prompt")
+        v = _validator("code", config=cfg)
+        assert v._system == _GATE2_SYSTEM_CODE
+
+    def test_system_docs_does_not_affect_creative_mode(self) -> None:
+        """system_docs must not override creative mode — modes are independent."""
+        from tools.auto.inner_loop import _GATE2_SYSTEM_CREATIVE
+        cfg = _cfg_mode_keys(system_docs="docs-only prompt")
+        v = _validator("creative", config=cfg)
+        assert v._system == _GATE2_SYSTEM_CREATIVE
+
+    def test_mode_specific_key_wins_over_legacy_system_key(self) -> None:
+        """system_docs beats legacy 'system' when both are present."""
+        cfg = _cfg_mode_keys(
+            system_docs="mode-specific docs prompt",
+            system_legacy="old catch-all prompt",
+        )
+        v = _validator("docs", config=cfg)
+        assert v._system == "mode-specific docs prompt"
+
+    def test_legacy_system_key_still_overrides_code_mode(self) -> None:
+        """Backward compat: a config with only 'system' still overrides code mode."""
+        cfg = _cfg_mode_keys(system_legacy="legacy custom prompt")
+        v = _validator("code", config=cfg)
+        assert v._system == "legacy custom prompt"
+
+    def test_legacy_system_key_still_overrides_docs_when_no_mode_key(self) -> None:
+        """If system_docs is absent, legacy 'system' key still wins over built-in."""
+        cfg = _cfg_mode_keys(system_legacy="legacy custom prompt")
+        v = _validator("docs", config=cfg)
+        assert v._system == "legacy custom prompt"
+
+    def test_independent_overrides_across_all_modes(self) -> None:
+        """All three modes can each have their own prompt without interfering."""
+        from tools.auto.inner_loop import _GATE2_SYSTEM_CODE
+        cfg = _cfg_mode_keys(
+            system_docs="docs validator",
+            system_creative="creative validator",
+        )
+        v_code     = _validator("code",     config=cfg)
+        v_docs     = _validator("docs",     config=cfg)
+        v_creative = _validator("creative", config=cfg)
+        assert v_code._system     == _GATE2_SYSTEM_CODE   # no override for code
+        assert v_docs._system     == "docs validator"
+        assert v_creative._system == "creative validator"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # approve() uses self._system, not the bare module constant
 # ─────────────────────────────────────────────────────────────────────────────
 
