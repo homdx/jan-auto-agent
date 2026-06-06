@@ -38,10 +38,13 @@ from __future__ import annotations
 import configparser
 import json
 import logging
+from tools.auto.context_broker import ContextBroker
+
 from dataclasses import dataclass, field
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
 
 _DEFAULT_MAX_ATTEMPTS = 5
 
@@ -72,6 +75,7 @@ class InnerLoopResult:
     last_feedback: str   = ""
     records:       list  = field(default_factory=list)   # list[AttemptRecord]
     hint_history:  list  = field(default_factory=list)   # list[str] — LOOP-4
+    context_satisfied: bool = True   # pull-model: False ⇒ last attempt still needed context
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -85,7 +89,10 @@ _GATE2_SYSTEM_CODE = (
     "Return ONLY a JSON object — no text before or after:\n"
     '{"approved": true|false, "feedback": "<one sentence reason>", '
     '"hints": ["<actionable hint 1>", ...], '
-    '"suggested_approach": "<optional one-sentence alternative>"}\n'
+    '"suggested_approach": "<optional one-sentence alternative>", '
+    '"missing_context": ["<symbol you needed to see but were not shown>", ...]}\n'
+    "Use missing_context ONLY when you cannot verify correctness because a "
+    "referenced symbol's definition was not provided; otherwise omit it.\n"
     "HINTS RULES:\n"
     "  - Each hint MUST point to a specific name, line, or pattern in the code.\n"
     "  - Good: 'import re is used on line 12 but not present in imports'.\n"
@@ -159,40 +166,107 @@ class LLMGate2Validator:
         self.max_hints   = max(1, int(max_hints))
         self.ssl_context = ssl_context
         self.base_dir    = Path(base_dir)
+        self.last_missing_context: list[str] = []
         self.num_ctx     = int(num_ctx)
         self.max_tokens  = int(max_tokens)
         self.task_mode   = str(task_mode)
-        # AUTO-DM-5: select system prompt — agents.ini override wins over built-in
+        # AUTO-DM-5: select system prompt — agents.ini override wins over built-in.
+        # Priority (mirrors Coder/Architect): mode-specific key (system_docs /
+        # system_creative) > legacy "system" key > built-in constant.
+        # This allows independent per-mode validator prompt overrides without
+        # clobbering the other modes, which a single "system" key cannot do.
         _builtin = _GATE2_SYSTEMS.get(self.task_mode, _GATE2_SYSTEM_CODE)
         if config is not None:
-            self._system = config.get("validator_agent", "system", fallback=_builtin)
+            _mode_key = f"system_{self.task_mode}" if self.task_mode != "code" else None
+            if _mode_key and config.has_option("validator_agent", _mode_key):
+                self._system = config.get("validator_agent", _mode_key).strip()
+            else:
+                self._system = config.get("validator_agent", "system", fallback=_builtin).strip()
         else:
             self._system = _builtin
 
-    # ------------------------------------------------------------------
+        # Task 3 — smart context additions
+        from tools.search_agent import make_search_agent
+        self._search_agent = make_search_agent(config, base_dir) if config else None
+        self._context_probe_enabled = (
+            config.getboolean("coder", "context_probe", fallback=True) if config else True
+        )
+        self._max_chars_per_dep = (
+            config.getint("coder", "max_chars_per_dep", fallback=2000) if config else 2000
+        )
 
     # ------------------------------------------------------------------
 
-    def _read_changed_content(self, coder_result) -> str:
+    # ------------------------------------------------------------------
+
+    def _read_changed_content(self, coder_result, task: dict | None = None) -> str:
         """Read the post-edit content of the files the coder wrote, so the
         validator judges the ACTUAL code (not just file names).  The Gate-2
         system prompt promises 'the generated code' and asks for line/pattern
         specific hints, so the code must be present in the prompt."""
+        from pathlib import Path as _Path
         files = list(getattr(coder_result, "files_written", []) or [])
         if not files:
             return "(the coder reported NO files written — nothing changed)"
-        budget = max(800, 6000 // len(files))
+        budget = max(800, 6000 // max(len(files), 1))
         blocks = []
         for rel in files:
             try:
                 content = (self.base_dir / rel).read_text(
                     encoding="utf-8", errors="replace")
             except OSError as exc:
-                content = f"(could not read {rel}: {exc})"
-            if len(content) > budget:
+                blocks.append(f"--- {rel} ---\n(could not read {rel}: {exc})")
+                continue
+
+            if len(content) <= budget:
+                blocks.append(f"--- {rel} ---\n{content}")
+                continue
+
+            ext = _Path(rel).suffix.lower()
+            cited_symbol = None
+            if task:
+                locs = task.get("cited_locations") or []
+                if locs and isinstance(locs[0], dict):
+                    cited_symbol = locs[0].get("symbol")
+
+            try:
+                from tools.auto.coder import _chunk_file, _select_relevant_chunks
+                chunks = _chunk_file(content, ext, budget)
+                content = _select_relevant_chunks(chunks, cited_symbol, budget)
+            except Exception as exc:
+                logger.warning("validator: smart chunk failed for %s: %s", rel, exc)
                 content = content[:budget] + f"\n… [+{len(content) - budget} chars truncated]"
+
+            # blind dep fetch — no probe LLM call
+            if self._context_probe_enabled and self._search_agent:
+                try:
+                    from tools.block_extractor import extract_imports
+                    dep_ctx = self._fetch_needed_flat(
+                        extract_imports(content, ext)[:4], budget_per=400
+                    )
+                    if dep_ctx:
+                        content += "\n\n## Interfaces and callers\n" + dep_ctx
+                except Exception as exc:
+                    logger.debug("validator: dep fetch skipped for %s: %s", rel, exc)
+
             blocks.append(f"--- {rel} ---\n{content}")
         return "\n\n".join(blocks)
+
+    def _fetch_needed_flat(self, symbols: list[str], budget_per: int) -> str:
+        """Fetch short snippets for the given symbol names via the search agent."""
+        if not self._search_agent or not symbols:
+            return ""
+        parts = []
+        for sym in symbols:
+            try:
+                result = self._search_agent.run(references=[sym], base_dir=self.base_dir)
+                found = result.get("found", {})
+                if found:
+                    block = next(iter(found.values())).get("code", "")[:budget_per]
+                    parts.append(f"### {sym}\n{block}")
+            except Exception:
+                pass
+        return "\n\n".join(parts)
 
     def approve(
         self,
@@ -200,7 +274,12 @@ class LLMGate2Validator:
         exec_result,
         coder_result,
     ) -> tuple[bool, str]:
-        """Return (approved, feedback_string).  Never raises — fail-closed."""
+        """Return (approved, feedback_string).  Never raises — fail-closed.
+
+        Side channel: ``self.last_missing_context`` is set to any symbol names
+        the validator reported as needed (pull-model); InnerLoop reads it.
+        """
+        self.last_missing_context = []
         try:
             from tools.llm_stream import request_completion, strip_think
 
@@ -220,7 +299,7 @@ class LLMGate2Validator:
                 f"Acceptance check exit code: {getattr(exec_result, 'exit_code', 0)}\n"
                 f"stdout:\n{getattr(exec_result, 'stdout', '')[:2000]}\n\n"
                 f"Generated files (CHANGED FILE CONTENT after the coder's edit):\n"
-                + self._read_changed_content(coder_result)
+                + self._read_changed_content(coder_result, task=task)
             )
 
             if self.api_format == "ollama":
@@ -261,6 +340,10 @@ class LLMGate2Validator:
                 raw = raw.split("```")[1].split("```")[0].strip()
 
             parsed   = json.loads(raw)
+            self.last_missing_context = [
+                str(x).strip() for x in (parsed.get("missing_context") or [])
+                if str(x).strip()
+            ]
             approved = bool(parsed.get("approved", False))
             if approved:
                 return True, ""
@@ -270,6 +353,7 @@ class LLMGate2Validator:
 
         except Exception as exc:
             logger.warning("LLMGate2Validator error: %s", exc)
+            self.last_missing_context = []
             return False, f"validator unavailable: {exc}"
 
 
@@ -311,11 +395,13 @@ class InnerLoop:
         executor,
         validator,
         max_attempts: int = _DEFAULT_MAX_ATTEMPTS,
+        context_broker=None,
     ):
         self.coder        = coder
         self.executor     = executor
         self.validator    = validator
         self.max_attempts = max(1, int(max_attempts))
+        self._broker      = context_broker or ContextBroker()
 
     # ------------------------------------------------------------------
 
@@ -336,6 +422,11 @@ class InnerLoop:
         task_id = task.get("id", "")
         feedback: list[str] = list(prior_feedback or [])
         records:  list[AttemptRecord] = []
+        # Pull-model state (carried across attempts within this round)
+        prefetched_context: str = ""
+        _any_missing: bool = False   # True if any attempt's coder still reported a context gap
+        base_dir_path = Path(base_dir)
+        target_files  = task.get("target_files", []) or []
 
         # LOOP-4: prepend prior implementation history
         if prior_implementations:
@@ -354,7 +445,8 @@ class InnerLoop:
             # ── 1. Coder ──────────────────────────────────────────────────────
             try:
                 coder_result = self.coder.generate(
-                    task, base_dir, prior_feedback=feedback
+                    task, base_dir, prior_feedback=feedback,
+                    prefetched_context=prefetched_context,
                 )
             except Exception as exc:
                 logger.error("InnerLoop: coder raised on attempt %d: %s", attempt, exc)
@@ -362,6 +454,12 @@ class InnerLoop:
                 feedback.append(fb)
                 records.append(AttemptRecord(attempt, False, False, False, fb))
                 continue
+
+            # SCTX: the coder fetches its own missing context inside generate()
+            # (the in-generate context probe). context_satisfied is False when its
+            # final response still reported a gap — that gates the outer-loop rewrite.
+            if not getattr(coder_result, "context_satisfied", True):
+                _any_missing = True
 
             if not getattr(coder_result, "succeeded", True):
                 fb = f"attempt {attempt}: coder failed — {getattr(coder_result, 'error', 'unknown error')}"
@@ -417,6 +515,11 @@ class InnerLoop:
                 logger.info("InnerLoop: attempt %d rejected — %s", attempt, vfb[:80])
                 feedback.append(fb)
                 records.append(AttemptRecord(attempt, True, True, False, fb))
+                val_missing = list(getattr(self.validator, "last_missing_context", []) or [])
+                if val_missing:
+                    prefetched_context = self._broker.fetch(
+                        val_missing, target_files, base_dir_path
+                    )
                 continue
 
             # ── APPROVED ──────────────────────────────────────────────────────
@@ -428,6 +531,7 @@ class InnerLoop:
                 attempts_used=attempt,
                 last_feedback="",
                 records=records,
+                context_satisfied=True,
             )
 
         # All attempts exhausted
@@ -438,6 +542,7 @@ class InnerLoop:
             attempts_used=self.max_attempts,
             last_feedback=last,
             records=records,
+            context_satisfied=not _any_missing,
         )
 
 
@@ -495,7 +600,7 @@ def make_inner_loop(
     if coder is None:
         try:
             from tools.auto.coder import make_coder  # type: ignore
-            coder = make_coder(config)
+            coder = make_coder(config, task_mode=task_mode)
         except ImportError:
             logger.warning("Coder not found — using _StubCoder (tests only)")
             coder = _StubCoder()
@@ -533,7 +638,7 @@ def make_inner_loop(
 # ── Stubs for environments without real agents (unit tests) ──────────────────
 
 class _StubCoder:
-    def generate(self, task, base_dir, prior_feedback=None):
+    def generate(self, task, base_dir, prior_feedback=None, prefetched_context=""):
         from types import SimpleNamespace
         return SimpleNamespace(succeeded=False, files_written=[], error="stub coder — no real coder available")
 

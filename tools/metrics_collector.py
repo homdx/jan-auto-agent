@@ -1,6 +1,8 @@
 import json
 import logging
+import os
 import re
+import tempfile
 from collections import Counter
 from dataclasses import dataclass, asdict
 from pathlib import Path
@@ -28,12 +30,28 @@ class MetricsCollector:
         self.metrics_path = metrics_path
 
     def record(self, run: RunRecord) -> None:
-        """Append a RunRecord to metrics.json, creating the file if needed."""
+        """Append a RunRecord to metrics.json, creating the file if needed.
+
+        The write is atomic: data is serialised to a sibling temp file first,
+        then renamed over the target with os.replace().  A crash mid-write
+        therefore leaves the previous metrics.json intact rather than producing
+        a truncated file that would silence the prompt optimizer on the next run.
+        """
         records = self._load_all()
         records.append(asdict(run))
         try:
-            with open(self.metrics_path, "w", encoding="utf-8") as f:
-                json.dump(records, f, indent=2)
+            dir_ = self.metrics_path.parent
+            dir_.mkdir(parents=True, exist_ok=True)
+            fd, tmp_path = tempfile.mkstemp(
+                dir=dir_, prefix=".metrics_tmp_", suffix=".json"
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(records, f, indent=2)
+            except Exception:
+                os.unlink(tmp_path)
+                raise
+            os.replace(tmp_path, self.metrics_path)
         except Exception as e:
             logger.error(f"MetricsCollector failed to write metrics: {e}")
 

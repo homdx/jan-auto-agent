@@ -281,3 +281,17 @@ class SearchAgent:
                              "not_found": result["not_found"],
                              "searched_files": result["searched_files"]})
         return result
+
+def make_search_agent(config, base_dir="."):
+    """Factory: build a SearchAgent from a ConfigParser config (or return
+    a default instance when config is None)."""
+    if config is None:
+        return SearchAgent()
+    active  = config.get("api", "active", fallback="local")
+    section = f"api_{active}"
+    return SearchAgent(
+        model=config.get(section, "model", fallback=None),
+        base_url=config.get(section, "base_url", fallback=None),
+        api_key=config.get(section, "api_key", fallback=""),
+        api_format=config.get(section, "api_format", fallback="openai"),
+    )

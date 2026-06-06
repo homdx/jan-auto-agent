@@ -22,7 +22,6 @@ import argparse
 import difflib
 import json
 import sys
-from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -182,6 +181,35 @@ def _parse_validator_verdict(content) -> Optional[bool]:
 
 # ── Core analysis ─────────────────────────────────────────────────────────────
 
+def _extract_context_signals(src, content) -> list:
+    """Pull-model: return the symbol names a coder/validator asked for in an
+    ``llm_response``.  The coder embeds a top-level ``context_request`` array and
+    the validator a ``missing_context`` array in its JSON response.  Returns an
+    empty list when absent or unparseable (so callers can treat it as a flag)."""
+    if not content or not isinstance(content, str):
+        return []
+    text = content.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1] if "\n" in text else ""
+        if text.rstrip().endswith("```"):
+            text = text.rstrip()[:-3]
+    brace = text.find("{")
+    if brace > 0:                      # tolerate <think>… preambles
+        text = text[brace:]
+    try:
+        data = json.loads(text)
+    except Exception:
+        return []
+    if not isinstance(data, dict):
+        return []
+    req = data.get("context_request")
+    if not isinstance(req, list):
+        req = data.get("missing_context")
+    if not isinstance(req, list):
+        return []
+    return [str(x).strip() for x in req if str(x).strip()]
+
+
 def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
     """
     Walk events and build an analytics structure:
@@ -206,6 +234,7 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
                 "prompt_changes": [],
                 "events":         [],
                 "llm_calls":      0,
+                "context_requests": [],
                 "total_events":   0,
                 # Internal tracking — not rendered directly
                 "_current_task":  None,      # task_id of the task currently in the loop
@@ -356,6 +385,12 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
         elif kind == "llm_request":
             run["llm_calls"] += 1
 
+        # ── pull-model context requests (coder context_request / validator missing_context) ──
+        elif kind == "llm_response":
+            _syms = _extract_context_signals(src, content)
+            if _syms:
+                run["context_requests"].append({"ts": ts, "src": src, "symbols": _syms})
+
         # ── prompt changes ─────────────────────────────────────────────────
         elif kind in ("prompt_updated", "prompt_push", "prompt_change"):
             agent_name = params.get("agent") or params.get("agent_name") or src
@@ -471,6 +506,11 @@ def render_run_summary(run: dict) -> None:
           f"approved={green(str(total_approved))}  "
           f"rejected={red(str(total_rejected))}")
     print(f"  {bold('LLM calls')}:       {run['llm_calls']}")
+    _ctx_reqs = run.get("context_requests", [])
+    if _ctx_reqs:
+        _total_syms = sum(len(r["symbols"]) for r in _ctx_reqs)
+        print(f"  {bold('Context pulls')}:   {cyan(str(len(_ctx_reqs)))} "
+              f"request(s), {_total_syms} symbol(s)")
     print(f"  {bold('Prompt changes')}: {magenta(str(prompt_changes))}")
     print(f"  {bold('Total events')}:    {run['total_events']}")
 
@@ -532,7 +572,7 @@ def render_tasks(run: dict) -> None:
         elif status in ("BLOCKED", "FAIL"):
             status_str = red(f"✗ {status}")
         elif status == "in_progress":
-            status_str = yellow(f"◌ IN_PROGRESS")
+            status_str = yellow("◌ IN_PROGRESS")
         else:
             status_str = yellow(f"● {status}")
 
@@ -593,7 +633,12 @@ def render_timeline(run: dict, max_events: int = 40) -> None:
         "prompt_updated", "prompt_push", "prompt_change",
         "rejected", "phase_transition",
     }
-    shown = [e for e in events if e.get("kind") in INTERESTING]
+    shown = [
+        e for e in events
+        if e.get("kind") in INTERESTING
+        or (e.get("kind") == "llm_response"
+            and _extract_context_signals(e.get("source", ""), str(e.get("content") or "")))
+    ]
 
     if not shown:
         return
@@ -662,6 +707,13 @@ def render_timeline(run: dict, max_events: int = 40) -> None:
             phase  = params.get("phase", "?")
             status = params.get("status", "?")
             print(f"  {dim(ts)}  {bold('phase')} {cyan(phase)} → {status}")
+
+        elif kind == "llm_response":
+            _syms = _extract_context_signals(src, content)
+            if not _syms:
+                continue   # only surface responses that carry a context pull
+            print(f"  {dim(ts)}  {cyan(bold('\u27f3 context pull'))}  "
+                  f"{dim(src)} \u2192 {', '.join(_syms)}")
 
         elif kind == "error":
             msg = truncate(content or str(params), 70)

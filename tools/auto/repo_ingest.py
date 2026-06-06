@@ -74,6 +74,10 @@ _DEFAULT_CLUSTERS: list[tuple[str, list[str]]] = [
             "*.ini",
             "*.cfg",
             "*.toml",
+            "*.gradle",
+            "*.kts",
+            "*.yaml",
+            "*.yml",
         ],
     ),
     (

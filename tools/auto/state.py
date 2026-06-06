@@ -72,13 +72,13 @@ _REQUIRED_TASK_FIELDS: dict[str, type] = {
 # ─────────────────────────────────────────────────────────────────────────────
 
 def make_task(
-    id: str,
-    title: str,
+    id: str,            # noqa: A002 — "id" matches the task schema field name;
+    title: str,         #              the builtin is not used inside this function.
     instruction: str,
     target_files: list[str] | None = None,
     acceptance_check: str = "",
     status: str = STATUS_TODO,
-    round: int = 0,
+    round: int = 0,     # noqa: A002 — "round" matches the schema field; builtin unused.
     attempt: int = 0,
     impl_version: int = 1,
     cited_locations: list[dict] | None = None,
@@ -336,9 +336,13 @@ class StateStore:
         if stop_reason is not None:
             self._progress["stop_reason"] = stop_reason
         elif "stop_reason" in extra:
-            # allow explicit kwarg path too
+            # stop_reason was passed as a **extra kwarg — do NOT pop it here;
+            # self._progress.update(extra) below will set it.
             pass
         else:
+            # Neither the named param nor **extra carries a stop_reason → clear
+            # any previously recorded value so stale reasons don't survive a
+            # status transition (e.g. "capped" → "running" on resume).
             self._progress.pop("stop_reason", None)
         self._progress.update(extra)
         self._refresh_progress(write=False)   # recalculates counts

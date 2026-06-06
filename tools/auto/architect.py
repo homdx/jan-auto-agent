@@ -31,6 +31,7 @@ api_format, verify_ssl — same pattern as every other agent in this codebase.
 from __future__ import annotations
 
 import configparser
+import hashlib
 import json
 import logging
 from dataclasses import dataclass, field
@@ -131,11 +132,13 @@ STRICT RULES:
    code shown.  If the goal asks for behavior the code does not yet have, that \
    absence IS the work — do not return [].
 6. The "acceptance_check" MUST be a real shell command (not a description or sentence). \
-   It must start with an executable token such as "python", "pytest", "bash", "node", etc. \
-   When the task adds an optional CLI argument (e.g. --name), the check MUST call the \
-   script with that flag using the double-dash form: "python main.py --name Alice" — \
-   never use a positional argument form ("python main.py Alice") unless the instruction \
-   explicitly defines a positional argument.
+   Use the project's OWN build/test runner — match the language of the files shown. \
+   Examples: "pytest tests/test_foo.py", "python main.py --name Alice", \
+   "./gradlew test", "gradle build", "mvn -q test", "npm test", "go test ./...", \
+   "cargo test", "make check". If no automated check is feasible for this change, \
+   use "true". For a Python CLI flag use the double-dash form \
+   ("python main.py --name Alice"), never a positional argument form \
+   ("python main.py Alice") unless the instruction explicitly defines a positional argument.
 
 Each element of the JSON array must match this schema exactly (no extra keys):
 
@@ -144,7 +147,7 @@ Each element of the JSON array must match this schema exactly (no extra keys):
     "title": "<short imperative phrase>",
     "instruction": "<detailed instruction for the coder agent>",
     "target_files": ["<exact path from the list below>"],
-    "acceptance_check": "<shell command that exits 0 when the task is done — MUST be a real runnable command, e.g. 'python main.py --name Alice' or 'pytest tests/test_foo.py'. If the task adds a CLI flag --flag, the check MUST call the script with that exact flag using the optional-argument syntax (e.g. 'python script.py --flag value'), NOT a positional argument>",
+    "acceptance_check": "<shell command that exits 0 when the task is done — a real runnable command using the project's own test/build runner (e.g. 'pytest tests/test_foo.py', 'python main.py --name Alice', './gradlew test', 'mvn -q test', 'npm test', 'go test ./...', 'cargo test'), or 'true' if no automated check fits. For a Python CLI flag --flag use 'python script.py --flag value', NOT a positional argument>",
     "cited_location": {{
       "file": "<exact path from the list below>",
       "symbol": "<function or class name, or null>",
@@ -386,7 +389,11 @@ class ClusterReviewer:
                     patterns=cluster.patterns,
                     files=batch_files,
                 )
-                batch_key = f"{sub.name}||{goal}"
+                # Content-aware key: a fingerprint of the batch files is appended so
+                # the checkpoint is invalidated when the reviewed content changes
+                # (file edits, or a different file set after a max_depth / cluster
+                # change). Without this a stale result would be replayed forever.
+                batch_key = f"{sub.name}||{goal}||{_batch_fingerprint(base_dir, sub.files)}"
 
                 # ── Checkpoint hit: skip LLM call, reuse saved candidates ────
                 if checkpoint_path is not None and batch_key in checkpoint:
@@ -406,9 +413,10 @@ class ClusterReviewer:
                 cluster_candidates.extend(batch_results)
 
                 # ── Checkpoint save: persist immediately after each batch ─────
-                # Only reached when the LLM call succeeded (batch_results is a list,
-                # possibly empty if the LLM returned no valid candidates).
-                if checkpoint_path is not None:
+                # Only persist NON-EMPTY results. An empty list means the LLM
+                # found nothing — caching that would prevent a retry after the
+                # inputs are fixed (e.g. raising max_depth to expose source).
+                if checkpoint_path is not None and batch_results:
                     checkpoint[batch_key] = _serialise_candidates(batch_results)
                     try:
                         checkpoint_path.write_text(
@@ -738,6 +746,22 @@ class ClusterReviewer:
 # Convenience factory
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _batch_fingerprint(base_dir: "Path", files: list[str]) -> str:
+    """Short hash of a batch's files (relative path + size + mtime) used to make
+    the architect checkpoint content-aware. Any change to the reviewed file set
+    or contents yields a new key, so a stale cached result is never replayed.
+    Missing/unreadable files hash as a sentinel rather than raising."""
+    h = hashlib.sha1()
+    for rel in sorted(files):
+        h.update(rel.encode("utf-8", "replace"))
+        try:
+            st = (Path(base_dir) / rel).stat()
+            h.update(f"|{st.st_size}|{st.st_mtime_ns}|".encode("utf-8"))
+        except OSError:
+            h.update(b"|?|")
+    return h.hexdigest()[:12]
+
+
 def _serialise_candidates(candidates: list[CandidateTask]) -> list[dict]:
     """Convert CandidateTask objects to plain dicts for JSON checkpoint storage."""
     out = []
@@ -847,7 +871,19 @@ def review_clusters(
 
 _REWRITER_SYSTEM_DEFAULT = (
     "You are an architect who has reviewed failed implementation attempts. "
-    "Your job is to propose a genuinely different technical approach. "
+    "First, read the failure history and classify the failure. There are two "
+    "distinct kinds: (a) the CODE is wrong — the acceptance_check ran and "
+    "reported a real defect (assertion error, wrong output, test failure, "
+    "compile error in the edited file); or (b) the acceptance_check COMMAND "
+    "ITSELF could not run — meaning the failure occurred before or instead of "
+    "any test logic executing, because the checker process failed to launch or "
+    "initialize (missing binary, missing dependency, bad path, bad interpreter, "
+    "insufficient permissions, or any other environment issue). "
+    "Case (b) is an environment/verification problem, NOT a code defect: the "
+    "implementation may already be correct. In case (b) do NOT keep re-issuing "
+    "the same un-runnable command and do NOT thrash the code — instead change "
+    "acceptance_check to a verification that CAN run in this environment. "
+    "Only in case (a) should you propose a genuinely different technical approach. "
     "Do not suggest the same solution with minor changes. "
     "If the previous approach used class inheritance, consider composition. "
     "If it used a loop, consider a generator. "
@@ -874,7 +910,7 @@ Return a JSON object with exactly these fields:
 {{
   "title": "<keep original or append '— alternative approach'>",
   "instruction": "<new implementation strategy written for the coder agent>",
-  "acceptance_check": "<MUST be a real runnable shell command that exits 0 when done — keep the original command unchanged unless the new strategy genuinely requires a different invocation. Do NOT replace with a prose description.>"
+  "acceptance_check": "<MUST be a real runnable shell command that exits 0 when done. KEEP the original command if the code simply produced a wrong result. BUT if the failure history shows the command itself could not execute (exit 127 / 'not found' / 'No such file' / 'permission denied'), REPLACE it with a check that can run here: a different runner for the same language (e.g. 'gradle test' or 'sh gradlew test' instead of './gradlew test', or 'mvn -q test'), a lighter compile-only check, or 'true' as a last resort — with 'true' the change is judged by code review alone. Never repeat a command that already failed to execute. Do NOT replace with a prose description.>"
 }}
 """
 
@@ -1106,6 +1142,7 @@ class TaskRewriter:
 _SHELL_COMMAND_PREFIXES: tuple[str, ...] = (
     "python", "python3", "pytest", "bash", "sh", "node", "npm", "npx",
     "make", "cargo", "go ", "ruby", "rspec", "php", "java ", "mvn",
+    "gradle", "gradlew", "mvnw", "dotnet", "true", "false",
     "./", "/",
 )
 

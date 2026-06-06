@@ -189,12 +189,17 @@ class OuterLoop:
             # LOOP-2: check whether a rewrite is due.
             # Condition: rnd >= 3, (rnd-1) % rewrite_every_n_rounds == 0,
             #            rewrites_done < max_rewrites, and a rewriter is wired up.
+            # Pull-model gate: only rewrite when the inner loop's context was
+            # satisfied. If the last attempt was still REQUESTING context, the
+            # failure is "missing information", not "bad framing" — skip the
+            # rewrite this round and let the prefetched context flow instead.
             if (
                 self.task_rewriter is not None
                 and self.max_rewrites > 0
                 and rnd >= 3
                 and (rnd - 1) % self.rewrite_every_n_rounds == 0
                 and rewrites_done < self.max_rewrites
+                and getattr(res, "context_satisfied", True)
             ):
                 failure_history = self._read_round_feedback(task_id)
                 impl_num = rewrites_done + 2  # v1 → first rewrite → v2, etc.

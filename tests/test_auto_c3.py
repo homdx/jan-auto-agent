@@ -50,7 +50,7 @@ class FakeCoder:
     def __init__(self, results):
         self._results = list(results)
         self.calls = []                 # list of prior_feedback lists seen
-    def generate(self, task, base_dir, prior_feedback=None):
+    def generate(self, task, base_dir, prior_feedback=None, **kwargs):
         self.calls.append(list(prior_feedback or []))
         return self._results.pop(0) if self._results else FakeCoderResult()
 

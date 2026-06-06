@@ -74,7 +74,9 @@ class TestPatternSets:
         assert "fork bomb py" in labels
 
     def test_blocked_code_only_contains_sudo(self) -> None:
-        labels = {label for label, _ in Coder._BLOCKED_CODE_ONLY}
+        # sudo moved to _BLOCKED_CODE_WORD_BOUNDARY for word-boundary matching;
+        # verify it is still checked in code mode via that dedicated set.
+        labels = {label for label, _ in Coder._BLOCKED_CODE_WORD_BOUNDARY}
         assert "sudo invocation" in labels
 
     def test_blocked_code_only_contains_curl(self) -> None:

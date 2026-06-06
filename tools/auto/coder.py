@@ -58,12 +58,17 @@ api_format, verify_ssl — the same pattern used throughout this codebase.
 
 from __future__ import annotations
 
+import ast
 import configparser
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
+
+from tools.block_extractor import extract_block as _block_extractor_extract_block
+# SearchAgent is imported lazily inside Coder._fetch_needed
 
 from tools.agent_trace import tracer
 import tools.llm_stream as _llm_stream
@@ -100,8 +105,41 @@ _SYSTEM_PROMPT = (
     "5. Do NOT add any explanation or commentary outside the JSON.\n"
     "6. The 'files' array MUST NEVER be empty. The task always requires at least one "
     "file change — if you think nothing needs changing, re-read the instruction and "
-    "produce the correct implementation. An empty files array is always wrong."
+    "produce the correct implementation. An empty files array is always wrong.\n"
+    "7. If the provided file contents are insufficient to complete the task — "
+    "for example, a referenced class or function is not shown — add a top-level "
+    "\"missing_context\" key to your JSON response listing the symbol names you "
+    "needed but did not receive. "
+    "Format: \"missing_context\": [\"ClassName\", \"function_name\"] "
+    "Omit the key entirely if context was sufficient. "
+    "Do not include it as an empty list."
 )
+
+# Backward-compat alias — "code" is the default persona.
+_SYSTEM_PROMPT_CODE = _SYSTEM_PROMPT
+
+# Docs/creative reuse the IDENTICAL JSON contract + rules above; only the writing
+# persona and the "code improvement" framing change. This mirrors the architect
+# (_SYSTEM_PROMPTS) and Gate-2 validator (_GATE2_SYSTEMS), which already switch
+# persona by task_mode — the coder was previously the only stage that did not.
+_SYSTEM_PROMPT_DOCS = _SYSTEM_PROMPT_CODE.replace(
+    "You are a senior software engineer implementing a targeted code improvement. ",
+    "You are a senior technical writer implementing a targeted documentation "
+    "improvement. You produce clear, accurate prose — not code. ",
+    1,
+)
+_SYSTEM_PROMPT_CREATIVE = _SYSTEM_PROMPT_CODE.replace(
+    "You are a senior software engineer implementing a targeted code improvement. ",
+    "You are a creative writing editor implementing a targeted revision to a piece "
+    "of creative writing. You produce polished, engaging prose — not code. ",
+    1,
+)
+
+_CODER_SYSTEM_PROMPTS: dict[str, str] = {
+    "code":     _SYSTEM_PROMPT_CODE,
+    "docs":     _SYSTEM_PROMPT_DOCS,
+    "creative": _SYSTEM_PROMPT_CREATIVE,
+}
 
 # ── Per-task user prompt template ─────────────────────────────────────────────
 _USER_PROMPT_TMPL = """\
@@ -151,6 +189,8 @@ class CoderResult:
     files_written: list[str] = field(default_factory=list)
     error:         str = ""
     raw_response:  str = field(default="", repr=False)
+    missing_context: list[str] = field(default_factory=list)
+    context_satisfied: bool = True  # False when the LLM reported missing_context
 
     @property
     def succeeded(self) -> bool:
@@ -215,12 +255,23 @@ class Coder:
         sec = "coder"
         self._temperature = float(config.get(sec, "temperature", fallback="0.2"))
         self._max_tokens  = int(config.get(sec, "max_tokens",   fallback="16384"))
-        self._system      = config.get(sec, "system", fallback=_SYSTEM_PROMPT).strip()
+        # Select system prompt by task_mode (mirrors architect / validator).
+        # Priority: mode-specific ini key > legacy "system" key > built-in constant.
+        _mode_key = f"system_{self._task_mode}" if self._task_mode != "code" else None
+        if _mode_key and config.has_option(sec, _mode_key):
+            self._system  = config.get(sec, _mode_key).strip()
+        else:
+            _builtin      = _CODER_SYSTEM_PROMPTS.get(self._task_mode, _SYSTEM_PROMPT_CODE)
+            self._system  = config.get(sec, "system", fallback=_builtin).strip()
         self._timeout     = float(config.get("loop", "timeout_seconds", fallback="300"))
         self._max_file_chars = int(config.get(sec, "max_file_chars", fallback=str(_DEFAULT_MAX_FILE_CHARS)))
         active_profile = config.get("api", "active", fallback="local")
         # num_ctx controls the total context window on Ollama; 0 means "use server default".
         self._num_ctx = config.getint(f"api_{active_profile}", "num_ctx", fallback=0)
+        # Context-probe: fetch missing symbols on first LLM response, then retry once.
+        self._context_probe_enabled = config.getboolean(sec, "context_probe", fallback=True)
+        self._max_chars_per_dep     = config.getint(sec, "max_chars_per_dep", fallback=2000)
+        self._max_dep_chars         = config.getint(sec, "max_dep_chars",     fallback=6000)
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -229,6 +280,7 @@ class Coder:
         task: dict,
         base_dir: str | Path,
         prior_feedback: Optional[list[str]] = None,
+        prefetched_context: str = "",
     ) -> CoderResult:
         """Generate and write code changes for *task*.
 
@@ -260,7 +312,7 @@ class Coder:
         base_dir = Path(base_dir).resolve()
 
         # ── Build and send the prompt ─────────────────────────────────────────
-        user_msg = self._build_prompt(task, base_dir, prior_feedback or [])
+        user_msg = self._build_prompt(task, base_dir, prior_feedback or [], prefetched_context)
 
         headers = {
             "Content-Type":  "application/json",
@@ -321,8 +373,40 @@ class Coder:
             )
             return CoderResult(task_id=task_id, error=msg)
 
-        # ── Strip think blocks + outer fences, then parse JSON ────────────────
+        # ── Strip think blocks; check for missing-context signal ─────────────
         cleaned = strip_think(raw_text)
+        # ── Context probe: if the LLM reported missing_context, fetch once ───
+        _missing = self._extract_missing_context(cleaned)
+        context_satisfied = not bool(_missing)
+
+        if _missing and self._context_probe_enabled:
+            dep_ctx = self._fetch_needed(
+                _missing, base_dir,
+                max_chars_per_dep=self._max_chars_per_dep,
+                max_total_dep_chars=self._max_dep_chars,
+            )
+            if dep_ctx:
+                user_msg += f"\n\n## Fetched context (requested)\n{dep_ctx}"
+                # Mutate payload in-place — messages[-1] is always the user role.
+                payload["messages"][-1]["content"] = user_msg
+                try:
+                    raw_text = _llm_stream.request_completion(
+                        url=url,
+                        headers=headers,
+                        payload=payload,
+                        timeout=self._timeout,
+                        stream=True,
+                        api_format=self._api_format,
+                        ssl_context=self._ssl_context,
+                    )
+                    cleaned = strip_think(raw_text)
+                except Exception as exc:
+                    logger.warning(
+                        "coder.generate [%s]: context-probe second call failed: %s "
+                        "— using first response", task_id, exc,
+                    )
+                    # cleaned already holds the first response; carry on.
+
         tracer.event(
             source="llm", target="coder", kind="llm_response",
             content=cleaned, params={"task_id": task_id},
@@ -330,7 +414,11 @@ class Coder:
 
         parsed_files, parse_error = self._parse_response(cleaned, task_id)
         if parse_error:
-            return CoderResult(task_id=task_id, error=parse_error, raw_response=cleaned)
+            return CoderResult(
+                task_id=task_id, error=parse_error,
+                raw_response=cleaned,
+                context_satisfied=context_satisfied,
+            )
 
         # ── Write files to disk ───────────────────────────────────────────────
         target_files = task.get("target_files") or []
@@ -340,7 +428,8 @@ class Coder:
         )
         if write_error and not written:
             return CoderResult(
-                task_id=task_id, error=write_error, raw_response=cleaned
+                task_id=task_id, error=write_error, raw_response=cleaned,
+                context_satisfied=context_satisfied,
             )
 
         result = CoderResult(
@@ -348,6 +437,7 @@ class Coder:
             files_written=written,
             error=write_error,
             raw_response=cleaned,
+            context_satisfied=context_satisfied,
         )
         logger.info("coder.generate: %s", result.summary())
         return result
@@ -359,6 +449,7 @@ class Coder:
         task: dict,
         base_dir: Path,
         prior_feedback: list[str],
+        prefetched_context: str = "",
     ) -> str:
         """Construct the user-role prompt for this task."""
         task_id      = task.get("id", "")
@@ -388,7 +479,13 @@ class Coder:
         target_files_listing = "\n".join(f"  - {f}" for f in target_files) or "  (none)"
 
         # ── File contents ─────────────────────────────────────────────────────
-        file_contents = self._read_file_contents(target_files, base_dir)
+        # Pass task so _read_file_contents can resolve cited_symbol itself.
+        file_contents = self._read_file_contents(
+            target_files, base_dir, task=task
+        )
+        # Pull-model: prepend any context the previous attempt requested.
+        if prefetched_context:
+            file_contents = prefetched_context.rstrip() + "\n\n" + file_contents
 
         # ── Prior feedback section ────────────────────────────────────────────
         if prior_feedback:
@@ -411,31 +508,159 @@ class Coder:
             feedback_section      = feedback_section,
         )
 
-    def _read_file_contents(self, target_files: list[str], base_dir: Path) -> str:
+
+    def _extract_missing_context(self, text: str) -> list[str]:
+        """Extract the top-level ``missing_context`` list from the LLM response.
+
+        Returns up to 8 symbol names; returns ``[]`` on absence or any parse
+        error so callers can treat it as fail-safe.
+        """
+        try:
+            data = json.loads(_strip_outer_fence(text))
+            missing = data.get("missing_context")
+            if isinstance(missing, list):
+                return [str(s).strip() for s in missing if s][:8]
+        except Exception:
+            pass
+        return []
+
+    def _fetch_needed(
+        self,
+        symbols: list[str],
+        base_dir: Path,
+        max_chars_per_dep: int,
+        max_total_dep_chars: int,
+    ) -> str:
+        """Search *base_dir* for the source blocks of *symbols* and return them
+        formatted as prompt context.
+
+        Each found block is trimmed to *max_chars_per_dep* and prefixed with::
+
+            ### dep: SymbolName  (from path/to/file.py)
+
+        Accumulation stops once the total reaches *max_total_dep_chars*.
+        Symbols that cannot be found are skipped with a DEBUG log entry.
+        Returns ``""`` when nothing was found.  Never raises.
+        """
+        try:
+            from tools.search_agent import SearchAgent as _SearchAgent  # lazy import
+            active  = self._config.get("api", "active", fallback="local")
+            section = f"api_{active}"
+            agent = _SearchAgent(
+                model      = self._config.get(section, "model",      fallback=None),
+                base_url   = self._config.get(section, "base_url",   fallback=None),
+                api_key    = self._config.get(section, "api_key",    fallback=""),
+                api_format = self._config.get(section, "api_format", fallback="openai"),
+                timeout    = int(self._config.get("loop", "timeout_seconds", fallback="120")),
+                ssl_context = self._ssl_context,
+            )
+        except Exception as exc:
+            logger.warning("coder._fetch_needed: could not create SearchAgent: %s", exc)
+            return ""
+
+        parts: list[str] = []
+        total = 0
+
+        for symbol in symbols:
+            if total >= max_total_dep_chars:
+                break
+            try:
+                result = agent.run(references=[symbol], base_dir=str(base_dir))
+                found  = result.get("found", {})
+                if symbol not in found:
+                    logger.debug("coder._fetch_needed: symbol %r not found", symbol)
+                    continue
+                entry = found[symbol]
+                block = (entry.get("code") or "").strip()
+                file_path = entry.get("file", "")
+                if not block:
+                    logger.debug("coder._fetch_needed: empty block for %r", symbol)
+                    continue
+                # Trim individual block to budget.
+                if len(block) > max_chars_per_dep:
+                    block = block[:max_chars_per_dep] + "\n... [trimmed]"
+                header = f"### dep: {symbol}  (from {file_path})"
+                entry_text = f"{header}\n{block}"
+                # Check total budget.
+                if total + len(entry_text) > max_total_dep_chars:
+                    remaining = max_total_dep_chars - total
+                    if remaining < len(header) + 20:
+                        break  # not worth including a stub
+                    entry_text = entry_text[:remaining] + "\n... [trimmed]"
+                parts.append(entry_text)
+                total += len(entry_text)
+            except Exception as exc:
+                logger.debug("coder._fetch_needed: error fetching %r: %s", symbol, exc)
+                continue
+
+        return "\n\n".join(parts)
+
+    def _read_file_contents(
+        self,
+        target_files: list[str],
+        base_dir: Path,
+        cited_symbol: str | None = None,
+        task: "dict | None" = None,
+    ) -> str:
         """Read and annotate file contents for the prompt.
 
-        Each file is prefixed with a ``### path/to/file.py`` header.  Content
-        is truncated to ``self._max_file_chars`` (configured via ``max_file_chars``
-        in the ``[coder]`` section of agents.ini) with a notice.  Files that don't
-        exist yet are labelled as ``[new file — no existing content]`` so the
-        model knows it must create them from scratch.
+        Each file is prefixed with a ``### path/to/file.py`` header.
+
+        Small files (≤ ``max_file_chars``) are included byte-for-byte.  Larger
+        files are split into symbol-aware chunks via :func:`_chunk_file` and
+        assembled with :func:`_select_relevant_chunks`, guaranteeing that the
+        import block and the *cited_symbol* are always present.  Any exception
+        in the smart path falls back to plain character truncation so the caller
+        always receives something useful.
+
+        Parameters
+        ----------
+        task:
+            When provided, the cited symbol is extracted from
+            ``task["cited_locations"][0]["symbol"]`` (takes priority over the
+            *cited_symbol* keyword argument).
         """
+        # Resolve cited_symbol: explicit kwarg first, then task dict.
+        if task is not None:
+            locs = task.get("cited_locations") or []
+            if locs and isinstance(locs[0], dict):
+                _sym = locs[0].get("symbol")
+                if _sym:
+                    cited_symbol = _sym
+
         parts: list[str] = []
         for rel in target_files:
             abs_path = base_dir / rel
             if not abs_path.exists():
-                content = "[new file — no existing content]"
-            else:
-                try:
-                    content = abs_path.read_text(encoding="utf-8", errors="replace")
-                except OSError as exc:
-                    content = f"[unreadable: {exc}]"
-                if len(content) > self._max_file_chars:
-                    content = (
-                        content[:self._max_file_chars]
-                        + f"\n... [truncated — {len(content) - self._max_file_chars} more chars]"
-                    )
-            parts.append(f"### {rel}\n{content}")
+                parts.append(f"### {rel}\n[new file — no existing content]")
+                continue
+
+            try:
+                content = abs_path.read_text(encoding="utf-8", errors="replace")
+            except OSError as exc:
+                parts.append(f"### {rel}\n[unreadable: {exc}]")
+                continue
+
+            ext = Path(rel).suffix.lower()
+
+            if len(content) <= self._max_file_chars:
+                parts.append(f"### {rel}\n{content}")
+                continue
+
+            try:
+                chunks   = _chunk_file(content, ext, self._max_file_chars)
+                assembled = _select_relevant_chunks(chunks, cited_symbol, self._max_file_chars)
+                parts.append(f"### {rel}\n{assembled}")
+            except Exception as exc:
+                logger.warning(
+                    "coder: smart context failed for %s: %s — falling back", rel, exc
+                )
+                truncated = (
+                    content[:self._max_file_chars]
+                    + f"\n... [truncated — {len(content) - self._max_file_chars} more chars]"
+                )
+                parts.append(f"### {rel}\n{truncated}")
+
         return "\n\n".join(parts) if parts else "(no target files)"
 
     def _parse_response(
@@ -547,16 +772,44 @@ class Coder:
         # Shell injection via subprocess / os.system with dangerous args
         ("subprocess rm",       "subprocess"),          # too broad? — see note below
         ("os.system rm",        'os.system('),
-        # Privilege escalation
-        ("sudo invocation",     "sudo"),             # space or quoted: sudo, 'sudo', "sudo"
         # Outbound data exfiltration via common tools
         ("curl exfil",          "curl "),
-        ("wget exfil",          "wget "),
-        # Overwrite root / system paths via open()
-        ("open root write",     'open("/'),
-        # Shutdown / reboot
-        ("shutdown cmd",        "shutdown"),
-        ("reboot cmd",          "reboot"),
+    )
+
+    # Patterns requiring \b word-boundary matching to avoid false positives
+    # in identifiers (e.g. test_reboot_gracefully, mock_shutdown_handler,
+    # sudo_required).  Substring matching would fire inside function names
+    # and class names, causing the LLM to silently rename or strip them.
+    _BLOCKED_CODE_WORD_BOUNDARY: tuple[tuple[str, str], ...] = (
+        ("sudo invocation", "sudo"),
+        ("wget exfil",      "wget"),
+        ("shutdown cmd",    "shutdown"),
+        ("reboot cmd",      "reboot"),
+    )
+
+    # Dangerous absolute path prefixes for open() calls.  Paths outside this
+    # list (/tmp, /var/tmp, /home, /Users, /var/log, …) are legitimate
+    # destinations for temp files, logs, and user-space exports.
+    _DANGEROUS_OPEN_PREFIXES: tuple[str, ...] = (
+        "/etc/",    # system configuration
+        "/bin/",    # system binaries
+        "/sbin/",   # system-admin binaries
+        "/usr/",    # unix system resources
+        "/lib/",    # system libraries
+        "/lib64/",
+        "/boot/",   # bootloader / kernel images
+        "/sys/",    # kernel / sysfs
+        "/proc/",   # procfs
+        "/dev/",    # device files
+        "/root/",   # root's home directory
+        "/run/",    # runtime state
+    )
+
+    # Matches open("/ or open('/ in either quote style so single-quote
+    # bypasses (open('/etc/passwd', 'w')) are caught alongside double-quote.
+    _OPEN_WRITE_RE: re.Pattern = re.compile(
+        r"""open\s*\(\s*['"](?P<path>/[^'"]+)""",
+        re.IGNORECASE,
     )
 
     # Union of both sets — kept for backward compatibility; code mode uses this.
@@ -620,6 +873,26 @@ class Coder:
 
             if pat_lower in lower:
                 return False, f"blocked content pattern {pattern!r} ({label})"
+
+        if task_mode == "code":
+            # Word-boundary patterns: avoids false positives in identifiers
+            # (test_reboot_gracefully, mock_shutdown_handler, sudo_required)
+            # while still catching standalone command usage.
+            for label, pattern in cls._BLOCKED_CODE_WORD_BOUNDARY:
+                if re.search(r"\b" + re.escape(pattern) + r"\b", lower):
+                    return False, f"blocked content pattern {pattern!r} ({label})"
+
+            # open() targeting dangerous system paths — both single and double
+            # quote styles.  Legitimate write destinations (/tmp, /home,
+            # /var/log, …) are intentionally excluded from _DANGEROUS_OPEN_PREFIXES.
+            for m in cls._OPEN_WRITE_RE.finditer(content):
+                path = m.group("path").lower()
+                if any(path.startswith(pfx) for pfx in cls._DANGEROUS_OPEN_PREFIXES):
+                    return (
+                        False,
+                        f"blocked content: open() targeting system path"
+                        f" {path!r} (open root write)",
+                    )
 
         return True, ""
 
@@ -722,16 +995,27 @@ class Coder:
                 dest.parent.mkdir(parents=True, exist_ok=True)
 
                 # Back up existing file before overwriting (reversible).
+                # Guard: only write the backup when one does NOT already exist so
+                # that repeated attempts preserve the *original* file content rather
+                # than overwriting the backup with the output of a previous (possibly
+                # broken) attempt.  Once a .coder.bak exists for this file it is
+                # never touched again — it always reflects the pre-agent state.
                 if dest.exists():
                     backup = dest.with_suffix(dest.suffix + ".coder.bak")
-                    backup.write_text(
-                        dest.read_text(encoding="utf-8", errors="replace"),
-                        encoding="utf-8",
-                    )
-                    logger.debug(
-                        "coder._write_files [%s]: backed up %s → %s",
-                        task_id, dest, backup,
-                    )
+                    if not backup.exists():
+                        backup.write_text(
+                            dest.read_text(encoding="utf-8", errors="replace"),
+                            encoding="utf-8",
+                        )
+                        logger.debug(
+                            "coder._write_files [%s]: backed up %s → %s",
+                            task_id, dest, backup,
+                        )
+                    else:
+                        logger.debug(
+                            "coder._write_files [%s]: backup already exists for %s — skipping",
+                            task_id, dest,
+                        )
 
                 dest.write_text(content, encoding="utf-8")
                 written.append(rel)
@@ -747,6 +1031,235 @@ class Coder:
                     first_error = msg
 
         return written, first_error
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Symbol-aware file chunking (SCTX Task 1)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _chunk_file(source: str, file_ext: str, max_chars: int) -> list[dict]:
+    """Split *source* into symbol-aware chunks for prompt assembly.
+
+    Each returned dict has:
+        name      — "full" | "imports" | <symbol_name> | "truncated"
+        content   — the source text for this chunk
+        line      — 1-based line number where this chunk starts
+        is_import — True only on the imports chunk
+
+    If ``len(source) <= max_chars`` the list contains a single "full" chunk
+    whose content is the unmodified source (byte-for-byte identical).
+
+    On AST parse failure for a .py file a WARNING is logged and a single
+    "truncated" chunk is returned; no exception is raised.  For all other
+    extensions a regex scan is used (best-effort; partial results are fine).
+    """
+    if len(source) <= max_chars:
+        return [{"name": "full", "content": source, "line": 1}]
+
+    ext = (file_ext or "").strip().lower()
+    if ext and not ext.startswith("."):
+        ext = "." + ext
+
+    # ── Extract import / preamble block ────────────────────────────────────────
+    # Collect all leading lines that look like imports/includes/pragmas for
+    # any supported language, plus blank lines interleaved between them.
+    # Patterns covered:
+    #   Python/JS/TS:   import …  /  from … import …
+    #   Go:             import "…"  /  import ( … )
+    #   Rust:           use …;
+    #   C/C++/ObjC:     #include …  /  #pragma …  /  #define …  /  #ifndef …
+    #   Java/Kotlin:    package …  /  import …
+    #   Ruby:           require …  /  require_relative …
+    #   PHP:            use …;  /  require …  /  include …
+    #   Shell:          #!/…  (shebang on line 1)
+    # Unknown languages: the block will simply be empty (first non-blank line
+    # is not a preamble line), which is safe — no import chunk is emitted.
+    _import_re = re.compile(
+        r"^\s*("
+        r"import\s"                             # Python, JS, TS, Java, Go bare
+        r"|from\s"                              # Python from-import
+        r"|use\s"                               # Rust / PHP
+        r"|#include\s*[\"<]"                  # C/C++/ObjC
+        r"|#pragma\s"                           # C/C++ pragmas
+        r"|#ifndef\s|#ifdef\s|#define\s|#endif"  # C/C++ guards
+        r"|package\s"                           # Go, Java, Kotlin
+        r"|require\s*[\"'(]"                 # Ruby, PHP, Node.js
+        r"|require_relative\s*[\"'(]"        # Ruby
+        r"|include\s*[\"'(]"                 # PHP
+        r"|#!/"                                  # shebang (line 1 only)
+        r")"
+    )
+    _blank_re = re.compile(r"^\s*$")
+    lines = source.splitlines(keepends=True)
+    import_end = 0
+    for i, line in enumerate(lines):
+        # Shebang is only valid on the very first line.
+        if i == 0 and line.startswith("#!"):
+            import_end = 1
+        elif _blank_re.match(line) or _import_re.match(line):
+            import_end = i + 1
+        else:
+            break
+    import_content = "".join(lines[:import_end])
+    import_chunk: dict = {
+        "name": "imports",
+        "content": import_content,
+        "line": 1,
+        "is_import": True,
+    }
+
+    # ── Collect top-level symbol names + start lines ──────────────────────────
+    symbols: list[tuple[str, int]] = []  # (name, 1-based lineno)
+
+    if ext == ".py":
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            logger.warning(
+                "_chunk_file: ast.parse failed for ext=%r — returning truncated chunk", ext
+            )
+            return [
+                {
+                    "name": "truncated",
+                    "content": source[:max_chars] + "\n... [truncated]",
+                    "line": 1,
+                }
+            ]
+        for node in ast.iter_child_nodes(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                symbols.append((node.name, node.lineno))
+    else:
+        # Best-effort regex scan for top-level symbols across all brace-based
+        # and indent-based languages.  Covers:
+        #   JS/TS:    function foo / async function foo / class Foo
+        #             const foo = (...) =>    (arrow functions)
+        #   Go:       func foo / func (r T) foo
+        #   Rust:     fn foo / pub fn foo / pub(crate) fn foo
+        #   Java/C#:  class Foo / interface IFoo / enum Status
+        #             public void foo(  (methods — best-effort)
+        #   C/C++:    type_name foo(   (free functions, rough heuristic)
+        #   Ruby:     def foo / class Foo / module Bar
+        #   PHP:      function foo / class Foo
+        #   Swift:    func foo / class Foo / struct Bar / enum Baz / protocol P
+        #   Kotlin:   fun foo / class Foo / object Obj / data class Bar
+        _sym_re = re.compile(
+            r"(?m)^[ \t]*"
+            # optional visibility / modifier keywords (greedy, non-capturing)
+            r"(?:(?:pub(?:\s*\([^)]*\))?|public|private|protected|internal"
+            r"|static|final|abstract|override|open|sealed|data|inline|suspend"
+            r"|async|export|default)\s+)*"
+            # the keyword that introduces a symbol
+            r"(?:function|func|fn|def|class|interface|struct|enum|module"
+            r"|object|protocol|trait|impl|type|fun)"
+            r"\s+"
+            # optional receiver for Go methods: (r *Receiver)
+            r"(?:\([^)]*\)\s+)?"
+            # the symbol name — captured
+            r"([A-Za-z_][A-Za-z0-9_]*)"
+        )
+        # Also capture JS/TS arrow-function assignments at statement level:
+        #   const myFunc = (...) => {
+        #   let   myFunc = async (...) => {
+        _arrow_re = re.compile(
+            r"(?m)^[ \t]*(?:export\s+)?(?:const|let|var)\s+"
+            r"([A-Za-z_][A-Za-z0-9_]*)\s*="
+            r"\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_][A-Za-z0-9_]*)\s*=>"
+        )
+        seen_names: set[str] = set()
+        for m in _sym_re.finditer(source):
+            name = m.group(1)
+            if name not in seen_names:
+                seen_names.add(name)
+                lineno = source.count("\n", 0, m.start()) + 1
+                symbols.append((name, lineno))
+        for m in _arrow_re.finditer(source):
+            name = m.group(1)
+            if name not in seen_names:
+                seen_names.add(name)
+                lineno = source.count("\n", 0, m.start()) + 1
+                symbols.append((name, lineno))
+        # Keep stable line-order after the two passes.
+        symbols.sort(key=lambda t: t[1])
+
+    # ── Extract the source block for each symbol ──────────────────────────────
+    symbol_chunks: list[dict] = []
+    for name, lineno in symbols:
+        try:
+            block = _block_extractor_extract_block(source, name, ext)
+        except Exception:
+            block = ""
+        if block:
+            symbol_chunks.append({"name": name, "content": block, "line": lineno})
+
+    symbol_chunks.sort(key=lambda c: c["line"])
+
+    return [import_chunk] + symbol_chunks
+
+
+def _select_relevant_chunks(
+    chunks: list[dict],
+    cited_symbol: str | None,
+    budget_chars: int,
+) -> str:
+    """Assemble *chunks* into a prompt string, respecting *budget_chars*.
+
+    Ordering and budget rules:
+      1. Import chunk always first; its size is deducted from the budget.
+      2. *cited_symbol* chunk always second — never stubbed, even if its size
+         alone exceeds the remaining budget.
+      3. All remaining chunks are included in ascending line order; any chunk
+         that does not fit is replaced with a single stub comment::
+
+             # [symbol_name — N chars, not included]
+
+    Chunks are separated by a blank line.  Returns ``"(no content)"`` when
+    *chunks* is empty.
+    """
+    if not chunks:
+        return "(no content)"
+
+    # "full" chunk means the file was already within max_chars — return as-is.
+    full = next((c for c in chunks if c.get("name") == "full"), None)
+    if full is not None:
+        return full["content"]
+
+    import_chunk = next((c for c in chunks if c.get("is_import")), None)
+
+    result_parts: list[str] = []
+    remaining = budget_chars
+    included: set[str] = set()
+
+    # 1. Import chunk — always first.
+    if import_chunk:
+        result_parts.append(import_chunk["content"])
+        remaining -= len(import_chunk["content"])
+        included.add(import_chunk["name"])
+
+    # 2. Cited symbol — always second, never stubbed.
+    if cited_symbol:
+        cited_chunk = next(
+            (c for c in chunks if c.get("name") == cited_symbol), None
+        )
+        if cited_chunk:
+            result_parts.append(cited_chunk["content"])
+            remaining -= len(cited_chunk["content"])
+            included.add(cited_symbol)
+
+    # 3. Remaining chunks in ascending line order.
+    others = sorted(
+        (c for c in chunks if c.get("name") not in included),
+        key=lambda c: c.get("line", 0),
+    )
+    for chunk in others:
+        name    = chunk.get("name", "?")
+        content = chunk.get("content", "")
+        if len(content) <= remaining:
+            result_parts.append(content)
+            remaining -= len(content)
+        else:
+            result_parts.append(f"# [{name} — {len(content)} chars, not included]")
+
+    return "\n\n".join(result_parts)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

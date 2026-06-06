@@ -310,8 +310,27 @@ def _brace_candidate_patterns(target_name: str) -> list[re.Pattern[str]]:
         #   async foo(...) {
         #   static foo(...) {
         re.compile(rf"(?m)^\s*(?:public|private|protected|static|async|final|export|default|\s)*{name}\s*\("),
+        # C-like method/function WITH a return type (Java/C/C++/Kotlin/etc.):
+        #   public String foo(    static int foo(    void foo(    List<X> foo(    int[] foo(
+        # Allows optional annotations + modifiers, then a return-type token
+        # (identifier with optional generics / array / dotted name), then `foo(`.
+        re.compile(
+            rf"(?m)^\s*"
+            rf"(?:@[\w.]+(?:\([^)]*\))?\s*)*"
+            rf"(?:(?:public|private|protected|static|final|abstract|synchronized|"
+            rf"native|default|transient|volatile|strictfp|export|async|inline|"
+            rf"virtual|const|extern|unsafe|suspend|open|override|fun|fn|pub)\s+)*"
+            rf"[A-Za-z_$][\w$.]*(?:<[^>{{}}]*>)?(?:\[\s*\])*\s+"
+            rf"{name}\s*\("
+        ),
         # class X { foo(...) { ... } }
         re.compile(rf"(?m)^\s*{name}\s*\("),
+        # type declarations in C-like / JVM / Rust syntax:
+        #   public class App {   interface Foo {   struct Bar {   enum E {   record R(   trait T {
+        re.compile(
+            rf"(?m)^\s*(?:@[\w.]+(?:\([^)]*\))?\s*)*(?:[A-Za-z_$][\w$]*\s+)*?"
+            rf"(?:class|interface|struct|enum|trait|record|object|namespace)\s+{name}\b"
+        ),
     ]
 
 
