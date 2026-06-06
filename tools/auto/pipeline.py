@@ -88,6 +88,22 @@ def run_pipeline(controller: "AutoController") -> tuple[Optional[str], int]:
     # ── PLAN phase ────────────────────────────────────────────────────────────
     _run_plan_phase(controller, cfg)
 
+    # ── Emit plan size into trace now that tasks are loaded ───────────────────
+    # Emitted after _run_plan_phase so all_tasks() is populated regardless of
+    # whether this is a fresh run or a resume.  analyze_logs.py reads this
+    # event to show the correct total in the banner (plan=N).
+    if controller.run_trace:
+        from tools.agent_trace import tracer as _tracer
+        _tracer.event(
+            source="run_trace",
+            target="auto_run",
+            kind="plan_ready",
+            params={
+                "total_tasks": len(controller.state.all_tasks()),
+                "run_id": getattr(controller.run_trace, "run_id", ""),
+            },
+        )
+
     # ── DRY-RUN: plan only, no code execution, no commits ─────────────────────
     # AUTO-G10: --dry-run exits here after writing IMPROVEMENTS.md + plan.json.
     # The return value mirrors _run_task_loop so the finalise block is unchanged.

@@ -236,6 +236,7 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
                 "llm_calls":      0,
                 "context_requests": [],
                 "total_events":   0,
+                "plan_total":     0,         # filled by plan_ready event — total tasks in plan
                 "files_preparing": [],       # [{ts, task, file_count, files_copied, files_missing, files}]
                 # Internal tracking — not rendered directly
                 "_current_task":  None,      # task_id of the task currently in the loop
@@ -272,6 +273,12 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
         elif kind in ("run_finished", "run_capped"):
             run["end_ts"] = ts
             run["stop_reason"] = params.get("stop_reason")
+
+        # ── plan size (emitted by pipeline.py after _run_plan_phase) ──────────
+        elif kind == "plan_ready":
+            total = params.get("total_tasks", 0)
+            if total:
+                run["plan_total"] = int(total)
 
         # ── task lifecycle ─────────────────────────────────────────────────
         elif kind == "call" and tgt == "outer_loop":
@@ -527,7 +534,9 @@ def render_run_summary(run: dict) -> None:
         print(f"  {bold('Stop reason')}:    {yellow(run['stop_reason'])}")
 
     print()
-    print(f"  {bold('Tasks')}:           total={bold(str(len(real)))}  "
+    plan_total = run.get("plan_total") or len(real)
+    print(f"  {bold('Tasks')}:           plan={bold(str(plan_total))}  "
+          f"seen={str(len(real))}  "
           f"done={green(str(len(done_tasks)))}  "
           f"blocked={red(str(len(blocked_tasks)))}  "
           f"other={str(len(other_tasks))}")
@@ -776,8 +785,10 @@ def render_timeline(run: dict, max_events: int = 40) -> None:
             _syms = _extract_context_signals(src, content)
             if not _syms:
                 continue   # only surface responses that carry a context pull
-            print(f"  {dim(ts)}  {cyan(bold('\u27f3 context pull'))}  "
-                  f"{dim(src)} \u2192 {', '.join(_syms)}")
+            _arrow = chr(0x2192)
+            _pull  = chr(0x27f3)
+            print(f"  {dim(ts)}  {cyan(bold(_pull + ' context pull'))}  "
+                  f"{dim(src)} {_arrow} {', '.join(_syms)}")
 
         elif kind == "error":
             msg = truncate(content or str(params), 70)
