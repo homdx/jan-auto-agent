@@ -417,6 +417,7 @@ class InnerLoop:
         # Pull-model state (carried across attempts within this round)
         prefetched_context: str = ""
         final_missing: list[str] = []
+        _any_missing: bool = False   # Task 4: True if any attempt had unsatisfied context
         base_dir_path = Path(base_dir)
         target_files  = task.get("target_files", []) or []
 
@@ -450,6 +451,8 @@ class InnerLoop:
             # Pull-model: resolve any context the coder asked for, for the NEXT attempt.
             coder_missing = list(getattr(coder_result, "missing_context", []) or [])
             final_missing = coder_missing
+            if not getattr(coder_result, "context_satisfied", True):
+                _any_missing = True
             if coder_missing:
                 prefetched_context = self._broker.fetch(coder_missing, target_files, base_dir_path)
                 logger.info("InnerLoop: attempt %d coder requested context %s — prefetched for next attempt",
@@ -537,7 +540,7 @@ class InnerLoop:
             attempts_used=self.max_attempts,
             last_feedback=last,
             records=records,
-            context_satisfied=not final_missing,
+            context_satisfied=not _any_missing,
         )
 
 
