@@ -132,11 +132,13 @@ STRICT RULES:
    code shown.  If the goal asks for behavior the code does not yet have, that \
    absence IS the work — do not return [].
 6. The "acceptance_check" MUST be a real shell command (not a description or sentence). \
-   It must start with an executable token such as "python", "pytest", "bash", "node", etc. \
-   When the task adds an optional CLI argument (e.g. --name), the check MUST call the \
-   script with that flag using the double-dash form: "python main.py --name Alice" — \
-   never use a positional argument form ("python main.py Alice") unless the instruction \
-   explicitly defines a positional argument.
+   Use the project's OWN build/test runner — match the language of the files shown. \
+   Examples: "pytest tests/test_foo.py", "python main.py --name Alice", \
+   "./gradlew test", "gradle build", "mvn -q test", "npm test", "go test ./...", \
+   "cargo test", "make check". If no automated check is feasible for this change, \
+   use "true". For a Python CLI flag use the double-dash form \
+   ("python main.py --name Alice"), never a positional argument form \
+   ("python main.py Alice") unless the instruction explicitly defines a positional argument.
 
 Each element of the JSON array must match this schema exactly (no extra keys):
 
@@ -145,7 +147,7 @@ Each element of the JSON array must match this schema exactly (no extra keys):
     "title": "<short imperative phrase>",
     "instruction": "<detailed instruction for the coder agent>",
     "target_files": ["<exact path from the list below>"],
-    "acceptance_check": "<shell command that exits 0 when the task is done — MUST be a real runnable command, e.g. 'python main.py --name Alice' or 'pytest tests/test_foo.py'. If the task adds a CLI flag --flag, the check MUST call the script with that exact flag using the optional-argument syntax (e.g. 'python script.py --flag value'), NOT a positional argument>",
+    "acceptance_check": "<shell command that exits 0 when the task is done — a real runnable command using the project's own test/build runner (e.g. 'pytest tests/test_foo.py', 'python main.py --name Alice', './gradlew test', 'mvn -q test', 'npm test', 'go test ./...', 'cargo test'), or 'true' if no automated check fits. For a Python CLI flag --flag use 'python script.py --flag value', NOT a positional argument>",
     "cited_location": {{
       "file": "<exact path from the list below>",
       "symbol": "<function or class name, or null>",
