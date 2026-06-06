@@ -58,12 +58,16 @@ api_format, verify_ssl — the same pattern used throughout this codebase.
 
 from __future__ import annotations
 
+import ast
 import configparser
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
+
+from tools.block_extractor import extract_block as _block_extractor_extract_block
 
 from tools.agent_trace import tracer
 import tools.llm_stream as _llm_stream
@@ -402,7 +406,11 @@ class Coder:
         target_files_listing = "\n".join(f"  - {f}" for f in target_files) or "  (none)"
 
         # ── File contents ─────────────────────────────────────────────────────
-        file_contents = self._read_file_contents(target_files, base_dir)
+        # Pass cited_symbol so _read_file_contents can pin the relevant chunk.
+        _cited_sym_for_chunks = loc.get("symbol") or None
+        file_contents = self._read_file_contents(
+            target_files, base_dir, cited_symbol=_cited_sym_for_chunks
+        )
         # Pull-model: prepend any context the previous attempt requested.
         if prefetched_context:
             file_contents = prefetched_context.rstrip() + "\n\n" + file_contents
@@ -443,14 +451,20 @@ class Coder:
             return []
         return [str(s).strip() for s in req if str(s).strip()]
 
-    def _read_file_contents(self, target_files: list[str], base_dir: Path) -> str:
+    def _read_file_contents(
+        self,
+        target_files: list[str],
+        base_dir: Path,
+        cited_symbol: str | None = None,
+    ) -> str:
         """Read and annotate file contents for the prompt.
 
-        Each file is prefixed with a ``### path/to/file.py`` header.  Content
-        is truncated to ``self._max_file_chars`` (configured via ``max_file_chars``
-        in the ``[coder]`` section of agents.ini) with a notice.  Files that don't
-        exist yet are labelled as ``[new file — no existing content]`` so the
-        model knows it must create them from scratch.
+        Each file is prefixed with a ``### path/to/file.py`` header.  Instead
+        of blind character truncation, large files are split into symbol-aware
+        chunks via :func:`_chunk_file` and then assembled with
+        :func:`_select_relevant_chunks` so that the *cited_symbol* and import
+        block are always present.  Files that don't exist yet are labelled as
+        ``[new file — no existing content]``.
         """
         parts: list[str] = []
         for rel in target_files:
@@ -459,14 +473,17 @@ class Coder:
                 content = "[new file — no existing content]"
             else:
                 try:
-                    content = abs_path.read_text(encoding="utf-8", errors="replace")
+                    raw = abs_path.read_text(encoding="utf-8", errors="replace")
                 except OSError as exc:
-                    content = f"[unreadable: {exc}]"
-                if len(content) > self._max_file_chars:
-                    content = (
-                        content[:self._max_file_chars]
-                        + f"\n... [truncated — {len(content) - self._max_file_chars} more chars]"
-                    )
+                    parts.append(f"### {rel}\n[unreadable: {exc}]")
+                    continue
+
+                file_ext = Path(rel).suffix
+                chunks = _chunk_file(raw, file_ext, self._max_file_chars)
+                content = _select_relevant_chunks(
+                    chunks, cited_symbol, self._max_file_chars
+                )
+
             parts.append(f"### {rel}\n{content}")
         return "\n\n".join(parts) if parts else "(no target files)"
 
@@ -779,6 +796,235 @@ class Coder:
                     first_error = msg
 
         return written, first_error
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Symbol-aware file chunking (SCTX Task 1)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _chunk_file(source: str, file_ext: str, max_chars: int) -> list[dict]:
+    """Split *source* into symbol-aware chunks for prompt assembly.
+
+    Each returned dict has:
+        name      — "full" | "imports" | <symbol_name> | "truncated"
+        content   — the source text for this chunk
+        line      — 1-based line number where this chunk starts
+        is_import — True only on the imports chunk
+
+    If ``len(source) <= max_chars`` the list contains a single "full" chunk
+    whose content is the unmodified source (byte-for-byte identical).
+
+    On AST parse failure for a .py file a WARNING is logged and a single
+    "truncated" chunk is returned; no exception is raised.  For all other
+    extensions a regex scan is used (best-effort; partial results are fine).
+    """
+    if len(source) <= max_chars:
+        return [{"name": "full", "content": source, "line": 1}]
+
+    ext = (file_ext or "").strip().lower()
+    if ext and not ext.startswith("."):
+        ext = "." + ext
+
+    # ── Extract import / preamble block ────────────────────────────────────────
+    # Collect all leading lines that look like imports/includes/pragmas for
+    # any supported language, plus blank lines interleaved between them.
+    # Patterns covered:
+    #   Python/JS/TS:   import …  /  from … import …
+    #   Go:             import "…"  /  import ( … )
+    #   Rust:           use …;
+    #   C/C++/ObjC:     #include …  /  #pragma …  /  #define …  /  #ifndef …
+    #   Java/Kotlin:    package …  /  import …
+    #   Ruby:           require …  /  require_relative …
+    #   PHP:            use …;  /  require …  /  include …
+    #   Shell:          #!/…  (shebang on line 1)
+    # Unknown languages: the block will simply be empty (first non-blank line
+    # is not a preamble line), which is safe — no import chunk is emitted.
+    _import_re = re.compile(
+        r"^\s*("
+        r"import\s"                             # Python, JS, TS, Java, Go bare
+        r"|from\s"                              # Python from-import
+        r"|use\s"                               # Rust / PHP
+        r"|#include\s*[\"<]"                  # C/C++/ObjC
+        r"|#pragma\s"                           # C/C++ pragmas
+        r"|#ifndef\s|#ifdef\s|#define\s|#endif"  # C/C++ guards
+        r"|package\s"                           # Go, Java, Kotlin
+        r"|require\s*[\"'(]"                 # Ruby, PHP, Node.js
+        r"|require_relative\s*[\"'(]"        # Ruby
+        r"|include\s*[\"'(]"                 # PHP
+        r"|#!/"                                  # shebang (line 1 only)
+        r")"
+    )
+    _blank_re = re.compile(r"^\s*$")
+    lines = source.splitlines(keepends=True)
+    import_end = 0
+    for i, line in enumerate(lines):
+        # Shebang is only valid on the very first line.
+        if i == 0 and line.startswith("#!"):
+            import_end = 1
+        elif _blank_re.match(line) or _import_re.match(line):
+            import_end = i + 1
+        else:
+            break
+    import_content = "".join(lines[:import_end])
+    import_chunk: dict = {
+        "name": "imports",
+        "content": import_content,
+        "line": 1,
+        "is_import": True,
+    }
+
+    # ── Collect top-level symbol names + start lines ──────────────────────────
+    symbols: list[tuple[str, int]] = []  # (name, 1-based lineno)
+
+    if ext == ".py":
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            logger.warning(
+                "_chunk_file: ast.parse failed for ext=%r — returning truncated chunk", ext
+            )
+            return [
+                {
+                    "name": "truncated",
+                    "content": source[:max_chars] + "\n... [truncated]",
+                    "line": 1,
+                }
+            ]
+        for node in ast.iter_child_nodes(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                symbols.append((node.name, node.lineno))
+    else:
+        # Best-effort regex scan for top-level symbols across all brace-based
+        # and indent-based languages.  Covers:
+        #   JS/TS:    function foo / async function foo / class Foo
+        #             const foo = (...) =>    (arrow functions)
+        #   Go:       func foo / func (r T) foo
+        #   Rust:     fn foo / pub fn foo / pub(crate) fn foo
+        #   Java/C#:  class Foo / interface IFoo / enum Status
+        #             public void foo(  (methods — best-effort)
+        #   C/C++:    type_name foo(   (free functions, rough heuristic)
+        #   Ruby:     def foo / class Foo / module Bar
+        #   PHP:      function foo / class Foo
+        #   Swift:    func foo / class Foo / struct Bar / enum Baz / protocol P
+        #   Kotlin:   fun foo / class Foo / object Obj / data class Bar
+        _sym_re = re.compile(
+            r"(?m)^[ \t]*"
+            # optional visibility / modifier keywords (greedy, non-capturing)
+            r"(?:(?:pub(?:\s*\([^)]*\))?|public|private|protected|internal"
+            r"|static|final|abstract|override|open|sealed|data|inline|suspend"
+            r"|async|export|default)\s+)*"
+            # the keyword that introduces a symbol
+            r"(?:function|func|fn|def|class|interface|struct|enum|module"
+            r"|object|protocol|trait|impl|type|fun)"
+            r"\s+"
+            # optional receiver for Go methods: (r *Receiver)
+            r"(?:\([^)]*\)\s+)?"
+            # the symbol name — captured
+            r"([A-Za-z_][A-Za-z0-9_]*)"
+        )
+        # Also capture JS/TS arrow-function assignments at statement level:
+        #   const myFunc = (...) => {
+        #   let   myFunc = async (...) => {
+        _arrow_re = re.compile(
+            r"(?m)^[ \t]*(?:export\s+)?(?:const|let|var)\s+"
+            r"([A-Za-z_][A-Za-z0-9_]*)\s*="
+            r"\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_][A-Za-z0-9_]*)\s*=>"
+        )
+        seen_names: set[str] = set()
+        for m in _sym_re.finditer(source):
+            name = m.group(1)
+            if name not in seen_names:
+                seen_names.add(name)
+                lineno = source.count("\n", 0, m.start()) + 1
+                symbols.append((name, lineno))
+        for m in _arrow_re.finditer(source):
+            name = m.group(1)
+            if name not in seen_names:
+                seen_names.add(name)
+                lineno = source.count("\n", 0, m.start()) + 1
+                symbols.append((name, lineno))
+        # Keep stable line-order after the two passes.
+        symbols.sort(key=lambda t: t[1])
+
+    # ── Extract the source block for each symbol ──────────────────────────────
+    symbol_chunks: list[dict] = []
+    for name, lineno in symbols:
+        try:
+            block = _block_extractor_extract_block(source, name, ext)
+        except Exception:
+            block = ""
+        if block:
+            symbol_chunks.append({"name": name, "content": block, "line": lineno})
+
+    symbol_chunks.sort(key=lambda c: c["line"])
+
+    return [import_chunk] + symbol_chunks
+
+
+def _select_relevant_chunks(
+    chunks: list[dict],
+    cited_symbol: str | None,
+    budget_chars: int,
+) -> str:
+    """Assemble *chunks* into a prompt string, respecting *budget_chars*.
+
+    Ordering and budget rules:
+      1. Import chunk always first; its size is deducted from the budget.
+      2. *cited_symbol* chunk always second — never stubbed, even if its size
+         alone exceeds the remaining budget.
+      3. All remaining chunks are included in ascending line order; any chunk
+         that does not fit is replaced with a single stub comment::
+
+             # [symbol_name — N chars, not included]
+
+    Chunks are separated by a blank line.  Returns ``"(no content)"`` when
+    *chunks* is empty.
+    """
+    if not chunks:
+        return "(no content)"
+
+    # "full" chunk means the file was already within max_chars — return as-is.
+    full = next((c for c in chunks if c.get("name") == "full"), None)
+    if full is not None:
+        return full["content"]
+
+    import_chunk = next((c for c in chunks if c.get("is_import")), None)
+
+    result_parts: list[str] = []
+    remaining = budget_chars
+    included: set[str] = set()
+
+    # 1. Import chunk — always first.
+    if import_chunk:
+        result_parts.append(import_chunk["content"])
+        remaining -= len(import_chunk["content"])
+        included.add(import_chunk["name"])
+
+    # 2. Cited symbol — always second, never stubbed.
+    if cited_symbol:
+        cited_chunk = next(
+            (c for c in chunks if c.get("name") == cited_symbol), None
+        )
+        if cited_chunk:
+            result_parts.append(cited_chunk["content"])
+            remaining -= len(cited_chunk["content"])
+            included.add(cited_symbol)
+
+    # 3. Remaining chunks in ascending line order.
+    others = sorted(
+        (c for c in chunks if c.get("name") not in included),
+        key=lambda c: c.get("line", 0),
+    )
+    for chunk in others:
+        name    = chunk.get("name", "?")
+        content = chunk.get("content", "")
+        if len(content) <= remaining:
+            result_parts.append(content)
+            remaining -= len(content)
+        else:
+            result_parts.append(f"# [{name} — {len(content)} chars, not included]")
+
+    return "\n\n".join(result_parts)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
