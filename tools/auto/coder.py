@@ -106,14 +106,7 @@ _SYSTEM_PROMPT = (
     "6. The 'files' array MUST NEVER be empty. The task always requires at least one "
     "file change — if you think nothing needs changing, re-read the instruction and "
     "produce the correct implementation. An empty files array is always wrong.\n"
-    "7. If a symbol you must use (a class, function, or constant) is referenced but its "
-    "definition is NOT shown to you, do not guess — add a top-level \"context_request\" "
-    "array naming the exact symbols you need, e.g. "
-    '{"files": [...], "context_request": ["Config", "_resolve_path"]}. '
-    "The names you request are resolved and provided on the next attempt. Omit "
-    "context_request (or use []) when you already have everything you need."
-    "\n"
-    "8. If the provided file contents are insufficient to complete the task — "
+    "7. If the provided file contents are insufficient to complete the task — "
     "for example, a referenced class or function is not shown — add a top-level "
     "\"missing_context\" key to your JSON response listing the symbol names you "
     "needed but did not receive. "
@@ -382,9 +375,6 @@ class Coder:
 
         # ── Strip think blocks; check for missing-context signal ─────────────
         cleaned = strip_think(raw_text)
-        # Pull-model: capture any symbols the coder asked for (context_request).
-        missing_ctx = self._extract_context_request(cleaned)
-
         # ── Context probe: if the LLM reported missing_context, fetch once ───
         _missing = self._extract_missing_context(cleaned)
         context_satisfied = not bool(_missing)
@@ -426,7 +416,7 @@ class Coder:
         if parse_error:
             return CoderResult(
                 task_id=task_id, error=parse_error,
-                raw_response=cleaned, missing_context=missing_ctx,
+                raw_response=cleaned,
                 context_satisfied=context_satisfied,
             )
 
@@ -439,7 +429,7 @@ class Coder:
         if write_error and not written:
             return CoderResult(
                 task_id=task_id, error=write_error, raw_response=cleaned,
-                missing_context=missing_ctx, context_satisfied=context_satisfied,
+                context_satisfied=context_satisfied,
             )
 
         result = CoderResult(
@@ -447,7 +437,6 @@ class Coder:
             files_written=written,
             error=write_error,
             raw_response=cleaned,
-            missing_context=missing_ctx,
             context_satisfied=context_satisfied,
         )
         logger.info("coder.generate: %s", result.summary())
@@ -519,20 +508,6 @@ class Coder:
             feedback_section      = feedback_section,
         )
 
-    @staticmethod
-    def _extract_context_request(text: str) -> list[str]:
-        """Extract a top-level 'context_request' list of symbol names from the LLM
-        JSON response. Returns [] on absence or any parse error (fail-safe)."""
-        try:
-            data = json.loads(_strip_outer_fence(text))
-        except Exception:
-            return []
-        if not isinstance(data, dict):
-            return []
-        req = data.get("context_request")
-        if not isinstance(req, list):
-            return []
-        return [str(s).strip() for s in req if str(s).strip()]
 
     def _extract_missing_context(self, text: str) -> list[str]:
         """Extract the top-level ``missing_context`` list from the LLM response.
@@ -1020,16 +995,27 @@ class Coder:
                 dest.parent.mkdir(parents=True, exist_ok=True)
 
                 # Back up existing file before overwriting (reversible).
+                # Guard: only write the backup when one does NOT already exist so
+                # that repeated attempts preserve the *original* file content rather
+                # than overwriting the backup with the output of a previous (possibly
+                # broken) attempt.  Once a .coder.bak exists for this file it is
+                # never touched again — it always reflects the pre-agent state.
                 if dest.exists():
                     backup = dest.with_suffix(dest.suffix + ".coder.bak")
-                    backup.write_text(
-                        dest.read_text(encoding="utf-8", errors="replace"),
-                        encoding="utf-8",
-                    )
-                    logger.debug(
-                        "coder._write_files [%s]: backed up %s → %s",
-                        task_id, dest, backup,
-                    )
+                    if not backup.exists():
+                        backup.write_text(
+                            dest.read_text(encoding="utf-8", errors="replace"),
+                            encoding="utf-8",
+                        )
+                        logger.debug(
+                            "coder._write_files [%s]: backed up %s → %s",
+                            task_id, dest, backup,
+                        )
+                    else:
+                        logger.debug(
+                            "coder._write_files [%s]: backup already exists for %s — skipping",
+                            task_id, dest,
+                        )
 
                 dest.write_text(content, encoding="utf-8")
                 written.append(rel)

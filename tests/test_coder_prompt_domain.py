@@ -51,7 +51,6 @@ def test_json_contract_preserved_across_modes():
     for mode in ("code", "docs", "creative"):
         s = _coder(mode)._system
         assert '"files"' in s
-        assert "context_request" in s
 
 
 def test_mode_specific_ini_override_wins():

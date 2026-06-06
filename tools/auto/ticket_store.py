@@ -107,8 +107,8 @@ class TicketSchemaError(TicketError):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def make_ticket(
-    id: str,
-    type: str,
+    id: str,    # noqa: A002 — matches ticket schema field; builtin not used here.
+    type: str,  # noqa: A002 — matches ticket schema field; builtin not used here.
     linked_task: str,
     title: str,
     body: str,

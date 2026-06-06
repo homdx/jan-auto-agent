@@ -1,10 +1,19 @@
 """tests/test_context_broker_pull_model.py
 
-Regression coverage for the pull-model context flow:
+Regression coverage for the ContextBroker prefetch flow (SCTX architecture).
+
+After SCTX-3 the coder no longer emits a separate ``context_request`` signal:
+it probes and fetches its own missing context inside ``generate()`` (Signal A),
+exposing the outcome via ``CoderResult.context_satisfied``.  The ContextBroker
+is still used on the *validator* side — when the Gate-2 validator rejects an
+attempt and reports ``missing_context``, the inner loop resolves those symbols
+and feeds them into the NEXT attempt's prompt.
+
+Covered here:
   * ContextBroker resolves requested symbols from target files / project.
-  * Coder.generate populates missing_context from a context_request.
-  * InnerLoop feeds the broker's resolved context into the NEXT attempt and
-    sets InnerLoopResult.context_satisfied correctly.
+  * CoderResult.missing_context field contract (retained; default empty).
+  * InnerLoop feeds validator-requested context into the NEXT attempt.
+  * InnerLoopResult.context_satisfied tracks the coder's reported gap.
   * outer_loop skips the TaskRewriter when context_satisfied is False.
 """
 
@@ -19,7 +28,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from tools.auto.context_broker import ContextBroker
 from tools.auto.coder import CoderResult
-from tools.auto.inner_loop import InnerLoop, InnerLoopResult
+from tools.auto.inner_loop import InnerLoop
 
 
 # ───────────────────────── ContextBroker ─────────────────────────
@@ -29,8 +38,7 @@ def test_broker_resolves_symbol_from_target_file():
         d = Path(d)
         (d / "helper.py").write_text(
             "def my_helper(x):\n    return x + 1\n\nclass Other:\n    pass\n")
-        broker = ContextBroker()
-        out = broker.fetch(["my_helper"], ["helper.py"], d)
+        out = ContextBroker().fetch(["my_helper"], ["helper.py"], d)
         assert "my_helper" in out
         assert "PREFETCHED CONTEXT" in out
 
@@ -42,16 +50,16 @@ def test_broker_returns_empty_for_unresolvable():
         assert ContextBroker().fetch(["does_not_exist"], ["helper.py"], d) == ""
 
 
-# ───────────────────────── Coder context_request ─────────────────
+# ───────────────────────── CoderResult contract ──────────────────
 
-def test_coder_result_carries_missing_context():
-    # the field exists and defaults empty; population is covered by the
-    # coder unit checks — here we lock the dataclass contract.
+def test_coder_result_missing_context_field_retained():
+    # The field is kept on the dataclass (default empty) for the validator
+    # side-channel / future use; the coder no longer populates it itself.
     assert CoderResult().missing_context == []
     assert CoderResult(missing_context=["Foo"]).missing_context == ["Foo"]
 
 
-# ───────────────────────── InnerLoop pull-model ──────────────────
+# ───────────────────────── InnerLoop (validator-side prefetch) ────
 
 class _Exec:
     def run(self, task):
@@ -59,50 +67,57 @@ class _Exec:
                                stderr="", traceback="", command="")
 
 
-class _Validator:
-    last_missing_context: list = []
-    def approve(self, task, exec_result, coder_result):
-        return True, ""
-
-
-class _ScriptedCoder:
-    """Attempt 1 requests context and writes nothing; attempt 2 succeeds.
-    Records the prefetched_context received on each call."""
+class _OkCoder:
+    """Always writes the file; records the prefetched_context per attempt."""
     def __init__(self):
         self.calls = []
     def generate(self, task, base_dir, prior_feedback=None, prefetched_context="", **kw):
         self.calls.append(prefetched_context)
-        if len(self.calls) == 1:
-            return CoderResult(task_id="T", files_written=[], error="need ctx",
-                               missing_context=["my_helper"])
         return CoderResult(task_id="T", files_written=["helper.py"])
 
 
-def test_inner_loop_prefetches_requested_context_into_next_attempt():
+class _RejectThenApprove:
+    """Rejects attempt 1 reporting a missing symbol, approves attempt 2."""
+    def __init__(self):
+        self.n = 0
+        self.last_missing_context: list = []
+    def approve(self, task, exec_result, coder_result):
+        self.n += 1
+        if self.n == 1:
+            self.last_missing_context = ["my_helper"]
+            return False, "need to see my_helper"
+        self.last_missing_context = []
+        return True, ""
+
+
+def test_inner_loop_prefetches_validator_requested_context_into_next_attempt():
     with tempfile.TemporaryDirectory() as d:
         d = Path(d)
         (d / "helper.py").write_text("def my_helper(x):\n    return x + 1\n")
-        coder = _ScriptedCoder()
-        loop = InnerLoop(coder, _Exec(), _Validator(), max_attempts=3)
+        coder = _OkCoder()
+        loop = InnerLoop(coder, _Exec(), _RejectThenApprove(), max_attempts=3)
         res = loop.run_task({"id": "T", "target_files": ["helper.py"]}, d)
         assert res.passed is True
-        # attempt 1 got no prefetched context; attempt 2 received the resolved block
+        # attempt 1 got no prefetch; attempt 2 received the validator-requested block
         assert coder.calls[0] == ""
         assert "my_helper" in coder.calls[1]
         assert "PREFETCHED CONTEXT" in coder.calls[1]
-        # it passed → context considered satisfied
         assert res.context_satisfied is True
 
 
-class _AlwaysNeedsContext:
+# ───────────────────────── context_satisfied (Signal A) ──────────
+
+class _CoderReportsGap:
+    """SCTX: coder probed but still could not resolve a needed symbol."""
     def generate(self, task, base_dir, prior_feedback=None, prefetched_context="", **kw):
         return CoderResult(task_id="T", files_written=[], error="need ctx",
-                           missing_context=["never_found_symbol"])
+                           context_satisfied=False)
 
 
-def test_context_satisfied_false_when_last_attempt_still_requests():
+def test_context_satisfied_false_when_coder_reports_gap():
     with tempfile.TemporaryDirectory() as d:
-        loop = InnerLoop(_AlwaysNeedsContext(), _Exec(), _Validator(), max_attempts=2)
+        loop = InnerLoop(_CoderReportsGap(), _Exec(),
+                         _RejectThenApprove(), max_attempts=2)
         res = loop.run_task({"id": "T", "target_files": []}, Path(d))
         assert res.passed is False
         assert res.context_satisfied is False
@@ -111,7 +126,6 @@ def test_context_satisfied_false_when_last_attempt_still_requests():
 # ───────────────────────── outer_loop gate ───────────────────────
 
 def test_outer_loop_gate_uses_context_satisfied():
-    # The rewrite condition must include `getattr(res, "context_satisfied", True)`.
     src = (PROJECT_ROOT / "tools" / "auto" / "outer_loop.py").read_text()
     assert 'getattr(res, "context_satisfied", True)' in src
 

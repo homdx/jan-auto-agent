@@ -3,11 +3,12 @@
 The *push* model that existed before this module forced both the Coder and the
 Gate-2 Validator to guess which surrounding code they needed.  They received a
 fixed char-budget slice and had no way to ask for more.  This module adds the
-*pull* side: when the coder emits a ``context_request`` in its JSON response, or
-when the validator signals ``missing_context`` in its rejection, the
-:class:`ContextBroker` resolves those symbol names from the AST index that
-``block_extractor`` already exposes, and returns the full source blocks so the
-*next* attempt starts with the context the *previous* attempt asked for.
+*pull* side: when the Gate-2 validator signals ``missing_context`` in its
+rejection, the :class:`ContextBroker` resolves those symbol names from the AST
+index that ``block_extractor`` already exposes, and returns the full source
+blocks so the *next* attempt starts with the context the validator asked for.
+(The coder resolves its own missing context inside ``generate()`` via the
+in-generate context probe, so it does not go through this broker.)
 
 Design
 ------
