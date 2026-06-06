@@ -62,6 +62,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from tools.agent_trace import tracer
+
 logger = logging.getLogger(__name__)
 
 # Environment variables that could give a subprocess network access that we
@@ -285,17 +287,49 @@ class Executor:
             shutil.rmtree(workspace)
         workspace.mkdir(parents=True, exist_ok=True)
 
+        tracer.event(
+            source="executor",
+            target="workspace",
+            kind="phase_transition",
+            params={
+                "phase":      "files_preparing",
+                "status":     "started",
+                "task":       task_id,
+                "file_count": len(target_files),
+                "files":      target_files,
+            },
+        )
+
+        copied: list[str] = []
+        missing: list[str] = []
         for rel in target_files:
             src = self._base_dir / rel
             if not src.exists():
                 logger.debug(
                     "_prepare_workspace: %r not found in base_dir — skipping copy", rel
                 )
+                missing.append(rel)
                 continue
             dst = workspace / rel
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dst)
             logger.debug("_prepare_workspace: copied %s → %s", src, dst)
+            copied.append(rel)
+
+        tracer.event(
+            source="executor",
+            target="workspace",
+            kind="phase_transition",
+            params={
+                "phase":         "files_preparing",
+                "status":        "done",
+                "task":          task_id,
+                "files_copied":  len(copied),
+                "files_missing": len(missing),
+                "copied":        copied,
+                "missing":       missing,
+            },
+        )
 
         return workspace
 

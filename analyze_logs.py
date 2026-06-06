@@ -236,6 +236,7 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
                 "llm_calls":      0,
                 "context_requests": [],
                 "total_events":   0,
+                "files_preparing": [],       # [{ts, task, file_count, files_copied, files_missing, files}]
                 # Internal tracking — not rendered directly
                 "_current_task":  None,      # task_id of the task currently in the loop
             }
@@ -404,6 +405,36 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
                 "run_id":     rid,
             })
 
+        # ── file preparation phase (executor workspace setup) ──────────────
+        elif kind == "phase_transition" and params.get("phase") == "files_preparing":
+            status = params.get("status", "")
+            task_id_fp = params.get("task", "")
+            if status == "started":
+                run["files_preparing"].append({
+                    "ts":            ts,
+                    "task":          task_id_fp,
+                    "file_count":    params.get("file_count", 0),
+                    "files":         params.get("files", []),
+                    "files_copied":  None,   # filled in on "done"
+                    "files_missing": None,
+                    "status":        "started",
+                })
+                # Annotate the task dict so per-task view shows it.
+                if task_id_fp in run["tasks"]:
+                    t = run["tasks"][task_id_fp]
+                    t.setdefault("files_prep_count", 0)
+                    t["files_prep_count"] += 1
+            elif status == "done":
+                # Update the most recent "started" record for this task.
+                for rec in reversed(run["files_preparing"]):
+                    if rec["task"] == task_id_fp and rec["status"] == "started":
+                        rec["files_copied"]  = params.get("files_copied", 0)
+                        rec["files_missing"] = params.get("files_missing", 0)
+                        rec["copied"]        = params.get("copied", [])
+                        rec["missing"]       = params.get("missing", [])
+                        rec["status"]        = "done"
+                        break
+
     return runs
 
 
@@ -512,6 +543,17 @@ def render_run_summary(run: dict) -> None:
         print(f"  {bold('Context pulls')}:   {cyan(str(len(_ctx_reqs)))} "
               f"request(s), {_total_syms} symbol(s)")
     print(f"  {bold('Prompt changes')}: {magenta(str(prompt_changes))}")
+    _fp_recs = run.get("files_preparing", [])
+    _fp_done = [r for r in _fp_recs if r.get("status") == "done"]
+    if _fp_done:
+        _fp_copied  = sum(r.get("files_copied",  0) for r in _fp_done)
+        _fp_missing = sum(r.get("files_missing", 0) for r in _fp_done)
+        _fp_miss_str = f"  {yellow(f'({_fp_missing} missing)')}" if _fp_missing else ""
+        print(
+            f"  {bold('Files prepared')}: "
+            f"{cyan(str(len(_fp_done)))} workspace setup(s)  "
+            f"{_fp_copied} file(s) copied{_fp_miss_str}"
+        )
     print(f"  {bold('Total events')}:    {run['total_events']}")
 
 
@@ -633,9 +675,16 @@ def render_timeline(run: dict, max_events: int = 40) -> None:
         "prompt_updated", "prompt_push", "prompt_change",
         "rejected", "phase_transition",
     }
+    # Include only files_preparing "started" transitions to avoid double-entries.
+    def _is_interesting_phase(e: dict) -> bool:
+        if e.get("kind") != "phase_transition":
+            return False
+        p = (e.get("params") or {})
+        return p.get("phase") == "files_preparing" and p.get("status") == "started"
     shown = [
         e for e in events
         if e.get("kind") in INTERESTING
+        or _is_interesting_phase(e)
         or (e.get("kind") == "llm_response"
             and _extract_context_signals(e.get("source", ""), str(e.get("content") or "")))
     ]
@@ -703,6 +752,21 @@ def render_timeline(run: dict, max_events: int = 40) -> None:
             agent = params.get("agent") or params.get("agent_name") or src
             print(f"  {dim(ts)}  {magenta(bold('↺ prompt change'))}  agent={cyan(agent)}")
 
+        elif kind == "phase_transition" and params.get("phase") == "files_preparing":
+            task_fp    = params.get("task", "")
+            file_count = params.get("file_count", 0)
+            files      = params.get("files", [])
+            preview    = ", ".join(files[:3])
+            if len(files) > 3:
+                preview += dim(f" … +{len(files)-3}")
+            label = cyan(bold("⧉ files preparing"))
+            print(
+                f"  {dim(ts)}  {label}  "
+                f"{dim(task_fp)}  "
+                f"{bold(str(file_count))} file(s)"
+                + (f"  {dim(preview)}" if preview else "")
+            )
+
         elif kind == "phase_transition":
             phase  = params.get("phase", "?")
             status = params.get("status", "?")
@@ -720,12 +784,64 @@ def render_timeline(run: dict, max_events: int = 40) -> None:
             print(f"  {dim(ts)}  {red(bold('ERROR'))}  {msg}")
 
 
+# ── Files-preparing renderer ──────────────────────────────────────────────────
+
+def render_files_preparing(run: dict) -> None:
+    """Show a summary of all workspace file-preparation events for this run."""
+    records = run.get("files_preparing", [])
+    if not records:
+        return
+
+    # Group by task and count preparation rounds.
+    from collections import defaultdict
+    by_task: dict = defaultdict(list)
+    for r in records:
+        by_task[r["task"]].append(r)
+
+    done_recs = [r for r in records if r.get("status") == "done"]
+    total_copied  = sum(r.get("files_copied",  0) for r in done_recs)
+    total_missing = sum(r.get("files_missing", 0) for r in done_recs)
+
+    print_section(
+        f"FILES PREPARING  ({len(done_recs)} workspace setup(s)  "
+        f"copied={total_copied}  missing={total_missing})"
+    )
+
+    for task_id, recs in by_task.items():
+        done = [r for r in recs if r.get("status") == "done"]
+        if not done:
+            continue
+        last = done[-1]
+        ts_str  = fmt_ts(last["ts"])
+        n_preps = len(done)
+        copied  = last.get("files_copied",  0)
+        missing = last.get("files_missing", 0)
+        files   = last.get("files", [])
+
+        miss_str = f"  {yellow(f'({missing} missing)')}" if missing else ""
+        print(
+            f"  {cyan(task_id):30} "
+            f"preps={bold(str(n_preps))}  "
+            f"files={bold(str(copied))}{miss_str}  "
+            f"{dim(ts_str)}"
+        )
+        # Show the file list (up to 6, then summarise).
+        shown = files[:6]
+        for f_name in shown:
+            is_missing = f_name in (last.get("missing") or [])
+            marker = red("✗") if is_missing else dim("·")
+            print(f"    {marker} {dim(f_name)}")
+        if len(files) > 6:
+            print(f"    {dim(f'… and {len(files) - 6} more file(s)')}")
+
+
 # ── Main render ───────────────────────────────────────────────────────────────
 
 def render_run(run: dict, show_timeline: bool = True, show_diff: bool = True) -> None:
     print_header(f"Run Analysis  [{run['run_id']}]")
     render_run_summary(run)
-    render_applied_tasks(run)   # NEW: show what was actually applied/done
+    render_applied_tasks(run)   # show what was actually applied/done
+    render_files_preparing(run) # show workspace file-preparation stages
     render_tasks(run)
     if show_diff:
         render_prompt_changes(run)
