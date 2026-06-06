@@ -871,7 +871,19 @@ def review_clusters(
 
 _REWRITER_SYSTEM_DEFAULT = (
     "You are an architect who has reviewed failed implementation attempts. "
-    "Your job is to propose a genuinely different technical approach. "
+    "First, read the failure history and classify the failure. There are two "
+    "distinct kinds: (a) the CODE is wrong — the acceptance_check ran and "
+    "reported a real defect (assertion error, wrong output, test failure, "
+    "compile error in the edited file); or (b) the acceptance_check COMMAND "
+    "ITSELF could not run — meaning the failure occurred before or instead of "
+    "any test logic executing, because the checker process failed to launch or "
+    "initialize (missing binary, missing dependency, bad path, bad interpreter, "
+    "insufficient permissions, or any other environment issue). "
+    "Case (b) is an environment/verification problem, NOT a code defect: the "
+    "implementation may already be correct. In case (b) do NOT keep re-issuing "
+    "the same un-runnable command and do NOT thrash the code — instead change "
+    "acceptance_check to a verification that CAN run in this environment. "
+    "Only in case (a) should you propose a genuinely different technical approach. "
     "Do not suggest the same solution with minor changes. "
     "If the previous approach used class inheritance, consider composition. "
     "If it used a loop, consider a generator. "
@@ -898,7 +910,7 @@ Return a JSON object with exactly these fields:
 {{
   "title": "<keep original or append '— alternative approach'>",
   "instruction": "<new implementation strategy written for the coder agent>",
-  "acceptance_check": "<MUST be a real runnable shell command that exits 0 when done — keep the original command unchanged unless the new strategy genuinely requires a different invocation. Do NOT replace with a prose description.>"
+  "acceptance_check": "<MUST be a real runnable shell command that exits 0 when done. KEEP the original command if the code simply produced a wrong result. BUT if the failure history shows the command itself could not execute (exit 127 / 'not found' / 'No such file' / 'permission denied'), REPLACE it with a check that can run here: a different runner for the same language (e.g. 'gradle test' or 'sh gradlew test' instead of './gradlew test', or 'mvn -q test'), a lighter compile-only check, or 'true' as a last resort — with 'true' the change is judged by code review alone. Never repeat a command that already failed to execute. Do NOT replace with a prose description.>"
 }}
 """
 
@@ -1130,6 +1142,7 @@ class TaskRewriter:
 _SHELL_COMMAND_PREFIXES: tuple[str, ...] = (
     "python", "python3", "pytest", "bash", "sh", "node", "npm", "npx",
     "make", "cargo", "go ", "ruby", "rspec", "php", "java ", "mvn",
+    "gradle", "gradlew", "mvnw", "dotnet", "true", "false",
     "./", "/",
 )
 
