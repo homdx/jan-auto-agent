@@ -280,7 +280,6 @@ class Orchestrator(OrchestratorActions):
         context_lines = block_extractor.get_context_lines(source, parsed.target_name, file_ext=ext)
 
         iteration = 1
-        validation: Dict[str, Any] = {}
         already_searched = [parsed.file_path]
         search_result: Dict[str, Any] = {"found": {}, "not_found": [], "searched_files": []}
         validation: Dict[str, Any] = {}
