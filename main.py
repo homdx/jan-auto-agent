@@ -265,7 +265,7 @@ class Orchestrator(OrchestratorActions):
             return
 
         # Re-parse with source so parse_prompt can verify the target symbol exists.
-        parsed = parse_prompt(user_input, source=source) if hasattr(parse_prompt, '__code__') and parse_prompt.__code__.co_varnames.__contains__('source') else parsed
+        parsed = parse_prompt(user_input, source=source)
 
         # Non-code files (.txt, .md, etc.) → validated question-answering.
         _is_text_file = ext not in _CODE_EXTENSIONS
@@ -355,7 +355,7 @@ class Orchestrator(OrchestratorActions):
         self.metrics_collector.record(RunRecord(
             timestamp=timestamp,
             intent=parsed.intent,
-            prompt_version="hardcoded",
+            prompt_version=self.prompt_store.get_version_label("validator_agent"),
             iterations_used=iteration,
             validator_status=last_validation.get("status", "skipped"),
             validator_feedback=last_validation.get("feedback", ""),

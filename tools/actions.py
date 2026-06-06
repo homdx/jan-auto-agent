@@ -13,8 +13,6 @@ import sys
 import json
 import time
 import logging
-import urllib.request
-import urllib.error
 
 from tools.llm_stream import request_completion, strip_think, ollama_chat_url
 from tools.agent_trace import tracer
@@ -30,7 +28,7 @@ def _ts() -> str:
 
 
 class OrchestratorActions:
-    """Mixin that adds execute_direct_chat, run_search, run_text_qa, and run_edit
+    """Mixin that adds run_search, run_text_qa, and run_edit
     to the Orchestrator without cluttering its core orchestration logic."""
 
     def _cfg_temp(self, section: str, default: float) -> float:
@@ -51,58 +49,6 @@ class OrchestratorActions:
         if getattr(self, "api_format", "openai") == "ollama":
             return ollama_chat_url(base)
         return f"{base}/chat/completions"
-
-    # ------------------------------------------------------------------ #
-    # Direct chat                                                          #
-    # ------------------------------------------------------------------ #
-
-    def execute_direct_chat(self, user_input: str) -> None:
-        """Routes conversational queries to local model with streaming output."""
-        url = self._chat_url()
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}"
-        }
-        payload = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": "You are a helpful assistant integrated into an offline DevOps pipeline environment."},
-                {"role": "user", "content": user_input}
-            ],
-            "temperature": self._cfg_temp("direct_chat", 0.3),
-            "stream": True
-        }
-
-        print(f"\n[{_ts()}] RESPONSE (direct-chat):")
-        try:
-            req = urllib.request.Request(
-                url,
-                data=json.dumps(payload).encode("utf-8"),
-                headers=headers,
-                method="POST"
-            )
-            with urllib.request.urlopen(req, timeout=self.timeout_seconds, context=self.ssl_context) as response:
-                for raw_line in response:
-                    line = raw_line.decode("utf-8").strip()
-                    if not line.startswith("data:"):
-                        continue
-                    data = line[len("data:"):].strip()
-                    if data == "[DONE]":
-                        break
-                    try:
-                        chunk = json.loads(data)
-                        token = chunk["choices"][0]["delta"].get("content", "")
-                        if token:
-                            sys.stdout.write(token)
-                            sys.stdout.flush()
-                    except (json.JSONDecodeError, KeyError):
-                        continue
-            print("\n")
-        except urllib.error.HTTPError as e:
-            body = e.read().decode("utf-8", errors="replace")
-            logger.error(f"Jan API HTTP {e.code}: {body}")
-        except Exception as e:
-            logger.error(f"Failed to communicate with local Jan engine endpoint: {e}")
 
     # ------------------------------------------------------------------ #
     # Full-file search (/search)                                          #
