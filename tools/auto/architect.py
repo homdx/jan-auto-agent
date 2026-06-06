@@ -31,6 +31,7 @@ api_format, verify_ssl — same pattern as every other agent in this codebase.
 from __future__ import annotations
 
 import configparser
+import hashlib
 import json
 import logging
 from dataclasses import dataclass, field
@@ -386,7 +387,11 @@ class ClusterReviewer:
                     patterns=cluster.patterns,
                     files=batch_files,
                 )
-                batch_key = f"{sub.name}||{goal}"
+                # Content-aware key: a fingerprint of the batch files is appended so
+                # the checkpoint is invalidated when the reviewed content changes
+                # (file edits, or a different file set after a max_depth / cluster
+                # change). Without this a stale result would be replayed forever.
+                batch_key = f"{sub.name}||{goal}||{_batch_fingerprint(base_dir, sub.files)}"
 
                 # ── Checkpoint hit: skip LLM call, reuse saved candidates ────
                 if checkpoint_path is not None and batch_key in checkpoint:
@@ -406,9 +411,10 @@ class ClusterReviewer:
                 cluster_candidates.extend(batch_results)
 
                 # ── Checkpoint save: persist immediately after each batch ─────
-                # Only reached when the LLM call succeeded (batch_results is a list,
-                # possibly empty if the LLM returned no valid candidates).
-                if checkpoint_path is not None:
+                # Only persist NON-EMPTY results. An empty list means the LLM
+                # found nothing — caching that would prevent a retry after the
+                # inputs are fixed (e.g. raising max_depth to expose source).
+                if checkpoint_path is not None and batch_results:
                     checkpoint[batch_key] = _serialise_candidates(batch_results)
                     try:
                         checkpoint_path.write_text(
@@ -737,6 +743,22 @@ class ClusterReviewer:
 # ─────────────────────────────────────────────────────────────────────────────
 # Convenience factory
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _batch_fingerprint(base_dir: "Path", files: list[str]) -> str:
+    """Short hash of a batch's files (relative path + size + mtime) used to make
+    the architect checkpoint content-aware. Any change to the reviewed file set
+    or contents yields a new key, so a stale cached result is never replayed.
+    Missing/unreadable files hash as a sentinel rather than raising."""
+    h = hashlib.sha1()
+    for rel in sorted(files):
+        h.update(rel.encode("utf-8", "replace"))
+        try:
+            st = (Path(base_dir) / rel).stat()
+            h.update(f"|{st.st_size}|{st.st_mtime_ns}|".encode("utf-8"))
+        except OSError:
+            h.update(b"|?|")
+    return h.hexdigest()[:12]
+
 
 def _serialise_candidates(candidates: list[CandidateTask]) -> list[dict]:
     """Convert CandidateTask objects to plain dicts for JSON checkpoint storage."""
