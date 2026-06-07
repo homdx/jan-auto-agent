@@ -495,7 +495,7 @@ class ClusterReviewer:
             }
         else:
             url = f"{self._base_url}/chat/completions"
-            payload: dict[str, Any] = {
+            payload = {
                 "model":       self._model,
                 "temperature": self._temperature,
                 "max_tokens":  self._max_tokens,
@@ -1016,7 +1016,7 @@ class TaskRewriter:
             }
         else:
             url = f"{self._base_url}/chat/completions"
-            payload: dict[str, Any] = {
+            payload = {
                 "model":       self._model,
                 "temperature": self._temperature,
                 "max_tokens":  self._max_tokens,

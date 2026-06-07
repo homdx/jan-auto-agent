@@ -344,7 +344,7 @@ class Coder:
             }
         else:
             url = f"{self._base_url}/chat/completions"
-            payload: dict[str, Any] = {
+            payload = {
                 "model":       self._model,
                 "temperature": self._temperature,
                 "max_tokens":  self._max_tokens,
@@ -810,11 +810,6 @@ class Coder:
         ("open root write",     'open("/'),
     )
 
-    # Union of both sets — kept for backward compatibility; code mode uses this.
-    _BLOCKED_CONTENT_PATTERNS: tuple[tuple[str, str], ...] = (
-        _BLOCKED_ALWAYS + _BLOCKED_CODE_ONLY
-    )
-
     # System directory prefixes that must never be written to by generated
     # code.  /tmp, /var/tmp, /home, and /Users are intentionally excluded:
     # they are legitimate destinations for temp files, exports, and local data.
@@ -1245,7 +1240,7 @@ def select_relevant_chunks(
     included: set[str] = set()
 
     # 1. Import chunk — always first.
-    if import_chunk:
+    if import_chunk and import_chunk["content"]:
         result_parts.append(import_chunk["content"])
         remaining -= len(import_chunk["content"])
         included.add(import_chunk["name"])

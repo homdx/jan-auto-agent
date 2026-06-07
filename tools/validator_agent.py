@@ -71,7 +71,7 @@ class ValidatorAgent:
         stream: bool = False,
         api_format: str = "openai",
         num_ctx: int = 0,
-        ssl_context: ssl.SSLContext = None,
+        ssl_context: ssl.SSLContext | None = None,
         temperature: float = 0.1,
         max_hints: int = 3,
     ):

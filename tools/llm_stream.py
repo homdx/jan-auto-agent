@@ -104,7 +104,7 @@ def make_unverified_context() -> ssl.SSLContext:
 
 
 def request_completion(url, headers, payload, timeout, stream=False, on_token=None,
-                       api_format: str = "openai", ssl_context: ssl.SSLContext = None):
+                       api_format: str = "openai", ssl_context: ssl.SSLContext | None = None):
     """
     POST a chat-completions request and return the assistant message text.
 

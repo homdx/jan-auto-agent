@@ -62,7 +62,7 @@ class ImprovementAgent:
         config=None,
         api_format: str = "openai",
         num_ctx: int = 0,
-        ssl_context: ssl.SSLContext = None,
+        ssl_context: ssl.SSLContext | None = None,
     ):
         self.model = model
         self.base_url = base_url

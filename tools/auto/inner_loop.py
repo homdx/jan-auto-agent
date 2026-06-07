@@ -302,11 +302,15 @@ class LLMGate2Validator:
                 "Authorization": f"Bearer {self.api_key}",
             }
 
+            _exec_stderr = getattr(exec_result, 'stderr', '') or ''
+            _exec_stdout = getattr(exec_result, 'stdout', '') or ''
+            _stderr_section = f"stderr:\n{_exec_stderr[:2000]}\n\n" if _exec_stderr.strip() else ""
             user_msg = (
                 f"Task: {task.get('instruction', '')}\n\n"
                 f"Acceptance check exit code: {getattr(exec_result, 'exit_code', 0)}\n"
-                f"stdout:\n{getattr(exec_result, 'stdout', '')[:2000]}\n\n"
-                f"Generated files (CHANGED FILE CONTENT after the coder's edit):\n"
+                f"stdout:\n{_exec_stdout[:2000]}\n\n"
+                + _stderr_section
+                + f"Generated files (CHANGED FILE CONTENT after the coder's edit):\n"
                 + self._read_changed_content(coder_result, task=task, base_dir=base_dir)
             )
 
@@ -649,7 +653,7 @@ def make_inner_loop(
             api_key=api_key,
             api_format=api_format,
             temperature=val_temp,
-            timeout=120,
+            timeout=config.getint("validator_agent", "llm_timeout_sec", fallback=120),
             max_hints=max_hints,
             ssl_context=ssl_context,
             base_dir=str(base_dir),
