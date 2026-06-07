@@ -316,6 +316,7 @@ class AutoController:
         stop_reason, session_tasks_done = run_pipeline(self)
 
         # ── Finalise ──────────────────────────────────────────────────────
+        self._log_auto_prompts()
         if stop_reason:
             self._handle_cap(stop_reason, session_tasks_done)
         else:
@@ -599,6 +600,26 @@ class AutoController:
             self.git = None
             logger.warning("git setup failed (continuing without git): %s", exc)
             self.state.log(f"git setup failed: {exc}")
+
+
+
+
+    def _log_auto_prompts(self) -> None:
+        """If auto_prompts.json exists, print its contents to console and log it."""
+        prompts_path = self.agent_dir / "auto_prompts.json"
+        if not prompts_path.exists():
+            return
+        import json as _json
+        try:
+            data = _json.loads(prompts_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            print(f"[{_ts()}] ⚠️  Could not read auto_prompts.json: {exc}")
+            return
+        ts = _ts()
+        text = _json.dumps(data, indent=2, ensure_ascii=False)
+        print(f"[{ts}] ✨ Validator prompts were tuned this run — auto_prompts.json:")
+        print(text)
+        self.state.log(f"auto_prompts.json contents:\n{text}")
 
     def _print_banner(self) -> None:
         ts = _ts()
