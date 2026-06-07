@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import json
 import logging
 import configparser
 import ssl
@@ -510,6 +511,14 @@ def _parse_args():
                         help="One-shot FAQ lookup against the knowledge folder, then exit. "
                              "Exit code 0 = answer found, 1 = NOT FOUND. "
                              "e.g. --faq \"how do I reset my password?\"")
+    # JSON output flag — used together with --faq
+    parser.add_argument("--json", action="store_true", default=False,
+                        help="With --faq: print ONLY a JSON object to stdout and suppress "
+                             "all other output. Suitable for machine consumption / chat-bot "
+                             "automation. Output format: "
+                             "{\"found\": true, \"answer\": \"...\"}  or "
+                             "{\"found\": false, \"answer\": null}. "
+                             "e.g. --faq \"how do I reset my password?\" --json")
     return parser.parse_args()
 
 
@@ -538,15 +547,43 @@ def main():
         if not question:
             print("Error: --faq requires a non-empty question string.", file=sys.stderr)
             sys.exit(1)
+
+        json_mode: bool = getattr(args, "json", False)
+
+        if json_mode:
+            # Redirect ALL logging to stderr so stdout stays clean for JSON.
+            for handler in logging.root.handlers[:]:
+                logging.root.removeHandler(handler)
+            logging.basicConfig(
+                level=logging.WARNING,
+                format="%(asctime)s [%(levelname)s] %(message)s",
+                stream=sys.stderr,
+            )
+
         orchestrator = Orchestrator(config_path=args.config)
-        print(f"[{_ts()}] 🗂  FAQ lookup: {question}")
-        result = orchestrator.faq_agent.answer(question)
-        if result == orchestrator.faq_agent.NOT_FOUND:
-            print("\n❌ NOT FOUND — no matching entry in the knowledge base.")
-            sys.exit(1)
+
+        if json_mode:
+            # answer() with stream=False — no tokens written to stdout mid-call.
+            result = orchestrator.faq_agent.answer(question, stream=False)
+            if result == orchestrator.faq_agent.NOT_FOUND:
+                payload = {"found": False, "answer": None}
+                print(json.dumps(payload, ensure_ascii=False))
+                sys.exit(1)
+            else:
+                payload = {"found": True, "answer": result}
+                print(json.dumps(payload, ensure_ascii=False))
+                sys.exit(0)
         else:
-            print(f"\n✅ Answer:\n{result}")
-            sys.exit(0)
+            print(f"[{_ts()}] 🗂  FAQ lookup: {question}")
+            # stream=False: this branch prints the formatted result itself,
+            # so streaming here would emit the answer twice (and leak rejected text).
+            result = orchestrator.faq_agent.answer(question, stream=False)
+            if result == orchestrator.faq_agent.NOT_FOUND:
+                print("\n❌ NOT FOUND — no matching entry in the knowledge base.")
+                sys.exit(1)
+            else:
+                print(f"\n✅ Answer:\n{result}")
+                sys.exit(0)
 
     orchestrator = Orchestrator(config_path=args.config)
 
@@ -640,7 +677,7 @@ def main():
                     continue
 
                 print(f"\n[{_ts()}] 🗂  FAQ lookup …")
-                result = orchestrator.faq_agent.answer(body)
+                result = orchestrator.faq_agent.answer(body, stream=False)
                 if result == orchestrator.faq_agent.NOT_FOUND:
                     print(f"\n[{_ts()}] ❌ NOT FOUND — no matching entry in the knowledge base.")
                 else:

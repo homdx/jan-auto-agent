@@ -271,7 +271,7 @@ class FaqAgent:
             text = re.sub(r"```(?:json)?\n?", "", text).strip().rstrip("`").strip()
             keywords = json.loads(text)
             if isinstance(keywords, list):
-                return [str(k).lower() for k in keywords if k]
+                return [str(k).strip().lower() for k in keywords if str(k).strip()]
         except Exception as exc:
             logger.warning(
                 "FaqAgent: keyword extraction failed (%s) — using word-split fallback",
@@ -315,7 +315,15 @@ class FaqAgent:
 
         def _score(name: str, content: str) -> int:
             combined = (name + " " + content).lower()
-            return sum(combined.count(kw) for kw in lower_kw)
+            total = 0
+            for kw in lower_kw:
+                kw = kw.strip()
+                if not kw:
+                    continue
+                # Word-boundary match so "api" doesn't score inside "rapid"
+                # and a stray blank keyword can't inflate every document.
+                total += len(re.findall(r"\b" + re.escape(kw) + r"\b", combined))
+            return total
 
         scored = [
             (name, content, _score(name, content))
@@ -366,14 +374,29 @@ class FaqAgent:
             )
             verdict = strip_think(verdict).strip().upper()
             logger.debug("FaqAgent validate verdict: %r", verdict)
-            # "VALID" passes; "INVALID: …" fails; anything else → treat as valid
-            return verdict.startswith("VALID") and not verdict.startswith("INVALID")
+            # Strict: only an explicit VALID verdict passes. "INVALID: …" and any
+            # unexpected/garbled verdict are treated as not-valid (conservative).
+            return verdict.startswith("VALID")
         except Exception as exc:
             logger.warning(
                 "FaqAgent: validation call failed (%s) — treating answer as valid",
                 exc,
             )
             return True  # fail open
+
+    # ── Not-found detection ──────────────────────────────────────────────────
+
+    def _is_not_found(self, answer: str) -> bool:
+        """True only when the reply IS the not-found marker, not merely mentions it.
+
+        The model is instructed to reply with exactly the marker, so we match it
+        as the whole stripped reply or its leading token. This avoids discarding
+        a real answer that happens to contain the phrase (e.g. "if the page is
+        not found, click Retry").
+        """
+        stripped = answer.strip().upper()
+        marker = self.not_found_marker.strip().upper()
+        return stripped == marker or stripped.startswith(marker)
 
     # ── Knowledge loading ────────────────────────────────────────────────────
 
@@ -558,7 +581,7 @@ class FaqAgent:
                 )
                 continue
 
-            if self.not_found_marker.lower() in candidate_ans.lower():
+            if self._is_not_found(candidate_ans):
                 logger.debug(
                     "FaqAgent: candidate %r → NOT FOUND, trying next", name
                 )
@@ -649,7 +672,7 @@ class FaqAgent:
             answer = strip_think(reply).strip()
 
             # step 4: not-found check
-            if self.not_found_marker.lower() in answer.lower():
+            if self._is_not_found(answer):
                 return self.not_found_marker
 
             # step 5: answer-validate

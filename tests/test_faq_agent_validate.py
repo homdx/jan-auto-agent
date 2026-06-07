@@ -866,3 +866,43 @@ class TestSmartSearchFlow:
         ]):
             result = agent.answer("How install node exporter?", stream=False)
         assert result == self._ANS
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Regression — review fixes (double-print, scoring, not-found, keywords)
+# ════════════════════════════════════════════════════════════════════════════
+
+class TestReviewRegressions:
+    def test_stream_false_emits_nothing_to_stdout(self, tmp_path, capsys):
+        """stream=False must NOT write the answer to stdout — the caller prints
+        it. (The bug: human callers used the default stream=True, so the answer
+        was streamed AND re-printed → doubled.)"""
+        agent = _make_agent(tmp_path, extra_kb="Q: reset?\nA: Go to settings.\n")
+        with patch(_RC_PATH, return_value="Go to settings."):
+            result = agent.answer("how do I reset?", stream=False)
+        out = capsys.readouterr().out
+        assert result == "Go to settings."
+        assert out == "", f"stream=False must not print; got {out!r}"
+
+    def test_word_boundary_scoring(self, tmp_path):
+        """'cat' must not score inside 'category'."""
+        agent = _make_agent(tmp_path)
+        docs = [("a.txt", "the cat sat"), ("b.txt", "category management")]
+        ranked = {n: s for n, _, s in agent._rank_candidates(docs, ["cat"])}
+        assert ranked["a.txt"] == 1
+        assert ranked["b.txt"] == 0, "substring match leaked into 'category'"
+
+    def test_blank_keyword_does_not_inflate(self, tmp_path):
+        """A blank/whitespace keyword must contribute 0, not count every space."""
+        agent = _make_agent(tmp_path)
+        docs = [("a.txt", "alpha beta gamma delta")]
+        score = agent._rank_candidates(docs, ["  ", "alpha"])[0][2]
+        assert score == 1, f"blank keyword inflated score to {score}"
+
+    def test_is_not_found_strict(self, tmp_path):
+        agent = _make_agent(tmp_path)
+        assert agent._is_not_found("NOT FOUND") is True
+        assert agent._is_not_found("not found.") is True
+        assert agent._is_not_found("  NOT FOUND  ") is True
+        assert agent._is_not_found("If the page is not found, click Retry") is False
+        assert agent._is_not_found("Go to settings to reset.") is False

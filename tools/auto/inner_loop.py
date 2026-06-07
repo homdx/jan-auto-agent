@@ -613,8 +613,7 @@ def make_inner_loop(
     api_format = config.get(api_section, "api_format", fallback="openai")
     num_ctx    = config.getint(api_section, "num_ctx",  fallback=0)
 
-    verify_ssl_raw = config.get("api", "verify_ssl", fallback="true")
-    verify_ssl     = verify_ssl_raw.strip().lower() not in ("false", "0", "no")
+    verify_ssl = config.getboolean("api", "verify_ssl", fallback=True)
 
     import ssl
     ssl_context: ssl.SSLContext | None = None
