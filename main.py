@@ -28,6 +28,8 @@ from tools.prompt_store import PromptStore
 from tools.prompt_optimizer import PromptOptimizer
 from tools.prompt_evaluator import PromptEvaluator
 from tools.actions import OrchestratorActions, _ts
+from tools.faq_agent import FaqAgent
+from tools.llm_stream import request_completion, strip_think
 
 # Extensions that support AST/block extraction and code validation.
 # Everything else is treated as plain text and routed to run_text_qa.
@@ -142,6 +144,16 @@ class Orchestrator(OrchestratorActions):
             ssl_context=self.ssl_context,
             config=self.config,
         )
+        # ── FAQ / knowledge-base resolver ──────────────────────────────────────
+        self.faq_agent = FaqAgent(
+            model=self.model,
+            base_url=self.base_url,
+            api_key=self.api_key,
+            api_format=self.api_format,
+            timeout=self.timeout_seconds,
+            ssl_context=self.ssl_context,
+            config=self.config,
+        )
 
     def reload_agents(self) -> None:
         """Re-read agents.ini and rebuild all agents mid-session (no restart)."""
@@ -196,6 +208,48 @@ class Orchestrator(OrchestratorActions):
         self.stream_agents = self.config.getboolean("output", "stream_agents", fallback=False)
         self.search_full_file_max_chars = self.config.getint("search", "full_file_max_chars", fallback=12000)
         self.file_editor_max_tokens = self.config.getint("file_editor", "max_tokens", fallback=0)
+
+    def execute_direct_chat(self, user_input: str) -> None:
+        """
+        Send a free-form message directly to the model with no file context —
+        used when run_pipeline detects no file path in the user's request.
+
+        Uses the [direct_chat] temperature from agents.ini (default 0.3).
+        Streams the reply token-by-token to stdout, same as other agents.
+        """
+        temperature = self.config.getfloat("direct_chat", "temperature", fallback=0.3)
+
+        base = self.base_url.rstrip("/")
+        if self.api_format == "ollama":
+            from tools.llm_stream import ollama_chat_url
+            url = ollama_chat_url(base)
+        else:
+            url = f"{base}/chat/completions"
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+        }
+        payload: Dict[str, Any] = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": user_input}],
+            "temperature": temperature,
+        }
+
+        print(f"\n[{_ts()}] 💬 direct chat →")
+        try:
+            reply = request_completion(
+                url, headers, payload, self.timeout_seconds,
+                stream=True,
+                api_format=self.api_format,
+                on_token=lambda t: (sys.stdout.write(t), sys.stdout.flush()),
+                ssl_context=self.ssl_context,
+            )
+            print()
+            return strip_think(reply).strip()
+        except Exception as exc:
+            logger.error("execute_direct_chat failed: %s", exc)
+            print(f"[{_ts()}] ❌ Chat request failed: {exc}")
 
     def run_pipeline(self, user_input: str, base_dir: str) -> None:
         """Executes pipelines with adaptive search, validation loops, and visual feedback."""
@@ -377,6 +431,10 @@ Available commands
   /help, /?            Show this help
   /auto <goal>         Run autonomous improvement mode (AUTO-A1).
                        e.g. /auto improve current code
+  /faq <question>      Search the knowledge folder and answer the question.
+                       Replies NOT FOUND if no matching entry exists.
+                       e.g. /faq how do I reset my password?
+  /faq --list          List all files currently loaded in the knowledge base.
   /search <q> in <f>   Answer a question using the WHOLE file (no block extraction).
                        Also accepts:  /search <file> :: <question>
   /edit <instr> in <f> Apply an instruction to a file and WRITE IT BACK (validated;
@@ -404,6 +462,13 @@ Text / documentation files (.txt, .md, …)
     answer how do I reset in faq.md
     hello.txt
   Use /edit to actually modify the file in place.
+
+Knowledge base (FAQ resolver)
+  Place .txt or .md files in the folder set by knowledge_dir in agents.ini.
+  Recommended file format:
+    Q: How do I reset my password?
+    A: Go to Settings → Account → Reset password.
+  Then ask:  /faq how do I reset my password?
 """
 
 
@@ -420,6 +485,8 @@ def _parse_args():
               python main.py --once "show def load in p.py"     # one-shot, cwd
               python main.py --once "/search topic in qa.md" --base /srv/app
               python main.py --once "/edit fix grammar in readme.md" --base /srv/app
+              python main.py --faq "how do I reset my password?"
+              python main.py --faq "question" --base /path/to/project
         """),
     )
     parser.add_argument("base_dir_positional", nargs="?", default=None, metavar="base_dir",
@@ -438,6 +505,11 @@ def _parse_args():
     parser.add_argument("--dry-run", action="store_true", default=False,
                         help="With --auto: build the plan and emit IMPROVEMENTS.md, "
                              "but do not execute any tasks or make any commits.")
+    # FAQ one-shot flag
+    parser.add_argument("--faq", metavar="QUESTION", default=None,
+                        help="One-shot FAQ lookup against the knowledge folder, then exit. "
+                             "Exit code 0 = answer found, 1 = NOT FOUND. "
+                             "e.g. --faq \"how do I reset my password?\"")
     return parser.parse_args()
 
 
@@ -460,7 +532,24 @@ def main():
         )
         sys.exit(exit_code)
 
+    # ── FAQ ONE-SHOT MODE ──────────────────────────────────────────────
+    if args.faq is not None:
+        question = args.faq.strip()
+        if not question:
+            print("Error: --faq requires a non-empty question string.", file=sys.stderr)
+            sys.exit(1)
+        orchestrator = Orchestrator(config_path=args.config)
+        print(f"[{_ts()}] 🗂  FAQ lookup: {question}")
+        result = orchestrator.faq_agent.answer(question)
+        if result == orchestrator.faq_agent.NOT_FOUND:
+            print("\n❌ NOT FOUND — no matching entry in the knowledge base.")
+            sys.exit(1)
+        else:
+            print(f"\n✅ Answer:\n{result}")
+            sys.exit(0)
+
     orchestrator = Orchestrator(config_path=args.config)
+
     # ── ONE-SHOT MODE ──────────────────────────────────────────────────
     if args.once is not None:
         query = args.once.strip()
@@ -526,6 +615,37 @@ def main():
                         # REPL); surface the failure as a visible warning instead.
                         print(f"⚠️  autonomous run finished with exit code {_rc} "
                               f"(see logs / .agent trace for details).")
+                continue
+
+            # ── FAQ resolver ───────────────────────────────────────────────────
+            if user_input.startswith("/faq"):
+                body = user_input[len("/faq"):].strip()
+
+                # /faq --list  →  show which knowledge files are loaded
+                if body in ("--list", "-l", "list"):
+                    files = orchestrator.faq_agent.list_knowledge_files()
+                    kdir  = orchestrator.faq_agent.knowledge_dir
+                    if files:
+                        print(f"\n[{_ts()}] 🗂  Knowledge base ({kdir}) — {len(files)} file(s):")
+                        for fname in files:
+                            print(f"    • {fname}")
+                    else:
+                        print(f"\n[{_ts()}] ⚠️  Knowledge base is empty or not found: {kdir}")
+                    print()
+                    continue
+
+                if not body:
+                    print("Usage: /faq <question>   e.g.  /faq how do I reset my password?")
+                    print("       /faq --list        list all files in the knowledge base")
+                    continue
+
+                print(f"\n[{_ts()}] 🗂  FAQ lookup …")
+                result = orchestrator.faq_agent.answer(body)
+                if result == orchestrator.faq_agent.NOT_FOUND:
+                    print(f"\n[{_ts()}] ❌ NOT FOUND — no matching entry in the knowledge base.")
+                else:
+                    print(f"\n[{_ts()}] ✅ Answer:\n{result}")
+                print()
                 continue
 
             # Guard: unrecognized slash-commands should NOT be sent to the model.
