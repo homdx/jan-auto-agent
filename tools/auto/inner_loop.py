@@ -427,6 +427,7 @@ class InnerLoop:
         _any_missing: bool = False   # Task 4: True if any attempt had unsatisfied context
         base_dir_path = Path(base_dir)
         target_files  = task.get("target_files", []) or []
+        self._broker.reset_cache()  # clear per-task cache; Pass-2 hits re-accumulate fresh
 
         # LOOP-4: prepend prior implementation history
         if prior_implementations:

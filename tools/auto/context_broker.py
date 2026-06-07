@@ -70,6 +70,14 @@ class ContextBroker:
     ) -> None:
         self._max_block_chars = max_block_chars
         self._max_symbols = max_symbols
+        # Only PROJECT-SCAN (Pass-2) hits are cached. They live in files the current
+        # task does not edit (dependencies), so they stay valid across attempts, and
+        # the rglob scan that finds them is the expensive part. Target-file (Pass-1)
+        # hits are never cached — the coder rewrites those files every attempt.
+        self._resolved_cache: dict[str, str] = {}
+
+    def reset_cache(self) -> None:
+        self._resolved_cache.clear()
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -90,9 +98,16 @@ class ContextBroker:
         """
         from tools.block_extractor import extract_block  # local import — optional dep
 
-        capped = list(symbols)[: self._max_symbols]
-        resolved: dict[str, str] = {}
-        remaining = list(capped)
+        # Deduplicate while preserving order.
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for sym in symbols:
+            if sym not in seen:
+                seen.add(sym); ordered.append(sym)
+
+        # Cache hits are free — they don't count against _max_symbols.
+        resolved = {s: self._resolved_cache[s] for s in ordered if s in self._resolved_cache}
+        remaining = [s for s in ordered if s not in self._resolved_cache][: self._max_symbols]
 
         # ── Pass 1: search target files (fast path) ───────────────────────────
         for rel in target_files:
@@ -124,7 +139,9 @@ class ContextBroker:
                     block = extract_block(source, sym, ext)
                     if block.strip():
                         rel = str(abs_path.relative_to(base_dir))
-                        resolved[sym] = self._cap(block)
+                        capped_block = self._cap(block)
+                        resolved[sym] = capped_block
+                        self._resolved_cache[sym] = capped_block   # fallback hit → safe to cache
                         logger.debug(
                             "ContextBroker: found %r in %s (fallback search)",
                             sym, rel,
