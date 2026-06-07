@@ -1,28 +1,33 @@
 """
-FAQ / knowledge-base resolver agent.
+FAQ / knowledge-base resolver agent — two-stage smart-search edition.
 
-Loads every file from a configured knowledge folder, sends them all to the
-model together with the user's question, and returns either the answer text
-or NOT_FOUND_MARKER when nothing in the knowledge base matches.
+╔══════════════════════════════════════════════════════════════════════════╗
+║  STAGE 1 — Architect / Smart-Search                                      ║
+║                                                                          ║
+║  • LLM extracts search keywords from the question  (one cheap call).     ║
+║  • Every knowledge file is scored by counting keyword hits across both   ║
+║    its file-system path and text content.                                ║
+║  • Ranked candidates are tried ONE AT A TIME — the first file that       ║
+║    produces a non-empty, grounded answer is returned immediately.        ║
+║                                                                          ║
+║  STAGE 2 — Full-KB Fallback                                              ║
+║                                                                          ║
+║  • If every per-candidate call returns NOT FOUND (or fails validation),  ║
+║    ALL knowledge files are concatenated into one context block and the   ║
+║    model is given a final single-call attempt (classic mode).            ║
+╚══════════════════════════════════════════════════════════════════════════╝
 
-Each knowledge file should contain a short question + answer pair, e.g.:
-
-    Q: How do I reset my password?
-    A: Go to Settings → Account → Reset password and follow the steps.
-
-Plain prose files (no Q/A markers) are supported too — the model reads the
-whole content and extracts the relevant answer.
-
-Configuration (agents.ini):
+Toggle via agents.ini:
   [faq_agent]
-  knowledge_dir    = ./knowledge   # folder that contains the KB files
-  extensions       = .txt,.md      # which extensions to load
-  temperature      = 0.0
-  max_tokens       = 512
-  not_found_marker = NOT FOUND
-  system           = <custom system prompt>
+  smart_search = true     ; enable two-stage (default: false — legacy single call)
+
+Each knowledge file should contain a short Q+A pair, e.g.:
+  Q: How do I reset my password?
+  A: Go to Settings → Account → Reset password and follow the steps.
+Plain prose files are supported too.
 """
 
+import re
 import sys
 import json
 import logging
@@ -34,10 +39,27 @@ from tools.llm_stream import request_completion, strip_think, ollama_chat_url
 
 logger = logging.getLogger(__name__)
 
-# Canonical "nothing found" sentinel — returned as a plain string so callers
-# can do a simple equality check:  if result == faq_agent.NOT_FOUND: ...
+# Module-level sentinel — callers can use `faq_agent.NOT_FOUND_MARKER` for
+# equality checks independent of any ini customisation.
 NOT_FOUND_MARKER = "NOT FOUND"
 
+# ── English stop-words removed during keyword fallback word-split ────────────
+_STOP_WORDS = frozenset({
+    "a", "an", "the", "is", "are", "was", "were", "be", "been", "being",
+    "have", "has", "had", "will", "would", "can", "could", "should",
+    "may", "might", "shall", "must", "do", "does", "did",
+    "to", "of", "in", "on", "at", "for", "from", "with",
+    "and", "or", "but", "not",
+    "how", "what", "where", "when", "why", "who", "which",
+    "this", "that", "these", "those",
+    "i", "me", "my", "we", "our", "you", "your",
+    "he", "she", "it", "they", "their", "its",
+    "about", "into", "through", "during", "before", "after",
+    "above", "below", "if", "then", "so", "because", "as",
+    "until", "while",
+})
+
+# ── Default system prompts ───────────────────────────────────────────────────
 _DEFAULT_SYSTEM = (
     "You are a help-desk FAQ resolver. "
     "Answer the user's question using ONLY the content of the knowledge files "
@@ -56,12 +78,20 @@ _DEFAULT_VALIDATE_SYSTEM = (
     "No other output — VALID or INVALID: <reason> only."
 )
 
+_DEFAULT_KEYWORD_SYSTEM = (
+    "You are a search keyword extractor. "
+    "Given a user question, extract 3–8 important search keywords. "
+    'Return ONLY a JSON array of lowercase strings, for example: ["reset","password","account"]. '
+    "No explanation, no markdown fences, no other text."
+)
+
 
 class FaqAgent:
     """
     Scans a knowledge folder and answers a single question against its content.
 
-    Usage:
+    Usage::
+
         agent = FaqAgent(model=..., base_url=..., api_key=...,
                          api_format=..., timeout=..., config=cfg)
         answer = agent.answer("How do I reset my password?")
@@ -69,9 +99,18 @@ class FaqAgent:
             print("No answer found in knowledge base.")
         else:
             print(answer)
+
+    Two-stage smart-search (smart_search = true in agents.ini):
+
+        1. LLM extracts keywords from the question (architect pass).
+        2. Knowledge files are scored and ranked by keyword relevance.
+        3. Each ranked candidate is tried with a focused single-file context.
+           The first candidate whose answer passes the optional validation
+           check is returned immediately.
+        4. If all candidates fail → full-KB fallback (classic single call).
     """
 
-    NOT_FOUND = NOT_FOUND_MARKER  # expose on instance for easy comparison
+    NOT_FOUND = NOT_FOUND_MARKER  # instance attribute for easy comparison
 
     def __init__(
         self,
@@ -91,8 +130,6 @@ class FaqAgent:
         self.timeout     = timeout
         self.ssl_context = ssl_context
 
-        # Pull settings from agents.ini [faq_agent] with safe fallbacks so the
-        # agent works even when the section is partially filled in.
         cfg = config
         if cfg is not None:
             self.knowledge_dir = Path(
@@ -101,12 +138,13 @@ class FaqAgent:
             raw_ext = cfg.get("faq_agent", "extensions", fallback=".txt,.md")
             self.extensions = [e.strip() for e in raw_ext.split(",") if e.strip()]
             self.temperature = cfg.getfloat("faq_agent", "temperature", fallback=0.0)
-            self.max_tokens  = cfg.getint("faq_agent", "max_tokens",    fallback=512)
+            self.max_tokens  = cfg.getint("faq_agent", "max_tokens",    fallback=1024)
             self.not_found_marker = cfg.get(
                 "faq_agent", "not_found_marker", fallback=NOT_FOUND_MARKER
             )
             self.system_prompt = cfg.get("faq_agent", "system", fallback=_DEFAULT_SYSTEM)
-            # ── answer-validation pass ──────────────────────────────────────────
+
+            # ── answer-validation pass ──────────────────────────────────────
             self.validate_answer_enabled = cfg.getboolean(
                 "faq_agent", "validate_answer", fallback=False
             )
@@ -119,26 +157,45 @@ class FaqAgent:
             self.validate_system = cfg.get(
                 "faq_agent", "validate_system", fallback=_DEFAULT_VALIDATE_SYSTEM
             )
+
+            # ── two-stage smart-search ──────────────────────────────────────
+            self.smart_search = cfg.getboolean(
+                "faq_agent", "smart_search", fallback=False
+            )
+            self.keyword_system = cfg.get(
+                "faq_agent", "keyword_system", fallback=_DEFAULT_KEYWORD_SYSTEM
+            )
+            self.keyword_max_tokens = cfg.getint(
+                "faq_agent", "keyword_max_tokens", fallback=64
+            )
+            # Maximum number of top-ranked candidates tried in Stage 1.
+            # 0 means unlimited (try all candidates with score > 0).
+            self.max_candidates = cfg.getint(
+                "faq_agent", "max_candidates", fallback=5
+            )
         else:
             self.knowledge_dir    = Path("./knowledge")
             self.extensions       = [".txt", ".md"]
             self.temperature      = 0.0
-            self.max_tokens       = 512
+            self.max_tokens       = 1024
             self.not_found_marker = NOT_FOUND_MARKER
             self.system_prompt    = _DEFAULT_SYSTEM
-            # ── answer-validation pass ──────────────────────────────────────────
+
             self.validate_answer_enabled = False
             self.validate_temperature    = 0.0
             self.validate_max_tokens     = 64
             self.validate_system         = _DEFAULT_VALIDATE_SYSTEM
 
-        # Keep NOT_FOUND in sync with the ini-configured marker so callers can
-        # always use  `agent.NOT_FOUND`  regardless of ini customisation.
+            self.smart_search       = False
+            self.keyword_system     = _DEFAULT_KEYWORD_SYSTEM
+            self.keyword_max_tokens = 64
+            self.max_candidates     = 5
+
+        # Keep NOT_FOUND in sync with any ini-customised marker so callers can
+        # always use `agent.NOT_FOUND` regardless of ini customisation.
         self.NOT_FOUND = self.not_found_marker
 
-    # ------------------------------------------------------------------ #
-    # Internal helpers                                                     #
-    # ------------------------------------------------------------------ #
+    # ── Connectivity helpers ─────────────────────────────────────────────────
 
     def _chat_url(self) -> str:
         base = self.base_url.rstrip("/")
@@ -148,21 +205,16 @@ class FaqAgent:
 
     def _ensure_model(self) -> None:
         """
-        Ollama only: POST /api/pull to ensure the model is locally available
-        before the first inference call.  Idempotent — Ollama returns quickly
-        when the model is already present.  For OpenAI-format endpoints the
-        model is assumed to be available remotely; this method is a no-op.
-        Errors are logged as warnings and swallowed so a transient registry
-        hiccup never blocks the FAQ lookup itself.
+        Ollama only: POST /api/pull before the first inference call so the
+        model is locally available.  Idempotent.  No-op for openai format.
+        Errors are swallowed — a transient registry hiccup must not block FAQ.
         """
         if self.api_format != "ollama":
             return
 
-        base = self.base_url.rstrip("/")
-        pull_url = (
-            f"{base}/pull" if base.endswith("/api") else f"{base}/api/pull"
-        )
-        body = json.dumps({"name": self.model, "stream": False}).encode()
+        base     = self.base_url.rstrip("/")
+        pull_url = f"{base}/pull" if base.endswith("/api") else f"{base}/api/pull"
+        body     = json.dumps({"name": self.model, "stream": False}).encode()
         req = urllib.request.Request(
             pull_url,
             data=body,
@@ -172,23 +224,117 @@ class FaqAgent:
         try:
             ctx = self.ssl_context
             with urllib.request.urlopen(req, timeout=self.timeout, context=ctx) as resp:
-                resp.read()  # drain so the connection is properly closed
+                resp.read()
             logger.debug("FaqAgent: model %r is ready", self.model)
         except Exception as exc:
             logger.warning(
                 "FaqAgent: model pull check failed (%s) — proceeding anyway", exc
             )
 
+    # ── Stage 1a — Architect: keyword extraction ─────────────────────────────
+
+    def _extract_keywords(self, question: str) -> list[str]:
+        """
+        Ask the LLM to extract search keywords from *question*.
+
+        Returns a list of lowercase keyword strings.
+
+        The response is cleaned of ``<think>`` tags and markdown fences before
+        JSON parsing.  Falls back to simple word-splitting (stop-words removed)
+        when the LLM returns malformed JSON or the API call fails.
+        """
+        url     = self._chat_url()
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+        }
+        payload: dict = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": self.keyword_system},
+                {"role": "user",   "content": question},
+            ],
+            "temperature": 0.0,
+        }
+        if self.keyword_max_tokens:
+            payload["max_tokens"] = self.keyword_max_tokens
+
+        try:
+            raw  = request_completion(
+                url, headers, payload, self.timeout,
+                stream=False,
+                api_format=self.api_format,
+                ssl_context=self.ssl_context,
+            )
+            text = strip_think(raw).strip()
+            # Remove markdown fences: ```json ... ``` or ``` ... ```
+            text = re.sub(r"```(?:json)?\n?", "", text).strip().rstrip("`").strip()
+            keywords = json.loads(text)
+            if isinstance(keywords, list):
+                return [str(k).lower() for k in keywords if k]
+        except Exception as exc:
+            logger.warning(
+                "FaqAgent: keyword extraction failed (%s) — using word-split fallback",
+                exc,
+            )
+
+        # Fallback: tokenise the question, drop stop-words and single-char tokens.
+        return [
+            w.lower().strip("?.,!;:")
+            for w in question.split()
+            if w.lower().strip("?.,!;:") not in _STOP_WORDS
+            and len(w.strip("?.,!;:")) > 1
+        ]
+
+    # ── Stage 1b — Candidate ranking ────────────────────────────────────────
+
+    def _rank_candidates(
+        self,
+        docs: list[tuple[str, str]],
+        keywords: list[str],
+    ) -> list[tuple[str, str, int]]:
+        """
+        Score each doc by counting how often keywords appear across its path
+        and content, then return only docs with at least one hit, sorted by
+        score descending.
+
+        Scoring rule (per document):
+          score = Σ  occurrence_count(keyword, path + " " + content)
+                  for each keyword
+
+        Frequency-weighted scoring means a document that mentions a keyword
+        ten times ranks higher than one that mentions it once — a better
+        signal of topical focus than a binary presence check.
+
+        Returns ``list[tuple[name, content, score]]``, highest score first.
+        Zero-score docs are included (stable sort preserves input order for ties)
+        and appear at the tail.  ``_answer_smart`` filters them before building
+        the shortlist so they never receive a Stage-1 LLM call.
+        """
+        lower_kw = [k.lower() for k in keywords]
+
+        def _score(name: str, content: str) -> int:
+            combined = (name + " " + content).lower()
+            return sum(combined.count(kw) for kw in lower_kw)
+
+        scored = [
+            (name, content, _score(name, content))
+            for name, content in docs
+        ]
+        # Sort highest-score-first; stable sort preserves input order for ties.
+        # Zero-score docs land at the tail — _answer_smart filters them before
+        # building the shortlist so they never receive an LLM call in Stage 1.
+        return sorted(scored, key=lambda t: t[2], reverse=True)
+
+    # ── Validation pass ──────────────────────────────────────────────────────
+
     def _validate_answer(self, question: str, answer: str, context: str) -> bool:
         """
-        Second LLM pass: confirm that *answer* is correctly grounded in *context*
-        and actually addresses *question*.
+        Second LLM pass: confirm *answer* is grounded in *context*.
 
-        Returns True  → answer is valid, safe to return.
-        Returns False → answer failed validation; caller should return NOT_FOUND.
-
-        Fails open: if the validation call itself errors, True is returned so
-        that a transient API fault does not silently discard a good answer.
+        Returns ``True`` (valid) or ``False`` (invalid).
+        Fails open on API errors — a transient fault must not silently discard
+        a good answer.
         """
         user_msg = (
             f"QUESTION: {question}\n\n"
@@ -220,18 +366,24 @@ class FaqAgent:
             )
             verdict = strip_think(verdict).strip().upper()
             logger.debug("FaqAgent validate verdict: %r", verdict)
-            # Accept "VALID" but not "INVALID: …"
+            # "VALID" passes; "INVALID: …" fails; anything else → treat as valid
             return verdict.startswith("VALID") and not verdict.startswith("INVALID")
         except Exception as exc:
             logger.warning(
-                "FaqAgent: validation call failed (%s) — treating answer as valid", exc
+                "FaqAgent: validation call failed (%s) — treating answer as valid",
+                exc,
             )
             return True  # fail open
 
+    # ── Knowledge loading ────────────────────────────────────────────────────
+
     def _load_knowledge(self) -> list[tuple[str, str]]:
         """
-        Return a list of (filename, content) pairs from the knowledge folder.
-        Files are sorted alphabetically so lookup order is deterministic.
+        Return sorted ``(relative_path, content)`` pairs from the knowledge folder.
+
+        Walks the full directory tree recursively (``rglob``) so files nested
+        inside sub-folders are included.  Results sorted alphabetically by
+        relative path so lookup order is deterministic across runs.
         """
         docs: list[tuple[str, str]] = []
         kdir = self.knowledge_dir
@@ -244,10 +396,11 @@ class FaqAgent:
             )
             return docs
 
-        for fpath in sorted(kdir.iterdir()):
+        for fpath in sorted(kdir.rglob("*")):
             if fpath.is_file() and fpath.suffix in self.extensions:
+                rel = str(fpath.relative_to(kdir))
                 try:
-                    docs.append((fpath.name, fpath.read_text(encoding="utf-8")))
+                    docs.append((rel, fpath.read_text(encoding="utf-8")))
                 except Exception as exc:
                     logger.warning("FaqAgent: could not read %s — %s", fpath, exc)
 
@@ -261,48 +414,204 @@ class FaqAgent:
         return docs
 
     def _build_context(self, docs: list[tuple[str, str]]) -> str:
-        """Concatenate all knowledge files into a single labelled context block."""
+        """Concatenate all knowledge files into one labelled context block."""
         parts = []
         for name, content in docs:
             parts.append(f"=== {name} ===\n{content.strip()}")
         return "\n\n".join(parts)
 
-    # ------------------------------------------------------------------ #
-    # Public API                                                           #
-    # ------------------------------------------------------------------ #
+    # ── Per-candidate LLM query (non-streaming) ──────────────────────────────
+
+    def _query_candidate(self, question: str, context: str) -> str:
+        """
+        Single non-streaming LLM call for a specific ``context`` block.
+
+        Used inside the smart-search candidate loop where we must inspect the
+        answer before committing to it; streaming intermediate attempts would
+        produce garbled output.
+        """
+        url     = self._chat_url()
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+        }
+        user_msg = (
+            f"KNOWLEDGE BASE:\n\n{context}\n\n"
+            f"QUESTION: {question}"
+        )
+        payload: dict = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": self.system_prompt},
+                {"role": "user",   "content": user_msg},
+            ],
+            "temperature": self.temperature,
+        }
+        if self.max_tokens:
+            payload["max_tokens"] = self.max_tokens
+
+        raw = request_completion(
+            url, headers, payload, self.timeout,
+            stream=False,
+            api_format=self.api_format,
+            ssl_context=self.ssl_context,
+        )
+        return strip_think(raw).strip()
+
+    # ── Public API ───────────────────────────────────────────────────────────
 
     def answer(self, question: str, *, stream: bool = True) -> str:
         """
-        Ask the model `question` against every file in the knowledge folder.
+        Answer *question* against the knowledge base.
 
-        Flow
-        ----
-        1. Pull model if required (_ensure_model — Ollama only, no-op elsewhere).
-        2. Load knowledge files; if empty return NOT_FOUND immediately.
-        3. Query the model (streamed or blocking).
-        4. If the reply contains not_found_marker → return NOT_FOUND.
-        5. If validate_answer is enabled → run _validate_answer();
-           return NOT_FOUND when the answer fails the grounding check.
-        6. Return the validated answer string.
+        **smart_search = True** (two-stage):
 
-        Returns:
-            The answer string if a match is found and passes validation.
-            self.NOT_FOUND  (== self.not_found_marker) in all other cases.
+        1. ``_ensure_model()`` — pull model if Ollama.
+        2. Load all knowledge files via ``_load_knowledge()``.
+        3. ``_extract_keywords(question)`` — architect LLM call → keyword list.
+        4. ``_rank_candidates(docs, keywords)`` — score & sort by relevance.
+        5. For each candidate in the shortlist (top ``max_candidates`` by score):
+
+           a. ``_query_candidate(question, single_file_context)`` — focused call.
+           b. If reply contains ``not_found_marker`` → skip, try next.
+           c. If ``validate_answer`` is enabled → ``_validate_answer()``; skip on
+              INVALID verdict.
+           d. First accepted answer: emit to stdout when ``stream=True``, return.
+
+        6. All candidates exhausted → ``_answer_legacy()`` (full-KB single call).
+
+        **smart_search = False** (legacy, default):
+            All files concatenated into one context; single LLM call.
+
+        Returns the answer string or ``self.NOT_FOUND``.
         """
-        # ── step 1: pull model if required ─────────────────────────────────
+        # step 1: pull model if Ollama
         self._ensure_model()
 
-        # ── step 2: load knowledge ──────────────────────────────────────────
+        # step 2: load knowledge files
         docs = self._load_knowledge()
         if not docs:
             return self.not_found_marker
 
+        if self.smart_search:
+            return self._answer_smart(question, docs, stream=stream)
+        return self._answer_legacy(question, docs, stream=stream)
+
+    # ── Two-stage smart-search path ──────────────────────────────────────────
+
+    def _answer_smart(
+        self,
+        question: str,
+        docs: list[tuple[str, str]],
+        *,
+        stream: bool,
+    ) -> str:
+        """
+        Keyword-ranked per-candidate tries, then full-KB fallback.
+
+        Intermediate candidates are queried without streaming so we can inspect
+        the answer before showing it.  The final accepted answer is written to
+        stdout when *stream* is ``True``.
+        """
+        # ── architect pass: extract keywords ────────────────────────────────
+        keywords = self._extract_keywords(question)
+        logger.info("FaqAgent smart_search keywords: %r", keywords)
+
+        # ── rank candidates — zero-score docs are already filtered out ───────
+        ranked = self._rank_candidates(docs, keywords)
+
+        # Keep only docs with at least one keyword hit for Stage 1.
+        # Zero-score docs fall through to the full-KB Stage-2 fallback.
+        candidates = [(n, c, s) for n, c, s in ranked if s > 0]
+
+        if not candidates:
+            logger.info(
+                "FaqAgent: no knowledge files matched keywords %r (all scored 0) — "
+                "going straight to full-KB fallback",
+                keywords,
+            )
+            return self._answer_legacy(question, docs, stream=stream)
+
+        # Honour the max_candidates cap (0 = unlimited).
+        cap = self.max_candidates if self.max_candidates > 0 else len(candidates)
+        shortlist = candidates[:cap]
+
+        logger.info(
+            "FaqAgent Stage 1: %d/%d candidate(s) in shortlist (cap=%d). "
+            "Top scores: %s",
+            len(shortlist),
+            len(ranked),
+            cap,
+            ", ".join(f"{n!r}:{s}" for n, _, s in shortlist[:3]),
+        )
+
+        # ── try each candidate individually ──────────────────────────────────
+        for name, content, score in shortlist:
+            candidate_ctx = f"=== {name} ===\n{content.strip()}"
+            logger.debug("FaqAgent: trying candidate %r (score=%d)", name, score)
+
+            try:
+                candidate_ans = self._query_candidate(question, candidate_ctx)
+            except Exception as exc:
+                logger.warning(
+                    "FaqAgent: candidate %r query failed (%s) — skipping", name, exc
+                )
+                continue
+
+            if self.not_found_marker.lower() in candidate_ans.lower():
+                logger.debug(
+                    "FaqAgent: candidate %r → NOT FOUND, trying next", name
+                )
+                continue
+
+            # optional validation pass
+            if self.validate_answer_enabled:
+                if not self._validate_answer(question, candidate_ans, candidate_ctx):
+                    logger.info(
+                        "FaqAgent: candidate %r failed validation — trying next", name
+                    )
+                    continue
+
+            # ── accepted: emit and return ────────────────────────────────────
+            if stream:
+                sys.stdout.write(candidate_ans)
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+            logger.info(
+                "FaqAgent: Stage 1 accepted answer from %r (score=%d)", name, score
+            )
+            return candidate_ans
+
+        # ── Stage 2: all Stage-1 candidates exhausted → full-KB fallback ─────
+        logger.info(
+            "FaqAgent: all %d Stage-1 candidate(s) exhausted — "
+            "falling back to full-KB call (%d total files)",
+            len(shortlist),
+            len(docs),
+        )
+        return self._answer_legacy(question, docs, stream=stream)
+
+    # ── Legacy single-call path ───────────────────────────────────────────────
+
+    def _answer_legacy(
+        self,
+        question: str,
+        docs: list[tuple[str, str]],
+        *,
+        stream: bool,
+    ) -> str:
+        """
+        Classic mode: all knowledge files concatenated into one context block,
+        sent to the model in a single call.
+
+        This is the original ``answer()`` implementation, now called either
+        directly (``smart_search = False``) or as the Stage-2 fallback.
+        """
         context  = self._build_context(docs)
         user_msg = (
             f"KNOWLEDGE BASE:\n\n{context}\n\n"
             f"QUESTION: {question}"
         )
-
         url     = self._chat_url()
         headers = {
             "Content-Type": "application/json",
@@ -320,7 +629,6 @@ class FaqAgent:
             payload["max_tokens"] = self.max_tokens
 
         try:
-            # ── step 3: query the model ─────────────────────────────────────
             if stream:
                 reply = request_completion(
                     url, headers, payload, self.timeout,
@@ -340,13 +648,11 @@ class FaqAgent:
 
             answer = strip_think(reply).strip()
 
-            # ── step 4: not-found check ─────────────────────────────────────
-            # Treat any reply that contains the not-found marker as "not found",
-            # regardless of surrounding whitespace or punctuation.
+            # step 4: not-found check
             if self.not_found_marker.lower() in answer.lower():
                 return self.not_found_marker
 
-            # ── step 5: answer-validate ─────────────────────────────────────
+            # step 5: answer-validate
             if self.validate_answer_enabled:
                 if not self._validate_answer(question, answer, context):
                     logger.info(
@@ -354,13 +660,18 @@ class FaqAgent:
                     )
                     return self.not_found_marker
 
-            # ── step 6: return validated answer ────────────────────────────
+            # step 6: return validated answer
             return answer
 
         except Exception as exc:
             logger.error("FaqAgent: API call failed: %s", exc)
             return self.not_found_marker
 
+    # ── Diagnostics ──────────────────────────────────────────────────────────
+
     def list_knowledge_files(self) -> list[str]:
-        """Return the sorted list of knowledge-file names (for diagnostics)."""
-        return [name for name, _ in self._load_knowledge()]
+        """Return the sorted list of knowledge-file relative paths (for /faq --list).
+
+        Sub-folder files appear as e.g. ``'billing/invoices.txt'``.
+        """
+        return [rel for rel, _ in self._load_knowledge()]

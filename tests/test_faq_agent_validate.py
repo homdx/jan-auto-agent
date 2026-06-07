@@ -392,5 +392,477 @@ class TestIniConfig:
         assert agent.validate_max_tokens     == 64
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# 5.  Recursive knowledge loading
+# ════════════════════════════════════════════════════════════════════════════
+
+class TestRecursiveKnowledge:
+    """_load_knowledge() must walk sub-folders, not just the top level."""
+
+    def _make_kb(self, tmp_path: Path) -> tuple[Path, FaqAgent]:
+        kb = tmp_path / "knowledge"
+        kb.mkdir()
+        agent = FaqAgent(
+            model="m", base_url="http://localhost:11434",
+            api_key="k", api_format="ollama", timeout=10,
+        )
+        agent.knowledge_dir = kb
+        return kb, agent
+
+    def test_flat_file_found(self, tmp_path):
+        kb, agent = self._make_kb(tmp_path)
+        (kb / "top.txt").write_text("Q: foo\nA: bar")
+        files = agent.list_knowledge_files()
+        assert "top.txt" in files
+
+    def test_nested_file_found(self, tmp_path):
+        kb, agent = self._make_kb(tmp_path)
+        sub = kb / "billing"
+        sub.mkdir()
+        (sub / "invoices.txt").write_text("Q: invoice\nA: check billing portal")
+        files = agent.list_knowledge_files()
+        # Relative path includes the sub-folder name
+        assert any("invoices.txt" in f for f in files), f"got: {files}"
+        assert any("billing" in f for f in files), f"got: {files}"
+
+    def test_deeply_nested_file_found(self, tmp_path):
+        kb, agent = self._make_kb(tmp_path)
+        deep = kb / "a" / "b" / "c"
+        deep.mkdir(parents=True)
+        (deep / "deep.md").write_text("Q: deep\nA: yes")
+        files = agent.list_knowledge_files()
+        assert any("deep.md" in f for f in files), f"got: {files}"
+
+    def test_top_and_nested_both_loaded(self, tmp_path):
+        kb, agent = self._make_kb(tmp_path)
+        (kb / "root.txt").write_text("root content")
+        sub = kb / "sub"
+        sub.mkdir()
+        (sub / "child.txt").write_text("child content")
+        files = agent.list_knowledge_files()
+        assert len(files) == 2
+
+    def test_non_matching_extension_ignored(self, tmp_path):
+        kb, agent = self._make_kb(tmp_path)
+        sub = kb / "sub"
+        sub.mkdir()
+        (sub / "ignored.json").write_text("{}")
+        (sub / "kept.txt").write_text("kept")
+        files = agent.list_knowledge_files()
+        assert files == [str(Path("sub") / "kept.txt")]
+
+    def test_context_includes_subfolder_label(self, tmp_path):
+        kb, agent = self._make_kb(tmp_path)
+        (kb / "products").mkdir()
+        (kb / "products" / "pricing.txt").write_text("Price is $10/mo")
+        docs = agent._load_knowledge()
+        name, content = docs[0]
+        # The section header shown to the model should include the sub-path
+        assert "pricing.txt" in name
+        assert "products" in name
+
+    def test_answer_uses_nested_content(self, tmp_path):
+        kb, agent = self._make_kb(tmp_path)
+        agent._ensure_model = MagicMock()
+        agent.validate_answer_enabled = False
+        (kb / "auth").mkdir()
+        (kb / "auth" / "login.txt").write_text(
+            "Q: How do I log in?\nA: Use your email and password on the login page."
+        )
+        rc_path = (
+            "faq_agent_mod.request_completion"
+            if _FAQ_AGENT_PATH.exists()
+            else "tools.faq_agent.request_completion"
+        )
+        with patch(rc_path, return_value="Use your email and password on the login page."):
+            result = agent.answer("How do I log in?", stream=False)
+        assert result == "Use your email and password on the login page."
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+# ════════════════════════════════════════════════════════════════════════════
+# 6.  _extract_keywords
+# ════════════════════════════════════════════════════════════════════════════
+
+class TestExtractKeywords:
+    """Architect pass: LLM returns JSON keyword list; fallback on failure."""
+
+    def test_parses_json_array(self, tmp_path):
+        agent = _make_agent(tmp_path)
+        with patch(_RC_PATH, return_value='["node", "exporter", "install"]'):
+            kw = agent._extract_keywords("How install node exporter?")
+        assert kw == ["node", "exporter", "install"]
+
+    def test_strips_markdown_fences(self, tmp_path):
+        agent = _make_agent(tmp_path)
+        with patch(_RC_PATH, return_value='```json\n["foo","bar"]\n```'):
+            kw = agent._extract_keywords("foo bar?")
+        assert kw == ["foo", "bar"]
+
+    def test_strips_think_tags(self, tmp_path):
+        agent = _make_agent(tmp_path)
+        with patch(_RC_PATH, return_value='<think>reasoning</think>["a","b"]'):
+            kw = agent._extract_keywords("a b?")
+        assert kw == ["a", "b"]
+
+    def test_falls_back_on_json_error(self, tmp_path):
+        agent = _make_agent(tmp_path)
+        with patch(_RC_PATH, return_value="not json at all"):
+            kw = agent._extract_keywords("How install node exporter")
+        # Fallback: words from question minus stop-words
+        assert "install" in kw
+        assert "node" in kw
+        assert "exporter" in kw
+
+    def test_falls_back_on_api_error(self, tmp_path):
+        agent = _make_agent(tmp_path)
+        with patch(_RC_PATH, side_effect=RuntimeError("timeout")):
+            kw = agent._extract_keywords("How install node exporter")
+        assert isinstance(kw, list)
+        assert len(kw) > 0
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 7.  _rank_candidates
+# ════════════════════════════════════════════════════════════════════════════
+
+class TestRankCandidates:
+    """Files with more keyword hits come first."""
+
+    def test_best_match_first(self, tmp_path):
+        agent = _make_agent(tmp_path)
+        docs = [
+            ("unrelated/other.txt",         "something completely different"),
+            ("elk/node-exporter.txt",        "install node exporter on linux"),
+            ("network/firewall.txt",         "firewall rules"),
+        ]
+        ranked = agent._rank_candidates(docs, ["node", "exporter", "install"])
+        assert ranked[0][0] == "elk/node-exporter.txt"
+
+    def test_zero_score_files_still_included(self, tmp_path):
+        agent = _make_agent(tmp_path)
+        docs = [("a.txt", "apples"), ("b.txt", "bananas")]
+        ranked = agent._rank_candidates(docs, ["mango"])
+        # Both score 0 — order preserved from input (stable sort)
+        assert len(ranked) == 2
+
+    def test_path_match_counts(self, tmp_path):
+        """Keyword match in the file path should score even with blank content."""
+        agent = _make_agent(tmp_path)
+        docs = [
+            ("node-exporter/README.txt", ""),
+            ("other/README.txt",         "node exporter install"),
+        ]
+        # First file: 2 path hits (node, exporter); second file: 3 content hits
+        ranked = agent._rank_candidates(docs, ["node", "exporter", "install"])
+        # Second file has more total hits
+        assert ranked[0][0] == "other/README.txt"
+
+    def test_content_and_path_hits_sum(self, tmp_path):
+        agent = _make_agent(tmp_path)
+        docs = [
+            ("node/exporter.txt", "install steps here"),   # 3 hits (node+exporter+install)
+            ("other.txt",         "node info"),             # 1 hit
+        ]
+        ranked = agent._rank_candidates(docs, ["node", "exporter", "install"])
+        assert ranked[0][0] == "node/exporter.txt"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 8.  answer() smart-search flow
+# ════════════════════════════════════════════════════════════════════════════
+
+class TestSmartSearchFlow:
+    _KB  = "Q: How install node exporter?\nA: Run: apt install prometheus-node-exporter"
+    _ANS = "Run: apt install prometheus-node-exporter"
+
+    def _agent(self, tmp_path, *, validate=False) -> FaqAgent:
+        kb = tmp_path / "knowledge"
+        (kb / "elk").mkdir(parents=True)
+        (kb / "elk" / "node-exporter.txt").write_text(self._KB)
+        agent = FaqAgent(
+            model="m", base_url="http://localhost:11434",
+            api_key="k", api_format="ollama", timeout=10,
+        )
+        agent.knowledge_dir          = kb
+        agent.smart_search           = True
+        agent.validate_answer_enabled = validate
+        agent._ensure_model          = MagicMock()
+        return agent
+
+    def test_smart_search_finds_nested_file(self, tmp_path):
+        agent = self._agent(tmp_path)
+        # Call 1: keyword extraction  → keywords
+        # Call 2: per-candidate answer → answer text
+        with patch(_RC_PATH, side_effect=['["node","exporter","install"]', self._ANS]):
+            result = agent.answer("How install node exporter?", stream=False)
+        assert result == self._ANS
+
+    def test_smart_search_skips_not_found_candidate(self, tmp_path):
+        """If best candidate returns NOT FOUND, fall through to fallback."""
+        kb = tmp_path / "knowledge"
+        kb.mkdir()
+        (kb / "node-exporter.txt").write_text(self._KB)
+        (kb / "other.txt").write_text("unrelated content")
+        agent = FaqAgent(
+            model="m", base_url="http://localhost:11434",
+            api_key="k", api_format="ollama", timeout=10,
+        )
+        agent.knowledge_dir = kb
+        agent.smart_search  = True
+        agent._ensure_model = MagicMock()
+
+        # "other.txt" scores 0 against keywords ["node","exporter"] and is
+        # never tried in Stage 1.  Only node-exporter.txt is tried; when it
+        # returns NOT FOUND the agent falls straight to the full-KB fallback.
+        with patch(_RC_PATH, side_effect=[
+            '["node","exporter"]',   # keyword extraction
+            "NOT FOUND",             # candidate (node-exporter.txt) fails
+            self._ANS,               # fallback full-KB call succeeds
+        ]):
+            result = agent.answer("How install node exporter?", stream=False)
+        assert result == self._ANS
+
+    def test_smart_search_fallback_when_all_candidates_fail(self, tmp_path):
+        agent = self._agent(tmp_path)
+        with patch(_RC_PATH, side_effect=[
+            '["node","exporter","install"]',  # keywords
+            "NOT FOUND",                       # candidate fails
+            self._ANS,                         # fallback succeeds
+        ]):
+            result = agent.answer("How install node exporter?", stream=False)
+        assert result == self._ANS
+
+    def test_smart_search_disabled_uses_legacy(self, tmp_path):
+        agent = self._agent(tmp_path)
+        agent.smart_search = False
+        # Only ONE rc call (no keyword extraction, no per-candidate loop)
+        with patch(_RC_PATH, return_value=self._ANS) as mock_rc:
+            result = agent.answer("How install node exporter?", stream=False)
+        assert result == self._ANS
+        assert mock_rc.call_count == 1
+
+    def test_keyword_extraction_failure_falls_back_gracefully(self, tmp_path):
+        agent = self._agent(tmp_path)
+        with patch(_RC_PATH, side_effect=[
+            RuntimeError("LLM down"),  # keyword extraction fails → word-split fallback
+            self._ANS,                  # per-candidate answer
+        ]):
+            result = agent.answer("How install node exporter?", stream=False)
+        assert result == self._ANS
+
+    def test_smart_search_with_validation_pass(self, tmp_path):
+        agent = self._agent(tmp_path, validate=True)
+        with patch(_RC_PATH, side_effect=[
+            '["node","exporter","install"]',  # keywords
+            self._ANS,                         # candidate answer
+            "VALID",                           # validation
+        ]):
+            result = agent.answer("How install node exporter?", stream=False)
+        assert result == self._ANS
+
+    def test_smart_search_with_validation_fail_then_fallback(self, tmp_path):
+        agent = self._agent(tmp_path, validate=True)
+        with patch(_RC_PATH, side_effect=[
+            '["node","exporter","install"]',  # keywords
+            "Hallucinated answer.",            # candidate answer
+            "INVALID: not grounded",           # validation fails
+            self._ANS,                         # fallback answer
+            "VALID",                           # fallback validation
+        ]):
+            result = agent.answer("How install node exporter?", stream=False)
+        assert result == self._ANS
+# ════════════════════════════════════════════════════════════════════════════
+# 6.  _extract_keywords
+# ════════════════════════════════════════════════════════════════════════════
+
+class TestExtractKeywords:
+    """Architect pass: LLM returns JSON keyword list; fallback on failure."""
+
+    def test_parses_json_array(self, tmp_path):
+        agent = _make_agent(tmp_path)
+        with patch(_RC_PATH, return_value='["node", "exporter", "install"]'):
+            kw = agent._extract_keywords("How install node exporter?")
+        assert kw == ["node", "exporter", "install"]
+
+    def test_strips_markdown_fences(self, tmp_path):
+        agent = _make_agent(tmp_path)
+        with patch(_RC_PATH, return_value='```json\n["foo","bar"]\n```'):
+            kw = agent._extract_keywords("foo bar?")
+        assert kw == ["foo", "bar"]
+
+    def test_strips_think_tags(self, tmp_path):
+        agent = _make_agent(tmp_path)
+        with patch(_RC_PATH, return_value='<think>reasoning</think>["a","b"]'):
+            kw = agent._extract_keywords("a b?")
+        assert kw == ["a", "b"]
+
+    def test_falls_back_on_json_error(self, tmp_path):
+        agent = _make_agent(tmp_path)
+        with patch(_RC_PATH, return_value="not json at all"):
+            kw = agent._extract_keywords("How install node exporter")
+        # Fallback: words from question minus stop-words
+        assert "install" in kw
+        assert "node" in kw
+        assert "exporter" in kw
+
+    def test_falls_back_on_api_error(self, tmp_path):
+        agent = _make_agent(tmp_path)
+        with patch(_RC_PATH, side_effect=RuntimeError("timeout")):
+            kw = agent._extract_keywords("How install node exporter")
+        assert isinstance(kw, list)
+        assert len(kw) > 0
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 7.  _rank_candidates
+# ════════════════════════════════════════════════════════════════════════════
+
+class TestRankCandidates:
+    """Files with more keyword hits come first."""
+
+    def test_best_match_first(self, tmp_path):
+        agent = _make_agent(tmp_path)
+        docs = [
+            ("unrelated/other.txt",         "something completely different"),
+            ("elk/node-exporter.txt",        "install node exporter on linux"),
+            ("network/firewall.txt",         "firewall rules"),
+        ]
+        ranked = agent._rank_candidates(docs, ["node", "exporter", "install"])
+        assert ranked[0][0] == "elk/node-exporter.txt"
+
+    def test_zero_score_files_still_included(self, tmp_path):
+        agent = _make_agent(tmp_path)
+        docs = [("a.txt", "apples"), ("b.txt", "bananas")]
+        ranked = agent._rank_candidates(docs, ["mango"])
+        # Both score 0 — order preserved from input (stable sort)
+        assert len(ranked) == 2
+
+    def test_path_match_counts(self, tmp_path):
+        """Keyword match in the file path should score even with blank content."""
+        agent = _make_agent(tmp_path)
+        docs = [
+            ("node-exporter/README.txt", ""),
+            ("other/README.txt",         "node exporter install"),
+        ]
+        # First file: 2 path hits (node, exporter); second file: 3 content hits
+        ranked = agent._rank_candidates(docs, ["node", "exporter", "install"])
+        # Second file has more total hits
+        assert ranked[0][0] == "other/README.txt"
+
+    def test_content_and_path_hits_sum(self, tmp_path):
+        agent = _make_agent(tmp_path)
+        docs = [
+            ("node/exporter.txt", "install steps here"),   # 3 hits (node+exporter+install)
+            ("other.txt",         "node info"),             # 1 hit
+        ]
+        ranked = agent._rank_candidates(docs, ["node", "exporter", "install"])
+        assert ranked[0][0] == "node/exporter.txt"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 8.  answer() smart-search flow
+# ════════════════════════════════════════════════════════════════════════════
+
+class TestSmartSearchFlow:
+    _KB  = "Q: How install node exporter?\nA: Run: apt install prometheus-node-exporter"
+    _ANS = "Run: apt install prometheus-node-exporter"
+
+    def _agent(self, tmp_path, *, validate=False) -> FaqAgent:
+        kb = tmp_path / "knowledge"
+        (kb / "elk").mkdir(parents=True)
+        (kb / "elk" / "node-exporter.txt").write_text(self._KB)
+        agent = FaqAgent(
+            model="m", base_url="http://localhost:11434",
+            api_key="k", api_format="ollama", timeout=10,
+        )
+        agent.knowledge_dir          = kb
+        agent.smart_search           = True
+        agent.validate_answer_enabled = validate
+        agent._ensure_model          = MagicMock()
+        return agent
+
+    def test_smart_search_finds_nested_file(self, tmp_path):
+        agent = self._agent(tmp_path)
+        # Call 1: keyword extraction  → keywords
+        # Call 2: per-candidate answer → answer text
+        with patch(_RC_PATH, side_effect=['["node","exporter","install"]', self._ANS]):
+            result = agent.answer("How install node exporter?", stream=False)
+        assert result == self._ANS
+
+    def test_smart_search_skips_not_found_candidate(self, tmp_path):
+        """If best candidate returns NOT FOUND, fall through to fallback."""
+        kb = tmp_path / "knowledge"
+        kb.mkdir()
+        (kb / "node-exporter.txt").write_text(self._KB)
+        (kb / "other.txt").write_text("unrelated content")
+        agent = FaqAgent(
+            model="m", base_url="http://localhost:11434",
+            api_key="k", api_format="ollama", timeout=10,
+        )
+        agent.knowledge_dir = kb
+        agent.smart_search  = True
+        agent._ensure_model = MagicMock()
+
+        # "other.txt" scores 0 against keywords ["node","exporter"] and is
+        # never tried in Stage 1.  Only node-exporter.txt is tried; when it
+        # returns NOT FOUND the agent falls straight to the full-KB fallback.
+        with patch(_RC_PATH, side_effect=[
+            '["node","exporter"]',   # keyword extraction
+            "NOT FOUND",             # candidate (node-exporter.txt) fails
+            self._ANS,               # fallback full-KB call succeeds
+        ]):
+            result = agent.answer("How install node exporter?", stream=False)
+        assert result == self._ANS
+
+    def test_smart_search_fallback_when_all_candidates_fail(self, tmp_path):
+        agent = self._agent(tmp_path)
+        with patch(_RC_PATH, side_effect=[
+            '["node","exporter","install"]',  # keywords
+            "NOT FOUND",                       # candidate fails
+            self._ANS,                         # fallback succeeds
+        ]):
+            result = agent.answer("How install node exporter?", stream=False)
+        assert result == self._ANS
+
+    def test_smart_search_disabled_uses_legacy(self, tmp_path):
+        agent = self._agent(tmp_path)
+        agent.smart_search = False
+        # Only ONE rc call (no keyword extraction, no per-candidate loop)
+        with patch(_RC_PATH, return_value=self._ANS) as mock_rc:
+            result = agent.answer("How install node exporter?", stream=False)
+        assert result == self._ANS
+        assert mock_rc.call_count == 1
+
+    def test_keyword_extraction_failure_falls_back_gracefully(self, tmp_path):
+        agent = self._agent(tmp_path)
+        with patch(_RC_PATH, side_effect=[
+            RuntimeError("LLM down"),  # keyword extraction fails → word-split fallback
+            self._ANS,                  # per-candidate answer
+        ]):
+            result = agent.answer("How install node exporter?", stream=False)
+        assert result == self._ANS
+
+    def test_smart_search_with_validation_pass(self, tmp_path):
+        agent = self._agent(tmp_path, validate=True)
+        with patch(_RC_PATH, side_effect=[
+            '["node","exporter","install"]',  # keywords
+            self._ANS,                         # candidate answer
+            "VALID",                           # validation
+        ]):
+            result = agent.answer("How install node exporter?", stream=False)
+        assert result == self._ANS
+
+    def test_smart_search_with_validation_fail_then_fallback(self, tmp_path):
+        agent = self._agent(tmp_path, validate=True)
+        with patch(_RC_PATH, side_effect=[
+            '["node","exporter","install"]',  # keywords
+            "Hallucinated answer.",            # candidate answer
+            "INVALID: not grounded",           # validation fails
+            self._ANS,                         # fallback answer
+            "VALID",                           # fallback validation
+        ]):
+            result = agent.answer("How install node exporter?", stream=False)
+        assert result == self._ANS
