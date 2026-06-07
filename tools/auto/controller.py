@@ -27,7 +27,7 @@ from tools.auto.utils import _ts
 from pathlib import Path
 from typing import Callable, Optional
 
-from tools.auto.state import StateStore, STATUS_DONE, STATUS_BLOCKED
+from tools.auto.state import StateStore, STATUS_DONE, STATUS_BLOCKED, STATUS_TODO
 from tools.auto.git_manager import make_git_manager, GitError
 from tools.auto.outer_loop import make_outer_loop  # noqa: F401 — re-exported as a patch target for tests
 
@@ -286,6 +286,14 @@ class AutoController:
 
         # AUTO-A3: ensure the target folder is a git repo with agent identity.
         self._setup_git()
+
+        # Reset any tasks that were blocked in a prior session back to TODO so
+        # their dependencies are re-evaluated this session.  A task blocked
+        # because dep A wasn't done yet will simply be re-blocked immediately
+        # if A is still pending; if A is now DONE it will run normally.
+        for task in self.state.all_tasks():
+            if task["status"] == STATUS_BLOCKED:
+                self.state.set_task_status(task["id"], STATUS_TODO)
 
         resume_info = self.state.resume_info()
         if not is_fresh:

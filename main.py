@@ -520,9 +520,7 @@ def main():
                     print("Usage: /auto <goal>   e.g.  /auto improve current code")
                 else:
                     from tools.auto.controller import run_auto
-                    exit_code = run_auto(goal=goal, base_dir=base_dir, config_path=args.config)
-                    if exit_code:
-                        print(f"[/auto] run finished with exit code {exit_code} (non-zero indicates errors)")
+                    run_auto(goal=goal, base_dir=base_dir, config_path=args.config)
                 continue
 
             # Guard: unrecognized slash-commands should NOT be sent to the model.

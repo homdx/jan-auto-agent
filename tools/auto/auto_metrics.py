@@ -23,7 +23,7 @@ Design contract
 Public API
 ----------
   stream = AutoMetricsStream(agent_dir)           # creates dir if missing
-  stream.record_gate2(task_id, approved=True, feedback="...", attempts=2)
+  stream.record_gate2(task_id, approved=True, feedback="...", attempts_used=2)
   stream.record_gate2(task_id, ..., prompt_store=ps)  # optional prompt version
   stream.flush()                                  # explicit sync (clean shutdown)
   stream.collector   → the underlying MetricsCollector (e.g. for AutoTuner)
@@ -146,7 +146,8 @@ class AutoMetricsStream:
         *,
         approved: bool,
         feedback: str,
-        attempts: int,
+        attempts_used: int = 0,
+        attempts: int = 0,   # backward-compatible alias — prefer attempts_used
         prompt_store=None,  # Optional[PromptStore]
     ) -> None:
         """
@@ -161,7 +162,13 @@ class AutoMetricsStream:
         computation even if the paths were accidentally shared.
 
         Never raises — errors are logged and swallowed.
+
+        .. note::
+            Use ``attempts_used=N``.  The old ``attempts=N`` keyword is kept
+            for backward compatibility but will be removed in a future release.
         """
+        # Support legacy callers that pass attempts= instead of attempts_used=.
+        effective_attempts = attempts_used if attempts_used else attempts
         try:
             with self._lock:
                 _record_gate2_locked(
@@ -169,7 +176,7 @@ class AutoMetricsStream:
                     task_id,
                     approved=approved,
                     feedback=feedback,
-                    attempts_used=attempts,
+                    attempts_used=effective_attempts,
                     prompt_store=prompt_store,
                 )
         except Exception as exc:

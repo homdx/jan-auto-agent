@@ -236,9 +236,9 @@ class LLMGate2Validator:
                     cited_symbol = locs[0].get("symbol")
 
             try:
-                from tools.auto.coder import _chunk_file, _select_relevant_chunks
-                chunks = _chunk_file(content, ext, budget)
-                content = _select_relevant_chunks(chunks, cited_symbol, budget)
+                from tools.auto.coder import chunk_file, select_relevant_chunks
+                chunks = chunk_file(content, ext, budget)
+                content = select_relevant_chunks(chunks, cited_symbol, budget)
             except Exception as exc:
                 logger.warning("validator: smart chunk failed for %s: %s", rel, exc)
                 content = content[:budget] + f"\n… [+{len(content) - budget} chars truncated]"

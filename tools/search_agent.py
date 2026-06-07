@@ -6,7 +6,7 @@ logger = logging.getLogger(__name__)
 
 from tools.agent_trace import tracer
 
-from tools.file_reader import list_py_files as _list_py_files
+from tools.file_reader import list_py_files as _list_py_files, list_source_files as _list_source_files
 from tools.block_extractor import extract_block as _extract_block_from_source
 import json
 from tools.llm_stream import (
@@ -27,6 +27,11 @@ _FILTER_SYSTEM = (
 def list_py_files(base_dir: str, skip_dirs: List[str] = None) -> List[str]:
     """Delegates to tools.file_reader.list_py_files."""
     return _list_py_files(base_dir, skip_dirs or [])
+
+
+def list_source_files(base_dir: str, skip_dirs: List[str] = None) -> List[str]:
+    """Delegates to tools.file_reader.list_source_files (all supported languages)."""
+    return _list_source_files(base_dir, skip_dirs or [])
 
 
 def extract_block(filepath: str, target_name: str) -> Optional[str]:
@@ -182,13 +187,18 @@ class SearchAgent:
         references: List[str],
         base_dir: str,
         already_searched: Optional[List[str]] = None,
-        file_ext_hint: str = ".py",
+        file_ext_hint: str = "",
         visited_names: Optional[Set[str]] = None,
         current_depth: int = 0
     ) -> Dict[str, Any]:
         """
         Scans local files to find definitions of referenced names.
         Never raises exceptions; returns partial results on failure.
+
+        ``file_ext_hint`` is kept for backward compatibility but is no longer
+        used as a hard filter — all extensions in ``_SEARCHABLE_EXTS`` are
+        searched so non-Python projects receive context too.  Pass a non-empty
+        value to *prefer* files with that extension (they are scanned first).
         """
         already_searched_set = set(already_searched or [])
         visited_names = visited_names or set()
@@ -214,19 +224,23 @@ class SearchAgent:
                 result["not_found"] = references
                 return result
 
-            # 1. Gather Candidate Files
-            raw_candidates = list_py_files(base_dir, skip_dirs=self.skip_dirs)
+            # 1. Gather Candidate Files — all supported source languages.
+            # If file_ext_hint is set, preferred-extension files come first so
+            # the most likely match is found quickly; others follow.
+            raw_candidates = list_source_files(base_dir, skip_dirs=self.skip_dirs)
+            if file_ext_hint:
+                preferred = [f for f in raw_candidates if Path(f).suffix == file_ext_hint]
+                others    = [f for f in raw_candidates if Path(f).suffix != file_ext_hint]
+                raw_candidates = preferred + others
             valid_candidates = []
-            
+
             for file_path in raw_candidates:
                 p = Path(file_path)
                 str_path = str(p)
-                
-                if file_ext_hint and p.suffix != file_ext_hint:
-                    continue
+
                 if str_path in already_searched_set:
                     continue
-                    
+
                 # Guard: File size limit
                 if p.exists() and (p.stat().st_size / 1024) <= self.max_file_kb:
                     valid_candidates.append(str_path)
