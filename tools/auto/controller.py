@@ -4,28 +4,6 @@ Entry point for the autonomous improvement mode.  Provides the public surface
 that main.py imports:
 
     from tools.auto.controller import AutoController, run_auto
-
-AUTO-A1 (entry point):
-  * Validates inputs (non-empty goal, existing base_dir).
-  * Prints start banner echoing goal and base_dir.
-  * Routes --auto / /auto to this module; interactive/one-shot paths untouched.
-
-AUTO-A2 (state store + resume):
-  * Delegates all .agent/ I/O to StateStore (tools/auto/state.py).
-  * On start: loads existing state and resumes (skips DONE tasks,
-    continues IN_PROGRESS tasks) — kill mid-run, restart → no repeated work.
-  * plan.json schema enforced via make_task() / _validate_task_schema().
-  * progress.json updated after every logical step.
-
-AUTO-A4 (run limits & safety):
-  * Reads ``[auto] max_runtime_min`` and ``[auto] max_tasks_per_run`` from
-    agents.ini (both default to 0 = no cap).
-  * Wall-clock and task caps are checked before every task iteration.
-  * When a cap fires the run stops gracefully:
-      - progress.json status → "capped"
-      - progress.json stop_reason → "runtime_cap" | "task_cap"
-      - run.log records which cap fired and how many tasks completed
-      - exit code 0 (graceful stop, not an error)
   * Resumable: a subsequent run reloads state and continues from the last
     unfinished task, respecting caps anew.
 
@@ -34,7 +12,6 @@ agents.ini [auto] keys (AUTO-A4)
 max_runtime_min   — wall-clock cap in minutes (float; 0 = disabled)
 max_tasks_per_run — maximum tasks to execute this session (int; 0 = disabled)
 
-agents.ini [auto] keys (AUTO-DM-1)
 -----------------------------------
 task_mode — domain mode: code (default) | docs | creative
 """
@@ -572,7 +549,6 @@ class AutoController:
                 f"state saved, run is resumable."
             )
         else:  # STOP_TASK_CAP
-            # BUG 12 FIXED: Reports the accurate session tasks_done
             print(
                 f"[{ts}] 🔢 Task cap reached "
                 f"({self.limits.max_tasks_per_run} tasks/session, "
@@ -613,7 +589,6 @@ class AutoController:
         done    = len(info["done_ids"])
         pending = len(info["pending"])
         ts = _ts()
-        # BUG 13 FIXED: Removed redundant "{len(done_ids)} skipped" mislabel.
         print(f"[{ts}] ♻️  Resuming existing run — "
               f"{done} already done, {pending} pending")
         if info["done_ids"]:

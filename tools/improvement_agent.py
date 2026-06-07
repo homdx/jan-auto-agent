@@ -12,7 +12,7 @@ from tools.llm_stream import request_completion, strip_think, ollama_chat_url
 
 logger = logging.getLogger(__name__)
 
-# STORY-2.1: Hardcoded prompt extracted to a named module-level constant.
+# Hardcoded prompt extracted to a named module-level constant.
 # This is the canonical fallback that PromptStore will always be able to return to.
 # Runtime values are injected via .format() in process() — do not use f-string here.
 IMPROVEMENT_PROMPT_HARDCODED = (
@@ -103,7 +103,7 @@ class ImprovementAgent:
             "Authorization": f"Bearer {self.api_key}"
         }
 
-        # STORY-2.3: pull prompt dynamically at call time so any push()/rollback()
+        # pull prompt dynamically at call time so any push()/rollback()
         # takes effect on the very next pipeline run with zero code change.
         template = (
             self.prompt_store.get_current("improvement_agent")

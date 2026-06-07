@@ -12,7 +12,7 @@ from tools.llm_stream import request_completion, strip_think, ollama_chat_url
 
 logger = logging.getLogger(__name__)
 
-# STORY-2.1: Hardcoded prompt extracted to a named module-level constant.
+# Hardcoded prompt extracted to a named module-level constant.
 # This is the canonical fallback that PromptStore will always be able to return to.
 # Runtime values are injected via .format() in validate() — do not use f-string here.
 VALIDATOR_PROMPT_HARDCODED = (
@@ -99,7 +99,7 @@ class ValidatorAgent:
             "Authorization": f"Bearer {self.api_key}"
         }
 
-        # STORY-2.3: pull prompt dynamically at call time so any push()/rollback()
+        # pull prompt dynamically at call time so any push()/rollback()
         # takes effect on the very next pipeline run with zero code change.
         template = (
             self.prompt_store.get_current("validator_agent")
@@ -107,8 +107,6 @@ class ValidatorAgent:
             else VALIDATOR_PROMPT_HARDCODED
         )
 
-        # Bug #5 fix: build prompt inside try so a malformed candidate template
-        # (stray braces / missing placeholders) is caught rather than aborting the run.
         try:
             prompt = template.format(
                 task=payload.get("task"),
@@ -183,14 +181,12 @@ class ValidatorAgent:
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="replace")
             logger.error(f"ValidatorAgent HTTP {e.code}: {body}")
-            # Bug #7 fix: errors must NOT be treated as approved — use needs_fix.
             # _api_error sentinel lets prompt_evaluator exclude this from scoring.
             _err = {"status": "needs_fix", "feedback": f"HTTP {e.code} from API: {body}", "_api_error": True}
             tracer.event("validator_agent", "orchestrator", "error", content=_err)
             return _err
         except Exception as e:
             logger.error(f"ValidatorAgent execution loop failed: {e}")
-            # Bug #7 fix: same — fail-closed, not fail-open.
             _err = {"status": "needs_fix", "feedback": f"API Connection Timeout Fallback: {e}", "_api_error": True}
             tracer.event("validator_agent", "orchestrator", "error", content=_err)
             return _err

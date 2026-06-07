@@ -1,6 +1,8 @@
+import os
 import json
 import logging
 import configparser
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -205,7 +207,21 @@ class PromptStore:
 
     def _save(self, data: dict) -> None:
         try:
-            with open(self.store_path, "w", encoding="utf-8") as f:
+            # 1. Create a temporary file in the same directory as the target
+            fd, tmp_path = tempfile.mkstemp(dir=self.store_path.parent, suffix=".tmp")
+            
+            # 2. Write the JSON data to the temp file
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
-        except IOError as e:
+                
+            # 3. Atomically replace the target file with the complete temp file
+            os.replace(tmp_path, self.store_path)
+            
+        except Exception as e:
+            # 4. Clean up the temporary file if something failed before the replace
+            if 'tmp_path' in locals():
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
             logger.error(f"PromptStore failed to write {self.store_path}: {e}")

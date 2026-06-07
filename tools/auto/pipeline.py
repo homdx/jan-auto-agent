@@ -1,40 +1,4 @@
-"""tools/auto/pipeline.py — AUTO-G0 / AUTO-G1: Controller orchestration pipeline.
-
-AUTO-G0 — Pipeline skeleton
-    Defines ``run_pipeline(controller)`` as the single entry point the controller
-    calls, keeping ``controller.run()`` thin and the orchestration unit-testable
-    in isolation.  The shared *run context* is the controller itself (config,
-    state, git, base_dir, limits, tracer, progress), so no extra object is needed.
-
-AUTO-DM-1 — task_mode threading
-    ``controller.task_mode`` is forwarded from here to every downstream
-    factory that needs it: ``review_clusters``, ``filter_candidates``, and
-    ``controller._run_task_loop``.  The value defaults to ``"code"`` and
-    is a pure no-op when that default is in effect.
-
-AUTO-G1 — PLAN phase wiring
-    When no plan exists yet (fresh run):
-        repo_ingest → architect → gate1_filter → backlog_prioritiser → plan_emitter
-
-    The plan is then committed to git.  On a resume run the PLAN phase is skipped
-    entirely.  Changed-cluster detection (``PlanEmitter.changed_clusters``) is
-    available for future partial-replan support but is not yet wired into the
-    main path (the priority is correctness, not speed, on the first working run).
-
-Phase order (to be filled in by G2–G8):
-    1. PLAN   — ingest → architect → gate1 → prioritise → emit (G1)
-    2. EXECUTE — outer_loop per task → commit_on_success / exhaustion (G2–G5)
-    3. OBS    — progress_display, run_trace, auto_tuner already wired in controller
-
-Public surface::
-
-    from tools.auto.pipeline import run_pipeline
-
-    # Inside AutoController.run():
-    stop_reason, tasks_done = run_pipeline(self)
-
-The return signature matches ``_run_task_loop`` so the existing finalise code in
-``controller.run()`` requires no changes.
+"""tools/auto/pipeline.py
 """
 
 from __future__ import annotations
@@ -127,7 +91,7 @@ def run_pipeline(controller: "AutoController") -> tuple[Optional[str], int]:
             controller.progress_display.code_done = already_done
             controller.progress_display.refresh()
 
-    # ── EXECUTE phase (G2 will replace _run_task_loop delegation) ─────────────
+    # ── EXECUTE phase — G2 / G3 / G4 / G5 wired inside _run_task_loop ─────────
     return controller._run_task_loop(task_mode=getattr(controller, "task_mode", "code"))  # AUTO-DM-1
 
 

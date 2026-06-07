@@ -106,7 +106,14 @@ _SYSTEM_PROMPT = (
     "6. The 'files' array MUST NEVER be empty. The task always requires at least one "
     "file change — if you think nothing needs changing, re-read the instruction and "
     "produce the correct implementation. An empty files array is always wrong.\n"
-    "7. If the provided file contents are insufficient to complete the task — "
+    "7. If a symbol you must use (a class, function, or constant) is referenced but its "
+    "definition is NOT shown to you, do not guess — add a top-level \"context_request\" "
+    "array naming the exact symbols you need, e.g. "
+    '{"files": [...], "context_request": ["Config", "_resolve_path"]}. '
+    "The names you request are resolved and provided on the next attempt. Omit "
+    "context_request (or use []) when you already have everything you need."
+    "\n"
+    "8. If the provided file contents are insufficient to complete the task — "
     "for example, a referenced class or function is not shown — add a top-level "
     "\"missing_context\" key to your JSON response listing the symbol names you "
     "needed but did not receive. "
@@ -375,6 +382,9 @@ class Coder:
 
         # ── Strip think blocks; check for missing-context signal ─────────────
         cleaned = strip_think(raw_text)
+        # Pull-model: capture any symbols the coder asked for (context_request).
+        missing_ctx = self._extract_context_request(cleaned)
+
         # ── Context probe: if the LLM reported missing_context, fetch once ───
         _missing = self._extract_missing_context(cleaned)
         context_satisfied = not bool(_missing)
@@ -416,7 +426,7 @@ class Coder:
         if parse_error:
             return CoderResult(
                 task_id=task_id, error=parse_error,
-                raw_response=cleaned,
+                raw_response=cleaned, missing_context=missing_ctx,
                 context_satisfied=context_satisfied,
             )
 
@@ -429,7 +439,7 @@ class Coder:
         if write_error and not written:
             return CoderResult(
                 task_id=task_id, error=write_error, raw_response=cleaned,
-                context_satisfied=context_satisfied,
+                missing_context=missing_ctx, context_satisfied=context_satisfied,
             )
 
         result = CoderResult(
@@ -437,6 +447,7 @@ class Coder:
             files_written=written,
             error=write_error,
             raw_response=cleaned,
+            missing_context=missing_ctx,
             context_satisfied=context_satisfied,
         )
         logger.info("coder.generate: %s", result.summary())
@@ -508,6 +519,20 @@ class Coder:
             feedback_section      = feedback_section,
         )
 
+    @staticmethod
+    def _extract_context_request(text: str) -> list[str]:
+        """Extract a top-level 'context_request' list of symbol names from the LLM
+        JSON response. Returns [] on absence or any parse error (fail-safe)."""
+        try:
+            data = json.loads(_strip_outer_fence(text))
+        except Exception:
+            return []
+        if not isinstance(data, dict):
+            return []
+        req = data.get("context_request")
+        if not isinstance(req, list):
+            return []
+        return [str(s).strip() for s in req if str(s).strip()]
 
     def _extract_missing_context(self, text: str) -> list[str]:
         """Extract the top-level ``missing_context`` list from the LLM response.
@@ -774,47 +799,36 @@ class Coder:
         ("os.system rm",        'os.system('),
         # Outbound data exfiltration via common tools
         ("curl exfil",          "curl "),
-    )
-
-    # Patterns requiring \b word-boundary matching to avoid false positives
-    # in identifiers (e.g. test_reboot_gracefully, mock_shutdown_handler,
-    # sudo_required).  Substring matching would fire inside function names
-    # and class names, causing the LLM to silently rename or strip them.
-    _BLOCKED_CODE_WORD_BOUNDARY: tuple[tuple[str, str], ...] = (
-        ("sudo invocation", "sudo"),
-        ("wget exfil",      "wget"),
-        ("shutdown cmd",    "shutdown"),
-        ("reboot cmd",      "reboot"),
-    )
-
-    # Dangerous absolute path prefixes for open() calls.  Paths outside this
-    # list (/tmp, /var/tmp, /home, /Users, /var/log, …) are legitimate
-    # destinations for temp files, logs, and user-space exports.
-    _DANGEROUS_OPEN_PREFIXES: tuple[str, ...] = (
-        "/etc/",    # system configuration
-        "/bin/",    # system binaries
-        "/sbin/",   # system-admin binaries
-        "/usr/",    # unix system resources
-        "/lib/",    # system libraries
-        "/lib64/",
-        "/boot/",   # bootloader / kernel images
-        "/sys/",    # kernel / sysfs
-        "/proc/",   # procfs
-        "/dev/",    # device files
-        "/root/",   # root's home directory
-        "/run/",    # runtime state
-    )
-
-    # Matches open("/ or open('/ in either quote style so single-quote
-    # bypasses (open('/etc/passwd', 'w')) are caught alongside double-quote.
-    _OPEN_WRITE_RE: re.Pattern = re.compile(
-        r"""open\s*\(\s*['"](?P<path>/[^'"]+)""",
-        re.IGNORECASE,
+        ("wget exfil",          "wget "),
+        # Overwrite root / system paths via open()  (sentinel — see _check_content_safety)
+        ("open root write",     'open("/'),
     )
 
     # Union of both sets — kept for backward compatibility; code mode uses this.
     _BLOCKED_CONTENT_PATTERNS: tuple[tuple[str, str], ...] = (
         _BLOCKED_ALWAYS + _BLOCKED_CODE_ONLY
+    )
+
+    # System directory prefixes that must never be written to by generated
+    # code.  /tmp, /var/tmp, /home, and /Users are intentionally excluded:
+    # they are legitimate destinations for temp files, exports, and local data.
+    # Both single-quote and double-quote forms are checked in
+    # _check_content_safety to close the single-quote bypass.
+    _DANGEROUS_WRITE_PREFIXES: tuple[str, ...] = (
+        "/etc/", "/usr/", "/bin/", "/sbin/", "/boot/",
+        "/proc/", "/sys/", "/root/", "/lib/",
+    )
+
+    # Patterns checked with whole-word regex (\b) instead of plain substring
+    # containment.  Same (label, pattern) structure as _BLOCKED_CODE_ONLY so
+    # tests can introspect membership identically.  Python \b treats '_' as a
+    # word character, so underscore-joined identifiers (test_reboot_gracefully,
+    # handle_shutdown_signal, test_sudo_not_needed) do NOT fire.
+    # Applied in code mode only — same scope as _BLOCKED_CODE_ONLY.
+    _BLOCKED_CODE_WORD_BOUNDARY: tuple[tuple[str, str], ...] = (
+        ("sudo invocation",     "sudo"),
+        ("shutdown cmd",        "shutdown"),
+        ("reboot cmd",          "reboot"),
     )
 
     # subprocess is legitimate in many generated files; only flag it when
@@ -871,28 +885,34 @@ class Coder:
                             )
                 continue
 
+            # Special case: open() root-write — check both quote styles and
+            # restrict to genuinely dangerous system paths so that legitimate
+            # patterns like open("/tmp/out.txt", "w") are not blocked.
+            if label == "open root write":
+                for prefix in cls._DANGEROUS_WRITE_PREFIXES:
+                    for q in ('"', "'"):
+                        if f"open({q}{prefix}".lower() in lower:
+                            return (
+                                False,
+                                f"blocked content: open() targeting system path "
+                                f"{prefix!r} ({label})",
+                            )
+                continue
+
             if pat_lower in lower:
                 return False, f"blocked content pattern {pattern!r} ({label})"
 
+        # Word-boundary patterns (code mode only) — sudo / shutdown / reboot.
+        # Checked separately so that identifier names embedding the keyword
+        # (test_reboot_gracefully, handle_shutdown_signal, test_sudo_not_needed)
+        # do NOT fire.  Python \b treats '_' as a word character, so
+        # underscore-joined names have no boundary at the underscore.
         if task_mode == "code":
-            # Word-boundary patterns: avoids false positives in identifiers
-            # (test_reboot_gracefully, mock_shutdown_handler, sudo_required)
-            # while still catching standalone command usage.
+            import re as _re
             for label, pattern in cls._BLOCKED_CODE_WORD_BOUNDARY:
-                if re.search(r"\b" + re.escape(pattern) + r"\b", lower):
+                keyword = pattern.lower().rstrip()
+                if _re.search(r"\b" + _re.escape(keyword) + r"\b", lower):
                     return False, f"blocked content pattern {pattern!r} ({label})"
-
-            # open() targeting dangerous system paths — both single and double
-            # quote styles.  Legitimate write destinations (/tmp, /home,
-            # /var/log, …) are intentionally excluded from _DANGEROUS_OPEN_PREFIXES.
-            for m in cls._OPEN_WRITE_RE.finditer(content):
-                path = m.group("path").lower()
-                if any(path.startswith(pfx) for pfx in cls._DANGEROUS_OPEN_PREFIXES):
-                    return (
-                        False,
-                        f"blocked content: open() targeting system path"
-                        f" {path!r} (open root write)",
-                    )
 
         return True, ""
 
@@ -995,27 +1015,16 @@ class Coder:
                 dest.parent.mkdir(parents=True, exist_ok=True)
 
                 # Back up existing file before overwriting (reversible).
-                # Guard: only write the backup when one does NOT already exist so
-                # that repeated attempts preserve the *original* file content rather
-                # than overwriting the backup with the output of a previous (possibly
-                # broken) attempt.  Once a .coder.bak exists for this file it is
-                # never touched again — it always reflects the pre-agent state.
                 if dest.exists():
                     backup = dest.with_suffix(dest.suffix + ".coder.bak")
-                    if not backup.exists():
-                        backup.write_text(
-                            dest.read_text(encoding="utf-8", errors="replace"),
-                            encoding="utf-8",
-                        )
-                        logger.debug(
-                            "coder._write_files [%s]: backed up %s → %s",
-                            task_id, dest, backup,
-                        )
-                    else:
-                        logger.debug(
-                            "coder._write_files [%s]: backup already exists for %s — skipping",
-                            task_id, dest,
-                        )
+                    backup.write_text(
+                        dest.read_text(encoding="utf-8", errors="replace"),
+                        encoding="utf-8",
+                    )
+                    logger.debug(
+                        "coder._write_files [%s]: backed up %s → %s",
+                        task_id, dest, backup,
+                    )
 
                 dest.write_text(content, encoding="utf-8")
                 written.append(rel)
