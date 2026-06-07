@@ -623,9 +623,10 @@ def make_inner_loop(
         ssl_context.check_hostname = False
         ssl_context.verify_mode    = ssl.CERT_NONE
 
-    max_hints  = config.getint("validator_agent", "max_hints", fallback=3)
-    val_temp   = config.getfloat("validator_agent", "temperature", fallback=0.1)
-    exec_timeout = config.getint("auto", "exec_timeout_sec", fallback=120)
+    max_hints    = config.getint("validator_agent", "max_hints",        fallback=3)
+    val_temp     = config.getfloat("validator_agent", "temperature",    fallback=0.1)
+    val_timeout  = config.getint("loop",              "timeout_seconds", fallback=300)
+    exec_timeout = config.getint("auto",              "exec_timeout_sec", fallback=120)
 
     # ── Coder ─────────────────────────────────────────────────────────────────
     if coder is None:
@@ -653,7 +654,7 @@ def make_inner_loop(
             api_key=api_key,
             api_format=api_format,
             temperature=val_temp,
-            timeout=config.getint("validator_agent", "llm_timeout_sec", fallback=120),
+            timeout=val_timeout,
             max_hints=max_hints,
             ssl_context=ssl_context,
             base_dir=str(base_dir),
