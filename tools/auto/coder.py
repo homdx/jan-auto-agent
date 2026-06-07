@@ -63,6 +63,7 @@ import configparser
 import json
 import logging
 import re
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -361,16 +362,27 @@ class Coder:
                     "task_id": task_id},
         )
 
+        print(f"\n💻 [LIVE CODER STREAMING — task: {task_id}]:")
         try:
+            _coder_tokens: list[str] = []
+
+            def _coder_on_token(t: str) -> None:
+                sys.stdout.write(t)
+                sys.stdout.flush()
+                _coder_tokens.append(t)
+
             raw_text = _llm_stream.request_completion(
                 url=url,
                 headers=headers,
                 payload=payload,
                 timeout=self._timeout,
                 stream=True,
+                on_token=_coder_on_token,
                 api_format=self._api_format,
                 ssl_context=self._ssl_context,
             )
+            raw_text = raw_text or "".join(_coder_tokens)
+            print("\n" + "═" * 80 + "\n")
         except Exception as exc:
             msg = f"LLM call failed: {exc}"
             logger.warning("coder.generate [%s]: %s", task_id, msg)
@@ -400,15 +412,26 @@ class Coder:
                 # Mutate payload in-place — messages[-1] is always the user role.
                 payload["messages"][-1]["content"] = user_msg
                 try:
+                    print(f"\n💻 [LIVE CODER STREAMING — context probe, task: {task_id}]:")
+                    _probe_tokens: list[str] = []
+
+                    def _probe_on_token(t: str) -> None:
+                        sys.stdout.write(t)
+                        sys.stdout.flush()
+                        _probe_tokens.append(t)
+
                     raw_text = _llm_stream.request_completion(
                         url=url,
                         headers=headers,
                         payload=payload,
                         timeout=self._timeout,
                         stream=True,
+                        on_token=_probe_on_token,
                         api_format=self._api_format,
                         ssl_context=self._ssl_context,
                     )
+                    raw_text = raw_text or "".join(_probe_tokens)
+                    print("\n" + "═" * 80 + "\n")
                     cleaned = strip_think(raw_text)
                     # Re-extract context_request symbols from the new response
                     # so the CoderResult reflects any new symbols the second
