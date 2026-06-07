@@ -199,12 +199,19 @@ class LLMGate2Validator:
 
     # ------------------------------------------------------------------
 
-    def _read_changed_content(self, coder_result, task: dict | None = None) -> str:
+    def _read_changed_content(self, coder_result, task: dict | None = None,
+                              base_dir: "Path | None" = None) -> str:
         """Read the post-edit content of the files the coder wrote, so the
         validator judges the ACTUAL code (not just file names).  The Gate-2
         system prompt promises 'the generated code' and asks for line/pattern
-        specific hints, so the code must be present in the prompt."""
+        specific hints, so the code must be present in the prompt.
+
+        ``base_dir`` overrides ``self.base_dir`` for this call, allowing the
+        inner loop to pass the per-invocation working directory without
+        requiring a construction-time match.
+        """
         from pathlib import Path as _Path
+        _base = Path(base_dir) if base_dir is not None else self.base_dir
         files = list(getattr(coder_result, "files_written", []) or [])
         if not files:
             return "(the coder reported NO files written — nothing changed)"
@@ -212,7 +219,7 @@ class LLMGate2Validator:
         blocks = []
         for rel in files:
             try:
-                content = (self.base_dir / rel).read_text(
+                content = (_base / rel).read_text(
                     encoding="utf-8", errors="replace")
             except OSError as exc:
                 blocks.append(f"--- {rel} ---\n(could not read {rel}: {exc})")
@@ -273,6 +280,8 @@ class LLMGate2Validator:
         task:         dict,
         exec_result,
         coder_result,
+        *,
+        base_dir=None,
     ) -> tuple[bool, str]:
         """Return (approved, feedback_string).  Never raises — fail-closed.
 
@@ -299,7 +308,7 @@ class LLMGate2Validator:
                 f"Acceptance check exit code: {getattr(exec_result, 'exit_code', 0)}\n"
                 f"stdout:\n{getattr(exec_result, 'stdout', '')[:2000]}\n\n"
                 f"Generated files (CHANGED FILE CONTENT after the coder's edit):\n"
-                + self._read_changed_content(coder_result, task=task)
+                + self._read_changed_content(coder_result, task=task, base_dir=base_dir)
             )
 
             if self.api_format == "ollama":
@@ -473,6 +482,9 @@ class InnerLoop:
                             attempt, coder_missing, len(resolved_context))
 
             if not getattr(coder_result, "succeeded", True):
+                # Context is accumulated above even on coder failure: the next
+                # attempt benefits from symbols already resolved, regardless of
+                # whether the current attempt produced valid code.
                 fb = f"attempt {attempt}: coder failed — {getattr(coder_result, 'error', 'unknown error')}"
                 feedback.append(fb)
                 records.append(AttemptRecord(attempt, False, False, False, fb))
@@ -513,7 +525,8 @@ class InnerLoop:
 
             # ── 3. Validator (subjective half of Gate 2) ─────────────────────
             try:
-                approved, vfb = self.validator.approve(task, exec_result, coder_result)
+                approved, vfb = self.validator.approve(task, exec_result, coder_result,
+                                                       base_dir=base_dir_path)
             except Exception as exc:
                 logger.error("InnerLoop: validator raised on attempt %d: %s", attempt, exc)
                 fb = f"attempt {attempt}: validator error — {exc}"
@@ -647,7 +660,13 @@ def make_inner_loop(
             config=config,  # AUTO-DM-5: for system prompt override lookup
         )
 
-    return InnerLoop(coder, executor, validator, max_attempts=max_attempts)
+    # ── ContextBroker ─────────────────────────────────────────────────────────
+    broker = ContextBroker(
+        max_symbols=config.getint("context_broker", "max_symbols", fallback=20),
+    )
+
+    return InnerLoop(coder, executor, validator, max_attempts=max_attempts,
+                     context_broker=broker)
 
 
 # ── Stubs for environments without real agents (unit tests) ──────────────────

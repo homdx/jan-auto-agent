@@ -69,11 +69,12 @@ class _Exec:
 
 class _OkCoder:
     """Always writes the file; records the prefetched_context per attempt."""
-    def __init__(self):
+    def __init__(self, files_written=None):
         self.calls = []
+        self._files_written = files_written or ["helper.py"]
     def generate(self, task, base_dir, prior_feedback=None, prefetched_context="", **kw):
         self.calls.append(prefetched_context)
-        return CoderResult(task_id="T", files_written=["helper.py"])
+        return CoderResult(task_id="T", files_written=list(self._files_written))
 
 
 class _RejectThenApprove:
@@ -81,7 +82,7 @@ class _RejectThenApprove:
     def __init__(self):
         self.n = 0
         self.last_missing_context: list = []
-    def approve(self, task, exec_result, coder_result):
+    def approve(self, task, exec_result, coder_result, *, base_dir=None):
         self.n += 1
         if self.n == 1:
             self.last_missing_context = ["my_helper"]
@@ -203,7 +204,7 @@ class _AccumulatingValidator:
         self.n = 0
         self.last_missing_context: list[str] = []
 
-    def approve(self, task, exec_result, coder_result):
+    def approve(self, task, exec_result, coder_result, *, base_dir=None):
         self.n += 1
         if self.n == 1:
             self.last_missing_context = ["alpha"]
@@ -224,7 +225,7 @@ def test_inner_loop_accumulates_validator_context_across_attempts():
         (d / "lib.py").write_text(
             "def alpha():\n    return 'a'\n\ndef beta():\n    return 'b'\n"
         )
-        coder = _OkCoder()
+        coder = _OkCoder(files_written=["lib.py"])
         loop = InnerLoop(coder, _Exec(), _AccumulatingValidator(), max_attempts=4)
         res = loop.run_task({"id": "T", "target_files": []}, d)
         assert res.passed is True
@@ -251,7 +252,7 @@ class _ValBarThenNoMissing:
     def __init__(self):
         self.n = 0
         self.last_missing_context: list = []
-    def approve(self, task, exec_result, coder_result):
+    def approve(self, task, exec_result, coder_result, *, base_dir=None):
         self.n += 1
         if self.n == 1:
             self.last_missing_context = ["bar"]

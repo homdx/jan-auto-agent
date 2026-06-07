@@ -68,7 +68,7 @@ class FakeValidator:
     def __init__(self, verdicts):
         self._v = list(verdicts)        # list of (approved, feedback)
         self.calls = 0
-    def approve(self, task, exec_result, coder_result):
+    def approve(self, task, exec_result, coder_result, *, base_dir=None):
         self.calls += 1
         return self._v.pop(0) if self._v else (True, "")
 
