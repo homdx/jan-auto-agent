@@ -92,7 +92,7 @@ def run_pipeline(controller: "AutoController") -> tuple[Optional[str], int]:
             controller.progress_display.refresh()
 
     # ── EXECUTE phase — G2 / G3 / G4 / G5 wired inside _run_task_loop ─────────
-    return controller._run_task_loop(task_mode=getattr(controller, "task_mode", "code"))  # AUTO-DM-1
+    return controller._run_task_loop(task_mode=getattr(controller, "task_mode", "code"), cfg=cfg)  # AUTO-DM-1
 
 
 # ─────────────────────────────────────────────────────────────────────────────

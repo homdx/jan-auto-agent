@@ -200,9 +200,12 @@ def make_auto_tuner(
     Auto metrics are rooted at <agent_dir>/metrics.json, not the interactive
     metrics.json, fulfilling the AUTO-E2 isolation requirement.
     """
-    # Prompt store
+    # Prompt store — isolated from the interactive prompts.json so that
+    # auto-mode promotions (driven by binary pass/fail signals) never silently
+    # overwrite prompts used by human-driven interactive sessions.
     if prompt_store is None:
-        store_path_str = config.get("prompt_store", "store_path", fallback="prompts.json")
+        default_store = str(agent_dir / "auto_prompts.json")
+        store_path_str = config.get("auto", "prompt_store_path", fallback=default_store)
         max_versions = config.getint("prompt_store", "max_versions", fallback=3)
         prompt_store = PromptStore(store_path=Path(store_path_str), max_versions=max_versions)
 

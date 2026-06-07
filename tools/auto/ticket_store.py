@@ -57,7 +57,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+from tools.auto.utils import _ts
 from pathlib import Path
 from typing import Any, Optional
 
@@ -402,6 +402,3 @@ def make_ticket_store(agent_dir: str | Path) -> TicketStore:
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
-
-def _ts() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")

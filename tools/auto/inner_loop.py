@@ -74,7 +74,6 @@ class InnerLoopResult:
     attempts_used: int   = 0
     last_feedback: str   = ""
     records:       list  = field(default_factory=list)   # list[AttemptRecord]
-    hint_history:  list  = field(default_factory=list)   # list[str] — LOOP-4
     context_satisfied: bool = True   # pull-model: False ⇒ last attempt still needed context
 
 

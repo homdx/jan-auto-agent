@@ -410,6 +410,12 @@ class Coder:
                         ssl_context=self._ssl_context,
                     )
                     cleaned = strip_think(raw_text)
+                    # Re-extract context_request symbols from the new response
+                    # so the CoderResult reflects any new symbols the second
+                    # call asked for.  context_satisfied intentionally keeps
+                    # the first response's value: False signals "probe was
+                    # needed" and is used by outer_loop to skip TaskRewriter.
+                    missing_ctx = self._extract_context_request(cleaned)
                 except Exception as exc:
                     logger.warning(
                         "coder.generate [%s]: context-probe second call failed: %s "
@@ -795,7 +801,7 @@ class Coder:
         ("rm -rf",              "rm -rf"),
         ("rm -f /",             "rm -f /"),
         # Shell injection via subprocess / os.system with dangerous args
-        ("subprocess rm",       "subprocess"),          # too broad? — see note below
+        ("subprocess rm",       "subprocess"),          # paired with danger token — see _SUBPROCESS_DANGER_TOKENS
         ("os.system rm",        'os.system('),
         # Outbound data exfiltration via common tools
         ("curl exfil",          "curl "),
@@ -1286,8 +1292,13 @@ def _strip_outer_fence(text: str) -> str:
     """
     t = text.strip()
     if t.startswith("```"):
-        # Drop the opening fence line (e.g. "```json")
-        t = t.split("\n", 1)[1] if "\n" in t else ""
+        # Drop the opening fence line (e.g. "```json").
+        # If there is no newline the input is just a bare fence marker with no
+        # content — return the original text so json.loads can fail gracefully
+        # rather than getting an empty string.
+        if "\n" not in t:
+            return t
+        t = t.split("\n", 1)[1]
         # Drop the closing fence
         if t.rstrip().endswith("```"):
             t = t.rstrip()[:-3]

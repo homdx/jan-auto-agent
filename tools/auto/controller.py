@@ -23,7 +23,7 @@ import logging
 import os
 import sys
 import time
-from datetime import datetime, timezone
+from tools.auto.utils import _ts
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -325,6 +325,7 @@ class AutoController:
         self,
         *,
         task_mode: str = "code",
+        cfg: Optional[configparser.ConfigParser] = None,
     ) -> tuple[Optional[str], int]:
         """Iterate pending tasks, check caps, execute via outer_loop, return stop reason.
 
@@ -348,9 +349,10 @@ class AutoController:
         tasks_done = 0
 
         # ── Build execution helpers once per loop ──────────────────────────
-        cfg = configparser.ConfigParser()
-        if Path(self.config_path).exists():
-            cfg.read(self.config_path)
+        if cfg is None:
+            cfg = configparser.ConfigParser()
+            if Path(self.config_path).exists():
+                cfg.read(self.config_path)
 
         from tools.auto.outer_loop import make_outer_loop
         from tools.auto.commit_on_success import CommitOnSuccess
@@ -611,10 +613,6 @@ class AutoController:
         if Path(config_path).exists():
             cfg.read(config_path)
         return RunLimits.from_config(cfg)
-
-
-def _ts() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
