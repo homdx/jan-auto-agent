@@ -638,8 +638,8 @@ class Coder:
         Each file is prefixed with a ``### path/to/file.py`` header.
 
         Small files (≤ ``max_file_chars``) are included byte-for-byte.  Larger
-        files are split into symbol-aware chunks via :func:`_chunk_file` and
-        assembled with :func:`_select_relevant_chunks`, guaranteeing that the
+        files are split into symbol-aware chunks via :func:`chunk_file` and
+        assembled with :func:`select_relevant_chunks`, guaranteeing that the
         import block and the *cited_symbol* are always present.  Any exception
         in the smart path falls back to plain character truncation so the caller
         always receives something useful.
@@ -679,8 +679,8 @@ class Coder:
                 continue
 
             try:
-                chunks   = _chunk_file(content, ext, self._max_file_chars)
-                assembled = _select_relevant_chunks(chunks, cited_symbol, self._max_file_chars)
+                chunks   = chunk_file(content, ext, self._max_file_chars)
+                assembled = select_relevant_chunks(chunks, cited_symbol, self._max_file_chars)
                 parts.append(f"### {rel}\n{assembled}")
             except Exception as exc:
                 logger.warning(
@@ -1052,7 +1052,7 @@ class Coder:
 # Symbol-aware file chunking (SCTX Task 1)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _chunk_file(source: str, file_ext: str, max_chars: int) -> list[dict]:
+def chunk_file(source: str, file_ext: str, max_chars: int) -> list[dict]:
     """Split *source* into symbol-aware chunks for prompt assembly.
 
     Each returned dict has:
@@ -1131,7 +1131,7 @@ def _chunk_file(source: str, file_ext: str, max_chars: int) -> list[dict]:
             tree = ast.parse(source)
         except SyntaxError:
             logger.warning(
-                "_chunk_file: ast.parse failed for ext=%r — returning truncated chunk", ext
+                "chunk_file: ast.parse failed for ext=%r — returning truncated chunk", ext
             )
             return [
                 {
@@ -1211,7 +1211,7 @@ def _chunk_file(source: str, file_ext: str, max_chars: int) -> list[dict]:
     return [import_chunk] + symbol_chunks
 
 
-def _select_relevant_chunks(
+def select_relevant_chunks(
     chunks: list[dict],
     cited_symbol: str | None,
     budget_chars: int,

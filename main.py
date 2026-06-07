@@ -520,7 +520,12 @@ def main():
                     print("Usage: /auto <goal>   e.g.  /auto improve current code")
                 else:
                     from tools.auto.controller import run_auto
-                    run_auto(goal=goal, base_dir=base_dir, config_path=args.config)
+                    _rc = run_auto(goal=goal, base_dir=base_dir, config_path=args.config)
+                    if _rc:
+                        # Interactive mode must NOT sys.exit (that would kill the
+                        # REPL); surface the failure as a visible warning instead.
+                        print(f"⚠️  autonomous run finished with exit code {_rc} "
+                              f"(see logs / .agent trace for details).")
                 continue
 
             # Guard: unrecognized slash-commands should NOT be sent to the model.

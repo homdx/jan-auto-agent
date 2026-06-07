@@ -167,18 +167,21 @@ class AutoController:
         # AUTO-DM-1: read task_mode once at startup; forwarded to pipeline and
         # all downstream factory calls.  Defaults to "code" so existing configs
         # and call sites are completely unaffected.
-        _cfg_dm = configparser.ConfigParser()
+        # Config is parsed exactly once here and reused everywhere via
+        # self.config (run(), _run_task_loop(), _setup_git(), limits) instead of
+        # re-reading agents.ini from disk on each call.
+        self.config = configparser.ConfigParser()
         if Path(config_path).exists():
-            _cfg_dm.read(config_path)
-        self.task_mode: str = _cfg_dm.get("auto", "task_mode", fallback="code")
+            self.config.read(config_path)
+        self.task_mode: str = self.config.get("auto", "task_mode", fallback="code")
         # AUTO-A4: execution working dir (executor/AUTO-C1 runs code here)
         self.workspace_dir = self.agent_dir / "workspace"
 
         # AUTO-A4: monotonic clock — injectable for unit tests
         self._time_fn: Callable[[], float] = _time_fn or time.monotonic
 
-        # AUTO-A4: load run limits from agents.ini
-        self.limits = self._load_limits(config_path)
+        # AUTO-A4: load run limits from agents.ini (reuse the already-parsed config)
+        self.limits = RunLimits.from_config(self.config)
 
         # AUTO-A2: StateStore owns all .agent/ I/O
         self.state = StateStore(self.agent_dir)
@@ -264,9 +267,7 @@ class AutoController:
         # AUTO-A2: MUST initialise state first so .agent/ exists
         is_fresh = self.state.initialise(self.goal, self.base_dir)
 
-        cfg = configparser.ConfigParser()
-        if Path(self.config_path).exists():
-            cfg.read(self.config_path)
+        cfg = self._cfg()
 
         # ── Epic G Initialization ─────────────────────────────────────────
 
@@ -358,9 +359,7 @@ class AutoController:
 
         # ── Build execution helpers once per loop ──────────────────────────
         if cfg is None:
-            cfg = configparser.ConfigParser()
-            if Path(self.config_path).exists():
-                cfg.read(self.config_path)
+            cfg = self._cfg()
 
         from tools.auto.outer_loop import make_outer_loop
         from tools.auto.commit_on_success import CommitOnSuccess
@@ -566,6 +565,22 @@ class AutoController:
                 f"state saved, run is resumable."
             )
 
+    def _cfg(self) -> configparser.ConfigParser:
+        """Return the parsed agents.ini, loading it once and caching on self.
+
+        Real runs set ``self.config`` in ``__init__`` so this returns it with no
+        disk read.  Test harnesses that build the controller via ``__new__``
+        (bypassing ``__init__``) hit the lazy path, which reads ``config_path``
+        once and caches it — so the single-parse guarantee holds either way.
+        """
+        cfg = getattr(self, "config", None)
+        if cfg is None:
+            cfg = configparser.ConfigParser()
+            if Path(self.config_path).exists():
+                cfg.read(self.config_path)
+            self.config = cfg
+        return cfg
+
     def _setup_git(self) -> None:
         """AUTO-A3: ensure the base dir is a git repo and apply agent identity.
 
@@ -574,9 +589,7 @@ class AutoController:
         simply won't happen until git is available.
         """
         try:
-            cfg = configparser.ConfigParser()
-            if Path(self.config_path).exists():
-                cfg.read(self.config_path)
+            cfg = self._cfg()
             self.git = make_git_manager(self.base_dir, cfg)
             self.workspace_dir.mkdir(parents=True, exist_ok=True)
             self.state.log(
@@ -614,13 +627,6 @@ class AutoController:
             self.state.log(f"run limits active: {', '.join(parts)}")
         else:
             self.state.log("run limits: none configured")
-
-    @staticmethod
-    def _load_limits(config_path: str) -> RunLimits:
-        cfg = configparser.ConfigParser()
-        if Path(config_path).exists():
-            cfg.read(config_path)
-        return RunLimits.from_config(cfg)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

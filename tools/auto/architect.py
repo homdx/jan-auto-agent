@@ -560,13 +560,19 @@ class ClusterReviewer:
                 exc_str = str(exc)
                 # Only retry on transient server-side errors (5xx) or connection
                 # failures.  Client errors (4xx) are deterministic — no point retrying.
-                # Parse the HTTP status code directly from the exception to avoid
-                # false positives from substrings (e.g. a model name like
-                # "gpt-4-5000" or an error body that mentions "error 500").
+                # Prefer the REAL status from the exception object: urllib raises
+                # HTTPError with an integer ``.code``.  Only fall back to a
+                # word-boundary scan of the message for non-HTTP transport errors,
+                # which avoids false positives from substrings (e.g. a model name
+                # like "gpt-4-5000" or an error body that mentions "error 500").
                 _http_status: int = 0
-                _status_match = _re.search(r"\b([1-5]\d{2})\b", exc_str)
-                if _status_match:
-                    _http_status = int(_status_match.group(1))
+                _code = getattr(exc, "code", None)
+                if isinstance(_code, int):
+                    _http_status = _code
+                else:
+                    _status_match = _re.search(r"\b([1-5]\d{2})\b", exc_str)
+                    if _status_match:
+                        _http_status = int(_status_match.group(1))
                 _is_transient = (
                     (500 <= _http_status <= 599)
                     or "ConnectionRefused" in exc_str
