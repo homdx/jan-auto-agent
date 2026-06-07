@@ -234,6 +234,57 @@ def test_inner_loop_accumulates_validator_context_across_attempts():
         assert "beta" in ctx_attempt3, "beta (from attempt-2 rejection) missing on attempt 3"
 
 
+class _CoderRequestsThenSatisfied:
+    """Reports context_request=['foo'] on attempts 1 & 2 (via CoderResult.missing_context)."""
+    def __init__(self):
+        self.calls: list = []
+        self.n = 0
+    def generate(self, task, base_dir, prior_feedback=None, prefetched_context="", **kw):
+        self.calls.append(prefetched_context)
+        self.n += 1
+        mc = ["foo"] if self.n <= 2 else []
+        return CoderResult(task_id="T", files_written=["lib.py"], missing_context=mc)
+
+
+class _ValBarThenNoMissing:
+    """Attempt1: reject + missing ['bar']; Attempt2: reject + NO missing; Attempt3: approve."""
+    def __init__(self):
+        self.n = 0
+        self.last_missing_context: list = []
+    def approve(self, task, exec_result, coder_result):
+        self.n += 1
+        if self.n == 1:
+            self.last_missing_context = ["bar"]
+            return False, "need bar"
+        if self.n == 2:
+            self.last_missing_context = []
+            return False, "still wrong"
+        self.last_missing_context = []
+        return True, ""
+
+
+def test_coder_pull_does_not_clobber_validator_accumulated_context():
+    """Regression: coder-side context_request must accumulate, not overwrite.
+
+    Reviewer requests 'bar' on attempt 1; coder requests 'foo' on attempts 1-2;
+    attempt 2's rejection carries no missing_context. Attempt 3 must still see
+    BOTH 'bar' (reviewer) and 'foo' (coder) — the coder pull previously
+    overwrote prefetched_context and dropped 'bar'.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        (d / "lib.py").write_text(
+            "def foo():\n    return 1\n\ndef bar():\n    return 2\n"
+        )
+        coder = _CoderRequestsThenSatisfied()
+        loop = InnerLoop(coder, _Exec(), _ValBarThenNoMissing(), max_attempts=4)
+        res = loop.run_task({"id": "T", "target_files": []}, d)
+        assert res.passed is True
+        ctx3 = coder.calls[2]
+        assert "bar" in ctx3, "reviewer-accumulated 'bar' was clobbered by the coder pull"
+        assert "foo" in ctx3, "coder-requested 'foo' missing from accumulated context"
+
+
 if __name__ == "__main__":
     import pytest
     sys.exit(pytest.main([__file__, "-q"]))

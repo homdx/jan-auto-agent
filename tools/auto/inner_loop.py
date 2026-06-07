@@ -462,9 +462,15 @@ class InnerLoop:
             if coder_missing or not getattr(coder_result, "context_satisfied", True):
                 _any_missing = True
             if coder_missing:
-                prefetched_context = self._broker.fetch(coder_missing, target_files, base_dir_path)
-                logger.info("InnerLoop: attempt %d coder requested context %s — prefetched for next attempt",
-                            attempt, coder_missing)
+                # Accumulate into the SAME running context as the validator path
+                # so neither side clobbers the other's pulls (was: overwrite via
+                # fetch(), which dropped reviewer-accumulated context when the
+                # next rejection carried no missing_context of its own).
+                newly = self._broker.resolve(coder_missing, target_files, base_dir_path)
+                resolved_context.update(newly)
+                prefetched_context = self._broker.format_for_prompt(resolved_context)
+                logger.info("InnerLoop: attempt %d coder requested context %s — accumulated (%d total)",
+                            attempt, coder_missing, len(resolved_context))
 
             if not getattr(coder_result, "succeeded", True):
                 fb = f"attempt {attempt}: coder failed — {getattr(coder_result, 'error', 'unknown error')}"
