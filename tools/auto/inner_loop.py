@@ -197,6 +197,8 @@ class LLMGate2Validator:
 
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+
     def _read_changed_content(self, coder_result, task: dict | None = None) -> str:
         """Read the post-edit content of the files the coder wrote, so the
         validator judges the ACTUAL code (not just file names).  The Gate-2
@@ -422,7 +424,8 @@ class InnerLoop:
         records:  list[AttemptRecord] = []
         # Pull-model state (carried across attempts within this round)
         prefetched_context: str = ""
-        _any_missing: bool = False   # True if any attempt's coder still reported a context gap
+        final_missing: list[str] = []
+        _any_missing: bool = False   # Task 4: True if any attempt had unsatisfied context
         base_dir_path = Path(base_dir)
         target_files  = task.get("target_files", []) or []
 
@@ -453,11 +456,15 @@ class InnerLoop:
                 records.append(AttemptRecord(attempt, False, False, False, fb))
                 continue
 
-            # SCTX: the coder fetches its own missing context inside generate()
-            # (the in-generate context probe). context_satisfied is False when its
-            # final response still reported a gap — that gates the outer-loop rewrite.
-            if not getattr(coder_result, "context_satisfied", True):
+            # Pull-model: resolve any context the coder asked for, for the NEXT attempt.
+            coder_missing = list(getattr(coder_result, "missing_context", []) or [])
+            final_missing = coder_missing
+            if coder_missing or not getattr(coder_result, "context_satisfied", True):
                 _any_missing = True
+            if coder_missing:
+                prefetched_context = self._broker.fetch(coder_missing, target_files, base_dir_path)
+                logger.info("InnerLoop: attempt %d coder requested context %s — prefetched for next attempt",
+                            attempt, coder_missing)
 
             if not getattr(coder_result, "succeeded", True):
                 fb = f"attempt {attempt}: coder failed — {getattr(coder_result, 'error', 'unknown error')}"
@@ -515,8 +522,9 @@ class InnerLoop:
                 records.append(AttemptRecord(attempt, True, True, False, fb))
                 val_missing = list(getattr(self.validator, "last_missing_context", []) or [])
                 if val_missing:
+                    final_missing = val_missing
                     prefetched_context = self._broker.fetch(
-                        val_missing, target_files, base_dir_path
+                        val_missing, task.get("target_files", []) or [], Path(base_dir)
                     )
                 continue
 

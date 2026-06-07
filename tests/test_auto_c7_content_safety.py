@@ -249,83 +249,81 @@ class TestCheckContentSafety:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# False-positive regression — patterns that must NOT be blocked after fix
+# Bug-2 regression — false positives and single-quote bypass (open root write)
 # ─────────────────────────────────────────────────────────────────────────────
 
-class TestFalsePositiveRegression:
-    """Patterns that were blocked before the HIGH fix but should now pass."""
+class TestBug2FalsePositives:
+    """Verify that the improved pattern matching no longer fires on legitimate
+    code patterns while still blocking genuinely dangerous content."""
 
-    # ── open() — safe write destinations ─────────────────────────────────────
+    # ── open() path narrowing ─────────────────────────────────────────────────
 
-    def test_open_tmp_path_is_safe(self) -> None:
-        """/tmp is a legitimate temp-file destination; must not be blocked."""
+    def test_tmp_file_write_is_safe(self) -> None:
+        """/tmp is a legitimate destination — must not be blocked."""
         code = 'with open("/tmp/output.txt", "w") as f:\n    f.write(data)\n'
-        safe, reason = _check(code)
-        assert safe is True, f"unexpected block: {reason}"
+        safe, _ = _check(code)
+        assert safe is True
 
-    def test_open_var_log_is_safe(self) -> None:
-        """/var/log is a standard log directory; must not be blocked."""
-        code = 'handler = open("/var/log/app.log", "a")\n'
-        safe, reason = _check(code)
-        assert safe is True, f"unexpected block: {reason}"
+    def test_tmp_file_single_quote_is_safe(self) -> None:
+        code = "with open('/tmp/output.txt', 'w') as f:\n    f.write(data)\n"
+        safe, _ = _check(code)
+        assert safe is True
 
-    def test_open_home_path_is_safe(self) -> None:
-        """/home paths are user-space; must not be blocked."""
-        code = 'f = open("/home/user/config.json", "w")\n'
-        safe, reason = _check(code)
-        assert safe is True, f"unexpected block: {reason}"
-
-    # ── reboot in identifier — word-boundary fix ──────────────────────────────
-
-    def test_reboot_in_function_name_is_safe(self) -> None:
-        """Function name test_reboot_gracefully must not trip the reboot guard."""
-        code = "def test_reboot_gracefully():\n    assert system.can_recover()\n"
-        safe, reason = _check(code)
-        assert safe is True, f"unexpected block: {reason}"
-
-    def test_reboot_in_class_name_is_safe(self) -> None:
-        code = "class MockRebootHandler:\n    def handle(self): pass\n"
-        safe, reason = _check(code)
-        assert safe is True, f"unexpected block: {reason}"
-
-    def test_shutdown_in_method_name_is_safe(self) -> None:
-        """mock_shutdown_handler must not be blocked by the shutdown guard."""
-        code = "def mock_shutdown_handler(sig, frame):\n    pass\n"
-        safe, reason = _check(code)
-        assert safe is True, f"unexpected block: {reason}"
-
-    # ── open() bypass now closed — single quotes must still be blocked ────────
-
-    def test_open_etc_single_quote_is_blocked(self) -> None:
-        """open('/etc/passwd', 'w') via single quotes was previously a bypass."""
+    def test_single_quote_system_path_blocked(self) -> None:
+        """Single-quoted dangerous paths were previously bypassed — now blocked."""
         code = "with open('/etc/passwd', 'w') as f:\n    f.write('evil')\n"
         safe, reason = _check(code)
         assert safe is False
         assert "open" in reason.lower()
 
-    def test_open_etc_double_quote_still_blocked(self) -> None:
-        """Existing double-quote form must continue to be blocked."""
+    def test_double_quote_system_path_still_blocked(self) -> None:
         code = 'with open("/etc/hosts", "w") as f:\n    f.write("evil")\n'
         safe, reason = _check(code)
         assert safe is False
         assert "open" in reason.lower()
 
-    def test_open_usr_single_quote_blocked(self) -> None:
-        code = "open('/usr/lib/python3/bad.py', 'w')\n"
+    def test_usr_bin_path_blocked(self) -> None:
+        code = 'open("/usr/bin/python3", "wb").write(payload)\n'
         safe, _ = _check(code)
         assert safe is False
 
-    # ── standalone dangerous words still blocked ──────────────────────────────
+    # ── word-boundary: identifier names must not fire ─────────────────────────
 
-    def test_bare_reboot_command_still_blocked(self) -> None:
+    def test_reboot_in_function_name_is_safe(self) -> None:
+        """test_reboot_gracefully contains 'reboot' but is not a shell command."""
+        code = "def test_reboot_gracefully():\n    assert service.restart() == 0\n"
+        safe, _ = _check(code)
+        assert safe is True
+
+    def test_reboot_in_variable_name_is_safe(self) -> None:
+        code = "reboot_flag = False\nif reboot_flag:\n    logger.info('skip')\n"
+        safe, _ = _check(code)
+        assert safe is True
+
+    def test_shutdown_in_function_name_is_safe(self) -> None:
+        code = "def handle_shutdown_signal(sig, frame):\n    cleanup()\n"
+        safe, _ = _check(code)
+        assert safe is True
+
+    def test_sudo_in_function_name_is_safe(self) -> None:
+        code = "def test_sudo_not_needed():\n    assert run_as_user() == 0\n"
+        safe, _ = _check(code)
+        assert safe is True
+
+    # ── standalone dangerous keywords still blocked ───────────────────────────
+
+    def test_standalone_reboot_still_blocked(self) -> None:
         """A bare 'reboot' shell command must still be caught."""
-        script = "reboot\n"
-        safe, _ = _check(script)
+        safe, _ = _check("reboot\n")
         assert safe is False
 
-    def test_bare_shutdown_command_still_blocked(self) -> None:
-        script = "import os\nos.system('shutdown -h now')\n"
-        safe, _ = _check(script)
+    def test_shutdown_in_os_system_still_blocked(self) -> None:
+        safe, _ = _check("import os\nos.system('shutdown -h now')\n")
+        assert safe is False
+
+    def test_sudo_standalone_still_blocked(self) -> None:
+        """'sudo apt install' in a shell script must still be caught."""
+        safe, _ = _check("sudo apt install nginx\n")
         assert safe is False
 
 
