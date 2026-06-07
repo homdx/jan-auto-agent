@@ -424,6 +424,7 @@ class InnerLoop:
         records:  list[AttemptRecord] = []
         # Pull-model state (carried across attempts within this round)
         prefetched_context: str = ""
+        resolved_context: dict[str, str] = {}   # accumulates every symbol the validator has asked for
         _any_missing: bool = False   # Task 4: True if any attempt had unsatisfied context
         base_dir_path = Path(base_dir)
         target_files  = task.get("target_files", []) or []
@@ -521,8 +522,12 @@ class InnerLoop:
                 records.append(AttemptRecord(attempt, True, True, False, fb))
                 val_missing = list(getattr(self.validator, "last_missing_context", []) or [])
                 if val_missing:
-                    prefetched_context = self._broker.fetch(
-                        val_missing, task.get("target_files", []) or [], Path(base_dir)
+                    newly = self._broker.resolve(val_missing, target_files, base_dir_path)
+                    resolved_context.update(newly)
+                    prefetched_context = self._broker.format_for_prompt(resolved_context)
+                    logger.info(
+                        "InnerLoop: attempt %d validator requested context %s — accumulated (%d total)",
+                        attempt, val_missing, len(resolved_context),
                     )
                 continue
 
