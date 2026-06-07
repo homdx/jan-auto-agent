@@ -130,6 +130,110 @@ def test_outer_loop_gate_uses_context_satisfied():
     assert 'getattr(res, "context_satisfied", True)' in src
 
 
+# ───────────────────────── PIPE-104 additions ────────────────────
+
+
+def test_project_scan_result_is_cached():
+    """Pass-2 hit is cached; deleting the source file doesn't break a second
+    resolve; reset_cache() forces a real re-scan (which then misses)."""
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        dep = d / "dep.py"
+        dep.write_text("def cached_fn():\n    return 42\n")
+        broker = ContextBroker()
+        # First resolve — hits Pass-2 (dep.py is not a target file)
+        result1 = broker.resolve(["cached_fn"], [], d)
+        assert "cached_fn" in result1
+        # Delete the source; second resolve must still be served from cache
+        dep.unlink()
+        result2 = broker.resolve(["cached_fn"], [], d)
+        assert "cached_fn" in result2, "expected cache hit after source deleted"
+        # After reset the broker must re-scan — file is gone, so it misses
+        broker.reset_cache()
+        result3 = broker.resolve(["cached_fn"], [], d)
+        assert "cached_fn" not in result3, "expected cache miss after reset_cache()"
+
+
+def test_target_file_results_stay_fresh():
+    """Pass-1 (target-file) hits are never cached, so rewriting the file is
+    reflected in the very next resolve() call."""
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        target = d / "target.py"
+        target.write_text("def fresh_fn():\n    return 'original'\n")
+        broker = ContextBroker()
+        result1 = broker.resolve(["fresh_fn"], ["target.py"], d)
+        assert "original" in result1.get("fresh_fn", "")
+        # Overwrite the target file (simulates what the coder does each attempt)
+        target.write_text("def fresh_fn():\n    return 'rewritten'\n")
+        result2 = broker.resolve(["fresh_fn"], ["target.py"], d)
+        assert "rewritten" in result2.get("fresh_fn", ""), (
+            "Pass-1 result should reflect new file content, not a stale cache"
+        )
+
+
+def test_cap_applies_only_to_uncached():
+    """Cached symbols are free; the _max_symbols cap only limits the number of
+    *new* (uncached) symbols resolved in one call."""
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        # Write 6 symbols into a dependency file (not a target file → Pass-2)
+        lines = []
+        for i in range(6):
+            lines.append(f"def sym_{i}():\n    return {i}\n")
+        (d / "lib.py").write_text("\n".join(lines))
+
+        broker = ContextBroker(max_symbols=3)
+
+        # First call — only 3 new symbols resolved (cap applied)
+        first = broker.resolve([f"sym_{i}" for i in range(3)], [], d)
+        assert len(first) == 3
+
+        # Second call — first 3 are cached (free) + 3 new ones requested
+        second = broker.resolve([f"sym_{i}" for i in range(6)], [], d)
+        # Must return all 6: 3 from cache (free) + 3 new (within cap)
+        assert len(second) == 6, (
+            f"expected 6 symbols (3 cached + 3 new), got {len(second)}"
+        )
+
+
+class _AccumulatingValidator:
+    """Rejects twice, citing a different symbol each time, then approves."""
+    def __init__(self):
+        self.n = 0
+        self.last_missing_context: list[str] = []
+
+    def approve(self, task, exec_result, coder_result):
+        self.n += 1
+        if self.n == 1:
+            self.last_missing_context = ["alpha"]
+            return False, "need alpha"
+        if self.n == 2:
+            self.last_missing_context = ["beta"]
+            return False, "need beta"
+        self.last_missing_context = []
+        return True, ""
+
+
+def test_inner_loop_accumulates_validator_context_across_attempts():
+    """Symbols requested by the validator accumulate: attempt 3's
+    prefetched_context must contain BOTH 'alpha' (from attempt 1) and
+    'beta' (from attempt 2)."""
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        (d / "lib.py").write_text(
+            "def alpha():\n    return 'a'\n\ndef beta():\n    return 'b'\n"
+        )
+        coder = _OkCoder()
+        loop = InnerLoop(coder, _Exec(), _AccumulatingValidator(), max_attempts=4)
+        res = loop.run_task({"id": "T", "target_files": []}, d)
+        assert res.passed is True
+        # attempt 3 (index 2) must have received both symbols
+        ctx_attempt3 = coder.calls[2]
+        assert "alpha" in ctx_attempt3, "alpha (from attempt-1 rejection) missing on attempt 3"
+        assert "beta" in ctx_attempt3, "beta (from attempt-2 rejection) missing on attempt 3"
+
+
 if __name__ == "__main__":
     import pytest
     sys.exit(pytest.main([__file__, "-q"]))
