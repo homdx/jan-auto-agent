@@ -106,6 +106,23 @@ def test_inner_loop_prefetches_validator_requested_context_into_next_attempt():
         assert res.context_satisfied is True
 
 
+# ───────────────────────── CoderResult.succeeded contract ────────────────────
+
+def test_coder_result_succeeded_false_when_error_set():
+    """succeeded must be False whenever error is non-empty, regardless of
+    files_written.  test_context_satisfied_false_when_coder_reports_gap
+    depends on this holding — make the dependency explicit and load-bearing."""
+    assert CoderResult(task_id="T", files_written=[],    error="need ctx").succeeded is False
+    assert CoderResult(task_id="T", files_written=["f"], error="need ctx").succeeded is False
+
+def test_coder_result_succeeded_false_when_no_files_written():
+    """No files written → failed even without an error string."""
+    assert CoderResult(task_id="T", files_written=[], error="").succeeded is False
+
+def test_coder_result_succeeded_true_only_when_files_and_no_error():
+    assert CoderResult(task_id="T", files_written=["f.py"], error="").succeeded is True
+
+
 # ───────────────────────── context_satisfied (Signal A) ──────────
 
 class _CoderReportsGap:
@@ -116,6 +133,15 @@ class _CoderReportsGap:
 
 
 def test_context_satisfied_false_when_coder_reports_gap():
+    # Guard: the test only makes sense if a CoderResult with error set
+    # and no files written is treated as not succeeded.  If this assertion
+    # fails, fix CoderResult.succeeded before debugging this test.
+    _sentinel = CoderResult(task_id="T", files_written=[], error="need ctx",
+                            context_satisfied=False)
+    assert _sentinel.succeeded is False, (
+        "CoderResult.succeeded contract broken: error non-empty must imply succeeded=False"
+    )
+
     with tempfile.TemporaryDirectory() as d:
         loop = InnerLoop(_CoderReportsGap(), _Exec(),
                          _RejectThenApprove(), max_attempts=2)
