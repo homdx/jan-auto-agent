@@ -424,7 +424,6 @@ class InnerLoop:
         records:  list[AttemptRecord] = []
         # Pull-model state (carried across attempts within this round)
         prefetched_context: str = ""
-        final_missing: list[str] = []
         _any_missing: bool = False   # Task 4: True if any attempt had unsatisfied context
         base_dir_path = Path(base_dir)
         target_files  = task.get("target_files", []) or []
@@ -458,7 +457,6 @@ class InnerLoop:
 
             # Pull-model: resolve any context the coder asked for, for the NEXT attempt.
             coder_missing = list(getattr(coder_result, "missing_context", []) or [])
-            final_missing = coder_missing
             if coder_missing or not getattr(coder_result, "context_satisfied", True):
                 _any_missing = True
             if coder_missing:
@@ -522,7 +520,6 @@ class InnerLoop:
                 records.append(AttemptRecord(attempt, True, True, False, fb))
                 val_missing = list(getattr(self.validator, "last_missing_context", []) or [])
                 if val_missing:
-                    final_missing = val_missing
                     prefetched_context = self._broker.fetch(
                         val_missing, task.get("target_files", []) or [], Path(base_dir)
                     )
