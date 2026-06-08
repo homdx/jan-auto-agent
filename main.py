@@ -566,11 +566,11 @@ def main():
             # answer() with stream=False — no tokens written to stdout mid-call.
             result = orchestrator.faq_agent.answer(question, stream=False)
             if result == orchestrator.faq_agent.NOT_FOUND:
-                payload = {"found": False, "answer": None}
+                payload = {"found": False, "answer": None, "llm_call_count": orchestrator.faq_agent.llm_call_count}
                 print(json.dumps(payload, ensure_ascii=False))
                 sys.exit(1)
             else:
-                payload = {"found": True, "answer": result}
+                payload = {"found": True, "answer": result, "llm_call_count": orchestrator.faq_agent.llm_call_count}
                 print(json.dumps(payload, ensure_ascii=False))
                 sys.exit(0)
         else:
@@ -578,6 +578,8 @@ def main():
             # stream=False: this branch prints the formatted result itself,
             # so streaming here would emit the answer twice (and leak rejected text).
             result = orchestrator.faq_agent.answer(question, stream=False)
+            llm_calls = orchestrator.faq_agent.llm_call_count
+            print(f"[{_ts()}] 📊 LLM API calls: {llm_calls}")
             if result == orchestrator.faq_agent.NOT_FOUND:
                 print("\n❌ NOT FOUND — no matching entry in the knowledge base.")
                 sys.exit(1)
@@ -678,6 +680,8 @@ def main():
 
                 print(f"\n[{_ts()}] 🗂  FAQ lookup …")
                 result = orchestrator.faq_agent.answer(body, stream=False)
+                llm_calls = orchestrator.faq_agent.llm_call_count
+                print(f"[{_ts()}] 📊 LLM API calls: {llm_calls}")
                 if result == orchestrator.faq_agent.NOT_FOUND:
                     print(f"\n[{_ts()}] ❌ NOT FOUND — no matching entry in the knowledge base.")
                 else:

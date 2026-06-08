@@ -195,6 +195,10 @@ class FaqAgent:
         # always use `agent.NOT_FOUND` regardless of ini customisation.
         self.NOT_FOUND = self.not_found_marker
 
+        # Counter: total LLM API calls made during the last answer() invocation.
+        # Reset to 0 at the top of every answer() call.
+        self.llm_call_count: int = 0
+
     # ── Connectivity helpers ─────────────────────────────────────────────────
 
     def _chat_url(self) -> str:
@@ -266,6 +270,7 @@ class FaqAgent:
                 api_format=self.api_format,
                 ssl_context=self.ssl_context,
             )
+            self.llm_call_count += 1  # keyword extraction call
             text = strip_think(raw).strip()
             # Remove markdown fences: ```json ... ``` or ``` ... ```
             text = re.sub(r"```(?:json)?\n?", "", text).strip().rstrip("`").strip()
@@ -413,6 +418,7 @@ class FaqAgent:
                 api_format=self.api_format,
                 ssl_context=self.ssl_context,
             )
+            self.llm_call_count += 1  # validation call
             verdict = strip_think(verdict).strip().upper()
             logger.debug("FaqAgent validate verdict: %r", verdict)
             # Strict: only an explicit VALID verdict passes. "INVALID: …" and any
@@ -520,6 +526,7 @@ class FaqAgent:
             api_format=self.api_format,
             ssl_context=self.ssl_context,
         )
+        self.llm_call_count += 1  # per-candidate call
         return strip_think(raw).strip()
 
     # ── Public API ───────────────────────────────────────────────────────────
@@ -558,6 +565,7 @@ class FaqAgent:
         """
         # step 1: pull model if Ollama
         self._ensure_model()
+        self.llm_call_count = 0  # reset at start of each answer() call
 
         # step 2: load knowledge files
         docs = self._load_knowledge()
@@ -708,6 +716,7 @@ class FaqAgent:
                     on_token=lambda t: (sys.stdout.write(t), sys.stdout.flush()),
                     ssl_context=self.ssl_context,
                 )
+                self.llm_call_count += 1  # legacy streaming call
                 print()  # newline after streamed output
             else:
                 reply = request_completion(
@@ -716,6 +725,7 @@ class FaqAgent:
                     api_format=self.api_format,
                     ssl_context=self.ssl_context,
                 )
+                self.llm_call_count += 1  # legacy non-streaming call
 
             answer = strip_think(reply).strip()
 
