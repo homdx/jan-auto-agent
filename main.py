@@ -166,6 +166,12 @@ class Orchestrator(OrchestratorActions):
     def load_config(self, config_path: str) -> None:
         if os.path.exists(config_path):
             self.config.read(config_path)
+        else:
+            logger.warning(
+                "Config file not found: '%s' — all settings will use built-in defaults. "
+                "Pass --config <file> to specify the correct path.",
+                config_path,
+            )
         
         self.max_iterations = self.config.getint("loop", "max_iterations", fallback=3)
         self.timeout_seconds = self.config.getint("loop", "timeout_seconds", fallback=240)

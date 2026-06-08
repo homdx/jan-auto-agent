@@ -496,6 +496,61 @@ class FaqAgent:
             )
             return True  # fail open
 
+    # ── Deterministic grounding check ───────────────────────────────────────
+
+    # Regex: a non-empty line that looks like a shell command.
+    _CMD_LINE_RE = re.compile(
+        r"^\s*(sudo|apt(?:-get)?|systemctl|service|ln|rm|mv|cp|chmod|chown|"
+        r"mkdir|echo|cat|grep|sed|awk|bash|sh|python3?|pip3?|curl|wget|"
+        r"tar|unzip|export|source|\.)\s+\S",
+        re.MULTILINE,
+    )
+
+    def _is_grounded(self, answer: str, context: str) -> bool:
+        """
+        Deterministic (no LLM) grounding check: every shell command line
+        found inside fenced code blocks in *answer* must appear verbatim
+        in *context* (whitespace-normalised).
+
+        Returns True  → answer is grounded (or has no code blocks to check).
+        Returns False → at least one command is not in the source; likely
+                        hallucinated by inverting / extending the knowledge.
+
+        This catches the canonical failure mode — e.g. the model fabricates
+        ``sudo rm /usr/sbin/angie-debug`` from a file that only contains
+        ``sudo ln -fs angie-debug /usr/sbin/angie`` — without any LLM call.
+        """
+        # Extract every non-empty line from fenced code blocks in the answer.
+        code_lines: list[str] = []
+        for block in re.finditer(r"```[^\n]*\n(.*?)```", answer, re.DOTALL):
+            for raw_line in block.group(1).splitlines():
+                line = raw_line.strip()
+                if line:
+                    code_lines.append(line)
+
+        if not code_lines:
+            return True  # no code blocks — nothing to check deterministically
+
+        # Only check lines that look like shell commands; skip comments and
+        # plain-text annotations inside code blocks.
+        cmd_lines = [l for l in code_lines if self._CMD_LINE_RE.match(l)]
+        if not cmd_lines:
+            return True  # code blocks exist but contain no shell commands
+
+        # Normalise whitespace in context once for all comparisons.
+        ctx_norm = " ".join(context.split())
+
+        for cmd in cmd_lines:
+            cmd_norm = " ".join(cmd.split())
+            if cmd_norm not in ctx_norm:
+                logger.info(
+                    "FaqAgent grounding check FAILED: command not in source: %r",
+                    cmd_norm,
+                )
+                return False
+
+        return True
+
     # ── Not-found detection ──────────────────────────────────────────────────
 
     def _is_not_found(self, answer: str) -> bool:
@@ -709,6 +764,14 @@ class FaqAgent:
                 )
                 continue
 
+            # deterministic grounding check — no LLM call
+            if not self._is_grounded(candidate_ans, candidate_ctx):
+                logger.info(
+                    "FaqAgent: candidate %r failed grounding check "
+                    "(answer contains commands not in source) — trying next", name
+                )
+                continue
+
             # optional validation pass
             if self.validate_answer_enabled:
                 if not self._validate_answer(question, candidate_ans, candidate_ctx):
@@ -798,6 +861,13 @@ class FaqAgent:
 
             # step 4: not-found check
             if self._is_not_found(answer):
+                return self.not_found_marker
+
+            # step 4b: deterministic grounding check — no LLM call
+            if not self._is_grounded(answer, context):
+                logger.info(
+                    "FaqAgent: legacy answer failed grounding check — returning NOT FOUND"
+                )
                 return self.not_found_marker
 
             # step 5: answer-validate
