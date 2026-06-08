@@ -129,3 +129,50 @@ class TestRevalidateDisabled:
         with patch(_RC, side_effect=[good]) as rc:   # only ONE call, no revalidation
             assert agent.answer("How enable debug log Angie Pro", stream=False) == good
         assert rc.call_count == 1
+
+
+# ── Cross-language flexibility (regression) ───────────────────────────────────
+
+_RU_NODE_EXPORTER = (
+    "Джоба для установки node_exporter на сервер.\n"
+    "Запустить следующую джобу Jenkins\n"
+    "https://jenkins.com/job/node_exporter/\n"
+)
+
+
+def _make_agent_ru(tmp_path: Path, *, smart: bool) -> FaqAgent:
+    kb = tmp_path / "knowledge" / "elk"
+    kb.mkdir(parents=True)
+    (kb / "node_exporter.txt").write_text(_RU_NODE_EXPORTER)
+    agent = FaqAgent(model="m", base_url="http://localhost:11434",
+                     api_key="k", api_format="ollama", timeout=10)
+    agent.knowledge_dir = tmp_path / "knowledge"
+    agent.smart_search = smart
+    agent.validate_answer_enabled = False
+    agent.revalidate_grounding_enabled = True
+    agent._ensure_model = MagicMock()
+    return agent
+
+
+class TestCrossLanguage:
+    """English question + Russian KB → must still answer (DIRECT), not NOT FOUND.
+    A cross-language match is a MEANING match; revalidation must return DIRECT."""
+
+    def test_english_question_russian_kb_legacy(self, tmp_path):
+        agent = _make_agent_ru(tmp_path, smart=False)
+        translated = "Run the following Jenkins job: https://jenkins.com/job/node_exporter/"
+        with patch(_RC, side_effect=[translated, "DIRECT"]):
+            result = agent.answer("How install node_exporter", stream=False)
+        assert result == translated
+        assert result != NOT_FOUND_MARKER
+
+    def test_english_question_russian_kb_smart(self, tmp_path):
+        agent = _make_agent_ru(tmp_path, smart=True)
+        translated = "Run the following Jenkins job: https://jenkins.com/job/node_exporter/"
+        with patch(_RC, side_effect=[
+            '["node_exporter","install","prometheus"]',  # keyword extraction
+            translated,                                   # candidate answer (translated)
+            "DIRECT",                                     # revalidation: meaning matches
+        ]):
+            result = agent.answer("How install node_exporter", stream=False)
+        assert result == translated
