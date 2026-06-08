@@ -875,3 +875,69 @@ class TestReviewRegressions:
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+# ════════════════════════════════════════════════════════════════════════════
+#  Regression — auto_pull / remote-endpoint pull handling (404 noise)
+# ════════════════════════════════════════════════════════════════════════════
+
+class TestAutoPull:
+    """`_ensure_model` must not POST /api/pull to a remote/hosted gateway
+    (which has no such route and 404s on every call); pull is for local Ollama."""
+
+    def _ollama(self, tmp_path, url, auto="auto"):
+        agent = _make_agent(tmp_path, api_format="ollama")
+        agent.base_url = url
+        agent.auto_pull = auto
+        return agent
+
+    def test_remote_endpoint_auto_skips_pull(self, tmp_path):
+        agent = self._ollama(tmp_path, "https://api.company.com")
+        with patch("urllib.request.urlopen") as mock_open:
+            agent._ensure_model()
+        mock_open.assert_not_called()
+
+    def test_local_endpoint_auto_pulls(self, tmp_path):
+        agent = self._ollama(tmp_path, "http://localhost:11434")
+        fake = MagicMock()
+        fake.__enter__ = lambda s: s
+        fake.__exit__  = MagicMock(return_value=False)
+        fake.read      = MagicMock(return_value=b"{}")
+        with patch("urllib.request.urlopen", return_value=fake) as mock_open:
+            agent._ensure_model()
+        assert mock_open.called
+
+    def test_auto_pull_false_never_pulls(self, tmp_path):
+        agent = self._ollama(tmp_path, "http://localhost:11434", auto="false")
+        with patch("urllib.request.urlopen") as mock_open:
+            agent._ensure_model()
+        mock_open.assert_not_called()
+
+    def test_auto_pull_true_forces_pull_on_remote(self, tmp_path):
+        agent = self._ollama(tmp_path, "https://api.company.com", auto="true")
+        fake = MagicMock()
+        fake.__enter__ = lambda s: s
+        fake.__exit__  = MagicMock(return_value=False)
+        fake.read      = MagicMock(return_value=b"{}")
+        with patch("urllib.request.urlopen", return_value=fake) as mock_open:
+            agent._ensure_model()
+        assert mock_open.called
+
+    def test_pull_404_is_benign_no_warning(self, tmp_path, caplog):
+        """A 404 from /api/pull (endpoint has no pull route) must NOT warn."""
+        import urllib.error, logging as _logging
+        agent = self._ollama(tmp_path, "https://api.company.com", auto="true")
+        err = urllib.error.HTTPError("https://api.company.com/api/pull", 404, "", {}, None)
+        with patch("urllib.request.urlopen", side_effect=err):
+            with caplog.at_level(_logging.WARNING, logger="tools.faq_agent"):
+                agent._ensure_model()  # must not raise
+        assert not [r for r in caplog.records if r.levelno >= _logging.WARNING], \
+            "404 pull must be benign (debug), not a warning"
+
+    def test_pull_non_404_still_warns(self, tmp_path):
+        """A genuine transient error (e.g. 503) keeps the warning."""
+        import urllib.error
+        agent = self._ollama(tmp_path, "http://localhost:11434", auto="true")
+        err = urllib.error.HTTPError("http://localhost:11434/api/pull", 503, "", {}, None)
+        with patch("urllib.request.urlopen", side_effect=err):
+            agent._ensure_model()  # must not raise

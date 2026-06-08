@@ -33,6 +33,7 @@ import json
 import logging
 import urllib.request
 import urllib.error
+import urllib.parse
 from pathlib import Path
 
 from tools.llm_stream import request_completion, strip_think, ollama_chat_url
@@ -173,6 +174,12 @@ class FaqAgent:
             self.max_candidates = cfg.getint(
                 "faq_agent", "max_candidates", fallback=5
             )
+            # auto_pull: when (and whether) to POST /api/pull before inference.
+            #   "auto"  (default) → only for a local Ollama daemon
+            #   "true"/"false"    → force on / off
+            self.auto_pull = cfg.get(
+                "faq_agent", "auto_pull", fallback="auto"
+            ).strip().lower()
         else:
             self.knowledge_dir    = Path("./knowledge")
             self.extensions       = [".txt", ".md"]
@@ -190,6 +197,7 @@ class FaqAgent:
             self.keyword_system     = _DEFAULT_KEYWORD_SYSTEM
             self.keyword_max_tokens = 64
             self.max_candidates     = 5
+            self.auto_pull          = "auto"
 
         # Keep NOT_FOUND in sync with any ini-customised marker so callers can
         # always use `agent.NOT_FOUND` regardless of ini customisation.
@@ -207,13 +215,45 @@ class FaqAgent:
             return ollama_chat_url(base)
         return f"{base}/chat/completions"
 
+    # Hosts that denote a local Ollama daemon (where /api/pull is meaningful).
+    _LOCAL_HOSTS = frozenset(
+        {"localhost", "127.0.0.1", "0.0.0.0", "::1", "host.docker.internal"}
+    )
+
+    def _should_pull(self) -> bool:
+        """Whether to attempt an Ollama ``/api/pull`` before inference.
+
+        ``auto_pull`` (from ``[faq_agent]``):
+          * ``"true"``  → always attempt;
+          * ``"false"`` → never;
+          * ``"auto"`` (default) → only when the endpoint is a *local* Ollama
+            daemon. A remote/hosted ollama-compatible gateway serves models and
+            exposes no ``/api/pull`` route, so pulling there is meaningless and
+            merely 404s on every call.
+        """
+        mode = getattr(self, "auto_pull", "auto")
+        if mode in ("true", "yes", "on", "1"):
+            return True
+        if mode in ("false", "no", "off", "0"):
+            return False
+        host = (urllib.parse.urlparse(self.base_url).hostname or "").lower()
+        return host in self._LOCAL_HOSTS
+
     def _ensure_model(self) -> None:
         """
-        Ollama only: POST /api/pull before the first inference call so the
-        model is locally available.  Idempotent.  No-op for openai format.
-        Errors are swallowed — a transient registry hiccup must not block FAQ.
+        Ollama only: POST /api/pull before the first inference call so a *local*
+        daemon has the model available.  Idempotent.  No-op for openai format
+        and for remote/hosted endpoints (see ``_should_pull``).  Errors are
+        swallowed — a best-effort pre-flight must never block the FAQ answer.
         """
         if self.api_format != "ollama":
+            return
+        if not self._should_pull():
+            logger.debug(
+                "FaqAgent: skipping model pull (auto_pull=%s, endpoint=%s); "
+                "remote endpoints serve models and have no /api/pull",
+                getattr(self, "auto_pull", "auto"), self.base_url,
+            )
             return
 
         base     = self.base_url.rstrip("/")
@@ -230,6 +270,19 @@ class FaqAgent:
             with urllib.request.urlopen(req, timeout=self.timeout, context=ctx) as resp:
                 resp.read()
             logger.debug("FaqAgent: model %r is ready", self.model)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                # No /api/pull on this endpoint — it's a chat-only/hosted
+                # gateway, not a local daemon. The model is already served;
+                # nothing to pull. Benign, so debug rather than warning.
+                logger.debug(
+                    "FaqAgent: %s has no /api/pull (404) — model assumed served",
+                    pull_url,
+                )
+            else:
+                logger.warning(
+                    "FaqAgent: model pull check failed (%s) — proceeding anyway", exc
+                )
         except Exception as exc:
             logger.warning(
                 "FaqAgent: model pull check failed (%s) — proceeding anyway", exc

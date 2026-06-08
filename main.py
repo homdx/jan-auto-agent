@@ -420,7 +420,7 @@ class Orchestrator(OrchestratorActions):
             iteration=iteration,
             output_config={
                 "show_timing": self.config.getboolean("output", "show_timing", fallback=True),
-                "show_iteration_": self.config.getboolean("output", "show_iteration_count", fallback=True),
+                "show_iteration_count": self.config.getboolean("output", "show_iteration_count", fallback=True),
                 "max_iterations": self.max_iterations
             },
             prompt_version=self.prompt_store.get_version_label("validator_agent")
@@ -551,11 +551,15 @@ def main():
         json_mode: bool = getattr(args, "json", False)
 
         if json_mode:
-            # Redirect ALL logging to stderr so stdout stays clean for JSON.
+            # JSON mode must emit the JSON object and nothing else. Drop existing
+            # handlers and raise the threshold to ERROR so informational lines —
+            # e.g. "SSL certificate verification DISABLED" or "model pull check
+            # failed … proceeding anyway" — are suppressed. Genuine errors still
+            # go to stderr (never stdout), keeping the JSON on stdout pristine.
             for handler in logging.root.handlers[:]:
                 logging.root.removeHandler(handler)
             logging.basicConfig(
-                level=logging.WARNING,
+                level=logging.ERROR,
                 format="%(asctime)s [%(levelname)s] %(message)s",
                 stream=sys.stderr,
             )
