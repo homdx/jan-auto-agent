@@ -17,7 +17,7 @@ import logging
 from tools.llm_stream import request_completion, strip_think, ollama_chat_url
 from tools.agent_trace import tracer
 from tools.file_reader import read_file
-from tools.ui import Spinner
+from tools.ui import Spinner, stream_tracker
 
 logger = logging.getLogger(__name__)
 
@@ -117,14 +117,17 @@ class OrchestratorActions:
                      params={"file": file_label, "chunk": chunk_label, "query": query},
                      content=user, model=self.model, temperature=self._cfg_temp("search_agent", 0.2))
         try:
+            _on_tok, _tok_stats = stream_tracker()
             answer = request_completion(
                 url, headers, payload, self.timeout_seconds,
                 stream=True,
                 api_format=self.api_format,
-                on_token=lambda t: (sys.stdout.write(t), sys.stdout.flush()),
+                on_token=_on_tok,
                 ssl_context=self.ssl_context,
             )
             print()
+            if _s := _tok_stats():
+                print(f"[{_ts()}] {_s}")
             tracer.event("search_fullfile", "orchestrator", "llm_response", content=answer)
             return strip_think(answer).strip()
         except Exception as e:
@@ -243,14 +246,17 @@ class OrchestratorActions:
                              "retry_feedback": feedback},
                      content=user, model=self.model, temperature=self._cfg_temp("main_agent", 0.3))
         try:
+            _on_tok, _tok_stats = stream_tracker()
             ans = request_completion(
                 url, headers, payload, self.timeout_seconds,
                 stream=True,
                 api_format=self.api_format,
-                on_token=lambda t: (sys.stdout.write(t), sys.stdout.flush()),
+                on_token=_on_tok,
                 ssl_context=self.ssl_context,
             )
             print()
+            if _s := _tok_stats():
+                print(f"[{_ts()}] {_s}")
             tracer.event("text_answerer", "orchestrator", "llm_response", content=ans)
             return strip_think(ans).strip()
         except Exception as e:
@@ -258,11 +264,14 @@ class OrchestratorActions:
             print(f"[{_ts()}] answer generation failed: {e}")
             return ""
 
-    def _validate_text_answer(self, question: str, knowledge: str, answer: str) -> dict:
+    def _validate_text_answer(self, question: str, knowledge: str, answer: str,
+                               stream_mode: bool = False) -> dict:
         """
         Validate a proposed answer against the document. Returns
         {status: approved|needs_fix, grounded: bool, feedback: str}.
         Fail-closed (needs_fix + _api_error) on any LLM/parse error.
+        stream_mode=True uses streaming to avoid Ollama blocking hangs (tokens
+        are accumulated silently; caller always shows a Spinner for feedback).
         """
         system = (
             "You are a strict QA validator. Given a DOCUMENT, a QUESTION and a PROPOSED "
@@ -286,6 +295,7 @@ class OrchestratorActions:
                      model=self.model, temperature=self._cfg_temp("validator_agent", 0.1))
         try:
             content = request_completion(url, headers, payload, self.timeout_seconds,
+                                         stream=stream_mode,
                                          api_format=self.api_format,
                                          ssl_context=self.ssl_context)
             tracer.event("text_validator", "orchestrator", "llm_response", content=content)
@@ -334,18 +344,20 @@ class OrchestratorActions:
             if time.time() - start >= self.timeout_seconds:
                 print(f"[{_ts()}] ⏳ timeout reached; returning best answer so far.")
                 break
+            _step_start = time.time()
             answer = self._answer_from_file(question, file_path, knowledge, feedback)
+            print(f"[{_ts()}] ⏱  Answer generated in {time.time() - _step_start:.1f}s")
             print(f"[{_ts()}] 🤖 Validating answer ({iteration}/{self.max_iterations})...")
-            if self.stream_agents:
-                validation = self._validate_text_answer(question, knowledge, answer)
-            else:
-                with Spinner(f"Validator iter {iteration}/{self.max_iterations}"):
-                    validation = self._validate_text_answer(question, knowledge, answer)
+            _val_start = time.time()
+            with Spinner(f"Validator iter {iteration}/{self.max_iterations}"):
+                validation = self._validate_text_answer(question, knowledge, answer,
+                                                        stream_mode=self.stream_agents)
+            _val_elapsed = time.time() - _val_start
 
             status = validation.get("status")
             if status == "approved":
                 print(f"[{_ts()}] ✅ Answer approved by validator "
-                      f"(grounded={validation.get('grounded')}).")
+                      f"(grounded={validation.get('grounded')}, {_val_elapsed:.1f}s).")
                 break
             # If the validator itself failed (unreachable / unparseable), do NOT
             # feed that internal error back to the answerer as if it were a
@@ -353,7 +365,7 @@ class OrchestratorActions:
             # minutes on CPU. Keep the answer and stop; mark it unvalidated.
             if validation.get("_api_error"):
                 print(f"[{_ts()}] ⚠️  Validator unavailable — keeping the answer "
-                      f"without validation. ({validation.get('feedback','')})")
+                      f"without validation. ({validation.get('feedback','')}, {_val_elapsed:.1f}s)")
                 break
             feedback = (validation.get("feedback") or "").strip()
             if feedback:
@@ -427,14 +439,17 @@ class OrchestratorActions:
                      params={"file": file_label, "instruction": instruction},
                      content=user, model=self.model, temperature=self._cfg_temp("file_editor", 0.2))
         try:
+            _on_tok, _tok_stats = stream_tracker()
             out = request_completion(
                 url, headers, payload, self.timeout_seconds,
                 stream=True,
                 api_format=self.api_format,
-                on_token=lambda t: (sys.stdout.write(t), sys.stdout.flush()),
+                on_token=_on_tok,
                 ssl_context=self.ssl_context,
             )
             print()
+            if _s := _tok_stats():
+                print(f"[{_ts()}] {_s}")
             out = self._strip_code_fence(strip_think(out))
             tracer.event("file_editor", "orchestrator", "llm_response", content=out)
             return out
@@ -443,8 +458,12 @@ class OrchestratorActions:
             print(f"[{_ts()}] edit generation failed: {e}")
             return ""
 
-    def _validate_edit(self, instruction: str, original: str, revised: str) -> dict:
-        """Validate that `revised` correctly applies `instruction` to `original`."""
+    def _validate_edit(self, instruction: str, original: str, revised: str,
+                        stream_mode: bool = False) -> dict:
+        """Validate that `revised` correctly applies `instruction` to `original`.
+        stream_mode=True uses streaming to avoid Ollama blocking hangs (tokens
+        are accumulated silently; caller always shows a Spinner for feedback).
+        """
         system = (
             "You are an edit QA validator. Given ORIGINAL, INSTRUCTION and REVISED file "
             "content, decide whether REVISED correctly applies the instruction, fixes the "
@@ -466,6 +485,7 @@ class OrchestratorActions:
                      model=self.model, temperature=self._cfg_temp("validator_agent", 0.1))
         try:
             content = strip_think(request_completion(url, headers, payload, self.timeout_seconds,
+                                                      stream=stream_mode,
                                                       api_format=self.api_format,
                                                       ssl_context=self.ssl_context))
             tracer.event("edit_validator", "orchestrator", "llm_response", content=content)
@@ -508,22 +528,24 @@ class OrchestratorActions:
             if time.time() - start >= self.timeout_seconds:
                 print(f"[{_ts()}] ⏳ timeout; using best edit so far.")
                 break
+            _step_start = time.time()
             revised = self._edit_file_content(instruction, file_path, original, feedback)
             if not revised.strip():
                 print(f"[{_ts()}] No content produced — file left unchanged.")
                 return
+            print(f"[{_ts()}] ⏱  Edit generated in {time.time() - _step_start:.1f}s")
             print(f"[{_ts()}] 🤖 Validating edit ({iteration}/{self.max_iterations})...")
-            if self.stream_agents:
-                validation = self._validate_edit(instruction, original, revised)
-            else:
-                with Spinner(f"Edit validator {iteration}/{self.max_iterations}"):
-                    validation = self._validate_edit(instruction, original, revised)
+            _val_start = time.time()
+            with Spinner(f"Edit validator {iteration}/{self.max_iterations}"):
+                validation = self._validate_edit(instruction, original, revised,
+                                                 stream_mode=self.stream_agents)
+            _val_elapsed = time.time() - _val_start
             if validation.get("status") == "approved":
-                print(f"[{_ts()}] ✅ Edit approved by validator.")
+                print(f"[{_ts()}] ✅ Edit approved by validator. ({_val_elapsed:.1f}s)")
                 break
             if validation.get("_api_error"):
                 print(f"[{_ts()}] ⚠️  Edit validator unavailable — writing best effort "
-                      f"(backup kept). ({validation.get('feedback','')})")
+                      f"(backup kept). ({validation.get('feedback','')}, {_val_elapsed:.1f}s)")
                 break
             feedback = (validation.get("feedback") or "").strip()
             if feedback:

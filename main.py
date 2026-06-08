@@ -9,6 +9,13 @@ import textwrap
 from pathlib import Path
 from typing import Dict, Any, List
 
+# Enable GNU Readline for input(): arrow keys, Ctrl+A/E, history (↑/↓), etc.
+# On Linux/macOS this is stdlib. On Windows: pip install pyreadline3
+try:
+    import readline  # noqa: F401
+except ImportError:
+    pass  # Windows without pyreadline3 — input() degrades gracefully
+
 # ────────────────────────────────────────────────────────────────────────
 # DYNAMIC PATH RESOLUTION
 # ────────────────────────────────────────────────────────────────────────
@@ -31,6 +38,7 @@ from tools.prompt_evaluator import PromptEvaluator
 from tools.actions import OrchestratorActions, _ts
 from tools.faq_agent import FaqAgent
 from tools.llm_stream import request_completion, strip_think
+from tools.ui import stream_tracker
 
 # Extensions that support AST/block extraction and code validation.
 # Everything else is treated as plain text and routed to run_text_qa.
@@ -239,14 +247,17 @@ class Orchestrator(OrchestratorActions):
 
         print(f"\n[{_ts()}] 💬 direct chat →")
         try:
+            _on_tok, _tok_stats = stream_tracker()
             reply = request_completion(
                 url, headers, payload, self.timeout_seconds,
                 stream=True,
                 api_format=self.api_format,
-                on_token=lambda t: (sys.stdout.write(t), sys.stdout.flush()),
+                on_token=_on_tok,
                 ssl_context=self.ssl_context,
             )
             print()
+            if _s := _tok_stats():
+                print(f"[{_ts()}] {_s}")
             return strip_think(reply).strip()
         except Exception as exc:
             logger.error("execute_direct_chat failed: %s", exc)
