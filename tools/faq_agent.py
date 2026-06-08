@@ -342,10 +342,13 @@ class FaqAgent:
                 # \b is the boundary between \w and \W.  A hyphen is \W, so
                 # \bansible-playbook\b falsely fires inside "run-ansible-playbook"
                 # because "-" before "a" is itself a \W->\w boundary.
-                # For keywords containing non-word chars, require actual whitespace
-                # or string edge so a joining hyphen cannot act as a boundary.
+                # For keywords containing non-word chars, require a genuine
+                # delimiter before and after: whitespace OR the path separators
+                # "/" and "." so that "ops/ansible-playbook.txt" scores correctly
+                # (a joining hyphen — e.g. "run-ansible-playbook" — still does
+                # not satisfy the lookbehind and therefore scores 0 as intended).
                 return re.compile(
-                    r"(?:(?:^|(?<=\s)))" + escaped + r"(?=\s|$)",
+                    r"(?:(?:^|(?<=[/.\s])))" + escaped + r"(?=[/.\s]|$)",
                     re.MULTILINE,
                 )
             return re.compile(r"\b" + escaped + r"\b")
@@ -521,9 +524,16 @@ class FaqAgent:
 
     # ── Public API ───────────────────────────────────────────────────────────
 
-    def answer(self, question: str, *, stream: bool = True) -> str:
+    def answer(self, question: str, *, stream: bool = False) -> str:
         """
         Answer *question* against the knowledge base.
+
+        ``stream=False`` (default): the answer is returned as a string and
+        nothing is written to stdout — the caller is responsible for output.
+        ``stream=True``: the accepted answer is also written to stdout as it
+        arrives (token-by-token for the legacy path; as a single write for the
+        smart-search path), in addition to being returned.  Pass this only when
+        you want the agent itself to drive terminal output.
 
         **smart_search = True** (two-stage):
 
@@ -541,7 +551,7 @@ class FaqAgent:
 
         6. All candidates exhausted → ``_answer_legacy()`` (full-KB single call).
 
-        **smart_search = False** (legacy, default):
+        **smart_search = False** (legacy):
             All files concatenated into one context; single LLM call.
 
         Returns the answer string or ``self.NOT_FOUND``.

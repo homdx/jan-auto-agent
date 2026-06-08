@@ -479,13 +479,6 @@ class TestRecursiveKnowledge:
         assert result == "Use your email and password on the login page."
 
 
-if __name__ == "__main__":
-    sys.exit(pytest.main([__file__, "-v"]))
-
-# ════════════════════════════════════════════════════════════════════════════
-# 6.  _extract_keywords
-# ════════════════════════════════════════════════════════════════════════════
-
 class TestExtractKeywords:
     """Architect pass: LLM returns JSON keyword list; fallback on failure."""
 
@@ -613,270 +606,34 @@ class TestRankCandidates:
             "got score=%d" % ranked["b.txt"]
         )
 
-    def test_popularity_tiebreaker(self, tmp_path):
-        """SECONDARY: among equal unique-hit counts, higher total frequency wins."""
-        agent = _make_agent(tmp_path)
-        docs = [
-            ("a.txt", "node info"),               # unique=1, total=1
-            ("b.txt", "node node node exporter"),  # unique=2, total=4
-            ("c.txt", "node exporter"),            # unique=2, total=2
-        ]
-        ranked = agent._rank_candidates(docs, ["node", "exporter"])
-        names = [n for n, _, _ in ranked]
-        assert names[0] == "b.txt", "got %s" % names
-        assert names[1] == "c.txt", "got %s" % names
-        assert names[2] == "a.txt", "got %s" % names
+    def test_hyphenated_keyword_path_separators(self, tmp_path):
+        """Hyphenated keyword must score when path separators (/ .) surround it.
 
-    def test_word_boundary_scoring(self, tmp_path):
-        """cat must not score inside category."""
-        agent = _make_agent(tmp_path)
-        docs = [("a.txt", "the cat sat"), ("b.txt", "category management")]
-        ranked = {n: s for n, _, s in agent._rank_candidates(docs, ["cat"])}
-        assert ranked["b.txt"] == 0, "substring match leaked into category"
-        assert ranked["a.txt"] > 0
-
-    def test_blank_keyword_does_not_inflate(self, tmp_path):
-        """A blank/whitespace keyword must contribute 0."""
-        agent = _make_agent(tmp_path)
-        docs = [("a.txt", "alpha beta gamma delta")]
-        score = agent._rank_candidates(docs, ["  ", "alpha"])[0][2]
-        # unique=1 (alpha), total=1 -> _SCORE_MULTIPLIER + 1
-        assert score == agent._SCORE_MULTIPLIER + 1, "blank keyword inflated score to %d" % score
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# 8.  answer() smart-search flow
-# ════════════════════════════════════════════════════════════════════════════
-
-class TestSmartSearchFlow:
-    _KB  = "Q: How install node exporter?\nA: Run: apt install prometheus-node-exporter"
-    _ANS = "Run: apt install prometheus-node-exporter"
-
-    def _agent(self, tmp_path, *, validate=False) -> FaqAgent:
-        kb = tmp_path / "knowledge"
-        (kb / "elk").mkdir(parents=True)
-        (kb / "elk" / "node-exporter.txt").write_text(self._KB)
-        agent = FaqAgent(
-            model="m", base_url="http://localhost:11434",
-            api_key="k", api_format="ollama", timeout=10,
-        )
-        agent.knowledge_dir          = kb
-        agent.smart_search           = True
-        agent.validate_answer_enabled = validate
-        agent._ensure_model          = MagicMock()
-        return agent
-
-    def test_smart_search_finds_nested_file(self, tmp_path):
-        agent = self._agent(tmp_path)
-        # Call 1: keyword extraction  → keywords
-        # Call 2: per-candidate answer → answer text
-        with patch(_RC_PATH, side_effect=['["node","exporter","install"]', self._ANS]):
-            result = agent.answer("How install node exporter?", stream=False)
-        assert result == self._ANS
-
-    def test_smart_search_skips_not_found_candidate(self, tmp_path):
-        """If best candidate returns NOT FOUND, fall through to fallback."""
-        kb = tmp_path / "knowledge"
-        kb.mkdir()
-        (kb / "node-exporter.txt").write_text(self._KB)
-        (kb / "other.txt").write_text("unrelated content")
-        agent = FaqAgent(
-            model="m", base_url="http://localhost:11434",
-            api_key="k", api_format="ollama", timeout=10,
-        )
-        agent.knowledge_dir = kb
-        agent.smart_search  = True
-        agent._ensure_model = MagicMock()
-
-        # "other.txt" scores 0 against keywords ["node","exporter"] and is
-        # never tried in Stage 1.  Only node-exporter.txt is tried; when it
-        # returns NOT FOUND the agent falls straight to the full-KB fallback.
-        with patch(_RC_PATH, side_effect=[
-            '["node","exporter"]',   # keyword extraction
-            "NOT FOUND",             # candidate (node-exporter.txt) fails
-            self._ANS,               # fallback full-KB call succeeds
-        ]):
-            result = agent.answer("How install node exporter?", stream=False)
-        assert result == self._ANS
-
-    def test_smart_search_fallback_when_all_candidates_fail(self, tmp_path):
-        agent = self._agent(tmp_path)
-        with patch(_RC_PATH, side_effect=[
-            '["node","exporter","install"]',  # keywords
-            "NOT FOUND",                       # candidate fails
-            self._ANS,                         # fallback succeeds
-        ]):
-            result = agent.answer("How install node exporter?", stream=False)
-        assert result == self._ANS
-
-    def test_smart_search_disabled_uses_legacy(self, tmp_path):
-        agent = self._agent(tmp_path)
-        agent.smart_search = False
-        # Only ONE rc call (no keyword extraction, no per-candidate loop)
-        with patch(_RC_PATH, return_value=self._ANS) as mock_rc:
-            result = agent.answer("How install node exporter?", stream=False)
-        assert result == self._ANS
-        assert mock_rc.call_count == 1
-
-    def test_keyword_extraction_failure_falls_back_gracefully(self, tmp_path):
-        agent = self._agent(tmp_path)
-        with patch(_RC_PATH, side_effect=[
-            RuntimeError("LLM down"),  # keyword extraction fails → word-split fallback
-            self._ANS,                  # per-candidate answer
-        ]):
-            result = agent.answer("How install node exporter?", stream=False)
-        assert result == self._ANS
-
-    def test_smart_search_with_validation_pass(self, tmp_path):
-        agent = self._agent(tmp_path, validate=True)
-        with patch(_RC_PATH, side_effect=[
-            '["node","exporter","install"]',  # keywords
-            self._ANS,                         # candidate answer
-            "VALID",                           # validation
-        ]):
-            result = agent.answer("How install node exporter?", stream=False)
-        assert result == self._ANS
-
-    def test_smart_search_with_validation_fail_then_fallback(self, tmp_path):
-        agent = self._agent(tmp_path, validate=True)
-        with patch(_RC_PATH, side_effect=[
-            '["node","exporter","install"]',  # keywords
-            "Hallucinated answer.",            # candidate answer
-            "INVALID: not grounded",           # validation fails
-            self._ANS,                         # fallback answer
-            "VALID",                           # fallback validation
-        ]):
-            result = agent.answer("How install node exporter?", stream=False)
-        assert result == self._ANS
-# ════════════════════════════════════════════════════════════════════════════
-# 6.  _extract_keywords
-# ════════════════════════════════════════════════════════════════════════════
-
-class TestExtractKeywords:
-    """Architect pass: LLM returns JSON keyword list; fallback on failure."""
-
-    def test_parses_json_array(self, tmp_path):
-        agent = _make_agent(tmp_path)
-        with patch(_RC_PATH, return_value='["node", "exporter", "install"]'):
-            kw = agent._extract_keywords("How install node exporter?")
-        assert kw == ["node", "exporter", "install"]
-
-    def test_strips_markdown_fences(self, tmp_path):
-        agent = _make_agent(tmp_path)
-        with patch(_RC_PATH, return_value='```json\n["foo","bar"]\n```'):
-            kw = agent._extract_keywords("foo bar?")
-        assert kw == ["foo", "bar"]
-
-    def test_strips_think_tags(self, tmp_path):
-        agent = _make_agent(tmp_path)
-        with patch(_RC_PATH, return_value='<think>reasoning</think>["a","b"]'):
-            kw = agent._extract_keywords("a b?")
-        assert kw == ["a", "b"]
-
-    def test_falls_back_on_json_error(self, tmp_path):
-        agent = _make_agent(tmp_path)
-        with patch(_RC_PATH, return_value="not json at all"):
-            kw = agent._extract_keywords("How install node exporter")
-        # Fallback: words from question minus stop-words
-        assert "install" in kw
-        assert "node" in kw
-        assert "exporter" in kw
-
-    def test_falls_back_on_api_error(self, tmp_path):
-        agent = _make_agent(tmp_path)
-        with patch(_RC_PATH, side_effect=RuntimeError("timeout")):
-            kw = agent._extract_keywords("How install node exporter")
-        assert isinstance(kw, list)
-        assert len(kw) > 0
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# 7.  _rank_candidates
-# ════════════════════════════════════════════════════════════════════════════
-
-class TestRankCandidates:
-    """Coverage-first (unique keywords matched), then popularity (total hits)."""
-
-    def test_best_match_first(self, tmp_path):
-        """File matching all 3 keywords wins even if another file repeats one keyword more."""
-        agent = _make_agent(tmp_path)
-        docs = [
-            ("unrelated/other.txt",  "something completely different"),
-            ("elk/node-exporter.txt", "install node exporter on linux"),
-            ("network/firewall.txt", "firewall rules"),
-        ]
-        ranked = agent._rank_candidates(docs, ["node", "exporter", "install"])
-        assert ranked[0][0] == "elk/node-exporter.txt"
-
-    def test_zero_score_files_still_included(self, tmp_path):
-        agent = _make_agent(tmp_path)
-        docs = [("a.txt", "apples"), ("b.txt", "bananas")]
-        ranked = agent._rank_candidates(docs, ["mango"])
-        # Both score 0 -- order preserved from input (stable sort)
-        assert len(ranked) == 2
-
-    def test_path_match_counts(self, tmp_path):
-        """Keyword match in the file path should score even with blank content."""
-        agent = _make_agent(tmp_path)
-        docs = [
-            ("node-exporter/README.txt", ""),
-            ("other/README.txt",         "node exporter install"),
-        ]
-        # file1: unique=2 (node,exporter in path), total=2  -> 200_002
-        # file2: unique=3 (node,exporter,install in content), total=3 -> 300_003
-        ranked = agent._rank_candidates(docs, ["node", "exporter", "install"])
-        assert ranked[0][0] == "other/README.txt"
-
-    def test_content_and_path_hits_sum(self, tmp_path):
-        agent = _make_agent(tmp_path)
-        docs = [
-            ("node/exporter.txt", "install steps here"),  # path:node+exporter, content:install -> unique=3
-            ("other.txt",         "node info"),            # content:node -> unique=1
-        ]
-        ranked = agent._rank_candidates(docs, ["node", "exporter", "install"])
-        assert ranked[0][0] == "node/exporter.txt"
-
-    def test_coverage_beats_frequency(self, tmp_path):
-        """PRIMARY: unique keyword coverage beats raw repetition.
-
-        Reproduces the ansible-playbook/prometheus bug from the original scorer:
-        file1 repeats "ansible-playbook" 3x (only 1 unique keyword hit).
-        file3 has "ansible-playbook" once AND "prometheus" once (2 unique hits).
-        New scorer must rank file3 first despite lower total occurrence count.
+        The whitespace-only lookarounds introduced in v2 broke path-based scoring:
+        'ops/ansible-playbook.txt' and 'ansible-playbook/readme.txt' both
+        scored 0 because '/' and '.' are not \\s.  The fix extends the character
+        class to [/.\\s] so path segments are treated as valid delimiters while
+        a joining hyphen (e.g. 'run-ansible-playbook') still does not satisfy
+        the lookbehind and scores 0 as required.
         """
         agent = _make_agent(tmp_path)
         docs = [
-            ("ops/file1.txt", "ansible-playbook nginx.yml\nansible-playbook logrotate.yml\nansible-playbook other-server.yml"),
-            ("ops/file2.txt", "ansible-playbook nginx.yml\nansible-playbook httpd.yml"),
-            ("ops/file3.txt", "ansible-playbook prometheus.yml"),
-        ]
-        ranked = agent._rank_candidates(docs, ["ansible-playbook", "prometheus"])
-        # file3: unique=2, total=2  -> score 200_002
-        # file1: unique=1, total=3  -> score 100_003
-        # file2: unique=1, total=2  -> score 100_002
-        names = [n for n, _, _ in ranked]
-        assert names[0] == "ops/file3.txt", (
-            "Expected ops/file3.txt first (2 unique kw hits), "
-            "got %r. Full ranking: %s" % (names[0], [(n, s) for n, _, s in ranked])
-        )
-
-    def test_hyphenated_keyword_no_false_match(self, tmp_path):
-        """Hyphenated keyword must NOT match when joined by a hyphen to other words.
-
-        'ansible-playbook' must not score inside 'run-ansible-playbook' because
-        \\b fires after '-' (a \\W char), producing a spurious boundary before 'a'.
-        The fix uses whitespace anchors for keywords that contain non-word chars.
-        """
-        agent = _make_agent(tmp_path)
-        docs = [
-            ("a.txt", "ansible-playbook nginx.yml"),     # standalone -> should match
-            ("b.txt", "run-ansible-playbook nginx.yml"),  # joined by hyphen -> should NOT match
+            ("ops/ansible-playbook.txt",    ""),  # / before, . after  -> must match
+            ("ansible-playbook/readme.txt", ""),  # ^ before, / after  -> must match
+            ("run-ansible-playbook.txt",    ""),  # - before           -> must NOT match
         ]
         ranked = {n: s for n, _, s in agent._rank_candidates(docs, ["ansible-playbook"])}
-        assert ranked["a.txt"] > 0,  "standalone ansible-playbook must score"
-        assert ranked["b.txt"] == 0, (
+        assert ranked["ops/ansible-playbook.txt"] > 0, (
+            "keyword as path filename (/ before, . after) must score; "
+            "got score=%d" % ranked["ops/ansible-playbook.txt"]
+        )
+        assert ranked["ansible-playbook/readme.txt"] > 0, (
+            "keyword as path directory name (^ before, / after) must score; "
+            "got score=%d" % ranked["ansible-playbook/readme.txt"]
+        )
+        assert ranked["run-ansible-playbook.txt"] == 0, (
             "ansible-playbook must not match inside run-ansible-playbook; "
-            "got score=%d" % ranked["b.txt"]
+            "got score=%d" % ranked["run-ansible-playbook.txt"]
         )
 
     def test_popularity_tiebreaker(self, tmp_path):
@@ -894,20 +651,21 @@ class TestRankCandidates:
         assert names[2] == "a.txt", "got %s" % names
 
     def test_word_boundary_scoring(self, tmp_path):
-        """cat must not score inside category."""
+        """'cat' must not score inside 'category'."""
         agent = _make_agent(tmp_path)
         docs = [("a.txt", "the cat sat"), ("b.txt", "category management")]
         ranked = {n: s for n, _, s in agent._rank_candidates(docs, ["cat"])}
-        assert ranked["b.txt"] == 0, "substring match leaked into category"
-        assert ranked["a.txt"] > 0
+        # a.txt: unique=1, total=1 → _SCORE_MULTIPLIER + 1
+        assert ranked["a.txt"] == agent._SCORE_MULTIPLIER + 1
+        assert ranked["b.txt"] == 0, "substring match leaked into 'category'"
 
     def test_blank_keyword_does_not_inflate(self, tmp_path):
-        """A blank/whitespace keyword must contribute 0."""
+        """A blank/whitespace keyword must contribute 0, not count every space."""
         agent = _make_agent(tmp_path)
         docs = [("a.txt", "alpha beta gamma delta")]
         score = agent._rank_candidates(docs, ["  ", "alpha"])[0][2]
-        # unique=1 (alpha), total=1 -> _SCORE_MULTIPLIER + 1
-        assert score == agent._SCORE_MULTIPLIER + 1, "blank keyword inflated score to %d" % score
+        # unique=1 (alpha only), total=1 → _SCORE_MULTIPLIER + 1
+        assert score == agent._SCORE_MULTIPLIER + 1, f"blank keyword inflated score to {score}"
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -1032,6 +790,63 @@ class TestReviewRegressions:
         assert result == "Go to settings."
         assert out == "", f"stream=False must not print; got {out!r}"
 
+    def test_smart_search_default_stream_emits_nothing_to_stdout(self, tmp_path, capsys):
+        """smart_search=True with no explicit stream arg must NOT write to stdout.
+
+        The stream default was True, so agent.answer(q) + print(result) would
+        print twice in the smart-search path.  The default is now False; callers
+        who want the agent to drive terminal output must opt in with stream=True.
+        """
+        kb = tmp_path / "knowledge"
+        (kb / "elk").mkdir(parents=True)
+        (kb / "elk" / "node-exporter.txt").write_text(
+            "Q: How install node exporter?\nA: Run: apt install prometheus-node-exporter"
+        )
+        agent = FaqAgent(
+            model="m", base_url="http://localhost:11434",
+            api_key="k", api_format="ollama", timeout=10,
+        )
+        agent.knowledge_dir = kb
+        agent.smart_search  = True
+        agent._ensure_model = MagicMock()
+        ans = "Run: apt install prometheus-node-exporter"
+        with patch(_RC_PATH, side_effect=['["node","exporter","install"]', ans]):
+            result = agent.answer("How install node exporter?")  # no stream kwarg
+        out = capsys.readouterr().out
+        assert result == ans
+        assert out == "", f"default stream must not print to stdout; got {out!r}"
+
+    def test_smart_search_stream_true_emits_exactly_once(self, tmp_path, capsys):
+        """smart_search=True + stream=True must write the answer to stdout exactly once.
+
+        Confirms the other side of the double-print contract: when the caller
+        explicitly opts in to stream=True the agent writes the answer once, and
+        the return value is identical — so a caller who also prints the return
+        value would double-print, which is now a deliberate opt-in rather than
+        an accidental default.
+        """
+        kb = tmp_path / "knowledge"
+        (kb / "elk").mkdir(parents=True)
+        (kb / "elk" / "node-exporter.txt").write_text(
+            "Q: How install node exporter?\nA: Run: apt install prometheus-node-exporter"
+        )
+        agent = FaqAgent(
+            model="m", base_url="http://localhost:11434",
+            api_key="k", api_format="ollama", timeout=10,
+        )
+        agent.knowledge_dir = kb
+        agent.smart_search  = True
+        agent._ensure_model = MagicMock()
+        ans = "Run: apt install prometheus-node-exporter"
+        with patch(_RC_PATH, side_effect=['["node","exporter","install"]', ans]):
+            result = agent.answer("How install node exporter?", stream=True)
+        out = capsys.readouterr().out
+        assert result == ans
+        # stdout must contain the answer exactly once (the agent writes it + "\n")
+        assert out == ans + "\n", (
+            f"stream=True must write answer exactly once to stdout; got {out!r}"
+        )
+
     def test_word_boundary_scoring(self, tmp_path):
         """'cat' must not score inside 'category'."""
         agent = _make_agent(tmp_path)
@@ -1056,3 +871,7 @@ class TestReviewRegressions:
         assert agent._is_not_found("  NOT FOUND  ") is True
         assert agent._is_not_found("If the page is not found, click Retry") is False
         assert agent._is_not_found("Go to settings to reset.") is False
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
