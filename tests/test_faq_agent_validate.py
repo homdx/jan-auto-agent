@@ -529,14 +529,15 @@ class TestExtractKeywords:
 # ════════════════════════════════════════════════════════════════════════════
 
 class TestRankCandidates:
-    """Files with more keyword hits come first."""
+    """Coverage-first (unique keywords matched), then popularity (total hits)."""
 
     def test_best_match_first(self, tmp_path):
+        """File matching all 3 keywords wins even if another file repeats one keyword more."""
         agent = _make_agent(tmp_path)
         docs = [
-            ("unrelated/other.txt",         "something completely different"),
-            ("elk/node-exporter.txt",        "install node exporter on linux"),
-            ("network/firewall.txt",         "firewall rules"),
+            ("unrelated/other.txt",  "something completely different"),
+            ("elk/node-exporter.txt", "install node exporter on linux"),
+            ("network/firewall.txt", "firewall rules"),
         ]
         ranked = agent._rank_candidates(docs, ["node", "exporter", "install"])
         assert ranked[0][0] == "elk/node-exporter.txt"
@@ -545,7 +546,7 @@ class TestRankCandidates:
         agent = _make_agent(tmp_path)
         docs = [("a.txt", "apples"), ("b.txt", "bananas")]
         ranked = agent._rank_candidates(docs, ["mango"])
-        # Both score 0 — order preserved from input (stable sort)
+        # Both score 0 -- order preserved from input (stable sort)
         assert len(ranked) == 2
 
     def test_path_match_counts(self, tmp_path):
@@ -555,19 +556,73 @@ class TestRankCandidates:
             ("node-exporter/README.txt", ""),
             ("other/README.txt",         "node exporter install"),
         ]
-        # First file: 2 path hits (node, exporter); second file: 3 content hits
+        # file1: unique=2 (node,exporter in path), total=2  -> 200_002
+        # file2: unique=3 (node,exporter,install in content), total=3 -> 300_003
         ranked = agent._rank_candidates(docs, ["node", "exporter", "install"])
-        # Second file has more total hits
         assert ranked[0][0] == "other/README.txt"
 
     def test_content_and_path_hits_sum(self, tmp_path):
         agent = _make_agent(tmp_path)
         docs = [
-            ("node/exporter.txt", "install steps here"),   # 3 hits (node+exporter+install)
-            ("other.txt",         "node info"),             # 1 hit
+            ("node/exporter.txt", "install steps here"),  # path:node+exporter, content:install -> unique=3
+            ("other.txt",         "node info"),            # content:node -> unique=1
         ]
         ranked = agent._rank_candidates(docs, ["node", "exporter", "install"])
         assert ranked[0][0] == "node/exporter.txt"
+
+    def test_coverage_beats_frequency(self, tmp_path):
+        """PRIMARY: unique keyword coverage beats raw repetition.
+
+        Reproduces the ansible-playbook/prometheus bug from the original scorer:
+        file1 repeats "ansible-playbook" 3x (only 1 unique keyword hit).
+        file3 has "ansible-playbook" once AND "prometheus" once (2 unique hits).
+        New scorer must rank file3 first despite lower total occurrence count.
+        """
+        agent = _make_agent(tmp_path)
+        docs = [
+            ("ops/file1.txt", "ansible-playbook nginx.yml\nansible-playbook logrotate.yml\nansible-playbook other-server.yml"),
+            ("ops/file2.txt", "ansible-playbook nginx.yml\nansible-playbook httpd.yml"),
+            ("ops/file3.txt", "ansible-playbook prometheus.yml"),
+        ]
+        ranked = agent._rank_candidates(docs, ["ansible-playbook", "prometheus"])
+        # file3: unique=2, total=2  -> score 200_002
+        # file1: unique=1, total=3  -> score 100_003
+        # file2: unique=1, total=2  -> score 100_002
+        names = [n for n, _, _ in ranked]
+        assert names[0] == "ops/file3.txt", (
+            "Expected ops/file3.txt first (2 unique kw hits), "
+            "got %r. Full ranking: %s" % (names[0], [(n, s) for n, _, s in ranked])
+        )
+
+    def test_popularity_tiebreaker(self, tmp_path):
+        """SECONDARY: among equal unique-hit counts, higher total frequency wins."""
+        agent = _make_agent(tmp_path)
+        docs = [
+            ("a.txt", "node info"),               # unique=1, total=1
+            ("b.txt", "node node node exporter"),  # unique=2, total=4
+            ("c.txt", "node exporter"),            # unique=2, total=2
+        ]
+        ranked = agent._rank_candidates(docs, ["node", "exporter"])
+        names = [n for n, _, _ in ranked]
+        assert names[0] == "b.txt", "got %s" % names
+        assert names[1] == "c.txt", "got %s" % names
+        assert names[2] == "a.txt", "got %s" % names
+
+    def test_word_boundary_scoring(self, tmp_path):
+        """cat must not score inside category."""
+        agent = _make_agent(tmp_path)
+        docs = [("a.txt", "the cat sat"), ("b.txt", "category management")]
+        ranked = {n: s for n, _, s in agent._rank_candidates(docs, ["cat"])}
+        assert ranked["b.txt"] == 0, "substring match leaked into category"
+        assert ranked["a.txt"] > 0
+
+    def test_blank_keyword_does_not_inflate(self, tmp_path):
+        """A blank/whitespace keyword must contribute 0."""
+        agent = _make_agent(tmp_path)
+        docs = [("a.txt", "alpha beta gamma delta")]
+        score = agent._rank_candidates(docs, ["  ", "alpha"])[0][2]
+        # unique=1 (alpha), total=1 -> _SCORE_MULTIPLIER + 1
+        assert score == agent._SCORE_MULTIPLIER + 1, "blank keyword inflated score to %d" % score
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -721,14 +776,15 @@ class TestExtractKeywords:
 # ════════════════════════════════════════════════════════════════════════════
 
 class TestRankCandidates:
-    """Files with more keyword hits come first."""
+    """Coverage-first (unique keywords matched), then popularity (total hits)."""
 
     def test_best_match_first(self, tmp_path):
+        """File matching all 3 keywords wins even if another file repeats one keyword more."""
         agent = _make_agent(tmp_path)
         docs = [
-            ("unrelated/other.txt",         "something completely different"),
-            ("elk/node-exporter.txt",        "install node exporter on linux"),
-            ("network/firewall.txt",         "firewall rules"),
+            ("unrelated/other.txt",  "something completely different"),
+            ("elk/node-exporter.txt", "install node exporter on linux"),
+            ("network/firewall.txt", "firewall rules"),
         ]
         ranked = agent._rank_candidates(docs, ["node", "exporter", "install"])
         assert ranked[0][0] == "elk/node-exporter.txt"
@@ -737,7 +793,7 @@ class TestRankCandidates:
         agent = _make_agent(tmp_path)
         docs = [("a.txt", "apples"), ("b.txt", "bananas")]
         ranked = agent._rank_candidates(docs, ["mango"])
-        # Both score 0 — order preserved from input (stable sort)
+        # Both score 0 -- order preserved from input (stable sort)
         assert len(ranked) == 2
 
     def test_path_match_counts(self, tmp_path):
@@ -747,19 +803,73 @@ class TestRankCandidates:
             ("node-exporter/README.txt", ""),
             ("other/README.txt",         "node exporter install"),
         ]
-        # First file: 2 path hits (node, exporter); second file: 3 content hits
+        # file1: unique=2 (node,exporter in path), total=2  -> 200_002
+        # file2: unique=3 (node,exporter,install in content), total=3 -> 300_003
         ranked = agent._rank_candidates(docs, ["node", "exporter", "install"])
-        # Second file has more total hits
         assert ranked[0][0] == "other/README.txt"
 
     def test_content_and_path_hits_sum(self, tmp_path):
         agent = _make_agent(tmp_path)
         docs = [
-            ("node/exporter.txt", "install steps here"),   # 3 hits (node+exporter+install)
-            ("other.txt",         "node info"),             # 1 hit
+            ("node/exporter.txt", "install steps here"),  # path:node+exporter, content:install -> unique=3
+            ("other.txt",         "node info"),            # content:node -> unique=1
         ]
         ranked = agent._rank_candidates(docs, ["node", "exporter", "install"])
         assert ranked[0][0] == "node/exporter.txt"
+
+    def test_coverage_beats_frequency(self, tmp_path):
+        """PRIMARY: unique keyword coverage beats raw repetition.
+
+        Reproduces the ansible-playbook/prometheus bug from the original scorer:
+        file1 repeats "ansible-playbook" 3x (only 1 unique keyword hit).
+        file3 has "ansible-playbook" once AND "prometheus" once (2 unique hits).
+        New scorer must rank file3 first despite lower total occurrence count.
+        """
+        agent = _make_agent(tmp_path)
+        docs = [
+            ("ops/file1.txt", "ansible-playbook nginx.yml\nansible-playbook logrotate.yml\nansible-playbook other-server.yml"),
+            ("ops/file2.txt", "ansible-playbook nginx.yml\nansible-playbook httpd.yml"),
+            ("ops/file3.txt", "ansible-playbook prometheus.yml"),
+        ]
+        ranked = agent._rank_candidates(docs, ["ansible-playbook", "prometheus"])
+        # file3: unique=2, total=2  -> score 200_002
+        # file1: unique=1, total=3  -> score 100_003
+        # file2: unique=1, total=2  -> score 100_002
+        names = [n for n, _, _ in ranked]
+        assert names[0] == "ops/file3.txt", (
+            "Expected ops/file3.txt first (2 unique kw hits), "
+            "got %r. Full ranking: %s" % (names[0], [(n, s) for n, _, s in ranked])
+        )
+
+    def test_popularity_tiebreaker(self, tmp_path):
+        """SECONDARY: among equal unique-hit counts, higher total frequency wins."""
+        agent = _make_agent(tmp_path)
+        docs = [
+            ("a.txt", "node info"),               # unique=1, total=1
+            ("b.txt", "node node node exporter"),  # unique=2, total=4
+            ("c.txt", "node exporter"),            # unique=2, total=2
+        ]
+        ranked = agent._rank_candidates(docs, ["node", "exporter"])
+        names = [n for n, _, _ in ranked]
+        assert names[0] == "b.txt", "got %s" % names
+        assert names[1] == "c.txt", "got %s" % names
+        assert names[2] == "a.txt", "got %s" % names
+
+    def test_word_boundary_scoring(self, tmp_path):
+        """cat must not score inside category."""
+        agent = _make_agent(tmp_path)
+        docs = [("a.txt", "the cat sat"), ("b.txt", "category management")]
+        ranked = {n: s for n, _, s in agent._rank_candidates(docs, ["cat"])}
+        assert ranked["b.txt"] == 0, "substring match leaked into category"
+        assert ranked["a.txt"] > 0
+
+    def test_blank_keyword_does_not_inflate(self, tmp_path):
+        """A blank/whitespace keyword must contribute 0."""
+        agent = _make_agent(tmp_path)
+        docs = [("a.txt", "alpha beta gamma delta")]
+        score = agent._rank_candidates(docs, ["  ", "alpha"])[0][2]
+        # unique=1 (alpha), total=1 -> _SCORE_MULTIPLIER + 1
+        assert score == agent._SCORE_MULTIPLIER + 1, "blank keyword inflated score to %d" % score
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -889,7 +999,8 @@ class TestReviewRegressions:
         agent = _make_agent(tmp_path)
         docs = [("a.txt", "the cat sat"), ("b.txt", "category management")]
         ranked = {n: s for n, _, s in agent._rank_candidates(docs, ["cat"])}
-        assert ranked["a.txt"] == 1
+        # a.txt: unique=1, total=1 → _SCORE_MULTIPLIER + 1
+        assert ranked["a.txt"] == agent._SCORE_MULTIPLIER + 1
         assert ranked["b.txt"] == 0, "substring match leaked into 'category'"
 
     def test_blank_keyword_does_not_inflate(self, tmp_path):
@@ -897,7 +1008,8 @@ class TestReviewRegressions:
         agent = _make_agent(tmp_path)
         docs = [("a.txt", "alpha beta gamma delta")]
         score = agent._rank_candidates(docs, ["  ", "alpha"])[0][2]
-        assert score == 1, f"blank keyword inflated score to {score}"
+        # unique=1 (alpha only), total=1 → _SCORE_MULTIPLIER + 1
+        assert score == agent._SCORE_MULTIPLIER + 1, f"blank keyword inflated score to {score}"
 
     def test_is_not_found_strict(self, tmp_path):
         agent = _make_agent(tmp_path)

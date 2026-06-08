@@ -288,42 +288,64 @@ class FaqAgent:
 
     # ── Stage 1b — Candidate ranking ────────────────────────────────────────
 
+    # Multiplier separating the two scoring tiers.
+    # total_hits (popularity) can never realistically reach this value,
+    # so unique_hits always dominates the sort without affecting the tiebreaker.
+    _SCORE_MULTIPLIER = 100_000
+
     def _rank_candidates(
         self,
         docs: list[tuple[str, str]],
         keywords: list[str],
     ) -> list[tuple[str, str, int]]:
         """
-        Score each doc by counting how often keywords appear across its path
-        and content, then return only docs with at least one hit, sorted by
-        score descending.
+        Two-tier scoring — PRIMARY coverage, SECONDARY popularity.
 
-        Scoring rule (per document):
-          score = Σ  occurrence_count(keyword, path + " " + content)
-                  for each keyword
+        For each document, keywords are matched with word-boundary regex across
+        the concatenation of its file-system path and text content.
 
-        Frequency-weighted scoring means a document that mentions a keyword
-        ten times ranks higher than one that mentions it once — a better
-        signal of topical focus than a binary presence check.
+        PRIMARY (unique keyword coverage):
+            Count how many *distinct* keywords appear at least once.
+            A document matching 3 out of 4 keywords ranks above one that
+            repeats a single keyword dozens of times.  This prevents a long
+            generic file from crowding out a short but precisely relevant one.
+
+        SECONDARY (total occurrence count / popularity):
+            Among documents with equal unique-keyword coverage, the one with
+            more total keyword hits wins.  This preserves the original
+            frequency-weighted intuition as a tiebreaker.
+
+        Encoding:
+            score = unique_hits × _SCORE_MULTIPLIER + total_hits
+
+        Using a single int keeps the return type and all downstream code
+        (``s > 0`` filter, logging) unchanged.
+
+        Example — keywords ["ansible-playbook", "prometheus"]:
+            file1 (nginx/logrotate/other): ansible-playbook×3, prometheus×0
+                → unique=1, total=3  → score = 100_003
+            file2 (nginx/httpd):          ansible-playbook×2, prometheus×0
+                → unique=1, total=2  → score = 100_002
+            file3 (prometheus):           ansible-playbook×1, prometheus×1
+                → unique=2, total=2  → score = 200_002  ← ranked first ✓
 
         Returns ``list[tuple[name, content, score]]``, highest score first.
-        Zero-score docs are included (stable sort preserves input order for ties)
-        and appear at the tail.  ``_answer_smart`` filters them before building
-        the shortlist so they never receive a Stage-1 LLM call.
+        Zero-score docs are included (stable sort preserves input order for
+        ties) and appear at the tail; ``_answer_smart`` filters them before
+        building the shortlist so they never receive a Stage-1 LLM call.
         """
-        lower_kw = [k.lower() for k in keywords]
+        lower_kw = [k.lower().strip() for k in keywords if k.strip()]
 
         def _score(name: str, content: str) -> int:
             combined = (name + " " + content).lower()
-            total = 0
+            unique_hits = 0
+            total_hits  = 0
             for kw in lower_kw:
-                kw = kw.strip()
-                if not kw:
-                    continue
-                # Word-boundary match so "api" doesn't score inside "rapid"
-                # and a stray blank keyword can't inflate every document.
-                total += len(re.findall(r"\b" + re.escape(kw) + r"\b", combined))
-            return total
+                count = len(re.findall(r"\b" + re.escape(kw) + r"\b", combined))
+                if count:
+                    unique_hits += 1
+                    total_hits  += count
+            return unique_hits * self._SCORE_MULTIPLIER + total_hits
 
         scored = [
             (name, content, _score(name, content))
