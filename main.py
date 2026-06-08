@@ -570,11 +570,11 @@ def main():
             # answer() with stream=False — no tokens written to stdout mid-call.
             result = orchestrator.faq_agent.answer(question, stream=False)
             if result == orchestrator.faq_agent.NOT_FOUND:
-                payload = {"found": False, "answer": None, "llm_call_count": orchestrator.faq_agent.llm_call_count}
+                payload = {"found": False, "answer": None, "source": None, "llm_call_count": orchestrator.faq_agent.llm_call_count}
                 print(json.dumps(payload, ensure_ascii=False))
                 sys.exit(1)
             else:
-                payload = {"found": True, "answer": result, "llm_call_count": orchestrator.faq_agent.llm_call_count}
+                payload = {"found": True, "answer": result, "source": orchestrator.faq_agent.last_source, "llm_call_count": orchestrator.faq_agent.llm_call_count}
                 print(json.dumps(payload, ensure_ascii=False))
                 sys.exit(0)
         else:

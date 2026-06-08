@@ -63,19 +63,31 @@ _STOP_WORDS = frozenset({
 # ── Default system prompts ───────────────────────────────────────────────────
 _DEFAULT_SYSTEM = (
     "You are a help-desk FAQ resolver. "
-    "Answer the user's question using ONLY the content of the knowledge files "
-    "provided below. Quote or paraphrase the relevant answer text. "
-    "If NONE of the files contain a suitable answer, reply with exactly: NOT FOUND"
+    "Answer the user's question using ONLY information that is EXPLICITLY and DIRECTLY "
+    "present in the knowledge files provided below. "
+    "STRICT RULES — reply with exactly NOT FOUND if ANY of these apply:\n"
+    "  • The knowledge files do not contain a direct answer to the question.\n"
+    "  • The question asks how to DO something but the files only describe how to UNDO it "
+    "(or vice-versa: e.g. question asks 'how to disable X' but files only show 'how to enable X').\n"
+    "  • The answer would require inverting, reversing, or extrapolating from the available "
+    "instructions rather than quoting or paraphrasing them directly.\n"
+    "Do NOT infer, derive, or construct an answer from related but non-matching content. "
+    "If the knowledge directly and explicitly answers the question, quote or paraphrase it."
 )
 
 _DEFAULT_VALIDATE_SYSTEM = (
     "You are an answer quality validator for a help-desk FAQ system. "
     "You are given a user question, the knowledge-base content that was searched, "
     "and a candidate answer produced from that content. "
-    "Reply with exactly VALID if the answer correctly and completely addresses "
-    "the question using only the provided knowledge. "
-    "Reply with INVALID: <brief reason> if the answer is wrong, hallucinated, "
-    "incomplete, or not grounded in the knowledge base. "
+    "Reply with exactly VALID only when BOTH conditions hold:\n"
+    "  1. The knowledge base DIRECTLY and EXPLICITLY answers the question as asked.\n"
+    "  2. The candidate answer correctly reflects that explicit information.\n"
+    "Reply with INVALID: <brief reason> in ALL other cases, including:\n"
+    "  • The answer was produced by inverting or reversing the knowledge "
+    "(e.g. the question asks 'how to disable X' but the knowledge only describes "
+    "'how to enable X' — the candidate must be INVALID even if the steps look plausible).\n"
+    "  • The answer extrapolates, infers, or derives steps not explicitly stated.\n"
+    "  • The answer is hallucinated, incomplete, or factually wrong relative to the knowledge.\n"
     "No other output — VALID or INVALID: <reason> only."
 )
 
@@ -619,6 +631,7 @@ class FaqAgent:
         # step 1: pull model if Ollama
         self._ensure_model()
         self.llm_call_count = 0  # reset at start of each answer() call
+        self.last_source: str | None = None  # reset: set to matched filename on success
 
         # step 2: load knowledge files
         docs = self._load_knowledge()
@@ -712,6 +725,7 @@ class FaqAgent:
             logger.info(
                 "FaqAgent: Stage 1 accepted answer from %r (score=%d)", name, score
             )
+            self.last_source = name
             return candidate_ans
 
         # ── Stage 2: all Stage-1 candidates exhausted → full-KB fallback ─────
