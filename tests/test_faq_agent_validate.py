@@ -594,6 +594,25 @@ class TestRankCandidates:
             "got %r. Full ranking: %s" % (names[0], [(n, s) for n, _, s in ranked])
         )
 
+    def test_hyphenated_keyword_no_false_match(self, tmp_path):
+        """Hyphenated keyword must NOT match when joined by a hyphen to other words.
+
+        'ansible-playbook' must not score inside 'run-ansible-playbook' because
+        \\b fires after '-' (a \\W char), producing a spurious boundary before 'a'.
+        The fix uses whitespace anchors for keywords that contain non-word chars.
+        """
+        agent = _make_agent(tmp_path)
+        docs = [
+            ("a.txt", "ansible-playbook nginx.yml"),     # standalone -> should match
+            ("b.txt", "run-ansible-playbook nginx.yml"),  # joined by hyphen -> should NOT match
+        ]
+        ranked = {n: s for n, _, s in agent._rank_candidates(docs, ["ansible-playbook"])}
+        assert ranked["a.txt"] > 0,  "standalone ansible-playbook must score"
+        assert ranked["b.txt"] == 0, (
+            "ansible-playbook must not match inside run-ansible-playbook; "
+            "got score=%d" % ranked["b.txt"]
+        )
+
     def test_popularity_tiebreaker(self, tmp_path):
         """SECONDARY: among equal unique-hit counts, higher total frequency wins."""
         agent = _make_agent(tmp_path)
@@ -839,6 +858,25 @@ class TestRankCandidates:
         assert names[0] == "ops/file3.txt", (
             "Expected ops/file3.txt first (2 unique kw hits), "
             "got %r. Full ranking: %s" % (names[0], [(n, s) for n, _, s in ranked])
+        )
+
+    def test_hyphenated_keyword_no_false_match(self, tmp_path):
+        """Hyphenated keyword must NOT match when joined by a hyphen to other words.
+
+        'ansible-playbook' must not score inside 'run-ansible-playbook' because
+        \\b fires after '-' (a \\W char), producing a spurious boundary before 'a'.
+        The fix uses whitespace anchors for keywords that contain non-word chars.
+        """
+        agent = _make_agent(tmp_path)
+        docs = [
+            ("a.txt", "ansible-playbook nginx.yml"),     # standalone -> should match
+            ("b.txt", "run-ansible-playbook nginx.yml"),  # joined by hyphen -> should NOT match
+        ]
+        ranked = {n: s for n, _, s in agent._rank_candidates(docs, ["ansible-playbook"])}
+        assert ranked["a.txt"] > 0,  "standalone ansible-playbook must score"
+        assert ranked["b.txt"] == 0, (
+            "ansible-playbook must not match inside run-ansible-playbook; "
+            "got score=%d" % ranked["b.txt"]
         )
 
     def test_popularity_tiebreaker(self, tmp_path):

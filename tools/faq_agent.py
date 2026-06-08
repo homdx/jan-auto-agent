@@ -336,12 +336,28 @@ class FaqAgent:
         """
         lower_kw = [k.lower().strip() for k in keywords if k.strip()]
 
+        def _make_kw_pattern(kw: str) -> "re.Pattern[str]":
+            escaped = re.escape(kw)
+            if re.search(r"\W", kw):
+                # \b is the boundary between \w and \W.  A hyphen is \W, so
+                # \bansible-playbook\b falsely fires inside "run-ansible-playbook"
+                # because "-" before "a" is itself a \W->\w boundary.
+                # For keywords containing non-word chars, require actual whitespace
+                # or string edge so a joining hyphen cannot act as a boundary.
+                return re.compile(
+                    r"(?:(?:^|(?<=\s)))" + escaped + r"(?=\s|$)",
+                    re.MULTILINE,
+                )
+            return re.compile(r"\b" + escaped + r"\b")
+
+        kw_patterns = [(kw, _make_kw_pattern(kw)) for kw in lower_kw]
+
         def _score(name: str, content: str) -> int:
             combined = (name + " " + content).lower()
             unique_hits = 0
             total_hits  = 0
-            for kw in lower_kw:
-                count = len(re.findall(r"\b" + re.escape(kw) + r"\b", combined))
+            for _kw, pat in kw_patterns:
+                count = len(pat.findall(combined))
                 if count:
                     unique_hits += 1
                     total_hits  += count
