@@ -74,7 +74,6 @@ class InnerLoopResult:
     attempts_used: int   = 0
     last_feedback: str   = ""
     records:       list  = field(default_factory=list)   # list[AttemptRecord]
-    hint_history:  list  = field(default_factory=list)   # list[str] — LOOP-4
     context_satisfied: bool = True   # pull-model: False ⇒ last attempt still needed context
 
 
@@ -199,12 +198,19 @@ class LLMGate2Validator:
 
     # ------------------------------------------------------------------
 
-    def _read_changed_content(self, coder_result, task: dict | None = None) -> str:
+    def _read_changed_content(self, coder_result, task: dict | None = None,
+                              base_dir: "Path | None" = None) -> str:
         """Read the post-edit content of the files the coder wrote, so the
         validator judges the ACTUAL code (not just file names).  The Gate-2
         system prompt promises 'the generated code' and asks for line/pattern
-        specific hints, so the code must be present in the prompt."""
+        specific hints, so the code must be present in the prompt.
+
+        ``base_dir`` overrides ``self.base_dir`` for this call, allowing the
+        inner loop to pass the per-invocation working directory without
+        requiring a construction-time match.
+        """
         from pathlib import Path as _Path
+        _base = Path(base_dir) if base_dir is not None else self.base_dir
         files = list(getattr(coder_result, "files_written", []) or [])
         if not files:
             return "(the coder reported NO files written — nothing changed)"
@@ -212,7 +218,7 @@ class LLMGate2Validator:
         blocks = []
         for rel in files:
             try:
-                content = (self.base_dir / rel).read_text(
+                content = (_base / rel).read_text(
                     encoding="utf-8", errors="replace")
             except OSError as exc:
                 blocks.append(f"--- {rel} ---\n(could not read {rel}: {exc})")
@@ -230,9 +236,9 @@ class LLMGate2Validator:
                     cited_symbol = locs[0].get("symbol")
 
             try:
-                from tools.auto.coder import _chunk_file, _select_relevant_chunks
-                chunks = _chunk_file(content, ext, budget)
-                content = _select_relevant_chunks(chunks, cited_symbol, budget)
+                from tools.auto.coder import chunk_file, select_relevant_chunks
+                chunks = chunk_file(content, ext, budget)
+                content = select_relevant_chunks(chunks, cited_symbol, budget)
             except Exception as exc:
                 logger.warning("validator: smart chunk failed for %s: %s", rel, exc)
                 content = content[:budget] + f"\n… [+{len(content) - budget} chars truncated]"
@@ -273,6 +279,8 @@ class LLMGate2Validator:
         task:         dict,
         exec_result,
         coder_result,
+        *,
+        base_dir=None,
     ) -> tuple[bool, str]:
         """Return (approved, feedback_string).  Never raises — fail-closed.
 
@@ -294,12 +302,16 @@ class LLMGate2Validator:
                 "Authorization": f"Bearer {self.api_key}",
             }
 
+            _exec_stderr = getattr(exec_result, 'stderr', '') or ''
+            _exec_stdout = getattr(exec_result, 'stdout', '') or ''
+            _stderr_section = f"stderr:\n{_exec_stderr[:2000]}\n\n" if _exec_stderr.strip() else ""
             user_msg = (
                 f"Task: {task.get('instruction', '')}\n\n"
                 f"Acceptance check exit code: {getattr(exec_result, 'exit_code', 0)}\n"
-                f"stdout:\n{getattr(exec_result, 'stdout', '')[:2000]}\n\n"
-                f"Generated files (CHANGED FILE CONTENT after the coder's edit):\n"
-                + self._read_changed_content(coder_result, task=task)
+                f"stdout:\n{_exec_stdout[:2000]}\n\n"
+                + _stderr_section
+                + f"Generated files (CHANGED FILE CONTENT after the coder's edit):\n"
+                + self._read_changed_content(coder_result, task=task, base_dir=base_dir)
             )
 
             if self.api_format == "ollama":
@@ -424,9 +436,11 @@ class InnerLoop:
         records:  list[AttemptRecord] = []
         # Pull-model state (carried across attempts within this round)
         prefetched_context: str = ""
+        resolved_context: dict[str, str] = {}   # accumulates every symbol the validator has asked for
         _any_missing: bool = False   # Task 4: True if any attempt had unsatisfied context
         base_dir_path = Path(base_dir)
         target_files  = task.get("target_files", []) or []
+        self._broker.reset_cache()  # clear per-task cache; Pass-2 hits re-accumulate fresh
 
         # LOOP-4: prepend prior implementation history
         if prior_implementations:
@@ -460,11 +474,20 @@ class InnerLoop:
             if coder_missing or not getattr(coder_result, "context_satisfied", True):
                 _any_missing = True
             if coder_missing:
-                prefetched_context = self._broker.fetch(coder_missing, target_files, base_dir_path)
-                logger.info("InnerLoop: attempt %d coder requested context %s — prefetched for next attempt",
-                            attempt, coder_missing)
+                # Accumulate into the SAME running context as the validator path
+                # so neither side clobbers the other's pulls (was: overwrite via
+                # fetch(), which dropped reviewer-accumulated context when the
+                # next rejection carried no missing_context of its own).
+                newly = self._broker.resolve(coder_missing, target_files, base_dir_path)
+                resolved_context.update(newly)
+                prefetched_context = self._broker.format_for_prompt(resolved_context)
+                logger.info("InnerLoop: attempt %d coder requested context %s — accumulated (%d total)",
+                            attempt, coder_missing, len(resolved_context))
 
             if not getattr(coder_result, "succeeded", True):
+                # Context is accumulated above even on coder failure: the next
+                # attempt benefits from symbols already resolved, regardless of
+                # whether the current attempt produced valid code.
                 fb = f"attempt {attempt}: coder failed — {getattr(coder_result, 'error', 'unknown error')}"
                 feedback.append(fb)
                 records.append(AttemptRecord(attempt, False, False, False, fb))
@@ -505,7 +528,8 @@ class InnerLoop:
 
             # ── 3. Validator (subjective half of Gate 2) ─────────────────────
             try:
-                approved, vfb = self.validator.approve(task, exec_result, coder_result)
+                approved, vfb = self.validator.approve(task, exec_result, coder_result,
+                                                       base_dir=base_dir_path)
             except Exception as exc:
                 logger.error("InnerLoop: validator raised on attempt %d: %s", attempt, exc)
                 fb = f"attempt {attempt}: validator error — {exc}"
@@ -520,8 +544,12 @@ class InnerLoop:
                 records.append(AttemptRecord(attempt, True, True, False, fb))
                 val_missing = list(getattr(self.validator, "last_missing_context", []) or [])
                 if val_missing:
-                    prefetched_context = self._broker.fetch(
-                        val_missing, task.get("target_files", []) or [], Path(base_dir)
+                    newly = self._broker.resolve(val_missing, target_files, base_dir_path)
+                    resolved_context.update(newly)
+                    prefetched_context = self._broker.format_for_prompt(resolved_context)
+                    logger.info(
+                        "InnerLoop: attempt %d validator requested context %s — accumulated (%d total)",
+                        attempt, val_missing, len(resolved_context),
                     )
                 continue
 
@@ -585,8 +613,7 @@ def make_inner_loop(
     api_format = config.get(api_section, "api_format", fallback="openai")
     num_ctx    = config.getint(api_section, "num_ctx",  fallback=0)
 
-    verify_ssl_raw = config.get("api", "verify_ssl", fallback="true")
-    verify_ssl     = verify_ssl_raw.strip().lower() not in ("false", "0", "no")
+    verify_ssl = config.getboolean("api", "verify_ssl", fallback=True)
 
     import ssl
     ssl_context: ssl.SSLContext | None = None
@@ -595,9 +622,10 @@ def make_inner_loop(
         ssl_context.check_hostname = False
         ssl_context.verify_mode    = ssl.CERT_NONE
 
-    max_hints  = config.getint("validator_agent", "max_hints", fallback=3)
-    val_temp   = config.getfloat("validator_agent", "temperature", fallback=0.1)
-    exec_timeout = config.getint("auto", "exec_timeout_sec", fallback=120)
+    max_hints    = config.getint("validator_agent", "max_hints",        fallback=3)
+    val_temp     = config.getfloat("validator_agent", "temperature",    fallback=0.1)
+    val_timeout  = config.getint("loop",              "timeout_seconds", fallback=300)
+    exec_timeout = config.getint("auto",              "exec_timeout_sec", fallback=120)
 
     # ── Coder ─────────────────────────────────────────────────────────────────
     if coder is None:
@@ -625,7 +653,7 @@ def make_inner_loop(
             api_key=api_key,
             api_format=api_format,
             temperature=val_temp,
-            timeout=120,
+            timeout=val_timeout,
             max_hints=max_hints,
             ssl_context=ssl_context,
             base_dir=str(base_dir),
@@ -635,7 +663,13 @@ def make_inner_loop(
             config=config,  # AUTO-DM-5: for system prompt override lookup
         )
 
-    return InnerLoop(coder, executor, validator, max_attempts=max_attempts)
+    # ── ContextBroker ─────────────────────────────────────────────────────────
+    broker = ContextBroker(
+        max_symbols=config.getint("context_broker", "max_symbols", fallback=20),
+    )
+
+    return InnerLoop(coder, executor, validator, max_attempts=max_attempts,
+                     context_broker=broker)
 
 
 # ── Stubs for environments without real agents (unit tests) ──────────────────

@@ -474,8 +474,7 @@ class Executor:
                     command, rewritten, full_path,
                 )
                 return rewritten
-            # Zero or multiple matches — leave command unchanged.
-            return command
+            # Zero or multiple matches — continue scanning subsequent tokens.
 
         return command
 

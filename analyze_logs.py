@@ -918,6 +918,27 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def render_auto_prompts(search_path: str) -> None:
+    """If auto_prompts.json exists near search_path, print its contents."""
+    p = Path(search_path)
+    candidates = [
+        p.parent / "auto_prompts.json",          # next to trace file
+        p / "auto_prompts.json",                 # inside given dir
+        p / ".agent" / "auto_prompts.json",      # .agent/ subdir
+    ]
+    found = next((c for c in candidates if c.exists()), None)
+    if not found:
+        return
+    try:
+        data = json.loads(found.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"  [!] Could not read {found}: {exc}", file=sys.stderr)
+        return
+    print_section(f"AUTO-TUNED PROMPTS  ({found})")
+    print(json.dumps(data, indent=2, ensure_ascii=False))
+
+
+
 def main() -> int:
     global USE_COLOR
 
@@ -963,6 +984,8 @@ def main() -> int:
             show_timeline=not args.no_timeline,
             show_diff=not args.no_diff,
         )
+
+    render_auto_prompts(args.path)
 
     return 0
 

@@ -63,6 +63,7 @@ import configparser
 import json
 import logging
 import re
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -344,7 +345,7 @@ class Coder:
             }
         else:
             url = f"{self._base_url}/chat/completions"
-            payload: dict[str, Any] = {
+            payload = {
                 "model":       self._model,
                 "temperature": self._temperature,
                 "max_tokens":  self._max_tokens,
@@ -361,16 +362,27 @@ class Coder:
                     "task_id": task_id},
         )
 
+        print(f"\n💻 [LIVE CODER STREAMING — task: {task_id}]:")
         try:
+            _coder_tokens: list[str] = []
+
+            def _coder_on_token(t: str) -> None:
+                sys.stdout.write(t)
+                sys.stdout.flush()
+                _coder_tokens.append(t)
+
             raw_text = _llm_stream.request_completion(
                 url=url,
                 headers=headers,
                 payload=payload,
                 timeout=self._timeout,
                 stream=True,
+                on_token=_coder_on_token,
                 api_format=self._api_format,
                 ssl_context=self._ssl_context,
             )
+            raw_text = raw_text or "".join(_coder_tokens)
+            print("\n" + "═" * 80 + "\n")
         except Exception as exc:
             msg = f"LLM call failed: {exc}"
             logger.warning("coder.generate [%s]: %s", task_id, msg)
@@ -400,16 +412,33 @@ class Coder:
                 # Mutate payload in-place — messages[-1] is always the user role.
                 payload["messages"][-1]["content"] = user_msg
                 try:
+                    print(f"\n💻 [LIVE CODER STREAMING — context probe, task: {task_id}]:")
+                    _probe_tokens: list[str] = []
+
+                    def _probe_on_token(t: str) -> None:
+                        sys.stdout.write(t)
+                        sys.stdout.flush()
+                        _probe_tokens.append(t)
+
                     raw_text = _llm_stream.request_completion(
                         url=url,
                         headers=headers,
                         payload=payload,
                         timeout=self._timeout,
                         stream=True,
+                        on_token=_probe_on_token,
                         api_format=self._api_format,
                         ssl_context=self._ssl_context,
                     )
+                    raw_text = raw_text or "".join(_probe_tokens)
+                    print("\n" + "═" * 80 + "\n")
                     cleaned = strip_think(raw_text)
+                    # Re-extract context_request symbols from the new response
+                    # so the CoderResult reflects any new symbols the second
+                    # call asked for.  context_satisfied intentionally keeps
+                    # the first response's value: False signals "probe was
+                    # needed" and is used by outer_loop to skip TaskRewriter.
+                    missing_ctx = self._extract_context_request(cleaned)
                 except Exception as exc:
                     logger.warning(
                         "coder.generate [%s]: context-probe second call failed: %s "
@@ -632,8 +661,8 @@ class Coder:
         Each file is prefixed with a ``### path/to/file.py`` header.
 
         Small files (≤ ``max_file_chars``) are included byte-for-byte.  Larger
-        files are split into symbol-aware chunks via :func:`_chunk_file` and
-        assembled with :func:`_select_relevant_chunks`, guaranteeing that the
+        files are split into symbol-aware chunks via :func:`chunk_file` and
+        assembled with :func:`select_relevant_chunks`, guaranteeing that the
         import block and the *cited_symbol* are always present.  Any exception
         in the smart path falls back to plain character truncation so the caller
         always receives something useful.
@@ -673,8 +702,8 @@ class Coder:
                 continue
 
             try:
-                chunks   = _chunk_file(content, ext, self._max_file_chars)
-                assembled = _select_relevant_chunks(chunks, cited_symbol, self._max_file_chars)
+                chunks   = chunk_file(content, ext, self._max_file_chars)
+                assembled = select_relevant_chunks(chunks, cited_symbol, self._max_file_chars)
                 parts.append(f"### {rel}\n{assembled}")
             except Exception as exc:
                 logger.warning(
@@ -795,18 +824,13 @@ class Coder:
         ("rm -rf",              "rm -rf"),
         ("rm -f /",             "rm -f /"),
         # Shell injection via subprocess / os.system with dangerous args
-        ("subprocess rm",       "subprocess"),          # too broad? — see note below
+        ("subprocess rm",       "subprocess"),          # paired with danger token — see _SUBPROCESS_DANGER_TOKENS
         ("os.system rm",        'os.system('),
         # Outbound data exfiltration via common tools
         ("curl exfil",          "curl "),
         ("wget exfil",          "wget "),
         # Overwrite root / system paths via open()  (sentinel — see _check_content_safety)
         ("open root write",     'open("/'),
-    )
-
-    # Union of both sets — kept for backward compatibility; code mode uses this.
-    _BLOCKED_CONTENT_PATTERNS: tuple[tuple[str, str], ...] = (
-        _BLOCKED_ALWAYS + _BLOCKED_CODE_ONLY
     )
 
     # System directory prefixes that must never be written to by generated
@@ -1046,7 +1070,7 @@ class Coder:
 # Symbol-aware file chunking (SCTX Task 1)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _chunk_file(source: str, file_ext: str, max_chars: int) -> list[dict]:
+def chunk_file(source: str, file_ext: str, max_chars: int) -> list[dict]:
     """Split *source* into symbol-aware chunks for prompt assembly.
 
     Each returned dict has:
@@ -1125,7 +1149,7 @@ def _chunk_file(source: str, file_ext: str, max_chars: int) -> list[dict]:
             tree = ast.parse(source)
         except SyntaxError:
             logger.warning(
-                "_chunk_file: ast.parse failed for ext=%r — returning truncated chunk", ext
+                "chunk_file: ast.parse failed for ext=%r — returning truncated chunk", ext
             )
             return [
                 {
@@ -1205,7 +1229,7 @@ def _chunk_file(source: str, file_ext: str, max_chars: int) -> list[dict]:
     return [import_chunk] + symbol_chunks
 
 
-def _select_relevant_chunks(
+def select_relevant_chunks(
     chunks: list[dict],
     cited_symbol: str | None,
     budget_chars: int,
@@ -1239,7 +1263,7 @@ def _select_relevant_chunks(
     included: set[str] = set()
 
     # 1. Import chunk — always first.
-    if import_chunk:
+    if import_chunk and import_chunk["content"]:
         result_parts.append(import_chunk["content"])
         remaining -= len(import_chunk["content"])
         included.add(import_chunk["name"])
@@ -1286,8 +1310,13 @@ def _strip_outer_fence(text: str) -> str:
     """
     t = text.strip()
     if t.startswith("```"):
-        # Drop the opening fence line (e.g. "```json")
-        t = t.split("\n", 1)[1] if "\n" in t else ""
+        # Drop the opening fence line (e.g. "```json").
+        # If there is no newline the input is just a bare fence marker with no
+        # content — return the original text so json.loads can fail gracefully
+        # rather than getting an empty string.
+        if "\n" not in t:
+            return t
+        t = t.split("\n", 1)[1]
         # Drop the closing fence
         if t.rstrip().endswith("```"):
             t = t.rstrip()[:-3]

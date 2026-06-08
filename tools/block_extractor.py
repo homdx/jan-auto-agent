@@ -533,7 +533,7 @@ def extract_imports(source: str, file_ext: str) -> list[str]:
         return _unique_preserve_order(items)
 
     if ext == ".go":
-        items: list[str] = []
+        items = []
         for m in re.finditer(r'(?m)^\s*import\s+(?:([A-Za-z_][\w]*)\s+)?["`]([^"`]+)["`]', source):
             alias, path = m.group(1), m.group(2)
             if alias:
@@ -557,7 +557,7 @@ def extract_imports(source: str, file_ext: str) -> list[str]:
         return _unique_preserve_order(items)
 
     if ext in {".java", ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".rs"}:
-        items: list[str] = []
+        items = []
 
         # Java / C-like imports.
         for m in re.finditer(r"(?m)^\s*import\s+(?:static\s+)?([A-Za-z_][\w\.]*)\s*;", source):

@@ -292,10 +292,11 @@ system = You are a documentation change validator. Given a task description and
 | Key | Default | Description |
 |---|---|---|
 | `enabled` | `true` | Enable agent trace output |
-| `path` | `agent_trace.jsonl` | Trace file path |
 | `max_field_chars` | `4000` | Truncation limit per field |
 | `console_echo` | `true` | Print trace events to console |
 | `console_preview_chars` | `600` | Characters of prompt/response to preview live (`0` = header only) |
+
+> **Note:** The trace file path is not configurable. Each run automatically creates `.agent/trace_<run_id>.jsonl`.
 
 ---
 
@@ -561,14 +562,14 @@ Prompt versions are stored in `prompts.json` (up to `prompt_store.max_versions` 
 
 ## 14. Trace & Analytics
 
-All agent exchanges are written to `agent_trace.jsonl` (path set by `[trace] path`). Console preview is controlled by `console_preview_chars`.
+All agent exchanges are written to `.agent/trace_<run_id>.jsonl` (one file per run, auto-named). Console preview is controlled by `console_preview_chars`.
 
 View a trace:
 
 ```bash
 python view_trace.py .agent/trace_<run_id>.jsonl
-python view_trace.py .agent/trace_<run_id>.jsonl --agent architect
-python view_trace.py .agent/trace_<run_id>.jsonl --task AUTO-T3
+python view_trace.py .agent/trace_<run_id>.jsonl --sources architect
+python view_trace.py .agent/trace_<run_id>.jsonl --summary
 ```
 
 Analyze logs:

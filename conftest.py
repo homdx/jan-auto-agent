@@ -17,10 +17,13 @@ Handles two things:
 
 import subprocess
 import sys
-from pathlib import Path
+
 
 import pytest
+# conftest.py  (project root)
 
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 # ── 1. sys.path bootstrap ──────────────────────────────────────────────────────
 
 ROOT = Path(__file__).resolve().parent

@@ -36,8 +36,8 @@ if str(PROJECT_ROOT) not in sys.path:
 from tools.auto.coder import (
     Coder,
     CoderResult,
-    _chunk_file,
-    _select_relevant_chunks,
+    chunk_file,
+    select_relevant_chunks,
     make_coder,
 )
 from tools.auto.inner_loop import (
@@ -159,17 +159,17 @@ class TestSmallFilePassthrough:
         expected_block = f"### module.py\n{content}"
         assert expected_block in prompt
 
-    def test_chunk_file_small_returns_full_chunk(self) -> None:
+    def testchunk_file_small_returns_full_chunk(self) -> None:
         source = "x = 1\n"
-        chunks = _chunk_file(source, ".py", max_chars=8000)
+        chunks = chunk_file(source, ".py", max_chars=8000)
         assert len(chunks) == 1
         assert chunks[0]["name"] == "full"
         assert chunks[0]["content"] == source
 
-    def test_select_relevant_chunks_full_returns_source(self) -> None:
+    def testselect_relevant_chunks_full_returns_source(self) -> None:
         source = "x = 1\n"
-        chunks = _chunk_file(source, ".py", max_chars=8000)
-        result = _select_relevant_chunks(chunks, "anything", budget_chars=8000)
+        chunks = chunk_file(source, ".py", max_chars=8000)
+        result = select_relevant_chunks(chunks, "anything", budget_chars=8000)
         assert result == source
 
 
@@ -202,7 +202,7 @@ class TestLargePythonCitedSymbol:
 
     def test_cited_symbol_in_chunks(self) -> None:
         source = self._PYTHON_SOURCE
-        chunks = _chunk_file(source, ".py", max_chars=200)
+        chunks = chunk_file(source, ".py", max_chars=200)
         names = [c["name"] for c in chunks]
         # Should not be a single "full" chunk since source > max_chars
         assert "full" not in names
@@ -213,16 +213,16 @@ class TestLargePythonCitedSymbol:
     def test_cited_symbol_always_in_output(self) -> None:
         source = self._PYTHON_SOURCE
         # Use tiny budget to force stubbing
-        chunks = _chunk_file(source, ".py", max_chars=200)
-        result = _select_relevant_chunks(chunks, "Alpha", budget_chars=200)
+        chunks = chunk_file(source, ".py", max_chars=200)
+        result = select_relevant_chunks(chunks, "Alpha", budget_chars=200)
         # Alpha's class body must be present (not stubbed)
         assert "Alpha" in result
         assert "alpha" in result  # the string literal inside Alpha.run
 
     def test_import_chunk_first(self) -> None:
         source = self._PYTHON_SOURCE
-        chunks = _chunk_file(source, ".py", max_chars=200)
-        result = _select_relevant_chunks(chunks, "Beta", budget_chars=200)
+        chunks = chunk_file(source, ".py", max_chars=200)
+        result = select_relevant_chunks(chunks, "Beta", budget_chars=200)
         # imports line should appear before Beta's body
         import_pos = result.find("import os")
         beta_pos = result.find("class Beta")
@@ -232,8 +232,8 @@ class TestLargePythonCitedSymbol:
     def test_budget_respected_for_non_cited(self) -> None:
         source = self._PYTHON_SOURCE
         budget = 300
-        chunks = _chunk_file(source, ".py", max_chars=budget)
-        result = _select_relevant_chunks(chunks, "Alpha", budget_chars=budget)
+        chunks = chunk_file(source, ".py", max_chars=budget)
+        result = select_relevant_chunks(chunks, "Alpha", budget_chars=budget)
         # Non-cited chunks that don't fit should be stubbed
         # (total can exceed budget only because of the cited chunk guarantee)
         # At minimum, stubs should appear for some symbols
@@ -282,7 +282,7 @@ class TestLargeJavaBraceChunking:
 
     def test_java_chunks_detected(self) -> None:
         source = self._JAVA_SOURCE
-        chunks = _chunk_file(source, ".java", max_chars=200)
+        chunks = chunk_file(source, ".java", max_chars=200)
         if "full" in [c["name"] for c in chunks]:
             pytest.skip("source too small for this budget")
         names = [c["name"] for c in chunks]
@@ -291,17 +291,17 @@ class TestLargeJavaBraceChunking:
 
     def test_cited_symbol_widget_present(self) -> None:
         source = self._JAVA_SOURCE
-        chunks = _chunk_file(source, ".java", max_chars=200)
+        chunks = chunk_file(source, ".java", max_chars=200)
         if "full" in [c["name"] for c in chunks]:
             pytest.skip("source too small for this budget")
-        result = _select_relevant_chunks(chunks, "Widget", budget_chars=200)
+        result = select_relevant_chunks(chunks, "Widget", budget_chars=200)
         assert "Widget" in result
 
     def test_no_crash_on_java(self) -> None:
         source = self._JAVA_SOURCE
         # Must not raise regardless of budget
-        chunks = _chunk_file(source, ".java", max_chars=100)
-        result = _select_relevant_chunks(chunks, "Helper", budget_chars=100)
+        chunks = chunk_file(source, ".java", max_chars=100)
+        result = select_relevant_chunks(chunks, "Helper", budget_chars=100)
         assert isinstance(result, str)
 
 
@@ -601,10 +601,10 @@ class TestContextProbeDisabled:
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestSmartPathException:
-    def test_chunk_file_parse_failure_returns_truncated(self) -> None:
+    def testchunk_file_parse_failure_returns_truncated(self) -> None:
         """Syntax-error Python → single truncated chunk, WARNING logged, no raise."""
         bad_python = "def (:\n    ???\n" + ("x = 1\n" * 500)  # definitely > small budget
-        chunks = _chunk_file(bad_python, ".py", max_chars=100)
+        chunks = chunk_file(bad_python, ".py", max_chars=100)
         assert len(chunks) == 1
         assert chunks[0]["name"] == "truncated"
         assert "[truncated]" in chunks[0]["content"]
@@ -612,7 +612,7 @@ class TestSmartPathException:
     def test_exception_in_chunk_path_falls_back_to_truncation(
         self, tmp_path: Path
     ) -> None:
-        """If _chunk_file raises inside generate(), fallback truncation is used."""
+        """If chunk_file raises inside generate(), fallback truncation is used."""
         long_content = "x = 1\n" * 2000  # definitely > 8000 chars
         base_dir = tmp_path / "repo"
         base_dir.mkdir()
@@ -630,7 +630,7 @@ class TestSmartPathException:
 
         with (
             patch("tools.llm_stream.request_completion", side_effect=fake_llm),
-            patch("tools.auto.coder._chunk_file", side_effect=RuntimeError("boom")),
+            patch("tools.auto.coder.chunk_file", side_effect=RuntimeError("boom")),
         ):
             result = coder.generate(task, base_dir)
 
@@ -641,7 +641,7 @@ class TestSmartPathException:
         assert result is not None
 
     def test_empty_chunks_returns_no_content(self) -> None:
-        result = _select_relevant_chunks([], None, 8000)
+        result = select_relevant_chunks([], None, 8000)
         assert result == "(no content)"
 
 

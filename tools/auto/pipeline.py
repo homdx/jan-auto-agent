@@ -92,7 +92,7 @@ def run_pipeline(controller: "AutoController") -> tuple[Optional[str], int]:
             controller.progress_display.refresh()
 
     # ── EXECUTE phase — G2 / G3 / G4 / G5 wired inside _run_task_loop ─────────
-    return controller._run_task_loop(task_mode=getattr(controller, "task_mode", "code"))  # AUTO-DM-1
+    return controller._run_task_loop(task_mode=getattr(controller, "task_mode", "code"), cfg=cfg)  # AUTO-DM-1
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -143,12 +143,37 @@ def _run_plan_phase(controller: "AutoController", cfg: configparser.ConfigParser
     # ── Step 2: Architect review ──────────────────────────────────────────────
     logger.info("plan_phase: architect reviewing %d cluster(s)", len(clusters))
 
+    # Use PlanEmitter early so we can call changed_clusters() — skip clusters
+    # whose file-lists haven't changed since the last emit (re-plan cheapness).
+    # On a fresh first run the hash file doesn't exist yet, so all clusters are
+    # returned unchanged.
+    if controller.git is not None:
+        _early_emitter = PlanEmitter(
+            base_dir=controller.base_dir,
+            state=controller.state,
+            git=controller.git,
+        )
+        clusters_to_review = _early_emitter.changed_clusters(clusters)
+        if len(clusters_to_review) < len(clusters):
+            logger.info(
+                "plan_phase: %d/%d cluster(s) unchanged — skipping their review",
+                len(clusters) - len(clusters_to_review),
+                len(clusters),
+            )
+            controller.state.log(
+                f"plan phase: skipping {len(clusters) - len(clusters_to_review)} "
+                f"unchanged cluster(s)"
+            )
+    else:
+        _early_emitter = None
+        clusters_to_review = clusters
+
     def _on_cluster_done():
         if controller.progress_display:
             controller.progress_display.tick_arch()
 
     candidates = review_clusters(
-        clusters, controller.base_dir, cfg,
+        clusters_to_review, controller.base_dir, cfg,
         goal=controller.goal,
         on_cluster_done=_on_cluster_done,
         task_mode=getattr(controller, "task_mode", "code"),   # AUTO-DM-1
@@ -205,7 +230,7 @@ def _run_plan_phase(controller: "AutoController", cfg: configparser.ConfigParser
         logger.warning("plan_phase: git not available — emitting without commit")
         _emit_without_git(controller, backlog, clusters)
     else:
-        emitter = PlanEmitter(
+        emitter = _early_emitter or PlanEmitter(
             base_dir=controller.base_dir,
             state=controller.state,
             git=controller.git,

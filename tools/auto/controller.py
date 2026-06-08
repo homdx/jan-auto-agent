@@ -23,11 +23,11 @@ import logging
 import os
 import sys
 import time
-from datetime import datetime, timezone
+from tools.auto.utils import _ts
 from pathlib import Path
 from typing import Callable, Optional
 
-from tools.auto.state import StateStore, STATUS_DONE, STATUS_BLOCKED
+from tools.auto.state import StateStore, STATUS_DONE, STATUS_BLOCKED, STATUS_TODO
 from tools.auto.git_manager import make_git_manager, GitError
 from tools.auto.outer_loop import make_outer_loop  # noqa: F401 — re-exported as a patch target for tests
 
@@ -167,18 +167,21 @@ class AutoController:
         # AUTO-DM-1: read task_mode once at startup; forwarded to pipeline and
         # all downstream factory calls.  Defaults to "code" so existing configs
         # and call sites are completely unaffected.
-        _cfg_dm = configparser.ConfigParser()
+        # Config is parsed exactly once here and reused everywhere via
+        # self.config (run(), _run_task_loop(), _setup_git(), limits) instead of
+        # re-reading agents.ini from disk on each call.
+        self.config = configparser.ConfigParser()
         if Path(config_path).exists():
-            _cfg_dm.read(config_path)
-        self.task_mode: str = _cfg_dm.get("auto", "task_mode", fallback="code")
+            self.config.read(config_path)
+        self.task_mode: str = self.config.get("auto", "task_mode", fallback="code")
         # AUTO-A4: execution working dir (executor/AUTO-C1 runs code here)
         self.workspace_dir = self.agent_dir / "workspace"
 
         # AUTO-A4: monotonic clock — injectable for unit tests
         self._time_fn: Callable[[], float] = _time_fn or time.monotonic
 
-        # AUTO-A4: load run limits from agents.ini
-        self.limits = self._load_limits(config_path)
+        # AUTO-A4: load run limits from agents.ini (reuse the already-parsed config)
+        self.limits = RunLimits.from_config(self.config)
 
         # AUTO-A2: StateStore owns all .agent/ I/O
         self.state = StateStore(self.agent_dir)
@@ -264,9 +267,7 @@ class AutoController:
         # AUTO-A2: MUST initialise state first so .agent/ exists
         is_fresh = self.state.initialise(self.goal, self.base_dir)
 
-        cfg = configparser.ConfigParser()
-        if Path(self.config_path).exists():
-            cfg.read(self.config_path)
+        cfg = self._cfg()
 
         # ── Epic G Initialization ─────────────────────────────────────────
 
@@ -286,6 +287,14 @@ class AutoController:
 
         # AUTO-A3: ensure the target folder is a git repo with agent identity.
         self._setup_git()
+
+        # Reset any tasks that were blocked in a prior session back to TODO so
+        # their dependencies are re-evaluated this session.  A task blocked
+        # because dep A wasn't done yet will simply be re-blocked immediately
+        # if A is still pending; if A is now DONE it will run normally.
+        for task in self.state.all_tasks():
+            if task["status"] == STATUS_BLOCKED:
+                self.state.set_task_status(task["id"], STATUS_TODO)
 
         resume_info = self.state.resume_info()
         if not is_fresh:
@@ -307,6 +316,7 @@ class AutoController:
         stop_reason, session_tasks_done = run_pipeline(self)
 
         # ── Finalise ──────────────────────────────────────────────────────
+        self._log_auto_prompts()
         if stop_reason:
             self._handle_cap(stop_reason, session_tasks_done)
         else:
@@ -325,6 +335,7 @@ class AutoController:
         self,
         *,
         task_mode: str = "code",
+        cfg: Optional[configparser.ConfigParser] = None,
     ) -> tuple[Optional[str], int]:
         """Iterate pending tasks, check caps, execute via outer_loop, return stop reason.
 
@@ -348,9 +359,8 @@ class AutoController:
         tasks_done = 0
 
         # ── Build execution helpers once per loop ──────────────────────────
-        cfg = configparser.ConfigParser()
-        if Path(self.config_path).exists():
-            cfg.read(self.config_path)
+        if cfg is None:
+            cfg = self._cfg()
 
         from tools.auto.outer_loop import make_outer_loop
         from tools.auto.commit_on_success import CommitOnSuccess
@@ -556,6 +566,22 @@ class AutoController:
                 f"state saved, run is resumable."
             )
 
+    def _cfg(self) -> configparser.ConfigParser:
+        """Return the parsed agents.ini, loading it once and caching on self.
+
+        Real runs set ``self.config`` in ``__init__`` so this returns it with no
+        disk read.  Test harnesses that build the controller via ``__new__``
+        (bypassing ``__init__``) hit the lazy path, which reads ``config_path``
+        once and caches it — so the single-parse guarantee holds either way.
+        """
+        cfg = getattr(self, "config", None)
+        if cfg is None:
+            cfg = configparser.ConfigParser()
+            if Path(self.config_path).exists():
+                cfg.read(self.config_path)
+            self.config = cfg
+        return cfg
+
     def _setup_git(self) -> None:
         """AUTO-A3: ensure the base dir is a git repo and apply agent identity.
 
@@ -564,9 +590,7 @@ class AutoController:
         simply won't happen until git is available.
         """
         try:
-            cfg = configparser.ConfigParser()
-            if Path(self.config_path).exists():
-                cfg.read(self.config_path)
+            cfg = self._cfg()
             self.git = make_git_manager(self.base_dir, cfg)
             self.workspace_dir.mkdir(parents=True, exist_ok=True)
             self.state.log(
@@ -576,6 +600,26 @@ class AutoController:
             self.git = None
             logger.warning("git setup failed (continuing without git): %s", exc)
             self.state.log(f"git setup failed: {exc}")
+
+
+
+
+    def _log_auto_prompts(self) -> None:
+        """If auto_prompts.json exists, print its contents to console and log it."""
+        prompts_path = self.agent_dir / "auto_prompts.json"
+        if not prompts_path.exists():
+            return
+        import json as _json
+        try:
+            data = _json.loads(prompts_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            print(f"[{_ts()}] ⚠️  Could not read auto_prompts.json: {exc}")
+            return
+        ts = _ts()
+        text = _json.dumps(data, indent=2, ensure_ascii=False)
+        print(f"[{ts}] ✨ Validator prompts were tuned this run — auto_prompts.json:")
+        print(text)
+        self.state.log(f"auto_prompts.json contents:\n{text}")
 
     def _print_banner(self) -> None:
         ts = _ts()
@@ -604,17 +648,6 @@ class AutoController:
             self.state.log(f"run limits active: {', '.join(parts)}")
         else:
             self.state.log("run limits: none configured")
-
-    @staticmethod
-    def _load_limits(config_path: str) -> RunLimits:
-        cfg = configparser.ConfigParser()
-        if Path(config_path).exists():
-            cfg.read(config_path)
-        return RunLimits.from_config(cfg)
-
-
-def _ts() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

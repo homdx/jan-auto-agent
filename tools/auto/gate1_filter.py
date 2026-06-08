@@ -402,7 +402,8 @@ class Gate1Filter:
 
         # Include some context around the cited range, capped to max_context_lines.
         ctx_start = max(0, start - 1)
-        ctx_end   = min(total, ctx_start + self._max_context_lines)
+        ctx_end   = min(total, end)  # use clamped end, then cap at max_context_lines
+        ctx_end   = min(ctx_end, ctx_start + self._max_context_lines)
         block = "\n".join(lines[ctx_start:ctx_end])
         return True, "line range found", _truncate(block, self._max_block_chars)
 
@@ -451,7 +452,7 @@ class Gate1Filter:
             }
         else:
             url = f"{self._base_url}/chat/completions"
-            payload: dict[str, Any] = {
+            payload = {
                 "model":       self._model,
                 "temperature": self._temperature,
                 "max_tokens":  self._max_tokens,

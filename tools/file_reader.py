@@ -72,3 +72,35 @@ def list_py_files(base_dir: str, skip_dirs: list) -> list[str]:
                 results.append(str(Path(current_dir) / filename))
 
     return results
+
+
+# Extensions handled well by block_extractor — mirrors context_broker._SEARCHABLE_EXTS.
+_SEARCHABLE_EXTS: frozenset[str] = frozenset({
+    ".py", ".js", ".ts", ".tsx", ".jsx",
+    ".go", ".java", ".rs", ".c", ".cpp", ".h", ".hpp",
+})
+
+
+def list_source_files(base_dir: str, skip_dirs: list) -> list[str]:
+    """Walk *base_dir* recursively and return all source files whose extension
+    is in ``_SEARCHABLE_EXTS``, skipping directories in *skip_dirs*.
+
+    Supersedes :func:`list_py_files` for multi-language projects.
+    """
+    root = Path(resolve_path(base_dir))
+
+    if not root.exists():
+        raise FileNotFoundError(f"Directory not found: {root}")
+    if not root.is_dir():
+        raise NotADirectoryError(f"Not a directory: {root}")
+
+    skip_set = set(skip_dirs)
+    results: list[str] = []
+
+    for current_dir, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d not in skip_set]
+        for filename in filenames:
+            if Path(filename).suffix.lower() in _SEARCHABLE_EXTS:
+                results.append(str(Path(current_dir) / filename))
+
+    return results

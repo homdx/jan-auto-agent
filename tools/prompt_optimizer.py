@@ -43,7 +43,7 @@ class PromptOptimizer:
         base_url: str = "http://localhost:1337/v1",
         api_key: str = "jan",
         timeout: int = 120,
-        ssl_context: ssl.SSLContext = None,
+        ssl_context: ssl.SSLContext | None = None,
         temperature: float = 0.4,
         api_format: str = "openai",
     ):

@@ -34,6 +34,9 @@ import configparser
 import hashlib
 import json
 import logging
+import re as _re
+import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -492,7 +495,7 @@ class ClusterReviewer:
             }
         else:
             url = f"{self._base_url}/chat/completions"
-            payload: dict[str, Any] = {
+            payload = {
                 "model":       self._model,
                 "temperature": self._temperature,
                 "max_tokens":  self._max_tokens,
@@ -511,9 +514,6 @@ class ClusterReviewer:
             params={"model": self._model, "temperature": self._temperature,
                     "cluster": cluster.name},
         )
-
-        import sys
-        import time
 
         _RETRY_DELAYS = [5, 15, 30]   # seconds between attempts (3 retries)
 
@@ -560,11 +560,21 @@ class ClusterReviewer:
                 exc_str = str(exc)
                 # Only retry on transient server-side errors (5xx) or connection
                 # failures.  Client errors (4xx) are deterministic — no point retrying.
+                # Prefer the REAL status from the exception object: urllib raises
+                # HTTPError with an integer ``.code``.  Only fall back to a
+                # word-boundary scan of the message for non-HTTP transport errors,
+                # which avoids false positives from substrings (e.g. a model name
+                # like "gpt-4-5000" or an error body that mentions "error 500").
+                _http_status: int = 0
+                _code = getattr(exc, "code", None)
+                if isinstance(_code, int):
+                    _http_status = _code
+                else:
+                    _status_match = _re.search(r"\b([1-5]\d{2})\b", exc_str)
+                    if _status_match:
+                        _http_status = int(_status_match.group(1))
                 _is_transient = (
-                    "500" in exc_str
-                    or "502" in exc_str
-                    or "503" in exc_str
-                    or "504" in exc_str
+                    (500 <= _http_status <= 599)
                     or "ConnectionRefused" in exc_str
                     or "Connection refused" in exc_str
                     or "timed out" in exc_str.lower()
@@ -1006,7 +1016,7 @@ class TaskRewriter:
             }
         else:
             url = f"{self._base_url}/chat/completions"
-            payload: dict[str, Any] = {
+            payload = {
                 "model":       self._model,
                 "temperature": self._temperature,
                 "max_tokens":  self._max_tokens,
@@ -1149,7 +1159,6 @@ _SHELL_COMMAND_PREFIXES: tuple[str, ...] = (
 # Heuristic upper bound: real commands are short; prose descriptions are long.
 _MAX_ACCEPTANCE_CHECK_CHARS = 300
 
-import re as _re
 _SENTENCE_END_RE = _re.compile(r"\.\s+[A-Z]")
 
 
@@ -1185,8 +1194,7 @@ def _normalise(text: str) -> str:
     same instruction/acceptance_check content as the original task, even
     if the LLM emitted different surrounding whitespace.
     """
-    import re as _re2
-    return _re2.sub(r"\s+", " ", text.strip())
+    return _re.sub(r"\s+", " ", text.strip())
 
 
 def _fire_callback(cb) -> None:

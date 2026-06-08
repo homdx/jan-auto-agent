@@ -65,6 +65,7 @@ class AgentTracer:
         self._seq: int = 0
         self._run_id: Optional[str] = None
         self._lock = threading.Lock()
+        self._fh: Optional[Any] = None   # persistent file handle opened at configure()
 
     # ------------------------------------------------------------------ #
     # Configuration                                                       #
@@ -84,6 +85,18 @@ class AgentTracer:
         self.console_preview_chars = max(80, int(console_preview_chars))
         self.path = Path(path) if path else None
         self.max_field_chars = max(200, int(max_field_chars))
+        # Close any previously open handle before opening the new one.
+        if self._fh is not None:
+            try:
+                self._fh.close()
+            except OSError:
+                pass
+            self._fh = None
+        if self.enabled and self.path is not None:
+            try:
+                self._fh = open(self.path, "a", encoding="utf-8")  # noqa: SIM115
+            except OSError:
+                self._fh = None
 
     # ------------------------------------------------------------------ #
     # Run grouping                                                         #
@@ -127,8 +140,6 @@ class AgentTracer:
         model/temperature/max_tokens : sampling parameters, when an LLM is involved.
         """
         if not self.enabled or self.path is None:
-            if self.console_echo:
-                self._console_line(source, target, kind, model, temperature, max_tokens, params, content)
             return
 
         with self._lock:
@@ -156,8 +167,9 @@ class AgentTracer:
                 self._console_line(source, target, kind, model, temperature, max_tokens, params, content)
 
             try:
-                with open(self.path, "a", encoding="utf-8") as fh:
-                    fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+                if self._fh is not None:
+                    self._fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    self._fh.flush()
             except OSError:
                 # Tracing must never break the pipeline — swallow write errors.
                 pass

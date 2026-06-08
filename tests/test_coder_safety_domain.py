@@ -84,8 +84,8 @@ class TestPatternSets:
         assert "curl exfil" in labels
 
     def test_blocked_content_patterns_is_union(self) -> None:
-        """_BLOCKED_CONTENT_PATTERNS must be the union for backward compat."""
-        all_labels = {label for label, _ in Coder._BLOCKED_CONTENT_PATTERNS}
+        """Code mode must cover both _BLOCKED_ALWAYS and _BLOCKED_CODE_ONLY patterns."""
+        all_labels = {label for label, _ in Coder._BLOCKED_ALWAYS + Coder._BLOCKED_CODE_ONLY}
         always_labels = {label for label, _ in Coder._BLOCKED_ALWAYS}
         code_only_labels = {label for label, _ in Coder._BLOCKED_CODE_ONLY}
         assert always_labels.issubset(all_labels)

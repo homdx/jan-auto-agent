@@ -69,11 +69,12 @@ class _Exec:
 
 class _OkCoder:
     """Always writes the file; records the prefetched_context per attempt."""
-    def __init__(self):
+    def __init__(self, files_written=None):
         self.calls = []
+        self._files_written = files_written or ["helper.py"]
     def generate(self, task, base_dir, prior_feedback=None, prefetched_context="", **kw):
         self.calls.append(prefetched_context)
-        return CoderResult(task_id="T", files_written=["helper.py"])
+        return CoderResult(task_id="T", files_written=list(self._files_written))
 
 
 class _RejectThenApprove:
@@ -81,7 +82,7 @@ class _RejectThenApprove:
     def __init__(self):
         self.n = 0
         self.last_missing_context: list = []
-    def approve(self, task, exec_result, coder_result):
+    def approve(self, task, exec_result, coder_result, *, base_dir=None):
         self.n += 1
         if self.n == 1:
             self.last_missing_context = ["my_helper"]
@@ -105,6 +106,23 @@ def test_inner_loop_prefetches_validator_requested_context_into_next_attempt():
         assert res.context_satisfied is True
 
 
+# ───────────────────────── CoderResult.succeeded contract ────────────────────
+
+def test_coder_result_succeeded_false_when_error_set():
+    """succeeded must be False whenever error is non-empty, regardless of
+    files_written.  test_context_satisfied_false_when_coder_reports_gap
+    depends on this holding — make the dependency explicit and load-bearing."""
+    assert CoderResult(task_id="T", files_written=[],    error="need ctx").succeeded is False
+    assert CoderResult(task_id="T", files_written=["f"], error="need ctx").succeeded is False
+
+def test_coder_result_succeeded_false_when_no_files_written():
+    """No files written → failed even without an error string."""
+    assert CoderResult(task_id="T", files_written=[], error="").succeeded is False
+
+def test_coder_result_succeeded_true_only_when_files_and_no_error():
+    assert CoderResult(task_id="T", files_written=["f.py"], error="").succeeded is True
+
+
 # ───────────────────────── context_satisfied (Signal A) ──────────
 
 class _CoderReportsGap:
@@ -115,6 +133,15 @@ class _CoderReportsGap:
 
 
 def test_context_satisfied_false_when_coder_reports_gap():
+    # Guard: the test only makes sense if a CoderResult with error set
+    # and no files written is treated as not succeeded.  If this assertion
+    # fails, fix CoderResult.succeeded before debugging this test.
+    _sentinel = CoderResult(task_id="T", files_written=[], error="need ctx",
+                            context_satisfied=False)
+    assert _sentinel.succeeded is False, (
+        "CoderResult.succeeded contract broken: error non-empty must imply succeeded=False"
+    )
+
     with tempfile.TemporaryDirectory() as d:
         loop = InnerLoop(_CoderReportsGap(), _Exec(),
                          _RejectThenApprove(), max_attempts=2)
@@ -128,6 +155,161 @@ def test_context_satisfied_false_when_coder_reports_gap():
 def test_outer_loop_gate_uses_context_satisfied():
     src = (PROJECT_ROOT / "tools" / "auto" / "outer_loop.py").read_text()
     assert 'getattr(res, "context_satisfied", True)' in src
+
+
+# ───────────────────────── PIPE-104 additions ────────────────────
+
+
+def test_project_scan_result_is_cached():
+    """Pass-2 hit is cached; deleting the source file doesn't break a second
+    resolve; reset_cache() forces a real re-scan (which then misses)."""
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        dep = d / "dep.py"
+        dep.write_text("def cached_fn():\n    return 42\n")
+        broker = ContextBroker()
+        # First resolve — hits Pass-2 (dep.py is not a target file)
+        result1 = broker.resolve(["cached_fn"], [], d)
+        assert "cached_fn" in result1
+        # Delete the source; second resolve must still be served from cache
+        dep.unlink()
+        result2 = broker.resolve(["cached_fn"], [], d)
+        assert "cached_fn" in result2, "expected cache hit after source deleted"
+        # After reset the broker must re-scan — file is gone, so it misses
+        broker.reset_cache()
+        result3 = broker.resolve(["cached_fn"], [], d)
+        assert "cached_fn" not in result3, "expected cache miss after reset_cache()"
+
+
+def test_target_file_results_stay_fresh():
+    """Pass-1 (target-file) hits are never cached, so rewriting the file is
+    reflected in the very next resolve() call."""
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        target = d / "target.py"
+        target.write_text("def fresh_fn():\n    return 'original'\n")
+        broker = ContextBroker()
+        result1 = broker.resolve(["fresh_fn"], ["target.py"], d)
+        assert "original" in result1.get("fresh_fn", "")
+        # Overwrite the target file (simulates what the coder does each attempt)
+        target.write_text("def fresh_fn():\n    return 'rewritten'\n")
+        result2 = broker.resolve(["fresh_fn"], ["target.py"], d)
+        assert "rewritten" in result2.get("fresh_fn", ""), (
+            "Pass-1 result should reflect new file content, not a stale cache"
+        )
+
+
+def test_cap_applies_only_to_uncached():
+    """Cached symbols are free; the _max_symbols cap only limits the number of
+    *new* (uncached) symbols resolved in one call."""
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        # Write 6 symbols into a dependency file (not a target file → Pass-2)
+        lines = []
+        for i in range(6):
+            lines.append(f"def sym_{i}():\n    return {i}\n")
+        (d / "lib.py").write_text("\n".join(lines))
+
+        broker = ContextBroker(max_symbols=3)
+
+        # First call — only 3 new symbols resolved (cap applied)
+        first = broker.resolve([f"sym_{i}" for i in range(3)], [], d)
+        assert len(first) == 3
+
+        # Second call — first 3 are cached (free) + 3 new ones requested
+        second = broker.resolve([f"sym_{i}" for i in range(6)], [], d)
+        # Must return all 6: 3 from cache (free) + 3 new (within cap)
+        assert len(second) == 6, (
+            f"expected 6 symbols (3 cached + 3 new), got {len(second)}"
+        )
+
+
+class _AccumulatingValidator:
+    """Rejects twice, citing a different symbol each time, then approves."""
+    def __init__(self):
+        self.n = 0
+        self.last_missing_context: list[str] = []
+
+    def approve(self, task, exec_result, coder_result, *, base_dir=None):
+        self.n += 1
+        if self.n == 1:
+            self.last_missing_context = ["alpha"]
+            return False, "need alpha"
+        if self.n == 2:
+            self.last_missing_context = ["beta"]
+            return False, "need beta"
+        self.last_missing_context = []
+        return True, ""
+
+
+def test_inner_loop_accumulates_validator_context_across_attempts():
+    """Symbols requested by the validator accumulate: attempt 3's
+    prefetched_context must contain BOTH 'alpha' (from attempt 1) and
+    'beta' (from attempt 2)."""
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        (d / "lib.py").write_text(
+            "def alpha():\n    return 'a'\n\ndef beta():\n    return 'b'\n"
+        )
+        coder = _OkCoder(files_written=["lib.py"])
+        loop = InnerLoop(coder, _Exec(), _AccumulatingValidator(), max_attempts=4)
+        res = loop.run_task({"id": "T", "target_files": []}, d)
+        assert res.passed is True
+        # attempt 3 (index 2) must have received both symbols
+        ctx_attempt3 = coder.calls[2]
+        assert "alpha" in ctx_attempt3, "alpha (from attempt-1 rejection) missing on attempt 3"
+        assert "beta" in ctx_attempt3, "beta (from attempt-2 rejection) missing on attempt 3"
+
+
+class _CoderRequestsThenSatisfied:
+    """Reports context_request=['foo'] on attempts 1 & 2 (via CoderResult.missing_context)."""
+    def __init__(self):
+        self.calls: list = []
+        self.n = 0
+    def generate(self, task, base_dir, prior_feedback=None, prefetched_context="", **kw):
+        self.calls.append(prefetched_context)
+        self.n += 1
+        mc = ["foo"] if self.n <= 2 else []
+        return CoderResult(task_id="T", files_written=["lib.py"], missing_context=mc)
+
+
+class _ValBarThenNoMissing:
+    """Attempt1: reject + missing ['bar']; Attempt2: reject + NO missing; Attempt3: approve."""
+    def __init__(self):
+        self.n = 0
+        self.last_missing_context: list = []
+    def approve(self, task, exec_result, coder_result, *, base_dir=None):
+        self.n += 1
+        if self.n == 1:
+            self.last_missing_context = ["bar"]
+            return False, "need bar"
+        if self.n == 2:
+            self.last_missing_context = []
+            return False, "still wrong"
+        self.last_missing_context = []
+        return True, ""
+
+
+def test_coder_pull_does_not_clobber_validator_accumulated_context():
+    """Regression: coder-side context_request must accumulate, not overwrite.
+
+    Reviewer requests 'bar' on attempt 1; coder requests 'foo' on attempts 1-2;
+    attempt 2's rejection carries no missing_context. Attempt 3 must still see
+    BOTH 'bar' (reviewer) and 'foo' (coder) — the coder pull previously
+    overwrote prefetched_context and dropped 'bar'.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        (d / "lib.py").write_text(
+            "def foo():\n    return 1\n\ndef bar():\n    return 2\n"
+        )
+        coder = _CoderRequestsThenSatisfied()
+        loop = InnerLoop(coder, _Exec(), _ValBarThenNoMissing(), max_attempts=4)
+        res = loop.run_task({"id": "T", "target_files": []}, d)
+        assert res.passed is True
+        ctx3 = coder.calls[2]
+        assert "bar" in ctx3, "reviewer-accumulated 'bar' was clobbered by the coder pull"
+        assert "foo" in ctx3, "coder-requested 'foo' missing from accumulated context"
 
 
 if __name__ == "__main__":
