@@ -426,8 +426,29 @@ class OrchestratorActions:
         return t.rstrip("\n") + "\n"
 
     def _edit_file_content(self, instruction: str, file_label: str,
-                           source: str, feedback: str = None) -> str:
-        """Ask the model for the COMPLETE revised file content (no commentary)."""
+                           source: str, feedback: str = None,
+                           previous_revised: str = None) -> str:
+        """Ask the model for the COMPLETE revised file content (no commentary).
+
+        Message structure depends on whether this is a first attempt or a retry:
+
+        First attempt (feedback=None):
+            user: DOCUMENT + INSTRUCTION
+
+        Retry with previous attempt (feedback + previous_revised):
+            user:      DOCUMENT + INSTRUCTION      ← never changes
+            assistant: <previous_revised>           ← model's own prior output
+            user:      correction instruction only  ← unambiguously meta, not content
+
+        Retry without previous attempt (reset iter / feature disabled):
+            user: DOCUMENT + INSTRUCTION + clearly-delimited CORRECTION block
+
+        The multi-turn structure for the second case is critical: when feedback is
+        appended to the same user message as the instruction, the model can confuse
+        the feedback text for document content and start editing the feedback instead
+        of the original document. Putting feedback in a separate user turn after an
+        assistant turn removes that ambiguity entirely.
+        """
         system = (
             "You are a precise text/file editor. Apply the INSTRUCTION to the DOCUMENT. "
             "Output ONLY the complete, updated file content — no explanations, no "
@@ -435,22 +456,87 @@ class OrchestratorActions:
             "change; fix what the instruction asks; if asked to add a question or note, "
             "append it as plain text in the file."
         )
-        fb = (f"\n\nThe previous edit was rejected: {feedback}\nProduce a corrected "
-              "full file.") if feedback else ""
-        user = f"DOCUMENT ({file_label}):\n-----\n{source}\n-----\nINSTRUCTION: {instruction}{fb}"
+
+        base_user = (
+            f"DOCUMENT ({file_label}):\n-----\n{source}\n-----\n"
+            f"INSTRUCTION: {instruction}"
+        )
+
+        if not feedback:
+            # ── First attempt: single turn ─────────────────────────────────
+            messages = [
+                {"role": "system",    "content": system},
+                {"role": "user",      "content": base_user},
+            ]
+            trace_content = base_user
+
+        elif previous_revised:
+            # ── Retry with context: multi-turn ─────────────────────────────
+            # The model's previous output becomes an assistant message so the
+            # correction request is a clean, unambiguous new user turn.
+            #
+            # IMPORTANT: the correction turn deliberately repeats the full
+            # DOCUMENT and INSTRUCTION.  Without this re-anchoring, weak
+            # models lose track of what they are supposed to edit after seeing
+            # their own previous output as an assistant turn and treat the
+            # feedback text as the new document to edit instead.
+            correction = (
+                f"That edit was rejected.\n\n"
+                f"Error: {feedback}\n\n"
+                f"Re-apply the INSTRUCTION to the DOCUMENT below, correcting "
+                f"the error above. Output ONLY the complete corrected file — "
+                f"no explanations, no code fences.\n\n"
+                f"DOCUMENT ({file_label}):\n-----\n{source}\n-----\n"
+                f"INSTRUCTION: {instruction}"
+            )
+            messages = [
+                {"role": "system",    "content": system},
+                {"role": "user",      "content": base_user},
+                {"role": "assistant", "content": previous_revised},
+                {"role": "user",      "content": correction},
+            ]
+            trace_content = (
+                f"{base_user}\n"
+                f"[assistant turn: {len(previous_revised)} chars]\n"
+                f"{correction}"
+            )
+
+        else:
+            # ── Clean/reset retry: single turn with delimited correction ───
+            # No previous_revised available (reset iter or feature disabled).
+            # Correction block is appended to the same user message.
+            # We reference the document by its label (not "above") to avoid
+            # ambiguity, and re-state the instruction so the model doesn't have
+            # to scroll up mentally to find it.
+            correction_block = (
+                f"\n\n---CORRECTION---\n"
+                f"Error in previous attempt: {feedback}\n"
+                f"Re-apply the INSTRUCTION to DOCUMENT ({file_label}), "
+                f"correcting the error above.\n"
+                f"INSTRUCTION (reminder): {instruction}\n"
+                "Output ONLY the complete corrected file content — no explanations, no code fences.\n"
+                "---END CORRECTION---"
+            )
+            messages = [
+                {"role": "system", "content": system},
+                {"role": "user",   "content": base_user + correction_block},
+            ]
+            trace_content = base_user + correction_block
+
         url = self._chat_url()
         headers = {"Content-Type": "application/json",
                    "Authorization": f"Bearer {self.api_key}"}
         payload = {"model": self.model,
-                   "messages": [{"role": "system", "content": system},
-                                {"role": "user", "content": user}],
+                   "messages": messages,
                    "temperature": self._cfg_temp("file_editor", 0.2)}
         if getattr(self, "file_editor_max_tokens", 0):
             payload["max_tokens"] = self.file_editor_max_tokens
         print(f"\n[{_ts()}] ✏️  edit → model:")
         tracer.event("orchestrator", "file_editor", "llm_request",
-                     params={"file": file_label, "instruction": instruction},
-                     content=user, model=self.model, temperature=self._cfg_temp("file_editor", 0.2))
+                     params={"file": file_label, "instruction": instruction,
+                             "prev_context": previous_revised is not None},
+                     content=trace_content, model=self.model,
+                     temperature=self._cfg_temp("file_editor", 0.2))
         try:
             _on_tok, _tok_stats = stream_tracker()
             out = request_completion(
@@ -549,13 +635,55 @@ class OrchestratorActions:
             print(f"[{_ts()}] Could not read {target}: {e}")
             return
 
+        # ── prev-context window ────────────────────────────────────────────
+        # Read prev_context_every from [file_editor] in agents.ini.
+        # N > 0: show the writer its previous attempt for N consecutive retries,
+        # then one forced "clean" iteration (feedback only) to break loops, repeat.
+        # 0 (default) = original behaviour — writer never sees its own previous attempt.
+        _prev_ctx_every   = 0
+        _prev_ctx_max     = 0   # max chars for previous_revised; 0 = no limit
+        _cfg = getattr(self, "config", None)
+        if _cfg:
+            _prev_ctx_every = _cfg.getint("file_editor", "prev_context_every",   fallback=0)
+            _prev_ctx_max   = _cfg.getint("file_editor", "prev_context_max_chars", fallback=0)
+
         revised, validation, feedback = "", {}, None
+        _prev_shown_count = 0     # consecutive iters where previous_revised was shown
+        _is_reset_iter    = False  # True → this iteration must be clean (no prev)
+
         for iteration in range(1, self.max_iterations + 1):
             if time.time() - start >= self.timeout_seconds:
                 print(f"[{_ts()}] ⏳ timeout; using best edit so far.")
                 break
+
+            # Decide whether to pass the previous attempt to the editor.
+            _use_prev = (
+                bool(revised)            # have a previous attempt
+                and _prev_ctx_every > 0  # feature enabled in agents.ini
+                and not _is_reset_iter   # not a forced clean iteration
+            )
+            if _is_reset_iter and revised:
+                # FIX: _prev_shown_count is already 0 here (reset when the flag
+                # was set), so print the window size from config, not the counter.
+                print(f"[{_ts()}] 🔄 Reset iter {iteration} — clean feedback only "
+                      f"(window of {_prev_ctx_every} exhausted).")
+
+            # Truncate previous_revised to avoid blowing the context window.
+            # prev_context_max_chars = 0 means no limit.
+            _prev_to_pass = None
+            if _use_prev:
+                if _prev_ctx_max > 0 and len(revised) > _prev_ctx_max:
+                    _prev_to_pass = revised[:_prev_ctx_max] + f"\n…(truncated at {_prev_ctx_max} chars)"
+                    logger.debug("previous_revised truncated %d→%d chars", len(revised), _prev_ctx_max)
+                else:
+                    _prev_to_pass = revised
+
             _step_start = time.time()
-            revised = self._edit_file_content(instruction, file_path, original, feedback)
+            revised = self._edit_file_content(
+                instruction, file_path, original,
+                feedback=feedback,
+                previous_revised=_prev_to_pass,
+            )
             if not revised.strip():
                 print(f"[{_ts()}] No content produced — file left unchanged.")
                 return
@@ -576,6 +704,24 @@ class OrchestratorActions:
             feedback = (validation.get("feedback") or "").strip()
             if feedback:
                 print(f"[{_ts()}] ❗ Edit feedback: {feedback}")
+
+            # ── update prev-context window state for the NEXT iteration ───
+            if _prev_ctx_every > 0:
+                if _use_prev:
+                    _prev_shown_count += 1
+                    if _prev_shown_count >= _prev_ctx_every:
+                        # Window full → next iter is a clean reset.
+                        # Counter is zeroed here; the reset message above uses
+                        # _prev_ctx_every (not _prev_shown_count) to avoid
+                        # printing 0 by mistake.
+                        _prev_shown_count = 0
+                        _is_reset_iter    = True
+                else:
+                    # iter 1 (no prev yet) or just finished a reset iter →
+                    # start / restart the window.
+                    # FIX: _prev_shown_count is already 0 — removing the
+                    # redundant assignment that existed here before.
+                    _is_reset_iter = False
 
         # Guard: if the loop never ran (max_iterations=0) or every iteration
         # returned empty content, revised is still "" — do NOT write an empty
