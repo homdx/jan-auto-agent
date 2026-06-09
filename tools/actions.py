@@ -304,7 +304,20 @@ class OrchestratorActions:
                 content = content.split("```json")[1].split("```")[0].strip()
             elif "```" in content:
                 content = content.split("```")[1].split("```")[0].strip()
-            return json.loads(content)
+            data = json.loads(content)
+            # The model may return valid JSON that is NOT an object — a list
+            # [{...}], a bare string, or null. The caller (run_text_qa) then does
+            # validation.get(...) and crashes with AttributeError. Unwrap a
+            # single-element list; otherwise fail-closed.
+            if isinstance(data, list) and len(data) == 1 and isinstance(data[0], dict):
+                data = data[0]
+            if not isinstance(data, dict):
+                logger.warning("text validator returned non-object JSON (%s) — "
+                               "treating as needs_fix", type(data).__name__)
+                return {"status": "needs_fix", "grounded": False,
+                        "feedback": f"validator returned {type(data).__name__}, expected object",
+                        "_api_error": True}
+            return data
         except Exception as e:
             logger.error(f"text validator failed: {e}")
             # Fail-closed: do NOT approve on error.
@@ -493,7 +506,20 @@ class OrchestratorActions:
                 content = content.split("```json")[1].split("```")[0].strip()
             elif "```" in content:
                 content = content.split("```")[1].split("```")[0].strip()
-            return json.loads(content)
+            data = json.loads(content)
+            # The model sometimes returns valid JSON that is NOT an object —
+            # e.g. a list [{"status":...}], a bare string, or null. Without this
+            # guard the caller's validation.get(...) raises AttributeError and
+            # crashes /edit. Unwrap a single-element list; otherwise fail-closed.
+            if isinstance(data, list) and len(data) == 1 and isinstance(data[0], dict):
+                data = data[0]
+            if not isinstance(data, dict):
+                logger.warning("edit validator returned non-object JSON (%s) — "
+                               "treating as needs_fix", type(data).__name__)
+                return {"status": "needs_fix",
+                        "feedback": f"validator returned {type(data).__name__}, expected object",
+                        "_api_error": True}
+            return data
         except Exception as e:
             logger.error(f"edit validator failed: {e}")
             return {"status": "needs_fix", "feedback": f"validator unavailable: {e}",

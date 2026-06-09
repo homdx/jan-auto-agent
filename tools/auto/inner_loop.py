@@ -345,13 +345,33 @@ class LLMGate2Validator:
                 api_format=self.api_format,
                 ssl_context=self.ssl_context,
             )
-            raw = strip_think(raw)
+            raw = strip_think(raw or "")
+            # ── Guard: empty response ─────────────────────────────────────────
+            # An empty body means the model returned nothing at all (network
+            # timeout that still got a 200, or a model that refused silently).
+            # json.loads("") raises the cryptic "Expecting value: line 1 column
+            # 1 (char 0)" — we surface a clearer message instead.
+            if not raw or not raw.strip():
+                raise ValueError(
+                    "validator model returned an empty response "
+                    "(possible network error or silent refusal)"
+                )
             if "```json" in raw:
                 raw = raw.split("```json")[1].split("```")[0].strip()
             elif "```" in raw:
                 raw = raw.split("```")[1].split("```")[0].strip()
 
             parsed   = json.loads(raw)
+            # Guard against valid-but-non-object JSON (list / string / null):
+            # the .get(...) calls below would otherwise raise AttributeError
+            # (caught, but with a cryptic message). Unwrap a single-element list;
+            # otherwise raise a clear error → fail-closed in the except handler.
+            if isinstance(parsed, list) and len(parsed) == 1 and isinstance(parsed[0], dict):
+                parsed = parsed[0]
+            if not isinstance(parsed, dict):
+                raise ValueError(
+                    f"validator returned {type(parsed).__name__}, expected JSON object"
+                )
             self.last_missing_context = [
                 str(x).strip() for x in (parsed.get("missing_context") or [])
                 if str(x).strip()
