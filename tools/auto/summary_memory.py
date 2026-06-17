@@ -288,9 +288,12 @@ class SummaryMemory:
     def summarize_chapter(self, chapter_text: str) -> str:
         """Compress *chapter_text* to bullet facts.
 
-        Uses at most ``max_compression_passes`` LLM calls.  Returns the best
-        summary available when the cap is hit, even if it is still long.
-        Never raises.
+        Runs at most ``max_compression_passes`` *compression rounds* (recursion
+        levels). A chunked round issues one LLM call per chunk, so the total
+        number of LLM calls may exceed ``max_compression_passes``; the bound is
+        on recursion depth, which is what guarantees the process always
+        terminates and never loops. Returns the best summary available when the
+        cap is hit, even if it is still long. Never raises.
         """
         return self._compress(chapter_text, passes_used=0)
 

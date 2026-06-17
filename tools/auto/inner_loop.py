@@ -495,12 +495,17 @@ class InnerLoop:
         validator,
         max_attempts: int = _DEFAULT_MAX_ATTEMPTS,
         context_broker=None,
+        canon_validator=None,
+        task_mode: str = "code",
     ):
         self.coder        = coder
         self.executor     = executor
         self.validator    = validator
         self.max_attempts = max(1, int(max_attempts))
         self._broker      = context_broker or ContextBroker()
+        # AUTO-CR-7: optional periodic canon/fact gate (creative mode only).
+        self.canon_validator = canon_validator
+        self.task_mode    = str(task_mode)
 
     # ------------------------------------------------------------------
 
@@ -525,6 +530,7 @@ class InnerLoop:
         prefetched_context: str = ""
         resolved_context: dict[str, str] = {}   # accumulates every symbol the validator has asked for
         _any_missing: bool = False   # Task 4: True if any attempt had unsatisfied context
+        _canon_revisions: int = 0     # AUTO-CR-7: canon-driven rejections used so far
         base_dir_path = Path(base_dir)
         target_files  = task.get("target_files", []) or []
         self._broker.reset_cache()  # clear per-task cache; Pass-2 hits re-accumulate fresh
@@ -641,6 +647,51 @@ class InnerLoop:
                 continue
 
             # ── APPROVED ──────────────────────────────────────────────────────
+            # AUTO-CR-7: before committing a creative chapter, run the periodic
+            # canon/fact gate. A real contradiction with earlier chapters turns
+            # this approval back into a rejection-with-feedback — but only up to
+            # ``max_canon_revisions`` times, after which we accept-with-warning
+            # so the gate can never ping-pong the loop.
+            if (
+                self.task_mode == "creative"
+                and self.canon_validator is not None
+                and target_files
+            ):
+                chapter_file = target_files[0]
+                cap = getattr(self.canon_validator, "max_canon_revisions", 1)
+                if (
+                    _canon_revisions < cap
+                    and self.canon_validator.should_check(chapter_file)
+                ):
+                    try:
+                        chapter_text = (base_dir_path / chapter_file).read_text(
+                            encoding="utf-8", errors="replace"
+                        )
+                        canon_res = self.canon_validator.check(
+                            chapter_text, chapter_file, base_dir=base_dir_path
+                        )
+                    except Exception as exc:  # noqa: BLE001 — fail-open
+                        logger.warning("InnerLoop: canon check raised — %s; approving.", exc)
+                        canon_res = None
+
+                    if canon_res is not None and canon_res.has_conflict:
+                        _canon_revisions += 1
+                        cfb = canon_res.feedback()
+                        logger.info(
+                            "InnerLoop: attempt %d canon REJECT (%d/%d) — %s",
+                            attempt, _canon_revisions, cap,
+                            cfb.replace("\n", " ")[:120],
+                        )
+                        feedback.append(f"attempt {attempt}: canon rejected\n{cfb}")
+                        records.append(AttemptRecord(attempt, True, True, False, cfb))
+                        continue
+                elif _canon_revisions >= cap and self.canon_validator.should_check(chapter_file):
+                    logger.warning(
+                        "InnerLoop: canon revision cap (%d) reached for %s — "
+                        "accepting chapter with possible unresolved canon issues.",
+                        cap, chapter_file,
+                    )
+
             logger.info("InnerLoop: attempt %d APPROVED", attempt)
             records.append(AttemptRecord(attempt, True, True, True, ""))
             return InnerLoopResult(
@@ -755,8 +806,21 @@ def make_inner_loop(
         max_symbols=config.getint("context_broker", "max_symbols", fallback=20),
     )
 
+    # ── AUTO-CR-7: periodic canon/fact gate (creative mode only) ──────────────
+    canon_validator = None
+    if task_mode == "creative":
+        try:
+            from tools.auto.canon_validator import make_canon_validator
+            canon_validator = make_canon_validator(
+                config, base_dir, task_mode=task_mode, broker=broker,
+            )
+        except Exception as exc:  # noqa: BLE001 — never block the loop on setup
+            logger.warning("make_inner_loop: canon validator unavailable — %s", exc)
+            canon_validator = None
+
     return InnerLoop(coder, executor, validator, max_attempts=max_attempts,
-                     context_broker=broker)
+                     context_broker=broker, canon_validator=canon_validator,
+                     task_mode=task_mode)
 
 
 # ── Stubs for environments without real agents (unit tests) ──────────────────
