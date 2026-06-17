@@ -18,6 +18,7 @@ from tools.llm_stream import request_completion, strip_think, ollama_chat_url
 from tools.agent_trace import tracer
 from tools.file_reader import read_file
 from tools.ui import Spinner, stream_tracker
+from tools import backoff
 
 logger = logging.getLogger(__name__)
 
@@ -159,6 +160,15 @@ class OrchestratorActions:
         sent in one shot. If it is larger, the file is split into chunks (the
         'agent/validator may split if required' path) and each chunk is queried
         in turn until one answers.
+
+        Each chunk's candidate answer is passed through _validate_text_answer
+        before being accepted — the model is told to reply "NONE" when a chunk
+        has no answer, but a weakly relevant or incomplete answer would still
+        clear that gate on its own, so the same grounding check run_text_qa
+        uses is applied here too. A chunk whose answer fails validation
+        (needs_fix) is treated like a non-answer and the scan continues to the
+        next chunk. If the validator itself is unreachable (_api_error), the
+        candidate answer is accepted as-is rather than blocking the search.
         """
         query, file_path = self._parse_search_command(user_input)
         if not query or not file_path:
@@ -185,10 +195,31 @@ class OrchestratorActions:
               f"splitting into {len(chunks)} chunks and searching each.")
         for i, ch in enumerate(chunks, 1):
             ans = self._ask_over_text(query, file_path, ch, chunk_label=f"{i}/{len(chunks)}")
-            if ans and ans.strip().upper() != "NONE":
-                print(f"[{_ts()}] ✅ Answer found in chunk {i}/{len(chunks)}.")
+            if not ans or ans.strip().upper() == "NONE":
+                continue
+
+            print(f"[{_ts()}] 🤖 Validating candidate answer from chunk {i}/{len(chunks)}...")
+            with Spinner(f"Search validator {i}/{len(chunks)}"):
+                validation = self._validate_text_answer(query, ch, ans,
+                                                         stream_mode=self.stream_agents)
+
+            if validation.get("_api_error"):
+                print(f"[{_ts()}] ⚠️  Validator unavailable — accepting answer as-is. "
+                      f"({validation.get('feedback', '')})")
+                print(f"[{_ts()}] ✅ Answer found in chunk {i}/{len(chunks)} (unvalidated).")
                 return
-        print(f"[{_ts()}] No chunk contained an answer to: {query}")
+
+            if validation.get("status") == "approved":
+                print(f"[{_ts()}] ✅ Answer found in chunk {i}/{len(chunks)} "
+                      f"(validated, grounded={validation.get('grounded')}).")
+                return
+
+            feedback = (validation.get("feedback") or "").strip()
+            if feedback:
+                print(f"[{_ts()}] ❗ Chunk {i}/{len(chunks)} answer rejected: {feedback}")
+
+        print(f"[{_ts()}] No chunk contained a validated answer to: {query}")
+
 
     # ------------------------------------------------------------------ #
     # Validated text Q&A (FAQ / documentation files)                      #
@@ -264,6 +295,29 @@ class OrchestratorActions:
             print(f"[{_ts()}] answer generation failed: {e}")
             return ""
 
+    def _parse_llm_json(self, content: str) -> dict:
+        """
+        Parse a validator's raw LLM response into a dict.
+
+        Strips ```json / ``` fences (if present) and JSON-decodes the
+        result. The model sometimes returns valid JSON that is NOT an
+        object — a list ([{...}]), a bare string, or null. A single-element
+        list wrapping an object is unwrapped transparently; anything else
+        that isn't a dict raises ValueError so the caller can fail closed
+        with its own validator-specific feedback message (callers differ in
+        which extra keys, e.g. "grounded", their fail-closed dict carries).
+        """
+        if "```json" in content:
+            content = content.split("```json")[1].split("```")[0].strip()
+        elif "```" in content:
+            content = content.split("```")[1].split("```")[0].strip()
+        data = json.loads(content)
+        if isinstance(data, list) and len(data) == 1 and isinstance(data[0], dict):
+            data = data[0]
+        if not isinstance(data, dict):
+            raise ValueError(f"validator returned {type(data).__name__}, expected object")
+        return data
+
     def _validate_text_answer(self, question: str, knowledge: str, answer: str,
                                stream_mode: bool = False) -> dict:
         """
@@ -300,39 +354,22 @@ class OrchestratorActions:
                                          ssl_context=self.ssl_context)
             tracer.event("text_validator", "orchestrator", "llm_response", content=content)
             content = strip_think(content)
-            if "```json" in content:
-                content = content.split("```json")[1].split("```")[0].strip()
-            elif "```" in content:
-                content = content.split("```")[1].split("```")[0].strip()
-            data = json.loads(content)
-            # The model may return valid JSON that is NOT an object — a list
-            # [{...}], a bare string, or null. The caller (run_text_qa) then does
-            # validation.get(...) and crashes with AttributeError. Unwrap a
-            # single-element list; otherwise fail-closed.
-            if isinstance(data, list) and len(data) == 1 and isinstance(data[0], dict):
-                data = data[0]
-            if not isinstance(data, dict):
-                logger.warning("text validator returned non-object JSON (%s) — "
-                               "treating as needs_fix", type(data).__name__)
-                return {"status": "needs_fix", "grounded": False,
-                        "feedback": f"validator returned {type(data).__name__}, expected object",
-                        "_api_error": True}
-            return data
+            return self._parse_llm_json(content)
         except Exception as e:
             logger.error(f"text validator failed: {e}")
             # Fail-closed: do NOT approve on error.
             return {"status": "needs_fix", "grounded": False,
                     "feedback": f"validator unavailable: {e}", "_api_error": True}
 
-    def run_text_qa(self, question: str, file_path: str, source: str, base_dir: str) -> None:
+    def run_text_qa(self, question: str, file_path: str, source: str, base_dir: str,
+                     resume_state: dict = None) -> None:
         """
         Validated question-answering over a text/FAQ/doc file:
           1. generate an answer grounded in the file,
           2. validate it against the file,
           3. retry with feedback up to max_iterations,
-          4. render the final, validated answer.
-        Large files are chunked the same way /search does, but here each chunk's
-        answer is still validated.
+          4. render the final, validated answer (Issue 7: exponential backoff on
+             API errors, with checkpoint save on KeyboardInterrupt).
         """
         start = time.time()
         tracer.start_run(f"answer: {question or '[file-as-question]'} in {file_path}")
@@ -340,7 +377,7 @@ class OrchestratorActions:
         # If no explicit question was given, the file content IS the question.
         if not question.strip():
             question = source.strip()
-            print(f"[{_ts()}] 📄 No explicit question — treating the file content as the question.")
+            print(f"[{_ts()}] \U0001f4c4 No explicit question — treating the file content as the question.")
         knowledge = source
 
         # If the document is larger than the full-file budget, keep only the most
@@ -353,6 +390,16 @@ class OrchestratorActions:
         feedback = None
         validation: dict = {}
         answer = ""
+        _api_err_count = 0  # consecutive API errors; reset on any non-error response
+
+        # ── Restore checkpoint (Issue 7) ──────────────────────────────────
+        if resume_state and resume_state.get("loop") == "run_text_qa":
+            iteration = resume_state.get("iteration", 1)
+            feedback  = resume_state.get("feedback")
+            answer    = resume_state.get("answer", "")
+            print(f"[{_ts()}] ▶  Resuming run_text_qa from iteration {iteration} "
+                  "(checkpoint restored).")
+
         while iteration <= self.max_iterations:
             if time.time() - start >= self.timeout_seconds:
                 print(f"[{_ts()}] ⏳ timeout reached; returning best answer so far.")
@@ -360,7 +407,7 @@ class OrchestratorActions:
             _step_start = time.time()
             answer = self._answer_from_file(question, file_path, knowledge, feedback)
             print(f"[{_ts()}] ⏱  Answer generated in {time.time() - _step_start:.1f}s")
-            print(f"[{_ts()}] 🤖 Validating answer ({iteration}/{self.max_iterations})...")
+            print(f"[{_ts()}] \U0001f916 Validating answer ({iteration}/{self.max_iterations})...")
             _val_start = time.time()
             with Spinner(f"Validator iter {iteration}/{self.max_iterations}"):
                 validation = self._validate_text_answer(question, knowledge, answer,
@@ -369,31 +416,41 @@ class OrchestratorActions:
 
             status = validation.get("status")
             if status == "approved":
+                _api_err_count = 0
                 print(f"[{_ts()}] ✅ Answer approved by validator "
                       f"(grounded={validation.get('grounded')}, {_val_elapsed:.1f}s).")
                 break
-            # If the validator itself failed (unreachable / unparseable), do NOT
-            # feed that internal error back to the answerer as if it were a
-            # critique of the answer — that derails the next answer and wastes
-            # minutes on CPU. Keep the answer and stop; mark it unvalidated.
+
             if validation.get("_api_error"):
-                print(f"[{_ts()}] ⚠️  Validator unavailable — keeping the answer "
-                      f"without validation. ({validation.get('feedback','')}, {_val_elapsed:.1f}s)")
-                break
+                # Issue 7: exponential backoff instead of immediate break.
+                # Keep the current best answer; do NOT feed the error back as
+                # feedback (that derails the answerer on the next attempt).
+                _api_err_count += 1
+                if _api_err_count == 1:
+                    print(backoff.MILESTONE_TABLE)
+                _wait = backoff.backoff_seconds(_api_err_count - 1)
+                if iteration >= self.max_iterations:
+                    print(f"[{_ts()}] ⚠️  Validator unavailable — "
+                          f"max iterations reached, keeping best answer. "
+                          f"({validation.get('feedback','')}, {_val_elapsed:.1f}s)")
+                    break
+                _chk = {
+                    "loop": "run_text_qa",
+                    "question": question,
+                    "file_path": file_path,
+                    "base_dir": base_dir,
+                    "iteration": iteration,  # retry same iteration
+                    "feedback": feedback,
+                    "answer": answer,
+                }
+                backoff.sleep_with_interrupt_save(_wait, _chk)
+                continue  # retry same iteration (do not increment)
+
+            _api_err_count = 0
             feedback = (validation.get("feedback") or "").strip()
             if feedback:
                 print(f"[{_ts()}] ❗ Validator feedback: {feedback}")
             iteration += 1
-
-        total = time.time() - start
-        print(f"\n[{_ts()}] ── FINAL ANSWER ({file_path}) — {total:.1f}s from request ──")
-        print(answer if answer else "(no answer produced)")
-        _status = validation.get("status", "unknown")
-        if validation.get("_api_error"):
-            _status = "unvalidated (validator unavailable)"
-        print(f"\n[{_ts()}] status={_status}  "
-              f"iterations={min(iteration, self.max_iterations)}  ({total:.1f}s)")
-
     # ------------------------------------------------------------------ #
     # In-place file editing (/edit) — writes the file, with backup + diff  #
     # ------------------------------------------------------------------ #
@@ -588,35 +645,21 @@ class OrchestratorActions:
                                                       api_format=self.api_format,
                                                       ssl_context=self.ssl_context))
             tracer.event("edit_validator", "orchestrator", "llm_response", content=content)
-            if "```json" in content:
-                content = content.split("```json")[1].split("```")[0].strip()
-            elif "```" in content:
-                content = content.split("```")[1].split("```")[0].strip()
-            data = json.loads(content)
-            # The model sometimes returns valid JSON that is NOT an object —
-            # e.g. a list [{"status":...}], a bare string, or null. Without this
-            # guard the caller's validation.get(...) raises AttributeError and
-            # crashes /edit. Unwrap a single-element list; otherwise fail-closed.
-            if isinstance(data, list) and len(data) == 1 and isinstance(data[0], dict):
-                data = data[0]
-            if not isinstance(data, dict):
-                logger.warning("edit validator returned non-object JSON (%s) — "
-                               "treating as needs_fix", type(data).__name__)
-                return {"status": "needs_fix",
-                        "feedback": f"validator returned {type(data).__name__}, expected object",
-                        "_api_error": True}
-            return data
+            return self._parse_llm_json(content)
         except Exception as e:
             logger.error(f"edit validator failed: {e}")
             return {"status": "needs_fix", "feedback": f"validator unavailable: {e}",
                     "_api_error": True}
 
-    def run_edit(self, user_input: str, base_dir: str) -> None:
+    def run_edit(self, user_input: str, base_dir: str,
+                 resume_state: dict = None) -> None:
         """
         /edit — apply an instruction to a file AND WRITE IT BACK.
         Generates the full revised content, validates it (retry up to
-        max_iterations), backs up the original to <file>.bak, writes the new
-        content, and prints a unified diff. Reversible via the .bak file.
+        max_iterations), backs up the original to <file>.bak.<HHMMSS>,
+        writes the new content, and prints a unified diff.
+        Issue 7: exponential back-off on API errors; checkpoint saved to
+        pipeline_state.json on KeyboardInterrupt for resume on restart.
         """
         import difflib
         instruction, file_path = self._parse_edit_command(user_input)
@@ -635,11 +678,7 @@ class OrchestratorActions:
             print(f"[{_ts()}] Could not read {target}: {e}")
             return
 
-        # ── prev-context window ────────────────────────────────────────────
-        # Read prev_context_every from [file_editor] in agents.ini.
-        # N > 0: show the writer its previous attempt for N consecutive retries,
-        # then one forced "clean" iteration (feedback only) to break loops, repeat.
-        # 0 (default) = original behaviour — writer never sees its own previous attempt.
+        # ── prev-context window ─────────────────────────────────────────────────────────
         _prev_ctx_every   = 0
         _prev_ctx_max     = 0   # max chars for previous_revised; 0 = no limit
         _cfg = getattr(self, "config", None)
@@ -650,8 +689,22 @@ class OrchestratorActions:
         revised, validation, feedback = "", {}, None
         _prev_shown_count = 0     # consecutive iters where previous_revised was shown
         _is_reset_iter    = False  # True → this iteration must be clean (no prev)
+        _api_err_count    = 0     # consecutive API errors; reset on non-error response
 
-        for iteration in range(1, self.max_iterations + 1):
+        # ── Issue 7: restore checkpoint ────────────────────────────────────────
+        iteration = 1
+        if resume_state and resume_state.get("loop") == "run_edit":
+            iteration         = resume_state.get("iteration", 1)
+            revised           = resume_state.get("revised", "")
+            feedback          = resume_state.get("feedback")
+            _prev_shown_count = resume_state.get("_prev_shown_count", 0)
+            _is_reset_iter    = resume_state.get("_is_reset_iter", False)
+            print(f"[{_ts()}] ▶  Resuming run_edit from iteration {iteration} "
+                  "(checkpoint restored).")
+
+        # Use a while loop (not for-range) so API-error iterations can be
+        # retried without consuming the iteration counter.
+        while iteration <= self.max_iterations:
             if time.time() - start >= self.timeout_seconds:
                 print(f"[{_ts()}] ⏳ timeout; using best edit so far.")
                 break
@@ -663,13 +716,10 @@ class OrchestratorActions:
                 and not _is_reset_iter   # not a forced clean iteration
             )
             if _is_reset_iter and revised:
-                # FIX: _prev_shown_count is already 0 here (reset when the flag
-                # was set), so print the window size from config, not the counter.
                 print(f"[{_ts()}] 🔄 Reset iter {iteration} — clean feedback only "
                       f"(window of {_prev_ctx_every} exhausted).")
 
             # Truncate previous_revised to avoid blowing the context window.
-            # prev_context_max_chars = 0 means no limit.
             _prev_to_pass = None
             if _use_prev:
                 if _prev_ctx_max > 0 and len(revised) > _prev_ctx_max:
@@ -694,13 +744,39 @@ class OrchestratorActions:
                 validation = self._validate_edit(instruction, original, revised,
                                                  stream_mode=self.stream_agents)
             _val_elapsed = time.time() - _val_start
+
             if validation.get("status") == "approved":
+                _api_err_count = 0
                 print(f"[{_ts()}] ✅ Edit approved by validator. ({_val_elapsed:.1f}s)")
                 break
+
             if validation.get("_api_error"):
-                print(f"[{_ts()}] ⚠️  Edit validator unavailable — writing best effort "
-                      f"(backup kept). ({validation.get('feedback','')}, {_val_elapsed:.1f}s)")
-                break
+                # Issue 7: exponential backoff instead of immediate break.
+                _api_err_count += 1
+                if _api_err_count == 1:
+                    print(backoff.MILESTONE_TABLE)
+                _wait = backoff.backoff_seconds(_api_err_count - 1)
+                if iteration >= self.max_iterations:
+                    print(f"[{_ts()}] ⚠️  Edit validator unavailable — "
+                          f"max iterations reached, writing best effort. "
+                          f"({validation.get('feedback','')}, {_val_elapsed:.1f}s)")
+                    break
+                _chk = {
+                    "loop": "run_edit",
+                    "user_input": user_input,
+                    "base_dir": base_dir,
+                    "instruction": instruction,
+                    "file_path": file_path,
+                    "iteration": iteration,  # retry same iteration
+                    "revised": revised,
+                    "feedback": feedback,
+                    "_prev_shown_count": _prev_shown_count,
+                    "_is_reset_iter": _is_reset_iter,
+                }
+                backoff.sleep_with_interrupt_save(_wait, _chk)
+                continue  # retry same iteration (do not increment)
+
+            _api_err_count = 0
             feedback = (validation.get("feedback") or "").strip()
             if feedback:
                 print(f"[{_ts()}] ❗ Edit feedback: {feedback}")
@@ -710,29 +786,25 @@ class OrchestratorActions:
                 if _use_prev:
                     _prev_shown_count += 1
                     if _prev_shown_count >= _prev_ctx_every:
-                        # Window full → next iter is a clean reset.
-                        # Counter is zeroed here; the reset message above uses
-                        # _prev_ctx_every (not _prev_shown_count) to avoid
-                        # printing 0 by mistake.
                         _prev_shown_count = 0
                         _is_reset_iter    = True
                 else:
-                    # iter 1 (no prev yet) or just finished a reset iter →
-                    # start / restart the window.
-                    # FIX: _prev_shown_count is already 0 — removing the
-                    # redundant assignment that existed here before.
                     _is_reset_iter = False
 
-        # Guard: if the loop never ran (max_iterations=0) or every iteration
-        # returned empty content, revised is still "" — do NOT write an empty
-        # file.  The inner-loop guard catches empty content mid-run; this one
-        # covers the edge case where the loop body was never entered at all.
+            iteration += 1
+
+        # Guard: if the loop never ran or every iteration returned empty
+        # content, revised is still "" — do NOT write an empty file.
         if not revised.strip():
             print(f"[{_ts()}] No content produced — file left unchanged.")
             return
 
-        # Write: back up original, then overwrite. Fully reversible via .bak.
-        backup = target + ".bak"
+        # Write: back up current content with a timestamped suffix, then overwrite.
+        backup = target + ".bak." + time.strftime("%H%M%S")
+        _bak_n = 0
+        while os.path.exists(backup):
+            _bak_n += 1
+            backup = f"{target}.bak.{time.strftime('%H%M%S')}.{_bak_n}"
         try:
             with open(backup, "w", encoding="utf-8") as b:
                 b.write(original)
