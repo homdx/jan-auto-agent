@@ -136,11 +136,18 @@ _SYSTEM_PROMPT_DOCS = _SYSTEM_PROMPT_CODE.replace(
     "improvement. You produce clear, accurate prose — not code. ",
     1,
 )
-_SYSTEM_PROMPT_CREATIVE = _SYSTEM_PROMPT_CODE.replace(
-    "You are a senior software engineer implementing a targeted code improvement. ",
-    "You are a creative writing editor implementing a targeted revision to a piece "
-    "of creative writing. You produce polished, engaging prose — not code. ",
-    1,
+_SYSTEM_PROMPT_CREATIVE = (
+    "You are a creative writing author generating a chapter of long-form fiction. "
+    "Return ONLY the chapter prose. No JSON, no preamble, no code fences. "
+    "Write the complete chapter as plain prose text. "
+    "If you are given a single target file, write the complete chapter text for it. "
+    "If you are given multiple target files, prefix each file's content with "
+    "<<<FILE: relative/path>>> on its own line and close it with <<<END>>> on its own line. "
+    "Optional: if you need material from a prior chapter that was not provided, "
+    "you may add a final line (after all prose) in the form: "
+    "CONTEXT_REQUEST: name1, name2 — listing the chapter filenames or topic names you need. "
+    "Strip that line from the chapter content itself. "
+    "Do not include CONTEXT_REQUEST unless you genuinely need missing context."
 )
 
 _CODER_SYSTEM_PROMPTS: dict[str, str] = {
@@ -451,7 +458,9 @@ class Coder:
             content=cleaned, params={"task_id": task_id},
         )
 
-        parsed_files, parse_error = self._parse_response(cleaned, task_id)
+        parsed_files, parse_error = self._parse_response(
+            cleaned, task_id, task.get("target_files") or []
+        )
         if parse_error:
             return CoderResult(
                 task_id=task_id, error=parse_error,
@@ -718,17 +727,24 @@ class Coder:
         return "\n\n".join(parts) if parts else "(no target files)"
 
     def _parse_response(
-        self, text: str, task_id: str
+        self, text: str, task_id: str,
+        target_files: "list[str] | None" = None,
     ) -> tuple[list[dict], str]:
-        """Parse the LLM's JSON response into a list of ``{path, content}`` dicts.
+        """Parse the LLM response into a list of ``{path, content}`` dicts.
+
+        In ``creative`` mode delegates to :meth:`_parse_response_prose` which
+        is line-oriented and fail-open.  In ``code`` / ``docs`` modes uses the
+        existing strict JSON path (byte-for-byte unchanged behaviour).
 
         Returns
         -------
         (parsed_files, error_message)
             ``parsed_files`` is a non-empty list on success; ``error_message``
-            is a non-empty string on failure (fail-closed: never returns a
-            partially-constructed file list on parse error).
+            is a non-empty string on failure.
         """
+        if self._task_mode == "creative":
+            return self._parse_response_prose(text, task_id, target_files or [])
+
         stripped = _strip_outer_fence(text)
 
         try:
@@ -796,6 +812,116 @@ class Coder:
             return [], msg
 
         return parsed, ""
+
+    def _parse_response_prose(
+        self,
+        text: str,
+        task_id: str,
+        target_files: list[str],
+    ) -> tuple[list[dict], str]:
+        """Fail-open prose parser for ``task_mode='creative'``.
+
+        Protocol (line-oriented, never requires JSON):
+
+        * Strip outer code fences (reuses :func:`_strip_outer_fence`).
+        * Extract and remove a trailing ``CONTEXT_REQUEST:`` line if present;
+          callers read context_request from :meth:`_extract_context_request`
+          but this method also strips it from the written content.
+        * **Single target file:** treat the entire cleaned body as that file's
+          content.
+        * **Multiple target files:** split on ``<<<FILE: relpath>>>`` /
+          ``<<<END>>>`` markers.  Text outside markers is ignored.  If no
+          markers are found but the body is non-empty and there is exactly one
+          target file, fall back to single-file behaviour.
+        * **Truncation guard:** if the body ends mid-sentence AND its length is
+          within 5 % of ``self._max_tokens * 4`` (chars), surface an actionable
+          retry message instead of silently writing a truncated chapter.
+        * Returns ``([], error)`` **only** when the body is empty/whitespace
+          after stripping — that is the single legitimate failure mode.
+
+        Returns
+        -------
+        (parsed_files, error_message)
+        """
+        # ── Strip outer fences (```markdown, ```md, ``` …) ─────────────────
+        body = _strip_outer_fence(text)
+
+        # ── Extract trailing CONTEXT_REQUEST line ───────────────────────────
+        lines = body.splitlines()
+        cr_idx = None
+        for i in range(len(lines) - 1, max(len(lines) - 4, -1), -1):
+            if lines[i].strip().upper().startswith("CONTEXT_REQUEST:"):
+                cr_idx = i
+                break
+        if cr_idx is not None:
+            # Remove the line from the body so it is not written to disk.
+            lines = lines[:cr_idx] + lines[cr_idx + 1:]
+            body = "\n".join(lines)
+
+        body = body.strip()
+
+        # ── Empty-body failure (the only real failure mode) ─────────────────
+        if not body:
+            msg = "creative coder: LLM returned empty body — no chapter content to write"
+            logger.warning("coder._parse_response_prose [%s]: %s", task_id, msg)
+            return [], msg
+
+        # ── Truncation guard ────────────────────────────────────────────────
+        # Estimate the token budget in chars (conservative: 4 chars ≈ 1 token).
+        char_budget = self._max_tokens * 4
+        last_char = body[-1] if body else ""
+        ends_mid_sentence = last_char not in {".", "!", "?", '"', "'", "\n", "…"}
+        if ends_mid_sentence and len(body) >= char_budget * 0.95:
+            msg = (
+                "creative coder: response hit the token budget mid-sentence — "
+                "raise [coder] max_tokens or shorten the chapter target. "
+                f"(body length {len(body)} chars ≈ budget {char_budget} chars)"
+            )
+            logger.warning("coder._parse_response_prose [%s]: %s", task_id, msg)
+            return [], msg
+
+        # ── Multi-file marker split ─────────────────────────────────────────
+        _FILE_OPEN  = re.compile(r"^<<<FILE:\s*(.+?)\s*>>>$", re.MULTILINE)
+        _FILE_CLOSE = re.compile(r"^<<<END>>>$", re.MULTILINE)
+
+        open_matches = list(_FILE_OPEN.finditer(body))
+        if open_matches and len(target_files) > 1:
+            parsed: list[dict] = []
+            for i, m_open in enumerate(open_matches):
+                relpath = m_open.group(1).strip()
+                content_start = m_open.end()
+                # Find the matching <<<END>>> after this <<<FILE:>>> marker.
+                close_match = _FILE_CLOSE.search(body, content_start)
+                if close_match:
+                    content_end = close_match.start()
+                else:
+                    # No closing marker: take everything up to the next <<<FILE:>>>.
+                    next_open = open_matches[i + 1] if i + 1 < len(open_matches) else None
+                    content_end = next_open.start() if next_open else len(body)
+                chunk = body[content_start:content_end].strip()
+                if chunk:
+                    parsed.append({"path": relpath, "content": chunk + "\n"})
+                else:
+                    logger.debug(
+                        "coder._parse_response_prose [%s]: marker %r had empty body — skipped",
+                        task_id, relpath,
+                    )
+            if parsed:
+                return parsed, ""
+            # Markers present but all bodies empty — fall through to single-file.
+            logger.warning(
+                "coder._parse_response_prose [%s]: FILE markers produced no content "
+                "— falling back to single-file mode", task_id,
+            )
+
+        # ── Single-file (default) ────────────────────────────────────────────
+        if target_files:
+            relpath = target_files[0]
+        else:
+            # No target declared — synthesise a sensible default name.
+            relpath = "chapter.md"
+
+        return [{"path": relpath, "content": body + "\n"}], ""
 
     # ── Content safety ────────────────────────────────────────────────────────
 

@@ -43,14 +43,22 @@ def test_docs_mode_uses_writer_persona():
 
 
 def test_creative_mode_uses_editor_persona():
-    assert "creative writing editor" in _coder("creative")._system
+    # AUTO-CR-1: creative prompt is now prose-native ("author" not "editor").
+    assert "creative writing author" in _coder("creative")._system
+    assert "Return ONLY the chapter prose" in _coder("creative")._system
 
 
 def test_json_contract_preserved_across_modes():
-    # The mode-agnostic tail (output schema + pull-model keys) must survive.
-    for mode in ("code", "docs", "creative"):
+    # The JSON contract must survive for code and docs modes.
+    # Creative mode deliberately uses a prose-native protocol (AUTO-CR-1) and
+    # does NOT carry the JSON contract.
+    for mode in ("code", "docs"):
         s = _coder(mode)._system
-        assert '"files"' in s
+        assert '"files"' in s, f"JSON contract missing for mode={mode!r}"
+    # Creative: prose-native, no JSON schema.
+    creative_s = _coder("creative")._system
+    assert '"files"' not in creative_s
+    assert "Return ONLY the chapter prose" in creative_s
 
 
 def test_mode_specific_ini_override_wins():
