@@ -274,9 +274,19 @@ def _emit_without_git(
 
 
 def _load_config(controller: "AutoController") -> configparser.ConfigParser:
-    """Load agents.ini from the controller's config_path."""
+    """Return the controller's parsed agents.ini.
+
+    Prefer the already-parsed ``controller.config`` (set in ``__init__``) so the
+    documented single-parse guarantee holds and any in-memory mutation of the
+    config is honoured in the plan/execute phases.  Falls back to reading
+    ``config_path`` from disk only when no cached config is present (e.g. a
+    controller built via ``__new__`` in tests).
+    """
+    cfg = getattr(controller, "config", None)
+    if cfg is not None:
+        return cfg
     cfg = configparser.ConfigParser()
     p = Path(controller.config_path)
     if p.exists():
-        cfg.read(p)
+        cfg.read(p, encoding="utf-8")
     return cfg

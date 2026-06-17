@@ -362,9 +362,21 @@ class Executor:
         command that would delete files, escalate privileges, or exfiltrate data.
         It does NOT replace a proper sandbox; it catches common cases fast.
         """
+        import re as _re
         lower = command.lower()
         for pattern in Executor._BLOCKED_COMMAND_PATTERNS:
-            if pattern in lower:
+            token = pattern.strip().lower()
+            if token.isalpha():
+                # Whole-word match (mirrors coder.py's _check_content_safety):
+                # plain substring containment falsely flagged ordinary commands
+                # — 'rm ' matched 'terrafo[rm ]', 'nc ' matched 'rsy[nc ]',
+                # 'rm ' matched 'confi[rm ]'.  Python \b treats '_' as a word
+                # char, so identifier-style checks stay safe too.
+                if _re.search(r"\b" + _re.escape(token) + r"\b", lower):
+                    return False, f"blocked pattern {pattern!r} in acceptance_check"
+            elif pattern in lower:
+                # Non-word tokens (shell metachars: '> /', '>/', fork bomb) have
+                # no word boundary to anchor on — keep the substring check.
                 return False, f"blocked pattern {pattern!r} in acceptance_check"
         return True, ""
 

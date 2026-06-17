@@ -180,7 +180,7 @@ class Orchestrator(OrchestratorActions):
 
     def load_config(self, config_path: str) -> None:
         if os.path.exists(config_path):
-            self.config.read(config_path)
+            self.config.read(config_path, encoding="utf-8")
         
         self.max_iterations = self.config.getint("loop", "max_iterations", fallback=3)
         self.timeout_seconds = self.config.getint("loop", "timeout_seconds", fallback=240)

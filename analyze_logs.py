@@ -7,12 +7,17 @@ Usage:
     python analyze_logs.py <trace_file.jsonl> --run-id abc123
     python analyze_logs.py .agent/              # auto-finds newest trace
     python analyze_logs.py .agent/ --all-runs   # show all runs in dir
+    python analyze_logs.py .agent/ --rewrites       # + prompt rewrite report
+    python analyze_logs.py .agent/ --rewrites-only  # rewrite report only
 
 What it shows:
     • Summary: total tasks, iterations, approve/reject counts, prompt changes
     • Applied tasks: every completed task with commit hash and iteration count
     • Per-task breakdown: status, iteration count, approve/reject per task
     • Prompt changes: when, which agent, old→new diff
+    • Prompt rewrite attempts (--rewrites): every auto-tuner candidate, its
+      score, and whether it was promoted or denied; promoted attempts show
+      the old → new prompt diff
     • Timeline: human-readable event flow
 """
 
@@ -210,6 +215,29 @@ def _extract_context_signals(src, content) -> list:
     return [str(x).strip() for x in req if str(x).strip()]
 
 
+def _extract_current_prompt_from_meta(meta_prompt: str) -> str:
+    """
+    Pull the old/active prompt text out of PromptOptimizer's meta-prompt.
+
+    tools/prompt_optimizer.py renders OPTIMIZER_META_PROMPT with the agent's
+    current prompt embedded between a "CURRENT PROMPT:" and a "FAILURE
+    SUMMARY:" marker. The llm_request event traced for that call carries the
+    full rendered meta-prompt as its content; this pulls just the embedded
+    prompt back out so a rewrite report can show what the optimizer started
+    from. Returns "" if the markers aren't found (e.g. unrelated llm_request).
+    """
+    if not meta_prompt:
+        return ""
+    start_marker = "CURRENT PROMPT:\n"
+    end_marker = "\nFAILURE SUMMARY:"
+    if start_marker not in meta_prompt:
+        return ""
+    after = meta_prompt.split(start_marker, 1)[1]
+    if end_marker in after:
+        after = after.split(end_marker, 1)[0]
+    return after.rstrip("\n")
+
+
 def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
     """
     Walk events and build an analytics structure:
@@ -232,6 +260,7 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
                 "goal":           None,
                 "tasks":          {},        # task_id -> task_info
                 "prompt_changes": [],
+                "rewrite_attempts": [],      # auto-tuner prompt rewrites: score + promoted/denied + old/new prompt
                 "events":         [],
                 "llm_calls":      0,
                 "context_requests": [],
@@ -240,6 +269,8 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
                 "files_preparing": [],       # [{ts, task, file_count, files_copied, files_missing, files}]
                 # Internal tracking — not rendered directly
                 "_current_task":  None,      # task_id of the task currently in the loop
+                "_pending_old_prompt": None, # most recent prompt_optimizer llm_request "CURRENT PROMPT" text
+                "_pending_new_prompt": None, # most recent prompt_optimizer llm_response candidate text
             }
         return runs[rid]
 
@@ -392,12 +423,38 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
         # ── llm calls ─────────────────────────────────────────────────────
         elif kind == "llm_request":
             run["llm_calls"] += 1
+            # prompt_optimizer's meta-prompt embeds the CURRENT PROMPT text —
+            # stash it so a later prompt_denied/prompt_promoted event (which
+            # only carries score/reason) can be paired with the old prompt.
+            if src == "prompt_optimizer":
+                run["_pending_old_prompt"] = _extract_current_prompt_from_meta(str(content or ""))
 
         # ── pull-model context requests (coder context_request / validator missing_context) ──
         elif kind == "llm_response":
             _syms = _extract_context_signals(src, content)
             if _syms:
                 run["context_requests"].append({"ts": ts, "src": src, "symbols": _syms})
+            # The candidate prompt the optimizer's LLM call returned — this is
+            # the "new prompt" half of a rewrite attempt.
+            if src == "llm" and tgt == "prompt_optimizer":
+                run["_pending_new_prompt"] = str(content or "")
+
+        # ── auto-tuner prompt rewrite outcomes (score, promoted or denied) ──
+        elif kind in ("prompt_denied", "prompt_promoted"):
+            promoted = (kind == "prompt_promoted")
+            run["rewrite_attempts"].append({
+                "ts":         ts,
+                "agent":      params.get("agent") or params.get("agent_name") or "?",
+                "score":      params.get("score", 0.0),
+                "promoted":   promoted,
+                "reason":     str(content or ""),
+                "old_prompt": run.get("_pending_old_prompt") or "",
+                "new_prompt": run.get("_pending_new_prompt") or "",
+                "run_id":     rid,
+            })
+            # Consumed — don't let a stale pair leak into an unrelated event.
+            run["_pending_old_prompt"] = None
+            run["_pending_new_prompt"] = None
 
         # ── prompt changes ─────────────────────────────────────────────────
         elif kind in ("prompt_updated", "prompt_push", "prompt_change"):
@@ -552,6 +609,15 @@ def render_run_summary(run: dict) -> None:
         print(f"  {bold('Context pulls')}:   {cyan(str(len(_ctx_reqs)))} "
               f"request(s), {_total_syms} symbol(s)")
     print(f"  {bold('Prompt changes')}: {magenta(str(prompt_changes))}")
+    _rewrites = run.get("rewrite_attempts", [])
+    if _rewrites:
+        _n_promoted = sum(1 for a in _rewrites if a.get("promoted"))
+        _n_denied = len(_rewrites) - _n_promoted
+        print(
+            f"  {bold('Rewrite attempts')}: {len(_rewrites)}  "
+            f"({green(f'{_n_promoted} promoted')} / {red(f'{_n_denied} denied')})  "
+            f"{dim('— see --rewrites for full report')}"
+        )
     _fp_recs = run.get("files_preparing", [])
     _fp_done = [r for r in _fp_recs if r.get("status") == "done"]
     if _fp_done:
@@ -673,6 +739,58 @@ def render_prompt_changes(run: dict) -> None:
             print(f"    {line}")
 
 
+def render_rewrite_report(run: dict) -> None:
+    """
+    New mode: every auto-tuner rewrite attempt — score, agent, and whether it
+    was promoted or denied. Successful (promoted) attempts also show the
+    old→new prompt diff, recovered from the optimizer's llm_request/response
+    pair that produced the candidate.
+    """
+    attempts = run.get("rewrite_attempts", [])
+
+    if not attempts:
+        print_section("PROMPT REWRITE ATTEMPTS")
+        print(dim("  (no auto-tuner rewrite attempts recorded in this run)"))
+        return
+
+    n_promoted = sum(1 for a in attempts if a.get("promoted"))
+    n_denied = len(attempts) - n_promoted
+
+    print_section(f"PROMPT REWRITE ATTEMPTS  ({len(attempts)} total)")
+    print(
+        f"  {bold('Outcomes')}: "
+        f"{green(f'{n_promoted} promoted')}  /  {red(f'{n_denied} denied')}"
+    )
+
+    for i, a in enumerate(attempts, 1):
+        promoted = a.get("promoted", False)
+        score    = a.get("score", 0.0)
+        status   = green(bold("✓ PROMOTED")) if promoted else red(bold("✗ DENIED"))
+
+        print()
+        print(
+            f"  {bold(f'Attempt #{i}')}  agent={cyan(a.get('agent', '?'))}  "
+            f"score={bold(f'{score:.4f}')}  {status}  {dim(fmt_ts(a.get('ts', '')))}"
+        )
+        reason = a.get("reason", "")
+        if reason:
+            print(f"    {dim('reason:')} {truncate(reason, 100)}")
+
+        if promoted:
+            old_p = a.get("old_prompt", "")
+            new_p = a.get("new_prompt", "")
+            if old_p or new_p:
+                print(f"    {dim('— old → new prompt —')}")
+                diff_text = render_prompt_diff(old_p, new_p)
+                for line in diff_text.splitlines():
+                    print(f"    {line}")
+            else:
+                print(dim(
+                    "    (old/new prompt text not found — optimizer "
+                    "llm_request/llm_response missing from this trace)"
+                ))
+
+
 def render_timeline(run: dict, max_events: int = 40) -> None:
     events = run["events"]
     if not events:
@@ -682,6 +800,7 @@ def render_timeline(run: dict, max_events: int = 40) -> None:
         "run_start", "run_finished", "run_capped",
         "call", "result", "decision", "error",
         "prompt_updated", "prompt_push", "prompt_change",
+        "prompt_denied", "prompt_promoted",
         "rejected", "phase_transition",
     }
     # Include only files_preparing "started" transitions to avoid double-entries.
@@ -760,6 +879,15 @@ def render_timeline(run: dict, max_events: int = 40) -> None:
         elif kind in ("prompt_updated", "prompt_push", "prompt_change"):
             agent = params.get("agent") or params.get("agent_name") or src
             print(f"  {dim(ts)}  {magenta(bold('↺ prompt change'))}  agent={cyan(agent)}")
+
+        elif kind in ("prompt_denied", "prompt_promoted"):
+            agent = params.get("agent") or params.get("agent_name") or "?"
+            score = params.get("score", 0.0)
+            if kind == "prompt_promoted":
+                label = green(bold("✓ rewrite promoted"))
+            else:
+                label = red(bold("✗ rewrite denied"))
+            print(f"  {dim(ts)}  {label}  agent={cyan(agent)}  score={score:.4f}")
 
         elif kind == "phase_transition" and params.get("phase") == "files_preparing":
             task_fp    = params.get("task", "")
@@ -848,14 +976,25 @@ def render_files_preparing(run: dict) -> None:
 
 # ── Main render ───────────────────────────────────────────────────────────────
 
-def render_run(run: dict, show_timeline: bool = True, show_diff: bool = True) -> None:
+def render_run(
+    run: dict,
+    show_timeline: bool = True,
+    show_diff: bool = True,
+    show_rewrites: bool = False,
+    rewrites_only: bool = False,
+) -> None:
     print_header(f"Run Analysis  [{run['run_id']}]")
+    if rewrites_only:
+        render_rewrite_report(run)
+        return
     render_run_summary(run)
     render_applied_tasks(run)   # show what was actually applied/done
     render_files_preparing(run) # show workspace file-preparation stages
     render_tasks(run)
     if show_diff:
         render_prompt_changes(run)
+    if show_rewrites:
+        render_rewrite_report(run)
     if show_timeline:
         render_timeline(run)
 
@@ -912,6 +1051,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-diff",
                    action="store_true",
                    help="Skip the prompt diff section")
+    p.add_argument("--rewrites",
+                   action="store_true",
+                   help=(
+                       "New mode: also show the PROMPT REWRITE ATTEMPTS report — "
+                       "every auto-tuner candidate with its score and whether it "
+                       "was promoted or denied; promoted attempts include the "
+                       "old → new prompt diff"
+                   ))
+    p.add_argument("--rewrites-only",
+                   action="store_true",
+                   help="Like --rewrites, but skip every other report section")
     p.add_argument("--no-color",
                    action="store_true",
                    help="Disable ANSI colours")
@@ -971,7 +1121,7 @@ def main() -> int:
         print("No matching runs found.", file=sys.stderr)
         return 1
 
-    if len(runs) > 1 and not args.run_id:
+    if len(runs) > 1 and not args.run_id and not args.rewrites_only:
         render_multi_run_overview(runs)
         print()
         ans = input(bold("Show details for each run? [Y/n] ")).strip().lower()
@@ -983,9 +1133,12 @@ def main() -> int:
             run,
             show_timeline=not args.no_timeline,
             show_diff=not args.no_diff,
+            show_rewrites=args.rewrites or args.rewrites_only,
+            rewrites_only=args.rewrites_only,
         )
 
-    render_auto_prompts(args.path)
+    if not args.rewrites_only:
+        render_auto_prompts(args.path)
 
     return 0
 

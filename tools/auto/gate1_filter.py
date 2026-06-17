@@ -396,9 +396,19 @@ class Gate1Filter:
                 f"line_start={start} is out of range (file has {total} lines)",
                 "",
             )
-        if end < start or end > total:
-            # Clamp end rather than reject — a slightly-off end line is still useful.
-            end = min(end, total)
+        if end < start:
+            # Inverted range (line_end before line_start) would slice to an
+            # empty block yet still be reported as "line range found".  Reject
+            # it as a real existence failure instead.
+            return (
+                False,
+                f"line_end={end} is before line_start={start}",
+                "",
+            )
+        if end > total:
+            # Clamp a too-large end rather than reject — a slightly-off end
+            # line is still useful.
+            end = total
 
         # Include some context around the cited range, capped to max_context_lines.
         ctx_start = max(0, start - 1)

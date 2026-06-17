@@ -183,6 +183,29 @@ class GitManager:
         self._run(["git", "add", "-u"], "git add -u failed")
         self._run(["git", "add", "."], "git add . failed")
 
+    def discard_working_changes(self) -> None:
+        """Discard all uncommitted working-tree changes, restoring to HEAD.
+
+        Resets tracked files to HEAD (``git reset --hard``) and removes
+        untracked files (``git clean -fd``).  ``git clean`` without ``-x``
+        respects ``.gitignore``, so internal agent state (``.agent/``) and
+        coder backups (``*.coder.bak``) are preserved.
+
+        Used to clean up after a task that failed/exhausted without a commit:
+        without this, its half-finished edits stay dirty in the repo and get
+        swept into the *next* successful task's ``stage_all()`` commit, since
+        ``commit()`` stages everything (``git add -u && git add .``).  Between
+        task commits the working tree is HEAD plus only the current task's
+        edits, so resetting to HEAD discards exactly that task's residue and
+        nothing already committed.
+
+        No-op before the first commit (no HEAD to reset to).
+        """
+        if self.get_current_hash() is None:
+            return
+        self._run(["git", "reset", "--hard", "HEAD"], "git reset --hard failed")
+        self._run(["git", "clean", "-fd"], "git clean failed")
+
     def has_staged_changes(self) -> bool:
         """Return ``True`` if there is at least one staged change."""
         result = subprocess.run(
