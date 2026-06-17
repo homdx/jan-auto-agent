@@ -172,7 +172,7 @@ class AutoController:
         # re-reading agents.ini from disk on each call.
         self.config = configparser.ConfigParser()
         if Path(config_path).exists():
-            self.config.read(config_path)
+            self.config.read(config_path, encoding="utf-8")
         self.task_mode: str = self.config.get("auto", "task_mode", fallback="code")
         # AUTO-A4: execution working dir (executor/AUTO-C1 runs code here)
         self.workspace_dir = self.agent_dir / "workspace"
@@ -620,7 +620,7 @@ class AutoController:
         if cfg is None:
             cfg = configparser.ConfigParser()
             if Path(self.config_path).exists():
-                cfg.read(self.config_path)
+                cfg.read(self.config_path, encoding="utf-8")
             self.config = cfg
         return cfg
 

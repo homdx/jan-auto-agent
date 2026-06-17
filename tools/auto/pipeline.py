@@ -288,5 +288,5 @@ def _load_config(controller: "AutoController") -> configparser.ConfigParser:
     cfg = configparser.ConfigParser()
     p = Path(controller.config_path)
     if p.exists():
-        cfg.read(p)
+        cfg.read(p, encoding="utf-8")
     return cfg
