@@ -157,13 +157,29 @@ class ContextAssembler:
 
         budget_chars = self._budget_chars()
         if budget_chars <= 0:
-            # Pathological config (max_tokens >= num_ctx) — nothing fits.
+            # Pathological config (max_tokens >= num_ctx). Rather than silently
+            # returning NO context (which makes the model invent a chapter in
+            # the wrong language with nothing to continue), degrade gracefully:
+            # prefer the compact synopsis of the story so far; only if there is
+            # no synopsis yet, fall back to a truncated tail of the previous
+            # chapter so there is always *some* anchor.
+            prev_num, prev_file = prior[-1]
             logger.warning(
                 "ContextAssembler: zero/negative budget for %s "
-                "(num_ctx=%d, max_tokens=%d) — returning no context.",
+                "(num_ctx=%d, max_tokens=%d) — degrading (synopsis, else truncated prev).",
                 target_file, self._num_ctx, self._max_tokens,
             )
-            return ""
+            floor = 2000
+            synopsis_block = self._fit_synopsis(sections, prior, floor)
+            if synopsis_block:
+                return synopsis_block
+            prev_text = self._read_chapter_text(prev_file)
+            if not prev_text:
+                return ""
+            tail = prev_text[-floor:]
+            if len(prev_text) > floor:
+                tail = "… [earlier text omitted]\n" + tail
+            return self._format_prev_chapter_block(prev_file, tail)
 
         prev_num, prev_file = prior[-1]  # highest-numbered chapter < target
         prev_text = self._read_chapter_text(prev_file)

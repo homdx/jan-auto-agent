@@ -261,8 +261,11 @@ class TestContextAssembler:
         )
         assert context == ""
 
-    def test_pathological_budget_returns_empty(self, tmp_path: Path):
-        """When max_tokens >= num_ctx the budget is zero; must return '' not crash."""
+    def test_pathological_budget_degrades_not_empty(self, tmp_path: Path):
+        """AUTO-CR-12: when max_tokens >= num_ctx the budget is zero. Instead of
+        silently returning '' (which left the model with no story so far and
+        the wrong language), degrade to the previous chapter so there is always
+        an anchor. Must not crash."""
         _make_chapter(tmp_path, "chapter_01.md", "Some text.")
         assembler = ContextAssembler(
             num_ctx=512, max_tokens=512, base_dir=tmp_path,
@@ -271,7 +274,9 @@ class TestContextAssembler:
             target_file="chapter_02.md",
             all_chapter_files=["chapter_01.md"],
         )
-        assert context == ""
+        # No synopsis on disk → falls back to the previous chapter's text.
+        assert "Some text." in context
+        assert "chapter_01.md" in context
 
     def test_unreadable_chapter_degrades_gracefully(self, tmp_path: Path):
         """If chapter N-1 cannot be read (file missing), assembler returns

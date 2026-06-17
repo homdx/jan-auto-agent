@@ -232,6 +232,20 @@ class Executor:
         # Resolve the command to run.
         command = self._resolve_command(acceptance_check, target_files, workspace)
 
+        # AUTO-CR-12: cross-platform no-op acceptance. Creative/docs tasks
+        # default acceptance_check to "true" (a Unix shell builtin). On Windows
+        # `true`/`false`/`:` are NOT commands, so cmd.exe returns rc=1 and every
+        # such task fails the executor gate. Recognise ONLY these Unix builtins
+        # and resolve them without spawning a shell. ("exit 0"/"exit 1" are
+        # valid on every platform and are intentionally left to run normally.)
+        _norm = (command or "").strip().lower().rstrip(";")
+        if _norm in ("true", ":"):
+            logger.info("executor run: task=%s no-op acceptance (%r) → pass", task_id, command)
+            return ExecutionResult(exit_code=0, command=command, task_id=task_id)
+        if _norm == "false":
+            logger.info("executor run: task=%s no-op acceptance (%r) → fail", task_id, command)
+            return ExecutionResult(exit_code=1, command=command, task_id=task_id)
+
         logger.info("executor run: task=%s cmd=%r cwd=%s", task_id, command, workspace)
 
         # Execute.

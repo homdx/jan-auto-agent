@@ -772,13 +772,21 @@ class Coder:
 
             all_chapter_files: list[str] = []
             if chapter_dir.is_dir():
-                for p in sorted(chapter_dir.glob("chapter_*.md")):
-                    rel = (
-                        p.name if target_rel.parent in (Path("."), Path(""))
-                        else str(target_rel.parent / p.name)
-                    )
-                    if rel != target_file:
-                        all_chapter_files.append(rel)
+                # AUTO-CR-12: match prose chapters by BOTH common extensions
+                # (.md and .txt). The old glob was ".md"-only, so a project of
+                # chapter_*.txt files found no predecessors → the model got no
+                # "story so far" and drifted language + had nothing to continue.
+                _seen: set[str] = set()
+                for pat in ("chapter_*.md", "chapter_*.txt",
+                            "chapter*.md", "chapter*.txt"):
+                    for p in sorted(chapter_dir.glob(pat)):
+                        rel = (
+                            p.name if target_rel.parent in (Path("."), Path(""))
+                            else str(target_rel.parent / p.name)
+                        )
+                        if rel != target_file and rel not in _seen:
+                            _seen.add(rel)
+                            all_chapter_files.append(rel)
 
             assembler = ContextAssembler(
                 num_ctx=self._num_ctx, max_tokens=self._max_tokens, base_dir=base_dir,
@@ -930,6 +938,18 @@ class Coder:
         # ── Empty-body failure (the only real failure mode) ─────────────────
         if not body:
             msg = "creative coder: LLM returned empty body — no chapter content to write"
+            logger.warning("coder._parse_response_prose [%s]: %s", task_id, msg)
+            return [], msg
+
+        # ── AUTO-CR-12: refusal / meta-response guard ───────────────────────
+        # Without this, the fail-open parser writes a model refusal ("I cannot
+        # fulfill your request…", "{}", "please provide more context") straight
+        # into the chapter file. Conservative: only trip on an empty JSON stub
+        # or a SHORT body that contains an explicit refusal marker, so genuine
+        # prose is never rejected. A trip fails the attempt → the loop retries.
+        if _looks_like_refusal(body):
+            msg = ("creative coder: response looks like a refusal / meta-reply, "
+                   "not chapter prose — retrying")
             logger.warning("coder._parse_response_prose [%s]: %s", task_id, msg)
             return [], msg
 
@@ -1491,6 +1511,34 @@ def select_relevant_chunks(
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
+
+_REFUSAL_MARKERS: tuple[str, ...] = (
+    "i cannot fulfill", "i can't fulfill", "i cannot assist", "i can't assist",
+    "i cannot help", "i'm unable to", "i am unable to", "i cannot generate",
+    "i don't see any", "i do not see any", "please provide more context",
+    "provide more context", "clarify what", "as an ai", "i need more context",
+    "there's a misunderstanding", "there is a misunderstanding",
+    "seem to be related to a programming task",
+)
+
+
+def _looks_like_refusal(body: str) -> bool:
+    """Heuristic: True when *body* is a refusal / meta-reply, not chapter prose.
+
+    Deliberately conservative to avoid rejecting real fiction:
+      * an empty JSON stub (``{}`` / ``[]``) is always a refusal/no-op;
+      * otherwise the body must be SHORT (< 600 chars) AND contain an explicit
+        refusal marker. Long prose is never tripped even if it quotes such a
+        phrase in dialogue.
+    """
+    stripped = body.strip()
+    if stripped in ("{}", "[]"):
+        return True
+    if len(stripped) >= 600:
+        return False
+    low = stripped.lower()
+    return any(marker in low for marker in _REFUSAL_MARKERS)
+
 
 def _strip_outer_fence(text: str) -> str:
     """Remove an outer ``` or ```json fence wrapping the entire JSON response.
