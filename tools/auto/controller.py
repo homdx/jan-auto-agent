@@ -496,9 +496,24 @@ class AutoController:
                 )
                 tune_outcome = self.auto_tuner.maybe_tune()
                 if tune_outcome.promoted:
+                    # Full record (score/agent/reason) also lands in
+                    # agent_trace.jsonl via auto_tuner's
+                    # tracer.event(kind="prompt_promoted") call, so
+                    # analyze_logs.py can report promoted rewrites alongside
+                    # denied ones.
                     self.state.log(
                         f"[AUTO-E1] auto_tuner promoted validator prompt: "
                         f"score={tune_outcome.new_prompt_score:.2f}"
+                    )
+                elif getattr(tune_outcome, "triggered", False):
+                    # Candidate was evaluated but denied. Print only — run.log
+                    # must stay silent for non-promoted outcomes (AC4); the
+                    # full record already lands in agent_trace.jsonl via
+                    # auto_tuner's tracer.event(kind="prompt_denied") call.
+                    print(
+                        f"[AUTO-E1] auto_tuner denied candidate prompt: "
+                        f"score={tune_outcome.new_prompt_score:.4f} — "
+                        f"{getattr(tune_outcome, 'reason', '')}"
                     )
 
         return None, tasks_done  # all tasks done / no tasks

@@ -20,6 +20,7 @@ from typing import Callable, Optional, TYPE_CHECKING
 from tools.metrics_collector import MetricsCollector
 from tools.prompt_store import PromptStore
 from tools.auto.auto_metrics import record_gate2_result  # noqa: F401 — re-exported for back-compat
+from tools.agent_trace import tracer
 
 if TYPE_CHECKING:
     from tools.prompt_optimizer import PromptOptimizer
@@ -144,6 +145,17 @@ class AutoTuner:
         if eval_result.promoted:
             # Push to store
             self.prompt_store.push(self.agent_name, candidate, eval_result.score)
+            tracer.event(
+                source="auto_tuner",
+                target="prompt_evaluator",
+                kind="prompt_promoted",
+                content=eval_result.reason,
+                params={
+                    "agent": self.agent_name,
+                    "score": eval_result.score,
+                    "promoted": True,
+                },
+            )
             # Fire reload — fail-open (error here must not prevent a promoted outcome)
             if self.reload_agents_fn is not None:
                 try:
@@ -158,6 +170,17 @@ class AutoTuner:
                 new_prompt_score=eval_result.score,
             )
         else:
+            tracer.event(
+                source="auto_tuner",
+                target="prompt_evaluator",
+                kind="prompt_denied",
+                content=eval_result.reason,
+                params={
+                    "agent": self.agent_name,
+                    "score": eval_result.score,
+                    "promoted": False,
+                },
+            )
             return TuneOutcome(
                 agent_name=self.agent_name,
                 triggered=True,
