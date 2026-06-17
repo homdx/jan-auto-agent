@@ -115,12 +115,18 @@ _GATE2_SYSTEM_DOCS = (
 )
 
 _GATE2_SYSTEM_CREATIVE = (
-    "You are a creative writing editor validating a revision. "
-    "Given a task description and the revised text, decide whether "
-    "the creative improvement is complete and faithful to the task. "
-    "Return ONLY a JSON object:\n"
-    '{"approved": true|false, "feedback": "<one sentence>", '
-    '"hints": ["<specific hint>"], "suggested_approach": "<optional>"}'
+    "You are a creative writing editor validating a chapter. "
+    "Given a task description and the generated chapter prose, decide whether "
+    "the chapter fulfils the task and reads as coherent, complete prose. "
+    "Reply with ONE line only. "
+    "The first token must be APPROVED or REVISE. "
+    "If REVISE, follow immediately with ': ' and one concrete reason that "
+    "points at a specific passage, character, or continuity issue. "
+    "Examples of valid replies:\n"
+    "  APPROVED\n"
+    "  REVISE: the duel in paragraph 3 contradicts the earlier truce in chapter_02\n"
+    "  REVISE: Elena's eye colour changes from blue to green mid-scene\n"
+    "Do NOT return JSON. Do NOT add preamble. One line, first token APPROVED or REVISE."
 )
 
 # Backward-compatibility alias
@@ -356,6 +362,20 @@ class LLMGate2Validator:
                     "validator model returned an empty response "
                     "(possible network error or silent refusal)"
                 )
+
+            # ── Creative mode: line-oriented soft verdict (AUTO-CR-2) ─────────
+            if self.task_mode == "creative":
+                approved, reason, unparseable = _parse_verdict_soft(raw)
+                if unparseable:
+                    logger.warning(
+                        "LLMGate2Validator [creative]: verdict unparseable — "
+                        "passing on fail-open. raw=%r", raw[:120]
+                    )
+                if approved:
+                    return True, ""
+                return False, f"Reason: {reason}"
+
+            # ── Code / docs mode: strict JSON path (unchanged) ───────────────
             if "```json" in raw:
                 raw = raw.split("```json")[1].split("```")[0].strip()
             elif "```" in raw:
@@ -387,6 +407,53 @@ class LLMGate2Validator:
             logger.warning("LLMGate2Validator error: %s", exc)
             self.last_missing_context = []
             return False, f"validator unavailable: {exc}"
+
+
+def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
+    """Parse a line-oriented Gate-2 verdict for creative mode (AUTO-CR-2).
+
+    Protocol: the model is expected to reply with one line whose first token is
+    ``APPROVED`` (or ``OK``) or ``REVISE`` / ``REJECT`` / ``NO``.  If ``REVISE``,
+    the reason follows after ``: ``.
+
+    Returns
+    -------
+    (approved, reason, unparseable)
+        ``approved``    — True when the verdict is positive.
+        ``reason``      — Non-empty string on rejection; note string on fail-open.
+        ``unparseable`` — True when no recognised verdict token was found.
+                          The caller should log a warning; the verdict is treated
+                          as approved (fail-open) so a rambling 8B response cannot
+                          hard-block a chapter.
+
+    Acceptance criteria (spec AUTO-CR-2):
+        * ``APPROVED`` / ``approved`` / ``OK …``         → approved=True
+        * ``REVISE: <reason>``                           → approved=False, reason captured
+        * ``REJECT: <reason>`` / ``NO: <reason>``        → approved=False, reason captured
+        * Any other content (rambling, JSON, prose, …)  → approved=True (fail-open)
+    """
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        upper = stripped.upper()
+
+        if upper.startswith("APPROVED") or upper.startswith("OK"):
+            return True, "", False
+
+        for token in ("REVISE", "REJECT", "NO"):
+            if upper.startswith(token):
+                # Extract reason after the token + optional ': '
+                rest = stripped[len(token):].lstrip(": ").strip()
+                reason = rest if rest else "validator rejected (no reason given)"
+                return False, reason, False
+
+        # First non-empty line matched no verdict token → fail-open
+        break
+
+    # Empty response or no matching line
+    note = "verdict unparseable — passed on fail-open"
+    return True, note, True
 
 
 def _format_gate2_feedback(parsed: dict, max_hints: int) -> str:
