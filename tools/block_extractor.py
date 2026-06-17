@@ -424,6 +424,138 @@ def _extract_brace_block(source: str, target_name: str) -> str:
 
 
 # ----------------------------
+# Prose strategy (.md / .txt) — AUTO-CR-6
+# ----------------------------
+#
+# Code has symbols (classes/functions) the AST/brace strategies above can
+# locate by name. Prose has no symbols, so the creative-mode pull model needs
+# a different notion of "the block named X":
+#
+#   1. Heading match  — X is (or matches) a markdown heading; return that
+#      heading's whole section.
+#   2. Entity match   — fallback for names/places that aren't headings;
+#      return the paragraph(s) around the first mention.
+#
+# Both strategies are best-effort and fail-open: an unmatched query returns
+# "" (the same "not found" contract extract_block already uses), never a
+# raised exception.
+
+_HEADING_RE = re.compile(r"(?m)^(#{1,6})[ \t]+(.+?)[ \t]*$")
+
+
+def _iter_prose_headings(source: str) -> list[tuple[int, str, int]]:
+    """Return ``[(level, heading_text, char_start_of_heading_line), ...]``
+    for every ATX-style (``#``) markdown heading, in document order."""
+    return [
+        (len(m.group(1)), m.group(2).strip(), m.start())
+        for m in _HEADING_RE.finditer(source)
+    ]
+
+
+def _extract_heading_section(source: str, query_norm: str) -> str:
+    """Return the section for the heading matching *query_norm* (already
+    lower-cased/stripped), from the heading line up to the next heading of
+    equal-or-higher level (sub-headings stay inside the section), or end of
+    document. Returns "" if no heading matches.
+    """
+    headings = _iter_prose_headings(source)
+    if not headings:
+        return ""
+
+    match_idx: Optional[int] = None
+    # Prefer an exact (case-insensitive) heading-text match...
+    for i, (_level, text, _start) in enumerate(headings):
+        if text.lower() == query_norm:
+            match_idx = i
+            break
+    # ...fall back to a substring match either direction (query is a
+    # fragment of the heading, e.g. "the storm" vs "Chapter 3: The Storm").
+    if match_idx is None:
+        for i, (_level, text, _start) in enumerate(headings):
+            low = text.lower()
+            if query_norm in low or low in query_norm:
+                match_idx = i
+                break
+    if match_idx is None:
+        return ""
+
+    level, _text, start = headings[match_idx]
+    end = len(source)
+    for nxt_level, _nxt_text, nxt_start in headings[match_idx + 1:]:
+        if nxt_level <= level:
+            end = nxt_start
+            break
+
+    return source[start:end].rstrip() + "\n"
+
+
+def _split_prose_paragraphs(source: str) -> list[str]:
+    """Split *source* into paragraphs on one-or-more blank lines."""
+    return [p for p in re.split(r"\n[ \t]*\n", source) if p.strip()]
+
+
+def _extract_entity_paragraphs(source: str, query_norm: str, max_paragraphs: int) -> str:
+    """Return up to *max_paragraphs* paragraphs centred on the first
+    paragraph containing *query_norm* (case-insensitive substring).
+    Returns "" if no paragraph contains the query.
+    """
+    paragraphs = _split_prose_paragraphs(source)
+    hit_idx: Optional[int] = None
+    for i, para in enumerate(paragraphs):
+        if query_norm in para.lower():
+            hit_idx = i
+            break
+    if hit_idx is None:
+        return ""
+
+    before = (max_paragraphs - 1) // 2
+    start_idx = max(0, hit_idx - before)
+    end_idx = min(len(paragraphs), start_idx + max_paragraphs)
+    start_idx = max(0, end_idx - max_paragraphs)  # re-anchor near doc edges
+
+    selected = paragraphs[start_idx:end_idx]
+    return "\n\n".join(p.strip() for p in selected).strip() + "\n"
+
+
+def extract_prose_section(
+    source: str, query: str, file_ext: str, max_paragraphs: int = 3,
+) -> str:
+    """
+    Extract a section of prose (``.md`` / ``.txt``) matching *query* — the
+    pull side of the creative-mode context broker (AUTO-CR-6). Mirrors
+    :func:`extract_block`'s "not found → ''" contract so callers can treat
+    code and prose targets identically.
+
+    Strategy, in order:
+
+    1. **Heading match.** If *query* matches a markdown heading (exact
+       case-insensitive match preferred, substring as a fallback), return
+       that heading's full section: from the heading line up to the next
+       heading of equal-or-higher level, or end of file.
+    2. **Entity match (fallback).** Return the paragraph containing the
+       first occurrence of *query* (case-insensitive), plus a couple of
+       neighbouring paragraphs for context, capped to *max_paragraphs*
+       paragraphs total.
+
+    Returns ``""`` when *file_ext* is not prose, *query* is empty/whitespace,
+    or nothing matches.
+    """
+    ext = _normalize_ext(file_ext)
+    if ext not in {".md", ".txt"}:
+        return ""
+
+    query_norm = (query or "").strip().lstrip("#").strip().lower()
+    if not query_norm:
+        return ""
+
+    section = _extract_heading_section(source, query_norm)
+    if section:
+        return section
+
+    return _extract_entity_paragraphs(source, query_norm, max_paragraphs)
+
+
+# ----------------------------
 # Public API
 # ----------------------------
 

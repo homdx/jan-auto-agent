@@ -13,11 +13,24 @@ in-generate context probe, so it does not go through this broker.)
 Design
 ------
 * Thin router over ``tools.block_extractor``: ``extract_block``,
-  ``find_references``, ``get_context_lines``.
+  ``extract_prose_section``, ``find_references``, ``get_context_lines``.
 * Searches ``target_files`` first (cheapest and most likely hit), then falls
   back to a depth-first scan of all project Python files in ``base_dir``.
 * Returns a formatted string ready to be injected into the coder prompt as a
   ``PREFETCHED CONTEXT`` section — not as failure feedback.
+
+Prose pull (AUTO-CR-6)
+----------------------
+Creative-mode chapters have no code symbols, so a "symbol" requested against
+a ``.md`` / ``.txt`` file is treated as a *query* instead: a heading name
+(e.g. ``"Chapter 3: The Storm"``) or a free-text entity/topic (e.g. a
+character or place name). ``resolve`` dispatches per-file, by extension, to
+``block_extractor.extract_prose_section`` instead of ``extract_block`` — the
+``CONTEXT_REQUEST:`` / ``last_missing_context`` channels feeding this broker
+are unchanged; only the extraction strategy used per file differs. Earlier
+(lower-numbered) chapters are searched before later ones during the Pass-2
+project scan, so an ambiguous query prefers to resolve against material the
+model has already "seen" rather than a future chapter.
 
 Public surface::
 
@@ -39,14 +52,25 @@ Public surface::
 from __future__ import annotations
 
 import logging
+import re
 from pathlib import Path
 from typing import Sequence
 
 logger = logging.getLogger(__name__)
 
-# Extensions we know block_extractor handles well.
+# Extensions we know block_extractor handles well (code, via extract_block).
 _SEARCHABLE_EXTS = frozenset({".py", ".js", ".ts", ".tsx", ".jsx", ".go",
-                               ".java", ".rs", ".c", ".cpp", ".h", ".hpp"})
+                               ".java", ".rs", ".c", ".cpp", ".h", ".hpp",
+                               ".md", ".txt"})
+
+# Subset of _SEARCHABLE_EXTS that is prose rather than code — these are
+# routed to extract_prose_section instead of extract_block (AUTO-CR-6).
+_PROSE_EXTS = frozenset({".md", ".txt"})
+
+# Matches "chapter_07", "chapter_7", "Chapter_07.md", etc. — mirrors the
+# pattern context_assembler.py uses, so "earlier chapters first" means the
+# same thing throughout the creative pipeline.
+_CHAPTER_RE = re.compile(r"chapter_(\d+)", re.IGNORECASE)
 
 
 class ContextBroker:
@@ -95,8 +119,18 @@ class ContextBroker:
         omitted from the result (the caller should not treat a missing symbol
         as an error — the block may simply not exist or use a name the model
         hallucinated).
+
+        Against a ``.md`` / ``.txt`` file, *symbols* are treated as prose
+        queries (heading text or an entity/topic mention) and resolved via
+        ``extract_prose_section`` instead of ``extract_block`` (AUTO-CR-6).
         """
-        from tools.block_extractor import extract_block  # local import — optional dep
+        from tools.block_extractor import extract_block, extract_prose_section  # local import — optional dep
+
+        def _extract(source: str, query: str, ext: str) -> str:
+            """Route to the prose or code extraction strategy by extension."""
+            if ext in _PROSE_EXTS:
+                return extract_prose_section(source, query, ext)
+            return extract_block(source, query, ext)
 
         # Deduplicate while preserving order.
         seen: set[str] = set()
@@ -119,7 +153,7 @@ class ContextBroker:
                 continue
             found_now: list[str] = []
             for sym in remaining:
-                block = extract_block(source, sym, ext)
+                block = _extract(source, sym, ext)
                 if block.strip():
                     resolved[sym] = self._cap(block)
                     found_now.append(sym)
@@ -136,7 +170,7 @@ class ContextBroker:
                     continue
                 found_now = []
                 for sym in remaining:
-                    block = extract_block(source, sym, ext)
+                    block = _extract(source, sym, ext)
                     if block.strip():
                         rel = str(abs_path.relative_to(base_dir))
                         capped_block = self._cap(block)
@@ -209,7 +243,15 @@ class ContextBroker:
         already_searched: Sequence[str],
     ):
         """Yield project source files, skipping already-searched ones and
-        well-known noise directories."""
+        well-known noise directories.
+
+        Sort order: files matching ``chapter_<N>`` are yielded in ascending
+        chapter-number order ahead of everything else, so a prose pull
+        prefers earlier chapters over later ones when a query is ambiguous
+        (AUTO-CR-6). Non-chapter files keep their existing alphabetical
+        order, unaffected by this — they simply sort after every numbered
+        chapter.
+        """
         skip_dirs = frozenset({
             "__pycache__", ".git", ".hg", ".svn",
             "node_modules", "venv", ".venv", "dist", "build", ".tox",
@@ -217,7 +259,13 @@ class ContextBroker:
         searched_abs = frozenset(
             str((base_dir / r).resolve()) for r in already_searched
         )
-        for path in sorted(base_dir.rglob("*")):
+
+        def _sort_key(path: Path) -> tuple[float, str]:
+            m = _CHAPTER_RE.search(path.name)
+            chapter_num = float(m.group(1)) if m else float("inf")
+            return (chapter_num, str(path))
+
+        for path in sorted(base_dir.rglob("*"), key=_sort_key):
             if any(part in skip_dirs for part in path.parts):
                 continue
             if path.suffix.lower() not in _SEARCHABLE_EXTS:
