@@ -176,8 +176,7 @@ TARGET FILES TO MODIFY:
 CURRENT FILE CONTENTS:
 {file_contents}
 {feedback_section}
-Produce the corrected files now. Return ONLY the JSON object described in the \
-system prompt — nothing else.
+{closing_instruction}
 """
 
 
@@ -580,6 +579,18 @@ class Coder:
             target_files_listing  = target_files_listing,
             file_contents         = file_contents,
             feedback_section      = feedback_section,
+            closing_instruction   = (
+                # AUTO-CR-13: the closing line is the LAST, most concrete
+                # instruction the model sees. In creative mode it MUST ask for
+                # prose — the old hardcoded "Return ONLY the JSON object" line
+                # overrode the creative system prompt and made the model emit a
+                # JSON wrapper that got written verbatim into the chapter.
+                "Write the complete chapter now as plain prose — no JSON, no "
+                "preamble, no code fences, nothing but the chapter text."
+                if self._task_mode == "creative" else
+                "Produce the corrected files now. Return ONLY the JSON object "
+                "described in the system prompt — nothing else."
+            ),
         )
 
     @staticmethod
@@ -920,6 +931,19 @@ class Coder:
         """
         # ── Strip outer fences (```markdown, ```md, ``` …) ─────────────────
         body = _strip_outer_fence(text)
+
+        # ── AUTO-CR-13: salvage prose from a JSON wrapper ───────────────────
+        # Despite the prose-only instruction, a small instruct model sometimes
+        # wraps the chapter in JSON ({"files":[{"content": "..."}]} etc.).
+        # Without this, the entire JSON string was written into the chapter
+        # file. Extract the inner prose when that happens.
+        _salvaged = _extract_prose_from_json(body)
+        if _salvaged is not None:
+            logger.info(
+                "coder._parse_response_prose [%s]: model returned a JSON wrapper "
+                "— extracted chapter prose from it.", task_id,
+            )
+            body = _salvaged
 
         # ── Extract trailing CONTEXT_REQUEST line ───────────────────────────
         lines = body.splitlines()
@@ -1520,6 +1544,60 @@ _REFUSAL_MARKERS: tuple[str, ...] = (
     "there's a misunderstanding", "there is a misunderstanding",
     "seem to be related to a programming task",
 )
+
+
+def _extract_prose_from_json(body: str) -> "str | None":
+    """If *body* is a JSON wrapper the model emitted instead of raw prose,
+    extract the chapter text from it. Returns the prose string, or ``None``
+    when *body* is not such a wrapper (so the caller treats it as plain prose).
+
+    Handles the shapes small models actually produce:
+      {"files":[{"content": "..."}]}
+      {"tasks":[{"files":[{"content": "..."}]}]}
+      {"content": "..."}  /  {"target_files":[{"content": "..."}]}
+    The ``content``/``text`` key inside a file object may be named ``content``
+    or ``text``; the file path key is ignored.
+    """
+    s = body.strip()
+    if not (s.startswith("{") or s.startswith("[")):
+        return None
+    try:
+        data = json.loads(s)
+    except json.JSONDecodeError:
+        return None
+
+    def _content_of(obj) -> "str | None":
+        if isinstance(obj, dict):
+            for k in ("content", "text", "body", "prose"):
+                v = obj.get(k)
+                if isinstance(v, str) and v.strip():
+                    return v
+        return None
+
+    def _files_of(obj):
+        if isinstance(obj, dict):
+            for k in ("files", "target_files"):
+                v = obj.get(k)
+                if isinstance(v, list):
+                    return v
+        return None
+
+    # Top-level content
+    top = _content_of(data) if isinstance(data, dict) else None
+    if top:
+        return top
+
+    # files[] at top level, or nested under tasks[]
+    candidate_files = _files_of(data) if isinstance(data, dict) else None
+    if candidate_files is None and isinstance(data, dict):
+        tasks = data.get("tasks")
+        if isinstance(tasks, list) and tasks and isinstance(tasks[0], dict):
+            candidate_files = _files_of(tasks[0])
+    if isinstance(candidate_files, list):
+        chunks = [c for c in (_content_of(f) for f in candidate_files) if c]
+        if chunks:
+            return "\n\n".join(chunks)
+    return None
 
 
 def _looks_like_refusal(body: str) -> bool:
