@@ -9,6 +9,13 @@ import textwrap
 from pathlib import Path
 from typing import Dict, Any, List
 
+# Enable GNU Readline for input(): arrow keys, Ctrl+A/E, history (↑/↓), etc.
+# On Linux/macOS this is stdlib. On Windows: pip install pyreadline3
+try:
+    import readline  # noqa: F401
+except ImportError:
+    pass  # Windows without pyreadline3 — input() degrades gracefully
+
 # ────────────────────────────────────────────────────────────────────────
 # DYNAMIC PATH RESOLUTION
 # ────────────────────────────────────────────────────────────────────────
@@ -30,7 +37,9 @@ from tools.prompt_optimizer import PromptOptimizer
 from tools.prompt_evaluator import PromptEvaluator
 from tools.actions import OrchestratorActions, _ts
 from tools.faq_agent import FaqAgent
+import tools.backoff as backoff
 from tools.llm_stream import request_completion, strip_think
+from tools.ui import stream_tracker
 
 # Extensions that support AST/block extraction and code validation.
 # Everything else is treated as plain text and routed to run_text_qa.
@@ -81,6 +90,12 @@ class Orchestrator(OrchestratorActions):
         # (prompts.json / metrics.json) and survive reloads.
         self.metrics_collector = MetricsCollector()
         self.prompt_store = PromptStore(config=None)
+
+        # Session-level direct-chat history.
+        # Lives here (not in _build_agents) so it survives /reload — the user's
+        # conversation context should not be wiped when config is refreshed.
+        # Reset explicitly by /new.
+        self._direct_chat_history: List[Dict[str, str]] = []
 
         self._build_agents()
 
@@ -215,10 +230,19 @@ class Orchestrator(OrchestratorActions):
         Send a free-form message directly to the model with no file context —
         used when run_pipeline detects no file path in the user's request.
 
+        Maintains a rolling session history so follow-up questions work
+        correctly ("what did you mean by X?", "elaborate on that").
+        History depth is capped at [direct_chat] history_max_turns (default 10
+        turns = 20 messages); oldest turns are dropped when the cap is reached.
+        History is cleared by /new.
+
         Uses the [direct_chat] temperature from agents.ini (default 0.3).
         Streams the reply token-by-token to stdout, same as other agents.
         """
         temperature = self.config.getfloat("direct_chat", "temperature", fallback=0.3)
+        # Clamp to >=0: a negative config value should not be interpreted as
+        # "unlimited" (it isn't — see the _max_msgs note below).
+        history_max_turns = max(0, self.config.getint("direct_chat", "history_max_turns", fallback=10))
 
         base = self.base_url.rstrip("/")
         if self.api_format == "ollama":
@@ -231,28 +255,57 @@ class Orchestrator(OrchestratorActions):
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",
         }
+
+        # Append the new user turn, then trim history to the rolling cap.
+        # Each turn = 1 user message + 1 assistant message = 2 entries.
+        #
+        # _max_msgs uses max(1, ...) rather than history_max_turns * 2 directly:
+        # Python's list[-0:] is the SAME as list[0:] — i.e. the *whole* list,
+        # not an empty one. A bare `history_max_turns * 2` would mean
+        # history_max_turns=0 (a natural value to pick for "no history")
+        # silently disabled the cap instead of clearing history, letting it
+        # grow unbounded. max(1, ...) guarantees _max_msgs is never 0, so the
+        # negative-slice trick always trims correctly — and it always keeps at
+        # least the current user turn, so the payload below is never empty.
+        self._direct_chat_history.append({"role": "user", "content": user_input})
+        _max_msgs = max(1, history_max_turns * 2)
+        if len(self._direct_chat_history) > _max_msgs:
+            self._direct_chat_history = self._direct_chat_history[-_max_msgs:]
+
         payload: Dict[str, Any] = {
             "model": self.model,
-            "messages": [{"role": "user", "content": user_input}],
+            "messages": list(self._direct_chat_history),
             "temperature": temperature,
         }
 
         print(f"\n[{_ts()}] 💬 direct chat →")
         try:
+            _on_tok, _tok_stats = stream_tracker()
             reply = request_completion(
                 url, headers, payload, self.timeout_seconds,
                 stream=True,
                 api_format=self.api_format,
-                on_token=lambda t: (sys.stdout.write(t), sys.stdout.flush()),
+                on_token=_on_tok,
                 ssl_context=self.ssl_context,
             )
             print()
-            return strip_think(reply).strip()
+            if _s := _tok_stats():
+                print(f"[{_ts()}] {_s}")
+            clean_reply = strip_think(reply).strip()
+            # Record the assistant turn so the next message has full context.
+            self._direct_chat_history.append({"role": "assistant", "content": clean_reply})
+            if len(self._direct_chat_history) > _max_msgs:
+                self._direct_chat_history = self._direct_chat_history[-_max_msgs:]
+            return clean_reply
         except Exception as exc:
             logger.error("execute_direct_chat failed: %s", exc)
             print(f"[{_ts()}] ❌ Chat request failed: {exc}")
+            # Remove the user turn we just added — the exchange never completed,
+            # so history should not reflect a half-finished turn.
+            self._direct_chat_history.pop()
 
-    def run_pipeline(self, user_input: str, base_dir: str) -> None:
+    def run_pipeline(self, user_input: str, base_dir: str,
+                     resume_state: dict = None) -> None:
         """Executes pipelines with adaptive search, validation loops, and visual feedback."""
         start_time = time.time()
 
@@ -305,6 +358,24 @@ class Orchestrator(OrchestratorActions):
         search_result: Dict[str, Any] = {"found": {}, "not_found": [], "searched_files": []}
         validation: Dict[str, Any] = {}
 
+        # Cap total ref growth: no more than max_hints new symbols may be added
+        # across all iterations combined.  Without this, a struggling validator
+        # that keeps suggesting new names compounds the search scope on every
+        # pass instead of converging.  One batch of suggestions is enough —
+        # if the validator still can't approve after that context, more symbols
+        # are unlikely to help and only slow down the search agent.
+        _refs_cap = len(refs) + self.validator_agent.max_hints
+        _api_err_count = 0  # consecutive API errors; reset on any non-error response
+
+        # ── Restore checkpoint (Issue 7: resume after interrupted backoff) ──
+        if resume_state and resume_state.get("loop") == "run_pipeline":
+            iteration        = resume_state.get("iteration", 1)
+            refs             = resume_state.get("refs", refs)
+            already_searched = resume_state.get("already_searched", already_searched)
+            search_result    = resume_state.get("search_result", search_result)
+            print(f"[{_ts()}] ▶  Resuming run_pipeline from iteration {iteration} "
+                  f"(checkpoint restored).")
+
         # --- VALIDATION LOOP (Only if not a simple 'show' intent) ---
         if parsed.intent not in ("show", "show_imports"):
             while iteration <= self.max_iterations:
@@ -333,8 +404,32 @@ class Orchestrator(OrchestratorActions):
                 })
 
                 if validation.get("status") == "approved":
+                    _api_err_count = 0
                     break
 
+                if validation.get("_api_error"):
+                    _api_err_count += 1
+                    if _api_err_count == 1:
+                        print(backoff.MILESTONE_TABLE)
+                    _wait = backoff.backoff_seconds(_api_err_count - 1)
+                    if iteration >= self.max_iterations:
+                        print(f"[{_ts()}] ⚠️  Validator unavailable — "
+                              f"max iterations reached, stopping. "
+                              f"({validation.get('feedback', '')})")
+                        break
+                    _chk = {
+                        "loop": "run_pipeline",
+                        "user_input": user_input,
+                        "base_dir": base_dir,
+                        "iteration": iteration,  # retry same iteration
+                        "refs": list(refs),
+                        "already_searched": list(already_searched),
+                        "search_result": search_result,
+                    }
+                    backoff.sleep_with_interrupt_save(_wait, _chk)
+                    continue  # retry same iteration (do not increment)
+
+                _api_err_count = 0
                 feedback = validation.get("feedback", "").strip()
                 if feedback:
                     print(f"❗ Validation – {feedback}")
@@ -344,8 +439,14 @@ class Orchestrator(OrchestratorActions):
                 new_suggestions = validation.get("suggested_searches", [])
                 if isinstance(new_suggestions, list):
                     for suggestion in new_suggestions:
-                        if suggestion not in refs:
+                        if suggestion not in refs and len(refs) < _refs_cap:
                             refs.append(suggestion)
+                    if len(refs) >= _refs_cap and new_suggestions:
+                        logger.debug(
+                            "run_pipeline: refs cap (%d) reached — "
+                            "%d suggestion(s) from validator discarded",
+                            _refs_cap, len(new_suggestions),
+                        )
                 iteration += 1
         else:
             print("ℹ️ Intent is 'show'. Skipping agent validation pipeline.")
@@ -593,6 +694,45 @@ def main():
 
     orchestrator = Orchestrator(config_path=args.config)
 
+    # ── Issue 7: Resume interrupted backoff session ──────────────────────
+    _saved = backoff.load_state()
+    if _saved:
+        _loop = _saved.get("loop", "unknown")
+        _it   = _saved.get("iteration", "?")
+        print(f"\n⚡ Checkpoint found: loop='{_loop}', iteration={_it}")
+        _ans = input("Resume interrupted session? [y/N] ").strip().lower()
+        if _ans == "y":
+            backoff.clear_state()
+            if _loop == "run_pipeline":
+                orchestrator.run_pipeline(
+                    _saved["user_input"], _saved["base_dir"], resume_state=_saved)
+            elif _loop == "run_text_qa":
+                import os as _os
+                _src = ""
+                _fp  = _saved.get("file_path", "")
+                _fp_abs = _fp if _os.path.isabs(_fp) else _os.path.join(
+                    _saved.get("base_dir", base_dir), _fp)
+                try:
+                    from tools.file_reader import read_file as _rf
+                    _src = _rf(_fp_abs)
+                except Exception:
+                    pass
+                orchestrator.run_text_qa(
+                    _saved["question"], _fp, _src,
+                    _saved.get("base_dir", base_dir),
+                    resume_state=_saved)
+            elif _loop == "run_edit":
+                orchestrator.run_edit(
+                    _saved["user_input"], _saved.get("base_dir", base_dir),
+                    resume_state=_saved)
+            else:
+                print(f"  Unknown loop '{_loop}' in checkpoint — discarded.")
+        else:
+            backoff.clear_state()
+            print("Checkpoint discarded. Starting fresh.")
+        print()
+
+
     # ── ONE-SHOT MODE ──────────────────────────────────────────────────
     if args.once is not None:
         query = args.once.strip()
@@ -619,6 +759,7 @@ def main():
                 print("Exiting lifecycle orchestrator run loop.")
                 break
             if user_input == orchestrator.new_chat_key:
+                orchestrator._direct_chat_history.clear()
                 print("Session reset completed.")
                 continue
 

@@ -64,7 +64,10 @@ _STOP_WORDS = frozenset({
 _DEFAULT_SYSTEM = (
     "You are a help-desk FAQ resolver. "
     "Answer the user's question using ONLY the content of the knowledge files "
-    "provided below. Quote or paraphrase the relevant answer text. "
+    "provided below. The knowledge files and the question may be written in "
+    "DIFFERENT languages — understand the content by meaning regardless of "
+    "language, and write your answer in the language of the user's question. "
+    "Quote or paraphrase the relevant answer text. "
     "If NONE of the files contain a suitable answer, reply with exactly: NOT FOUND"
 )
 
@@ -72,11 +75,41 @@ _DEFAULT_VALIDATE_SYSTEM = (
     "You are an answer quality validator for a help-desk FAQ system. "
     "You are given a user question, the knowledge-base content that was searched, "
     "and a candidate answer produced from that content. "
+    "The question, knowledge, and answer may be in different languages — judge by "
+    "MEANING, not language; a correct translation of the knowledge is VALID. "
     "Reply with exactly VALID if the answer correctly and completely addresses "
     "the question using only the provided knowledge. "
     "Reply with INVALID: <brief reason> if the answer is wrong, hallucinated, "
     "incomplete, or not grounded in the knowledge base. "
     "No other output — VALID or INVALID: <reason> only."
+)
+
+_DEFAULT_REVALIDATE_GROUNDING_SYSTEM = (
+    "You are a strict grounding and intent checker for a help-desk FAQ system. "
+    "You receive a user QUESTION, the KNOWLEDGE BASE text that was retrieved, and "
+    "a CANDIDATE ANSWER generated from it. Judge how well the KNOWLEDGE BASE "
+    "answers the QUESTION exactly as asked, then reply in EXACTLY one of these "
+    "three forms and nothing else.\n"
+    "IMPORTANT: differences in LANGUAGE between the QUESTION and the KNOWLEDGE "
+    "BASE are NEVER a reason to answer INDIRECT or NONE — judge strictly by "
+    "MEANING, not language. Knowledge written in another language that answers "
+    "the question's meaning is DIRECT. INDIRECT is only for a MEANING/intent "
+    "mismatch (e.g. asked how to DISABLE but the knowledge only ENABLES).\n\n"
+    "DIRECT\n"
+    "    Use when the KNOWLEDGE BASE explicitly and directly answers the QUESTION "
+    "as asked and the CANDIDATE ANSWER reflects only that information.\n\n"
+    "INDIRECT\n"
+    "<one short caveat sentence stating plainly that the knowledge base does not "
+    "directly cover what was asked and what it documents instead>\n"
+    "<the relevant information taken ONLY from the KNOWLEDGE BASE>\n"
+    "    Use when the KNOWLEDGE BASE does NOT directly answer the QUESTION but "
+    "contains related or opposite information (for example the question asks how "
+    "to DISABLE something but the knowledge only documents how to ENABLE it). Use "
+    "ONLY facts present in the KNOWLEDGE BASE; never invent, invert, or "
+    "extrapolate commands or steps.\n\n"
+    "NONE\n"
+    "    Use when the KNOWLEDGE BASE contains nothing relevant to the QUESTION.\n\n"
+    "Output exactly one block in one of the three forms above."
 )
 
 _DEFAULT_KEYWORD_SYSTEM = (
@@ -180,6 +213,18 @@ class FaqAgent:
             self.auto_pull = cfg.get(
                 "faq_agent", "auto_pull", fallback="auto"
             ).strip().lower()
+
+            # ── grounding / intent revalidation ─────────────────────────────
+            # Dedicated extra LLM pass confirming the answer is DIRECTLY grounded
+            # in the KB for the question as asked. Related/opposite KB → answer
+            # returned with an explicit caveat; irrelevant KB → NOT FOUND.
+            self.revalidate_grounding_enabled = cfg.getboolean(
+                "faq_agent", "revalidate_grounding", fallback=False
+            )
+            self.revalidate_grounding_system = cfg.get(
+                "faq_agent", "revalidate_grounding_system",
+                fallback=_DEFAULT_REVALIDATE_GROUNDING_SYSTEM,
+            )
         else:
             self.knowledge_dir    = Path("./knowledge")
             self.extensions       = [".txt", ".md"]
@@ -198,6 +243,8 @@ class FaqAgent:
             self.keyword_max_tokens = 64
             self.max_candidates     = 5
             self.auto_pull          = "auto"
+            self.revalidate_grounding_enabled = False
+            self.revalidate_grounding_system  = _DEFAULT_REVALIDATE_GROUNDING_SYSTEM
 
         # Keep NOT_FOUND in sync with any ini-customised marker so callers can
         # always use `agent.NOT_FOUND` regardless of ini customisation.
@@ -484,6 +531,86 @@ class FaqAgent:
             )
             return True  # fail open
 
+    # ── Grounding / intent revalidation ──────────────────────────────────────
+
+    def _revalidate_grounding(self, question: str, answer: str, context: str) -> str:
+        """Dedicated grounding/intent revalidation pass (one LLM call).
+
+        Classifies the candidate against the question + knowledge and returns the
+        FINAL answer text:
+
+          * DIRECT   → knowledge answers the question as asked → *answer* unchanged.
+          * INDIRECT → knowledge is related/opposite (e.g. asked "disable" but the
+                       KB only documents "enable") → the KB's actual information
+                       rewritten with an explicit caveat; any fabricated/inverted
+                       steps in *answer* are discarded.
+          * NONE     → nothing relevant → the not-found marker.
+
+        Fails OPEN on API errors (returns *answer* unchanged) so a transient fault
+        never silently drops a good answer.
+        """
+        user_msg = (
+            f"QUESTION: {question}\n\n"
+            f"KNOWLEDGE BASE:\n{context}\n\n"
+            f"CANDIDATE ANSWER:\n{answer}"
+        )
+        url     = self._chat_url()
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+        }
+        payload: dict = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": self.revalidate_grounding_system},
+                {"role": "user",   "content": user_msg},
+            ],
+            "temperature": self.temperature,
+        }
+        if self.max_tokens:
+            payload["max_tokens"] = self.max_tokens  # INDIRECT returns a full answer
+
+        try:
+            reply = request_completion(
+                url, headers, payload, self.timeout,
+                stream=False,
+                api_format=self.api_format,
+                ssl_context=self.ssl_context,
+            )
+            self.llm_call_count += 1  # grounding revalidation call
+        except Exception as exc:
+            logger.warning(
+                "FaqAgent: grounding revalidation failed (%s) — keeping answer", exc
+            )
+            return answer  # fail open
+
+        verdict_text = strip_think(reply).strip()
+        head = verdict_text.split("\n", 1)[0].strip().upper()
+
+        if head.startswith("DIRECT"):
+            logger.debug("FaqAgent grounding: DIRECT")
+            return answer
+        if head.startswith("NONE"):
+            logger.info("FaqAgent grounding: NONE — returning NOT FOUND")
+            return self.not_found_marker
+        if head.startswith("INDIRECT"):
+            body = (
+                verdict_text.split("\n", 1)[1].strip()
+                if "\n" in verdict_text else ""
+            )
+            if body:
+                logger.info(
+                    "FaqAgent grounding: INDIRECT — returning caveated KB info"
+                )
+                return body
+            # INDIRECT with no body is unusable → safest is NOT FOUND.
+            return self.not_found_marker
+        # Unrecognised verdict → fail open, keep the original answer.
+        logger.debug(
+            "FaqAgent grounding: unrecognised verdict %r — keeping answer", head
+        )
+        return answer
+
     # ── Not-found detection ──────────────────────────────────────────────────
 
     def _is_not_found(self, answer: str) -> bool:
@@ -704,6 +831,18 @@ class FaqAgent:
                     )
                     continue
 
+            # dedicated grounding / intent revalidation (may add a caveat or reject)
+            if self.revalidate_grounding_enabled:
+                candidate_ans = self._revalidate_grounding(
+                    question, candidate_ans, candidate_ctx
+                )
+                if candidate_ans == self.not_found_marker:
+                    logger.info(
+                        "FaqAgent: candidate %r not grounded (revalidation NONE) "
+                        "— trying next", name
+                    )
+                    continue
+
             # ── accepted: emit and return ────────────────────────────────────
             if stream:
                 sys.stdout.write(candidate_ans)
@@ -794,7 +933,11 @@ class FaqAgent:
                     )
                     return self.not_found_marker
 
-            # step 6: return validated answer
+            # step 5b: dedicated grounding / intent revalidation
+            if self.revalidate_grounding_enabled:
+                answer = self._revalidate_grounding(question, answer, context)
+
+            # step 6: return validated answer (may be caveated or NOT FOUND)
             return answer
 
         except Exception as exc:

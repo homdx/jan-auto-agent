@@ -250,14 +250,36 @@ class SearchAgent:
             found_raw: Dict[str, Dict[str, str]] = {}
             searched_this_run: Set[str] = set()
 
+            # Intra-run source cache: each candidate file is read from disk at
+            # most once per run() call, regardless of how many references are
+            # searched. Key = absolute file path, value = file text (empty
+            # string marks a file that failed to read — skipped on all refs).
+            _source_cache: Dict[str, str] = {}
+
             for ref in refs_to_search:
                 visited_names.add(ref)  # Guard: Prevent circular resolution
                 ref_found = False
 
                 for candidate_file in valid_candidates:
                     searched_this_run.add(candidate_file)
-                    
-                    code_block = extract_block(candidate_file, ref)
+
+                    # Populate cache on first encounter of this file.
+                    if candidate_file not in _source_cache:
+                        try:
+                            with open(candidate_file, "r", encoding="utf-8",
+                                      errors="replace") as fh:
+                                _source_cache[candidate_file] = fh.read()
+                        except Exception as read_err:
+                            logger.debug("SearchAgent: could not read %s: %s",
+                                         candidate_file, read_err)
+                            _source_cache[candidate_file] = ""
+
+                    source = _source_cache[candidate_file]
+                    if not source:
+                        continue
+
+                    ext = Path(candidate_file).suffix
+                    code_block = _extract_block_from_source(source, ref, ext) or None
                     if code_block:
                         found_raw[ref] = {
                             "code": code_block,

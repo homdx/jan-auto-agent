@@ -59,3 +59,40 @@ class Spinner:
 
     def __exit__(self, *_):
         self.stop()
+
+
+def stream_tracker():
+    """
+    Returns (on_token, stats) for wrapping request_completion's on_token kwarg.
+
+    on_token(t): write token t to stdout and update counters.
+    stats(): return a formatted string like "(42.3 tok/s, 156 tok)"
+             to print after streaming ends. Returns "" if no tokens received.
+
+    Usage::
+        on_tok, tok_stats = stream_tracker()
+        result = request_completion(..., stream=True, on_token=on_tok)
+        print()
+        if s := tok_stats():
+            print(f"[{ts()}] {s}")
+    """
+    state: dict = {"n": 0, "t0": None}
+
+    def on_token(t: str) -> None:
+        if state["t0"] is None:
+            state["t0"] = time.time()
+        state["n"] += 1
+        sys.stdout.write(t)
+        sys.stdout.flush()
+
+    def stats() -> str:
+        n = state["n"]
+        t0 = state["t0"]
+        if n == 0 or t0 is None:
+            return ""
+        elapsed = time.time() - t0
+        if elapsed < 0.05:
+            return f"({n} tok)"
+        return f"({n / elapsed:.1f} tok/s, {n} tok)"
+
+    return on_token, stats
