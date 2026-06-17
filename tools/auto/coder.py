@@ -70,6 +70,7 @@ from typing import Any, Optional
 
 from tools.block_extractor import extract_block as _block_extractor_extract_block
 # SearchAgent is imported lazily inside Coder._fetch_needed
+from tools.auto.utils import _cfg_mode
 
 from tools.agent_trace import tracer
 import tools.llm_stream as _llm_stream
@@ -269,7 +270,8 @@ class Coder:
         self._task_mode = task_mode
         sec = "coder"
         self._temperature = float(config.get(sec, "temperature", fallback="0.2"))
-        self._max_tokens  = int(config.get(sec, "max_tokens",   fallback="16384"))
+        # AUTO-CR-3: prefer max_tokens_{task_mode} (e.g. max_tokens_creative) over max_tokens.
+        self._max_tokens  = int(_cfg_mode(config, sec, "max_tokens", task_mode, fallback="16384"))
         # Select system prompt by task_mode (mirrors architect / validator).
         # Priority: mode-specific ini key > legacy "system" key > built-in constant.
         _mode_key = f"system_{self._task_mode}" if self._task_mode != "code" else None
@@ -282,7 +284,11 @@ class Coder:
         self._max_file_chars = int(config.get(sec, "max_file_chars", fallback=str(_DEFAULT_MAX_FILE_CHARS)))
         active_profile = config.get("api", "active", fallback="local")
         # num_ctx controls the total context window on Ollama; 0 means "use server default".
-        self._num_ctx = config.getint(f"api_{active_profile}", "num_ctx", fallback=0)
+        # AUTO-CR-3: prefer [coder] num_ctx_{task_mode} then [api_{active}] num_ctx.
+        _num_ctx_str = _cfg_mode(config, sec, "num_ctx", task_mode, fallback=None)
+        if _num_ctx_str is None:
+            _num_ctx_str = config.get(f"api_{active_profile}", "num_ctx", fallback="0")
+        self._num_ctx = int(_num_ctx_str)
         # Context-probe: fetch missing symbols on first LLM response, then retry once.
         self._context_probe_enabled = config.getboolean(sec, "context_probe", fallback=True)
         self._max_chars_per_dep     = config.getint(sec, "max_chars_per_dep", fallback=2000)

@@ -697,9 +697,16 @@ class ClusterReviewer:
                 )
                 continue
 
-            # DM-2: in creative mode, empty acceptance_check is allowed (default to 'true').
+            # AUTO-CR-3: creative_acceptance_default (config-driven) decides whether
+            # an empty acceptance_check is permitted and defaults to "true".
+            # Replaces the previous hard-coded task_mode == "creative" check (DM-2).
             if not acceptance:
-                if self._task_mode == "creative":
+                _acc_default = (
+                    self._config.getboolean("auto", "creative_acceptance_default", fallback=True)
+                    if self._task_mode == "creative"
+                    else False
+                )
+                if _acc_default:
                     acceptance = "true"
                 else:
                     logger.warning(
