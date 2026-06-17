@@ -71,6 +71,7 @@ from typing import Any, Optional
 from tools.block_extractor import extract_block as _block_extractor_extract_block
 # SearchAgent is imported lazily inside Coder._fetch_needed
 from tools.auto.utils import _cfg_mode
+from tools.auto.context_assembler import ContextAssembler
 
 from tools.agent_trace import tracer
 import tools.llm_stream as _llm_stream
@@ -534,10 +535,18 @@ class Coder:
         target_files_listing = "\n".join(f"  - {f}" for f in target_files) or "  (none)"
 
         # ── File contents ─────────────────────────────────────────────────────
-        # Pass task so _read_file_contents can resolve cited_symbol itself.
-        file_contents = self._read_file_contents(
-            target_files, base_dir, task=task
-        )
+        # AUTO-CR-4: in creative mode, replace the generic "current file
+        # contents" fill with the budget-fitted synopsis + previous-chapter
+        # context (ContextAssembler). The target chapter is usually new/empty,
+        # so its own (nonexistent) content isn't useful — what the model
+        # needs is continuity with what came before.
+        if self._task_mode == "creative":
+            file_contents = self._build_creative_file_contents(target_files, base_dir)
+        else:
+            # Pass task so _read_file_contents can resolve cited_symbol itself.
+            file_contents = self._read_file_contents(
+                target_files, base_dir, task=task
+            )
         # Pull-model: prepend any context the previous attempt requested.
         if prefetched_context:
             file_contents = prefetched_context.rstrip() + "\n\n" + file_contents
@@ -731,6 +740,48 @@ class Coder:
                 parts.append(f"### {rel}\n{truncated}")
 
         return "\n\n".join(parts) if parts else "(no target files)"
+
+    def _build_creative_file_contents(
+        self, target_files: list[str], base_dir: Path,
+    ) -> str:
+        """Creative-mode replacement for ``_read_file_contents`` (AUTO-CR-4).
+
+        Discovers sibling ``chapter_<N>.*`` files alongside the target chapter
+        and delegates the actual budget-fitted assembly to
+        :class:`~tools.auto.context_assembler.ContextAssembler`. Never raises:
+        any failure degrades to an explanatory placeholder so the prompt
+        always has *something* in this slot.
+        """
+        if not target_files:
+            return "(no target files)"
+
+        target_file = target_files[0]
+        try:
+            target_rel = Path(target_file)
+            chapter_dir = base_dir / target_rel.parent
+
+            all_chapter_files: list[str] = []
+            if chapter_dir.is_dir():
+                for p in sorted(chapter_dir.glob("chapter_*.md")):
+                    rel = (
+                        p.name if target_rel.parent in (Path("."), Path(""))
+                        else str(target_rel.parent / p.name)
+                    )
+                    if rel != target_file:
+                        all_chapter_files.append(rel)
+
+            assembler = ContextAssembler(
+                num_ctx=self._num_ctx, max_tokens=self._max_tokens, base_dir=base_dir,
+            )
+            context = assembler.build_creative_context(target_file, all_chapter_files)
+        except Exception as exc:
+            logger.warning(
+                "coder: ContextAssembler failed for %s: %s — proceeding with no "
+                "prior-chapter context.", target_file, exc,
+            )
+            context = ""
+
+        return context or "(first chapter — no prior chapters to continue from)"
 
     def _parse_response(
         self, text: str, task_id: str,
