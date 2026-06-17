@@ -173,7 +173,14 @@ class AutoController:
         self.config = configparser.ConfigParser()
         if Path(config_path).exists():
             self.config.read(config_path, encoding="utf-8")
-        self.task_mode: str = self.config.get("auto", "task_mode", fallback="code")
+        # AUTO-CR-10: normalise task_mode (typo-tolerant) so a misspelling like
+        # 'creativy' is corrected with a loud warning instead of silently
+        # degrading to code mode.
+        from tools.auto.utils import normalize_task_mode
+        _raw_mode = self.config.get("auto", "task_mode", fallback="code")
+        self.task_mode, _mode_warn = normalize_task_mode(_raw_mode)
+        if _mode_warn:
+            logger.warning("controller: %s", _mode_warn)
         # AUTO-A4: execution working dir (executor/AUTO-C1 runs code here)
         self.workspace_dir = self.agent_dir / "workspace"
 

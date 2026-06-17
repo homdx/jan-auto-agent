@@ -74,13 +74,18 @@ _SYSTEM_PROMPT_DOCS = (
 )
 
 _SYSTEM_PROMPT_CREATIVE = (
-    "You are a creative writing editor reviewing drafts for improvement. "
-    "Your job is to identify concrete, actionable improvements in the creative "
-    "writing files provided. Each improvement MUST be grounded in a real location "
-    "— cite the exact file path and a line range where the issue lives. "
-    "cited_location.symbol must be null; cite line range only. "
-    "acceptance_check should be 'true' or a word-count sanity check. "
-    "Do NOT invent problems that are not actually present in the provided text. "
+    "You are a creative-writing planner for long-form fiction. The author wants "
+    "to CONTINUE or GENERATE prose (e.g. write the next chapter), not refactor "
+    "code. Produce concrete writing tasks that fulfil the stated goal. "
+    "GROUNDING RULE: cited_location.file MUST be one of the EXISTING files listed "
+    "(typically the latest existing chapter) — this is the source you continue "
+    "from. cited_location.symbol MUST be null and line_start/line_end SHOULD be "
+    "null (do not invent line numbers). "
+    "target_files names the file to write; it MAY be a NEW file that does not "
+    "exist yet (e.g. the next chapter). "
+    "acceptance_check is optional for creative tasks (omit it or use 'true'). "
+    "Prefer ONE focused task that writes a complete chapter over many tiny "
+    "fragment tasks. "
     "Return ONLY a JSON array — no prose, no markdown fences, no preamble."
 )
 
@@ -111,7 +116,7 @@ and target_files — do NOT invent, shorten, or add prefixes):
 File contents:
 {file_contents}
 
-Produce up to 5 concrete tasks for files in this cluster that ACHIEVE THE GOAL \
+Produce up to {max_tasks} concrete tasks for files in this cluster that ACHIEVE THE GOAL \
 above.  The goal may ask you to ADD or CHANGE functionality (new command-line \
 arguments, new behavior, new output) — not only to fix bugs.  Treat behavior the \
 goal requires but the code does not yet have as the work to be done.  If the goal \
@@ -165,7 +170,7 @@ REMINDER — the ONLY file paths you may put in "target_files" or \
 Any other path will be rejected:
 {file_listing}
 
-Now produce ONLY the JSON array of up to 5 concrete tasks that IMPLEMENT the \
+Now produce ONLY the JSON array of up to {max_tasks} concrete tasks that IMPLEMENT the \
 goal "{goal}" against the files above (no prose, no markdown fences):
 """
 
@@ -284,7 +289,10 @@ class ClusterReviewer:
 
         arch = "architect"
         self._temperature            = float(config.get(arch, "temperature",         fallback="0.2"))
-        self._max_tokens             = int(config.get(arch,   "max_tokens",          fallback="2048"))
+        # AUTO-CR-11: mode-aware token cap — creative tasks (Cyrillic, longer
+        # instructions) need more room or the JSON array truncates mid-object.
+        from tools.auto.utils import _cfg_mode
+        self._max_tokens             = int(_cfg_mode(config, arch, "max_tokens", task_mode, fallback="2048"))
         self._timeout                = float(config.get("loop", "timeout_seconds",   fallback="300"))
         self._max_file_chars         = int(config.get(arch,   "max_file_chars",      fallback=str(_DEFAULT_MAX_FILE_CHARS)))
         self._max_files_per_review   = int(config.get(arch,   "max_files_per_review", fallback=str(_DEFAULT_MAX_FILES_PER_REVIEW)))
@@ -469,6 +477,7 @@ class ClusterReviewer:
             cluster=cluster.name,
             file_listing=file_listing,
             file_contents=file_contents,
+            max_tasks=(1 if self._task_mode == "creative" else 5),
         )
 
 
@@ -608,9 +617,11 @@ class ClusterReviewer:
             params={"cluster": cluster.name},
         )
 
-        return self._parse_candidates(cleaned, cluster.name)
+        return self._parse_candidates(cleaned, cluster.name, cluster.files)
 
-    def _parse_candidates(self, text: str, cluster_name: str) -> list[CandidateTask]:
+    def _parse_candidates(
+        self, text: str, cluster_name: str, cluster_files: "list[str] | None" = None
+    ) -> list[CandidateTask]:
         """Parse the LLM's JSON array into :class:`CandidateTask` objects.
 
         Ungrounded candidates (missing file, missing symbol AND line_start) are
@@ -631,11 +642,25 @@ class ClusterReviewer:
         try:
             data = json.loads(stripped)
         except json.JSONDecodeError as exc:
-            logger.warning(
-                "_parse_candidates [%s]: JSON decode failed: %s\nRaw text: %.400s",
-                cluster_name, exc, text,
-            )
-            return []
+            # AUTO-CR-11: a small model (e.g. llama3.1:8b) frequently runs out
+            # of output tokens mid-array, truncating the final object's string
+            # and making the WHOLE array unparseable. Rather than discarding
+            # every candidate, salvage the complete top-level objects that DID
+            # finish and drop only the truncated tail.
+            salvaged = _salvage_json_objects(stripped)
+            if salvaged:
+                logger.warning(
+                    "_parse_candidates [%s]: array was truncated (%s) — "
+                    "salvaged %d complete task object(s) from the prefix.",
+                    cluster_name, exc, len(salvaged),
+                )
+                data = salvaged
+            else:
+                logger.warning(
+                    "_parse_candidates [%s]: JSON decode failed: %s\nRaw text: %.400s",
+                    cluster_name, exc, text,
+                )
+                return []
 
         if not isinstance(data, list):
             logger.warning(
@@ -675,6 +700,36 @@ class ClusterReviewer:
 
             # --- Validate and build cited_location (grounding gate) ---
             loc_raw = item.get("cited_location")
+
+            # AUTO-CR-10: in creative mode the grounding is "the story so far".
+            # A small model often (a) omits cited_location, or (b) cites the
+            # NEW target chapter (which does not exist yet). Both block the
+            # whole run. Repair by grounding on an EXISTING cluster file (the
+            # latest existing chapter) instead of rejecting.
+            if self._task_mode == "creative":
+                existing = list(cluster_files or [])
+                anchor_file = _latest_chapter_file(existing)
+                if not isinstance(loc_raw, dict):
+                    loc_raw = {"file": anchor_file, "symbol": None,
+                               "line_start": None, "line_end": None}
+                    logger.info(
+                        "_parse_candidates [%s]: item %d had no cited_location — "
+                        "grounding on existing file %r (creative).",
+                        cluster_name, i, anchor_file,
+                    )
+                else:
+                    _cf = (loc_raw.get("file") or "").strip()
+                    if anchor_file and _cf not in existing:
+                        logger.info(
+                            "_parse_candidates [%s]: item %d cited non-existing "
+                            "file %r — remapping grounding to %r (creative).",
+                            cluster_name, i, _cf, anchor_file,
+                        )
+                        loc_raw = dict(loc_raw)
+                        loc_raw["file"] = anchor_file
+                        loc_raw["line_start"] = None
+                        loc_raw["line_end"] = None
+
             if not isinstance(loc_raw, dict):
                 logger.warning(
                     "_parse_candidates [%s]: item %d missing cited_location — rejected",
@@ -762,6 +817,72 @@ class ClusterReviewer:
 # ─────────────────────────────────────────────────────────────────────────────
 # Convenience factory
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _salvage_json_objects(text: str) -> list:
+    """Extract complete top-level JSON objects from a (possibly truncated) array.
+
+    A small model often emits ``[ {..}, {..}, {..  ← cut off here``. ``json.loads``
+    then fails on the whole string. This scanner walks the text tracking string
+    state and brace depth, and returns every ``{...}`` object that closed
+    cleanly at array level, parsing each independently. The truncated trailing
+    object is silently dropped. Returns ``[]`` when nothing complete is found.
+    """
+    objects: list = []
+    depth = 0          # brace depth
+    in_str = False
+    escape = False
+    start = -1
+    for i, ch in enumerate(text):
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start >= 0:
+                    chunk = text[start : i + 1]
+                    try:
+                        obj = json.loads(chunk)
+                        if isinstance(obj, dict):
+                            objects.append(obj)
+                    except json.JSONDecodeError:
+                        pass  # malformed individual object — skip
+                    start = -1
+    return objects
+
+
+def _latest_chapter_file(files: "list[str]") -> str:
+    """Return the best existing file to ground a creative continuation on.
+
+    Prefers the highest-numbered ``chapter_<N>`` file (the most recent chapter
+    the new one continues from); falls back to the last file alphabetically.
+    Returns ``""`` when *files* is empty.
+    """
+    import re as _re
+    if not files:
+        return ""
+    rx = _re.compile(r"chapter[_\-\s]?(\d+)", _re.IGNORECASE)
+    numbered: list[tuple[int, str]] = []
+    for f in files:
+        m = rx.search(str(f))
+        if m:
+            numbered.append((int(m.group(1)), f))
+    if numbered:
+        numbered.sort()
+        return numbered[-1][1]
+    return sorted(files)[-1]
+
 
 def _batch_fingerprint(base_dir: "Path", files: list[str]) -> str:
     """Short hash of a batch's files (relative path + size + mtime) used to make

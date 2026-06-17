@@ -146,3 +146,49 @@ def language_instruction(language: "str | None") -> str:
         f"another language, do not translate, do not add text in any other "
         f"language. Output {language} only."
     )
+
+
+# ── AUTO-CR-10: task_mode normalisation (typo-tolerant) ──────────────────────
+
+_KNOWN_TASK_MODES = ("code", "docs", "creative")
+
+
+def normalize_task_mode(value: "str | None") -> tuple[str, "str | None"]:
+    """Normalise a configured ``task_mode`` to a known mode.
+
+    Returns ``(mode, warning)``. ``warning`` is ``None`` when *value* was an
+    exact known mode, otherwise a human-readable message describing the
+    correction (so the controller can log it loudly instead of silently
+    degrading — e.g. ``creativy`` → ``creative``).
+
+    Mapping:
+      * exact match (case/space-insensitive) → that mode
+      * starts with ``creat`` → ``creative``     (catches ``creativy``, ``creativ``)
+      * starts with ``doc``   → ``docs``
+      * starts with ``cod``   → ``code``
+      * anything else         → ``code`` (with a warning)
+    """
+    raw = (value or "").strip()
+    low = raw.lower()
+    if low in _KNOWN_TASK_MODES:
+        return low, None
+    if not low:
+        return "code", None  # empty/missing → default, no warning
+
+    if low.startswith("creat"):
+        guess = "creative"
+    elif low.startswith("doc"):
+        guess = "docs"
+    elif low.startswith("cod"):
+        guess = "code"
+    else:
+        return (
+            "code",
+            f"unknown task_mode {raw!r} — expected one of "
+            f"{_KNOWN_TASK_MODES}; falling back to 'code'.",
+        )
+    return (
+        guess,
+        f"task_mode {raw!r} is not exact — interpreting as {guess!r}. "
+        f"Set [auto] task_mode = {guess} in agents.ini to silence this.",
+    )
