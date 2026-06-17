@@ -453,6 +453,18 @@ class AutoController:
             else:
                 # ── AUTO-G4: exhaustion → knowledge note + ticket ──────────
                 ex_outcome = exhaustion_handler.handle(task, result)
+                # Bug 2: the coder writes its candidate straight into base_dir
+                # before validation; an exhausted task leaves that edit dirty
+                # in the repo.  commit() stages everything (git add -u/.), so
+                # the next successful task would otherwise sweep this failed
+                # task's half-finished file into its commit.  Discard the
+                # uncommitted residue now (no-op when git is disabled).
+                if self.git is not None:
+                    self.git.discard_working_changes()
+                    self.state.log(
+                        f"task {task['id']} uncommitted edits discarded "
+                        f"(exhausted, not committed)"
+                    )
                 self.state.log(
                     f"task {task['id']} exhausted — "
                     f"rounds={result.rounds_used} "
@@ -519,6 +531,21 @@ class AutoController:
             and t.get("acceptance_check", "").strip()
         ]
         for done_task in done_tasks:
+            # Bug 6: respect the run's time budget here too.  _run_task_loop
+            # only checks caps between tasks; a regression that breaks several
+            # earlier tasks could otherwise drive a long BugFixLoop cascade
+            # (rounds × attempts of LLM calls each) with no cap check until
+            # control returns to the main loop.
+            if self.is_runtime_exceeded():
+                logger.info(
+                    "_check_regressions: runtime cap reached — stopping "
+                    "regression checks after commit of %s", just_committed_id,
+                )
+                self.state.log(
+                    f"regression checks halted by runtime cap "
+                    f"(after commit of {just_committed_id})"
+                )
+                break
             exec_result = executor.run(done_task)
             if not exec_result.passed:
                 logger.warning(

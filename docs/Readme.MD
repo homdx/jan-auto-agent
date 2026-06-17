@@ -26,7 +26,10 @@ A local-LLM agent pipeline for code review, documentation improvement, and creat
 
 ```
 Repo Ingest → Architect (checkpoint) → Gate 1 (false-positive filter)
-           → Backlog Prioritiser → Plan
+                                         ├─ Stage A: existence check (no LLM)
+                                         ├─ Stage B: problem-presence check (LLM)
+                                         └─ Stage C: deduplication (no LLM)
+                                       → Backlog Prioritiser → Plan
            → Outer Loop  (rounds)
                └── Inner Loop  (attempts per round)
                        ├── Coder          (emits context_request)
@@ -379,8 +382,8 @@ CandidateTask
     │   └── cited line range in bounds?   → reject if not
     │
     ├─ Stage B  (one LLM call)
-    │   └── "is this problem present?" → {"present": true|false}
-    │       fail-closed: unparseable response = rejected
+    │   └── "is this problem present?" → {"verdict": "confirmed"|"rejected", "reason": "..."}
+    │       fail-closed: unparseable response or missing "verdict" key = rejected
     │
     └─ Stage C  (no LLM)
         └── deduplicate on (file, symbol/line, title)
@@ -404,20 +407,36 @@ Attempt N
     └─ Validator (subjective) → LLM checks completeness               (Gate 2b)
             APPROVED → commit
             REJECTED → structured feedback (reason + up to max_hints hints)
-                           + ContextBroker resolves any context_request symbols
-                           → next attempt (same round)
+                           + ContextBroker resolves Validator's `missing_context` symbols
+                           + ContextBroker resolves Coder's `context_request` symbols
+                           → next attempt (same round, with accumulated PREFETCHED CONTEXT)
 ```
 
 Validator JSON response format (autonomous mode):
 
 ```json
 {
-  "approved": true,
-  "feedback": "one sentence",
-  "hints": ["specific hint pointing to file/line"],
-  "suggested_approach": "optional"
+  "approved": true|false,
+  "feedback": "<one sentence explaining rejection reason>",
+  "hints": ["<specific hint pointing to file/line/symbol>"],
+  "suggested_approach": "<optional one-sentence alternative approach>",
+  "missing_context": ["<symbol you needed to see but were not shown>"]
 }
 ```
+
+**Field descriptions:**
+
+- `approved` (boolean, required): Pass/fail decision. Set `true` if implementation is complete and correct.
+- `feedback` (string, required): Concise one-sentence reason for the decision. Always include.
+- `hints` (array of strings, optional): Actionable hints pointing to specific code locations, variables, or patterns. Each hint MUST reference a concrete name, line, or symbol. Omit or use `[]` when `approved=true`.
+- `suggested_approach` (string, optional): Alternative strategy if rejection detected. Only fill when you have a concrete suggestion.
+- `missing_context` (array of strings, optional): List of symbol names that you needed to see but were not provided. When set, triggers the pull-model ContextBroker to resolve and prefetch these symbols for the next attempt. Omit if all context is available.
+
+**Rules:**
+- Use `missing_context` ONLY when you cannot verify correctness because a referenced symbol's definition was not provided.
+- Example hint (GOOD): `"import re is used on line 12 but not present in imports"`.
+- Example hint (BAD): `"make sure the code is correct"`.
+- Always omit hints array (or use `[]`) when `approved=true`.
 
 Configure the validator in `agents.ini`:
 
@@ -468,8 +487,13 @@ When a task exhausts its per-round attempts repeatedly, the Architect rewrites t
 Trigger condition (with `rewrite_every_n_rounds = 2`): first rewrite fires at round 3, then every 2 rounds after that.
 
 ```
-rnd >= 3  AND  (rnd - 1) % rewrite_every_n_rounds == 0
+rnd >= 3
+AND  (rnd - 1) % rewrite_every_n_rounds == 0
+AND  rewrites_done < max_rewrites
+AND  context_satisfied == True
 ```
+
+> **Note:** The `context_satisfied` gate prevents a rewrite when the inner loop's last attempt was still requesting missing context — in that case the failure is due to missing information, not bad task framing, so the system lets the prefetched context flow in on the next round instead of rewriting.
 
 Each rewrite increments `impl_version` in the task state. The Coder always sees the current `impl_version` as a header in its prompt (LOOP-4), so it knows which strategy it is implementing.
 
@@ -502,10 +526,16 @@ When a later task's acceptance check reveals a regression in already-committed w
 
 Ticket IDs are idempotent — if a bug ticket already exists for the same triggering task it is reused rather than duplicated.
 
+**Ticket ID Format:**
+
 ```
-Bug ticket:  BUG-<triggering_task_id>
-Fix task id: BUG-FIX-<triggering_task_id>
+Bug ticket:  BUG-<triggering_task_id>  (e.g., "BUG-AUTO-T3")
+Fix task id: BUG-FIX-<triggering_task_id>  (e.g., "BUG-FIX-AUTO-T3")
 ```
+
+**Examples:**
+- If task `AUTO-T5` causes a regression → Bug ticket: `BUG-AUTO-T5`, Fix task: `BUG-FIX-AUTO-T5`
+- If task `AUTO-T12` causes a regression → Bug ticket: `BUG-AUTO-T12`, Fix task: `BUG-FIX-AUTO-T12`
 
 ---
 

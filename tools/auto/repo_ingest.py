@@ -318,13 +318,25 @@ class RepoIngestor:
                 return True
         return False
 
+    # Well-known noise directories always pruned from the architect walk,
+    # mirroring tools/auto/context_broker._iter_project_files.  Without this,
+    # an empty/minimal [search] skip_dirs let node_modules/venv/dist/build be
+    # ingested and clustered for review (dot-dirs were already pruned by the
+    # walk's startswith('.') filter, but these non-dot ones were not).
+    _DEFAULT_SKIP_DIRS: frozenset[str] = frozenset({
+        "__pycache__", ".git", ".hg", ".svn",
+        "node_modules", "venv", ".venv", "dist", "build", ".tox",
+    })
+
     def _read_skip_dirs(self) -> set[str]:
-        """Read skip_dirs, preferring [architect] then [search]."""
+        """Read skip_dirs, preferring [architect] then [search]; always union
+        in the built-in noise-directory defaults."""
         raw = (
             self._config.get("architect", "skip_dirs", fallback=None)
             or self._config.get("search",   "skip_dirs", fallback="")
         )
-        return {d.strip() for d in raw.split(",") if d.strip()}
+        user = {d.strip() for d in raw.split(",") if d.strip()}
+        return set(self._DEFAULT_SKIP_DIRS) | user
 
     def _read_int(self, key: str, default: int) -> int:
         """Read an int config key, preferring [architect] then [search]."""
