@@ -542,6 +542,16 @@ class Coder:
         # needs is continuity with what came before.
         if self._task_mode == "creative":
             file_contents = self._build_creative_file_contents(target_files, base_dir)
+            # AUTO-CR-9: lock the output language to the story so far so a small
+            # model does not drift (e.g. Russian source → English continuation).
+            from tools.auto.utils import resolve_creative_language, language_instruction
+            _lang = resolve_creative_language(
+                getattr(self, "_config", None), file_contents, task_mode="creative",
+            )
+            _lang_instr = language_instruction(_lang)
+            if _lang_instr:
+                file_contents = _lang_instr + "\n\n" + file_contents
+                logger.info("Coder: creative language locked to %s", _lang)
         else:
             # Pass task so _read_file_contents can resolve cited_symbol itself.
             file_contents = self._read_file_contents(

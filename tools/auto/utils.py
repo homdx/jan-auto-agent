@@ -57,3 +57,92 @@ def _cfg_mode(
     if val is not None and str(val).strip():
         return val
     return fallback
+
+
+# ── AUTO-CR-9: language consistency for creative mode ────────────────────────
+
+def detect_language(text: str) -> "str | None":
+    """Best-effort detection of the dominant script/language of *text*.
+
+    Returns a human-readable language NAME suitable for dropping into an LLM
+    instruction (e.g. ``"Russian"``, ``"English"``), or ``None`` when the text
+    is too short / ambiguous to decide.
+
+    Intentionally lightweight (no external deps): it distinguishes the scripts
+    that matter for this project by counting characters. Cyrillic vs Latin is
+    the common case (Russian source, English drift); a few other scripts are
+    recognised so the instruction is correct if the source is in them.
+    """
+    if not text:
+        return None
+    counts = {
+        "Russian": 0,    # Cyrillic
+        "English": 0,    # Latin
+        "Greek": 0,
+        "Arabic": 0,
+        "Hebrew": 0,
+        "Chinese": 0,
+        "Japanese": 0,
+    }
+    for ch in text:
+        o = ord(ch)
+        if 0x0400 <= o <= 0x04FF:
+            counts["Russian"] += 1
+        elif (0x41 <= o <= 0x5A) or (0x61 <= o <= 0x7A):
+            counts["English"] += 1
+        elif 0x0370 <= o <= 0x03FF:
+            counts["Greek"] += 1
+        elif 0x0600 <= o <= 0x06FF:
+            counts["Arabic"] += 1
+        elif 0x0590 <= o <= 0x05FF:
+            counts["Hebrew"] += 1
+        elif 0x4E00 <= o <= 0x9FFF:
+            counts["Chinese"] += 1
+        elif (0x3040 <= o <= 0x30FF):
+            counts["Japanese"] += 1
+
+    total = sum(counts.values())
+    if total < 8:           # too little signal to be sure
+        return None
+    lang, n = max(counts.items(), key=lambda kv: kv[1])
+    if n == 0 or (n / total) < 0.30:
+        return None
+    return lang
+
+
+def resolve_creative_language(
+    config: "configparser.ConfigParser | None",
+    context_text: str = "",
+    task_mode: str = "creative",
+) -> "str | None":
+    """Resolve the language a creative chapter must be written in.
+
+    Priority:
+      1. Explicit ``[coder] creative_language`` (or ``language_creative``) in
+         config — lets the author force a language regardless of detection.
+      2. Auto-detection from *context_text* (the story so far).
+      3. ``None`` — caller omits the language instruction (model decides).
+    """
+    if config is not None:
+        for key in ("creative_language", "language_creative"):
+            if config.has_option("coder", key):
+                val = (config.get("coder", key) or "").strip()
+                if val and val.lower() not in ("auto", "detect", ""):
+                    return val
+    return detect_language(context_text)
+
+
+def language_instruction(language: "str | None") -> str:
+    """Return a strong, prompt-ready language-lock instruction, or ``""``.
+
+    Used by the creative coder/summary/canon prompts so a small model
+    (e.g. llama3.1:8b) does not drift into English when the source is Russian.
+    """
+    if not language:
+        return ""
+    return (
+        f"LANGUAGE: Write entirely in {language}. The story so far is in "
+        f"{language}; you MUST continue in the SAME language. Do not switch to "
+        f"another language, do not translate, do not add text in any other "
+        f"language. Output {language} only."
+    )

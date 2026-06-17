@@ -382,9 +382,14 @@ class SummaryMemory:
 
     def _summarise_once(self, text: str) -> str:
         """Make a single summarisation LLM call.  Returns ``\"\"`` on failure."""
+        from tools.auto.utils import detect_language, language_instruction
+        _sys = _SYSTEM_SUMMARISE
+        _instr = language_instruction(detect_language(text))
+        if _instr:
+            _sys = _SYSTEM_SUMMARISE + " " + _instr
         user_msg = f"CHAPTER TEXT:\n{text}"
         try:
-            reply = self._llm(_SYSTEM_SUMMARISE, user_msg) or ""
+            reply = self._llm(_sys, user_msg) or ""
             return reply.strip()
         except Exception as exc:
             logger.warning("SummaryMemory: LLM error during summarisation: %s", exc)

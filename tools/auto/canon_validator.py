@@ -275,8 +275,13 @@ class CanonValidator:
 
     def _extract_claims(self, chapter_text: str) -> list[str]:
         """One LLM call → list of claim lines. Fail-open: [] on any error."""
+        from tools.auto.utils import detect_language, language_instruction
+        _sys = _SYSTEM_EXTRACT_CLAIMS
+        _instr = language_instruction(detect_language(chapter_text))
+        if _instr:
+            _sys = _SYSTEM_EXTRACT_CLAIMS + " " + _instr
         try:
-            reply = self._llm(_SYSTEM_EXTRACT_CLAIMS, f"CHAPTER:\n{chapter_text}") or ""
+            reply = self._llm(_sys, f"CHAPTER:\n{chapter_text}") or ""
         except Exception as exc:  # noqa: BLE001 — fail-open by design
             logger.warning("CanonValidator: claim extraction failed: %s", exc)
             return []
