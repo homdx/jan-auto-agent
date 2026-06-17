@@ -70,7 +70,7 @@ _PROSE_EXTS = frozenset({".md", ".txt"})
 # Matches "chapter_07", "chapter_7", "Chapter_07.md", etc. — mirrors the
 # pattern context_assembler.py uses, so "earlier chapters first" means the
 # same thing throughout the creative pipeline.
-_CHAPTER_RE = re.compile(r"chapter_(\d+)", re.IGNORECASE)
+_CHAPTER_RE = re.compile(r"chapter[_\-\s]?(\d+)", re.IGNORECASE)
 
 
 class ContextBroker:

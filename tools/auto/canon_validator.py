@@ -60,7 +60,7 @@ _CHARS_PER_TOKEN = 4
 
 # Matches chapter_07 / chapter_7 / Chapter_07.md … — mirrors context_assembler
 # and context_broker so "chapter index" means the same thing everywhere.
-_CHAPTER_RE = re.compile(r"chapter_(\d+)", re.IGNORECASE)
+_CHAPTER_RE = re.compile(r"chapter[_\-\s]?(\d+)", re.IGNORECASE)
 
 # Reserve room for the model's own verdict output + instructions when sizing
 # the canon context we paste into a grounding prompt.

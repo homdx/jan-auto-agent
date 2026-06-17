@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 # Matches "chapter_07", "chapter_7", "Chapter_07.md", etc. — the number is
 # whatever digits follow "chapter_", case-insensitive.
-_CHAPTER_RE = re.compile(r"chapter_(\d+)", re.IGNORECASE)
+_CHAPTER_RE = re.compile(r"chapter[_\-\s]?(\d+)", re.IGNORECASE)
 
 # Conservative token-estimate ratio: ~4 characters per token. This slightly
 # *over*-counts tokens for typical English prose (favoring fewer chars per
