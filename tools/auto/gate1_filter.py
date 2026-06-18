@@ -281,8 +281,15 @@ class Gate1Filter:
         # ── Stage B: LLM problem-presence check ───────────────────────────────
         presence_passed: list[tuple[CandidateTask, str]] = []  # (task, reason)
 
-        if self._skip_llm:
-            presence_passed = [(c, "existence check passed (LLM skipped)") for c, _ in existence_passed]
+        if self._skip_llm or self._task_mode == "creative":
+            # AUTO-CR-8: Stage B verifies a claimed *issue* is present in
+            # existing text — an improvement-detector. For creative GENERATION
+            # the target chapter is new/empty, so "is the issue present?" is
+            # meaningless and would reject every task. Creative quality is
+            # governed downstream by the soft Gate-2 (AUTO-CR-2) and the canon
+            # gate (AUTO-CR-7), so existence is sufficient here.
+            _why = "LLM skipped" if self._skip_llm else "creative mode — existence only"
+            presence_passed = [(c, f"existence check passed ({_why})") for c, _ in existence_passed]
         else:
             for c, block in existence_passed:
                 ok, reason = self._check_presence(c, block)
@@ -366,6 +373,23 @@ class Gate1Filter:
             return False, f"cannot read {loc.file!r}: {exc}", ""
 
         file_ext = Path(loc.file).suffix or ".py"
+
+        # AUTO-CR-8: in docs/creative mode a FILE is sufficient grounding
+        # (mirrors CitedLocation.is_valid). Small models (e.g. llama3.1:8b)
+        # frequently emit a hallucinated line_start (0, 5, 15…) instead of the
+        # requested null, and the target chapter is often new/empty (0 lines),
+        # so strict line-range validation here wrongly rejects every candidate.
+        # Treat the citation as file-only and hand Stage B a head-of-file block
+        # (which may be empty for a brand-new chapter — that is expected when
+        # generating rather than improving).
+        if self._task_mode != "code":
+            lines = source.splitlines()
+            block = "\n".join(lines[: self._max_context_lines])
+            return (
+                True,
+                "file-only citation (creative/docs — line anchors ignored)",
+                _truncate(block, self._max_block_chars),
+            )
 
         # 2. Symbol anchor: must be locatable by block_extractor.
         if loc.symbol:

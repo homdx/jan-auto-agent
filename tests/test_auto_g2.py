@@ -581,9 +581,10 @@ class TestG2GitManagerReuse:
         captured_args = {}
 
         class _CapturingCommitOnSuccess:
-            def __init__(self, git_manager, state_store):
+            def __init__(self, git_manager, state_store, **kwargs):
                 captured_args["git_manager"] = git_manager
                 captured_args["state_store"] = state_store
+                captured_args.update(kwargs)
 
             def commit(self, task, result):
                 return "captured_hash"
@@ -643,3 +644,61 @@ class TestG2EdgeCases:
         assert stop_reason is None
         # run_trace.log_task_done called with None commit hash
         ctrl.run_trace.log_task_done.assert_called_once_with("T-GITERR", None)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AUTO-CR-14: controller wires SummaryMemory into CommitOnSuccess for creative
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestCR14SynopsisWiring:
+    def test_creative_wires_summary_memory(self, tmp_path):
+        """In creative mode the commit helper must receive a non-None
+        summary_memory + task_mode='creative', or synopsis.md is never written.
+        """
+        task = _make_task("T-SYN")
+        ctrl = _make_controller(tmp_path, [task])
+
+        captured = {}
+
+        class _CapturingCommitOnSuccess:
+            def __init__(self, git_manager, state_store, **kwargs):
+                captured.update(kwargs)
+
+            def commit(self, task, result):
+                return "h"
+
+        sentinel = object()
+        fake_outer = MagicMock()
+        fake_outer.run_task.return_value = _passed_result("T-SYN")
+
+        with patch("tools.auto.outer_loop.make_outer_loop", return_value=fake_outer), \
+             patch("tools.auto.commit_on_success.CommitOnSuccess", _CapturingCommitOnSuccess), \
+             patch("tools.auto.summary_memory.make_summary_memory", return_value=sentinel), \
+             patch("tools.auto.exhaustion_handler.make_exhaustion_handler"):
+            ctrl._run_task_loop(task_mode="creative")
+
+        assert captured.get("summary_memory") is sentinel
+        assert captured.get("task_mode") == "creative"
+
+    def test_code_mode_does_not_wire_summary_memory(self, tmp_path):
+        task = _make_task("T-CODE")
+        ctrl = _make_controller(tmp_path, [task])
+
+        captured = {}
+
+        class _CapturingCommitOnSuccess:
+            def __init__(self, git_manager, state_store, **kwargs):
+                captured.update(kwargs)
+
+            def commit(self, task, result):
+                return "h"
+
+        fake_outer = MagicMock()
+        fake_outer.run_task.return_value = _passed_result("T-CODE")
+
+        with patch("tools.auto.outer_loop.make_outer_loop", return_value=fake_outer), \
+             patch("tools.auto.commit_on_success.CommitOnSuccess", _CapturingCommitOnSuccess), \
+             patch("tools.auto.exhaustion_handler.make_exhaustion_handler"):
+            ctrl._run_task_loop(task_mode="code")
+
+        assert captured.get("summary_memory") is None

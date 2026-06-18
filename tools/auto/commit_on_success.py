@@ -51,6 +51,10 @@ from tools.agent_trace import tracer
 from tools.auto.git_manager import GitError, GitManager, make_git_manager
 from tools.auto.state import StateStore, STATUS_DONE
 
+# AUTO-CR-5: SummaryMemory is imported lazily inside commit() to keep the
+# import graph acyclic and to avoid a hard dependency on the LLM stack for
+# callers (tests) that don't need creative-mode synopsis updates.
+
 logger = logging.getLogger(__name__)
 
 
@@ -66,9 +70,20 @@ class CommitOnSuccess:
         The run's :class:`~tools.auto.state.StateStore` instance.
     """
 
-    def __init__(self, git_manager: GitManager, state_store: StateStore) -> None:
+    def __init__(
+        self,
+        git_manager: GitManager,
+        state_store: StateStore,
+        *,
+        summary_memory=None,
+        task_mode: str = "code",
+        base_dir=None,
+    ) -> None:
         self._git = git_manager
         self._state = state_store
+        self._summary_memory = summary_memory
+        self._task_mode = task_mode
+        self._base_dir = Path(base_dir) if base_dir is not None else None
 
     # ── Public API ───────────────────────────────────────────────────────────
 
@@ -126,6 +141,8 @@ class CommitOnSuccess:
                 "commit_on_success", "controller", "committed",
                 params={"task": task_id, "sha": sha[:12]},
             )
+            # AUTO-CR-5: after a successful creative commit, update synopsis.md.
+            self._update_synopsis(task)
         else:
             # Nothing new to commit — acceptance check already passed, so
             # the working tree is in the correct state from a prior commit.
@@ -144,6 +161,40 @@ class CommitOnSuccess:
             )
 
         return sha
+
+    # ── AUTO-CR-5: synopsis hook ─────────────────────────────────────────────
+
+    def _update_synopsis(self, task: dict) -> None:
+        """Call SummaryMemory.update() for a creative chapter task.
+
+        Only runs when:
+          - self._task_mode == "creative"
+          - self._summary_memory is set (not None)
+          - task["target_files"] contains at least one entry
+
+        Fails silently so a synopsis error never disrupts the commit outcome.
+        """
+        if self._task_mode != "creative":
+            return
+        if self._summary_memory is None:
+            return
+        target_files = task.get("target_files") or []
+        if not target_files:
+            return
+        chapter_file = target_files[0]
+        base_dir = self._base_dir
+        if base_dir is None:
+            logger.warning(
+                "CommitOnSuccess._update_synopsis: base_dir not set — "
+                "cannot update synopsis for %s.", chapter_file,
+            )
+            return
+        try:
+            self._summary_memory.update(chapter_file, base_dir=base_dir)
+        except Exception as exc:
+            logger.error(
+                "CommitOnSuccess: synopsis update failed for %s: %s — "                "commit outcome is unaffected.", chapter_file, exc,
+            )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -170,5 +221,24 @@ def make_commit_on_success(
     state_store:
         The active ``StateStore`` for this run.
     """
+    task_mode = config.get("auto", "task_mode", fallback="code")
     gm = make_git_manager(repo_dir, config)
-    return CommitOnSuccess(gm, state_store)
+
+    # AUTO-CR-5: wire SummaryMemory for creative mode so synopsis.md is
+    # updated after every accepted chapter commit.
+    summary_memory = None
+    if task_mode == "creative":
+        try:
+            from tools.auto.summary_memory import make_summary_memory
+            summary_memory = make_summary_memory(config, base_dir=repo_dir, task_mode=task_mode)
+        except Exception as exc:
+            logger.warning(
+                "make_commit_on_success: could not build SummaryMemory: %s — "                "synopsis updates will be skipped.", exc,
+            )
+
+    return CommitOnSuccess(
+        gm, state_store,
+        summary_memory=summary_memory,
+        task_mode=task_mode,
+        base_dir=repo_dir,
+    )

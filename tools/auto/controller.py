@@ -173,7 +173,14 @@ class AutoController:
         self.config = configparser.ConfigParser()
         if Path(config_path).exists():
             self.config.read(config_path, encoding="utf-8")
-        self.task_mode: str = self.config.get("auto", "task_mode", fallback="code")
+        # AUTO-CR-10: normalise task_mode (typo-tolerant) so a misspelling like
+        # 'creativy' is corrected with a loud warning instead of silently
+        # degrading to code mode.
+        from tools.auto.utils import normalize_task_mode
+        _raw_mode = self.config.get("auto", "task_mode", fallback="code")
+        self.task_mode, _mode_warn = normalize_task_mode(_raw_mode)
+        if _mode_warn:
+            logger.warning("controller: %s", _mode_warn)
         # AUTO-A4: execution working dir (executor/AUTO-C1 runs code here)
         self.workspace_dir = self.agent_dir / "workspace"
 
@@ -370,8 +377,31 @@ class AutoController:
 
         outer_loop = make_outer_loop(cfg, self.base_dir, self.state,
                                        task_mode=task_mode)
+        # AUTO-CR-14: the bare CommitOnSuccess(self.git, self.state) left
+        # summary_memory=None and task_mode="code", so the creative synopsis
+        # hook (AUTO-CR-5) NEVER fired — synopsis.md was never written, which
+        # in turn starved continuity (every chapter only saw the previous one
+        # → repetition) and disabled the canon gate (no canon to check). Wire
+        # SummaryMemory here, reusing self.git (no second git manager).
+        _summary_memory = None
+        if task_mode == "creative" and self.git is not None:
+            try:
+                from tools.auto.summary_memory import make_summary_memory
+                _summary_memory = make_summary_memory(
+                    cfg, base_dir=self.base_dir, task_mode=task_mode,
+                )
+            except Exception as exc:  # noqa: BLE001 — never block commits on setup
+                logger.warning(
+                    "controller: could not build SummaryMemory — synopsis "
+                    "updates will be skipped: %s", exc,
+                )
         commit_helper = (
-            CommitOnSuccess(self.git, self.state)
+            CommitOnSuccess(
+                self.git, self.state,
+                summary_memory=_summary_memory,
+                task_mode=task_mode,
+                base_dir=self.base_dir,
+            )
             if self.git is not None else None
         )
         exhaustion_handler = make_exhaustion_handler(self.state)

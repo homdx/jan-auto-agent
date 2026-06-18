@@ -70,6 +70,8 @@ from typing import Any, Optional
 
 from tools.block_extractor import extract_block as _block_extractor_extract_block
 # SearchAgent is imported lazily inside Coder._fetch_needed
+from tools.auto.utils import _cfg_mode
+from tools.auto.context_assembler import ContextAssembler
 
 from tools.agent_trace import tracer
 import tools.llm_stream as _llm_stream
@@ -136,11 +138,18 @@ _SYSTEM_PROMPT_DOCS = _SYSTEM_PROMPT_CODE.replace(
     "improvement. You produce clear, accurate prose — not code. ",
     1,
 )
-_SYSTEM_PROMPT_CREATIVE = _SYSTEM_PROMPT_CODE.replace(
-    "You are a senior software engineer implementing a targeted code improvement. ",
-    "You are a creative writing editor implementing a targeted revision to a piece "
-    "of creative writing. You produce polished, engaging prose — not code. ",
-    1,
+_SYSTEM_PROMPT_CREATIVE = (
+    "You are a creative writing author generating a chapter of long-form fiction. "
+    "Return ONLY the chapter prose. No JSON, no preamble, no code fences. "
+    "Write the complete chapter as plain prose text. "
+    "If you are given a single target file, write the complete chapter text for it. "
+    "If you are given multiple target files, prefix each file's content with "
+    "<<<FILE: relative/path>>> on its own line and close it with <<<END>>> on its own line. "
+    "Optional: if you need material from a prior chapter that was not provided, "
+    "you may add a final line (after all prose) in the form: "
+    "CONTEXT_REQUEST: name1, name2 — listing the chapter filenames or topic names you need. "
+    "Strip that line from the chapter content itself. "
+    "Do not include CONTEXT_REQUEST unless you genuinely need missing context."
 )
 
 _CODER_SYSTEM_PROMPTS: dict[str, str] = {
@@ -167,8 +176,7 @@ TARGET FILES TO MODIFY:
 CURRENT FILE CONTENTS:
 {file_contents}
 {feedback_section}
-Produce the corrected files now. Return ONLY the JSON object described in the \
-system prompt — nothing else.
+{closing_instruction}
 """
 
 
@@ -262,7 +270,8 @@ class Coder:
         self._task_mode = task_mode
         sec = "coder"
         self._temperature = float(config.get(sec, "temperature", fallback="0.2"))
-        self._max_tokens  = int(config.get(sec, "max_tokens",   fallback="16384"))
+        # AUTO-CR-3: prefer max_tokens_{task_mode} (e.g. max_tokens_creative) over max_tokens.
+        self._max_tokens  = int(_cfg_mode(config, sec, "max_tokens", task_mode, fallback="16384"))
         # Select system prompt by task_mode (mirrors architect / validator).
         # Priority: mode-specific ini key > legacy "system" key > built-in constant.
         _mode_key = f"system_{self._task_mode}" if self._task_mode != "code" else None
@@ -275,7 +284,11 @@ class Coder:
         self._max_file_chars = int(config.get(sec, "max_file_chars", fallback=str(_DEFAULT_MAX_FILE_CHARS)))
         active_profile = config.get("api", "active", fallback="local")
         # num_ctx controls the total context window on Ollama; 0 means "use server default".
-        self._num_ctx = config.getint(f"api_{active_profile}", "num_ctx", fallback=0)
+        # AUTO-CR-3: prefer [coder] num_ctx_{task_mode} then [api_{active}] num_ctx.
+        _num_ctx_str = _cfg_mode(config, sec, "num_ctx", task_mode, fallback=None)
+        if _num_ctx_str is None:
+            _num_ctx_str = config.get(f"api_{active_profile}", "num_ctx", fallback="0")
+        self._num_ctx = int(_num_ctx_str)
         # Context-probe: fetch missing symbols on first LLM response, then retry once.
         self._context_probe_enabled = config.getboolean(sec, "context_probe", fallback=True)
         self._max_chars_per_dep     = config.getint(sec, "max_chars_per_dep", fallback=2000)
@@ -451,13 +464,27 @@ class Coder:
             content=cleaned, params={"task_id": task_id},
         )
 
-        parsed_files, parse_error = self._parse_response(cleaned, task_id)
+        parsed_files, parse_error = self._parse_response(
+            cleaned, task_id, task.get("target_files") or []
+        )
         if parse_error:
             return CoderResult(
                 task_id=task_id, error=parse_error,
                 raw_response=cleaned, missing_context=missing_ctx,
                 context_satisfied=context_satisfied,
             )
+
+        # ── AUTO-CR-18: reject chapter duplication BEFORE writing to disk ────
+        if self._task_mode == "creative":
+            dup_error = self._creative_duplication_error(
+                parsed_files, base_dir, task.get("target_files") or []
+            )
+            if dup_error:
+                logger.warning("coder.generate [%s]: %s", task_id, dup_error)
+                return CoderResult(
+                    task_id=task_id, error=dup_error, raw_response=cleaned,
+                    missing_context=missing_ctx, context_satisfied=context_satisfied,
+                )
 
         # ── Write files to disk ───────────────────────────────────────────────
         target_files = task.get("target_files") or []
@@ -519,10 +546,33 @@ class Coder:
         target_files_listing = "\n".join(f"  - {f}" for f in target_files) or "  (none)"
 
         # ── File contents ─────────────────────────────────────────────────────
-        # Pass task so _read_file_contents can resolve cited_symbol itself.
-        file_contents = self._read_file_contents(
-            target_files, base_dir, task=task
-        )
+        # AUTO-CR-4: in creative mode, replace the generic "current file
+        # contents" fill with the budget-fitted synopsis + previous-chapter
+        # context (ContextAssembler). The target chapter is usually new/empty,
+        # so its own (nonexistent) content isn't useful — what the model
+        # needs is continuity with what came before.
+        if self._task_mode == "creative":
+            file_contents = self._build_creative_file_contents(target_files, base_dir)
+            # AUTO-CR-9/16: lock output language to the STORY text. Detect from
+            # the raw target/predecessor prose only — never from the English
+            # structural labels in file_contents, which would outvote a short
+            # Russian chapter and wrongly flip the lock to English.
+            from tools.auto.utils import resolve_creative_language, language_instruction
+            _sample = self._creative_language_sample(target_files, base_dir)
+            _lang = resolve_creative_language(
+                getattr(self, "_config", None),
+                _sample or file_contents,
+                task_mode="creative",
+            )
+            _lang_instr = language_instruction(_lang)
+            if _lang_instr:
+                file_contents = _lang_instr + "\n\n" + file_contents
+                logger.info("Coder: creative language locked to %s", _lang)
+        else:
+            # Pass task so _read_file_contents can resolve cited_symbol itself.
+            file_contents = self._read_file_contents(
+                target_files, base_dir, task=task
+            )
         # Pull-model: prepend any context the previous attempt requested.
         if prefetched_context:
             file_contents = prefetched_context.rstrip() + "\n\n" + file_contents
@@ -546,6 +596,31 @@ class Coder:
             target_files_listing  = target_files_listing,
             file_contents         = file_contents,
             feedback_section      = feedback_section,
+            closing_instruction   = (
+                # AUTO-CR-13/16: the closing line is the LAST, most concrete
+                # instruction the model sees. In creative mode it must ask for
+                # prose; if the target already has content it is an EDIT, so we
+                # tell the model to revise in place and preserve the original.
+                (
+                    "Now output the COMPLETE revised text of the file(s) above, "
+                    "applying ONLY the change the instruction requires and "
+                    "preserving everything else (plot, names, wording, and the "
+                    "ORIGINAL LANGUAGE). Do NOT copy text from another chapter, "
+                    "do NOT make two chapters identical, and do NOT change any "
+                    "chapter number or heading — each chapter stays its own "
+                    "distinct scene. For multiple files, wrap each in "
+                    "<<<FILE: path>>> … <<<END>>>. Plain prose only — no JSON, "
+                    "no commentary."
+                    if self._task_mode == "creative"
+                    and self._creative_is_edit(task.get("target_files") or [], base_dir)
+                    else
+                    "Write the complete chapter now as plain prose — no JSON, no "
+                    "preamble, no code fences, nothing but the chapter text."
+                )
+                if self._task_mode == "creative" else
+                "Produce the corrected files now. Return ONLY the JSON object "
+                "described in the system prompt — nothing else."
+            ),
         )
 
     @staticmethod
@@ -717,18 +792,207 @@ class Coder:
 
         return "\n\n".join(parts) if parts else "(no target files)"
 
+    def _creative_is_edit(self, target_files: list[str], base_dir: Path) -> bool:
+        """True when any target file already has non-empty content → this is an
+        EDIT of existing prose, not generation of a new chapter."""
+        for tf in target_files or []:
+            try:
+                if (base_dir / tf).read_text(encoding="utf-8", errors="replace").strip():
+                    return True
+            except OSError:
+                continue
+        return False
+
+    def _creative_duplication_error(
+        self, parsed_files: list[dict], base_dir: Path, target_files: list[str],
+    ) -> str:
+        """AUTO-CR-18: detect when an edit turned a chapter into a near-copy of
+        another chapter (the "make identical" failure mode). Returns an
+        actionable error string, or "" if all produced chapters stay distinct.
+        """
+        import difflib
+
+        try:
+            thresh = float(self._config.get("coder", "dup_reject_ratio", fallback="0.92"))
+        except (ValueError, TypeError):
+            thresh = 0.92
+        if thresh <= 0:
+            return ""
+
+        def _norm(s: str) -> str:
+            return " ".join((s or "").split()).lower()
+
+        # All chapters in play: existing siblings on disk, overlaid with the
+        # newly produced content for the target files.
+        chapters: dict[str, str] = {}
+        try:
+            tgt0 = Path(target_files[0]) if target_files else Path(".")
+            cdir = base_dir / tgt0.parent
+            for pat in ("chapter_*.md", "chapter_*.txt", "chapter*.md", "chapter*.txt"):
+                for p in cdir.glob(pat):
+                    try:
+                        chapters[p.name] = p.read_text(encoding="utf-8", errors="replace")
+                    except OSError:
+                        continue
+        except Exception:  # noqa: BLE001
+            pass
+
+        produced: dict[str, str] = {}
+        for f in parsed_files:
+            name = Path(f.get("path", "")).name
+            if name:
+                produced[name] = f.get("content", "")
+                chapters[name] = f.get("content", "")
+
+        for pname, pcontent in produced.items():
+            n1 = _norm(pcontent)
+            if len(n1) < 50:
+                continue
+            for oname, ocontent in chapters.items():
+                if oname == pname:
+                    continue
+                n2 = _norm(ocontent)
+                if len(n2) < 50:
+                    continue
+                ratio = difflib.SequenceMatcher(None, n1, n2).ratio()
+                if ratio >= thresh:
+                    return (
+                        f"duplication detected: '{pname}' is {int(ratio * 100)}% "
+                        f"identical to '{oname}'. Do NOT copy text between chapters "
+                        f"or make them the same. Edit ONLY the specific detail the "
+                        f"task names and keep '{pname}' a distinct scene with its "
+                        f"own events and its own chapter heading."
+                    )
+        return ""
+
+    def _creative_language_sample(self, target_files: list[str], base_dir: Path) -> str:
+        """Raw story prose for language detection: the target files' current
+        content, else the nearest preceding chapter. Excludes all English
+        scaffolding/labels so a short non-English chapter is detected correctly.
+        """
+        chunks: list[str] = []
+        for tf in target_files or []:
+            try:
+                t = (base_dir / tf).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                t = ""
+            if t.strip():
+                chunks.append(t)
+        if chunks:
+            return "\n".join(chunks)
+        try:
+            tgt = Path(target_files[0]) if target_files else None
+            cdir = base_dir / (tgt.parent if tgt else Path("."))
+            cands: list[Path] = []
+            for pat in ("chapter_*.md", "chapter_*.txt", "chapter*.md", "chapter*.txt"):
+                cands.extend(cdir.glob(pat))
+            for p in sorted(cands, reverse=True):
+                if tgt is None or p.name != tgt.name:
+                    txt = p.read_text(encoding="utf-8", errors="replace")
+                    if txt.strip():
+                        return txt
+        except Exception:  # noqa: BLE001
+            pass
+        return ""
+
+    def _build_creative_file_contents(
+        self, target_files: list[str], base_dir: Path,
+    ) -> str:
+        """Creative-mode replacement for ``_read_file_contents`` (AUTO-CR-4/16).
+
+        Assembles two things:
+          1. **Current content of every target file** (AUTO-CR-16) — so an EDIT
+             task ("fix inconsistencies") sees the text it must revise instead
+             of inventing a brand-new chapter from scratch. Previously only the
+             *previous* chapters were loaded and the target's own text never
+             was, so editing chapter 1 (no predecessor) gave the model an empty
+             context → it wrote an unrelated new chapter in the wrong language.
+          2. **Story-so-far context** (synopsis + previous chapter) for
+             continuity, via :class:`ContextAssembler`.
+
+        Never raises: any failure degrades to a placeholder.
+        """
+        if not target_files:
+            return "(no target files)"
+
+        parts: list[str] = []
+
+        # 1) Current content of ALL target files (not just the first).
+        edit_blocks: list[str] = []
+        for tf in target_files:
+            try:
+                content = (base_dir / tf).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                content = ""
+            if content.strip():
+                edit_blocks.append(f"<<<FILE: {tf}>>>\n{content.rstrip()}\n<<<END>>>")
+        if edit_blocks:
+            parts.append(
+                "FILES TO REVISE — current content (edit these in place; keep "
+                "everything the instruction does not require changing, and keep "
+                "the original language):\n" + "\n\n".join(edit_blocks)
+            )
+
+        # 2) Story-so-far continuity context (previous chapters + synopsis).
+        target_file = target_files[0]
+        try:
+            target_rel = Path(target_file)
+            chapter_dir = base_dir / target_rel.parent
+
+            all_chapter_files: list[str] = []
+            if chapter_dir.is_dir():
+                # AUTO-CR-12: match prose chapters by BOTH common extensions.
+                _seen: set[str] = set()
+                for pat in ("chapter_*.md", "chapter_*.txt",
+                            "chapter*.md", "chapter*.txt"):
+                    for p in sorted(chapter_dir.glob(pat)):
+                        rel = (
+                            p.name if target_rel.parent in (Path("."), Path(""))
+                            else str(target_rel.parent / p.name)
+                        )
+                        if rel not in target_files and rel not in _seen:
+                            _seen.add(rel)
+                            all_chapter_files.append(rel)
+
+            assembler = ContextAssembler(
+                num_ctx=self._num_ctx, max_tokens=self._max_tokens, base_dir=base_dir,
+            )
+            context = assembler.build_creative_context(target_file, all_chapter_files)
+        except Exception as exc:
+            logger.warning(
+                "coder: ContextAssembler failed for %s: %s — proceeding with no "
+                "prior-chapter context.", target_file, exc,
+            )
+            context = ""
+
+        # Only add the continuity block if it carries real prior content (skip
+        # the "first chapter" placeholder when we already have edit content).
+        if context and "no prior chapters" not in context:
+            parts.append("STORY SO FAR (for continuity):\n" + context)
+
+        if parts:
+            return "\n\n".join(parts)
+        return "(new chapter — no prior content to continue from)"
+
     def _parse_response(
-        self, text: str, task_id: str
+        self, text: str, task_id: str,
+        target_files: "list[str] | None" = None,
     ) -> tuple[list[dict], str]:
-        """Parse the LLM's JSON response into a list of ``{path, content}`` dicts.
+        """Parse the LLM response into a list of ``{path, content}`` dicts.
+
+        In ``creative`` mode delegates to :meth:`_parse_response_prose` which
+        is line-oriented and fail-open.  In ``code`` / ``docs`` modes uses the
+        existing strict JSON path (byte-for-byte unchanged behaviour).
 
         Returns
         -------
         (parsed_files, error_message)
             ``parsed_files`` is a non-empty list on success; ``error_message``
-            is a non-empty string on failure (fail-closed: never returns a
-            partially-constructed file list on parse error).
+            is a non-empty string on failure.
         """
+        if self._task_mode == "creative":
+            return self._parse_response_prose(text, task_id, target_files or [])
+
         stripped = _strip_outer_fence(text)
 
         try:
@@ -796,6 +1060,141 @@ class Coder:
             return [], msg
 
         return parsed, ""
+
+    def _parse_response_prose(
+        self,
+        text: str,
+        task_id: str,
+        target_files: list[str],
+    ) -> tuple[list[dict], str]:
+        """Fail-open prose parser for ``task_mode='creative'``.
+
+        Protocol (line-oriented, never requires JSON):
+
+        * Strip outer code fences (reuses :func:`_strip_outer_fence`).
+        * Extract and remove a trailing ``CONTEXT_REQUEST:`` line if present;
+          callers read context_request from :meth:`_extract_context_request`
+          but this method also strips it from the written content.
+        * **Single target file:** treat the entire cleaned body as that file's
+          content.
+        * **Multiple target files:** split on ``<<<FILE: relpath>>>`` /
+          ``<<<END>>>`` markers.  Text outside markers is ignored.  If no
+          markers are found but the body is non-empty and there is exactly one
+          target file, fall back to single-file behaviour.
+        * **Truncation guard:** if the body ends mid-sentence AND its length is
+          within 5 % of ``self._max_tokens * 4`` (chars), surface an actionable
+          retry message instead of silently writing a truncated chapter.
+        * Returns ``([], error)`` **only** when the body is empty/whitespace
+          after stripping — that is the single legitimate failure mode.
+
+        Returns
+        -------
+        (parsed_files, error_message)
+        """
+        # ── Strip outer fences (```markdown, ```md, ``` …) ─────────────────
+        body = _strip_outer_fence(text)
+
+        # ── AUTO-CR-13: salvage prose from a JSON wrapper ───────────────────
+        # Despite the prose-only instruction, a small instruct model sometimes
+        # wraps the chapter in JSON ({"files":[{"content": "..."}]} etc.).
+        # Without this, the entire JSON string was written into the chapter
+        # file. Extract the inner prose when that happens.
+        _salvaged = _extract_prose_from_json(body)
+        if _salvaged is not None:
+            logger.info(
+                "coder._parse_response_prose [%s]: model returned a JSON wrapper "
+                "— extracted chapter prose from it.", task_id,
+            )
+            body = _salvaged
+
+        # ── Extract trailing CONTEXT_REQUEST line ───────────────────────────
+        lines = body.splitlines()
+        cr_idx = None
+        for i in range(len(lines) - 1, max(len(lines) - 4, -1), -1):
+            if lines[i].strip().upper().startswith("CONTEXT_REQUEST:"):
+                cr_idx = i
+                break
+        if cr_idx is not None:
+            # Remove the line from the body so it is not written to disk.
+            lines = lines[:cr_idx] + lines[cr_idx + 1:]
+            body = "\n".join(lines)
+
+        body = body.strip()
+
+        # ── Empty-body failure (the only real failure mode) ─────────────────
+        if not body:
+            msg = "creative coder: LLM returned empty body — no chapter content to write"
+            logger.warning("coder._parse_response_prose [%s]: %s", task_id, msg)
+            return [], msg
+
+        # ── AUTO-CR-12: refusal / meta-response guard ───────────────────────
+        # Without this, the fail-open parser writes a model refusal ("I cannot
+        # fulfill your request…", "{}", "please provide more context") straight
+        # into the chapter file. Conservative: only trip on an empty JSON stub
+        # or a SHORT body that contains an explicit refusal marker, so genuine
+        # prose is never rejected. A trip fails the attempt → the loop retries.
+        if _looks_like_refusal(body):
+            msg = ("creative coder: response looks like a refusal / meta-reply, "
+                   "not chapter prose — retrying")
+            logger.warning("coder._parse_response_prose [%s]: %s", task_id, msg)
+            return [], msg
+
+        # ── Truncation guard ────────────────────────────────────────────────
+        # Estimate the token budget in chars (conservative: 4 chars ≈ 1 token).
+        char_budget = self._max_tokens * 4
+        last_char = body[-1] if body else ""
+        ends_mid_sentence = last_char not in {".", "!", "?", '"', "'", "\n", "…"}
+        if ends_mid_sentence and len(body) >= char_budget * 0.95:
+            msg = (
+                "creative coder: response hit the token budget mid-sentence — "
+                "raise [coder] max_tokens or shorten the chapter target. "
+                f"(body length {len(body)} chars ≈ budget {char_budget} chars)"
+            )
+            logger.warning("coder._parse_response_prose [%s]: %s", task_id, msg)
+            return [], msg
+
+        # ── Multi-file marker split ─────────────────────────────────────────
+        _FILE_OPEN  = re.compile(r"^<<<FILE:\s*(.+?)\s*>>>$", re.MULTILINE)
+        _FILE_CLOSE = re.compile(r"^<<<END>>>$", re.MULTILINE)
+
+        open_matches = list(_FILE_OPEN.finditer(body))
+        if open_matches and len(target_files) > 1:
+            parsed: list[dict] = []
+            for i, m_open in enumerate(open_matches):
+                relpath = m_open.group(1).strip()
+                content_start = m_open.end()
+                # Find the matching <<<END>>> after this <<<FILE:>>> marker.
+                close_match = _FILE_CLOSE.search(body, content_start)
+                if close_match:
+                    content_end = close_match.start()
+                else:
+                    # No closing marker: take everything up to the next <<<FILE:>>>.
+                    next_open = open_matches[i + 1] if i + 1 < len(open_matches) else None
+                    content_end = next_open.start() if next_open else len(body)
+                chunk = body[content_start:content_end].strip()
+                if chunk:
+                    parsed.append({"path": relpath, "content": chunk + "\n"})
+                else:
+                    logger.debug(
+                        "coder._parse_response_prose [%s]: marker %r had empty body — skipped",
+                        task_id, relpath,
+                    )
+            if parsed:
+                return parsed, ""
+            # Markers present but all bodies empty — fall through to single-file.
+            logger.warning(
+                "coder._parse_response_prose [%s]: FILE markers produced no content "
+                "— falling back to single-file mode", task_id,
+            )
+
+        # ── Single-file (default) ────────────────────────────────────────────
+        if target_files:
+            relpath = target_files[0]
+        else:
+            # No target declared — synthesise a sensible default name.
+            relpath = "chapter.md"
+
+        return [{"path": relpath, "content": body + "\n"}], ""
 
     # ── Content safety ────────────────────────────────────────────────────────
 
@@ -1298,6 +1697,88 @@ def select_relevant_chunks(
 # ─────────────────────────────────────────────────────────────────────────────
 # Helpers
 # ─────────────────────────────────────────────────────────────────────────────
+
+_REFUSAL_MARKERS: tuple[str, ...] = (
+    "i cannot fulfill", "i can't fulfill", "i cannot assist", "i can't assist",
+    "i cannot help", "i'm unable to", "i am unable to", "i cannot generate",
+    "i don't see any", "i do not see any", "please provide more context",
+    "provide more context", "clarify what", "as an ai", "i need more context",
+    "there's a misunderstanding", "there is a misunderstanding",
+    "seem to be related to a programming task",
+)
+
+
+def _extract_prose_from_json(body: str) -> "str | None":
+    """If *body* is a JSON wrapper the model emitted instead of raw prose,
+    extract the chapter text from it. Returns the prose string, or ``None``
+    when *body* is not such a wrapper (so the caller treats it as plain prose).
+
+    Handles the shapes small models actually produce:
+      {"files":[{"content": "..."}]}
+      {"tasks":[{"files":[{"content": "..."}]}]}
+      {"content": "..."}  /  {"target_files":[{"content": "..."}]}
+    The ``content``/``text`` key inside a file object may be named ``content``
+    or ``text``; the file path key is ignored.
+    """
+    s = body.strip()
+    if not (s.startswith("{") or s.startswith("[")):
+        return None
+    try:
+        data = json.loads(s)
+    except json.JSONDecodeError:
+        return None
+
+    def _content_of(obj) -> "str | None":
+        if isinstance(obj, dict):
+            for k in ("content", "text", "body", "prose"):
+                v = obj.get(k)
+                if isinstance(v, str) and v.strip():
+                    return v
+        return None
+
+    def _files_of(obj):
+        if isinstance(obj, dict):
+            for k in ("files", "target_files"):
+                v = obj.get(k)
+                if isinstance(v, list):
+                    return v
+        return None
+
+    # Top-level content
+    top = _content_of(data) if isinstance(data, dict) else None
+    if top:
+        return top
+
+    # files[] at top level, or nested under tasks[]
+    candidate_files = _files_of(data) if isinstance(data, dict) else None
+    if candidate_files is None and isinstance(data, dict):
+        tasks = data.get("tasks")
+        if isinstance(tasks, list) and tasks and isinstance(tasks[0], dict):
+            candidate_files = _files_of(tasks[0])
+    if isinstance(candidate_files, list):
+        chunks = [c for c in (_content_of(f) for f in candidate_files) if c]
+        if chunks:
+            return "\n\n".join(chunks)
+    return None
+
+
+def _looks_like_refusal(body: str) -> bool:
+    """Heuristic: True when *body* is a refusal / meta-reply, not chapter prose.
+
+    Deliberately conservative to avoid rejecting real fiction:
+      * an empty JSON stub (``{}`` / ``[]``) is always a refusal/no-op;
+      * otherwise the body must be SHORT (< 600 chars) AND contain an explicit
+        refusal marker. Long prose is never tripped even if it quotes such a
+        phrase in dialogue.
+    """
+    stripped = body.strip()
+    if stripped in ("{}", "[]"):
+        return True
+    if len(stripped) >= 600:
+        return False
+    low = stripped.lower()
+    return any(marker in low for marker in _REFUSAL_MARKERS)
+
 
 def _strip_outer_fence(text: str) -> str:
     """Remove an outer ``` or ```json fence wrapping the entire JSON response.

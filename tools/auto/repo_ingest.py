@@ -45,6 +45,7 @@ max_file_kb     — override [search] max_file_kb for architect walk
 from __future__ import annotations
 
 import configparser
+from tools.auto.utils import _cfg_mode
 import fnmatch
 import logging
 import os
@@ -195,14 +196,17 @@ class RepoIngestor:
         self,
         base_dir: str | Path,
         config: configparser.ConfigParser | None = None,
+        task_mode: str = "code",
     ) -> None:
-        self.base_dir = Path(base_dir).resolve()
-        self._config  = config or configparser.ConfigParser()
+        self.base_dir  = Path(base_dir).resolve()
+        self._config   = config or configparser.ConfigParser()
+        self._task_mode = task_mode
 
         # Walk limits — prefer [architect] overrides, fall back to [search].
+        # AUTO-CR-3: max_file_kb_creative overrides max_file_kb in creative mode.
         self._skip_dirs  = self._read_skip_dirs()
         self._max_depth  = self._read_int("max_depth",  2)
-        self._max_file_kb = self._read_int("max_file_kb", 500)
+        self._max_file_kb = self._read_int_mode("max_file_kb", 500)
 
         # Cluster definitions — config-driven or built-in default.
         self._cluster_defs: list[tuple[str, list[str]]] = self._read_cluster_defs()
@@ -250,6 +254,12 @@ class RepoIngestor:
                 if ext in _BINARY_EXTENSIONS or ext in _BACKUP_EXTENSIONS:
                     continue
                 if fname.endswith("~"):        # emacs/vim backup
+                    continue
+                # AUTO-CR-15: never ingest agent-generated meta files. synopsis.md
+                # is the running memory (not story content) and IMPROVEMENTS.md is
+                # the plan dump — ingesting them lets the architect cite/target
+                # them as if they were chapters.
+                if fname.lower() in ("synopsis.md", "improvements.md"):
                     continue
 
                 abs_path = Path(dirpath) / fname
@@ -344,6 +354,22 @@ class RepoIngestor:
             self._config.get("architect", key, fallback=None)
             or self._config.get("search",   key, fallback=None)
         )
+        try:
+            return int(val) if val is not None else default
+        except (ValueError, TypeError):
+            return default
+
+    def _read_int_mode(self, key: str, default: int) -> int:
+        """Read a mode-suffixed int config key (AUTO-CR-3).
+
+        Prefers [architect] then [search], with the mode-specific variant
+        (e.g. ``max_file_kb_creative``) taking priority over the base key
+        (``max_file_kb``) within each section — mirrors ``_read_int`` but
+        routes lookups through ``_cfg_mode`` so creative-mode overrides win.
+        """
+        val = _cfg_mode(self._config, "architect", key, self._task_mode, fallback=None)
+        if val is None:
+            val = _cfg_mode(self._config, "search", key, self._task_mode, fallback=None)
         try:
             return int(val) if val is not None else default
         except (ValueError, TypeError):

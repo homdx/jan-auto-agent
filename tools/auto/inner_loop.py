@@ -115,12 +115,18 @@ _GATE2_SYSTEM_DOCS = (
 )
 
 _GATE2_SYSTEM_CREATIVE = (
-    "You are a creative writing editor validating a revision. "
-    "Given a task description and the revised text, decide whether "
-    "the creative improvement is complete and faithful to the task. "
-    "Return ONLY a JSON object:\n"
-    '{"approved": true|false, "feedback": "<one sentence>", '
-    '"hints": ["<specific hint>"], "suggested_approach": "<optional>"}'
+    "You are a creative writing editor validating a chapter. "
+    "Given a task description and the generated chapter prose, decide whether "
+    "the chapter fulfils the task and reads as coherent, complete prose. "
+    "Reply with ONE line only. "
+    "The first token must be APPROVED or REVISE. "
+    "If REVISE, follow immediately with ': ' and one concrete reason that "
+    "points at a specific passage, character, or continuity issue. "
+    "Examples of valid replies:\n"
+    "  APPROVED\n"
+    "  REVISE: the duel in paragraph 3 contradicts the earlier truce in chapter_02\n"
+    "  REVISE: Elena's eye colour changes from blue to green mid-scene\n"
+    "Do NOT return JSON. Do NOT add preamble. One line, first token APPROVED or REVISE."
 )
 
 # Backward-compatibility alias
@@ -356,6 +362,20 @@ class LLMGate2Validator:
                     "validator model returned an empty response "
                     "(possible network error or silent refusal)"
                 )
+
+            # ── Creative mode: line-oriented soft verdict (AUTO-CR-2) ─────────
+            if self.task_mode == "creative":
+                approved, reason, unparseable = _parse_verdict_soft(raw)
+                if unparseable:
+                    logger.warning(
+                        "LLMGate2Validator [creative]: verdict unparseable — "
+                        "passing on fail-open. raw=%r", raw[:120]
+                    )
+                if approved:
+                    return True, ""
+                return False, f"Reason: {reason}"
+
+            # ── Code / docs mode: strict JSON path (unchanged) ───────────────
             if "```json" in raw:
                 raw = raw.split("```json")[1].split("```")[0].strip()
             elif "```" in raw:
@@ -387,6 +407,53 @@ class LLMGate2Validator:
             logger.warning("LLMGate2Validator error: %s", exc)
             self.last_missing_context = []
             return False, f"validator unavailable: {exc}"
+
+
+def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
+    """Parse a line-oriented Gate-2 verdict for creative mode (AUTO-CR-2).
+
+    Protocol: the model is expected to reply with one line whose first token is
+    ``APPROVED`` (or ``OK``) or ``REVISE`` / ``REJECT`` / ``NO``.  If ``REVISE``,
+    the reason follows after ``: ``.
+
+    Returns
+    -------
+    (approved, reason, unparseable)
+        ``approved``    — True when the verdict is positive.
+        ``reason``      — Non-empty string on rejection; note string on fail-open.
+        ``unparseable`` — True when no recognised verdict token was found.
+                          The caller should log a warning; the verdict is treated
+                          as approved (fail-open) so a rambling 8B response cannot
+                          hard-block a chapter.
+
+    Acceptance criteria (spec AUTO-CR-2):
+        * ``APPROVED`` / ``approved`` / ``OK …``         → approved=True
+        * ``REVISE: <reason>``                           → approved=False, reason captured
+        * ``REJECT: <reason>`` / ``NO: <reason>``        → approved=False, reason captured
+        * Any other content (rambling, JSON, prose, …)  → approved=True (fail-open)
+    """
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        upper = stripped.upper()
+
+        if upper.startswith("APPROVED") or upper.startswith("OK"):
+            return True, "", False
+
+        for token in ("REVISE", "REJECT", "NO"):
+            if upper.startswith(token):
+                # Extract reason after the token + optional ': '
+                rest = stripped[len(token):].lstrip(": ").strip()
+                reason = rest if rest else "validator rejected (no reason given)"
+                return False, reason, False
+
+        # First non-empty line matched no verdict token → fail-open
+        break
+
+    # Empty response or no matching line
+    note = "verdict unparseable — passed on fail-open"
+    return True, note, True
 
 
 def _format_gate2_feedback(parsed: dict, max_hints: int) -> str:
@@ -428,12 +495,17 @@ class InnerLoop:
         validator,
         max_attempts: int = _DEFAULT_MAX_ATTEMPTS,
         context_broker=None,
+        canon_validator=None,
+        task_mode: str = "code",
     ):
         self.coder        = coder
         self.executor     = executor
         self.validator    = validator
         self.max_attempts = max(1, int(max_attempts))
         self._broker      = context_broker or ContextBroker()
+        # AUTO-CR-7: optional periodic canon/fact gate (creative mode only).
+        self.canon_validator = canon_validator
+        self.task_mode    = str(task_mode)
 
     # ------------------------------------------------------------------
 
@@ -458,6 +530,7 @@ class InnerLoop:
         prefetched_context: str = ""
         resolved_context: dict[str, str] = {}   # accumulates every symbol the validator has asked for
         _any_missing: bool = False   # Task 4: True if any attempt had unsatisfied context
+        _canon_revisions: int = 0     # AUTO-CR-7: canon-driven rejections used so far
         base_dir_path = Path(base_dir)
         target_files  = task.get("target_files", []) or []
         self._broker.reset_cache()  # clear per-task cache; Pass-2 hits re-accumulate fresh
@@ -574,6 +647,51 @@ class InnerLoop:
                 continue
 
             # ── APPROVED ──────────────────────────────────────────────────────
+            # AUTO-CR-7: before committing a creative chapter, run the periodic
+            # canon/fact gate. A real contradiction with earlier chapters turns
+            # this approval back into a rejection-with-feedback — but only up to
+            # ``max_canon_revisions`` times, after which we accept-with-warning
+            # so the gate can never ping-pong the loop.
+            if (
+                self.task_mode == "creative"
+                and self.canon_validator is not None
+                and target_files
+            ):
+                chapter_file = target_files[0]
+                cap = getattr(self.canon_validator, "max_canon_revisions", 1)
+                if (
+                    _canon_revisions < cap
+                    and self.canon_validator.should_check(chapter_file)
+                ):
+                    try:
+                        chapter_text = (base_dir_path / chapter_file).read_text(
+                            encoding="utf-8", errors="replace"
+                        )
+                        canon_res = self.canon_validator.check(
+                            chapter_text, chapter_file, base_dir=base_dir_path
+                        )
+                    except Exception as exc:  # noqa: BLE001 — fail-open
+                        logger.warning("InnerLoop: canon check raised — %s; approving.", exc)
+                        canon_res = None
+
+                    if canon_res is not None and canon_res.has_conflict:
+                        _canon_revisions += 1
+                        cfb = canon_res.feedback()
+                        logger.info(
+                            "InnerLoop: attempt %d canon REJECT (%d/%d) — %s",
+                            attempt, _canon_revisions, cap,
+                            cfb.replace("\n", " ")[:120],
+                        )
+                        feedback.append(f"attempt {attempt}: canon rejected\n{cfb}")
+                        records.append(AttemptRecord(attempt, True, True, False, cfb))
+                        continue
+                elif _canon_revisions >= cap and self.canon_validator.should_check(chapter_file):
+                    logger.warning(
+                        "InnerLoop: canon revision cap (%d) reached for %s — "
+                        "accepting chapter with possible unresolved canon issues.",
+                        cap, chapter_file,
+                    )
+
             logger.info("InnerLoop: attempt %d APPROVED", attempt)
             records.append(AttemptRecord(attempt, True, True, True, ""))
             return InnerLoopResult(
@@ -620,8 +738,13 @@ def make_inner_loop(
     system prompts).  Defaults to ``"code"`` — no behavioural change for
     existing call sites.
     """
-    max_attempts = config.getint("auto", "max_attempts_per_task",
-                                 fallback=_DEFAULT_MAX_ATTEMPTS)
+    # AUTO-CR-16: creative editing/review benefits from more coder→review→
+    # revise cycles than code. Prefer a creative-specific cap when set.
+    from tools.auto.utils import _cfg_mode
+    max_attempts = int(_cfg_mode(
+        config, "auto", "max_attempts_per_task", task_mode,
+        fallback=str(_DEFAULT_MAX_ATTEMPTS),
+    ))
 
     # ── API settings ─────────────────────────────────────────────────────────
     active_profile = config.get("api", "active", fallback="local")
@@ -688,8 +811,21 @@ def make_inner_loop(
         max_symbols=config.getint("context_broker", "max_symbols", fallback=20),
     )
 
+    # ── AUTO-CR-7: periodic canon/fact gate (creative mode only) ──────────────
+    canon_validator = None
+    if task_mode == "creative":
+        try:
+            from tools.auto.canon_validator import make_canon_validator
+            canon_validator = make_canon_validator(
+                config, base_dir, task_mode=task_mode, broker=broker,
+            )
+        except Exception as exc:  # noqa: BLE001 — never block the loop on setup
+            logger.warning("make_inner_loop: canon validator unavailable — %s", exc)
+            canon_validator = None
+
     return InnerLoop(coder, executor, validator, max_attempts=max_attempts,
-                     context_broker=broker)
+                     context_broker=broker, canon_validator=canon_validator,
+                     task_mode=task_mode)
 
 
 # ── Stubs for environments without real agents (unit tests) ──────────────────

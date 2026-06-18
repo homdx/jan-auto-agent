@@ -110,9 +110,17 @@ class TestPromptConstants:
         assert "code" in _GATE2_SYSTEM_CODE.lower()
 
     def test_all_prompts_require_json_output(self) -> None:
+        # code and docs modes still use JSON verdict contracts.
+        # creative mode intentionally uses a line-oriented soft verdict (AUTO-CR-2).
         for name, prompt in _GATE2_SYSTEMS.items():
-            assert "approved" in prompt, f"{name} prompt missing 'approved'"
-            assert "feedback" in prompt, f"{name} prompt missing 'feedback'"
+            if name == "creative":
+                # Soft verdict: APPROVED/REVISE, no JSON contract required.
+                assert "APPROVED" in prompt, f"{name} prompt missing 'APPROVED'"
+                assert "REVISE" in prompt, f"{name} prompt missing 'REVISE'"
+                assert '"approved"' not in prompt, f"{name} prompt must NOT have JSON 'approved' key"
+            else:
+                assert "approved" in prompt, f"{name} prompt missing 'approved'"
+                assert "feedback" in prompt, f"{name} prompt missing 'feedback'"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
