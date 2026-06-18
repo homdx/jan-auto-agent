@@ -1197,7 +1197,12 @@ class Coder:
         _FILE_CLOSE = re.compile(r"^<<<END>>>$", re.MULTILINE)
 
         open_matches = list(_FILE_OPEN.finditer(body))
-        if open_matches and len(target_files) > 1:
+        # FIX: previously `len(target_files) > 1` caused the marker-stripping
+        # path to be skipped for single-target tasks, so <<<FILE:>>> / <<<END>>>
+        # delimiters were written verbatim into the chapter file.  Now we run
+        # the same extraction whenever markers are present, regardless of how
+        # many target files the task declares.
+        if open_matches:
             parsed: list[dict] = []
             for i, m_open in enumerate(open_matches):
                 relpath = m_open.group(1).strip()
