@@ -139,6 +139,40 @@ _GATE2_SYSTEMS: dict[str, str] = {
 }
 
 
+def _resolve_validator_system(config, task_mode: str) -> str:
+    """Resolve the Gate-2 validator system prompt for *task_mode*.
+
+    Priority:
+      1. Mode-specific override ``[validator_agent] system_{task_mode}``
+         (e.g. ``system_creative``, ``system_docs``) — wins whenever it is
+         explicitly set, for any mode.
+      2. The legacy bare ``[validator_agent] system`` key — but **only when
+         ``task_mode == "code"``**.
+      3. The built-in constant for *task_mode* (``_GATE2_SYSTEMS``), falling
+         back to ``_GATE2_SYSTEM_CODE`` for an unrecognised mode.
+
+    AUTO-CR-19-1: previously the bare ``system`` key was consulted as the
+    fallback for *every* mode. ``agents.ini`` / ``agents_32k.ini`` ship a
+    code-specific legacy ``system`` prompt ("You are a code completeness
+    validator…"), so a creative or docs run with no matching ``system_creative``
+    / ``system_docs`` override silently inherited that code prompt — the
+    model was asked to judge prose against code-completeness criteria
+    ("is the function body complete", "reply in JSON"), which the soft
+    parser then either fail-opened to APPROVED or treated as noisy feedback.
+    The bare key now only applies in code mode; every other mode falls
+    through to its built-in (or an explicit mode-specific override).
+    """
+    builtin = _GATE2_SYSTEMS.get(task_mode, _GATE2_SYSTEM_CODE)
+    if config is None:
+        return builtin
+    mode_key = f"system_{task_mode}" if task_mode != "code" else None
+    if mode_key and config.has_option("validator_agent", mode_key):
+        return config.get("validator_agent", mode_key).strip()
+    if task_mode == "code":
+        return config.get("validator_agent", "system", fallback=builtin).strip()
+    return builtin
+
+
 class LLMGate2Validator:
     """Fail-closed LLM-based Gate-2 validator.
 
@@ -175,20 +209,10 @@ class LLMGate2Validator:
         self.num_ctx     = int(num_ctx)
         self.max_tokens  = int(max_tokens)
         self.task_mode   = str(task_mode)
-        # AUTO-DM-5: select system prompt — agents.ini override wins over built-in.
-        # Priority (mirrors Coder/Architect): mode-specific key (system_docs /
-        # system_creative) > legacy "system" key > built-in constant.
-        # This allows independent per-mode validator prompt overrides without
-        # clobbering the other modes, which a single "system" key cannot do.
-        _builtin = _GATE2_SYSTEMS.get(self.task_mode, _GATE2_SYSTEM_CODE)
-        if config is not None:
-            _mode_key = f"system_{self.task_mode}" if self.task_mode != "code" else None
-            if _mode_key and config.has_option("validator_agent", _mode_key):
-                self._system = config.get("validator_agent", _mode_key).strip()
-            else:
-                self._system = config.get("validator_agent", "system", fallback=_builtin).strip()
-        else:
-            self._system = _builtin
+        # AUTO-DM-5 / AUTO-CR-19-1: select system prompt — mode-specific
+        # override > (code-mode-only) legacy "system" key > built-in.
+        # See _resolve_validator_system for the full priority rationale.
+        self._system = _resolve_validator_system(config, self.task_mode)
 
         # Task 3 — smart context additions
         from tools.search_agent import make_search_agent
