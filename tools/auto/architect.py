@@ -770,6 +770,20 @@ class ClusterReviewer:
                     )
                     continue
 
+            # AUTO-CR-17: prose has no meaningful objective shell test. A small
+            # model often invents nonsensical checks (e.g. "diff chapter_1.txt
+            # chapter_2.txt"), which run for real in the executor and FAIL on
+            # every attempt (distinct chapters never compare equal), burning the
+            # whole task. In creative mode force acceptance to the "true" no-op;
+            # quality is judged by Gate-2 and the canon gate, not a shell test.
+            if self._task_mode == "creative" and acceptance.strip().lower() != "true":
+                logger.info(
+                    "_parse_candidates [%s]: item %d — overriding creative "
+                    "acceptance_check %r with 'true' (no shell test for prose).",
+                    cluster_name, i, acceptance,
+                )
+                acceptance = "true"
+
             candidates.append(CandidateTask(
                 title            = title,
                 instruction      = instruction,
