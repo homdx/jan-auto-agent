@@ -88,7 +88,8 @@ _SYSTEM_SUMMARISE = (
     "You are a story archivist. "
     "List the durable facts of this chapter as short bullet lines: "
     "events, who/where, state changes, promises and setups. "
-    "No prose, no commentary, no preamble — bullet lines only."
+    "No prose, no commentary, no preamble, no parentheses, no self-evaluation "
+    "— each line is one plain fact only."
 )
 
 _SYSTEM_FIDELITY = (
@@ -99,8 +100,8 @@ _SYSTEM_FIDELITY = (
     "Otherwise, output the CORRECTED summary as a clean bullet list — one fact "
     "per line starting with '• ' — fixing or removing any inaccurate bullet and "
     "adding any missing key fact. Output ONLY the corrected bullet list: no "
-    "commentary, no explanations, no 'FIX:' prefixes, no parentheticals, no "
-    "preamble. Keep it concise."
+    "commentary, no explanations, no 'FIX:' prefixes, no parentheses, no "
+    "self-evaluation about the bullets, no preamble. Keep it concise."
 )
 
 # ── LlmCall type alias ────────────────────────────────────────────────────────
@@ -142,14 +143,38 @@ def _chunk_paragraphs(text: str, max_chars: int) -> list[str]:
     return chunks or [text]
 
 
+_META_PAREN_MARKERS = (
+    "bullet", "remove", "correct", "original", "accurate", "partially",
+    "should", "relevant", "mention", "grammat", "implies", "does not",
+    "doesn't", "not explicitly", "пункт", "удалить", "ориги", "ошибоч",
+    "следует", "граммат", "подразум", "уточня", "добавляет",
+)
+
+
+def _strip_meta_parentheticals(fact: str) -> str:
+    """Remove trailing/embedded ``(...)`` segments that are self-evaluation
+    commentary rather than story facts (e.g. '(this bullet should be removed
+    because...)'). Keeps parentheticals that look like genuine content.
+    """
+    import re as _re
+
+    def _repl(m: "_re.Match") -> str:
+        inner = m.group(1).lower()
+        return "" if any(k in inner for k in _META_PAREN_MARKERS) else m.group(0)
+
+    cleaned = _re.sub(r"\s*\(([^()]*)\)", _repl, fact)
+    return cleaned.strip()
+
+
 def _clean_bullet_list(reply: str) -> str:
     """Normalise a verifier reply into a clean bullet list, or "" if unusable.
 
     Only lines that actually START with a bullet/number marker (•, -, *, or
     'N.') are accepted as facts; arbitrary prose (a rambling non-compliant
     reply) yields "" so the caller keeps the previous summary (fail-open).
-    A stray 'FIX:' prefix is tolerated. Returns bullets joined with newlines,
-    each prefixed '• '.
+    A stray 'FIX:' prefix is tolerated, and AUTO-CR-16 meta-commentary
+    parentheticals are stripped. Returns bullets joined with newlines, each
+    prefixed '• '.
     """
     import re as _re
     _marker = _re.compile(r"^\s*(?:[\u2022\-\*]|\d+[.)])\s+")
@@ -159,15 +184,15 @@ def _clean_bullet_list(reply: str) -> str:
         if not line:
             continue
         if not _marker.match(line):
-            # Tolerate a bare 'FIX: ...' line (no bullet marker) too.
             if line[:4].upper() == "FIX:":
-                fact = line[4:].strip()
+                fact = _strip_meta_parentheticals(line[4:].strip())
                 if fact:
                     out.append(f"• {fact}")
             continue
         fact = _marker.sub("", line, count=1).strip()
         if fact[:4].upper() == "FIX:":
             fact = fact[4:].strip()
+        fact = _strip_meta_parentheticals(fact)
         if fact:
             out.append(f"• {fact}")
     return "\n".join(out)
@@ -365,7 +390,11 @@ class SummaryMemory:
 
         summary = self.summarize_chapter(chapter_text)
         verified = self._verifier.verify_and_fix(chapter_text, summary)
-        self._write_section(chapter_file, verified)
+        # AUTO-CR-16: final cleanup — strip any residual meta-commentary
+        # parentheticals / non-bullet noise. Keep the verified text if cleaning
+        # would empty it (fail-safe).
+        cleaned = _clean_bullet_list(verified)
+        self._write_section(chapter_file, cleaned or verified)
 
     # ── Internal compression logic ────────────────────────────────────────────
 

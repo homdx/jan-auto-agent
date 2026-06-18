@@ -738,8 +738,13 @@ def make_inner_loop(
     system prompts).  Defaults to ``"code"`` — no behavioural change for
     existing call sites.
     """
-    max_attempts = config.getint("auto", "max_attempts_per_task",
-                                 fallback=_DEFAULT_MAX_ATTEMPTS)
+    # AUTO-CR-16: creative editing/review benefits from more coder→review→
+    # revise cycles than code. Prefer a creative-specific cap when set.
+    from tools.auto.utils import _cfg_mode
+    max_attempts = int(_cfg_mode(
+        config, "auto", "max_attempts_per_task", task_mode,
+        fallback=str(_DEFAULT_MAX_ATTEMPTS),
+    ))
 
     # ── API settings ─────────────────────────────────────────────────────────
     active_profile = config.get("api", "active", fallback="local")

@@ -541,11 +541,16 @@ class Coder:
         # needs is continuity with what came before.
         if self._task_mode == "creative":
             file_contents = self._build_creative_file_contents(target_files, base_dir)
-            # AUTO-CR-9: lock the output language to the story so far so a small
-            # model does not drift (e.g. Russian source → English continuation).
+            # AUTO-CR-9/16: lock output language to the STORY text. Detect from
+            # the raw target/predecessor prose only — never from the English
+            # structural labels in file_contents, which would outvote a short
+            # Russian chapter and wrongly flip the lock to English.
             from tools.auto.utils import resolve_creative_language, language_instruction
+            _sample = self._creative_language_sample(target_files, base_dir)
             _lang = resolve_creative_language(
-                getattr(self, "_config", None), file_contents, task_mode="creative",
+                getattr(self, "_config", None),
+                _sample or file_contents,
+                task_mode="creative",
             )
             _lang_instr = language_instruction(_lang)
             if _lang_instr:
@@ -580,13 +585,23 @@ class Coder:
             file_contents         = file_contents,
             feedback_section      = feedback_section,
             closing_instruction   = (
-                # AUTO-CR-13: the closing line is the LAST, most concrete
-                # instruction the model sees. In creative mode it MUST ask for
-                # prose — the old hardcoded "Return ONLY the JSON object" line
-                # overrode the creative system prompt and made the model emit a
-                # JSON wrapper that got written verbatim into the chapter.
-                "Write the complete chapter now as plain prose — no JSON, no "
-                "preamble, no code fences, nothing but the chapter text."
+                # AUTO-CR-13/16: the closing line is the LAST, most concrete
+                # instruction the model sees. In creative mode it must ask for
+                # prose; if the target already has content it is an EDIT, so we
+                # tell the model to revise in place and preserve the original.
+                (
+                    "Now output the COMPLETE revised text of the file(s) above, "
+                    "applying ONLY the change the instruction requires and "
+                    "preserving everything else (plot, names, wording, and the "
+                    "ORIGINAL LANGUAGE). For multiple files, wrap each in "
+                    "<<<FILE: path>>> … <<<END>>>. Plain prose only — no JSON, "
+                    "no commentary."
+                    if self._task_mode == "creative"
+                    and self._creative_is_edit(task.get("target_files") or [], base_dir)
+                    else
+                    "Write the complete chapter now as plain prose — no JSON, no "
+                    "preamble, no code fences, nothing but the chapter text."
+                )
                 if self._task_mode == "creative" else
                 "Produce the corrected files now. Return ONLY the JSON object "
                 "described in the system prompt — nothing else."
@@ -762,20 +777,86 @@ class Coder:
 
         return "\n\n".join(parts) if parts else "(no target files)"
 
+    def _creative_is_edit(self, target_files: list[str], base_dir: Path) -> bool:
+        """True when any target file already has non-empty content → this is an
+        EDIT of existing prose, not generation of a new chapter."""
+        for tf in target_files or []:
+            try:
+                if (base_dir / tf).read_text(encoding="utf-8", errors="replace").strip():
+                    return True
+            except OSError:
+                continue
+        return False
+
+    def _creative_language_sample(self, target_files: list[str], base_dir: Path) -> str:
+        """Raw story prose for language detection: the target files' current
+        content, else the nearest preceding chapter. Excludes all English
+        scaffolding/labels so a short non-English chapter is detected correctly.
+        """
+        chunks: list[str] = []
+        for tf in target_files or []:
+            try:
+                t = (base_dir / tf).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                t = ""
+            if t.strip():
+                chunks.append(t)
+        if chunks:
+            return "\n".join(chunks)
+        try:
+            tgt = Path(target_files[0]) if target_files else None
+            cdir = base_dir / (tgt.parent if tgt else Path("."))
+            cands: list[Path] = []
+            for pat in ("chapter_*.md", "chapter_*.txt", "chapter*.md", "chapter*.txt"):
+                cands.extend(cdir.glob(pat))
+            for p in sorted(cands, reverse=True):
+                if tgt is None or p.name != tgt.name:
+                    txt = p.read_text(encoding="utf-8", errors="replace")
+                    if txt.strip():
+                        return txt
+        except Exception:  # noqa: BLE001
+            pass
+        return ""
+
     def _build_creative_file_contents(
         self, target_files: list[str], base_dir: Path,
     ) -> str:
-        """Creative-mode replacement for ``_read_file_contents`` (AUTO-CR-4).
+        """Creative-mode replacement for ``_read_file_contents`` (AUTO-CR-4/16).
 
-        Discovers sibling ``chapter_<N>.*`` files alongside the target chapter
-        and delegates the actual budget-fitted assembly to
-        :class:`~tools.auto.context_assembler.ContextAssembler`. Never raises:
-        any failure degrades to an explanatory placeholder so the prompt
-        always has *something* in this slot.
+        Assembles two things:
+          1. **Current content of every target file** (AUTO-CR-16) — so an EDIT
+             task ("fix inconsistencies") sees the text it must revise instead
+             of inventing a brand-new chapter from scratch. Previously only the
+             *previous* chapters were loaded and the target's own text never
+             was, so editing chapter 1 (no predecessor) gave the model an empty
+             context → it wrote an unrelated new chapter in the wrong language.
+          2. **Story-so-far context** (synopsis + previous chapter) for
+             continuity, via :class:`ContextAssembler`.
+
+        Never raises: any failure degrades to a placeholder.
         """
         if not target_files:
             return "(no target files)"
 
+        parts: list[str] = []
+
+        # 1) Current content of ALL target files (not just the first).
+        edit_blocks: list[str] = []
+        for tf in target_files:
+            try:
+                content = (base_dir / tf).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                content = ""
+            if content.strip():
+                edit_blocks.append(f"<<<FILE: {tf}>>>\n{content.rstrip()}\n<<<END>>>")
+        if edit_blocks:
+            parts.append(
+                "FILES TO REVISE — current content (edit these in place; keep "
+                "everything the instruction does not require changing, and keep "
+                "the original language):\n" + "\n\n".join(edit_blocks)
+            )
+
+        # 2) Story-so-far continuity context (previous chapters + synopsis).
         target_file = target_files[0]
         try:
             target_rel = Path(target_file)
@@ -783,10 +864,7 @@ class Coder:
 
             all_chapter_files: list[str] = []
             if chapter_dir.is_dir():
-                # AUTO-CR-12: match prose chapters by BOTH common extensions
-                # (.md and .txt). The old glob was ".md"-only, so a project of
-                # chapter_*.txt files found no predecessors → the model got no
-                # "story so far" and drifted language + had nothing to continue.
+                # AUTO-CR-12: match prose chapters by BOTH common extensions.
                 _seen: set[str] = set()
                 for pat in ("chapter_*.md", "chapter_*.txt",
                             "chapter*.md", "chapter*.txt"):
@@ -795,7 +873,7 @@ class Coder:
                             p.name if target_rel.parent in (Path("."), Path(""))
                             else str(target_rel.parent / p.name)
                         )
-                        if rel != target_file and rel not in _seen:
+                        if rel not in target_files and rel not in _seen:
                             _seen.add(rel)
                             all_chapter_files.append(rel)
 
@@ -810,7 +888,14 @@ class Coder:
             )
             context = ""
 
-        return context or "(first chapter — no prior chapters to continue from)"
+        # Only add the continuity block if it carries real prior content (skip
+        # the "first chapter" placeholder when we already have edit content).
+        if context and "no prior chapters" not in context:
+            parts.append("STORY SO FAR (for continuity):\n" + context)
+
+        if parts:
+            return "\n\n".join(parts)
+        return "(new chapter — no prior content to continue from)"
 
     def _parse_response(
         self, text: str, task_id: str,
