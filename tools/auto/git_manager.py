@@ -212,6 +212,9 @@ class GitManager:
             ["git", "diff", "--cached", "--quiet"],
             cwd=self.repo_dir,
             capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
         )
         # exit 0 → nothing staged; exit 1 → changes staged
         return result.returncode != 0
@@ -292,6 +295,8 @@ class GitManager:
             cwd=self.repo_dir,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
         )
         if result.returncode != 0:
             raise GitError(
