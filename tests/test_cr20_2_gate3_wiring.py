@@ -176,6 +176,35 @@ def test_disabled_skips_gate3(tmp_path):
     assert result.attempts_used == 1
 
 
+def test_no_target_files_skips_gate3(tmp_path):
+    """task has no target_files → Gate-3 must not fire (mirrors canon gate guard).
+
+    Regression for Bug-2: the original code fell back to _fact_text="" and
+    still called the LLM, risking a wasted call or a hallucinated REVISE on
+    empty text.  After the fix the outer `and target_files` guard short-circuits
+    the whole block, so check() is never invoked.
+    """
+    never = _never_called_validator()
+
+    coder = _WritingCoder(["Мама сидит дома."])
+    task = {
+        "id": "t1",
+        "instruction": "мама не работает",
+        # no target_files key at all
+    }
+
+    loop = InnerLoop(
+        coder, _OkExecutor(), _OkValidator(),
+        max_attempts=3,
+        fact_validator=never,
+        task_mode="creative",
+    )
+    result = loop.run_task(task, tmp_path)
+
+    never.check.assert_not_called()
+    assert result.passed is True
+
+
 def test_code_mode_unaffected(tmp_path):
     """task_mode='code' → Gate-3 must never fire, even if a fact_validator is attached."""
     never = _never_called_validator()
