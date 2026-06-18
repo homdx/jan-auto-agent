@@ -1216,6 +1216,7 @@ class Coder:
                     next_open = open_matches[i + 1] if i + 1 < len(open_matches) else None
                     content_end = next_open.start() if next_open else len(body)
                 chunk = body[content_start:content_end].strip()
+                chunk = re.sub(r"\s*<<<END>>>\s*$", "", chunk)
                 if chunk:
                     parsed.append({"path": relpath, "content": chunk + "\n"})
                 else:
