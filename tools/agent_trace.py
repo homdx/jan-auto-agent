@@ -33,7 +33,7 @@ import json
 import sys
 import threading
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone  # timezone kept for trace-file records
 from pathlib import Path
 from typing import Any, Optional
 
@@ -189,7 +189,7 @@ class AgentTracer:
         if kind == "run_start":
             return
 
-        ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        ts = datetime.now().strftime("%H:%M:%S")
         sc  = _C.get(source, "")
         tc  = _C.get(target, "")
         rst = _C["reset"]

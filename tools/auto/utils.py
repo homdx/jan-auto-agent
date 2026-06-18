@@ -2,13 +2,13 @@
 from __future__ import annotations
 
 import configparser
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any
 
 
 def _ts() -> str:
-    """Return the current UTC time as an ISO-8601 string (YYYY-MM-DDTHH:MM:SSZ)."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    """Return the current local time as an ISO-8601 string (YYYY-MM-DDTHH:MM:SS)."""
+    return datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
 
 
 def _cfg_mode(
