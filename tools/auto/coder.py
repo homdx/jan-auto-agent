@@ -407,12 +407,23 @@ class Coder:
 
         # ── Strip think blocks; check for missing-context signal ─────────────
         cleaned = strip_think(raw_text)
-        # Pull-model: capture any symbols the coder asked for (context_request).
-        missing_ctx = self._extract_context_request(cleaned)
+        # Pull-model: capture any names the coder asked for (context_request).
+        # AUTO-CR-19-2: creative output is prose, so the JSON extractor always
+        # returns []. Use the prose CONTEXT_REQUEST extractor in creative so the
+        # names reach CoderResult.missing_context and inner_loop's broker pull.
+        if self._task_mode == "creative":
+            missing_ctx = self._extract_context_request_prose(cleaned)
+        else:
+            missing_ctx = self._extract_context_request(cleaned)
 
         # ── Context probe: if the LLM reported missing_context, fetch once ───
         _missing = self._extract_missing_context(cleaned)
-        context_satisfied = not bool(_missing)
+        # Creative requests are surfaced via missing_ctx → inner_loop pulls them
+        # on the next attempt (the SearchAgent in-call probe is code/symbol
+        # oriented and does not apply to chapter files).
+        context_satisfied = not bool(_missing) and not (
+            self._task_mode == "creative" and bool(missing_ctx)
+        )
 
         if _missing and self._context_probe_enabled:
             dep_ctx = self._fetch_needed(
@@ -637,6 +648,34 @@ class Coder:
         if not isinstance(req, list):
             return []
         return [str(s).strip() for s in req if str(s).strip()]
+
+    @staticmethod
+    def _extract_context_request_prose(text: str) -> list[str]:
+        """AUTO-CR-19-2: extract the names from a trailing ``CONTEXT_REQUEST:``
+        line in a creative (non-JSON) response.
+
+        Creative output is prose, so the JSON-based ``_extract_context_request``
+        always returns ``[]`` and the pull channel was silently severed. This
+        reads the same line ``_parse_response_prose`` strips from the chapter
+        and returns the comma-separated names (e.g. ``["chapter_2", "chapter_3"]``).
+        Fail-safe: ``[]`` when no such line is present.
+        """
+        names: list[str] = []
+        for raw in text.splitlines():
+            line = raw.strip()
+            if line.upper().startswith("CONTEXT_REQUEST:"):
+                payload = line.split(":", 1)[1]
+                for part in payload.split(","):
+                    name = part.strip().strip(".\"'`")
+                    if name:
+                        names.append(name)
+        # Deduplicate, preserve order, cap (matches _extract_missing_context).
+        seen: set[str] = set()
+        out: list[str] = []
+        for n in names:
+            if n not in seen:
+                seen.add(n); out.append(n)
+        return out[:8]
 
     def _extract_missing_context(self, text: str) -> list[str]:
         """Extract the top-level ``missing_context`` list from the LLM response.
