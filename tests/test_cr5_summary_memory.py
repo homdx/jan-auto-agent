@@ -22,7 +22,7 @@ import pytest
 from tools.auto.summary_memory import (
     SummaryMemory,
     SummaryFidelityVerifier,
-    _apply_fixes,
+    _clean_bullet_list,
     _chunk_paragraphs,
 )
 
@@ -55,15 +55,17 @@ def _fv(llm_call, *, max_fidelity_rounds: int = 2) -> SummaryFidelityVerifier:
 # ── helper unit tests ─────────────────────────────────────────────────────────
 
 class TestHelpers:
-    def test_apply_fixes_appends_bullets(self):
-        summary = "- Hero arrived"
-        result = _apply_fixes(summary, ["Dragon's name is Fafnir", "Set in Norway"])
-        assert "Dragon" in result
-        assert "Norway" in result
-        assert result.startswith("- Hero arrived")
+    def test_clean_bullet_list_normalises_markers(self):
+        reply = "SUMMARY:\n- Hero arrived\n* Dragon is Smaug\n1. Set in Norway"
+        result = _clean_bullet_list(reply)
+        assert "\u2022 Hero arrived" in result
+        assert "\u2022 Dragon is Smaug" in result
+        assert "\u2022 Set in Norway" in result
+        assert "SUMMARY" not in result
 
-    def test_apply_fixes_empty_list(self):
-        assert _apply_fixes("- A", []) == "- A"
+    def test_clean_bullet_list_strips_fix_prefix_and_empty(self):
+        assert _clean_bullet_list("FIX: corrected fact") == "\u2022 corrected fact"
+        assert _clean_bullet_list("   \n  ") == ""
 
     def test_chunk_paragraphs_splits_on_blank_lines(self):
         text = "Para one.\n\nPara two.\n\nPara three."
@@ -165,35 +167,43 @@ class TestLongChapterChunkedCapped:
 # ── 3. Fidelity corrects injected omission ────────────────────────────────────
 
 class TestFidelityCorrection:
-    def test_fidelity_corrects_injected_omission(self):
-        """An injected FIX line is applied to the summary."""
+    def test_fidelity_replaces_with_corrected_list(self):
+        """The verifier replaces the summary with the corrected bullet list."""
         rounds = [0]
 
         def stub_verifier(system: str, user: str) -> str:
             rounds[0] += 1
             if rounds[0] == 1:
-                return "FIX: Dragon's name is Smaug, not Fafnir"
+                return "\u2022 The dragon Smaug burned the village\n\u2022 Smaug took the gold"
             return "OK"
 
         fv = _fv(stub_verifier, max_fidelity_rounds=3)
         chapter = "The dragon Smaug burned the village and took the gold."
-        summary = "- A dragon burned a village"
+        summary = "\u2022 A dragon burned a village"
 
         result = fv.verify_and_fix(chapter, summary)
 
-        assert "Smaug" in result, f"Expected 'Smaug' in result, got: {result!r}"
+        assert "Smaug" in result
+        # old wrong bullet must be gone (replaced, not appended)
+        assert "A dragon burned a village" not in result
+        assert "[corrected]" not in result
         assert rounds[0] == 2   # stopped after OK on round 2
 
-    def test_fidelity_multiple_fixes_all_applied(self):
-        """Multiple FIX lines in one round are all applied."""
+    def test_fidelity_multiple_corrections_replace(self):
+        """A corrected multi-bullet list replaces the old summary cleanly."""
+        calls = [0]
         def stub(system, user):
-            return "FIX: Hero's name is Frodo\nFIX: Journey is to Mordor"
+            calls[0] += 1
+            if calls[0] == 1:
+                return "\u2022 Hero is Frodo\n\u2022 Journey is to Mordor"
+            return "OK"
 
-        fv = _fv(stub, max_fidelity_rounds=1)
-        result = fv.verify_and_fix("...", "- A hobbit went somewhere")
+        fv = _fv(stub, max_fidelity_rounds=3)
+        result = fv.verify_and_fix("...", "\u2022 A hobbit went somewhere")
 
         assert "Frodo" in result
         assert "Mordor" in result
+        assert "A hobbit went somewhere" not in result
 
 
 # ── 4. Fidelity terminates at round cap ───────────────────────────────────────
@@ -205,17 +215,19 @@ class TestFidelityRoundCap:
 
         def stub_never_ok(system: str, user: str) -> str:
             rounds[0] += 1
-            return "FIX: yet another correction"
+            # Each round returns a DIFFERENT corrected list (never OK).
+            return f"\u2022 corrected fact round {rounds[0]}"
 
         cap = 2
         fv = _fv(stub_never_ok, max_fidelity_rounds=cap)
-        result = fv.verify_and_fix("chapter text", "- initial bullet")
+        result = fv.verify_and_fix("chapter text", "\u2022 initial bullet")
 
-        # Must have terminated
+        # Must have terminated at the cap.
         assert rounds[0] == cap
-        # Result must be a string (with fixes accumulated)
         assert isinstance(result, str)
-        assert "correction" in result
+        # Last corrected list wins; no accumulation / annotations.
+        assert "corrected fact round 2" in result
+        assert "[corrected]" not in result
 
 
 # ── 5. synopsis.md idempotent replace ─────────────────────────────────────────
@@ -286,7 +298,7 @@ class TestSynopsisIdempotency:
         assert f"<!-- BEGIN {ch} -->" in synopsis
         assert f"<!-- END {ch} -->" in synopsis
         assert f"## {ch}" in synopsis
-        assert "- Hero arrives" in synopsis
+        assert "Hero arrives" in synopsis  # marker normalised to \u2022 by fidelity pass
 
 
 # ── 6. Unparseable replies fail-open ──────────────────────────────────────────

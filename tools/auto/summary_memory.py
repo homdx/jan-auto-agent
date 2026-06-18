@@ -92,11 +92,15 @@ _SYSTEM_SUMMARISE = (
 )
 
 _SYSTEM_FIDELITY = (
-    "You are a careful fact-checker. "
+    "You are a careful fact-checker for a story synopsis. "
     "Compare the SUMMARY with the SOURCE text. "
-    "For each fact in the SOURCE that the SUMMARY OMITS, CONTRADICTS, or DISTORTS, "
-    "output one line beginning exactly with 'FIX: ' followed by the correction. "
-    "If the summary is fully faithful, reply with exactly: OK"
+    "If every bullet in the SUMMARY is faithful to the SOURCE and nothing "
+    "important is missing, reply with exactly: OK\n"
+    "Otherwise, output the CORRECTED summary as a clean bullet list — one fact "
+    "per line starting with '• ' — fixing or removing any inaccurate bullet and "
+    "adding any missing key fact. Output ONLY the corrected bullet list: no "
+    "commentary, no explanations, no 'FIX:' prefixes, no parentheticals, no "
+    "preamble. Keep it concise."
 )
 
 # ── LlmCall type alias ────────────────────────────────────────────────────────
@@ -138,12 +142,35 @@ def _chunk_paragraphs(text: str, max_chars: int) -> list[str]:
     return chunks or [text]
 
 
-def _apply_fixes(summary: str, fixes: list[str]) -> str:
-    """Append each *FIX* correction as a new bullet line to *summary*."""
-    if not fixes:
-        return summary
-    fix_lines = "\n".join(f"- [corrected] {f}" for f in fixes)
-    return summary.rstrip() + "\n" + fix_lines
+def _clean_bullet_list(reply: str) -> str:
+    """Normalise a verifier reply into a clean bullet list, or "" if unusable.
+
+    Only lines that actually START with a bullet/number marker (•, -, *, or
+    'N.') are accepted as facts; arbitrary prose (a rambling non-compliant
+    reply) yields "" so the caller keeps the previous summary (fail-open).
+    A stray 'FIX:' prefix is tolerated. Returns bullets joined with newlines,
+    each prefixed '• '.
+    """
+    import re as _re
+    _marker = _re.compile(r"^\s*(?:[\u2022\-\*]|\d+[.)])\s+")
+    out: list[str] = []
+    for raw in reply.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        if not _marker.match(line):
+            # Tolerate a bare 'FIX: ...' line (no bullet marker) too.
+            if line[:4].upper() == "FIX:":
+                fact = line[4:].strip()
+                if fact:
+                    out.append(f"• {fact}")
+            continue
+        fact = _marker.sub("", line, count=1).strip()
+        if fact[:4].upper() == "FIX:":
+            fact = fact[4:].strip()
+        if fact:
+            out.append(f"• {fact}")
+    return "\n".join(out)
 
 
 # ── SummaryFidelityVerifier ───────────────────────────────────────────────────
@@ -173,18 +200,25 @@ class SummaryFidelityVerifier:
     def verify_and_fix(self, chapter_text: str, summary: str) -> str:
         """Return a corrected *summary*, running at most ``max_fidelity_rounds``
         rounds.  Never raises — fail-open on any unparseable reply.
+
+        AUTO-CR-15: each round the verifier returns either ``OK`` or the FULL
+        corrected bullet list, which REPLACES the working summary. (The old
+        design appended ``[corrected] …`` annotations, which never fixed the
+        original wrong bullet, never converged — so it always burned every
+        round — and polluted synopsis.md with verbose meta-commentary.)
         """
+        from tools.auto.utils import detect_language, language_instruction
+        lang_instr = language_instruction(detect_language(chapter_text))
+        system = _SYSTEM_FIDELITY + (("\n" + lang_instr) if lang_instr else "")
+
         current = summary
         for rnd in range(1, self._max_rounds + 1):
-            user_msg = (
-                f"SOURCE:\n{chapter_text}\n\n"
-                f"SUMMARY:\n{current}"
-            )
+            user_msg = f"SOURCE:\n{chapter_text}\n\nSUMMARY:\n{current}"
             try:
-                reply = self._llm(_SYSTEM_FIDELITY, user_msg) or ""
+                reply = self._llm(system, user_msg) or ""
             except Exception as exc:
                 logger.warning(
-                    "SummaryFidelityVerifier: LLM error on round %d: %s — treating as OK.",
+                    "SummaryFidelityVerifier: LLM error on round %d: %s — keeping current.",
                     rnd, exc,
                 )
                 break
@@ -192,32 +226,34 @@ class SummaryFidelityVerifier:
             reply = reply.strip()
             if not reply:
                 logger.warning(
-                    "SummaryFidelityVerifier: empty reply on round %d — treating as OK.", rnd,
+                    "SummaryFidelityVerifier: empty reply on round %d — keeping current.", rnd,
                 )
                 break
 
             first_line = reply.splitlines()[0].strip().upper()
-            if first_line == "OK":
+            if first_line.startswith("OK") and len(reply) <= 4:
                 logger.debug("SummaryFidelityVerifier: OK on round %d.", rnd)
                 break
 
-            fixes = [
-                line[len("FIX:"):].strip()
-                for line in reply.splitlines()
-                if line.strip().upper().startswith("FIX:")
-            ]
-            if fixes:
-                logger.info(
-                    "SummaryFidelityVerifier: round %d — applying %d fix(es).", rnd, len(fixes),
-                )
-                current = _apply_fixes(current, fixes)
-            else:
-                # Reply was neither "OK" nor any "FIX:" lines — fail-open.
+            corrected = _clean_bullet_list(reply)
+            if not corrected:
+                # Reply was neither a clean OK nor a usable bullet list.
                 logger.warning(
-                    "SummaryFidelityVerifier: round %d reply unparseable — treating as OK. "
+                    "SummaryFidelityVerifier: round %d reply unusable — keeping current. "
                     "Reply preview: %.120s", rnd, reply,
                 )
                 break
+
+            if corrected.strip() == current.strip():
+                logger.debug(
+                    "SummaryFidelityVerifier: round %d produced no change — done.", rnd,
+                )
+                break
+
+            logger.info(
+                "SummaryFidelityVerifier: round %d — replaced summary with corrected list.", rnd,
+            )
+            current = corrected
 
             if rnd == self._max_rounds:
                 logger.warning(

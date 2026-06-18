@@ -255,6 +255,12 @@ class RepoIngestor:
                     continue
                 if fname.endswith("~"):        # emacs/vim backup
                     continue
+                # AUTO-CR-15: never ingest agent-generated meta files. synopsis.md
+                # is the running memory (not story content) and IMPROVEMENTS.md is
+                # the plan dump — ingesting them lets the architect cite/target
+                # them as if they were chapters.
+                if fname.lower() in ("synopsis.md", "improvements.md"):
+                    continue
 
                 abs_path = Path(dirpath) / fname
                 try:
