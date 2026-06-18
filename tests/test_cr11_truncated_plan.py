@@ -61,6 +61,7 @@ def _architect(task_mode):
     cfg = configparser.ConfigParser()
     for sec in ("architect", "auto"):
         cfg.add_section(sec)
+    cfg.set("architect", "max_tasks_creative", "10")  # don't let CR-18 cap mask salvage
     return ClusterReviewer(
         cfg, base_url="http://localhost:11434", api_key="x",
         model="llama3.1:8b", api_format="ollama", task_mode=task_mode,

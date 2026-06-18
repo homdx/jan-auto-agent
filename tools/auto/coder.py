@@ -474,6 +474,18 @@ class Coder:
                 context_satisfied=context_satisfied,
             )
 
+        # ── AUTO-CR-18: reject chapter duplication BEFORE writing to disk ────
+        if self._task_mode == "creative":
+            dup_error = self._creative_duplication_error(
+                parsed_files, base_dir, task.get("target_files") or []
+            )
+            if dup_error:
+                logger.warning("coder.generate [%s]: %s", task_id, dup_error)
+                return CoderResult(
+                    task_id=task_id, error=dup_error, raw_response=cleaned,
+                    missing_context=missing_ctx, context_satisfied=context_satisfied,
+                )
+
         # ── Write files to disk ───────────────────────────────────────────────
         target_files = task.get("target_files") or []
         allowed = frozenset(target_files) if target_files else None
@@ -593,7 +605,10 @@ class Coder:
                     "Now output the COMPLETE revised text of the file(s) above, "
                     "applying ONLY the change the instruction requires and "
                     "preserving everything else (plot, names, wording, and the "
-                    "ORIGINAL LANGUAGE). For multiple files, wrap each in "
+                    "ORIGINAL LANGUAGE). Do NOT copy text from another chapter, "
+                    "do NOT make two chapters identical, and do NOT change any "
+                    "chapter number or heading — each chapter stays its own "
+                    "distinct scene. For multiple files, wrap each in "
                     "<<<FILE: path>>> … <<<END>>>. Plain prose only — no JSON, "
                     "no commentary."
                     if self._task_mode == "creative"
@@ -787,6 +802,68 @@ class Coder:
             except OSError:
                 continue
         return False
+
+    def _creative_duplication_error(
+        self, parsed_files: list[dict], base_dir: Path, target_files: list[str],
+    ) -> str:
+        """AUTO-CR-18: detect when an edit turned a chapter into a near-copy of
+        another chapter (the "make identical" failure mode). Returns an
+        actionable error string, or "" if all produced chapters stay distinct.
+        """
+        import difflib
+
+        try:
+            thresh = float(self._config.get("coder", "dup_reject_ratio", fallback="0.92"))
+        except (ValueError, TypeError):
+            thresh = 0.92
+        if thresh <= 0:
+            return ""
+
+        def _norm(s: str) -> str:
+            return " ".join((s or "").split()).lower()
+
+        # All chapters in play: existing siblings on disk, overlaid with the
+        # newly produced content for the target files.
+        chapters: dict[str, str] = {}
+        try:
+            tgt0 = Path(target_files[0]) if target_files else Path(".")
+            cdir = base_dir / tgt0.parent
+            for pat in ("chapter_*.md", "chapter_*.txt", "chapter*.md", "chapter*.txt"):
+                for p in cdir.glob(pat):
+                    try:
+                        chapters[p.name] = p.read_text(encoding="utf-8", errors="replace")
+                    except OSError:
+                        continue
+        except Exception:  # noqa: BLE001
+            pass
+
+        produced: dict[str, str] = {}
+        for f in parsed_files:
+            name = Path(f.get("path", "")).name
+            if name:
+                produced[name] = f.get("content", "")
+                chapters[name] = f.get("content", "")
+
+        for pname, pcontent in produced.items():
+            n1 = _norm(pcontent)
+            if len(n1) < 50:
+                continue
+            for oname, ocontent in chapters.items():
+                if oname == pname:
+                    continue
+                n2 = _norm(ocontent)
+                if len(n2) < 50:
+                    continue
+                ratio = difflib.SequenceMatcher(None, n1, n2).ratio()
+                if ratio >= thresh:
+                    return (
+                        f"duplication detected: '{pname}' is {int(ratio * 100)}% "
+                        f"identical to '{oname}'. Do NOT copy text between chapters "
+                        f"or make them the same. Edit ONLY the specific detail the "
+                        f"task names and keep '{pname}' a distinct scene with its "
+                        f"own events and its own chapter heading."
+                    )
+        return ""
 
     def _creative_language_sample(self, target_files: list[str], base_dir: Path) -> str:
         """Raw story prose for language detection: the target files' current

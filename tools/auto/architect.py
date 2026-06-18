@@ -86,6 +86,10 @@ _SYSTEM_PROMPT_CREATIVE = (
     "acceptance_check is optional for creative tasks (omit it or use 'true'). "
     "Prefer ONE focused task that writes a complete chapter over many tiny "
     "fragment tasks. "
+    "When fixing inconsistencies, change ONLY the specific conflicting detail "
+    "(a name, an age, a description) — NEVER make chapters identical, NEVER "
+    "copy one chapter's text into another, and NEVER renumber chapters. Each "
+    "chapter must stay a distinct scene. "
     "Return ONLY a JSON array — no prose, no markdown fences, no preamble."
 )
 
@@ -800,6 +804,20 @@ class ClusterReviewer:
                 "_parse_candidates [%s]: %d/%d candidate(s) rejected (ungrounded/malformed)",
                 cluster_name, rejected, len(data),
             )
+
+        # AUTO-CR-18: hard-cap creative tasks. A small model ignores the
+        # "up to N" request and emits many overlapping "synchronize X" tasks
+        # (20 in one run); run sequentially over shared files they collapse
+        # every chapter into a copy of one. Keep only the first N.
+        if self._task_mode == "creative":
+            cap = self._config.getint("architect", "max_tasks_creative", fallback=1)
+            cap = max(1, cap)
+            if len(candidates) > cap:
+                logger.info(
+                    "_parse_candidates [%s]: creative cap — keeping %d of %d task(s).",
+                    cluster_name, cap, len(candidates),
+                )
+                candidates = candidates[:cap]
 
         return candidates
 
