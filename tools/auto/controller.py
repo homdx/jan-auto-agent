@@ -113,6 +113,84 @@ class RunLimits:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# AUTO-CR-19-4 — startup config lint (guards AUTO-CR-19-1 from regressing)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# (section, legacy bare key) pairs that are code-specific by convention.
+# Each has a mode-specific override form: f"{key}_{task_mode}" (e.g.
+# "system_creative"). AUTO-CR-19-1 fixed [validator_agent] system specifically
+# (see _resolve_validator_system in inner_loop.py); [coder] system and
+# [architect] system follow the same "mode-specific key > legacy key (code
+# only) > builtin" convention, so they are linted here too in case a future
+# edit reintroduces a generic override without a matching mode variant.
+_CR19_LEGACY_SYSTEM_KEYS = (
+    ("validator_agent", "system"),
+    ("coder", "system"),
+    ("architect", "system"),
+)
+
+# Below this base num_ctx, the 4k-era prompt budgets (see agents_4k.ini) are
+# known to be too tight for creative mode's larger architect/coder prompts —
+# unless an explicit num_ctx_creative override compensates.
+_CR19_SMALL_NUM_CTX_THRESHOLD = 8192
+
+
+def _lint_mode_config(config: "configparser.ConfigParser | None", task_mode: str) -> list[str]:
+    """AUTO-CR-19-4: warn at startup about config traps for non-code modes.
+
+    Specifically guards against the exact regression AUTO-CR-19-1 fixed: a
+    code-specific legacy ``system`` override (``[validator_agent]``,
+    ``[coder]``, ``[architect]``) silently winning over the builtin prompt in
+    a non-code ``task_mode`` because no matching ``system_{task_mode}``
+    override was added alongside it. Also flags an ``agents_4k.ini``-style
+    small ``num_ctx`` left in place for a ``creative`` run with no
+    ``[coder] num_ctx_creative`` override to compensate.
+
+    Pure logging — returns the list of warning strings it logged (for
+    testability) and never raises or changes behaviour. No-op for
+    ``task_mode == "code"`` since the legacy keys are exactly the ones code
+    mode is supposed to use.
+    """
+    warnings: list[str] = []
+    if config is None or task_mode == "code":
+        return warnings
+
+    mode_key = f"system_{task_mode}"
+    for section, key in _CR19_LEGACY_SYSTEM_KEYS:
+        legacy_val = config.get(section, key, fallback="").strip()
+        if not legacy_val:
+            continue
+        override_val = config.get(section, mode_key, fallback="").strip()
+        if override_val:
+            continue
+        warnings.append(
+            f"[{section}] {key} is code-specific but task_mode={task_mode}; "
+            f"set {mode_key} or rely on the builtin — the bare key is ignored "
+            f"in {task_mode} mode (AUTO-CR-19-1)."
+        )
+
+    if task_mode == "creative":
+        active_profile = config.get("api", "active", fallback="local")
+        try:
+            base_num_ctx = config.getint(f"api_{active_profile}", "num_ctx", fallback=0)
+        except ValueError:
+            base_num_ctx = 0
+        num_ctx_creative = config.get("coder", "num_ctx_creative", fallback="").strip()
+        if not num_ctx_creative and 0 < base_num_ctx < _CR19_SMALL_NUM_CTX_THRESHOLD:
+            warnings.append(
+                f"api_{active_profile} num_ctx={base_num_ctx} looks like an "
+                "agents_4k.ini-style small context window for task_mode=creative, "
+                "and no [coder] num_ctx_creative override is set; creative prompts "
+                "(architect + coder + prefetched context) tend to need more room — "
+                "consider agents_32k.ini or setting num_ctx_creative explicitly."
+            )
+
+    for w in warnings:
+        logger.warning("controller: %s", w)
+    return warnings
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # AutoController
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -181,6 +259,11 @@ class AutoController:
         self.task_mode, _mode_warn = normalize_task_mode(_raw_mode)
         if _mode_warn:
             logger.warning("controller: %s", _mode_warn)
+        # AUTO-CR-19-4: lint for the exact config trap AUTO-CR-19-1 fixed —
+        # a code-specific legacy "system" override left in place for a
+        # non-code task_mode with no matching system_{mode} override.
+        # Pure logging; never raises, never changes self.task_mode.
+        _lint_mode_config(self.config, self.task_mode)
         # AUTO-A4: execution working dir (executor/AUTO-C1 runs code here)
         self.workspace_dir = self.agent_dir / "workspace"
 
