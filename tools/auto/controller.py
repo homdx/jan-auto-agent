@@ -377,8 +377,31 @@ class AutoController:
 
         outer_loop = make_outer_loop(cfg, self.base_dir, self.state,
                                        task_mode=task_mode)
+        # AUTO-CR-14: the bare CommitOnSuccess(self.git, self.state) left
+        # summary_memory=None and task_mode="code", so the creative synopsis
+        # hook (AUTO-CR-5) NEVER fired — synopsis.md was never written, which
+        # in turn starved continuity (every chapter only saw the previous one
+        # → repetition) and disabled the canon gate (no canon to check). Wire
+        # SummaryMemory here, reusing self.git (no second git manager).
+        _summary_memory = None
+        if task_mode == "creative" and self.git is not None:
+            try:
+                from tools.auto.summary_memory import make_summary_memory
+                _summary_memory = make_summary_memory(
+                    cfg, base_dir=self.base_dir, task_mode=task_mode,
+                )
+            except Exception as exc:  # noqa: BLE001 — never block commits on setup
+                logger.warning(
+                    "controller: could not build SummaryMemory — synopsis "
+                    "updates will be skipped: %s", exc,
+                )
         commit_helper = (
-            CommitOnSuccess(self.git, self.state)
+            CommitOnSuccess(
+                self.git, self.state,
+                summary_memory=_summary_memory,
+                task_mode=task_mode,
+                base_dir=self.base_dir,
+            )
             if self.git is not None else None
         )
         exhaustion_handler = make_exhaustion_handler(self.state)
