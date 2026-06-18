@@ -520,6 +520,7 @@ class InnerLoop:
         max_attempts: int = _DEFAULT_MAX_ATTEMPTS,
         context_broker=None,
         canon_validator=None,
+        fact_validator=None,
         task_mode: str = "code",
     ):
         self.coder        = coder
@@ -529,6 +530,8 @@ class InnerLoop:
         self._broker      = context_broker or ContextBroker()
         # AUTO-CR-7: optional periodic canon/fact gate (creative mode only).
         self.canon_validator = canon_validator
+        # AUTO-CR-20: optional per-task fact-compliance gate (creative mode only).
+        self.fact_validator  = fact_validator
         self.task_mode    = str(task_mode)
 
     # ------------------------------------------------------------------
@@ -555,6 +558,7 @@ class InnerLoop:
         resolved_context: dict[str, str] = {}   # accumulates every symbol the validator has asked for
         _any_missing: bool = False   # Task 4: True if any attempt had unsatisfied context
         _canon_revisions: int = 0     # AUTO-CR-7: canon-driven rejections used so far
+        _fact_revisions:  int = 0     # AUTO-CR-20: Gate-3 fact-driven rejections used so far
         base_dir_path = Path(base_dir)
         target_files  = task.get("target_files", []) or []
         self._broker.reset_cache()  # clear per-task cache; Pass-2 hits re-accumulate fresh
@@ -716,6 +720,51 @@ class InnerLoop:
                         cap, chapter_file,
                     )
 
+            # ── AUTO-CR-20: Gate-3 per-task fact-compliance check ─────────────
+            # Runs after Gate-2 APPROVED (and after canon gate) in creative mode.
+            # Checks only: does the generated text CONTRADICT an explicit fact in
+            # the task?  Bounded by max_fact_revisions; fail-open on any error.
+            if (
+                self.task_mode == "creative"
+                and self.fact_validator is not None
+            ):
+                fact_cap = getattr(self.fact_validator, "max_fact_revisions", 1)
+                # Always run the check — the cap only gates *rejection*, not the
+                # check itself.  On a post-cap attempt the check still runs so a
+                # now-passing text is accepted cleanly instead of warned through.
+                try:
+                    # Read the chapter text from disk (same strategy as canon gate).
+                    if target_files:
+                        _fact_text = (base_dir_path / target_files[0]).read_text(
+                            encoding="utf-8", errors="replace"
+                        )
+                    else:
+                        _fact_text = ""
+                    fact_verdict = self.fact_validator.check(task, _fact_text)
+                except Exception as exc:  # noqa: BLE001 — fail-open
+                    logger.warning("InnerLoop: Gate-3 fact check raised — %s; approving.", exc)
+                    fact_verdict = None
+
+                if fact_verdict is not None and not fact_verdict.approved:
+                    if _fact_revisions < fact_cap:
+                        _fact_revisions += 1
+                        ffb = fact_verdict.feedback()
+                        logger.info(
+                            "InnerLoop: attempt %d fact-check rejected (%d/%d) — %s",
+                            attempt, _fact_revisions, fact_cap,
+                            ffb.replace("\n", " ")[:120],
+                        )
+                        full_ffb = f"fact-check rejected\n{ffb}"
+                        feedback.append(f"attempt {attempt}: {full_ffb}")
+                        records.append(AttemptRecord(attempt, True, True, False, full_ffb))
+                        continue
+                    else:
+                        logger.warning(
+                            "InnerLoop: fact revision cap (%d) reached — "
+                            "accepting chapter with possible unresolved fact contradiction.",
+                            fact_cap,
+                        )
+
             logger.info("InnerLoop: attempt %d APPROVED", attempt)
             records.append(AttemptRecord(attempt, True, True, True, ""))
             return InnerLoopResult(
@@ -847,9 +896,25 @@ def make_inner_loop(
             logger.warning("make_inner_loop: canon validator unavailable — %s", exc)
             canon_validator = None
 
+    # ── AUTO-CR-20: Gate-3 per-task fact-compliance gate (creative mode only) ─
+    fact_validator = None
+    if task_mode == "creative":
+        try:
+            from tools.auto.fact_validator import make_fact_validator
+            fact_validator = make_fact_validator(
+                config,
+                base_url=base_url,
+                api_key=api_key,
+                model=model,
+                api_format=api_format,
+            )
+        except Exception as exc:  # noqa: BLE001 — never block the loop on setup
+            logger.warning("make_inner_loop: fact validator unavailable — %s", exc)
+            fact_validator = None
+
     return InnerLoop(coder, executor, validator, max_attempts=max_attempts,
                      context_broker=broker, canon_validator=canon_validator,
-                     task_mode=task_mode)
+                     fact_validator=fact_validator, task_mode=task_mode)
 
 
 # ── Stubs for environments without real agents (unit tests) ──────────────────
