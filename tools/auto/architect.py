@@ -96,6 +96,17 @@ _SYSTEM_PROMPT_CREATIVE = (
 # Backward-compat alias — existing code that references _SYSTEM_PROMPT still works.
 _SYSTEM_PROMPT = _SYSTEM_PROMPT_CODE
 
+# ── AUTO-CR-20-3: Plan-validator prompt ───────────────────────────────────────
+# Narrow: contradictions and missing required facts only — never style/ordering.
+
+_ARCH_PLAN_SYSTEM = (
+    "You are a plan reviewer. Given a GOAL and a list of proposed TASKS, reply "
+    "ONE line. First token APPROVED or REVISE. Reply REVISE only when a task "
+    "contradicts a fact in the goal, or a required fact in the goal is "
+    "covered by no task. Name the problem. Do not REVISE for wording or "
+    "ordering. No JSON, no preamble."
+)
+
 _SYSTEM_PROMPTS: dict[str, str] = {
     "code":     _SYSTEM_PROMPT_CODE,
     "docs":     _SYSTEM_PROMPT_DOCS,
@@ -317,7 +328,62 @@ class ClusterReviewer:
             built_in = _SYSTEM_PROMPTS.get(task_mode, _SYSTEM_PROMPT_CODE)
             self._system = config.get(arch, "system", fallback=built_in).strip()
 
+        # ── AUTO-CR-20-3: LLM callable for validate_plan ─────────────────────
+        # Built lazily on first call if construction fails so __init__ never
+        # raises just because summary_memory is unavailable.
+        self._llm_call = self._build_llm_call()
+
     # ── Public API ────────────────────────────────────────────────────────────
+
+    def validate_plan(self, goal: str, candidates: list) -> tuple[bool, str]:
+        """Check the proposed task list against *goal* for contradictions / gaps.
+
+        AUTO-CR-20-3: a narrow, fail-open validator that runs **after** the
+        architect emits candidates and **before** Gate-1, in creative mode only.
+
+        Returns
+        -------
+        (ok, reason)
+            ``ok=True``  — plan is acceptable (or check failed open on error).
+            ``ok=False`` — the LLM found a contradiction or a missing required
+                           fact; *reason* names the problem for the log + re-run
+                           feedback.
+
+        Never raises — any LLM error or unparseable reply returns ``(True, "")``.
+        """
+        # Import locally to avoid a circular import (inner_loop imports architect).
+        from tools.auto.inner_loop import _parse_verdict_soft  # noqa: PLC0415
+
+        # Format candidates compactly: "title: instruction" per task.
+        task_lines: list[str] = []
+        for i, c in enumerate(candidates, 1):
+            if isinstance(c, dict):
+                title = c.get("title", "")
+                instruction = c.get("instruction", "")
+            else:
+                # CandidateTask dataclass
+                title = getattr(c, "title", "")
+                instruction = getattr(c, "instruction", "")
+            task_lines.append(f"Task {i}: {title}\n  {instruction}")
+
+        tasks_block = "\n".join(task_lines) if task_lines else "(no tasks)"
+        user_msg = f"GOAL:\n{goal}\n\nTASKS:\n{tasks_block}"
+
+        try:
+            raw = self._llm_call(_ARCH_PLAN_SYSTEM, user_msg) or ""
+        except Exception as exc:  # noqa: BLE001 — fail-open
+            logger.warning("validate_plan: LLM call failed — %s; passing plan.", exc)
+            return True, ""
+
+        approved, reason, unparseable = _parse_verdict_soft(raw)
+        if unparseable:
+            logger.warning(
+                "validate_plan: unparseable reply %r — passing plan (fail-open).",
+                raw[:120],
+            )
+        if not approved:
+            logger.info("validate_plan: REVISE — %s", reason)
+        return approved, (reason if not approved else "")
 
     def review_clusters(
         self,
@@ -456,6 +522,20 @@ class ClusterReviewer:
         return all_candidates
 
     # ── Private helpers ───────────────────────────────────────────────────────
+
+    def _build_llm_call(self):
+        """Build a ``llm_call(system, user) -> str`` callable for validate_plan.
+
+        Uses the same ``_make_llm_call`` factory as SummaryMemory / CanonValidator.
+        Falls back to a no-op that always returns ``""`` (fail-open) if the
+        import fails, so __init__ never raises.
+        """
+        try:
+            from tools.auto.summary_memory import _make_llm_call  # noqa: PLC0415
+            return _make_llm_call(self._config, task_mode=self._task_mode)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("ClusterReviewer._build_llm_call failed — validate_plan will fail-open: %s", exc)
+            return lambda system, user: ""
 
     def _review_one_cluster(
         self,
