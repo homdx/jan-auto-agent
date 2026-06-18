@@ -378,7 +378,7 @@ def _load_config(controller: "AutoController") -> configparser.ConfigParser:
     cfg = getattr(controller, "config", None)
     if cfg is not None:
         return cfg
-    cfg = configparser.ConfigParser()
+    cfg = configparser.ConfigParser(inline_comment_prefixes=(';', '#'))
     p = Path(controller.config_path)
     if p.exists():
         cfg.read(p, encoding="utf-8")

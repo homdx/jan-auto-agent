@@ -248,7 +248,7 @@ class AutoController:
         # Config is parsed exactly once here and reused everywhere via
         # self.config (run(), _run_task_loop(), _setup_git(), limits) instead of
         # re-reading agents.ini from disk on each call.
-        self.config = configparser.ConfigParser()
+        self.config = configparser.ConfigParser(inline_comment_prefixes=(';', '#'))
         if Path(config_path).exists():
             self.config.read(config_path, encoding="utf-8")
         # AUTO-CR-10: normalise task_mode (typo-tolerant) so a misspelling like
@@ -731,7 +731,7 @@ class AutoController:
         """
         cfg = getattr(self, "config", None)
         if cfg is None:
-            cfg = configparser.ConfigParser()
+            cfg = configparser.ConfigParser(inline_comment_prefixes=(';', '#'))
             if Path(self.config_path).exists():
                 cfg.read(self.config_path, encoding="utf-8")
             self.config = cfg

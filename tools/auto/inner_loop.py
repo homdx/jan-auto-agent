@@ -727,6 +727,7 @@ class InnerLoop:
             if (
                 self.task_mode == "creative"
                 and self.fact_validator is not None
+                and target_files
             ):
                 fact_cap = getattr(self.fact_validator, "max_fact_revisions", 1)
                 # Always run the check — the cap only gates *rejection*, not the
@@ -734,12 +735,9 @@ class InnerLoop:
                 # now-passing text is accepted cleanly instead of warned through.
                 try:
                     # Read the chapter text from disk (same strategy as canon gate).
-                    if target_files:
-                        _fact_text = (base_dir_path / target_files[0]).read_text(
-                            encoding="utf-8", errors="replace"
-                        )
-                    else:
-                        _fact_text = ""
+                    _fact_text = (base_dir_path / target_files[0]).read_text(
+                        encoding="utf-8", errors="replace"
+                    )
                     fact_verdict = self.fact_validator.check(task, _fact_text)
                 except Exception as exc:  # noqa: BLE001 — fail-open
                     logger.warning("InnerLoop: Gate-3 fact check raised — %s; approving.", exc)

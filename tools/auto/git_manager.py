@@ -68,7 +68,7 @@ class GitManager:
         config: Optional[configparser.ConfigParser] = None,
     ) -> None:
         self.repo_dir = Path(repo_dir).resolve()
-        self._config  = config or configparser.ConfigParser()
+        self._config  = config or configparser.ConfigParser(inline_comment_prefixes=(';', '#'))
 
     # ── Properties ──────────────────────────────────────────────────────────
 
