@@ -74,7 +74,11 @@ _BIBLE_SYSTEM = (
     "NO events, NO dialogue, NO prose, NO parentheses. "
     "Keep each fact a single plain statement. "
     "Do NOT record where characters currently are, what they are doing or wearing "
-    "in this scene, or anything that changes scene-to-scene."
+    "in this scene, or anything that changes scene-to-scene. "
+    "Record only PERMANENT attributes. Do NOT turn a momentary description into "
+    "a permanent trait (e.g. 'seemed darker in the sunset' is NOT 'dark hair'). "
+    "Preserve negations and qualifiers exactly (e.g. 'secret cargo', 'not "
+    "allowed to know', 'does not work')."
 )
 
 # AUTO-CR-24-3: compaction is now deterministic — no LLM call in this path.
@@ -182,8 +186,13 @@ class StoryBible:
         except OSError:
             return ""
 
-    def extract(self, chapter_text: str) -> list[str]:
+    def extract(self, chapter_text: str, known_facts: str = "") -> list[str]:
         """Ask the LLM to extract durable facts from *chapter_text*.
+
+        ``known_facts`` (AUTO-CR-25-1): when non-empty, the already-recorded
+        bible is prepended to the user message so the model stops re-emitting
+        known facts in paraphrased form. The deterministic substring/exact
+        dedup in ``_do_update``/``_compact`` remains as a backstop regardless.
 
         Returns a list of plain-text fact strings (without bullet markers).
         Returns ``[]`` on LLM error (fail-open).
@@ -192,7 +201,14 @@ class StoryBible:
 
         lang_instr = language_instruction(detect_language(chapter_text))
         system = _BIBLE_SYSTEM + (("\n" + lang_instr) if lang_instr else "")
-        user = f"CHAPTER:\n{chapter_text}"
+        if known_facts:
+            user = (
+                "KNOWN FACTS (already recorded — do NOT repeat these or "
+                f"restate them in other words):\n{known_facts}\n\n"
+                f"CHAPTER:\n{chapter_text}"
+            )
+        else:
+            user = f"CHAPTER:\n{chapter_text}"
         try:
             reply = self._llm(system, user) or ""
         except Exception as exc:
@@ -221,7 +237,7 @@ class StoryBible:
     # ── Internal ──────────────────────────────────────────────────────────────
 
     def _do_update(self, chapter_text: str) -> None:
-        new_facts = self.extract(chapter_text)
+        new_facts = self.extract(chapter_text, known_facts=self.load())
         if not new_facts:
             logger.debug("StoryBible.update: no new facts extracted — skipping write.")
             return
