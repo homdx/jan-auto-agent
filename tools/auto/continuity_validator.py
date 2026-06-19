@@ -64,7 +64,12 @@ _CONTINUITY_SYSTEM = (
     "jacket' or 'change Aisha from second grade to first grade'. "
     "Flag ONLY direct contradictions of an established fact (attribute, "
     "clothing, location, relationship, age). Do NOT flag new events, new "
-    "scenes, or added detail. No JSON, no preamble."
+    "scenes, or added detail. "
+    "Check gender/pronoun consistency: if KNOWN FACTS establish a character as "
+    "female (она / Ей / -ла endings) and the NEW chapter uses male forms (он / "
+    "стоял / спросил), or vice-versa, that is a contradiction — REVISE with the "
+    "concrete fix, e.g. 'change the captain from он/стоял to она/стояла'. "
+    "No JSON, no preamble."
 )
 
 

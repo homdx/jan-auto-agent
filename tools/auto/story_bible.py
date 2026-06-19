@@ -78,7 +78,9 @@ _BIBLE_SYSTEM = (
     "Record only PERMANENT attributes. Do NOT turn a momentary description into "
     "a permanent trait (e.g. 'seemed darker in the sunset' is NOT 'dark hair'). "
     "Preserve negations and qualifiers exactly (e.g. 'secret cargo', 'not "
-    "allowed to know', 'does not work')."
+    "allowed to know', 'does not work'). "
+    "Record each main character's gender when the text makes it clear (e.g. "
+    "'Капитан Рейес — женщина')."
 )
 
 # AUTO-CR-24-3: compaction is now deterministic — no LLM call in this path.
