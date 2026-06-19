@@ -1,8 +1,8 @@
-"""tools/auto/story_bible.py — AUTO-CR-23: Story Bible Store.
+"""tools/auto/story_bible.py — AUTO-CR-23 / AUTO-CR-24: Story Bible Store.
 
 Maintains a small, persisted, size-capped list of *durable, must-not-contradict
-facts* (character names, fixed attributes, current location/situation,
-relationships, promises/goals) for a long creative work.
+facts* (character names, fixed attributes, relationships, promises/goals) for a
+long creative work.
 
 Design is deliberately simple (AUTO-CR-23 spec):
 - Modelled on ``tools/auto/summary_memory.py``: same LLM-call style,
@@ -11,6 +11,14 @@ Design is deliberately simple (AUTO-CR-23 spec):
 - **No** entity graph, no NER, no tiered rolling synopsis re-summarisation.
   Those are explicitly out of scope for this CR.
 
+AUTO-CR-24-1: extracted facts are verified against the source chapter before
+being merged, using the proven ``SummaryFidelityVerifier`` pattern.  Controlled
+by ``[validator_agent] story_bible_verify`` (default: false for back-compat).
+
+AUTO-CR-24-2: the extract prompt requests ONLY immutable / slowly-changing
+facts.  Transient state (current location, what characters are doing/wearing
+right now) is explicitly excluded.
+
 Honest limits (per spec):
 - LLM fact-extraction can miss a fact.
 - Deduplication is string-normalised (lower-cased, punctuation/space-stripped),
@@ -18,7 +26,7 @@ Honest limits (per spec):
 - A fact not in the bible cannot be enforced.
 - An 8B model can still drift on details the bible does not hold.
 - The bible must therefore hold only *must-not-contradict* facts
-  (state/attributes/relationships/promises), not every story detail.
+  (attributes/relationships/promises), not every story detail.
 
 Public surface
 --------------
@@ -30,7 +38,7 @@ Public surface
         bible.update(chapter_text)
     facts = bible.load()   # → str, injected into prompt
 
-Spec reference: AUTO-CR-23-1
+Spec reference: AUTO-CR-23-1, AUTO-CR-24-1, AUTO-CR-24-2
 """
 from __future__ import annotations
 
@@ -52,12 +60,14 @@ LlmCall = Callable[[str, str], str]  # (system, user) -> response_text
 # ── Prompts ───────────────────────────────────────────────────────────────────
 
 _BIBLE_SYSTEM = (
-    "Extract ONLY durable, must-not-contradict facts from this chapter: "
-    "character names and fixed attributes (age, persistent appearance/clothing), "
-    "relationships, the current location/situation, and any promise/goal set up. "
+    "Extract ONLY immutable or slowly-changing facts from this chapter: "
+    "character names, relationships, fixed attributes (age, КМС, profession, "
+    "defining physical traits), world rules, and long-term promises/goals. "
     "One short bullet per fact. "
     "NO events, NO dialogue, NO prose, NO parentheses. "
-    "Keep each fact a single plain statement."
+    "Keep each fact a single plain statement. "
+    "Do NOT record where characters currently are, what they are doing or wearing "
+    "in this scene, or anything that changes scene-to-scene."
 )
 
 _COMPACT_SYSTEM = (
@@ -113,11 +123,20 @@ class StoryBible:
         *,
         path: str = "story_bible.md",
         max_chars: int = 2000,
+        verify: bool = False,
+        max_fidelity_rounds: int = 1,
     ) -> None:
         self._llm = llm_call
         self._base_dir = Path(base_dir)
         self._path = self._base_dir / path
         self._max_chars = max(100, int(max_chars))
+        self._verify = bool(verify)
+        self._fidelity: "SummaryFidelityVerifier | None" = None
+        if self._verify:
+            from tools.auto.summary_memory import SummaryFidelityVerifier
+            self._fidelity = SummaryFidelityVerifier(
+                llm_call, max_fidelity_rounds=max(1, int(max_fidelity_rounds))
+            )
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -167,6 +186,34 @@ class StoryBible:
 
     def _do_update(self, chapter_text: str) -> None:
         new_facts = self.extract(chapter_text)
+        if not new_facts:
+            logger.debug("StoryBible.update: no new facts extracted — skipping write.")
+            return
+
+        # AUTO-CR-24-1: verify extracted facts against the source chapter.
+        if self._fidelity is not None:
+            raw_bullet_text = "\n".join(f"• {f}" for f in new_facts)
+            try:
+                verified_text = self._fidelity.verify_and_fix(chapter_text, raw_bullet_text)
+                if verified_text and verified_text.strip():
+                    verified_facts = _parse_bullets(verified_text)
+                    if verified_facts:
+                        new_facts = verified_facts
+                    else:
+                        logger.warning(
+                            "StoryBible.update: fidelity check returned no usable bullets "
+                            "— falling back to raw extracted facts."
+                        )
+                else:
+                    logger.warning(
+                        "StoryBible.update: fidelity check returned empty — "
+                        "falling back to raw extracted facts."
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "StoryBible.update: fidelity check error (%s) — "
+                    "falling back to raw extracted facts (fail-open).", exc
+                )
         if not new_facts:
             logger.debug("StoryBible.update: no new facts extracted — skipping write.")
             return
@@ -252,6 +299,10 @@ def make_story_bible(
         return None
 
     max_chars = config.getint("validator_agent", "story_bible_max_chars", fallback=2000)
+    verify = config.getboolean("validator_agent", "story_bible_verify", fallback=False)
+    max_fidelity_rounds = config.getint(
+        "validator_agent", "story_bible_max_fidelity_rounds", fallback=1
+    )
 
     llm_call = _build_llm_call(
         base_url=base_url,
@@ -265,6 +316,8 @@ def make_story_bible(
         llm_call,
         base_dir=base_dir,
         max_chars=max_chars,
+        verify=verify,
+        max_fidelity_rounds=max_fidelity_rounds,
     )
 
 
