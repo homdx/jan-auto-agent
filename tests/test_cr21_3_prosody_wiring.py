@@ -350,7 +350,11 @@ class TestProsodyValidatorUnit:
 
     def test_non_verse_task_returns_approved(self):
         pv = ProsodyValidator()
-        task = {"goal": "рассказ о природе", "instruction": "без стихов"}
+        # AUTO-CR-22-2 widened is_verse_task to catch poem nouns; this
+        # control case must use text with no verse signal at all (the
+        # original instruction "без стихов" itself contains "стихов" and
+        # would now correctly activate the gate).
+        task = {"goal": "рассказ о природе", "instruction": "напиши прозу о лесе"}
         v = pv.check(task, _BAD_POEM)
         assert v.approved is True
 
@@ -394,7 +398,10 @@ class TestProsodyValidatorUnit:
 
     def test_instruction_checked_for_keyword(self):
         pv = ProsodyValidator()
-        task_instr_only = {"goal": "", "instruction": "добавь ритм к стихам"}
+        # AUTO-CR-22-2: rhyme/rhythm are now required independently — the
+        # instruction must mention "рифм" (not just "ритм") for the
+        # rhyme-violating _BAD_POEM to be rejected here.
+        task_instr_only = {"goal": "", "instruction": "добавь рифмы к стихам"}
         v = pv.check(task_instr_only, _BAD_POEM)
         assert v.approved is False
 

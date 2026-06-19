@@ -23,6 +23,11 @@ Public surface (CR-21-2)::
     analyze_ru(text, *, syllable_tolerance) -> ProsodyReport
     ProsodyVerdict         (dataclass)
     check_prosody(text, *, min_scheme, syllable_tolerance, require_quatrains) -> ProsodyVerdict
+
+Public surface (CR-22-2)::
+
+    verse_requirements(text) -> tuple[bool, bool]   # (require_rhyme, require_rhythm)
+    check_prosody(..., require_rhyme=True, require_rhythm=True) -> ProsodyVerdict
 """
 
 from __future__ import annotations
@@ -216,22 +221,103 @@ def detect_scheme(stanza: list[str]) -> str:
 # ── Keyword activation gate ───────────────────────────────────────────────────
 
 def is_verse_task(text: str) -> bool:
-    """Return True if *text* signals a Russian rhythm/rhyme task.
+    """Return True if *text* signals a Russian verse/poem task.
 
-    Matches the substrings ``"ритм"`` or ``"рифм"`` (case-insensitive,
-    Cyrillic) which cover ритм, ритма, рифма, рифму, рифмой, etc.
+    AUTO-CR-22-2: widened from the original bare ``ритм``/``рифм`` substring
+    check to also recognise poem nouns, so a request like
+    "напиши стихотворение про осень" (no ритм/рифм keyword at all) still
+    activates the gate. Activates on any of:
 
-    This is the **only** activation switch for the prosody gate.  When it
+    * substrings ``"ритм"`` / ``"рифм"``;
+    * poem stems: ``стихотворен``, ``четверостиш``, ``двустиш``, ``верлибр``,
+      ``сонет``, ``поэм``;
+    * the phrase ``"белый стих"``;
+    * whole-word forms of ``стих`` (стих, стихи, стиха, стиху, стихов,
+      стихам, стихах, стихе) and ``стиш`` diminutives (стишок, стишки,
+      стишка) — matched with word boundaries so it does **not** false-fire
+      on unrelated words sharing the same prefix (стихия, стихийн-,
+      стихать, утихать, стихл-, etc.).
+
+    This is the **only** activation switch for the prosody gate. When it
     returns False the gate is a no-op — non-verse creative tasks are never
     penalised.
 
     >>> is_verse_task("напиши стихи с ритмом и рифмой")
     True
+    >>> is_verse_task("напиши стихотворение про осень")
+    True
     >>> is_verse_task("исправь нестыковки")
+    False
+    >>> is_verse_task("рассказ про морскую стихию")
     False
     """
     lower = text.lower()
-    return "ритм" in lower or "рифм" in lower
+    if "ритм" in lower or "рифм" in lower:
+        return True
+    if any(stem in lower for stem in _VERSE_STEMS):
+        return True
+    if "белый стих" in lower:
+        return True
+    if _VERSE_WORD_RE.search(lower) or _VERSE_DIM_RE.search(lower):
+        return True
+    return False
+
+
+# Poem-noun stems — any substring match activates the gate.
+_VERSE_STEMS: tuple[str, ...] = (
+    "стихотворен", "четверостиш", "двустиш", "верлибр", "сонет", "поэм",
+)
+
+# Whole-word forms of стих / стиш — word-boundary anchored so the shared
+# "стих" prefix in стихия / стихийн- / стихать / утихать / стихл- never
+# matches (those words have no boundary right after the prefix or its
+# listed endings; see is_verse_task's docstring). The suffix group is
+# REQUIRED (not optional): the bare word "стих" is also the masculine past
+# tense of "стихнуть" (to die down/abate, e.g. "ветер стих к утру") — an
+# unsuffixed match would misfire on that verb, so only inflected noun forms
+# (стихи, стиха, стиху, стихов, стихам, стихах, стихе) trigger the gate.
+_VERSE_WORD_RE = re.compile(r"\bстих(и|а|у|ов|ам|ах|е)\b")
+_VERSE_DIM_RE  = re.compile(r"\bстиш(ок|ки|ка)\b")
+
+
+def verse_requirements(text: str) -> tuple[bool, bool]:
+    """Return ``(require_rhyme, require_rhythm)`` for a verse task's *text*.
+
+    AUTO-CR-22-2: lets a prompt request rhyme and rhythm **independently**,
+    so blank verse (белый стих / верлибр — regular rhythm, no rhyme) and a
+    rhyme-only request both work, instead of ``check_prosody`` always
+    demanding both.
+
+    Rules
+    -----
+    * ``no_rhyme``  — true when the text says "без рифм", "белый стих", or
+      "верлибр" (these forms explicitly disclaim rhyme).
+    * ``rhyme_kw``  — true when "рифм" appears anywhere in the text.
+    * ``rhythm_kw`` — true when "ритм" appears anywhere in the text.
+    * ``generic``   — a verse task (:func:`is_verse_task`) that mentions
+      neither keyword (e.g. plain "стихотворение") — defaults to both.
+
+    ``require_rhyme  = (rhyme_kw or generic) and not no_rhyme``
+    ``require_rhythm = rhythm_kw or generic or no_rhyme``
+
+    Examples
+    --------
+    >>> verse_requirements("стихи с ритмом, без рифмы")
+    (False, True)
+    >>> verse_requirements("напиши стихотворение")
+    (True, True)
+    >>> verse_requirements("белый стих")
+    (False, True)
+    """
+    t = text.lower()
+    no_rhyme  = ("без рифм" in t) or ("белый стих" in t) or ("верлибр" in t)
+    rhyme_kw  = "рифм" in t
+    rhythm_kw = "ритм" in t
+    generic   = is_verse_task(t) and not (rhyme_kw or rhythm_kw)
+
+    require_rhyme  = (rhyme_kw or generic) and not no_rhyme
+    require_rhythm = rhythm_kw or generic or no_rhyme
+    return require_rhyme, require_rhythm
 
 
 # ── ProsodyReport ─────────────────────────────────────────────────────────────
@@ -352,8 +438,10 @@ def check_prosody(
     min_scheme: str = "ABCB",
     syllable_tolerance: int = 2,
     require_quatrains: bool = True,
+    require_rhyme: bool = True,
+    require_rhythm: bool = True,
 ) -> ProsodyVerdict:
-    """Check *text* for rhythm and rhyme compliance.
+    """Check *text* for rhythm and/or rhyme compliance.
 
     Parameters
     ----------
@@ -368,14 +456,23 @@ def check_prosody(
         before the rhythm check fires.  Default is 2.
     require_quatrains:
         When True, any analysed stanza that is not exactly 4 lines causes
-        a REVISE verdict.
+        a REVISE verdict. Independent of ``require_rhyme``/``require_rhythm``.
+    require_rhyme:
+        AUTO-CR-22-2. When False, the rhyme-scheme rule (Rule 2) is skipped
+        entirely — lets blank verse / verlibre pass without a rhyme scheme.
+    require_rhythm:
+        AUTO-CR-22-2. When False, the syllable-regularity rule (Rule 3) is
+        skipped entirely. When True but only a single stanza is present,
+        there is nothing to compare against, so the rule is satisfied
+        (no REVISE) rather than failing open or closed arbitrarily.
 
     Returns
     -------
     ProsodyVerdict
-        ``approved=True`` when all checks pass.  ``approved=False`` with a
-        specific ``reason`` when a violation is detected.  **Never raises** --
-        any internal exception returns ``ProsodyVerdict(True, "")`` (fail-open).
+        ``approved=True`` when all enabled checks pass.  ``approved=False``
+        with a specific ``reason`` when a violation is detected.  **Never
+        raises** -- any internal exception returns
+        ``ProsodyVerdict(True, "")`` (fail-open).
     """
     try:
         return _check_prosody_inner(
@@ -383,6 +480,8 @@ def check_prosody(
             min_scheme=min_scheme,
             syllable_tolerance=syllable_tolerance,
             require_quatrains=require_quatrains,
+            require_rhyme=require_rhyme,
+            require_rhythm=require_rhythm,
         )
     except Exception as exc:  # noqa: BLE001 — fail-open by design
         logger.warning("check_prosody: internal error — %s", exc)
@@ -395,6 +494,8 @@ def _check_prosody_inner(
     min_scheme: str,
     syllable_tolerance: int,
     require_quatrains: bool,
+    require_rhyme: bool = True,
+    require_rhythm: bool = True,
 ) -> ProsodyVerdict:
     """Inner implementation — may raise; wrapped by :func:`check_prosody`."""
     if not text or not text.strip():
@@ -418,22 +519,26 @@ def _check_prosody_inner(
                 )
                 return ProsodyVerdict(approved=False, reason=reason)
 
-    # ── Rule 2: rhyme check ───────────────────────────────────────────────────
-    for info in report.stanzas:
-        if info.scheme not in accepts:
-            lines = info.lines
-            tail2 = rhyme_key_ru(lines[1]) if len(lines) > 1 else ""
-            tail4 = rhyme_key_ru(lines[3]) if len(lines) > 3 else ""
-            reason = (
-                f"stanza {info.index} has no acceptable rhyme "
-                f"(detected scheme: {info.scheme}, required: >={min_scheme}); "
-                f"lines 2/4 endings: \u00ab{tail2}\u00bb / \u00ab{tail4}\u00bb; "
-                f"revise so that at least lines 2 and 4 rhyme"
-            )
-            return ProsodyVerdict(approved=False, reason=reason)
+    # ── Rule 2: rhyme check (AUTO-CR-22-2: skipped when rhyme not required) ───
+    if require_rhyme:
+        for info in report.stanzas:
+            if info.scheme not in accepts:
+                lines = info.lines
+                tail2 = rhyme_key_ru(lines[1]) if len(lines) > 1 else ""
+                tail4 = rhyme_key_ru(lines[3]) if len(lines) > 3 else ""
+                reason = (
+                    f"stanza {info.index} has no acceptable rhyme "
+                    f"(detected scheme: {info.scheme}, required: >={min_scheme}); "
+                    f"lines 2/4 endings: \u00ab{tail2}\u00bb / \u00ab{tail4}\u00bb; "
+                    f"revise so that at least lines 2 and 4 rhyme"
+                )
+                return ProsodyVerdict(approved=False, reason=reason)
 
-    # ── Rule 3: syllable regularity ───────────────────────────────────────────
-    if not report.syllable_regular:
+    # ── Rule 3: syllable regularity (AUTO-CR-22-2: skipped when rhythm not
+    # required; with a single stanza there's nothing to compare against, so
+    # it's treated as satisfied — analyze_ru already leaves
+    # syllable_regular=True in that case). ──────────────────────────────────
+    if require_rhythm and not report.syllable_regular:
         ref = report.stanzas[0].syllables
         for info in report.stanzas[1:]:
             for pos, count in enumerate(info.syllables):
@@ -481,8 +586,12 @@ class ProsodyValidator:
         """Return a :class:`ProsodyVerdict` for *text* given *task*.
 
         No-op (always approved) unless the task's goal+instruction contains
-        a ритм/рифм keyword.  Never raises (delegates to ``check_prosody``,
-        which is itself fail-open).
+        a verse signal (:func:`is_verse_task` — keywords or poem nouns).
+        AUTO-CR-22-2: once active, rhyme and rhythm are required
+        *independently*, per :func:`verse_requirements` — so blank verse
+        (rhythm only) and rhyme-only requests are both handled correctly
+        instead of always demanding both.  Never raises (delegates to
+        ``check_prosody``, which is itself fail-open).
         """
         try:
             goal        = task.get("goal", "") or ""
@@ -490,11 +599,14 @@ class ProsodyValidator:
             combined    = f"{goal} {instruction}"
             if not is_verse_task(combined):
                 return ProsodyVerdict(approved=True, reason="")
+            require_rhyme, require_rhythm = verse_requirements(combined)
             return check_prosody(
                 text,
                 min_scheme=self._min_scheme,
                 syllable_tolerance=self._syllable_tolerance,
                 require_quatrains=self._require_quatrains,
+                require_rhyme=require_rhyme,
+                require_rhythm=require_rhythm,
             )
         except Exception as exc:  # noqa: BLE001 — fail-open by design
             logger.warning("ProsodyValidator.check: internal error — %s", exc)
