@@ -11,6 +11,14 @@ synopsis (written by AUTO-CR-5's ``SummaryMemory``) plus the immediately
 preceding chapter, which keeps voice/continuity intact without needing more
 context than a small local model (``llama3.1:8b``) can hold.
 
+AUTO-CR-23-2 adds a third, higher-priority block: the **story bible**
+(durable, must-not-contradict facts written by AUTO-CR-23-1's
+``StoryBible``). Its budget is reserved *before* the synopsis/previous-
+chapter budget is computed, so the bible is always present in the assembled
+context — even when the window is so tight that old synopsis sections get
+dropped. If there is no bible file (or it is empty), this degrades to
+exactly the pre-CR-23 behaviour.
+
 Public surface
 --------------
     from tools.auto.context_assembler import ContextAssembler
@@ -22,8 +30,9 @@ Public surface
     )
 
 ``build_creative_context`` never raises: missing files, a missing/malformed
-``synopsis.md``, or an over-budget chapter all degrade gracefully (fail-open),
-matching the rest of the creative pipeline's error handling philosophy.
+``synopsis.md``, a missing/malformed ``story_bible.md``, or an over-budget
+chapter all degrade gracefully (fail-open), matching the rest of the creative
+pipeline's error handling philosophy.
 """
 from __future__ import annotations
 
@@ -59,6 +68,13 @@ _SECTION_RE = re.compile(
 )
 
 _DROP_MARKER = "… [older synopsis omitted]"
+
+# AUTO-CR-23-2: default cap on how much of story_bible.md is injected per
+# prompt. Small and fixed — the bible itself is already kept small by
+# AUTO-CR-23-1 (story_bible_max_chars), this is just the per-prompt ceiling.
+_DEFAULT_BIBLE_BUDGET_CHARS = 700
+
+_BIBLE_HEADER = "STORY FACTS (must not contradict):"
 
 
 def _chapter_number(filename: str) -> "int | None":
@@ -101,6 +117,13 @@ class ContextAssembler:
         Relative path (from ``base_dir``) to the running synopsis file
         written by AUTO-CR-5's ``SummaryMemory``. Defaults to
         ``"synopsis.md"``.
+    bible_path:
+        Relative path (from ``base_dir``) to the story bible file written
+        by AUTO-CR-23-1's ``StoryBible``. Defaults to ``"story_bible.md"``.
+    bible_budget_chars:
+        Hard cap on how many characters of the bible are injected per
+        prompt. Defaults to ``700`` (AUTO-CR-23-2) — small and fixed, since
+        AUTO-CR-23-1 already keeps the bible file itself small.
     """
 
     def __init__(
@@ -109,6 +132,8 @@ class ContextAssembler:
         max_tokens: int,
         base_dir: "str | Path",
         synopsis_path: str = "synopsis.md",
+        bible_path: str = "story_bible.md",
+        bible_budget_chars: int = _DEFAULT_BIBLE_BUDGET_CHARS,
     ) -> None:
         # Tolerate 0 / missing values (e.g. num_ctx=0 meaning "server
         # default") with sane fallbacks rather than producing a zero or
@@ -117,6 +142,8 @@ class ContextAssembler:
         self._max_tokens = int(max_tokens) if max_tokens else 800
         self._base_dir = Path(base_dir)
         self._synopsis_path = self._base_dir / synopsis_path
+        self._bible_path = self._base_dir / bible_path
+        self._bible_budget_chars = max(0, int(bible_budget_chars))
 
     # ── Public API ───────────────────────────────────────────────────────
 
@@ -128,6 +155,13 @@ class ContextAssembler:
         """Return the assembled context block for *target_file*.
 
         Budget permitting, contains:
+          * ``STORY FACTS (must not contradict)`` — durable facts from
+            AUTO-CR-23-1's ``story_bible.md`` (AUTO-CR-23-2). Its budget is
+            reserved *first*, before anything else below, so this block is
+            always present — even when the synopsis has to drop sections to
+            fit. Omitted entirely if the bible file is missing/empty, in
+            which case the rest of this method is byte-for-byte unchanged
+            from before AUTO-CR-23.
           * ``STORY SO FAR (synopsis)`` — verified synopsis sections for
             chapters ``1..N-1``, newest first, oldest dropped first if the
             budget is exceeded (marked with ``"… [older synopsis omitted]"``).
@@ -155,13 +189,67 @@ class ContextAssembler:
 
         sections = self._read_synopsis_sections()
 
-        budget_chars = self._budget_chars()
+        # AUTO-CR-23-2: reserve the bible's own budget FIRST — before the
+        # synopsis/previous-chapter budget below is computed — so the bible
+        # survives even when the window is tight enough to drop synopsis
+        # sections. One read, one prepend, one budget subtraction; if there
+        # is no bible file (or it's empty) this is a no-op.
+        bible_block = self._read_bible_block()
+        bible_cost = (len(bible_block) + 2) if bible_block else 0  # +2 = "\n\n" join
+
+        total_budget = self._budget_chars()
+        budget_chars = max(total_budget - bible_cost, 0)
+
+        core = self._assemble_core(target_file, prior, sections, budget_chars)
+
+        if not bible_block:
+            return core
+        if not core:
+            return bible_block
+        return f"{bible_block}\n\n{core}"
+
+    # ── Story bible (AUTO-CR-23-2) ───────────────────────────────────────
+
+    def _read_bible_block(self) -> str:
+        """Read ``story_bible.md`` and format it as the
+        ``STORY FACTS (must not contradict)`` block, capped to
+        ``bible_budget_chars``.
+
+        Returns ``""`` if the file is missing, unreadable, or empty —
+        callers must treat that as "behave exactly as before AUTO-CR-23".
+        """
+        try:
+            text = self._bible_path.read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            return ""
+        if not text:
+            return ""
+        if len(text) > self._bible_budget_chars:
+            text = text[: self._bible_budget_chars]
+        return f"{_BIBLE_HEADER}\n{text}"
+
+    # ── Synopsis + previous-chapter assembly (pre-CR-23 logic) ──────────
+
+    def _assemble_core(
+        self,
+        target_file: str,
+        prior: "list[tuple[int, str]]",
+        sections: "dict[str, str]",
+        budget_chars: int,
+    ) -> str:
+        """Assemble the synopsis + previous-chapter blocks for *budget_chars*.
+
+        This is the original (pre-AUTO-CR-23) ``build_creative_context``
+        body, unchanged, except that *budget_chars* is now passed in already
+        net of the bible's reserved cost rather than computed here.
+        """
         if budget_chars <= 0:
-            # Pathological config (max_tokens >= num_ctx). Rather than silently
-            # returning NO context (which makes the model invent a chapter in
-            # the wrong language with nothing to continue), degrade gracefully:
-            # prefer the compact synopsis of the story so far; only if there is
-            # no synopsis yet, fall back to a truncated tail of the previous
+            # Pathological config (max_tokens >= num_ctx), or the bible ate
+            # the whole budget. Rather than silently returning NO context
+            # (which makes the model invent a chapter in the wrong language
+            # with nothing to continue), degrade gracefully: prefer the
+            # compact synopsis of the story so far; only if there is no
+            # synopsis yet, fall back to a truncated tail of the previous
             # chapter so there is always *some* anchor.
             prev_num, prev_file = prior[-1]
             logger.warning(
