@@ -523,6 +523,7 @@ class InnerLoop:
         canon_validator=None,
         fact_validator=None,
         prosody_validator=None,
+        continuity_validator=None,
         task_mode: str = "code",
         max_task_seconds: int = 0,
         run_goal: str = "",
@@ -538,6 +539,9 @@ class InnerLoop:
         self.fact_validator  = fact_validator
         # AUTO-CR-21: optional Russian rhythm/rhyme gate (creative mode only).
         self.prosody_validator = prosody_validator
+        # AUTO-CR-23-3: optional continuity gate vs bible + previous chapter
+        # (creative mode only).
+        self.continuity_validator = continuity_validator
         self.task_mode    = str(task_mode)
         # AUTO-CR-21-4: hard wall-clock cap per task; 0 disables the guard.
         self.max_task_seconds = max(0, int(max_task_seconds))
@@ -592,6 +596,7 @@ class InnerLoop:
         _canon_revisions: int = 0     # AUTO-CR-7: canon-driven rejections used so far
         _fact_revisions:  int = 0     # AUTO-CR-20: Gate-3 fact-driven rejections used so far
         _prosody_revisions: int = 0   # AUTO-CR-21: prosody-gate-driven rejections used so far
+        _continuity_revisions: int = 0  # AUTO-CR-23-3: continuity-gate-driven rejections used so far
         base_dir_path = Path(base_dir)
         target_files  = task.get("target_files", []) or []
         self._broker.reset_cache()  # clear per-task cache; Pass-2 hits re-accumulate fresh
@@ -820,6 +825,63 @@ class InnerLoop:
                             fact_cap,
                         )
 
+            # ── AUTO-CR-23-3: continuity gate vs bible + previous chapter ─────
+            # Runs after Gate-2 APPROVED, canon, and fact checks in creative
+            # mode. The catch-net that doesn't rely on the model knowing it
+            # was wrong: checks the new chapter against (story bible +
+            # previous chapter) and, on a genuine contradiction, returns a
+            # concrete "replace X with Y" edit instruction. Bounded by
+            # max_continuity_revisions; fail-open on any error.
+            if (
+                self.task_mode == "creative"
+                and self.continuity_validator is not None
+                and target_files
+            ):
+                continuity_cap = getattr(
+                    self.continuity_validator, "max_continuity_revisions", 1
+                )
+                try:
+                    chapter_file = target_files[0]
+                    _continuity_text = (base_dir_path / chapter_file).read_text(
+                        encoding="utf-8", errors="replace"
+                    )
+                    from tools.auto.continuity_validator import (
+                        find_previous_chapter_text, read_story_bible,
+                    )
+                    _bible_text = read_story_bible(base_dir_path)
+                    _prev_text = find_previous_chapter_text(chapter_file, base_dir_path)
+                    known_facts = (
+                        _bible_text + "\n\n--- previous chapter ---\n" + _prev_text
+                    )
+                    continuity_verdict = self.continuity_validator.check(
+                        known_facts, _continuity_text
+                    )
+                except Exception as exc:  # noqa: BLE001 — fail-open
+                    logger.warning(
+                        "InnerLoop: continuity check raised — %s; approving.", exc
+                    )
+                    continuity_verdict = None
+
+                if continuity_verdict is not None and not continuity_verdict.approved:
+                    if _continuity_revisions < continuity_cap:
+                        _continuity_revisions += 1
+                        cfb = continuity_verdict.feedback()
+                        logger.info(
+                            "InnerLoop: attempt %d continuity rejected (%d/%d) — %s",
+                            attempt, _continuity_revisions, continuity_cap,
+                            cfb.replace("\n", " ")[:120],
+                        )
+                        full_cfb = f"continuity rejected\n{cfb}"
+                        feedback.append(f"attempt {attempt}: {full_cfb}")
+                        records.append(AttemptRecord(attempt, True, True, False, full_cfb))
+                        continue
+                    else:
+                        logger.warning(
+                            "InnerLoop: continuity revision cap (%d) reached — "
+                            "accepting chapter with possible unresolved continuity issues.",
+                            continuity_cap,
+                        )
+
             # ── AUTO-CR-21: Gate-3 Russian rhythm/rhyme (prosody) gate ────────
             # Runs after Gate-2 APPROVED, canon, and fact checks in creative
             # mode. No-op unless the task is a verse task (ритм/рифм keyword).
@@ -1019,12 +1081,23 @@ def make_inner_loop(
             logger.warning("make_inner_loop: prosody validator unavailable — %s", exc)
             prosody_validator = None
 
+    # ── AUTO-CR-23-3: continuity gate vs bible + previous chapter (creative only) ─
+    continuity_validator = None
+    if task_mode == "creative":
+        try:
+            from tools.auto.continuity_validator import make_continuity_validator
+            continuity_validator = make_continuity_validator(config)
+        except Exception as exc:  # noqa: BLE001 — never block the loop on setup
+            logger.warning("make_inner_loop: continuity validator unavailable — %s", exc)
+            continuity_validator = None
+
     # ── AUTO-CR-21-4: hard per-task wall-clock guard ───────────────────────────
     max_task_seconds = config.getint("auto", "max_task_seconds", fallback=1800)
 
     return InnerLoop(coder, executor, validator, max_attempts=max_attempts,
                      context_broker=broker, canon_validator=canon_validator,
                      fact_validator=fact_validator, prosody_validator=prosody_validator,
+                     continuity_validator=continuity_validator,
                      task_mode=task_mode, max_task_seconds=max_task_seconds,
                      run_goal=run_goal)
 
