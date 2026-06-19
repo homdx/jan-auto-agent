@@ -525,6 +525,7 @@ class InnerLoop:
         prosody_validator=None,
         task_mode: str = "code",
         max_task_seconds: int = 0,
+        run_goal: str = "",
     ):
         self.coder        = coder
         self.executor     = executor
@@ -540,6 +541,30 @@ class InnerLoop:
         self.task_mode    = str(task_mode)
         # AUTO-CR-21-4: hard wall-clock cap per task; 0 disables the guard.
         self.max_task_seconds = max(0, int(max_task_seconds))
+        # AUTO-CR-22-1: run-level goal, propagated into per-task gate checks
+        # whenever a task's own "goal" key is absent — the architect emits
+        # only title/instruction per task, so the gates (fact/prosody) would
+        # otherwise only see the keyword if it happened to be echoed into the
+        # per-task instruction text.
+        self._run_goal    = str(run_goal or "")
+
+    # ------------------------------------------------------------------
+
+    def _task_with_goal(self, task: dict) -> dict:
+        """Shallow copy of *task* with the run goal injected when absent.
+
+        AUTO-CR-22-1: the architect only emits ``title``/``instruction`` per
+        task — ``task["goal"]`` is never populated in production. The fact
+        and prosody gates key their keyword/fact detection off
+        ``task.get("goal", "")``, so without this they only activate when
+        the architect happens to echo the keyword/fact into the per-task
+        instruction. This builds a copy (never mutates the stored task dict)
+        carrying the run-level goal whenever the task doesn't already have
+        its own.
+        """
+        if task.get("goal"):
+            return task
+        return {**task, "goal": self._run_goal}
 
     # ------------------------------------------------------------------
 
@@ -768,7 +793,9 @@ class InnerLoop:
                     _fact_text = (base_dir_path / target_files[0]).read_text(
                         encoding="utf-8", errors="replace"
                     )
-                    fact_verdict = self.fact_validator.check(task, _fact_text)
+                    fact_verdict = self.fact_validator.check(
+                        self._task_with_goal(task), _fact_text
+                    )
                 except Exception as exc:  # noqa: BLE001 — fail-open
                     logger.warning("InnerLoop: Gate-3 fact check raised — %s; approving.", exc)
                     fact_verdict = None
@@ -807,7 +834,9 @@ class InnerLoop:
                     _prosody_text = (base_dir_path / target_files[0]).read_text(
                         encoding="utf-8", errors="replace"
                     )
-                    prosody_verdict = self.prosody_validator.check(task, _prosody_text)
+                    prosody_verdict = self.prosody_validator.check(
+                        self._task_with_goal(task), _prosody_text
+                    )
                 except Exception as exc:  # noqa: BLE001 — fail-open
                     logger.warning("InnerLoop: prosody check raised — %s; approving.", exc)
                     prosody_verdict = None
@@ -867,6 +896,7 @@ def make_inner_loop(
     executor=None,
     validator=None,
     task_mode: str = "code",
+    run_goal: str = "",
 ) -> InnerLoop:
     """Construct an :class:`InnerLoop` with real agents from *config*.
 
@@ -995,7 +1025,8 @@ def make_inner_loop(
     return InnerLoop(coder, executor, validator, max_attempts=max_attempts,
                      context_broker=broker, canon_validator=canon_validator,
                      fact_validator=fact_validator, prosody_validator=prosody_validator,
-                     task_mode=task_mode, max_task_seconds=max_task_seconds)
+                     task_mode=task_mode, max_task_seconds=max_task_seconds,
+                     run_goal=run_goal)
 
 
 # ── Stubs for environments without real agents (unit tests) ──────────────────

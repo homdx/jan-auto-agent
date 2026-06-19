@@ -459,7 +459,7 @@ class AutoController:
         from tools.auto.bug_fix_loop import make_bug_fix_loop
 
         outer_loop = make_outer_loop(cfg, self.base_dir, self.state,
-                                       task_mode=task_mode)
+                                       task_mode=task_mode, run_goal=self.goal)
         # AUTO-CR-14: the bare CommitOnSuccess(self.git, self.state) left
         # summary_memory=None and task_mode="code", so the creative synopsis
         # hook (AUTO-CR-5) NEVER fired — synopsis.md was never written, which
