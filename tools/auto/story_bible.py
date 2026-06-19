@@ -110,6 +110,62 @@ def _parse_bullets(text: str) -> list[str]:
     return result
 
 
+_GENDER_FEMALE_RE = re.compile(
+    r"женщин|женского|девушк|female|\bона\b", re.IGNORECASE
+)
+_GENDER_MALE_RE = re.compile(
+    r"мужчин|мужского|парень|male|\bон\b", re.IGNORECASE
+)
+
+_AGE_RE = re.compile(r"(\d+)\s*(?:лет|год)", re.IGNORECASE)
+_AGE_UNKNOWN_RE = re.compile(r"не\s+указан|неизвестен", re.IGNORECASE)
+_AGE_WORDS = {
+    "двадцать": 20, "тридцать": 30, "сорок": 40, "пятьдесят": 50,
+    "шестьдесят": 60, "семьдесят": 70, "восемьдесят": 80, "девяносто": 90,
+}
+_AGE_WORD_RE = re.compile(
+    r"\b(" + "|".join(_AGE_WORDS) + r")\b", re.IGNORECASE
+)
+
+_NAME_RE = re.compile(r"\b[А-ЯЁ][а-яёА-ЯЁ]{2,}\b")
+# Common non-name capitalised words that should not be treated as entity names.
+_NAME_STOPWORDS = {
+    "Капитан", "Команда", "Корабль", "Мостик", "Возраст",
+}
+
+
+def _gender_of(bullet: str) -> "str | None":
+    """Return ``'f'``, ``'m'``, or ``None`` if *bullet* asserts a gender."""
+    if _GENDER_FEMALE_RE.search(bullet):
+        return "f"
+    if _GENDER_MALE_RE.search(bullet):
+        return "m"
+    return None
+
+
+def _age_of(bullet: str) -> "int | str | None":
+    """Return an int age, the sentinel ``"unknown"`` (for «не указан» /
+    «неизвестен» style assertions), or ``None`` if *bullet* asserts no age.
+    """
+    if _AGE_UNKNOWN_RE.search(bullet):
+        return "unknown"
+    m = _AGE_RE.search(bullet)
+    if m:
+        return int(m.group(1))
+    w = _AGE_WORD_RE.search(bullet)
+    if w:
+        return _AGE_WORDS[w.group(1).lower()]
+    return None
+
+
+def _names_in(bullet: str) -> set[str]:
+    """Return the set of capitalised Cyrillic tokens (len >= 3) in *bullet*,
+    used to scope an immutable fact to one or more entities. Best-effort —
+    not true NER.
+    """
+    return {tok for tok in _NAME_RE.findall(bullet) if tok not in _NAME_STOPWORDS}
+
+
 def _dedup_substrings(bullets: list[str]) -> list[str]:
     """Drop bullets whose normalised form is an exact duplicate of, or a
     substring of, another (longer or equal) bullet.  Order-preserving;
@@ -166,12 +222,14 @@ class StoryBible:
         max_chars: int = 2000,
         verify: bool = False,
         max_fidelity_rounds: int = 1,
+        immutable_guard: bool = True,
     ) -> None:
         self._llm = llm_call
         self._base_dir = Path(base_dir)
         self._path = self._base_dir / path
         self._max_chars = max(100, int(max_chars))
         self._verify = bool(verify)
+        self._immutable_guard = bool(immutable_guard)
         self._fidelity: "SummaryFidelityVerifier | None" = None
         if self._verify:
             from tools.auto.summary_memory import SummaryFidelityVerifier
@@ -279,10 +337,13 @@ class StoryBible:
         merged: list[str] = list(existing_bullets)
         added = 0
         for fact in new_facts:
-            if _normalise(fact) not in existing_norms:
-                merged.append(fact)
-                existing_norms.add(_normalise(fact))
-                added += 1
+            if _normalise(fact) in existing_norms:
+                continue
+            if self._immutable_guard and self._conflicts_with_established(fact, merged):
+                continue
+            merged.append(fact)
+            existing_norms.add(_normalise(fact))
+            added += 1
 
         logger.debug(
             "StoryBible.update: %d existing + %d new = %d total bullets.",
@@ -295,6 +356,45 @@ class StoryBible:
             merged_text = self._compact(merged_text)
 
         self._write(merged_text)
+
+    def _conflicts_with_established(self, new_fact: str, established: list[str]) -> bool:
+        """AUTO-CR-26-2: write-once guard for immutable attributes (gender, age).
+
+        Returns True (and logs a warning) when *new_fact* asserts a gender or
+        age for an entity that an already-established bullet asserts
+        *differently* for an overlapping name. Pure / deterministic — no LLM
+        call, so it can never be silently distorted by a bad model reply.
+        """
+        new_gender = _gender_of(new_fact)
+        new_age = _age_of(new_fact)
+        if new_gender is None and new_age is None:
+            return False
+
+        new_names = _names_in(new_fact)
+
+        for existing in established:
+            if new_names and not (new_names & _names_in(existing)):
+                continue  # scoped to a different entity — no conflict
+
+            if new_gender is not None:
+                existing_gender = _gender_of(existing)
+                if existing_gender is not None and existing_gender != new_gender:
+                    logger.warning(
+                        "StoryBible: dropped contradicting immutable fact %r "
+                        "(conflicts with established %r)", new_fact, existing,
+                    )
+                    return True
+
+            if new_age is not None:
+                existing_age = _age_of(existing)
+                if existing_age is not None and existing_age != new_age:
+                    logger.warning(
+                        "StoryBible: dropped contradicting immutable fact %r "
+                        "(conflicts with established %r)", new_fact, existing,
+                    )
+                    return True
+
+        return False
 
     def _compact(self, text: str) -> str:
         """Deterministic compaction.  Never calls the LLM (AUTO-CR-24-3).
@@ -392,6 +492,9 @@ def make_story_bible(
     max_fidelity_rounds = config.getint(
         "validator_agent", "story_bible_max_fidelity_rounds", fallback=1
     )
+    immutable_guard = config.getboolean(
+        "validator_agent", "story_bible_immutable_guard", fallback=True
+    )
 
     llm_call = _build_llm_call(
         base_url=base_url,
@@ -407,6 +510,7 @@ def make_story_bible(
         max_chars=max_chars,
         verify=verify,
         max_fidelity_rounds=max_fidelity_rounds,
+        immutable_guard=immutable_guard,
     )
 
 
