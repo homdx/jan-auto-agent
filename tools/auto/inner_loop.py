@@ -521,6 +521,7 @@ class InnerLoop:
         context_broker=None,
         canon_validator=None,
         fact_validator=None,
+        prosody_validator=None,
         task_mode: str = "code",
     ):
         self.coder        = coder
@@ -532,6 +533,8 @@ class InnerLoop:
         self.canon_validator = canon_validator
         # AUTO-CR-20: optional per-task fact-compliance gate (creative mode only).
         self.fact_validator  = fact_validator
+        # AUTO-CR-21: optional Russian rhythm/rhyme gate (creative mode only).
+        self.prosody_validator = prosody_validator
         self.task_mode    = str(task_mode)
 
     # ------------------------------------------------------------------
@@ -559,6 +562,7 @@ class InnerLoop:
         _any_missing: bool = False   # Task 4: True if any attempt had unsatisfied context
         _canon_revisions: int = 0     # AUTO-CR-7: canon-driven rejections used so far
         _fact_revisions:  int = 0     # AUTO-CR-20: Gate-3 fact-driven rejections used so far
+        _prosody_revisions: int = 0   # AUTO-CR-21: prosody-gate-driven rejections used so far
         base_dir_path = Path(base_dir)
         target_files  = task.get("target_files", []) or []
         self._broker.reset_cache()  # clear per-task cache; Pass-2 hits re-accumulate fresh
@@ -763,6 +767,45 @@ class InnerLoop:
                             fact_cap,
                         )
 
+            # ── AUTO-CR-21: Gate-3 Russian rhythm/rhyme (prosody) gate ────────
+            # Runs after Gate-2 APPROVED, canon, and fact checks in creative
+            # mode. No-op unless the task is a verse task (ритм/рифм keyword).
+            # Bounded by max_prosody_revisions; fail-open on any error.
+            if (
+                self.task_mode == "creative"
+                and self.prosody_validator is not None
+                and target_files
+            ):
+                prosody_cap = getattr(self.prosody_validator, "max_prosody_revisions", 2)
+                try:
+                    _prosody_text = (base_dir_path / target_files[0]).read_text(
+                        encoding="utf-8", errors="replace"
+                    )
+                    prosody_verdict = self.prosody_validator.check(task, _prosody_text)
+                except Exception as exc:  # noqa: BLE001 — fail-open
+                    logger.warning("InnerLoop: prosody check raised — %s; approving.", exc)
+                    prosody_verdict = None
+
+                if prosody_verdict is not None and not prosody_verdict.approved:
+                    if _prosody_revisions < prosody_cap:
+                        _prosody_revisions += 1
+                        pfb = prosody_verdict.feedback()
+                        logger.info(
+                            "InnerLoop: attempt %d prosody rejected (%d/%d) — %s",
+                            attempt, _prosody_revisions, prosody_cap,
+                            pfb.replace("\n", " ")[:120],
+                        )
+                        full_pfb = f"prosody rejected\n{pfb}"
+                        feedback.append(f"attempt {attempt}: {full_pfb}")
+                        records.append(AttemptRecord(attempt, True, True, False, full_pfb))
+                        continue
+                    else:
+                        logger.warning(
+                            "InnerLoop: prosody revision cap (%d) reached — "
+                            "accepting poem with possible unresolved rhythm/rhyme issues.",
+                            prosody_cap,
+                        )
+
             logger.info("InnerLoop: attempt %d APPROVED", attempt)
             records.append(AttemptRecord(attempt, True, True, True, ""))
             return InnerLoopResult(
@@ -910,9 +953,20 @@ def make_inner_loop(
             logger.warning("make_inner_loop: fact validator unavailable — %s", exc)
             fact_validator = None
 
+    # ── AUTO-CR-21: Gate-3 Russian rhythm/rhyme (prosody) gate (creative only) ─
+    prosody_validator = None
+    if task_mode == "creative":
+        try:
+            from tools.auto.prosody import make_prosody_validator
+            prosody_validator = make_prosody_validator(config)
+        except Exception as exc:  # noqa: BLE001 — never block the loop on setup
+            logger.warning("make_inner_loop: prosody validator unavailable — %s", exc)
+            prosody_validator = None
+
     return InnerLoop(coder, executor, validator, max_attempts=max_attempts,
                      context_broker=broker, canon_validator=canon_validator,
-                     fact_validator=fact_validator, task_mode=task_mode)
+                     fact_validator=fact_validator, prosody_validator=prosody_validator,
+                     task_mode=task_mode)
 
 
 # ── Stubs for environments without real agents (unit tests) ──────────────────

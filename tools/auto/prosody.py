@@ -446,3 +446,90 @@ def _check_prosody_inner(
                     return ProsodyVerdict(approved=False, reason=reason)
 
     return ProsodyVerdict(approved=True, reason="")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CR-21-3 — ProsodyValidator wrapper + config factory (inner-loop wiring)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class ProsodyValidator:
+    """Thin wrapper exposing the Gate-3-style ``.check()`` contract.
+
+    Mirrors :class:`tools.auto.fact_validator.FactValidator`'s surface so the
+    inner loop can treat it identically: ``.check(task, text) -> ProsodyVerdict``
+    and a ``.max_prosody_revisions`` cap.
+
+    ``check`` only activates when the task's goal/instruction contains the
+    ``ритм``/``рифм`` keyword (:func:`is_verse_task`); otherwise it is a no-op
+    that always returns an approved verdict.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_prosody_revisions: int = 2,
+        min_scheme: str = "ABCB",
+        syllable_tolerance: int = 2,
+        require_quatrains: bool = True,
+    ):
+        self.max_prosody_revisions = max(0, int(max_prosody_revisions))
+        self._min_scheme = min_scheme
+        self._syllable_tolerance = int(syllable_tolerance)
+        self._require_quatrains = bool(require_quatrains)
+
+    def check(self, task: dict, text: str) -> ProsodyVerdict:
+        """Return a :class:`ProsodyVerdict` for *text* given *task*.
+
+        No-op (always approved) unless the task's goal+instruction contains
+        a ритм/рифм keyword.  Never raises (delegates to ``check_prosody``,
+        which is itself fail-open).
+        """
+        try:
+            goal        = task.get("goal", "") or ""
+            instruction = task.get("instruction", "") or ""
+            combined    = f"{goal} {instruction}"
+            if not is_verse_task(combined):
+                return ProsodyVerdict(approved=True, reason="")
+            return check_prosody(
+                text,
+                min_scheme=self._min_scheme,
+                syllable_tolerance=self._syllable_tolerance,
+                require_quatrains=self._require_quatrains,
+            )
+        except Exception as exc:  # noqa: BLE001 — fail-open by design
+            logger.warning("ProsodyValidator.check: internal error — %s", exc)
+            return ProsodyVerdict(approved=True, reason="")
+
+
+def make_prosody_validator(config) -> "ProsodyValidator | None":
+    """Construct a :class:`ProsodyValidator` from *config*, or ``None``.
+
+    Reads ``[validator_agent]``:
+      - ``prosody_check_creative`` (bool, default False) — master switch.
+      - ``max_prosody_revisions``  (int,  default 2)
+      - ``prosody_min_scheme``     (str,  default "ABCB")
+      - ``prosody_syllable_tolerance`` (int, default 2)
+
+    Returns ``None`` when ``prosody_check_creative`` is falsy/absent.
+    """
+    try:
+        enabled = config.getboolean(
+            "validator_agent", "prosody_check_creative", fallback=False
+        )
+    except Exception:  # noqa: BLE001 — tolerate malformed config
+        enabled = False
+
+    if not enabled:
+        return None
+
+    max_rev = config.getint("validator_agent", "max_prosody_revisions", fallback=2)
+    min_scheme = config.get("validator_agent", "prosody_min_scheme", fallback="ABCB")
+    syllable_tolerance = config.getint(
+        "validator_agent", "prosody_syllable_tolerance", fallback=2
+    )
+
+    return ProsodyValidator(
+        max_prosody_revisions=max_rev,
+        min_scheme=min_scheme,
+        syllable_tolerance=syllable_tolerance,
+    )
