@@ -17,7 +17,14 @@ by ``[validator_agent] story_bible_verify`` (default: false for back-compat).
 
 AUTO-CR-24-2: the extract prompt requests ONLY immutable / slowly-changing
 facts.  Transient state (current location, what characters are doing/wearing
-right now) is explicitly excluded.
+right now) is explicitly excluded — per-scene state is the continuity gate's
+job, read from the previous chapter, not this store's.
+
+AUTO-CR-24-3: compaction is deterministic (stronger dedup, drop-substring
+merge).  No LLM call in the compaction path, so it can never silently distort
+or drop a fact via a bad model reply.  Slightly-over-cap is preferred over
+fact loss; only a hard ceiling (2x ``max_chars``) triggers dropping the
+oldest bullets, and that drop is always logged.
 
 Honest limits (per spec):
 - LLM fact-extraction can miss a fact.
@@ -38,7 +45,7 @@ Public surface
         bible.update(chapter_text)
     facts = bible.load()   # → str, injected into prompt
 
-Spec reference: AUTO-CR-23-1, AUTO-CR-24-1, AUTO-CR-24-2
+Spec reference: AUTO-CR-23-1, AUTO-CR-24-1, AUTO-CR-24-2, AUTO-CR-24-3
 """
 from __future__ import annotations
 
@@ -70,9 +77,8 @@ _BIBLE_SYSTEM = (
     "in this scene, or anything that changes scene-to-scene."
 )
 
-_COMPACT_SYSTEM = (
-    "Merge duplicates and shorten; keep every distinct fact; output bullets only."
-)
+# AUTO-CR-24-3: compaction is now deterministic — no LLM call in this path.
+# (Old AUTO-CR-23 _COMPACT_SYSTEM prompt removed; see StoryBible._compact.)
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
@@ -98,6 +104,34 @@ def _parse_bullets(text: str) -> list[str]:
     return result
 
 
+def _dedup_substrings(bullets: list[str]) -> list[str]:
+    """Drop bullets whose normalised form is an exact duplicate of, or a
+    substring of, another (longer or equal) bullet.  Order-preserving;
+    among substring/duplicate pairs the longer (more informative) bullet
+    wins, first-seen wins ties.
+    """
+    norms = [_normalise(b) for b in bullets]
+    keep = [True] * len(bullets)
+
+    for i, norm_i in enumerate(norms):
+        if not keep[i] or not norm_i:
+            continue
+        for j, norm_j in enumerate(norms):
+            if i == j or not keep[j]:
+                continue
+            if norm_i == norm_j:
+                # Exact duplicate — keep the first occurrence only.
+                if j > i:
+                    keep[j] = False
+                continue
+            if norm_i in norm_j:
+                # bullet i is a substring of the longer bullet j — drop i.
+                keep[i] = False
+                break
+
+    return [b for b, k in zip(bullets, keep) if k]
+
+
 # ── StoryBible ────────────────────────────────────────────────────────────────
 
 class StoryBible:
@@ -113,7 +147,8 @@ class StoryBible:
         Relative path (from *base_dir*) to the bible file.
     max_chars:
         Hard cap on the size of the persisted bible.  If the merged bible
-        exceeds this a single compaction LLM call is attempted.  Never raises.
+        exceeds this, deterministic compaction (dedup) is attempted; never
+        calls the LLM and never raises.
     """
 
     def __init__(
@@ -174,7 +209,8 @@ class StoryBible:
         1. Extract new bullets via LLM.
         2. Load existing bible bullets.
         3. Append only new bullets whose normalised form does not already exist.
-        4. If merged text > ``max_chars`` → one bounded compaction LLM call.
+        4. If merged text > ``max_chars`` → deterministic compaction (dedup;
+           no LLM call — AUTO-CR-24-3).
         5. Write result.  Never raises.
         """
         try:
@@ -243,27 +279,62 @@ class StoryBible:
         self._write(merged_text)
 
     def _compact(self, text: str) -> str:
-        """One bounded compaction call.  Returns *text* unchanged on failure."""
-        logger.info(
-            "StoryBible._compact: bible (%d chars) exceeds max_chars=%d — compacting.",
-            len(text), self._max_chars,
-        )
-        try:
-            reply = self._llm(_COMPACT_SYSTEM, text) or ""
-        except Exception as exc:
-            logger.warning("StoryBible._compact: LLM error — %s — keeping uncompacted.", exc)
-            return text
+        """Deterministic compaction.  Never calls the LLM (AUTO-CR-24-3).
 
-        compacted = _clean_bullet_list(reply)
-        if not compacted:
-            logger.warning("StoryBible._compact: LLM returned unusable reply — keeping uncompacted.")
-            return text
+        1. Stronger dedup: drop bullets whose normalised form is an exact
+           duplicate, or a substring, of another bullet (merges near-dupes).
+        2. If still over ``max_chars``: keep everything and log a WARNING —
+           a slightly-over-cap bible is safer than silently losing an anchor.
+        3. Only if a hard ceiling (2x ``max_chars``) is exceeded: drop the
+           OLDEST bullets until back under the ceiling, logging what was
+           dropped.
+        """
+        bullets = _parse_bullets(text)
+        deduped = _dedup_substrings(bullets)
+        deduped_text = "\n".join(f"• {b}" for b in deduped)
 
         logger.info(
-            "StoryBible._compact: compacted from %d to %d chars.",
-            len(text), len(compacted),
+            "StoryBible._compact: deterministic dedup %d -> %d bullets "
+            "(%d -> %d chars).",
+            len(bullets), len(deduped), len(text), len(deduped_text),
         )
-        return compacted
+
+        if len(deduped_text) <= self._max_chars:
+            return deduped_text
+
+        hard_ceiling = self._max_chars * 2
+        if len(deduped_text) <= hard_ceiling:
+            logger.warning(
+                "StoryBible._compact: bible is %d chars after dedup, still over "
+                "max_chars=%d; consider raising story_bible_max_chars. Keeping "
+                "all facts (no silent loss).",
+                len(deduped_text), self._max_chars,
+            )
+            return deduped_text
+
+        # Hard ceiling exceeded — drop the oldest bullets only, as a last
+        # resort, and log exactly what was dropped.
+        kept: list[str] = []
+        dropped: list[str] = []
+        # Walk from newest to oldest, keep what fits, then restore order.
+        running_len = 0
+        for bullet in reversed(deduped):
+            line_len = len(f"• {bullet}\n")
+            if running_len + line_len <= hard_ceiling:
+                kept.append(bullet)
+                running_len += line_len
+            else:
+                dropped.append(bullet)
+        kept.reverse()
+        dropped.reverse()
+
+        logger.warning(
+            "StoryBible._compact: hard ceiling (%d chars) exceeded after dedup "
+            "(%d chars) — dropped %d oldest fact(s): %s",
+            hard_ceiling, len(deduped_text), len(dropped), dropped,
+        )
+
+        return "\n".join(f"• {b}" for b in kept)
 
     def _write(self, text: str) -> None:
         """Write *text* to the bible file.  Creates parent dirs as needed."""

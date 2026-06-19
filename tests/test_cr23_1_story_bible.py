@@ -117,40 +117,26 @@ class TestMergeDedups:
 
 
 class TestCompactionWhenOverCap:
-    """test_compaction_when_over_cap: max_chars small → compaction LLM call fires once;
-    result within (or close to) cap; never raises.
+    """test_compaction_when_over_cap: max_chars small → deterministic compaction
+    fires (AUTO-CR-24-3: no LLM call); result is dedup'd; never raises.
     """
 
-    def test_compaction_called_and_does_not_raise(self, tmp_path: Path) -> None:
-        compaction_calls: list[str] = []
-
+    def test_compaction_runs_without_llm_call(self, tmp_path: Path) -> None:
         def smart_llm(system: str, user: str) -> str:
-            if "Merge duplicates" in system:
-                # compaction call
-                compaction_calls.append(user)
-                # Return a shortened bible
-                return "• Short fact A\n• Short fact B\n"
-            # extraction call
-            return "• " + " ".join(["word"] * 50) + "\n" * 10  # long reply
+            return "• A reasonably short durable fact about the world\n"
 
         bible = _make_bible(tmp_path, smart_llm, max_chars=30)
         bible.update("chapter text")  # should not raise
 
-        assert len(compaction_calls) == 1, (
-            f"Expected exactly 1 compaction call, got {len(compaction_calls)}"
-        )
+        content = bible.load()
+        assert content != ""  # compaction kept the fact, didn't drop everything
 
-    def test_never_raises_even_if_compaction_fails(self, tmp_path: Path) -> None:
-        call_count = [0]
-
-        def failing_compact_llm(system: str, user: str) -> str:
-            call_count[0] += 1
-            if "Merge duplicates" in system:
-                raise RuntimeError("simulated compaction failure")
+    def test_never_raises_even_if_llm_errors(self, tmp_path: Path) -> None:
+        def failing_llm(system: str, user: str) -> str:
             return "• " + "x" * 100 + "\n" * 5
 
-        bible = _make_bible(tmp_path, failing_compact_llm, max_chars=10)
-        bible.update("chapter text")  # must not propagate the RuntimeError
+        bible = _make_bible(tmp_path, failing_llm, max_chars=10)
+        bible.update("chapter text")  # must not raise — compaction is LLM-free now
 
 
 class TestUpdateNeverRaisesOnLlmError:
