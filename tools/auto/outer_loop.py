@@ -387,6 +387,7 @@ def make_outer_loop(
     *,
     inner_loop=None,
     task_mode: str = "code",
+    run_goal: str = "",
 ) -> OuterLoop:
     """Build an :class:`OuterLoop`, constructing the inner loop from config
     unless one is injected (tests / the controller may supply their own).
@@ -394,6 +395,10 @@ def make_outer_loop(
     AUTO-DM-1: ``task_mode`` is forwarded to ``make_inner_loop`` and stored
     on the constructed inner loop's validator so domain-aware prompts are used.
     Defaults to ``"code"`` — no behavioural change for existing call sites.
+
+    AUTO-CR-22-1: ``run_goal`` is forwarded to ``make_inner_loop`` so the
+    fact/prosody gates see the run goal even when the architect didn't echo
+    it into a task's own ``instruction``.
     """
     max_rounds             = config.getint("auto", "max_rounds_per_task",
                                            fallback=_DEFAULT_MAX_ROUNDS)
@@ -401,7 +406,8 @@ def make_outer_loop(
     max_rewrites           = config.getint("auto", "max_rewrites",           fallback=5)
 
     if inner_loop is None:
-        inner_loop = make_inner_loop(config, base_dir, task_mode=task_mode)  # AUTO-DM-1
+        inner_loop = make_inner_loop(config, base_dir, task_mode=task_mode,
+                                      run_goal=run_goal)  # AUTO-DM-1 / AUTO-CR-22-1
 
     # LOOP-2: build a TaskRewriter if the config has the rewrite keys and
     # max_rewrites > 0.  If anything is missing the outer loop just runs

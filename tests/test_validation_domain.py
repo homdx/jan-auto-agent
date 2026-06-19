@@ -11,9 +11,17 @@ Verifies:
     - task_mode="code"  with no config override → _GATE2_SYSTEM_CODE used.
     - task_mode="docs"  with no config override → _GATE2_SYSTEM_DOCS used.
     - task_mode="creative" with no config override → _GATE2_SYSTEM_CREATIVE used.
-    - [validator_agent] system = <custom> in agents.ini overrides ALL built-ins
-      regardless of task_mode — including for existing configs that set this key.
+    - [validator_agent] system = <custom> in agents.ini overrides the built-in
+      for task_mode="code" only.
     - Unknown task_mode falls back to _GATE2_SYSTEM_CODE (fail-safe).
+
+  AUTO-CR-19-1 (update): the legacy bare [validator_agent] system key is
+  code-specific (agents.ini ships a code-completeness prompt under that key).
+  It used to be consulted as the fallback for *every* task_mode, so a
+  creative/docs run with no system_creative / system_docs override silently
+  inherited the code prompt, and Gate-2 judged prose against code-completeness
+  criteria. The bare system key now applies to task_mode="code" only; other
+  modes fall through to system_{mode} (if set) or their own built-in.
 
   approve() uses self._system:
     - approve() sends self._system, not the bare module constant.
@@ -159,15 +167,20 @@ class TestValidatorSystemPromptSelection:
         v = _validator("code", config=cfg)
         assert v._system == "custom prompt"
 
-    def test_config_override_wins_over_docs_mode(self) -> None:
+    def test_config_override_does_not_win_over_docs_mode(self) -> None:
+        """AUTO-CR-19-1: the bare 'system' key is code-specific and must NOT
+        leak into docs mode. With no system_docs override, docs mode falls
+        through to its own built-in."""
         cfg = _cfg(system_override="custom prompt")
         v = _validator("docs", config=cfg)
-        assert v._system == "custom prompt"
+        assert v._system == _GATE2_SYSTEM_DOCS
 
-    def test_config_override_wins_over_creative_mode(self) -> None:
+    def test_config_override_does_not_win_over_creative_mode(self) -> None:
+        """AUTO-CR-19-1: same protection for creative mode — this is the exact
+        rubber-stamp scenario the bug caused (legacy code prompt judging prose)."""
         cfg = _cfg(system_override="custom prompt")
         v = _validator("creative", config=cfg)
-        assert v._system == "custom prompt"
+        assert v._system == _GATE2_SYSTEM_CREATIVE
 
     def test_config_without_system_key_uses_builtin(self) -> None:
         """Config present but without 'system' key → fallback to built-in."""
@@ -176,19 +189,33 @@ class TestValidatorSystemPromptSelection:
         assert v._system == _GATE2_SYSTEM_DOCS
 
     def test_existing_live_agents_ini_override_respected(self) -> None:
-        """Simulate the live agents.ini config which already has a custom system prompt.
-        This must NOT be replaced by the mode-selected built-in.
+        """Simulate the live agents.ini config which already has a custom
+        code-completeness system prompt under the bare 'system' key.
+
+        AUTO-CR-19-1: this legacy prompt is code-specific. It must still be
+        honoured for task_mode="code" (no behavioural change there), but it
+        must NOT leak into docs/creative — those fall back to their own
+        built-ins instead of inheriting a code-completeness prompt.
         """
         live_prompt = (
             "You are a code completeness validator. Check: 1) Is the function body "
             "complete and not cut off? ..."
         )
         cfg = _cfg(system_override=live_prompt)
-        for mode in ("code", "docs", "creative"):
-            v = _validator(mode, config=cfg)
-            assert v._system == live_prompt, (
-                f"Live prompt must be preserved in {mode} mode"
-            )
+
+        v_code = _validator("code", config=cfg)
+        assert v_code._system == live_prompt, "Live prompt must be preserved in code mode"
+
+        v_docs = _validator("docs", config=cfg)
+        assert v_docs._system == _GATE2_SYSTEM_DOCS, (
+            "docs mode must NOT inherit the code-specific legacy prompt"
+        )
+
+        v_creative = _validator("creative", config=cfg)
+        assert v_creative._system == _GATE2_SYSTEM_CREATIVE, (
+            "creative mode must NOT inherit the code-specific legacy prompt "
+            "(this was the AUTO-CR-19-1 rubber-stamp bug)"
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -220,7 +247,13 @@ def _cfg_mode_keys(
 
 
 class TestValidatorModeSpecificIniKeys:
-    """system_docs / system_creative take priority over legacy 'system' key."""
+    """system_docs / system_creative take priority over the legacy 'system' key.
+
+    AUTO-CR-19-1: the legacy 'system' key itself only applies as a fallback
+    for task_mode="code" — it is never consulted for docs/creative, even when
+    no system_docs / system_creative override is set (see the dedicated
+    test_legacy_system_key_does_not_leak_into_docs_without_mode_key below).
+    """
 
     def test_system_docs_key_used_for_docs_mode(self) -> None:
         cfg = _cfg_mode_keys(system_docs="validator for documentation")
@@ -261,11 +294,13 @@ class TestValidatorModeSpecificIniKeys:
         v = _validator("code", config=cfg)
         assert v._system == "legacy custom prompt"
 
-    def test_legacy_system_key_still_overrides_docs_when_no_mode_key(self) -> None:
-        """If system_docs is absent, legacy 'system' key still wins over built-in."""
+    def test_legacy_system_key_does_not_leak_into_docs_without_mode_key(self) -> None:
+        """AUTO-CR-19-1: if system_docs is absent, the legacy 'system' key
+        must NOT win — docs mode falls back to its own built-in instead of
+        silently inheriting the code-specific prompt."""
         cfg = _cfg_mode_keys(system_legacy="legacy custom prompt")
         v = _validator("docs", config=cfg)
-        assert v._system == "legacy custom prompt"
+        assert v._system == _GATE2_SYSTEM_DOCS
 
     def test_independent_overrides_across_all_modes(self) -> None:
         """All three modes can each have their own prompt without interfering."""
@@ -337,8 +372,17 @@ class TestApproveUsesSelfSystem:
         assert sent == _GATE2_SYSTEM_CREATIVE
 
     def test_config_override_prompt_is_sent(self) -> None:
+        """AUTO-CR-19-1: a bare 'system' override does not apply to docs mode,
+        so approve() sends the docs built-in, not the override."""
         cfg = _cfg(system_override="OVERRIDE PROMPT")
         v = _validator("docs", config=cfg)
+        sent = self._capture_system(v)
+        assert sent == _GATE2_SYSTEM_DOCS
+
+    def test_code_mode_config_override_prompt_is_sent(self) -> None:
+        """Regression: a bare 'system' override still applies to code mode."""
+        cfg = _cfg(system_override="OVERRIDE PROMPT")
+        v = _validator("code", config=cfg)
         sent = self._capture_system(v)
         assert sent == "OVERRIDE PROMPT"
 

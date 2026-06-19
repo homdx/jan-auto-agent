@@ -199,7 +199,7 @@ class RepoIngestor:
         task_mode: str = "code",
     ) -> None:
         self.base_dir  = Path(base_dir).resolve()
-        self._config   = config or configparser.ConfigParser()
+        self._config   = config or configparser.ConfigParser(inline_comment_prefixes=(';', '#'))
         self._task_mode = task_mode
 
         # Walk limits — prefer [architect] overrides, fall back to [search].

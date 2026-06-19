@@ -17,15 +17,51 @@ logger = logging.getLogger(__name__)
 # Imported at module level so test suites can patch via
 # ``patch("tools.auto.pipeline.<name>")``.
 from tools.auto.repo_ingest import ingest_repo
-from tools.auto.architect import review_clusters
+from tools.auto.architect import review_clusters, ClusterReviewer
 from tools.auto.gate1_filter import filter_candidates
 from tools.auto.backlog_prioritiser import build_backlog, to_improvements_md
 from tools.auto.plan_emitter import PlanEmitter, IMPROVEMENTS_FILENAME
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Public entry point
+# AUTO-CR-20-4: Plan-validator factory
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _build_plan_validator(
+    cfg: configparser.ConfigParser,
+    task_mode: str,
+) -> "ClusterReviewer | None":
+    """Return a :class:`ClusterReviewer` usable only for ``validate_plan``.
+
+    Returns ``None`` when the feature is disabled or the mode is not creative,
+    so the calling code stays a no-op with a simple ``if`` guard.
+    """
+    if task_mode != "creative":
+        return None
+    if not cfg.getboolean("architect", "validate_plan_creative", fallback=False):
+        return None
+
+    active     = cfg.get("api", "active", fallback="local")
+    section    = f"api_{active}"
+    base_url   = cfg.get(section, "base_url")
+    api_key    = cfg.get(section, "api_key",    fallback="")
+    model      = cfg.get(section, "model")
+    api_fmt    = cfg.get(section, "api_format", fallback="openai")
+    verify_ssl = cfg.getboolean("api", "verify_ssl", fallback=True)
+
+    try:
+        return ClusterReviewer(
+            cfg, base_url, api_key, model,
+            api_format=api_fmt,
+            verify_ssl=verify_ssl,
+            task_mode=task_mode,
+        )
+    except Exception as exc:  # noqa: BLE001 — never block the run on setup
+        logger.warning("_build_plan_validator: could not build reviewer — %s", exc)
+        return None
+
+
+
 
 
 def run_pipeline(controller: "AutoController") -> tuple[Optional[str], int]:
@@ -182,6 +218,63 @@ def _run_plan_phase(controller: "AutoController", cfg: configparser.ConfigParser
     logger.info("plan_phase: architect produced %d candidate(s)", len(candidates))
     controller.state.log(f"plan phase: architect produced {len(candidates)} candidate(s)")
 
+    # ── Step 2b: AUTO-CR-20-4 plan-validator (creative mode only) ─────────────
+    # After the architect emits candidates and before Gate-1, check the plan
+    # against the goal for contradictions / missing required facts.  Bounded by
+    # plan_max_revisions; fail-open on any error.
+    task_mode = getattr(controller, "task_mode", "code")
+    _plan_validator = _build_plan_validator(cfg, task_mode)
+    if _plan_validator is not None:
+        _plan_max_rev = cfg.getint(
+            "architect", "plan_max_revisions",
+            fallback=cfg.getint("architect", "max_rewrites", fallback=1),
+        )
+        _plan_max_rev = max(1, _plan_max_rev)
+        _plan_revisions = 0
+        while _plan_revisions < _plan_max_rev:
+            try:
+                ok, reason = _plan_validator.validate_plan(controller.goal, candidates)
+            except Exception as exc:  # noqa: BLE001 — fail-open
+                logger.warning("plan_phase: validate_plan raised — %s; keeping plan.", exc)
+                break
+            if ok:
+                break
+            _plan_revisions += 1
+            logger.info(
+                "plan_phase: architect plan REVISE (%d/%d): %s",
+                _plan_revisions, _plan_max_rev, reason,
+            )
+            controller.state.log(
+                f"plan phase: architect plan REVISE ({_plan_revisions}/{_plan_max_rev}): {reason}"
+            )
+            # Re-run the architect with the feedback appended to the goal so
+            # it can correct the offending task.  Skip the checkpoint on
+            # feedback re-runs (pass None) — the corrected result should not
+            # overwrite the original cache entry.
+            augmented_goal = controller.goal + f"\n\nPLAN FEEDBACK: {reason}"
+            try:
+                candidates = review_clusters(
+                    clusters_to_review, controller.base_dir, cfg,
+                    goal=augmented_goal,
+                    on_cluster_done=_on_cluster_done,
+                    task_mode=task_mode,
+                    checkpoint_path=None,
+                )
+            except Exception as exc:  # noqa: BLE001 — fail-open
+                logger.warning(
+                    "plan_phase: review_clusters re-run raised — %s; keeping previous candidates.", exc
+                )
+                break
+        else:
+            # Loop exited because _plan_revisions reached the cap without a break.
+            logger.warning(
+                "plan_phase: architect plan revision cap reached (%d) — keeping last candidates",
+                _plan_max_rev,
+            )
+            controller.state.log(
+                f"plan phase: architect plan revision cap reached ({_plan_max_rev})"
+            )
+
     # ── Step 3: Gate 1 filter ─────────────────────────────────────────────────
     logger.info("plan_phase: gate1 filtering %d candidate(s)", len(candidates))
     # Build cluster → file-set mapping so Gate 1 can detect hallucinated paths.
@@ -285,7 +378,7 @@ def _load_config(controller: "AutoController") -> configparser.ConfigParser:
     cfg = getattr(controller, "config", None)
     if cfg is not None:
         return cfg
-    cfg = configparser.ConfigParser()
+    cfg = configparser.ConfigParser(inline_comment_prefixes=(';', '#'))
     p = Path(controller.config_path)
     if p.exists():
         cfg.read(p, encoding="utf-8")

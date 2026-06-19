@@ -84,7 +84,7 @@ except Exception:
 class Orchestrator(OrchestratorActions):
     def __init__(self, config_path: str = "agents.ini"):
         self._config_path = config_path
-        self.config = configparser.ConfigParser()
+        self.config = configparser.ConfigParser(inline_comment_prefixes=(';', '#'))
 
         # Persistent components — created ONCE; they own on-disk state
         # (prompts.json / metrics.json) and survive reloads.

@@ -555,6 +555,8 @@ class Executor:
                 env=env,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=timeout,
             )
             stdout = _truncate(proc.stdout, _MAX_OUTPUT_CHARS)
@@ -617,6 +619,12 @@ class Executor:
             env.pop(var, None)
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         env["PYTHONUNBUFFERED"] = "1"
+        # Force UTF-8 for all child processes.  On Windows the default codec is
+        # cp1252 which cannot decode bytes such as 0x81 (undefined in that codepage).
+        # PYTHONUTF8=1 enables UTF-8 mode (PEP 540, Python >= 3.7);
+        # PYTHONIOENCODING is the legacy fallback recognised by older builds.
+        env["PYTHONUTF8"] = "1"
+        env["PYTHONIOENCODING"] = "utf-8"
         
         base_dir_str = str(self._base_dir)
         existing_pythonpath = env.get("PYTHONPATH", "")

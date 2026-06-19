@@ -75,6 +75,11 @@ _PLACEHOLDER_RE = re.compile(
 # Default prefix for generated task IDs.
 _DEFAULT_ID_PREFIX = "AUTO-T"
 
+# Matches "chapter_07", "chapter-3", "chapter 1", "Chapter_07.md" etc.
+# Mirrors the pattern used in context_broker, canon_validator, context_assembler
+# so "chapter index" means the same numeric value everywhere.
+_CHAPTER_RE = re.compile(r"chapter[_\-\s]?(\d+)", re.IGNORECASE)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Data model
@@ -280,13 +285,30 @@ class BacklogPrioritiser:
     def _infer_dependencies(self, tasks: list[ReadyTask]) -> None:
         """Populate ``ReadyTask.dependencies`` in-place.
 
-        Two rules are applied (see module docstring for rationale):
+        Three rules are applied (see module docstring for rationale):
 
         1. Same-file linear order: if A and B touch the same file and A's
            ``line_end`` is before B's ``line_start``, add A → B.
         2. Cross-file symbol reference: if B's instruction mentions A's
            cited symbol by name, and they don't share a target file, add A → B.
+        3. Chapter filename ordering (AUTO-CR-19-3): if a task targets
+           ``chapter_N.*`` and another targets ``chapter_M.*`` where M < N,
+           the lower-chapter task is a prerequisite of the higher one so that
+           a failed chapter N blocks chapter N+1 rather than leaving a silent
+           narrative gap.
         """
+        # Rule 3: filename-derived chapter edges (additive with rules 1 & 2).
+        chapter_edges = _chapter_dependencies(tasks)
+        for task_id, dep_ids in chapter_edges.items():
+            task = next(t for t in tasks if t.task_id == task_id)
+            for dep_id in dep_ids:
+                if dep_id not in task.dependencies:
+                    task.dependencies.append(dep_id)
+                    logger.debug(
+                        "dep [chapter-order]: %s → %s",
+                        dep_id, task_id,
+                    )
+
         for i, task_b in enumerate(tasks):
             for j, task_a in enumerate(tasks):
                 if i == j:
@@ -352,8 +374,80 @@ class BacklogPrioritiser:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Topological sort (Kahn's algorithm)
+# Chapter-filename dependency inference (AUTO-CR-19-3)
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _chapter_number(task: ReadyTask) -> int | None:
+    """Return the highest chapter number found in *task*'s target_files, or None.
+
+    Scans all filenames in ``task.target_files`` with ``_CHAPTER_RE`` and
+    returns the maximum integer found, or ``None`` if no chapter filename
+    is present.  Using the maximum means a task that touches both
+    ``chapter_3.md`` and ``chapter_4.md`` is treated as a chapter-4 task
+    (the one that most needs its predecessors to be done first).
+    """
+    best: int | None = None
+    for f in task.target_files:
+        m = _CHAPTER_RE.search(f)
+        if m:
+            n = int(m.group(1))
+            if best is None or n > best:
+                best = n
+    return best
+
+
+def _chapter_dependencies(tasks: list[ReadyTask]) -> dict[str, list[str]]:
+    """Return filename-derived chapter ordering edges.
+
+    For each task whose highest target chapter is N, this finds the task
+    whose highest target chapter is the largest M < N present in *tasks*
+    and records a dependency edge M → N.  Numeric ordering is used
+    (chapter_10 > chapter_9, not chapter_1), and only the **nearest**
+    preceding chapter gets a direct edge (transitivity covers the rest).
+
+    Parameters
+    ----------
+    tasks:
+        The full list of :class:`ReadyTask` objects (IDs already assigned).
+
+    Returns
+    -------
+    dict[str, list[str]]
+        Mapping ``{task_id: [dep_task_id, …]}`` — contains only tasks that
+        have at least one chapter-order dependency.  Tasks with no chapter
+        filenames are absent.
+    """
+    # Build (chapter_num, task) pairs for tasks that have chapter filenames.
+    chapter_tasks: list[tuple[int, ReadyTask]] = []
+    for t in tasks:
+        n = _chapter_number(t)
+        if n is not None:
+            chapter_tasks.append((n, t))
+
+    if len(chapter_tasks) < 2:
+        return {}
+
+    # Sort by chapter number (ascending, numeric).
+    chapter_tasks.sort(key=lambda x: x[0])
+
+    # For each chapter-N task, add a dependency on the nearest chapter-M task
+    # where M < N.  "Nearest" = the one with the largest M below N.
+    edges: dict[str, list[str]] = {}
+    for idx, (n, task_n) in enumerate(chapter_tasks):
+        if idx == 0:
+            continue  # chapter_1 (or lowest) has no predecessor
+        # The nearest predecessor is the entry just before this one.
+        _m, task_m = chapter_tasks[idx - 1]
+        edges.setdefault(task_n.task_id, []).append(task_m.task_id)
+        logger.debug(
+            "_chapter_dependencies: chapter_%d (%s) depends on chapter_%d (%s)",
+            n, task_n.task_id, _m, task_m.task_id,
+        )
+
+    return edges
+
+
+
 
 def _topological_sort(tasks: list[ReadyTask]) -> list[ReadyTask]:
     """Return *tasks* in dependency-first order using Kahn's algorithm.

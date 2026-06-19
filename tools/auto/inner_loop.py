@@ -38,6 +38,7 @@ from __future__ import annotations
 import configparser
 import json
 import logging
+import time
 from tools.auto.context_broker import ContextBroker
 
 from dataclasses import dataclass, field
@@ -139,6 +140,40 @@ _GATE2_SYSTEMS: dict[str, str] = {
 }
 
 
+def _resolve_validator_system(config, task_mode: str) -> str:
+    """Resolve the Gate-2 validator system prompt for *task_mode*.
+
+    Priority:
+      1. Mode-specific override ``[validator_agent] system_{task_mode}``
+         (e.g. ``system_creative``, ``system_docs``) — wins whenever it is
+         explicitly set, for any mode.
+      2. The legacy bare ``[validator_agent] system`` key — but **only when
+         ``task_mode == "code"``**.
+      3. The built-in constant for *task_mode* (``_GATE2_SYSTEMS``), falling
+         back to ``_GATE2_SYSTEM_CODE`` for an unrecognised mode.
+
+    AUTO-CR-19-1: previously the bare ``system`` key was consulted as the
+    fallback for *every* mode. ``agents.ini`` / ``agents_32k.ini`` ship a
+    code-specific legacy ``system`` prompt ("You are a code completeness
+    validator…"), so a creative or docs run with no matching ``system_creative``
+    / ``system_docs`` override silently inherited that code prompt — the
+    model was asked to judge prose against code-completeness criteria
+    ("is the function body complete", "reply in JSON"), which the soft
+    parser then either fail-opened to APPROVED or treated as noisy feedback.
+    The bare key now only applies in code mode; every other mode falls
+    through to its built-in (or an explicit mode-specific override).
+    """
+    builtin = _GATE2_SYSTEMS.get(task_mode, _GATE2_SYSTEM_CODE)
+    if config is None:
+        return builtin
+    mode_key = f"system_{task_mode}" if task_mode != "code" else None
+    if mode_key and config.has_option("validator_agent", mode_key):
+        return config.get("validator_agent", mode_key).strip()
+    if task_mode == "code":
+        return config.get("validator_agent", "system", fallback=builtin).strip()
+    return builtin
+
+
 class LLMGate2Validator:
     """Fail-closed LLM-based Gate-2 validator.
 
@@ -175,20 +210,10 @@ class LLMGate2Validator:
         self.num_ctx     = int(num_ctx)
         self.max_tokens  = int(max_tokens)
         self.task_mode   = str(task_mode)
-        # AUTO-DM-5: select system prompt — agents.ini override wins over built-in.
-        # Priority (mirrors Coder/Architect): mode-specific key (system_docs /
-        # system_creative) > legacy "system" key > built-in constant.
-        # This allows independent per-mode validator prompt overrides without
-        # clobbering the other modes, which a single "system" key cannot do.
-        _builtin = _GATE2_SYSTEMS.get(self.task_mode, _GATE2_SYSTEM_CODE)
-        if config is not None:
-            _mode_key = f"system_{self.task_mode}" if self.task_mode != "code" else None
-            if _mode_key and config.has_option("validator_agent", _mode_key):
-                self._system = config.get("validator_agent", _mode_key).strip()
-            else:
-                self._system = config.get("validator_agent", "system", fallback=_builtin).strip()
-        else:
-            self._system = _builtin
+        # AUTO-DM-5 / AUTO-CR-19-1: select system prompt — mode-specific
+        # override > (code-mode-only) legacy "system" key > built-in.
+        # See _resolve_validator_system for the full priority rationale.
+        self._system = _resolve_validator_system(config, self.task_mode)
 
         # Task 3 — smart context additions
         from tools.search_agent import make_search_agent
@@ -496,7 +521,11 @@ class InnerLoop:
         max_attempts: int = _DEFAULT_MAX_ATTEMPTS,
         context_broker=None,
         canon_validator=None,
+        fact_validator=None,
+        prosody_validator=None,
         task_mode: str = "code",
+        max_task_seconds: int = 0,
+        run_goal: str = "",
     ):
         self.coder        = coder
         self.executor     = executor
@@ -505,7 +534,37 @@ class InnerLoop:
         self._broker      = context_broker or ContextBroker()
         # AUTO-CR-7: optional periodic canon/fact gate (creative mode only).
         self.canon_validator = canon_validator
+        # AUTO-CR-20: optional per-task fact-compliance gate (creative mode only).
+        self.fact_validator  = fact_validator
+        # AUTO-CR-21: optional Russian rhythm/rhyme gate (creative mode only).
+        self.prosody_validator = prosody_validator
         self.task_mode    = str(task_mode)
+        # AUTO-CR-21-4: hard wall-clock cap per task; 0 disables the guard.
+        self.max_task_seconds = max(0, int(max_task_seconds))
+        # AUTO-CR-22-1: run-level goal, propagated into per-task gate checks
+        # whenever a task's own "goal" key is absent — the architect emits
+        # only title/instruction per task, so the gates (fact/prosody) would
+        # otherwise only see the keyword if it happened to be echoed into the
+        # per-task instruction text.
+        self._run_goal    = str(run_goal or "")
+
+    # ------------------------------------------------------------------
+
+    def _task_with_goal(self, task: dict) -> dict:
+        """Shallow copy of *task* with the run goal injected when absent.
+
+        AUTO-CR-22-1: the architect only emits ``title``/``instruction`` per
+        task — ``task["goal"]`` is never populated in production. The fact
+        and prosody gates key their keyword/fact detection off
+        ``task.get("goal", "")``, so without this they only activate when
+        the architect happens to echo the keyword/fact into the per-task
+        instruction. This builds a copy (never mutates the stored task dict)
+        carrying the run-level goal whenever the task doesn't already have
+        its own.
+        """
+        if task.get("goal"):
+            return task
+        return {**task, "goal": self._run_goal}
 
     # ------------------------------------------------------------------
 
@@ -531,9 +590,12 @@ class InnerLoop:
         resolved_context: dict[str, str] = {}   # accumulates every symbol the validator has asked for
         _any_missing: bool = False   # Task 4: True if any attempt had unsatisfied context
         _canon_revisions: int = 0     # AUTO-CR-7: canon-driven rejections used so far
+        _fact_revisions:  int = 0     # AUTO-CR-20: Gate-3 fact-driven rejections used so far
+        _prosody_revisions: int = 0   # AUTO-CR-21: prosody-gate-driven rejections used so far
         base_dir_path = Path(base_dir)
         target_files  = task.get("target_files", []) or []
         self._broker.reset_cache()  # clear per-task cache; Pass-2 hits re-accumulate fresh
+        _start_time = time.monotonic()  # AUTO-CR-21-4: wall-clock guard reference point
 
         # LOOP-4: prepend prior implementation history
         if prior_implementations:
@@ -548,6 +610,27 @@ class InnerLoop:
             feedback.insert(0, "\n".join(history_lines))
 
         for attempt in range(1, self.max_attempts + 1):
+
+            # ── AUTO-CR-21-4: hard wall-clock guard ──────────────────────────
+            # Independent safety valve for pathological tasks (e.g. the 3-hour
+            # rhythm/rhyme runaway that motivated CR-21). 0 disables the guard.
+            if self.max_task_seconds > 0:
+                _elapsed = time.monotonic() - _start_time
+                if _elapsed > self.max_task_seconds:
+                    logger.warning(
+                        "InnerLoop: task wall-clock limit (%ds) reached — "
+                        "stopping after %d attempts",
+                        self.max_task_seconds, attempt - 1,
+                    )
+                    last = feedback[-1] if feedback else ""
+                    return InnerLoopResult(
+                        task_id=task_id,
+                        passed=False,
+                        attempts_used=attempt - 1,
+                        last_feedback=last,
+                        records=records,
+                        context_satisfied=not _any_missing,
+                    )
 
             # ── 1. Coder ──────────────────────────────────────────────────────
             try:
@@ -692,6 +775,92 @@ class InnerLoop:
                         cap, chapter_file,
                     )
 
+            # ── AUTO-CR-20: Gate-3 per-task fact-compliance check ─────────────
+            # Runs after Gate-2 APPROVED (and after canon gate) in creative mode.
+            # Checks only: does the generated text CONTRADICT an explicit fact in
+            # the task?  Bounded by max_fact_revisions; fail-open on any error.
+            if (
+                self.task_mode == "creative"
+                and self.fact_validator is not None
+                and target_files
+            ):
+                fact_cap = getattr(self.fact_validator, "max_fact_revisions", 1)
+                # Always run the check — the cap only gates *rejection*, not the
+                # check itself.  On a post-cap attempt the check still runs so a
+                # now-passing text is accepted cleanly instead of warned through.
+                try:
+                    # Read the chapter text from disk (same strategy as canon gate).
+                    _fact_text = (base_dir_path / target_files[0]).read_text(
+                        encoding="utf-8", errors="replace"
+                    )
+                    fact_verdict = self.fact_validator.check(
+                        self._task_with_goal(task), _fact_text
+                    )
+                except Exception as exc:  # noqa: BLE001 — fail-open
+                    logger.warning("InnerLoop: Gate-3 fact check raised — %s; approving.", exc)
+                    fact_verdict = None
+
+                if fact_verdict is not None and not fact_verdict.approved:
+                    if _fact_revisions < fact_cap:
+                        _fact_revisions += 1
+                        ffb = fact_verdict.feedback()
+                        logger.info(
+                            "InnerLoop: attempt %d fact-check rejected (%d/%d) — %s",
+                            attempt, _fact_revisions, fact_cap,
+                            ffb.replace("\n", " ")[:120],
+                        )
+                        full_ffb = f"fact-check rejected\n{ffb}"
+                        feedback.append(f"attempt {attempt}: {full_ffb}")
+                        records.append(AttemptRecord(attempt, True, True, False, full_ffb))
+                        continue
+                    else:
+                        logger.warning(
+                            "InnerLoop: fact revision cap (%d) reached — "
+                            "accepting chapter with possible unresolved fact contradiction.",
+                            fact_cap,
+                        )
+
+            # ── AUTO-CR-21: Gate-3 Russian rhythm/rhyme (prosody) gate ────────
+            # Runs after Gate-2 APPROVED, canon, and fact checks in creative
+            # mode. No-op unless the task is a verse task (ритм/рифм keyword).
+            # Bounded by max_prosody_revisions; fail-open on any error.
+            if (
+                self.task_mode == "creative"
+                and self.prosody_validator is not None
+                and target_files
+            ):
+                prosody_cap = getattr(self.prosody_validator, "max_prosody_revisions", 2)
+                try:
+                    _prosody_text = (base_dir_path / target_files[0]).read_text(
+                        encoding="utf-8", errors="replace"
+                    )
+                    prosody_verdict = self.prosody_validator.check(
+                        self._task_with_goal(task), _prosody_text
+                    )
+                except Exception as exc:  # noqa: BLE001 — fail-open
+                    logger.warning("InnerLoop: prosody check raised — %s; approving.", exc)
+                    prosody_verdict = None
+
+                if prosody_verdict is not None and not prosody_verdict.approved:
+                    if _prosody_revisions < prosody_cap:
+                        _prosody_revisions += 1
+                        pfb = prosody_verdict.feedback()
+                        logger.info(
+                            "InnerLoop: attempt %d prosody rejected (%d/%d) — %s",
+                            attempt, _prosody_revisions, prosody_cap,
+                            pfb.replace("\n", " ")[:120],
+                        )
+                        full_pfb = f"prosody rejected\n{pfb}"
+                        feedback.append(f"attempt {attempt}: {full_pfb}")
+                        records.append(AttemptRecord(attempt, True, True, False, full_pfb))
+                        continue
+                    else:
+                        logger.warning(
+                            "InnerLoop: prosody revision cap (%d) reached — "
+                            "accepting poem with possible unresolved rhythm/rhyme issues.",
+                            prosody_cap,
+                        )
+
             logger.info("InnerLoop: attempt %d APPROVED", attempt)
             records.append(AttemptRecord(attempt, True, True, True, ""))
             return InnerLoopResult(
@@ -727,6 +896,7 @@ def make_inner_loop(
     executor=None,
     validator=None,
     task_mode: str = "code",
+    run_goal: str = "",
 ) -> InnerLoop:
     """Construct an :class:`InnerLoop` with real agents from *config*.
 
@@ -823,9 +993,40 @@ def make_inner_loop(
             logger.warning("make_inner_loop: canon validator unavailable — %s", exc)
             canon_validator = None
 
+    # ── AUTO-CR-20: Gate-3 per-task fact-compliance gate (creative mode only) ─
+    fact_validator = None
+    if task_mode == "creative":
+        try:
+            from tools.auto.fact_validator import make_fact_validator
+            fact_validator = make_fact_validator(
+                config,
+                base_url=base_url,
+                api_key=api_key,
+                model=model,
+                api_format=api_format,
+            )
+        except Exception as exc:  # noqa: BLE001 — never block the loop on setup
+            logger.warning("make_inner_loop: fact validator unavailable — %s", exc)
+            fact_validator = None
+
+    # ── AUTO-CR-21: Gate-3 Russian rhythm/rhyme (prosody) gate (creative only) ─
+    prosody_validator = None
+    if task_mode == "creative":
+        try:
+            from tools.auto.prosody import make_prosody_validator
+            prosody_validator = make_prosody_validator(config)
+        except Exception as exc:  # noqa: BLE001 — never block the loop on setup
+            logger.warning("make_inner_loop: prosody validator unavailable — %s", exc)
+            prosody_validator = None
+
+    # ── AUTO-CR-21-4: hard per-task wall-clock guard ───────────────────────────
+    max_task_seconds = config.getint("auto", "max_task_seconds", fallback=1800)
+
     return InnerLoop(coder, executor, validator, max_attempts=max_attempts,
                      context_broker=broker, canon_validator=canon_validator,
-                     task_mode=task_mode)
+                     fact_validator=fact_validator, prosody_validator=prosody_validator,
+                     task_mode=task_mode, max_task_seconds=max_task_seconds,
+                     run_goal=run_goal)
 
 
 # ── Stubs for environments without real agents (unit tests) ──────────────────

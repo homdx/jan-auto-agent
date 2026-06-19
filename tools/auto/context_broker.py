@@ -143,6 +143,21 @@ class ContextBroker:
         resolved = {s: self._resolved_cache[s] for s in ordered if s in self._resolved_cache}
         remaining = [s for s in ordered if s not in self._resolved_cache][: self._max_symbols]
 
+        # ── Pass 0: whole-file / chapter requests (AUTO-CR-19-2) ──────────────
+        # A creative CONTEXT_REQUEST names a chapter FILE (e.g. "chapter_2"),
+        # not a symbol or a phrase that appears in the prose — so the
+        # section/entity extractors below would never match it. Resolve such a
+        # request to the requested file's full (capped) content directly.
+        if remaining:
+            for sym in list(remaining):
+                whole = self._resolve_whole_file(sym, base_dir)
+                if whole:
+                    capped = self._cap(whole)
+                    resolved[sym] = capped
+                    self._resolved_cache[sym] = capped
+                    remaining.remove(sym)
+                    logger.debug("ContextBroker: resolved %r as a whole chapter file", sym)
+
         # ── Pass 1: search target files (fast path) ───────────────────────────
         for rel in target_files:
             if not remaining:
@@ -191,6 +206,55 @@ class ContextBroker:
             )
 
         return resolved
+
+    def _resolve_whole_file(self, sym: str, base_dir: Path) -> str:
+        """AUTO-CR-19-2: if *sym* names a chapter/prose FILE, return its full
+        text; else "". Matches a request like ``chapter_2``, ``chapter_2.txt``,
+        or ``chapter 2`` against existing ``chapter_*`` files by number, and any
+        token ending in a prose extension against that exact filename. Only
+        prose extensions are considered, so a code symbol never accidentally
+        resolves to a file here.
+        """
+        token = (sym or "").strip()
+        if not token:
+            return ""
+
+        candidates: list[Path] = []
+        # Direct filename (with prose extension).
+        low = token.lower()
+        if low.endswith((".md", ".txt", ".markdown")):
+            p = base_dir / token
+            if p.is_file():
+                candidates.append(p)
+        # Chapter-number reference (chapter_2, chapter 2, Chapter_02 …).
+        m = _CHAPTER_RE.search(token)
+        if m and not candidates:
+            want = int(m.group(1))
+            for path in base_dir.rglob("*"):
+                if not path.is_file():
+                    continue
+                if path.suffix.lower() not in _PROSE_EXTS:
+                    continue
+                cm = _CHAPTER_RE.search(path.name)
+                if cm and int(cm.group(1)) == want:
+                    candidates.append(path)
+                    break
+        # Bare stem match (e.g. "prologue" → prologue.md) as a last resort.
+        if not candidates:
+            for path in base_dir.rglob("*"):
+                if path.is_file() and path.suffix.lower() in _PROSE_EXTS \
+                        and path.stem.lower() == low:
+                    candidates.append(path)
+                    break
+
+        for p in candidates:
+            try:
+                text = p.read_text(encoding="utf-8", errors="replace")
+                if text.strip():
+                    return text
+            except OSError:
+                continue
+        return ""
 
     def fetch(
         self,
