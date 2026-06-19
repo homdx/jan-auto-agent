@@ -1,6 +1,7 @@
 """tools/auto/prosody.py — AUTO-CR-21: Deterministic Russian rhythm/rhyme gate.
 
 Phase 1 (CR-21-1): Pure prosody primitives — no LLM, no I/O, no config.
+Phase 2 (CR-21-2): Prosody report, tolerant verdict, keyword activation gate.
 
 All functions are deterministic and operate only on Unicode strings.  They are
 designed to be imported and unit-tested in complete isolation from the rest of
@@ -14,11 +15,23 @@ Public surface (CR-21-1)::
     rhymes_ru(a, b) -> bool
     split_stanzas(text) -> list[list[str]]
     detect_scheme(stanza) -> str
+
+Public surface (CR-21-2)::
+
+    is_verse_task(text) -> bool
+    ProsodyReport          (dataclass)
+    analyze_ru(text, *, syllable_tolerance) -> ProsodyReport
+    ProsodyVerdict         (dataclass)
+    check_prosody(text, *, min_scheme, syllable_tolerance, require_quatrains) -> ProsodyVerdict
 """
 
 from __future__ import annotations
 
+import logging
 import re
+from dataclasses import dataclass, field
+
+logger = logging.getLogger(__name__)
 
 # ── Vowels ────────────────────────────────────────────────────────────────────
 
@@ -194,3 +207,242 @@ def detect_scheme(stanza: list[str]) -> str:
         return "ABCB"
 
     return "NONE"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CR-21-2 — Prosody report + verdict + keyword gate
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── Keyword activation gate ───────────────────────────────────────────────────
+
+def is_verse_task(text: str) -> bool:
+    """Return True if *text* signals a Russian rhythm/rhyme task.
+
+    Matches the substrings ``"ритм"`` or ``"рифм"`` (case-insensitive,
+    Cyrillic) which cover ритм, ритма, рифма, рифму, рифмой, etc.
+
+    This is the **only** activation switch for the prosody gate.  When it
+    returns False the gate is a no-op — non-verse creative tasks are never
+    penalised.
+
+    >>> is_verse_task("напиши стихи с ритмом и рифмой")
+    True
+    >>> is_verse_task("исправь нестыковки")
+    False
+    """
+    lower = text.lower()
+    return "ритм" in lower or "рифм" in lower
+
+
+# ── ProsodyReport ─────────────────────────────────────────────────────────────
+
+@dataclass
+class StanzaInfo:
+    """Per-stanza analysis results (internal helper used by ProsodyReport)."""
+    index: int               # 1-based stanza number
+    lines: list[str]
+    syllables: list[int]     # syllable count per line
+    scheme: str              # one of AABB / ABAB / ABCB / NONE
+
+
+@dataclass
+class ProsodyReport:
+    """Full prosody analysis of a multi-stanza Russian poem.
+
+    Attributes
+    ----------
+    stanza_count:
+        Number of analysed stanzas (those with >= 2 lines).
+    stanzas:
+        Per-stanza breakdown — syllable counts and detected rhyme scheme.
+    syllable_regular:
+        True when every line position's syllable count stays within
+        ``syllable_tolerance`` across all stanzas (positional regularity).
+    """
+    stanza_count: int
+    stanzas: list[StanzaInfo] = field(default_factory=list)
+    syllable_regular: bool = True
+
+
+# ── analyze_ru ────────────────────────────────────────────────────────────────
+
+def analyze_ru(text: str, *, syllable_tolerance: int = 2) -> ProsodyReport:
+    """Analyse *text* as a Russian poem and return a :class:`ProsodyReport`.
+
+    The analysis:
+    1. Splits text into stanzas via :func:`split_stanzas`.
+    2. Counts syllables per line and detects the rhyme scheme per stanza.
+    3. Checks *positional* syllable regularity: for each line position N,
+       the syllable counts across stanzas must stay within
+       ``syllable_tolerance`` of the first stanza's count at that position.
+
+    Empty or non-Russian input returns an empty report with
+    ``syllable_regular=True`` (fail-open).
+    """
+    raw_stanzas = split_stanzas(text)
+    if not raw_stanzas:
+        return ProsodyReport(stanza_count=0, stanzas=[], syllable_regular=True)
+
+    stanza_infos: list[StanzaInfo] = []
+    for idx, lines in enumerate(raw_stanzas, start=1):
+        syllables = [count_syllables_ru(line) for line in lines]
+        scheme = detect_scheme(lines)
+        stanza_infos.append(StanzaInfo(index=idx, lines=lines, syllables=syllables, scheme=scheme))
+
+    # Positional syllable regularity check
+    # Use the first stanza as reference for each line position
+    syllable_regular = True
+    ref = stanza_infos[0].syllables
+    for info in stanza_infos[1:]:
+        for pos, count in enumerate(info.syllables):
+            if pos < len(ref):
+                if abs(count - ref[pos]) > syllable_tolerance:
+                    syllable_regular = False
+                    break
+        if not syllable_regular:
+            break
+
+    return ProsodyReport(
+        stanza_count=len(stanza_infos),
+        stanzas=stanza_infos,
+        syllable_regular=syllable_regular,
+    )
+
+
+# ── ProsodyVerdict ────────────────────────────────────────────────────────────
+
+# Acceptance sets for min_scheme parameter
+_SCHEME_ACCEPTS: dict[str, set[str]] = {
+    "ABCB": {"AABB", "ABAB", "ABCB"},   # loosest — accepts all rhyming schemes
+    "ABAB": {"AABB", "ABAB"},
+    "AABB": {"AABB"},
+}
+
+
+@dataclass
+class ProsodyVerdict:
+    """Outcome of :func:`check_prosody`.
+
+    Attributes
+    ----------
+    approved:
+        True when the poem passes all enabled checks (or the gate failed
+        open due to an internal error).
+    reason:
+        Short machine-readable reason when ``approved`` is False.
+    """
+    approved: bool
+    reason: str
+
+    def feedback(self) -> str:
+        """Return a coder-facing feedback string, mirroring FactValidator style.
+
+        Returns an empty string when approved.
+        """
+        if self.approved:
+            return ""
+        return f"PROSODY ISSUE — {self.reason}"
+
+
+# ── check_prosody ─────────────────────────────────────────────────────────────
+
+def check_prosody(
+    text: str,
+    *,
+    min_scheme: str = "ABCB",
+    syllable_tolerance: int = 2,
+    require_quatrains: bool = True,
+) -> ProsodyVerdict:
+    """Check *text* for rhythm and rhyme compliance.
+
+    Parameters
+    ----------
+    text:
+        The poem text to check.
+    min_scheme:
+        The minimum acceptable rhyme scheme, one of ``"ABCB"`` (loosest,
+        default), ``"ABAB"``, or ``"AABB"`` (strictest).  Schemes *better*
+        than the minimum are also accepted (see ``_SCHEME_ACCEPTS``).
+    syllable_tolerance:
+        How many syllables a line may deviate from the reference stanza
+        before the rhythm check fires.  Default is 2.
+    require_quatrains:
+        When True, any analysed stanza that is not exactly 4 lines causes
+        a REVISE verdict.
+
+    Returns
+    -------
+    ProsodyVerdict
+        ``approved=True`` when all checks pass.  ``approved=False`` with a
+        specific ``reason`` when a violation is detected.  **Never raises** --
+        any internal exception returns ``ProsodyVerdict(True, "")`` (fail-open).
+    """
+    try:
+        return _check_prosody_inner(
+            text,
+            min_scheme=min_scheme,
+            syllable_tolerance=syllable_tolerance,
+            require_quatrains=require_quatrains,
+        )
+    except Exception as exc:  # noqa: BLE001 — fail-open by design
+        logger.warning("check_prosody: internal error — %s", exc)
+        return ProsodyVerdict(approved=True, reason="")
+
+
+def _check_prosody_inner(
+    text: str,
+    *,
+    min_scheme: str,
+    syllable_tolerance: int,
+    require_quatrains: bool,
+) -> ProsodyVerdict:
+    """Inner implementation — may raise; wrapped by :func:`check_prosody`."""
+    if not text or not text.strip():
+        return ProsodyVerdict(approved=True, reason="")
+
+    report = analyze_ru(text, syllable_tolerance=syllable_tolerance)
+
+    if report.stanza_count == 0:
+        return ProsodyVerdict(approved=True, reason="")
+
+    accepts = _SCHEME_ACCEPTS.get(min_scheme, _SCHEME_ACCEPTS["ABCB"])
+
+    # ── Rule 1: require quatrains ─────────────────────────────────────────────
+    if require_quatrains:
+        for info in report.stanzas:
+            if len(info.lines) != 4:
+                reason = (
+                    f"stanza {info.index} has {len(info.lines)} lines "
+                    f"(expected 4 lines per quatrain); "
+                    f"revise so that each stanza contains exactly 4 lines"
+                )
+                return ProsodyVerdict(approved=False, reason=reason)
+
+    # ── Rule 2: rhyme check ───────────────────────────────────────────────────
+    for info in report.stanzas:
+        if info.scheme not in accepts:
+            lines = info.lines
+            tail2 = rhyme_key_ru(lines[1]) if len(lines) > 1 else ""
+            tail4 = rhyme_key_ru(lines[3]) if len(lines) > 3 else ""
+            reason = (
+                f"stanza {info.index} has no acceptable rhyme "
+                f"(detected scheme: {info.scheme}, required: >={min_scheme}); "
+                f"lines 2/4 endings: \u00ab{tail2}\u00bb / \u00ab{tail4}\u00bb; "
+                f"revise so that at least lines 2 and 4 rhyme"
+            )
+            return ProsodyVerdict(approved=False, reason=reason)
+
+    # ── Rule 3: syllable regularity ───────────────────────────────────────────
+    if not report.syllable_regular:
+        ref = report.stanzas[0].syllables
+        for info in report.stanzas[1:]:
+            for pos, count in enumerate(info.syllables):
+                if pos < len(ref) and abs(count - ref[pos]) > syllable_tolerance:
+                    reason = (
+                        f"line {pos + 1}: {count} syllables in stanza {info.index} "
+                        f"vs {ref[pos]} in stanza 1; "
+                        f"keep them within \u00b1{syllable_tolerance}"
+                    )
+                    return ProsodyVerdict(approved=False, reason=reason)
+
+    return ProsodyVerdict(approved=True, reason="")
