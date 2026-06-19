@@ -435,7 +435,7 @@ class LLMGate2Validator:
 
 
 def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
-    """Parse a line-oriented Gate-2 verdict for creative mode (AUTO-CR-2).
+    """Parse a line-oriented Gate-2 verdict for creative mode (AUTO-CR-2 / CR-26-1).
 
     Protocol: the model is expected to reply with one line whose first token is
     ``APPROVED`` (or ``OK``) or ``REVISE`` / ``REJECT`` / ``NO``.  If ``REVISE``,
@@ -451,32 +451,119 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
                           as approved (fail-open) so a rambling 8B response cannot
                           hard-block a chapter.
 
-    Acceptance criteria (spec AUTO-CR-2):
-        * ``APPROVED`` / ``approved`` / ``OK …``         → approved=True
-        * ``REVISE: <reason>``                           → approved=False, reason captured
-        * ``REJECT: <reason>`` / ``NO: <reason>``        → approved=False, reason captured
-        * Any other content (rambling, JSON, prose, …)  → approved=True (fail-open)
-    """
-    for line in text.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        upper = stripped.upper()
+    Acceptance criteria (spec AUTO-CR-2 + AUTO-CR-26-1):
+        * ``APPROVED`` / ``approved`` / ``OK …``                  → approved=True
+        * ``REVISE: <reason>`` / ``REJECT: …`` / ``NO: …``        → approved=False
+        * Russian APPROVED forms (нет противоречий, согласна, …)  → approved=True
+        * Russian REVISE forms (не согласна, противоречие, …)     → approved=False
+        * Any other content (rambling, JSON, prose, …)            → approved=True (fail-open)
 
-        if upper.startswith("APPROVED") or upper.startswith("OK"):
+    Order is load-bearing: negated-positive RU rules (нет противоречий, не против,
+    не противоречит) and the «не соглас» rule are tested **before** the bare
+    negative patterns (против, противоречи…, соглас) to avoid mis-classification.
+    """
+    import re as _re
+
+    def _normalise(s: str) -> str:
+        """Lowercase, collapse whitespace, strip surrounding punctuation."""
+        s = s.lower().strip()
+        s = _re.sub(r"[\s\u00a0]+", " ", s)   # collapse all whitespace
+        s = s.strip(".,!?;:—–-")
+        return s
+
+    def _reason_from(raw: str, norm: str) -> str:
+        """Extract human-readable reason: text after first ':' or the whole norm."""
+        if ":" in raw:
+            after = raw.split(":", 1)[1].strip()
+            if after:
+                return after
+        return norm if norm else "validator rejected (no reason given)"
+
+    # ── APPROVED patterns (Russian) — must be checked BEFORE bare negatives ──
+    _RU_APPROVED = [
+        # «нет противоречий» / «противоречий нет» / «не противоречит»
+        _re.compile(r"\b(нет|без)\s+противоречий\b"),
+        _re.compile(r"\bпротиворечий\s+нет\b"),
+        _re.compile(r"\bне\s+противоречит\b"),
+        # «не против» / «непротив»
+        _re.compile(r"\bне\s+против\b"),
+        _re.compile(r"\bнепротив\b"),
+        # «одобрен*»
+        _re.compile(r"\bодобрен"),
+        # «всё верно» / «все верно»
+        _re.compile(r"\b(всё|все)\s+верно\b"),
+        # «соответствует» — NOT preceded by «не »
+        _re.compile(r"(?<!не )соответствует\b"),
+        # «соглас*» (согласен/согласна/…) — NOT preceded by «не»/«нет»
+        _re.compile(r"(?<!не)(?<!нет)(?<!не )(?<!нет )соглас"),
+    ]
+
+    # ── REVISE patterns (Russian) — negated forms first, then bare ──
+    _RU_REVISE = [
+        # «не соглас*» / «несоглас*»
+        _re.compile(r"\b(не|нет)\s+соглас"),
+        _re.compile(r"\bнесоглас"),
+        # «не соответствует»
+        _re.compile(r"\bне\s+соответствует\b"),
+        # bare «противоречи*» (un-negated — the нет/не rules above returned already)
+        _re.compile(r"\bпротиворечи"),
+        # bare «против» (un-negated — «не против» / «непротив» returned above)
+        _re.compile(r"\bпротив\b"),
+        # error / correction vocabulary
+        _re.compile(r"\bисправ"),
+        _re.compile(r"\bошибк"),
+        _re.compile(r"\bневерн"),
+    ]
+
+    # ── Scan: first try the first non-empty line; fall back to whole text ──
+    candidates: list[str] = []
+    first_line: str | None = None
+    for line in text.splitlines():
+        s = line.strip()
+        if s:
+            if first_line is None:
+                first_line = s
+                candidates.append(s)   # first non-empty line tried first
+            # collect whole text as second candidate
+    if text.strip():
+        candidates.append(text.strip())   # whole text as fallback
+
+    for raw in candidates:
+        norm = _normalise(raw)
+        upper = raw.strip().upper()
+
+        # ── English APPROVED ──────────────────────────────────────────────
+        if upper.startswith("APPROVED") or _re.match(r"^OK\b", upper):
             return True, "", False
 
+        # ── English REVISE / REJECT / NO ─────────────────────────────────
         for token in ("REVISE", "REJECT", "NO"):
             if upper.startswith(token):
-                # Extract reason after the token + optional ': '
-                rest = stripped[len(token):].lstrip(": ").strip()
+                rest = raw.strip()[len(token):].lstrip(": ").strip()
                 reason = rest if rest else "validator rejected (no reason given)"
                 return False, reason, False
 
-        # First non-empty line matched no verdict token → fail-open
+        # ── Russian APPROVED (order matters — negated first) ──────────────
+        for pat in _RU_APPROVED:
+            if pat.search(norm):
+                return True, "", False
+
+        # ── Russian REVISE (order matters — negated first) ────────────────
+        for pat in _RU_REVISE:
+            if pat.search(norm):
+                reason = _reason_from(raw.strip(), norm)
+                return False, reason, False
+
+        # Only the *first* non-empty line is tried for the line-first pass.
+        # Break after processing the first candidate so that the second
+        # candidate (whole text) is only reached when the first line had no match.
+        if raw == first_line:
+            # did not match on first line — try whole text next iteration
+            continue
+        # whole-text pass also found nothing
         break
 
-    # Empty response or no matching line
+    # Empty response or no matching token found anywhere
     note = "verdict unparseable — passed on fail-open"
     return True, note, True
 
