@@ -38,6 +38,7 @@ from __future__ import annotations
 import configparser
 import json
 import logging
+import time
 from tools.auto.context_broker import ContextBroker
 
 from dataclasses import dataclass, field
@@ -523,6 +524,7 @@ class InnerLoop:
         fact_validator=None,
         prosody_validator=None,
         task_mode: str = "code",
+        max_task_seconds: int = 0,
     ):
         self.coder        = coder
         self.executor     = executor
@@ -536,6 +538,8 @@ class InnerLoop:
         # AUTO-CR-21: optional Russian rhythm/rhyme gate (creative mode only).
         self.prosody_validator = prosody_validator
         self.task_mode    = str(task_mode)
+        # AUTO-CR-21-4: hard wall-clock cap per task; 0 disables the guard.
+        self.max_task_seconds = max(0, int(max_task_seconds))
 
     # ------------------------------------------------------------------
 
@@ -566,6 +570,7 @@ class InnerLoop:
         base_dir_path = Path(base_dir)
         target_files  = task.get("target_files", []) or []
         self._broker.reset_cache()  # clear per-task cache; Pass-2 hits re-accumulate fresh
+        _start_time = time.monotonic()  # AUTO-CR-21-4: wall-clock guard reference point
 
         # LOOP-4: prepend prior implementation history
         if prior_implementations:
@@ -580,6 +585,27 @@ class InnerLoop:
             feedback.insert(0, "\n".join(history_lines))
 
         for attempt in range(1, self.max_attempts + 1):
+
+            # ── AUTO-CR-21-4: hard wall-clock guard ──────────────────────────
+            # Independent safety valve for pathological tasks (e.g. the 3-hour
+            # rhythm/rhyme runaway that motivated CR-21). 0 disables the guard.
+            if self.max_task_seconds > 0:
+                _elapsed = time.monotonic() - _start_time
+                if _elapsed > self.max_task_seconds:
+                    logger.warning(
+                        "InnerLoop: task wall-clock limit (%ds) reached — "
+                        "stopping after %d attempts",
+                        self.max_task_seconds, attempt - 1,
+                    )
+                    last = feedback[-1] if feedback else ""
+                    return InnerLoopResult(
+                        task_id=task_id,
+                        passed=False,
+                        attempts_used=attempt - 1,
+                        last_feedback=last,
+                        records=records,
+                        context_satisfied=not _any_missing,
+                    )
 
             # ── 1. Coder ──────────────────────────────────────────────────────
             try:
@@ -963,10 +989,13 @@ def make_inner_loop(
             logger.warning("make_inner_loop: prosody validator unavailable — %s", exc)
             prosody_validator = None
 
+    # ── AUTO-CR-21-4: hard per-task wall-clock guard ───────────────────────────
+    max_task_seconds = config.getint("auto", "max_task_seconds", fallback=1800)
+
     return InnerLoop(coder, executor, validator, max_attempts=max_attempts,
                      context_broker=broker, canon_validator=canon_validator,
                      fact_validator=fact_validator, prosody_validator=prosody_validator,
-                     task_mode=task_mode)
+                     task_mode=task_mode, max_task_seconds=max_task_seconds)
 
 
 # ── Stubs for environments without real agents (unit tests) ──────────────────
