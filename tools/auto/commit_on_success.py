@@ -76,12 +76,14 @@ class CommitOnSuccess:
         state_store: StateStore,
         *,
         summary_memory=None,
+        story_bible=None,
         task_mode: str = "code",
         base_dir=None,
     ) -> None:
         self._git = git_manager
         self._state = state_store
         self._summary_memory = summary_memory
+        self._story_bible = story_bible  # AUTO-CR-23-1
         self._task_mode = task_mode
         self._base_dir = Path(base_dir) if base_dir is not None else None
 
@@ -143,6 +145,8 @@ class CommitOnSuccess:
             )
             # AUTO-CR-5: after a successful creative commit, update synopsis.md.
             self._update_synopsis(task)
+            # AUTO-CR-23-1: update story bible after synopsis (same chapter).
+            self._update_story_bible(task)
         else:
             # Nothing new to commit — acceptance check already passed, so
             # the working tree is in the correct state from a prior commit.
@@ -196,6 +200,52 @@ class CommitOnSuccess:
                 "CommitOnSuccess: synopsis update failed for %s: %s — "                "commit outcome is unaffected.", chapter_file, exc,
             )
 
+    # ── AUTO-CR-23-1: story bible hook ───────────────────────────────────────
+
+    def _update_story_bible(self, task: dict) -> None:
+        """Call StoryBible.update() for a creative chapter task.
+
+        Only runs when:
+          - self._task_mode == "creative"
+          - self._story_bible is set (not None)
+          - task["target_files"] contains at least one entry
+
+        Reads the chapter text directly from disk (same pattern as
+        _update_synopsis). Fails silently so a bible error never disrupts
+        the commit outcome.
+        """
+        if self._task_mode != "creative":
+            return
+        if self._story_bible is None:
+            return
+        target_files = task.get("target_files") or []
+        if not target_files:
+            return
+        chapter_file = target_files[0]
+        base_dir = self._base_dir
+        if base_dir is None:
+            logger.warning(
+                "CommitOnSuccess._update_story_bible: base_dir not set — "
+                "cannot update bible for %s.", chapter_file,
+            )
+            return
+        chapter_path = base_dir / chapter_file
+        try:
+            chapter_text = chapter_path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            logger.error(
+                "CommitOnSuccess._update_story_bible: cannot read %s: %s — "
+                "bible update skipped.", chapter_file, exc,
+            )
+            return
+        try:
+            self._story_bible.update(chapter_text)
+        except Exception as exc:
+            logger.error(
+                "CommitOnSuccess: bible update failed for %s: %s — "
+                "commit outcome is unaffected.", chapter_file, exc,
+            )
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Factory
@@ -236,9 +286,31 @@ def make_commit_on_success(
                 "make_commit_on_success: could not build SummaryMemory: %s — "                "synopsis updates will be skipped.", exc,
             )
 
+    # AUTO-CR-23-1: wire StoryBible for creative mode (gated by config flag).
+    story_bible = None
+    if task_mode == "creative":
+        try:
+            from tools.auto.story_bible import make_story_bible
+            active = config.get("api", "active", fallback="local")
+            api_sec = f"api_{active}"
+            story_bible = make_story_bible(
+                config,
+                base_url=config.get(api_sec, "base_url", fallback="http://localhost:11434"),
+                api_key=config.get(api_sec, "api_key", fallback="ollama"),
+                model=config.get(api_sec, "model", fallback="llama3.1:8b"),
+                api_format=config.get(api_sec, "api_format", fallback="ollama"),
+                base_dir=repo_dir,
+            )
+        except Exception as exc:
+            logger.warning(
+                "make_commit_on_success: could not build StoryBible: %s — "
+                "bible updates will be skipped.", exc,
+            )
+
     return CommitOnSuccess(
         gm, state_store,
         summary_memory=summary_memory,
+        story_bible=story_bible,
         task_mode=task_mode,
         base_dir=repo_dir,
     )
