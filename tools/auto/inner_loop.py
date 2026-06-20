@@ -788,9 +788,10 @@ class InnerLoop:
                 _elapsed = time.monotonic() - _start_time
                 if _elapsed > self.max_task_seconds:
                     logger.warning(
-                        "InnerLoop: task wall-clock limit (%ds) reached — "
-                        "stopping after %d attempts",
-                        self.max_task_seconds, attempt - 1,
+                        "InnerLoop: task wall-clock limit (%ds = %.1f min, "
+                        "from max_task_seconds) reached — stopping after %d attempts",
+                        self.max_task_seconds, self.max_task_seconds / 60.0,
+                        attempt - 1,
                     )
                     last = feedback[-1] if feedback else ""
                     return InnerLoopResult(
@@ -891,7 +892,12 @@ class InnerLoop:
 
             if not approved:
                 fb = f"attempt {attempt}: validator rejected\n{vfb}"
-                logger.info("InnerLoop: attempt %d rejected — %s", attempt, vfb[:80])
+                logger.info(
+                    "InnerLoop: attempt %d rejected — full critique below:\n"
+                    "──────── validator critique (attempt %d) ────────\n%s\n"
+                    "─────────────────────────────────────────────────",
+                    attempt, attempt, vfb,
+                )
                 feedback.append(fb)
                 _prior_validator_critique = vfb   # AUTO-CR-30: carry into next review
                 records.append(AttemptRecord(attempt, True, True, False, fb))
