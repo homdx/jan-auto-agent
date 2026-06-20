@@ -39,6 +39,8 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from tools.auto.repo_ingest import RESERVED_META_FILES
 from typing import Any
 
 from tools.agent_trace import tracer
@@ -779,6 +781,23 @@ class ClusterReviewer:
                 logger.warning(
                     "_parse_candidates [%s]: item %d has empty/missing target_files — rejected",
                     cluster_name, i,
+                )
+                continue
+
+            # AUTO-CR-28: never let a task target a control/memory file
+            # (story_bible.md, synopsis.md, IMPROVEMENTS.md, plan.json). These
+            # are not story content; editing them corrupts the bible/synopsis
+            # and sends the redundancy gate into an endless rewrite loop. Bounce
+            # the candidate here, before Gate 1, so no attempt is ever spent.
+            if any(
+                str(tf).strip().lower().rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+                in RESERVED_META_FILES
+                for tf in target_files
+            ):
+                logger.warning(
+                    "_parse_candidates [%s]: item %d targets a reserved "
+                    "memory/control file %r — rejected (not editable).",
+                    cluster_name, i, target_files,
                 )
                 continue
 

@@ -115,6 +115,13 @@ _DEFAULT_CLUSTERS: list[tuple[str, list[str]]] = [
     ),
 ]
 
+# AUTO-CR-28: agent-generated control/memory files. Read into context elsewhere,
+# but NEVER editable story content — excluded from the walk so the architect
+# can neither cite nor target them.
+RESERVED_META_FILES: frozenset[str] = frozenset(
+    {"synopsis.md", "improvements.md", "story_bible.md", "plan.json"}
+)
+
 # Extensions always skipped during the walk (binary / compiled / generated).
 _BINARY_EXTENSIONS: frozenset[str] = frozenset(
     {
@@ -122,7 +129,7 @@ _BINARY_EXTENSIONS: frozenset[str] = frozenset(
         ".so", ".dll", ".dylib", ".exe",
         ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".ico", ".svg",
         ".mp3", ".mp4", ".wav", ".avi",
-        ".zip", ".tar", ".gz", ".bz2", ".xz", ".rar",
+        ".zip", ".tar", ".gz", ".bz2", ".xz", ".rar", ".7z", ".7zip",
         ".pdf", ".docx", ".xlsx", ".pptx",
         ".db", ".sqlite", ".sqlite3",
         ".lock",            # package-manager lock files (large, not useful)
@@ -255,11 +262,13 @@ class RepoIngestor:
                     continue
                 if fname.endswith("~"):        # emacs/vim backup
                     continue
-                # AUTO-CR-15: never ingest agent-generated meta files. synopsis.md
-                # is the running memory (not story content) and IMPROVEMENTS.md is
-                # the plan dump — ingesting them lets the architect cite/target
-                # them as if they were chapters.
-                if fname.lower() in ("synopsis.md", "improvements.md"):
+                # AUTO-CR-15 / AUTO-CR-28: never ingest agent-generated control
+                # files. These are running MEMORY / plan state, not story
+                # content — ingesting them lets the architect cite or target
+                # them as if they were chapters, so the coder rewrites the bible
+                # as prose and the redundancy gate loops forever (observed: a
+                # "remove repetition" run spent ~1h editing story_bible.md).
+                if fname.lower() in RESERVED_META_FILES:
                     continue
 
                 abs_path = Path(dirpath) / fname
