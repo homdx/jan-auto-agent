@@ -58,6 +58,7 @@ Spec reference: AUTO-CR-5
 from __future__ import annotations
 
 import configparser
+import difflib
 import logging
 import re
 import ssl
@@ -251,6 +252,10 @@ class SummaryFidelityVerifier:
         current = summary
         for rnd in range(1, self._max_rounds + 1):
             user_msg = f"SOURCE:\n{chapter_text}\n\nSUMMARY:\n{current}"
+            print(
+                f"\n🔎 [SummaryFidelityVerifier — round {rnd}] full text sent to validation:\n"
+                f"{'-' * 80}\n{user_msg}\n{'-' * 80}"
+            )
             try:
                 reply = self._llm(system, user_msg) or ""
             except Exception as exc:
@@ -289,6 +294,19 @@ class SummaryFidelityVerifier:
 
             logger.info(
                 "SummaryFidelityVerifier: round %d — replaced summary with corrected list.", rnd,
+            )
+            diff = "\n".join(
+                difflib.unified_diff(
+                    current.splitlines(),
+                    corrected.splitlines(),
+                    fromfile=f"summary (before round {rnd})",
+                    tofile=f"summary (after round {rnd})",
+                    lineterm="",
+                )
+            )
+            print(
+                f"\n✏️  [SummaryFidelityVerifier — round {rnd}] summary changed:\n"
+                f"{'-' * 80}\n{diff}\n{'-' * 80}"
             )
             current = corrected
 
