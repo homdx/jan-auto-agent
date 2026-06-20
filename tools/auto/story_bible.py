@@ -80,7 +80,7 @@ _BIBLE_SYSTEM = (
     "Preserve negations and qualifiers exactly (e.g. 'secret cargo', 'not "
     "allowed to know', 'does not work'). "
     "Record each main character's gender when the text makes it clear (e.g. "
-    "'Капитан Рейес — женщина')."
+    "write a line like '<имя персонажа> — женщина' / '<имя персонажа> — мужчина')."
 )
 
 # AUTO-CR-24-3: compaction is now deterministic — no LLM call in this path.

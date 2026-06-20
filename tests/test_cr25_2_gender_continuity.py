@@ -89,7 +89,9 @@ class TestBiblePromptRequestsGender:
 
     def test_gender_clause_present(self) -> None:
         assert "gender" in _BIBLE_SYSTEM
-        assert "Капитан Рейес — женщина" in _BIBLE_SYSTEM
+        # AUTO-CR-32: the example is now generic (no hardcoded character name)
+        assert "женщина" in _BIBLE_SYSTEM and "мужчина" in _BIBLE_SYSTEM
+        assert "Рейес" not in _BIBLE_SYSTEM   # no story-specific names leak in
 
 
 # ── test_continuity_prompt_checks_gender ───────────────────────────────────────
