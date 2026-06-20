@@ -47,8 +47,11 @@ def main() -> None:
     base = Path(args.base)
 
     # IMPORTANT: same loader as main.py / controller.py — strips inline ; and # comments.
+    # encoding="utf-8" is REQUIRED on Windows: Python there defaults to the
+    # locale codec (cp1252) and crashes on the UTF-8 bytes in the .ini
+    # (UnicodeDecodeError: 'charmap' codec can't decode byte 0x90 ...).
     cfg = configparser.ConfigParser(inline_comment_prefixes=(";", "#"))
-    cfg.read(args.config)
+    cfg.read(args.config, encoding="utf-8")
 
     if args.fresh:
         for f in ("synopsis.md", "story_bible.md"):
