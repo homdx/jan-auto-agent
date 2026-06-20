@@ -379,38 +379,40 @@ class LLMGate2Validator:
                     "(say what is still wrong) and add any new problems you now see."
                 )
 
-            if self.api_format == "ollama":
-                _val_opts: dict = {"temperature": self.temperature, "num_predict": self.max_tokens}
-                if self.num_ctx:
-                    _val_opts["num_ctx"] = self.num_ctx
-                payload = {
-                    "model": self.model,
-                    "messages": [
-                        {"role": "system",  "content": self._system},
-                        {"role": "user",    "content": user_msg},
-                    ],
-                    "options": _val_opts,
-                }
-            else:
-                payload = {
-                    "model": self.model,
-                    "messages": [
-                        {"role": "system",  "content": self._system},
-                        {"role": "user",    "content": user_msg},
-                    ],
-                    "temperature": self.temperature,
-                    "max_tokens": self.max_tokens,
-                }
+            def _call_validator(um: str) -> str:
+                if self.api_format == "ollama":
+                    _val_opts: dict = {"temperature": self.temperature, "num_predict": self.max_tokens}
+                    if self.num_ctx:
+                        _val_opts["num_ctx"] = self.num_ctx
+                    _payload = {
+                        "model": self.model,
+                        "messages": [
+                            {"role": "system",  "content": self._system},
+                            {"role": "user",    "content": um},
+                        ],
+                        "options": _val_opts,
+                    }
+                else:
+                    _payload = {
+                        "model": self.model,
+                        "messages": [
+                            {"role": "system",  "content": self._system},
+                            {"role": "user",    "content": um},
+                        ],
+                        "temperature": self.temperature,
+                        "max_tokens": self.max_tokens,
+                    }
+                _r = request_completion(
+                    url=url,
+                    headers=headers,
+                    payload=_payload,
+                    timeout=self.timeout,
+                    api_format=self.api_format,
+                    ssl_context=self.ssl_context,
+                )
+                return strip_think(_r or "")
 
-            raw = request_completion(
-                url=url,
-                headers=headers,
-                payload=payload,
-                timeout=self.timeout,
-                api_format=self.api_format,
-                ssl_context=self.ssl_context,
-            )
-            raw = strip_think(raw or "")
+            raw = _call_validator(user_msg)
             # ── Guard: empty response ─────────────────────────────────────────
             # An empty body means the model returned nothing at all (network
             # timeout that still got a 200, or a model that refused silently).
@@ -425,10 +427,30 @@ class LLMGate2Validator:
             # ── Creative mode: line-oriented soft verdict (AUTO-CR-2) ─────────
             if self.task_mode == "creative":
                 approved, reason, unparseable = _parse_verdict_soft(raw)
+                # AUTO-CR-31: if the model buried the verdict (e.g. it started
+                # with "Let's go through each point:" instead of APPROVED/REVISE),
+                # re-ask ONCE with a hard nudge before falling open. Capped at a
+                # single retry — no loop, max two validator calls total.
+                if unparseable:
+                    logger.info(
+                        "LLMGate2Validator [creative]: verdict unparseable — "
+                        "re-asking once. raw=%r", raw[:120]
+                    )
+                    _nudge = (
+                        "\n\nIMPORTANT: your previous reply did not begin with a "
+                        "verdict. Reply AGAIN and make the VERY FIRST token exactly "
+                        "APPROVED or REVISE (in English, uppercase). If REVISE, "
+                        "follow it with ':' and the numbered list of problems."
+                    )
+                    raw2 = _call_validator(user_msg + _nudge)
+                    if raw2 and raw2.strip():
+                        a2, r2, u2 = _parse_verdict_soft(raw2)
+                        if not u2:        # second answer was clear — use it
+                            raw, approved, reason, unparseable = raw2, a2, r2, u2
                 if unparseable:
                     logger.warning(
-                        "LLMGate2Validator [creative]: verdict unparseable — "
-                        "passing on fail-open. raw=%r", raw[:120]
+                        "LLMGate2Validator [creative]: verdict still unparseable "
+                        "after one retry — passing on fail-open. raw=%r", raw[:120]
                     )
                 if approved:
                     return True, ""
