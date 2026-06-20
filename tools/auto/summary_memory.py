@@ -235,6 +235,18 @@ class SummaryFidelityVerifier:
         from tools.auto.utils import detect_language, language_instruction
         lang_instr = language_instruction(detect_language(chapter_text))
         system = _SYSTEM_FIDELITY + (("\n" + lang_instr) if lang_instr else "")
+        if lang_instr:
+            # Same class of bug as the continuity validator: "output
+            # {language} only, do not translate" also swallows the literal
+            # "OK" sentinel on rounds where no correction is needed, so the
+            # early-exit branch below can never fire for non-English books —
+            # every round looks like it "needed a fix" and the loop always
+            # bleeds out via max_fidelity_rounds instead of a genuine pass.
+            system += (
+                "\nEXCEPTION TO THE LANGUAGE RULE ABOVE: if no correction is "
+                "needed, reply with exactly the English word OK — do not "
+                "translate or transliterate it into another language."
+            )
 
         current = summary
         for rnd in range(1, self._max_rounds + 1):
