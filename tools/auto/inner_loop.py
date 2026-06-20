@@ -827,7 +827,7 @@ class InnerLoop:
 
             if not approved:
                 fb = f"attempt {attempt}: validator rejected\n{vfb}"
-                logger.info("InnerLoop: attempt %d rejected — %s", attempt, vfb[:80])
+                logger.info("InnerLoop: attempt %d rejected — %s", attempt, vfb[:380])
                 feedback.append(fb)
                 records.append(AttemptRecord(attempt, True, True, False, fb))
                 val_missing = list(getattr(self.validator, "last_missing_context", []) or [])
