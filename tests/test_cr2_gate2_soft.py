@@ -248,10 +248,15 @@ def test_creative_system_prompt_no_json_contract():
     assert "JSON object" not in _GATE2_SYSTEM_CREATIVE
 
 def test_creative_system_prompt_instructs_one_line_verdict():
-    """Creative system prompt must instruct APPROVED/REVISE line-oriented protocol."""
+    """Creative system prompt must keep the APPROVED/REVISE verdict protocol and
+    (AUTO-CR-29) ask for a numbered, multi-point critique on REVISE."""
     assert "APPROVED" in _GATE2_SYSTEM_CREATIVE
     assert "REVISE" in _GATE2_SYSTEM_CREATIVE
-    assert "ONE line" in _GATE2_SYSTEM_CREATIVE or "one line" in _GATE2_SYSTEM_CREATIVE.lower()
+    # first token still pinned for the parser
+    assert "FIRST token" in _GATE2_SYSTEM_CREATIVE or "first token" in _GATE2_SYSTEM_CREATIVE.lower()
+    # now expects a list of every problem, not a single sentence
+    assert "NUMBERED LIST" in _GATE2_SYSTEM_CREATIVE
+    assert "EVERY problem" in _GATE2_SYSTEM_CREATIVE
 
 def test_creative_validator_uses_creative_system_prompt():
     """LLMGate2Validator in creative mode loads the creative (non-JSON) prompt."""

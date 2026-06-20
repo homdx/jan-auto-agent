@@ -116,18 +116,30 @@ _GATE2_SYSTEM_DOCS = (
 )
 
 _GATE2_SYSTEM_CREATIVE = (
-    "You are a creative writing editor validating a chapter. "
-    "Given a task description and the generated chapter prose, decide whether "
-    "the chapter fulfils the task and reads as coherent, complete prose. "
-    "Reply with ONE line only. "
-    "The first token must be APPROVED or REVISE. "
-    "If REVISE, follow immediately with ': ' and one concrete reason that "
-    "points at a specific passage, character, or continuity issue. "
-    "Examples of valid replies:\n"
-    "  APPROVED\n"
-    "  REVISE: the duel in paragraph 3 contradicts the earlier truce in chapter_02\n"
-    "  REVISE: Elena's eye colour changes from blue to green mid-scene\n"
-    "Do NOT return JSON. Do NOT add preamble. One line, first token APPROVED or REVISE."
+    "You are a creative writing editor validating a chapter against its task. "
+    "Check ALL of these and report every problem you find:\n"
+    "  (a) TASK FULFILMENT — does the chapter actually do what the task asked "
+    "(the requested action, scene, mood, or dialogue is present and on-topic)? "
+    "Flag dialogue or passages that do not match the task.\n"
+    "  (b) COHERENCE & COMPLETENESS as prose.\n"
+    "  (c) REPETITION — scenes, lines, or descriptions already present earlier "
+    "or in another chapter.\n"
+    "  (d) CONTRADICTIONS / continuity errors (facts, names, gender, timeline).\n"
+    "The FIRST token of your reply MUST be APPROVED or REVISE, written in "
+    "English exactly (never translated). "
+    "If everything is fine, reply with exactly: APPROVED\n"
+    "If anything is wrong, reply with 'REVISE:' followed by a NUMBERED LIST of "
+    "EVERY problem — do NOT stop at the first one. For each item give: the exact "
+    "phrase or passage at fault (quote it), what is wrong, and the concrete fix "
+    "to apply. Write the problem list in the chapter's language. "
+    "Be specific and actionable, never vague. Do NOT return JSON, no preamble.\n"
+    "Example:\n"
+    "REVISE:\n"
+    "1. Диалог Миры в абзаце 2 («Какая хорошая погода») не отвечает заданию о "
+    "панике — заменить на реплику о страхе перед Ледяными проливами.\n"
+    "2. Описание мостика дословно повторяет сцену из chapter_2 — сократить до "
+    "одной фразы или убрать.\n"
+    "3. Капитан назван «он», хотя по фактам Рейес — женщина — заменить на «она/стояла»."
 )
 
 # Backward-compatibility alias
@@ -312,11 +324,18 @@ class LLMGate2Validator:
         coder_result,
         *,
         base_dir=None,
+        prior_critique: str = "",
     ) -> tuple[bool, str]:
         """Return (approved, feedback_string).  Never raises — fail-closed.
 
         Side channel: ``self.last_missing_context`` is set to any symbol names
         the validator reported as needed (pull-model); InnerLoop reads it.
+
+        AUTO-CR-30: ``prior_critique`` is the validator's OWN feedback from the
+        previous attempt (empty on the first). When present, it is shown to the
+        model so it can check, item by item, which of its earlier points the new
+        draft actually addressed, re-read the task, and write a fresh, more
+        detailed verdict instead of repeating itself.
         """
         self.last_missing_context = []
         try:
@@ -341,9 +360,24 @@ class LLMGate2Validator:
                 f"Acceptance check exit code: {getattr(exec_result, 'exit_code', 0)}\n"
                 f"stdout:\n{_exec_stdout[:2000]}\n\n"
                 + _stderr_section
-                + f"Generated files (CHANGED FILE CONTENT after the coder's edit):\n"
+                + "Generated files (CHANGED FILE CONTENT after the coder's edit):\n"
                 + self._read_changed_content(coder_result, task=task, base_dir=base_dir)
             )
+
+            # AUTO-CR-30: on a re-review, show the model its OWN previous critique
+            # so it verifies what was actually fixed rather than repeating itself.
+            if prior_critique and prior_critique.strip():
+                user_msg += (
+                    "\n\n--- YOUR PREVIOUS REVIEW (of the earlier draft) ---\n"
+                    + prior_critique.strip()
+                    + "\n\nThe chapter above is the author's NEW revision after that "
+                    "review. Go through your previous points ONE BY ONE: state for "
+                    "each whether the new draft fixed it or not. Re-read the Task. "
+                    "Then give a FRESH verdict: APPROVED only if every point is "
+                    "resolved and the task is met; otherwise REVISE with an UPDATED, "
+                    "MORE DETAILED numbered list — keep the still-unfixed points "
+                    "(say what is still wrong) and add any new problems you now see."
+                )
 
             if self.api_format == "ollama":
                 _val_opts: dict = {"temperature": self.temperature, "num_predict": self.max_tokens}
@@ -398,7 +432,20 @@ class LLMGate2Validator:
                     )
                 if approved:
                     return True, ""
-                return False, f"Reason: {reason}"
+                # AUTO-CR-29: the prompt now asks for a NUMBERED LIST of every
+                # problem. _parse_verdict_soft is line-oriented and only pulls
+                # the reason off the matched verdict line, so a multi-line
+                # critique would be lost. Feed the coder the FULL reviewer reply
+                # minus the leading verdict token instead.
+                critique = raw.strip()
+                _low = critique.lower()
+                for _tok in ("revise:", "revise", "reject:", "reject", "no:"):
+                    if _low.startswith(_tok):
+                        critique = critique[len(_tok):].lstrip(" :\n\t")
+                        break
+                if not critique:
+                    critique = reason  # fall back to the parsed reason
+                return False, f"Reason: {critique}"
 
             # ── Code / docs mode: strict JSON path (unchanged) ───────────────
             if "```json" in raw:
@@ -695,6 +742,17 @@ class InnerLoop:
         """
         task_id = task.get("id", "")
         feedback: list[str] = list(prior_feedback or [])
+        _prior_validator_critique: str = ""   # AUTO-CR-30: last Gate-2 critique
+        # AUTO-CR-30: detect (once) whether this validator's approve() accepts
+        # prior_critique, so we never break fakes/older validators that don't.
+        try:
+            import inspect as _inspect
+            _validator_accepts_prior = (
+                "prior_critique"
+                in _inspect.signature(self.validator.approve).parameters
+            )
+        except (ValueError, TypeError):
+            _validator_accepts_prior = False
         records:  list[AttemptRecord] = []
         # Pull-model state (carried across attempts within this round)
         prefetched_context: str = ""
@@ -816,8 +874,14 @@ class InnerLoop:
 
             # ── 3. Validator (subjective half of Gate 2) ─────────────────────
             try:
-                approved, vfb = self.validator.approve(task, exec_result, coder_result,
-                                                       base_dir=base_dir_path)
+                # AUTO-CR-30: only pass prior_critique to validators that accept
+                # it (real LLMGate2Validator); fakes/older validators are unaffected.
+                _ap_kwargs = {"base_dir": base_dir_path}
+                if _validator_accepts_prior:
+                    _ap_kwargs["prior_critique"] = _prior_validator_critique
+                approved, vfb = self.validator.approve(
+                    task, exec_result, coder_result, **_ap_kwargs
+                )
             except Exception as exc:
                 logger.error("InnerLoop: validator raised on attempt %d: %s", attempt, exc)
                 fb = f"attempt {attempt}: validator error — {exc}"
@@ -827,8 +891,9 @@ class InnerLoop:
 
             if not approved:
                 fb = f"attempt {attempt}: validator rejected\n{vfb}"
-                logger.info("InnerLoop: attempt %d rejected — %s", attempt, vfb[:380])
+                logger.info("InnerLoop: attempt %d rejected — %s", attempt, vfb[:80])
                 feedback.append(fb)
+                _prior_validator_critique = vfb   # AUTO-CR-30: carry into next review
                 records.append(AttemptRecord(attempt, True, True, False, fb))
                 val_missing = list(getattr(self.validator, "last_missing_context", []) or [])
                 if val_missing:
