@@ -485,11 +485,19 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
         _re.compile(r"\b(нет|без)\s+противоречий\b"),
         _re.compile(r"\bпротиворечий\s+нет\b"),
         _re.compile(r"\bне\s+противоречит\b"),
+        # negated / absent contradictions expressed without «нет/без»:
+        #   «противоречий не обнаружено / не выявлено», «противоречия отсутствуют»
+        _re.compile(r"противоречи\w*\s+(?:отсутств\w*|не\s+\w+)"),
+        #   «не вижу / не обнаружил / не нашёл … противоречий»
+        _re.compile(r"\bне\s+\w+\s+противоречи"),
         # «не против» / «непротив»
         _re.compile(r"\bне\s+против\b"),
         _re.compile(r"\bнепротив\b"),
-        # «одобрен*»
-        _re.compile(r"\bодобрен"),
+        # «одобрен* / одобряю» — NOT preceded by «не »
+        _re.compile(r"(?<!не )одобр"),
+        # «принято / принимаю / можно принять» — NOT preceded by «не »
+        _re.compile(r"(?<!не )принят"),
+        _re.compile(r"\bможно\s+принять\b"),
         # «всё верно» / «все верно»
         _re.compile(r"\b(всё|все)\s+верно\b"),
         # «соответствует» — NOT preceded by «не »
@@ -513,6 +521,18 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
         _re.compile(r"\bисправ"),
         _re.compile(r"\bошибк"),
         _re.compile(r"\bневерн"),
+        # «доработать / переписать / переделать»
+        _re.compile(r"\bдоработ"),
+        _re.compile(r"\bперепис"),
+        _re.compile(r"\bпередел"),
+        # «нужно / надо / следует изменить|поправить|переписать|исправить|доработать»
+        _re.compile(r"\b(нужно|надо|следует)\s+(изменить|поправить|переписать|исправить|доработать|переделать)"),
+        # «(так) нельзя оставлять»
+        _re.compile(r"нельзя\s+оставля"),
+        # standalone negative answer «Нет, …» / «Нет.» — comma/period only, so
+        # approvals like «нет проблем» / «нет замечаний» (followed by a space) are
+        # NOT caught here. «нет противоречий» already returned APPROVED above.
+        _re.compile(r"^нет(?:[,.]|$)"),
     ]
 
     # ── Scan: first try the first non-empty line; fall back to whole text ──

@@ -412,8 +412,18 @@ def make_outer_loop(
     # LOOP-2: build a TaskRewriter if the config has the rewrite keys and
     # max_rewrites > 0.  If anything is missing the outer loop just runs
     # without rewriting.
+    #
+    # AUTO-CR-27: the TaskRewriter is a CODE-mode recovery path — its prompt is
+    # all software-test framing ("completely different implementation",
+    # "exit 127", "gradlew test", "mvn test", "compile-only check"). On a
+    # creative task that vocabulary is nonsense: acceptance_check is forced to
+    # "true" (CR-17) and quality is judged by the gates, so a repeatedly-failing
+    # chapter must be steered by gate feedback in the inner loop, NOT by a
+    # code reframer. Running it here wasted an 8B call and nudged the model
+    # toward emitting shell commands / code mid-story. So: never build it in
+    # creative mode.
     task_rewriter = None
-    if max_rewrites > 0:
+    if max_rewrites > 0 and task_mode != "creative":
         try:
             from tools.auto.architect import TaskRewriter
 
