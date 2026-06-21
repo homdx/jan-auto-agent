@@ -116,18 +116,39 @@ _GATE2_SYSTEM_DOCS = (
 )
 
 _GATE2_SYSTEM_CREATIVE = (
-    "You are a creative writing editor validating a chapter. "
-    "Given a task description and the generated chapter prose, decide whether "
-    "the chapter fulfils the task and reads as coherent, complete prose. "
-    "Reply with ONE line only. "
-    "The first token must be APPROVED or REVISE. "
-    "If REVISE, follow immediately with ': ' and one concrete reason that "
-    "points at a specific passage, character, or continuity issue. "
-    "Examples of valid replies:\n"
-    "  APPROVED\n"
-    "  REVISE: the duel in paragraph 3 contradicts the earlier truce in chapter_02\n"
-    "  REVISE: Elena's eye colour changes from blue to green mid-scene\n"
-    "Do NOT return JSON. Do NOT add preamble. One line, first token APPROVED or REVISE."
+    "You are a creative writing editor validating a chapter against its task. "
+    "Check ALL of these and report every problem you find:\n"
+    "  (a) TASK FULFILMENT — does the chapter actually do what the task asked "
+    "(the requested action, scene, mood, or dialogue is present and on-topic)? "
+    "Flag dialogue or passages that do not match the task.\n"
+    "  (b) COHERENCE & COMPLETENESS as prose.\n"
+    "  (c) REPETITION — scenes, lines, or descriptions already present earlier "
+    "or in another chapter.\n"
+    "  (d) CONTRADICTIONS / continuity errors (facts, names, gender, timeline).\n"
+    "The FIRST token of your reply MUST be APPROVED or REVISE, written in "
+    "English exactly (never translated). "
+    "If everything is fine, reply with exactly: APPROVED\n"
+    "If anything is wrong, reply with 'REVISE:' followed by a NUMBERED LIST of "
+    "EVERY problem — do NOT stop at the first one. For each item give: the exact "
+    "phrase or passage at fault (quote it), what is wrong, and the concrete fix "
+    "to apply. Write the problem list in the chapter's language. "
+    "Be specific and actionable, never vague. Do NOT return JSON, no preamble.\n"
+    "VERY IMPORTANT — how to phrase a fix: for PROSE, DIALOGUE, or STYLE "
+    "problems, describe the DESIRED OUTCOME in your own words (e.g. 'rewrite this "
+    "narrated summary as a short direct-speech exchange between the characters "
+    "involved'). Do NOT write the exact replacement sentence yourself — the "
+    "author copies such sentences verbatim, and your terse phrasing then becomes "
+    "flat 'telling' prose, which loops. ONLY for a factual value (a name, gender, "
+    "age, date, place) may you give the exact corrected value.\n"
+    "Example of the FORMAT (generic — describe the real problems in the chapter, "
+    "do not reuse this wording):\n"
+    "REVISE:\n"
+    "1. Реплика персонажа в абзаце 2 не отвечает заданию — оживить как короткий "
+    "диалог по теме задания (своими словами).\n"
+    "2. Описание сцены дословно повторяет другую главу — сократить до одной "
+    "фразы или убрать.\n"
+    "3. Персонаж назван «он», хотя по фактам это женщина — привести местоимения "
+    "и глаголы к женскому роду («она/стояла»)."
 )
 
 # Backward-compatibility alias
@@ -312,11 +333,18 @@ class LLMGate2Validator:
         coder_result,
         *,
         base_dir=None,
+        prior_critique: str = "",
     ) -> tuple[bool, str]:
         """Return (approved, feedback_string).  Never raises — fail-closed.
 
         Side channel: ``self.last_missing_context`` is set to any symbol names
         the validator reported as needed (pull-model); InnerLoop reads it.
+
+        AUTO-CR-30: ``prior_critique`` is the validator's OWN feedback from the
+        previous attempt (empty on the first). When present, it is shown to the
+        model so it can check, item by item, which of its earlier points the new
+        draft actually addressed, re-read the task, and write a fresh, more
+        detailed verdict instead of repeating itself.
         """
         self.last_missing_context = []
         try:
@@ -341,42 +369,59 @@ class LLMGate2Validator:
                 f"Acceptance check exit code: {getattr(exec_result, 'exit_code', 0)}\n"
                 f"stdout:\n{_exec_stdout[:2000]}\n\n"
                 + _stderr_section
-                + f"Generated files (CHANGED FILE CONTENT after the coder's edit):\n"
+                + "Generated files (CHANGED FILE CONTENT after the coder's edit):\n"
                 + self._read_changed_content(coder_result, task=task, base_dir=base_dir)
             )
 
-            if self.api_format == "ollama":
-                _val_opts: dict = {"temperature": self.temperature, "num_predict": self.max_tokens}
-                if self.num_ctx:
-                    _val_opts["num_ctx"] = self.num_ctx
-                payload = {
-                    "model": self.model,
-                    "messages": [
-                        {"role": "system",  "content": self._system},
-                        {"role": "user",    "content": user_msg},
-                    ],
-                    "options": _val_opts,
-                }
-            else:
-                payload = {
-                    "model": self.model,
-                    "messages": [
-                        {"role": "system",  "content": self._system},
-                        {"role": "user",    "content": user_msg},
-                    ],
-                    "temperature": self.temperature,
-                    "max_tokens": self.max_tokens,
-                }
+            # AUTO-CR-30: on a re-review, show the model its OWN previous critique
+            # so it verifies what was actually fixed rather than repeating itself.
+            if prior_critique and prior_critique.strip():
+                user_msg += (
+                    "\n\n--- YOUR PREVIOUS REVIEW (of the earlier draft) ---\n"
+                    + prior_critique.strip()
+                    + "\n\nThe chapter above is the author's NEW revision after that "
+                    "review. Go through your previous points ONE BY ONE: state for "
+                    "each whether the new draft fixed it or not. Re-read the Task. "
+                    "Then give a FRESH verdict: APPROVED only if every point is "
+                    "resolved and the task is met; otherwise REVISE with an UPDATED, "
+                    "MORE DETAILED numbered list — keep the still-unfixed points "
+                    "(say what is still wrong) and add any new problems you now see."
+                )
 
-            raw = request_completion(
-                url=url,
-                headers=headers,
-                payload=payload,
-                timeout=self.timeout,
-                api_format=self.api_format,
-                ssl_context=self.ssl_context,
-            )
-            raw = strip_think(raw or "")
+            def _call_validator(um: str) -> str:
+                if self.api_format == "ollama":
+                    _val_opts: dict = {"temperature": self.temperature, "num_predict": self.max_tokens}
+                    if self.num_ctx:
+                        _val_opts["num_ctx"] = self.num_ctx
+                    _payload = {
+                        "model": self.model,
+                        "messages": [
+                            {"role": "system",  "content": self._system},
+                            {"role": "user",    "content": um},
+                        ],
+                        "options": _val_opts,
+                    }
+                else:
+                    _payload = {
+                        "model": self.model,
+                        "messages": [
+                            {"role": "system",  "content": self._system},
+                            {"role": "user",    "content": um},
+                        ],
+                        "temperature": self.temperature,
+                        "max_tokens": self.max_tokens,
+                    }
+                _r = request_completion(
+                    url=url,
+                    headers=headers,
+                    payload=_payload,
+                    timeout=self.timeout,
+                    api_format=self.api_format,
+                    ssl_context=self.ssl_context,
+                )
+                return strip_think(_r or "")
+
+            raw = _call_validator(user_msg)
             # ── Guard: empty response ─────────────────────────────────────────
             # An empty body means the model returned nothing at all (network
             # timeout that still got a 200, or a model that refused silently).
@@ -391,14 +436,47 @@ class LLMGate2Validator:
             # ── Creative mode: line-oriented soft verdict (AUTO-CR-2) ─────────
             if self.task_mode == "creative":
                 approved, reason, unparseable = _parse_verdict_soft(raw)
+                # AUTO-CR-31: if the model buried the verdict (e.g. it started
+                # with "Let's go through each point:" instead of APPROVED/REVISE),
+                # re-ask ONCE with a hard nudge before falling open. Capped at a
+                # single retry — no loop, max two validator calls total.
+                if unparseable:
+                    logger.info(
+                        "LLMGate2Validator [creative]: verdict unparseable — "
+                        "re-asking once. raw=%r", raw[:120]
+                    )
+                    _nudge = (
+                        "\n\nIMPORTANT: your previous reply did not begin with a "
+                        "verdict. Reply AGAIN and make the VERY FIRST token exactly "
+                        "APPROVED or REVISE (in English, uppercase). If REVISE, "
+                        "follow it with ':' and the numbered list of problems."
+                    )
+                    raw2 = _call_validator(user_msg + _nudge)
+                    if raw2 and raw2.strip():
+                        a2, r2, u2 = _parse_verdict_soft(raw2)
+                        if not u2:        # second answer was clear — use it
+                            raw, approved, reason, unparseable = raw2, a2, r2, u2
                 if unparseable:
                     logger.warning(
-                        "LLMGate2Validator [creative]: verdict unparseable — "
-                        "passing on fail-open. raw=%r", raw[:120]
+                        "LLMGate2Validator [creative]: verdict still unparseable "
+                        "after one retry — passing on fail-open. raw=%r", raw[:120]
                     )
                 if approved:
                     return True, ""
-                return False, f"Reason: {reason}"
+                # AUTO-CR-29: the prompt now asks for a NUMBERED LIST of every
+                # problem. _parse_verdict_soft is line-oriented and only pulls
+                # the reason off the matched verdict line, so a multi-line
+                # critique would be lost. Feed the coder the FULL reviewer reply
+                # minus the leading verdict token instead.
+                critique = raw.strip()
+                _low = critique.lower()
+                for _tok in ("revise:", "revise", "reject:", "reject", "no:"):
+                    if _low.startswith(_tok):
+                        critique = critique[len(_tok):].lstrip(" :\n\t")
+                        break
+                if not critique:
+                    critique = reason  # fall back to the parsed reason
+                return False, f"Reason: {critique}"
 
             # ── Code / docs mode: strict JSON path (unchanged) ───────────────
             if "```json" in raw:
@@ -435,7 +513,7 @@ class LLMGate2Validator:
 
 
 def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
-    """Parse a line-oriented Gate-2 verdict for creative mode (AUTO-CR-2).
+    """Parse a line-oriented Gate-2 verdict for creative mode (AUTO-CR-2 / CR-26-1).
 
     Protocol: the model is expected to reply with one line whose first token is
     ``APPROVED`` (or ``OK``) or ``REVISE`` / ``REJECT`` / ``NO``.  If ``REVISE``,
@@ -451,32 +529,139 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
                           as approved (fail-open) so a rambling 8B response cannot
                           hard-block a chapter.
 
-    Acceptance criteria (spec AUTO-CR-2):
-        * ``APPROVED`` / ``approved`` / ``OK …``         → approved=True
-        * ``REVISE: <reason>``                           → approved=False, reason captured
-        * ``REJECT: <reason>`` / ``NO: <reason>``        → approved=False, reason captured
-        * Any other content (rambling, JSON, prose, …)  → approved=True (fail-open)
-    """
-    for line in text.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        upper = stripped.upper()
+    Acceptance criteria (spec AUTO-CR-2 + AUTO-CR-26-1):
+        * ``APPROVED`` / ``approved`` / ``OK …``                  → approved=True
+        * ``REVISE: <reason>`` / ``REJECT: …`` / ``NO: …``        → approved=False
+        * Russian APPROVED forms (нет противоречий, согласна, …)  → approved=True
+        * Russian REVISE forms (не согласна, противоречие, …)     → approved=False
+        * Any other content (rambling, JSON, prose, …)            → approved=True (fail-open)
 
-        if upper.startswith("APPROVED") or upper.startswith("OK"):
+    Order is load-bearing: negated-positive RU rules (нет противоречий, не против,
+    не противоречит) and the «не соглас» rule are tested **before** the bare
+    negative patterns (против, противоречи…, соглас) to avoid mis-classification.
+    """
+    import re as _re
+
+    def _normalise(s: str) -> str:
+        """Lowercase, collapse whitespace, strip surrounding punctuation."""
+        s = s.lower().strip()
+        s = _re.sub(r"[\s\u00a0]+", " ", s)   # collapse all whitespace
+        s = s.strip(".,!?;:—–-")
+        return s
+
+    def _reason_from(raw: str, norm: str) -> str:
+        """Extract human-readable reason: text after first ':' or the whole norm."""
+        if ":" in raw:
+            after = raw.split(":", 1)[1].strip()
+            if after:
+                return after
+        return norm if norm else "validator rejected (no reason given)"
+
+    # ── APPROVED patterns (Russian) — must be checked BEFORE bare negatives ──
+    _RU_APPROVED = [
+        # «нет противоречий» / «противоречий нет» / «не противоречит»
+        _re.compile(r"\b(нет|без)\s+противоречий\b"),
+        _re.compile(r"\bпротиворечий\s+нет\b"),
+        _re.compile(r"\bне\s+противоречит\b"),
+        # negated / absent contradictions expressed without «нет/без»:
+        #   «противоречий не обнаружено / не выявлено», «противоречия отсутствуют»
+        _re.compile(r"противоречи\w*\s+(?:отсутств\w*|не\s+\w+)"),
+        #   «не вижу / не обнаружил / не нашёл … противоречий»
+        _re.compile(r"\bне\s+\w+\s+противоречи"),
+        # «не против» / «непротив»
+        _re.compile(r"\bне\s+против\b"),
+        _re.compile(r"\bнепротив\b"),
+        # «одобрен* / одобряю» — NOT preceded by «не »
+        _re.compile(r"(?<!не )одобр"),
+        # «принято / принимаю / можно принять» — NOT preceded by «не »
+        _re.compile(r"(?<!не )принят"),
+        _re.compile(r"\bможно\s+принять\b"),
+        # «всё верно» / «все верно»
+        _re.compile(r"\b(всё|все)\s+верно\b"),
+        # «соответствует» — NOT preceded by «не »
+        _re.compile(r"(?<!не )соответствует\b"),
+        # «соглас*» (согласен/согласна/…) — NOT preceded by «не»/«нет»
+        _re.compile(r"(?<!не)(?<!нет)(?<!не )(?<!нет )соглас"),
+    ]
+
+    # ── REVISE patterns (Russian) — negated forms first, then bare ──
+    _RU_REVISE = [
+        # «не соглас*» / «несоглас*»
+        _re.compile(r"\b(не|нет)\s+соглас"),
+        _re.compile(r"\bнесоглас"),
+        # «не соответствует»
+        _re.compile(r"\bне\s+соответствует\b"),
+        # bare «противоречи*» (un-negated — the нет/не rules above returned already)
+        _re.compile(r"\bпротиворечи"),
+        # bare «против» (un-negated — «не против» / «непротив» returned above)
+        _re.compile(r"\bпротив\b"),
+        # error / correction vocabulary
+        _re.compile(r"\bисправ"),
+        _re.compile(r"\bошибк"),
+        _re.compile(r"\bневерн"),
+        # «доработать / переписать / переделать»
+        _re.compile(r"\bдоработ"),
+        _re.compile(r"\bперепис"),
+        _re.compile(r"\bпередел"),
+        # «нужно / надо / следует изменить|поправить|переписать|исправить|доработать»
+        _re.compile(r"\b(нужно|надо|следует)\s+(изменить|поправить|переписать|исправить|доработать|переделать)"),
+        # «(так) нельзя оставлять»
+        _re.compile(r"нельзя\s+оставля"),
+        # standalone negative answer «Нет, …» / «Нет.» — comma/period only, so
+        # approvals like «нет проблем» / «нет замечаний» (followed by a space) are
+        # NOT caught here. «нет противоречий» already returned APPROVED above.
+        _re.compile(r"^нет(?:[,.]|$)"),
+    ]
+
+    # ── Scan: first try the first non-empty line; fall back to whole text ──
+    candidates: list[str] = []
+    first_line: str | None = None
+    for line in text.splitlines():
+        s = line.strip()
+        if s:
+            if first_line is None:
+                first_line = s
+                candidates.append(s)   # first non-empty line tried first
+            # collect whole text as second candidate
+    if text.strip():
+        candidates.append(text.strip())   # whole text as fallback
+
+    for raw in candidates:
+        norm = _normalise(raw)
+        upper = raw.strip().upper()
+
+        # ── English APPROVED ──────────────────────────────────────────────
+        if upper.startswith("APPROVED") or _re.match(r"^OK\b", upper):
             return True, "", False
 
+        # ── English REVISE / REJECT / NO ─────────────────────────────────
         for token in ("REVISE", "REJECT", "NO"):
             if upper.startswith(token):
-                # Extract reason after the token + optional ': '
-                rest = stripped[len(token):].lstrip(": ").strip()
+                rest = raw.strip()[len(token):].lstrip(": ").strip()
                 reason = rest if rest else "validator rejected (no reason given)"
                 return False, reason, False
 
-        # First non-empty line matched no verdict token → fail-open
+        # ── Russian APPROVED (order matters — negated first) ──────────────
+        for pat in _RU_APPROVED:
+            if pat.search(norm):
+                return True, "", False
+
+        # ── Russian REVISE (order matters — negated first) ────────────────
+        for pat in _RU_REVISE:
+            if pat.search(norm):
+                reason = _reason_from(raw.strip(), norm)
+                return False, reason, False
+
+        # Only the *first* non-empty line is tried for the line-first pass.
+        # Break after processing the first candidate so that the second
+        # candidate (whole text) is only reached when the first line had no match.
+        if raw == first_line:
+            # did not match on first line — try whole text next iteration
+            continue
+        # whole-text pass also found nothing
         break
 
-    # Empty response or no matching line
+    # Empty response or no matching token found anywhere
     note = "verdict unparseable — passed on fail-open"
     return True, note, True
 
@@ -523,6 +708,7 @@ class InnerLoop:
         canon_validator=None,
         fact_validator=None,
         prosody_validator=None,
+        continuity_validator=None,
         task_mode: str = "code",
         max_task_seconds: int = 0,
         run_goal: str = "",
@@ -538,6 +724,9 @@ class InnerLoop:
         self.fact_validator  = fact_validator
         # AUTO-CR-21: optional Russian rhythm/rhyme gate (creative mode only).
         self.prosody_validator = prosody_validator
+        # AUTO-CR-23-3: optional continuity gate vs bible + previous chapter
+        # (creative mode only).
+        self.continuity_validator = continuity_validator
         self.task_mode    = str(task_mode)
         # AUTO-CR-21-4: hard wall-clock cap per task; 0 disables the guard.
         self.max_task_seconds = max(0, int(max_task_seconds))
@@ -575,8 +764,15 @@ class InnerLoop:
         *,
         prior_feedback:   list[str] | None = None,
         prior_implementations: list[dict] | None = None,   # LOOP-4
+        deadline:         float | None = None,              # AUTO-CR-33
     ) -> InnerLoopResult:
         """Run up to ``max_attempts`` Gate-2 cycles for *task*.
+
+        ``deadline`` (monotonic seconds) is a TASK-WIDE wall-clock budget shared
+        across all outer-loop rounds. When omitted, the limit is computed per
+        call from ``max_task_seconds`` (legacy/standalone behaviour). This is the
+        AUTO-CR-33 fix: previously ``_start_time`` reset every round, so the real
+        cap was ``max_rounds × max_task_seconds`` (e.g. 10 × 30 min ≈ 5 h).
 
         Returns:
             :class:`InnerLoopResult` with ``passed`` flag, attempt count,
@@ -584,6 +780,17 @@ class InnerLoop:
         """
         task_id = task.get("id", "")
         feedback: list[str] = list(prior_feedback or [])
+        _prior_validator_critique: str = ""   # AUTO-CR-30: last Gate-2 critique
+        # AUTO-CR-30: detect (once) whether this validator's approve() accepts
+        # prior_critique, so we never break fakes/older validators that don't.
+        try:
+            import inspect as _inspect
+            _validator_accepts_prior = (
+                "prior_critique"
+                in _inspect.signature(self.validator.approve).parameters
+            )
+        except (ValueError, TypeError):
+            _validator_accepts_prior = False
         records:  list[AttemptRecord] = []
         # Pull-model state (carried across attempts within this round)
         prefetched_context: str = ""
@@ -592,10 +799,19 @@ class InnerLoop:
         _canon_revisions: int = 0     # AUTO-CR-7: canon-driven rejections used so far
         _fact_revisions:  int = 0     # AUTO-CR-20: Gate-3 fact-driven rejections used so far
         _prosody_revisions: int = 0   # AUTO-CR-21: prosody-gate-driven rejections used so far
+        _continuity_revisions: int = 0  # AUTO-CR-23-3: continuity-gate-driven rejections used so far
         base_dir_path = Path(base_dir)
         target_files  = task.get("target_files", []) or []
         self._broker.reset_cache()  # clear per-task cache; Pass-2 hits re-accumulate fresh
         _start_time = time.monotonic()  # AUTO-CR-21-4: wall-clock guard reference point
+        # AUTO-CR-33: prefer a task-wide deadline shared across rounds; fall back
+        # to a per-call budget when called standalone (no deadline passed).
+        if deadline is not None:
+            _eff_deadline = deadline
+        elif self.max_task_seconds > 0:
+            _eff_deadline = _start_time + self.max_task_seconds
+        else:
+            _eff_deadline = None
 
         # LOOP-4: prepend prior implementation history
         if prior_implementations:
@@ -611,16 +827,18 @@ class InnerLoop:
 
         for attempt in range(1, self.max_attempts + 1):
 
-            # ── AUTO-CR-21-4: hard wall-clock guard ──────────────────────────
+            # ── AUTO-CR-21-4 / CR-33: hard wall-clock guard (task-wide) ──────
             # Independent safety valve for pathological tasks (e.g. the 3-hour
-            # rhythm/rhyme runaway that motivated CR-21). 0 disables the guard.
-            if self.max_task_seconds > 0:
-                _elapsed = time.monotonic() - _start_time
-                if _elapsed > self.max_task_seconds:
+            # rhythm/rhyme runaway that motivated CR-21). The deadline is shared
+            # across outer-loop rounds (CR-33) so the cap is the real per-task
+            # budget, not budget × rounds. None disables the guard.
+            if _eff_deadline is not None:
+                if time.monotonic() >= _eff_deadline:
                     logger.warning(
-                        "InnerLoop: task wall-clock limit (%ds) reached — "
-                        "stopping after %d attempts",
-                        self.max_task_seconds, attempt - 1,
+                        "InnerLoop: task wall-clock limit (%ds = %.1f min, "
+                        "from max_task_seconds) reached — stopping after %d attempts",
+                        self.max_task_seconds, self.max_task_seconds / 60.0,
+                        attempt - 1,
                     )
                     last = feedback[-1] if feedback else ""
                     return InnerLoopResult(
@@ -704,8 +922,14 @@ class InnerLoop:
 
             # ── 3. Validator (subjective half of Gate 2) ─────────────────────
             try:
-                approved, vfb = self.validator.approve(task, exec_result, coder_result,
-                                                       base_dir=base_dir_path)
+                # AUTO-CR-30: only pass prior_critique to validators that accept
+                # it (real LLMGate2Validator); fakes/older validators are unaffected.
+                _ap_kwargs = {"base_dir": base_dir_path}
+                if _validator_accepts_prior:
+                    _ap_kwargs["prior_critique"] = _prior_validator_critique
+                approved, vfb = self.validator.approve(
+                    task, exec_result, coder_result, **_ap_kwargs
+                )
             except Exception as exc:
                 logger.error("InnerLoop: validator raised on attempt %d: %s", attempt, exc)
                 fb = f"attempt {attempt}: validator error — {exc}"
@@ -715,8 +939,14 @@ class InnerLoop:
 
             if not approved:
                 fb = f"attempt {attempt}: validator rejected\n{vfb}"
-                logger.info("InnerLoop: attempt %d rejected — %s", attempt, vfb[:80])
+                logger.info(
+                    "InnerLoop: attempt %d rejected — full critique below:\n"
+                    "──────── validator critique (attempt %d) ────────\n%s\n"
+                    "─────────────────────────────────────────────────",
+                    attempt, attempt, vfb,
+                )
                 feedback.append(fb)
+                _prior_validator_critique = vfb   # AUTO-CR-30: carry into next review
                 records.append(AttemptRecord(attempt, True, True, False, fb))
                 val_missing = list(getattr(self.validator, "last_missing_context", []) or [])
                 if val_missing:
@@ -818,6 +1048,63 @@ class InnerLoop:
                             "InnerLoop: fact revision cap (%d) reached — "
                             "accepting chapter with possible unresolved fact contradiction.",
                             fact_cap,
+                        )
+
+            # ── AUTO-CR-23-3: continuity gate vs bible + previous chapter ─────
+            # Runs after Gate-2 APPROVED, canon, and fact checks in creative
+            # mode. The catch-net that doesn't rely on the model knowing it
+            # was wrong: checks the new chapter against (story bible +
+            # previous chapter) and, on a genuine contradiction, returns a
+            # concrete "replace X with Y" edit instruction. Bounded by
+            # max_continuity_revisions; fail-open on any error.
+            if (
+                self.task_mode == "creative"
+                and self.continuity_validator is not None
+                and target_files
+            ):
+                continuity_cap = getattr(
+                    self.continuity_validator, "max_continuity_revisions", 1
+                )
+                try:
+                    chapter_file = target_files[0]
+                    _continuity_text = (base_dir_path / chapter_file).read_text(
+                        encoding="utf-8", errors="replace"
+                    )
+                    from tools.auto.continuity_validator import (
+                        find_previous_chapter_text, read_story_bible,
+                    )
+                    _bible_text = read_story_bible(base_dir_path)
+                    _prev_text = find_previous_chapter_text(chapter_file, base_dir_path)
+                    known_facts = (
+                        _bible_text + "\n\n--- previous chapter ---\n" + _prev_text
+                    )
+                    continuity_verdict = self.continuity_validator.check(
+                        known_facts, _continuity_text
+                    )
+                except Exception as exc:  # noqa: BLE001 — fail-open
+                    logger.warning(
+                        "InnerLoop: continuity check raised — %s; approving.", exc
+                    )
+                    continuity_verdict = None
+
+                if continuity_verdict is not None and not continuity_verdict.approved:
+                    if _continuity_revisions < continuity_cap:
+                        _continuity_revisions += 1
+                        cfb = continuity_verdict.feedback()
+                        logger.info(
+                            "InnerLoop: attempt %d continuity rejected (%d/%d) — %s",
+                            attempt, _continuity_revisions, continuity_cap,
+                            cfb.replace("\n", " ")[:120],
+                        )
+                        full_cfb = f"continuity rejected\n{cfb}"
+                        feedback.append(f"attempt {attempt}: {full_cfb}")
+                        records.append(AttemptRecord(attempt, True, True, False, full_cfb))
+                        continue
+                    else:
+                        logger.warning(
+                            "InnerLoop: continuity revision cap (%d) reached — "
+                            "accepting chapter with possible unresolved continuity issues.",
+                            continuity_cap,
                         )
 
             # ── AUTO-CR-21: Gate-3 Russian rhythm/rhyme (prosody) gate ────────
@@ -1019,12 +1306,23 @@ def make_inner_loop(
             logger.warning("make_inner_loop: prosody validator unavailable — %s", exc)
             prosody_validator = None
 
+    # ── AUTO-CR-23-3: continuity gate vs bible + previous chapter (creative only) ─
+    continuity_validator = None
+    if task_mode == "creative":
+        try:
+            from tools.auto.continuity_validator import make_continuity_validator
+            continuity_validator = make_continuity_validator(config)
+        except Exception as exc:  # noqa: BLE001 — never block the loop on setup
+            logger.warning("make_inner_loop: continuity validator unavailable — %s", exc)
+            continuity_validator = None
+
     # ── AUTO-CR-21-4: hard per-task wall-clock guard ───────────────────────────
     max_task_seconds = config.getint("auto", "max_task_seconds", fallback=1800)
 
     return InnerLoop(coder, executor, validator, max_attempts=max_attempts,
                      context_broker=broker, canon_validator=canon_validator,
                      fact_validator=fact_validator, prosody_validator=prosody_validator,
+                     continuity_validator=continuity_validator,
                      task_mode=task_mode, max_task_seconds=max_task_seconds,
                      run_goal=run_goal)
 

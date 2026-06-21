@@ -58,6 +58,7 @@ Spec reference: AUTO-CR-5
 from __future__ import annotations
 
 import configparser
+import difflib
 import logging
 import re
 import ssl
@@ -235,10 +236,26 @@ class SummaryFidelityVerifier:
         from tools.auto.utils import detect_language, language_instruction
         lang_instr = language_instruction(detect_language(chapter_text))
         system = _SYSTEM_FIDELITY + (("\n" + lang_instr) if lang_instr else "")
+        if lang_instr:
+            # Same class of bug as the continuity validator: "output
+            # {language} only, do not translate" also swallows the literal
+            # "OK" sentinel on rounds where no correction is needed, so the
+            # early-exit branch below can never fire for non-English books —
+            # every round looks like it "needed a fix" and the loop always
+            # bleeds out via max_fidelity_rounds instead of a genuine pass.
+            system += (
+                "\nEXCEPTION TO THE LANGUAGE RULE ABOVE: if no correction is "
+                "needed, reply with exactly the English word OK — do not "
+                "translate or transliterate it into another language."
+            )
 
         current = summary
         for rnd in range(1, self._max_rounds + 1):
             user_msg = f"SOURCE:\n{chapter_text}\n\nSUMMARY:\n{current}"
+            print(
+                f"\n🔎 [SummaryFidelityVerifier — round {rnd}] full text sent to validation:\n"
+                f"{'-' * 80}\n{user_msg}\n{'-' * 80}"
+            )
             try:
                 reply = self._llm(system, user_msg) or ""
             except Exception as exc:
@@ -277,6 +294,19 @@ class SummaryFidelityVerifier:
 
             logger.info(
                 "SummaryFidelityVerifier: round %d — replaced summary with corrected list.", rnd,
+            )
+            diff = "\n".join(
+                difflib.unified_diff(
+                    current.splitlines(),
+                    corrected.splitlines(),
+                    fromfile=f"summary (before round {rnd})",
+                    tofile=f"summary (after round {rnd})",
+                    lineterm="",
+                )
+            )
+            print(
+                f"\n✏️  [SummaryFidelityVerifier — round {rnd}] summary changed:\n"
+                f"{'-' * 80}\n{diff}\n{'-' * 80}"
             )
             current = corrected
 

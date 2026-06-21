@@ -39,6 +39,8 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from tools.auto.repo_ingest import RESERVED_META_FILES
 from typing import Any
 
 from tools.agent_trace import tracer
@@ -187,6 +189,66 @@ Any other path will be rejected:
 
 Now produce ONLY the JSON array of up to {max_tasks} concrete tasks that IMPLEMENT the \
 goal "{goal}" against the files above (no prose, no markdown fences):
+"""
+
+# AUTO-CR-34: creative tasks are prose, not code. The shared code template above
+# demands a "symbol" and a runnable shell-test acceptance_check (pytest/npm/...),
+# which contradicts the creative system prompt and makes the model emit shell
+# commands that have no meaning for a book (they are force-overridden to the
+# "true" no-op at parse time anyway). This variant drops the symbol/shell-test
+# guidance and asks for prose-appropriate tasks while keeping the exact-path rules.
+_USER_PROMPT_CREATIVE = """\
+Goal: {goal}
+
+You are reviewing the "{cluster}" group of chapter/text files.
+
+Files in this group (EXACT paths you MUST use verbatim in cited_location.file \
+and target_files — do NOT invent, shorten, or add prefixes):
+{file_listing}
+
+File contents:
+{file_contents}
+
+Produce up to {max_tasks} concrete writing/editing task(s) for the files above that \
+ACHIEVE THE GOAL.  Prefer ONE focused task that writes or revises a complete chapter \
+over many tiny fragment tasks.  Treat content the goal asks for but the text does not \
+yet have as the work to be done.
+
+STRICT RULES:
+1. Every entry in target_files and cited_location.file MUST be copied EXACTLY from \
+   the list above — character for character.  Do NOT invent new paths or add prefixes.
+2. Ground each task in a real file from the list.  This is prose, so you do NOT need a \
+   function/class symbol or a line range — leave "symbol", "line_start" and "line_end" \
+   as null.
+3. Keep each task self-contained: one chapter/scene per task where possible.
+4. Return an empty array [] ONLY if the goal is ALREADY fully satisfied by the text shown.
+5. acceptance_check MUST be the literal string "true".  Prose quality is judged by the \
+   editorial review gate, not by a shell command — never put a test/build command here.
+
+Each element of the JSON array must match this schema exactly (no extra keys):
+
+[
+  {{
+    "title": "<short imperative phrase>",
+    "instruction": "<detailed instruction for the writing agent: what to write or change>",
+    "target_files": ["<exact path from the list above>"],
+    "acceptance_check": "true",
+    "cited_location": {{
+      "file": "<exact path from the list above>",
+      "symbol": null,
+      "line_start": null,
+      "line_end":   null
+    }}
+  }}
+]
+
+REMINDER — the ONLY file paths you may put in "target_files" or \
+"cited_location.file" are these, copied character-for-character. \
+Any other path will be rejected:
+{file_listing}
+
+Now produce ONLY the JSON array of up to {max_tasks} concrete writing/editing task(s) \
+that achieve the goal "{goal}" against the files above (no prose, no markdown fences):
 """
 
 # _MAX_FILE_CHARS and _MAX_FILES_PER_REVIEW are now read from [architect] in
@@ -556,7 +618,12 @@ class ClusterReviewer:
         file_listing = "\n".join(f"  - {f}" for f in cluster.files)
         file_contents = self._build_file_contents(cluster.files, base_dir)
 
-        user_msg = _USER_PROMPT_TMPL.format(
+        _tmpl = (
+            _USER_PROMPT_CREATIVE
+            if self._task_mode == "creative"
+            else _USER_PROMPT_TMPL
+        )
+        user_msg = _tmpl.format(
             goal=goal,
             cluster=cluster.name,
             file_listing=file_listing,
@@ -779,6 +846,23 @@ class ClusterReviewer:
                 logger.warning(
                     "_parse_candidates [%s]: item %d has empty/missing target_files — rejected",
                     cluster_name, i,
+                )
+                continue
+
+            # AUTO-CR-28: never let a task target a control/memory file
+            # (story_bible.md, synopsis.md, IMPROVEMENTS.md, plan.json). These
+            # are not story content; editing them corrupts the bible/synopsis
+            # and sends the redundancy gate into an endless rewrite loop. Bounce
+            # the candidate here, before Gate 1, so no attempt is ever spent.
+            if any(
+                str(tf).strip().lower().rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+                in RESERVED_META_FILES
+                for tf in target_files
+            ):
+                logger.warning(
+                    "_parse_candidates [%s]: item %d targets a reserved "
+                    "memory/control file %r — rejected (not editable).",
+                    cluster_name, i, target_files,
                 )
                 continue
 

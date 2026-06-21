@@ -478,12 +478,37 @@ class AutoController:
                     "controller: could not build SummaryMemory — synopsis "
                     "updates will be skipped: %s", exc,
                 )
+        # AUTO-CR-23-1: build the StoryBible the same way as SummaryMemory so
+        # durable facts are actually maintained in production. Without this the
+        # bible (and its always-on injection + the continuity gate's anchor)
+        # never fires — make_story_bible was never called anywhere.
+        _story_bible = None
+        if task_mode == "creative":
+            try:
+                from tools.auto.story_bible import make_story_bible
+                _active  = cfg.get("api", "active", fallback="local")
+                _api_sec = f"api_{_active}"
+                _story_bible = make_story_bible(
+                    cfg,
+                    base_url=cfg.get(_api_sec, "base_url", fallback="http://localhost:11434"),
+                    api_key=cfg.get(_api_sec, "api_key", fallback="ollama"),
+                    model=cfg.get(_api_sec, "model", fallback="llama3.1:8b"),
+                    api_format=cfg.get(_api_sec, "api_format", fallback="ollama"),
+                    base_dir=self.base_dir,
+                )
+            except Exception as exc:  # noqa: BLE001 — never block commits on setup
+                logger.warning(
+                    "controller: could not build StoryBible — durable-fact "
+                    "updates will be skipped: %s", exc,
+                )
+
         commit_helper = (
             CommitOnSuccess(
                 self.git, self.state,
                 summary_memory=_summary_memory,
                 task_mode=task_mode,
                 base_dir=self.base_dir,
+                story_bible=_story_bible,
             )
             if self.git is not None else None
         )

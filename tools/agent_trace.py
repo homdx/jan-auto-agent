@@ -37,7 +37,9 @@ from datetime import datetime, timezone  # timezone kept for trace-file records
 from pathlib import Path
 from typing import Any, Optional
 
-logger = None  # avoid importing logging machinery here; orchestrator owns logging
+import logging as _logging
+
+logger = _logging.getLogger(__name__)
 
 # ANSI colours for the console echo lines (degrade gracefully on dumb terminals)
 _C = {
@@ -189,31 +191,21 @@ class AgentTracer:
         if kind == "run_start":
             return
 
-        ts = datetime.now().strftime("%H:%M:%S")
-        sc  = _C.get(source, "")
-        tc  = _C.get(target, "")
         rst = _C["reset"]
         dim = _C["dim"]
-        bold = _C["bold"]
 
-        # ── header line ────────────────────────────────────────────────────
-        meta = ""
+        # ── header line — routed through standard logging so the timestamp,
+        # level and module name match the rest of the pipeline output.
+        meta_parts: list[str] = []
         if model:
-            meta += f"  {dim}model={model}{rst}"
+            meta_parts.append(f"model={model}")
         if temperature is not None:
-            meta += f"  {dim}temp={temperature}{rst}"
+            meta_parts.append(f"temp={temperature}")
         if max_tokens is not None:
-            meta += f"  {dim}max_tokens={max_tokens}{rst}"
+            meta_parts.append(f"max_tokens={max_tokens}")
 
-        header = (
-            f"{dim}{ts}{rst}  "
-            f"{bold}{sc}{source}{rst}"
-            f"{dim} → {rst}"
-            f"{bold}{tc}{target}{rst}"
-            f"  {dim}[{kind}]{rst}"
-            f"{meta}"
-        )
-        sys.stdout.write(header + "\n")
+        meta_str = ("  " + "  ".join(meta_parts)) if meta_parts else ""
+        logger.info("%s \u2192 %s  [%s]%s", source, target, kind, meta_str)
 
         # ── content preview ─────────────────────────────────────────────────
         PREVIEW_CHARS = self.console_preview_chars
