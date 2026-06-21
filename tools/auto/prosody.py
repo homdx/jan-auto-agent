@@ -51,8 +51,8 @@ def count_syllables_ru(line: str) -> int:
     Non-Cyrillic characters (Latin letters, digits, punctuation, spaces) are
     ignored.  Case-insensitive.
 
-    >>> count_syllables_ru("Аделина КМС по гимнастике")
-    9
+    >>> count_syllables_ru("стихи о тёплом море")
+    7
     >>> count_syllables_ru("")
     0
     """
