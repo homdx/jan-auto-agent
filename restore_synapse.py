@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 """restore_synapse.py — regenerate synopsis.md + story_bible.md from chapter
 files WITHOUT a full --auto run (no architect/coder/gates).
 
