@@ -764,8 +764,15 @@ class InnerLoop:
         *,
         prior_feedback:   list[str] | None = None,
         prior_implementations: list[dict] | None = None,   # LOOP-4
+        deadline:         float | None = None,              # AUTO-CR-33
     ) -> InnerLoopResult:
         """Run up to ``max_attempts`` Gate-2 cycles for *task*.
+
+        ``deadline`` (monotonic seconds) is a TASK-WIDE wall-clock budget shared
+        across all outer-loop rounds. When omitted, the limit is computed per
+        call from ``max_task_seconds`` (legacy/standalone behaviour). This is the
+        AUTO-CR-33 fix: previously ``_start_time`` reset every round, so the real
+        cap was ``max_rounds × max_task_seconds`` (e.g. 10 × 30 min ≈ 5 h).
 
         Returns:
             :class:`InnerLoopResult` with ``passed`` flag, attempt count,
@@ -797,6 +804,14 @@ class InnerLoop:
         target_files  = task.get("target_files", []) or []
         self._broker.reset_cache()  # clear per-task cache; Pass-2 hits re-accumulate fresh
         _start_time = time.monotonic()  # AUTO-CR-21-4: wall-clock guard reference point
+        # AUTO-CR-33: prefer a task-wide deadline shared across rounds; fall back
+        # to a per-call budget when called standalone (no deadline passed).
+        if deadline is not None:
+            _eff_deadline = deadline
+        elif self.max_task_seconds > 0:
+            _eff_deadline = _start_time + self.max_task_seconds
+        else:
+            _eff_deadline = None
 
         # LOOP-4: prepend prior implementation history
         if prior_implementations:
@@ -812,12 +827,13 @@ class InnerLoop:
 
         for attempt in range(1, self.max_attempts + 1):
 
-            # ── AUTO-CR-21-4: hard wall-clock guard ──────────────────────────
+            # ── AUTO-CR-21-4 / CR-33: hard wall-clock guard (task-wide) ──────
             # Independent safety valve for pathological tasks (e.g. the 3-hour
-            # rhythm/rhyme runaway that motivated CR-21). 0 disables the guard.
-            if self.max_task_seconds > 0:
-                _elapsed = time.monotonic() - _start_time
-                if _elapsed > self.max_task_seconds:
+            # rhythm/rhyme runaway that motivated CR-21). The deadline is shared
+            # across outer-loop rounds (CR-33) so the cap is the real per-task
+            # budget, not budget × rounds. None disables the guard.
+            if _eff_deadline is not None:
+                if time.monotonic() >= _eff_deadline:
                     logger.warning(
                         "InnerLoop: task wall-clock limit (%ds = %.1f min, "
                         "from max_task_seconds) reached — stopping after %d attempts",

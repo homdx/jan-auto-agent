@@ -42,6 +42,7 @@ from __future__ import annotations
 import configparser
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -119,6 +120,27 @@ class OuterLoop:
         round if feedback files already exist.  Never raises."""
         task_id = task.get("id", "?")
 
+        # AUTO-CR-33: ONE wall-clock budget for the whole task (all rounds).
+        # Previously each round re-entered InnerLoop.run_task which reset its
+        # own start time, so the effective cap was max_rounds × max_task_seconds
+        # (10 × 30 min ≈ 5 h observed). Compute the deadline once here and both
+        # gate the round loop and hand it to the inner loop.
+        try:
+            _mts = int(getattr(self.inner_loop, "max_task_seconds", 0) or 0)
+        except (TypeError, ValueError):
+            _mts = 0   # non-numeric (e.g. a test mock) → guard disabled
+        _task_deadline = (time.monotonic() + _mts) if _mts > 0 else None
+        # AUTO-CR-33: only hand the deadline to inner loops that accept it, so
+        # fakes/older InnerLoop signatures are not broken.
+        try:
+            import inspect as _inspect
+            _inner_accepts_deadline = (
+                "deadline"
+                in _inspect.signature(self.inner_loop.run_task).parameters
+            )
+        except (ValueError, TypeError):
+            _inner_accepts_deadline = False
+
         # LOOP-4: save original instruction before any rewrite may change task
         original_instruction: str = task.get("instruction", "")
 
@@ -147,6 +169,18 @@ class OuterLoop:
                              "impl_version": impl_version})
 
         for rnd in range(start_round, self.max_rounds + 1):
+            # AUTO-CR-33: enforce the task-wide wall-clock budget BEFORE starting
+            # another round (this is what previously ran away for ~5 h).
+            if _task_deadline is not None and time.monotonic() >= _task_deadline:
+                logger.warning(
+                    "OuterLoop: task %s wall-clock budget (%ds = %.1f min) "
+                    "exhausted across rounds — stopping before round %d.",
+                    task_id, _mts, _mts / 60.0, rnd,
+                )
+                self.state.set_task_status(task_id, STATUS_BLOCKED)
+                return OuterLoopResult(task_id, False, rnd - 1, True,
+                                       feedback_files, inner_results)
+
             # Fresh context: seed ONLY with the compact prior-round summaries.
             prior = self._read_round_feedback(task_id)
             self.state.set_task_status(task_id, STATUS_IN_PROGRESS, round=rnd)
@@ -158,11 +192,13 @@ class OuterLoop:
                 task_id, impl_version, original_instruction
             )
 
-            res = self.inner_loop.run_task(
-                task, base_dir,
+            _rt_kwargs = dict(
                 prior_feedback=prior,
                 prior_implementations=prior_impls or None,
             )
+            if _inner_accepts_deadline:
+                _rt_kwargs["deadline"] = _task_deadline   # AUTO-CR-33: shared budget
+            res = self.inner_loop.run_task(task, base_dir, **_rt_kwargs)
             inner_results.append(res)
             # round is set authoritatively above via set_task_status(round=rnd);
             # here we only accumulate the attempt count.
