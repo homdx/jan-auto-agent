@@ -1216,11 +1216,8 @@ def make_inner_loop(
     verify_ssl = config.getboolean("api", "verify_ssl", fallback=True)
 
     import ssl
-    ssl_context: ssl.SSLContext | None = None
-    if not verify_ssl:
-        ssl_context = ssl.create_default_context()
-        ssl_context.check_hostname = False
-        ssl_context.verify_mode    = ssl.CERT_NONE
+    from tools.llm_stream import make_unverified_context
+    ssl_context: ssl.SSLContext | None = make_unverified_context() if not verify_ssl else None
 
     max_hints    = config.getint("validator_agent", "max_hints",        fallback=3)
     val_temp     = config.getfloat("validator_agent", "temperature",    fallback=0.1)

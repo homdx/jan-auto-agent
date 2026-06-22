@@ -215,9 +215,6 @@ class StateStore:
     def get_goal(self) -> str:
         return self._plan.get("goal", "")
 
-    def get_base_dir(self) -> str:
-        return self._plan.get("base_dir", "")
-
     def get_progress(self) -> dict:
         return dict(self._progress)
 

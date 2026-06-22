@@ -75,7 +75,7 @@ from tools.auto.context_assembler import ContextAssembler
 
 from tools.agent_trace import tracer
 import tools.llm_stream as _llm_stream
-from tools.llm_stream import strip_think
+from tools.llm_stream import strip_think, make_unverified_context
 
 logger = logging.getLogger(__name__)
 
@@ -259,13 +259,7 @@ class Coder:
         self._model      = model
         self._api_format = api_format
 
-        import ssl
-        self._ssl_context = None
-        if not verify_ssl:
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            self._ssl_context = ctx
+        self._ssl_context = make_unverified_context() if not verify_ssl else None
 
         self._task_mode = task_mode
         sec = "coder"

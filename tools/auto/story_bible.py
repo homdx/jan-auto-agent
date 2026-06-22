@@ -531,11 +531,7 @@ def _build_llm_call(
     timeout = config.getint("loop", "timeout_seconds", fallback=300)
     max_tokens = config.getint("validator_agent", "max_tokens", fallback=200)
 
-    ssl_context: ssl.SSLContext | None = None
-    if not verify_ssl:
-        ssl_context = ssl.create_default_context()
-        ssl_context.check_hostname = False
-        ssl_context.verify_mode = ssl.CERT_NONE
+    ssl_context: ssl.SSLContext | None = _llm_stream.make_unverified_context() if not verify_ssl else None
 
     if api_format == "ollama":
         url = _llm_stream.ollama_chat_url(base_url)

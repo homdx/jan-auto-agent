@@ -9,7 +9,6 @@ OrchestratorActions is a mixin; Orchestrator inherits from it and supplies:
 """
 import os
 import re
-import sys
 import json
 import time
 import logging
@@ -56,25 +55,31 @@ class OrchestratorActions:
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    def _parse_search_command(user_input: str):
+    def _parse_payload_and_file(user_input: str, command: str):
         """
-        Parse '/search <query> in <file>'  (also accepts '<file> :: <query>').
-        Returns (query, file_path) or (None, None) if it can't be parsed.
+        Parse '/<command> <payload> in <file>' (also accepts '<file> :: <payload>').
+        Returns (payload, file_path) or (None, None) if it can't be parsed.
+        Shared by /search (payload = query) and /edit (payload = instruction).
         """
-        body = user_input.strip()[len("/search"):].strip()
+        body = user_input.strip()[len(command):].strip()
         if not body:
             return None, None
-        if "::" in body:                       # /search <file> :: <query>
-            file_path, query = body.split("::", 1)
-            return query.strip(), file_path.strip()
-        if " in " in body:                     # /search <query> in <file>
-            query, file_path = body.rsplit(" in ", 1)
-            return query.strip(), file_path.strip()
-        # Fallback: first token is the file, the rest is the query.
+        if "::" in body:                       # /<command> <file> :: <payload>
+            file_path, payload = body.split("::", 1)
+            return payload.strip(), file_path.strip()
+        if " in " in body:                     # /<command> <payload> in <file>
+            payload, file_path = body.rsplit(" in ", 1)
+            return payload.strip(), file_path.strip()
+        # Fallback: first token is the file, the rest is the payload.
         parts = body.split(None, 1)
         if len(parts) == 2:
             return parts[1].strip(), parts[0].strip()
         return None, None
+
+    @staticmethod
+    def _parse_search_command(user_input: str):
+        """Parse '/search <query> in <file>'  (also accepts '<file> :: <query>')."""
+        return OrchestratorActions._parse_payload_and_file(user_input, "/search")
 
     def _ask_over_text(self, query: str, file_label: str, text: str,
                        chunk_label: str = None, generative: bool = False) -> str:
@@ -458,19 +463,7 @@ class OrchestratorActions:
     @staticmethod
     def _parse_edit_command(user_input: str):
         """Parse '/edit <instruction> in <file>' (or '/edit <file> :: <instruction>')."""
-        body = user_input.strip()[len("/edit"):].strip()
-        if not body:
-            return None, None
-        if "::" in body:
-            file_path, instr = body.split("::", 1)
-            return instr.strip(), file_path.strip()
-        if " in " in body:
-            instr, file_path = body.rsplit(" in ", 1)
-            return instr.strip(), file_path.strip()
-        parts = body.split(None, 1)
-        if len(parts) == 2:
-            return parts[1].strip(), parts[0].strip()
-        return None, None
+        return OrchestratorActions._parse_payload_and_file(user_input, "/edit")
 
     @staticmethod
     def _strip_code_fence(text: str) -> str:

@@ -57,7 +57,7 @@ from tools.agent_trace import tracer
 from tools.auto.architect import CandidateTask
 from tools.block_extractor import extract_block
 import tools.llm_stream as _llm_stream
-from tools.llm_stream import strip_think
+from tools.llm_stream import strip_think, make_unverified_context
 
 logger = logging.getLogger(__name__)
 
@@ -196,13 +196,7 @@ class Gate1Filter:
         self._api_format = api_format
         self._task_mode  = task_mode
 
-        import ssl
-        self._ssl_context = None
-        if not verify_ssl:
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            self._ssl_context = ctx
+        self._ssl_context = make_unverified_context() if not verify_ssl else None
 
         sec = "gate1"
         self._temperature    = float(config.get(sec, "temperature", fallback="0.0"))

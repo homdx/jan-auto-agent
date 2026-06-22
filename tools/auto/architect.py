@@ -46,7 +46,7 @@ from typing import Any
 from tools.agent_trace import tracer
 from tools.auto.repo_ingest import RepoCluster
 import tools.llm_stream as _llm_stream
-from tools.llm_stream import strip_think
+from tools.llm_stream import strip_think, make_unverified_context
 
 logger = logging.getLogger(__name__)
 
@@ -356,13 +356,7 @@ class ClusterReviewer:
         self._api_format = api_format
         self._task_mode  = task_mode
 
-        import ssl
-        self._ssl_context = None
-        if not verify_ssl:
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            self._ssl_context = ctx
+        self._ssl_context = make_unverified_context() if not verify_ssl else None
 
         arch = "architect"
         self._temperature            = float(config.get(arch, "temperature",         fallback="0.2"))
@@ -376,10 +370,6 @@ class ClusterReviewer:
         # num_ctx controls the total context window on Ollama; 0 means "use server default".
         active_profile               = config.get("api", "active", fallback="local")
         self._num_ctx                = config.getint(f"api_{active_profile}", "num_ctx", fallback=0)
-        # ── TaskRewriter config (LOOP-5) ──────────────────────────────────────
-        self._rewrite_max_tokens     = int(config.get(arch,   "rewrite_max_tokens",  fallback="512"))
-        self._rewrite_temperature    = float(config.get(arch, "rewrite_temperature", fallback="0.4"))
-        self._rewrite_system         = config.get(arch, "rewrite_system", fallback="").strip()
 
         # ── DM-2: select system prompt based on task_mode + ini overrides ─────
         # Priority: mode-specific ini key > legacy "system" key > built-in constant.
@@ -1278,13 +1268,7 @@ class TaskRewriter:
         self._model      = model
         self._api_format = api_format
 
-        import ssl
-        self._ssl_context = None
-        if not verify_ssl:
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            self._ssl_context = ctx
+        self._ssl_context = make_unverified_context() if not verify_ssl else None
 
         arch = "architect"
         self._max_tokens  = int(config.get(arch, "rewrite_max_tokens",  fallback="512"))

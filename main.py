@@ -4,7 +4,6 @@ import time
 import json
 import logging
 import configparser
-import ssl
 import textwrap
 from pathlib import Path
 from typing import Dict, Any, List
@@ -38,7 +37,7 @@ from tools.prompt_evaluator import PromptEvaluator
 from tools.actions import OrchestratorActions, _ts
 from tools.faq_agent import FaqAgent
 import tools.backoff as backoff
-from tools.llm_stream import request_completion, strip_think
+from tools.llm_stream import request_completion, strip_think, make_unverified_context
 from tools.ui import stream_tracker
 
 # Extensions that support AST/block extraction and code validation.
@@ -184,7 +183,6 @@ class Orchestrator(OrchestratorActions):
         
         self.max_iterations = self.config.getint("loop", "max_iterations", fallback=3)
         self.timeout_seconds = self.config.getint("loop", "timeout_seconds", fallback=240)
-        self.use_context = self.config.getboolean("chat", "use_context", fallback=True)
         self.new_chat_key = self.config.get("chat", "new_chat_key", fallback="/new").strip()
         self.exit_key = self.config.get("chat", "exit_key", fallback="/exit").strip()
 
@@ -204,10 +202,7 @@ class Orchestrator(OrchestratorActions):
         # Applies to all HTTPS API calls (agents, optimizer, direct chat).
         verify_ssl = self.config.getboolean("api", "verify_ssl", fallback=True)
         if not verify_ssl:
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            self.ssl_context = ctx
+            self.ssl_context = make_unverified_context()
             logger.warning("SSL certificate verification DISABLED (verify_ssl = false in agents.ini)")
         else:
             self.ssl_context = None  # urllib default: full verification

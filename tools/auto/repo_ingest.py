@@ -177,10 +177,6 @@ class RepoCluster:
     def __repr__(self) -> str:  # pragma: no cover
         return f"RepoCluster(name={self.name!r}, files={len(self.files)})"
 
-    def summary_line(self) -> str:
-        """One-liner for the console banner."""
-        return f"  [{self.name}]  {len(self.files)} file(s)"
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # RepoIngestor

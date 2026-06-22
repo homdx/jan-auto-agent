@@ -21,38 +21,8 @@ def _normalize_ext(file_ext: str) -> str:
     return ext
 
 
-def _split_lines(source: str) -> list[str]:
-    return source.splitlines()
-
-
 def _split_lines_keepends(source: str) -> list[str]:
     return source.splitlines(keepends=True)
-
-
-def _line_start_offsets(source: str) -> list[int]:
-    """
-    Returns the character offset for each 1-based line number.
-    Index 0 is always 0 (line 1 starts at offset 0).
-    """
-    offsets = [0]
-    for line in source.splitlines(keepends=True):
-        offsets.append(offsets[-1] + len(line))
-    return offsets
-
-
-def _line_number_from_index(offsets: list[int], index: int) -> int:
-    """
-    Convert a character index into a 1-based line number.
-    """
-    # Binary search without importing bisect to keep this file simple.
-    lo, hi = 0, len(offsets) - 1
-    while lo <= hi:
-        mid = (lo + hi) // 2
-        if offsets[mid] <= index:
-            lo = mid + 1
-        else:
-            hi = mid - 1
-    return max(1, lo)
 
 
 def _line_start_index(source: str, char_index: int) -> int:

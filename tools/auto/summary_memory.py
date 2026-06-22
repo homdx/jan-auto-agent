@@ -112,10 +112,6 @@ LlmCall = Callable[[str, str], str]   # (system, user) -> response_text
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
-def _estimate_tokens(text: str) -> int:
-    return max(1, len(text) // _CHARS_PER_TOKEN)
-
-
 def _chunk_paragraphs(text: str, max_chars: int) -> list[str]:
     """Split *text* on paragraph breaks (blank lines) so each chunk stays ≤
     *max_chars*.  A single paragraph that exceeds *max_chars* is kept as its
@@ -569,11 +565,7 @@ def _make_llm_call(
     temperature = config.getfloat("inner_loop", "temperature", fallback=0.2)
     timeout     = config.getint("loop", "timeout_seconds", fallback=300)
 
-    ssl_context: ssl.SSLContext | None = None
-    if not verify_ssl:
-        ssl_context = ssl.create_default_context()
-        ssl_context.check_hostname = False
-        ssl_context.verify_mode    = ssl.CERT_NONE
+    ssl_context: ssl.SSLContext | None = _llm_stream.make_unverified_context() if not verify_ssl else None
 
     if api_format == "ollama":
         url = _llm_stream.ollama_chat_url(base_url)
