@@ -151,11 +151,22 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
                 continue
 
             if api_format == "ollama":
-                # Ollama streams newline-delimited JSON objects
-                # {"message": {"role": "assistant", "content": "tok"}, "done": false}
+                # Ollama streams newline-delimited JSON objects.
+                # Non-thinking models:
+                #   {"message": {"role": "assistant", "content": "tok"}, "done": false}
+                # qwen3 / other reasoning models (Ollama 0.9+):
+                #   {"message": {"role": "assistant", "content": "", "thinking": "..."}, "done": false}
+                #   followed by:
+                #   {"message": {"role": "assistant", "content": "[JSON]"}, "done": false}
+                # Thinking tokens go to "thinking"; the final answer goes to "content".
+                # We display thinking tokens live via on_token but do NOT add them to
+                # `parts` — so the value returned by request_completion is pure content,
+                # ready for strip_think / json.loads without any thinking noise.
                 try:
                     chunk = json.loads(line)
-                    token = chunk.get("message", {}).get("content", "")
+                    msg   = chunk.get("message", {})
+                    token = msg.get("content", "")
+                    think = msg.get("thinking", "")
                     done  = chunk.get("done", False)
                 except json.JSONDecodeError:
                     continue
@@ -177,6 +188,10 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
                 parts.append(token)
                 if on_token is not None:
                     on_token(token)
+            elif think and on_token is not None:
+                # Display thinking tokens live (qwen3 reasoning phase) without
+                # adding them to parts — the returned text must be content-only.
+                on_token(think)
             if done:
                 break
 

@@ -376,6 +376,12 @@ class ClusterReviewer:
         # num_ctx controls the total context window on Ollama; 0 means "use server default".
         active_profile               = config.get("api", "active", fallback="local")
         self._num_ctx                = config.getint(f"api_{active_profile}", "num_ctx", fallback=0)
+        # think=false disables the qwen3 / reasoning-model thinking chain on Ollama 0.9+.
+        # When thinking is enabled the model routes its <think>…</think> tokens into
+        # message.thinking (not message.content), consuming the num_predict budget before
+        # writing any JSON answer.  Default true preserves existing behaviour for models
+        # that don't support the flag; set think=false in [architect] for qwen3.
+        self._think                  = config.getboolean(arch, "think", fallback=True)
         # ── TaskRewriter config (LOOP-5) ──────────────────────────────────────
         self._rewrite_max_tokens     = int(config.get(arch,   "rewrite_max_tokens",  fallback="512"))
         self._rewrite_temperature    = float(config.get(arch, "rewrite_temperature", fallback="0.4"))
@@ -653,6 +659,13 @@ class ClusterReviewer:
                 ],
                 "options": _ollama_opts,
             }
+            # qwen3 and other Ollama 0.9+ reasoning models spend the num_predict
+            # budget on thinking tokens (message.thinking) before writing any
+            # message.content.  With num_predict=512 the model exhausts its budget
+            # mid-think and never emits a JSON answer.  think=false disables the
+            # chain so the full budget is available for the JSON response.
+            if not self._think:
+                payload["think"] = False
         else:
             url = f"{self._base_url}/chat/completions"
             payload = {
