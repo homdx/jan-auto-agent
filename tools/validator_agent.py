@@ -8,7 +8,7 @@ import logging
 
 
 from tools.agent_trace import tracer
-from tools.llm_stream import request_completion, strip_think, ollama_chat_url
+from tools.llm_stream import request_completion, strip_think, ollama_chat_url, strip_json_fence
 
 logger = logging.getLogger(__name__)
 
@@ -165,10 +165,7 @@ class ValidatorAgent:
             tracer.event("llm", "validator_agent", "llm_response", content=content)
             content = strip_think(content)
 
-            if "```json" in content:
-                content = content.split("```json")[1].split("```")[0].strip()
-            elif "```" in content:
-                content = content.split("```")[1].split("```")[0].strip()
+            content = strip_json_fence(content)
 
             parsed_result = json.loads(content)
             # Enforce max_hints: cap the suggested_searches list so the outer

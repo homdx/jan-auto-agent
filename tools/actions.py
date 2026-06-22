@@ -13,7 +13,7 @@ import json
 import time
 import logging
 
-from tools.llm_stream import request_completion, strip_think, ollama_chat_url
+from tools.llm_stream import request_completion, strip_think, ollama_chat_url, strip_json_fence
 from tools.agent_trace import tracer
 from tools.file_reader import read_file
 from tools.ui import Spinner, stream_tracker
@@ -49,6 +49,10 @@ class OrchestratorActions:
         if getattr(self, "api_format", "openai") == "ollama":
             return ollama_chat_url(base)
         return f"{base}/chat/completions"
+
+    def _headers(self) -> dict:
+        return {"Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}"}
 
     # ------------------------------------------------------------------ #
     # Full-file search (/search)                                          #
@@ -112,8 +116,7 @@ class OrchestratorActions:
             )
         user = f"FILE: {file_label}{where}\n-----\n{text}\n-----\nQUESTION: {query}"
         url = self._chat_url()
-        headers = {"Content-Type": "application/json",
-                   "Authorization": f"Bearer {self.api_key}"}
+        headers = self._headers()
         payload = {"model": self.model,
                    "messages": [{"role": "system", "content": system},
                                 {"role": "user", "content": user}],
@@ -270,8 +273,7 @@ class OrchestratorActions:
               f"Address this feedback and try again:\n{feedback}") if feedback else ""
         user = f"DOCUMENT: {file_label}\n-----\n{knowledge}\n-----\nQUESTION: {question}{fb}"
         url = self._chat_url()
-        headers = {"Content-Type": "application/json",
-                   "Authorization": f"Bearer {self.api_key}"}
+        headers = self._headers()
         payload = {"model": self.model,
                    "messages": [{"role": "system", "content": system},
                                 {"role": "user", "content": user}],
@@ -312,10 +314,7 @@ class OrchestratorActions:
         with its own validator-specific feedback message (callers differ in
         which extra keys, e.g. "grounded", their fail-closed dict carries).
         """
-        if "```json" in content:
-            content = content.split("```json")[1].split("```")[0].strip()
-        elif "```" in content:
-            content = content.split("```")[1].split("```")[0].strip()
+        content = strip_json_fence(content)
         data = json.loads(content)
         if isinstance(data, list) and len(data) == 1 and isinstance(data[0], dict):
             data = data[0]
@@ -343,8 +342,7 @@ class OrchestratorActions:
         user = (f"DOCUMENT:\n{knowledge}\n\nQUESTION:\n{question}\n\n"
                 f"PROPOSED ANSWER:\n{answer}")
         url = self._chat_url()
-        headers = {"Content-Type": "application/json",
-                   "Authorization": f"Bearer {self.api_key}"}
+        headers = self._headers()
         payload = {"model": self.model,
                    "messages": [{"role": "system", "content": system},
                                 {"role": "user", "content": user}],
@@ -574,8 +572,7 @@ class OrchestratorActions:
             trace_content = base_user + correction_block
 
         url = self._chat_url()
-        headers = {"Content-Type": "application/json",
-                   "Authorization": f"Bearer {self.api_key}"}
+        headers = self._headers()
         payload = {"model": self.model,
                    "messages": messages,
                    "temperature": self._cfg_temp("file_editor", 0.2)}
@@ -623,8 +620,7 @@ class OrchestratorActions:
         user = (f"ORIGINAL:\n{original}\n\nINSTRUCTION:\n{instruction}\n\n"
                 f"REVISED:\n{revised}")
         url = self._chat_url()
-        headers = {"Content-Type": "application/json",
-                   "Authorization": f"Bearer {self.api_key}"}
+        headers = self._headers()
         payload = {"model": self.model,
                    "messages": [{"role": "system", "content": system},
                                 {"role": "user", "content": user}],

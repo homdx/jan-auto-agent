@@ -95,12 +95,57 @@ def ollama_chat_url(base_url: str) -> str:
     return f"{base}/api/chat"
 
 
+def strip_json_fence(text: str) -> str:
+    """Strip a ```json ... ``` or ``` ... ``` fence wrapping a JSON blob, if present."""
+    if "```json" in text:
+        return text.split("```json")[1].split("```")[0].strip()
+    if "```" in text:
+        return text.split("```")[1].split("```")[0].strip()
+    return text
+
+
 def make_unverified_context() -> ssl.SSLContext:
     """Return an SSLContext that skips certificate verification."""
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
     return ctx
+
+
+def build_chat_request(
+    *, base_url: str, api_key: str, model: str, api_format: str,
+    temperature: float, max_tokens: int, system: str, user_msg: str,
+    num_ctx: int = 0,
+) -> tuple[str, dict, dict]:
+    """
+    Build the (url, headers, payload) triple for a one-shot system/user chat
+    call, branching on *api_format* ("ollama" vs an openai-compatible API).
+
+    Shared by Coder, Gate1Filter, Architect, and TaskRewriter — all four send
+    the same single-turn system+user request and only differ in which
+    model/temperature/system prompt they configure.
+    """
+    headers = {
+        "Content-Type":  "application/json",
+        "Authorization": f"Bearer {api_key}",
+    }
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user",   "content": user_msg},
+    ]
+    if api_format == "ollama":
+        url = ollama_chat_url(base_url)
+        opts: dict = {"temperature": temperature, "num_predict": max_tokens}
+        if num_ctx:
+            opts["num_ctx"] = num_ctx
+        payload: dict = {"model": model, "messages": messages, "options": opts}
+    else:
+        url = f"{base_url}/chat/completions"
+        payload = {
+            "model": model, "temperature": temperature, "max_tokens": max_tokens,
+            "messages": messages,
+        }
+    return url, headers, payload
 
 
 def request_completion(url, headers, payload, timeout, stream=False, on_token=None,

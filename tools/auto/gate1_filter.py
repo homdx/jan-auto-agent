@@ -457,38 +457,12 @@ class Gate1Filter:
         )
 
 
-        headers = {
-            "Content-Type":  "application/json",
-            "Authorization": f"Bearer {self._api_key}",
-        }
-
-        if self._api_format == "ollama":
-            url = _llm_stream.ollama_chat_url(self._base_url)
-            _gate1_opts: dict[str, Any] = {
-                "temperature": self._temperature,
-                "num_predict": self._max_tokens,
-            }
-            if self._num_ctx:
-                _gate1_opts["num_ctx"] = self._num_ctx
-            payload: dict[str, Any] = {
-                "model":       self._model,
-                "messages": [
-                    {"role": "system", "content": self._system},
-                    {"role": "user",   "content": user_msg},
-                ],
-                "options": _gate1_opts,
-            }
-        else:
-            url = f"{self._base_url}/chat/completions"
-            payload = {
-                "model":       self._model,
-                "temperature": self._temperature,
-                "max_tokens":  self._max_tokens,
-                "messages": [
-                    {"role": "system", "content": self._system},
-                    {"role": "user",   "content": user_msg},
-                ],
-            }
+        url, headers, payload = _llm_stream.build_chat_request(
+            base_url=self._base_url, api_key=self._api_key, model=self._model,
+            api_format=self._api_format, temperature=self._temperature,
+            max_tokens=self._max_tokens, system=self._system, user_msg=user_msg,
+            num_ctx=self._num_ctx,
+        )
 
         tracer.event(
             source="gate1",

@@ -262,6 +262,12 @@ class FaqAgent:
             return ollama_chat_url(base)
         return f"{base}/chat/completions"
 
+    def _headers(self) -> dict:
+        return {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+        }
+
     # Hosts that denote a local Ollama daemon (where /api/pull is meaningful).
     _LOCAL_HOSTS = frozenset(
         {"localhost", "127.0.0.1", "0.0.0.0", "::1", "host.docker.internal"}
@@ -348,10 +354,7 @@ class FaqAgent:
         when the LLM returns malformed JSON or the API call fails.
         """
         url     = self._chat_url()
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}",
-        }
+        headers = self._headers()
         payload: dict = {
             "model": self.model,
             "messages": [
@@ -496,10 +499,7 @@ class FaqAgent:
             f"CANDIDATE ANSWER: {answer}"
         )
         url     = self._chat_url()
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}",
-        }
+        headers = self._headers()
         payload: dict = {
             "model": self.model,
             "messages": [
@@ -555,10 +555,7 @@ class FaqAgent:
             f"CANDIDATE ANSWER:\n{answer}"
         )
         url     = self._chat_url()
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}",
-        }
+        headers = self._headers()
         payload: dict = {
             "model": self.model,
             "messages": [
@@ -672,19 +669,8 @@ class FaqAgent:
 
     # ── Per-candidate LLM query (non-streaming) ──────────────────────────────
 
-    def _query_candidate(self, question: str, context: str) -> str:
-        """
-        Single non-streaming LLM call for a specific ``context`` block.
-
-        Used inside the smart-search candidate loop where we must inspect the
-        answer before committing to it; streaming intermediate attempts would
-        produce garbled output.
-        """
-        url     = self._chat_url()
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}",
-        }
+    def _build_qa_request(self, question: str, context: str) -> tuple[str, dict, dict]:
+        """Build (url, headers, payload) for a single QA chat call over *context*."""
         user_msg = (
             f"KNOWLEDGE BASE:\n\n{context}\n\n"
             f"QUESTION: {question}"
@@ -699,6 +685,17 @@ class FaqAgent:
         }
         if self.max_tokens:
             payload["max_tokens"] = self.max_tokens
+        return self._chat_url(), self._headers(), payload
+
+    def _query_candidate(self, question: str, context: str) -> str:
+        """
+        Single non-streaming LLM call for a specific ``context`` block.
+
+        Used inside the smart-search candidate loop where we must inspect the
+        answer before committing to it; streaming intermediate attempts would
+        produce garbled output.
+        """
+        url, headers, payload = self._build_qa_request(question, context)
 
         raw = request_completion(
             url, headers, payload, self.timeout,
@@ -879,25 +876,7 @@ class FaqAgent:
         directly (``smart_search = False``) or as the Stage-2 fallback.
         """
         context  = self._build_context(docs)
-        user_msg = (
-            f"KNOWLEDGE BASE:\n\n{context}\n\n"
-            f"QUESTION: {question}"
-        )
-        url     = self._chat_url()
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}",
-        }
-        payload: dict = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": self.system_prompt},
-                {"role": "user",   "content": user_msg},
-            ],
-            "temperature": self.temperature,
-        }
-        if self.max_tokens:
-            payload["max_tokens"] = self.max_tokens
+        url, headers, payload = self._build_qa_request(question, context)
 
         try:
             if stream:

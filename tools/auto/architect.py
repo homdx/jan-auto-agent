@@ -622,38 +622,12 @@ class ClusterReviewer:
         )
 
 
-        headers = {
-            "Content-Type":  "application/json",
-            "Authorization": f"Bearer {self._api_key}",
-        }
-
-        if self._api_format == "ollama":
-            url = _llm_stream.ollama_chat_url(self._base_url)
-            _ollama_opts: dict[str, Any] = {
-                "temperature": self._temperature,
-                "num_predict": self._max_tokens,
-            }
-            if self._num_ctx:
-                _ollama_opts["num_ctx"] = self._num_ctx
-            payload: dict[str, Any] = {
-                "model":       self._model,
-                "messages": [
-                    {"role": "system", "content": self._system},
-                    {"role": "user",   "content": user_msg},
-                ],
-                "options": _ollama_opts,
-            }
-        else:
-            url = f"{self._base_url}/chat/completions"
-            payload = {
-                "model":       self._model,
-                "temperature": self._temperature,
-                "max_tokens":  self._max_tokens,
-                "messages": [
-                    {"role": "system", "content": self._system},
-                    {"role": "user",   "content": user_msg},
-                ],
-            }
+        url, headers, payload = _llm_stream.build_chat_request(
+            base_url=self._base_url, api_key=self._api_key, model=self._model,
+            api_format=self._api_format, temperature=self._temperature,
+            max_tokens=self._max_tokens, system=self._system, user_msg=user_msg,
+            num_ctx=self._num_ctx,
+        )
 
         # Trace the outgoing call.
         tracer.event(
@@ -1301,38 +1275,12 @@ class TaskRewriter:
             failure_history=history_text,
         )
 
-        headers = {
-            "Content-Type":  "application/json",
-            "Authorization": f"Bearer {self._api_key}",
-        }
-
-        if self._api_format == "ollama":
-            url = _llm_stream.ollama_chat_url(self._base_url)
-            _rewriter_opts: dict[str, Any] = {
-                "temperature": self._temperature,
-                "num_predict": self._max_tokens,
-            }
-            if self._num_ctx:
-                _rewriter_opts["num_ctx"] = self._num_ctx
-            payload: dict[str, Any] = {
-                "model":   self._model,
-                "messages": [
-                    {"role": "system", "content": self._system},
-                    {"role": "user",   "content": user_msg},
-                ],
-                "options": _rewriter_opts,
-            }
-        else:
-            url = f"{self._base_url}/chat/completions"
-            payload = {
-                "model":       self._model,
-                "temperature": self._temperature,
-                "max_tokens":  self._max_tokens,
-                "messages": [
-                    {"role": "system", "content": self._system},
-                    {"role": "user",   "content": user_msg},
-                ],
-            }
+        url, headers, payload = _llm_stream.build_chat_request(
+            base_url=self._base_url, api_key=self._api_key, model=self._model,
+            api_format=self._api_format, temperature=self._temperature,
+            max_tokens=self._max_tokens, system=self._system, user_msg=user_msg,
+            num_ctx=self._num_ctx,
+        )
 
         tracer.event(
             source="task_rewriter",

@@ -60,18 +60,15 @@ class _PythonTargetFinder(ast.NodeVisitor):
         self.found: Optional[_PythonTarget] = None
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
-        if self.found is None and node.name == self.target_name:
-            self.found = _PythonTarget(node=node, start_line=self._start_line(node), end_line=getattr(node, "end_lineno", node.lineno))
-        if self.found is None:
-            self.generic_visit(node)
+        self._check(node)
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-        if self.found is None and node.name == self.target_name:
-            self.found = _PythonTarget(node=node, start_line=self._start_line(node), end_line=getattr(node, "end_lineno", node.lineno))
-        if self.found is None:
-            self.generic_visit(node)
+        self._check(node)
 
     def visit_ClassDef(self, node: ast.ClassDef) -> None:
+        self._check(node)
+
+    def _check(self, node: ast.AST) -> None:
         if self.found is None and node.name == self.target_name:
             self.found = _PythonTarget(node=node, start_line=self._start_line(node), end_line=getattr(node, "end_lineno", node.lineno))
         if self.found is None:
@@ -545,6 +542,26 @@ def extract_block(source: str, target_name: str, file_ext: str) -> str:
     return _extract_brace_block(source, target_name)
 
 
+def _split_braced_names(inner: str, alias_sep: str) -> list[str]:
+    """
+    Split a comma-separated ``{a, b as c}``-style clause into bound names,
+    taking the right-hand side of *alias_sep* when present.
+
+    *alias_sep* is ``" as "`` for JS/TS ``import``/``require`` aliasing, or
+    ``":"`` for destructured-require renaming (``const {a: b} = require(...)``).
+    """
+    names: list[str] = []
+    for part in inner.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if alias_sep in part:
+            names.append(part.split(alias_sep, 1)[1].strip())
+        else:
+            names.append(part)
+    return names
+
+
 def extract_imports(source: str, file_ext: str) -> list[str]:
     """
     Language-aware import extraction.
@@ -591,28 +608,14 @@ def extract_imports(source: str, file_ext: str) -> list[str]:
                 items.append(clause[5:].strip())
             elif clause.startswith("{"):
                 inner = clause.strip("{} ").strip()
-                for part in inner.split(","):
-                    part = part.strip()
-                    if not part:
-                        continue
-                    if " as " in part:
-                        items.append(part.split(" as ", 1)[1].strip())
-                    else:
-                        items.append(part)
+                items.extend(_split_braced_names(inner, " as "))
             elif "," in clause:
                 default_part, rest = clause.split(",", 1)
                 items.append(default_part.strip())
                 inner = rest.strip()
                 if inner.startswith("{") and inner.endswith("}"):
                     inner = inner[1:-1]
-                for part in inner.split(","):
-                    part = part.strip()
-                    if not part:
-                        continue
-                    if " as " in part:
-                        items.append(part.split(" as ", 1)[1].strip())
-                    else:
-                        items.append(part)
+                items.extend(_split_braced_names(inner, " as "))
             else:
                 items.append(clause)
 
@@ -623,14 +626,7 @@ def extract_imports(source: str, file_ext: str) -> list[str]:
         # destructuring require
         for m in re.finditer(r"(?m)^\s*(?:const|let|var)\s*\{([^}]+)\}\s*=\s*require\s*\(", source):
             inner = m.group(1)
-            for part in inner.split(","):
-                part = part.strip()
-                if not part:
-                    continue
-                if ":" in part:
-                    items.append(part.split(":", 1)[1].strip())
-                else:
-                    items.append(part)
+            items.extend(_split_braced_names(inner, ":"))
 
         return _unique_preserve_order(items)
 

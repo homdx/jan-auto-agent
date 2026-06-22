@@ -274,6 +274,11 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
             }
         return runs[rid]
 
+    def _minimal_task(task_id: str) -> dict:
+        """Fallback task shape for a 'result'/'decision' event with no prior 'call' event."""
+        return {"task_id": task_id, "status": "in_progress", "iterations": 0,
+                "approved": 0, "rejected": 0, "commit": None}
+
     for evt in events:
         rid     = evt.get("run_id") or "__ungrouped__"
         run     = get_run(rid)
@@ -342,12 +347,7 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
             if task_id == "?":
                 # Skip malformed / internal outer_loop events with no identifiable task.
                 continue
-            task = run["tasks"].setdefault(task_id, {"task_id": task_id,
-                                                      "status": "in_progress",
-                                                      "iterations": 0,
-                                                      "approved": 0,
-                                                      "rejected": 0,
-                                                      "commit": None})
+            task = run["tasks"].setdefault(task_id, _minimal_task(task_id))
             task["end_ts"] = ts
             # Determine status: prefer content string, fall back to params["passed"].
             if content:
@@ -368,12 +368,7 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
             task_id = params.get("task_id") or params.get("task", "?")
             if task_id == "?":
                 continue
-            task = run["tasks"].setdefault(task_id, {"task_id": task_id,
-                                                      "status": "in_progress",
-                                                      "iterations": 0,
-                                                      "approved": 0,
-                                                      "rejected": 0,
-                                                      "commit": None})
+            task = run["tasks"].setdefault(task_id, _minimal_task(task_id))
             task["end_ts"] = ts
             task["status"] = str(content).strip().upper() if content else "BLOCKED"
             if run["_current_task"] == task_id:
