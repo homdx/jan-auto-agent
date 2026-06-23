@@ -75,7 +75,7 @@ from tools.auto.context_assembler import ContextAssembler
 
 from tools.agent_trace import tracer
 import tools.llm_stream as _llm_stream
-from tools.llm_stream import strip_think, make_unverified_context
+from tools.llm_stream import strip_think
 
 logger = logging.getLogger(__name__)
 
@@ -224,7 +224,7 @@ class CoderResult:
 # Coder
 # ─────────────────────────────────────────────────────────────────────────────
 
-class Coder:
+class Coder(_llm_stream.LLMClientBase):
     """Generates full revised file content for a single autonomous task.
 
     Parameters
@@ -253,13 +253,7 @@ class Coder:
         verify_ssl: bool = True,
         task_mode: str = "code",
     ) -> None:
-        self._config     = config
-        self._base_url   = base_url.rstrip("/")
-        self._api_key    = api_key
-        self._model      = model
-        self._api_format = api_format
-
-        self._ssl_context = make_unverified_context() if not verify_ssl else None
+        super().__init__(config, base_url, api_key, model, api_format, verify_ssl)
 
         self._task_mode = task_mode
         sec = "coder"
@@ -377,7 +371,7 @@ class Coder:
         cleaned = strip_think(raw_text)
         # Pull-model: capture any names the coder asked for (context_request).
         # AUTO-CR-19-2: creative output is prose, so the JSON extractor always
-        # returns []. Use the prose CONTEXT_REQUEST extractor in creative so the
+        # returns [] — use the prose CONTEXT_REQUEST extractor instead, so the
         # names reach CoderResult.missing_context and inner_loop's broker pull.
         if self._task_mode == "creative":
             missing_ctx = self._extract_context_request_prose(cleaned)
@@ -642,12 +636,7 @@ class Coder:
                     if name:
                         names.append(name)
         # Deduplicate, preserve order, cap (matches _extract_missing_context).
-        seen: set[str] = set()
-        out: list[str] = []
-        for n in names:
-            if n not in seen:
-                seen.add(n); out.append(n)
-        return out[:8]
+        return list(dict.fromkeys(names))[:8]
 
     def _extract_missing_context(self, text: str) -> list[str]:
         """Extract the top-level ``missing_context`` list from the LLM response.
@@ -1107,8 +1096,8 @@ class Coder:
 
         # ── AUTO-CR-13: salvage prose from a JSON wrapper ───────────────────
         # Despite the prose-only instruction, a small instruct model sometimes
-        # wraps the chapter in JSON ({"files":[{"content": "..."}]} etc.).
-        # Without this, the entire JSON string was written into the chapter
+        # wraps the chapter in JSON ({"files":[{"content": "..."}]} etc.), and
+        # without this the entire JSON string was written into the chapter
         # file. Extract the inner prose when that happens.
         _salvaged = _extract_prose_from_json(body)
         if _salvaged is not None:
@@ -1141,9 +1130,9 @@ class Coder:
         # ── AUTO-CR-12: refusal / meta-response guard ───────────────────────
         # Without this, the fail-open parser writes a model refusal ("I cannot
         # fulfill your request…", "{}", "please provide more context") straight
-        # into the chapter file. Conservative: only trip on an empty JSON stub
-        # or a SHORT body that contains an explicit refusal marker, so genuine
-        # prose is never rejected. A trip fails the attempt → the loop retries.
+        # into the chapter file. Conservative — only trips on an empty JSON stub
+        # or a short body with an explicit refusal marker, so genuine prose is
+        # never rejected; a trip fails the attempt and the loop retries.
         if _looks_like_refusal(body):
             msg = ("creative coder: response looks like a refusal / meta-reply, "
                    "not chapter prose — retrying")
@@ -1215,10 +1204,10 @@ class Coder:
 
     # ── Content safety ────────────────────────────────────────────────────────
 
-    # Patterns that should never appear in LLM-generated file content.
-    # Keyed by a short label (used in the rejection message) → substring/regex.
-    # This is defence-in-depth, not a complete sandbox; it catches the most
-    # dangerous accidental or injected payloads before they reach disk.
+    # Patterns that should never appear in LLM-generated file content, keyed by
+    # a short label (used in the rejection message) → substring/regex. This is
+    # defence-in-depth, not a complete sandbox — it catches the most dangerous
+    # accidental or injected payloads before they reach disk.
 
     # Patterns always checked regardless of task_mode: catastrophic payloads
     # with no legitimate false-positive risk in any document or creative context.
@@ -1260,11 +1249,11 @@ class Coder:
     )
 
     # Patterns checked with whole-word regex (\b) instead of plain substring
-    # containment.  Same (label, pattern) structure as _BLOCKED_CODE_ONLY so
-    # tests can introspect membership identically.  Python \b treats '_' as a
+    # containment — same (label, pattern) structure as _BLOCKED_CODE_ONLY so
+    # tests can introspect membership identically. Python \b treats '_' as a
     # word character, so underscore-joined identifiers (test_reboot_gracefully,
-    # handle_shutdown_signal, test_sudo_not_needed) do NOT fire.
-    # Applied in code mode only — same scope as _BLOCKED_CODE_ONLY.
+    # etc.) do NOT fire; applied in code mode only, same scope as
+    # _BLOCKED_CODE_ONLY.
     _BLOCKED_CODE_WORD_BOUNDARY: tuple[tuple[str, str], ...] = (
         ("sudo invocation",     "sudo"),
         ("shutdown cmd",        "shutdown"),
@@ -1342,10 +1331,10 @@ class Coder:
             if pat_lower in lower:
                 return False, f"blocked content pattern {pattern!r} ({label})"
 
-        # Word-boundary patterns (code mode only) — sudo / shutdown / reboot.
-        # Checked separately so that identifier names embedding the keyword
+        # Word-boundary patterns (code mode only: sudo/shutdown/reboot), checked
+        # separately so identifier names embedding the keyword
         # (test_reboot_gracefully, handle_shutdown_signal, test_sudo_not_needed)
-        # do NOT fire.  Python \b treats '_' as a word character, so
+        # do NOT fire. Python \b treats '_' as a word character, so
         # underscore-joined names have no boundary at the underscore.
         if task_mode == "code":
             import re as _re
@@ -1510,19 +1499,9 @@ def chunk_file(source: str, file_ext: str, max_chars: int) -> list[dict]:
         ext = "." + ext
 
     # ── Extract import / preamble block ────────────────────────────────────────
-    # Collect all leading lines that look like imports/includes/pragmas for
-    # any supported language, plus blank lines interleaved between them.
-    # Patterns covered:
-    #   Python/JS/TS:   import …  /  from … import …
-    #   Go:             import "…"  /  import ( … )
-    #   Rust:           use …;
-    #   C/C++/ObjC:     #include …  /  #pragma …  /  #define …  /  #ifndef …
-    #   Java/Kotlin:    package …  /  import …
-    #   Ruby:           require …  /  require_relative …
-    #   PHP:            use …;  /  require …  /  include …
-    #   Shell:          #!/…  (shebang on line 1)
-    # Unknown languages: the block will simply be empty (first non-blank line
-    # is not a preamble line), which is safe — no import chunk is emitted.
+    # Collects leading import/include/pragma lines (plus interleaved blanks)
+    # across Python/JS/TS/Go/Rust/C/C++/Java/Kotlin/Ruby/PHP/shell. Unsupported
+    # languages just get an empty block — safe, no import chunk is emitted.
     _import_re = re.compile(
         r"^\s*("
         r"import\s"                             # Python, JS, TS, Java, Go bare
@@ -1578,19 +1557,9 @@ def chunk_file(source: str, file_ext: str, max_chars: int) -> list[dict]:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 symbols.append((node.name, node.lineno))
     else:
-        # Best-effort regex scan for top-level symbols across all brace-based
-        # and indent-based languages.  Covers:
-        #   JS/TS:    function foo / async function foo / class Foo
-        #             const foo = (...) =>    (arrow functions)
-        #   Go:       func foo / func (r T) foo
-        #   Rust:     fn foo / pub fn foo / pub(crate) fn foo
-        #   Java/C#:  class Foo / interface IFoo / enum Status
-        #             public void foo(  (methods — best-effort)
-        #   C/C++:    type_name foo(   (free functions, rough heuristic)
-        #   Ruby:     def foo / class Foo / module Bar
-        #   PHP:      function foo / class Foo
-        #   Swift:    func foo / class Foo / struct Bar / enum Baz / protocol P
-        #   Kotlin:   fun foo / class Foo / object Obj / data class Bar
+        # Best-effort regex scan for top-level symbols across brace- and
+        # indent-based languages (JS/TS, Go, Rust, Java/C#, C/C++, Ruby, PHP,
+        # Swift, Kotlin) — functions, classes, structs, etc.
         _sym_re = re.compile(
             r"(?m)^[ \t]*"
             # optional visibility / modifier keywords (greedy, non-capturing)

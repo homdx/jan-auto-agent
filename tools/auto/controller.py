@@ -116,13 +116,10 @@ class RunLimits:
 # AUTO-CR-19-4 — startup config lint (guards AUTO-CR-19-1 from regressing)
 # ─────────────────────────────────────────────────────────────────────────────
 
-# (section, legacy bare key) pairs that are code-specific by convention.
-# Each has a mode-specific override form: f"{key}_{task_mode}" (e.g.
-# "system_creative"). AUTO-CR-19-1 fixed [validator_agent] system specifically
-# (see _resolve_validator_system in inner_loop.py); [coder] system and
-# [architect] system follow the same "mode-specific key > legacy key (code
-# only) > builtin" convention, so they are linted here too in case a future
-# edit reintroduces a generic override without a matching mode variant.
+# (section, legacy bare key) pairs that are code-specific by convention; each
+# has a mode-specific override form f"{key}_{task_mode}" (e.g. "system_creative").
+# Linted here so a future edit can't reintroduce a generic override without a
+# matching mode variant, per AUTO-CR-19-1's "mode key > legacy key > builtin" rule.
 _CR19_LEGACY_SYSTEM_KEYS = (
     ("validator_agent", "system"),
     ("coder", "system"),
@@ -242,11 +239,9 @@ class AutoController:
         self.dry_run     = dry_run
         self.agent_dir   = base_path / ".agent"
 
-        # AUTO-DM-1: read task_mode once at startup; forwarded to pipeline and
-        # all downstream factory calls.  Defaults to "code" so existing configs
-        # and call sites are completely unaffected.
-        # Config is parsed exactly once here and reused everywhere via
-        # self.config (run(), _run_task_loop(), _setup_git(), limits) instead of
+        # AUTO-DM-1: task_mode is read once here and forwarded everywhere
+        # (defaults to "code", so existing configs are unaffected). self.config
+        # is likewise parsed exactly once and reused everywhere, instead of
         # re-reading agents.ini from disk on each call.
         self.config = configparser.ConfigParser(inline_comment_prefixes=(';', '#'))
         if Path(config_path).exists():
@@ -396,12 +391,10 @@ class AutoController:
         # Update progress to "running"
         self.state.update_progress(status="running")
 
-        # ── AUTO-G0: Delegate to pipeline ─────────────────────────────────
-        # pipeline.run_pipeline() handles:
-        #   G1 — PLAN phase (ingest → architect → gate1 → prioritise → emit)
-        #   G2+ — EXECUTE phase (outer_loop per task, commit, exhaustion)
-        # controller.run() stays thin; all orchestration is unit-testable via
-        # tools/auto/pipeline.py in isolation.
+        # AUTO-G0: delegates to pipeline.run_pipeline(), which handles PLAN
+        # (ingest → architect → gate1 → prioritise → emit) and EXECUTE
+        # (outer_loop per task, commit, exhaustion). controller.run() stays
+        # thin — all orchestration is unit-testable via pipeline.py in isolation.
         from tools.auto.pipeline import run_pipeline
         stop_reason, session_tasks_done = run_pipeline(self)
 
@@ -460,12 +453,10 @@ class AutoController:
 
         outer_loop = make_outer_loop(cfg, self.base_dir, self.state,
                                        task_mode=task_mode, run_goal=self.goal)
-        # AUTO-CR-14: the bare CommitOnSuccess(self.git, self.state) left
-        # summary_memory=None and task_mode="code", so the creative synopsis
-        # hook (AUTO-CR-5) NEVER fired — synopsis.md was never written, which
-        # in turn starved continuity (every chapter only saw the previous one
-        # → repetition) and disabled the canon gate (no canon to check). Wire
-        # SummaryMemory here, reusing self.git (no second git manager).
+        # AUTO-CR-14: the bare CommitOnSuccess left summary_memory=None, so the
+        # creative synopsis hook (CR-5) never fired — starving continuity (each
+        # chapter only saw the previous one) and disabling the canon gate. Wire
+        # SummaryMemory here, reusing self.git, so it actually runs.
         _summary_memory = None
         if task_mode == "creative" and self.git is not None:
             try:
@@ -478,10 +469,11 @@ class AutoController:
                     "controller: could not build SummaryMemory — synopsis "
                     "updates will be skipped: %s", exc,
                 )
-        # AUTO-CR-23-1: build the StoryBible the same way as SummaryMemory so
-        # durable facts are actually maintained in production. Without this the
-        # bible (and its always-on injection + the continuity gate's anchor)
-        # never fires — make_story_bible was never called anywhere.
+        # AUTO-CR-23-1: build the StoryBible here too, the same way as
+        # SummaryMemory, so durable facts are actually maintained in
+        # production — make_story_bible was previously never called anywhere.
+        # Without it, the bible's always-on injection and the continuity
+        # gate's anchor never fire.
         _story_bible = None
         if task_mode == "creative":
             try:
@@ -591,11 +583,10 @@ class AutoController:
             else:
                 # ── AUTO-G4: exhaustion → knowledge note + ticket ──────────
                 ex_outcome = exhaustion_handler.handle(task, result)
-                # Bug 2: the coder writes its candidate straight into base_dir
-                # before validation; an exhausted task leaves that edit dirty
-                # in the repo.  commit() stages everything (git add -u/.), so
-                # the next successful task would otherwise sweep this failed
-                # task's half-finished file into its commit.  Discard the
+                # Bug 2: the coder writes its candidate into base_dir before
+                # validation, so an exhausted task leaves that edit dirty — and
+                # commit() stages everything (git add -u/.), which would sweep
+                # it into the next successful task's commit. Discard the
                 # uncommitted residue now (no-op when git is disabled).
                 if self.git is not None:
                     self.git.discard_working_changes()
@@ -780,8 +771,6 @@ class AutoController:
             self.git = None
             logger.warning("git setup failed (continuing without git): %s", exc)
             self.state.log(f"git setup failed: {exc}")
-
-
 
 
     def _log_auto_prompts(self) -> None:

@@ -519,15 +519,10 @@ class OrchestratorActions:
             trace_content = base_user
 
         elif previous_revised:
-            # ── Retry with context: multi-turn ─────────────────────────────
-            # The model's previous output becomes an assistant message so the
-            # correction request is a clean, unambiguous new user turn.
-            #
-            # IMPORTANT: the correction turn deliberately repeats the full
-            # DOCUMENT and INSTRUCTION.  Without this re-anchoring, weak
-            # models lose track of what they are supposed to edit after seeing
-            # their own previous output as an assistant turn and treat the
-            # feedback text as the new document to edit instead.
+            # Retry with context: previous output becomes an assistant message
+            # so the correction is a clean new turn. It deliberately re-includes
+            # the full DOCUMENT and INSTRUCTION — without it, weak models mistake
+            # the feedback text for the new document to edit.
             correction = (
                 f"That edit was rejected.\n\n"
                 f"Error: {feedback}\n\n"
@@ -550,12 +545,10 @@ class OrchestratorActions:
             )
 
         else:
-            # ── Clean/reset retry: single turn with delimited correction ───
-            # No previous_revised available (reset iter or feature disabled).
-            # Correction block is appended to the same user message.
-            # We reference the document by its label (not "above") to avoid
-            # ambiguity, and re-state the instruction so the model doesn't have
-            # to scroll up mentally to find it.
+            # Clean/reset retry: single-turn with delimited correction, appended
+            # to the same user message when previous_revised isn't available. We
+            # reference the document by its label (not "above") and re-state the
+            # instruction, so the model doesn't have to scroll up mentally to find it.
             correction_block = (
                 f"\n\n---CORRECTION---\n"
                 f"Error in previous attempt: {feedback}\n"

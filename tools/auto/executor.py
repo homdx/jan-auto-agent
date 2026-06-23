@@ -232,12 +232,12 @@ class Executor:
         # Resolve the command to run.
         command = self._resolve_command(acceptance_check, target_files, workspace)
 
-        # AUTO-CR-12: cross-platform no-op acceptance. Creative/docs tasks
-        # default acceptance_check to "true" (a Unix shell builtin). On Windows
-        # `true`/`false`/`:` are NOT commands, so cmd.exe returns rc=1 and every
-        # such task fails the executor gate. Recognise ONLY these Unix builtins
-        # and resolve them without spawning a shell. ("exit 0"/"exit 1" are
-        # valid on every platform and are intentionally left to run normally.)
+        # AUTO-CR-12: cross-platform no-op acceptance — creative/docs tasks
+        # default acceptance_check to "true" (a Unix builtin), but on Windows
+        # `true`/`false`/`:` aren't commands, so cmd.exe returns rc=1 and every
+        # such task fails. Recognise only these Unix builtins and resolve them
+        # without spawning a shell ("exit 0"/"exit 1" are valid everywhere and
+        # run normally).
         _norm = (command or "").strip().lower().rstrip(";")
         if _norm in ("true", ":"):
             logger.info("executor run: task=%s no-op acceptance (%r) → pass", task_id, command)
@@ -540,11 +540,10 @@ class Executor:
         """
         env = self._build_env()
         # Use explicit comparison instead of `or None` — 0.0 is falsy in Python,
-        # so `0.0 or None` evaluates to None (= no timeout), which is the intended
-        # meaning of 0.  But the `or` form is a silent footgun: any future reader
-        # or config author who sets exec_timeout_sec = 0 expecting "no timeout"
-        # gets it, while someone who sets it accidentally gets an infinite hang
-        # with no warning.  The explicit form below makes the intent unmistakable.
+        # so `0.0 or None` would silently mean "no timeout" instead of
+        # "immediate timeout," tricking anyone who sets exec_timeout_sec = 0
+        # expecting one behavior into getting the other with no warning. The
+        # explicit form below makes the intent unmistakable.
         timeout = self._timeout_sec if self._timeout_sec > 0 else None
 
         try:
@@ -619,10 +618,10 @@ class Executor:
             env.pop(var, None)
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         env["PYTHONUNBUFFERED"] = "1"
-        # Force UTF-8 for all child processes.  On Windows the default codec is
-        # cp1252 which cannot decode bytes such as 0x81 (undefined in that codepage).
-        # PYTHONUTF8=1 enables UTF-8 mode (PEP 540, Python >= 3.7);
-        # PYTHONIOENCODING is the legacy fallback recognised by older builds.
+        # Force UTF-8 for all child processes — Windows' default cp1252 codec
+        # can't decode bytes like 0x81. PYTHONUTF8=1 enables UTF-8 mode (PEP
+        # 540, Python >= 3.7); PYTHONIOENCODING is the legacy fallback for
+        # older builds.
         env["PYTHONUTF8"] = "1"
         env["PYTHONIOENCODING"] = "utf-8"
         

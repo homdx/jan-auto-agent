@@ -325,9 +325,9 @@ class FaqAgent:
             logger.debug("FaqAgent: model %r is ready", self.model)
         except urllib.error.HTTPError as exc:
             if exc.code == 404:
-                # No /api/pull on this endpoint — it's a chat-only/hosted
-                # gateway, not a local daemon. The model is already served;
-                # nothing to pull. Benign, so debug rather than warning.
+                # No /api/pull on this endpoint — a chat-only/hosted gateway,
+                # not a local daemon, so the model is already served and
+                # there's nothing to pull. Benign, so debug rather than warning.
                 logger.debug(
                     "FaqAgent: %s has no /api/pull (404) — model assumed served",
                     pull_url,
@@ -447,14 +447,10 @@ class FaqAgent:
         def _make_kw_pattern(kw: str) -> "re.Pattern[str]":
             escaped = re.escape(kw)
             if re.search(r"\W", kw):
-                # \b is the boundary between \w and \W.  A hyphen is \W, so
-                # \bansible-playbook\b falsely fires inside "run-ansible-playbook"
-                # because "-" before "a" is itself a \W->\w boundary.
-                # For keywords containing non-word chars, require a genuine
-                # delimiter before and after: whitespace OR the path separators
-                # "/" and "." so that "ops/ansible-playbook.txt" scores correctly
-                # (a joining hyphen — e.g. "run-ansible-playbook" — still does
-                # not satisfy the lookbehind and therefore scores 0 as intended).
+                # \b fails for hyphenated keywords since "-" is itself a
+                # \w/\W boundary (\bansible-playbook\b wrongly matches inside
+                # "run-ansible-playbook"). So for non-word-char keywords we
+                # require whitespace or "/"/"." as the delimiter instead.
                 return re.compile(
                     r"(?:(?:^|(?<=[/.\s])))" + escaped + r"(?=[/.\s]|$)",
                     re.MULTILINE,

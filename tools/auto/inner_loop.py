@@ -464,10 +464,9 @@ class LLMGate2Validator:
                 if approved:
                     return True, ""
                 # AUTO-CR-29: the prompt now asks for a NUMBERED LIST of every
-                # problem. _parse_verdict_soft is line-oriented and only pulls
-                # the reason off the matched verdict line, so a multi-line
-                # critique would be lost. Feed the coder the FULL reviewer reply
-                # minus the leading verdict token instead.
+                # problem, but _parse_verdict_soft is line-oriented and would
+                # lose a multi-line critique. Feed the coder the FULL reviewer
+                # reply minus the leading verdict token instead.
                 critique = raw.strip()
                 _low = critique.lower()
                 for _tok in ("revise:", "revise", "reject:", "reject", "no:"):
@@ -828,10 +827,10 @@ class InnerLoop:
         for attempt in range(1, self.max_attempts + 1):
 
             # ── AUTO-CR-21-4 / CR-33: hard wall-clock guard (task-wide) ──────
-            # Independent safety valve for pathological tasks (e.g. the 3-hour
-            # rhythm/rhyme runaway that motivated CR-21). The deadline is shared
-            # across outer-loop rounds (CR-33) so the cap is the real per-task
-            # budget, not budget × rounds. None disables the guard.
+            # Independent safety valve for pathological tasks (e.g. the CR-21
+            # rhythm/rhyme runaway), with the deadline shared across outer-loop
+            # rounds (CR-33) so the cap is the real per-task budget, not budget
+            # × rounds. None disables the guard.
             if _eff_deadline is not None:
                 if time.monotonic() >= _eff_deadline:
                     logger.warning(
@@ -1006,9 +1005,10 @@ class InnerLoop:
                     )
 
             # ── AUTO-CR-20: Gate-3 per-task fact-compliance check ─────────────
-            # Runs after Gate-2 APPROVED (and after canon gate) in creative mode.
-            # Checks only: does the generated text CONTRADICT an explicit fact in
-            # the task?  Bounded by max_fact_revisions; fail-open on any error.
+            # Runs after Gate-2 APPROVED (and the canon gate) in creative mode,
+            # checking only whether the generated text contradicts an explicit
+            # fact in the task. Bounded by max_fact_revisions; fail-open on
+            # any error.
             if (
                 self.task_mode == "creative"
                 and self.fact_validator is not None
@@ -1051,12 +1051,12 @@ class InnerLoop:
                         )
 
             # ── AUTO-CR-23-3: continuity gate vs bible + previous chapter ─────
-            # Runs after Gate-2 APPROVED, canon, and fact checks in creative
-            # mode. The catch-net that doesn't rely on the model knowing it
-            # was wrong: checks the new chapter against (story bible +
-            # previous chapter) and, on a genuine contradiction, returns a
-            # concrete "replace X with Y" edit instruction. Bounded by
-            # max_continuity_revisions; fail-open on any error.
+            # Runs after Gate-2 APPROVED, canon, and fact checks; the catch-net
+            # that doesn't rely on the model knowing it was wrong, checking the
+            # new chapter against (story bible + previous chapter) and returning
+            # a concrete "replace X with Y" instruction on a genuine
+            # contradiction. Bounded by max_continuity_revisions; fail-open on
+            # any error.
             if (
                 self.task_mode == "creative"
                 and self.continuity_validator is not None
@@ -1109,7 +1109,7 @@ class InnerLoop:
 
             # ── AUTO-CR-21: Gate-3 Russian rhythm/rhyme (prosody) gate ────────
             # Runs after Gate-2 APPROVED, canon, and fact checks in creative
-            # mode. No-op unless the task is a verse task (ритм/рифм keyword).
+            # mode; no-op unless the task is a verse task (ритм/рифм keyword).
             # Bounded by max_prosody_revisions; fail-open on any error.
             if (
                 self.task_mode == "creative"

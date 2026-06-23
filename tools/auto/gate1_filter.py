@@ -57,7 +57,7 @@ from tools.agent_trace import tracer
 from tools.auto.architect import CandidateTask
 from tools.block_extractor import extract_block
 import tools.llm_stream as _llm_stream
-from tools.llm_stream import strip_think, make_unverified_context
+from tools.llm_stream import strip_think
 
 logger = logging.getLogger(__name__)
 
@@ -160,7 +160,7 @@ class FilterResult:
 # Gate1Filter
 # ─────────────────────────────────────────────────────────────────────────────
 
-class Gate1Filter:
+class Gate1Filter(_llm_stream.LLMClientBase):
     """Runs the two-stage Gate 1 filter over a list of :class:`CandidateTask`.
 
     Parameters
@@ -189,14 +189,8 @@ class Gate1Filter:
         verify_ssl: bool = True,
         task_mode: str = "code",
     ) -> None:
-        self._config     = config
-        self._base_url   = base_url.rstrip("/")
-        self._api_key    = api_key
-        self._model      = model
-        self._api_format = api_format
+        super().__init__(config, base_url, api_key, model, api_format, verify_ssl)
         self._task_mode  = task_mode
-
-        self._ssl_context = make_unverified_context() if not verify_ssl else None
 
         sec = "gate1"
         self._temperature    = float(config.get(sec, "temperature", fallback="0.0"))
@@ -276,12 +270,12 @@ class Gate1Filter:
         presence_passed: list[tuple[CandidateTask, str]] = []  # (task, reason)
 
         if self._skip_llm or self._task_mode == "creative":
-            # AUTO-CR-8: Stage B verifies a claimed *issue* is present in
-            # existing text — an improvement-detector. For creative GENERATION
-            # the target chapter is new/empty, so "is the issue present?" is
+            # AUTO-CR-8: Stage B verifies a claimed issue is present in existing
+            # text — an improvement-detector — but for creative GENERATION the
+            # target chapter is new/empty, so "is the issue present?" is
             # meaningless and would reject every task. Creative quality is
-            # governed downstream by the soft Gate-2 (AUTO-CR-2) and the canon
-            # gate (AUTO-CR-7), so existence is sufficient here.
+            # governed downstream by the soft Gate-2 (CR-2) and canon gate
+            # (CR-7) instead, so existence is sufficient here.
             _why = "LLM skipped" if self._skip_llm else "creative mode — existence only"
             presence_passed = [(c, f"existence check passed ({_why})") for c, _ in existence_passed]
         else:
@@ -368,14 +362,11 @@ class Gate1Filter:
 
         file_ext = Path(loc.file).suffix or ".py"
 
-        # AUTO-CR-8: in docs/creative mode a FILE is sufficient grounding
-        # (mirrors CitedLocation.is_valid). Small models (e.g. llama3.1:8b)
-        # frequently emit a hallucinated line_start (0, 5, 15…) instead of the
-        # requested null, and the target chapter is often new/empty (0 lines),
-        # so strict line-range validation here wrongly rejects every candidate.
-        # Treat the citation as file-only and hand Stage B a head-of-file block
-        # (which may be empty for a brand-new chapter — that is expected when
-        # generating rather than improving).
+        # AUTO-CR-8: in docs/creative mode a FILE alone is sufficient grounding,
+        # since small models often hallucinate line_start and the target
+        # chapter may be new/empty, which would make strict line-range
+        # validation wrongly reject every candidate. So treat the citation as
+        # file-only and hand Stage B a head-of-file block (possibly empty).
         if self._task_mode != "code":
             lines = source.splitlines()
             block = "\n".join(lines[: self._max_context_lines])

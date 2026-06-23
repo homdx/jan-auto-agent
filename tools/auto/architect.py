@@ -46,7 +46,7 @@ from typing import Any
 from tools.agent_trace import tracer
 from tools.auto.repo_ingest import RepoCluster
 import tools.llm_stream as _llm_stream
-from tools.llm_stream import strip_think, make_unverified_context
+from tools.llm_stream import strip_think
 
 logger = logging.getLogger(__name__)
 
@@ -191,12 +191,11 @@ Now produce ONLY the JSON array of up to {max_tasks} concrete tasks that IMPLEME
 goal "{goal}" against the files above (no prose, no markdown fences):
 """
 
-# AUTO-CR-34: creative tasks are prose, not code. The shared code template above
-# demands a "symbol" and a runnable shell-test acceptance_check (pytest/npm/...),
-# which contradicts the creative system prompt and makes the model emit shell
-# commands that have no meaning for a book (they are force-overridden to the
-# "true" no-op at parse time anyway). This variant drops the symbol/shell-test
-# guidance and asks for prose-appropriate tasks while keeping the exact-path rules.
+# AUTO-CR-34: creative tasks are prose, not code — the shared code template
+# demands a "symbol" and shell-test acceptance_check, which contradicts the
+# creative prompt and makes the model emit meaningless shell commands. This
+# variant drops that guidance and asks for prose-appropriate tasks while
+# keeping the exact-path rules.
 _USER_PROMPT_CREATIVE = """\
 Goal: {goal}
 
@@ -320,7 +319,7 @@ class CandidateTask:
 # ClusterReviewer
 # ─────────────────────────────────────────────────────────────────────────────
 
-class ClusterReviewer:
+class ClusterReviewer(_llm_stream.LLMClientBase):
     """Sends one Architect LLM call per cluster and returns grounded candidates.
 
     Parameters
@@ -349,14 +348,8 @@ class ClusterReviewer:
         verify_ssl: bool = True,
         task_mode: str = "code",
     ) -> None:
-        self._config     = config
-        self._base_url   = base_url.rstrip("/")
-        self._api_key    = api_key
-        self._model      = model
-        self._api_format = api_format
+        super().__init__(config, base_url, api_key, model, api_format, verify_ssl)
         self._task_mode  = task_mode
-
-        self._ssl_context = make_unverified_context() if not verify_ssl else None
 
         arch = "architect"
         self._temperature            = float(config.get(arch, "temperature",         fallback="0.2"))
@@ -683,12 +676,10 @@ class ClusterReviewer:
                 last_exc = exc
                 exc_str = str(exc)
                 # Only retry on transient server-side errors (5xx) or connection
-                # failures.  Client errors (4xx) are deterministic — no point retrying.
-                # Prefer the REAL status from the exception object: urllib raises
-                # HTTPError with an integer ``.code``.  Only fall back to a
-                # word-boundary scan of the message for non-HTTP transport errors,
-                # which avoids false positives from substrings (e.g. a model name
-                # like "gpt-4-5000" or an error body that mentions "error 500").
+                # failures, not deterministic 4xx client errors. Prefer the real
+                # status from exc.code (urllib's HTTPError); only fall back to a
+                # word-boundary scan of the message for non-HTTP errors, to avoid
+                # false positives from substrings like a model name "gpt-4-5000".
                 _http_status: int = 0
                 _code = getattr(exc, "code", None)
                 if isinstance(_code, int):
@@ -814,10 +805,10 @@ class ClusterReviewer:
                 continue
 
             # AUTO-CR-28: never let a task target a control/memory file
-            # (story_bible.md, synopsis.md, IMPROVEMENTS.md, plan.json). These
-            # are not story content; editing them corrupts the bible/synopsis
-            # and sends the redundancy gate into an endless rewrite loop. Bounce
-            # the candidate here, before Gate 1, so no attempt is ever spent.
+            # (story_bible.md, synopsis.md, IMPROVEMENTS.md, plan.json) —
+            # editing these corrupts the bible/synopsis and sends the
+            # redundancy gate into an endless rewrite loop. Bounce the
+            # candidate here, before Gate 1, so no attempt is ever spent.
             if any(
                 str(tf).strip().lower().rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
                 in RESERVED_META_FILES
@@ -833,11 +824,11 @@ class ClusterReviewer:
             # --- Validate and build cited_location (grounding gate) ---
             loc_raw = item.get("cited_location")
 
-            # AUTO-CR-10: in creative mode the grounding is "the story so far".
-            # A small model often (a) omits cited_location, or (b) cites the
-            # NEW target chapter (which does not exist yet). Both block the
-            # whole run. Repair by grounding on an EXISTING cluster file (the
-            # latest existing chapter) instead of rejecting.
+            # AUTO-CR-10: in creative mode the grounding is "the story so far,"
+            # but a small model often omits cited_location or cites the new
+            # (nonexistent) target chapter, blocking the whole run. Repair by
+            # grounding on an existing cluster file (the latest chapter)
+            # instead of rejecting.
             if self._task_mode == "creative":
                 existing = list(cluster_files or [])
                 anchor_file = _latest_chapter_file(existing)
@@ -902,12 +893,11 @@ class ClusterReviewer:
                     )
                     continue
 
-            # AUTO-CR-17: prose has no meaningful objective shell test. A small
-            # model often invents nonsensical checks (e.g. "diff chapter_1.txt
-            # chapter_2.txt"), which run for real in the executor and FAIL on
-            # every attempt (distinct chapters never compare equal), burning the
-            # whole task. In creative mode force acceptance to the "true" no-op;
-            # quality is judged by Gate-2 and the canon gate, not a shell test.
+            # AUTO-CR-17: prose has no meaningful objective shell test, and a
+            # small model often invents nonsensical checks (e.g. "diff
+            # chapter_1.txt chapter_2.txt") that fail on every attempt, burning
+            # the whole task. In creative mode force acceptance to the "true"
+            # no-op — quality is judged by Gate-2 and the canon gate instead.
             if self._task_mode == "creative" and acceptance.strip().lower() != "true":
                 logger.info(
                     "_parse_candidates [%s]: item %d — overriding creative "
@@ -933,10 +923,10 @@ class ClusterReviewer:
                 cluster_name, rejected, len(data),
             )
 
-        # AUTO-CR-18: hard-cap creative tasks. A small model ignores the
-        # "up to N" request and emits many overlapping "synchronize X" tasks
-        # (20 in one run); run sequentially over shared files they collapse
-        # every chapter into a copy of one. Keep only the first N.
+        # AUTO-CR-18: hard-cap creative tasks — a small model ignores the
+        # "up to N" request and emits many overlapping "synchronize X" tasks,
+        # which collapse every chapter into a copy of one when run
+        # sequentially over shared files. Keep only the first N.
         if self._task_mode == "creative":
             cap = self._config.getint("architect", "max_tasks_creative", fallback=1)
             cap = max(1, cap)
@@ -1213,7 +1203,7 @@ Return a JSON object with exactly these fields:
 """
 
 
-class TaskRewriter:
+class TaskRewriter(_llm_stream.LLMClientBase):
     """Rewrites a repeatedly-failing task with a new implementation strategy.
 
     Mirrors the constructor signature of :class:`ClusterReviewer` so
@@ -1236,13 +1226,7 @@ class TaskRewriter:
         api_format: str = "openai",
         verify_ssl: bool = True,
     ) -> None:
-        self._config     = config
-        self._base_url   = base_url.rstrip("/")
-        self._api_key    = api_key
-        self._model      = model
-        self._api_format = api_format
-
-        self._ssl_context = make_unverified_context() if not verify_ssl else None
+        super().__init__(config, base_url, api_key, model, api_format, verify_ssl)
 
         arch = "architect"
         self._max_tokens  = int(config.get(arch, "rewrite_max_tokens",  fallback="512"))
@@ -1358,12 +1342,11 @@ class TaskRewriter:
             return original_task
 
         # Guard: reject acceptance_check values that look like prose rather than
-        # a real shell command.  A valid check starts with a known executable token
-        # and is short enough to be a single command.  When the LLM drifts and
-        # writes a sentence (e.g. "The script must run without errors …"), the
-        # executor runs it as a shell command, bash cannot find "The" as a binary,
-        # and every subsequent attempt fails with exit 127 — even when the generated
-        # code is correct.  Falling back to the original command is always safer.
+        # a real shell command (a valid check starts with a known executable
+        # token and is short). When the LLM drifts and writes a sentence
+        # instead, bash can't find a binary for it and every attempt fails
+        # with exit 127 — even on correct code — so falling back to the
+        # original command is always safer.
         if new_acceptance and not _looks_like_shell_command(new_acceptance):
             logger.warning(
                 "TaskRewriter._parse_rewrite: acceptance_check looks like prose, "

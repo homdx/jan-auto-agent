@@ -112,6 +112,21 @@ def make_unverified_context() -> ssl.SSLContext:
     return ctx
 
 
+class LLMClientBase:
+    """Shared constructor for Coder, Gate1Filter, ClusterReviewer, and
+    TaskRewriter: the connection fields and SSL context are identical
+    across all four; each subclass adds its own model/prompt settings."""
+
+    def __init__(self, config, base_url: str, api_key: str, model: str,
+                 api_format: str = "openai", verify_ssl: bool = True) -> None:
+        self._config     = config
+        self._base_url   = base_url.rstrip("/")
+        self._api_key    = api_key
+        self._model      = model
+        self._api_format = api_format
+        self._ssl_context = make_unverified_context() if not verify_ssl else None
+
+
 def build_chat_request(
     *, base_url: str, api_key: str, model: str, api_format: str,
     temperature: float, max_tokens: int, system: str, user_msg: str,

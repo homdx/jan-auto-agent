@@ -120,10 +120,10 @@ class OuterLoop:
         round if feedback files already exist.  Never raises."""
         task_id = task.get("id", "?")
 
-        # AUTO-CR-33: ONE wall-clock budget for the whole task (all rounds).
-        # Previously each round re-entered InnerLoop.run_task which reset its
-        # own start time, so the effective cap was max_rounds × max_task_seconds
-        # (10 × 30 min ≈ 5 h observed). Compute the deadline once here and both
+        # AUTO-CR-33: one wall-clock budget for the whole task (all rounds) —
+        # previously each round re-entered InnerLoop.run_task and reset its own
+        # start time, so the effective cap was max_rounds × max_task_seconds
+        # (10 × 30 min ≈ 5h observed). Compute the deadline once here and both
         # gate the round loop and hand it to the inner loop.
         try:
             _mts = int(getattr(self.inner_loop, "max_task_seconds", 0) or 0)
@@ -222,13 +222,13 @@ class OuterLoop:
             feedback_files.append(str(fpath))
             self.state.log(f"{task_id}: round {rnd} failed — wrote {fpath.name}")
 
-            # LOOP-2: check whether a rewrite is due.
-            # Condition: rnd >= 3, (rnd-1) % rewrite_every_n_rounds == 0,
-            #            rewrites_done < max_rewrites, and a rewriter is wired up.
-            # Pull-model gate: only rewrite when the inner loop's context was
-            # satisfied. If the last attempt was still REQUESTING context, the
-            # failure is "missing information", not "bad framing" — skip the
-            # rewrite this round and let the prefetched context flow instead.
+            # LOOP-2: check whether a rewrite is due (rnd >= 3, (rnd-1) %
+            # rewrite_every_n_rounds == 0, rewrites_done < max_rewrites, and a
+            # rewriter wired up). Pull-model gate: only rewrite when the inner
+            # loop's context was satisfied — if the last attempt was still
+            # REQUESTING context, the failure is "missing information," not
+            # "bad framing," so skip the rewrite and let the prefetched
+            # context flow instead.
             if (
                 self.task_rewriter is not None
                 and self.max_rewrites > 0
@@ -445,19 +445,10 @@ def make_outer_loop(
         inner_loop = make_inner_loop(config, base_dir, task_mode=task_mode,
                                       run_goal=run_goal)  # AUTO-DM-1 / AUTO-CR-22-1
 
-    # LOOP-2: build a TaskRewriter if the config has the rewrite keys and
-    # max_rewrites > 0.  If anything is missing the outer loop just runs
-    # without rewriting.
-    #
-    # AUTO-CR-27: the TaskRewriter is a CODE-mode recovery path — its prompt is
-    # all software-test framing ("completely different implementation",
-    # "exit 127", "gradlew test", "mvn test", "compile-only check"). On a
-    # creative task that vocabulary is nonsense: acceptance_check is forced to
-    # "true" (CR-17) and quality is judged by the gates, so a repeatedly-failing
-    # chapter must be steered by gate feedback in the inner loop, NOT by a
-    # code reframer. Running it here wasted an 8B call and nudged the model
-    # toward emitting shell commands / code mid-story. So: never build it in
-    # creative mode.
+    # LOOP-2: build a TaskRewriter only if rewrite keys + max_rewrites > 0 are
+    # configured. AUTO-CR-27: skip it in creative mode — its code-test-framed
+    # prompt is meaningless there and previously wasted a call while nudging
+    # the model toward emitting code mid-story.
     task_rewriter = None
     if max_rewrites > 0 and task_mode != "creative":
         try:

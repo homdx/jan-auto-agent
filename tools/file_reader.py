@@ -4,7 +4,6 @@ import os
 from pathlib import Path
 
 
-
 def resolve_path(path: str, base_dir: str | None = None) -> str:
     """
     Expand '~', make absolute, and optionally resolve relative paths against base_dir.

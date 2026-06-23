@@ -12,9 +12,9 @@ from tools.llm_stream import request_completion, strip_think, ollama_chat_url, s
 
 logger = logging.getLogger(__name__)
 
-# Hardcoded prompt extracted to a named module-level constant.
-# This is the canonical fallback that PromptStore will always be able to return to.
-# Runtime values are injected via .format() in validate() — do not use f-string here.
+# Hardcoded prompt extracted to a named module-level constant — the canonical
+# fallback PromptStore can always return to. Runtime values are injected via
+# .format() in validate(); do not use f-string here.
 VALIDATOR_PROMPT_HARDCODED = (
     "You are a code completeness validator. Your job is to check whether a code block "
     "has all the definitions it needs — nothing more.\n"

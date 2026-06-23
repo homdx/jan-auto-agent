@@ -34,13 +34,7 @@ def _line_start_index(source: str, char_index: int) -> int:
 
 
 def _unique_preserve_order(items: Iterable[str]) -> list[str]:
-    seen = set()
-    out: list[str] = []
-    for item in items:
-        if item and item not in seen:
-            seen.add(item)
-            out.append(item)
-    return out
+    return list(dict.fromkeys(item for item in items if item))
 
 
 # ----------------------------
@@ -390,22 +384,9 @@ def _extract_brace_block(source: str, target_name: str) -> str:
     return source[best_start:end]
 
 
-# ----------------------------
-# Prose strategy (.md / .txt) — AUTO-CR-6
-# ----------------------------
-#
-# Code has symbols (classes/functions) the AST/brace strategies above can
-# locate by name. Prose has no symbols, so the creative-mode pull model needs
-# a different notion of "the block named X":
-#
-#   1. Heading match  — X is (or matches) a markdown heading; return that
-#      heading's whole section.
-#   2. Entity match   — fallback for names/places that aren't headings;
-#      return the paragraph(s) around the first mention.
-#
-# Both strategies are best-effort and fail-open: an unmatched query returns
-# "" (the same "not found" contract extract_block already uses), never a
-# raised exception.
+# Prose strategy (.md/.txt, AUTO-CR-6) locates "block named X" via heading
+# match, falling back to the first-mention paragraph. Fails open (returns ""
+# rather than raising, like extract_block).
 
 _HEADING_RE = re.compile(r"(?m)^(#{1,6})[ \t]+(.+?)[ \t]*$")
 
