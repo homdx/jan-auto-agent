@@ -9,6 +9,7 @@ Usage:
     python analyze_logs.py .agent/ --all-runs   # show all runs in dir
     python analyze_logs.py .agent/ --rewrites       # + prompt rewrite report
     python analyze_logs.py .agent/ --rewrites-only  # rewrite report only
+    python analyze_logs.py .agent/ --mode creative  # story-progress layout
 
 What it shows:
     • Summary: total tasks, iterations, approve/reject counts, prompt changes
@@ -19,6 +20,12 @@ What it shows:
       score, and whether it was promoted or denied; promoted attempts show
       the old → new prompt diff
     • Timeline: human-readable event flow
+
+Creative mode (--mode creative or --mode auto on a creative run):
+    • Story Progress: chapters in narrative order with revision counts
+    • Per-gate breakdown (Gate-2 LLM / Gate-3 fact / prosody / continuity)
+      when those validators emit tracer events
+    • Non-chapter tasks shown separately
 """
 
 from __future__ import annotations
@@ -26,10 +33,50 @@ from __future__ import annotations
 import argparse
 import difflib
 import json
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
+
+
+# ── Creative-mode helpers ─────────────────────────────────────────────────────
+
+# Matches "chapter 1", "chapter_02", "Chapter-3", etc. in task titles / IDs.
+_CHAPTER_RE = re.compile(r"chapter[\s_\-]?(\d+)", re.IGNORECASE)
+
+# Creative gate sources — these validators run in inner_loop.py but do NOT emit
+# tracer events themselves (rejections surface only as extra coder iterations).
+# Tracked here for documentation and future tracer integration.
+_CREATIVE_GATE_LABELS = {
+    "validator_agent":      "Gate-2 (LLM)",
+    "fact_validator":       "Gate-3 fact",
+    "prosody":              "Gate-3 prosody",
+    "continuity_validator": "Gate-3 continuity",
+    "story_bible":          "Story bible",
+}
+
+def _chapter_num(task: dict) -> int:
+    """Extract chapter number from task title or id, or return 9999 for non-chapters."""
+    for field in ("title", "task_id"):
+        m = _CHAPTER_RE.search(task.get(field, "") or "")
+        if m:
+            return int(m.group(1))
+    return 9999
+
+
+def _detect_task_mode(run: dict) -> str:
+    """Infer task mode from trace patterns.
+
+    Returns ``"creative"`` when the majority of tasks look like chapter-writing
+    tasks (title or task_id contains a chapter number).  Falls back to
+    ``"code"`` otherwise.
+    """
+    real_tasks = [v for k, v in run["tasks"].items() if not k.startswith("gate1:")]
+    if not real_tasks:
+        return "code"
+    chapter_tasks = sum(1 for t in real_tasks if _chapter_num(t) < 9999)
+    return "creative" if chapter_tasks > len(real_tasks) / 2 else "code"
 
 
 # ── ANSI colours ─────────────────────────────────────────────────────────────
@@ -274,11 +321,6 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
             }
         return runs[rid]
 
-    def _minimal_task(task_id: str) -> dict:
-        """Fallback task shape for a 'result'/'decision' event with no prior 'call' event."""
-        return {"task_id": task_id, "status": "in_progress", "iterations": 0,
-                "approved": 0, "rejected": 0, "commit": None}
-
     for evt in events:
         rid     = evt.get("run_id") or "__ungrouped__"
         run     = get_run(rid)
@@ -332,6 +374,7 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
                 "approved":   0,
                 "rejected":   0,
                 "commit":     None,
+                "stages":     {},   # AUTO-CR-27: per-stage gate counts
             })
             task["start_ts"] = ts
             task["title"]    = task["title"] or title
@@ -347,7 +390,12 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
             if task_id == "?":
                 # Skip malformed / internal outer_loop events with no identifiable task.
                 continue
-            task = run["tasks"].setdefault(task_id, _minimal_task(task_id))
+            task = run["tasks"].setdefault(task_id, {"task_id": task_id,
+                                                      "status": "in_progress",
+                                                      "iterations": 0,
+                                                      "approved": 0,
+                                                      "rejected": 0,
+                                                      "commit": None})
             task["end_ts"] = ts
             # Determine status: prefer content string, fall back to params["passed"].
             if content:
@@ -368,7 +416,12 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
             task_id = params.get("task_id") or params.get("task", "?")
             if task_id == "?":
                 continue
-            task = run["tasks"].setdefault(task_id, _minimal_task(task_id))
+            task = run["tasks"].setdefault(task_id, {"task_id": task_id,
+                                                      "status": "in_progress",
+                                                      "iterations": 0,
+                                                      "approved": 0,
+                                                      "rejected": 0,
+                                                      "commit": None})
             task["end_ts"] = ts
             task["status"] = str(content).strip().upper() if content else "BLOCKED"
             if run["_current_task"] == task_id:
@@ -390,12 +443,77 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
                 "commit":     None,
             })
 
+        # ── AUTO-CR-27: inner-loop per-stage gate decisions ────────────────
+        #
+        # _trace_stage() in inner_loop.py emits:
+        #   kind="decision", target="inner_loop", source=<stage>,
+        #   params={"task": id, "attempt": N, "stage": <stage>, ...},
+        #   content=REJECTED|APPROVED|EXHAUSTED|ACCEPTED_AT_CAP|ERROR
+        #
+        # Stages (all modes):  coder, executor, gate2, overall
+        # Stages (creative):   canon, fact, continuity, prosody
+        #
+        # "overall APPROVED"  → the attempt fully passed every gate
+        # "overall EXHAUSTED" → all attempts used up, task fails
+        # All other stages    → a single gate rejected this attempt
+        elif kind == "decision" and tgt == "inner_loop":
+            task_id = params.get("task") or params.get("task_id", "?")
+            stage   = params.get("stage", src or "?")
+            verdict = str(content or "").strip().upper()
+            attempt = params.get("attempt", 0)
+
+            # Associate with the current task; fall back to in-progress scan.
+            current_id = run.get("_current_task")
+            if task_id != "?" and task_id in run["tasks"]:
+                target_task = run["tasks"][task_id]
+            elif current_id and current_id in run["tasks"]:
+                target_task = run["tasks"][current_id]
+            else:
+                active = [t for t in run["tasks"].values()
+                          if t.get("status") == "in_progress"]
+                target_task = active[-1] if active else None
+
+            if target_task is None and task_id != "?":
+                target_task = run["tasks"].setdefault(
+                    task_id, {"task_id": task_id, "status": "in_progress",
+                              "iterations": 0, "approved": 0, "rejected": 0,
+                              "commit": None, "stages": {}}
+                )
+
+            if target_task is not None:
+                target_task.setdefault("stages", {})
+                stage_counter = target_task["stages"].setdefault(
+                    stage, {"REJECTED": 0, "ACCEPTED_AT_CAP": 0,
+                            "ERROR": 0, "APPROVED": 0, "EXHAUSTED": 0}
+                )
+                stage_counter[verdict] = stage_counter.get(verdict, 0) + 1
+
+                # "overall" is the authoritative attempt-level outcome.
+                if stage == "overall":
+                    target_task["iterations"] = max(
+                        target_task.get("iterations", 0), int(attempt)
+                    )
+                    if verdict == "APPROVED":
+                        target_task["approved"] = target_task.get("approved", 0) + 1
+                    elif verdict == "EXHAUSTED":
+                        target_task["rejected"] = target_task.get("rejected", 0) + 1
+
         # ── validator decisions ────────────────────────────────────────────
         #
         # FIX: validator_agent emits kind="result" (NOT kind="decision").
         # The content is a JSON-encoded dict, not a plain "APPROVED"/"REJECTED"
         # string, so it must be parsed via _parse_validator_verdict().
-        elif kind == "result" and "validator" in src:
+        #
+        # NOTE: creative-mode gates (fact, prosody, continuity) now ALSO emit
+        # kind="decision" target="inner_loop" stage=<gate> via _trace_stage()
+        # (AUTO-CR-27).  The block above handles those.  This block remains for
+        # the Gate-2 LLM validator (validator_agent) which still emits
+        # kind="result" with a JSON payload, and for backward-compat with older
+        # traces that pre-date AUTO-CR-27.
+        elif kind == "result" and (
+            "validator" in src
+            or src in ("prosody", "story_bible")  # creative-mode gate sources
+        ):
             # Associate with the tracked current task first; fall back to
             # heuristic scan of in-progress tasks if the tracker is empty.
             current_id = run.get("_current_task")
@@ -409,14 +527,27 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
             if target_task:
                 target_task["iterations"] = target_task.get("iterations", 0) + 1
                 verdict = _parse_validator_verdict(content)
+                # Per-gate breakdown (useful for creative-mode reports).
+                gate_label = _CREATIVE_GATE_LABELS.get(src, "Gate-2 (LLM)")
+                gates = target_task.setdefault("gates", {})
+                g = gates.setdefault(gate_label, {"approved": 0, "rejected": 0})
                 if verdict is True:
                     target_task["approved"] = target_task.get("approved", 0) + 1
+                    g["approved"] += 1
                 elif verdict is False:
                     target_task["rejected"] = target_task.get("rejected", 0) + 1
+                    g["rejected"] += 1
                 # verdict is None → count the iteration but don't skew either bucket
 
+        # ── creative-mode detection ────────────────────────────────────────
+        # Standalone check (outside the elif chain above) so it always fires
+        # regardless of which branch matched.  If any creative-specific gate
+        # source appears in this run, tag it as creative.
+        if src in _CREATIVE_GATE_LABELS and src != "validator_agent":
+            run.setdefault("detected_mode", "creative")
+
         # ── llm calls ─────────────────────────────────────────────────────
-        elif kind == "llm_request":
+        if kind == "llm_request":
             run["llm_calls"] += 1
             # prompt_optimizer's meta-prompt embeds the CURRENT PROMPT text —
             # stash it so a later prompt_denied/prompt_promoted event (which
@@ -495,6 +626,70 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
                         break
 
     return runs
+
+
+# ── Stage-breakdown renderer (AUTO-CR-27) ─────────────────────────────────────
+
+# Pipeline order for display; unknown stages sort last.
+_STAGE_ORDER  = ["coder", "executor", "gate2", "canon", "fact",
+                 "continuity", "prosody", "overall"]
+_STAGE_LABELS = {
+    "coder":       "Coder",
+    "executor":    "Executor",
+    "gate2":       "Gate-2 (LLM)",
+    "canon":       "Canon",
+    "fact":        "Fact",
+    "continuity":  "Continuity",
+    "prosody":     "Prosody",
+    "overall":     "Overall",
+}
+
+
+def _fmt_stage_counts(stage: str, counts: dict) -> str:
+    """One-line summary for one stage — e.g. 'Gate-2 (LLM):  2✗  1✓'."""
+    label    = _STAGE_LABELS.get(stage, stage)
+    rejected = counts.get("REJECTED", 0)
+    approved = counts.get("APPROVED", 0)
+    cap      = counts.get("ACCEPTED_AT_CAP", 0)
+    errors   = counts.get("ERROR", 0)
+    exhaust  = counts.get("EXHAUSTED", 0)
+
+    parts: list[str] = []
+    if rejected:
+        parts.append(red(f"{rejected}✗"))
+    if approved:
+        parts.append(green(f"{approved}✓"))
+    if cap:
+        parts.append(yellow(f"{cap}⚠ cap"))
+    if errors:
+        parts.append(red(f"{errors} err"))
+    if exhaust:
+        parts.append(red("EXHAUSTED"))
+    return f"{dim(label + ':')}  {'  '.join(parts) if parts else dim('—')}"
+
+
+def render_stage_breakdown(task: dict, indent: str = "    ") -> None:
+    """Print per-stage gate counts for a task when AUTO-CR-27 stage data exists.
+
+    Stages are displayed in pipeline order:
+      coder → executor → gate2 → (canon → fact → continuity → prosody) → overall
+    Only stages that actually fired are shown; creative-only stages appear only
+    for creative-mode tasks.
+    """
+    stages = task.get("stages", {})
+    if not stages:
+        return
+
+    ordered = sorted(
+        stages.items(),
+        key=lambda kv: (
+            _STAGE_ORDER.index(kv[0]) if kv[0] in _STAGE_ORDER else 99,
+            kv[0],
+        ),
+    )
+    print(f"{indent}{dim('gate log:')}")
+    for stage, counts in ordered:
+        print(f"{indent}  {_fmt_stage_counts(stage, counts)}")
 
 
 # ── Prompt diff renderer ───────────────────────────────────────────────────────
@@ -664,6 +859,7 @@ def render_applied_tasks(run: dict) -> None:
                 f" / {red(str(rejected))} rejected)"
             )
             print(f"    {dim('attempts:')} {iters}{attempt_str}")
+        render_stage_breakdown(t, indent="    ")
 
 
 def render_tasks(run: dict) -> None:
@@ -708,6 +904,7 @@ def render_tasks(run: dict) -> None:
         task_id_str = dim(f"[{t.get('task_id', '?')}]")
         print(f"  {status_str:<30} {title}{dur_str}{iter_str}{commit_str}")
         print(f"    {task_id_str}  started: {fmt_ts(t.get('start_ts',''))}")
+        render_stage_breakdown(t, indent="    ")
 
     if gate1:
         print()
@@ -848,15 +1045,36 @@ def render_timeline(run: dict, max_events: int = 40) -> None:
             print(f"  {dim(ts)}  {col(bold(f'✓ task {verdict}'))}  {dim(task_id)}{extra}")
 
         # FIX: validator now correctly emits kind="result" — show it in the timeline
-        elif kind == "result" and "validator" in src:
+        elif kind == "result" and (
+            "validator" in src
+            or src in ("prosody", "story_bible")
+        ):
             verdict_bool = _parse_validator_verdict(evt.get("content"))
+            gate_label   = _CREATIVE_GATE_LABELS.get(src, "validator")
             if verdict_bool is True:
-                verdict_str = green(bold("validator: APPROVED"))
+                verdict_str = green(bold(f"{gate_label}: APPROVED"))
             elif verdict_bool is False:
-                verdict_str = red(bold("validator: REJECTED"))
+                verdict_str = red(bold(f"{gate_label}: REJECTED"))
             else:
-                verdict_str = yellow(bold("validator: ?"))
+                verdict_str = yellow(bold(f"{gate_label}: ?"))
             print(f"  {dim(ts)}  {verdict_str}  {dim(src)}")
+
+        elif kind == "decision" and tgt == "inner_loop":
+            # AUTO-CR-27 stage event — show compact one-liner per stage decision.
+            stage   = params.get("stage", src or "?")
+            verdict = content or "?"
+            attempt = params.get("attempt", "")
+            task_id = params.get("task") or params.get("task_id", "")
+            label   = _STAGE_LABELS.get(stage, stage)
+            if verdict in ("APPROVED", "ACCEPTED_AT_CAP"):
+                col = green if verdict == "APPROVED" else yellow
+            elif verdict in ("REJECTED", "EXHAUSTED", "ERROR"):
+                col = red
+            else:
+                col = dim
+            attempt_str = f"  {dim(f'attempt {attempt}')}" if attempt else ""
+            print(f"  {dim(ts)}  {col(bold(f'{label}: {verdict}'))}"
+                  f"  {dim(task_id)}{attempt_str}")
 
         elif kind == "decision":
             verdict   = content or ""
@@ -969,6 +1187,104 @@ def render_files_preparing(run: dict) -> None:
             print(f"    {dim(f'… and {len(files) - 6} more file(s)')}")
 
 
+# ── Story-progress renderer (creative mode) ───────────────────────────────────
+
+def render_story_progress(run: dict) -> None:
+    """Chapter-by-chapter story progress for ``--auto`` creative-mode runs.
+
+    Chapters are sorted by their numeric suffix (``chapter_01``, ``chapter_2``,
+    …) so the output reads in narrative order regardless of trace order.
+    Non-chapter tasks are shown after all chapters under "Other tasks".
+
+    Per-chapter it shows:
+    • Status (✓ done / ✗ blocked / ◌ in_progress / …)
+    • Duration
+    • Validator iteration breakdown (approved / rejected per gate when available)
+    • Commit hash if present
+    """
+    tasks = {k: v for k, v in run["tasks"].items() if not k.startswith("gate1:")}
+    if not tasks:
+        print_section("STORY PROGRESS")
+        print(dim("  (no chapter tasks recorded in this run)"))
+        return
+
+    chapters   = sorted(
+        [t for t in tasks.values() if _chapter_num(t) < 9999],
+        key=lambda t: (_chapter_num(t), t.get("start_ts", "")),
+    )
+    other_tasks = [t for t in tasks.values() if _chapter_num(t) == 9999]
+
+    done_ch    = sum(1 for t in chapters if t.get("status") in ("DONE","APPROVED","PASS"))
+    blocked_ch = sum(1 for t in chapters if t.get("status") in ("BLOCKED","FAIL"))
+
+    print_section(
+        f"STORY PROGRESS  "
+        f"({len(chapters)} chapter(s)  "
+        f"{green(str(done_ch))} done  "
+        f"{red(str(blocked_ch))} blocked)"
+    )
+
+    for t in chapters:
+        ch_num   = _chapter_num(t)
+        ch_label = f"Chapter {ch_num:02d}"
+        title    = t.get("title", "").strip()
+        # Strip leading "chapter N" prefix if title duplicates the label.
+        m = _CHAPTER_RE.match(title)
+        if m:
+            title = title[m.end():].lstrip(" :—-")
+
+        status = t.get("status", "?")
+        if status in ("DONE", "APPROVED", "PASS"):
+            status_icon = green("✓")
+            status_col  = green
+        elif status in ("BLOCKED", "FAIL"):
+            status_icon = red("✗")
+            status_col  = red
+        elif status == "in_progress":
+            status_icon = yellow("◌")
+            status_col  = yellow
+        else:
+            status_icon = yellow("●")
+            status_col  = yellow
+
+        iters    = t.get("iterations", 0)
+        approved = t.get("approved", 0)
+        rejected = t.get("rejected", 0)
+        dur      = elapsed(t.get("start_ts", ""), t.get("end_ts", ""))
+        commit   = t.get("commit", "")
+
+        header_parts = [f"  {status_icon} {bold(ch_label)}"]
+        if title:
+            header_parts.append(f"  {truncate(title, 50)}")
+        print("".join(header_parts))
+
+        detail_parts: list[str] = []
+        if dur:
+            detail_parts.append(f"{dim('duration:')} {dur}")
+        if iters:
+            detail_parts.append(
+                f"{dim('revisions:')} {iters}  "
+                f"({green(str(approved))} approved / {red(str(rejected))} rejected)"
+            )
+        if commit:
+            detail_parts.append(f"{dim('commit:')} {cyan(commit[:10])}")
+        if detail_parts:
+            print("    " + "   ".join(detail_parts))
+
+        # Per-stage gate log (AUTO-CR-27: populated whenever _trace_stage fires).
+        render_stage_breakdown(t, indent="    ")
+
+    if other_tasks:
+        print()
+        print(f"  {bold(dim('Non-chapter tasks:'))}")
+        for t in other_tasks:
+            status = t.get("status", "?")
+            col = green if status in ("DONE","APPROVED","PASS") else (
+                  red   if status in ("BLOCKED","FAIL") else yellow)
+            print(f"    {col('●')} {truncate(t.get('title', t.get('task_id','?')), 60)}  "
+                  f"{dim(status)}")
+
+
 # ── Main render ───────────────────────────────────────────────────────────────
 
 def render_run(
@@ -977,14 +1293,32 @@ def render_run(
     show_diff: bool = True,
     show_rewrites: bool = False,
     rewrites_only: bool = False,
+    mode: str = "auto",
 ) -> None:
-    print_header(f"Run Analysis  [{run['run_id']}]")
+    """Render a full run report.
+
+    Parameters
+    ----------
+    mode:
+        ``"auto"``     — detect from trace (default; uses :func:`_detect_task_mode`)
+        ``"code"``     — standard code-pipeline layout
+        ``"creative"`` — story-progress layout with chapter ordering
+    """
+    effective_mode = mode if mode != "auto" else _detect_task_mode(run)
+
+    print_header(f"Run Analysis  [{run['run_id']}]"
+                 + (f"  [{cyan(effective_mode)} mode]" if effective_mode == "creative" else ""))
     if rewrites_only:
         render_rewrite_report(run)
         return
     render_run_summary(run)
-    render_applied_tasks(run)   # show what was actually applied/done
-    render_files_preparing(run) # show workspace file-preparation stages
+
+    if effective_mode == "creative":
+        render_story_progress(run)         # chapter ordering + gate breakdown
+    else:
+        render_applied_tasks(run)          # standard code-pipeline view
+
+    render_files_preparing(run)            # workspace file-preparation stages
     render_tasks(run)
     if show_diff:
         render_prompt_changes(run)
@@ -1060,6 +1394,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-color",
                    action="store_true",
                    help="Disable ANSI colours")
+    p.add_argument("--mode",
+                   choices=["auto", "code", "creative"],
+                   default="auto",
+                   metavar="MODE",
+                   help=(
+                       "Display mode: auto (default), code, or creative. "
+                       "auto detects from trace patterns. Use creative when "
+                       "the run used task_mode=creative in agents.ini to get "
+                       "chapter-ordered story-progress output."
+                   ))
     return p
 
 
@@ -1081,6 +1425,7 @@ def render_auto_prompts(search_path: str) -> None:
         return
     print_section(f"AUTO-TUNED PROMPTS  ({found})")
     print(json.dumps(data, indent=2, ensure_ascii=False))
+
 
 
 def main() -> int:
@@ -1129,6 +1474,7 @@ def main() -> int:
             show_diff=not args.no_diff,
             show_rewrites=args.rewrites or args.rewrites_only,
             rewrites_only=args.rewrites_only,
+            mode=args.mode,
         )
 
     if not args.rewrites_only:
