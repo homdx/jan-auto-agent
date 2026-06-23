@@ -484,6 +484,19 @@ class LLMGate2Validator:
             elif "```" in raw:
                 raw = raw.split("```")[1].split("```")[0].strip()
 
+            # ── Guard: empty AFTER fence-stripping ────────────────────────
+            # The pre-strip empty check above only catches a fully-empty raw
+            # reply. A reply like "```json\n```" (fences with nothing inside)
+            # passes that check but becomes "" once the fences are stripped,
+            # so json.loads("") would raise the same cryptic
+            # "Expecting value: line 1 column 1 (char 0)" error. Surface a
+            # clear message instead.
+            if not raw or not raw.strip():
+                raise ValueError(
+                    "validator model returned empty JSON content "
+                    "(empty code fences or no body after stripping markdown)"
+                )
+
             parsed   = json.loads(raw)
             # Guard against valid-but-non-object JSON (list / string / null):
             # the .get(...) calls below would otherwise raise AttributeError
