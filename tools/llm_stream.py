@@ -180,6 +180,7 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
                 try:
                     chunk = json.loads(data)
                     token = chunk["choices"][0]["delta"].get("content", "")
+                    think = ""   # OpenAI-format deltas have no separate thinking field
                     done  = False
                 except (json.JSONDecodeError, KeyError):
                     continue

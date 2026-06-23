@@ -40,6 +40,7 @@ import json
 import logging
 import time
 from tools.auto.context_broker import ContextBroker
+from tools.agent_trace import tracer   # AUTO-CR-27: per-stage decision tracing
 
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -686,6 +687,18 @@ def _format_gate2_feedback(parsed: dict, max_hints: int) -> str:
 # InnerLoop
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _trace_stage(task_id: str, attempt: int, stage: str, content: str, **extra) -> None:
+    """AUTO-CR-27: emit one stage-decision trace event. Never raises — tracing
+    must never affect pipeline behaviour even if the tracer is misconfigured."""
+    try:
+        params = {"task": task_id, "attempt": attempt, "stage": stage}
+        params.update(extra)
+        tracer.event(source=stage, target="inner_loop", kind="decision",
+                     content=content, params=params)
+    except Exception:  # noqa: BLE001 — tracing is best-effort
+        pass
+
+
 class InnerLoop:
     """Runs up to ``max_attempts`` coder → executor → validator cycles.
 
@@ -840,6 +853,7 @@ class InnerLoop:
                         self.max_task_seconds, self.max_task_seconds / 60.0,
                         attempt - 1,
                     )
+                    _trace_stage(task_id, attempt - 1, "overall", "EXHAUSTED", reason="wall_clock")
                     last = feedback[-1] if feedback else ""
                     return InnerLoopResult(
                         task_id=task_id,
@@ -859,6 +873,7 @@ class InnerLoop:
             except Exception as exc:
                 logger.error("InnerLoop: coder raised on attempt %d: %s", attempt, exc)
                 fb = f"attempt {attempt}: coder error — {exc}"
+                _trace_stage(task_id, attempt, "coder", "ERROR", error=str(exc))
                 feedback.append(fb)
                 records.append(AttemptRecord(attempt, False, False, False, fb))
                 continue
@@ -883,6 +898,7 @@ class InnerLoop:
                 # attempt benefits from symbols already resolved, regardless of
                 # whether the current attempt produced valid code.
                 fb = f"attempt {attempt}: coder failed — {getattr(coder_result, 'error', 'unknown error')}"
+                _trace_stage(task_id, attempt, "coder", "REJECTED")
                 feedback.append(fb)
                 records.append(AttemptRecord(attempt, False, False, False, fb))
                 continue
@@ -893,6 +909,7 @@ class InnerLoop:
             except Exception as exc:
                 logger.error("InnerLoop: executor raised on attempt %d: %s", attempt, exc)
                 fb = f"attempt {attempt}: executor error — {exc}"
+                _trace_stage(task_id, attempt, "executor", "ERROR", error=str(exc))
                 feedback.append(fb)
                 records.append(AttemptRecord(attempt, True, False, False, fb))
                 continue
@@ -916,6 +933,7 @@ class InnerLoop:
                     + (f"  cmd={cmd!r}" if cmd else "")
                     + f"\n{detail}"
                 )
+                _trace_stage(task_id, attempt, "executor", "REJECTED", exit_code=ec)
                 feedback.append(fb)
                 records.append(AttemptRecord(attempt, True, False, False, fb))
                 continue
@@ -933,6 +951,7 @@ class InnerLoop:
             except Exception as exc:
                 logger.error("InnerLoop: validator raised on attempt %d: %s", attempt, exc)
                 fb = f"attempt {attempt}: validator error — {exc}"
+                _trace_stage(task_id, attempt, "gate2", "ERROR", error=str(exc))
                 feedback.append(fb)
                 records.append(AttemptRecord(attempt, True, True, False, fb))
                 continue
@@ -945,6 +964,7 @@ class InnerLoop:
                     "─────────────────────────────────────────────────",
                     attempt, attempt, vfb,
                 )
+                _trace_stage(task_id, attempt, "gate2", "REJECTED")
                 feedback.append(fb)
                 _prior_validator_critique = vfb   # AUTO-CR-30: carry into next review
                 records.append(AttemptRecord(attempt, True, True, False, fb))
@@ -997,6 +1017,8 @@ class InnerLoop:
                         )
                         feedback.append(f"attempt {attempt}: canon rejected\n{cfb}")
                         records.append(AttemptRecord(attempt, True, True, False, cfb))
+                        _trace_stage(task_id, attempt, "canon", "REJECTED",
+                                    revisions_used=_canon_revisions, cap=cap)
                         continue
                 elif _canon_revisions >= cap and self.canon_validator.should_check(chapter_file):
                     logger.warning(
@@ -1004,6 +1026,7 @@ class InnerLoop:
                         "accepting chapter with possible unresolved canon issues.",
                         cap, chapter_file,
                     )
+                    _trace_stage(task_id, attempt, "canon", "ACCEPTED_AT_CAP", cap=cap)
 
             # ── AUTO-CR-20: Gate-3 per-task fact-compliance check ─────────────
             # Runs after Gate-2 APPROVED (and after canon gate) in creative mode.
@@ -1042,6 +1065,8 @@ class InnerLoop:
                         full_ffb = f"fact-check rejected\n{ffb}"
                         feedback.append(f"attempt {attempt}: {full_ffb}")
                         records.append(AttemptRecord(attempt, True, True, False, full_ffb))
+                        _trace_stage(task_id, attempt, "fact", "REJECTED",
+                                    revisions_used=_fact_revisions, cap=fact_cap)
                         continue
                     else:
                         logger.warning(
@@ -1049,6 +1074,7 @@ class InnerLoop:
                             "accepting chapter with possible unresolved fact contradiction.",
                             fact_cap,
                         )
+                        _trace_stage(task_id, attempt, "fact", "ACCEPTED_AT_CAP", cap=fact_cap)
 
             # ── AUTO-CR-23-3: continuity gate vs bible + previous chapter ─────
             # Runs after Gate-2 APPROVED, canon, and fact checks in creative
@@ -1099,6 +1125,8 @@ class InnerLoop:
                         full_cfb = f"continuity rejected\n{cfb}"
                         feedback.append(f"attempt {attempt}: {full_cfb}")
                         records.append(AttemptRecord(attempt, True, True, False, full_cfb))
+                        _trace_stage(task_id, attempt, "continuity", "REJECTED",
+                                    revisions_used=_continuity_revisions, cap=continuity_cap)
                         continue
                     else:
                         logger.warning(
@@ -1106,6 +1134,8 @@ class InnerLoop:
                             "accepting chapter with possible unresolved continuity issues.",
                             continuity_cap,
                         )
+                        _trace_stage(task_id, attempt, "continuity", "ACCEPTED_AT_CAP",
+                                    cap=continuity_cap)
 
             # ── AUTO-CR-21: Gate-3 Russian rhythm/rhyme (prosody) gate ────────
             # Runs after Gate-2 APPROVED, canon, and fact checks in creative
@@ -1140,6 +1170,8 @@ class InnerLoop:
                         full_pfb = f"prosody rejected\n{pfb}"
                         feedback.append(f"attempt {attempt}: {full_pfb}")
                         records.append(AttemptRecord(attempt, True, True, False, full_pfb))
+                        _trace_stage(task_id, attempt, "prosody", "REJECTED",
+                                    revisions_used=_prosody_revisions, cap=prosody_cap)
                         continue
                     else:
                         logger.warning(
@@ -1147,9 +1179,12 @@ class InnerLoop:
                             "accepting poem with possible unresolved rhythm/rhyme issues.",
                             prosody_cap,
                         )
+                        _trace_stage(task_id, attempt, "prosody", "ACCEPTED_AT_CAP",
+                                    cap=prosody_cap)
 
             logger.info("InnerLoop: attempt %d APPROVED", attempt)
             records.append(AttemptRecord(attempt, True, True, True, ""))
+            _trace_stage(task_id, attempt, "overall", "APPROVED")
             return InnerLoopResult(
                 task_id=task_id,
                 passed=True,
@@ -1161,6 +1196,7 @@ class InnerLoop:
 
         # All attempts exhausted
         last = feedback[-1] if feedback else ""
+        _trace_stage(task_id, self.max_attempts, "overall", "EXHAUSTED")
         return InnerLoopResult(
             task_id=task_id,
             passed=False,
