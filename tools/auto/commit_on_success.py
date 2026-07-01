@@ -169,14 +169,26 @@ class CommitOnSuccess:
     # ── AUTO-CR-5: synopsis hook ─────────────────────────────────────────────
 
     def _update_synopsis(self, task: dict) -> None:
-        """Call SummaryMemory.update() for a creative chapter task.
+        """Call SummaryMemory.update() for every target file of a creative task.
 
         Only runs when:
           - self._task_mode == "creative"
           - self._summary_memory is set (not None)
           - task["target_files"] contains at least one entry
 
-        Fails silently so a synopsis error never disrupts the commit outcome.
+        AUTO-CR-16 fixed the analogous "only target_files[0]" bug in the
+        coder's prompt-building (a multi-chapter edit task must load ALL
+        target files, not just the first). Multi-file creative tasks are a
+        supported, tested shape at the architect level (e.g. a single task
+        fixing a name inconsistency across two chapters — see
+        tests/test_cr17_creative_acceptance.py), so the synopsis hook must
+        update EVERY edited chapter's section, not only the first one, or a
+        second/third chapter's changes silently never reach synopsis.md.
+
+        Each file is updated independently and failures don't stop the
+        remaining files — one bad chapter shouldn't block the others.
+        Fails silently overall so a synopsis error never disrupts the commit
+        outcome.
         """
         if self._task_mode != "creative":
             return
@@ -185,34 +197,43 @@ class CommitOnSuccess:
         target_files = task.get("target_files") or []
         if not target_files:
             return
-        chapter_file = target_files[0]
         base_dir = self._base_dir
         if base_dir is None:
             logger.warning(
                 "CommitOnSuccess._update_synopsis: base_dir not set — "
-                "cannot update synopsis for %s.", chapter_file,
+                "cannot update synopsis for %s.", target_files,
             )
             return
-        try:
-            self._summary_memory.update(chapter_file, base_dir=base_dir)
-        except Exception as exc:
-            logger.error(
-                "CommitOnSuccess: synopsis update failed for %s: %s — "                "commit outcome is unaffected.", chapter_file, exc,
-            )
+        for chapter_file in target_files:
+            try:
+                self._summary_memory.update(chapter_file, base_dir=base_dir)
+            except Exception as exc:
+                logger.error(
+                    "CommitOnSuccess: synopsis update failed for %s: %s — "
+                    "commit outcome is unaffected.", chapter_file, exc,
+                )
 
     # ── AUTO-CR-23-1: story bible hook ───────────────────────────────────────
 
     def _update_story_bible(self, task: dict) -> None:
-        """Call StoryBible.update() for a creative chapter task.
+        """Call StoryBible.update() for every target file of a creative task.
 
         Only runs when:
           - self._task_mode == "creative"
           - self._story_bible is set (not None)
           - task["target_files"] contains at least one entry
 
-        Reads the chapter text directly from disk (same pattern as
-        _update_synopsis). Fails silently so a bible error never disrupts
-        the commit outcome.
+        Reads each chapter's text directly from disk (same pattern as
+        _update_synopsis) and calls StoryBible.update() once per file — see
+        _update_synopsis for why multi-file creative tasks need every target
+        file processed, not just the first. StoryBible.update() reloads and
+        dedupes against existing bullets on each call (AUTO-CR-25's
+        known_facts mechanism), so calling it once per chapter in sequence
+        accumulates correctly rather than clobbering earlier chapters' facts.
+
+        Each file is updated independently and failures don't stop the
+        remaining files. Fails silently overall so a bible error never
+        disrupts the commit outcome.
         """
         if self._task_mode != "creative":
             return
@@ -221,30 +242,30 @@ class CommitOnSuccess:
         target_files = task.get("target_files") or []
         if not target_files:
             return
-        chapter_file = target_files[0]
         base_dir = self._base_dir
         if base_dir is None:
             logger.warning(
                 "CommitOnSuccess._update_story_bible: base_dir not set — "
-                "cannot update bible for %s.", chapter_file,
+                "cannot update bible for %s.", target_files,
             )
             return
-        chapter_path = base_dir / chapter_file
-        try:
-            chapter_text = chapter_path.read_text(encoding="utf-8", errors="replace")
-        except OSError as exc:
-            logger.error(
-                "CommitOnSuccess._update_story_bible: cannot read %s: %s — "
-                "bible update skipped.", chapter_file, exc,
-            )
-            return
-        try:
-            self._story_bible.update(chapter_text)
-        except Exception as exc:
-            logger.error(
-                "CommitOnSuccess: bible update failed for %s: %s — "
-                "commit outcome is unaffected.", chapter_file, exc,
-            )
+        for chapter_file in target_files:
+            chapter_path = base_dir / chapter_file
+            try:
+                chapter_text = chapter_path.read_text(encoding="utf-8", errors="replace")
+            except OSError as exc:
+                logger.error(
+                    "CommitOnSuccess._update_story_bible: cannot read %s: %s — "
+                    "bible update skipped for this file.", chapter_file, exc,
+                )
+                continue
+            try:
+                self._story_bible.update(chapter_text)
+            except Exception as exc:
+                logger.error(
+                    "CommitOnSuccess: bible update failed for %s: %s — "
+                    "commit outcome is unaffected.", chapter_file, exc,
+                )
 
 
 # ─────────────────────────────────────────────────────────────────────────────

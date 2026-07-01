@@ -29,7 +29,12 @@ from typing import Callable, Optional
 
 from tools.auto.state import StateStore, STATUS_DONE, STATUS_BLOCKED, STATUS_TODO
 from tools.auto.git_manager import make_git_manager, GitError
-from tools.auto.outer_loop import make_outer_loop  # noqa: F401 — re-exported as a patch target for tests
+# NOTE: make_outer_loop is deliberately NOT imported at module level here.
+# _run_task_loop() imports it locally (see below) precisely so that tests
+# can mock it via patch("tools.auto.outer_loop.make_outer_loop", ...) — the
+# established convention used throughout tests/test_auto_g*.py. A module-
+# level import used to sit here as an alternate "patch target", but it was
+# never actually live (the local import always shadowed it); see CR notes.
 
 # Epic G Integrations
 from tools.auto.run_trace import setup_run_trace
@@ -445,6 +450,11 @@ class AutoController:
         if cfg is None:
             cfg = self._cfg()
 
+        # NOTE: make_outer_loop must be imported here (locally, per-call), not
+        # hoisted to module scope. tests/test_auto_g*.py mock it via
+        # patch("tools.auto.outer_loop.make_outer_loop", ...); a fresh local
+        # import is what makes that patch visible here. Hoisting this would
+        # silently break ~15 test files that rely on the local re-resolve.
         from tools.auto.outer_loop import make_outer_loop
         from tools.auto.commit_on_success import CommitOnSuccess
         from tools.auto.exhaustion_handler import make_exhaustion_handler

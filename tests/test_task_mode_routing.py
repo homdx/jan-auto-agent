@@ -109,7 +109,7 @@ class TestRunTaskLoopSignature:
         c.metrics_stream = None
         c.auto_tuner = None
 
-        with patch("tools.auto.controller.make_outer_loop") as mock_ol:
+        with patch("tools.auto.outer_loop.make_outer_loop") as mock_ol:
             mock_ol.return_value = MagicMock()
             stop_reason, tasks_done = c._run_task_loop(task_mode="docs")
 
@@ -130,7 +130,7 @@ class TestRunTaskLoopSignature:
         c.metrics_stream = None
         c.auto_tuner = None
 
-        with patch("tools.auto.controller.make_outer_loop") as mock_ol:
+        with patch("tools.auto.outer_loop.make_outer_loop") as mock_ol:
             mock_ol.return_value = MagicMock()
             stop_reason, tasks_done = c._run_task_loop()  # no task_mode
 

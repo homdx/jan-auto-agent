@@ -997,31 +997,48 @@ class InnerLoop:
             # this approval back into a rejection-with-feedback — but only up to
             # ``max_canon_revisions`` times, after which we accept-with-warning
             # so the gate can never ping-pong the loop.
+            #
+            # Checks EVERY target file, not just target_files[0]: a multi-file
+            # creative task (e.g. a cross-chapter consistency fix — see
+            # tests/test_cr17_creative_acceptance.py) can touch several
+            # chapters in one attempt, and a contradiction introduced in any
+            # one of them is just as real as one in the first. Conflicts are
+            # aggregated into a single combined feedback so the coder sees
+            # every problem at once, and the revision cap is still spent once
+            # per REJECTED attempt (not once per file), matching the existing
+            # cap semantics.
             if (
                 self.task_mode == "creative"
                 and self.canon_validator is not None
                 and target_files
             ):
-                chapter_file = target_files[0]
                 cap = getattr(self.canon_validator, "max_canon_revisions", 1)
-                if (
-                    _canon_revisions < cap
-                    and self.canon_validator.should_check(chapter_file)
-                ):
-                    try:
-                        chapter_text = (base_dir_path / chapter_file).read_text(
-                            encoding="utf-8", errors="replace"
-                        )
-                        canon_res = self.canon_validator.check(
-                            chapter_text, chapter_file, base_dir=base_dir_path
-                        )
-                    except Exception as exc:  # noqa: BLE001 — fail-open
-                        logger.warning("InnerLoop: canon check raised — %s; approving.", exc)
-                        canon_res = None
+                checkable_files = [
+                    tf for tf in target_files if self.canon_validator.should_check(tf)
+                ]
+                if _canon_revisions < cap and checkable_files:
+                    conflict_blocks: list[str] = []
+                    for chapter_file in checkable_files:
+                        try:
+                            chapter_text = (base_dir_path / chapter_file).read_text(
+                                encoding="utf-8", errors="replace"
+                            )
+                            canon_res = self.canon_validator.check(
+                                chapter_text, chapter_file, base_dir=base_dir_path
+                            )
+                        except Exception as exc:  # noqa: BLE001 — fail-open
+                            logger.warning(
+                                "InnerLoop: canon check raised for %s — %s; approving.",
+                                chapter_file, exc,
+                            )
+                            canon_res = None
 
-                    if canon_res is not None and canon_res.has_conflict:
+                        if canon_res is not None and canon_res.has_conflict:
+                            conflict_blocks.append(f"{chapter_file}:\n{canon_res.feedback()}")
+
+                    if conflict_blocks:
                         _canon_revisions += 1
-                        cfb = canon_res.feedback()
+                        cfb = "\n\n".join(conflict_blocks)
                         logger.info(
                             "InnerLoop: attempt %d canon REJECT (%d/%d) — %s",
                             attempt, _canon_revisions, cap,
@@ -1032,11 +1049,11 @@ class InnerLoop:
                         _trace_stage(task_id, attempt, "canon", "REJECTED",
                                     revisions_used=_canon_revisions, cap=cap)
                         continue
-                elif _canon_revisions >= cap and self.canon_validator.should_check(chapter_file):
+                elif _canon_revisions >= cap and checkable_files:
                     logger.warning(
                         "InnerLoop: canon revision cap (%d) reached for %s — "
                         "accepting chapter with possible unresolved canon issues.",
-                        cap, chapter_file,
+                        cap, checkable_files,
                     )
                     _trace_stage(task_id, attempt, "canon", "ACCEPTED_AT_CAP", cap=cap)
 
@@ -1045,6 +1062,11 @@ class InnerLoop:
             # checking only whether the generated text contradicts an explicit
             # fact in the task. Bounded by max_fact_revisions; fail-open on
             # any error.
+            #
+            # Checks EVERY target file (see the canon gate above for why a
+            # multi-file creative task needs every file checked, not just
+            # target_files[0]) and aggregates any contradictions into one
+            # combined feedback.
             if (
                 self.task_mode == "creative"
                 and self.fact_validator is not None
@@ -1054,22 +1076,29 @@ class InnerLoop:
                 # Always run the check — the cap only gates *rejection*, not the
                 # check itself.  On a post-cap attempt the check still runs so a
                 # now-passing text is accepted cleanly instead of warned through.
-                try:
-                    # Read the chapter text from disk (same strategy as canon gate).
-                    _fact_text = (base_dir_path / target_files[0]).read_text(
-                        encoding="utf-8", errors="replace"
-                    )
-                    fact_verdict = self.fact_validator.check(
-                        self._task_with_goal(task), _fact_text
-                    )
-                except Exception as exc:  # noqa: BLE001 — fail-open
-                    logger.warning("InnerLoop: Gate-3 fact check raised — %s; approving.", exc)
-                    fact_verdict = None
+                fact_problem_blocks: list[str] = []
+                _fact_task = self._task_with_goal(task)
+                for _fact_file in target_files:
+                    try:
+                        # Read the chapter text from disk (same strategy as canon gate).
+                        _fact_text = (base_dir_path / _fact_file).read_text(
+                            encoding="utf-8", errors="replace"
+                        )
+                        fact_verdict = self.fact_validator.check(_fact_task, _fact_text)
+                    except Exception as exc:  # noqa: BLE001 — fail-open
+                        logger.warning(
+                            "InnerLoop: Gate-3 fact check raised for %s — %s; approving.",
+                            _fact_file, exc,
+                        )
+                        fact_verdict = None
 
-                if fact_verdict is not None and not fact_verdict.approved:
+                    if fact_verdict is not None and not fact_verdict.approved:
+                        fact_problem_blocks.append(f"{_fact_file}:\n{fact_verdict.feedback()}")
+
+                if fact_problem_blocks:
+                    ffb = "\n\n".join(fact_problem_blocks)
                     if _fact_revisions < fact_cap:
                         _fact_revisions += 1
-                        ffb = fact_verdict.feedback()
                         logger.info(
                             "InnerLoop: attempt %d fact-check rejected (%d/%d) — %s",
                             attempt, _fact_revisions, fact_cap,
@@ -1096,6 +1125,14 @@ class InnerLoop:
             # a concrete "replace X with Y" instruction on a genuine
             # contradiction. Bounded by max_continuity_revisions; fail-open on
             # any error.
+            #
+            # Checks EVERY target file (see the canon gate above for why a
+            # multi-file creative task needs every file checked). Each file's
+            # own previous-chapter text is looked up independently — for a
+            # task touching chapter_02 and chapter_03 together, chapter_03's
+            # "previous chapter" naturally resolves to chapter_02 as this
+            # same attempt just wrote it to disk, since files are written
+            # before this gate runs.
             if (
                 self.task_mode == "creative"
                 and self.continuity_validator is not None
@@ -1104,32 +1141,39 @@ class InnerLoop:
                 continuity_cap = getattr(
                     self.continuity_validator, "max_continuity_revisions", 1
                 )
-                try:
-                    chapter_file = target_files[0]
-                    _continuity_text = (base_dir_path / chapter_file).read_text(
-                        encoding="utf-8", errors="replace"
-                    )
-                    from tools.auto.continuity_validator import (
-                        find_previous_chapter_text, read_story_bible,
-                    )
-                    _bible_text = read_story_bible(base_dir_path)
-                    _prev_text = find_previous_chapter_text(chapter_file, base_dir_path)
-                    known_facts = (
-                        _bible_text + "\n\n--- previous chapter ---\n" + _prev_text
-                    )
-                    continuity_verdict = self.continuity_validator.check(
-                        known_facts, _continuity_text
-                    )
-                except Exception as exc:  # noqa: BLE001 — fail-open
-                    logger.warning(
-                        "InnerLoop: continuity check raised — %s; approving.", exc
-                    )
-                    continuity_verdict = None
+                continuity_problem_blocks: list[str] = []
+                from tools.auto.continuity_validator import (
+                    find_previous_chapter_text, read_story_bible,
+                )
+                for chapter_file in target_files:
+                    try:
+                        _continuity_text = (base_dir_path / chapter_file).read_text(
+                            encoding="utf-8", errors="replace"
+                        )
+                        _bible_text = read_story_bible(base_dir_path)
+                        _prev_text = find_previous_chapter_text(chapter_file, base_dir_path)
+                        known_facts = (
+                            _bible_text + "\n\n--- previous chapter ---\n" + _prev_text
+                        )
+                        continuity_verdict = self.continuity_validator.check(
+                            known_facts, _continuity_text
+                        )
+                    except Exception as exc:  # noqa: BLE001 — fail-open
+                        logger.warning(
+                            "InnerLoop: continuity check raised for %s — %s; approving.",
+                            chapter_file, exc,
+                        )
+                        continuity_verdict = None
 
-                if continuity_verdict is not None and not continuity_verdict.approved:
+                    if continuity_verdict is not None and not continuity_verdict.approved:
+                        continuity_problem_blocks.append(
+                            f"{chapter_file}:\n{continuity_verdict.feedback()}"
+                        )
+
+                if continuity_problem_blocks:
+                    cfb = "\n\n".join(continuity_problem_blocks)
                     if _continuity_revisions < continuity_cap:
                         _continuity_revisions += 1
-                        cfb = continuity_verdict.feedback()
                         logger.info(
                             "InnerLoop: attempt %d continuity rejected (%d/%d) — %s",
                             attempt, _continuity_revisions, continuity_cap,
@@ -1154,27 +1198,42 @@ class InnerLoop:
             # Runs after Gate-2 APPROVED, canon, and fact checks in creative
             # mode; no-op unless the task is a verse task (ритм/рифм keyword).
             # Bounded by max_prosody_revisions; fail-open on any error.
+            #
+            # Checks EVERY target file (see the canon gate above for why a
+            # multi-file creative task needs every file checked). Cheap when
+            # not applicable since .check() itself no-ops on non-verse text.
             if (
                 self.task_mode == "creative"
                 and self.prosody_validator is not None
                 and target_files
             ):
                 prosody_cap = getattr(self.prosody_validator, "max_prosody_revisions", 2)
-                try:
-                    _prosody_text = (base_dir_path / target_files[0]).read_text(
-                        encoding="utf-8", errors="replace"
-                    )
-                    prosody_verdict = self.prosody_validator.check(
-                        self._task_with_goal(task), _prosody_text
-                    )
-                except Exception as exc:  # noqa: BLE001 — fail-open
-                    logger.warning("InnerLoop: prosody check raised — %s; approving.", exc)
-                    prosody_verdict = None
+                prosody_problem_blocks: list[str] = []
+                _prosody_task = self._task_with_goal(task)
+                for _prosody_file in target_files:
+                    try:
+                        _prosody_text = (base_dir_path / _prosody_file).read_text(
+                            encoding="utf-8", errors="replace"
+                        )
+                        prosody_verdict = self.prosody_validator.check(
+                            _prosody_task, _prosody_text
+                        )
+                    except Exception as exc:  # noqa: BLE001 — fail-open
+                        logger.warning(
+                            "InnerLoop: prosody check raised for %s — %s; approving.",
+                            _prosody_file, exc,
+                        )
+                        prosody_verdict = None
 
-                if prosody_verdict is not None and not prosody_verdict.approved:
+                    if prosody_verdict is not None and not prosody_verdict.approved:
+                        prosody_problem_blocks.append(
+                            f"{_prosody_file}:\n{prosody_verdict.feedback()}"
+                        )
+
+                if prosody_problem_blocks:
+                    pfb = "\n\n".join(prosody_problem_blocks)
                     if _prosody_revisions < prosody_cap:
                         _prosody_revisions += 1
-                        pfb = prosody_verdict.feedback()
                         logger.info(
                             "InnerLoop: attempt %d prosody rejected (%d/%d) — %s",
                             attempt, _prosody_revisions, prosody_cap,
