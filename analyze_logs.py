@@ -1253,7 +1253,7 @@ def render_story_progress(run: dict) -> None:
         dur      = elapsed(t.get("start_ts", ""), t.get("end_ts", ""))
         commit   = t.get("commit", "")
 
-        header_parts = [f"  {status_icon} {bold(ch_label)}"]
+        header_parts = [f"  {status_icon} {status_col(bold(ch_label))}"]
         if title:
             header_parts.append(f"  {truncate(title, 50)}")
         print("".join(header_parts))

@@ -129,8 +129,16 @@ _AGE_WORD_RE = re.compile(
 
 _NAME_RE = re.compile(r"\b[А-ЯЁ][а-яёА-ЯЁ]{2,}\b")
 # Common non-name capitalised words that should not be treated as entity names.
+# Includes pronouns/demonstratives and generic role nouns that are capitalised
+# only because they start a sentence (bugfix: these were being misread as
+# character names, e.g. "Она сказала..." -> name "Она", "Главный герой..."
+# -> name "Главный" — which corrupted the entity-scoping in
+# _conflicts_with_established below).
 _NAME_STOPWORDS = {
     "Капитан", "Команда", "Корабль", "Мостик", "Возраст",
+    "Она", "Его", "Ему", "Себя", "Этот", "Эта", "Это",
+    "Главный", "Главная", "Герой", "Героиня", "Рассказчик", "Рассказчица",
+    "Персонаж", "Персонажи",
 }
 
 
@@ -364,6 +372,14 @@ class StoryBible:
         age for an entity that an already-established bullet asserts
         *differently* for an overlapping name. Pure / deterministic — no LLM
         call, so it can never be silently distorted by a bad model reply.
+
+        Bugfix: a fact with NO detected name (e.g. a pronoun-only assertion
+        like "Ей 45 лет") cannot be safely scoped to one entity, so it is now
+        let through unchecked instead of being compared against every
+        established bullet. Previously an unscoped fact was checked against
+        the WHOLE bible, so a fact about one (unnamed-in-this-bullet)
+        character could be silently dropped as a false conflict with a
+        completely different, already-named character's age/gender.
         """
         new_gender = _gender_of(new_fact)
         new_age = _age_of(new_fact)
@@ -371,9 +387,11 @@ class StoryBible:
             return False
 
         new_names = _names_in(new_fact)
+        if not new_names:
+            return False  # unscoped — cannot safely compare to one entity
 
         for existing in established:
-            if new_names and not (new_names & _names_in(existing)):
+            if not (new_names & _names_in(existing)):
                 continue  # scoped to a different entity — no conflict
 
             if new_gender is not None:

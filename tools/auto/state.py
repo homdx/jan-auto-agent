@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from tools.auto.utils import _ts
 from pathlib import Path
 from typing import Any
@@ -406,14 +407,62 @@ class StateStore:
         self._save_progress()
 
     def _load_existing(self) -> None:
-        self._plan = json.loads(self._plan_path.read_text(encoding="utf-8"))
+        self._plan = self._load_json_with_backup(self._plan_path, "plan.json")
         if self._prog_path.exists():
-            self._progress = json.loads(self._prog_path.read_text(encoding="utf-8"))
-        else:
-            # progress.json was lost — rebuild from plan
-            self._progress = {"status": "idle", "updated_at": _ts(),
-                              "done_count": 0, "pending_count": 0}
-            self._refresh_progress()
+            try:
+                self._progress = json.loads(
+                    self._prog_path.read_text(encoding="utf-8")
+                )
+                return
+            except json.JSONDecodeError as exc:
+                logger.warning(
+                    "StateStore: progress.json is corrupted (%s) — rebuilding "
+                    "from plan.json instead (progress counts are fully "
+                    "derivable from the plan, so no data is lost).", exc,
+                )
+        # progress.json was lost or corrupted — rebuild from plan
+        self._progress = {"status": "idle", "updated_at": _ts(),
+                          "done_count": 0, "pending_count": 0}
+        self._refresh_progress()
+
+    def _load_json_with_backup(self, path: Path, what: str) -> dict:
+        """Load JSON from *path*; on corruption, recover from the ``.bak``
+        snapshot written just before the last atomic update, instead of
+        letting a raw ``JSONDecodeError`` crash the resume path.
+
+        Bugfix: plan.json/progress.json used to be written with a plain
+        ``write_text()``, which truncates the file before writing — a
+        process killed mid-write (the exact scenario ``max_task_seconds`` /
+        wall-clock caps and a long unattended run are meant to survive) could
+        leave a truncated file, and the next resume crashed here with an
+        unhandled ``JSONDecodeError`` instead of resuming. Writes are now
+        atomic (see ``_atomic_write``); this recovery path is the safety net
+        for any file that is corrupted despite that (e.g. a manual edit).
+        """
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            bak = path.with_suffix(path.suffix + ".bak")
+            if bak.exists():
+                try:
+                    recovered = json.loads(bak.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError) as bak_exc:
+                    raise RuntimeError(
+                        f"{what} ({path}) is corrupted: {exc}. Its backup "
+                        f"({bak}) is also unreadable: {bak_exc}. Manual "
+                        "repair is needed before this run can resume."
+                    ) from exc
+                logger.warning(
+                    "StateStore: %s is corrupted (%s) — recovered from "
+                    "backup %s. The most recent update before the crash "
+                    "may be lost.", path, exc, bak,
+                )
+                return recovered
+            raise RuntimeError(
+                f"{what} ({path}) is corrupted: {exc}. No backup ({bak}) "
+                "is available. Manual repair is needed before this run "
+                "can resume."
+            ) from exc
 
     def _refresh_progress(self, *, write: bool = True) -> None:
         """Recalculate done/pending counts from current plan; optionally persist."""
@@ -424,16 +473,44 @@ class StateStore:
         if write:
             self._save_progress()
 
+    @staticmethod
+    def _atomic_write(path: Path, content: str) -> None:
+        """Write *content* to *path* atomically, keeping a ``.bak`` snapshot
+        of the previous contents.
+
+        Bugfix: this used to be a plain ``path.write_text()``, which opens
+        the file in truncate mode — a process killed between truncation and
+        the write completing left a corrupt/empty file, and this fired on
+        almost every task-status change, so the window was hit often over a
+        multi-hour run. Now: write to a temp file in the same directory,
+        then ``os.replace()`` swaps it into place — atomic on POSIX and
+        Windows, so *path* is always either the previous complete file or
+        the new complete file, never a partial write. The pre-write ``.bak``
+        copy is best-effort (not itself atomic) but never touches *path*, so
+        an interrupted backup can't put the primary file at risk.
+        """
+        if path.exists():
+            try:
+                bak = path.with_suffix(path.suffix + ".bak")
+                bak.write_text(path.read_text(encoding="utf-8"), encoding="utf-8")
+            except OSError as exc:
+                logger.debug(
+                    "StateStore: could not refresh backup for %s: %s", path, exc,
+                )
+        tmp_path = path.with_suffix(path.suffix + ".tmp")
+        tmp_path.write_text(content, encoding="utf-8")
+        os.replace(tmp_path, path)
+
     def _save_plan(self) -> None:
-        self._plan_path.write_text(
+        self._atomic_write(
+            self._plan_path,
             json.dumps(self._plan, indent=2, ensure_ascii=False),
-            encoding="utf-8",
         )
 
     def _save_progress(self) -> None:
-        self._prog_path.write_text(
+        self._atomic_write(
+            self._prog_path,
             json.dumps(self._progress, indent=2, ensure_ascii=False),
-            encoding="utf-8",
         )
 
 
