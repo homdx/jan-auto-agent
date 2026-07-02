@@ -1342,7 +1342,7 @@ def make_inner_loop(
     if coder is None:
         try:
             from tools.auto.coder import make_coder  # type: ignore
-            coder = make_coder(config, task_mode=task_mode)
+            coder = make_coder(config, task_mode=task_mode, run_goal=run_goal)
         except ImportError:
             logger.warning("Coder not found — using _StubCoder (tests only)")
             coder = _StubCoder()

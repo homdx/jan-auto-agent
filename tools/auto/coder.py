@@ -252,10 +252,20 @@ class Coder(_llm_stream.LLMClientBase):
         api_format: str = "openai",
         verify_ssl: bool = True,
         task_mode: str = "code",
+        run_goal: str = "",
     ) -> None:
         super().__init__(config, base_url, api_key, model, api_format, verify_ssl)
 
         self._task_mode = task_mode
+        # AUTO-FIX-9: the raw --auto GOAL string, verbatim from the CLI/user —
+        # never touched by an LLM. Used as the MOST reliable language-detection
+        # sample for a chapter-1 cold start (see _build_prompt), because the
+        # architect-authored task["instruction"] is LLM output and, per the
+        # whole CR-9/16 language-lock history, small models tend to write such
+        # fields in English (the system prompt's own language) even when the
+        # story itself is in Russian — task["instruction"] is NOT a safe proxy
+        # for "the story's language" the way the user's own goal text is.
+        self._run_goal = str(run_goal or "")
         sec = "coder"
         self._temperature = float(config.get(sec, "temperature", fallback="0.2"))
         # AUTO-CR-3: prefer max_tokens_{task_mode} (e.g. max_tokens_creative) over max_tokens.
@@ -532,16 +542,22 @@ class Coder(_llm_stream.LLMClientBase):
             # "(new chapter — no prior content to continue from)" marker), which
             # would make detect_language() return "English" and make this ACTIVELY
             # instruct the model to write chapter 1 in English — worse than no
-            # lock at all. AUTO-FIX-5: when there is no prior prose (chapter 1,
-            # nothing written yet), fall back to the task's own instruction/goal
-            # text — usually the story's language — before giving up; if that is
-            # also empty, omit the lock entirely rather than ever sampling
-            # file_contents.
+            # lock at all. AUTO-FIX-5/9: when there is no prior prose (chapter 1,
+            # nothing written yet), fall back to self._run_goal — the raw --auto
+            # GOAL string, verbatim from the user, never touched by an LLM — before
+            # task["instruction"], which is architect-authored and, per the whole
+            # CR-9/16 language-lock history, prone to drifting into English (the
+            # system prompt's own language) regardless of the story's language.
+            # task["instruction"]/task["goal"] are kept as a last-resort fallback
+            # only for callers that don't wire run_goal through (tests, older call
+            # sites); if everything is empty, omit the lock entirely rather than
+            # ever sampling file_contents.
             from tools.auto.utils import resolve_creative_language, language_instruction
             _sample = (
                 self._creative_language_sample(target_files, base_dir)
-                or task.get("instruction", "")
+                or self._run_goal
                 or task.get("goal", "")
+                or task.get("instruction", "")
             )
             _lang = resolve_creative_language(
                 getattr(self, "_config", None),
@@ -1820,7 +1836,8 @@ def _strip_code_fence(text: str) -> str:
 # Convenience factory — mirrors make_executor / review_clusters pattern
 # ─────────────────────────────────────────────────────────────────────────────
 
-def make_coder(config: configparser.ConfigParser, task_mode: str = "code") -> Coder:
+def make_coder(config: configparser.ConfigParser, task_mode: str = "code",
+               run_goal: str = "") -> Coder:
     """Create a :class:`Coder` from *config* (agents.ini).
 
     Reads the active API section (``[api_local]`` / ``[api_remote]``) using
@@ -1830,6 +1847,10 @@ def make_coder(config: configparser.ConfigParser, task_mode: str = "code") -> Co
     ----------
     config:
         A ``ConfigParser`` instance loaded from ``agents.ini``.
+    run_goal:
+        AUTO-FIX-9: the raw --auto GOAL string, forwarded so a chapter-1
+        cold start can detect the story's language from the user's own text
+        instead of the architect-authored (and English-prone) instruction.
 
     Returns
     -------
@@ -1852,4 +1873,5 @@ def make_coder(config: configparser.ConfigParser, task_mode: str = "code") -> Co
         api_format = api_fmt,
         verify_ssl = verify_ssl,
         task_mode  = task_mode,
+        run_goal   = run_goal,
     )
