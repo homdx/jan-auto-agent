@@ -166,16 +166,26 @@ def _strip_meta_parentheticals(fact: str) -> str:
 def _clean_bullet_list(reply: str) -> str:
     """Normalise a verifier reply into a clean bullet list, or "" if unusable.
 
-    Only lines that actually START with a bullet/number marker (•, -, *, or
-    'N.') are accepted as facts; arbitrary prose (a rambling non-compliant
-    reply) yields "" so the caller keeps the previous summary (fail-open).
-    A stray 'FIX:' prefix is tolerated, and AUTO-CR-16 meta-commentary
-    parentheticals are stripped. Returns bullets joined with newlines, each
-    prefixed '• '.
+    Lines that START with a bullet/number marker (•, -, *, or 'N.') are
+    accepted as facts. A stray 'FIX:' prefix is tolerated, and AUTO-CR-16
+    meta-commentary parentheticals are stripped.
+
+    AUTO-BUG-5 fix: if NO line has a marker at all, fall back to treating
+    each short, non-empty line as one fact — a small local model very
+    plausibly ignores the "one bullet per line" formatting instruction and
+    just writes plain sentences, one fact per line. Without this fallback
+    that entire (otherwise perfectly usable) extraction was silently
+    discarded and the caller kept believing there were "no new facts". The
+    fallback still fails open (returns "") when the reply doesn't look like
+    a short fact list — e.g. full narrative prose / a refusal — to avoid
+    accidentally ingesting chapter text as "facts".
+
+    Returns bullets joined with newlines, each prefixed '• '.
     """
     import re as _re
     _marker = _re.compile(r"^\s*(?:[\u2022\-\*]|\d+[.)])\s+")
     out: list[str] = []
+    any_marker = False
     for raw in reply.splitlines():
         line = raw.strip()
         if not line:
@@ -186,13 +196,29 @@ def _clean_bullet_list(reply: str) -> str:
                 if fact:
                     out.append(f"• {fact}")
             continue
+        any_marker = True
         fact = _marker.sub("", line, count=1).strip()
         if fact[:4].upper() == "FIX:":
             fact = fact[4:].strip()
         fact = _strip_meta_parentheticals(fact)
         if fact:
             out.append(f"• {fact}")
-    return "\n".join(out)
+
+    if out or any_marker:
+        return "\n".join(out)
+
+    # ── Fallback: no bullet markers anywhere in the reply ───────────────────
+    candidate_lines = [ln.strip() for ln in reply.splitlines() if ln.strip()]
+    if not (2 <= len(candidate_lines) <= 20):
+        return ""  # too few/many lines to plausibly be "one fact per line"
+    if any(len(ln) > 220 for ln in candidate_lines):
+        return ""  # looks like narrative prose, not short facts — fail open
+    fallback: list[str] = []
+    for ln in candidate_lines:
+        fact = _strip_meta_parentheticals(ln)
+        if fact:
+            fallback.append(f"• {fact}")
+    return "\n".join(fallback)
 
 
 # ── SummaryFidelityVerifier ───────────────────────────────────────────────────
@@ -420,7 +446,25 @@ class SummaryMemory:
         # parentheticals / non-bullet noise. Keep the verified text if cleaning
         # would empty it (fail-safe).
         cleaned = _clean_bullet_list(verified)
-        self._write_section(chapter_file, cleaned or verified)
+        body = cleaned or verified
+
+        # AUTO-BUG-6 fix: previously `cleaned or verified` would happily
+        # persist whatever `verified` was even when it was obviously not a
+        # summary at all (observed in practice: the literal grader verdict
+        # "APPROVED" ended up written into synopsis.md as a chapter's
+        # "durable fact summary"). Refuse to write anything that looks like
+        # a bare verdict word or is implausibly short for a summary, and
+        # leave the previous section (if any) untouched instead.
+        _stripped = body.strip()
+        if not _stripped or _stripped.upper().rstrip(".:!") in {"APPROVED", "OK", "REVISE"}:
+            logger.warning(
+                "SummaryMemory.update: summary for %s looks invalid (%r) — "
+                "not writing it to synopsis.md (keeping previous content, if any).",
+                chapter_file, _stripped[:60],
+            )
+            return
+
+        self._write_section(chapter_file, body)
 
     # ── Internal compression logic ────────────────────────────────────────────
 

@@ -50,6 +50,7 @@ Spec reference: AUTO-CR-23-1, AUTO-CR-24-1, AUTO-CR-24-2, AUTO-CR-24-3
 from __future__ import annotations
 
 import configparser
+import json
 import logging
 import re
 import string
@@ -68,7 +69,7 @@ LlmCall = Callable[[str, str], str]  # (system, user) -> response_text
 
 _BIBLE_SYSTEM = (
     "Extract ONLY immutable or slowly-changing facts from this chapter: "
-    "character names, relationships, fixed attributes (age, КМС, profession, "
+    "character names, relationships, fixed attributes (age, occupation, "
     "defining physical traits), world rules, and long-term promises/goals. "
     "One short bullet per fact. "
     "NO events, NO dialogue, NO prose, NO parentheses. "
@@ -307,7 +308,7 @@ class StoryBible:
     def _do_update(self, chapter_text: str) -> None:
         new_facts = self.extract(chapter_text, known_facts=self.load())
         if not new_facts:
-            logger.debug("StoryBible.update: no new facts extracted — skipping write.")
+            logger.warning("StoryBible.update: no new facts extracted — skipping write. (AUTO-BUG-5: if this happens every chapter, the model may not be following the bullet-list format at all.)")
             return
 
         # AUTO-CR-24-1: verify extracted facts against the source chapter.
@@ -335,7 +336,7 @@ class StoryBible:
                     "falling back to raw extracted facts (fail-open).", exc
                 )
         if not new_facts:
-            logger.debug("StoryBible.update: no new facts extracted — skipping write.")
+            logger.warning("StoryBible.update: no new facts extracted — skipping write. (AUTO-BUG-5: if this happens every chapter, the model may not be following the bullet-list format at all.)")
             return
 
         existing_text = self.load()
@@ -347,8 +348,29 @@ class StoryBible:
         for fact in new_facts:
             if _normalise(fact) in existing_norms:
                 continue
-            if self._immutable_guard and self._conflicts_with_established(fact, merged):
-                continue
+            if self._immutable_guard:
+                conflict_bullet = self._find_conflict(fact, merged)
+                if conflict_bullet is not None:
+                    if self._register_correction_attempt(fact, conflict_bullet):
+                        # AUTO-BUG-2 fix: the SAME correction has now been
+                        # proposed by _CORRECTION_THRESHOLD independent
+                        # chapters in a row — treat it as a genuine fix to
+                        # a bad first extraction rather than an attack /
+                        # one-off model slip, and replace the established
+                        # bullet instead of dropping the correction forever.
+                        logger.warning(
+                            "StoryBible: accepting correction %r -> %r after "
+                            "%d consistent re-observations.",
+                            conflict_bullet, fact, self._CORRECTION_THRESHOLD,
+                        )
+                        merged.remove(conflict_bullet)
+                        existing_norms.discard(_normalise(conflict_bullet))
+                    else:
+                        logger.warning(
+                            "StoryBible: dropped contradicting immutable fact %r "
+                            "(conflicts with established %r)", fact, conflict_bullet,
+                        )
+                        continue
             merged.append(fact)
             existing_norms.add(_normalise(fact))
             added += 1
@@ -365,53 +387,92 @@ class StoryBible:
 
         self._write(merged_text)
 
-    def _conflicts_with_established(self, new_fact: str, established: list[str]) -> bool:
-        """AUTO-CR-26-2: write-once guard for immutable attributes (gender, age).
+    def _find_conflict(self, new_fact: str, established: list[str]) -> "str | None":
+        """AUTO-CR-26-2 (write-once guard), reworked for AUTO-BUG-2.
 
-        Returns True (and logs a warning) when *new_fact* asserts a gender or
-        age for an entity that an already-established bullet asserts
-        *differently* for an overlapping name. Pure / deterministic — no LLM
-        call, so it can never be silently distorted by a bad model reply.
+        Returns the conflicting established bullet (or None) instead of a
+        bare bool, so the caller can decide whether to drop the new fact
+        or -- if the same correction keeps being independently re-observed
+        -- accept it as a fix and replace the established bullet.
 
-        Bugfix: a fact with NO detected name (e.g. a pronoun-only assertion
-        like "Ей 45 лет") cannot be safely scoped to one entity, so it is now
-        let through unchecked instead of being compared against every
-        established bullet. Previously an unscoped fact was checked against
-        the WHOLE bible, so a fact about one (unnamed-in-this-bullet)
-        character could be silently dropped as a false conflict with a
-        completely different, already-named character's age/gender.
+        Bugfix retained from the original: a fact with NO detected name
+        (e.g. a pronoun-only assertion like "Ei 45 let") cannot be safely
+        scoped to one entity, so it is let through unchecked instead of
+        being compared against every established bullet.
         """
         new_gender = _gender_of(new_fact)
         new_age = _age_of(new_fact)
         if new_gender is None and new_age is None:
-            return False
+            return None
 
         new_names = _names_in(new_fact)
         if not new_names:
-            return False  # unscoped — cannot safely compare to one entity
+            return None  # unscoped -- cannot safely compare to one entity
 
         for existing in established:
             if not (new_names & _names_in(existing)):
-                continue  # scoped to a different entity — no conflict
+                continue  # scoped to a different entity -- no conflict
 
             if new_gender is not None:
                 existing_gender = _gender_of(existing)
                 if existing_gender is not None and existing_gender != new_gender:
-                    logger.warning(
-                        "StoryBible: dropped contradicting immutable fact %r "
-                        "(conflicts with established %r)", new_fact, existing,
-                    )
-                    return True
+                    return existing
 
             if new_age is not None:
                 existing_age = _age_of(existing)
                 if existing_age is not None and existing_age != new_age:
-                    logger.warning(
-                        "StoryBible: dropped contradicting immutable fact %r "
-                        "(conflicts with established %r)", new_fact, existing,
-                    )
-                    return True
+                    return existing
 
+        return None
+
+    def _conflicts_with_established(self, new_fact: str, established: list[str]) -> bool:
+        """Backward-compatible bool wrapper around :meth:`_find_conflict`."""
+        return self._find_conflict(new_fact, established) is not None
+
+    # AUTO-BUG-2: number of independent chapters that must propose the exact
+    # same correction before it overrides a previously "locked" immutable
+    # fact. Persisted to disk (not just in-memory) because in this pipeline
+    # each chapter is typically a separate `main.py --auto` process.
+    _CORRECTION_THRESHOLD = 2
+
+    def _pending_corrections_path(self) -> Path:
+        return self._path.with_suffix(self._path.suffix + ".pending.json")
+
+    def _register_correction_attempt(self, new_fact: str, conflict_bullet: str) -> bool:
+        """Track repeated attempts to correct *conflict_bullet* to *new_fact*.
+
+        Returns True once the same correction has been independently
+        proposed `_CORRECTION_THRESHOLD` times (and clears its counter),
+        meaning the caller should accept it; False otherwise (counter was
+        just incremented and persisted).
+        """
+        key = _normalise(conflict_bullet)
+        proposal = _normalise(new_fact)
+        path = self._pending_corrections_path()
+        try:
+            state = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        except Exception:
+            state = {}
+
+        entry = state.get(key)
+        if entry is not None and entry.get("proposal") == proposal:
+            count = int(entry.get("count", 1)) + 1
+        else:
+            count = 1
+
+        if count >= self._CORRECTION_THRESHOLD:
+            state.pop(key, None)
+            try:
+                path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+            except Exception as exc:
+                logger.warning("StoryBible: could not persist pending-corrections state: %s", exc)
+            return True
+
+        state[key] = {"proposal": proposal, "count": count}
+        try:
+            path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as exc:
+            logger.warning("StoryBible: could not persist pending-corrections state: %s", exc)
         return False
 
     def _compact(self, text: str) -> str:
@@ -500,9 +561,15 @@ def make_story_bible(
     re-parsed from config so the bible uses the same API endpoint as the rest
     of the pipeline.
     """
-    enabled = config.getboolean("validator_agent", "story_bible_creative", fallback=False)
+    # AUTO-BUG-1 fix: default to enabled. The bible's continuity-anchoring
+    # was designed to always run in creative mode; requiring an opt-in flag
+    # that the shipped agents.ini never actually set left the whole
+    # subsystem (and its story_bible_verify / story_bible_immutable_guard
+    # sub-settings) silently inert out of the box.
+    enabled = config.getboolean("validator_agent", "story_bible_creative", fallback=True)
     if not enabled:
-        logger.debug("make_story_bible: story_bible_creative=false — bible disabled.")
+        logger.warning("make_story_bible: story_bible_creative=false — bible disabled "
+                        "(durable cross-chapter facts will NOT be tracked).")
         return None
 
     max_chars = config.getint("validator_agent", "story_bible_max_chars", fallback=2000)

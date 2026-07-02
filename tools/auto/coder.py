@@ -528,13 +528,24 @@ class Coder(_llm_stream.LLMClientBase):
             file_contents = self._build_creative_file_contents(target_files, base_dir)
             # AUTO-CR-9/16: lock output language to the STORY text. Detect from
             # the raw target/predecessor prose only — never from the English
-            # structural labels in file_contents, which would outvote a short
-            # Russian chapter and wrongly flip the lock to English.
+            # structural labels/placeholders in file_contents (e.g. the cold-start
+            # "(new chapter — no prior content to continue from)" marker), which
+            # would make detect_language() return "English" and make this ACTIVELY
+            # instruct the model to write chapter 1 in English — worse than no
+            # lock at all. AUTO-FIX-5: when there is no prior prose (chapter 1,
+            # nothing written yet), fall back to the task's own instruction/goal
+            # text — usually the story's language — before giving up; if that is
+            # also empty, omit the lock entirely rather than ever sampling
+            # file_contents.
             from tools.auto.utils import resolve_creative_language, language_instruction
-            _sample = self._creative_language_sample(target_files, base_dir)
+            _sample = (
+                self._creative_language_sample(target_files, base_dir)
+                or task.get("instruction", "")
+                or task.get("goal", "")
+            )
             _lang = resolve_creative_language(
                 getattr(self, "_config", None),
-                _sample or file_contents,
+                _sample,
                 task_mode="creative",
             )
             _lang_instr = language_instruction(_lang)

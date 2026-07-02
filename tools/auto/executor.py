@@ -83,6 +83,17 @@ _MAX_OUTPUT_CHARS = 64_000
 # Maximum traceback snippet length returned in ExecutionResult.traceback.
 _MAX_TRACEBACK_CHARS = 4_000
 
+# Directories excluded when mirroring base_dir into a task workspace (see
+# _prepare_workspace / AUTO-FIX-1): VCS metadata, the agent's own
+# state/workspace tree — workspace_root defaults to base_dir/.agent/workspace,
+# so excluding ".agent" also prevents shutil.copytree from recursing into its
+# own destination — and common cache/dependency dirs that are large,
+# irrelevant to acceptance checks, and safe to leave out (regenerable).
+_MIRROR_IGNORE = shutil.ignore_patterns(
+    ".git", ".agent", "__pycache__", ".pytest_cache", ".mypy_cache",
+    ".venv", "venv", "node_modules", ".tox", "*.egg-info",
+)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Result dataclass
@@ -275,11 +286,18 @@ class Executor:
     # ── Workspace setup ───────────────────────────────────────────────────────
 
     def _prepare_workspace(self, task_id: str, target_files: list[str]) -> Path:
-        """Create the per-task workspace dir and copy target files into it.
+        """Create the per-task workspace and populate it for acceptance_check.
 
         The workspace is ``<workspace_root>/<task_id>/``.  It is recreated
         fresh on each call so stale artefacts from previous attempts don't
         interfere.
+
+        Population happens in two passes: first the whole repo (``base_dir``)
+        is mirrored in, so files the acceptance_check needs but that aren't
+        listed in ``target_files`` — pre-existing tests, conftest.py,
+        fixtures, sibling modules — are present; then each entry in
+        ``target_files`` is re-copied on top to guarantee the freshest
+        on-disk version wins regardless of mirror timing.
 
         Parameters
         ----------
@@ -300,6 +318,30 @@ class Executor:
         if workspace.exists():
             shutil.rmtree(workspace)
         workspace.mkdir(parents=True, exist_ok=True)
+
+        # AUTO-FIX-1: mirror the whole repo into the workspace *before*
+        # overlaying target_files. Previously only target_files were copied,
+        # so an acceptance_check referencing a file that exists in base_dir
+        # but wasn't listed in target_files (a pre-existing test file,
+        # conftest.py, a fixture, a sibling module the target imports) would
+        # fail with a spurious "file or directory not found" — a false
+        # negative unrelated to whether the Coder's change was correct, and
+        # one that (via TaskRewriter's failure-pattern handling) could lead
+        # to acceptance_check being silently replaced with a no-op. Best
+        # effort: mirroring failures are logged, not raised, so the run
+        # continues with the pre-existing target-files-only behaviour below
+        # rather than aborting the task outright.
+        try:
+            shutil.copytree(
+                self._base_dir, workspace,
+                ignore=_MIRROR_IGNORE, dirs_exist_ok=True, symlinks=True,
+            )
+        except (OSError, shutil.Error) as exc:
+            logger.warning(
+                "_prepare_workspace: could not fully mirror %s into %s (%s) — "
+                "acceptance_check may still fail on files outside target_files",
+                self._base_dir, workspace, exc,
+            )
 
         tracer.event(
             source="executor",

@@ -560,6 +560,38 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                         )
 
             print(f"   → {len(cluster_candidates)} grounded candidate(s)")
+
+            # AUTO-BUG-3 fix: when a cluster is large enough to be split into
+            # multiple batches, each batch is reviewed independently and can
+            # (and in practice does, e.g. in creative mode with a single
+            # target file) propose the *identical* task. Gate-1 has its own
+            # fingerprint-based dedup, but de-duplicating right here — before
+            # candidates from different batches of the same cluster are even
+            # merged — is a cheap, local belt-and-braces fix that does not
+            # depend on downstream Gate-1 behaving as expected.
+            if len(batches) > 1 and len(cluster_candidates) > 1:
+                from tools.auto.gate1_filter import _fingerprint, _target_fingerprint  # noqa: PLC0415
+                _seen: set[str] = set()
+                _seen_targets: set[str] = set()
+                _deduped: list[CandidateTask] = []
+                for _c in cluster_candidates:
+                    _fp = _fingerprint(_c)
+                    _tfp = _target_fingerprint(_c) if self._task_mode == "creative" else None
+                    if _fp in _seen or (_tfp is not None and _tfp in _seen_targets):
+                        logger.info(
+                            "review_clusters: dropped cross-batch duplicate candidate "
+                            "%r (cluster=%r)", _c.title, cluster.name,
+                        )
+                        continue
+                    _seen.add(_fp)
+                    if _tfp is not None:
+                        _seen_targets.add(_tfp)
+                    _deduped.append(_c)
+                if len(_deduped) != len(cluster_candidates):
+                    print(f"   → {len(cluster_candidates) - len(_deduped)} cross-batch "
+                          f"duplicate(s) dropped, {len(_deduped)} remaining")
+                cluster_candidates = _deduped
+
             all_candidates.extend(cluster_candidates)
             _fire_callback(on_cluster_done)
 
@@ -632,7 +664,19 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                     "cluster": cluster.name},
         )
 
-        _RETRY_DELAYS = [5, 15, 30]   # seconds between attempts (3 retries)
+        # AUTO-BUG-8 fix: configurable retry backoff. Previously hardcoded to
+        # [5, 15, 30] (~50s total) regardless of deployment — for a local
+        # Ollama instance still loading a model into memory, that's ~50s of
+        # silent retrying inside this call before the cluster fails open.
+        _delays_raw = self._config.get("architect", "retry_delays_sec", fallback="5,15,30")
+        try:
+            _RETRY_DELAYS = [float(x.strip()) for x in _delays_raw.split(",") if x.strip()]
+        except ValueError:
+            logger.warning(
+                "architect: invalid [architect] retry_delays_sec=%r — using default [5, 15, 30].",
+                _delays_raw,
+            )
+            _RETRY_DELAYS = [5, 15, 30]
 
         raw_text = ""
         last_exc: Exception | None = None

@@ -299,17 +299,22 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         # ── Stage C: deduplication ────────────────────────────────────────────
         accepted: list[CandidateTask] = []
         seen_fingerprints: set[str] = set()
+        seen_target_fingerprints: set[str] = set()
 
         for c, reason in presence_passed:
             fp = _fingerprint(c)
-            if fp in seen_fingerprints:
+            tfp = _target_fingerprint(c) if self._task_mode == "creative" else None
+            if fp in seen_fingerprints or (tfp is not None and tfp in seen_target_fingerprints):
+                dup_key = fp if fp in seen_fingerprints else tfp
                 all_results.append(FilterResult(
                     candidate=c, accepted=False, stage="duplicate",
-                    reason=f"duplicate of an earlier candidate with fingerprint {fp!r}",
+                    reason=f"duplicate of an earlier candidate with fingerprint {dup_key!r}",
                 ))
                 logger.info("Gate1[dedup] merged duplicate %r", c.title)
                 continue
             seen_fingerprints.add(fp)
+            if tfp is not None:
+                seen_target_fingerprints.add(tfp)
             accepted.append(c)
             all_results.append(FilterResult(
                 candidate=c, accepted=True, stage="presence", reason=reason,
@@ -599,14 +604,35 @@ def filter_candidates(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _fingerprint(c: CandidateTask) -> str:
-    """Stable deduplication key for a candidate.
+    """Stable deduplication key for a candidate, based on cited location.
 
-    Two candidates are considered duplicates when they cite the same location
-    and have the same normalised title (lowercased, stripped).
+    Two candidates are considered duplicates when they cite the same
+    location and have the same normalised title (lowercased, stripped).
     """
     loc = c.cited_location
     anchor = loc.symbol or f"L{loc.line_start}-{loc.line_end}"
     return f"{loc.file}::{anchor}::{c.title.strip().lower()}"
+
+
+def _target_fingerprint(c: CandidateTask) -> "str | None":
+    """AUTO-BUG-3: secondary dedup key based on the file(s) being WRITTEN.
+
+    ``_fingerprint`` alone keys on ``cited_location`` — the SOURCE the
+    candidate references — which is the right disambiguator for code tasks
+    (two different fixes can legitimately cite the same file at different
+    symbols/lines). For creative-generation tasks, though, ``cited_location``
+    is largely arbitrary (there's no meaningful symbol/line in a chapter
+    that doesn't exist yet) and can differ between two batches of the same
+    cluster even when both are proposing to write the exact same target
+    file — which is exactly the "two independent tasks generate chapter_4"
+    duplication observed in practice. Two candidates that target the same
+    file set with the same title are duplicates regardless of what they
+    cited, so this key is checked *in addition to* ``_fingerprint``.
+    Returns ``None`` when there are no target files to key on.
+    """
+    if not c.target_files:
+        return None
+    return f"{'|'.join(sorted(c.target_files))}::{c.title.strip().lower()}"
 
 
 def _location_str(loc: Any) -> str:

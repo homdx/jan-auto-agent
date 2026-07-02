@@ -57,7 +57,7 @@ from __future__ import annotations
 
 import json
 import logging
-from tools.auto.utils import _ts
+from tools.auto.utils import _ts, atomic_write_text
 from pathlib import Path
 from typing import Any, Optional
 
@@ -376,9 +376,9 @@ class TicketStore:
 
     @staticmethod
     def _write(path: Path, ticket: dict) -> None:
-        path.write_text(
+        atomic_write_text(
+            path,
             json.dumps(ticket, indent=2, ensure_ascii=False),
-            encoding="utf-8",
         )
 
 
