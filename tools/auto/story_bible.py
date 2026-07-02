@@ -119,6 +119,32 @@ _GENDER_MALE_RE = re.compile(
 )
 
 _AGE_RE = re.compile(r"(\d+)\s*(?:лет|год)", re.IGNORECASE)
+
+# AUTO-BUG-2 (extended): a second example of a guarded, narrowly but
+# deterministically detectable "immutable-ish" attribute besides
+# gender/age -- recovery/health status. Full generalisation to arbitrary
+# contradicting facts would need semantic (LLM) comparison; this mirrors
+# the same narrow, false-positive-resistant pattern as gender/age instead
+# of attempting that.
+_RECOVERY_FULL_RE = re.compile(
+    r"полностью (?:выздоровел|восстановил(?:ся|ась)|поправил(?:ся|ась))", re.IGNORECASE,
+)
+_RECOVERY_PARTIAL_RE = re.compile(
+    r"(?:постепенно|частично) восстанавлива|обрывками|не (?:полностью|до конца) "
+    r"(?:восстанов|поправ)|рука не слушается|речь (?:ещё )?путается",
+    re.IGNORECASE,
+)
+
+
+def _recovery_status_of(bullet: str) -> "str | None":
+    """Return 'full', 'partial', or None if *bullet* asserts a recovery status."""
+    if _RECOVERY_FULL_RE.search(bullet):
+        return "full"
+    if _RECOVERY_PARTIAL_RE.search(bullet):
+        return "partial"
+    return None
+
+
 _AGE_UNKNOWN_RE = re.compile(r"не\s+указан|неизвестен", re.IGNORECASE)
 _AGE_WORDS = {
     "двадцать": 20, "тридцать": 30, "сорок": 40, "пятьдесят": 50,
@@ -402,7 +428,8 @@ class StoryBible:
         """
         new_gender = _gender_of(new_fact)
         new_age = _age_of(new_fact)
-        if new_gender is None and new_age is None:
+        new_recovery = _recovery_status_of(new_fact)
+        if new_gender is None and new_age is None and new_recovery is None:
             return None
 
         new_names = _names_in(new_fact)
@@ -421,6 +448,11 @@ class StoryBible:
             if new_age is not None:
                 existing_age = _age_of(existing)
                 if existing_age is not None and existing_age != new_age:
+                    return existing
+
+            if new_recovery is not None:
+                existing_recovery = _recovery_status_of(existing)
+                if existing_recovery is not None and existing_recovery != new_recovery:
                     return existing
 
         return None

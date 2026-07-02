@@ -531,7 +531,8 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                     continue
 
                 # ── Live LLM call ─────────────────────────────────────────────
-                batch_results = self._review_one_cluster(sub, base_dir, goal)
+                _all_files = files if (len(batches) > 1 and self._task_mode == "creative") else None
+                batch_results = self._review_one_cluster(sub, base_dir, goal, all_files=_all_files)
                 # None means the LLM call failed outright (all retries exhausted).
                 # Do NOT checkpoint a failure — the batch must be retried on next run.
                 if batch_results is None:
@@ -619,8 +620,23 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
         cluster: RepoCluster,
         base_dir: Path,
         goal: str,
+        all_files: "list[str] | None" = None,
     ) -> "list[CandidateTask] | None":
         """Send one LLM call for *cluster* and return grounded candidates.
+
+        Parameters
+        ----------
+        all_files
+            AUTO-BUG-9 fix: the FULL set of files in the cluster this batch
+            belongs to (names only), used for the file listing shown to the
+            model even when this call's file contents only cover one
+            batch's subset (cluster.files). Without this, a batched review
+            of a growing creative-writing repo only ever sees a partial
+            file listing, and "what's the next chapter number" logic can
+            conclude a stale/wrong answer -- observed in practice: it
+            proposed regenerating an already-completed middle chapter
+            instead of only ever extending the book forward. Defaults to
+            cluster.files (old behaviour) when not given.
 
         Returns
         -------
@@ -630,7 +646,8 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
             The LLM call failed after all retries (transient server error).
             The caller must NOT checkpoint this result.
         """
-        file_listing = "\n".join(f"  - {f}" for f in cluster.files)
+        listing_files = all_files if all_files is not None else cluster.files
+        file_listing = "\n".join(f"  - {f}" for f in listing_files)
         file_contents = self._build_file_contents(cluster.files, base_dir)
 
         _tmpl = (
