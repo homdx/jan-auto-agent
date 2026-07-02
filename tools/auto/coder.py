@@ -298,6 +298,10 @@ class Coder(_llm_stream.LLMClientBase):
         if _num_ctx_str is None:
             _num_ctx_str = config.get(f"api_{active_profile}", "num_ctx", fallback="0")
         self._num_ctx = int(_num_ctx_str)
+        # AUTO-FIX (fable follow-up): same thinking-model truncation risk as
+        # gate1/architect — a big coder JSON response (files array) plus a
+        # <think> block is even more likely to blow the budget mid-reasoning.
+        self._think = config.getboolean(sec, "think", fallback=False)
         # Context-probe: fetch missing symbols on first LLM response, then retry once.
         self._context_probe_enabled = config.getboolean(sec, "context_probe", fallback=True)
         self._max_chars_per_dep     = config.getint(sec, "max_chars_per_dep", fallback=2000)
@@ -348,7 +352,7 @@ class Coder(_llm_stream.LLMClientBase):
             base_url=self._base_url, api_key=self._api_key, model=self._model,
             api_format=self._api_format, temperature=self._temperature,
             max_tokens=self._max_tokens, system=self._system, user_msg=user_msg,
-            num_ctx=self._num_ctx,
+            num_ctx=self._num_ctx, think=self._think,
         )
 
         tracer.event(

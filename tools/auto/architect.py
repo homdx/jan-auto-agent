@@ -363,6 +363,15 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
         # num_ctx controls the total context window on Ollama; 0 means "use server default".
         active_profile               = config.get("api", "active", fallback="local")
         self._num_ctx                = config.getint(f"api_{active_profile}", "num_ctx", fallback=0)
+        # AUTO-FIX (fable follow-up): mirrors the gate1_filter.py fix — a
+        # thinking model (e.g. qwen3) wraps its JSON task array in
+        # <think>...</think> by default. If that reasoning consumes the
+        # whole max_tokens budget, strip_think() discards everything and
+        # architect produces 0 candidates (observed live: architect call
+        # returned a totally empty response after ~5 minutes on qwen3:8b).
+        # Default to disabling thinking for this call; [architect] think =
+        # true re-enables it for a model/setup that needs it.
+        self._think                  = config.getboolean(arch, "think", fallback=False)
 
         # ── DM-2: select system prompt based on task_mode + ini overrides ─────
         # Priority: mode-specific ini key > legacy "system" key > built-in constant.
@@ -668,7 +677,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
             base_url=self._base_url, api_key=self._api_key, model=self._model,
             api_format=self._api_format, temperature=self._temperature,
             max_tokens=self._max_tokens, system=self._system, user_msg=user_msg,
-            num_ctx=self._num_ctx,
+            num_ctx=self._num_ctx, think=self._think,
         )
 
         # Trace the outgoing call.
@@ -1292,6 +1301,7 @@ class TaskRewriter(_llm_stream.LLMClientBase):
         arch = "architect"
         self._max_tokens  = int(config.get(arch, "rewrite_max_tokens",  fallback="512"))
         self._temperature = float(config.get(arch, "rewrite_temperature", fallback="0.4"))
+        self._think       = config.getboolean(arch, "think", fallback=False)
         raw_system        = config.get(arch, "rewrite_system", fallback="").strip()
         self._system      = raw_system or _REWRITER_SYSTEM_DEFAULT
         self._timeout     = float(config.get("loop", "timeout_seconds", fallback="300"))
@@ -1324,7 +1334,7 @@ class TaskRewriter(_llm_stream.LLMClientBase):
             base_url=self._base_url, api_key=self._api_key, model=self._model,
             api_format=self._api_format, temperature=self._temperature,
             max_tokens=self._max_tokens, system=self._system, user_msg=user_msg,
-            num_ctx=self._num_ctx,
+            num_ctx=self._num_ctx, think=self._think,
         )
 
         tracer.event(

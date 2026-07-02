@@ -239,6 +239,11 @@ class LLMGate2Validator:
         self.max_tokens  = int(max_tokens)
         self.task_mode   = str(task_mode)
         self._config     = config
+        # AUTO-FIX (fable follow-up): Gate-2 in code/docs mode requires
+        # strict JSON with no soft-parse fallback (see AUTO-BUG-10) — a
+        # thinking model truncated mid-<think> here fails closed exactly
+        # like architect/coder did before the think=false fix.
+        self._think      = config.getboolean("validator_agent", "think", fallback=False) if config is not None else False
         # AUTO-DM-5 / AUTO-CR-19-1: select system prompt — mode-specific
         # override > (code-mode-only) legacy "system" key > built-in.
         # See _resolve_validator_system for the full priority rationale.
@@ -479,6 +484,7 @@ class LLMGate2Validator:
                             {"role": "user",    "content": um},
                         ],
                         "options": _val_opts,
+                        "think": getattr(self, "_think", False),
                     }
                 else:
                     _payload = {
