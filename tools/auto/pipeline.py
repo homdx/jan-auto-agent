@@ -61,9 +61,6 @@ def _build_plan_validator(
         return None
 
 
-
-
-
 def run_pipeline(controller: "AutoController") -> tuple[Optional[str], int]:
     """Run the full autonomous pipeline; return (stop_reason, tasks_done).
 

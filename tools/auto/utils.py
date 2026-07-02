@@ -2,13 +2,48 @@
 from __future__ import annotations
 
 import configparser
+import os
+import tempfile
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 
 def _ts() -> str:
     """Return the current local time as an ISO-8601 string (YYYY-MM-DDTHH:MM:SS)."""
     return datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def atomic_write_text(path: "str | Path", content: str) -> None:
+    """Write *content* to *path* atomically (temp file + ``os.replace``).
+
+    ``os.replace`` is a single filesystem rename, which POSIX and Windows both
+    guarantee is atomic within the same directory/filesystem: *path* always
+    ends up holding either the old complete content or the new complete
+    content, never a partial write. Plain ``Path.write_text`` gives no such
+    guarantee — a process killed mid-write (SIGKILL, OOM-kill, power loss)
+    can leave a truncated file behind that later fails ``json.loads``.
+
+    Used for state that must survive an interrupted run (plan.json,
+    progress.json, tickets) so a mid-write kill can never corrupt it.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 def _cfg_mode(

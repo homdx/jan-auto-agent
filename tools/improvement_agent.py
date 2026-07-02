@@ -8,13 +8,13 @@ import logging
 
 
 from tools.agent_trace import tracer
-from tools.llm_stream import request_completion, strip_think, ollama_chat_url
+from tools.llm_stream import request_completion, strip_think, ollama_chat_url, strip_json_fence
 
 logger = logging.getLogger(__name__)
 
-# Hardcoded prompt extracted to a named module-level constant.
-# This is the canonical fallback that PromptStore will always be able to return to.
-# Runtime values are injected via .format() in process() — do not use f-string here.
+# Hardcoded prompt extracted to a named module-level constant — the canonical
+# fallback PromptStore can always return to. Runtime values are injected via
+# .format() in process(); do not use f-string here.
 IMPROVEMENT_PROMPT_HARDCODED = (
     "You are a senior codebase refactoring agent. Optimize the target source code "
     "according to the requested intent action matrix.\n"
@@ -165,10 +165,7 @@ class ImprovementAgent:
             tracer.event("llm", "improvement_agent", "llm_response", content=content)
             content = strip_think(content)
 
-            if "```json" in content:
-                content = content.split("```json")[1].split("```")[0].strip()
-            elif "```" in content:
-                content = content.split("```")[1].split("```")[0].strip()
+            content = strip_json_fence(content)
 
             parsed_result = json.loads(content)
             tracer.event("improvement_agent", "orchestrator", "result", content=parsed_result)

@@ -436,3 +436,51 @@ class TestCommitOnSuccessHook:
         cos = CommitOnSuccess(mock_git, mock_state)   # no extra args
         sha = cos.commit({"id": "T-00", "title": "init", "target_files": []})
         assert sha == "cafebabe0000"
+
+    def test_synopsis_and_bible_update_every_target_file(self, tmp_path: Path):
+        """Regression: a multi-chapter creative task (e.g. a cross-chapter
+        consistency fix, the shape tested in
+        test_cr17_creative_acceptance.py's target_files=["chapter_1.txt",
+        "chapter_2.txt"]) must update synopsis.md and story_bible.md for
+        EVERY target file, not just target_files[0]. This mirrors the
+        AUTO-CR-16 fix that made the coder load all target files' content
+        instead of only the first.
+        """
+        from tools.auto.commit_on_success import CommitOnSuccess
+        from tools.auto.git_manager import GitManager
+        from tools.auto.state import StateStore
+
+        (tmp_path / "chapter_2.txt").write_text("Chapter 2 revised text.")
+        (tmp_path / "chapter_3.txt").write_text("Chapter 3 revised text.")
+
+        mock_git = MagicMock(spec=GitManager)
+        mock_git.commit_task.return_value = "1234567890ab"
+        mock_state = MagicMock(spec=StateStore)
+        mock_memory = MagicMock()
+        mock_bible = MagicMock()
+
+        cos = CommitOnSuccess(
+            mock_git, mock_state,
+            summary_memory=mock_memory,
+            story_bible=mock_bible,
+            task_mode="creative",
+            base_dir=tmp_path,
+        )
+        task = {
+            "id": "CH-FIX-1",
+            "title": "fix name inconsistency across chapters 2 and 3",
+            "target_files": ["chapter_2.txt", "chapter_3.txt"],
+        }
+        cos.commit(task)
+
+        assert mock_memory.update.call_count == 2
+        mock_memory.update.assert_has_calls([
+            call("chapter_2.txt", base_dir=tmp_path),
+            call("chapter_3.txt", base_dir=tmp_path),
+        ])
+        assert mock_bible.update.call_count == 2
+        mock_bible.update.assert_has_calls([
+            call("Chapter 2 revised text."),
+            call("Chapter 3 revised text."),
+        ])
+

@@ -262,6 +262,12 @@ class FaqAgent:
             return ollama_chat_url(base)
         return f"{base}/chat/completions"
 
+    def _headers(self) -> dict:
+        return {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+        }
+
     # Hosts that denote a local Ollama daemon (where /api/pull is meaningful).
     _LOCAL_HOSTS = frozenset(
         {"localhost", "127.0.0.1", "0.0.0.0", "::1", "host.docker.internal"}
@@ -319,9 +325,9 @@ class FaqAgent:
             logger.debug("FaqAgent: model %r is ready", self.model)
         except urllib.error.HTTPError as exc:
             if exc.code == 404:
-                # No /api/pull on this endpoint — it's a chat-only/hosted
-                # gateway, not a local daemon. The model is already served;
-                # nothing to pull. Benign, so debug rather than warning.
+                # No /api/pull on this endpoint — a chat-only/hosted gateway,
+                # not a local daemon, so the model is already served and
+                # there's nothing to pull. Benign, so debug rather than warning.
                 logger.debug(
                     "FaqAgent: %s has no /api/pull (404) — model assumed served",
                     pull_url,
@@ -348,10 +354,7 @@ class FaqAgent:
         when the LLM returns malformed JSON or the API call fails.
         """
         url     = self._chat_url()
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}",
-        }
+        headers = self._headers()
         payload: dict = {
             "model": self.model,
             "messages": [
@@ -444,14 +447,10 @@ class FaqAgent:
         def _make_kw_pattern(kw: str) -> "re.Pattern[str]":
             escaped = re.escape(kw)
             if re.search(r"\W", kw):
-                # \b is the boundary between \w and \W.  A hyphen is \W, so
-                # \bansible-playbook\b falsely fires inside "run-ansible-playbook"
-                # because "-" before "a" is itself a \W->\w boundary.
-                # For keywords containing non-word chars, require a genuine
-                # delimiter before and after: whitespace OR the path separators
-                # "/" and "." so that "ops/ansible-playbook.txt" scores correctly
-                # (a joining hyphen — e.g. "run-ansible-playbook" — still does
-                # not satisfy the lookbehind and therefore scores 0 as intended).
+                # \b fails for hyphenated keywords since "-" is itself a
+                # \w/\W boundary (\bansible-playbook\b wrongly matches inside
+                # "run-ansible-playbook"). So for non-word-char keywords we
+                # require whitespace or "/"/"." as the delimiter instead.
                 return re.compile(
                     r"(?:(?:^|(?<=[/.\s])))" + escaped + r"(?=[/.\s]|$)",
                     re.MULTILINE,
@@ -496,10 +495,7 @@ class FaqAgent:
             f"CANDIDATE ANSWER: {answer}"
         )
         url     = self._chat_url()
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}",
-        }
+        headers = self._headers()
         payload: dict = {
             "model": self.model,
             "messages": [
@@ -555,10 +551,7 @@ class FaqAgent:
             f"CANDIDATE ANSWER:\n{answer}"
         )
         url     = self._chat_url()
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}",
-        }
+        headers = self._headers()
         payload: dict = {
             "model": self.model,
             "messages": [
@@ -672,19 +665,8 @@ class FaqAgent:
 
     # ── Per-candidate LLM query (non-streaming) ──────────────────────────────
 
-    def _query_candidate(self, question: str, context: str) -> str:
-        """
-        Single non-streaming LLM call for a specific ``context`` block.
-
-        Used inside the smart-search candidate loop where we must inspect the
-        answer before committing to it; streaming intermediate attempts would
-        produce garbled output.
-        """
-        url     = self._chat_url()
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}",
-        }
+    def _build_qa_request(self, question: str, context: str) -> tuple[str, dict, dict]:
+        """Build (url, headers, payload) for a single QA chat call over *context*."""
         user_msg = (
             f"KNOWLEDGE BASE:\n\n{context}\n\n"
             f"QUESTION: {question}"
@@ -699,6 +681,17 @@ class FaqAgent:
         }
         if self.max_tokens:
             payload["max_tokens"] = self.max_tokens
+        return self._chat_url(), self._headers(), payload
+
+    def _query_candidate(self, question: str, context: str) -> str:
+        """
+        Single non-streaming LLM call for a specific ``context`` block.
+
+        Used inside the smart-search candidate loop where we must inspect the
+        answer before committing to it; streaming intermediate attempts would
+        produce garbled output.
+        """
+        url, headers, payload = self._build_qa_request(question, context)
 
         raw = request_completion(
             url, headers, payload, self.timeout,
@@ -879,25 +872,7 @@ class FaqAgent:
         directly (``smart_search = False``) or as the Stage-2 fallback.
         """
         context  = self._build_context(docs)
-        user_msg = (
-            f"KNOWLEDGE BASE:\n\n{context}\n\n"
-            f"QUESTION: {question}"
-        )
-        url     = self._chat_url()
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}",
-        }
-        payload: dict = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": self.system_prompt},
-                {"role": "user",   "content": user_msg},
-            ],
-            "temperature": self.temperature,
-        }
-        if self.max_tokens:
-            payload["max_tokens"] = self.max_tokens
+        url, headers, payload = self._build_qa_request(question, context)
 
         try:
             if stream:

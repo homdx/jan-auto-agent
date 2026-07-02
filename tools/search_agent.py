@@ -224,7 +224,7 @@ class SearchAgent:
                 result["not_found"] = references
                 return result
 
-            # 1. Gather Candidate Files — all supported source languages.
+            # Gather candidate files across all supported source languages.
             # If file_ext_hint is set, preferred-extension files come first so
             # the most likely match is found quickly; others follow.
             raw_candidates = list_source_files(base_dir, skip_dirs=self.skip_dirs)

@@ -244,13 +244,10 @@ class ContextAssembler:
         net of the bible's reserved cost rather than computed here.
         """
         if budget_chars <= 0:
-            # Pathological config (max_tokens >= num_ctx), or the bible ate
-            # the whole budget. Rather than silently returning NO context
-            # (which makes the model invent a chapter in the wrong language
-            # with nothing to continue), degrade gracefully: prefer the
-            # compact synopsis of the story so far; only if there is no
-            # synopsis yet, fall back to a truncated tail of the previous
-            # chapter so there is always *some* anchor.
+            # Pathological config (max_tokens >= num_ctx) or the bible ate the
+            # whole budget. Degrade gracefully instead of returning no context:
+            # prefer the synopsis, falling back to a truncated tail of the
+            # previous chapter only if there's no synopsis yet.
             prev_num, prev_file = prior[-1]
             logger.warning(
                 "ContextAssembler: zero/negative budget for %s "

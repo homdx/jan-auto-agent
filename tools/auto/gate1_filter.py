@@ -160,7 +160,7 @@ class FilterResult:
 # Gate1Filter
 # ─────────────────────────────────────────────────────────────────────────────
 
-class Gate1Filter:
+class Gate1Filter(_llm_stream.LLMClientBase):
     """Runs the two-stage Gate 1 filter over a list of :class:`CandidateTask`.
 
     Parameters
@@ -189,20 +189,8 @@ class Gate1Filter:
         verify_ssl: bool = True,
         task_mode: str = "code",
     ) -> None:
-        self._config     = config
-        self._base_url   = base_url.rstrip("/")
-        self._api_key    = api_key
-        self._model      = model
-        self._api_format = api_format
+        super().__init__(config, base_url, api_key, model, api_format, verify_ssl)
         self._task_mode  = task_mode
-
-        import ssl
-        self._ssl_context = None
-        if not verify_ssl:
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            self._ssl_context = ctx
 
         sec = "gate1"
         self._temperature    = float(config.get(sec, "temperature", fallback="0.0"))
@@ -282,12 +270,12 @@ class Gate1Filter:
         presence_passed: list[tuple[CandidateTask, str]] = []  # (task, reason)
 
         if self._skip_llm or self._task_mode == "creative":
-            # AUTO-CR-8: Stage B verifies a claimed *issue* is present in
-            # existing text — an improvement-detector. For creative GENERATION
-            # the target chapter is new/empty, so "is the issue present?" is
+            # AUTO-CR-8: Stage B verifies a claimed issue is present in existing
+            # text — an improvement-detector — but for creative GENERATION the
+            # target chapter is new/empty, so "is the issue present?" is
             # meaningless and would reject every task. Creative quality is
-            # governed downstream by the soft Gate-2 (AUTO-CR-2) and the canon
-            # gate (AUTO-CR-7), so existence is sufficient here.
+            # governed downstream by the soft Gate-2 (CR-2) and canon gate
+            # (CR-7) instead, so existence is sufficient here.
             _why = "LLM skipped" if self._skip_llm else "creative mode — existence only"
             presence_passed = [(c, f"existence check passed ({_why})") for c, _ in existence_passed]
         else:
@@ -311,17 +299,22 @@ class Gate1Filter:
         # ── Stage C: deduplication ────────────────────────────────────────────
         accepted: list[CandidateTask] = []
         seen_fingerprints: set[str] = set()
+        seen_target_fingerprints: set[str] = set()
 
         for c, reason in presence_passed:
             fp = _fingerprint(c)
-            if fp in seen_fingerprints:
+            tfp = _target_fingerprint(c) if self._task_mode == "creative" else None
+            if fp in seen_fingerprints or (tfp is not None and tfp in seen_target_fingerprints):
+                dup_key = fp if fp in seen_fingerprints else tfp
                 all_results.append(FilterResult(
                     candidate=c, accepted=False, stage="duplicate",
-                    reason=f"duplicate of an earlier candidate with fingerprint {fp!r}",
+                    reason=f"duplicate of an earlier candidate with fingerprint {dup_key!r}",
                 ))
                 logger.info("Gate1[dedup] merged duplicate %r", c.title)
                 continue
             seen_fingerprints.add(fp)
+            if tfp is not None:
+                seen_target_fingerprints.add(tfp)
             accepted.append(c)
             all_results.append(FilterResult(
                 candidate=c, accepted=True, stage="presence", reason=reason,
@@ -374,14 +367,11 @@ class Gate1Filter:
 
         file_ext = Path(loc.file).suffix or ".py"
 
-        # AUTO-CR-8: in docs/creative mode a FILE is sufficient grounding
-        # (mirrors CitedLocation.is_valid). Small models (e.g. llama3.1:8b)
-        # frequently emit a hallucinated line_start (0, 5, 15…) instead of the
-        # requested null, and the target chapter is often new/empty (0 lines),
-        # so strict line-range validation here wrongly rejects every candidate.
-        # Treat the citation as file-only and hand Stage B a head-of-file block
-        # (which may be empty for a brand-new chapter — that is expected when
-        # generating rather than improving).
+        # AUTO-CR-8: in docs/creative mode a FILE alone is sufficient grounding,
+        # since small models often hallucinate line_start and the target
+        # chapter may be new/empty, which would make strict line-range
+        # validation wrongly reject every candidate. So treat the citation as
+        # file-only and hand Stage B a head-of-file block (possibly empty).
         if self._task_mode != "code":
             lines = source.splitlines()
             block = "\n".join(lines[: self._max_context_lines])
@@ -463,38 +453,12 @@ class Gate1Filter:
         )
 
 
-        headers = {
-            "Content-Type":  "application/json",
-            "Authorization": f"Bearer {self._api_key}",
-        }
-
-        if self._api_format == "ollama":
-            url = _llm_stream.ollama_chat_url(self._base_url)
-            _gate1_opts: dict[str, Any] = {
-                "temperature": self._temperature,
-                "num_predict": self._max_tokens,
-            }
-            if self._num_ctx:
-                _gate1_opts["num_ctx"] = self._num_ctx
-            payload: dict[str, Any] = {
-                "model":       self._model,
-                "messages": [
-                    {"role": "system", "content": self._system},
-                    {"role": "user",   "content": user_msg},
-                ],
-                "options": _gate1_opts,
-            }
-        else:
-            url = f"{self._base_url}/chat/completions"
-            payload = {
-                "model":       self._model,
-                "temperature": self._temperature,
-                "max_tokens":  self._max_tokens,
-                "messages": [
-                    {"role": "system", "content": self._system},
-                    {"role": "user",   "content": user_msg},
-                ],
-            }
+        url, headers, payload = _llm_stream.build_chat_request(
+            base_url=self._base_url, api_key=self._api_key, model=self._model,
+            api_format=self._api_format, temperature=self._temperature,
+            max_tokens=self._max_tokens, system=self._system, user_msg=user_msg,
+            num_ctx=self._num_ctx,
+        )
 
         tracer.event(
             source="gate1",
@@ -640,14 +604,35 @@ def filter_candidates(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _fingerprint(c: CandidateTask) -> str:
-    """Stable deduplication key for a candidate.
+    """Stable deduplication key for a candidate, based on cited location.
 
-    Two candidates are considered duplicates when they cite the same location
-    and have the same normalised title (lowercased, stripped).
+    Two candidates are considered duplicates when they cite the same
+    location and have the same normalised title (lowercased, stripped).
     """
     loc = c.cited_location
     anchor = loc.symbol or f"L{loc.line_start}-{loc.line_end}"
     return f"{loc.file}::{anchor}::{c.title.strip().lower()}"
+
+
+def _target_fingerprint(c: CandidateTask) -> "str | None":
+    """AUTO-BUG-3: secondary dedup key based on the file(s) being WRITTEN.
+
+    ``_fingerprint`` alone keys on ``cited_location`` — the SOURCE the
+    candidate references — which is the right disambiguator for code tasks
+    (two different fixes can legitimately cite the same file at different
+    symbols/lines). For creative-generation tasks, though, ``cited_location``
+    is largely arbitrary (there's no meaningful symbol/line in a chapter
+    that doesn't exist yet) and can differ between two batches of the same
+    cluster even when both are proposing to write the exact same target
+    file — which is exactly the "two independent tasks generate chapter_4"
+    duplication observed in practice. Two candidates that target the same
+    file set with the same title are duplicates regardless of what they
+    cited, so this key is checked *in addition to* ``_fingerprint``.
+    Returns ``None`` when there are no target files to key on.
+    """
+    if not c.target_files:
+        return None
+    return f"{'|'.join(sorted(c.target_files))}::{c.title.strip().lower()}"
 
 
 def _location_str(loc: Any) -> str:

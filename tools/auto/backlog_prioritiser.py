@@ -447,8 +447,6 @@ def _chapter_dependencies(tasks: list[ReadyTask]) -> dict[str, list[str]]:
     return edges
 
 
-
-
 def _topological_sort(tasks: list[ReadyTask]) -> list[ReadyTask]:
     """Return *tasks* in dependency-first order using Kahn's algorithm.
 

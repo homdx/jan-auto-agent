@@ -9,12 +9,11 @@ OrchestratorActions is a mixin; Orchestrator inherits from it and supplies:
 """
 import os
 import re
-import sys
 import json
 import time
 import logging
 
-from tools.llm_stream import request_completion, strip_think, ollama_chat_url
+from tools.llm_stream import request_completion, strip_think, ollama_chat_url, strip_json_fence
 from tools.agent_trace import tracer
 from tools.file_reader import read_file
 from tools.ui import Spinner, stream_tracker
@@ -51,30 +50,40 @@ class OrchestratorActions:
             return ollama_chat_url(base)
         return f"{base}/chat/completions"
 
+    def _headers(self) -> dict:
+        return {"Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}"}
+
     # ------------------------------------------------------------------ #
     # Full-file search (/search)                                          #
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    def _parse_search_command(user_input: str):
+    def _parse_payload_and_file(user_input: str, command: str):
         """
-        Parse '/search <query> in <file>'  (also accepts '<file> :: <query>').
-        Returns (query, file_path) or (None, None) if it can't be parsed.
+        Parse '/<command> <payload> in <file>' (also accepts '<file> :: <payload>').
+        Returns (payload, file_path) or (None, None) if it can't be parsed.
+        Shared by /search (payload = query) and /edit (payload = instruction).
         """
-        body = user_input.strip()[len("/search"):].strip()
+        body = user_input.strip()[len(command):].strip()
         if not body:
             return None, None
-        if "::" in body:                       # /search <file> :: <query>
-            file_path, query = body.split("::", 1)
-            return query.strip(), file_path.strip()
-        if " in " in body:                     # /search <query> in <file>
-            query, file_path = body.rsplit(" in ", 1)
-            return query.strip(), file_path.strip()
-        # Fallback: first token is the file, the rest is the query.
+        if "::" in body:                       # /<command> <file> :: <payload>
+            file_path, payload = body.split("::", 1)
+            return payload.strip(), file_path.strip()
+        if " in " in body:                     # /<command> <payload> in <file>
+            payload, file_path = body.rsplit(" in ", 1)
+            return payload.strip(), file_path.strip()
+        # Fallback: first token is the file, the rest is the payload.
         parts = body.split(None, 1)
         if len(parts) == 2:
             return parts[1].strip(), parts[0].strip()
         return None, None
+
+    @staticmethod
+    def _parse_search_command(user_input: str):
+        """Parse '/search <query> in <file>'  (also accepts '<file> :: <query>')."""
+        return OrchestratorActions._parse_payload_and_file(user_input, "/search")
 
     def _ask_over_text(self, query: str, file_label: str, text: str,
                        chunk_label: str = None, generative: bool = False) -> str:
@@ -107,8 +116,7 @@ class OrchestratorActions:
             )
         user = f"FILE: {file_label}{where}\n-----\n{text}\n-----\nQUESTION: {query}"
         url = self._chat_url()
-        headers = {"Content-Type": "application/json",
-                   "Authorization": f"Bearer {self.api_key}"}
+        headers = self._headers()
         payload = {"model": self.model,
                    "messages": [{"role": "system", "content": system},
                                 {"role": "user", "content": user}],
@@ -265,8 +273,7 @@ class OrchestratorActions:
               f"Address this feedback and try again:\n{feedback}") if feedback else ""
         user = f"DOCUMENT: {file_label}\n-----\n{knowledge}\n-----\nQUESTION: {question}{fb}"
         url = self._chat_url()
-        headers = {"Content-Type": "application/json",
-                   "Authorization": f"Bearer {self.api_key}"}
+        headers = self._headers()
         payload = {"model": self.model,
                    "messages": [{"role": "system", "content": system},
                                 {"role": "user", "content": user}],
@@ -307,10 +314,7 @@ class OrchestratorActions:
         with its own validator-specific feedback message (callers differ in
         which extra keys, e.g. "grounded", their fail-closed dict carries).
         """
-        if "```json" in content:
-            content = content.split("```json")[1].split("```")[0].strip()
-        elif "```" in content:
-            content = content.split("```")[1].split("```")[0].strip()
+        content = strip_json_fence(content)
         data = json.loads(content)
         if isinstance(data, list) and len(data) == 1 and isinstance(data[0], dict):
             data = data[0]
@@ -338,8 +342,7 @@ class OrchestratorActions:
         user = (f"DOCUMENT:\n{knowledge}\n\nQUESTION:\n{question}\n\n"
                 f"PROPOSED ANSWER:\n{answer}")
         url = self._chat_url()
-        headers = {"Content-Type": "application/json",
-                   "Authorization": f"Bearer {self.api_key}"}
+        headers = self._headers()
         payload = {"model": self.model,
                    "messages": [{"role": "system", "content": system},
                                 {"role": "user", "content": user}],
@@ -458,19 +461,7 @@ class OrchestratorActions:
     @staticmethod
     def _parse_edit_command(user_input: str):
         """Parse '/edit <instruction> in <file>' (or '/edit <file> :: <instruction>')."""
-        body = user_input.strip()[len("/edit"):].strip()
-        if not body:
-            return None, None
-        if "::" in body:
-            file_path, instr = body.split("::", 1)
-            return instr.strip(), file_path.strip()
-        if " in " in body:
-            instr, file_path = body.rsplit(" in ", 1)
-            return instr.strip(), file_path.strip()
-        parts = body.split(None, 1)
-        if len(parts) == 2:
-            return parts[1].strip(), parts[0].strip()
-        return None, None
+        return OrchestratorActions._parse_payload_and_file(user_input, "/edit")
 
     @staticmethod
     def _strip_code_fence(text: str) -> str:
@@ -528,15 +519,10 @@ class OrchestratorActions:
             trace_content = base_user
 
         elif previous_revised:
-            # ── Retry with context: multi-turn ─────────────────────────────
-            # The model's previous output becomes an assistant message so the
-            # correction request is a clean, unambiguous new user turn.
-            #
-            # IMPORTANT: the correction turn deliberately repeats the full
-            # DOCUMENT and INSTRUCTION.  Without this re-anchoring, weak
-            # models lose track of what they are supposed to edit after seeing
-            # their own previous output as an assistant turn and treat the
-            # feedback text as the new document to edit instead.
+            # Retry with context: previous output becomes an assistant message
+            # so the correction is a clean new turn. It deliberately re-includes
+            # the full DOCUMENT and INSTRUCTION — without it, weak models mistake
+            # the feedback text for the new document to edit.
             correction = (
                 f"That edit was rejected.\n\n"
                 f"Error: {feedback}\n\n"
@@ -559,12 +545,10 @@ class OrchestratorActions:
             )
 
         else:
-            # ── Clean/reset retry: single turn with delimited correction ───
-            # No previous_revised available (reset iter or feature disabled).
-            # Correction block is appended to the same user message.
-            # We reference the document by its label (not "above") to avoid
-            # ambiguity, and re-state the instruction so the model doesn't have
-            # to scroll up mentally to find it.
+            # Clean/reset retry: single-turn with delimited correction, appended
+            # to the same user message when previous_revised isn't available. We
+            # reference the document by its label (not "above") and re-state the
+            # instruction, so the model doesn't have to scroll up mentally to find it.
             correction_block = (
                 f"\n\n---CORRECTION---\n"
                 f"Error in previous attempt: {feedback}\n"
@@ -581,8 +565,7 @@ class OrchestratorActions:
             trace_content = base_user + correction_block
 
         url = self._chat_url()
-        headers = {"Content-Type": "application/json",
-                   "Authorization": f"Bearer {self.api_key}"}
+        headers = self._headers()
         payload = {"model": self.model,
                    "messages": messages,
                    "temperature": self._cfg_temp("file_editor", 0.2)}
@@ -630,8 +613,7 @@ class OrchestratorActions:
         user = (f"ORIGINAL:\n{original}\n\nINSTRUCTION:\n{instruction}\n\n"
                 f"REVISED:\n{revised}")
         url = self._chat_url()
-        headers = {"Content-Type": "application/json",
-                   "Authorization": f"Bearer {self.api_key}"}
+        headers = self._headers()
         payload = {"model": self.model,
                    "messages": [{"role": "system", "content": system},
                                 {"role": "user", "content": user}],

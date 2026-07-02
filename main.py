@@ -4,7 +4,6 @@ import time
 import json
 import logging
 import configparser
-import ssl
 import textwrap
 from pathlib import Path
 from typing import Dict, Any, List
@@ -38,7 +37,7 @@ from tools.prompt_evaluator import PromptEvaluator
 from tools.actions import OrchestratorActions, _ts
 from tools.faq_agent import FaqAgent
 import tools.backoff as backoff
-from tools.llm_stream import request_completion, strip_think
+from tools.llm_stream import request_completion, strip_think, make_unverified_context
 from tools.ui import stream_tracker
 
 # Extensions that support AST/block extraction and code validation.
@@ -91,10 +90,9 @@ class Orchestrator(OrchestratorActions):
         self.metrics_collector = MetricsCollector()
         self.prompt_store = PromptStore(config=None)
 
-        # Session-level direct-chat history.
-        # Lives here (not in _build_agents) so it survives /reload — the user's
-        # conversation context should not be wiped when config is refreshed.
-        # Reset explicitly by /new.
+        # Session-level direct-chat history; lives here (not in _build_agents)
+        # so it survives /reload, since refreshing config shouldn't wipe the
+        # user's conversation context. Reset explicitly by /new.
         self._direct_chat_history: List[Dict[str, str]] = []
 
         self._build_agents()
@@ -184,7 +182,6 @@ class Orchestrator(OrchestratorActions):
         
         self.max_iterations = self.config.getint("loop", "max_iterations", fallback=3)
         self.timeout_seconds = self.config.getint("loop", "timeout_seconds", fallback=240)
-        self.use_context = self.config.getboolean("chat", "use_context", fallback=True)
         self.new_chat_key = self.config.get("chat", "new_chat_key", fallback="/new").strip()
         self.exit_key = self.config.get("chat", "exit_key", fallback="/exit").strip()
 
@@ -204,10 +201,7 @@ class Orchestrator(OrchestratorActions):
         # Applies to all HTTPS API calls (agents, optimizer, direct chat).
         verify_ssl = self.config.getboolean("api", "verify_ssl", fallback=True)
         if not verify_ssl:
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            self.ssl_context = ctx
+            self.ssl_context = make_unverified_context()
             logger.warning("SSL certificate verification DISABLED (verify_ssl = false in agents.ini)")
         else:
             self.ssl_context = None  # urllib default: full verification
@@ -256,17 +250,10 @@ class Orchestrator(OrchestratorActions):
             "Authorization": f"Bearer {self.api_key}",
         }
 
-        # Append the new user turn, then trim history to the rolling cap.
-        # Each turn = 1 user message + 1 assistant message = 2 entries.
-        #
-        # _max_msgs uses max(1, ...) rather than history_max_turns * 2 directly:
-        # Python's list[-0:] is the SAME as list[0:] — i.e. the *whole* list,
-        # not an empty one. A bare `history_max_turns * 2` would mean
-        # history_max_turns=0 (a natural value to pick for "no history")
-        # silently disabled the cap instead of clearing history, letting it
-        # grow unbounded. max(1, ...) guarantees _max_msgs is never 0, so the
-        # negative-slice trick always trims correctly — and it always keeps at
-        # least the current user turn, so the payload below is never empty.
+        # Append the new turn, then trim history to the rolling cap (1 user +
+        # 1 assistant = 2 entries/turn). _max_msgs uses max(1, ...) because
+        # list[-0:] returns the whole list, not empty — so history_max_turns=0
+        # would otherwise silently disable the cap instead of clearing it.
         self._direct_chat_history.append({"role": "user", "content": user_input})
         _max_msgs = max(1, history_max_turns * 2)
         if len(self._direct_chat_history) > _max_msgs:
@@ -359,10 +346,9 @@ class Orchestrator(OrchestratorActions):
         validation: Dict[str, Any] = {}
 
         # Cap total ref growth: no more than max_hints new symbols may be added
-        # across all iterations combined.  Without this, a struggling validator
-        # that keeps suggesting new names compounds the search scope on every
-        # pass instead of converging.  One batch of suggestions is enough —
-        # if the validator still can't approve after that context, more symbols
+        # across all iterations combined, or a struggling validator that keeps
+        # suggesting new names would compound the search scope instead of
+        # converging. One batch of suggestions is enough — more beyond that
         # are unlikely to help and only slow down the search agent.
         _refs_cap = len(refs) + self.validator_agent.max_hints
         _api_err_count = 0  # consecutive API errors; reset on any non-error response
@@ -652,11 +638,11 @@ def main():
         json_mode: bool = getattr(args, "json", False)
 
         if json_mode:
-            # JSON mode must emit the JSON object and nothing else. Drop existing
-            # handlers and raise the threshold to ERROR so informational lines —
-            # e.g. "SSL certificate verification DISABLED" or "model pull check
-            # failed … proceeding anyway" — are suppressed. Genuine errors still
-            # go to stderr (never stdout), keeping the JSON on stdout pristine.
+            # JSON mode must emit the JSON object and nothing else, so drop
+            # existing handlers and raise the threshold to ERROR to suppress
+            # informational lines (e.g. "SSL certificate verification
+            # DISABLED"). Genuine errors still go to stderr, never stdout,
+            # keeping the JSON output pristine.
             for handler in logging.root.handlers[:]:
                 logging.root.removeHandler(handler)
             logging.basicConfig(

@@ -18,7 +18,7 @@ Public surface
     display.tick_arch()
     display.set_task(task_num=1, attempt=1, round_num=1,
                      task_id="T-01", title="Fix login bug")
-    display.finish_task(passed=True)   # records ✓/✗ and calls tick_code()
+    display.record_result(passed=True); display.tick_code()
 """
 
 from __future__ import annotations
@@ -194,11 +194,6 @@ class ProgressDisplay:
             while len(self._results) <= idx:
                 self._results.append(None)
             self._results[idx] = passed
-
-    def finish_task(self, passed: bool) -> None:
-        """Convenience: record_result + tick_code in one call."""
-        self.record_result(passed)
-        self.tick_code()
 
     def set_task(
         self,

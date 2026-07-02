@@ -167,14 +167,12 @@ class ContinuityValidator:
         lang_instr = language_instruction(detect_language(new_text))
         system = _CONTINUITY_SYSTEM + (("\n" + lang_instr) if lang_instr else "")
         if lang_instr:
-            # The LANGUAGE lock above tells the model not to translate
-            # anything — which, taken literally, also swallows the verdict
-            # token itself (observed in the wild: a Russian chapter produced
-            # "НЕОБХОДИМО ИЗМЕНИТЬ: ..." instead of "REVISE: ...", which
-            # _parse_verdict_soft cannot recognise, so it failed open and a
-            # real contradiction slipped through uncaught). Carve the verdict
-            # word out of the language lock explicitly, stated last so it
-            # isn't overridden by the broader "output {language} only" rule.
+            # The LANGUAGE lock above can swallow the verdict token itself —
+            # observed as a Russian chapter producing "НЕОБХОДИМО ИЗМЕНИТЬ:"
+            # instead of "REVISE:", which _parse_verdict_soft can't recognize
+            # and silently lets a real contradiction through. So carve the
+            # verdict word out of the lock explicitly, stated last so it isn't
+            # overridden by the broader rule.
             system += (
                 "\nEXCEPTION TO THE LANGUAGE RULE ABOVE: the verdict word "
                 "itself — APPROVED or REVISE — must always be written in "

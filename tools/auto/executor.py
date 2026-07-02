@@ -83,6 +83,17 @@ _MAX_OUTPUT_CHARS = 64_000
 # Maximum traceback snippet length returned in ExecutionResult.traceback.
 _MAX_TRACEBACK_CHARS = 4_000
 
+# Directories excluded when mirroring base_dir into a task workspace (see
+# _prepare_workspace / AUTO-FIX-1): VCS metadata, the agent's own
+# state/workspace tree — workspace_root defaults to base_dir/.agent/workspace,
+# so excluding ".agent" also prevents shutil.copytree from recursing into its
+# own destination — and common cache/dependency dirs that are large,
+# irrelevant to acceptance checks, and safe to leave out (regenerable).
+_MIRROR_IGNORE = shutil.ignore_patterns(
+    ".git", ".agent", "__pycache__", ".pytest_cache", ".mypy_cache",
+    ".venv", "venv", "node_modules", ".tox", "*.egg-info",
+)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Result dataclass
@@ -232,12 +243,12 @@ class Executor:
         # Resolve the command to run.
         command = self._resolve_command(acceptance_check, target_files, workspace)
 
-        # AUTO-CR-12: cross-platform no-op acceptance. Creative/docs tasks
-        # default acceptance_check to "true" (a Unix shell builtin). On Windows
-        # `true`/`false`/`:` are NOT commands, so cmd.exe returns rc=1 and every
-        # such task fails the executor gate. Recognise ONLY these Unix builtins
-        # and resolve them without spawning a shell. ("exit 0"/"exit 1" are
-        # valid on every platform and are intentionally left to run normally.)
+        # AUTO-CR-12: cross-platform no-op acceptance — creative/docs tasks
+        # default acceptance_check to "true" (a Unix builtin), but on Windows
+        # `true`/`false`/`:` aren't commands, so cmd.exe returns rc=1 and every
+        # such task fails. Recognise only these Unix builtins and resolve them
+        # without spawning a shell ("exit 0"/"exit 1" are valid everywhere and
+        # run normally).
         _norm = (command or "").strip().lower().rstrip(";")
         if _norm in ("true", ":"):
             logger.info("executor run: task=%s no-op acceptance (%r) → pass", task_id, command)
@@ -275,11 +286,18 @@ class Executor:
     # ── Workspace setup ───────────────────────────────────────────────────────
 
     def _prepare_workspace(self, task_id: str, target_files: list[str]) -> Path:
-        """Create the per-task workspace dir and copy target files into it.
+        """Create the per-task workspace and populate it for acceptance_check.
 
         The workspace is ``<workspace_root>/<task_id>/``.  It is recreated
         fresh on each call so stale artefacts from previous attempts don't
         interfere.
+
+        Population happens in two passes: first the whole repo (``base_dir``)
+        is mirrored in, so files the acceptance_check needs but that aren't
+        listed in ``target_files`` — pre-existing tests, conftest.py,
+        fixtures, sibling modules — are present; then each entry in
+        ``target_files`` is re-copied on top to guarantee the freshest
+        on-disk version wins regardless of mirror timing.
 
         Parameters
         ----------
@@ -300,6 +318,30 @@ class Executor:
         if workspace.exists():
             shutil.rmtree(workspace)
         workspace.mkdir(parents=True, exist_ok=True)
+
+        # AUTO-FIX-1: mirror the whole repo into the workspace *before*
+        # overlaying target_files. Previously only target_files were copied,
+        # so an acceptance_check referencing a file that exists in base_dir
+        # but wasn't listed in target_files (a pre-existing test file,
+        # conftest.py, a fixture, a sibling module the target imports) would
+        # fail with a spurious "file or directory not found" — a false
+        # negative unrelated to whether the Coder's change was correct, and
+        # one that (via TaskRewriter's failure-pattern handling) could lead
+        # to acceptance_check being silently replaced with a no-op. Best
+        # effort: mirroring failures are logged, not raised, so the run
+        # continues with the pre-existing target-files-only behaviour below
+        # rather than aborting the task outright.
+        try:
+            shutil.copytree(
+                self._base_dir, workspace,
+                ignore=_MIRROR_IGNORE, dirs_exist_ok=True, symlinks=True,
+            )
+        except (OSError, shutil.Error) as exc:
+            logger.warning(
+                "_prepare_workspace: could not fully mirror %s into %s (%s) — "
+                "acceptance_check may still fail on files outside target_files",
+                self._base_dir, workspace, exc,
+            )
 
         tracer.event(
             source="executor",
@@ -540,11 +582,10 @@ class Executor:
         """
         env = self._build_env()
         # Use explicit comparison instead of `or None` — 0.0 is falsy in Python,
-        # so `0.0 or None` evaluates to None (= no timeout), which is the intended
-        # meaning of 0.  But the `or` form is a silent footgun: any future reader
-        # or config author who sets exec_timeout_sec = 0 expecting "no timeout"
-        # gets it, while someone who sets it accidentally gets an infinite hang
-        # with no warning.  The explicit form below makes the intent unmistakable.
+        # so `0.0 or None` would silently mean "no timeout" instead of
+        # "immediate timeout," tricking anyone who sets exec_timeout_sec = 0
+        # expecting one behavior into getting the other with no warning. The
+        # explicit form below makes the intent unmistakable.
         timeout = self._timeout_sec if self._timeout_sec > 0 else None
 
         try:
@@ -619,10 +660,10 @@ class Executor:
             env.pop(var, None)
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         env["PYTHONUNBUFFERED"] = "1"
-        # Force UTF-8 for all child processes.  On Windows the default codec is
-        # cp1252 which cannot decode bytes such as 0x81 (undefined in that codepage).
-        # PYTHONUTF8=1 enables UTF-8 mode (PEP 540, Python >= 3.7);
-        # PYTHONIOENCODING is the legacy fallback recognised by older builds.
+        # Force UTF-8 for all child processes — Windows' default cp1252 codec
+        # can't decode bytes like 0x81. PYTHONUTF8=1 enables UTF-8 mode (PEP
+        # 540, Python >= 3.7); PYTHONIOENCODING is the legacy fallback for
+        # older builds.
         env["PYTHONUTF8"] = "1"
         env["PYTHONIOENCODING"] = "utf-8"
         

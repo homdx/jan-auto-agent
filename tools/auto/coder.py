@@ -66,7 +66,7 @@ import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 from tools.block_extractor import extract_block as _block_extractor_extract_block
 # SearchAgent is imported lazily inside Coder._fetch_needed
@@ -224,7 +224,7 @@ class CoderResult:
 # Coder
 # ─────────────────────────────────────────────────────────────────────────────
 
-class Coder:
+class Coder(_llm_stream.LLMClientBase):
     """Generates full revised file content for a single autonomous task.
 
     Parameters
@@ -252,22 +252,20 @@ class Coder:
         api_format: str = "openai",
         verify_ssl: bool = True,
         task_mode: str = "code",
+        run_goal: str = "",
     ) -> None:
-        self._config     = config
-        self._base_url   = base_url.rstrip("/")
-        self._api_key    = api_key
-        self._model      = model
-        self._api_format = api_format
-
-        import ssl
-        self._ssl_context = None
-        if not verify_ssl:
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            self._ssl_context = ctx
+        super().__init__(config, base_url, api_key, model, api_format, verify_ssl)
 
         self._task_mode = task_mode
+        # AUTO-FIX-9: the raw --auto GOAL string, verbatim from the CLI/user —
+        # never touched by an LLM. Used as the MOST reliable language-detection
+        # sample for a chapter-1 cold start (see _build_prompt), because the
+        # architect-authored task["instruction"] is LLM output and, per the
+        # whole CR-9/16 language-lock history, small models tend to write such
+        # fields in English (the system prompt's own language) even when the
+        # story itself is in Russian — task["instruction"] is NOT a safe proxy
+        # for "the story's language" the way the user's own goal text is.
+        self._run_goal = str(run_goal or "")
         sec = "coder"
         self._temperature = float(config.get(sec, "temperature", fallback="0.2"))
         # AUTO-CR-3: prefer max_tokens_{task_mode} (e.g. max_tokens_creative) over max_tokens.
@@ -335,38 +333,12 @@ class Coder:
         # ── Build and send the prompt ─────────────────────────────────────────
         user_msg = self._build_prompt(task, base_dir, prior_feedback or [], prefetched_context)
 
-        headers = {
-            "Content-Type":  "application/json",
-            "Authorization": f"Bearer {self._api_key}",
-        }
-        
-        if self._api_format == "ollama":
-            url = _llm_stream.ollama_chat_url(self._base_url)
-            _ollama_opts: dict[str, Any] = {
-                "temperature": self._temperature,
-                "num_predict": self._max_tokens,
-            }
-            if self._num_ctx:
-                _ollama_opts["num_ctx"] = self._num_ctx
-            payload: dict[str, Any] = {
-                "model":       self._model,
-                "messages": [
-                    {"role": "system", "content": self._system},
-                    {"role": "user",   "content": user_msg},
-                ],
-                "options": _ollama_opts,
-            }
-        else:
-            url = f"{self._base_url}/chat/completions"
-            payload = {
-                "model":       self._model,
-                "temperature": self._temperature,
-                "max_tokens":  self._max_tokens,
-                "messages": [
-                    {"role": "system", "content": self._system},
-                    {"role": "user",   "content": user_msg},
-                ],
-            }
+        url, headers, payload = _llm_stream.build_chat_request(
+            base_url=self._base_url, api_key=self._api_key, model=self._model,
+            api_format=self._api_format, temperature=self._temperature,
+            max_tokens=self._max_tokens, system=self._system, user_msg=user_msg,
+            num_ctx=self._num_ctx,
+        )
 
         tracer.event(
             source="coder", target="llm", kind="llm_request",
@@ -409,7 +381,7 @@ class Coder:
         cleaned = strip_think(raw_text)
         # Pull-model: capture any names the coder asked for (context_request).
         # AUTO-CR-19-2: creative output is prose, so the JSON extractor always
-        # returns []. Use the prose CONTEXT_REQUEST extractor in creative so the
+        # returns [] — use the prose CONTEXT_REQUEST extractor instead, so the
         # names reach CoderResult.missing_context and inner_loop's broker pull.
         if self._task_mode == "creative":
             missing_ctx = self._extract_context_request_prose(cleaned)
@@ -566,13 +538,30 @@ class Coder:
             file_contents = self._build_creative_file_contents(target_files, base_dir)
             # AUTO-CR-9/16: lock output language to the STORY text. Detect from
             # the raw target/predecessor prose only — never from the English
-            # structural labels in file_contents, which would outvote a short
-            # Russian chapter and wrongly flip the lock to English.
+            # structural labels/placeholders in file_contents (e.g. the cold-start
+            # "(new chapter — no prior content to continue from)" marker), which
+            # would make detect_language() return "English" and make this ACTIVELY
+            # instruct the model to write chapter 1 in English — worse than no
+            # lock at all. AUTO-FIX-5/9: when there is no prior prose (chapter 1,
+            # nothing written yet), fall back to self._run_goal — the raw --auto
+            # GOAL string, verbatim from the user, never touched by an LLM — before
+            # task["instruction"], which is architect-authored and, per the whole
+            # CR-9/16 language-lock history, prone to drifting into English (the
+            # system prompt's own language) regardless of the story's language.
+            # task["instruction"]/task["goal"] are kept as a last-resort fallback
+            # only for callers that don't wire run_goal through (tests, older call
+            # sites); if everything is empty, omit the lock entirely rather than
+            # ever sampling file_contents.
             from tools.auto.utils import resolve_creative_language, language_instruction
-            _sample = self._creative_language_sample(target_files, base_dir)
+            _sample = (
+                self._creative_language_sample(target_files, base_dir)
+                or self._run_goal
+                or task.get("goal", "")
+                or task.get("instruction", "")
+            )
             _lang = resolve_creative_language(
                 getattr(self, "_config", None),
-                _sample or file_contents,
+                _sample,
                 task_mode="creative",
             )
             _lang_instr = language_instruction(_lang)
@@ -674,12 +663,7 @@ class Coder:
                     if name:
                         names.append(name)
         # Deduplicate, preserve order, cap (matches _extract_missing_context).
-        seen: set[str] = set()
-        out: list[str] = []
-        for n in names:
-            if n not in seen:
-                seen.add(n); out.append(n)
-        return out[:8]
+        return list(dict.fromkeys(names))[:8]
 
     def _extract_missing_context(self, text: str) -> list[str]:
         """Extract the top-level ``missing_context`` list from the LLM response.
@@ -1139,8 +1123,8 @@ class Coder:
 
         # ── AUTO-CR-13: salvage prose from a JSON wrapper ───────────────────
         # Despite the prose-only instruction, a small instruct model sometimes
-        # wraps the chapter in JSON ({"files":[{"content": "..."}]} etc.).
-        # Without this, the entire JSON string was written into the chapter
+        # wraps the chapter in JSON ({"files":[{"content": "..."}]} etc.), and
+        # without this the entire JSON string was written into the chapter
         # file. Extract the inner prose when that happens.
         _salvaged = _extract_prose_from_json(body)
         if _salvaged is not None:
@@ -1173,9 +1157,9 @@ class Coder:
         # ── AUTO-CR-12: refusal / meta-response guard ───────────────────────
         # Without this, the fail-open parser writes a model refusal ("I cannot
         # fulfill your request…", "{}", "please provide more context") straight
-        # into the chapter file. Conservative: only trip on an empty JSON stub
-        # or a SHORT body that contains an explicit refusal marker, so genuine
-        # prose is never rejected. A trip fails the attempt → the loop retries.
+        # into the chapter file. Conservative — only trips on an empty JSON stub
+        # or a short body with an explicit refusal marker, so genuine prose is
+        # never rejected; a trip fails the attempt and the loop retries.
         if _looks_like_refusal(body):
             msg = ("creative coder: response looks like a refusal / meta-reply, "
                    "not chapter prose — retrying")
@@ -1247,10 +1231,10 @@ class Coder:
 
     # ── Content safety ────────────────────────────────────────────────────────
 
-    # Patterns that should never appear in LLM-generated file content.
-    # Keyed by a short label (used in the rejection message) → substring/regex.
-    # This is defence-in-depth, not a complete sandbox; it catches the most
-    # dangerous accidental or injected payloads before they reach disk.
+    # Patterns that should never appear in LLM-generated file content, keyed by
+    # a short label (used in the rejection message) → substring/regex. This is
+    # defence-in-depth, not a complete sandbox — it catches the most dangerous
+    # accidental or injected payloads before they reach disk.
 
     # Patterns always checked regardless of task_mode: catastrophic payloads
     # with no legitimate false-positive risk in any document or creative context.
@@ -1292,11 +1276,11 @@ class Coder:
     )
 
     # Patterns checked with whole-word regex (\b) instead of plain substring
-    # containment.  Same (label, pattern) structure as _BLOCKED_CODE_ONLY so
-    # tests can introspect membership identically.  Python \b treats '_' as a
+    # containment — same (label, pattern) structure as _BLOCKED_CODE_ONLY so
+    # tests can introspect membership identically. Python \b treats '_' as a
     # word character, so underscore-joined identifiers (test_reboot_gracefully,
-    # handle_shutdown_signal, test_sudo_not_needed) do NOT fire.
-    # Applied in code mode only — same scope as _BLOCKED_CODE_ONLY.
+    # etc.) do NOT fire; applied in code mode only, same scope as
+    # _BLOCKED_CODE_ONLY.
     _BLOCKED_CODE_WORD_BOUNDARY: tuple[tuple[str, str], ...] = (
         ("sudo invocation",     "sudo"),
         ("shutdown cmd",        "shutdown"),
@@ -1374,10 +1358,10 @@ class Coder:
             if pat_lower in lower:
                 return False, f"blocked content pattern {pattern!r} ({label})"
 
-        # Word-boundary patterns (code mode only) — sudo / shutdown / reboot.
-        # Checked separately so that identifier names embedding the keyword
+        # Word-boundary patterns (code mode only: sudo/shutdown/reboot), checked
+        # separately so identifier names embedding the keyword
         # (test_reboot_gracefully, handle_shutdown_signal, test_sudo_not_needed)
-        # do NOT fire.  Python \b treats '_' as a word character, so
+        # do NOT fire. Python \b treats '_' as a word character, so
         # underscore-joined names have no boundary at the underscore.
         if task_mode == "code":
             import re as _re
@@ -1542,19 +1526,9 @@ def chunk_file(source: str, file_ext: str, max_chars: int) -> list[dict]:
         ext = "." + ext
 
     # ── Extract import / preamble block ────────────────────────────────────────
-    # Collect all leading lines that look like imports/includes/pragmas for
-    # any supported language, plus blank lines interleaved between them.
-    # Patterns covered:
-    #   Python/JS/TS:   import …  /  from … import …
-    #   Go:             import "…"  /  import ( … )
-    #   Rust:           use …;
-    #   C/C++/ObjC:     #include …  /  #pragma …  /  #define …  /  #ifndef …
-    #   Java/Kotlin:    package …  /  import …
-    #   Ruby:           require …  /  require_relative …
-    #   PHP:            use …;  /  require …  /  include …
-    #   Shell:          #!/…  (shebang on line 1)
-    # Unknown languages: the block will simply be empty (first non-blank line
-    # is not a preamble line), which is safe — no import chunk is emitted.
+    # Collects leading import/include/pragma lines (plus interleaved blanks)
+    # across Python/JS/TS/Go/Rust/C/C++/Java/Kotlin/Ruby/PHP/shell. Unsupported
+    # languages just get an empty block — safe, no import chunk is emitted.
     _import_re = re.compile(
         r"^\s*("
         r"import\s"                             # Python, JS, TS, Java, Go bare
@@ -1610,19 +1584,9 @@ def chunk_file(source: str, file_ext: str, max_chars: int) -> list[dict]:
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 symbols.append((node.name, node.lineno))
     else:
-        # Best-effort regex scan for top-level symbols across all brace-based
-        # and indent-based languages.  Covers:
-        #   JS/TS:    function foo / async function foo / class Foo
-        #             const foo = (...) =>    (arrow functions)
-        #   Go:       func foo / func (r T) foo
-        #   Rust:     fn foo / pub fn foo / pub(crate) fn foo
-        #   Java/C#:  class Foo / interface IFoo / enum Status
-        #             public void foo(  (methods — best-effort)
-        #   C/C++:    type_name foo(   (free functions, rough heuristic)
-        #   Ruby:     def foo / class Foo / module Bar
-        #   PHP:      function foo / class Foo
-        #   Swift:    func foo / class Foo / struct Bar / enum Baz / protocol P
-        #   Kotlin:   fun foo / class Foo / object Obj / data class Bar
+        # Best-effort regex scan for top-level symbols across brace- and
+        # indent-based languages (JS/TS, Go, Rust, Java/C#, C/C++, Ruby, PHP,
+        # Swift, Kotlin) — functions, classes, structs, etc.
         _sym_re = re.compile(
             r"(?m)^[ \t]*"
             # optional visibility / modifier keywords (greedy, non-capturing)
@@ -1872,7 +1836,8 @@ def _strip_code_fence(text: str) -> str:
 # Convenience factory — mirrors make_executor / review_clusters pattern
 # ─────────────────────────────────────────────────────────────────────────────
 
-def make_coder(config: configparser.ConfigParser, task_mode: str = "code") -> Coder:
+def make_coder(config: configparser.ConfigParser, task_mode: str = "code",
+               run_goal: str = "") -> Coder:
     """Create a :class:`Coder` from *config* (agents.ini).
 
     Reads the active API section (``[api_local]`` / ``[api_remote]``) using
@@ -1882,6 +1847,10 @@ def make_coder(config: configparser.ConfigParser, task_mode: str = "code") -> Co
     ----------
     config:
         A ``ConfigParser`` instance loaded from ``agents.ini``.
+    run_goal:
+        AUTO-FIX-9: the raw --auto GOAL string, forwarded so a chapter-1
+        cold start can detect the story's language from the user's own text
+        instead of the architect-authored (and English-prone) instruction.
 
     Returns
     -------
@@ -1904,4 +1873,5 @@ def make_coder(config: configparser.ConfigParser, task_mode: str = "code") -> Co
         api_format = api_fmt,
         verify_ssl = verify_ssl,
         task_mode  = task_mode,
+        run_goal   = run_goal,
     )

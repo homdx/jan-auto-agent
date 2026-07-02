@@ -56,9 +56,8 @@ from typing import Iterator
 logger = logging.getLogger(__name__)
 
 # ── Default cluster definitions ──────────────────────────────────────────────
-# Tuned for this codebase's layout (tools/, tools/auto/, main.py, agents.ini).
-# Format: list of (name, [glob_patterns]).
-# Files are tried against each cluster IN ORDER; first match wins.
+# Tuned for this codebase's layout (tools/, tools/auto/, main.py, agents.ini);
+# format is (name, [glob_patterns]), tried in order with first match winning.
 # The last cluster should be a broad catch-all.
 
 _DEFAULT_CLUSTERS: list[tuple[str, list[str]]] = [
@@ -176,10 +175,6 @@ class RepoCluster:
 
     def __repr__(self) -> str:  # pragma: no cover
         return f"RepoCluster(name={self.name!r}, files={len(self.files)})"
-
-    def summary_line(self) -> str:
-        """One-liner for the console banner."""
-        return f"  [{self.name}]  {len(self.files)} file(s)"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

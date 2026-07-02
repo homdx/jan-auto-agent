@@ -191,12 +191,11 @@ Now produce ONLY the JSON array of up to {max_tasks} concrete tasks that IMPLEME
 goal "{goal}" against the files above (no prose, no markdown fences):
 """
 
-# AUTO-CR-34: creative tasks are prose, not code. The shared code template above
-# demands a "symbol" and a runnable shell-test acceptance_check (pytest/npm/...),
-# which contradicts the creative system prompt and makes the model emit shell
-# commands that have no meaning for a book (they are force-overridden to the
-# "true" no-op at parse time anyway). This variant drops the symbol/shell-test
-# guidance and asks for prose-appropriate tasks while keeping the exact-path rules.
+# AUTO-CR-34: creative tasks are prose, not code — the shared code template
+# demands a "symbol" and shell-test acceptance_check, which contradicts the
+# creative prompt and makes the model emit meaningless shell commands. This
+# variant drops that guidance and asks for prose-appropriate tasks while
+# keeping the exact-path rules.
 _USER_PROMPT_CREATIVE = """\
 Goal: {goal}
 
@@ -320,7 +319,7 @@ class CandidateTask:
 # ClusterReviewer
 # ─────────────────────────────────────────────────────────────────────────────
 
-class ClusterReviewer:
+class ClusterReviewer(_llm_stream.LLMClientBase):
     """Sends one Architect LLM call per cluster and returns grounded candidates.
 
     Parameters
@@ -349,20 +348,8 @@ class ClusterReviewer:
         verify_ssl: bool = True,
         task_mode: str = "code",
     ) -> None:
-        self._config     = config
-        self._base_url   = base_url.rstrip("/")
-        self._api_key    = api_key
-        self._model      = model
-        self._api_format = api_format
+        super().__init__(config, base_url, api_key, model, api_format, verify_ssl)
         self._task_mode  = task_mode
-
-        import ssl
-        self._ssl_context = None
-        if not verify_ssl:
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            self._ssl_context = ctx
 
         arch = "architect"
         self._temperature            = float(config.get(arch, "temperature",         fallback="0.2"))
@@ -376,10 +363,6 @@ class ClusterReviewer:
         # num_ctx controls the total context window on Ollama; 0 means "use server default".
         active_profile               = config.get("api", "active", fallback="local")
         self._num_ctx                = config.getint(f"api_{active_profile}", "num_ctx", fallback=0)
-        # ── TaskRewriter config (LOOP-5) ──────────────────────────────────────
-        self._rewrite_max_tokens     = int(config.get(arch,   "rewrite_max_tokens",  fallback="512"))
-        self._rewrite_temperature    = float(config.get(arch, "rewrite_temperature", fallback="0.4"))
-        self._rewrite_system         = config.get(arch, "rewrite_system", fallback="").strip()
 
         # ── DM-2: select system prompt based on task_mode + ini overrides ─────
         # Priority: mode-specific ini key > legacy "system" key > built-in constant.
@@ -548,7 +531,8 @@ class ClusterReviewer:
                     continue
 
                 # ── Live LLM call ─────────────────────────────────────────────
-                batch_results = self._review_one_cluster(sub, base_dir, goal)
+                _all_files = files if (len(batches) > 1 and self._task_mode == "creative") else None
+                batch_results = self._review_one_cluster(sub, base_dir, goal, all_files=_all_files)
                 # None means the LLM call failed outright (all retries exhausted).
                 # Do NOT checkpoint a failure — the batch must be retried on next run.
                 if batch_results is None:
@@ -577,6 +561,38 @@ class ClusterReviewer:
                         )
 
             print(f"   → {len(cluster_candidates)} grounded candidate(s)")
+
+            # AUTO-BUG-3 fix: when a cluster is large enough to be split into
+            # multiple batches, each batch is reviewed independently and can
+            # (and in practice does, e.g. in creative mode with a single
+            # target file) propose the *identical* task. Gate-1 has its own
+            # fingerprint-based dedup, but de-duplicating right here — before
+            # candidates from different batches of the same cluster are even
+            # merged — is a cheap, local belt-and-braces fix that does not
+            # depend on downstream Gate-1 behaving as expected.
+            if len(batches) > 1 and len(cluster_candidates) > 1:
+                from tools.auto.gate1_filter import _fingerprint, _target_fingerprint  # noqa: PLC0415
+                _seen: set[str] = set()
+                _seen_targets: set[str] = set()
+                _deduped: list[CandidateTask] = []
+                for _c in cluster_candidates:
+                    _fp = _fingerprint(_c)
+                    _tfp = _target_fingerprint(_c) if self._task_mode == "creative" else None
+                    if _fp in _seen or (_tfp is not None and _tfp in _seen_targets):
+                        logger.info(
+                            "review_clusters: dropped cross-batch duplicate candidate "
+                            "%r (cluster=%r)", _c.title, cluster.name,
+                        )
+                        continue
+                    _seen.add(_fp)
+                    if _tfp is not None:
+                        _seen_targets.add(_tfp)
+                    _deduped.append(_c)
+                if len(_deduped) != len(cluster_candidates):
+                    print(f"   → {len(cluster_candidates) - len(_deduped)} cross-batch "
+                          f"duplicate(s) dropped, {len(_deduped)} remaining")
+                cluster_candidates = _deduped
+
             all_candidates.extend(cluster_candidates)
             _fire_callback(on_cluster_done)
 
@@ -604,8 +620,23 @@ class ClusterReviewer:
         cluster: RepoCluster,
         base_dir: Path,
         goal: str,
+        all_files: "list[str] | None" = None,
     ) -> "list[CandidateTask] | None":
         """Send one LLM call for *cluster* and return grounded candidates.
+
+        Parameters
+        ----------
+        all_files
+            AUTO-BUG-9 fix: the FULL set of files in the cluster this batch
+            belongs to (names only), used for the file listing shown to the
+            model even when this call's file contents only cover one
+            batch's subset (cluster.files). Without this, a batched review
+            of a growing creative-writing repo only ever sees a partial
+            file listing, and "what's the next chapter number" logic can
+            conclude a stale/wrong answer -- observed in practice: it
+            proposed regenerating an already-completed middle chapter
+            instead of only ever extending the book forward. Defaults to
+            cluster.files (old behaviour) when not given.
 
         Returns
         -------
@@ -615,7 +646,8 @@ class ClusterReviewer:
             The LLM call failed after all retries (transient server error).
             The caller must NOT checkpoint this result.
         """
-        file_listing = "\n".join(f"  - {f}" for f in cluster.files)
+        listing_files = all_files if all_files is not None else cluster.files
+        file_listing = "\n".join(f"  - {f}" for f in listing_files)
         file_contents = self._build_file_contents(cluster.files, base_dir)
 
         _tmpl = (
@@ -632,38 +664,12 @@ class ClusterReviewer:
         )
 
 
-        headers = {
-            "Content-Type":  "application/json",
-            "Authorization": f"Bearer {self._api_key}",
-        }
-
-        if self._api_format == "ollama":
-            url = _llm_stream.ollama_chat_url(self._base_url)
-            _ollama_opts: dict[str, Any] = {
-                "temperature": self._temperature,
-                "num_predict": self._max_tokens,
-            }
-            if self._num_ctx:
-                _ollama_opts["num_ctx"] = self._num_ctx
-            payload: dict[str, Any] = {
-                "model":       self._model,
-                "messages": [
-                    {"role": "system", "content": self._system},
-                    {"role": "user",   "content": user_msg},
-                ],
-                "options": _ollama_opts,
-            }
-        else:
-            url = f"{self._base_url}/chat/completions"
-            payload = {
-                "model":       self._model,
-                "temperature": self._temperature,
-                "max_tokens":  self._max_tokens,
-                "messages": [
-                    {"role": "system", "content": self._system},
-                    {"role": "user",   "content": user_msg},
-                ],
-            }
+        url, headers, payload = _llm_stream.build_chat_request(
+            base_url=self._base_url, api_key=self._api_key, model=self._model,
+            api_format=self._api_format, temperature=self._temperature,
+            max_tokens=self._max_tokens, system=self._system, user_msg=user_msg,
+            num_ctx=self._num_ctx,
+        )
 
         # Trace the outgoing call.
         tracer.event(
@@ -675,7 +681,19 @@ class ClusterReviewer:
                     "cluster": cluster.name},
         )
 
-        _RETRY_DELAYS = [5, 15, 30]   # seconds between attempts (3 retries)
+        # AUTO-BUG-8 fix: configurable retry backoff. Previously hardcoded to
+        # [5, 15, 30] (~50s total) regardless of deployment — for a local
+        # Ollama instance still loading a model into memory, that's ~50s of
+        # silent retrying inside this call before the cluster fails open.
+        _delays_raw = self._config.get("architect", "retry_delays_sec", fallback="5,15,30")
+        try:
+            _RETRY_DELAYS = [float(x.strip()) for x in _delays_raw.split(",") if x.strip()]
+        except ValueError:
+            logger.warning(
+                "architect: invalid [architect] retry_delays_sec=%r — using default [5, 15, 30].",
+                _delays_raw,
+            )
+            _RETRY_DELAYS = [5, 15, 30]
 
         raw_text = ""
         last_exc: Exception | None = None
@@ -719,12 +737,10 @@ class ClusterReviewer:
                 last_exc = exc
                 exc_str = str(exc)
                 # Only retry on transient server-side errors (5xx) or connection
-                # failures.  Client errors (4xx) are deterministic — no point retrying.
-                # Prefer the REAL status from the exception object: urllib raises
-                # HTTPError with an integer ``.code``.  Only fall back to a
-                # word-boundary scan of the message for non-HTTP transport errors,
-                # which avoids false positives from substrings (e.g. a model name
-                # like "gpt-4-5000" or an error body that mentions "error 500").
+                # failures, not deterministic 4xx client errors. Prefer the real
+                # status from exc.code (urllib's HTTPError); only fall back to a
+                # word-boundary scan of the message for non-HTTP errors, to avoid
+                # false positives from substrings like a model name "gpt-4-5000".
                 _http_status: int = 0
                 _code = getattr(exc, "code", None)
                 if isinstance(_code, int):
@@ -850,10 +866,10 @@ class ClusterReviewer:
                 continue
 
             # AUTO-CR-28: never let a task target a control/memory file
-            # (story_bible.md, synopsis.md, IMPROVEMENTS.md, plan.json). These
-            # are not story content; editing them corrupts the bible/synopsis
-            # and sends the redundancy gate into an endless rewrite loop. Bounce
-            # the candidate here, before Gate 1, so no attempt is ever spent.
+            # (story_bible.md, synopsis.md, IMPROVEMENTS.md, plan.json) —
+            # editing these corrupts the bible/synopsis and sends the
+            # redundancy gate into an endless rewrite loop. Bounce the
+            # candidate here, before Gate 1, so no attempt is ever spent.
             if any(
                 str(tf).strip().lower().rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
                 in RESERVED_META_FILES
@@ -869,11 +885,11 @@ class ClusterReviewer:
             # --- Validate and build cited_location (grounding gate) ---
             loc_raw = item.get("cited_location")
 
-            # AUTO-CR-10: in creative mode the grounding is "the story so far".
-            # A small model often (a) omits cited_location, or (b) cites the
-            # NEW target chapter (which does not exist yet). Both block the
-            # whole run. Repair by grounding on an EXISTING cluster file (the
-            # latest existing chapter) instead of rejecting.
+            # AUTO-CR-10: in creative mode the grounding is "the story so far,"
+            # but a small model often omits cited_location or cites the new
+            # (nonexistent) target chapter, blocking the whole run. Repair by
+            # grounding on an existing cluster file (the latest chapter)
+            # instead of rejecting.
             if self._task_mode == "creative":
                 existing = list(cluster_files or [])
                 anchor_file = _latest_chapter_file(existing)
@@ -938,12 +954,11 @@ class ClusterReviewer:
                     )
                     continue
 
-            # AUTO-CR-17: prose has no meaningful objective shell test. A small
-            # model often invents nonsensical checks (e.g. "diff chapter_1.txt
-            # chapter_2.txt"), which run for real in the executor and FAIL on
-            # every attempt (distinct chapters never compare equal), burning the
-            # whole task. In creative mode force acceptance to the "true" no-op;
-            # quality is judged by Gate-2 and the canon gate, not a shell test.
+            # AUTO-CR-17: prose has no meaningful objective shell test, and a
+            # small model often invents nonsensical checks (e.g. "diff
+            # chapter_1.txt chapter_2.txt") that fail on every attempt, burning
+            # the whole task. In creative mode force acceptance to the "true"
+            # no-op — quality is judged by Gate-2 and the canon gate instead.
             if self._task_mode == "creative" and acceptance.strip().lower() != "true":
                 logger.info(
                     "_parse_candidates [%s]: item %d — overriding creative "
@@ -969,10 +984,10 @@ class ClusterReviewer:
                 cluster_name, rejected, len(data),
             )
 
-        # AUTO-CR-18: hard-cap creative tasks. A small model ignores the
-        # "up to N" request and emits many overlapping "synchronize X" tasks
-        # (20 in one run); run sequentially over shared files they collapse
-        # every chapter into a copy of one. Keep only the first N.
+        # AUTO-CR-18: hard-cap creative tasks — a small model ignores the
+        # "up to N" request and emits many overlapping "synchronize X" tasks,
+        # which collapse every chapter into a copy of one when run
+        # sequentially over shared files. Keep only the first N.
         if self._task_mode == "creative":
             cap = self._config.getint("architect", "max_tasks_creative", fallback=1)
             cap = max(1, cap)
@@ -1249,7 +1264,7 @@ Return a JSON object with exactly these fields:
 """
 
 
-class TaskRewriter:
+class TaskRewriter(_llm_stream.LLMClientBase):
     """Rewrites a repeatedly-failing task with a new implementation strategy.
 
     Mirrors the constructor signature of :class:`ClusterReviewer` so
@@ -1272,19 +1287,7 @@ class TaskRewriter:
         api_format: str = "openai",
         verify_ssl: bool = True,
     ) -> None:
-        self._config     = config
-        self._base_url   = base_url.rstrip("/")
-        self._api_key    = api_key
-        self._model      = model
-        self._api_format = api_format
-
-        import ssl
-        self._ssl_context = None
-        if not verify_ssl:
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            self._ssl_context = ctx
+        super().__init__(config, base_url, api_key, model, api_format, verify_ssl)
 
         arch = "architect"
         self._max_tokens  = int(config.get(arch, "rewrite_max_tokens",  fallback="512"))
@@ -1317,38 +1320,12 @@ class TaskRewriter:
             failure_history=history_text,
         )
 
-        headers = {
-            "Content-Type":  "application/json",
-            "Authorization": f"Bearer {self._api_key}",
-        }
-
-        if self._api_format == "ollama":
-            url = _llm_stream.ollama_chat_url(self._base_url)
-            _rewriter_opts: dict[str, Any] = {
-                "temperature": self._temperature,
-                "num_predict": self._max_tokens,
-            }
-            if self._num_ctx:
-                _rewriter_opts["num_ctx"] = self._num_ctx
-            payload: dict[str, Any] = {
-                "model":   self._model,
-                "messages": [
-                    {"role": "system", "content": self._system},
-                    {"role": "user",   "content": user_msg},
-                ],
-                "options": _rewriter_opts,
-            }
-        else:
-            url = f"{self._base_url}/chat/completions"
-            payload = {
-                "model":       self._model,
-                "temperature": self._temperature,
-                "max_tokens":  self._max_tokens,
-                "messages": [
-                    {"role": "system", "content": self._system},
-                    {"role": "user",   "content": user_msg},
-                ],
-            }
+        url, headers, payload = _llm_stream.build_chat_request(
+            base_url=self._base_url, api_key=self._api_key, model=self._model,
+            api_format=self._api_format, temperature=self._temperature,
+            max_tokens=self._max_tokens, system=self._system, user_msg=user_msg,
+            num_ctx=self._num_ctx,
+        )
 
         tracer.event(
             source="task_rewriter",
@@ -1426,12 +1403,11 @@ class TaskRewriter:
             return original_task
 
         # Guard: reject acceptance_check values that look like prose rather than
-        # a real shell command.  A valid check starts with a known executable token
-        # and is short enough to be a single command.  When the LLM drifts and
-        # writes a sentence (e.g. "The script must run without errors …"), the
-        # executor runs it as a shell command, bash cannot find "The" as a binary,
-        # and every subsequent attempt fails with exit 127 — even when the generated
-        # code is correct.  Falling back to the original command is always safer.
+        # a real shell command (a valid check starts with a known executable
+        # token and is short). When the LLM drifts and writes a sentence
+        # instead, bash can't find a binary for it and every attempt fails
+        # with exit 127 — even on correct code — so falling back to the
+        # original command is always safer.
         if new_acceptance and not _looks_like_shell_command(new_acceptance):
             logger.warning(
                 "TaskRewriter._parse_rewrite: acceptance_check looks like prose, "

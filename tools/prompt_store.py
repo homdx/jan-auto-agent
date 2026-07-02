@@ -78,10 +78,6 @@ class PromptStore:
                 return item["prompt"]
         return stack[-1]["prompt"]
 
-    def get_hardcoded(self, agent_name: str) -> str:
-        """Always return the original hardcoded constant — bypasses the store."""
-        return _get_hardcoded(agent_name)
-
     def get_store_summary(self, agent_names: list) -> str:
         """Return a formatted /prompts introspection table for the given agents.
 

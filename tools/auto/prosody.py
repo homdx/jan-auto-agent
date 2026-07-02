@@ -269,13 +269,9 @@ _VERSE_STEMS: tuple[str, ...] = (
 )
 
 # Whole-word forms of стих / стиш — word-boundary anchored so the shared
-# "стих" prefix in стихия / стихийн- / стихать / утихать / стихл- never
-# matches (those words have no boundary right after the prefix or its
-# listed endings; see is_verse_task's docstring). The suffix group is
-# REQUIRED (not optional): the bare word "стих" is also the masculine past
-# tense of "стихнуть" (to die down/abate, e.g. "ветер стих к утру") — an
-# unsuffixed match would misfire on that verb, so only inflected noun forms
-# (стихи, стиха, стиху, стихов, стихам, стихах, стихе) trigger the gate.
+# "стих" prefix in стихия/стихать/etc. never matches. The suffix group is
+# required (not optional) because bare "стих" is also a verb ("died down");
+# only inflected noun forms (стихи, стиха, ...) should trigger the gate.
 _VERSE_WORD_RE = re.compile(r"\bстих(и|а|у|ов|ам|ах|е)\b")
 _VERSE_DIM_RE  = re.compile(r"\bстиш(ок|ки|ка)\b")
 

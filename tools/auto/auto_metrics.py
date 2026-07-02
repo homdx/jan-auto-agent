@@ -37,11 +37,9 @@ from __future__ import annotations
 
 import json
 import logging
-import tempfile
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
 from tools.metrics_collector import MetricsCollector, RunRecord
 
@@ -49,33 +47,6 @@ logger = logging.getLogger(__name__)
 
 # Interactive default — used only to assert isolation in tests / guards.
 _INTERACTIVE_DEFAULT = Path("metrics.json")
-
-
-# ── Atomic write helper (extracted from draft's _write_locked idea) ──────────
-
-def _atomic_write_json(path: Path, data: Any) -> None:
-    """
-    Write *data* as JSON to *path* atomically via a sibling temp file.
-
-    Replaces the direct ``json.dump(open(path))`` pattern in MetricsCollector
-    with a write-to-tmp + ``replace()`` so a crash mid-write never leaves a
-    partially-written file.  ``replace()`` is atomic on POSIX; on Windows it is
-    best-effort.
-
-    Raises ``OSError`` on failure — callers are responsible for handling.
-    """
-    tmp_fd, tmp_name = tempfile.mkstemp(dir=path.parent, suffix=".tmp")
-    try:
-        with open(tmp_fd, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, indent=2)
-            fh.write("\n")
-        Path(tmp_name).replace(path)
-    except Exception:
-        try:
-            Path(tmp_name).unlink(missing_ok=True)
-        except OSError:
-            pass
-        raise
 
 
 class AutoMetricsStream:

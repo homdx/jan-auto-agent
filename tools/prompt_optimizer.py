@@ -1,7 +1,5 @@
 import json
 import ssl
-import urllib.request
-import urllib.error
 import logging
 
 
