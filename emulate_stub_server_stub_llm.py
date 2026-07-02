@@ -81,7 +81,7 @@ BIBLE_CALLS = 0       # story_bible.extract() call count this run
 def _log(kind, system, user, reply):
     with open(LOG_PATH, "a", encoding="utf-8") as f:
         f.write(f"\n===== {kind} =====\n--- system (first 220) ---\n{system[:220]}\n"
-                 f"--- user (first 700) ---\n{user[:700]}\n--- reply (first 700) ---\n{reply[:700]}\n")
+                 f"--- user (first 4000) ---\n{user[:4000]}\n--- reply (first 700) ---\n{reply[:700]}\n")
 
 
 def _chapter_num_from_text(text):
@@ -176,6 +176,8 @@ def build_reply(system: str, user: str) -> str:
     if "creative writing author generating a chapter" in system:
         target_block = user.split("TARGET FILES TO MODIFY:", 1)[-1].split("\n\n", 1)[0]
         nums = [int(m) for m in re.findall(r"chapter_(\d+)\.txt", target_block)]
+        with open(os.path.join(HERE, "debug_target_parse.log"), "a", encoding="utf-8") as _df:
+            _df.write(f"target_block={target_block!r} nums={nums}\n")
         target_num = max(nums) if nums else max(_chapter_num_from_text(user) or [1])
         target_file = f"chapter_{target_num}.txt"
         CODER_ATTEMPTS[target_file] = CODER_ATTEMPTS.get(target_file, 0) + 1
