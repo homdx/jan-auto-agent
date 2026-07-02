@@ -11,11 +11,9 @@ All tests mock urllib and request_completion so no real network is needed.
 
 import sys
 import json
-import tempfile
 import urllib.error
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -58,7 +56,7 @@ except ModuleNotFoundError:
     _HAS_REAL_LLMSTREAM = False
 
 # Import the module under test (uses the stub or the real one transparently)
-import importlib.util, os
+import importlib.util
 
 _FAQ_AGENT_PATH = PROJECT_ROOT / "faq_agent.py"
 
@@ -350,7 +348,7 @@ class TestIniConfig:
     """Verify that agents.ini keys are wired up correctly in __init__."""
 
     def _cfg(self, section_body: str):
-        import configparser, io
+        import configparser
         cfg = configparser.ConfigParser()
         cfg.read_string(f"[faq_agent]\n{section_body}")
         return cfg
@@ -925,7 +923,7 @@ class TestAutoPull:
 
     def test_pull_404_is_benign_no_warning(self, tmp_path, caplog):
         """A 404 from /api/pull (endpoint has no pull route) must NOT warn."""
-        import urllib.error, logging as _logging
+        import logging as _logging
         agent = self._ollama(tmp_path, "https://api.company.com", auto="true")
         err = urllib.error.HTTPError("https://api.company.com/api/pull", 404, "", {}, None)
         with patch("urllib.request.urlopen", side_effect=err):
@@ -936,7 +934,6 @@ class TestAutoPull:
 
     def test_pull_non_404_still_warns(self, tmp_path):
         """A genuine transient error (e.g. 503) keeps the warning."""
-        import urllib.error
         agent = self._ollama(tmp_path, "http://localhost:11434", auto="true")
         err = urllib.error.HTTPError("http://localhost:11434/api/pull", 503, "", {}, None)
         with patch("urllib.request.urlopen", side_effect=err):

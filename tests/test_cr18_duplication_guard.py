@@ -12,9 +12,7 @@ from __future__ import annotations
 
 import configparser
 import json
-from pathlib import Path
 
-import pytest
 
 from tools.auto.coder import Coder
 from tools.auto.architect import ClusterReviewer

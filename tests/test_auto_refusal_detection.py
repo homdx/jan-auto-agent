@@ -22,7 +22,6 @@ Test groups
 from __future__ import annotations
 
 import sys
-import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from unittest.mock import patch
@@ -37,8 +36,6 @@ from tools.auto.coder import Coder
 from tools.auto.inner_loop import (
     InnerLoop,
     LLMGate2Validator,
-    AttemptRecord,
-    InnerLoopResult,
 )
 
 

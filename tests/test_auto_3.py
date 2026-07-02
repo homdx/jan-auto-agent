@@ -423,7 +423,6 @@ class TestStageAll:
 
 
 if __name__ == "__main__":
-    import traceback
 
     tests_funcs = []  # pytest handles discovery; use `pytest test_auto_3.py -v`
     print("Run with: pytest test_auto_3.py -v")

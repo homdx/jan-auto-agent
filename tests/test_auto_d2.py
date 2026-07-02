@@ -18,7 +18,7 @@ import sys
 from dataclasses import dataclass, field as dc_field
 from pathlib import Path
 from typing import Optional
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -27,8 +27,8 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from tools.auto.bug_fix_loop import BugFixLoop, BugFixResult, make_bug_fix_loop
-from tools.auto.ticket_store import TicketStore, make_ticket, make_ticket_store
-from tools.auto.state import StateStore, make_task as make_state_task
+from tools.auto.ticket_store import TicketStore, make_ticket_store
+from tools.auto.state import StateStore
 
 
 # ── Fake helpers ─────────────────────────────────────────────────────────────

@@ -22,7 +22,6 @@ ACs (from the Jira story):
 
 import json
 import sys
-import time
 from pathlib import Path
 
 import pytest
@@ -36,7 +35,6 @@ from tools.auto.ticket_store import (
     TicketAlreadyExists,
     TicketNotFound,
     TicketSchemaError,
-    TICKET_TYPES,
     TICKET_STATUSES,
     make_ticket,
     make_ticket_store,

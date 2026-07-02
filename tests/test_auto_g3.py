@@ -30,14 +30,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from tools.auto.controller import AutoController, RunLimits
-from tools.auto.git_manager import GitManager, make_git_manager
+from tools.auto.git_manager import make_git_manager
 from tools.auto.outer_loop import OuterLoopResult
 from tools.auto.state import StateStore, STATUS_DONE
 

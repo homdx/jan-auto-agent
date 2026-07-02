@@ -34,14 +34,12 @@ Scope
 from __future__ import annotations
 
 import configparser
-import io
 import json
 import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Optional
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -53,7 +51,7 @@ from tools.auto.controller import AutoController, RunLimits
 from tools.auto.outer_loop import OuterLoopResult
 from tools.auto.pipeline import _run_plan_phase, run_pipeline
 from tools.auto.run_trace import RunTrace, setup_run_trace
-from tools.auto.state import StateStore, STATUS_DONE
+from tools.auto.state import StateStore
 from tools.auto.view_trace import load_events, apply_filters
 
 

@@ -12,7 +12,6 @@ from __future__ import annotations
 import configparser
 import json
 
-import pytest
 
 from tools.auto.architect import ClusterReviewer
 

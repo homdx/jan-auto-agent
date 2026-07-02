@@ -62,7 +62,6 @@ import pytest
 from tools.auto.architect import CandidateTask, CitedLocation
 from tools.auto.backlog_prioritiser import (
     BacklogPrioritiser,
-    PrioritisedBacklog,
     ReadyTask,
     _is_runnable_check,
     _topological_sort,

@@ -6,7 +6,6 @@ Tests cover the _cfg_mode helper and verify that the three consumers
 
 import configparser
 
-import pytest
 
 from tools.auto.utils import _cfg_mode
 

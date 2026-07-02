@@ -14,7 +14,6 @@ from __future__ import annotations
 import configparser
 import json
 
-import pytest
 
 from tools.auto.utils import normalize_task_mode
 from tools.auto.architect import ClusterReviewer

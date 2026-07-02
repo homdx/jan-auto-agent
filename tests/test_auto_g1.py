@@ -26,20 +26,18 @@ git repo is used so the commit path is exercised end-to-end.
 from __future__ import annotations
 
 import configparser
-import json
 import subprocess
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from tools.auto.architect import CandidateTask, CitedLocation
-from tools.auto.backlog_prioritiser import PrioritisedBacklog, build_backlog
+from tools.auto.backlog_prioritiser import build_backlog
 from tools.auto.pipeline import _run_plan_phase, run_pipeline
 from tools.auto.repo_ingest import RepoCluster
 from tools.auto.state import StateStore

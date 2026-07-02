@@ -20,7 +20,6 @@ Also exercises the full StateStore public API:
 
 import json
 import sys
-import tempfile
 from pathlib import Path
 
 import pytest

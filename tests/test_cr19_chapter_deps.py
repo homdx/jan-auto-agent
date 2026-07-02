@@ -13,7 +13,6 @@ Spec (from CREATIVE_AUTO_EPIC_CR19.md):
 
 from __future__ import annotations
 
-import pytest
 
 from tools.auto.architect import CandidateTask, CitedLocation
 from tools.auto.backlog_prioritiser import (

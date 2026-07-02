@@ -372,9 +372,14 @@ class StateStore:
         return d
 
     def write_task_file(self, task_id: str, filename: str, content: str) -> Path:
-        """Write *content* to .agent/tasks/<task_id>/<filename> and return the path."""
+        """Write *content* to .agent/tasks/<task_id>/<filename> and return the path.
+
+        Uses the same atomic write as plan.json/progress.json (see
+        ``_atomic_write``) so a process killed mid-write (e.g. OOM-killer)
+        can't leave a truncated task file behind.
+        """
         path = self.task_dir(task_id) / filename
-        path.write_text(content, encoding="utf-8")
+        self._atomic_write(path, content)
         return path
 
     def read_task_file(self, task_id: str, filename: str) -> str | None:

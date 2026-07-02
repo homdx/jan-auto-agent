@@ -36,9 +36,8 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
-import time
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
@@ -506,7 +505,6 @@ class TestDryRunCLIWiring:
 
     def test_argparser_accepts_dry_run(self):
         """AC-DRYRUN: argparse accepts --dry-run without error."""
-        import importlib
         import sys as _sys
         # Temporarily override sys.argv to simulate CLI invocation
         old_argv = _sys.argv[:]

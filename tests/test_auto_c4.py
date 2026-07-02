@@ -22,9 +22,9 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from tools.auto.outer_loop import OuterLoop, OuterLoopResult, make_outer_loop
+from tools.auto.outer_loop import OuterLoop, make_outer_loop
 from tools.auto.state import (
-    StateStore, make_task, STATUS_DONE, STATUS_BLOCKED, STATUS_IN_PROGRESS,
+    StateStore, make_task, STATUS_DONE, STATUS_BLOCKED,
 )
 
 

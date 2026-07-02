@@ -9,7 +9,7 @@ the shared deadline to the inner loop.
 from __future__ import annotations
 
 import tools.auto.outer_loop as ol_mod
-from tools.auto.outer_loop import OuterLoop, OuterLoopResult
+from tools.auto.outer_loop import OuterLoop
 
 
 class _Res:

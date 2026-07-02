@@ -7,12 +7,9 @@ JSON path (code / docs modes) is byte-for-byte unaffected.
 import configparser
 import json
 import textwrap
-from pathlib import Path
-from unittest.mock import MagicMock, patch
 
-import pytest
 
-from tools.auto.coder import Coder, _SYSTEM_PROMPT_CREATIVE, _strip_outer_fence
+from tools.auto.coder import Coder, _SYSTEM_PROMPT_CREATIVE
 
 
 # ─────────────────────────────────────────────────────────────────────────────

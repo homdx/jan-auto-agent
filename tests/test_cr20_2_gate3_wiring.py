@@ -16,9 +16,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-import pytest
 
-from tools.auto.fact_validator import FactValidator, FactVerdict
+from tools.auto.fact_validator import FactValidator
 from tools.auto.inner_loop import InnerLoop
 
 

@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import configparser
 
-import pytest
 
 from tools.auto.story_bible import make_story_bible, StoryBible
 from tools.auto.commit_on_success import CommitOnSuccess

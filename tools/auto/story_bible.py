@@ -226,7 +226,7 @@ def _dedup_substrings(bullets: list[str]) -> list[str]:
                 keep[i] = False
                 break
 
-    return [b for b, k in zip(bullets, keep) if k]
+    return [b for b, k in zip(bullets, keep, strict=True) if k]
 
 
 # ── StoryBible ────────────────────────────────────────────────────────────────

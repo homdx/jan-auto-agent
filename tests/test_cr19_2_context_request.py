@@ -9,9 +9,7 @@ Reconnect the creative CONTEXT_REQUEST pull channel:
 from __future__ import annotations
 
 import configparser
-from pathlib import Path
 
-import pytest
 
 from tools.auto.coder import Coder
 from tools.auto.context_broker import ContextBroker

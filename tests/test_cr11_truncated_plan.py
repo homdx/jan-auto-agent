@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import configparser
 
-import pytest
 
 from tools.auto.architect import _salvage_json_objects, ClusterReviewer
 

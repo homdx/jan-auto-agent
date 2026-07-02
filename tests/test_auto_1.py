@@ -11,11 +11,9 @@ Covers both ACs from the story:
        controller directly).
 """
 
-import os
 import subprocess
 import sys
 import tempfile
-import textwrap
 from pathlib import Path
 
 # Resolve the project root (one level above tests/)
@@ -99,7 +97,7 @@ def test_once_mode_unaffected():
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_controller_raises_on_empty_goal():
-    import importlib, sys
+    import sys
     # Ensure tools/ is importable from project root
     if str(PROJECT_ROOT) not in sys.path:
         sys.path.insert(0, str(PROJECT_ROOT))

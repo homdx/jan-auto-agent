@@ -10,9 +10,7 @@ From the field synopsis.md:
 from __future__ import annotations
 
 import configparser
-from pathlib import Path
 
-import pytest
 
 from tools.auto.summary_memory import _clean_bullet_list, SummaryFidelityVerifier
 

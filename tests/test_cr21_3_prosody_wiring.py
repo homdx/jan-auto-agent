@@ -29,11 +29,9 @@ import configparser
 import logging
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
 
-import pytest
 
-from tools.auto.inner_loop import InnerLoop, InnerLoopResult
+from tools.auto.inner_loop import InnerLoop
 from tools.auto.prosody import (
     ProsodyValidator,
     ProsodyVerdict,
