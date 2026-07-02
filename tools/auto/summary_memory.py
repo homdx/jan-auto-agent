@@ -65,11 +65,12 @@ import ssl
 from pathlib import Path
 from typing import Callable
 
+from tools.auto.utils import chars_per_token
+
 logger = logging.getLogger(__name__)
 
 # ── constants ─────────────────────────────────────────────────────────────────
 
-_CHARS_PER_TOKEN = 4
 _INSTRUCTION_OVERHEAD_TOKENS = 300
 
 # Reserved headroom inside the summarisation budget for the system prompt and
@@ -388,13 +389,22 @@ class SummaryMemory:
         # Budget for *input* to a single summarisation LLM call.
         # Reserve output budget + overhead; leave _SUMMARISE_OVERHEAD_TOKENS
         # of headroom for the system prompt and wrapper text.
-        _input_tokens = (
-            max(0, (int(num_ctx) if num_ctx else 4096))
+        # Stored as a token count, not a fixed char count: the char budget
+        # depends on the text being chunked (Cyrillic tokenizes ~2x denser
+        # than Latin — see chars_per_token()), so it's computed per-call in
+        # _chunk_budget_chars() rather than fixed at construction time.
+        self._input_tokens = max(
+            0,
+            (int(num_ctx) if num_ctx else 4096)
             - (int(max_tokens) if max_tokens else 800)
             - _INSTRUCTION_OVERHEAD_TOKENS
-            - _SUMMARISE_OVERHEAD_TOKENS
+            - _SUMMARISE_OVERHEAD_TOKENS,
         )
-        self._chunk_budget_chars = max(200, _input_tokens * _CHARS_PER_TOKEN)
+
+    def _chunk_budget_chars(self, sample_text: str = "") -> int:
+        """Char budget for a single summarisation call, sized to *sample_text*'s
+        script (see ``chars_per_token``)."""
+        return max(200, int(self._input_tokens * chars_per_token(sample_text)))
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -478,7 +488,8 @@ class SummaryMemory:
             )
             return text
 
-        fits_in_budget = len(text) <= self._chunk_budget_chars
+        chunk_budget_chars = self._chunk_budget_chars(text)
+        fits_in_budget = len(text) <= chunk_budget_chars
 
         if fits_in_budget:
             # Single pass.
@@ -490,11 +501,11 @@ class SummaryMemory:
             return text
 
         # Chunked pass: split, summarise each chunk, then merge.
-        chunks = _chunk_paragraphs(text, self._chunk_budget_chars)
+        chunks = _chunk_paragraphs(text, chunk_budget_chars)
         logger.info(
             "SummaryMemory: chapter too large (%d chars > %d budget) — "
             "splitting into %d chunks (pass %d/%d).",
-            len(text), self._chunk_budget_chars,
+            len(text), chunk_budget_chars,
             len(chunks), passes_used + 1, self._max_passes,
         )
         chunk_summaries: list[str] = []
@@ -509,7 +520,7 @@ class SummaryMemory:
 
         if not chunk_summaries:
             logger.warning("SummaryMemory: all chunks returned empty — using raw text.")
-            return text[:self._chunk_budget_chars]
+            return text[:chunk_budget_chars]
 
         merged = "\n".join(chunk_summaries)
         # Recurse: try to compress the merged chunk-summaries into one summary.

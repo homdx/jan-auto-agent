@@ -130,7 +130,7 @@ class LLMClientBase:
 def build_chat_request(
     *, base_url: str, api_key: str, model: str, api_format: str,
     temperature: float, max_tokens: int, system: str, user_msg: str,
-    num_ctx: int = 0,
+    num_ctx: int = 0, think: "bool | None" = None,
 ) -> tuple[str, dict, dict]:
     """
     Build the (url, headers, payload) triple for a one-shot system/user chat
@@ -139,6 +139,16 @@ def build_chat_request(
     Shared by Coder, Gate1Filter, Architect, and TaskRewriter — all four send
     the same single-turn system+user request and only differ in which
     model/temperature/system prompt they configure.
+
+    *think*, when not ``None`` and *api_format* is ``"ollama"``, is passed as
+    the top-level ``"think"`` field Ollama uses to toggle a reasoning model's
+    (e.g. qwen3) internal ``<think>...</think>`` chain-of-thought. Callers
+    that don't need the model's reasoning in the reply (short, deterministic
+    classification calls like Gate 1's presence check) should pass
+    ``think=False``: otherwise a small ``max_tokens`` cap can truncate the
+    reply mid-``<think>``, before any usable answer is emitted, and the
+    caller sees an empty/unparseable response. Ignored for non-Ollama
+    formats and omitted entirely when ``None`` (server/model default).
     """
     headers = {
         "Content-Type":  "application/json",
@@ -154,6 +164,8 @@ def build_chat_request(
         if num_ctx:
             opts["num_ctx"] = num_ctx
         payload: dict = {"model": model, "messages": messages, "options": opts}
+        if think is not None:
+            payload["think"] = think
     else:
         url = f"{base_url}/chat/completions"
         payload = {

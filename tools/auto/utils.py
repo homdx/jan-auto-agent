@@ -96,6 +96,53 @@ def _cfg_mode(
 
 # ── AUTO-CR-9: language consistency for creative mode ────────────────────────
 
+# ── Input-side token budgeting: chars-per-token varies by script ────────────
+
+# English/Latin prose in llama3.1/qwen tokenizers runs close to ~4 chars per
+# token; this is the default, conservative-for-English estimate used
+# throughout the project's *input* budget math (context_assembler,
+# summary_memory, canon_validator).
+_CHARS_PER_TOKEN_DEFAULT = 4.0
+
+# Cyrillic tokenizes far more densely in these tokenizers — commonly
+# ~1.5-2.5 chars/token rather than ~4, since many Cyrillic characters cost
+# their own BPE token(s). Using the Latin ratio for Cyrillic text
+# *under*-counts real token usage, so a context assembler sized with the
+# default budget silently overflows num_ctx and Ollama truncates the start
+# of the prompt (system prompt / story bible) — the root cause of a class of
+# continuity errors that Gate-2 then catches only as a downstream symptom.
+_CHARS_PER_TOKEN_CYRILLIC = 2.2
+
+# Fraction of alphabetic characters that must be Cyrillic before we switch
+# to the denser ratio. Mirrors the confidence threshold used by
+# detect_language() below, kept as a separate constant since the two
+# functions answer different questions (script ratio vs. dominant language).
+_CYRILLIC_RATIO_THRESHOLD = 0.30
+
+
+def chars_per_token(text: str) -> float:
+    """Estimate characters-per-token for *text*, for sizing input budgets.
+
+    Returns ``_CHARS_PER_TOKEN_CYRILLIC`` (2.2) when at least 30% of the
+    text's alphabetic characters are Cyrillic, else the Latin/English-safe
+    default of 4.0. Empty or non-alphabetic text falls back to the default.
+
+    This is the input-side counterpart to the project's Cyrillic-aware
+    output truncation (``max_tokens_creative``) — without it, budgets
+    computed as ``tokens * 4`` let ~2x too much Cyrillic text into a prompt,
+    silently overflowing the model's context window.
+    """
+    if not text:
+        return _CHARS_PER_TOKEN_DEFAULT
+    cyrillic = sum(1 for ch in text if 0x0400 <= ord(ch) <= 0x04FF)
+    total_alpha = sum(1 for ch in text if ch.isalpha())
+    if total_alpha == 0:
+        return _CHARS_PER_TOKEN_DEFAULT
+    if (cyrillic / total_alpha) >= _CYRILLIC_RATIO_THRESHOLD:
+        return _CHARS_PER_TOKEN_CYRILLIC
+    return _CHARS_PER_TOKEN_DEFAULT
+
+
 def detect_language(text: str) -> "str | None":
     """Best-effort detection of the dominant script/language of *text*.
 

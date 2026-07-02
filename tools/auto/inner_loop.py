@@ -238,6 +238,7 @@ class LLMGate2Validator:
         self.num_ctx     = int(num_ctx)
         self.max_tokens  = int(max_tokens)
         self.task_mode   = str(task_mode)
+        self._config     = config
         # AUTO-DM-5 / AUTO-CR-19-1: select system prompt — mode-specific
         # override > (code-mode-only) legacy "system" key > built-in.
         # See _resolve_validator_system for the full priority rationale.
@@ -333,6 +334,63 @@ class LLMGate2Validator:
                 pass
         return "\n\n".join(parts)
 
+    def _creative_language_mismatch(self, coder_result, base_dir) -> "str | None":
+        """Deterministic (non-LLM) language pre-gate for creative mode.
+
+        Detects the story's established language from ``synopsis.md`` /
+        ``story_bible.md`` (or ``[coder] creative_language`` in config) and
+        compares it against the dominant script of the chapter the coder
+        just wrote. On a clear mismatch (e.g. story is Russian, the new
+        chapter drifted into English — a known failure mode for small
+        models mid-chapter), returns a REVISE reason string so the caller
+        can reject WITHOUT spending an LLM call on it — cheaper and instant
+        compared to catching the same problem via the Gate-2 LLM review.
+
+        Fail-open: returns ``None`` (no mismatch — proceed to the real
+        Gate-2 LLM check as normal) whenever there's nothing to compare
+        against, or detection itself fails for any reason. This is a fast
+        path, not a substitute for the LLM review, so it never blocks a
+        chapter it isn't confident about.
+        """
+        if self.task_mode != "creative":
+            return None
+        try:
+            from tools.auto.utils import resolve_creative_language, detect_language
+
+            _base = Path(base_dir) if base_dir is not None else self.base_dir
+
+            sample = ""
+            for fname in ("synopsis.md", "story_bible.md"):
+                p = _base / fname
+                if p.exists():
+                    text = p.read_text(encoding="utf-8", errors="replace")
+                    if text.strip():
+                        sample = text
+                        break
+
+            expected = resolve_creative_language(self._config, sample, task_mode="creative")
+            if not expected:
+                return None  # nothing established yet (e.g. chapter 1) — skip
+
+            files = list(getattr(coder_result, "files_written", []) or [])
+            if not files:
+                return None
+            chapter_text = "\n".join(
+                (_base / rel).read_text(encoding="utf-8", errors="replace")
+                for rel in files
+                if (_base / rel).exists()
+            )
+            actual = detect_language(chapter_text)
+            if actual and actual != expected:
+                return (
+                    f"The chapter appears to be written in {actual}, but the "
+                    f"story so far is in {expected}. Rewrite the ENTIRE "
+                    f"chapter in {expected} — do not mix languages."
+                )
+        except Exception as exc:  # noqa: BLE001 — fast path must never raise
+            logger.debug("Gate2 language pre-gate skipped: %s", exc)
+        return None
+
     def approve(
         self,
         task:         dict,
@@ -354,6 +412,20 @@ class LLMGate2Validator:
         detailed verdict instead of repeating itself.
         """
         self.last_missing_context = []
+
+        # AUTO-FIX: cheap deterministic language pre-gate for creative mode —
+        # catches a chapter that drifted into the wrong language WITHOUT
+        # spending an LLM call on it. Only ever short-circuits to REVISE; it
+        # never approves on its own, so a false trigger still gets caught by
+        # the real LLM review below on the next attempt.
+        _lang_reason = self._creative_language_mismatch(coder_result, base_dir)
+        if _lang_reason:
+            logger.info(
+                "LLMGate2Validator [creative]: language pre-gate REVISE "
+                "(no LLM call) — %s", _lang_reason,
+            )
+            return False, f"Reason: {_lang_reason}"
+
         try:
             from tools.llm_stream import request_completion, strip_think
 

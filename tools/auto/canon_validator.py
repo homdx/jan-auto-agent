@@ -51,12 +51,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
+from tools.auto.utils import chars_per_token
+
 logger = logging.getLogger(__name__)
 
 # llm_call(system, user) -> str   (same callable contract as summary_memory)
 LlmCall = Callable[[str, str], str]
-
-_CHARS_PER_TOKEN = 4
 
 # Matches chapter_07 / chapter_7 / Chapter_07.md … — mirrors context_assembler
 # and context_broker so "chapter index" means the same thing everywhere.
@@ -188,9 +188,11 @@ class CanonValidator:
         self.max_canon_revisions = max(0, int(max_canon_revisions))
         self._synopsis_path = synopsis_path
         self._max_claims = max(1, int(max_claims))
-        # Canon context budget in chars: leave room for output + the claim.
-        usable = max(0, int(num_ctx) - int(max_tokens) - _GROUNDING_OVERHEAD_TOKENS)
-        self._canon_budget_chars = max(800, usable * _CHARS_PER_TOKEN)
+        # Canon context budget: leave room for output + the claim. Stored as
+        # a token count — the char budget depends on the synopsis text's
+        # script (Cyrillic tokenizes ~2x denser than Latin — see
+        # chars_per_token()), so it's computed per-call in _load_canon().
+        self._canon_budget_tokens = max(0, int(num_ctx) - int(max_tokens) - _GROUNDING_OVERHEAD_TOKENS)
 
     # ── Cadence ──────────────────────────────────────────────────────────────
 
@@ -267,10 +269,11 @@ class CanonValidator:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             return ""
-        if len(text) <= self._canon_budget_chars:
+        canon_budget_chars = max(800, int(self._canon_budget_tokens * chars_per_token(text)))
+        if len(text) <= canon_budget_chars:
             return text
         # Keep the most recent canon (tail); mark the truncation.
-        tail = text[-self._canon_budget_chars:]
+        tail = text[-canon_budget_chars:]
         return "… [older canon omitted]\n" + tail
 
     def _extract_claims(self, chapter_text: str) -> list[str]:
