@@ -130,7 +130,12 @@ _SYSTEM_PROMPT = (
     "Use at most one of \"context_request\" / \"missing_context\" per response — "
     "\"context_request\" is for a working answer you're confident enough to give now but "
     "could improve with more context next time; \"missing_context\" is for an answer you're "
-    "not confident in at all without that context, needed to fix it within this same turn."
+    "not confident in at all without that context, needed to fix it within this same turn.\n"
+    "9. To DELETE a file (e.g. a refactor that merges a module away), include "
+    '{"path": "relative/path.py", "delete": true} in "files" — with NO '
+    '"content" key. Deletion is only allowed for paths listed in target_files; '
+    "the original is backed up automatically. Never emit shell commands or "
+    "os.remove calls to delete files — use the delete flag."
 )
 
 # Backward-compat alias — "code" is the default persona.
@@ -291,6 +296,10 @@ class Coder(_llm_stream.LLMClientBase):
             self._system  = config.get(sec, "system", fallback=_builtin).strip()
         self._timeout     = float(config.get("loop", "timeout_seconds", fallback="300"))
         self._max_file_chars = int(config.get(sec, "max_file_chars", fallback=str(_DEFAULT_MAX_FILE_CHARS)))
+        # pullrun-sim: optional deterministic gate rejecting non-ASCII
+        # identifiers in generated .py files (code mode only).
+        self._ascii_identifiers_only = config.getboolean(
+            sec, "ascii_identifiers_only", fallback=False)
         active_profile = config.get("api", "active", fallback="local")
         # num_ctx controls the total context window on Ollama; 0 means "use server default".
         # AUTO-CR-3: prefer [coder] num_ctx_{task_mode} then [api_{active}] num_ctx.
@@ -1106,6 +1115,11 @@ class Coder(_llm_stream.LLMClientBase):
                     task_id, i,
                 )
                 continue
+            # pullrun-sim fix: {"path": ..., "delete": true} marks a file for
+            # deletion (refactors that merge a module away). No content needed.
+            if item.get("delete") is True:
+                parsed.append({"path": path, "delete": True})
+                continue
             if content is None:
                 logger.warning(
                     "coder._parse_response [%s]: item %d (%r) missing 'content' — skipped",
@@ -1466,8 +1480,7 @@ class Coder(_llm_stream.LLMClientBase):
         first_error = ""
 
         for item in parsed_files:
-            rel     = item["path"]
-            content = item["content"]
+            rel = item["path"]
 
             # ── Guard 1: path must not escape base_dir ─────────────────────
             dest, path_err = self._safe_dest(base_dir, rel)
@@ -1487,6 +1500,64 @@ class Coder(_llm_stream.LLMClientBase):
                     msg = (
                         f"[SAFETY] LLM tried to write {rel!r} which is not in "
                         f"target_files — skipped to protect unrelated files"
+                    )
+                    logger.warning("coder._write_files [%s]: %s", task_id, msg)
+                    if not first_error:
+                        first_error = msg
+                    continue
+
+            # ── Delete branch (pullrun-sim): {"path": ..., "delete": true} ──
+            # Same path/target guards as writes; original backed up to
+            # .coder.bak so the deletion is reversible without git. Deleting
+            # an already-absent file is a no-op success (idempotent retries).
+            if item.get("delete") is True:
+                try:
+                    if dest.exists():
+                        backup = dest.with_suffix(dest.suffix + ".coder.bak")
+                        backup.write_text(
+                            dest.read_text(encoding="utf-8", errors="replace"),
+                            encoding="utf-8",
+                        )
+                        dest.unlink()
+                        logger.info(
+                            "coder._write_files [%s]: DELETED %s (backup: %s)",
+                            task_id, rel, backup.name,
+                        )
+                    else:
+                        logger.info(
+                            "coder._write_files [%s]: delete of %s — already "
+                            "absent, treated as success", task_id, rel,
+                        )
+                    written.append(rel)
+                except OSError as exc:
+                    msg = f"delete failed for {rel}: {exc}"
+                    logger.error("coder._write_files [%s]: %s", task_id, msg)
+                    if not first_error:
+                        first_error = msg
+                continue
+
+            content = item["content"]
+
+            # ── Guard 2.5 (pullrun-sim): identifier language ────────────────
+            # PEP 3131 makes fully-Russian identifiers VALID Python; with a
+            # compatibility alias (run = запустить) such code even passes the
+            # acceptance check (exit 0) — nothing else in code mode would
+            # ever reject it. Optional deterministic gate: tokenize and
+            # reject non-ASCII identifiers with a precise, named list, so the
+            # retry feedback tells the model exactly what to rename.
+            if (
+                self._ascii_identifiers_only
+                and self._task_mode == "code"
+                and rel.endswith(".py")
+            ):
+                bad_idents = _find_non_ascii_identifiers(content)
+                if bad_idents:
+                    msg = (
+                        f"[STYLE] non-ASCII identifiers in {rel!r}: "
+                        f"{', '.join(sorted(bad_idents)[:8])} — rename all "
+                        f"identifiers to English/ASCII (strings, comments and "
+                        f"docstrings may stay in any language). "
+                        f"Set [coder] ascii_identifiers_only = false to allow."
                     )
                     logger.warning("coder._write_files [%s]: %s", task_id, msg)
                     if not first_error:
@@ -1826,6 +1897,26 @@ def _looks_like_refusal(body: str) -> bool:
         return False
     low = stripped.lower()
     return any(marker in low for marker in _REFUSAL_MARKERS)
+
+
+def _find_non_ascii_identifiers(content: str) -> set:
+    """Return NAME tokens containing non-ASCII characters (PEP 3131 idents).
+
+    Strings, comments and docstrings are naturally excluded because only
+    NAME tokens are inspected. Falls back to an empty set on tokenize
+    errors — the syntax problem will surface via execution anyway.
+    """
+    import io
+    import tokenize
+
+    bad: set = set()
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(content).readline):
+            if tok.type == tokenize.NAME and not tok.string.isascii():
+                bad.add(tok.string)
+    except (tokenize.TokenizeError, IndentationError, SyntaxError, ValueError):
+        return set()
+    return bad
 
 
 def _strip_outer_fence(text: str) -> str:
