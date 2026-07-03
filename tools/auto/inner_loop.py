@@ -373,6 +373,34 @@ class LLMGate2Validator:
                         sample = text
                         break
 
+            # AUTO-FIX (podrugi run): when the run starts from user-provided
+            # chapters (the documented Creative.MD workflow: hand-written
+            # chapter_1.txt + goal "продолжи рассказ"), synopsis.md /
+            # story_bible.md do not exist yet — they are only written AFTER
+            # the first generated chapter is accepted. That left this gate
+            # blind exactly on the first generated chapter: an all-English
+            # chapter_2 sailed through and then poisoned the synopsis.
+            # Fallback: establish the language from the chapters already on
+            # disk (excluding the files the coder just wrote and reserved
+            # meta files).
+            if not sample:
+                _written = set(getattr(coder_result, "files_written", []) or [])
+                _reserved = {"synopsis.md", "story_bible.md", "IMPROVEMENTS.md",
+                             "plan.json", "progress.json"}
+                _parts: list[str] = []
+                for prev in sorted(_base.glob("*.txt")) + sorted(_base.glob("*.md")):
+                    if prev.name in _reserved or prev.name in _written:
+                        continue
+                    try:
+                        t = prev.read_text(encoding="utf-8", errors="replace").strip()
+                    except OSError:
+                        continue
+                    if t:
+                        _parts.append(t[:2000])
+                    if len(_parts) >= 3:
+                        break
+                sample = "\n".join(_parts)
+
             expected = resolve_creative_language(self._config, sample, task_mode="creative")
             if not expected:
                 return None  # nothing established yet (e.g. chapter 1) — skip

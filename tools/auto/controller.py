@@ -446,6 +446,29 @@ class AutoController:
         pending = self.state.resume_info()["pending"]
         tasks_done = 0
 
+        # AUTO-FIX (podrugi sim): a repeat --auto invocation against a
+        # directory whose plan.json is already fully done used to exit with
+        # a bare "run_finished" and no explanation — from the outside it
+        # looked like the run silently did nothing. Say why, and say what to
+        # do about it, before the (correct) early exit below.
+        # NOTE: resume_info()["pending"] is a LIST of tasks, not a count —
+        # the first version of this fix compared it to 0 and never fired.
+        if not pending:
+            _total = len(self.state.all_tasks())
+            if _total > 0:
+                print(f"[controller] plan.json in {self.base_dir} has no "
+                      f"pending tasks — all {_total} task(s) in the existing "
+                      f"plan are already done. Nothing to execute this run. "
+                      f"To plan NEW work toward the goal, remove the .agent "
+                      f"state directory (or start with a fresh --base) and "
+                      f"re-run.")
+                logger.info("execute_phase: resumed plan has 0 pending of %d "
+                            "task(s) — exiting without work; stale plan.json "
+                            "is the likely cause on a repeat --auto "
+                            "invocation.", _total)
+            # _total == 0 (architect produced nothing) is already reported by
+            # the plan-phase logs — no extra message needed here.
+
         # ── Build execution helpers once per loop ──────────────────────────
         if cfg is None:
             cfg = self._cfg()
