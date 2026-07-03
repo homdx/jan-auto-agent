@@ -66,7 +66,12 @@ def _build_payload(payload: dict, api_format: str, stream: bool) -> dict:
         if "temperature" in body:
             options["temperature"] = body.pop("temperature")
         if "num_ctx" in body:
-            options["num_ctx"] = body.pop("num_ctx")
+            # 0 / falsy means "use server default" everywhere in this
+            # project — never forward it, or Ollama would treat it as a
+            # literal zero-token context window.
+            _nc = body.pop("num_ctx")
+            if _nc:
+                options["num_ctx"] = _nc
         if options:
             body["options"] = options
         body["stream"] = stream
@@ -74,6 +79,9 @@ def _build_payload(payload: dict, api_format: str, stream: bool) -> dict:
         # system content is passed as a messages entry with role "system",
         # which is already the format callers use, so nothing extra needed.
     else:
+        # num_ctx is an Ollama-only concept; OpenAI-compatible servers
+        # reject or ignore unknown fields — drop it rather than leak it.
+        body.pop("num_ctx", None)
         if stream:
             body["stream"] = True
     return body

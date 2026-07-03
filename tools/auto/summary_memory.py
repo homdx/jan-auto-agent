@@ -619,6 +619,14 @@ def _make_llm_call(
 
     temperature = config.getfloat("inner_loop", "temperature", fallback=0.2)
     timeout     = config.getint("loop", "timeout_seconds", fallback=300)
+    # AUTO-FIX (fable follow-up 3): thinking models (qwen3) prepend a
+    # <think> block; if it truncates against num_predict the synopsis update
+    # comes back empty, and if it doesn't, the reasoning text is WRITTEN
+    # INTO synopsis.md — a long-lived artifact re-injected into every later
+    # prompt, so one polluted call poisons the whole run. Same toggle as
+    # gate1/architect/coder: default off, [summary_memory] think = true
+    # re-enables it.
+    think = config.getboolean("summary_memory", "think", fallback=False)
 
     ssl_context: ssl.SSLContext | None = _llm_stream.make_unverified_context() if not verify_ssl else None
 
@@ -645,6 +653,8 @@ def _make_llm_call(
                 ],
                 "options": _opts,
             }
+            if not think:
+                payload["think"] = False
         else:
             payload = {
                 "model":       model,
@@ -655,14 +665,18 @@ def _make_llm_call(
                     {"role": "user",   "content": user},
                 ],
             }
-        return _llm_stream.request_completion(
-            url=url,
-            headers=headers,
-            payload=payload,
-            timeout=timeout,
-            api_format=api_format,
-            ssl_context=ssl_context,
-        ) or ""
+        # AUTO-FIX (fable follow-up 3): strip <think> BEFORE the synopsis
+        # parser — reasoning text must never be persisted into synopsis.md.
+        return _llm_stream.strip_think(
+            _llm_stream.request_completion(
+                url=url,
+                headers=headers,
+                payload=payload,
+                timeout=timeout,
+                api_format=api_format,
+                ssl_context=ssl_context,
+            ) or ""
+        )
 
     return _call
 

@@ -120,7 +120,8 @@ class OrchestratorActions:
         payload = {"model": self.model,
                    "messages": [{"role": "system", "content": system},
                                 {"role": "user", "content": user}],
-                   "temperature": self._cfg_temp("search_agent", 0.2)}
+                   "temperature": self._cfg_temp("search_agent", 0.2),
+                   "num_ctx": getattr(self, "num_ctx", 0)}
         print(f"\n[{_ts()}] 🔎 search → model{where}:")
         tracer.event("orchestrator", "search_fullfile", "llm_request",
                      params={"file": file_label, "chunk": chunk_label, "query": query},
@@ -277,7 +278,8 @@ class OrchestratorActions:
         payload = {"model": self.model,
                    "messages": [{"role": "system", "content": system},
                                 {"role": "user", "content": user}],
-                   "temperature": self._cfg_temp("main_agent", 0.3)}
+                   "temperature": self._cfg_temp("main_agent", 0.3),
+                   "num_ctx": getattr(self, "num_ctx", 0)}
         print(f"\n[{_ts()}] 💬 answer → model:")
         tracer.event("orchestrator", "text_answerer", "llm_request",
                      params={"file": file_label, "question": question,
@@ -346,7 +348,8 @@ class OrchestratorActions:
         payload = {"model": self.model,
                    "messages": [{"role": "system", "content": system},
                                 {"role": "user", "content": user}],
-                   "temperature": self._cfg_temp("validator_agent", 0.1)}
+                   "temperature": self._cfg_temp("validator_agent", 0.1),
+                   "num_ctx": getattr(self, "num_ctx", 0)}
         tracer.event("orchestrator", "text_validator", "llm_request",
                      params={"question": question}, content=user,
                      model=self.model, temperature=self._cfg_temp("validator_agent", 0.1))
@@ -383,11 +386,25 @@ class OrchestratorActions:
             print(f"[{_ts()}] \U0001f4c4 No explicit question — treating the file content as the question.")
         knowledge = source
 
-        # If the document is larger than the full-file budget, keep only the most
-        # relevant slice by reusing the /search chunk scan first, then validate.
+        # AUTO-FIX (fable follow-up 3): this used to only PRINT "validating
+        # against chunks" and then pass the full document anyway — a no-op
+        # message. With the head-truncation behavior of an overfull Ollama
+        # context, the system prompt (not the document tail) is what got cut.
+        # Now the document is actually reduced to the budget, keeping the
+        # head and tail halves (question-relevant material in FAQs/docs tends
+        # to live near headings at the top or recent additions at the bottom)
+        # with an explicit elision marker so the model knows text is missing.
         if len(knowledge) > self.search_full_file_max_chars:
-            print(f"[{_ts()}] Document {len(knowledge)} chars > budget "
-                  f"{self.search_full_file_max_chars}; validating against chunks.")
+            _budget = self.search_full_file_max_chars
+            _half = max(1, _budget // 2)
+            _omitted = len(knowledge) - 2 * _half
+            knowledge = (
+                knowledge[:_half]
+                + f"\n\n… [{_omitted} chars omitted to fit the context budget] …\n\n"
+                + knowledge[-_half:]
+            )
+            print(f"[{_ts()}] Document {len(source)} chars > budget "
+                  f"{_budget}; using head+tail slice ({_omitted} chars omitted).")
 
         iteration = 1
         feedback = None
@@ -568,7 +585,8 @@ class OrchestratorActions:
         headers = self._headers()
         payload = {"model": self.model,
                    "messages": messages,
-                   "temperature": self._cfg_temp("file_editor", 0.2)}
+                   "temperature": self._cfg_temp("file_editor", 0.2),
+                   "num_ctx": getattr(self, "num_ctx", 0)}
         if getattr(self, "file_editor_max_tokens", 0):
             payload["max_tokens"] = self.file_editor_max_tokens
         print(f"\n[{_ts()}] ✏️  edit → model:")
@@ -612,12 +630,32 @@ class OrchestratorActions:
         )
         user = (f"ORIGINAL:\n{original}\n\nINSTRUCTION:\n{instruction}\n\n"
                 f"REVISED:\n{revised}")
+        # AUTO-FIX (fable follow-up 3): ORIGINAL + REVISED is two full copies
+        # of the file. If that exceeds the context window, Ollama silently
+        # drops the HEAD of the prompt — the system prompt and the start of
+        # ORIGINAL — and the validator issues a verdict on partial data
+        # without anyone knowing. Don't silently trust it: warn loudly.
+        # (chars/token ≈ 2 for Cyrillic-heavy text, 4 for Latin — use the
+        # project-wide estimator.)
+        _nc = getattr(self, "num_ctx", 0)
+        if _nc:
+            try:
+                from tools.auto.utils import chars_per_token
+                _est_tokens = len(user) / chars_per_token(user)
+                if _est_tokens > _nc * 0.9:
+                    print(f"[{_ts()}] ⚠️  Edit validator prompt ≈{int(_est_tokens)} "
+                          f"tokens vs num_ctx={_nc} — the window will overflow "
+                          f"and the verdict may be based on a truncated file. "
+                          f"Consider a larger num_ctx profile for files this size.")
+            except Exception:
+                pass  # estimation is best-effort; never block validation
         url = self._chat_url()
         headers = self._headers()
         payload = {"model": self.model,
                    "messages": [{"role": "system", "content": system},
                                 {"role": "user", "content": user}],
-                   "temperature": self._cfg_temp("validator_agent", 0.1)}
+                   "temperature": self._cfg_temp("validator_agent", 0.1),
+                   "num_ctx": getattr(self, "num_ctx", 0)}
         tracer.event("orchestrator", "edit_validator", "llm_request",
                      params={"instruction": instruction}, content=user,
                      model=self.model, temperature=self._cfg_temp("validator_agent", 0.1))
@@ -781,6 +819,19 @@ class OrchestratorActions:
             print(f"[{_ts()}] No content produced — file left unchanged.")
             return
 
+        # AUTO-FIX (fable follow-up 3): if the loop exhausted max_iterations
+        # with the validator still saying needs_fix, we are about to write
+        # content the validator NEVER approved. The gates exist to do their
+        # job — so say it loudly instead of writing in silence. (The write
+        # still happens: the timestamped .bak below makes it reversible, and
+        # the last attempt is usually closer to the goal than the original.)
+        if validation.get("status") != "approved":
+            print(f"[{_ts()}] ⚠️  WRITING UNAPPROVED EDIT — validator never "
+                  f"approved after {self.max_iterations} iteration(s). "
+                  f"Last feedback: {validation.get('feedback', '(none)')!r}. "
+                  f"Original is preserved in the .bak file below — review the "
+                  f"diff carefully.")
+
         # Write: back up current content with a timestamped suffix, then overwrite.
         backup = target + ".bak." + time.strftime("%H%M%S")
         _bak_n = 0
@@ -790,8 +841,12 @@ class OrchestratorActions:
         try:
             with open(backup, "w", encoding="utf-8") as b:
                 b.write(original)
-            with open(target, "w", encoding="utf-8") as f:
+            # Atomic write (same pattern as state.py's _atomic_write): a
+            # process killed mid-write must not leave a truncated target.
+            _tmp = target + ".tmp-edit"
+            with open(_tmp, "w", encoding="utf-8") as f:
                 f.write(revised)
+            os.replace(_tmp, target)
         except Exception as e:
             print(f"[{_ts()}] ❌ Failed to write {target}: {e}")
             return

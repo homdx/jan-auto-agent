@@ -646,7 +646,28 @@ def _build_llm_call(
     verify_ssl = config.getboolean("api", "verify_ssl", fallback=True)
     temperature = config.getfloat("inner_loop", "temperature", fallback=0.1)
     timeout = config.getint("loop", "timeout_seconds", fallback=300)
-    max_tokens = config.getint("validator_agent", "max_tokens", fallback=200)
+    # AUTO-FIX (fable follow-up 3): the bible generator used to borrow
+    # [validator_agent] max_tokens (a cap sized for a short JSON verdict /
+    # numbered critique). Raising the validator budget silently inflated the
+    # bible and vice versa, and the 200-token fallback is ~13 lines — far too
+    # small for a whole-story bible in Cyrillic (~2 chars/token). Give the
+    # bible its own key with a creative-sized default; keep the old
+    # validator_agent value as a secondary fallback so existing tuned
+    # configs don't regress.
+    _legacy_mt = config.getint("validator_agent", "max_tokens", fallback=200)
+    max_tokens = config.getint("story_bible", "max_tokens",
+                               fallback=max(1000, _legacy_mt))
+    # Same context-window forwarding as everywhere else: 0 = server default.
+    active_profile = config.get("api", "active", fallback="local")
+    num_ctx = config.getint(f"api_{active_profile}", "num_ctx", fallback=0)
+    # AUTO-FIX (fable follow-up 3): thinking models (qwen3) wrap output in
+    # <think>…</think>; with a bounded num_predict the reply can truncate
+    # mid-think and the bible comes back empty — or worse, reasoning lines
+    # that happen to match the FACT markers get PERSISTED into
+    # story_bible.md and re-injected into every later chapter prompt.
+    # Mirror the gate1/architect/coder toggle: default off, re-enable via
+    # [story_bible] think = true.
+    think = config.getboolean("story_bible", "think", fallback=False)
 
     ssl_context: ssl.SSLContext | None = _llm_stream.make_unverified_context() if not verify_ssl else None
 
@@ -662,14 +683,19 @@ def _build_llm_call(
 
     def _call(system: str, user: str) -> str:
         if api_format == "ollama":
+            _opts: dict = {"temperature": temperature, "num_predict": max_tokens}
+            if num_ctx:
+                _opts["num_ctx"] = num_ctx
             payload: dict = {
                 "model": model,
                 "messages": [
                     {"role": "system", "content": system},
                     {"role": "user", "content": user},
                 ],
-                "options": {"temperature": temperature, "num_predict": max_tokens},
+                "options": _opts,
             }
+            if not think:
+                payload["think"] = False
         else:
             payload = {
                 "model": model,
@@ -680,7 +706,10 @@ def _build_llm_call(
                     {"role": "user", "content": user},
                 ],
             }
-        return (
+        # AUTO-FIX (fable follow-up 3): strip <think> reasoning BEFORE the
+        # fact-marker parser sees the text — otherwise reasoning lines can be
+        # mistaken for facts and persisted into story_bible.md.
+        return _llm_stream.strip_think(
             _llm_stream.request_completion(
                 url=url,
                 headers=headers,
