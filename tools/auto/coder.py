@@ -1040,22 +1040,42 @@ class Coder(_llm_stream.LLMClientBase):
         try:
             data = json.loads(stripped)
         except json.JSONDecodeError as exc:
-            # Distinguish a TRUNCATED response (ran out of output tokens mid-file)
-            # from genuinely malformed JSON, so the retry feedback is actionable.
-            truncated = (
-                "Unterminated string" in str(exc)
-                or "Expecting" in str(exc)
-            ) and not stripped.rstrip().endswith("}")
-            if truncated:
+            # codeapp-sim fix: three DIFFERENT failure modes need three
+            # DIFFERENT prescriptions, or the retry feedback misleads a weak
+            # model:
+            #   (a) the reply contains no JSON at all — typically the model
+            #       asked a clarifying question or chatted instead of
+            #       emitting files. The old heuristic classified this as
+            #       "truncated" (json's 'Expecting value' matched) and told
+            #       the model its FILE WAS TOO LONG — the exact wrong advice
+            #       for a model that produced no file at all.
+            #   (b) JSON started but was cut off by the output token budget.
+            #   (c) JSON present but malformed.
+            if "{" not in stripped:
                 msg = (
-                    "LLM response was cut off before the JSON was complete — the "
-                    "revised file was too long for the output token budget. Emit "
-                    "the COMPLETE file content and keep the response minimal (only "
-                    "the required files), or raise [coder] max_tokens. "
-                    f"(decode error: {exc})"
+                    "LLM response contained NO JSON at all — it looks like "
+                    "prose or a clarifying question. Do NOT ask questions and "
+                    "do NOT explain: reply with ONLY the JSON object "
+                    '{"files": [{"path": ..., "content": ...}]} containing the '
+                    "complete revised file(s). Make reasonable assumptions for "
+                    "anything unspecified. "
+                    f"(reply started with: {stripped[:120]!r})"
                 )
             else:
-                msg = f"JSON decode failed: {exc} — raw[:200]={text[:200]!r}"
+                truncated = (
+                    "Unterminated string" in str(exc)
+                    or "Expecting" in str(exc)
+                ) and not stripped.rstrip().endswith("}")
+                if truncated:
+                    msg = (
+                        "LLM response was cut off before the JSON was complete — the "
+                        "revised file was too long for the output token budget. Emit "
+                        "the COMPLETE file content and keep the response minimal (only "
+                        "the required files), or raise [coder] max_tokens. "
+                        f"(decode error: {exc})"
+                    )
+                else:
+                    msg = f"JSON decode failed: {exc} — raw[:200]={text[:200]!r}"
             logger.warning("coder._parse_response [%s]: %s", task_id, msg)
             return [], msg
 
