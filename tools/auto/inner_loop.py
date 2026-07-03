@@ -846,6 +846,7 @@ class InnerLoop:
         fact_validator=None,
         prosody_validator=None,
         continuity_validator=None,
+        theme_validator=None,
         task_mode: str = "code",
         max_task_seconds: int = 0,
         run_goal: str = "",
@@ -864,6 +865,10 @@ class InnerLoop:
         # AUTO-CR-23-3: optional continuity gate vs bible + previous chapter
         # (creative mode only).
         self.continuity_validator = continuity_validator
+        # podrugi-3: optional theme/content gate vs story-level guidelines
+        # (creative mode only) — the one gate that judges WHAT the chapter
+        # says, not whether it is consistent.
+        self.theme_validator = theme_validator
         self.task_mode    = str(task_mode)
         # AUTO-CR-21-4: hard wall-clock cap per task; 0 disables the guard.
         self.max_task_seconds = max(0, int(max_task_seconds))
@@ -937,6 +942,7 @@ class InnerLoop:
         _fact_revisions:  int = 0     # AUTO-CR-20: Gate-3 fact-driven rejections used so far
         _prosody_revisions: int = 0   # AUTO-CR-21: prosody-gate-driven rejections used so far
         _continuity_revisions: int = 0  # AUTO-CR-23-3: continuity-gate-driven rejections used so far
+        _theme_revisions: int = 0     # podrugi-3: theme-gate-driven rejections used so far
         base_dir_path = Path(base_dir)
         target_files  = task.get("target_files", []) or []
         self._broker.reset_cache()  # clear per-task cache; Pass-2 hits re-accumulate fresh
@@ -1306,6 +1312,63 @@ class InnerLoop:
                         _trace_stage(task_id, attempt, "continuity", "ACCEPTED_AT_CAP",
                                     cap=continuity_cap)
 
+            # ── podrugi-3: theme/content gate vs story-level guidelines ───────
+            # Runs after the continuity gate. Every other gate checks
+            # consistency; this one checks CONTENT against the author's
+            # configured guidelines (e.g. "the story must not glamorize the
+            # addiction it depicts"). A chapter can be consistent, complete,
+            # and in the right language — and still violate the story's
+            # theme contract; nothing else in the chain would ever notice.
+            # Bounded by max_theme_revisions; fail-open on any error.
+            if (
+                self.task_mode == "creative"
+                and self.theme_validator is not None
+                and target_files
+            ):
+                theme_cap = getattr(self.theme_validator, "max_theme_revisions", 2)
+                theme_problem_blocks: list[str] = []
+                for _theme_file in target_files:
+                    try:
+                        _theme_text = (base_dir_path / _theme_file).read_text(
+                            encoding="utf-8", errors="replace"
+                        )
+                        theme_verdict = self.theme_validator.check(_theme_text)
+                    except Exception as exc:  # noqa: BLE001 — fail-open
+                        logger.warning(
+                            "InnerLoop: theme check raised for %s — %s; approving.",
+                            _theme_file, exc,
+                        )
+                        theme_verdict = None
+
+                    if theme_verdict is not None and not theme_verdict.approved:
+                        theme_problem_blocks.append(
+                            f"{_theme_file}:\n{theme_verdict.feedback()}"
+                        )
+
+                if theme_problem_blocks:
+                    tfb = "\n\n".join(theme_problem_blocks)
+                    if _theme_revisions < theme_cap:
+                        _theme_revisions += 1
+                        logger.info(
+                            "InnerLoop: attempt %d theme rejected (%d/%d) — %s",
+                            attempt, _theme_revisions, theme_cap,
+                            tfb.replace("\n", " ")[:120],
+                        )
+                        full_tfb = f"theme rejected\n{tfb}"
+                        feedback.append(f"attempt {attempt}: {full_tfb}")
+                        records.append(AttemptRecord(attempt, True, True, False, full_tfb))
+                        _trace_stage(task_id, attempt, "theme", "REJECTED",
+                                    revisions_used=_theme_revisions, cap=theme_cap)
+                        continue
+                    else:
+                        logger.warning(
+                            "InnerLoop: theme revision cap (%d) reached — "
+                            "accepting chapter with possible unresolved theme issues.",
+                            theme_cap,
+                        )
+                        _trace_stage(task_id, attempt, "theme", "ACCEPTED_AT_CAP",
+                                    cap=theme_cap)
+
             # ── AUTO-CR-21: Gate-3 Russian rhythm/rhyme (prosody) gate ────────
             # Runs after Gate-2 APPROVED, canon, and fact checks in creative
             # mode; no-op unless the task is a verse task (ритм/рифм keyword).
@@ -1533,6 +1596,16 @@ def make_inner_loop(
             logger.warning("make_inner_loop: continuity validator unavailable — %s", exc)
             continuity_validator = None
 
+    # ── podrugi-3: optional theme/content gate (creative mode only) ────────────
+    theme_validator = None
+    if task_mode == "creative":
+        try:
+            from tools.auto.theme_validator import make_theme_validator
+            theme_validator = make_theme_validator(config)
+        except Exception as exc:  # noqa: BLE001 — never block the loop on setup
+            logger.warning("make_inner_loop: theme validator unavailable — %s", exc)
+            theme_validator = None
+
     # ── AUTO-CR-21-4: hard per-task wall-clock guard ───────────────────────────
     max_task_seconds = config.getint("auto", "max_task_seconds", fallback=1800)
 
@@ -1540,6 +1613,7 @@ def make_inner_loop(
                      context_broker=broker, canon_validator=canon_validator,
                      fact_validator=fact_validator, prosody_validator=prosody_validator,
                      continuity_validator=continuity_validator,
+                     theme_validator=theme_validator,
                      task_mode=task_mode, max_task_seconds=max_task_seconds,
                      run_goal=run_goal)
 

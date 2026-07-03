@@ -258,6 +258,7 @@ class StoryBible:
         verify: bool = False,
         max_fidelity_rounds: int = 1,
         immutable_guard: bool = True,
+        semantic_guard: bool = True,
     ) -> None:
         self._llm = llm_call
         self._base_dir = Path(base_dir)
@@ -265,6 +266,13 @@ class StoryBible:
         self._max_chars = max(100, int(max_chars))
         self._verify = bool(verify)
         self._immutable_guard = bool(immutable_guard)
+        # Litera-sim fix: LLM-backed semantic conflict gate on merge. The
+        # deterministic _find_conflict covers only gender/age/recovery; any
+        # other hallucinated fact that contradicts an established one (e.g.
+        # «долг полностью погашен» vs «долг за три месяца аренды») used to be
+        # APPENDED alongside it, leaving the bible self-contradictory forever
+        # and burning continuity-revision caps on perfectly correct chapters.
+        self._semantic_guard = bool(semantic_guard)
         self._fidelity: "SummaryFidelityVerifier | None" = None
         if self._verify:
             from tools.auto.summary_memory import SummaryFidelityVerifier
@@ -369,6 +377,19 @@ class StoryBible:
         existing_bullets = _parse_bullets(existing_text)
         existing_norms = {_normalise(b) for b in existing_bullets}
 
+        # Litera-sim fix: ONE batched semantic conflict check for all genuinely
+        # new facts against the established bible, feeding the same
+        # correction-attempt machinery as the deterministic guard — so a
+        # hallucinated contradiction is dropped on arrival, while a REAL
+        # correction (proposed consistently by _CORRECTION_THRESHOLD
+        # independent chapters) still eventually replaces a bad established
+        # bullet.
+        _candidates = [f for f in new_facts if _normalise(f) not in existing_norms]
+        _semantic_map = (
+            self._semantic_conflicts(_candidates, existing_bullets)
+            if self._immutable_guard else {}
+        )
+
         merged: list[str] = list(existing_bullets)
         added = 0
         for fact in new_facts:
@@ -376,6 +397,14 @@ class StoryBible:
                 continue
             if self._immutable_guard:
                 conflict_bullet = self._find_conflict(fact, merged)
+                if conflict_bullet is None:
+                    _sem = _semantic_map.get(fact)
+                    # The semantic map was computed against the pre-merge
+                    # bible; only honour it if the flagged bullet is still
+                    # present (it may have been replaced by a correction
+                    # earlier in this same loop).
+                    if _sem is not None and _sem in merged:
+                        conflict_bullet = _sem
                 if conflict_bullet is not None:
                     if self._register_correction_attempt(fact, conflict_bullet):
                         # AUTO-BUG-2 fix: the SAME correction has now been
@@ -460,6 +489,59 @@ class StoryBible:
     def _conflicts_with_established(self, new_fact: str, established: list[str]) -> bool:
         """Backward-compatible bool wrapper around :meth:`_find_conflict`."""
         return self._find_conflict(new_fact, established) is not None
+
+    # ── Litera-sim fix: semantic (LLM) conflict gate ──────────────────────────
+    _SEMANTIC_CONFLICT_SYSTEM = (
+        "You are a strict continuity judge for a story bible. You get "
+        "ESTABLISHED facts and NEW candidate facts, each numbered. A NEW fact "
+        "CONFLICTS with an ESTABLISHED fact only if both cannot be true at "
+        "the same time in the story (direct contradiction), e.g. one says a "
+        "debt is unpaid and the other says the same debt is fully repaid. "
+        "Rephrasings, additional details, or unrelated facts are NOT "
+        "conflicts. Reply with one line per conflict in the exact form "
+        "'CONFLICT <new_number> <established_number>' and nothing else. If "
+        "there are no conflicts reply exactly 'NONE'."
+    )
+
+    def _semantic_conflicts(
+        self, new_facts: list[str], established: list[str]
+    ) -> dict[str, str]:
+        """Return ``{new_fact: conflicting_established_bullet}`` via ONE
+        batched LLM call. Fail-open: any error or unparsable reply -> ``{}``
+        (merge proceeds exactly as before this gate existed).
+
+        This is the semantic complement to the deterministic
+        :meth:`_find_conflict` (gender/age/recovery). One extra LLM call per
+        chapter is the accepted price for a bible that cannot silently hold
+        two mutually exclusive facts.
+        """
+        if not self._semantic_guard or not new_facts or not established:
+            return {}
+        try:
+            est_block = "\n".join(f"E{i + 1}. {b}" for i, b in enumerate(established))
+            new_block = "\n".join(f"N{i + 1}. {b}" for i, b in enumerate(new_facts))
+            user = (f"ESTABLISHED FACTS:\n{est_block}\n\n"
+                    f"NEW CANDIDATE FACTS:\n{new_block}\n\n"
+                    f"List conflicts, or NONE.")
+            reply = (self._llm(self._SEMANTIC_CONFLICT_SYSTEM, user) or "").strip()
+            conflicts: dict[str, str] = {}
+            for m in re.finditer(r"CONFLICT\s+N?(\d+)\s+E?(\d+)", reply, re.IGNORECASE):
+                ni, ei = int(m.group(1)) - 1, int(m.group(2)) - 1
+                if 0 <= ni < len(new_facts) and 0 <= ei < len(established):
+                    conflicts[new_facts[ni]] = established[ei]
+            if conflicts:
+                logger.warning(
+                    "StoryBible: semantic conflict gate flagged %d new fact(s) "
+                    "as contradicting established facts.", len(conflicts),
+                )
+            return conflicts
+        except Exception as exc:  # noqa: BLE001 — fail-open contract
+            logger.warning(
+                "StoryBible: semantic conflict gate error (%s) — proceeding "
+                "without it (fail-open).", exc,
+            )
+            return {}
+
 
     # AUTO-BUG-2: number of independent chapters that must propose the exact
     # same correction before it overrides a previously "locked" immutable
@@ -612,6 +694,12 @@ def make_story_bible(
     immutable_guard = config.getboolean(
         "validator_agent", "story_bible_immutable_guard", fallback=True
     )
+    # Litera-sim fix: LLM semantic conflict gate on merge (see StoryBible).
+    # Default ON — one extra LLM call per chapter is the accepted price for
+    # a bible that cannot hold two mutually exclusive facts.
+    semantic_guard = config.getboolean(
+        "validator_agent", "story_bible_semantic_guard", fallback=True
+    )
 
     llm_call = _build_llm_call(
         base_url=base_url,
@@ -628,6 +716,7 @@ def make_story_bible(
         verify=verify,
         max_fidelity_rounds=max_fidelity_rounds,
         immutable_guard=immutable_guard,
+        semantic_guard=semantic_guard,
     )
 
 
