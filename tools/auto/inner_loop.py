@@ -94,6 +94,9 @@ _GATE2_SYSTEM_CODE = (
     '"missing_context": ["<symbol you needed to see but were not shown>", ...]}\n'
     "Use missing_context ONLY when you cannot verify correctness because a "
     "referenced symbol's definition was not provided; otherwise omit it.\n"
+    "A change may deliberately DELETE a file (it appears as '(file DELETED by "
+    "this change …)'); a deleted file is a valid part of a refactor, not an "
+    "error — judge whether the deletion matches the task.\n"
     "HINTS RULES:\n"
     "  - Each hint MUST point to a specific name, line, or pattern in the code.\n"
     "  - Good: 'import re is used on line 12 but not present in imports'.\n"
@@ -286,7 +289,19 @@ class LLMGate2Validator:
                 content = (_base / rel).read_text(
                     encoding="utf-8", errors="replace")
             except OSError as exc:
-                blocks.append(f"--- {rel} ---\n(could not read {rel}: {exc})")
+                # Final-polish: a file absent WITH a .coder.bak sibling is a
+                # deliberate deletion (coder's delete:true), not a read
+                # failure — say so, or the validator may treat the feature
+                # as an error.
+                if not (_base / rel).exists() and (
+                    _base / (rel + ".coder.bak")
+                ).exists():
+                    blocks.append(
+                        f"--- {rel} ---\n(file DELETED by this change — "
+                        f"original backed up at {rel}.coder.bak)"
+                    )
+                else:
+                    blocks.append(f"--- {rel} ---\n(could not read {rel}: {exc})")
                 continue
 
             if len(content) <= budget:
