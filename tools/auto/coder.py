@@ -1914,7 +1914,7 @@ def _find_non_ascii_identifiers(content: str) -> set:
         for tok in tokenize.generate_tokens(io.StringIO(content).readline):
             if tok.type == tokenize.NAME and not tok.string.isascii():
                 bad.add(tok.string)
-    except (tokenize.TokenizeError, IndentationError, SyntaxError, ValueError):
+    except (tokenize.TokenError, IndentationError, SyntaxError, ValueError):
         return set()
     return bad
 

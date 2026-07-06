@@ -371,3 +371,30 @@ def test_ascii_guard_off_by_default(tmp_path):
         [{"path": "main.py", "content": code}], tmp_path, "T",
         allowed_paths=frozenset({"main.py"}))
     assert err == "" and written == ["main.py"]
+
+
+def test_ascii_guard_survives_malformed_python(tmp_path):
+    """Regression: a truncated/malformed .py body (e.g. cut off mid-file by
+    the output token budget — the single most likely real-world trigger for
+    this gate) must not crash the write; it must fall through gracefully,
+    the same way _parse_response's own truncation handling does.
+
+    Previously this raised AttributeError: the except clause caught
+    ``tokenize.TokenizeError``, which does not exist on the ``tokenize``
+    module (the real name is ``tokenize.TokenError``), so the exception
+    handler itself crashed instead of catching anything.
+    """
+    c = _make_coder(tmp_path, ascii_only=True)
+    truncated = (
+        "def process_записи(источник):\n"
+        "    result = []\n"
+        "    for item in источник:\n"
+        "        result.append(item.strip(\n"  # unterminated call — TokenError
+    )
+    written, err = c._write_files(
+        [{"path": "main.py", "content": truncated}], tmp_path, "T",
+        allowed_paths=frozenset({"main.py"}))
+    # Must not raise. The ascii gate can't tokenize broken code, so it can't
+    # find identifiers to flag — the file proceeds to the remaining guards
+    # (which is where a genuinely broken file gets caught, on its own terms).
+    assert isinstance(err, str)

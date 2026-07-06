@@ -384,10 +384,18 @@ class StoryBible:
         # correction (proposed consistently by _CORRECTION_THRESHOLD
         # independent chapters) still eventually replaces a bad established
         # bullet.
+        # AUTO-FIX: gated on self._semantic_guard, NOT self._immutable_guard.
+        # These are two independent config flags (story_bible_immutable_guard
+        # / story_bible_semantic_guard) — the previous version gated this
+        # call on immutable_guard alone, so setting immutable_guard=false
+        # silently disabled the semantic gate too, regardless of its own
+        # flag. _semantic_conflicts() already no-ops when self._semantic_guard
+        # is false, so gating the call here on the same flag just skips the
+        # (redundant) LLM call in that case rather than changing behavior.
         _candidates = [f for f in new_facts if _normalise(f) not in existing_norms]
         _semantic_map = (
             self._semantic_conflicts(_candidates, existing_bullets)
-            if self._immutable_guard else {}
+            if self._semantic_guard else {}
         )
 
         merged: list[str] = list(existing_bullets)
@@ -395,9 +403,17 @@ class StoryBible:
         for fact in new_facts:
             if _normalise(fact) in existing_norms:
                 continue
-            if self._immutable_guard:
-                conflict_bullet = self._find_conflict(fact, merged)
-                if conflict_bullet is None:
+            # AUTO-FIX: each guard now checks independently — a fact can be
+            # dropped/corrected by the deterministic check, the semantic
+            # check, or both, and either guard alone is enough to enter this
+            # branch (previously the whole branch — including the semantic
+            # lookup — was nested under immutable_guard, so semantic_guard
+            # had no effect when immutable_guard was off).
+            if self._immutable_guard or self._semantic_guard:
+                conflict_bullet = None
+                if self._immutable_guard:
+                    conflict_bullet = self._find_conflict(fact, merged)
+                if conflict_bullet is None and self._semantic_guard:
                     _sem = _semantic_map.get(fact)
                     # The semantic map was computed against the pre-merge
                     # bible; only honour it if the flagged bullet is still
