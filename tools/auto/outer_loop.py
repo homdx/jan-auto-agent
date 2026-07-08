@@ -49,6 +49,7 @@ from pathlib import Path
 from tools.agent_trace import tracer
 from tools.auto.state import StateStore, STATUS_IN_PROGRESS, STATUS_DONE, STATUS_BLOCKED
 from tools.auto.inner_loop import make_inner_loop
+from tools.auto.utils import highest_completed_round
 
 logger = logging.getLogger(__name__)
 
@@ -141,8 +142,18 @@ class OuterLoop:
         except (ValueError, TypeError):
             _inner_accepts_deadline = False
 
-        # LOOP-4: save original instruction before any rewrite may change task
-        original_instruction: str = task.get("instruction", "")
+        # LOOP-4: the TRUE v1 baseline instruction — used so _build_impl_history
+        # can correctly label version 1 even after a later rewrite overwrites
+        # task["instruction"]. Bugfix: this used to just read task["instruction"]
+        # unconditionally, which was safe only within a single continuous run
+        # (before any rewrite happened yet). Now that a rewrite's text is
+        # persisted back into task["instruction"] (see StateStore.apply_rewrite,
+        # LOOP-3 below), a *resumed* session loads a task whose "instruction"
+        # already holds the latest rewrite, not v1's — so prefer the explicitly
+        # preserved "original_instruction" when one exists, falling back to
+        # "instruction" for a task that has never been rewritten (where
+        # "instruction" still IS v1).
+        original_instruction: str = task.get("original_instruction") or task.get("instruction", "")
 
         # ── Resume: existing feedback files mean prior rounds already ran ──
         done_rounds = self._existing_rounds(task_id)
@@ -150,10 +161,17 @@ class OuterLoop:
         feedback_files = [str(p) for p in self._feedback_paths(task_id)]
         inner_results: list = []
 
-        # LOOP-2: rewrite tracking (per run_task call, not per instance)
-        rewrites_done = 0
+        # LOOP-2: rewrite tracking. Bugfix: this used to always start at 0, so
+        # max_rewrites was only ever enforced within a single process's
+        # lifetime — restarting the process (a crash, or just stopping and
+        # re-running the CLI) reset the count and allowed unlimited further
+        # rewrites across enough restarts. impl_version is persisted and
+        # already tracks exactly this (starts at 1, +1 per rewrite — see
+        # apply_rewrite), so seed the local counter from it to make the cap a
+        # true per-task, cross-resume limit.
         # LOOP-3: impl_version tracking — starts at 1, bumped on each rewrite
         impl_version = task.get("impl_version", 1)
+        rewrites_done = max(0, int(impl_version or 1) - 1)
         impl_versions_used: list[int] = []
 
         if start_round > self.max_rounds:
@@ -251,9 +269,22 @@ class OuterLoop:
                 new_task = self.task_rewriter.rewrite(task, failure_history)
                 if new_task is not task:
                     # A genuine rewrite was produced — record it on disk and
-                    # bump the impl_version counter in state (LOOP-3).
+                    # persist it in state (LOOP-3). Bugfix: this used to call
+                    # bare increment_impl_version(), which only persisted the
+                    # version *number* — the rewritten instruction itself lived
+                    # only in the local `task` variable below and was lost the
+                    # moment the process restarted. apply_rewrite() persists
+                    # the rewritten instruction/acceptance_check/title in the
+                    # SAME call that bumps impl_version, so a resumed session
+                    # picks up the latest rewrite instead of silently reverting
+                    # to the original (already-failing) instruction.
                     try:
-                        impl_version = self.state.increment_impl_version(task_id)
+                        impl_version = self.state.apply_rewrite(
+                            task_id,
+                            instruction=new_task.get("instruction", ""),
+                            acceptance_check=new_task.get("acceptance_check", ""),
+                            title=new_task.get("title"),
+                        )
                     except Exception:
                         impl_version = impl_num   # fallback: derive from rewrites_done
 
@@ -310,8 +341,11 @@ class OuterLoop:
         return int(m.group(1)) if m else 0
 
     def _existing_rounds(self, task_id: str) -> int:
-        paths = self._feedback_paths(task_id)
-        return self._round_of(paths[-1].name) if paths else 0
+        # Delegates to the shared helper (tools.auto.utils) also used by
+        # AutoController's BLOCKED-reset check, so the two can never disagree
+        # about how many rounds a task has actually used (see the
+        # round-exhaustion bugfix in controller.py's run()).
+        return highest_completed_round(self.state.task_dir(task_id))
 
     def _read_round_feedback(self, task_id: str) -> list[str]:
         """Return the compact summary text of each prior round, in order."""

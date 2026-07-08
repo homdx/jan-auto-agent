@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import configparser
+import hashlib
 import os
+import re
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -12,6 +14,72 @@ from typing import Any
 def _ts() -> str:
     """Return the current local time as an ISO-8601 string (YYYY-MM-DDTHH:MM:SS)."""
     return datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def safe_filename_component(value: str) -> str:
+    """Return a filesystem-safe version of *value* for use as a file/dir name.
+
+    Strips path separators, leading dots, and anything else that could let a
+    crafted id (e.g. ``"../../evil"``) escape the intended directory when
+    interpolated into a path. Keeps only alphanumerics, hyphens, and
+    underscores. Shared by StateStore (task directories) and TicketStore
+    (ticket files) so both apply the identical rule to ids that flow between
+    them (a ticket id is typically derived from a task id).
+    """
+    safe = re.sub(r"[^A-Za-z0-9_\-]", "_", value)
+    safe = safe.strip("_") or "task"
+    return safe
+
+
+# ── Shared round-file accounting ─────────────────────────────────────────────
+# OuterLoop writes one ``feedback_round_<N>.md`` file per failed attempt and
+# uses the highest N found on disk to decide where a resumed task should pick
+# up. AutoController needs to ask the *same* question — "has this task
+# actually used up all its rounds, or would resetting it to TODO give it a
+# genuine new attempt?" — before resetting a BLOCKED task back to TODO.
+# Sharing one implementation means the two can never disagree about what
+# "already exhausted" means (see the BLOCKED-reset bugfix in controller.py).
+_FEEDBACK_ROUND_RE = re.compile(r"feedback_round_(\d+)\.md$")
+
+
+def highest_completed_round(task_dir: "str | Path") -> int:
+    """Return the highest ``feedback_round_<N>.md`` round number under *task_dir*.
+
+    Returns 0 if the directory doesn't exist or contains no feedback files
+    (i.e. the task has never failed a round yet).
+    """
+    best = 0
+    for p in Path(task_dir).glob("feedback_round_*.md"):
+        m = _FEEDBACK_ROUND_RE.search(p.name)
+        if m:
+            best = max(best, int(m.group(1)))
+    return best
+
+
+def file_set_fingerprint(base_dir: "str | Path", files: "list[str]") -> str:
+    """Short, content-aware hash of a set of files (relative path + size + mtime).
+
+    Any change to the file SET (added/removed/renamed) or to a file's
+    CONTENT (which changes its size and/or mtime) yields a different
+    fingerprint. Used anywhere a cache needs to answer "have these files
+    actually changed?" — a plain list-of-paths hash answers a different,
+    weaker question (did the *set* of paths change) and silently goes stale
+    the moment a file already in the set is edited in place.
+
+    Missing/unreadable files hash as a sentinel rather than raising, so a
+    file that was deleted (or briefly inaccessible) still changes the
+    fingerprint instead of crashing the caller.
+    """
+    base = Path(base_dir)
+    h = hashlib.sha1()
+    for rel in sorted(files):
+        h.update(rel.encode("utf-8", "replace"))
+        try:
+            st = (base / rel).stat()
+            h.update(f"|{st.st_size}|{st.st_mtime_ns}|".encode("utf-8"))
+        except OSError:
+            h.update(b"|?|")
+    return h.hexdigest()[:12]
 
 
 def atomic_write_text(path: "str | Path", content: str) -> None:

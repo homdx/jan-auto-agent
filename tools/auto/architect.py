@@ -45,6 +45,7 @@ from typing import Any
 
 from tools.agent_trace import tracer
 from tools.auto.repo_ingest import RepoCluster
+from tools.auto.utils import atomic_write_text, file_set_fingerprint
 import tools.llm_stream as _llm_stream
 from tools.llm_stream import strip_think
 
@@ -555,9 +556,21 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 if checkpoint_path is not None and batch_results:
                     checkpoint[batch_key] = _serialise_candidates(batch_results)
                     try:
-                        checkpoint_path.write_text(
+                        # Bugfix: this used to be a plain checkpoint_path.write_text(),
+                        # which truncates-then-writes — a process killed mid-write
+                        # (the exact "LLM crash or HTTP 500 storm" scenario this
+                        # checkpoint exists to survive) could leave invalid JSON
+                        # behind. The loader below then silently resets to an
+                        # empty checkpoint on ANY parse failure, discarding every
+                        # previously-cached batch result and forcing a full,
+                        # expensive re-review. atomic_write_text (temp file +
+                        # os.replace) guarantees the file on disk is always either
+                        # the old complete content or the new complete content —
+                        # see state.py's StateStore._atomic_write, which fixed the
+                        # identical bug for plan.json/progress.json.
+                        atomic_write_text(
+                            checkpoint_path,
                             json.dumps(checkpoint, indent=2, ensure_ascii=False),
-                            encoding="utf-8",
                         )
                         logger.debug(
                             "review_clusters: checkpoint saved — %d batch key(s) total",
@@ -1108,16 +1121,14 @@ def _batch_fingerprint(base_dir: "Path", files: list[str]) -> str:
     """Short hash of a batch's files (relative path + size + mtime) used to make
     the architect checkpoint content-aware. Any change to the reviewed file set
     or contents yields a new key, so a stale cached result is never replayed.
-    Missing/unreadable files hash as a sentinel rather than raising."""
-    h = hashlib.sha1()
-    for rel in sorted(files):
-        h.update(rel.encode("utf-8", "replace"))
-        try:
-            st = (Path(base_dir) / rel).stat()
-            h.update(f"|{st.st_size}|{st.st_mtime_ns}|".encode("utf-8"))
-        except OSError:
-            h.update(b"|?|")
-    return h.hexdigest()[:12]
+    Missing/unreadable files hash as a sentinel rather than raising.
+
+    Delegates to tools.auto.utils.file_set_fingerprint — the same content-aware
+    fingerprint plan_emitter.py's changed_clusters() now uses, so the two
+    "has this content actually changed?" checks in the PLAN phase can't drift
+    out of sync with each other again.
+    """
+    return file_set_fingerprint(base_dir, files)
 
 
 def _serialise_candidates(candidates: list[CandidateTask]) -> list[dict]:

@@ -53,6 +53,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 from tools.auto.backlog_prioritiser import PrioritisedBacklog, to_improvements_md
+from tools.auto.utils import file_set_fingerprint
 
 if TYPE_CHECKING:  # avoid circular imports at runtime
     from tools.auto.git_manager import GitManager
@@ -188,7 +189,7 @@ class PlanEmitter:
         stored = self._load_cluster_hashes()
         stale: list = []
         for cluster in clusters:
-            current_hash = _cluster_hash(cluster)
+            current_hash = _cluster_hash(cluster, self._base_dir)
             if stored.get(cluster.name) != current_hash:
                 stale.append(cluster)
                 logger.debug(
@@ -205,7 +206,7 @@ class PlanEmitter:
 
     def _save_cluster_hashes(self, clusters: "list[RepoCluster]") -> None:
         """Persist current cluster fingerprints to .agent/cluster_hashes.json."""
-        hashes = {c.name: _cluster_hash(c) for c in clusters}
+        hashes = {c.name: _cluster_hash(c, self._base_dir) for c in clusters}
         self._hashes_path.write_text(
             json.dumps(hashes, indent=2, ensure_ascii=False),
             encoding="utf-8",
@@ -225,12 +226,28 @@ class PlanEmitter:
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _cluster_hash(cluster: "RepoCluster") -> str:
-    """Return a stable SHA-256 hex digest of a cluster's sorted file list.
+def _cluster_hash(cluster: "RepoCluster", base_dir: "str | Path | None" = None) -> str:
+    """Return a stable SHA-256 hex digest identifying a cluster's file list.
 
     The hash is over the newline-joined sorted relative paths, encoded as
     UTF-8.  The cluster *name* is also included so that renaming a cluster
     (without changing its files) registers as a change.
+
+    Bugfix: when *base_dir* is given, each file's size and mtime are folded
+    in too (via tools.auto.utils.file_set_fingerprint — the same fingerprint
+    architect.py's checkpoint uses for the identical "did the content
+    actually change?" question). Previously this hash was blind to file
+    CONTENT — only to which paths were in the cluster — so editing a file in
+    place (by hand, or by an earlier auto task's own coder) never changed
+    the hash. changed_clusters() would then report that cluster "unchanged"
+    forever, silently skipping it from all future re-review.
+
+    *base_dir* is optional and defaults to the old, path-only behaviour so
+    this function's return format is unaffected for any direct caller that
+    doesn't have a base_dir handy; PlanEmitter itself always passes its own
+    ``self._base_dir``.
     """
     content = cluster.name + "\n" + "\n".join(sorted(cluster.files))
+    if base_dir is not None:
+        content += "\n" + file_set_fingerprint(base_dir, cluster.files)
     return hashlib.sha256(content.encode("utf-8")).hexdigest()

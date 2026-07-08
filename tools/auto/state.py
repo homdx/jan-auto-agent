@@ -38,7 +38,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from tools.auto.utils import _ts
+from tools.auto.utils import _ts, safe_filename_component
 from pathlib import Path
 from typing import Any
 
@@ -308,6 +308,54 @@ class StateStore:
                 return new_ver
         raise ValueError(f"Task '{task_id}' not found in plan")
 
+    def apply_rewrite(
+        self,
+        task_id: str,
+        *,
+        instruction: str,
+        acceptance_check: str | None = None,
+        title: str | None = None,
+    ) -> int:
+        """Persist a TaskRewriter rewrite and bump impl_version, atomically.
+
+        Bugfix (rewrite lost on resume): a rewrite used to live only in the
+        caller's local ``task`` variable for the rest of that process's
+        lifetime — only the ``impl_version`` *number* was persisted, via the
+        old bare ``increment_impl_version`` call. If the process was
+        killed/restarted right after a rewrite (exactly the scenario the
+        ``.agent/`` state store exists to survive), the next session reloaded
+        the ORIGINAL, already-failing instruction from plan.json while
+        impl_version still correctly claimed a rewrite had happened — so the
+        coder was handed the very instruction it was told (via
+        "prior_implementations") not to repeat.
+
+        This method makes the rewritten ``instruction`` / ``acceptance_check``
+        / ``title`` durable in the SAME call that bumps ``impl_version``, so
+        a resumed session picks up the latest rewrite instead of silently
+        discarding it. The task's TRUE original (v1) instruction is preserved
+        once, in ``original_instruction``, the first time this is called for
+        a task — OuterLoop needs that unchanged v1 baseline to correctly
+        label version 1 in its "previously tried" history even after later
+        rewrites overwrite ``instruction``.
+
+        Returns the new impl_version.
+        """
+        tasks = self._plan.get("tasks", [])
+        for t in tasks:
+            if t["id"] == task_id:
+                if "original_instruction" not in t:
+                    t["original_instruction"] = t.get("instruction", "")
+                t["instruction"] = instruction
+                if acceptance_check:
+                    t["acceptance_check"] = acceptance_check
+                if title:
+                    t["title"] = title
+                new_ver = t.get("impl_version", 1) + 1
+                t["impl_version"] = new_ver
+                self._save_plan()
+                return new_ver
+        raise ValueError(f"Task '{task_id}' not found in plan")
+
     def update_progress(
         self,
         status: str,
@@ -359,11 +407,12 @@ class StateStore:
         Strips path separators and leading dots so a task id like
         ``"../../evil"`` cannot escape the tasks directory.  The canonical
         form keeps only alphanumeric characters, hyphens, and underscores.
+
+        Delegates to tools.auto.utils.safe_filename_component, also used by
+        TicketStore, so both apply the identical rule to ids that flow
+        between them (a ticket id is typically derived from a task id).
         """
-        import re as _re
-        safe = _re.sub(r"[^A-Za-z0-9_\-]", "_", task_id)
-        safe = safe.strip("_") or "task"
-        return safe
+        return safe_filename_component(task_id)
 
     def task_dir(self, task_id: str) -> Path:
         """Return (and create) the per-task artefact directory."""
