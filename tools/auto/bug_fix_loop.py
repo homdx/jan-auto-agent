@@ -165,6 +165,27 @@ class BugFixLoop:
             )
             return BugFixResult(ticket_id, fix_id, fixed=True, skipped=True)
 
+        # Bugfix: a "deferred" ticket (a prior fix attempt already exhausted
+        # its full OuterLoop rounds/rewrites budget) had no short-circuit —
+        # only "fixed" did. controller._check_regressions re-runs EVERY
+        # previously-DONE task's acceptance check after EVERY subsequent
+        # commit for the rest of the run; a persistent, hard-to-fix
+        # regression's status never changes, so every later commit
+        # re-triggered this exact same expensive fix loop again from
+        # scratch — burning a full attempt budget on a regression already
+        # known not to resolve, over and over, for the rest of the run.
+        # Once deferred, an operator is expected to look at the ticket and
+        # decide whether to retry (exactly the manual ``status="open"``
+        # reset already exercised by
+        # test_existing_open_ticket_reused_not_duplicated) rather than the
+        # system re-attempting it automatically on every unrelated commit.
+        if existing and existing.get("status") == "deferred":
+            logger.info(
+                "BugFixLoop: ticket %s already deferred — skipping "
+                "(reset its status to retry)", ticket_id,
+            )
+            return BugFixResult(ticket_id, fix_id, fixed=False, exhausted=True, skipped=True)
+
         if existing is None:
             body = self._build_ticket_body(triggering_task, exec_result)
             ticket = make_ticket(

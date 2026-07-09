@@ -285,7 +285,12 @@ class OuterLoop:
                             acceptance_check=new_task.get("acceptance_check", ""),
                             title=new_task.get("title"),
                         )
-                    except Exception:
+                    except Exception as exc:
+                        logger.warning(
+                            "outer_loop: apply_rewrite failed for %s — rewrite "
+                            "will NOT survive a resume this round (continuing "
+                            "in-memory only): %s", task_id, exc,
+                        )
                         impl_version = impl_num   # fallback: derive from rewrites_done
 
                     rewrite_body = (

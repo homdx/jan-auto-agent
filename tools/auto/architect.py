@@ -31,7 +31,6 @@ api_format, verify_ssl — same pattern as every other agent in this codebase.
 from __future__ import annotations
 
 import configparser
-import hashlib
 import json
 import logging
 import re as _re
