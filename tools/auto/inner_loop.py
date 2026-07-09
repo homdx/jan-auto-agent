@@ -757,10 +757,24 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
         _re.compile(r"\b(нужно|надо|следует)\s+(изменить|поправить|переписать|исправить|доработать|переделать)"),
         # «(так) нельзя оставлять»
         _re.compile(r"нельзя\s+оставля"),
-        # standalone negative answer «Нет, …» / «Нет.» — comma/period only, so
-        # approvals like «нет проблем» / «нет замечаний» (followed by a space) are
-        # NOT caught here. «нет противоречий» already returned APPROVED above.
-        _re.compile(r"^нет(?:[,.]|$)"),
+        # standalone negative answer «Нет, …» / «Нет.» — comma/period only,
+        # so approvals like «нет проблем» / «нет замечаний» (followed by a
+        # space) are NOT caught here. «нет противоречий» already returned
+        # APPROVED above.
+        # AUTO-BUG: this used to fire unconditionally on ANY "Нет, ..."
+        # opener, which also caught casual-Russian approvals where "Нет" is
+        # a discourse filler rather than a substantive rejection — "Нет,
+        # всё хорошо." / "Нет, всё нормально." / "Нет, всё в порядке."
+        # ("nah, it's all fine") were confidently misclassified as REVISE
+        # even though nothing else in the reply objects to anything. A
+        # negative lookahead excludes exactly that "Нет, <all-good phrase>"
+        # shape while leaving every other "Нет, ..." opener — including the
+        # test-locked "Нет, так нельзя оставлять" / "Нет, это не подходит"
+        # — classified as REVISE exactly as before.
+        _re.compile(
+            r"^нет(?:[,.]|$)"
+            r"(?!\s*(?:всё|все)\s+(?:хорошо|нормально|в\s+порядке|ок(?:ей)?|отлично|супер)\b)"
+        ),
     ]
 
     # ── Scan: first try the first non-empty line; fall back to whole text ──
