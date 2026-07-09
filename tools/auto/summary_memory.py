@@ -566,8 +566,28 @@ class SummaryMemory:
             rf"<!--\s*BEGIN\s+{re.escape(chapter_file)}\s*-->.*?<!--\s*END\s+{re.escape(chapter_file)}\s*-->",
             re.DOTALL,
         )
+        #
+        # Bugfix: this used to be `pattern.sub(section_text, existing)` —
+        # passing section_text (which embeds the LLM-generated chapter
+        # summary) as re.sub's REPLACEMENT argument. re.sub interprets
+        # backslash sequences in a *string* replacement as backreferences
+        # (\1, \g<name>, ...); this pattern has no capture groups, so any
+        # summary containing an ordinary backslash — a footnote marker, a
+        # Windows path, dialogue about a regex or LaTeX expression, even
+        # just "...found it at 221\1 Baker Street." — raised
+        # `re.error: invalid group reference`. Only the *replace an existing
+        # section* path was affected (a fresh section is plain string
+        # concatenation, below); commit_on_success.py catches the exception
+        # so it doesn't crash the run, but because it fires before the file
+        # write, that chapter's section was silently left at its FIRST-DRAFT
+        # summary forever — exactly the staleness this file exists to
+        # prevent — with only one logger.error to show for it.
+        #
+        # A callable replacement sidesteps this entirely: re.sub never
+        # interprets backslash escapes in a function's return value, no
+        # matter what it contains.
         if pattern.search(existing):
-            new_content = pattern.sub(section_text, existing)
+            new_content = pattern.sub(lambda _m: section_text, existing)
         else:
             separator = "\n\n" if existing.strip() else ""
             new_content = existing.rstrip() + separator + section_text + "\n"
