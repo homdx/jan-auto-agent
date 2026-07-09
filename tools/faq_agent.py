@@ -622,10 +622,29 @@ class FaqAgent:
         as the whole stripped reply or its leading token. This avoids discarding
         a real answer that happens to contain the phrase (e.g. "if the page is
         not found, click Retry").
+
+        AUTO-BUG: the default marker is the ordinary English phrase "NOT
+        FOUND" — a plausible opening for a genuine, on-topic technical
+        answer (e.g. a question about HTTP 404s: "NOT FOUND errors occur
+        when the requested resource does not exist..."). The old
+        unconditional ``stripped.startswith(marker)`` discarded exactly
+        that kind of real, useful answer as if nothing were found, which
+        directly contradicts this method's own stated purpose above. A
+        genuine sentinel reply is the marker plus at most a little trailing
+        punctuation/decoration ("NOT FOUND." / "NOT FOUND — nothing in the
+        knowledge base."); a substantive answer runs far longer than that.
+        Capping how much may trail the marker keeps the decorated-sentinel
+        case working while no longer eating real answers.
         """
         stripped = answer.strip().upper()
         marker = self.not_found_marker.strip().upper()
-        return stripped == marker or stripped.startswith(marker)
+        if stripped == marker:
+            return True
+        _DECORATION_SLACK_CHARS = 40
+        return (
+            stripped.startswith(marker)
+            and len(stripped) - len(marker) <= _DECORATION_SLACK_CHARS
+        )
 
     # ── Knowledge loading ────────────────────────────────────────────────────
 
