@@ -261,7 +261,7 @@ class OrchestratorActions:
         return " ".join(tokens).strip(" .,:;?-")
 
     def _answer_from_file(self, question: str, file_label: str,
-                          knowledge: str, feedback: str = None) -> str:
+                          knowledge: str, feedback: str = None) -> "str | None":
         """Generate a grounded answer to `question` using `knowledge` as the source."""
         system = (
             "You are a documentation/FAQ assistant. Answer the QUESTION using the "
@@ -300,9 +300,18 @@ class OrchestratorActions:
             tracer.event("text_answerer", "orchestrator", "llm_response", content=ans)
             return strip_think(ans).strip()
         except Exception as e:
+            # AUTO-BUG: same asymmetric-resilience bug as _edit_file_content
+            # (see its comment) — a transient network/API error here used
+            # to come back as "" indistinguishable from a legitimately
+            # empty answer, so run_text_qa() would validate an EMPTY
+            # answer, get an ordinary (misleading) needs_fix verdict about
+            # the answer's content rather than the real network failure,
+            # and burn a whole iteration + wrong feedback instead of
+            # retrying the generation call the way the validator call two
+            # lines later already retries on the identical failure mode.
             logger.error(f"text answer call failed: {e}")
             print(f"[{_ts()}] answer generation failed: {e}")
-            return ""
+            return None
 
     def _parse_llm_json(self, content: str) -> dict:
         """
@@ -464,7 +473,35 @@ class OrchestratorActions:
                 print(f"[{_ts()}] ⏳ timeout reached; returning best answer so far.")
                 break
             _step_start = time.time()
-            answer = self._answer_from_file(question, file_path, knowledge, feedback)
+            _new_answer = self._answer_from_file(question, file_path, knowledge, feedback)
+
+            if _new_answer is None:
+                # AUTO-BUG: retry the transient generation failure the same
+                # way an _api_error from the validator is retried below,
+                # instead of validating an empty answer with misleading
+                # content-based feedback. Keep the previous best `answer`
+                # (if any) rather than clobbering it with the failure.
+                _api_err_count += 1
+                if _api_err_count == 1:
+                    print(backoff.MILESTONE_TABLE)
+                _wait = backoff.backoff_seconds(_api_err_count - 1)
+                if iteration >= self.max_iterations:
+                    print(f"[{_ts()}] ⚠️  Answer generation unavailable — "
+                          f"max iterations reached, keeping best answer so far.")
+                    break
+                _chk = {
+                    "loop": "run_text_qa",
+                    "question": question,
+                    "file_path": file_path,
+                    "base_dir": base_dir,
+                    "iteration": iteration,  # retry same iteration
+                    "feedback": feedback,
+                    "answer": answer,
+                }
+                backoff.sleep_with_interrupt_save(_wait, _chk)
+                continue  # retry same iteration (do not increment)
+
+            answer = _new_answer
             print(f"[{_ts()}] ⏱  Answer generated in {time.time() - _step_start:.1f}s")
             print(f"[{_ts()}] \U0001f916 Validating answer ({iteration}/{self.max_iterations})...")
             _val_start = time.time()
@@ -531,7 +568,7 @@ class OrchestratorActions:
 
     def _edit_file_content(self, instruction: str, file_label: str,
                            source: str, feedback: str = None,
-                           previous_revised: str = None) -> str:
+                           previous_revised: str = None) -> "str | None":
         """Ask the model for the COMPLETE revised file content (no commentary).
 
         Message structure depends on whether this is a first attempt or a retry:
@@ -650,9 +687,23 @@ class OrchestratorActions:
             tracer.event("file_editor", "orchestrator", "llm_response", content=out)
             return out
         except Exception as e:
+            # AUTO-BUG: this used to return "" on ANY exception here — same
+            # as a genuinely empty LLM reply — and run_edit() treated an
+            # empty result as fatal: "No content produced" and an immediate,
+            # unconditional return with NO retry, NO backoff, and NO
+            # checkpoint. That's a real asymmetry: the validator call two
+            # steps later gets full exponential-backoff retry (Issue 7) for
+            # this exact class of transient network/API error, but the
+            # generation call that produces the edit in the first place got
+            # none — a single dropped connection permanently kills the
+            # whole /edit command, misleadingly reported as "the model said
+            # nothing." Returning None (vs "" for a genuinely empty reply)
+            # lets run_edit tell the two apart and retry only the real
+            # transient-failure case, the same way it already retries a
+            # validator API error.
             logger.error(f"file edit call failed: {e}")
             print(f"[{_ts()}] edit generation failed: {e}")
-            return ""
+            return None
 
     def _validate_edit(self, instruction: str, original: str, revised: str,
                         stream_mode: bool = False) -> dict:
@@ -819,11 +870,45 @@ class OrchestratorActions:
                     _prev_to_pass = revised
 
             _step_start = time.time()
-            revised = self._edit_file_content(
+            _new_revised = self._edit_file_content(
                 instruction, file_path, original,
                 feedback=feedback,
                 previous_revised=_prev_to_pass,
             )
+
+            if _new_revised is None:
+                # AUTO-BUG: a transient network/API error generating the
+                # edit used to fall through to the "no content produced"
+                # check below and return immediately — no retry, no
+                # backoff, no checkpoint — even though the validator call
+                # a few lines later gets full exponential-backoff retry
+                # for the identical failure mode. Apply the same treatment
+                # here so one dropped connection doesn't permanently kill
+                # the whole /edit command.
+                _api_err_count += 1
+                if _api_err_count == 1:
+                    print(backoff.MILESTONE_TABLE)
+                _wait = backoff.backoff_seconds(_api_err_count - 1)
+                if iteration >= self.max_iterations:
+                    print(f"[{_ts()}] ⚠️  Edit generation unavailable — "
+                          f"max iterations reached, using best edit so far.")
+                    break
+                _chk = {
+                    "loop": "run_edit",
+                    "user_input": user_input,
+                    "base_dir": base_dir,
+                    "instruction": instruction,
+                    "file_path": file_path,
+                    "iteration": iteration,  # retry same iteration
+                    "revised": revised,      # keep the last good attempt, not the failure
+                    "feedback": feedback,
+                    "_prev_shown_count": _prev_shown_count,
+                    "_is_reset_iter": _is_reset_iter,
+                }
+                backoff.sleep_with_interrupt_save(_wait, _chk)
+                continue  # retry same iteration (do not increment)
+
+            revised = _new_revised
             if not revised.strip():
                 print(f"[{_ts()}] No content produced — file left unchanged.")
                 return
