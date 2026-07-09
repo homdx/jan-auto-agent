@@ -705,9 +705,19 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
         _re.compile(r"\bне\s+противоречит\b"),
         # negated / absent contradictions expressed without «нет/без»:
         #   «противоречий не обнаружено / не выявлено», «противоречия отсутствуют»
-        _re.compile(r"противоречи\w*\s+(?:отсутств\w*|не\s+\w+)"),
-        #   «не вижу / не обнаружил / не нашёл … противоречий»
-        _re.compile(r"\bне\s+\w+\s+противоречи"),
+        # AUTO-BUG: real LLM replies routinely insert filler words between the
+        # noun and the negated verb — «противоречий В ТЕКСТЕ не обнаружено»,
+        # «противоречий С ТЕКСТОМ не обнаружено» — which the old
+        # immediately-adjacent ``\s+`` pattern missed, falling through to the
+        # bare «противоречи» REVISE pattern below and flipping a genuine
+        # APPROVED into a false REVISE. Allow up to 3 filler words (bounded so
+        # it can't jump across an unrelated sentence) in between.
+        _re.compile(
+            r"противоречи\w*(?:\s+\S+){0,3}\s+(?:отсутств\w*|не\s+\w+)"
+        ),
+        #   «не вижу / не обнаружил / не нашёл … противоречий» — same filler-word
+        #   gap allowed on this side (e.g. «не смог найти каких-либо противоречий»).
+        _re.compile(r"\bне(?:\s+\S+){0,3}\s+противоречи"),
         # «не против» / «непротив»
         _re.compile(r"\bне\s+против\b"),
         _re.compile(r"\bнепротив\b"),
