@@ -353,19 +353,43 @@ class OrchestratorActions:
         tracer.event("orchestrator", "text_validator", "llm_request",
                      params={"question": question}, content=user,
                      model=self.model, temperature=self._cfg_temp("validator_agent", 0.1))
+        # AUTO-BUG: same class of bug as _validate_edit (see its comment) —
+        # a network/API failure and a successfully-returned-but-malformed
+        # (non-JSON) response used to share one except clause and both came
+        # out as {"_api_error": True}. In run_text_qa(), _api_error takes
+        # the exponential-backoff retry path, which explicitly skips
+        # `iteration += 1` on `continue`, so `iteration >= self.max_iterations`
+        # never trips either — a validator that reliably answers with prose
+        # instead of STRICT JSON burns the entire timeout budget in
+        # escalating sleeps instead of counting as an ordinary needs_fix
+        # round. Only a genuine request_completion failure is a real API
+        # error; a parse failure on a response that DID arrive is a normal
+        # needs_fix with corrective feedback the model can act on.
         try:
             content = request_completion(url, headers, payload, self.timeout_seconds,
                                          stream=stream_mode,
                                          api_format=self.api_format,
                                          ssl_context=self.ssl_context)
-            tracer.event("text_validator", "orchestrator", "llm_response", content=content)
-            content = strip_think(content)
-            return self._parse_llm_json(content)
         except Exception as e:
-            logger.error(f"text validator failed: {e}")
-            # Fail-closed: do NOT approve on error.
+            logger.error(f"text validator API call failed: {e}")
             return {"status": "needs_fix", "grounded": False,
                     "feedback": f"validator unavailable: {e}", "_api_error": True}
+
+        tracer.event("text_validator", "orchestrator", "llm_response", content=content)
+        content = strip_think(content)
+        try:
+            return self._parse_llm_json(content)
+        except Exception as e:
+            logger.warning(f"text validator returned unparseable content: {e}")
+            return {
+                "status": "needs_fix",
+                "grounded": False,
+                "feedback": (
+                    "Your reply could not be parsed as the required STRICT "
+                    'JSON {"status": ..., "grounded": ..., "feedback": ...} '
+                    "— reply with JSON only, no prose, no code fences."
+                ),
+            }
 
     def run_text_qa(self, question: str, file_path: str, source: str, base_dir: str,
                      resume_state: dict = None) -> None:
