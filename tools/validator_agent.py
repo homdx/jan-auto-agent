@@ -132,17 +132,30 @@ class ValidatorAgent:
                 missing_refs=payload.get("missing_refs"),
             )
 
-        try:
-            req_payload = {
-                "model": self.model,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": self.temperature,
-            }
-            if self.num_ctx:
-                req_payload["num_ctx"] = self.num_ctx
-            tracer.event("validator_agent", "llm", "llm_request",
-                         content=prompt, model=self.model, temperature=self.temperature)
+        req_payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": self.temperature,
+        }
+        if self.num_ctx:
+            req_payload["num_ctx"] = self.num_ctx
+        tracer.event("validator_agent", "llm", "llm_request",
+                     content=prompt, model=self.model, temperature=self.temperature)
 
+        # AUTO-BUG: this used to wrap the network call AND json.loads() in
+        # one try/except, so a successfully-returned-but-malformed (non-JSON)
+        # reply was indistinguishable from a genuine network/HTTP failure —
+        # both came out as {"_api_error": True}. main.py's run_pipeline()
+        # retries _api_error with exponential backoff via a `continue` that
+        # explicitly skips `iteration += 1`, so `iteration >= self.max_iterations`
+        # never trips either: a validator that reliably answers with prose
+        # instead of the required STRICT JSON burns the whole run's timeout
+        # budget in escalating sleeps, retrying the identical prompt with no
+        # corrective feedback, instead of counting as an ordinary needs_fix
+        # round that advances iteration and tells the model what to fix.
+        # Only a genuine request_completion failure is a real API error; a
+        # parse failure on a response that DID arrive is a normal needs_fix.
+        try:
             if self.stream:
                 ts = time.strftime("%H:%M:%S")
                 print(f"\n[{ts}] validator_agent → llm  (iter {payload.get('iteration')}/{self.max_iter}):")
@@ -161,20 +174,6 @@ class ValidatorAgent:
                 content = request_completion(url, headers, req_payload, self.timeout,
                                              api_format=self.api_format,
                                              ssl_context=self.ssl_context)
-
-            tracer.event("llm", "validator_agent", "llm_response", content=content)
-            content = strip_think(content)
-
-            content = strip_json_fence(content)
-
-            parsed_result = json.loads(content)
-            # Enforce max_hints: cap the suggested_searches list so the outer
-            # loop does not expand search scope beyond the configured limit.
-            if isinstance(parsed_result.get("suggested_searches"), list):
-                parsed_result["suggested_searches"] = \
-                    parsed_result["suggested_searches"][:self.max_hints]
-            tracer.event("validator_agent", "orchestrator", "result", content=parsed_result)
-            return parsed_result
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="replace")
             logger.error(f"ValidatorAgent HTTP {e.code}: {body}")
@@ -183,7 +182,35 @@ class ValidatorAgent:
             tracer.event("validator_agent", "orchestrator", "error", content=_err)
             return _err
         except Exception as e:
-            logger.error(f"ValidatorAgent execution loop failed: {e}")
+            logger.error(f"ValidatorAgent API call failed: {e}")
             _err = {"status": "needs_fix", "feedback": f"API Connection Timeout Fallback: {e}", "_api_error": True}
             tracer.event("validator_agent", "orchestrator", "error", content=_err)
             return _err
+
+        tracer.event("llm", "validator_agent", "llm_response", content=content)
+        content = strip_think(content)
+        content = strip_json_fence(content)
+
+        try:
+            parsed_result = json.loads(content)
+        except Exception as e:
+            logger.warning(f"ValidatorAgent: unparseable reply — {e}")
+            _err = {
+                "status": "needs_fix",
+                "feedback": (
+                    'Your reply could not be parsed as the required STRICT JSON '
+                    '{"status": "approved" | "needs_fix", "feedback": "...", '
+                    '"suggested_searches": [...]} — reply with JSON only, no '
+                    "prose, no code fences."
+                ),
+            }
+            tracer.event("validator_agent", "orchestrator", "error", content=_err)
+            return _err
+
+        # Enforce max_hints: cap the suggested_searches list so the outer
+        # loop does not expand search scope beyond the configured limit.
+        if isinstance(parsed_result.get("suggested_searches"), list):
+            parsed_result["suggested_searches"] = \
+                parsed_result["suggested_searches"][:self.max_hints]
+        tracer.event("validator_agent", "orchestrator", "result", content=parsed_result)
+        return parsed_result
