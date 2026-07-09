@@ -116,7 +116,9 @@ def _detect_task_mode(run: dict) -> str:
     Returns ``"creative"`` when the majority of tasks look like chapter-writing
     tasks (title or task_id contains a chapter number); ``"docs"`` when the
     majority of the remaining tasks touched only prose/doc files (AUTO-CR-35);
-    otherwise falls back to ``"code"``.
+    otherwise falls back to ``"code"``. Requires at least two file-carrying
+    tasks before ever returning "docs", so a single incidental README tweak
+    inside an otherwise ordinary code run isn't misread as a docs run.
     """
     real_tasks = [v for k, v in run["tasks"].items() if not k.startswith("gate1:")]
     if not real_tasks:
@@ -136,7 +138,7 @@ def _detect_task_mode(run: dict) -> str:
         considered += 1
         if all(_is_doc_file(f) for f in files):
             doc_tasks += 1
-    if considered and doc_tasks > considered / 2 and doc_tasks > len(real_tasks) / 2:
+    if considered >= 2 and doc_tasks > considered / 2 and doc_tasks > len(real_tasks) / 2:
         return "docs"
 
     return "code"
@@ -928,7 +930,10 @@ def render_applied_tasks(run: dict, mode: str = "code") -> None:
         if mode == "docs":
             doc_files = files_by_task.get(task_id, [])
             if doc_files:
-                print(f"    {dim('file:')}     {dim(', '.join(doc_files[:3]))}")
+                preview = ", ".join(doc_files[:3])
+                if len(doc_files) > 3:
+                    preview += dim(f" … +{len(doc_files) - 3}")
+                print(f"    {dim('file:')}     {dim(preview)}")
         if commit:
             print(f"    {dim('commit:')}   {cyan(commit[:12])}")
         if dur:
