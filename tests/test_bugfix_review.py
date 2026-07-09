@@ -551,3 +551,63 @@ class TestPreexistingPatternGrandfathering:
             [{"path": "utils.py", "content": self.UTILS_LIKE + "# edit\n"}],
             tmp_path, "T", allowed_paths=frozenset({"utils.py"}))
         assert written == [] and "blocked" in err
+
+
+# ── selfrun E2E: недостижимый rewriter при max_rounds < 3 ────────────────────
+
+def test_unreachable_rewriter_config_warns(caplog, tmp_path):
+    import configparser
+    import logging
+    from tools.auto.outer_loop import make_outer_loop
+    cfg = configparser.ConfigParser()
+    cfg.read_string("""
+[api]
+active = local
+[api_local]
+base_url = http://localhost:1
+api_key = k
+model = m
+api_format = ollama
+[auto]
+max_rounds_per_task = 2
+max_rewrites = 3
+[loop]
+timeout_seconds = 5
+""")
+    from tools.auto.state import StateStore
+    with caplog.at_level(logging.WARNING):
+        try:
+            make_outer_loop(cfg, str(tmp_path), StateStore(tmp_path),
+                            task_mode="code")
+        except Exception:
+            pass  # интересует только предупреждение о конфиге
+    assert any("UNREACHABLE" in r.message for r in caplog.records)
+
+
+def test_reachable_rewriter_config_silent(caplog, tmp_path):
+    import configparser
+    import logging
+    from tools.auto.outer_loop import make_outer_loop
+    cfg = configparser.ConfigParser()
+    cfg.read_string("""
+[api]
+active = local
+[api_local]
+base_url = http://localhost:1
+api_key = k
+model = m
+api_format = ollama
+[auto]
+max_rounds_per_task = 4
+max_rewrites = 3
+[loop]
+timeout_seconds = 5
+""")
+    from tools.auto.state import StateStore
+    with caplog.at_level(logging.WARNING):
+        try:
+            make_outer_loop(cfg, str(tmp_path), StateStore(tmp_path),
+                            task_mode="code")
+        except Exception:
+            pass
+    assert not any("UNREACHABLE" in r.message for r in caplog.records)

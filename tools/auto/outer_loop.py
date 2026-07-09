@@ -475,6 +475,19 @@ def make_outer_loop(
     rewrite_every_n_rounds = config.getint("auto", "rewrite_every_n_rounds", fallback=2)
     max_rewrites           = config.getint("auto", "max_rewrites",           fallback=5)
 
+    # selfrun E2E finding: the rewrite condition requires rnd >= 3, so with
+    # max_rounds_per_task <= 2 a configured rewriter can NEVER fire — and
+    # until now that mismatch was silent (a run just exhausted its rounds and
+    # blocked, with max_rewrites looking enabled). Say it once, loudly.
+    if max_rewrites > 0 and max_rounds < 3 and task_mode != "creative":
+        logger.warning(
+            "make_outer_loop: max_rewrites=%d is configured but "
+            "max_rounds_per_task=%d < 3 — the task rewriter only fires from "
+            "round 3, so it is UNREACHABLE with this config. Raise "
+            "[auto] max_rounds_per_task to >= 3 or set max_rewrites = 0.",
+            max_rewrites, max_rounds,
+        )
+
     if inner_loop is None:
         inner_loop = make_inner_loop(config, base_dir, task_mode=task_mode,
                                       run_goal=run_goal)  # AUTO-DM-1 / AUTO-CR-22-1
