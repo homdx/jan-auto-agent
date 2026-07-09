@@ -687,14 +687,25 @@ def _target_fingerprint(c: CandidateTask) -> "str | None":
     that doesn't exist yet) and can differ between two batches of the same
     cluster even when both are proposing to write the exact same target
     file — which is exactly the "two independent tasks generate chapter_4"
-    duplication observed in practice. Two candidates that target the same
-    file set with the same title are duplicates regardless of what they
-    cited, so this key is checked *in addition to* ``_fingerprint``.
+    duplication observed in practice.
+
+    AUTO-BUG fix: the key used to also include the normalised title, on the
+    theory that "same target + same title" was enough to call it a
+    duplicate. In practice two *independent* architect batches essentially
+    never phrase a "write chapter_4" task identically — different wording,
+    different framing — so titles almost always differ even when the
+    target file is the exact same one, and the title-inclusive key silently
+    let the very duplication this function exists to catch straight
+    through. A chapter file being generated fresh has no legitimate reason
+    for two independent tasks to both target it in the same run (unlike
+    code, where "same file, same title" undersells how differently two
+    code fixes on one file can legitimately coexist) — so for creative
+    mode the target file set alone is a safe, sufficient duplicate key.
     Returns ``None`` when there are no target files to key on.
     """
     if not c.target_files:
         return None
-    return f"{'|'.join(sorted(c.target_files))}::{c.title.strip().lower()}"
+    return "|".join(sorted(c.target_files))
 
 
 def _location_str(loc: Any) -> str:
