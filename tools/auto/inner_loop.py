@@ -862,6 +862,7 @@ class InnerLoop:
         prosody_validator=None,
         continuity_validator=None,
         theme_validator=None,
+        require_tests: bool = False,
         task_mode: str = "code",
         max_task_seconds: int = 0,
         run_goal: str = "",
@@ -884,6 +885,8 @@ class InnerLoop:
         # (creative mode only) — the one gate that judges WHAT the chapter
         # says, not whether it is consistent.
         self.theme_validator = theme_validator
+        # selfhost pilot: deterministic tests-mandate gate for code mode.
+        self.require_tests = bool(require_tests)
         self.task_mode    = str(task_mode)
         # AUTO-CR-21-4: hard wall-clock cap per task; 0 disables the guard.
         self.max_task_seconds = max(0, int(max_task_seconds))
@@ -958,6 +961,7 @@ class InnerLoop:
         _prosody_revisions: int = 0   # AUTO-CR-21: prosody-gate-driven rejections used so far
         _continuity_revisions: int = 0  # AUTO-CR-23-3: continuity-gate-driven rejections used so far
         _theme_revisions: int = 0     # podrugi-3: theme-gate-driven rejections used so far
+        _tests_mandate_rejections: int = 0  # selfhost: code-without-tests rejections
         base_dir_path = Path(base_dir)
         target_files  = task.get("target_files", []) or []
         self._broker.reset_cache()  # clear per-task cache; Pass-2 hits re-accumulate fresh
@@ -1050,6 +1054,38 @@ class InnerLoop:
 
             # ── 2. Executor (objective half of Gate 2) ────────────────────────
             try:
+                # ── selfhost pilot: deterministic tests-mandate gate ─────
+                if self.require_tests and self.task_mode == "code":
+                    _written = list(getattr(coder_result, "files_written", []) or [])
+                    _py = [f for f in _written if f.endswith(".py")]
+                    def _is_test(f: str) -> bool:
+                        import os as _os
+                        base = _os.path.basename(f)
+                        return base.startswith("test_") or base.endswith("_test.py") \
+                            or "/tests/" in f.replace("\\", "/") or f.replace("\\", "/").startswith("tests/")
+                    _code_py = [f for f in _py if not _is_test(f)]
+                    _test_py = [f for f in _py if _is_test(f)]
+                    if _code_py and not _test_py:
+                        _tests_mandate_rejections += 1
+                        _cap = 2
+                        _msg = ("tests mandate: code files written without any "
+                                "test file (" + ", ".join(_code_py[:4]) + ") — every "
+                                "code change must include new or updated tests "
+                                "(tests/test_*.py) covering it; resubmit code AND tests.")
+                        if _tests_mandate_rejections <= _cap:
+                            logger.info("InnerLoop: attempt %d rejected by tests "
+                                        "mandate (%d/%d)", attempt,
+                                        _tests_mandate_rejections, _cap)
+                            feedback.append(f"attempt {attempt}: {_msg}")
+                            records.append(AttemptRecord(attempt, True, False, False, _msg))
+                            _trace_stage(task_id, attempt, "tests_mandate", "REJECTED",
+                                        revisions_used=_tests_mandate_rejections, cap=_cap)
+                            continue
+                        logger.warning("InnerLoop: tests-mandate cap (%d) reached — "
+                                       "proceeding to execution without tests.", _cap)
+                        _trace_stage(task_id, attempt, "tests_mandate",
+                                    "ACCEPTED_AT_CAP", cap=_cap)
+
                 exec_result = self.executor.run(task)
             except Exception as exc:
                 logger.error("InnerLoop: executor raised on attempt %d: %s", attempt, exc)
@@ -1623,12 +1659,15 @@ def make_inner_loop(
 
     # ── AUTO-CR-21-4: hard per-task wall-clock guard ───────────────────────────
     max_task_seconds = config.getint("auto", "max_task_seconds", fallback=1800)
+    require_tests = config.getboolean("inner_loop", "require_tests_code",
+                                      fallback=False)
 
     return InnerLoop(coder, executor, validator, max_attempts=max_attempts,
                      context_broker=broker, canon_validator=canon_validator,
                      fact_validator=fact_validator, prosody_validator=prosody_validator,
                      continuity_validator=continuity_validator,
                      theme_validator=theme_validator,
+                     require_tests=require_tests,
                      task_mode=task_mode, max_task_seconds=max_task_seconds,
                      run_goal=run_goal)
 

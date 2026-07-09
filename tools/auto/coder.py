@@ -300,6 +300,12 @@ class Coder(_llm_stream.LLMClientBase):
         # identifiers in generated .py files (code mode only).
         self._ascii_identifiers_only = config.getboolean(
             sec, "ascii_identifiers_only", fallback=False)
+        # selfhost pilot: allow editing files that already contain a flagged
+        # pattern (see _check_content_safety grandfathering). Default on —
+        # it strictly reduces false positives; introducing a pattern into a
+        # clean file is still blocked either way.
+        self._allow_preexisting_patterns = config.getboolean(
+            sec, "allow_preexisting_patterns", fallback=True)
         active_profile = config.get("api", "active", fallback="local")
         # num_ctx controls the total context window on Ollama; 0 means "use server default".
         # AUTO-CR-3: prefer [coder] num_ctx_{task_mode} then [api_{active}] num_ctx.
@@ -1347,7 +1353,8 @@ class Coder(_llm_stream.LLMClientBase):
     )
 
     @classmethod
-    def _check_content_safety(cls, content: str, task_mode: str = "code") -> tuple[bool, str]:
+    def _check_content_safety(cls, content: str, task_mode: str = "code",
+                              existing_content: "str | None" = None) -> tuple[bool, str]:
         """Return *(safe, reason)* — ``safe=False`` blocks the write.
 
         Scans generated file content for patterns that would be dangerous
@@ -1374,6 +1381,20 @@ class Coder(_llm_stream.LLMClientBase):
             # docs / creative: only block truly catastrophic payloads
             active_patterns = cls._BLOCKED_ALWAYS
 
+        # selfhost pilot: pre-existing-pattern grandfathering. When the file
+        # being edited ALREADY legitimately contains a flagged pattern on
+        # disk (the agent's own utils.py holds os.unlink inside
+        # atomic_write_text's cleanup, executor holds subprocess, ...),
+        # editing that file must not be blocked — otherwise the agent can
+        # never modify its own infrastructure code. INTRODUCING a pattern
+        # into a file that did not have it remains blocked as before, so the
+        # scanner still stops a model from smuggling deletions into clean
+        # files. New files (existing_content is None) get no grandfathering.
+        _existing_lower = (existing_content or "").lower()
+
+        def _preexisting(token: str) -> bool:
+            return bool(_existing_lower) and token.lower() in _existing_lower
+
         for label, pattern in active_patterns:
             pat_lower = pattern.lower()
 
@@ -1383,6 +1404,13 @@ class Coder(_llm_stream.LLMClientBase):
                 if "subprocess" in lower:
                     for danger in cls._SUBPROCESS_DANGER_TOKENS:
                         if danger.lower() in lower:
+                            if _preexisting(danger):
+                                logger.info(
+                                    "coder._check_content_safety: subprocess+%r "
+                                    "pre-exists in the target file — edit "
+                                    "permitted (grandfathered).", danger,
+                                )
+                                continue
                             return (
                                 False,
                                 f"blocked content: subprocess combined with "
@@ -1405,6 +1433,13 @@ class Coder(_llm_stream.LLMClientBase):
                 continue
 
             if pat_lower in lower:
+                if _preexisting(pat_lower):
+                    logger.info(
+                        "coder._check_content_safety: pattern %r pre-exists in "
+                        "the target file — edit permitted (grandfathered).",
+                        pattern,
+                    )
+                    continue
                 return False, f"blocked content pattern {pattern!r} ({label})"
 
         # Word-boundary patterns (code mode only: sudo/shutdown/reboot), checked
@@ -1565,7 +1600,14 @@ class Coder(_llm_stream.LLMClientBase):
                     continue
 
             # ── Guard 3: scan file content for dangerous patterns ──────────
-            content_safe, content_reason = self._check_content_safety(content, self._task_mode)
+            _existing = None
+            if self._allow_preexisting_patterns and dest.exists():
+                try:
+                    _existing = dest.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    _existing = None
+            content_safe, content_reason = self._check_content_safety(
+                content, self._task_mode, existing_content=_existing)
             if not content_safe:
                 msg = f"[SAFETY] {content_reason} in file {rel!r} — write blocked"
                 logger.error("coder._write_files [%s]: %s", task_id, msg)

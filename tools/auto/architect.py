@@ -61,6 +61,10 @@ _SYSTEM_PROMPT_CODE = (
     "in the code — you MUST cite the exact file path and either a symbol name "
     "(function, class, method) or a line range. "
     "Do NOT invent problems that are not actually present in the provided code. "
+    "Every task's instruction MUST require new or updated tests for the change, "
+    "its target_files MUST include the test file (tests/test_*.py), and its "
+    "acceptance_check MUST run those tests (e.g. python3 -m pytest "
+    "tests/test_x.py -q). "
     "Return ONLY a JSON array — no prose, no markdown fences, no preamble."
 )
 

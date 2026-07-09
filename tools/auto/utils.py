@@ -342,3 +342,24 @@ def normalize_task_mode(value: "str | None") -> tuple[str, "str | None"]:
         f"task_mode {raw!r} is not exact — interpreting as {guess!r}. "
         f"Set [auto] task_mode = {guess} in agents.ini to silence this.",
     )
+
+
+def human_duration(seconds: float) -> str:
+    """Format *seconds* as a compact human-readable duration.
+
+    Examples: 0.4 -> '0.4s', 42 -> '42s', 125 -> '2m 5s', 3725 -> '1h 2m 5s',
+    90061 -> '1d 1h 1m 1s'. Negative values get a leading '-'.
+    """
+    sign = "-" if seconds < 0 else ""
+    s = abs(float(seconds))
+    if s < 1:
+        return f"{sign}{s:.1f}s"
+    s = int(s)
+    parts = []
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if s >= size:
+            parts.append(f"{s // size}{unit}")
+            s %= size
+    if s or not parts:
+        parts.append(f"{s}s")
+    return sign + " ".join(parts)

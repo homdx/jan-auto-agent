@@ -415,3 +415,139 @@ class TestTicketStorePathSanitization:
         written = list(tickets_dir.glob("*evil*"))
         assert len(written) == 1
         assert written[0].parent == tickets_dir
+
+
+# ── selfhost pilot: tests-mandate gate ────────────────────────────────────────
+
+class TestTestsMandateGate:
+    class _Coder:
+        def __init__(self, base, drafts):
+            self.base, self.drafts, self.calls = base, drafts, 0
+
+        def generate(self, task, base_dir, prior_feedback=None, **kw):
+            pairs = self.drafts[min(self.calls, len(self.drafts) - 1)]
+            self.calls += 1
+            for rel, content in pairs:
+                p = self.base / rel
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text(content, encoding="utf-8")
+
+            class R:
+                ok = True
+                files_written = [rel for rel, _ in pairs]
+                response = ""
+                missing_context = []
+            return R()
+
+    class _Exec:
+        def run(self, task):
+            class R:
+                passed = True
+                exit_code = 0
+                stdout = ""
+                stderr = ""
+                timed_out = False
+            return R()
+
+    class _Val:
+        task_mode = "code"
+        last_missing_context = []
+
+        def approve(self, task, exec_result, coder_result, *, base_dir=None,
+                    prior_critique=""):
+            return True, "approved"
+
+    def _loop(self, tmp_path, drafts, require=True):
+        from tools.auto.inner_loop import InnerLoop
+        coder = self._Coder(tmp_path, drafts)
+        loop = InnerLoop(coder, self._Exec(), self._Val(), max_attempts=5,
+                         require_tests=require, task_mode="code")
+        return loop, coder
+
+    def _task(self):
+        return {"id": "S1", "title": "t", "instruction": "x",
+                "target_files": ["mod.py", "tests/test_mod.py"],
+                "acceptance_check": "true"}
+
+    def test_code_without_tests_rejected_then_accepted(self, tmp_path):
+        loop, coder = self._loop(tmp_path, [
+            [("mod.py", "def f():\n    return 1\n")],
+            [("mod.py", "def f():\n    return 1\n"),
+             ("tests/test_mod.py", "from mod import f\n\ndef test_f():\n    assert f() == 1\n")],
+        ])
+        r = loop.run_task(self._task(), str(tmp_path))
+        assert r.passed and coder.calls == 2
+        assert any("tests mandate" in rec.feedback for rec in r.records)
+
+    def test_tests_only_change_passes_gate(self, tmp_path):
+        loop, coder = self._loop(tmp_path, [
+            [("tests/test_mod.py", "def test_x():\n    assert True\n")],
+        ])
+        assert loop.run_task(self._task(), str(tmp_path)).passed
+        assert coder.calls == 1
+
+    def test_cap_reached_proceeds_fail_open(self, tmp_path):
+        loop, coder = self._loop(tmp_path, [
+            [("mod.py", "def f():\n    return 1\n")],
+        ])
+        r = loop.run_task(self._task(), str(tmp_path))
+        assert r.passed
+        assert coder.calls == 3
+
+    def test_gate_off_by_default(self, tmp_path):
+        loop, coder = self._loop(tmp_path, [
+            [("mod.py", "def f():\n    return 1\n")],
+        ], require=False)
+        assert loop.run_task(self._task(), str(tmp_path)).passed
+        assert coder.calls == 1
+
+
+# ── selfhost pilot: pre-existing-pattern grandfathering в safety-сканере ─────
+
+class TestPreexistingPatternGrandfathering:
+    def _coder(self, allow=True):
+        import configparser
+        from tools.auto.coder import Coder
+        cfg = configparser.ConfigParser()
+        cfg.read_string(f"[coder]\nallow_preexisting_patterns = {'true' if allow else 'false'}\n"
+                        "[loop]\ntimeout_seconds = 5\n[api]\nactive = local\n[api_local]\nnum_ctx = 0\n")
+        return Coder(config=cfg, base_url="http://x", api_key="k", model="m",
+                     api_format="ollama", verify_ssl=True, task_mode="code")
+
+    UTILS_LIKE = ("import os, tempfile\n\n"
+                  "def atomic_write_text(path, content):\n"
+                  "    fd, tmp = tempfile.mkstemp()\n"
+                  "    os.replace(tmp, path)\n"
+                  "    os.unlink(tmp)\n")
+
+    def test_editing_file_with_preexisting_pattern_allowed(self, tmp_path):
+        c = self._coder()
+        (tmp_path / "utils.py").write_text(self.UTILS_LIKE, encoding="utf-8")
+        new = self.UTILS_LIKE + "\n\ndef human_duration(s):\n    return f'{s}s'\n"
+        written, err = c._write_files(
+            [{"path": "utils.py", "content": new}], tmp_path, "T",
+            allowed_paths=frozenset({"utils.py"}))
+        assert err == "" and written == ["utils.py"]
+
+    def test_introducing_pattern_into_clean_file_still_blocked(self, tmp_path):
+        c = self._coder()
+        (tmp_path / "clean.py").write_text("x = 1\n", encoding="utf-8")
+        written, err = c._write_files(
+            [{"path": "clean.py", "content": "import os\nos.unlink('x')\n"}],
+            tmp_path, "T", allowed_paths=frozenset({"clean.py"}))
+        assert written == [] and "blocked content pattern" in err
+
+    def test_new_file_with_pattern_blocked(self, tmp_path):
+        c = self._coder()
+        written, err = c._write_files(
+            [{"path": "fresh.py", "content": "import os\nos.unlink('x')\n"}],
+            tmp_path, "T", allowed_paths=frozenset({"fresh.py"}))
+        assert written == [] and "blocked" in err
+
+    def test_flag_off_blocks_even_preexisting(self, tmp_path):
+        c = self._coder(allow=False)
+        (tmp_path / "utils.py").write_text(self.UTILS_LIKE, encoding="utf-8")
+        written, err = c._write_files(
+            [{"path": "utils.py", "content": self.UTILS_LIKE + "# edit\n"}],
+            tmp_path, "T", allowed_paths=frozenset({"utils.py"}))
+        assert written == [] and "blocked" in err
