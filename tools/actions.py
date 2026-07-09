@@ -659,17 +659,48 @@ class OrchestratorActions:
         tracer.event("orchestrator", "edit_validator", "llm_request",
                      params={"instruction": instruction}, content=user,
                      model=self.model, temperature=self._cfg_temp("validator_agent", 0.1))
+        # AUTO-BUG: network/API failure and a malformed (non-JSON) response
+        # from a server that DID respond used to share one try/except and
+        # both came out as {"_api_error": True}. In run_edit(), _api_error
+        # takes the exponential-backoff retry path, which explicitly does
+        # NOT advance `iteration` (`continue` skips `iteration += 1`) so
+        # the `iteration >= self.max_iterations` escape check can never
+        # trip either — nothing bounds that path except the overall task
+        # timeout. A validator that reliably replies with prose instead of
+        # STRICT JSON (a real, observed small-model failure mode elsewhere
+        # in this project — see gate1_filter's skip_llm and coder.py's
+        # AUTO-CR-13 JSON-wrapper salvage) then burns the entire
+        # [loop] timeout_seconds budget in escalating sleeps, retrying the
+        # exact same prompt with no corrective feedback, instead of
+        # counting as an ordinary "needs_fix" round that would advance
+        # iteration, feed the parse error back as feedback, and let the
+        # loop terminate normally at max_iterations. Only a genuine
+        # request_completion failure (network/HTTP) is a real API error;
+        # a JSON-parse failure on a response that DID arrive is validated
+        # separately below as a normal needs_fix.
         try:
             content = strip_think(request_completion(url, headers, payload, self.timeout_seconds,
                                                       stream=stream_mode,
                                                       api_format=self.api_format,
                                                       ssl_context=self.ssl_context))
-            tracer.event("edit_validator", "orchestrator", "llm_response", content=content)
-            return self._parse_llm_json(content)
         except Exception as e:
-            logger.error(f"edit validator failed: {e}")
+            logger.error(f"edit validator API call failed: {e}")
             return {"status": "needs_fix", "feedback": f"validator unavailable: {e}",
                     "_api_error": True}
+
+        tracer.event("edit_validator", "orchestrator", "llm_response", content=content)
+        try:
+            return self._parse_llm_json(content)
+        except Exception as e:
+            logger.warning(f"edit validator returned unparseable content: {e}")
+            return {
+                "status": "needs_fix",
+                "feedback": (
+                    "Your reply could not be parsed as the required STRICT "
+                    'JSON {"status": ..., "feedback": ...} — reply with '
+                    "JSON only, no prose, no code fences."
+                ),
+            }
 
     def run_edit(self, user_input: str, base_dir: str,
                  resume_state: dict = None) -> None:
