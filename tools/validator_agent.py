@@ -195,6 +195,20 @@ class ValidatorAgent:
             parsed_result = json.loads(content)
         except Exception as e:
             logger.warning(f"ValidatorAgent: unparseable reply — {e}")
+            # AUTO-BUG (follow-up): prompt_evaluator.py's _shadow_score()
+            # computes json_ok_rate = fraction of results WITHOUT
+            # _api_error, as a direct proxy for "did the candidate prompt
+            # produce valid JSON." Before the fix above, a malformed reply
+            # WAS labelled _api_error, so that proxy was correct. Now that
+            # malformed-but-received replies are a distinct outcome, a
+            # candidate prompt that never produces valid JSON has none of
+            # its failures labelled _api_error and json_ok_rate silently
+            # inverts to 1.0 — rewarding exactly the failure mode it exists
+            # to penalise, which could get a bad candidate PROMOTED by the
+            # AutoTuner. _unparseable lets that caller (and any other) tell
+            # "genuine API error" apart from "response arrived, wrong
+            # format" apart from "valid JSON" — all three are different
+            # outcomes worth scoring differently.
             _err = {
                 "status": "needs_fix",
                 "feedback": (
@@ -203,6 +217,7 @@ class ValidatorAgent:
                     '"suggested_searches": [...]} — reply with JSON only, no '
                     "prose, no code fences."
                 ),
+                "_unparseable": True,
             }
             tracer.event("validator_agent", "orchestrator", "error", content=_err)
             return _err
