@@ -547,6 +547,28 @@ class OrchestratorActions:
             if feedback:
                 print(f"[{_ts()}] ❗ Validator feedback: {feedback}")
             iteration += 1
+
+        # FIX: run_text_qa's own docstring (step 4) promises to "render the
+        # final, validated answer" — but the loop above only ever streamed
+        # each draft live during generation (via _answer_from_file's
+        # on_token callback) and printed one-line validator verdicts
+        # ("approved" / feedback). There was no concluding block: on
+        # multi-iteration runs the final answer is just whichever streamed
+        # draft happened to print last, with no clear marker of which draft
+        # is the validated one, and unlike run_edit there was no warning at
+        # all if the loop exhausted max_iterations/timeout without ever
+        # being approved. Neither caller (main.py) uses this method's
+        # return value, so this concluding print is the only place the
+        # user ever sees a clearly-labelled final answer.
+        total = time.time() - start
+        print(f"\n[{_ts()}] ── ANSWER — {file_path} — {total:.1f}s from request ──")
+        if validation.get("status") != "approved":
+            print(f"[{_ts()}] ⚠️  UNVALIDATED ANSWER — validator never approved "
+                  f"after {self.max_iterations} iteration(s). Last feedback: "
+                  f"{validation.get('feedback', '(none)')!r}. Review carefully.")
+        print(answer.strip() if answer and answer.strip() else "(no answer produced)")
+        print(f"\n[{_ts()}] status={validation.get('status', 'unknown')}  "
+              f"grounded={validation.get('grounded')}")
     # ------------------------------------------------------------------ #
     # In-place file editing (/edit) — writes the file, with backup + diff  #
     # ------------------------------------------------------------------ #
