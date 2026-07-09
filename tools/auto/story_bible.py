@@ -119,6 +119,14 @@ _GENDER_MALE_RE = re.compile(
 )
 
 _AGE_RE = re.compile(r"(\d+)\s*(?:лет|год)", re.IGNORECASE)
+# AUTO-BUG: no human age is >= 120, but a calendar-year reference like
+# "в 1990 году" / "к 2020 году" / "с 1985 года" matches _AGE_RE too — "год"
+# is an unanchored prefix of "году"/"года", so "1990 году" was being read as
+# age=1990. That false "age" then fed straight into the immutable-fact
+# conflict gate below, so a bullet stating a character's BIRTH YEAR and a
+# later bullet stating their AGE (two compatible facts) were flagged as a
+# contradiction and one of them silently dropped. Cap plausible human age.
+_MAX_PLAUSIBLE_AGE = 119
 
 # AUTO-BUG-2 (extended): a second example of a guarded, narrowly but
 # deterministically detectable "immutable-ish" attribute besides
@@ -184,9 +192,15 @@ def _age_of(bullet: str) -> "int | str | None":
     """
     if _AGE_UNKNOWN_RE.search(bullet):
         return "unknown"
-    m = _AGE_RE.search(bullet)
-    if m:
-        return int(m.group(1))
+    # AUTO-BUG fix: a bullet can contain BOTH a calendar year ("в 1990
+    # году") and a genuine age ("ей было 45 лет") — scan every match and
+    # take the first one that is a plausible human age instead of just the
+    # first match found, so the calendar year no longer shadows the real
+    # age (or gets misread as one when it's the only \d+ (лет|год) hit).
+    for m in _AGE_RE.finditer(bullet):
+        value = int(m.group(1))
+        if value <= _MAX_PLAUSIBLE_AGE:
+            return value
     w = _AGE_WORD_RE.search(bullet)
     if w:
         return _AGE_WORDS[w.group(1).lower()]

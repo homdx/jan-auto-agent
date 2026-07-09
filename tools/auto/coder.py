@@ -1222,15 +1222,25 @@ class Coder(_llm_stream.LLMClientBase):
             return [], msg
 
         # ── Truncation guard ────────────────────────────────────────────────
-        # Estimate the token budget in chars (conservative: 4 chars ≈ 1 token).
-        char_budget = self._max_tokens * 4
+        # AUTO-BUG: was a hardcoded "4 chars ≈ 1 token" — correct for Latin
+        # text but wrong by ~2x for Cyrillic (chars_per_token() already
+        # encodes the measured ~2.2 chars/token for Russian, and is used for
+        # exactly this reason by canon_validator / summary_memory). Creative
+        # mode is predominantly Russian prose, so a genuinely truncated
+        # ~2048-token Russian chapter is only ~4.5k chars — that never
+        # reaches 95% of the old hardcoded 8k-char budget, so this guard
+        # could never fire on the one language it most needed to catch,
+        # silently writing a mid-sentence-truncated chapter instead of
+        # surfacing the actionable retry message.
+        from tools.auto.utils import chars_per_token
+        char_budget = self._max_tokens * chars_per_token(body)
         last_char = body[-1] if body else ""
         ends_mid_sentence = last_char not in {".", "!", "?", '"', "'", "\n", "…"}
         if ends_mid_sentence and len(body) >= char_budget * 0.95:
             msg = (
                 "creative coder: response hit the token budget mid-sentence — "
                 "raise [coder] max_tokens or shorten the chapter target. "
-                f"(body length {len(body)} chars ≈ budget {char_budget} chars)"
+                f"(body length {len(body)} chars ≈ budget {char_budget:.0f} chars)"
             )
             logger.warning("coder._parse_response_prose [%s]: %s", task_id, msg)
             return [], msg
