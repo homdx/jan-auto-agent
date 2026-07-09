@@ -99,7 +99,15 @@ def _normalise(text: str) -> str:
 
 def _parse_bullets(text: str) -> list[str]:
     """Return raw bullet strings (without leading marker) from *text*."""
-    marker = re.compile(r"^\s*[•\-\*]|\d+[.)]\s+")
+    # BUGFIX: the numbered-marker alternative (\d+[.)]\s+) had no ^ anchor,
+    # so re.sub with count=1 stripped the FIRST "<digits>.<space>" or
+    # "<digits>)<space>" found anywhere in the line — not just a leading
+    # list marker. A fact like "Лена вернулась 1. мая в деревню" (an ordinal
+    # mid-sentence, not a bullet marker) was silently mangled to "Лена
+    # вернулась мая в деревню" before ever being stored or compared, since
+    # every _parse_bullets caller (_do_update, _compact, _dedup_substrings,
+    # the correction gate) works from this parsed-and-stripped text.
+    marker = re.compile(r"^\s*[•\-\*]|^\d+[.)]\s+")
     result: list[str] = []
     for line in text.splitlines():
         line = line.strip()

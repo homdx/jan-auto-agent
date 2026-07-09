@@ -464,7 +464,21 @@ class Coder(_llm_stream.LLMClientBase):
                     # call asked for.  context_satisfied intentionally keeps
                     # the first response's value: False signals "probe was
                     # needed" and is used by outer_loop to skip TaskRewriter.
-                    missing_ctx = self._extract_context_request(cleaned)
+                    #
+                    # BUGFIX: this always used the JSON extractor, unlike the
+                    # first call above (which branches on task_mode). Dormant
+                    # today only because this probe block is gated on
+                    # _extract_missing_context (JSON-based), which always
+                    # returns [] for creative-mode prose — so the guard above
+                    # never lets creative-mode code reach this line. If
+                    # _extract_missing_context is ever extended to parse
+                    # prose, or the guard changes, this would silently wipe
+                    # out the context request the model just made in
+                    # creative mode. Branch the same way the first call does.
+                    if self._task_mode == "creative":
+                        missing_ctx = self._extract_context_request_prose(cleaned)
+                    else:
+                        missing_ctx = self._extract_context_request(cleaned)
                 except Exception as exc:
                     logger.warning(
                         "coder.generate [%s]: context-probe second call failed: %s "
@@ -1480,16 +1494,31 @@ class Coder(_llm_stream.LLMClientBase):
         Prevents path traversal (``../../etc/passwd``) and absolute-path
         injection from LLM responses.  Returns ``(resolved_path, "")`` on
         success or ``(None, error_message)`` on violation.
+
+        BUGFIX: this used to call ``.resolve()`` on ``base_dir / rel`` but
+        compare the result against the *unresolved* ``base_dir`` argument.
+        ``generate()`` happens to resolve its own ``base_dir`` before
+        reaching here, so the mismatch is currently masked in the only
+        production call path — but ``_safe_dest`` is a general-purpose
+        boundary check with no documented precondition that its caller must
+        pre-resolve, and calling it directly with an unresolved path (e.g.
+        a workspace under a symlinked parent — ``/tmp`` → ``/private/tmp``
+        on macOS, a symlinked home directory, an NFS/bind-mounted project
+        dir) makes ``dest.relative_to(base_dir)`` raise on every single
+        legitimate write, since ``dest`` follows the symlink but
+        ``base_dir`` doesn't. Resolving both sides here makes the check
+        correct independent of what the caller passes in.
         """
         # Reject obviously absolute paths before Path() normalises them.
         if rel.startswith("/") or (len(rel) > 1 and rel[1:3] == ":\\"):
             return None, f"rejected absolute path from LLM: {rel!r}"
         try:
+            base_resolved = base_dir.resolve()
             dest = (base_dir / rel).resolve()
         except (OSError, ValueError) as exc:
             return None, f"path resolution error for {rel!r}: {exc}"
         try:
-            dest.relative_to(base_dir)
+            dest.relative_to(base_resolved)
         except ValueError:
             return None, f"path escapes base_dir: {rel!r} → {dest}"
         return dest, ""

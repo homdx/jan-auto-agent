@@ -805,6 +805,15 @@ class OrchestratorActions:
             return self._parse_llm_json(content)
         except Exception as e:
             logger.warning(f"edit validator returned unparseable content: {e}")
+            # BUGFIX: this was the only one of the three sibling validator
+            # methods (_validate_text_answer, ValidatorAgent.validate, and
+            # this one) that didn't set _unparseable on a parse failure —
+            # an inconsistency, not currently a live bug (run_edit doesn't
+            # check the flag), but any future caller that does — the way
+            # run_search already checks `_api_error or _unparseable` — would
+            # silently misroute this failure, and prompt_evaluator's
+            # json_ok_rate scoring would mis-classify it if this validator
+            # is ever wired into the evaluator.
             return {
                 "status": "needs_fix",
                 "feedback": (
@@ -812,6 +821,7 @@ class OrchestratorActions:
                     'JSON {"status": ..., "feedback": ...} — reply with '
                     "JSON only, no prose, no code fences."
                 ),
+                "_unparseable": True,
             }
 
     def run_edit(self, user_input: str, base_dir: str,

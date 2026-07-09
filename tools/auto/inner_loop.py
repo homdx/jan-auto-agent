@@ -712,12 +712,32 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
         # bare «противоречи» REVISE pattern below and flipping a genuine
         # APPROVED into a false REVISE. Allow up to 3 filler words (bounded so
         # it can't jump across an unrelated sentence) in between.
+        #
+        # BUGFIX: the filler-gap fix above first shipped as `не\s+\w+` — ANY
+        # "не + word" — which also matched the critic negating their OWN
+        # reaction/expectation rather than the existence of a contradiction:
+        # «противоречий мне не понравилось», «противоречий я здесь не
+        # одобрю», «противоречий не ожидал найти» all wrongly APPROVED.
+        # Restrict the negated verb to ones that actually mean "not found /
+        # not detected" instead of accepting any verb.
         _re.compile(
-            r"противоречи\w*(?:\s+\S+){0,3}\s+(?:отсутств\w*|не\s+\w+)"
+            r"противоречи\w*(?:\s+\S+){0,3}\s+"
+            r"(?:отсутств\w*|не\s+(?:обнаружен\w*|выявлен\w*|найден\w*|"
+            r"встречает\w*|замечен\w*|видн\w*))"
         ),
         #   «не вижу / не обнаружил / не нашёл … противоречий» — same filler-word
         #   gap allowed on this side (e.g. «не смог найти каких-либо противоречий»).
-        _re.compile(r"\bне(?:\s+\S+){0,3}\s+противоречи"),
+        # BUGFIX: the original `\bне(?:\s+\S+){0,3}\s+противоречи` allowed ANY
+        # gap after «не», so «не ожидал встретить противоречия» / «не
+        # нравятся противоречия» — negating the critic's expectation/liking,
+        # not the presence of a contradiction — wrongly APPROVED too. Require
+        # «не» to be followed by a search/perception verb (вижу, нахожу,
+        # обнаружил, ...) before the filler-word gap kicks in.
+        _re.compile(
+            r"\bне\s+(?:вижу|нахожу|нашёл|нашел|обнаружил|выявил|заметил|"
+            r"встретил|встречаю|смог\s+найти)"
+            r"(?:\s+\S+){0,3}\s+противоречи"
+        ),
         # «не против» / «непротив»
         _re.compile(r"\bне\s+против\b"),
         _re.compile(r"\bнепротив\b"),

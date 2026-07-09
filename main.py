@@ -424,14 +424,26 @@ class Orchestrator(OrchestratorActions):
                 already_searched.extend(search_result.get("searched_files", []))
                 new_suggestions = validation.get("suggested_searches", [])
                 if isinstance(new_suggestions, list):
+                    # BUGFIX: this used to log len(new_suggestions) as the
+                    # "discarded" count whenever the cap was hit at all —
+                    # even when most of this round's suggestions were
+                    # actually added before the cap was reached (e.g. 5
+                    # offered, 3 added, cap hit on the 4th — logged "5
+                    # discarded" instead of the true 2). Count discards
+                    # directly instead of inferring them from the batch size.
+                    _discarded = 0
                     for suggestion in new_suggestions:
-                        if suggestion not in refs and len(refs) < _refs_cap:
+                        if suggestion in refs:
+                            continue
+                        if len(refs) < _refs_cap:
                             refs.append(suggestion)
-                    if len(refs) >= _refs_cap and new_suggestions:
+                        else:
+                            _discarded += 1
+                    if _discarded:
                         logger.debug(
                             "run_pipeline: refs cap (%d) reached — "
                             "%d suggestion(s) from validator discarded",
-                            _refs_cap, len(new_suggestions),
+                            _refs_cap, _discarded,
                         )
                 iteration += 1
         else:
