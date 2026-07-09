@@ -212,7 +212,7 @@ class OrchestratorActions:
                 validation = self._validate_text_answer(query, ch, ans,
                                                          stream_mode=self.stream_agents)
 
-            if validation.get("_api_error"):
+            if validation.get("_api_error") or validation.get("_unparseable"):
                 print(f"[{_ts()}] ⚠️  Validator unavailable — accepting answer as-is. "
                       f"({validation.get('feedback', '')})")
                 print(f"[{_ts()}] ✅ Answer found in chunk {i}/{len(chunks)} (unvalidated).")
@@ -381,6 +381,20 @@ class OrchestratorActions:
             return self._parse_llm_json(content)
         except Exception as e:
             logger.warning(f"text validator returned unparseable content: {e}")
+            # AUTO-BUG (follow-up): run_search() has NO retry loop — its
+            # docstring's own contract is "if the validator is unreachable,
+            # accept the candidate answer as-is rather than blocking the
+            # search," and it originally implemented that by checking this
+            # method's _api_error flag. When the fix above stopped labelling
+            # a parse failure as _api_error (correctly, for run_text_qa's
+            # retry loop), it silently broke that contract for run_search:
+            # a validator that never produces valid JSON now causes EVERY
+            # chunk to be rejected as needs_fix, so run_search reports "no
+            # answer found" even when a genuinely correct candidate answer
+            # was found in every single chunk. _unparseable lets run_search
+            # apply its own fail-open rule to this failure mode too, while
+            # run_text_qa's retry loop (which only checks _api_error) is
+            # unaffected and still advances iteration/feeds back correctly.
             return {
                 "status": "needs_fix",
                 "grounded": False,
@@ -389,6 +403,7 @@ class OrchestratorActions:
                     'JSON {"status": ..., "grounded": ..., "feedback": ...} '
                     "— reply with JSON only, no prose, no code fences."
                 ),
+                "_unparseable": True,
             }
 
     def run_text_qa(self, question: str, file_path: str, source: str, base_dir: str,
