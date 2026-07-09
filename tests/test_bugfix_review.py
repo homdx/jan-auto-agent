@@ -23,6 +23,13 @@ bug; the short version:
      file already in a cluster was invisible to it forever.
   6. TestTicketStorePathSanitization — ticket ids were not sanitized before
      being interpolated into a filesystem path (unlike task ids).
+  7. TestWordBoundaryGrandfathering — the selfhost-pilot grandfathering added
+     to _check_content_safety covered the general substring patterns and the
+     subprocess+danger-token combo, but not the separate word-boundary check
+     (sudo/shutdown/reboot). Since coder.py's own pattern tables contain the
+     word "sudo" as data, this silently blocked EVERY edit to coder.py,
+     including a no-op rewrite of its own unchanged content — defeating the
+     self-editing feature the commit was written to enable.
 """
 
 from __future__ import annotations
@@ -35,6 +42,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from tools.auto.coder import Coder
 from tools.auto.state import (
     StateStore,
     make_task,
@@ -551,6 +559,63 @@ class TestPreexistingPatternGrandfathering:
             [{"path": "utils.py", "content": self.UTILS_LIKE + "# edit\n"}],
             tmp_path, "T", allowed_paths=frozenset({"utils.py"}))
         assert written == [] and "blocked" in err
+
+
+# ── Bug 7: word-boundary patterns (sudo/shutdown/reboot) were never given the
+#    same pre-existing-pattern grandfathering as the other two checks in
+#    _check_content_safety, so any file whose *legitimate* content contains
+#    one of those words as data (coder.py's own pattern tables, a devops
+#    README, ...) could never be written again — not even as a no-op rewrite.
+
+class TestWordBoundaryGrandfathering:
+    # Mirrors the real coder.py self-edit case: a file whose own content
+    # necessarily contains "sudo" as data (defining what to block), not as an
+    # actual invocation.
+    SELF_REFERENTIAL = (
+        "SUDO_TOKENS = ('sudo ', '\"sudo\"')  # patterns this scanner blocks\n"
+        "def greet(name):\n"
+        "    return f'hi {name}'\n"
+    )
+
+    def test_noop_rewrite_of_self_referential_file_allowed(self):
+        # The exact real-world case: rewriting a file back to itself
+        # unchanged must not be permanently blocked by its own data.
+        safe, reason = Coder._check_content_safety(
+            self.SELF_REFERENTIAL, "code", existing_content=self.SELF_REFERENTIAL)
+        assert safe, reason
+
+    def test_unrelated_edit_to_self_referential_file_allowed(self):
+        edited = self.SELF_REFERENTIAL + "\ndef farewell(name):\n    return f'bye {name}'\n"
+        safe, reason = Coder._check_content_safety(
+            edited, "code", existing_content=self.SELF_REFERENTIAL)
+        assert safe, reason
+
+    def test_new_sudo_word_in_clean_file_still_blocked(self):
+        clean = "def greet(name):\n    return f'hi {name}'\n"
+        injected = clean + "\n# TODO: this needs sudo to install\n"
+        safe, reason = Coder._check_content_safety(injected, "code", existing_content=clean)
+        assert not safe and "sudo" in reason
+
+    def test_new_shutdown_word_in_clean_file_still_blocked(self):
+        clean = "def greet(name):\n    return f'hi {name}'\n"
+        injected = clean + "\n# TODO: call shutdown when idle\n"
+        safe, reason = Coder._check_content_safety(injected, "code", existing_content=clean)
+        assert not safe and "shutdown" in reason
+
+    def test_new_file_with_word_boundary_pattern_still_blocked(self):
+        # No existing_content at all (brand-new file) — must never be
+        # grandfathered regardless of what the pattern is.
+        safe, reason = Coder._check_content_safety(
+            "# reboot the host after install\n", "code", existing_content=None)
+        assert not safe
+
+    def test_identifier_names_still_exempt(self):
+        # Unrelated pre-existing behaviour must be untouched: underscore-
+        # joined identifiers embedding the keyword never match (\\b treats
+        # '_' as a word character), independent of grandfathering.
+        clean = "def test_reboot_gracefully():\n    assert True\n"
+        safe, reason = Coder._check_content_safety(clean, "code", existing_content=None)
+        assert safe, reason
 
 
 # ── selfrun E2E: недостижимый rewriter при max_rounds < 3 ────────────────────

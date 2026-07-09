@@ -1462,6 +1462,13 @@ class Coder(_llm_stream.LLMClientBase):
             for label, pattern in cls._BLOCKED_CODE_WORD_BOUNDARY:
                 keyword = pattern.lower().rstrip()
                 if _re.search(r"\b" + _re.escape(keyword) + r"\b", lower):
+                    if _preexisting(keyword):
+                        logger.info(
+                            "coder._check_content_safety: word-boundary pattern "
+                            "%r pre-exists in the target file — edit permitted "
+                            "(grandfathered).", pattern,
+                        )
+                        continue
                     return False, f"blocked content pattern {pattern!r} ({label})"
 
         return True, ""
