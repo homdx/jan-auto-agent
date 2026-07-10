@@ -1574,9 +1574,25 @@ class Coder(_llm_stream.LLMClientBase):
 
             # ── Guard 2: path must be in the task's approved target_files ──
             if allowed_paths is not None:
-                # Normalise to forward-slash for comparison.
-                norm = rel.replace("\\", "/").lstrip("./")
-                allowed_norm = {p.replace("\\", "/").lstrip("./") for p in allowed_paths}
+                # Normalise to forward-slash for comparison. Bugfix: this
+                # used to be rel.replace("\\", "/").lstrip("./") — str.lstrip
+                # strips ANY of the given characters from the left, repeatedly,
+                # not the literal two-character prefix "./". A path starting
+                # with its own leading dot (a dotfile like ".notes.md", or
+                # any name beginning with "." or "/") had that character
+                # eaten too, so ".notes.md" normalised to the same string as
+                # "notes.md" — letting the LLM write to a file it was never
+                # authorised for as long as some allowed target_file's name,
+                # after the same bad stripping, happened to collide with it.
+                # A single literal "./" prefix strip has no such collision.
+                def _norm_target(p: str) -> str:
+                    p = p.replace("\\", "/")
+                    while p.startswith("./"):
+                        p = p[2:]
+                    return p
+
+                norm = _norm_target(rel)
+                allowed_norm = {_norm_target(p) for p in allowed_paths}
                 if norm not in allowed_norm:
                     msg = (
                         f"[SAFETY] LLM tried to write {rel!r} which is not in "

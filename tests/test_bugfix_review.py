@@ -427,6 +427,51 @@ class TestTicketStorePathSanitization:
 
 # ── selfhost pilot: tests-mandate gate ────────────────────────────────────────
 
+class TestCoderTargetFilesDotfileCollision:
+    """Coder._write_files' target_files allow-list guard must not let a
+    disallowed dotfile slip through by colliding, after normalisation, with
+    an allowed non-dotfile name (or vice versa)."""
+
+    def _coder(self):
+        import configparser
+        from tools.auto.coder import Coder
+        cfg = configparser.ConfigParser()
+        cfg.read_dict({
+            "api":       {"active": "local", "verify_ssl": "true"},
+            "api_local": {"base_url": "http://localhost:9999", "model": "x", "api_key": ""},
+            "coder":     {"temperature": "0.2", "max_tokens": "1024"},
+            "loop":      {"timeout_seconds": "60"},
+        })
+        return Coder(cfg, "http://localhost:9999", "", "x")
+
+    def test_dotfile_not_authorised_is_rejected(self, tmp_path):
+        coder = self._coder()
+        allowed = frozenset({"notes.md"})
+        written, _ = coder._write_files(
+            [{"path": ".notes.md", "content": "sneaky"}],
+            tmp_path, "T1", allowed_paths=allowed,
+        )
+        assert written == [], (
+            ".notes.md must NOT be treated as the same target as the "
+            "approved notes.md — the allow-list guard must not collapse "
+            "distinct filenames that merely share a suffix after a leading "
+            "dot/slash is stripped"
+        )
+        assert not (tmp_path / ".notes.md").exists()
+
+    def test_leading_dot_slash_is_still_normalised(self, tmp_path):
+        """A genuine "./" prefix (not a bare leading dot) must still be
+        stripped so the intended normalisation keeps working."""
+        coder = self._coder()
+        allowed = frozenset({"notes.md"})
+        written, _ = coder._write_files(
+            [{"path": "./notes.md", "content": "hello"}],
+            tmp_path, "T1", allowed_paths=allowed,
+        )
+        assert written == ["./notes.md"]
+        assert (tmp_path / "notes.md").read_text(encoding="utf-8") == "hello"
+
+
 class TestCanonValidatorPreservesNumbers:
     """CanonValidator._extract_claims must not eat a claim's own leading
     digits (ages, years, counts) while stripping list-marker prefixes."""
