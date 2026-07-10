@@ -111,11 +111,20 @@ class TestJsonOkRateExcludesBothFailureModes:
     @staticmethod
     def _json_ok_rate(results: list[dict]) -> float:
         """Mirrors tools/prompt_evaluator.py's _shadow_score() formula
-        exactly (see the AUTO-BUG (follow-up) comment there)."""
-        n = len(results)
-        return sum(
-            1 for r in results if not r.get("_api_error") and not r.get("_unparseable")
-        ) / n
+        exactly (see the AUTO-BUG (follow-up) / AUTO-BUG (follow-up 2)
+        comments there).
+
+        UPDATED (follow-up 2): _api_error results are now excluded from the
+        denominator too, not just the numerator — matching
+        _score_from_records' treatment of not-applicable records — so
+        network jitter during a shadow run doesn't distort a candidate's
+        score. Only _unparseable results (a reply DID arrive and failed
+        the thing this rate measures) still count against the candidate.
+        """
+        judged = [r for r in results if not r.get("_api_error")]
+        if not judged:
+            return 0.0
+        return sum(1 for r in judged if not r.get("_unparseable")) / len(judged)
 
     def test_all_unparseable_scores_zero_not_one(self):
         results = [{"status": "needs_fix", "_unparseable": True} for _ in range(5)]
@@ -145,7 +154,12 @@ class TestJsonOkRateExcludesBothFailureModes:
             {"status": "needs_fix"},  # ordinary content-based rejection — still "ok JSON"
         ]
         rate = self._json_ok_rate(results)
-        assert rate == 3 / 5
+        # 1 _api_error result is excluded from the denominator entirely
+        # (network jitter, not a prompt-quality signal) — 2 approved + 1
+        # ordinary needs_fix count as "ok JSON" out of the 4 judged results
+        # (5 total minus the 1 _api_error); the 1 _unparseable result is
+        # judged and counts against the candidate.
+        assert rate == 3 / 4
 
 
 # ── C: actions.py _answer_from_file None-on-failure + retry ─────────────────

@@ -244,10 +244,21 @@ class BugFixLoop:
                 outer_result.knowledge() if hasattr(outer_result, "knowledge")
                 else "", _MAX_OUTPUT_CHARS
             )
+            # BUGFIX: TicketStore.get() does a fresh disk read here and
+            # returns None if the ticket file is absent — and self._outer
+            # .run_task() above can run for a long time (many LLM calls /
+            # retries), during which the ticket file could be deleted
+            # externally (an operator cleaning up a stuck ticket, a
+            # concurrent process, a filesystem hiccup). The ticket having
+            # existed or been created earlier in this same call doesn't
+            # guarantee it still exists now — a bare `[...]["body"]`
+            # subscript on None would raise TypeError and crash the whole
+            # bug-fix loop instead of just this one deferred update.
+            _existing_ticket = self._tickets.get(ticket_id) or {}
             self._tickets.update(
                 ticket_id,
                 status="deferred",
-                body=self._tickets.get(ticket_id)["body"] + (
+                body=_existing_ticket.get("body", "") + (
                     f"\n\n## Fix attempt exhausted\n{knowledge}"
                 ),
             )

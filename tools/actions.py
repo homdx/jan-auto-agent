@@ -208,7 +208,25 @@ class OrchestratorActions:
         budget = self.search_full_file_max_chars
         if len(source) <= budget:
             print(f"[{_ts()}] Full-file search over {file_path} ({len(source)} chars).")
-            self._ask_over_text(query, file_path, source)
+            # BUGFIX: the multi-chunk path below already retries a transient
+            # network/API error (None) up to 3 times before giving up on a
+            # chunk — this single-file path called _ask_over_text and threw
+            # the return value away entirely, so the exact same error on a
+            # SMALL file (one that fits the budget and never gets chunked)
+            # got zero retries: the search just printed nothing and
+            # returned silently. Same asymmetric-resilience bug, same fix.
+            _RETRY = 3
+            ans = None
+            for _attempt in range(_RETRY):
+                ans = self._ask_over_text(query, file_path, source)
+                if ans is not None:
+                    return
+                if _attempt < _RETRY - 1:
+                    _wait = backoff.backoff_seconds(_attempt)
+                    print(f"[{_ts()}] ⚠️  Retrying after error "
+                          f"(attempt {_attempt + 2}/{_RETRY})...")
+                    time.sleep(_wait)
+            print(f"[{_ts()}] ⚠️  Search unreachable after {_RETRY} attempts.")
             return
 
         # File too large for one context → allowed to split.

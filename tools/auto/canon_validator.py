@@ -341,7 +341,15 @@ class CanonValidator:
             return ""
         # Salient tokens: capitalised words (names/places) are the cheapest,
         # most useful query terms for an entity-based prose pull.
-        tokens = re.findall(r"\b[A-Z][a-zA-Z]{2,}\b", claim)
+        # BUGFIX: [A-Z][a-zA-Z]{2,} is ASCII-only, so it matched nothing at
+        # all for Cyrillic character names (Иван, Мария, Андрей, ...) —
+        # every Russian-fiction claim hit the `if not tokens: return ""`
+        # guard below, silently dropping the earlier-chapter excerpt from
+        # every canon-conflict message. The coder was told WHAT conflicted
+        # but never WHERE the conflicting canon was established. Python 3's
+        # \b is already Unicode-aware, so adding the Cyrillic ranges to the
+        # character class is enough — no extra flags needed.
+        tokens = re.findall(r"\b[A-ZА-ЯЁ][a-zA-Zа-яёА-ЯЁ]{2,}\b", claim)
         if not tokens:
             return ""
         try:
