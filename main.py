@@ -450,8 +450,15 @@ class Orchestrator(OrchestratorActions):
             print("ℹ️ Intent is 'show'. Skipping agent validation pipeline.")
 
         # --- IMPROVEMENT AGENT (Intent-based) ---
+        # parsed.intent is always one of: "show", "improve", "explain",
+        # "show_and_improve", "show_imports" (see tools/prompt_parser.py).
+        # "optimize"/"fix" are user-typed *keywords* that map into "improve" —
+        # they are never themselves an intent value — and "show_and_improve"
+        # (the parser's own default fallback, produced whenever a prompt uses
+        # both a show-type and an improve-type verb) must run the improvement
+        # agent too, exactly like plain "improve" does.
         improvement: Dict[str, Any] = {}
-        if parsed.intent in ("optimize", "fix", "improve", "explain"):
+        if parsed.intent in ("improve", "explain", "show_and_improve"):
             print("⚡ Processing improvements...")
             improvement_context = {
                 "target_block": block,
