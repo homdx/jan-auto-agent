@@ -424,9 +424,13 @@ class Orchestrator(OrchestratorActions):
                 already_searched.extend(search_result.get("searched_files", []))
                 new_suggestions = validation.get("suggested_searches", [])
                 if isinstance(new_suggestions, list):
-                    # Count discards directly instead of inferring them from
-                    # the batch size, which over-counted when most of the
-                    # batch was added before the cap was hit.
+                    # BUGFIX: this used to log len(new_suggestions) as the
+                    # "discarded" count whenever the cap was hit at all —
+                    # even when most of this round's suggestions were
+                    # actually added before the cap was reached (e.g. 5
+                    # offered, 3 added, cap hit on the 4th — logged "5
+                    # discarded" instead of the true 2). Count discards
+                    # directly instead of inferring them from the batch size.
                     _discarded = 0
                     for suggestion in new_suggestions:
                         if suggestion in refs:
@@ -446,15 +450,8 @@ class Orchestrator(OrchestratorActions):
             print("ℹ️ Intent is 'show'. Skipping agent validation pipeline.")
 
         # --- IMPROVEMENT AGENT (Intent-based) ---
-        # parsed.intent is always one of: "show", "improve", "explain",
-        # "show_and_improve", "show_imports" (see tools/prompt_parser.py).
-        # "optimize"/"fix" are user-typed *keywords* that map into "improve" —
-        # they are never themselves an intent value — and "show_and_improve"
-        # (the parser's own default fallback, produced whenever a prompt uses
-        # both a show-type and an improve-type verb) must run the improvement
-        # agent too, exactly like plain "improve" does.
         improvement: Dict[str, Any] = {}
-        if parsed.intent in ("improve", "explain", "show_and_improve"):
+        if parsed.intent in ("optimize", "fix", "improve", "explain"):
             print("⚡ Processing improvements...")
             improvement_context = {
                 "target_block": block,

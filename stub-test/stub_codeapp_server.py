@@ -98,7 +98,8 @@ def build_reply(system: str, user: str) -> str:
                 "target_files": ["app.py"],
                 "acceptance_check": ACCEPT_1,
                 "cited_location": {"file": "app.py", "symbol": "hello",
-                                   "line_start": None, "line_end": None},
+                                   "line_start": None, "line_end": None,
+                                   "new_file": True},
             },
             {
                 "title": "T2: add Swagger (OpenAPI) endpoint",

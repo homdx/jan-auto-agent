@@ -142,10 +142,19 @@ class ValidatorAgent:
         tracer.event("validator_agent", "llm", "llm_request",
                      content=prompt, model=self.model, temperature=self.temperature)
 
-        # Split network failure from parse failure: only a genuine transport
-        # error is _api_error (triggers backoff-retry without consuming an
-        # iteration in main.py's run_pipeline); a malformed-but-received
-        # reply is an ordinary needs_fix.
+        # AUTO-BUG: this used to wrap the network call AND json.loads() in
+        # one try/except, so a successfully-returned-but-malformed (non-JSON)
+        # reply was indistinguishable from a genuine network/HTTP failure —
+        # both came out as {"_api_error": True}. main.py's run_pipeline()
+        # retries _api_error with exponential backoff via a `continue` that
+        # explicitly skips `iteration += 1`, so `iteration >= self.max_iterations`
+        # never trips either: a validator that reliably answers with prose
+        # instead of the required STRICT JSON burns the whole run's timeout
+        # budget in escalating sleeps, retrying the identical prompt with no
+        # corrective feedback, instead of counting as an ordinary needs_fix
+        # round that advances iteration and tells the model what to fix.
+        # Only a genuine request_completion failure is a real API error; a
+        # parse failure on a response that DID arrive is a normal needs_fix.
         try:
             if self.stream:
                 ts = time.strftime("%H:%M:%S")
@@ -186,8 +195,20 @@ class ValidatorAgent:
             parsed_result = json.loads(content)
         except Exception as e:
             logger.warning(f"ValidatorAgent: unparseable reply — {e}")
-            # _unparseable, distinct from _api_error, so prompt_evaluator's
-            # json_ok_rate scores this differently from a genuine API error.
+            # AUTO-BUG (follow-up): prompt_evaluator.py's _shadow_score()
+            # computes json_ok_rate = fraction of results WITHOUT
+            # _api_error, as a direct proxy for "did the candidate prompt
+            # produce valid JSON." Before the fix above, a malformed reply
+            # WAS labelled _api_error, so that proxy was correct. Now that
+            # malformed-but-received replies are a distinct outcome, a
+            # candidate prompt that never produces valid JSON has none of
+            # its failures labelled _api_error and json_ok_rate silently
+            # inverts to 1.0 — rewarding exactly the failure mode it exists
+            # to penalise, which could get a bad candidate PROMOTED by the
+            # AutoTuner. _unparseable lets that caller (and any other) tell
+            # "genuine API error" apart from "response arrived, wrong
+            # format" apart from "valid JSON" — all three are different
+            # outcomes worth scoring differently.
             _err = {
                 "status": "needs_fix",
                 "feedback": (

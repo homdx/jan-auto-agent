@@ -272,11 +272,21 @@ class PromptEvaluator:
         avg_iter = sum(sim_iters) / n
         iter_score = max(0.0, 1.0 - (avg_iter - 1.0) / max(1, self.max_iter - 1))
 
-        # Exclude _api_error from both numerator and denominator (no reply
-        # arrived to judge at all — the shadow-run equivalent of "not
-        # applicable"), matching _score_from_records' treatment above.
-        # _unparseable stays in the denominator: a reply DID arrive there,
-        # and failed the exact thing this rate measures.
+        # AUTO-BUG (follow-up 2): the previous fix correctly excluded
+        # _api_error from the NUMERATOR (so an all-network-failure candidate
+        # can't score a false 1.0), but still divided by the full `n`,
+        # including _api_error results in the DENOMINATOR. _score_from_records
+        # (the production-run scorer just above) excludes not-applicable
+        # records from BOTH numerator and denominator — an _api_error result
+        # is the shadow-run equivalent of "not applicable" (no reply
+        # arrived to judge at all, unlike _unparseable where a reply DID
+        # arrive and failed the exact thing json_ok_rate measures). Counting
+        # _api_error in the denominator means a candidate shadow-tested
+        # during network jitter scores lower than the identical candidate
+        # tested on a stable connection purely by chance — 5 good replies +
+        # 5 _api_error = 0.5, vs. 5 good + 0 errors = 1.0 — on the
+        # highest-weighted (35%) component of the score, for reasons
+        # entirely unrelated to prompt quality.
         _json_judged = [r for r in results if not r.get("_api_error")]
         json_ok_rate = (
             sum(1 for r in _json_judged if not r.get("_unparseable")) / len(_json_judged)

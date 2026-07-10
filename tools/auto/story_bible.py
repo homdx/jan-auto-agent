@@ -58,7 +58,6 @@ from pathlib import Path
 from typing import Callable
 
 from tools.auto.summary_memory import _clean_bullet_list  # reuse existing helper
-from tools.auto.utils import atomic_write_text
 
 logger = logging.getLogger(__name__)
 
@@ -100,9 +99,14 @@ def _normalise(text: str) -> str:
 
 def _parse_bullets(text: str) -> list[str]:
     """Return raw bullet strings (without leading marker) from *text*."""
-    # Both alternatives anchored — regex alternation binds ^ to only the
-    # first branch otherwise, letting a mid-sentence ordinal ("1. мая")
-    # get silently stripped as if it were a leading list marker.
+    # BUGFIX: the numbered-marker alternative (\d+[.)]\s+) had no ^ anchor,
+    # so re.sub with count=1 stripped the FIRST "<digits>.<space>" or
+    # "<digits>)<space>" found anywhere in the line — not just a leading
+    # list marker. A fact like "Лена вернулась 1. мая в деревню" (an ordinal
+    # mid-sentence, not a bullet marker) was silently mangled to "Лена
+    # вернулась мая в деревню" before ever being stored or compared, since
+    # every _parse_bullets caller (_do_update, _compact, _dedup_substrings,
+    # the correction gate) works from this parsed-and-stripped text.
     marker = re.compile(r"^\s*[•\-\*]|^\d+[.)]\s+")
     result: list[str] = []
     for line in text.splitlines():
@@ -123,14 +127,21 @@ _GENDER_MALE_RE = re.compile(
 )
 
 _AGE_RE = re.compile(r"(\d+)\s*(?:лет|год)", re.IGNORECASE)
-# Cap plausible human age: "год" is an unanchored prefix of "году"/"года",
-# so a calendar year ("в 1990 году") would otherwise be read as age=1990,
-# and a compatible birth-year + stated-age pair would be flagged as a
-# contradiction.
+# AUTO-BUG: no human age is >= 120, but a calendar-year reference like
+# "в 1990 году" / "к 2020 году" / "с 1985 года" matches _AGE_RE too — "год"
+# is an unanchored prefix of "году"/"года", so "1990 году" was being read as
+# age=1990. That false "age" then fed straight into the immutable-fact
+# conflict gate below, so a bullet stating a character's BIRTH YEAR and a
+# later bullet stating their AGE (two compatible facts) were flagged as a
+# contradiction and one of them silently dropped. Cap plausible human age.
 _MAX_PLAUSIBLE_AGE = 119
 
-# AUTO-BUG-2 (extended): recovery/health status — a second narrow,
-# deterministically-detectable "immutable-ish" attribute besides gender/age.
+# AUTO-BUG-2 (extended): a second example of a guarded, narrowly but
+# deterministically detectable "immutable-ish" attribute besides
+# gender/age -- recovery/health status. Full generalisation to arbitrary
+# contradicting facts would need semantic (LLM) comparison; this mirrors
+# the same narrow, false-positive-resistant pattern as gender/age instead
+# of attempting that.
 _RECOVERY_FULL_RE = re.compile(
     r"полностью (?:выздоровел|восстановил(?:ся|ась)|поправил(?:ся|ась))", re.IGNORECASE,
 )
@@ -160,9 +171,12 @@ _AGE_WORD_RE = re.compile(
 )
 
 _NAME_RE = re.compile(r"\b[А-ЯЁ][а-яёА-ЯЁ]{2,}\b")
-# Common non-name capitalised words (pronouns, generic role nouns) that
-# start a sentence and would otherwise be misread as character names
-# (e.g. "Она сказала..." -> name "Она"), corrupting entity-scoping below.
+# Common non-name capitalised words that should not be treated as entity names.
+# Includes pronouns/demonstratives and generic role nouns that are capitalised
+# only because they start a sentence (bugfix: these were being misread as
+# character names, e.g. "Она сказала..." -> name "Она", "Главный герой..."
+# -> name "Главный" — which corrupted the entity-scoping in
+# _conflicts_with_established below).
 _NAME_STOPWORDS = {
     "Капитан", "Команда", "Корабль", "Мостик", "Возраст",
     "Она", "Его", "Ему", "Себя", "Этот", "Эта", "Это",
@@ -186,8 +200,11 @@ def _age_of(bullet: str) -> "int | str | None":
     """
     if _AGE_UNKNOWN_RE.search(bullet):
         return "unknown"
-    # Scan all matches and take the first plausible human age, so a
-    # calendar year mentioned alongside a real age doesn't shadow it.
+    # AUTO-BUG fix: a bullet can contain BOTH a calendar year ("в 1990
+    # году") and a genuine age ("ей было 45 лет") — scan every match and
+    # take the first one that is a plausible human age instead of just the
+    # first match found, so the calendar year no longer shadows the real
+    # age (or gets misread as one when it's the only \d+ (лет|год) hit).
     for m in _AGE_RE.finditer(bullet):
         value = int(m.group(1))
         if value <= _MAX_PLAUSIBLE_AGE:
@@ -428,9 +445,12 @@ class StoryBible:
                         conflict_bullet = _sem
                 if conflict_bullet is not None:
                     if self._register_correction_attempt(fact, conflict_bullet):
-                        # AUTO-BUG-2: same correction proposed by
-                        # _CORRECTION_THRESHOLD chapters in a row — accept
-                        # it as a genuine fix rather than a one-off slip.
+                        # AUTO-BUG-2 fix: the SAME correction has now been
+                        # proposed by _CORRECTION_THRESHOLD independent
+                        # chapters in a row — treat it as a genuine fix to
+                        # a bad first extraction rather than an attack /
+                        # one-off model slip, and replace the established
+                        # bullet instead of dropping the correction forever.
                         logger.warning(
                             "StoryBible: accepting correction %r -> %r after "
                             "%d consistent re-observations.",
@@ -464,10 +484,14 @@ class StoryBible:
         """AUTO-CR-26-2 (write-once guard), reworked for AUTO-BUG-2.
 
         Returns the conflicting established bullet (or None) instead of a
-        bare bool, so a correction repeatedly re-observed can replace the
-        established bullet instead of being dropped forever. A fact with
-        no detected name can't be safely scoped to one entity, so it's let
-        through unchecked.
+        bare bool, so the caller can decide whether to drop the new fact
+        or -- if the same correction keeps being independently re-observed
+        -- accept it as a fix and replace the established bullet.
+
+        Bugfix retained from the original: a fact with NO detected name
+        (e.g. a pronoun-only assertion like "Ei 45 let") cannot be safely
+        scoped to one entity, so it is let through unchecked instead of
+        being compared against every established bullet.
         """
         new_gender = _gender_of(new_fact)
         new_age = _age_of(new_fact)
@@ -557,8 +581,9 @@ class StoryBible:
             return {}
 
 
-    # AUTO-BUG-2: independent chapters that must propose the same correction
-    # before it overrides a locked fact. Persisted to disk, not memory —
+    # AUTO-BUG-2: number of independent chapters that must propose the exact
+    # same correction before it overrides a previously "locked" immutable
+    # fact. Persisted to disk (not just in-memory) because in this pipeline
     # each chapter is typically a separate `main.py --auto` process.
     _CORRECTION_THRESHOLD = 2
 
@@ -590,14 +615,14 @@ class StoryBible:
         if count >= self._CORRECTION_THRESHOLD:
             state.pop(key, None)
             try:
-                atomic_write_text(path, json.dumps(state, ensure_ascii=False, indent=2))
+                path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
             except Exception as exc:
                 logger.warning("StoryBible: could not persist pending-corrections state: %s", exc)
             return True
 
         state[key] = {"proposal": proposal, "count": count}
         try:
-            atomic_write_text(path, json.dumps(state, ensure_ascii=False, indent=2))
+            path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception as exc:
             logger.warning("StoryBible: could not persist pending-corrections state: %s", exc)
         return False
@@ -664,10 +689,7 @@ class StoryBible:
         """Write *text* to the bible file.  Creates parent dirs as needed."""
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
-            # Atomic write: this file is rewritten wholesale (full fact
-            # set, not an append) with no parse step to detect truncation,
-            # so a kill mid-write must not corrupt it.
-            atomic_write_text(self._path, text)
+            self._path.write_text(text, encoding="utf-8")
             logger.info("StoryBible: wrote %d chars to %s", len(text), self._path)
         except OSError as exc:
             logger.error("StoryBible: cannot write %s: %s", self._path, exc)
@@ -691,9 +713,11 @@ def make_story_bible(
     re-parsed from config so the bible uses the same API endpoint as the rest
     of the pipeline.
     """
-    # AUTO-BUG-1: defaults to enabled — this subsystem was designed to
-    # always run in creative mode, and the shipped agents.ini never sets
-    # an opt-in flag, so requiring one left it silently inert.
+    # AUTO-BUG-1 fix: default to enabled. The bible's continuity-anchoring
+    # was designed to always run in creative mode; requiring an opt-in flag
+    # that the shipped agents.ini never actually set left the whole
+    # subsystem (and its story_bible_verify / story_bible_immutable_guard
+    # sub-settings) silently inert out of the box.
     enabled = config.getboolean("validator_agent", "story_bible_creative", fallback=True)
     if not enabled:
         logger.warning("make_story_bible: story_bible_creative=false — bible disabled "

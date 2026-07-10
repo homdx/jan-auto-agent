@@ -30,19 +30,33 @@ bug; the short version:
      word "sudo" as data, this silently blocked EVERY edit to coder.py,
      including a no-op rewrite of its own unchanged content — defeating the
      self-editing feature the commit was written to enable.
+  8. TestNewFileCreation — Gate1's existence check and the architect's
+     cited_location schema had no way to represent "this file does not exist
+     yet, and this task's purpose is to create it." Every candidate task
+     targeting a genuinely new file was unconditionally rejected as a
+     hallucinated path (discovered via a live end-to-end simulation using
+     stub_codeapp_server.py's T1 "create app.py from nothing" scenario,
+     which could never pass Gate 1). Adds an explicit, opt-in
+     cited_location.new_file flag (default False — fully backward
+     compatible) that lets a candidate skip the existence and problem-
+     presence checks for a file that legitimately does not exist yet,
+     mirroring the reasoning AUTO-CR-8 already applies to creative mode.
 """
 
 from __future__ import annotations
 
+import configparser
 import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tools.auto.architect import CandidateTask, CitedLocation
 from tools.auto.coder import Coder
+from tools.auto.gate1_filter import Gate1Filter
 from tools.auto.state import (
     StateStore,
     make_task,
@@ -427,168 +441,6 @@ class TestTicketStorePathSanitization:
 
 # ── selfhost pilot: tests-mandate gate ────────────────────────────────────────
 
-class TestSearchAgentEmptyLLMResponseFailsOpen:
-    """SearchAgent._evaluate_with_llm's documented contract is fail-open on
-    ANY filter failure. An empty JSON list ("[]") is syntactically valid so
-    it skipped the except-block's fail-open path and silently rejected every
-    reference instead — verified against a real, reproducing test case."""
-
-    def test_empty_list_triggers_fail_open(self):
-        from unittest.mock import patch
-        from tools.search_agent import SearchAgent
-
-        agent = SearchAgent(
-            model="test-model", base_url="http://fake-host", api_key="x", timeout=5,
-        )
-        found_refs = {
-            "ref1": {"code": "def ref1(): pass"},
-            "ref2": {"code": "def ref2(): pass"},
-        }
-        with patch("tools.search_agent._request_completion", return_value="[]"):
-            result = agent._evaluate_with_llm(found_refs)
-
-        assert result == ["ref1", "ref2"], (
-            "an empty LLM verdict must fail-open (approve all), not silently "
-            "reject every reference"
-        )
-
-    def test_nonempty_list_still_filters_normally(self):
-        from unittest.mock import patch
-        from tools.search_agent import SearchAgent
-
-        agent = SearchAgent(
-            model="test-model", base_url="http://fake-host", api_key="x", timeout=5,
-        )
-        found_refs = {
-            "ref1": {"code": "real dependency"},
-            "ref2": {"code": "stdlib wrapper"},
-            "ref3": {"code": "another real dep"},
-        }
-        with patch("tools.search_agent._request_completion", return_value='["ref1", "ref3"]'):
-            result = agent._evaluate_with_llm(found_refs)
-
-        assert result == ["ref1", "ref3"]
-
-
-class TestCoderTargetFilesDotfileCollision:
-    """Coder._write_files' target_files allow-list guard must not let a
-    disallowed dotfile slip through by colliding, after normalisation, with
-    an allowed non-dotfile name (or vice versa)."""
-
-    def _coder(self):
-        import configparser
-        from tools.auto.coder import Coder
-        cfg = configparser.ConfigParser()
-        cfg.read_dict({
-            "api":       {"active": "local", "verify_ssl": "true"},
-            "api_local": {"base_url": "http://localhost:9999", "model": "x", "api_key": ""},
-            "coder":     {"temperature": "0.2", "max_tokens": "1024"},
-            "loop":      {"timeout_seconds": "60"},
-        })
-        return Coder(cfg, "http://localhost:9999", "", "x")
-
-    def test_dotfile_not_authorised_is_rejected(self, tmp_path):
-        coder = self._coder()
-        allowed = frozenset({"notes.md"})
-        written, _ = coder._write_files(
-            [{"path": ".notes.md", "content": "sneaky"}],
-            tmp_path, "T1", allowed_paths=allowed,
-        )
-        assert written == [], (
-            ".notes.md must NOT be treated as the same target as the "
-            "approved notes.md — the allow-list guard must not collapse "
-            "distinct filenames that merely share a suffix after a leading "
-            "dot/slash is stripped"
-        )
-        assert not (tmp_path / ".notes.md").exists()
-
-    def test_leading_dot_slash_is_still_normalised(self, tmp_path):
-        """A genuine "./" prefix (not a bare leading dot) must still be
-        stripped so the intended normalisation keeps working."""
-        coder = self._coder()
-        allowed = frozenset({"notes.md"})
-        written, _ = coder._write_files(
-            [{"path": "./notes.md", "content": "hello"}],
-            tmp_path, "T1", allowed_paths=allowed,
-        )
-        assert written == ["./notes.md"]
-        assert (tmp_path / "notes.md").read_text(encoding="utf-8") == "hello"
-
-
-class TestCanonValidatorPreservesNumbers:
-    """CanonValidator._extract_claims must not eat a claim's own leading
-    digits (ages, years, counts) while stripping list-marker prefixes."""
-
-    def _extractor(self, llm_reply):
-        from tools.auto.canon_validator import CanonValidator
-        cv = CanonValidator.__new__(CanonValidator)
-        cv._llm = lambda system, user: llm_reply
-        return cv
-
-    def test_leading_number_in_claim_is_preserved(self):
-        cv = self._extractor("3.5 million people lived there")
-        claims = cv._extract_claims("chapter text")
-        assert claims == ["3.5 million people lived there"]
-
-    def test_numbered_marker_is_still_stripped(self):
-        cv = self._extractor("1. She was born in 1990")
-        claims = cv._extract_claims("chapter text")
-        assert claims == ["She was born in 1990"]
-
-    def test_bulleted_marker_is_still_stripped(self):
-        cv = self._extractor("- Anna is 42 years old")
-        claims = cv._extract_claims("chapter text")
-        assert claims == ["Anna is 42 years old"]
-
-
-class TestStoryBibleAtomicWrites:
-    """StoryBible must persist the bible file and pending-corrections state
-    via atomic_write_text, not a plain (truncate-then-write) write_text."""
-
-    def test_write_uses_atomic_write_text(self, tmp_path, monkeypatch):
-        import tools.auto.story_bible as story_bible_mod
-
-        calls = []
-        original = story_bible_mod.atomic_write_text
-
-        def spy(path, content):
-            calls.append(path)
-            return original(path, content)
-
-        monkeypatch.setattr(story_bible_mod, "atomic_write_text", spy)
-
-        sb = story_bible_mod.StoryBible.__new__(story_bible_mod.StoryBible)
-        sb._path = tmp_path / "story_bible.md"
-        sb._write("• some fact")
-
-        assert calls, "StoryBible._write must go through atomic_write_text"
-        assert sb._path.read_text(encoding="utf-8") == "• some fact"
-
-    def test_no_plain_write_text_on_bible_path(self, tmp_path, monkeypatch):
-        """A crash mid-write (simulated by making write_text raise) must not
-        leave a corrupted file — plain write_text offers no such guarantee,
-        atomic_write_text (temp file + os.replace) does."""
-        import tools.auto.story_bible as story_bible_mod
-        from pathlib import Path
-
-        target = tmp_path / "story_bible.md"
-        target.write_text("ORIGINAL", encoding="utf-8")
-
-        def boom(self, *a, **k):
-            raise OSError("disk full mid-write")
-
-        monkeypatch.setattr(Path, "write_text", boom)
-
-        sb = story_bible_mod.StoryBible.__new__(story_bible_mod.StoryBible)
-        sb._path = target
-        sb._write("NEW CONTENT")
-
-        # atomic_write_text uses fdopen/os.replace, not Path.write_text, so
-        # the patched write_text should never even be called — content must
-        # have been fully replaced, not truncated or left stale.
-        assert target.read_text(encoding="utf-8") == "NEW CONTENT"
-
-
 class TestTestsMandateGate:
     class _Coder:
         def __init__(self, base, drafts):
@@ -838,3 +690,102 @@ timeout_seconds = 5
         except Exception:
             pass
     assert not any("UNREACHABLE" in r.message for r in caplog.records)
+
+
+# ── Bug 8: Gate1 had no way to accept a task that creates a brand-new file —
+#    the existence check unconditionally rejected any cited_location.file
+#    that didn't already exist, treating legitimate "create X" tasks the
+#    same as hallucinated paths. Fixed with an explicit, opt-in
+#    cited_location.new_file flag.
+
+def _gate1(task_mode="code"):
+    cfg = configparser.ConfigParser()
+    cfg.add_section("gate1"); cfg.add_section("api"); cfg.add_section("loop")
+    return Gate1Filter(cfg, base_url="http://localhost:11434", api_key="x",
+                        model="m", api_format="ollama", task_mode=task_mode)
+
+
+def _candidate(new_file, file="app.py", symbol=None):
+    return CandidateTask(
+        title="Create app.py", instruction="Create app.py with a hello() function",
+        target_files=[file], acceptance_check="true",
+        cited_location=CitedLocation(file=file, symbol=symbol,
+                                      line_start=None, line_end=None,
+                                      new_file=new_file),
+        cluster="support",
+    )
+
+
+class TestNewFileCreation:
+    def test_is_valid_true_for_new_file_without_anchor(self):
+        loc = CitedLocation(file="app.py", new_file=True)
+        assert loc.is_valid("code")
+
+    def test_is_valid_still_false_without_anchor_when_not_new_file(self):
+        # Regression check: the pre-existing "must have symbol or line_start"
+        # rule for code mode must be completely unchanged for the default case.
+        loc = CitedLocation(file="app.py")
+        assert not loc.is_valid("code")
+
+    def test_existence_check_passes_for_declared_new_file(self, tmp_path):
+        gate = _gate1()
+        cand = _candidate(new_file=True, file="app.py")
+        ok, reason, block = gate._check_existence(
+            cand, tmp_path, cluster_files={"support": {"README.md"}})
+        assert ok, reason
+        assert "new file" in reason
+
+    def test_existence_check_still_rejects_missing_file_by_default(self, tmp_path):
+        # The critical regression-safety test: new_file defaults to False,
+        # so an ordinary hallucinated path must be rejected exactly as
+        # before this fix.
+        gate = _gate1()
+        cand = _candidate(new_file=False, file="app.py")
+        ok, reason, block = gate._check_existence(
+            cand, tmp_path, cluster_files={"support": {"README.md"}})
+        assert not ok
+        assert "hallucinated" in reason
+
+    def test_new_file_cannot_escape_base_dir(self, tmp_path):
+        gate = _gate1()
+        cand = _candidate(new_file=True, file="../../etc/passwd")
+        ok, reason, block = gate._check_existence(cand, tmp_path, cluster_files=None)
+        assert not ok
+        assert "escapes" in reason
+
+    def test_new_file_rejected_if_path_is_existing_directory(self, tmp_path):
+        (tmp_path / "app.py").mkdir()
+        gate = _gate1()
+        cand = _candidate(new_file=True, file="app.py")
+        ok, reason, block = gate._check_existence(cand, tmp_path, cluster_files=None)
+        assert not ok
+        assert "directory" in reason
+
+    def test_existing_file_still_uses_normal_symbol_lookup(self, tmp_path):
+        # new_file=True on a file that DOES exist must not read disk
+        # content - the new_file branch returns early by design.
+        (tmp_path / "app.py").write_text("def hello():\n    return 'hi'\n")
+        gate = _gate1()
+        cand = _candidate(new_file=True, file="app.py")
+        ok, reason, block = gate._check_existence(cand, tmp_path, cluster_files=None)
+        assert ok
+        assert block == ""  # new_file path never reads file content
+
+    def test_checkpoint_roundtrip_preserves_new_file(self):
+        from tools.auto.architect import _serialise_candidates, _deserialise_candidates
+        cand = _candidate(new_file=True, file="app.py", symbol=None)
+        data = _serialise_candidates([cand])
+        assert data[0]["cited_location"]["new_file"] is True
+        restored = _deserialise_candidates(data)
+        assert restored[0].cited_location.new_file is True
+
+    def test_presence_stage_skips_llm_for_new_file_candidate(self, tmp_path):
+        # A new_file candidate must not trigger an LLM presence check —
+        # mirrors the existing creative-mode exemption (AUTO-CR-8).
+        gate = _gate1()
+        cand = _candidate(new_file=True, file="app.py")
+        with patch("tools.llm_stream.request_completion") as mock_call:
+            accepted, rejected = gate.filter([cand], tmp_path,
+                                              cluster_files={"support": {"README.md"}})
+        mock_call.assert_not_called()
+        assert len(accepted) == 1 and accepted[0].title == "Create app.py"

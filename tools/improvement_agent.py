@@ -163,11 +163,14 @@ class ImprovementAgent:
                                              ssl_context=self.ssl_context)
 
             tracer.event("llm", "improvement_agent", "llm_response", content=content)
+            content = strip_think(content)
+
+            content = strip_json_fence(content)
+
+            parsed_result = json.loads(content)
+            tracer.event("improvement_agent", "orchestrator", "result", content=parsed_result)
+            return parsed_result
         except urllib.error.HTTPError as e:
-            # Kept for defense-in-depth: request_completion() currently
-            # normalizes HTTPError into RuntimeError before it reaches us
-            # (tools/llm_stream.py _open()), so in practice the branch below
-            # is what fires for HTTP failures today.
             body = e.read().decode("utf-8", errors="replace")
             logger.error(f"ImprovementAgent HTTP {e.code}: {body}")
             _err = {
@@ -177,35 +180,10 @@ class ImprovementAgent:
             tracer.event("improvement_agent", "orchestrator", "error", content=_err)
             return _err
         except Exception as e:
-            # A genuine transport/connection failure (DNS, connection
-            # refused, read timeout, etc). A malformed-JSON reply is a
-            # separate failure domain handled below, so this message no
-            # longer gets shown for what is really just a formatting
-            # problem in the model's output.
-            logger.error(f"ImprovementAgent request failed: {e}")
+            logger.error(f"ImprovementAgent processing thread failed: {e}")
             _err = {
-                "explanation": f"Request to the LLM failed: {e}",
-                "issues": ["The model/API did not respond — see logs for details."],
-                "improved_code": "",
-                "changes": []
-            }
-            tracer.event("improvement_agent", "orchestrator", "error", content=_err)
-            return _err
-
-        try:
-            content = strip_think(content)
-            content = strip_json_fence(content)
-            parsed_result = json.loads(content)
-            tracer.event("improvement_agent", "orchestrator", "result", content=parsed_result)
-            return parsed_result
-        except json.JSONDecodeError as e:
-            logger.error(f"ImprovementAgent: could not parse LLM response as JSON: {e}")
-            _err = {
-                "explanation": (
-                    "The model's response could not be parsed as JSON, so no "
-                    f"improvement result is available for this request ({e})."
-                ),
-                "issues": ["Model returned malformed/non-JSON output — see logs."],
+                "explanation": f"Failed to execute local optimization pipeline context: {e}",
+                "issues": ["Connection validation boundary errors detected."],
                 "improved_code": "",
                 "changes": []
             }

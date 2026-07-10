@@ -736,17 +736,15 @@ class Coder(_llm_stream.LLMClientBase):
         Returns ``""`` when nothing was found.  Never raises.
         """
         try:
-            from tools.search_agent import SearchAgent as _SearchAgent  # lazy import
-            active  = self._config.get("api", "active", fallback="local")
-            section = f"api_{active}"
-            agent = _SearchAgent(
-                model      = self._config.get(section, "model",      fallback=None),
-                base_url   = self._config.get(section, "base_url",   fallback=None),
-                api_key    = self._config.get(section, "api_key",    fallback=""),
-                api_format = self._config.get(section, "api_format", fallback="openai"),
-                timeout    = int(self._config.get("loop", "timeout_seconds", fallback="120")),
-                ssl_context = self._ssl_context,
-            )
+            from tools.search_agent import make_search_agent  # lazy import
+            # AUTO-BUG: this used to construct SearchAgent directly, reading
+            # only model/base_url/api_key/api_format/timeout — silently
+            # ignoring [search] skip_dirs/max_depth/max_file_kb and
+            # [api] verify_ssl, the exact config keys make_search_agent
+            # exists to read consistently with main.py's own SearchAgent
+            # (see its docstring). A self-signed-cert HTTPS profile or a
+            # customised skip_dirs list was silently not honoured here.
+            agent = make_search_agent(self._config, str(base_dir))
         except Exception as exc:
             logger.warning("coder._fetch_needed: could not create SearchAgent: %s", exc)
             return ""
