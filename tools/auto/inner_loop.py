@@ -242,10 +242,9 @@ class LLMGate2Validator:
         self.max_tokens  = int(max_tokens)
         self.task_mode   = str(task_mode)
         self._config     = config
-        # AUTO-FIX (fable follow-up): Gate-2 in code/docs mode requires
-        # strict JSON with no soft-parse fallback (see AUTO-BUG-10) — a
-        # thinking model truncated mid-<think> here fails closed exactly
-        # like architect/coder did before the think=false fix.
+        # AUTO-FIX: Gate-2 code/docs mode needs strict JSON, no soft-parse
+        # fallback (AUTO-BUG-10) — think=false avoids failing closed on a
+        # thinking model truncated mid-<think>.
         self._think      = config.getboolean("validator_agent", "think", fallback=False) if config is not None else False
         # AUTO-DM-5 / AUTO-CR-19-1: select system prompt — mode-specific
         # override > (code-mode-only) legacy "system" key > built-in.
@@ -705,34 +704,15 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
         _re.compile(r"\bне\s+противоречит\b"),
         # negated / absent contradictions expressed without «нет/без»:
         #   «противоречий не обнаружено / не выявлено», «противоречия отсутствуют»
-        # AUTO-BUG: real LLM replies routinely insert filler words between the
-        # noun and the negated verb — «противоречий В ТЕКСТЕ не обнаружено»,
-        # «противоречий С ТЕКСТОМ не обнаружено» — which the old
-        # immediately-adjacent ``\s+`` pattern missed, falling through to the
-        # bare «противоречи» REVISE pattern below and flipping a genuine
-        # APPROVED into a false REVISE. Allow up to 3 filler words (bounded so
-        # it can't jump across an unrelated sentence) in between.
-        #
-        # BUGFIX: the filler-gap fix above first shipped as `не\s+\w+` — ANY
-        # "не + word" — which also matched the critic negating their OWN
-        # reaction/expectation rather than the existence of a contradiction:
-        # «противоречий мне не понравилось», «противоречий я здесь не
-        # одобрю», «противоречий не ожидал найти» all wrongly APPROVED.
-        # Restrict the negated verb to ones that actually mean "not found /
-        # not detected" instead of accepting any verb.
+        # (fix: allow up to 3 filler words between noun and negated verb; negated
+        # verb restricted to search/perception verbs to avoid false positives)
         _re.compile(
             r"противоречи\w*(?:\s+\S+){0,3}\s+"
             r"(?:отсутств\w*|не\s+(?:обнаружен\w*|выявлен\w*|найден\w*|"
             r"встречает\w*|замечен\w*|видн\w*))"
         ),
         #   «не вижу / не обнаружил / не нашёл … противоречий» — same filler-word
-        #   gap allowed on this side (e.g. «не смог найти каких-либо противоречий»).
-        # BUGFIX: the original `\bне(?:\s+\S+){0,3}\s+противоречи` allowed ANY
-        # gap after «не», so «не ожидал встретить противоречия» / «не
-        # нравятся противоречия» — negating the critic's expectation/liking,
-        # not the presence of a contradiction — wrongly APPROVED too. Require
-        # «не» to be followed by a search/perception verb (вижу, нахожу,
-        # обнаружил, ...) before the filler-word gap kicks in.
+        #   gap allowed on this side (e.g. «не смог найти каких-либо противоречий»)
         _re.compile(
             r"\bне\s+(?:вижу|нахожу|нашёл|нашел|обнаружил|выявил|заметил|"
             r"встретил|встречаю|смог\s+найти)"
@@ -780,17 +760,8 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
         # standalone negative answer «Нет, …» / «Нет.» — comma/period only,
         # so approvals like «нет проблем» / «нет замечаний» (followed by a
         # space) are NOT caught here. «нет противоречий» already returned
-        # APPROVED above.
-        # AUTO-BUG: this used to fire unconditionally on ANY "Нет, ..."
-        # opener, which also caught casual-Russian approvals where "Нет" is
-        # a discourse filler rather than a substantive rejection — "Нет,
-        # всё хорошо." / "Нет, всё нормально." / "Нет, всё в порядке."
-        # ("nah, it's all fine") were confidently misclassified as REVISE
-        # even though nothing else in the reply objects to anything. A
-        # negative lookahead excludes exactly that "Нет, <all-good phrase>"
-        # shape while leaving every other "Нет, ..." opener — including the
-        # test-locked "Нет, так нельзя оставлять" / "Нет, это не подходит"
-        # — classified as REVISE exactly as before.
+        # APPROVED above. Excludes casual "Нет, всё хорошо/нормально/..."
+        # openers, which are approvals, not rejections.
         _re.compile(
             r"^нет(?:[,.]|$)"
             r"(?!\s*(?:всё|все)\s+(?:хорошо|нормально|в\s+порядке|ок(?:ей)?|отлично|супер)\b)"

@@ -289,15 +289,9 @@ class CanonValidator:
             logger.warning("CanonValidator: claim extraction failed: %s", exc)
             return []
         claims: list[str] = []
-        # Bugfix: this used to be
-        #   line = raw.strip().lstrip("-*0123456789. \t").strip()
-        # str.lstrip(chars) removes ANY of the given characters from the
-        # left, repeatedly — it has no concept of "a marker" versus "the
-        # claim's own leading digits". A claim that legitimately starts
-        # with a number (an age, a year, a population count — precisely
-        # what a CANON validator exists to protect) had that number
-        # silently eaten: "3.5 million people lived there" became "million
-        # people lived there" before ever reaching the conflict check.
+        # Marker strip uses a regex, not str.lstrip(chars) (which removes
+        # any of the given characters repeatedly, eating a claim's own
+        # leading number: "3.5 million people..." -> "million people...").
         _marker_re = re.compile(r"^\s*(?:[-*]|\d+[.)])\s+")
         for raw in reply.splitlines():
             line = _marker_re.sub("", raw.strip(), count=1).strip()
@@ -350,15 +344,9 @@ class CanonValidator:
         if self._broker is None:
             return ""
         # Salient tokens: capitalised words (names/places) are the cheapest,
-        # most useful query terms for an entity-based prose pull.
-        # BUGFIX: [A-Z][a-zA-Z]{2,} is ASCII-only, so it matched nothing at
-        # all for Cyrillic character names (Иван, Мария, Андрей, ...) —
-        # every Russian-fiction claim hit the `if not tokens: return ""`
-        # guard below, silently dropping the earlier-chapter excerpt from
-        # every canon-conflict message. The coder was told WHAT conflicted
-        # but never WHERE the conflicting canon was established. Python 3's
-        # \b is already Unicode-aware, so adding the Cyrillic ranges to the
-        # character class is enough — no extra flags needed.
+        # most useful query terms for an entity-based prose pull. Cyrillic
+        # ranges included so Russian character names (Иван, Мария, ...)
+        # aren't silently dropped — Python's \b is already Unicode-aware.
         tokens = re.findall(r"\b[A-ZА-ЯЁ][a-zA-Zа-яёА-ЯЁ]{2,}\b", claim)
         if not tokens:
             return ""

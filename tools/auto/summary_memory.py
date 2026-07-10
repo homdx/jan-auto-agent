@@ -171,15 +171,10 @@ def _clean_bullet_list(reply: str) -> str:
     accepted as facts. A stray 'FIX:' prefix is tolerated, and AUTO-CR-16
     meta-commentary parentheticals are stripped.
 
-    AUTO-BUG-5 fix: if NO line has a marker at all, fall back to treating
-    each short, non-empty line as one fact — a small local model very
-    plausibly ignores the "one bullet per line" formatting instruction and
-    just writes plain sentences, one fact per line. Without this fallback
-    that entire (otherwise perfectly usable) extraction was silently
-    discarded and the caller kept believing there were "no new facts". The
-    fallback still fails open (returns "") when the reply doesn't look like
-    a short fact list — e.g. full narrative prose / a refusal — to avoid
-    accidentally ingesting chapter text as "facts".
+    AUTO-BUG-5: if NO line has a marker, fall back to treating each short
+    line as one fact (a small model may ignore the bullet-per-line
+    instruction) — still fails open on anything that looks like prose,
+    not a fact list.
 
     Returns bullets joined with newlines, each prefixed '• '.
     """
@@ -458,13 +453,9 @@ class SummaryMemory:
         cleaned = _clean_bullet_list(verified)
         body = cleaned or verified
 
-        # AUTO-BUG-6 fix: previously `cleaned or verified` would happily
-        # persist whatever `verified` was even when it was obviously not a
-        # summary at all (observed in practice: the literal grader verdict
-        # "APPROVED" ended up written into synopsis.md as a chapter's
-        # "durable fact summary"). Refuse to write anything that looks like
-        # a bare verdict word or is implausibly short for a summary, and
-        # leave the previous section (if any) untouched instead.
+        # AUTO-BUG-6: refuse to write a bare verdict word ("APPROVED" etc.)
+        # or implausibly short text as if it were a real summary — this
+        # was observed leaking a grader verdict into synopsis.md.
         _stripped = body.strip()
         if not _stripped or _stripped.upper().rstrip(".:!") in {"APPROVED", "OK", "REVISE"}:
             logger.warning(

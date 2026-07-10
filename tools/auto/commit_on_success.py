@@ -292,18 +292,9 @@ def make_commit_on_success(
     state_store:
         The active ``StateStore`` for this run.
     """
-    # AUTO-BUG: this used to read task_mode with a plain config.get() and
-    # compare it with `== "creative"` — an exact, case-sensitive match. Every
-    # other entry point (controller.py) normalises task_mode through
-    # normalize_task_mode() so a config typo/case variant like "Creative" or
-    # "creativ" still resolves to "creative". This factory's raw read did
-    # not, so if it is ever reached with an unnormalised value (e.g. this
-    # factory called directly, or the controller's own commit_on_success is
-    # None and make_bug_fix_loop falls back to building one here) the
-    # summary_memory / story_bible wiring below would silently never fire —
-    # the run proceeds in creative mode everywhere else but synopsis.md and
-    # story_bible.md are never updated after a chapter commit, with no
-    # error logged. Route through the same normaliser everyone else uses.
+    # Normalise task_mode the same way controller.py does, so a config
+    # typo/case variant ("Creative") doesn't silently skip the
+    # summary_memory / story_bible wiring below.
     from tools.auto.utils import normalize_task_mode
     _raw_task_mode = config.get("auto", "task_mode", fallback="code")
     task_mode, _ = normalize_task_mode(_raw_task_mode)

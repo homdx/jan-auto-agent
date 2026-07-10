@@ -365,12 +365,8 @@ class TicketStore:
     # ── Private ──────────────────────────────────────────────────────────────
 
     def _path(self, ticket_id: str) -> Path:
-        # Bugfix: ticket ids are typically system-generated (e.g.
-        # "TICKET-AUTO-T1", "BUG-FIX-AUTO-T1") so this was not previously
-        # exploitable, but unlike state.py's task directories (which have
-        # always sanitized task_id via _safe_task_id) this path was built
-        # straight from the raw id with no defense if that ever changes —
-        # a ticket id containing ".." or "/" could escape self._dir.
+        # Sanitised defensively — a ticket id containing ".." or "/" must
+        # not escape self._dir (mirrors state.py's task_dir sanitisation).
         return self._dir / f"{safe_filename_component(ticket_id)}.json"
 
     def _ensure_dir(self) -> None:

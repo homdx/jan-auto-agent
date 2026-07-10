@@ -679,29 +679,13 @@ def _fingerprint(c: CandidateTask) -> str:
 def _target_fingerprint(c: CandidateTask) -> "str | None":
     """AUTO-BUG-3: secondary dedup key based on the file(s) being WRITTEN.
 
-    ``_fingerprint`` alone keys on ``cited_location`` — the SOURCE the
-    candidate references — which is the right disambiguator for code tasks
-    (two different fixes can legitimately cite the same file at different
-    symbols/lines). For creative-generation tasks, though, ``cited_location``
-    is largely arbitrary (there's no meaningful symbol/line in a chapter
-    that doesn't exist yet) and can differ between two batches of the same
-    cluster even when both are proposing to write the exact same target
-    file — which is exactly the "two independent tasks generate chapter_4"
-    duplication observed in practice.
-
-    AUTO-BUG fix: the key used to also include the normalised title, on the
-    theory that "same target + same title" was enough to call it a
-    duplicate. In practice two *independent* architect batches essentially
-    never phrase a "write chapter_4" task identically — different wording,
-    different framing — so titles almost always differ even when the
-    target file is the exact same one, and the title-inclusive key silently
-    let the very duplication this function exists to catch straight
-    through. A chapter file being generated fresh has no legitimate reason
-    for two independent tasks to both target it in the same run (unlike
-    code, where "same file, same title" undersells how differently two
-    code fixes on one file can legitimately coexist) — so for creative
-    mode the target file set alone is a safe, sufficient duplicate key.
-    Returns ``None`` when there are no target files to key on.
+    ``_fingerprint`` alone keys on ``cited_location``, which is largely
+    arbitrary for creative-generation tasks (no meaningful symbol/line in a
+    chapter that doesn't exist yet) and can differ between two batches
+    proposing to write the same target file. The key is the target file set
+    alone (not the title too — independently-generated batches rarely
+    phrase the same "write chapter_4" task identically, so a title-inclusive
+    key let real duplicates through). Returns ``None`` with no target files.
     """
     if not c.target_files:
         return None

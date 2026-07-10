@@ -528,17 +528,10 @@ class Executor:
                     # would misquote them.  Do a safe word-boundary string
                     # substitution on the original command string instead.
                     #
-                    # Bugfix: full_path must NOT be passed as re.sub's string
-                    # replacement argument — re.sub interprets backslash
-                    # sequences in a *string* replacement as backreferences
-                    # (\1, \g<n>, ...). This pattern has no capture groups, so
-                    # a target path containing an ordinary backslash (a
-                    # Windows-style path, or any oddly-named file) would raise
-                    # `re.error: invalid group reference` instead of
-                    # substituting cleanly. Same root cause already fixed in
-                    # tools/auto/summary_memory.py — a callable replacement
-                    # sidesteps this entirely, since re.sub never interprets
-                    # backslash escapes in a function's return value.
+                    # Callable replacement, not a string one — re.sub
+                    # interprets backslashes in a string replacement as
+                    # backreferences, which would break on a path
+                    # containing an ordinary backslash.
                     import re as _re_local
                     rewritten = _re_local.sub(
                         r"(?<!\S)" + _re_local.escape(basename) + r"(?!\S)",

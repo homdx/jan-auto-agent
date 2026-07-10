@@ -142,17 +142,9 @@ class OuterLoop:
         except (ValueError, TypeError):
             _inner_accepts_deadline = False
 
-        # LOOP-4: the TRUE v1 baseline instruction — used so _build_impl_history
-        # can correctly label version 1 even after a later rewrite overwrites
-        # task["instruction"]. Bugfix: this used to just read task["instruction"]
-        # unconditionally, which was safe only within a single continuous run
-        # (before any rewrite happened yet). Now that a rewrite's text is
-        # persisted back into task["instruction"] (see StateStore.apply_rewrite,
-        # LOOP-3 below), a *resumed* session loads a task whose "instruction"
-        # already holds the latest rewrite, not v1's — so prefer the explicitly
-        # preserved "original_instruction" when one exists, falling back to
-        # "instruction" for a task that has never been rewritten (where
-        # "instruction" still IS v1).
+        # LOOP-4: true v1 baseline instruction for _build_impl_history — after
+        # a rewrite, task["instruction"] holds the latest rewrite, not v1's,
+        # so prefer "original_instruction" when present.
         original_instruction: str = task.get("original_instruction") or task.get("instruction", "")
 
         # ── Resume: existing feedback files mean prior rounds already ran ──
@@ -161,15 +153,9 @@ class OuterLoop:
         feedback_files = [str(p) for p in self._feedback_paths(task_id)]
         inner_results: list = []
 
-        # LOOP-2: rewrite tracking. Bugfix: this used to always start at 0, so
-        # max_rewrites was only ever enforced within a single process's
-        # lifetime — restarting the process (a crash, or just stopping and
-        # re-running the CLI) reset the count and allowed unlimited further
-        # rewrites across enough restarts. impl_version is persisted and
-        # already tracks exactly this (starts at 1, +1 per rewrite — see
-        # apply_rewrite), so seed the local counter from it to make the cap a
-        # true per-task, cross-resume limit.
-        # LOOP-3: impl_version tracking — starts at 1, bumped on each rewrite
+        # LOOP-2/3: rewrite tracking. Seed from impl_version (persisted,
+        # starts at 1, +1 per rewrite) so max_rewrites is a true per-task,
+        # cross-resume limit, not reset by every process restart.
         impl_version = task.get("impl_version", 1)
         rewrites_done = max(0, int(impl_version or 1) - 1)
         impl_versions_used: list[int] = []
@@ -268,16 +254,9 @@ class OuterLoop:
 
                 new_task = self.task_rewriter.rewrite(task, failure_history)
                 if new_task is not task:
-                    # A genuine rewrite was produced — record it on disk and
-                    # persist it in state (LOOP-3). Bugfix: this used to call
-                    # bare increment_impl_version(), which only persisted the
-                    # version *number* — the rewritten instruction itself lived
-                    # only in the local `task` variable below and was lost the
-                    # moment the process restarted. apply_rewrite() persists
-                    # the rewritten instruction/acceptance_check/title in the
-                    # SAME call that bumps impl_version, so a resumed session
-                    # picks up the latest rewrite instead of silently reverting
-                    # to the original (already-failing) instruction.
+                    # LOOP-3: apply_rewrite() persists the rewritten
+                    # instruction (not just the version number), so a
+                    # resumed session picks up the latest rewrite.
                     try:
                         impl_version = self.state.apply_rewrite(
                             task_id,

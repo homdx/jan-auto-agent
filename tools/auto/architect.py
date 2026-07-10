@@ -587,14 +587,9 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
 
             print(f"   → {len(cluster_candidates)} grounded candidate(s)")
 
-            # AUTO-BUG-3 fix: when a cluster is large enough to be split into
-            # multiple batches, each batch is reviewed independently and can
-            # (and in practice does, e.g. in creative mode with a single
-            # target file) propose the *identical* task. Gate-1 has its own
-            # fingerprint-based dedup, but de-duplicating right here — before
-            # candidates from different batches of the same cluster are even
-            # merged — is a cheap, local belt-and-braces fix that does not
-            # depend on downstream Gate-1 behaving as expected.
+            # AUTO-BUG-3: when a cluster splits into multiple batches, two
+            # batches can propose the identical task — dedup here too, as
+            # a cheap local belt-and-braces alongside Gate-1's own dedup.
             if len(batches) > 1 and len(cluster_candidates) > 1:
                 from tools.auto.gate1_filter import _fingerprint, _target_fingerprint  # noqa: PLC0415
                 _seen: set[str] = set()
@@ -652,16 +647,11 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
         Parameters
         ----------
         all_files
-            AUTO-BUG-9 fix: the FULL set of files in the cluster this batch
-            belongs to (names only), used for the file listing shown to the
-            model even when this call's file contents only cover one
-            batch's subset (cluster.files). Without this, a batched review
-            of a growing creative-writing repo only ever sees a partial
-            file listing, and "what's the next chapter number" logic can
-            conclude a stale/wrong answer -- observed in practice: it
-            proposed regenerating an already-completed middle chapter
-            instead of only ever extending the book forward. Defaults to
-            cluster.files (old behaviour) when not given.
+            AUTO-BUG-9: full file listing shown to the model even when this
+            batch's contents only cover a subset — without it, "what's the
+            next chapter" logic could see a stale listing and propose
+            regenerating an already-completed chapter. Defaults to
+            cluster.files when not given.
 
         Returns
         -------
@@ -706,10 +696,8 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                     "cluster": cluster.name},
         )
 
-        # AUTO-BUG-8 fix: configurable retry backoff. Previously hardcoded to
-        # [5, 15, 30] (~50s total) regardless of deployment — for a local
-        # Ollama instance still loading a model into memory, that's ~50s of
-        # silent retrying inside this call before the cluster fails open.
+        # AUTO-BUG-8: configurable retry backoff (was hardcoded [5,15,30]s
+        # regardless of deployment, e.g. a local Ollama still loading).
         _delays_raw = self._config.get("architect", "retry_delays_sec", fallback="5,15,30")
         try:
             _RETRY_DELAYS = [float(x.strip()) for x in _delays_raw.split(",") if x.strip()]

@@ -625,18 +625,11 @@ class FaqAgent:
         a real answer that happens to contain the phrase (e.g. "if the page is
         not found, click Retry").
 
-        AUTO-BUG: the default marker is the ordinary English phrase "NOT
-        FOUND" — a plausible opening for a genuine, on-topic technical
-        answer (e.g. a question about HTTP 404s: "NOT FOUND errors occur
-        when the requested resource does not exist..."). The old
-        unconditional ``stripped.startswith(marker)`` discarded exactly
-        that kind of real, useful answer as if nothing were found, which
-        directly contradicts this method's own stated purpose above. A
-        genuine sentinel reply is the marker plus at most a little trailing
-        punctuation/decoration ("NOT FOUND." / "NOT FOUND — nothing in the
-        knowledge base."); a substantive answer runs far longer than that.
-        Capping how much may trail the marker keeps the decorated-sentinel
-        case working while no longer eating real answers.
+        A genuine sentinel reply is the marker plus at most a little trailing
+        punctuation ("NOT FOUND." / "NOT FOUND — nothing found."); a real answer
+        runs far longer. Capping the trailing slack avoids discarding a genuine
+        answer that happens to open with the marker phrase (e.g. an answer
+        about HTTP 404s starting "NOT FOUND errors occur when...").
         """
         stripped = answer.strip().upper()
         marker = self.not_found_marker.strip().upper()
@@ -954,21 +947,9 @@ class FaqAgent:
         context  = self._build_context(docs)
         url, headers, payload = self._build_qa_request(question, context)
 
-        # AUTO-BUG: same asymmetric-resilience bug as tools/actions.py's
-        # _ask_over_text / _answer_from_file / _edit_file_content (see their
-        # comments) — a transient network/API error on THIS call used to be
-        # caught by the blanket except below and returned as
-        # self.not_found_marker, which is indistinguishable from the model's
-        # own legitimate "nothing relevant in the knowledge base" verdict.
-        # _answer_legacy is the last-resort Stage-2 fallback (called after
-        # every Stage-1 candidate is exhausted in smart-search mode, or
-        # directly in legacy mode) — there is no further fallback after it,
-        # so a single dropped connection here used to make a real, present
-        # answer come back as "not found" with no second try. Give the call
-        # itself a small bounded number of retries before giving up, same
-        # spirit as the chunk-retry fix in actions.py, scoped to just the
-        # request_completion call so a genuine model NOT_FOUND (which
-        # returns normally, no exception) still short-circuits immediately.
+        # This is the last-resort fallback with no further retry after it,
+        # so give the call itself a bounded retry — a transient error must
+        # not come back indistinguishable from a genuine "not found".
         _LEGACY_RETRY_ATTEMPTS = 3
         reply = None
         last_exc = None  # type: Exception | None

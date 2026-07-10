@@ -32,13 +32,8 @@ def safe_filename_component(value: str) -> str:
 
 
 # ── Shared round-file accounting ─────────────────────────────────────────────
-# OuterLoop writes one ``feedback_round_<N>.md`` file per failed attempt and
-# uses the highest N found on disk to decide where a resumed task should pick
-# up. AutoController needs to ask the *same* question — "has this task
-# actually used up all its rounds, or would resetting it to TODO give it a
-# genuine new attempt?" — before resetting a BLOCKED task back to TODO.
-# Sharing one implementation means the two can never disagree about what
-# "already exhausted" means (see the BLOCKED-reset bugfix in controller.py).
+# Shared by OuterLoop (resume) and AutoController (BLOCKED-reset) so both
+# agree on what "already exhausted its rounds" means.
 _FEEDBACK_ROUND_RE = re.compile(r"feedback_round_(\d+)\.md$")
 
 
