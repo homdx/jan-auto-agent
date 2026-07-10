@@ -203,6 +203,16 @@ class PromptStore:
 
     def _save(self, data: dict) -> None:
         try:
+            # 0. Ensure the parent directory exists — mirrors
+            # MetricsCollector.record()'s atomic-write helper. Without this,
+            # a configured store_path whose directory doesn't exist yet
+            # (e.g. "state/prompts.json") makes mkstemp raise
+            # FileNotFoundError, which the except below only logs: push()
+            # returns normally, the file is never written, and the very next
+            # get_current() re-reads from disk, finds nothing, and silently
+            # serves the stale/hardcoded prompt as if the push never happened.
+            self.store_path.parent.mkdir(parents=True, exist_ok=True)
+
             # 1. Create a temporary file in the same directory as the target
             fd, tmp_path = tempfile.mkstemp(dir=self.store_path.parent, suffix=".tmp")
             
