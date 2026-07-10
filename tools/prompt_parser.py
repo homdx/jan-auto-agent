@@ -50,6 +50,21 @@ def _parse_via_regex(raw: str, source: str = "") -> Optional[ParsedPrompt]:
         from_match = re.search(r'\b(show|improve|explain|find|view|display)\s+([A-Za-z_][\w]*)\s+from\b', cleaned_raw, re.IGNORECASE)
         if from_match:
             target_name = from_match.group(2)
+            # BUGFIX (same class as the already-fixed Strategy A collision,
+            # see test_fix10_prompt_parser_keyword_collision.py): unlike
+            # Strategy A, this branch never stripped the captured
+            # target_name out of `remainder` before the intent keyword
+            # search below. If target_name happens to itself be a
+            # DIFFERENT category's keyword — e.g. "explain optimize from
+            # utils.py" captures target_name="optimize", which is also a
+            # has_improve keyword — it stayed sitting in `remainder` and
+            # silently flipped the detected intent, even though the actual
+            # intent verb ("explain") was the only thing the user typed.
+            # Strip only the target_name token — group(1), the real intent
+            # verb, must stay in `remainder` for the keyword search to see it.
+            remainder = re.sub(
+                r'\b' + re.escape(target_name) + r'\b', ' ', remainder, count=1
+            ).strip()
         else:
             # Strategy C: Fallback to the remaining single standalone identifier word.
             # Only accept it if the symbol actually exists somewhere in the source file
