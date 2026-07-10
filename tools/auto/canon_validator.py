@@ -289,8 +289,18 @@ class CanonValidator:
             logger.warning("CanonValidator: claim extraction failed: %s", exc)
             return []
         claims: list[str] = []
+        # Bugfix: this used to be
+        #   line = raw.strip().lstrip("-*0123456789. \t").strip()
+        # str.lstrip(chars) removes ANY of the given characters from the
+        # left, repeatedly — it has no concept of "a marker" versus "the
+        # claim's own leading digits". A claim that legitimately starts
+        # with a number (an age, a year, a population count — precisely
+        # what a CANON validator exists to protect) had that number
+        # silently eaten: "3.5 million people lived there" became "million
+        # people lived there" before ever reaching the conflict check.
+        _marker_re = re.compile(r"^\s*(?:[-*]|\d+[.)])\s+")
         for raw in reply.splitlines():
-            line = raw.strip().lstrip("-*0123456789. \t").strip()
+            line = _marker_re.sub("", raw.strip(), count=1).strip()
             if line:
                 claims.append(line)
         return claims

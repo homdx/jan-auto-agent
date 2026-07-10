@@ -58,6 +58,7 @@ from pathlib import Path
 from typing import Callable
 
 from tools.auto.summary_memory import _clean_bullet_list  # reuse existing helper
+from tools.auto.utils import atomic_write_text
 
 logger = logging.getLogger(__name__)
 
@@ -615,14 +616,14 @@ class StoryBible:
         if count >= self._CORRECTION_THRESHOLD:
             state.pop(key, None)
             try:
-                path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+                atomic_write_text(path, json.dumps(state, ensure_ascii=False, indent=2))
             except Exception as exc:
                 logger.warning("StoryBible: could not persist pending-corrections state: %s", exc)
             return True
 
         state[key] = {"proposal": proposal, "count": count}
         try:
-            path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+            atomic_write_text(path, json.dumps(state, ensure_ascii=False, indent=2))
         except Exception as exc:
             logger.warning("StoryBible: could not persist pending-corrections state: %s", exc)
         return False
@@ -689,7 +690,14 @@ class StoryBible:
         """Write *text* to the bible file.  Creates parent dirs as needed."""
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
-            self._path.write_text(text, encoding="utf-8")
+            # Bugfix: was a plain path.write_text(), which truncates-then-
+            # writes. This file is rewritten WHOLESALE on every update (the
+            # full accumulated fact set, not an append), so a kill mid-write
+            # is the worst instance of this pattern in the module: unlike
+            # the JSON files elsewhere, there's no parse step to even detect
+            # a truncated bible, so it would just silently read back with
+            # however many bullets happened to make it out before the kill.
+            atomic_write_text(self._path, text)
             logger.info("StoryBible: wrote %d chars to %s", len(text), self._path)
         except OSError as exc:
             logger.error("StoryBible: cannot write %s: %s", self._path, exc)

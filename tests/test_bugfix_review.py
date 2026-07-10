@@ -427,6 +427,80 @@ class TestTicketStorePathSanitization:
 
 # ── selfhost pilot: tests-mandate gate ────────────────────────────────────────
 
+class TestCanonValidatorPreservesNumbers:
+    """CanonValidator._extract_claims must not eat a claim's own leading
+    digits (ages, years, counts) while stripping list-marker prefixes."""
+
+    def _extractor(self, llm_reply):
+        from tools.auto.canon_validator import CanonValidator
+        cv = CanonValidator.__new__(CanonValidator)
+        cv._llm = lambda system, user: llm_reply
+        return cv
+
+    def test_leading_number_in_claim_is_preserved(self):
+        cv = self._extractor("3.5 million people lived there")
+        claims = cv._extract_claims("chapter text")
+        assert claims == ["3.5 million people lived there"]
+
+    def test_numbered_marker_is_still_stripped(self):
+        cv = self._extractor("1. She was born in 1990")
+        claims = cv._extract_claims("chapter text")
+        assert claims == ["She was born in 1990"]
+
+    def test_bulleted_marker_is_still_stripped(self):
+        cv = self._extractor("- Anna is 42 years old")
+        claims = cv._extract_claims("chapter text")
+        assert claims == ["Anna is 42 years old"]
+
+
+class TestStoryBibleAtomicWrites:
+    """StoryBible must persist the bible file and pending-corrections state
+    via atomic_write_text, not a plain (truncate-then-write) write_text."""
+
+    def test_write_uses_atomic_write_text(self, tmp_path, monkeypatch):
+        import tools.auto.story_bible as story_bible_mod
+
+        calls = []
+        original = story_bible_mod.atomic_write_text
+
+        def spy(path, content):
+            calls.append(path)
+            return original(path, content)
+
+        monkeypatch.setattr(story_bible_mod, "atomic_write_text", spy)
+
+        sb = story_bible_mod.StoryBible.__new__(story_bible_mod.StoryBible)
+        sb._path = tmp_path / "story_bible.md"
+        sb._write("• some fact")
+
+        assert calls, "StoryBible._write must go through atomic_write_text"
+        assert sb._path.read_text(encoding="utf-8") == "• some fact"
+
+    def test_no_plain_write_text_on_bible_path(self, tmp_path, monkeypatch):
+        """A crash mid-write (simulated by making write_text raise) must not
+        leave a corrupted file — plain write_text offers no such guarantee,
+        atomic_write_text (temp file + os.replace) does."""
+        import tools.auto.story_bible as story_bible_mod
+        from pathlib import Path
+
+        target = tmp_path / "story_bible.md"
+        target.write_text("ORIGINAL", encoding="utf-8")
+
+        def boom(self, *a, **k):
+            raise OSError("disk full mid-write")
+
+        monkeypatch.setattr(Path, "write_text", boom)
+
+        sb = story_bible_mod.StoryBible.__new__(story_bible_mod.StoryBible)
+        sb._path = target
+        sb._write("NEW CONTENT")
+
+        # atomic_write_text uses fdopen/os.replace, not Path.write_text, so
+        # the patched write_text should never even be called — content must
+        # have been fully replaced, not truncated or left stale.
+        assert target.read_text(encoding="utf-8") == "NEW CONTENT"
+
+
 class TestTestsMandateGate:
     class _Coder:
         def __init__(self, base, drafts):
