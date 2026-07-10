@@ -166,6 +166,22 @@ class SearchAgent:
             approved = json.loads(cleaned)
             if not isinstance(approved, list):
                 raise ValueError(f"expected a JSON list, got {type(approved).__name__}")
+            # Bugfix: an empty JSON list ("[]") is syntactically valid, so it
+            # never reached the except-block's fail-open path below — but a
+            # model returning nothing here almost always means it failed to
+            # follow the task (misunderstood the prompt, got confused,
+            # truncated its own output) rather than genuinely judging every
+            # single reference to be a non-dependency. Per this method's own
+            # documented contract ("Fail-open: ... every found reference is
+            # approved"), treat an empty verdict the same as a parse failure
+            # instead of silently rejecting everything.
+            if not approved:
+                logger.warning(
+                    "_evaluate_with_llm: LLM returned an empty list — "
+                    "treating as a filter failure and approving all %d "
+                    "ref(s) [fail-open]", len(all_names),
+                )
+                return all_names
             # Keep only names that were actually in the input (guard against
             # the model inventing names), preserving the original order.
             approved_set = {str(a) for a in approved}

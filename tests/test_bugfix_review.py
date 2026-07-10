@@ -427,6 +427,49 @@ class TestTicketStorePathSanitization:
 
 # ── selfhost pilot: tests-mandate gate ────────────────────────────────────────
 
+class TestSearchAgentEmptyLLMResponseFailsOpen:
+    """SearchAgent._evaluate_with_llm's documented contract is fail-open on
+    ANY filter failure. An empty JSON list ("[]") is syntactically valid so
+    it skipped the except-block's fail-open path and silently rejected every
+    reference instead — verified against a real, reproducing test case."""
+
+    def test_empty_list_triggers_fail_open(self):
+        from unittest.mock import patch
+        from tools.search_agent import SearchAgent
+
+        agent = SearchAgent(
+            model="test-model", base_url="http://fake-host", api_key="x", timeout=5,
+        )
+        found_refs = {
+            "ref1": {"code": "def ref1(): pass"},
+            "ref2": {"code": "def ref2(): pass"},
+        }
+        with patch("tools.search_agent._request_completion", return_value="[]"):
+            result = agent._evaluate_with_llm(found_refs)
+
+        assert result == ["ref1", "ref2"], (
+            "an empty LLM verdict must fail-open (approve all), not silently "
+            "reject every reference"
+        )
+
+    def test_nonempty_list_still_filters_normally(self):
+        from unittest.mock import patch
+        from tools.search_agent import SearchAgent
+
+        agent = SearchAgent(
+            model="test-model", base_url="http://fake-host", api_key="x", timeout=5,
+        )
+        found_refs = {
+            "ref1": {"code": "real dependency"},
+            "ref2": {"code": "stdlib wrapper"},
+            "ref3": {"code": "another real dep"},
+        }
+        with patch("tools.search_agent._request_completion", return_value='["ref1", "ref3"]'):
+            result = agent._evaluate_with_llm(found_refs)
+
+        assert result == ["ref1", "ref3"]
+
+
 class TestCoderTargetFilesDotfileCollision:
     """Coder._write_files' target_files allow-list guard must not let a
     disallowed dotfile slip through by colliding, after normalisation, with
