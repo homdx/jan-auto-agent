@@ -58,6 +58,7 @@ from pathlib import Path
 from typing import Callable
 
 from tools.auto.summary_memory import _clean_bullet_list  # reuse existing helper
+from tools.auto.utils import atomic_write_text
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +100,10 @@ def _normalise(text: str) -> str:
 
 def _parse_bullets(text: str) -> list[str]:
     """Return raw bullet strings (without leading marker) from *text*."""
-    marker = re.compile(r"^\s*[•\-\*]|\d+[.)]\s+")
+    # Both alternatives anchored — regex alternation binds ^ to only the
+    # first branch otherwise, letting a mid-sentence ordinal ("1. мая")
+    # get silently stripped as if it were a leading list marker.
+    marker = re.compile(r"^\s*[•\-\*]|^\d+[.)]\s+")
     result: list[str] = []
     for line in text.splitlines():
         line = line.strip()
@@ -119,13 +123,14 @@ _GENDER_MALE_RE = re.compile(
 )
 
 _AGE_RE = re.compile(r"(\d+)\s*(?:лет|год)", re.IGNORECASE)
+# Cap plausible human age: "год" is an unanchored prefix of "году"/"года",
+# so a calendar year ("в 1990 году") would otherwise be read as age=1990,
+# and a compatible birth-year + stated-age pair would be flagged as a
+# contradiction.
+_MAX_PLAUSIBLE_AGE = 119
 
-# AUTO-BUG-2 (extended): a second example of a guarded, narrowly but
-# deterministically detectable "immutable-ish" attribute besides
-# gender/age -- recovery/health status. Full generalisation to arbitrary
-# contradicting facts would need semantic (LLM) comparison; this mirrors
-# the same narrow, false-positive-resistant pattern as gender/age instead
-# of attempting that.
+# AUTO-BUG-2 (extended): recovery/health status — a second narrow,
+# deterministically-detectable "immutable-ish" attribute besides gender/age.
 _RECOVERY_FULL_RE = re.compile(
     r"полностью (?:выздоровел|восстановил(?:ся|ась)|поправил(?:ся|ась))", re.IGNORECASE,
 )
@@ -155,12 +160,9 @@ _AGE_WORD_RE = re.compile(
 )
 
 _NAME_RE = re.compile(r"\b[А-ЯЁ][а-яёА-ЯЁ]{2,}\b")
-# Common non-name capitalised words that should not be treated as entity names.
-# Includes pronouns/demonstratives and generic role nouns that are capitalised
-# only because they start a sentence (bugfix: these were being misread as
-# character names, e.g. "Она сказала..." -> name "Она", "Главный герой..."
-# -> name "Главный" — which corrupted the entity-scoping in
-# _conflicts_with_established below).
+# Common non-name capitalised words (pronouns, generic role nouns) that
+# start a sentence and would otherwise be misread as character names
+# (e.g. "Она сказала..." -> name "Она"), corrupting entity-scoping below.
 _NAME_STOPWORDS = {
     "Капитан", "Команда", "Корабль", "Мостик", "Возраст",
     "Она", "Его", "Ему", "Себя", "Этот", "Эта", "Это",
@@ -184,9 +186,12 @@ def _age_of(bullet: str) -> "int | str | None":
     """
     if _AGE_UNKNOWN_RE.search(bullet):
         return "unknown"
-    m = _AGE_RE.search(bullet)
-    if m:
-        return int(m.group(1))
+    # Scan all matches and take the first plausible human age, so a
+    # calendar year mentioned alongside a real age doesn't shadow it.
+    for m in _AGE_RE.finditer(bullet):
+        value = int(m.group(1))
+        if value <= _MAX_PLAUSIBLE_AGE:
+            return value
     w = _AGE_WORD_RE.search(bullet)
     if w:
         return _AGE_WORDS[w.group(1).lower()]
@@ -226,7 +231,7 @@ def _dedup_substrings(bullets: list[str]) -> list[str]:
                 keep[i] = False
                 break
 
-    return [b for b, k in zip(bullets, keep) if k]
+    return [b for b, k in zip(bullets, keep, strict=True) if k]
 
 
 # ── StoryBible ────────────────────────────────────────────────────────────────
@@ -258,6 +263,7 @@ class StoryBible:
         verify: bool = False,
         max_fidelity_rounds: int = 1,
         immutable_guard: bool = True,
+        semantic_guard: bool = True,
     ) -> None:
         self._llm = llm_call
         self._base_dir = Path(base_dir)
@@ -265,6 +271,13 @@ class StoryBible:
         self._max_chars = max(100, int(max_chars))
         self._verify = bool(verify)
         self._immutable_guard = bool(immutable_guard)
+        # Litera-sim fix: LLM-backed semantic conflict gate on merge. The
+        # deterministic _find_conflict covers only gender/age/recovery; any
+        # other hallucinated fact that contradicts an established one (e.g.
+        # «долг полностью погашен» vs «долг за три месяца аренды») used to be
+        # APPENDED alongside it, leaving the bible self-contradictory forever
+        # and burning continuity-revision caps on perfectly correct chapters.
+        self._semantic_guard = bool(semantic_guard)
         self._fidelity: "SummaryFidelityVerifier | None" = None
         if self._verify:
             from tools.auto.summary_memory import SummaryFidelityVerifier
@@ -369,21 +382,55 @@ class StoryBible:
         existing_bullets = _parse_bullets(existing_text)
         existing_norms = {_normalise(b) for b in existing_bullets}
 
+        # Litera-sim fix: ONE batched semantic conflict check for all genuinely
+        # new facts against the established bible, feeding the same
+        # correction-attempt machinery as the deterministic guard — so a
+        # hallucinated contradiction is dropped on arrival, while a REAL
+        # correction (proposed consistently by _CORRECTION_THRESHOLD
+        # independent chapters) still eventually replaces a bad established
+        # bullet.
+        # AUTO-FIX: gated on self._semantic_guard, NOT self._immutable_guard.
+        # These are two independent config flags (story_bible_immutable_guard
+        # / story_bible_semantic_guard) — the previous version gated this
+        # call on immutable_guard alone, so setting immutable_guard=false
+        # silently disabled the semantic gate too, regardless of its own
+        # flag. _semantic_conflicts() already no-ops when self._semantic_guard
+        # is false, so gating the call here on the same flag just skips the
+        # (redundant) LLM call in that case rather than changing behavior.
+        _candidates = [f for f in new_facts if _normalise(f) not in existing_norms]
+        _semantic_map = (
+            self._semantic_conflicts(_candidates, existing_bullets)
+            if self._semantic_guard else {}
+        )
+
         merged: list[str] = list(existing_bullets)
         added = 0
         for fact in new_facts:
             if _normalise(fact) in existing_norms:
                 continue
-            if self._immutable_guard:
-                conflict_bullet = self._find_conflict(fact, merged)
+            # AUTO-FIX: each guard now checks independently — a fact can be
+            # dropped/corrected by the deterministic check, the semantic
+            # check, or both, and either guard alone is enough to enter this
+            # branch (previously the whole branch — including the semantic
+            # lookup — was nested under immutable_guard, so semantic_guard
+            # had no effect when immutable_guard was off).
+            if self._immutable_guard or self._semantic_guard:
+                conflict_bullet = None
+                if self._immutable_guard:
+                    conflict_bullet = self._find_conflict(fact, merged)
+                if conflict_bullet is None and self._semantic_guard:
+                    _sem = _semantic_map.get(fact)
+                    # The semantic map was computed against the pre-merge
+                    # bible; only honour it if the flagged bullet is still
+                    # present (it may have been replaced by a correction
+                    # earlier in this same loop).
+                    if _sem is not None and _sem in merged:
+                        conflict_bullet = _sem
                 if conflict_bullet is not None:
                     if self._register_correction_attempt(fact, conflict_bullet):
-                        # AUTO-BUG-2 fix: the SAME correction has now been
-                        # proposed by _CORRECTION_THRESHOLD independent
-                        # chapters in a row — treat it as a genuine fix to
-                        # a bad first extraction rather than an attack /
-                        # one-off model slip, and replace the established
-                        # bullet instead of dropping the correction forever.
+                        # AUTO-BUG-2: same correction proposed by
+                        # _CORRECTION_THRESHOLD chapters in a row — accept
+                        # it as a genuine fix rather than a one-off slip.
                         logger.warning(
                             "StoryBible: accepting correction %r -> %r after "
                             "%d consistent re-observations.",
@@ -417,14 +464,10 @@ class StoryBible:
         """AUTO-CR-26-2 (write-once guard), reworked for AUTO-BUG-2.
 
         Returns the conflicting established bullet (or None) instead of a
-        bare bool, so the caller can decide whether to drop the new fact
-        or -- if the same correction keeps being independently re-observed
-        -- accept it as a fix and replace the established bullet.
-
-        Bugfix retained from the original: a fact with NO detected name
-        (e.g. a pronoun-only assertion like "Ei 45 let") cannot be safely
-        scoped to one entity, so it is let through unchecked instead of
-        being compared against every established bullet.
+        bare bool, so a correction repeatedly re-observed can replace the
+        established bullet instead of being dropped forever. A fact with
+        no detected name can't be safely scoped to one entity, so it's let
+        through unchecked.
         """
         new_gender = _gender_of(new_fact)
         new_age = _age_of(new_fact)
@@ -461,9 +504,61 @@ class StoryBible:
         """Backward-compatible bool wrapper around :meth:`_find_conflict`."""
         return self._find_conflict(new_fact, established) is not None
 
-    # AUTO-BUG-2: number of independent chapters that must propose the exact
-    # same correction before it overrides a previously "locked" immutable
-    # fact. Persisted to disk (not just in-memory) because in this pipeline
+    # ── Litera-sim fix: semantic (LLM) conflict gate ──────────────────────────
+    _SEMANTIC_CONFLICT_SYSTEM = (
+        "You are a strict continuity judge for a story bible. You get "
+        "ESTABLISHED facts and NEW candidate facts, each numbered. A NEW fact "
+        "CONFLICTS with an ESTABLISHED fact only if both cannot be true at "
+        "the same time in the story (direct contradiction), e.g. one says a "
+        "debt is unpaid and the other says the same debt is fully repaid. "
+        "Rephrasings, additional details, or unrelated facts are NOT "
+        "conflicts. Reply with one line per conflict in the exact form "
+        "'CONFLICT <new_number> <established_number>' and nothing else. If "
+        "there are no conflicts reply exactly 'NONE'."
+    )
+
+    def _semantic_conflicts(
+        self, new_facts: list[str], established: list[str]
+    ) -> dict[str, str]:
+        """Return ``{new_fact: conflicting_established_bullet}`` via ONE
+        batched LLM call. Fail-open: any error or unparsable reply -> ``{}``
+        (merge proceeds exactly as before this gate existed).
+
+        This is the semantic complement to the deterministic
+        :meth:`_find_conflict` (gender/age/recovery). One extra LLM call per
+        chapter is the accepted price for a bible that cannot silently hold
+        two mutually exclusive facts.
+        """
+        if not self._semantic_guard or not new_facts or not established:
+            return {}
+        try:
+            est_block = "\n".join(f"E{i + 1}. {b}" for i, b in enumerate(established))
+            new_block = "\n".join(f"N{i + 1}. {b}" for i, b in enumerate(new_facts))
+            user = (f"ESTABLISHED FACTS:\n{est_block}\n\n"
+                    f"NEW CANDIDATE FACTS:\n{new_block}\n\n"
+                    f"List conflicts, or NONE.")
+            reply = (self._llm(self._SEMANTIC_CONFLICT_SYSTEM, user) or "").strip()
+            conflicts: dict[str, str] = {}
+            for m in re.finditer(r"CONFLICT\s+N?(\d+)\s+E?(\d+)", reply, re.IGNORECASE):
+                ni, ei = int(m.group(1)) - 1, int(m.group(2)) - 1
+                if 0 <= ni < len(new_facts) and 0 <= ei < len(established):
+                    conflicts[new_facts[ni]] = established[ei]
+            if conflicts:
+                logger.warning(
+                    "StoryBible: semantic conflict gate flagged %d new fact(s) "
+                    "as contradicting established facts.", len(conflicts),
+                )
+            return conflicts
+        except Exception as exc:  # noqa: BLE001 — fail-open contract
+            logger.warning(
+                "StoryBible: semantic conflict gate error (%s) — proceeding "
+                "without it (fail-open).", exc,
+            )
+            return {}
+
+
+    # AUTO-BUG-2: independent chapters that must propose the same correction
+    # before it overrides a locked fact. Persisted to disk, not memory —
     # each chapter is typically a separate `main.py --auto` process.
     _CORRECTION_THRESHOLD = 2
 
@@ -495,14 +590,14 @@ class StoryBible:
         if count >= self._CORRECTION_THRESHOLD:
             state.pop(key, None)
             try:
-                path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+                atomic_write_text(path, json.dumps(state, ensure_ascii=False, indent=2))
             except Exception as exc:
                 logger.warning("StoryBible: could not persist pending-corrections state: %s", exc)
             return True
 
         state[key] = {"proposal": proposal, "count": count}
         try:
-            path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+            atomic_write_text(path, json.dumps(state, ensure_ascii=False, indent=2))
         except Exception as exc:
             logger.warning("StoryBible: could not persist pending-corrections state: %s", exc)
         return False
@@ -569,7 +664,10 @@ class StoryBible:
         """Write *text* to the bible file.  Creates parent dirs as needed."""
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
-            self._path.write_text(text, encoding="utf-8")
+            # Atomic write: this file is rewritten wholesale (full fact
+            # set, not an append) with no parse step to detect truncation,
+            # so a kill mid-write must not corrupt it.
+            atomic_write_text(self._path, text)
             logger.info("StoryBible: wrote %d chars to %s", len(text), self._path)
         except OSError as exc:
             logger.error("StoryBible: cannot write %s: %s", self._path, exc)
@@ -593,11 +691,9 @@ def make_story_bible(
     re-parsed from config so the bible uses the same API endpoint as the rest
     of the pipeline.
     """
-    # AUTO-BUG-1 fix: default to enabled. The bible's continuity-anchoring
-    # was designed to always run in creative mode; requiring an opt-in flag
-    # that the shipped agents.ini never actually set left the whole
-    # subsystem (and its story_bible_verify / story_bible_immutable_guard
-    # sub-settings) silently inert out of the box.
+    # AUTO-BUG-1: defaults to enabled — this subsystem was designed to
+    # always run in creative mode, and the shipped agents.ini never sets
+    # an opt-in flag, so requiring one left it silently inert.
     enabled = config.getboolean("validator_agent", "story_bible_creative", fallback=True)
     if not enabled:
         logger.warning("make_story_bible: story_bible_creative=false — bible disabled "
@@ -611,6 +707,12 @@ def make_story_bible(
     )
     immutable_guard = config.getboolean(
         "validator_agent", "story_bible_immutable_guard", fallback=True
+    )
+    # Litera-sim fix: LLM semantic conflict gate on merge (see StoryBible).
+    # Default ON — one extra LLM call per chapter is the accepted price for
+    # a bible that cannot hold two mutually exclusive facts.
+    semantic_guard = config.getboolean(
+        "validator_agent", "story_bible_semantic_guard", fallback=True
     )
 
     llm_call = _build_llm_call(
@@ -628,6 +730,7 @@ def make_story_bible(
         verify=verify,
         max_fidelity_rounds=max_fidelity_rounds,
         immutable_guard=immutable_guard,
+        semantic_guard=semantic_guard,
     )
 
 
@@ -646,7 +749,28 @@ def _build_llm_call(
     verify_ssl = config.getboolean("api", "verify_ssl", fallback=True)
     temperature = config.getfloat("inner_loop", "temperature", fallback=0.1)
     timeout = config.getint("loop", "timeout_seconds", fallback=300)
-    max_tokens = config.getint("validator_agent", "max_tokens", fallback=200)
+    # AUTO-FIX (fable follow-up 3): the bible generator used to borrow
+    # [validator_agent] max_tokens (a cap sized for a short JSON verdict /
+    # numbered critique). Raising the validator budget silently inflated the
+    # bible and vice versa, and the 200-token fallback is ~13 lines — far too
+    # small for a whole-story bible in Cyrillic (~2 chars/token). Give the
+    # bible its own key with a creative-sized default; keep the old
+    # validator_agent value as a secondary fallback so existing tuned
+    # configs don't regress.
+    _legacy_mt = config.getint("validator_agent", "max_tokens", fallback=200)
+    max_tokens = config.getint("story_bible", "max_tokens",
+                               fallback=max(1000, _legacy_mt))
+    # Same context-window forwarding as everywhere else: 0 = server default.
+    active_profile = config.get("api", "active", fallback="local")
+    num_ctx = config.getint(f"api_{active_profile}", "num_ctx", fallback=0)
+    # AUTO-FIX (fable follow-up 3): thinking models (qwen3) wrap output in
+    # <think>…</think>; with a bounded num_predict the reply can truncate
+    # mid-think and the bible comes back empty — or worse, reasoning lines
+    # that happen to match the FACT markers get PERSISTED into
+    # story_bible.md and re-injected into every later chapter prompt.
+    # Mirror the gate1/architect/coder toggle: default off, re-enable via
+    # [story_bible] think = true.
+    think = config.getboolean("story_bible", "think", fallback=False)
 
     ssl_context: ssl.SSLContext | None = _llm_stream.make_unverified_context() if not verify_ssl else None
 
@@ -662,14 +786,19 @@ def _build_llm_call(
 
     def _call(system: str, user: str) -> str:
         if api_format == "ollama":
+            _opts: dict = {"temperature": temperature, "num_predict": max_tokens}
+            if num_ctx:
+                _opts["num_ctx"] = num_ctx
             payload: dict = {
                 "model": model,
                 "messages": [
                     {"role": "system", "content": system},
                     {"role": "user", "content": user},
                 ],
-                "options": {"temperature": temperature, "num_predict": max_tokens},
+                "options": _opts,
             }
+            if not think:
+                payload["think"] = False
         else:
             payload = {
                 "model": model,
@@ -680,7 +809,10 @@ def _build_llm_call(
                     {"role": "user", "content": user},
                 ],
             }
-        return (
+        # AUTO-FIX (fable follow-up 3): strip <think> reasoning BEFORE the
+        # fact-marker parser sees the text — otherwise reasoning lines can be
+        # mistaken for facts and persisted into story_bible.md.
+        return _llm_stream.strip_think(
             _llm_stream.request_completion(
                 url=url,
                 headers=headers,

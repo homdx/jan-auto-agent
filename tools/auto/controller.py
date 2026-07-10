@@ -29,6 +29,7 @@ from typing import Callable, Optional
 
 from tools.auto.state import StateStore, STATUS_DONE, STATUS_BLOCKED, STATUS_TODO
 from tools.auto.git_manager import make_git_manager, GitError
+from tools.auto.utils import highest_completed_round
 # NOTE: make_outer_loop is deliberately NOT imported at module level here.
 # _run_task_loop() imports it locally (see below) precisely so that tests
 # can mock it via patch("tools.auto.outer_loop.make_outer_loop", ...) — the
@@ -379,12 +380,10 @@ class AutoController:
         self._setup_git()
 
         # Reset any tasks that were blocked in a prior session back to TODO so
-        # their dependencies are re-evaluated this session.  A task blocked
-        # because dep A wasn't done yet will simply be re-blocked immediately
-        # if A is still pending; if A is now DONE it will run normally.
-        for task in self.state.all_tasks():
-            if task["status"] == STATUS_BLOCKED:
-                self.state.set_task_status(task["id"], STATUS_TODO)
+        # their dependencies are re-evaluated this session (see docstring on
+        # _reset_resettable_blocked_tasks for why this isn't simply "reset
+        # every BLOCKED task").
+        self._reset_resettable_blocked_tasks(cfg)
 
         resume_info = self.state.resume_info()
         if not is_fresh:
@@ -445,6 +444,29 @@ class AutoController:
         """
         pending = self.state.resume_info()["pending"]
         tasks_done = 0
+
+        # AUTO-FIX (podrugi sim): a repeat --auto invocation against a
+        # directory whose plan.json is already fully done used to exit with
+        # a bare "run_finished" and no explanation — from the outside it
+        # looked like the run silently did nothing. Say why, and say what to
+        # do about it, before the (correct) early exit below.
+        # NOTE: resume_info()["pending"] is a LIST of tasks, not a count —
+        # the first version of this fix compared it to 0 and never fired.
+        if not pending:
+            _total = len(self.state.all_tasks())
+            if _total > 0:
+                print(f"[controller] plan.json in {self.base_dir} has no "
+                      f"pending tasks — all {_total} task(s) in the existing "
+                      f"plan are already done. Nothing to execute this run. "
+                      f"To plan NEW work toward the goal, remove the .agent "
+                      f"state directory (or start with a fresh --base) and "
+                      f"re-run.")
+                logger.info("execute_phase: resumed plan has 0 pending of %d "
+                            "task(s) — exiting without work; stale plan.json "
+                            "is the likely cause on a repeat --auto "
+                            "invocation.", _total)
+            # _total == 0 (architect produced nothing) is already reported by
+            # the plan-phase logs — no extra message needed here.
 
         # ── Build execution helpers once per loop ──────────────────────────
         if cfg is None:
@@ -762,6 +784,43 @@ class AutoController:
                 cfg.read(self.config_path, encoding="utf-8")
             self.config = cfg
         return cfg
+
+    def _reset_resettable_blocked_tasks(self, cfg: configparser.ConfigParser) -> None:
+        """Reset BLOCKED tasks back to TODO — but only when that can help.
+
+        A task can be BLOCKED for two very different reasons:
+
+        1. An unmet dependency (set in ``_run_task_loop``). Resetting this to
+           TODO is exactly right: the dependency check runs again immediately,
+           so the task either runs now (dependency done) or is re-blocked
+           straight away (dependency still pending) — harmless either way.
+        2. OuterLoop used up every one of its ``max_rounds_per_task``
+           attempts (round-exhaustion; see ``OuterLoop.run_task``'s
+           "already exhausted" and "all rounds exhausted" paths).
+
+        Bugfix: this used to reset BOTH cases unconditionally, on the theory
+        (per the original comment, which only ever described case 1) that a
+        fresh session should give every BLOCKED task another look. For case 2
+        that reset was a no-op in disguise: OuterLoop decides where to resume
+        from ``feedback_round_*.md`` files on disk, which a bare status reset
+        never touches, so the task immediately re-exhausted and flipped
+        straight back to BLOCKED without a single new attempt — silently
+        defeating the exact restart an operator would reach for to give a
+        stuck task another chance.
+
+        This detects case 2 directly — via the same file-based round count
+        OuterLoop itself uses (``highest_completed_round``) compared against
+        the configured cap — and leaves those tasks BLOCKED so the status
+        honestly reflects reality. Only genuinely-resettable tasks (case 1,
+        or anything that hasn't used up its rounds) are reset.
+        """
+        max_rounds_cfg = cfg.getint("auto", "max_rounds_per_task", fallback=10)
+        for task in self.state.all_tasks():
+            if task["status"] != STATUS_BLOCKED:
+                continue
+            if highest_completed_round(self.state.task_dir(task["id"])) >= max_rounds_cfg:
+                continue  # round-exhausted — resetting would not help
+            self.state.set_task_status(task["id"], STATUS_TODO)
 
     def _setup_git(self) -> None:
         """AUTO-A3: ensure the base dir is a git repo and apply agent identity.

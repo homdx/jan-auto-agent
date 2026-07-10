@@ -208,14 +208,21 @@ class GitManager:
 
     def has_staged_changes(self) -> bool:
         """Return ``True`` if there is at least one staged change."""
-        result = subprocess.run(
-            ["git", "diff", "--cached", "--quiet"],
-            cwd=self.repo_dir,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
+        try:
+            result = subprocess.run(
+                ["git", "diff", "--cached", "--quiet"],
+                cwd=self.repo_dir,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=60,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise GitError(
+                "git diff --cached --quiet timed out after 60s "
+                "(possible stale .git/index.lock or hung hook)"
+            ) from exc
         # exit 0 → nothing staged; exit 1 → changes staged
         return result.returncode != 0
 
@@ -290,14 +297,23 @@ class GitManager:
 
     def _run(self, cmd: list[str], error_msg: str) -> str:
         """Run *cmd* inside *repo_dir*, capture output, raise on failure."""
-        result = subprocess.run(
-            cmd,
-            cwd=self.repo_dir,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
+        try:
+            result = subprocess.run(
+                cmd,
+                cwd=self.repo_dir,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=60,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise GitError(
+                f"{error_msg} (timed out after 60s)\n"
+                f"  cmd : {' '.join(cmd)}\n"
+                "  Possible causes: stale .git/index.lock, a hung git hook, "
+                "or an unresponsive remote."
+            ) from exc
         if result.returncode != 0:
             raise GitError(
                 f"{error_msg}\n"

@@ -71,13 +71,24 @@ def _parse_via_regex(raw: str, source: str = "") -> Optional[ParsedPrompt]:
     intent = "show_and_improve"  # Default fallback condition
 
     normalized_remainder = remainder.lower()
-    normalized_raw = cleaned_raw.lower()
 
     # Use word-boundary regex so a keyword like 'read' does not spuriously match
     # inside a file name such as 'README.md' or 'thread.py'.
+    #
+    # Only ever search `remainder` (the raw prompt with the matched file-path
+    # segment and any def/class declaration already stripped out) — never the
+    # original raw string. `remainder` already retains every real verb the
+    # user typed; the *only* extra text a raw-string search would add back in
+    # is the file path / target name itself, and `\b` only guards against
+    # keywords glued to *contiguous* letters (e.g. "thread.py", "README.md").
+    # It does not help when the keyword is its own hyphen/dot-delimited token,
+    # which is a completely ordinary way to name a file or a function — e.g.
+    # "show def helper in small-fix.py" or "improve def show in ui.py" would
+    # otherwise pick up a spurious has_improve/has_show from the filename or
+    # symbol name and misclassify the intent.
     def _has_kw(words: list[str]) -> bool:
         pattern = re.compile(r'\b(?:' + '|'.join(re.escape(w) for w in words) + r')\b')
-        return bool(pattern.search(normalized_remainder) or pattern.search(normalized_raw))
+        return bool(pattern.search(normalized_remainder))
 
     has_show    = _has_kw(["show", "find", "view", "display", "get", "read"])
     has_improve = _has_kw(["improve", "fix", "refactor", "optimize", "correct"])

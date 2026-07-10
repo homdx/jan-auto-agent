@@ -9,7 +9,7 @@ if str(_root) not in sys.path:
 STORY-2.3 -- Wire PromptStore into ValidatorAgent, ImprovementAgent, and Orchestrator.
 Run with:  python tests/test_story_2_3.py
 """
-import inspect, json, py_compile, sys
+import inspect, py_compile, sys
 
 from tools.prompt_store import PromptStore
 from tools.validator_agent import ValidatorAgent, VALIDATOR_PROMPT_HARDCODED

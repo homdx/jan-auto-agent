@@ -272,7 +272,16 @@ class PromptEvaluator:
         avg_iter = sum(sim_iters) / n
         iter_score = max(0.0, 1.0 - (avg_iter - 1.0) / max(1, self.max_iter - 1))
 
-        json_ok_rate = sum(1 for r in results if not r.get("_api_error")) / n
+        # Exclude _api_error from both numerator and denominator (no reply
+        # arrived to judge at all — the shadow-run equivalent of "not
+        # applicable"), matching _score_from_records' treatment above.
+        # _unparseable stays in the denominator: a reply DID arrive there,
+        # and failed the exact thing this rate measures.
+        _json_judged = [r for r in results if not r.get("_api_error")]
+        json_ok_rate = (
+            sum(1 for r in _json_judged if not r.get("_unparseable")) / len(_json_judged)
+            if _json_judged else 0.0
+        )
 
         approved_rate = (
             sum(1 for r in results if r.get("status") == "approved") / n

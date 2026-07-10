@@ -132,17 +132,21 @@ class ValidatorAgent:
                 missing_refs=payload.get("missing_refs"),
             )
 
-        try:
-            req_payload = {
-                "model": self.model,
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": self.temperature,
-            }
-            if self.num_ctx:
-                req_payload["num_ctx"] = self.num_ctx
-            tracer.event("validator_agent", "llm", "llm_request",
-                         content=prompt, model=self.model, temperature=self.temperature)
+        req_payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": self.temperature,
+        }
+        if self.num_ctx:
+            req_payload["num_ctx"] = self.num_ctx
+        tracer.event("validator_agent", "llm", "llm_request",
+                     content=prompt, model=self.model, temperature=self.temperature)
 
+        # Split network failure from parse failure: only a genuine transport
+        # error is _api_error (triggers backoff-retry without consuming an
+        # iteration in main.py's run_pipeline); a malformed-but-received
+        # reply is an ordinary needs_fix.
+        try:
             if self.stream:
                 ts = time.strftime("%H:%M:%S")
                 print(f"\n[{ts}] validator_agent → llm  (iter {payload.get('iteration')}/{self.max_iter}):")
@@ -161,20 +165,6 @@ class ValidatorAgent:
                 content = request_completion(url, headers, req_payload, self.timeout,
                                              api_format=self.api_format,
                                              ssl_context=self.ssl_context)
-
-            tracer.event("llm", "validator_agent", "llm_response", content=content)
-            content = strip_think(content)
-
-            content = strip_json_fence(content)
-
-            parsed_result = json.loads(content)
-            # Enforce max_hints: cap the suggested_searches list so the outer
-            # loop does not expand search scope beyond the configured limit.
-            if isinstance(parsed_result.get("suggested_searches"), list):
-                parsed_result["suggested_searches"] = \
-                    parsed_result["suggested_searches"][:self.max_hints]
-            tracer.event("validator_agent", "orchestrator", "result", content=parsed_result)
-            return parsed_result
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="replace")
             logger.error(f"ValidatorAgent HTTP {e.code}: {body}")
@@ -183,7 +173,38 @@ class ValidatorAgent:
             tracer.event("validator_agent", "orchestrator", "error", content=_err)
             return _err
         except Exception as e:
-            logger.error(f"ValidatorAgent execution loop failed: {e}")
+            logger.error(f"ValidatorAgent API call failed: {e}")
             _err = {"status": "needs_fix", "feedback": f"API Connection Timeout Fallback: {e}", "_api_error": True}
             tracer.event("validator_agent", "orchestrator", "error", content=_err)
             return _err
+
+        tracer.event("llm", "validator_agent", "llm_response", content=content)
+        content = strip_think(content)
+        content = strip_json_fence(content)
+
+        try:
+            parsed_result = json.loads(content)
+        except Exception as e:
+            logger.warning(f"ValidatorAgent: unparseable reply — {e}")
+            # _unparseable, distinct from _api_error, so prompt_evaluator's
+            # json_ok_rate scores this differently from a genuine API error.
+            _err = {
+                "status": "needs_fix",
+                "feedback": (
+                    'Your reply could not be parsed as the required STRICT JSON '
+                    '{"status": "approved" | "needs_fix", "feedback": "...", '
+                    '"suggested_searches": [...]} — reply with JSON only, no '
+                    "prose, no code fences."
+                ),
+                "_unparseable": True,
+            }
+            tracer.event("validator_agent", "orchestrator", "error", content=_err)
+            return _err
+
+        # Enforce max_hints: cap the suggested_searches list so the outer
+        # loop does not expand search scope beyond the configured limit.
+        if isinstance(parsed_result.get("suggested_searches"), list):
+            parsed_result["suggested_searches"] = \
+                parsed_result["suggested_searches"][:self.max_hints]
+        tracer.event("validator_agent", "orchestrator", "result", content=parsed_result)
+        return parsed_result

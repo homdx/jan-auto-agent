@@ -28,14 +28,13 @@ for _mod in [
         _make_stub(_mod)
 
 # Provide just enough surface for inner_loop top-level imports
-import types as _types
 
 _anthropic = sys.modules["anthropic"]
 _anthropic.Anthropic = lambda **kw: None          # type: ignore[attr-defined]
 _anthropic.types = sys.modules["anthropic.types"]  # type: ignore[attr-defined]
 
 # Now import the module under test
-import importlib, importlib.util, pathlib, os
+import importlib.util, pathlib
 
 _src = pathlib.Path(__file__).parent.parent / "tools" / "auto" / "inner_loop.py"
 _spec = importlib.util.spec_from_file_location("inner_loop", _src)

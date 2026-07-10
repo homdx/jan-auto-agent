@@ -32,11 +32,10 @@ from __future__ import annotations
 
 import sys
 import time
-from dataclasses import dataclass, field as dc_field
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Optional
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -48,9 +47,6 @@ from tools.auto.controller import AutoController, RunLimits
 from tools.auto.outer_loop import OuterLoopResult
 from tools.auto.state import (
     StateStore,
-    STATUS_BLOCKED,
-    STATUS_DONE,
-    STATUS_TODO,
 )
 from tools.auto.ticket_store import make_ticket_store
 from tools.auto.bug_fix_loop import BugFixResult

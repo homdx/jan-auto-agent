@@ -165,6 +165,17 @@ class BugFixLoop:
             )
             return BugFixResult(ticket_id, fix_id, fixed=True, skipped=True)
 
+        # A "deferred" ticket (a prior attempt exhausted its fix budget)
+        # short-circuits too, same as "fixed" — otherwise every later
+        # commit re-runs the full fix cycle on a regression already known
+        # not to resolve. Reset status to "open" to retry manually.
+        if existing and existing.get("status") == "deferred":
+            logger.info(
+                "BugFixLoop: ticket %s already deferred — skipping "
+                "(reset its status to retry)", ticket_id,
+            )
+            return BugFixResult(ticket_id, fix_id, fixed=False, exhausted=True, skipped=True)
+
         if existing is None:
             body = self._build_ticket_body(triggering_task, exec_result)
             ticket = make_ticket(
@@ -223,10 +234,14 @@ class BugFixLoop:
                 outer_result.knowledge() if hasattr(outer_result, "knowledge")
                 else "", _MAX_OUTPUT_CHARS
             )
+            # Re-fetch defensively: the ticket could have been deleted
+            # externally during the long-running fix attempt above; a bare
+            # None subscript would crash the whole bug-fix loop.
+            _existing_ticket = self._tickets.get(ticket_id) or {}
             self._tickets.update(
                 ticket_id,
                 status="deferred",
-                body=self._tickets.get(ticket_id)["body"] + (
+                body=_existing_ticket.get("body", "") + (
                     f"\n\n## Fix attempt exhausted\n{knowledge}"
                 ),
             )

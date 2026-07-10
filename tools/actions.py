@@ -86,7 +86,7 @@ class OrchestratorActions:
         return OrchestratorActions._parse_payload_and_file(user_input, "/search")
 
     def _ask_over_text(self, query: str, file_label: str, text: str,
-                       chunk_label: str = None, generative: bool = False) -> str:
+                       chunk_label: str = None, generative: bool = False) -> "str | None":
         """
         Send the whole `text` plus the question to the model and stream the
         answer. Returns the assistant's full reply (stripped).
@@ -120,7 +120,8 @@ class OrchestratorActions:
         payload = {"model": self.model,
                    "messages": [{"role": "system", "content": system},
                                 {"role": "user", "content": user}],
-                   "temperature": self._cfg_temp("search_agent", 0.2)}
+                   "temperature": self._cfg_temp("search_agent", 0.2),
+                   "num_ctx": getattr(self, "num_ctx", 0)}
         print(f"\n[{_ts()}] 🔎 search → model{where}:")
         tracer.event("orchestrator", "search_fullfile", "llm_request",
                      params={"file": file_label, "chunk": chunk_label, "query": query},
@@ -140,9 +141,11 @@ class OrchestratorActions:
             tracer.event("search_fullfile", "orchestrator", "llm_response", content=answer)
             return strip_think(answer).strip()
         except Exception as e:
+            # Return None (not "") so callers can tell a real failure apart
+            # from the model's own "NONE" (no answer) and retry accordingly.
             logger.error(f"/search model call failed: {e}")
             print(f"[{_ts()}] search failed: {e}")
-            return ""
+            return None
 
     @staticmethod
     def _split_text(text: str, budget: int, overlap: int = 200):
@@ -194,7 +197,19 @@ class OrchestratorActions:
         budget = self.search_full_file_max_chars
         if len(source) <= budget:
             print(f"[{_ts()}] Full-file search over {file_path} ({len(source)} chars).")
-            self._ask_over_text(query, file_path, source)
+            # Retry on a transient failure (None), same as the chunked path below.
+            _RETRY = 3
+            ans = None
+            for _attempt in range(_RETRY):
+                ans = self._ask_over_text(query, file_path, source)
+                if ans is not None:
+                    return
+                if _attempt < _RETRY - 1:
+                    _wait = backoff.backoff_seconds(_attempt)
+                    print(f"[{_ts()}] ⚠️  Retrying after error "
+                          f"(attempt {_attempt + 2}/{_RETRY})...")
+                    time.sleep(_wait)
+            print(f"[{_ts()}] ⚠️  Search unreachable after {_RETRY} attempts.")
             return
 
         # File too large for one context → allowed to split.
@@ -202,7 +217,24 @@ class OrchestratorActions:
         print(f"[{_ts()}] {file_path} is {len(source)} chars > budget {budget}; "
               f"splitting into {len(chunks)} chunks and searching each.")
         for i, ch in enumerate(chunks, 1):
-            ans = self._ask_over_text(query, file_path, ch, chunk_label=f"{i}/{len(chunks)}")
+            # Retry a transient failure (None) a bounded number of times
+            # before skipping the chunk — distinct from the model's own
+            # legitimate "NONE" (no answer here), which moves on immediately.
+            _CHUNK_RETRY_ATTEMPTS = 3
+            ans = None
+            for _attempt in range(_CHUNK_RETRY_ATTEMPTS):
+                ans = self._ask_over_text(query, file_path, ch, chunk_label=f"{i}/{len(chunks)}")
+                if ans is not None:
+                    break
+                if _attempt < _CHUNK_RETRY_ATTEMPTS - 1:
+                    _wait = backoff.backoff_seconds(_attempt)
+                    print(f"[{_ts()}] ⚠️  Retrying chunk {i}/{len(chunks)} "
+                          f"after error (attempt {_attempt + 2}/{_CHUNK_RETRY_ATTEMPTS})...")
+                    time.sleep(_wait)
+            if ans is None:
+                print(f"[{_ts()}] ⚠️  Chunk {i}/{len(chunks)} unreachable after "
+                      f"{_CHUNK_RETRY_ATTEMPTS} attempts — skipping.")
+                continue
             if not ans or ans.strip().upper() == "NONE":
                 continue
 
@@ -211,7 +243,7 @@ class OrchestratorActions:
                 validation = self._validate_text_answer(query, ch, ans,
                                                          stream_mode=self.stream_agents)
 
-            if validation.get("_api_error"):
+            if validation.get("_api_error") or validation.get("_unparseable"):
                 print(f"[{_ts()}] ⚠️  Validator unavailable — accepting answer as-is. "
                       f"({validation.get('feedback', '')})")
                 print(f"[{_ts()}] ✅ Answer found in chunk {i}/{len(chunks)} (unvalidated).")
@@ -260,7 +292,7 @@ class OrchestratorActions:
         return " ".join(tokens).strip(" .,:;?-")
 
     def _answer_from_file(self, question: str, file_label: str,
-                          knowledge: str, feedback: str = None) -> str:
+                          knowledge: str, feedback: str = None) -> "str | None":
         """Generate a grounded answer to `question` using `knowledge` as the source."""
         system = (
             "You are a documentation/FAQ assistant. Answer the QUESTION using the "
@@ -277,7 +309,8 @@ class OrchestratorActions:
         payload = {"model": self.model,
                    "messages": [{"role": "system", "content": system},
                                 {"role": "user", "content": user}],
-                   "temperature": self._cfg_temp("main_agent", 0.3)}
+                   "temperature": self._cfg_temp("main_agent", 0.3),
+                   "num_ctx": getattr(self, "num_ctx", 0)}
         print(f"\n[{_ts()}] 💬 answer → model:")
         tracer.event("orchestrator", "text_answerer", "llm_request",
                      params={"file": file_label, "question": question,
@@ -298,9 +331,11 @@ class OrchestratorActions:
             tracer.event("text_answerer", "orchestrator", "llm_response", content=ans)
             return strip_think(ans).strip()
         except Exception as e:
+            # Return None (not "") so run_text_qa can retry instead of
+            # validating an empty answer with misleading feedback.
             logger.error(f"text answer call failed: {e}")
             print(f"[{_ts()}] answer generation failed: {e}")
-            return ""
+            return None
 
     def _parse_llm_json(self, content: str) -> dict:
         """
@@ -346,23 +381,43 @@ class OrchestratorActions:
         payload = {"model": self.model,
                    "messages": [{"role": "system", "content": system},
                                 {"role": "user", "content": user}],
-                   "temperature": self._cfg_temp("validator_agent", 0.1)}
+                   "temperature": self._cfg_temp("validator_agent", 0.1),
+                   "num_ctx": getattr(self, "num_ctx", 0)}
         tracer.event("orchestrator", "text_validator", "llm_request",
                      params={"question": question}, content=user,
                      model=self.model, temperature=self._cfg_temp("validator_agent", 0.1))
+        # Split network failure from parse failure: only a genuine transport
+        # error is _api_error (triggers backoff-retry without consuming an
+        # iteration); a malformed-but-received reply is an ordinary needs_fix.
         try:
             content = request_completion(url, headers, payload, self.timeout_seconds,
                                          stream=stream_mode,
                                          api_format=self.api_format,
                                          ssl_context=self.ssl_context)
-            tracer.event("text_validator", "orchestrator", "llm_response", content=content)
-            content = strip_think(content)
-            return self._parse_llm_json(content)
         except Exception as e:
-            logger.error(f"text validator failed: {e}")
-            # Fail-closed: do NOT approve on error.
+            logger.error(f"text validator API call failed: {e}")
             return {"status": "needs_fix", "grounded": False,
                     "feedback": f"validator unavailable: {e}", "_api_error": True}
+
+        tracer.event("text_validator", "orchestrator", "llm_response", content=content)
+        content = strip_think(content)
+        try:
+            return self._parse_llm_json(content)
+        except Exception as e:
+            logger.warning(f"text validator returned unparseable content: {e}")
+            # _unparseable (distinct from _api_error) lets run_search fail
+            # open on this too, per its own no-retry-loop contract, while
+            # run_text_qa's retry loop still advances iteration normally.
+            return {
+                "status": "needs_fix",
+                "grounded": False,
+                "feedback": (
+                    "Your reply could not be parsed as the required STRICT "
+                    'JSON {"status": ..., "grounded": ..., "feedback": ...} '
+                    "— reply with JSON only, no prose, no code fences."
+                ),
+                "_unparseable": True,
+            }
 
     def run_text_qa(self, question: str, file_path: str, source: str, base_dir: str,
                      resume_state: dict = None) -> None:
@@ -383,11 +438,25 @@ class OrchestratorActions:
             print(f"[{_ts()}] \U0001f4c4 No explicit question — treating the file content as the question.")
         knowledge = source
 
-        # If the document is larger than the full-file budget, keep only the most
-        # relevant slice by reusing the /search chunk scan first, then validate.
+        # AUTO-FIX (fable follow-up 3): this used to only PRINT "validating
+        # against chunks" and then pass the full document anyway — a no-op
+        # message. With the head-truncation behavior of an overfull Ollama
+        # context, the system prompt (not the document tail) is what got cut.
+        # Now the document is actually reduced to the budget, keeping the
+        # head and tail halves (question-relevant material in FAQs/docs tends
+        # to live near headings at the top or recent additions at the bottom)
+        # with an explicit elision marker so the model knows text is missing.
         if len(knowledge) > self.search_full_file_max_chars:
-            print(f"[{_ts()}] Document {len(knowledge)} chars > budget "
-                  f"{self.search_full_file_max_chars}; validating against chunks.")
+            _budget = self.search_full_file_max_chars
+            _half = max(1, _budget // 2)
+            _omitted = len(knowledge) - 2 * _half
+            knowledge = (
+                knowledge[:_half]
+                + f"\n\n… [{_omitted} chars omitted to fit the context budget] …\n\n"
+                + knowledge[-_half:]
+            )
+            print(f"[{_ts()}] Document {len(source)} chars > budget "
+                  f"{_budget}; using head+tail slice ({_omitted} chars omitted).")
 
         iteration = 1
         feedback = None
@@ -408,7 +477,32 @@ class OrchestratorActions:
                 print(f"[{_ts()}] ⏳ timeout reached; returning best answer so far.")
                 break
             _step_start = time.time()
-            answer = self._answer_from_file(question, file_path, knowledge, feedback)
+            _new_answer = self._answer_from_file(question, file_path, knowledge, feedback)
+
+            if _new_answer is None:
+                # Retry a transient generation failure with the same backoff
+                # as a validator _api_error, keeping the previous best answer.
+                _api_err_count += 1
+                if _api_err_count == 1:
+                    print(backoff.MILESTONE_TABLE)
+                _wait = backoff.backoff_seconds(_api_err_count - 1)
+                if iteration >= self.max_iterations:
+                    print(f"[{_ts()}] ⚠️  Answer generation unavailable — "
+                          f"max iterations reached, keeping best answer so far.")
+                    break
+                _chk = {
+                    "loop": "run_text_qa",
+                    "question": question,
+                    "file_path": file_path,
+                    "base_dir": base_dir,
+                    "iteration": iteration,  # retry same iteration
+                    "feedback": feedback,
+                    "answer": answer,
+                }
+                backoff.sleep_with_interrupt_save(_wait, _chk)
+                continue  # retry same iteration (do not increment)
+
+            answer = _new_answer
             print(f"[{_ts()}] ⏱  Answer generated in {time.time() - _step_start:.1f}s")
             print(f"[{_ts()}] \U0001f916 Validating answer ({iteration}/{self.max_iterations})...")
             _val_start = time.time()
@@ -454,6 +548,28 @@ class OrchestratorActions:
             if feedback:
                 print(f"[{_ts()}] ❗ Validator feedback: {feedback}")
             iteration += 1
+
+        # FIX: run_text_qa's own docstring (step 4) promises to "render the
+        # final, validated answer" — but the loop above only ever streamed
+        # each draft live during generation (via _answer_from_file's
+        # on_token callback) and printed one-line validator verdicts
+        # ("approved" / feedback). There was no concluding block: on
+        # multi-iteration runs the final answer is just whichever streamed
+        # draft happened to print last, with no clear marker of which draft
+        # is the validated one, and unlike run_edit there was no warning at
+        # all if the loop exhausted max_iterations/timeout without ever
+        # being approved. Neither caller (main.py) uses this method's
+        # return value, so this concluding print is the only place the
+        # user ever sees a clearly-labelled final answer.
+        total = time.time() - start
+        print(f"\n[{_ts()}] ── ANSWER — {file_path} — {total:.1f}s from request ──")
+        if validation.get("status") != "approved":
+            print(f"[{_ts()}] ⚠️  UNVALIDATED ANSWER — validator never approved "
+                  f"after {self.max_iterations} iteration(s). Last feedback: "
+                  f"{validation.get('feedback', '(none)')!r}. Review carefully.")
+        print(answer.strip() if answer and answer.strip() else "(no answer produced)")
+        print(f"\n[{_ts()}] status={validation.get('status', 'unknown')}  "
+              f"grounded={validation.get('grounded')}")
     # ------------------------------------------------------------------ #
     # In-place file editing (/edit) — writes the file, with backup + diff  #
     # ------------------------------------------------------------------ #
@@ -475,7 +591,7 @@ class OrchestratorActions:
 
     def _edit_file_content(self, instruction: str, file_label: str,
                            source: str, feedback: str = None,
-                           previous_revised: str = None) -> str:
+                           previous_revised: str = None) -> "str | None":
         """Ask the model for the COMPLETE revised file content (no commentary).
 
         Message structure depends on whether this is a first attempt or a retry:
@@ -568,7 +684,8 @@ class OrchestratorActions:
         headers = self._headers()
         payload = {"model": self.model,
                    "messages": messages,
-                   "temperature": self._cfg_temp("file_editor", 0.2)}
+                   "temperature": self._cfg_temp("file_editor", 0.2),
+                   "num_ctx": getattr(self, "num_ctx", 0)}
         if getattr(self, "file_editor_max_tokens", 0):
             payload["max_tokens"] = self.file_editor_max_tokens
         print(f"\n[{_ts()}] ✏️  edit → model:")
@@ -593,9 +710,11 @@ class OrchestratorActions:
             tracer.event("file_editor", "orchestrator", "llm_response", content=out)
             return out
         except Exception as e:
+            # Return None (not "") so run_edit can retry a real failure
+            # instead of treating it the same as a genuinely empty reply.
             logger.error(f"file edit call failed: {e}")
             print(f"[{_ts()}] edit generation failed: {e}")
-            return ""
+            return None
 
     def _validate_edit(self, instruction: str, original: str, revised: str,
                         stream_mode: bool = False) -> dict:
@@ -612,26 +731,64 @@ class OrchestratorActions:
         )
         user = (f"ORIGINAL:\n{original}\n\nINSTRUCTION:\n{instruction}\n\n"
                 f"REVISED:\n{revised}")
+        # AUTO-FIX (fable follow-up 3): ORIGINAL + REVISED is two full copies
+        # of the file. If that exceeds the context window, Ollama silently
+        # drops the HEAD of the prompt — the system prompt and the start of
+        # ORIGINAL — and the validator issues a verdict on partial data
+        # without anyone knowing. Don't silently trust it: warn loudly.
+        # (chars/token ≈ 2 for Cyrillic-heavy text, 4 for Latin — use the
+        # project-wide estimator.)
+        _nc = getattr(self, "num_ctx", 0)
+        if _nc:
+            try:
+                from tools.auto.utils import chars_per_token
+                _est_tokens = len(user) / chars_per_token(user)
+                if _est_tokens > _nc * 0.9:
+                    print(f"[{_ts()}] ⚠️  Edit validator prompt ≈{int(_est_tokens)} "
+                          f"tokens vs num_ctx={_nc} — the window will overflow "
+                          f"and the verdict may be based on a truncated file. "
+                          f"Consider a larger num_ctx profile for files this size.")
+            except Exception:
+                pass  # estimation is best-effort; never block validation
         url = self._chat_url()
         headers = self._headers()
         payload = {"model": self.model,
                    "messages": [{"role": "system", "content": system},
                                 {"role": "user", "content": user}],
-                   "temperature": self._cfg_temp("validator_agent", 0.1)}
+                   "temperature": self._cfg_temp("validator_agent", 0.1),
+                   "num_ctx": getattr(self, "num_ctx", 0)}
         tracer.event("orchestrator", "edit_validator", "llm_request",
                      params={"instruction": instruction}, content=user,
                      model=self.model, temperature=self._cfg_temp("validator_agent", 0.1))
+        # Split network failure from parse failure: only a genuine transport
+        # error is _api_error (triggers backoff-retry without consuming an
+        # iteration); a malformed-but-received reply is an ordinary needs_fix.
         try:
             content = strip_think(request_completion(url, headers, payload, self.timeout_seconds,
                                                       stream=stream_mode,
                                                       api_format=self.api_format,
                                                       ssl_context=self.ssl_context))
-            tracer.event("edit_validator", "orchestrator", "llm_response", content=content)
-            return self._parse_llm_json(content)
         except Exception as e:
-            logger.error(f"edit validator failed: {e}")
+            logger.error(f"edit validator API call failed: {e}")
             return {"status": "needs_fix", "feedback": f"validator unavailable: {e}",
                     "_api_error": True}
+
+        tracer.event("edit_validator", "orchestrator", "llm_response", content=content)
+        try:
+            return self._parse_llm_json(content)
+        except Exception as e:
+            logger.warning(f"edit validator returned unparseable content: {e}")
+            # _unparseable, distinct from _api_error, for consistency with
+            # the sibling validator methods and any future caller/scorer.
+            return {
+                "status": "needs_fix",
+                "feedback": (
+                    "Your reply could not be parsed as the required STRICT "
+                    'JSON {"status": ..., "feedback": ...} — reply with '
+                    "JSON only, no prose, no code fences."
+                ),
+                "_unparseable": True,
+            }
 
     def run_edit(self, user_input: str, base_dir: str,
                  resume_state: dict = None) -> None:
@@ -711,11 +868,39 @@ class OrchestratorActions:
                     _prev_to_pass = revised
 
             _step_start = time.time()
-            revised = self._edit_file_content(
+            _new_revised = self._edit_file_content(
                 instruction, file_path, original,
                 feedback=feedback,
                 previous_revised=_prev_to_pass,
             )
+
+            if _new_revised is None:
+                # Retry a transient generation failure the same way the
+                # validator call further down already retries.
+                _api_err_count += 1
+                if _api_err_count == 1:
+                    print(backoff.MILESTONE_TABLE)
+                _wait = backoff.backoff_seconds(_api_err_count - 1)
+                if iteration >= self.max_iterations:
+                    print(f"[{_ts()}] ⚠️  Edit generation unavailable — "
+                          f"max iterations reached, using best edit so far.")
+                    break
+                _chk = {
+                    "loop": "run_edit",
+                    "user_input": user_input,
+                    "base_dir": base_dir,
+                    "instruction": instruction,
+                    "file_path": file_path,
+                    "iteration": iteration,  # retry same iteration
+                    "revised": revised,      # keep the last good attempt, not the failure
+                    "feedback": feedback,
+                    "_prev_shown_count": _prev_shown_count,
+                    "_is_reset_iter": _is_reset_iter,
+                }
+                backoff.sleep_with_interrupt_save(_wait, _chk)
+                continue  # retry same iteration (do not increment)
+
+            revised = _new_revised
             if not revised.strip():
                 print(f"[{_ts()}] No content produced — file left unchanged.")
                 return
@@ -781,6 +966,19 @@ class OrchestratorActions:
             print(f"[{_ts()}] No content produced — file left unchanged.")
             return
 
+        # AUTO-FIX (fable follow-up 3): if the loop exhausted max_iterations
+        # with the validator still saying needs_fix, we are about to write
+        # content the validator NEVER approved. The gates exist to do their
+        # job — so say it loudly instead of writing in silence. (The write
+        # still happens: the timestamped .bak below makes it reversible, and
+        # the last attempt is usually closer to the goal than the original.)
+        if validation.get("status") != "approved":
+            print(f"[{_ts()}] ⚠️  WRITING UNAPPROVED EDIT — validator never "
+                  f"approved after {self.max_iterations} iteration(s). "
+                  f"Last feedback: {validation.get('feedback', '(none)')!r}. "
+                  f"Original is preserved in the .bak file below — review the "
+                  f"diff carefully.")
+
         # Write: back up current content with a timestamped suffix, then overwrite.
         backup = target + ".bak." + time.strftime("%H%M%S")
         _bak_n = 0
@@ -790,8 +988,12 @@ class OrchestratorActions:
         try:
             with open(backup, "w", encoding="utf-8") as b:
                 b.write(original)
-            with open(target, "w", encoding="utf-8") as f:
+            # Atomic write (same pattern as state.py's _atomic_write): a
+            # process killed mid-write must not leave a truncated target.
+            _tmp = target + ".tmp-edit"
+            with open(_tmp, "w", encoding="utf-8") as f:
                 f.write(revised)
+            os.replace(_tmp, target)
         except Exception as e:
             print(f"[{_ts()}] ❌ Failed to write {target}: {e}")
             return

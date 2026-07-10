@@ -13,11 +13,9 @@ Plus edge-case extras for commit_on_success hook and boundary conditions.
 """
 from __future__ import annotations
 
-import re
 from pathlib import Path
 from unittest.mock import MagicMock, call
 
-import pytest
 
 from tools.auto.summary_memory import (
     SummaryMemory,

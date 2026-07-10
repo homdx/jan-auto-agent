@@ -94,6 +94,9 @@ _GATE2_SYSTEM_CODE = (
     '"missing_context": ["<symbol you needed to see but were not shown>", ...]}\n'
     "Use missing_context ONLY when you cannot verify correctness because a "
     "referenced symbol's definition was not provided; otherwise omit it.\n"
+    "A change may deliberately DELETE a file (it appears as '(file DELETED by "
+    "this change …)'); a deleted file is a valid part of a refactor, not an "
+    "error — judge whether the deletion matches the task.\n"
     "HINTS RULES:\n"
     "  - Each hint MUST point to a specific name, line, or pattern in the code.\n"
     "  - Good: 'import re is used on line 12 but not present in imports'.\n"
@@ -238,6 +241,11 @@ class LLMGate2Validator:
         self.num_ctx     = int(num_ctx)
         self.max_tokens  = int(max_tokens)
         self.task_mode   = str(task_mode)
+        self._config     = config
+        # AUTO-FIX: Gate-2 code/docs mode needs strict JSON, no soft-parse
+        # fallback (AUTO-BUG-10) — think=false avoids failing closed on a
+        # thinking model truncated mid-<think>.
+        self._think      = config.getboolean("validator_agent", "think", fallback=False) if config is not None else False
         # AUTO-DM-5 / AUTO-CR-19-1: select system prompt — mode-specific
         # override > (code-mode-only) legacy "system" key > built-in.
         # See _resolve_validator_system for the full priority rationale.
@@ -280,7 +288,19 @@ class LLMGate2Validator:
                 content = (_base / rel).read_text(
                     encoding="utf-8", errors="replace")
             except OSError as exc:
-                blocks.append(f"--- {rel} ---\n(could not read {rel}: {exc})")
+                # Final-polish: a file absent WITH a .coder.bak sibling is a
+                # deliberate deletion (coder's delete:true), not a read
+                # failure — say so, or the validator may treat the feature
+                # as an error.
+                if not (_base / rel).exists() and (
+                    _base / (rel + ".coder.bak")
+                ).exists():
+                    blocks.append(
+                        f"--- {rel} ---\n(file DELETED by this change — "
+                        f"original backed up at {rel}.coder.bak)"
+                    )
+                else:
+                    blocks.append(f"--- {rel} ---\n(could not read {rel}: {exc})")
                 continue
 
             if len(content) <= budget:
@@ -333,6 +353,91 @@ class LLMGate2Validator:
                 pass
         return "\n\n".join(parts)
 
+    def _creative_language_mismatch(self, coder_result, base_dir) -> "str | None":
+        """Deterministic (non-LLM) language pre-gate for creative mode.
+
+        Detects the story's established language from ``synopsis.md`` /
+        ``story_bible.md`` (or ``[coder] creative_language`` in config) and
+        compares it against the dominant script of the chapter the coder
+        just wrote. On a clear mismatch (e.g. story is Russian, the new
+        chapter drifted into English — a known failure mode for small
+        models mid-chapter), returns a REVISE reason string so the caller
+        can reject WITHOUT spending an LLM call on it — cheaper and instant
+        compared to catching the same problem via the Gate-2 LLM review.
+
+        Fail-open: returns ``None`` (no mismatch — proceed to the real
+        Gate-2 LLM check as normal) whenever there's nothing to compare
+        against, or detection itself fails for any reason. This is a fast
+        path, not a substitute for the LLM review, so it never blocks a
+        chapter it isn't confident about.
+        """
+        if self.task_mode != "creative":
+            return None
+        try:
+            from tools.auto.utils import resolve_creative_language, detect_language
+
+            _base = Path(base_dir) if base_dir is not None else self.base_dir
+
+            sample = ""
+            for fname in ("synopsis.md", "story_bible.md"):
+                p = _base / fname
+                if p.exists():
+                    text = p.read_text(encoding="utf-8", errors="replace")
+                    if text.strip():
+                        sample = text
+                        break
+
+            # AUTO-FIX (podrugi run): when the run starts from user-provided
+            # chapters (the documented Creative.MD workflow: hand-written
+            # chapter_1.txt + goal "продолжи рассказ"), synopsis.md /
+            # story_bible.md do not exist yet — they are only written AFTER
+            # the first generated chapter is accepted. That left this gate
+            # blind exactly on the first generated chapter: an all-English
+            # chapter_2 sailed through and then poisoned the synopsis.
+            # Fallback: establish the language from the chapters already on
+            # disk (excluding the files the coder just wrote and reserved
+            # meta files).
+            if not sample:
+                _written = set(getattr(coder_result, "files_written", []) or [])
+                _reserved = {"synopsis.md", "story_bible.md", "IMPROVEMENTS.md",
+                             "plan.json", "progress.json"}
+                _parts: list[str] = []
+                for prev in sorted(_base.glob("*.txt")) + sorted(_base.glob("*.md")):
+                    if prev.name in _reserved or prev.name in _written:
+                        continue
+                    try:
+                        t = prev.read_text(encoding="utf-8", errors="replace").strip()
+                    except OSError:
+                        continue
+                    if t:
+                        _parts.append(t[:2000])
+                    if len(_parts) >= 3:
+                        break
+                sample = "\n".join(_parts)
+
+            expected = resolve_creative_language(self._config, sample, task_mode="creative")
+            if not expected:
+                return None  # nothing established yet (e.g. chapter 1) — skip
+
+            files = list(getattr(coder_result, "files_written", []) or [])
+            if not files:
+                return None
+            chapter_text = "\n".join(
+                (_base / rel).read_text(encoding="utf-8", errors="replace")
+                for rel in files
+                if (_base / rel).exists()
+            )
+            actual = detect_language(chapter_text)
+            if actual and actual != expected:
+                return (
+                    f"The chapter appears to be written in {actual}, but the "
+                    f"story so far is in {expected}. Rewrite the ENTIRE "
+                    f"chapter in {expected} — do not mix languages."
+                )
+        except Exception as exc:  # noqa: BLE001 — fast path must never raise
+            logger.debug("Gate2 language pre-gate skipped: %s", exc)
+        return None
+
     def approve(
         self,
         task:         dict,
@@ -354,6 +459,20 @@ class LLMGate2Validator:
         detailed verdict instead of repeating itself.
         """
         self.last_missing_context = []
+
+        # AUTO-FIX: cheap deterministic language pre-gate for creative mode —
+        # catches a chapter that drifted into the wrong language WITHOUT
+        # spending an LLM call on it. Only ever short-circuits to REVISE; it
+        # never approves on its own, so a false trigger still gets caught by
+        # the real LLM review below on the next attempt.
+        _lang_reason = self._creative_language_mismatch(coder_result, base_dir)
+        if _lang_reason:
+            logger.info(
+                "LLMGate2Validator [creative]: language pre-gate REVISE "
+                "(no LLM call) — %s", _lang_reason,
+            )
+            return False, f"Reason: {_lang_reason}"
+
         try:
             from tools.llm_stream import request_completion, strip_think
 
@@ -407,6 +526,7 @@ class LLMGate2Validator:
                             {"role": "user",    "content": um},
                         ],
                         "options": _val_opts,
+                        "think": getattr(self, "_think", False),
                     }
                 else:
                     _payload = {
@@ -584,9 +704,20 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
         _re.compile(r"\bне\s+противоречит\b"),
         # negated / absent contradictions expressed without «нет/без»:
         #   «противоречий не обнаружено / не выявлено», «противоречия отсутствуют»
-        _re.compile(r"противоречи\w*\s+(?:отсутств\w*|не\s+\w+)"),
-        #   «не вижу / не обнаружил / не нашёл … противоречий»
-        _re.compile(r"\bне\s+\w+\s+противоречи"),
+        # (fix: allow up to 3 filler words between noun and negated verb; negated
+        # verb restricted to search/perception verbs to avoid false positives)
+        _re.compile(
+            r"противоречи\w*(?:\s+\S+){0,3}\s+"
+            r"(?:отсутств\w*|не\s+(?:обнаружен\w*|выявлен\w*|найден\w*|"
+            r"встречает\w*|замечен\w*|видн\w*))"
+        ),
+        #   «не вижу / не обнаружил / не нашёл … противоречий» — same filler-word
+        #   gap allowed on this side (e.g. «не смог найти каких-либо противоречий»)
+        _re.compile(
+            r"\bне\s+(?:вижу|нахожу|нашёл|нашел|обнаружил|выявил|заметил|"
+            r"встретил|встречаю|смог\s+найти)"
+            r"(?:\s+\S+){0,3}\s+противоречи"
+        ),
         # «не против» / «непротив»
         _re.compile(r"\bне\s+против\b"),
         _re.compile(r"\bнепротив\b"),
@@ -626,10 +757,15 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
         _re.compile(r"\b(нужно|надо|следует)\s+(изменить|поправить|переписать|исправить|доработать|переделать)"),
         # «(так) нельзя оставлять»
         _re.compile(r"нельзя\s+оставля"),
-        # standalone negative answer «Нет, …» / «Нет.» — comma/period only, so
-        # approvals like «нет проблем» / «нет замечаний» (followed by a space) are
-        # NOT caught here. «нет противоречий» already returned APPROVED above.
-        _re.compile(r"^нет(?:[,.]|$)"),
+        # standalone negative answer «Нет, …» / «Нет.» — comma/period only,
+        # so approvals like «нет проблем» / «нет замечаний» (followed by a
+        # space) are NOT caught here. «нет противоречий» already returned
+        # APPROVED above. Excludes casual "Нет, всё хорошо/нормально/..."
+        # openers, which are approvals, not rejections.
+        _re.compile(
+            r"^нет(?:[,.]|$)"
+            r"(?!\s*(?:всё|все)\s+(?:хорошо|нормально|в\s+порядке|ок(?:ей)?|отлично|супер)\b)"
+        ),
     ]
 
     # ── Scan: first try the first non-empty line; fall back to whole text ──
@@ -740,6 +876,8 @@ class InnerLoop:
         fact_validator=None,
         prosody_validator=None,
         continuity_validator=None,
+        theme_validator=None,
+        require_tests: bool = False,
         task_mode: str = "code",
         max_task_seconds: int = 0,
         run_goal: str = "",
@@ -758,6 +896,12 @@ class InnerLoop:
         # AUTO-CR-23-3: optional continuity gate vs bible + previous chapter
         # (creative mode only).
         self.continuity_validator = continuity_validator
+        # podrugi-3: optional theme/content gate vs story-level guidelines
+        # (creative mode only) — the one gate that judges WHAT the chapter
+        # says, not whether it is consistent.
+        self.theme_validator = theme_validator
+        # selfhost pilot: deterministic tests-mandate gate for code mode.
+        self.require_tests = bool(require_tests)
         self.task_mode    = str(task_mode)
         # AUTO-CR-21-4: hard wall-clock cap per task; 0 disables the guard.
         self.max_task_seconds = max(0, int(max_task_seconds))
@@ -831,6 +975,8 @@ class InnerLoop:
         _fact_revisions:  int = 0     # AUTO-CR-20: Gate-3 fact-driven rejections used so far
         _prosody_revisions: int = 0   # AUTO-CR-21: prosody-gate-driven rejections used so far
         _continuity_revisions: int = 0  # AUTO-CR-23-3: continuity-gate-driven rejections used so far
+        _theme_revisions: int = 0     # podrugi-3: theme-gate-driven rejections used so far
+        _tests_mandate_rejections: int = 0  # selfhost: code-without-tests rejections
         base_dir_path = Path(base_dir)
         target_files  = task.get("target_files", []) or []
         self._broker.reset_cache()  # clear per-task cache; Pass-2 hits re-accumulate fresh
@@ -923,6 +1069,38 @@ class InnerLoop:
 
             # ── 2. Executor (objective half of Gate 2) ────────────────────────
             try:
+                # ── selfhost pilot: deterministic tests-mandate gate ─────
+                if self.require_tests and self.task_mode == "code":
+                    _written = list(getattr(coder_result, "files_written", []) or [])
+                    _py = [f for f in _written if f.endswith(".py")]
+                    def _is_test(f: str) -> bool:
+                        import os as _os
+                        base = _os.path.basename(f)
+                        return base.startswith("test_") or base.endswith("_test.py") \
+                            or "/tests/" in f.replace("\\", "/") or f.replace("\\", "/").startswith("tests/")
+                    _code_py = [f for f in _py if not _is_test(f)]
+                    _test_py = [f for f in _py if _is_test(f)]
+                    if _code_py and not _test_py:
+                        _tests_mandate_rejections += 1
+                        _cap = 2
+                        _msg = ("tests mandate: code files written without any "
+                                "test file (" + ", ".join(_code_py[:4]) + ") — every "
+                                "code change must include new or updated tests "
+                                "(tests/test_*.py) covering it; resubmit code AND tests.")
+                        if _tests_mandate_rejections <= _cap:
+                            logger.info("InnerLoop: attempt %d rejected by tests "
+                                        "mandate (%d/%d)", attempt,
+                                        _tests_mandate_rejections, _cap)
+                            feedback.append(f"attempt {attempt}: {_msg}")
+                            records.append(AttemptRecord(attempt, True, False, False, _msg))
+                            _trace_stage(task_id, attempt, "tests_mandate", "REJECTED",
+                                        revisions_used=_tests_mandate_rejections, cap=_cap)
+                            continue
+                        logger.warning("InnerLoop: tests-mandate cap (%d) reached — "
+                                       "proceeding to execution without tests.", _cap)
+                        _trace_stage(task_id, attempt, "tests_mandate",
+                                    "ACCEPTED_AT_CAP", cap=_cap)
+
                 exec_result = self.executor.run(task)
             except Exception as exc:
                 logger.error("InnerLoop: executor raised on attempt %d: %s", attempt, exc)
@@ -1200,6 +1378,63 @@ class InnerLoop:
                         _trace_stage(task_id, attempt, "continuity", "ACCEPTED_AT_CAP",
                                     cap=continuity_cap)
 
+            # ── podrugi-3: theme/content gate vs story-level guidelines ───────
+            # Runs after the continuity gate. Every other gate checks
+            # consistency; this one checks CONTENT against the author's
+            # configured guidelines (e.g. "the story must not glamorize the
+            # addiction it depicts"). A chapter can be consistent, complete,
+            # and in the right language — and still violate the story's
+            # theme contract; nothing else in the chain would ever notice.
+            # Bounded by max_theme_revisions; fail-open on any error.
+            if (
+                self.task_mode == "creative"
+                and self.theme_validator is not None
+                and target_files
+            ):
+                theme_cap = getattr(self.theme_validator, "max_theme_revisions", 2)
+                theme_problem_blocks: list[str] = []
+                for _theme_file in target_files:
+                    try:
+                        _theme_text = (base_dir_path / _theme_file).read_text(
+                            encoding="utf-8", errors="replace"
+                        )
+                        theme_verdict = self.theme_validator.check(_theme_text)
+                    except Exception as exc:  # noqa: BLE001 — fail-open
+                        logger.warning(
+                            "InnerLoop: theme check raised for %s — %s; approving.",
+                            _theme_file, exc,
+                        )
+                        theme_verdict = None
+
+                    if theme_verdict is not None and not theme_verdict.approved:
+                        theme_problem_blocks.append(
+                            f"{_theme_file}:\n{theme_verdict.feedback()}"
+                        )
+
+                if theme_problem_blocks:
+                    tfb = "\n\n".join(theme_problem_blocks)
+                    if _theme_revisions < theme_cap:
+                        _theme_revisions += 1
+                        logger.info(
+                            "InnerLoop: attempt %d theme rejected (%d/%d) — %s",
+                            attempt, _theme_revisions, theme_cap,
+                            tfb.replace("\n", " ")[:120],
+                        )
+                        full_tfb = f"theme rejected\n{tfb}"
+                        feedback.append(f"attempt {attempt}: {full_tfb}")
+                        records.append(AttemptRecord(attempt, True, True, False, full_tfb))
+                        _trace_stage(task_id, attempt, "theme", "REJECTED",
+                                    revisions_used=_theme_revisions, cap=theme_cap)
+                        continue
+                    else:
+                        logger.warning(
+                            "InnerLoop: theme revision cap (%d) reached — "
+                            "accepting chapter with possible unresolved theme issues.",
+                            theme_cap,
+                        )
+                        _trace_stage(task_id, attempt, "theme", "ACCEPTED_AT_CAP",
+                                    cap=theme_cap)
+
             # ── AUTO-CR-21: Gate-3 Russian rhythm/rhyme (prosody) gate ────────
             # Runs after Gate-2 APPROVED, canon, and fact checks in creative
             # mode; no-op unless the task is a verse task (ритм/рифм keyword).
@@ -1427,13 +1662,27 @@ def make_inner_loop(
             logger.warning("make_inner_loop: continuity validator unavailable — %s", exc)
             continuity_validator = None
 
+    # ── podrugi-3: optional theme/content gate (creative mode only) ────────────
+    theme_validator = None
+    if task_mode == "creative":
+        try:
+            from tools.auto.theme_validator import make_theme_validator
+            theme_validator = make_theme_validator(config)
+        except Exception as exc:  # noqa: BLE001 — never block the loop on setup
+            logger.warning("make_inner_loop: theme validator unavailable — %s", exc)
+            theme_validator = None
+
     # ── AUTO-CR-21-4: hard per-task wall-clock guard ───────────────────────────
     max_task_seconds = config.getint("auto", "max_task_seconds", fallback=1800)
+    require_tests = config.getboolean("inner_loop", "require_tests_code",
+                                      fallback=False)
 
     return InnerLoop(coder, executor, validator, max_attempts=max_attempts,
                      context_broker=broker, canon_validator=canon_validator,
                      fact_validator=fact_validator, prosody_validator=prosody_validator,
                      continuity_validator=continuity_validator,
+                     theme_validator=theme_validator,
+                     require_tests=require_tests,
                      task_mode=task_mode, max_task_seconds=max_task_seconds,
                      run_goal=run_goal)
 

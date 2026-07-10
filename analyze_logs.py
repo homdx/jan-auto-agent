@@ -10,6 +10,7 @@ Usage:
     python analyze_logs.py .agent/ --rewrites       # + prompt rewrite report
     python analyze_logs.py .agent/ --rewrites-only  # rewrite report only
     python analyze_logs.py .agent/ --mode creative  # story-progress layout
+    python analyze_logs.py .agent/ --mode docs      # documentation-run layout
 
 What it shows:
     • Summary: total tasks, iterations, approve/reject counts, prompt changes
@@ -21,11 +22,24 @@ What it shows:
       the old → new prompt diff
     • Timeline: human-readable event flow
 
+Task modes mirror ``agents.ini [auto] task_mode`` (code | docs | creative —
+see AUTO-CR-10 / tools/auto/utils.py normalize_task_mode) so a run analyzed
+here always lines up with the mode it was actually generated under:
+
 Creative mode (--mode creative or --mode auto on a creative run):
     • Story Progress: chapters in narrative order with revision counts
     • Per-gate breakdown (Gate-2 LLM / Gate-3 fact / prosody / continuity)
       when those validators emit tracer events
     • Non-chapter tasks shown separately
+
+Docs mode (--mode docs, or --mode auto on a task_mode=docs run) (AUTO-CR-35):
+    • Documentation tasks are rendered like code tasks (docs runs use the
+      same coder → Gate-2 pipeline, with no Gate-3 prose gates), but the
+      section headers and run banner are relabelled so a docs run doesn't
+      read like a plain code run.
+    • Auto-detection infers "docs" when a majority of a run's tasks touch
+      only prose/doc files (.md, .rst, .txt, .adoc, .mdx) and don't look
+      like chapter-writing tasks.
 """
 
 from __future__ import annotations
@@ -65,18 +79,69 @@ def _chapter_num(task: dict) -> int:
     return 9999
 
 
+# ── Docs-mode helpers (AUTO-CR-35) ────────────────────────────────────────────
+# Keeps analyze_logs.py's mode support in sync with agents.ini [auto] task_mode
+# (code | docs | creative — tools/auto/utils.py normalize_task_mode). Unlike
+# creative mode, docs tasks don't emit a distinguishing structural marker like
+# a chapter number: the architect/gate1/validator prompts differ (see
+# docs/Readme.MD §4 "Task Modes"), but the trace shape is identical to plain
+# code tasks (coder → Gate-2, no Gate-3 prose gates). So detection here is a
+# best-effort heuristic based on which files a task actually touched.
+_DOC_EXTENSIONS = (".md", ".mdx", ".rst", ".txt", ".adoc")
+
+
+def _is_doc_file(filename: str) -> bool:
+    """True if *filename* looks like a prose/documentation file."""
+    return filename.lower().endswith(_DOC_EXTENSIONS)
+
+
+def _task_files_map(run: dict) -> dict:
+    """Build ``task_id -> [files touched]`` from files_preparing trace records.
+
+    Uses the most recent record per task (whichever file list was last
+    reported for that task's workspace setup).
+    """
+    files_by_task: dict = {}
+    for rec in run.get("files_preparing", []):
+        task_id = rec.get("task")
+        files = rec.get("files")
+        if task_id and files:
+            files_by_task[task_id] = files
+    return files_by_task
+
+
 def _detect_task_mode(run: dict) -> str:
     """Infer task mode from trace patterns.
 
     Returns ``"creative"`` when the majority of tasks look like chapter-writing
-    tasks (title or task_id contains a chapter number).  Falls back to
-    ``"code"`` otherwise.
+    tasks (title or task_id contains a chapter number); ``"docs"`` when the
+    majority of the remaining tasks touched only prose/doc files (AUTO-CR-35);
+    otherwise falls back to ``"code"``. Requires at least two file-carrying
+    tasks before ever returning "docs", so a single incidental README tweak
+    inside an otherwise ordinary code run isn't misread as a docs run.
     """
     real_tasks = [v for k, v in run["tasks"].items() if not k.startswith("gate1:")]
     if not real_tasks:
         return "code"
+
     chapter_tasks = sum(1 for t in real_tasks if _chapter_num(t) < 9999)
-    return "creative" if chapter_tasks > len(real_tasks) / 2 else "code"
+    if chapter_tasks > len(real_tasks) / 2:
+        return "creative"
+
+    files_by_task = _task_files_map(run)
+    doc_tasks = 0
+    considered = 0
+    for t in real_tasks:
+        files = files_by_task.get(t.get("task_id", ""))
+        if not files:
+            continue
+        considered += 1
+        if all(_is_doc_file(f) for f in files):
+            doc_tasks += 1
+    if considered >= 2 and doc_tasks > considered / 2 and doc_tasks > len(real_tasks) / 2:
+        return "docs"
+
+    return "code"
 
 
 # ── ANSI colours ─────────────────────────────────────────────────────────────
@@ -822,8 +887,13 @@ def render_run_summary(run: dict) -> None:
     print(f"  {bold('Total events')}:    {run['total_events']}")
 
 
-def render_applied_tasks(run: dict) -> None:
-    """Show every completed task — the things that were actually applied/done."""
+def render_applied_tasks(run: dict, mode: str = "code") -> None:
+    """Show every completed task — the things that were actually applied/done.
+
+    ``mode`` (AUTO-CR-35) only changes the section header and per-task file
+    annotation — docs runs share the exact same task shape as code runs, just
+    with prose files instead of source files (see docs/Readme.MD §4).
+    """
     tasks = run["tasks"]
     done = [
         v for k, v in tasks.items()
@@ -831,11 +901,19 @@ def render_applied_tasks(run: dict) -> None:
         and v.get("status") in ("DONE", "APPROVED", "PASS")
     ]
 
-    print_section(f"APPLIED / COMPLETED TASKS  ({len(done)} total)")
+    header = "DOCUMENTATION CHANGES APPLIED" if mode == "docs" else "APPLIED / COMPLETED TASKS"
+    print_section(f"{header}  ({len(done)} total)")
 
     if not done:
-        print(dim("  (no completed tasks recorded in this run)"))
+        no_tasks_msg = (
+            "  (no completed documentation tasks recorded in this run)"
+            if mode == "docs" else
+            "  (no completed tasks recorded in this run)"
+        )
+        print(dim(no_tasks_msg))
         return
+
+    files_by_task = _task_files_map(run) if mode == "docs" else {}
 
     for t in done:
         title    = t.get("title") or t.get("task_id", "?")
@@ -849,6 +927,13 @@ def render_applied_tasks(run: dict) -> None:
         print()
         print(f"  {green('✓')} {bold(truncate(title, 65))}")
         print(f"    {dim('id:')}       {dim(task_id)}")
+        if mode == "docs":
+            doc_files = files_by_task.get(task_id, [])
+            if doc_files:
+                preview = ", ".join(doc_files[:3])
+                if len(doc_files) > 3:
+                    preview += dim(f" … +{len(doc_files) - 3}")
+                print(f"    {dim('file:')}     {dim(preview)}")
         if commit:
             print(f"    {dim('commit:')}   {cyan(commit[:12])}")
         if dur:
@@ -1303,11 +1388,16 @@ def render_run(
         ``"auto"``     — detect from trace (default; uses :func:`_detect_task_mode`)
         ``"code"``     — standard code-pipeline layout
         ``"creative"`` — story-progress layout with chapter ordering
+        ``"docs"``     — standard code-pipeline layout, relabelled for
+                         documentation runs (AUTO-CR-35; see docs/Readme.MD
+                         §4 "Task Modes" — docs runs share the code-mode
+                         trace shape, just with different architect/gate1/
+                         validator prompts, so no separate renderer is needed)
     """
     effective_mode = mode if mode != "auto" else _detect_task_mode(run)
 
     print_header(f"Run Analysis  [{run['run_id']}]"
-                 + (f"  [{cyan(effective_mode)} mode]" if effective_mode == "creative" else ""))
+                 + (f"  [{cyan(effective_mode)} mode]" if effective_mode != "code" else ""))
     if rewrites_only:
         render_rewrite_report(run)
         return
@@ -1316,7 +1406,7 @@ def render_run(
     if effective_mode == "creative":
         render_story_progress(run)         # chapter ordering + gate breakdown
     else:
-        render_applied_tasks(run)          # standard code-pipeline view
+        render_applied_tasks(run, mode=effective_mode)   # code / docs pipeline view
 
     render_files_preparing(run)            # workspace file-preparation stages
     render_tasks(run)
@@ -1395,14 +1485,16 @@ def build_parser() -> argparse.ArgumentParser:
                    action="store_true",
                    help="Disable ANSI colours")
     p.add_argument("--mode",
-                   choices=["auto", "code", "creative"],
+                   choices=["auto", "code", "docs", "creative"],
                    default="auto",
                    metavar="MODE",
                    help=(
-                       "Display mode: auto (default), code, or creative. "
+                       "Display mode: auto (default), code, docs, or creative. "
                        "auto detects from trace patterns. Use creative when "
                        "the run used task_mode=creative in agents.ini to get "
-                       "chapter-ordered story-progress output."
+                       "chapter-ordered story-progress output. Use docs when "
+                       "the run used task_mode=docs to get documentation-run "
+                       "section labels."
                    ))
     return p
 

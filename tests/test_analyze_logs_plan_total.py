@@ -13,12 +13,10 @@ Covers:
 from __future__ import annotations
 
 import io
-import json
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:

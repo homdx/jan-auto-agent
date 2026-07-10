@@ -25,7 +25,7 @@ import sys
 import textwrap
 from dataclasses import dataclass, field
 from pathlib import Path
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -38,10 +38,8 @@ from tools.auto.coder import (
     CoderResult,
     chunk_file,
     select_relevant_chunks,
-    make_coder,
 )
 from tools.auto.inner_loop import (
-    InnerLoop,
     InnerLoopResult,
     LLMGate2Validator,
 )

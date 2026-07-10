@@ -22,7 +22,7 @@ from unittest.mock import MagicMock
 
 from tools.auto.fact_validator import FactVerdict
 from tools.auto.inner_loop import InnerLoop
-from tools.auto.prosody import ProsodyValidator, ProsodyVerdict
+from tools.auto.prosody import ProsodyValidator
 
 
 # ── Shared stubs ──────────────────────────────────────────────────────────────

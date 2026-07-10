@@ -41,8 +41,7 @@ import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Optional
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -52,7 +51,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from tools.auto.controller import AutoController, RunLimits
 from tools.auto.outer_loop import OuterLoopResult
-from tools.auto.state import StateStore, STATUS_DONE
+from tools.auto.state import StateStore
 from tools.auto.auto_metrics import AutoMetricsStream
 from tools.auto.auto_tuner import AutoTuner, TuneOutcome
 
@@ -527,7 +526,6 @@ class TestMetricsIsolation:
 
     def test_auto_metrics_stream_refuses_interactive_path(self, tmp_path):
         """AC9: AutoMetricsStream raises if given the interactive default path."""
-        import os
         # Only runnable when CWD has no existing metrics.json collision
         # (the guard compares resolved paths)
         cwd_metrics = Path("metrics.json").resolve()

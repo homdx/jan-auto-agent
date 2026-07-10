@@ -40,17 +40,13 @@ import logging
 import re
 from pathlib import Path
 
+from tools.auto.utils import chars_per_token
+
 logger = logging.getLogger(__name__)
 
 # Matches "chapter_07", "chapter_7", "Chapter_07.md", etc. — the number is
 # whatever digits follow "chapter_", case-insensitive.
 _CHAPTER_RE = re.compile(r"chapter[_\-\s]?(\d+)", re.IGNORECASE)
-
-# Conservative token-estimate ratio: ~4 characters per token. This slightly
-# *over*-counts tokens for typical English prose (favoring fewer chars per
-# token budget), which is the conservative direction for a budget we must
-# not exceed.
-_CHARS_PER_TOKEN = 4
 
 # Fixed overhead reserved for the task framing injected around this context
 # (TASK ID / TITLE / INSTRUCTION / CITED LOCATION / target file listing,
@@ -197,10 +193,20 @@ class ContextAssembler:
         bible_block = self._read_bible_block()
         bible_cost = (len(bible_block) + 2) if bible_block else 0  # +2 = "\n\n" join
 
-        total_budget = self._budget_chars()
+        # Read the previous chapter once, up front: it doubles as the
+        # sample used to detect the chars-per-token ratio for the budget
+        # below (Cyrillic tokenizes far denser than the ~4 chars/token
+        # default — see chars_per_token()), and _assemble_core needs its
+        # text anyway. Falls back to the synopsis sections as the sample
+        # when there's no previous chapter text (e.g. unreadable file).
+        prev_num, prev_file = prior[-1]
+        prev_text = self._read_chapter_text(prev_file)
+        sample_text = prev_text or "\n".join(sections.values())
+
+        total_budget = self._budget_chars(sample_text)
         budget_chars = max(total_budget - bible_cost, 0)
 
-        core = self._assemble_core(target_file, prior, sections, budget_chars)
+        core = self._assemble_core(target_file, prior, sections, budget_chars, prev_text)
 
         if not bible_block:
             return core
@@ -236,12 +242,15 @@ class ContextAssembler:
         prior: "list[tuple[int, str]]",
         sections: "dict[str, str]",
         budget_chars: int,
+        prev_text: str,
     ) -> str:
         """Assemble the synopsis + previous-chapter blocks for *budget_chars*.
 
         This is the original (pre-AUTO-CR-23) ``build_creative_context``
         body, unchanged, except that *budget_chars* is now passed in already
-        net of the bible's reserved cost rather than computed here.
+        net of the bible's reserved cost rather than computed here, and
+        *prev_text* is passed in (already read by the caller) rather than
+        re-read here.
         """
         if budget_chars <= 0:
             # Pathological config (max_tokens >= num_ctx) or the bible ate the
@@ -258,7 +267,6 @@ class ContextAssembler:
             synopsis_block = self._fit_synopsis(sections, prior, floor)
             if synopsis_block:
                 return synopsis_block
-            prev_text = self._read_chapter_text(prev_file)
             if not prev_text:
                 return ""
             tail = prev_text[-floor:]
@@ -267,7 +275,6 @@ class ContextAssembler:
             return self._format_prev_chapter_block(prev_file, tail)
 
         prev_num, prev_file = prior[-1]  # highest-numbered chapter < target
-        prev_text = self._read_chapter_text(prev_file)
         prev_block = self._format_prev_chapter_block(prev_file, prev_text)
 
         if prev_text and len(prev_block) <= budget_chars:
@@ -291,11 +298,18 @@ class ContextAssembler:
 
     # ── Budget math ──────────────────────────────────────────────────────
 
-    def _budget_chars(self) -> int:
+    def _budget_chars(self, sample_text: str = "") -> int:
         """Char budget available for context, after reserving output tokens
-        and a fixed instruction-framing overhead. Token estimate = chars/4."""
+        and a fixed instruction-framing overhead.
+
+        Token estimate uses ``chars_per_token(sample_text)`` rather than a
+        fixed ``4`` — Cyrillic text tokenizes much denser than Latin, so a
+        fixed English-tuned ratio silently overflows num_ctx for Russian
+        chapters. *sample_text* should be a representative excerpt of the
+        content actually being budgeted (e.g. the previous chapter).
+        """
         budget_tokens = self._num_ctx - self._max_tokens - _INSTRUCTION_OVERHEAD_TOKENS
-        return max(budget_tokens, 0) * _CHARS_PER_TOKEN
+        return int(max(budget_tokens, 0) * chars_per_token(sample_text))
 
     # ── File / synopsis reading ──────────────────────────────────────────
 

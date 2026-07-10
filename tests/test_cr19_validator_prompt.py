@@ -18,7 +18,6 @@ These tests cover both the standalone resolver function and the
 
 import configparser
 
-import pytest
 
 from tools.auto.inner_loop import (
     LLMGate2Validator,

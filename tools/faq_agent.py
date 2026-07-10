@@ -30,12 +30,14 @@ Plain prose files are supported too.
 import re
 import sys
 import json
+import time
 import logging
 import urllib.request
 import urllib.error
 import urllib.parse
 from pathlib import Path
 
+from tools import backoff
 from tools.llm_stream import request_completion, strip_think, ollama_chat_url
 
 logger = logging.getLogger(__name__)
@@ -163,6 +165,10 @@ class FaqAgent:
         self.api_format  = api_format
         self.timeout     = timeout
         self.ssl_context = ssl_context
+        # AUTO-FIX (fable follow-up 3): forward the profile's context window.
+        # Without it every FAQ call ran at Ollama's server default regardless
+        # of the 32K/128K profile in agents.ini.
+        self.num_ctx = 0
 
         cfg = config
         if cfg is not None:
@@ -177,6 +183,8 @@ class FaqAgent:
                 "faq_agent", "not_found_marker", fallback=NOT_FOUND_MARKER
             )
             self.system_prompt = cfg.get("faq_agent", "system", fallback=_DEFAULT_SYSTEM)
+            _active = cfg.get("api", "active", fallback="local")
+            self.num_ctx = cfg.getint(f"api_{_active}", "num_ctx", fallback=0)
 
             # ── answer-validation pass ──────────────────────────────────────
             self.validate_answer_enabled = cfg.getboolean(
@@ -362,6 +370,7 @@ class FaqAgent:
                 {"role": "user",   "content": question},
             ],
             "temperature": 0.0,
+            "num_ctx": self.num_ctx,
         }
         if self.keyword_max_tokens:
             payload["max_tokens"] = self.keyword_max_tokens
@@ -503,6 +512,7 @@ class FaqAgent:
                 {"role": "user",   "content": user_msg},
             ],
             "temperature": self.validate_temperature,
+            "num_ctx": self.num_ctx,
         }
         if self.validate_max_tokens:
             payload["max_tokens"] = self.validate_max_tokens
@@ -559,6 +569,7 @@ class FaqAgent:
                 {"role": "user",   "content": user_msg},
             ],
             "temperature": self.temperature,
+            "num_ctx": self.num_ctx,
         }
         if self.max_tokens:
             payload["max_tokens"] = self.max_tokens  # INDIRECT returns a full answer
@@ -613,10 +624,22 @@ class FaqAgent:
         as the whole stripped reply or its leading token. This avoids discarding
         a real answer that happens to contain the phrase (e.g. "if the page is
         not found, click Retry").
+
+        A genuine sentinel reply is the marker plus at most a little trailing
+        punctuation ("NOT FOUND." / "NOT FOUND — nothing found."); a real answer
+        runs far longer. Capping the trailing slack avoids discarding a genuine
+        answer that happens to open with the marker phrase (e.g. an answer
+        about HTTP 404s starting "NOT FOUND errors occur when...").
         """
         stripped = answer.strip().upper()
         marker = self.not_found_marker.strip().upper()
-        return stripped == marker or stripped.startswith(marker)
+        if stripped == marker:
+            return True
+        _DECORATION_SLACK_CHARS = 40
+        return (
+            stripped.startswith(marker)
+            and len(stripped) - len(marker) <= _DECORATION_SLACK_CHARS
+        )
 
     # ── Knowledge loading ────────────────────────────────────────────────────
 
@@ -657,10 +680,55 @@ class FaqAgent:
         return docs
 
     def _build_context(self, docs: list[tuple[str, str]]) -> str:
-        """Concatenate all knowledge files into one labelled context block."""
-        parts = []
+        """Concatenate knowledge files into one labelled context block,
+        bounded by the model's context window.
+
+        AUTO-FIX (fable follow-up 3): this used to concatenate EVERY file
+        with no limit. As the knowledge folder grows past num_ctx, Ollama
+        silently drops the HEAD of the prompt — the system prompt and the
+        first files — so both the answer and the "grounded" validation gate
+        end up judging against a truncated base without anyone noticing.
+        The gate must keep doing its job, so keep the validation call — just
+        make sure the context it sees is complete, not head-clipped.
+
+        Budget: reserve output tokens, convert the rest to characters with
+        the project-wide Cyrillic-aware estimator, and stop adding whole
+        files once the budget is reached (files are appended in the order
+        given — smart-search callers pass them ranked, so the tail we drop
+        is the least relevant part). num_ctx=0 (server default / unknown)
+        keeps the old unlimited behavior.
+        """
+        parts: list[str] = []
+        budget_chars = 0
+        if self.num_ctx:
+            try:
+                from tools.auto.utils import chars_per_token
+                sample = "".join(c for _, c in docs[:3])
+                usable_tokens = max(0, self.num_ctx - (self.max_tokens or 1024) - 400)
+                budget_chars = int(usable_tokens * chars_per_token(sample))
+            except Exception:
+                budget_chars = 0  # estimation failed → old unlimited behavior
+
+        used = 0
+        skipped: list[str] = []
         for name, content in docs:
-            parts.append(f"=== {name} ===\n{content.strip()}")
+            block = f"=== {name} ===\n{content.strip()}"
+            if budget_chars and used + len(block) > budget_chars and parts:
+                skipped.append(name)
+                continue
+            parts.append(block)
+            used += len(block) + 2
+        if skipped:
+            logger.warning(
+                "FaqAgent._build_context: knowledge base exceeds the context "
+                "budget (~%d chars for num_ctx=%d) — %d file(s) omitted: %s. "
+                "Consider a larger num_ctx profile or smart_search mode.",
+                budget_chars, self.num_ctx, len(skipped), ", ".join(skipped[:5]),
+            )
+            parts.append(
+                f"[NOTE: {len(skipped)} knowledge file(s) omitted to fit the "
+                f"context window: {', '.join(skipped[:10])}]"
+            )
         return "\n\n".join(parts)
 
     # ── Per-candidate LLM query (non-streaming) ──────────────────────────────
@@ -678,6 +746,7 @@ class FaqAgent:
                 {"role": "user",   "content": user_msg},
             ],
             "temperature": self.temperature,
+            "num_ctx": self.num_ctx,
         }
         if self.max_tokens:
             payload["max_tokens"] = self.max_tokens
@@ -853,7 +922,11 @@ class FaqAgent:
             len(shortlist),
             len(docs),
         )
-        return self._answer_legacy(question, docs, stream=stream)
+        # AUTO-FIX (fable follow-up 3): pass docs in RANKED order so that if
+        # _build_context has to drop files to fit the window, it drops the
+        # least relevant ones — not whichever happened to sort last on disk.
+        _ranked_docs = [(n, c) for n, c, _s in ranked]
+        return self._answer_legacy(question, _ranked_docs, stream=stream)
 
     # ── Legacy single-call path ───────────────────────────────────────────────
 
@@ -874,26 +947,53 @@ class FaqAgent:
         context  = self._build_context(docs)
         url, headers, payload = self._build_qa_request(question, context)
 
-        try:
-            if stream:
-                reply = request_completion(
-                    url, headers, payload, self.timeout,
-                    stream=True,
-                    api_format=self.api_format,
-                    on_token=lambda t: (sys.stdout.write(t), sys.stdout.flush()),
-                    ssl_context=self.ssl_context,
-                )
-                self.llm_call_count += 1  # legacy streaming call
-                print()  # newline after streamed output
-            else:
-                reply = request_completion(
-                    url, headers, payload, self.timeout,
-                    stream=False,
-                    api_format=self.api_format,
-                    ssl_context=self.ssl_context,
-                )
-                self.llm_call_count += 1  # legacy non-streaming call
+        # This is the last-resort fallback with no further retry after it,
+        # so give the call itself a bounded retry — a transient error must
+        # not come back indistinguishable from a genuine "not found".
+        _LEGACY_RETRY_ATTEMPTS = 3
+        reply = None
+        last_exc = None  # type: Exception | None
+        for _attempt in range(_LEGACY_RETRY_ATTEMPTS):
+            try:
+                if stream:
+                    reply = request_completion(
+                        url, headers, payload, self.timeout,
+                        stream=True,
+                        api_format=self.api_format,
+                        on_token=lambda t: (sys.stdout.write(t), sys.stdout.flush()),
+                        ssl_context=self.ssl_context,
+                    )
+                    self.llm_call_count += 1  # legacy streaming call
+                    print()  # newline after streamed output
+                else:
+                    reply = request_completion(
+                        url, headers, payload, self.timeout,
+                        stream=False,
+                        api_format=self.api_format,
+                        ssl_context=self.ssl_context,
+                    )
+                    self.llm_call_count += 1  # legacy non-streaming call
+                last_exc = None
+                break
+            except Exception as exc:
+                last_exc = exc
+                if _attempt < _LEGACY_RETRY_ATTEMPTS - 1:
+                    _wait = backoff.backoff_seconds(_attempt)
+                    logger.warning(
+                        "FaqAgent: legacy API call failed (%s) — retrying "
+                        "(attempt %d/%d) in %ds",
+                        exc, _attempt + 2, _LEGACY_RETRY_ATTEMPTS, _wait,
+                    )
+                    time.sleep(_wait)
 
+        if last_exc is not None:
+            logger.error(
+                "FaqAgent: API call failed after %d attempt(s): %s",
+                _LEGACY_RETRY_ATTEMPTS, last_exc,
+            )
+            return self.not_found_marker
+
+        try:
             answer = strip_think(reply).strip()
 
             # step 4: not-found check
@@ -916,7 +1016,7 @@ class FaqAgent:
             return answer
 
         except Exception as exc:
-            logger.error("FaqAgent: API call failed: %s", exc)
+            logger.error("FaqAgent: post-processing failed: %s", exc)
             return self.not_found_marker
 
     # ── Diagnostics ──────────────────────────────────────────────────────────

@@ -32,14 +32,11 @@ from __future__ import annotations
 
 import configparser
 import io
-import json
 import sys
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Optional
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -50,8 +47,8 @@ if str(PROJECT_ROOT) not in sys.path:
 from tools.auto.controller import AutoController, RunLimits
 from tools.auto.outer_loop import OuterLoopResult
 from tools.auto.pipeline import _run_plan_phase, run_pipeline
-from tools.auto.progress_display import ProgressDisplay, render_banner, render_task_line
-from tools.auto.state import StateStore, STATUS_DONE
+from tools.auto.progress_display import ProgressDisplay
+from tools.auto.state import StateStore
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -163,7 +160,6 @@ class TestArchitectCallback:
     def test_callback_called_once_per_non_empty_cluster(self):
         """on_cluster_done fires once per non-empty cluster reviewed."""
         from tools.auto.architect import ClusterReviewer
-        import configparser as cp
 
         cfg = _make_config()
         reviewer = ClusterReviewer(
@@ -283,7 +279,6 @@ class TestPlanPhaseArchTicks:
 
         clusters = self._make_clusters(n_clusters)
         candidates = []
-        from tools.auto.backlog_prioritiser import Backlog
         backlog = MagicMock()
         backlog.auto_tasks = [MagicMock() for _ in range(n_tasks)]
         backlog.manual_suggestions = []

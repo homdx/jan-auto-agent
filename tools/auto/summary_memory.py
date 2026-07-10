@@ -65,11 +65,12 @@ import ssl
 from pathlib import Path
 from typing import Callable
 
+from tools.auto.utils import chars_per_token
+
 logger = logging.getLogger(__name__)
 
 # ── constants ─────────────────────────────────────────────────────────────────
 
-_CHARS_PER_TOKEN = 4
 _INSTRUCTION_OVERHEAD_TOKENS = 300
 
 # Reserved headroom inside the summarisation budget for the system prompt and
@@ -170,15 +171,10 @@ def _clean_bullet_list(reply: str) -> str:
     accepted as facts. A stray 'FIX:' prefix is tolerated, and AUTO-CR-16
     meta-commentary parentheticals are stripped.
 
-    AUTO-BUG-5 fix: if NO line has a marker at all, fall back to treating
-    each short, non-empty line as one fact — a small local model very
-    plausibly ignores the "one bullet per line" formatting instruction and
-    just writes plain sentences, one fact per line. Without this fallback
-    that entire (otherwise perfectly usable) extraction was silently
-    discarded and the caller kept believing there were "no new facts". The
-    fallback still fails open (returns "") when the reply doesn't look like
-    a short fact list — e.g. full narrative prose / a refusal — to avoid
-    accidentally ingesting chapter text as "facts".
+    AUTO-BUG-5: if NO line has a marker, fall back to treating each short
+    line as one fact (a small model may ignore the bullet-per-line
+    instruction) — still fails open on anything that looks like prose,
+    not a fact list.
 
     Returns bullets joined with newlines, each prefixed '• '.
     """
@@ -388,13 +384,22 @@ class SummaryMemory:
         # Budget for *input* to a single summarisation LLM call.
         # Reserve output budget + overhead; leave _SUMMARISE_OVERHEAD_TOKENS
         # of headroom for the system prompt and wrapper text.
-        _input_tokens = (
-            max(0, (int(num_ctx) if num_ctx else 4096))
+        # Stored as a token count, not a fixed char count: the char budget
+        # depends on the text being chunked (Cyrillic tokenizes ~2x denser
+        # than Latin — see chars_per_token()), so it's computed per-call in
+        # _chunk_budget_chars() rather than fixed at construction time.
+        self._input_tokens = max(
+            0,
+            (int(num_ctx) if num_ctx else 4096)
             - (int(max_tokens) if max_tokens else 800)
             - _INSTRUCTION_OVERHEAD_TOKENS
-            - _SUMMARISE_OVERHEAD_TOKENS
+            - _SUMMARISE_OVERHEAD_TOKENS,
         )
-        self._chunk_budget_chars = max(200, _input_tokens * _CHARS_PER_TOKEN)
+
+    def _chunk_budget_chars(self, sample_text: str = "") -> int:
+        """Char budget for a single summarisation call, sized to *sample_text*'s
+        script (see ``chars_per_token``)."""
+        return max(200, int(self._input_tokens * chars_per_token(sample_text)))
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -448,13 +453,9 @@ class SummaryMemory:
         cleaned = _clean_bullet_list(verified)
         body = cleaned or verified
 
-        # AUTO-BUG-6 fix: previously `cleaned or verified` would happily
-        # persist whatever `verified` was even when it was obviously not a
-        # summary at all (observed in practice: the literal grader verdict
-        # "APPROVED" ended up written into synopsis.md as a chapter's
-        # "durable fact summary"). Refuse to write anything that looks like
-        # a bare verdict word or is implausibly short for a summary, and
-        # leave the previous section (if any) untouched instead.
+        # AUTO-BUG-6: refuse to write a bare verdict word ("APPROVED" etc.)
+        # or implausibly short text as if it were a real summary — this
+        # was observed leaking a grader verdict into synopsis.md.
         _stripped = body.strip()
         if not _stripped or _stripped.upper().rstrip(".:!") in {"APPROVED", "OK", "REVISE"}:
             logger.warning(
@@ -478,7 +479,8 @@ class SummaryMemory:
             )
             return text
 
-        fits_in_budget = len(text) <= self._chunk_budget_chars
+        chunk_budget_chars = self._chunk_budget_chars(text)
+        fits_in_budget = len(text) <= chunk_budget_chars
 
         if fits_in_budget:
             # Single pass.
@@ -490,11 +492,11 @@ class SummaryMemory:
             return text
 
         # Chunked pass: split, summarise each chunk, then merge.
-        chunks = _chunk_paragraphs(text, self._chunk_budget_chars)
+        chunks = _chunk_paragraphs(text, chunk_budget_chars)
         logger.info(
             "SummaryMemory: chapter too large (%d chars > %d budget) — "
             "splitting into %d chunks (pass %d/%d).",
-            len(text), self._chunk_budget_chars,
+            len(text), chunk_budget_chars,
             len(chunks), passes_used + 1, self._max_passes,
         )
         chunk_summaries: list[str] = []
@@ -509,7 +511,7 @@ class SummaryMemory:
 
         if not chunk_summaries:
             logger.warning("SummaryMemory: all chunks returned empty — using raw text.")
-            return text[:self._chunk_budget_chars]
+            return text[:chunk_budget_chars]
 
         merged = "\n".join(chunk_summaries)
         # Recurse: try to compress the merged chunk-summaries into one summary.
@@ -555,8 +557,28 @@ class SummaryMemory:
             rf"<!--\s*BEGIN\s+{re.escape(chapter_file)}\s*-->.*?<!--\s*END\s+{re.escape(chapter_file)}\s*-->",
             re.DOTALL,
         )
+        #
+        # Bugfix: this used to be `pattern.sub(section_text, existing)` —
+        # passing section_text (which embeds the LLM-generated chapter
+        # summary) as re.sub's REPLACEMENT argument. re.sub interprets
+        # backslash sequences in a *string* replacement as backreferences
+        # (\1, \g<name>, ...); this pattern has no capture groups, so any
+        # summary containing an ordinary backslash — a footnote marker, a
+        # Windows path, dialogue about a regex or LaTeX expression, even
+        # just "...found it at 221\1 Baker Street." — raised
+        # `re.error: invalid group reference`. Only the *replace an existing
+        # section* path was affected (a fresh section is plain string
+        # concatenation, below); commit_on_success.py catches the exception
+        # so it doesn't crash the run, but because it fires before the file
+        # write, that chapter's section was silently left at its FIRST-DRAFT
+        # summary forever — exactly the staleness this file exists to
+        # prevent — with only one logger.error to show for it.
+        #
+        # A callable replacement sidesteps this entirely: re.sub never
+        # interprets backslash escapes in a function's return value, no
+        # matter what it contains.
         if pattern.search(existing):
-            new_content = pattern.sub(section_text, existing)
+            new_content = pattern.sub(lambda _m: section_text, existing)
         else:
             separator = "\n\n" if existing.strip() else ""
             new_content = existing.rstrip() + separator + section_text + "\n"
@@ -608,6 +630,14 @@ def _make_llm_call(
 
     temperature = config.getfloat("inner_loop", "temperature", fallback=0.2)
     timeout     = config.getint("loop", "timeout_seconds", fallback=300)
+    # AUTO-FIX (fable follow-up 3): thinking models (qwen3) prepend a
+    # <think> block; if it truncates against num_predict the synopsis update
+    # comes back empty, and if it doesn't, the reasoning text is WRITTEN
+    # INTO synopsis.md — a long-lived artifact re-injected into every later
+    # prompt, so one polluted call poisons the whole run. Same toggle as
+    # gate1/architect/coder: default off, [summary_memory] think = true
+    # re-enables it.
+    think = config.getboolean("summary_memory", "think", fallback=False)
 
     ssl_context: ssl.SSLContext | None = _llm_stream.make_unverified_context() if not verify_ssl else None
 
@@ -634,6 +664,8 @@ def _make_llm_call(
                 ],
                 "options": _opts,
             }
+            if not think:
+                payload["think"] = False
         else:
             payload = {
                 "model":       model,
@@ -644,14 +676,18 @@ def _make_llm_call(
                     {"role": "user",   "content": user},
                 ],
             }
-        return _llm_stream.request_completion(
-            url=url,
-            headers=headers,
-            payload=payload,
-            timeout=timeout,
-            api_format=api_format,
-            ssl_context=ssl_context,
-        ) or ""
+        # AUTO-FIX (fable follow-up 3): strip <think> BEFORE the synopsis
+        # parser — reasoning text must never be persisted into synopsis.md.
+        return _llm_stream.strip_think(
+            _llm_stream.request_completion(
+                url=url,
+                headers=headers,
+                payload=payload,
+                timeout=timeout,
+                api_format=api_format,
+                ssl_context=ssl_context,
+            ) or ""
+        )
 
     return _call
 

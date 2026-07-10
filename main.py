@@ -424,22 +424,37 @@ class Orchestrator(OrchestratorActions):
                 already_searched.extend(search_result.get("searched_files", []))
                 new_suggestions = validation.get("suggested_searches", [])
                 if isinstance(new_suggestions, list):
+                    # Count discards directly instead of inferring them from
+                    # the batch size, which over-counted when most of the
+                    # batch was added before the cap was hit.
+                    _discarded = 0
                     for suggestion in new_suggestions:
-                        if suggestion not in refs and len(refs) < _refs_cap:
+                        if suggestion in refs:
+                            continue
+                        if len(refs) < _refs_cap:
                             refs.append(suggestion)
-                    if len(refs) >= _refs_cap and new_suggestions:
+                        else:
+                            _discarded += 1
+                    if _discarded:
                         logger.debug(
                             "run_pipeline: refs cap (%d) reached — "
                             "%d suggestion(s) from validator discarded",
-                            _refs_cap, len(new_suggestions),
+                            _refs_cap, _discarded,
                         )
                 iteration += 1
         else:
             print("ℹ️ Intent is 'show'. Skipping agent validation pipeline.")
 
         # --- IMPROVEMENT AGENT (Intent-based) ---
+        # parsed.intent is always one of: "show", "improve", "explain",
+        # "show_and_improve", "show_imports" (see tools/prompt_parser.py).
+        # "optimize"/"fix" are user-typed *keywords* that map into "improve" —
+        # they are never themselves an intent value — and "show_and_improve"
+        # (the parser's own default fallback, produced whenever a prompt uses
+        # both a show-type and an improve-type verb) must run the improvement
+        # agent too, exactly like plain "improve" does.
         improvement: Dict[str, Any] = {}
-        if parsed.intent in ("optimize", "fix", "improve", "explain"):
+        if parsed.intent in ("improve", "explain", "show_and_improve"):
             print("⚡ Processing improvements...")
             improvement_context = {
                 "target_block": block,

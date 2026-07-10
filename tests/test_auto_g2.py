@@ -40,16 +40,15 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch, call
+from unittest.mock import MagicMock, patch
 
-import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from tools.auto.controller import AutoController
-from tools.auto.state import StateStore, STATUS_DONE, STATUS_BLOCKED, STATUS_IN_PROGRESS
+from tools.auto.state import StateStore, STATUS_DONE, STATUS_BLOCKED
 from tools.auto.outer_loop import OuterLoopResult
 from tools.auto.exhaustion_handler import ExhaustionOutcome
 
@@ -158,7 +157,6 @@ class TestG2TaskPassesAndCommits:
 
         fake_exhaustion = MagicMock()
 
-        import configparser
         with patch("tools.auto.outer_loop.make_outer_loop", return_value=fake_outer), \
              patch("tools.auto.commit_on_success.CommitOnSuccess", return_value=fake_commit_helper), \
              patch("tools.auto.exhaustion_handler.make_exhaustion_handler", return_value=fake_exhaustion):
@@ -346,7 +344,6 @@ class TestG2CapsPreserved:
 
     def test_runtime_cap_fires_immediately_when_already_exceeded(self, tmp_path):
         """AC2: runtime cap fires before any task when time already elapsed."""
-        import time
         task = _make_task("T-1")
         ctrl = _make_controller(tmp_path, [task], runtime_cap=0.001)
         ctrl._start_time = ctrl._time_fn() - 10  # pretend 10s already elapsed

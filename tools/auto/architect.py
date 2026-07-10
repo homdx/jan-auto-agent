@@ -31,7 +31,6 @@ api_format, verify_ssl — same pattern as every other agent in this codebase.
 from __future__ import annotations
 
 import configparser
-import hashlib
 import json
 import logging
 import re as _re
@@ -45,6 +44,7 @@ from typing import Any
 
 from tools.agent_trace import tracer
 from tools.auto.repo_ingest import RepoCluster
+from tools.auto.utils import atomic_write_text, file_set_fingerprint
 import tools.llm_stream as _llm_stream
 from tools.llm_stream import strip_think
 
@@ -60,6 +60,10 @@ _SYSTEM_PROMPT_CODE = (
     "in the code — you MUST cite the exact file path and either a symbol name "
     "(function, class, method) or a line range. "
     "Do NOT invent problems that are not actually present in the provided code. "
+    "Every task's instruction MUST require new or updated tests for the change, "
+    "its target_files MUST include the test file (tests/test_*.py), and its "
+    "acceptance_check MUST run those tests (e.g. python3 -m pytest "
+    "tests/test_x.py -q). "
     "Return ONLY a JSON array — no prose, no markdown fences, no preamble."
 )
 
@@ -363,6 +367,15 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
         # num_ctx controls the total context window on Ollama; 0 means "use server default".
         active_profile               = config.get("api", "active", fallback="local")
         self._num_ctx                = config.getint(f"api_{active_profile}", "num_ctx", fallback=0)
+        # AUTO-FIX (fable follow-up): mirrors the gate1_filter.py fix — a
+        # thinking model (e.g. qwen3) wraps its JSON task array in
+        # <think>...</think> by default. If that reasoning consumes the
+        # whole max_tokens budget, strip_think() discards everything and
+        # architect produces 0 candidates (observed live: architect call
+        # returned a totally empty response after ~5 minutes on qwen3:8b).
+        # Default to disabling thinking for this call; [architect] think =
+        # true re-enables it for a model/setup that needs it.
+        self._think                  = config.getboolean(arch, "think", fallback=False)
 
         # ── DM-2: select system prompt based on task_mode + ini overrides ─────
         # Priority: mode-specific ini key > legacy "system" key > built-in constant.
@@ -546,9 +559,21 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 if checkpoint_path is not None and batch_results:
                     checkpoint[batch_key] = _serialise_candidates(batch_results)
                     try:
-                        checkpoint_path.write_text(
+                        # Bugfix: this used to be a plain checkpoint_path.write_text(),
+                        # which truncates-then-writes — a process killed mid-write
+                        # (the exact "LLM crash or HTTP 500 storm" scenario this
+                        # checkpoint exists to survive) could leave invalid JSON
+                        # behind. The loader below then silently resets to an
+                        # empty checkpoint on ANY parse failure, discarding every
+                        # previously-cached batch result and forcing a full,
+                        # expensive re-review. atomic_write_text (temp file +
+                        # os.replace) guarantees the file on disk is always either
+                        # the old complete content or the new complete content —
+                        # see state.py's StateStore._atomic_write, which fixed the
+                        # identical bug for plan.json/progress.json.
+                        atomic_write_text(
+                            checkpoint_path,
                             json.dumps(checkpoint, indent=2, ensure_ascii=False),
-                            encoding="utf-8",
                         )
                         logger.debug(
                             "review_clusters: checkpoint saved — %d batch key(s) total",
@@ -562,14 +587,9 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
 
             print(f"   → {len(cluster_candidates)} grounded candidate(s)")
 
-            # AUTO-BUG-3 fix: when a cluster is large enough to be split into
-            # multiple batches, each batch is reviewed independently and can
-            # (and in practice does, e.g. in creative mode with a single
-            # target file) propose the *identical* task. Gate-1 has its own
-            # fingerprint-based dedup, but de-duplicating right here — before
-            # candidates from different batches of the same cluster are even
-            # merged — is a cheap, local belt-and-braces fix that does not
-            # depend on downstream Gate-1 behaving as expected.
+            # AUTO-BUG-3: when a cluster splits into multiple batches, two
+            # batches can propose the identical task — dedup here too, as
+            # a cheap local belt-and-braces alongside Gate-1's own dedup.
             if len(batches) > 1 and len(cluster_candidates) > 1:
                 from tools.auto.gate1_filter import _fingerprint, _target_fingerprint  # noqa: PLC0415
                 _seen: set[str] = set()
@@ -627,16 +647,11 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
         Parameters
         ----------
         all_files
-            AUTO-BUG-9 fix: the FULL set of files in the cluster this batch
-            belongs to (names only), used for the file listing shown to the
-            model even when this call's file contents only cover one
-            batch's subset (cluster.files). Without this, a batched review
-            of a growing creative-writing repo only ever sees a partial
-            file listing, and "what's the next chapter number" logic can
-            conclude a stale/wrong answer -- observed in practice: it
-            proposed regenerating an already-completed middle chapter
-            instead of only ever extending the book forward. Defaults to
-            cluster.files (old behaviour) when not given.
+            AUTO-BUG-9: full file listing shown to the model even when this
+            batch's contents only cover a subset — without it, "what's the
+            next chapter" logic could see a stale listing and propose
+            regenerating an already-completed chapter. Defaults to
+            cluster.files when not given.
 
         Returns
         -------
@@ -668,7 +683,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
             base_url=self._base_url, api_key=self._api_key, model=self._model,
             api_format=self._api_format, temperature=self._temperature,
             max_tokens=self._max_tokens, system=self._system, user_msg=user_msg,
-            num_ctx=self._num_ctx,
+            num_ctx=self._num_ctx, think=self._think,
         )
 
         # Trace the outgoing call.
@@ -681,10 +696,8 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                     "cluster": cluster.name},
         )
 
-        # AUTO-BUG-8 fix: configurable retry backoff. Previously hardcoded to
-        # [5, 15, 30] (~50s total) regardless of deployment — for a local
-        # Ollama instance still loading a model into memory, that's ~50s of
-        # silent retrying inside this call before the cluster fails open.
+        # AUTO-BUG-8: configurable retry backoff (was hardcoded [5,15,30]s
+        # regardless of deployment, e.g. a local Ollama still loading).
         _delays_raw = self._config.get("architect", "retry_delays_sec", fallback="5,15,30")
         try:
             _RETRY_DELAYS = [float(x.strip()) for x in _delays_raw.split(",") if x.strip()]
@@ -1099,16 +1112,14 @@ def _batch_fingerprint(base_dir: "Path", files: list[str]) -> str:
     """Short hash of a batch's files (relative path + size + mtime) used to make
     the architect checkpoint content-aware. Any change to the reviewed file set
     or contents yields a new key, so a stale cached result is never replayed.
-    Missing/unreadable files hash as a sentinel rather than raising."""
-    h = hashlib.sha1()
-    for rel in sorted(files):
-        h.update(rel.encode("utf-8", "replace"))
-        try:
-            st = (Path(base_dir) / rel).stat()
-            h.update(f"|{st.st_size}|{st.st_mtime_ns}|".encode("utf-8"))
-        except OSError:
-            h.update(b"|?|")
-    return h.hexdigest()[:12]
+    Missing/unreadable files hash as a sentinel rather than raising.
+
+    Delegates to tools.auto.utils.file_set_fingerprint — the same content-aware
+    fingerprint plan_emitter.py's changed_clusters() now uses, so the two
+    "has this content actually changed?" checks in the PLAN phase can't drift
+    out of sync with each other again.
+    """
+    return file_set_fingerprint(base_dir, files)
 
 
 def _serialise_candidates(candidates: list[CandidateTask]) -> list[dict]:
@@ -1292,6 +1303,7 @@ class TaskRewriter(_llm_stream.LLMClientBase):
         arch = "architect"
         self._max_tokens  = int(config.get(arch, "rewrite_max_tokens",  fallback="512"))
         self._temperature = float(config.get(arch, "rewrite_temperature", fallback="0.4"))
+        self._think       = config.getboolean(arch, "think", fallback=False)
         raw_system        = config.get(arch, "rewrite_system", fallback="").strip()
         self._system      = raw_system or _REWRITER_SYSTEM_DEFAULT
         self._timeout     = float(config.get("loop", "timeout_seconds", fallback="300"))
@@ -1324,7 +1336,7 @@ class TaskRewriter(_llm_stream.LLMClientBase):
             base_url=self._base_url, api_key=self._api_key, model=self._model,
             api_format=self._api_format, temperature=self._temperature,
             max_tokens=self._max_tokens, system=self._system, user_msg=user_msg,
-            num_ctx=self._num_ctx,
+            num_ctx=self._num_ctx, think=self._think,
         )
 
         tracer.event(

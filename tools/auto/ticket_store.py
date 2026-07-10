@@ -57,7 +57,7 @@ from __future__ import annotations
 
 import json
 import logging
-from tools.auto.utils import _ts, atomic_write_text
+from tools.auto.utils import _ts, atomic_write_text, safe_filename_component
 from pathlib import Path
 from typing import Any, Optional
 
@@ -365,7 +365,9 @@ class TicketStore:
     # ── Private ──────────────────────────────────────────────────────────────
 
     def _path(self, ticket_id: str) -> Path:
-        return self._dir / f"{ticket_id}.json"
+        # Sanitised defensively — a ticket id containing ".." or "/" must
+        # not escape self._dir (mirrors state.py's task_dir sanitisation).
+        return self._dir / f"{safe_filename_component(ticket_id)}.json"
 
     def _ensure_dir(self) -> None:
         self._dir.mkdir(parents=True, exist_ok=True)

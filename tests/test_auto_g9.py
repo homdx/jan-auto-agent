@@ -22,14 +22,11 @@ Scope
 
 from __future__ import annotations
 
-import configparser
 import json
 import subprocess
 import sys
-import time
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 

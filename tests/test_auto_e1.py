@@ -26,11 +26,9 @@ from __future__ import annotations
 
 import configparser
 import sys
-import tempfile
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 

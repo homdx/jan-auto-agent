@@ -7,9 +7,8 @@ LLMGate2Validator uses the soft path while code/docs modes are unchanged.
 import configparser
 import json
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
-import pytest
 
 from tools.auto.inner_loop import (
     LLMGate2Validator,

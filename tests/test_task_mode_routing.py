@@ -14,11 +14,9 @@ These are pure unit tests — no LLM calls, no filesystem I/O beyond a temp dir.
 from __future__ import annotations
 
 import configparser
-import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-import pytest
 
 
 # ─────────────────────────────────────────────────────────────────────────────

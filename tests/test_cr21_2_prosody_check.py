@@ -11,7 +11,6 @@ Validates the CR-21-2 additions to tools/auto/prosody.py:
 All tests are purely deterministic — no LLM, no I/O, no config.
 """
 
-import pytest
 
 from tools.auto.prosody import (
     ProsodyReport,

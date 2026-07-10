@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import configparser
 
-import pytest
 
 from tools.auto.gate1_filter import Gate1Filter
 from tools.auto.architect import CandidateTask, CitedLocation

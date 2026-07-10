@@ -36,7 +36,13 @@ Public surface consumed by controller.py / the Architect stage::
 Configuration (agents.ini [gate1])
 ------------------------------------
 temperature   — sampling temperature (default 0.0 — deterministic)
-max_tokens    — token cap for the presence-check call (default 256)
+max_tokens    — token cap for the presence-check call (default 512; thinking
+                models like qwen3 spend part of this budget on an internal
+                <think> block before the JSON verdict, so this needs more
+                headroom than a plain JSON-only estimate)
+think         — Ollama "think" toggle for reasoning models (default false —
+                Gate 1 wants a tiny deterministic verdict, not reasoning in
+                the reply; set true to re-enable a model's thinking mode)
 system        — override the built-in system prompt (optional)
 skip_llm      — "true" to run existence checks only, skip LLM stage (testing)
 
@@ -194,11 +200,20 @@ class Gate1Filter(_llm_stream.LLMClientBase):
 
         sec = "gate1"
         self._temperature    = float(config.get(sec, "temperature", fallback="0.0"))
-        self._max_tokens     = int(config.get(sec, "max_tokens",   fallback="256"))
+        self._max_tokens     = int(config.get(sec, "max_tokens",   fallback="512"))
         self._skip_llm       = config.getboolean(sec, "skip_llm", fallback=False)
         self._timeout        = float(config.get("loop", "timeout_seconds", fallback="300"))
         self._max_context_lines = int(config.get(sec, "max_context_lines", fallback=str(_DEFAULT_MAX_CONTEXT_LINES)))
         self._max_block_chars   = int(config.get(sec, "max_block_chars",   fallback=str(_DEFAULT_MAX_BLOCK_CHARS)))
+        # AUTO-FIX: Gate 1's presence check wants a tiny, deterministic JSON
+        # verdict — no reasoning needed in the reply. A thinking model (e.g.
+        # qwen3) wraps its answer in <think>...</think> by default; with a
+        # small max_tokens that reasoning can consume the whole budget and
+        # truncate before any JSON is emitted, so strip_think() discards
+        # everything and every candidate fails closed. Default to disabling
+        # thinking for Gate 1's call (Ollama "think" field); an explicit
+        # [gate1] think = true in agents.ini re-enables it.
+        self._think = config.getboolean(sec, "think", fallback=False)
         # num_ctx controls the total context window on Ollama; 0 means "use server default".
         _active = config.get("api", "active", fallback="local")
         self._num_ctx = config.getint(f"api_{_active}", "num_ctx", fallback=0)
@@ -452,24 +467,21 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             code_block=code_block,
         )
 
-
-        url, headers, payload = _llm_stream.build_chat_request(
-            base_url=self._base_url, api_key=self._api_key, model=self._model,
-            api_format=self._api_format, temperature=self._temperature,
-            max_tokens=self._max_tokens, system=self._system, user_msg=user_msg,
-            num_ctx=self._num_ctx,
-        )
-
-        tracer.event(
-            source="gate1",
-            target="llm",
-            kind="llm_request",
-            content=user_msg,
-            params={"model": self._model, "candidate": candidate.title},
-        )
-
-        try:
-            raw_text = _llm_stream.request_completion(
+        def _call(msg: str) -> str:
+            url, headers, payload = _llm_stream.build_chat_request(
+                base_url=self._base_url, api_key=self._api_key, model=self._model,
+                api_format=self._api_format, temperature=self._temperature,
+                max_tokens=self._max_tokens, system=self._system, user_msg=msg,
+                num_ctx=self._num_ctx, think=self._think,
+            )
+            tracer.event(
+                source="gate1",
+                target="llm",
+                kind="llm_request",
+                content=msg,
+                params={"model": self._model, "candidate": candidate.title},
+            )
+            text = _llm_stream.request_completion(
                 url=url,
                 headers=headers,
                 payload=payload,
@@ -478,6 +490,18 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                 api_format=self._api_format,
                 ssl_context=self._ssl_context,
             )
+            cleaned = strip_think(text)
+            tracer.event(
+                source="llm",
+                target="gate1",
+                kind="llm_response",
+                content=cleaned,
+                params={"candidate": candidate.title},
+            )
+            return cleaned
+
+        try:
+            cleaned = _call(user_msg)
         except Exception as exc:
             reason = f"LLM call failed: {exc}"
             logger.warning("Gate1._check_presence: %s — failing closed", reason)
@@ -487,24 +511,61 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             )
             return False, reason
 
-        cleaned = strip_think(raw_text)
+        confirmed, reason, unparseable = self._parse_presence_response(cleaned, candidate.title)
 
-        tracer.event(
-            source="llm",
-            target="gate1",
-            kind="llm_response",
-            content=cleaned,
-            params={"candidate": candidate.title},
-        )
+        # AUTO-CR-31-style re-ask: an unparseable verdict (bad JSON, wrong
+        # shape, unrecognised verdict word — as opposed to a genuine
+        # "rejected") is often a thinking-model (e.g. qwen3) truncated
+        # mid-<think> by a small max_tokens, not an actual answer. One
+        # retry with a hard nudge, capped at a single extra call, before
+        # falling back to fail-closed.
+        if unparseable:
+            logger.info(
+                "Gate1._check_presence [%s]: verdict unparseable — "
+                "re-asking once. raw=%r", candidate.title, cleaned[:120],
+            )
+            nudge = (
+                "\n\nIMPORTANT: your previous reply was not valid JSON with a "
+                "\"verdict\" field. Reply AGAIN with ONLY a JSON object of the "
+                "exact form {\"verdict\": \"confirmed\" or \"rejected\", "
+                "\"reason\": \"...\"} — no reasoning, no markdown fences, no "
+                "other text."
+            )
+            try:
+                cleaned2 = _call(user_msg + nudge)
+            except Exception as exc:
+                logger.warning(
+                    "Gate1._check_presence [%s]: re-ask failed (%s) — "
+                    "keeping original fail-closed result.", candidate.title, exc,
+                )
+                return confirmed, reason
+            confirmed2, reason2, unparseable2 = self._parse_presence_response(
+                cleaned2, candidate.title,
+            )
+            if not unparseable2:  # second answer was clear — use it
+                return confirmed2, reason2
+            logger.warning(
+                "Gate1._check_presence [%s]: verdict still unparseable after "
+                "one retry — failing closed. raw=%r", candidate.title, cleaned2[:120],
+            )
 
-        return self._parse_presence_response(cleaned, candidate.title)
+        return confirmed, reason
 
     def _parse_presence_response(
         self,
         text: str,
         candidate_title: str,
-    ) -> tuple[bool, str]:
-        """Parse the LLM's JSON verdict.  Fail-closed on any error."""
+    ) -> tuple[bool, str, bool]:
+        """Parse the LLM's JSON verdict.  Fail-closed on any error.
+
+        Returns ``(confirmed, reason, unparseable)``. ``unparseable`` is
+        ``True`` only when the response couldn't be read as a verdict at
+        all (bad JSON, wrong shape, unrecognised verdict word) — as opposed
+        to a genuine ``"rejected"`` verdict, which is a real answer, not a
+        parse failure. Callers use this distinction to re-ask once on
+        ``unparseable`` (mirroring AUTO-CR-31's Gate-2 retry) without
+        biasing genuinely-rejected candidates toward acceptance.
+        """
         stripped = text.strip()
         # Strip optional markdown fences.
         if stripped.startswith("```"):
@@ -522,25 +583,26 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                 "Gate1._parse_presence_response [%s]: %s  raw=%.200s",
                 candidate_title, reason, text,
             )
-            return False, reason
+            return False, reason, True
 
         if not isinstance(data, dict):
             reason = f"expected JSON object, got {type(data).__name__} — failing closed"
             logger.warning("Gate1._parse_presence_response [%s]: %s", candidate_title, reason)
-            return False, reason
+            return False, reason, True
 
         verdict = (data.get("verdict") or "").strip().lower()
         reason  = (data.get("reason")  or "").strip()
 
         if verdict == "confirmed":
-            return True, reason or "LLM confirmed problem is present"
+            return True, reason or "LLM confirmed problem is present", False
         if verdict == "rejected":
-            return False, reason or "LLM found problem absent or already fixed"
+            return False, reason or "LLM found problem absent or already fixed", False
 
-        # Unrecognised verdict → fail closed.
+        # Unrecognised verdict → fail closed, but this is a parse failure,
+        # not a genuine rejection — eligible for re-ask.
         msg = f"unrecognised verdict {verdict!r} — failing closed"
         logger.warning("Gate1._parse_presence_response [%s]: %s", candidate_title, msg)
-        return False, msg
+        return False, msg, True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -617,22 +679,17 @@ def _fingerprint(c: CandidateTask) -> str:
 def _target_fingerprint(c: CandidateTask) -> "str | None":
     """AUTO-BUG-3: secondary dedup key based on the file(s) being WRITTEN.
 
-    ``_fingerprint`` alone keys on ``cited_location`` — the SOURCE the
-    candidate references — which is the right disambiguator for code tasks
-    (two different fixes can legitimately cite the same file at different
-    symbols/lines). For creative-generation tasks, though, ``cited_location``
-    is largely arbitrary (there's no meaningful symbol/line in a chapter
-    that doesn't exist yet) and can differ between two batches of the same
-    cluster even when both are proposing to write the exact same target
-    file — which is exactly the "two independent tasks generate chapter_4"
-    duplication observed in practice. Two candidates that target the same
-    file set with the same title are duplicates regardless of what they
-    cited, so this key is checked *in addition to* ``_fingerprint``.
-    Returns ``None`` when there are no target files to key on.
+    ``_fingerprint`` alone keys on ``cited_location``, which is largely
+    arbitrary for creative-generation tasks (no meaningful symbol/line in a
+    chapter that doesn't exist yet) and can differ between two batches
+    proposing to write the same target file. The key is the target file set
+    alone (not the title too — independently-generated batches rarely
+    phrase the same "write chapter_4" task identically, so a title-inclusive
+    key let real duplicates through). Returns ``None`` with no target files.
     """
     if not c.target_files:
         return None
-    return f"{'|'.join(sorted(c.target_files))}::{c.title.strip().lower()}"
+    return "|".join(sorted(c.target_files))
 
 
 def _location_str(loc: Any) -> str:

@@ -8,7 +8,6 @@ IMPROVEMENTS.md; story_bible.md (CR-23) and .7z were never added.
 """
 from __future__ import annotations
 
-import os
 
 from tools.auto.repo_ingest import RESERVED_META_FILES, _BINARY_EXTENSIONS, RepoIngestor
 

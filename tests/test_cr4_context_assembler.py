@@ -10,10 +10,8 @@ Five tests matching the acceptance criteria in the epic:
 """
 from __future__ import annotations
 
-import textwrap
 from pathlib import Path
 
-import pytest
 
 from tools.auto.context_assembler import (
     ContextAssembler,

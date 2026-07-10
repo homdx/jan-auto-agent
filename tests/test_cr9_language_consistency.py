@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import configparser
 
-import pytest
 
 from tools.auto.utils import (
     detect_language,

@@ -11,10 +11,8 @@ All six tests from the spec:
 from __future__ import annotations
 
 import configparser
-import textwrap
 from pathlib import Path
 
-import pytest
 
 from tools.auto.story_bible import StoryBible, make_story_bible, _normalise
 

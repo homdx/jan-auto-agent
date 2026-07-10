@@ -527,10 +527,15 @@ class Executor:
                     # The original command contains shell operators; shlex.join
                     # would misquote them.  Do a safe word-boundary string
                     # substitution on the original command string instead.
+                    #
+                    # Callable replacement, not a string one — re.sub
+                    # interprets backslashes in a string replacement as
+                    # backreferences, which would break on a path
+                    # containing an ordinary backslash.
                     import re as _re_local
                     rewritten = _re_local.sub(
                         r"(?<!\S)" + _re_local.escape(basename) + r"(?!\S)",
-                        full_path,
+                        lambda _m: full_path,
                         command,
                         count=1,
                     )

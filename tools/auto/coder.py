@@ -110,19 +110,32 @@ _SYSTEM_PROMPT = (
     "file change — if you think nothing needs changing, re-read the instruction and "
     "produce the correct implementation. An empty files array is always wrong.\n"
     "7. If a symbol you must use (a class, function, or constant) is referenced but its "
-    "definition is NOT shown to you, do not guess — add a top-level \"context_request\" "
-    "array naming the exact symbols you need, e.g. "
-    '{"files": [...], "context_request": ["Config", "_resolve_path"]}. '
-    "The names you request are resolved and provided on the next attempt. Omit "
-    "context_request (or use []) when you already have everything you need."
-    "\n"
-    "8. If the provided file contents are insufficient to complete the task — "
-    "for example, a referenced class or function is not shown — add a top-level "
-    "\"missing_context\" key to your JSON response listing the symbol names you "
-    "needed but did not receive. "
-    "Format: \"missing_context\": [\"ClassName\", \"function_name\"] "
-    "Omit the key entirely if context was sufficient. "
-    "Do not include it as an empty list."
+    "definition is NOT shown to you, and you can still produce a reasonable, complete "
+    "implementation right now (e.g. by making a sound assumption about its shape), do so — "
+    "then ALSO add a top-level \"context_request\" array naming the exact symbols you'd "
+    "like to see, e.g. {\"files\": [...], \"context_request\": [\"Config\", \"_resolve_path\"]}. "
+    "This does NOT change what \"files\" must contain — it must still be your complete "
+    "best-effort implementation (rule 6). The named symbols are fetched and provided on "
+    "your NEXT attempt, if there is one, so a later pass can correct any wrong assumption. "
+    "Omit context_request (or use []) when you already have everything you need.\n"
+    "8. If instead you genuinely cannot produce a correct implementation without seeing a "
+    "symbol's definition — not something you can reasonably assume — still fill \"files\" "
+    "with your best current attempt (rule 6 always applies), but ALSO add a top-level "
+    "\"missing_context\" key listing the symbol names you need. "
+    "Format: \"missing_context\": [\"ClassName\", \"function_name\"]. Unlike context_request, "
+    "this is fetched IMMEDIATELY and you are asked again, once, in the SAME turn, with that "
+    "context added — treat your \"files\" here as a fallback in case that immediate retry "
+    "doesn't happen. Omit the key entirely if context was sufficient; do not include it as "
+    "an empty list.\n"
+    "Use at most one of \"context_request\" / \"missing_context\" per response — "
+    "\"context_request\" is for a working answer you're confident enough to give now but "
+    "could improve with more context next time; \"missing_context\" is for an answer you're "
+    "not confident in at all without that context, needed to fix it within this same turn.\n"
+    "9. To DELETE a file (e.g. a refactor that merges a module away), include "
+    '{"path": "relative/path.py", "delete": true} in "files" — with NO '
+    '"content" key. Deletion is only allowed for paths listed in target_files; '
+    "the original is backed up automatically. Never emit shell commands or "
+    "os.remove calls to delete files — use the delete flag."
 )
 
 # Backward-compat alias — "code" is the default persona.
@@ -140,6 +153,9 @@ _SYSTEM_PROMPT_DOCS = _SYSTEM_PROMPT_CODE.replace(
 )
 _SYSTEM_PROMPT_CREATIVE = (
     "You are a creative writing author generating a chapter of long-form fiction. "
+    "Write in the SAME language as the story so far (the prior chapter / synopsis you "
+    "are given, or the task instruction if this is the first chapter) — do not switch to "
+    "English or any other language partway through, even for a single sentence. "
     "Return ONLY the chapter prose. No JSON, no preamble, no code fences. "
     "Write the complete chapter as plain prose text. "
     "If you are given a single target file, write the complete chapter text for it. "
@@ -280,6 +296,16 @@ class Coder(_llm_stream.LLMClientBase):
             self._system  = config.get(sec, "system", fallback=_builtin).strip()
         self._timeout     = float(config.get("loop", "timeout_seconds", fallback="300"))
         self._max_file_chars = int(config.get(sec, "max_file_chars", fallback=str(_DEFAULT_MAX_FILE_CHARS)))
+        # pullrun-sim: optional deterministic gate rejecting non-ASCII
+        # identifiers in generated .py files (code mode only).
+        self._ascii_identifiers_only = config.getboolean(
+            sec, "ascii_identifiers_only", fallback=False)
+        # selfhost pilot: allow editing files that already contain a flagged
+        # pattern (see _check_content_safety grandfathering). Default on —
+        # it strictly reduces false positives; introducing a pattern into a
+        # clean file is still blocked either way.
+        self._allow_preexisting_patterns = config.getboolean(
+            sec, "allow_preexisting_patterns", fallback=True)
         active_profile = config.get("api", "active", fallback="local")
         # num_ctx controls the total context window on Ollama; 0 means "use server default".
         # AUTO-CR-3: prefer [coder] num_ctx_{task_mode} then [api_{active}] num_ctx.
@@ -287,6 +313,10 @@ class Coder(_llm_stream.LLMClientBase):
         if _num_ctx_str is None:
             _num_ctx_str = config.get(f"api_{active_profile}", "num_ctx", fallback="0")
         self._num_ctx = int(_num_ctx_str)
+        # AUTO-FIX (fable follow-up): same thinking-model truncation risk as
+        # gate1/architect — a big coder JSON response (files array) plus a
+        # <think> block is even more likely to blow the budget mid-reasoning.
+        self._think = config.getboolean(sec, "think", fallback=False)
         # Context-probe: fetch missing symbols on first LLM response, then retry once.
         self._context_probe_enabled = config.getboolean(sec, "context_probe", fallback=True)
         self._max_chars_per_dep     = config.getint(sec, "max_chars_per_dep", fallback=2000)
@@ -337,7 +367,7 @@ class Coder(_llm_stream.LLMClientBase):
             base_url=self._base_url, api_key=self._api_key, model=self._model,
             api_format=self._api_format, temperature=self._temperature,
             max_tokens=self._max_tokens, system=self._system, user_msg=user_msg,
-            num_ctx=self._num_ctx,
+            num_ctx=self._num_ctx, think=self._think,
         )
 
         tracer.event(
@@ -434,7 +464,14 @@ class Coder(_llm_stream.LLMClientBase):
                     # call asked for.  context_satisfied intentionally keeps
                     # the first response's value: False signals "probe was
                     # needed" and is used by outer_loop to skip TaskRewriter.
-                    missing_ctx = self._extract_context_request(cleaned)
+                    #
+                    # Branch the same way the first call does (defensive —
+                    # currently dormant since this path is gated on the
+                    # JSON extractor, which never fires in creative mode).
+                    if self._task_mode == "creative":
+                        missing_ctx = self._extract_context_request_prose(cleaned)
+                    else:
+                        missing_ctx = self._extract_context_request(cleaned)
                 except Exception as exc:
                     logger.warning(
                         "coder.generate [%s]: context-probe second call failed: %s "
@@ -1025,22 +1062,42 @@ class Coder(_llm_stream.LLMClientBase):
         try:
             data = json.loads(stripped)
         except json.JSONDecodeError as exc:
-            # Distinguish a TRUNCATED response (ran out of output tokens mid-file)
-            # from genuinely malformed JSON, so the retry feedback is actionable.
-            truncated = (
-                "Unterminated string" in str(exc)
-                or "Expecting" in str(exc)
-            ) and not stripped.rstrip().endswith("}")
-            if truncated:
+            # codeapp-sim fix: three DIFFERENT failure modes need three
+            # DIFFERENT prescriptions, or the retry feedback misleads a weak
+            # model:
+            #   (a) the reply contains no JSON at all — typically the model
+            #       asked a clarifying question or chatted instead of
+            #       emitting files. The old heuristic classified this as
+            #       "truncated" (json's 'Expecting value' matched) and told
+            #       the model its FILE WAS TOO LONG — the exact wrong advice
+            #       for a model that produced no file at all.
+            #   (b) JSON started but was cut off by the output token budget.
+            #   (c) JSON present but malformed.
+            if "{" not in stripped:
                 msg = (
-                    "LLM response was cut off before the JSON was complete — the "
-                    "revised file was too long for the output token budget. Emit "
-                    "the COMPLETE file content and keep the response minimal (only "
-                    "the required files), or raise [coder] max_tokens. "
-                    f"(decode error: {exc})"
+                    "LLM response contained NO JSON at all — it looks like "
+                    "prose or a clarifying question. Do NOT ask questions and "
+                    "do NOT explain: reply with ONLY the JSON object "
+                    '{"files": [{"path": ..., "content": ...}]} containing the '
+                    "complete revised file(s). Make reasonable assumptions for "
+                    "anything unspecified. "
+                    f"(reply started with: {stripped[:120]!r})"
                 )
             else:
-                msg = f"JSON decode failed: {exc} — raw[:200]={text[:200]!r}"
+                truncated = (
+                    "Unterminated string" in str(exc)
+                    or "Expecting" in str(exc)
+                ) and not stripped.rstrip().endswith("}")
+                if truncated:
+                    msg = (
+                        "LLM response was cut off before the JSON was complete — the "
+                        "revised file was too long for the output token budget. Emit "
+                        "the COMPLETE file content and keep the response minimal (only "
+                        "the required files), or raise [coder] max_tokens. "
+                        f"(decode error: {exc})"
+                    )
+                else:
+                    msg = f"JSON decode failed: {exc} — raw[:200]={text[:200]!r}"
             logger.warning("coder._parse_response [%s]: %s", task_id, msg)
             return [], msg
 
@@ -1070,6 +1127,11 @@ class Coder(_llm_stream.LLMClientBase):
                     "coder._parse_response [%s]: item %d missing 'path' — skipped",
                     task_id, i,
                 )
+                continue
+            # pullrun-sim fix: {"path": ..., "delete": true} marks a file for
+            # deletion (refactors that merge a module away). No content needed.
+            if item.get("delete") is True:
+                parsed.append({"path": path, "delete": True})
                 continue
             if content is None:
                 logger.warning(
@@ -1167,15 +1229,19 @@ class Coder(_llm_stream.LLMClientBase):
             return [], msg
 
         # ── Truncation guard ────────────────────────────────────────────────
-        # Estimate the token budget in chars (conservative: 4 chars ≈ 1 token).
-        char_budget = self._max_tokens * 4
+        # Use language-aware chars/token (~2.2 for Cyrillic vs ~4 for Latin)
+        # so this actually fires on Russian text, the dominant creative-mode
+        # language, instead of a hardcoded Latin-only ratio letting a
+        # truncated chapter through silently.
+        from tools.auto.utils import chars_per_token
+        char_budget = self._max_tokens * chars_per_token(body)
         last_char = body[-1] if body else ""
         ends_mid_sentence = last_char not in {".", "!", "?", '"', "'", "\n", "…"}
         if ends_mid_sentence and len(body) >= char_budget * 0.95:
             msg = (
                 "creative coder: response hit the token budget mid-sentence — "
                 "raise [coder] max_tokens or shorten the chapter target. "
-                f"(body length {len(body)} chars ≈ budget {char_budget} chars)"
+                f"(body length {len(body)} chars ≈ budget {char_budget:.0f} chars)"
             )
             logger.warning("coder._parse_response_prose [%s]: %s", task_id, msg)
             return [], msg
@@ -1298,7 +1364,8 @@ class Coder(_llm_stream.LLMClientBase):
     )
 
     @classmethod
-    def _check_content_safety(cls, content: str, task_mode: str = "code") -> tuple[bool, str]:
+    def _check_content_safety(cls, content: str, task_mode: str = "code",
+                              existing_content: "str | None" = None) -> tuple[bool, str]:
         """Return *(safe, reason)* — ``safe=False`` blocks the write.
 
         Scans generated file content for patterns that would be dangerous
@@ -1325,6 +1392,20 @@ class Coder(_llm_stream.LLMClientBase):
             # docs / creative: only block truly catastrophic payloads
             active_patterns = cls._BLOCKED_ALWAYS
 
+        # selfhost pilot: pre-existing-pattern grandfathering. When the file
+        # being edited ALREADY legitimately contains a flagged pattern on
+        # disk (the agent's own utils.py holds os.unlink inside
+        # atomic_write_text's cleanup, executor holds subprocess, ...),
+        # editing that file must not be blocked — otherwise the agent can
+        # never modify its own infrastructure code. INTRODUCING a pattern
+        # into a file that did not have it remains blocked as before, so the
+        # scanner still stops a model from smuggling deletions into clean
+        # files. New files (existing_content is None) get no grandfathering.
+        _existing_lower = (existing_content or "").lower()
+
+        def _preexisting(token: str) -> bool:
+            return bool(_existing_lower) and token.lower() in _existing_lower
+
         for label, pattern in active_patterns:
             pat_lower = pattern.lower()
 
@@ -1334,6 +1415,13 @@ class Coder(_llm_stream.LLMClientBase):
                 if "subprocess" in lower:
                     for danger in cls._SUBPROCESS_DANGER_TOKENS:
                         if danger.lower() in lower:
+                            if _preexisting(danger):
+                                logger.info(
+                                    "coder._check_content_safety: subprocess+%r "
+                                    "pre-exists in the target file — edit "
+                                    "permitted (grandfathered).", danger,
+                                )
+                                continue
                             return (
                                 False,
                                 f"blocked content: subprocess combined with "
@@ -1356,6 +1444,13 @@ class Coder(_llm_stream.LLMClientBase):
                 continue
 
             if pat_lower in lower:
+                if _preexisting(pat_lower):
+                    logger.info(
+                        "coder._check_content_safety: pattern %r pre-exists in "
+                        "the target file — edit permitted (grandfathered).",
+                        pattern,
+                    )
+                    continue
                 return False, f"blocked content pattern {pattern!r} ({label})"
 
         # Word-boundary patterns (code mode only: sudo/shutdown/reboot), checked
@@ -1368,6 +1463,13 @@ class Coder(_llm_stream.LLMClientBase):
             for label, pattern in cls._BLOCKED_CODE_WORD_BOUNDARY:
                 keyword = pattern.lower().rstrip()
                 if _re.search(r"\b" + _re.escape(keyword) + r"\b", lower):
+                    if _preexisting(keyword):
+                        logger.info(
+                            "coder._check_content_safety: word-boundary pattern "
+                            "%r pre-exists in the target file — edit permitted "
+                            "(grandfathered).", pattern,
+                        )
+                        continue
                     return False, f"blocked content pattern {pattern!r} ({label})"
 
         return True, ""
@@ -1379,16 +1481,21 @@ class Coder(_llm_stream.LLMClientBase):
         Prevents path traversal (``../../etc/passwd``) and absolute-path
         injection from LLM responses.  Returns ``(resolved_path, "")`` on
         success or ``(None, error_message)`` on violation.
+
+        Resolves both sides before comparing, so a caller passing an
+        unresolved base_dir (e.g. a symlinked workspace) doesn't get a
+        false-positive rejection on every legitimate write.
         """
         # Reject obviously absolute paths before Path() normalises them.
         if rel.startswith("/") or (len(rel) > 1 and rel[1:3] == ":\\"):
             return None, f"rejected absolute path from LLM: {rel!r}"
         try:
+            base_resolved = base_dir.resolve()
             dest = (base_dir / rel).resolve()
         except (OSError, ValueError) as exc:
             return None, f"path resolution error for {rel!r}: {exc}"
         try:
-            dest.relative_to(base_dir)
+            dest.relative_to(base_resolved)
         except ValueError:
             return None, f"path escapes base_dir: {rel!r} → {dest}"
         return dest, ""
@@ -1431,8 +1538,7 @@ class Coder(_llm_stream.LLMClientBase):
         first_error = ""
 
         for item in parsed_files:
-            rel     = item["path"]
-            content = item["content"]
+            rel = item["path"]
 
             # ── Guard 1: path must not escape base_dir ─────────────────────
             dest, path_err = self._safe_dest(base_dir, rel)
@@ -1445,9 +1551,18 @@ class Coder(_llm_stream.LLMClientBase):
 
             # ── Guard 2: path must be in the task's approved target_files ──
             if allowed_paths is not None:
-                # Normalise to forward-slash for comparison.
-                norm = rel.replace("\\", "/").lstrip("./")
-                allowed_norm = {p.replace("\\", "/").lstrip("./") for p in allowed_paths}
+                # Strip a literal "./" prefix only (not str.lstrip("./"),
+                # which eats any leading dot/slash character and let a
+                # disallowed dotfile like .notes.md collide with an
+                # allowed notes.md after normalisation).
+                def _norm_target(p: str) -> str:
+                    p = p.replace("\\", "/")
+                    while p.startswith("./"):
+                        p = p[2:]
+                    return p
+
+                norm = _norm_target(rel)
+                allowed_norm = {_norm_target(p) for p in allowed_paths}
                 if norm not in allowed_norm:
                     msg = (
                         f"[SAFETY] LLM tried to write {rel!r} which is not in "
@@ -1458,8 +1573,73 @@ class Coder(_llm_stream.LLMClientBase):
                         first_error = msg
                     continue
 
+            # ── Delete branch (pullrun-sim): {"path": ..., "delete": true} ──
+            # Same path/target guards as writes; original backed up to
+            # .coder.bak so the deletion is reversible without git. Deleting
+            # an already-absent file is a no-op success (idempotent retries).
+            if item.get("delete") is True:
+                try:
+                    if dest.exists():
+                        backup = dest.with_suffix(dest.suffix + ".coder.bak")
+                        backup.write_text(
+                            dest.read_text(encoding="utf-8", errors="replace"),
+                            encoding="utf-8",
+                        )
+                        dest.unlink()
+                        logger.info(
+                            "coder._write_files [%s]: DELETED %s (backup: %s)",
+                            task_id, rel, backup.name,
+                        )
+                    else:
+                        logger.info(
+                            "coder._write_files [%s]: delete of %s — already "
+                            "absent, treated as success", task_id, rel,
+                        )
+                    written.append(rel)
+                except OSError as exc:
+                    msg = f"delete failed for {rel}: {exc}"
+                    logger.error("coder._write_files [%s]: %s", task_id, msg)
+                    if not first_error:
+                        first_error = msg
+                continue
+
+            content = item["content"]
+
+            # ── Guard 2.5 (pullrun-sim): identifier language ────────────────
+            # PEP 3131 makes fully-Russian identifiers VALID Python; with a
+            # compatibility alias (run = запустить) such code even passes the
+            # acceptance check (exit 0) — nothing else in code mode would
+            # ever reject it. Optional deterministic gate: tokenize and
+            # reject non-ASCII identifiers with a precise, named list, so the
+            # retry feedback tells the model exactly what to rename.
+            if (
+                self._ascii_identifiers_only
+                and self._task_mode == "code"
+                and rel.endswith(".py")
+            ):
+                bad_idents = _find_non_ascii_identifiers(content)
+                if bad_idents:
+                    msg = (
+                        f"[STYLE] non-ASCII identifiers in {rel!r}: "
+                        f"{', '.join(sorted(bad_idents)[:8])} — rename all "
+                        f"identifiers to English/ASCII (strings, comments and "
+                        f"docstrings may stay in any language). "
+                        f"Set [coder] ascii_identifiers_only = false to allow."
+                    )
+                    logger.warning("coder._write_files [%s]: %s", task_id, msg)
+                    if not first_error:
+                        first_error = msg
+                    continue
+
             # ── Guard 3: scan file content for dangerous patterns ──────────
-            content_safe, content_reason = self._check_content_safety(content, self._task_mode)
+            _existing = None
+            if self._allow_preexisting_patterns and dest.exists():
+                try:
+                    _existing = dest.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    _existing = None
+            content_safe, content_reason = self._check_content_safety(
+                content, self._task_mode, existing_content=_existing)
             if not content_safe:
                 msg = f"[SAFETY] {content_reason} in file {rel!r} — write blocked"
                 logger.error("coder._write_files [%s]: %s", task_id, msg)
@@ -1791,6 +1971,26 @@ def _looks_like_refusal(body: str) -> bool:
         return False
     low = stripped.lower()
     return any(marker in low for marker in _REFUSAL_MARKERS)
+
+
+def _find_non_ascii_identifiers(content: str) -> set:
+    """Return NAME tokens containing non-ASCII characters (PEP 3131 idents).
+
+    Strings, comments and docstrings are naturally excluded because only
+    NAME tokens are inspected. Falls back to an empty set on tokenize
+    errors — the syntax problem will surface via execution anyway.
+    """
+    import io
+    import tokenize
+
+    bad: set = set()
+    try:
+        for tok in tokenize.generate_tokens(io.StringIO(content).readline):
+            if tok.type == tokenize.NAME and not tok.string.isascii():
+                bad.add(tok.string)
+    except (tokenize.TokenError, IndentationError, SyntaxError, ValueError):
+        return set()
+    return bad
 
 
 def _strip_outer_fence(text: str) -> str:

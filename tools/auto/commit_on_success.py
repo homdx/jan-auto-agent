@@ -292,7 +292,12 @@ def make_commit_on_success(
     state_store:
         The active ``StateStore`` for this run.
     """
-    task_mode = config.get("auto", "task_mode", fallback="code")
+    # Normalise task_mode the same way controller.py does, so a config
+    # typo/case variant ("Creative") doesn't silently skip the
+    # summary_memory / story_bible wiring below.
+    from tools.auto.utils import normalize_task_mode
+    _raw_task_mode = config.get("auto", "task_mode", fallback="code")
+    task_mode, _ = normalize_task_mode(_raw_task_mode)
     gm = make_git_manager(repo_dir, config)
 
     # AUTO-CR-5: wire SummaryMemory for creative mode so synopsis.md is

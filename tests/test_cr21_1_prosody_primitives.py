@@ -11,7 +11,6 @@ Validates the pure prosody primitives in tools/auto/prosody.py:
 All tests are purely deterministic — no LLM, no I/O, no config.
 """
 
-import pytest
 
 from tools.auto.prosody import (
     _VOWELS_RU,

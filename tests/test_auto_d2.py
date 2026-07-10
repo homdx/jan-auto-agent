@@ -18,7 +18,7 @@ import sys
 from dataclasses import dataclass, field as dc_field
 from pathlib import Path
 from typing import Optional
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -27,8 +27,8 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from tools.auto.bug_fix_loop import BugFixLoop, BugFixResult, make_bug_fix_loop
-from tools.auto.ticket_store import TicketStore, make_ticket, make_ticket_store
-from tools.auto.state import StateStore, make_task as make_state_task
+from tools.auto.ticket_store import TicketStore, make_ticket_store
+from tools.auto.state import StateStore
 
 
 # ── Fake helpers ─────────────────────────────────────────────────────────────
@@ -354,6 +354,59 @@ class TestIdempotency:
         assert result.fixed is True
         outer.run_task.assert_not_called()
         cos.commit.assert_not_called()
+
+    def test_already_deferred_ticket_skipped(self, tmp_path):
+        """Regression: a deferred ticket must not re-run the fix loop on every
+        subsequent commit. controller._check_regressions re-checks every DONE
+        task's acceptance check after every later commit for the rest of the
+        run — without this short-circuit, a persistently-failing regression
+        re-attempts the full (expensive) OuterLoop fix cycle from scratch on
+        every single one of those re-checks, forever."""
+        bfl, tickets, _ = _make_bfl(
+            tmp_path, FakeOuterResult(passed=False, exhausted=True)
+        )
+        task = _make_triggering_task()
+        exec_result = FakeExecResult()
+
+        # First call exhausts and defers the ticket.
+        bfl.handle_regression(task, exec_result, base_dir=tmp_path)
+        assert tickets.get("BUG-AUTO-T1")["status"] == "deferred"
+
+        # Second call (simulating the NEXT commit's regression re-check) must
+        # skip without calling outer_loop again.
+        outer = _make_outer(FakeOuterResult(passed=True))
+        cos   = _make_cos()
+        bfl2  = BugFixLoop(outer, cos, tickets, bfl._state)
+        result = bfl2.handle_regression(task, exec_result, base_dir=tmp_path)
+
+        assert result.skipped is True
+        assert result.fixed is False
+        assert result.exhausted is True
+        outer.run_task.assert_not_called()
+        cos.commit.assert_not_called()
+        # Still exactly one ticket — no duplicate opened.
+        assert len(tickets.list_by_task("AUTO-T1")) == 1
+
+    def test_deferred_ticket_retried_after_manual_reset(self, tmp_path):
+        """The documented escape hatch: an operator resets status to "open"
+        to allow exactly one more attempt (mirrors
+        test_existing_open_ticket_reused_not_duplicated's pattern)."""
+        bfl, tickets, _ = _make_bfl(
+            tmp_path, FakeOuterResult(passed=False, exhausted=True)
+        )
+        task = _make_triggering_task()
+        exec_result = FakeExecResult()
+
+        bfl.handle_regression(task, exec_result, base_dir=tmp_path)
+        tickets.update("BUG-AUTO-T1", status="open")
+
+        outer2 = _make_outer(FakeOuterResult(passed=True))
+        cos2   = _make_cos()
+        bfl2   = BugFixLoop(outer2, cos2, tickets, bfl._state)
+        result = bfl2.handle_regression(task, exec_result, base_dir=tmp_path)
+
+        outer2.run_task.assert_called_once()
+        assert result.fixed is True
 
     def test_existing_open_ticket_reused_not_duplicated(self, tmp_path):
         """Second handle_regression on an open ticket must reuse it."""

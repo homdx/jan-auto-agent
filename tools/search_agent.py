@@ -166,6 +166,16 @@ class SearchAgent:
             approved = json.loads(cleaned)
             if not isinstance(approved, list):
                 raise ValueError(f"expected a JSON list, got {type(approved).__name__}")
+            # An empty list ("[]") is valid JSON, so it skipped the
+            # except-block's fail-open path — treat it the same way, per
+            # this method's own documented fail-open contract.
+            if not approved:
+                logger.warning(
+                    "_evaluate_with_llm: LLM returned an empty list — "
+                    "treating as a filter failure and approving all %d "
+                    "ref(s) [fail-open]", len(all_names),
+                )
+                return all_names
             # Keep only names that were actually in the input (guard against
             # the model inventing names), preserving the original order.
             approved_set = {str(a) for a in approved}
@@ -320,14 +330,42 @@ class SearchAgent:
 
 def make_search_agent(config, base_dir="."):
     """Factory: build a SearchAgent from a ConfigParser config (or return
-    a default instance when config is None)."""
+    a default instance when config is None).
+
+    Used by tools/auto/inner_loop.py to build the SearchAgent auto mode
+    uses internally. Must read the same [api]/[loop]/[search] keys
+    main.py's Orchestrator._build_agents() reads for its own SearchAgent —
+    otherwise auto mode silently runs with SearchAgent's hardcoded defaults
+    instead of the operator's configured timeout / verify_ssl / skip_dirs /
+    max_depth / max_file_kb. In particular, verify_ssl=false (documented for
+    the api_remote HTTPS profile) was not being honoured here, so an https
+    endpoint with a self-signed cert would fail every noise-filter LLM call
+    and _evaluate_with_llm's fail-open handling would silently approve
+    everything — i.e. reference noise filtering was permanently disabled
+    for that profile with no visible error.
+    """
     if config is None:
         return SearchAgent()
     active  = config.get("api", "active", fallback="local")
     section = f"api_{active}"
+
+    verify_ssl = config.getboolean("api", "verify_ssl", fallback=True)
+    ssl_context = None
+    if not verify_ssl:
+        from tools.llm_stream import make_unverified_context
+        ssl_context = make_unverified_context()
+
+    raw_skip_dirs = config.get("search", "skip_dirs", fallback="")
+    skip_dirs = [d.strip() for d in raw_skip_dirs.split(",") if d.strip()] or None
+
     return SearchAgent(
         model=config.get(section, "model", fallback=None),
         base_url=config.get(section, "base_url", fallback=None),
         api_key=config.get(section, "api_key", fallback=""),
         api_format=config.get(section, "api_format", fallback="openai"),
+        timeout=config.getint("loop", "timeout_seconds", fallback=240),
+        ssl_context=ssl_context,
+        skip_dirs=skip_dirs,
+        max_depth=config.getint("search", "max_depth", fallback=2),
+        max_file_kb=config.getint("search", "max_file_kb", fallback=500),
     )

@@ -10,7 +10,6 @@ Covers:
 
 from __future__ import annotations
 
-import pytest
 
 from tools.auto.fact_validator import FactValidator, FactVerdict
 

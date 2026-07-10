@@ -42,15 +42,13 @@ Covers all ACs from the story:
 
 from __future__ import annotations
 
-import configparser
 import json
 from pathlib import Path
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock
 
-import pytest
 
 from tools.auto.architect import CandidateTask, CitedLocation
-from tools.auto.backlog_prioritiser import PrioritisedBacklog, build_backlog, to_improvements_md
+from tools.auto.backlog_prioritiser import build_backlog, to_improvements_md
 from tools.auto.plan_emitter import IMPROVEMENTS_FILENAME, PlanEmitter, _cluster_hash
 from tools.auto.repo_ingest import RepoCluster
 from tools.auto.state import StateStore, _validate_task_schema
@@ -406,7 +404,6 @@ class TestIntegration:
         """
         import subprocess
         from tools.auto.git_manager import GitManager
-        from tools.auto.state import StateStore
 
         repo = tmp_path / "repo"
         repo.mkdir()
@@ -476,7 +473,6 @@ class TestIntegration:
         """Second emit with one modified cluster → only that cluster stale."""
         import subprocess
         from tools.auto.git_manager import GitManager
-        from tools.auto.state import StateStore
 
         repo = tmp_path / "repo"
         repo.mkdir()

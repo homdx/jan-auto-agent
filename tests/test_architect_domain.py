@@ -29,7 +29,6 @@ import pytest
 from tools.auto.architect import (
     CitedLocation,
     ClusterReviewer,
-    CandidateTask,
     _SYSTEM_PROMPT_CODE,
     _SYSTEM_PROMPT_DOCS,
     _SYSTEM_PROMPT_CREATIVE,

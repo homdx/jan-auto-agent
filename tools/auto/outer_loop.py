@@ -49,6 +49,7 @@ from pathlib import Path
 from tools.agent_trace import tracer
 from tools.auto.state import StateStore, STATUS_IN_PROGRESS, STATUS_DONE, STATUS_BLOCKED
 from tools.auto.inner_loop import make_inner_loop
+from tools.auto.utils import highest_completed_round
 
 logger = logging.getLogger(__name__)
 
@@ -141,8 +142,10 @@ class OuterLoop:
         except (ValueError, TypeError):
             _inner_accepts_deadline = False
 
-        # LOOP-4: save original instruction before any rewrite may change task
-        original_instruction: str = task.get("instruction", "")
+        # LOOP-4: true v1 baseline instruction for _build_impl_history — after
+        # a rewrite, task["instruction"] holds the latest rewrite, not v1's,
+        # so prefer "original_instruction" when present.
+        original_instruction: str = task.get("original_instruction") or task.get("instruction", "")
 
         # ── Resume: existing feedback files mean prior rounds already ran ──
         done_rounds = self._existing_rounds(task_id)
@@ -150,10 +153,11 @@ class OuterLoop:
         feedback_files = [str(p) for p in self._feedback_paths(task_id)]
         inner_results: list = []
 
-        # LOOP-2: rewrite tracking (per run_task call, not per instance)
-        rewrites_done = 0
-        # LOOP-3: impl_version tracking — starts at 1, bumped on each rewrite
+        # LOOP-2/3: rewrite tracking. Seed from impl_version (persisted,
+        # starts at 1, +1 per rewrite) so max_rewrites is a true per-task,
+        # cross-resume limit, not reset by every process restart.
         impl_version = task.get("impl_version", 1)
+        rewrites_done = max(0, int(impl_version or 1) - 1)
         impl_versions_used: list[int] = []
 
         if start_round > self.max_rounds:
@@ -250,11 +254,22 @@ class OuterLoop:
 
                 new_task = self.task_rewriter.rewrite(task, failure_history)
                 if new_task is not task:
-                    # A genuine rewrite was produced — record it on disk and
-                    # bump the impl_version counter in state (LOOP-3).
+                    # LOOP-3: apply_rewrite() persists the rewritten
+                    # instruction (not just the version number), so a
+                    # resumed session picks up the latest rewrite.
                     try:
-                        impl_version = self.state.increment_impl_version(task_id)
-                    except Exception:
+                        impl_version = self.state.apply_rewrite(
+                            task_id,
+                            instruction=new_task.get("instruction", ""),
+                            acceptance_check=new_task.get("acceptance_check", ""),
+                            title=new_task.get("title"),
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "outer_loop: apply_rewrite failed for %s — rewrite "
+                            "will NOT survive a resume this round (continuing "
+                            "in-memory only): %s", task_id, exc,
+                        )
                         impl_version = impl_num   # fallback: derive from rewrites_done
 
                     rewrite_body = (
@@ -310,8 +325,11 @@ class OuterLoop:
         return int(m.group(1)) if m else 0
 
     def _existing_rounds(self, task_id: str) -> int:
-        paths = self._feedback_paths(task_id)
-        return self._round_of(paths[-1].name) if paths else 0
+        # Delegates to the shared helper (tools.auto.utils) also used by
+        # AutoController's BLOCKED-reset check, so the two can never disagree
+        # about how many rounds a task has actually used (see the
+        # round-exhaustion bugfix in controller.py's run()).
+        return highest_completed_round(self.state.task_dir(task_id))
 
     def _read_round_feedback(self, task_id: str) -> list[str]:
         """Return the compact summary text of each prior round, in order."""
@@ -440,6 +458,19 @@ def make_outer_loop(
                                            fallback=_DEFAULT_MAX_ROUNDS)
     rewrite_every_n_rounds = config.getint("auto", "rewrite_every_n_rounds", fallback=2)
     max_rewrites           = config.getint("auto", "max_rewrites",           fallback=5)
+
+    # selfrun E2E finding: the rewrite condition requires rnd >= 3, so with
+    # max_rounds_per_task <= 2 a configured rewriter can NEVER fire — and
+    # until now that mismatch was silent (a run just exhausted its rounds and
+    # blocked, with max_rewrites looking enabled). Say it once, loudly.
+    if max_rewrites > 0 and max_rounds < 3 and task_mode != "creative":
+        logger.warning(
+            "make_outer_loop: max_rewrites=%d is configured but "
+            "max_rounds_per_task=%d < 3 — the task rewriter only fires from "
+            "round 3, so it is UNREACHABLE with this config. Raise "
+            "[auto] max_rounds_per_task to >= 3 or set max_rewrites = 0.",
+            max_rewrites, max_rounds,
+        )
 
     if inner_loop is None:
         inner_loop = make_inner_loop(config, base_dir, task_mode=task_mode,

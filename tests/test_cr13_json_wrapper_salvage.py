@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import configparser
 
-import pytest
 
 from tools.auto.coder import _extract_prose_from_json, Coder
 
