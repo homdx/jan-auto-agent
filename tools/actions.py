@@ -86,7 +86,7 @@ class OrchestratorActions:
         return OrchestratorActions._parse_payload_and_file(user_input, "/search")
 
     def _ask_over_text(self, query: str, file_label: str, text: str,
-                       chunk_label: str = None, generative: bool = False) -> str:
+                       chunk_label: str = None, generative: bool = False) -> "str | None":
         """
         Send the whole `text` plus the question to the model and stream the
         answer. Returns the assistant's full reply (stripped).
@@ -141,9 +141,22 @@ class OrchestratorActions:
             tracer.event("search_fullfile", "orchestrator", "llm_response", content=answer)
             return strip_think(answer).strip()
         except Exception as e:
+            # AUTO-BUG: same asymmetric-resilience bug as _edit_file_content /
+            # _answer_from_file (see their comments) — a transient network/API
+            # error here used to come back as "" indistinguishable from the
+            # model's own legitimate "NONE" sentinel (no answer in this
+            # chunk). run_search() treated both identically: silently move
+            # on to the next chunk, no retry. If the chunk that hit the
+            # transient error was the one actually containing the answer,
+            # it is lost for good — the search reports "no answer found"
+            # even though the correct answer was sitting right there and
+            # simply never got a second try. None lets run_search retry
+            # the same chunk a bounded number of times before giving up on
+            # it, instead of conflating "no answer here" with "the call to
+            # ask about this chunk failed."
             logger.error(f"/search model call failed: {e}")
             print(f"[{_ts()}] search failed: {e}")
-            return ""
+            return None
 
     @staticmethod
     def _split_text(text: str, budget: int, overlap: int = 200):
@@ -203,7 +216,33 @@ class OrchestratorActions:
         print(f"[{_ts()}] {file_path} is {len(source)} chars > budget {budget}; "
               f"splitting into {len(chunks)} chunks and searching each.")
         for i, ch in enumerate(chunks, 1):
-            ans = self._ask_over_text(query, file_path, ch, chunk_label=f"{i}/{len(chunks)}")
+            # AUTO-BUG: a transient network/API error asking about THIS
+            # chunk used to come back as "" — identical to the model's own
+            # legitimate "NONE" (no answer here) — and this loop treated
+            # both the same: silently move on to the next chunk. If the
+            # chunk that failed was the one actually containing the answer,
+            # it was lost for good; the search would report "no answer
+            # found" even though the correct answer was right there and
+            # simply never got a second try. Give a genuine failure (None)
+            # a small bounded number of retries before giving up on this
+            # chunk, same spirit as the retry logic elsewhere in this file
+            # but scoped to one chunk so a persistently broken connection
+            # can't stall the whole multi-chunk search.
+            _CHUNK_RETRY_ATTEMPTS = 3
+            ans = None
+            for _attempt in range(_CHUNK_RETRY_ATTEMPTS):
+                ans = self._ask_over_text(query, file_path, ch, chunk_label=f"{i}/{len(chunks)}")
+                if ans is not None:
+                    break
+                if _attempt < _CHUNK_RETRY_ATTEMPTS - 1:
+                    _wait = backoff.backoff_seconds(_attempt)
+                    print(f"[{_ts()}] ⚠️  Retrying chunk {i}/{len(chunks)} "
+                          f"after error (attempt {_attempt + 2}/{_CHUNK_RETRY_ATTEMPTS})...")
+                    time.sleep(_wait)
+            if ans is None:
+                print(f"[{_ts()}] ⚠️  Chunk {i}/{len(chunks)} unreachable after "
+                      f"{_CHUNK_RETRY_ATTEMPTS} attempts — skipping.")
+                continue
             if not ans or ans.strip().upper() == "NONE":
                 continue
 
