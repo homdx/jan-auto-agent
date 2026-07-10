@@ -30,12 +30,14 @@ Plain prose files are supported too.
 import re
 import sys
 import json
+import time
 import logging
 import urllib.request
 import urllib.error
 import urllib.parse
 from pathlib import Path
 
+from tools import backoff
 from tools.llm_stream import request_completion, strip_think, ollama_chat_url
 
 logger = logging.getLogger(__name__)
@@ -952,26 +954,65 @@ class FaqAgent:
         context  = self._build_context(docs)
         url, headers, payload = self._build_qa_request(question, context)
 
-        try:
-            if stream:
-                reply = request_completion(
-                    url, headers, payload, self.timeout,
-                    stream=True,
-                    api_format=self.api_format,
-                    on_token=lambda t: (sys.stdout.write(t), sys.stdout.flush()),
-                    ssl_context=self.ssl_context,
-                )
-                self.llm_call_count += 1  # legacy streaming call
-                print()  # newline after streamed output
-            else:
-                reply = request_completion(
-                    url, headers, payload, self.timeout,
-                    stream=False,
-                    api_format=self.api_format,
-                    ssl_context=self.ssl_context,
-                )
-                self.llm_call_count += 1  # legacy non-streaming call
+        # AUTO-BUG: same asymmetric-resilience bug as tools/actions.py's
+        # _ask_over_text / _answer_from_file / _edit_file_content (see their
+        # comments) — a transient network/API error on THIS call used to be
+        # caught by the blanket except below and returned as
+        # self.not_found_marker, which is indistinguishable from the model's
+        # own legitimate "nothing relevant in the knowledge base" verdict.
+        # _answer_legacy is the last-resort Stage-2 fallback (called after
+        # every Stage-1 candidate is exhausted in smart-search mode, or
+        # directly in legacy mode) — there is no further fallback after it,
+        # so a single dropped connection here used to make a real, present
+        # answer come back as "not found" with no second try. Give the call
+        # itself a small bounded number of retries before giving up, same
+        # spirit as the chunk-retry fix in actions.py, scoped to just the
+        # request_completion call so a genuine model NOT_FOUND (which
+        # returns normally, no exception) still short-circuits immediately.
+        _LEGACY_RETRY_ATTEMPTS = 3
+        reply = None
+        last_exc = None  # type: Exception | None
+        for _attempt in range(_LEGACY_RETRY_ATTEMPTS):
+            try:
+                if stream:
+                    reply = request_completion(
+                        url, headers, payload, self.timeout,
+                        stream=True,
+                        api_format=self.api_format,
+                        on_token=lambda t: (sys.stdout.write(t), sys.stdout.flush()),
+                        ssl_context=self.ssl_context,
+                    )
+                    self.llm_call_count += 1  # legacy streaming call
+                    print()  # newline after streamed output
+                else:
+                    reply = request_completion(
+                        url, headers, payload, self.timeout,
+                        stream=False,
+                        api_format=self.api_format,
+                        ssl_context=self.ssl_context,
+                    )
+                    self.llm_call_count += 1  # legacy non-streaming call
+                last_exc = None
+                break
+            except Exception as exc:
+                last_exc = exc
+                if _attempt < _LEGACY_RETRY_ATTEMPTS - 1:
+                    _wait = backoff.backoff_seconds(_attempt)
+                    logger.warning(
+                        "FaqAgent: legacy API call failed (%s) — retrying "
+                        "(attempt %d/%d) in %ds",
+                        exc, _attempt + 2, _LEGACY_RETRY_ATTEMPTS, _wait,
+                    )
+                    time.sleep(_wait)
 
+        if last_exc is not None:
+            logger.error(
+                "FaqAgent: API call failed after %d attempt(s): %s",
+                _LEGACY_RETRY_ATTEMPTS, last_exc,
+            )
+            return self.not_found_marker
+
+        try:
             answer = strip_think(reply).strip()
 
             # step 4: not-found check
@@ -994,7 +1035,7 @@ class FaqAgent:
             return answer
 
         except Exception as exc:
-            logger.error("FaqAgent: API call failed: %s", exc)
+            logger.error("FaqAgent: post-processing failed: %s", exc)
             return self.not_found_marker
 
     # ── Diagnostics ──────────────────────────────────────────────────────────
