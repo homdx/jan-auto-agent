@@ -73,6 +73,7 @@ from unittest.mock import patch
 
 import pytest
 
+import tools.auto.coder as coder_mod
 from tools.auto.coder import (
     Coder,
     CoderResult,
@@ -439,17 +440,20 @@ class TestFileWriting:
                 ]
             }
         )
-        # Fail the write for a.py only.
-        original_write_text = Path.write_text
+        # Fail the write for a.py only. _write_files now writes via
+        # atomic_write_text (see coder.py BUGFIX comment: plain write_text
+        # risked silent truncation on a mid-write kill), so patch that call
+        # instead of Path.write_text, which is no longer on the write path.
+        original_atomic_write_text = coder_mod.atomic_write_text
 
-        def patched_write_text(self, content, **kwargs):
-            if self.name == "a.py":
+        def patched_atomic_write_text(path, content):
+            if Path(path).name == "a.py":
                 raise OSError("disk full")
-            return original_write_text(self, content, **kwargs)
+            return original_atomic_write_text(path, content)
 
         with (
             patch("tools.llm_stream.request_completion", return_value=response),
-            patch.object(Path, "write_text", patched_write_text),
+            patch.object(coder_mod, "atomic_write_text", patched_atomic_write_text),
         ):
             r = coder.generate(task, base_dir)
 

@@ -62,7 +62,9 @@ import ast
 import configparser
 import json
 import logging
+import os
 import re
+import stat
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -70,7 +72,7 @@ from typing import Optional
 
 from tools.block_extractor import extract_block as _block_extractor_extract_block
 # SearchAgent is imported lazily inside Coder._fetch_needed
-from tools.auto.utils import _cfg_mode
+from tools.auto.utils import _cfg_mode, atomic_write_text
 from tools.auto.context_assembler import ContextAssembler
 
 from tools.agent_trace import tracer
@@ -1648,8 +1650,17 @@ class Coder(_llm_stream.LLMClientBase):
             try:
                 dest.parent.mkdir(parents=True, exist_ok=True)
 
+                # Preserve the existing file's permission bits (e.g. the
+                # executable bit on a shell script or CLI entry point) —
+                # see the BUGFIX note below for why this matters.
+                existing_mode: "int | None" = None
+
                 # Back up existing file before overwriting (reversible).
                 if dest.exists():
+                    try:
+                        existing_mode = stat.S_IMODE(dest.stat().st_mode)
+                    except OSError:
+                        existing_mode = None
                     backup = dest.with_suffix(dest.suffix + ".coder.bak")
                     backup.write_text(
                         dest.read_text(encoding="utf-8", errors="replace"),
@@ -1660,7 +1671,31 @@ class Coder(_llm_stream.LLMClientBase):
                         task_id, dest, backup,
                     )
 
-                dest.write_text(content, encoding="utf-8")
+                # BUGFIX: was `dest.write_text(content, encoding="utf-8")` —
+                # a plain, non-atomic write. If the process is killed mid-
+                # write (SIGKILL, OOM-kill, power loss) while writing the
+                # user's actual code file, the file is left truncated with
+                # no detection anywhere — unlike the JSON state files this
+                # codebase already protects, there's no parse step to even
+                # notice a corrupted source file. Same failure class already
+                # found and fixed for synopsis.md and story_bible.md
+                # elsewhere in this branch; this write is the single
+                # highest-stakes one in the whole pipeline (the user's real,
+                # possibly hand-written, source file) and was the one place
+                # still using the unsafe plain write.
+                # atomic_write_text's temp-file-plus-os.replace() approach
+                # creates the temp file via tempfile.mkstemp (mode 0600), so
+                # replacing over an existing file would otherwise silently
+                # reset its permission bits on every single edit — restore
+                # them explicitly so this fix doesn't trade a corruption bug
+                # for a permissions bug.
+                atomic_write_text(dest, content)
+                if existing_mode is not None:
+                    try:
+                        os.chmod(dest, existing_mode)
+                    except OSError:
+                        pass
+
                 written.append(rel)
                 logger.info(
                     "coder._write_files [%s]: wrote %s (%d chars)",
