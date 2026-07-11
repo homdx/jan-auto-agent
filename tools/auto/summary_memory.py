@@ -65,7 +65,7 @@ import ssl
 from pathlib import Path
 from typing import Callable
 
-from tools.auto.utils import chars_per_token
+from tools.auto.utils import atomic_write_text, chars_per_token
 
 logger = logging.getLogger(__name__)
 
@@ -610,7 +610,13 @@ class SummaryMemory:
 
         try:
             self._synopsis_path.parent.mkdir(parents=True, exist_ok=True)
-            self._synopsis_path.write_text(new_content, encoding="utf-8")
+            # Bugfix: was plain write_text() — same class as the story_bible.md
+            # fix.  synopsis.md is rewritten wholesale each update (pattern.sub
+            # produces a full new string, not an append), so a kill mid-write
+            # truncates it silently.  The next chapter's coder then receives an
+            # incomplete continuity context with no error anywhere.
+            # atomic_write_text (temp-file + os.replace) is the one-line fix.
+            atomic_write_text(self._synopsis_path, new_content)
             logger.info(
                 "SummaryMemory: wrote synopsis section for %s → %s",
                 chapter_file, self._synopsis_path,
