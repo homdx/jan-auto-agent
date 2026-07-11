@@ -327,7 +327,28 @@ class PromptEvaluator:
         base = self._score_from_records(recent)
         n = len(recent)
 
-        json_ok_rate = sum(1 for r in recent if r.improvement_json_ok) / n
+        # BUGFIX: RunRecord.improvement_json_ok's own docstring says
+        # "None = not applicable (show/show_imports); excluded from rate",
+        # and _score_from_records (just above) honors that by excluding
+        # not-applicable records from both the numerator AND denominator.
+        # This line only excluded them from the numerator (`if r.improvement_
+        # json_ok` is falsy for None) but still divided by the full `n` —
+        # the exact same "asymmetric" measurement bug the AUTO-BUG comment
+        # in _shadow_score, below, already documents and fixes for the
+        # shadow-mode path. In projection mode this meant: a batch of
+        # otherwise-healthy runs padded with a few show/show_imports calls
+        # reads as a low json_ok_rate purely from dilution, triggers the
+        # +0.07 "JSON failures are fixable" uplift for no real reason, and
+        # can push a candidate over the 0.05 promotion threshold and into
+        # production based on a counting artifact rather than genuine
+        # prompt quality. Reproduced: 5 records (3 N/A + 2 real successes,
+        # i.e. a real 100% success rate) evaluated as promoted=True purely
+        # from this miscount, when the correct rate gives promoted=False.
+        json_applicable = [r for r in recent if r.improvement_json_ok is not None]
+        json_ok_rate = (
+            sum(1 for r in json_applicable if r.improvement_json_ok) / len(json_applicable)
+            if json_applicable else 0.0
+        )
         approved_rate = sum(1 for r in recent if r.validator_status == "approved") / n
 
         uplift = 0.0
