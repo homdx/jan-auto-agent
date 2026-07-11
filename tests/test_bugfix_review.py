@@ -789,3 +789,56 @@ class TestNewFileCreation:
                                               cluster_files={"support": {"README.md"}})
         mock_call.assert_not_called()
         assert len(accepted) == 1 and accepted[0].title == "Create app.py"
+
+
+# ── novel14: bootstrap библии из seed-глав ────────────────────────────────────
+
+class TestBibleBootstrapFromSeedChapters:
+    def _cos(self, tmp_path, updates):
+        from tools.auto.commit_on_success import CommitOnSuccess
+
+        class _Bible:
+            def __init__(self, path):
+                self._path = path
+
+            def update(self, text):
+                updates.append(text)
+                self._path.write_text(
+                    (self._path.read_text(encoding="utf-8")
+                     if self._path.exists() else "") + "• f\n",
+                    encoding="utf-8")
+
+        cos = CommitOnSuccess.__new__(CommitOnSuccess)
+        cos._story_bible = _Bible(tmp_path / "story_bible.md")
+        cos._base_dir = tmp_path
+        cos._task_mode = "creative"
+        return cos
+
+    def test_seed_chapters_extracted_once_when_bible_empty(self, tmp_path):
+        updates = []
+        (tmp_path / "chapter_1.txt").write_text("Сид: виолончель и смены.",
+                                                encoding="utf-8")
+        (tmp_path / "chapter_2.txt").write_text("Новая глава.", encoding="utf-8")
+        cos = self._cos(tmp_path, updates)
+        cos._update_story_bible({"target_files": ["chapter_2.txt"]})
+        # первым апдейтом — сид, затем новая глава
+        assert updates[0].startswith("Сид") and updates[-1].startswith("Новая")
+        assert len(updates) == 2
+
+    def test_no_bootstrap_when_bible_already_has_content(self, tmp_path):
+        updates = []
+        (tmp_path / "chapter_1.txt").write_text("Сид.", encoding="utf-8")
+        (tmp_path / "chapter_2.txt").write_text("Новая.", encoding="utf-8")
+        cos = self._cos(tmp_path, updates)
+        cos._story_bible._path.write_text("• уже есть\n", encoding="utf-8")
+        cos._update_story_bible({"target_files": ["chapter_2.txt"]})
+        assert len(updates) == 1 and updates[0].startswith("Новая")
+
+    def test_written_and_reserved_files_excluded_from_seeds(self, tmp_path):
+        updates = []
+        (tmp_path / "chapter_2.txt").write_text("Свежезаписанная.",
+                                                encoding="utf-8")
+        cos = self._cos(tmp_path, updates)
+        cos._update_story_bible({"target_files": ["chapter_2.txt"]})
+        # сидов нет — только сама глава, без самозацикливания
+        assert len(updates) == 1

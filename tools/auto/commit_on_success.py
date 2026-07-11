@@ -249,6 +249,42 @@ class CommitOnSuccess:
                 "cannot update bible for %s.", target_files,
             )
             return
+        # novel14 experiment fix: BOOTSTRAP the bible from pre-existing
+        # chapters. The documented Creative.MD workflow starts from a
+        # hand-written chapter_1.txt; it never passes through this hook, so
+        # every fact established ONLY there (инструмент, мамины смены, ...)
+        # never enters the bible — the continuity gate has nothing to defend,
+        # the first generation window without a recent mention confabulates,
+        # and the wrong value self-perpetuates through later chapters. Run
+        # extraction once over the seed chapters before the first update.
+        # (Same class of bug as the creative language pre-gate bootstrap fix.)
+        try:
+            bible_path = getattr(self._story_bible, "_path", None)
+            bible_empty = (bible_path is None
+                           or not bible_path.exists()
+                           or not bible_path.read_text(
+                               encoding="utf-8", errors="replace").strip())
+        except OSError:
+            bible_empty = True
+        if bible_empty:
+            _written = {str(f) for f in target_files}
+            _reserved = {"synopsis.md", "story_bible.md", "IMPROVEMENTS.md"}
+            _seeds = [pf for pf in sorted(base_dir.glob("*.txt"))
+                      if pf.name not in _written and pf.name not in _reserved]
+            for _seed in _seeds[:10]:
+                try:
+                    _seed_text = _seed.read_text(encoding="utf-8",
+                                                 errors="replace")
+                except OSError:
+                    continue
+                if _seed_text.strip():
+                    logger.info(
+                        "CommitOnSuccess: bootstrapping story bible from "
+                        "pre-existing chapter %s (bible was empty).",
+                        _seed.name,
+                    )
+                    self._story_bible.update(_seed_text)
+
         for chapter_file in target_files:
             chapter_path = base_dir / chapter_file
             try:
