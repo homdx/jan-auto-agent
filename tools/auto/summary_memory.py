@@ -466,7 +466,23 @@ class SummaryMemory:
         # a bare verdict word or is implausibly short for a summary, and
         # leave the previous section (if any) untouched instead.
         _stripped = body.strip()
-        if not _stripped or _stripped.upper().rstrip(".:!") in {"APPROVED", "OK", "REVISE"}:
+        _is_bare_verdict = _stripped.upper().rstrip(".:!") in {"APPROVED", "OK", "REVISE"}
+        # BUGFIX (generalizes AUTO-BUG-6): the check above only ever caught
+        # those 3 literal words — but _clean_bullet_list's own no-marker
+        # fallback already refuses to treat a reply as a fact list unless it
+        # has at least 2 non-empty lines (a single line can never plausibly
+        # be "one fact per line"; see its docstring). When `cleaned` is ""
+        # for exactly that reason, `body` silently falls back to the raw
+        # single-line text, so ANY short single-line reply — not just
+        # "APPROVED"/"OK"/"REVISE" — slipped past this guard and got
+        # persisted to synopsis.md as if it were a real multi-fact summary.
+        # Observed in practice: verifier/summarizer error strings like
+        # "Unable to summarize this chapter." or "N/A" writing straight into
+        # continuity memory that later chapters rely on. A single line that
+        # bullet-cleaning couldn't parse can only be a verdict, refusal, or
+        # error string — never a genuine summary — so reject it the same way.
+        _single_line_and_unclean = (not cleaned) and len(_stripped.splitlines()) <= 1
+        if not _stripped or _is_bare_verdict or _single_line_and_unclean:
             logger.warning(
                 "SummaryMemory.update: summary for %s looks invalid (%r) — "
                 "not writing it to synopsis.md (keeping previous content, if any).",
