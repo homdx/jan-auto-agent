@@ -1415,7 +1415,26 @@ class Coder(_llm_stream.LLMClientBase):
                 if "subprocess" in lower:
                     for danger in cls._SUBPROCESS_DANGER_TOKENS:
                         if danger.lower() in lower:
-                            if _preexisting(danger):
+                            # BUGFIX: this used to be `_preexisting(danger)` —
+                            # checking only whether the danger TOKEN string
+                            # appeared anywhere in the old file, with no
+                            # requirement that it co-occurred with
+                            # "subprocess". A file with an entirely unrelated
+                            # mention of the token text (e.g. a comment
+                            # "# warning: never run rm -rf here", or a test
+                            # asserting a shutdown handler works) permanently
+                            # exempted that file from this guard for every
+                            # future edit — a genuinely NEW subprocess+rm-rf
+                            # (or +sudo, +shutdown, ...) combination introduced
+                            # later would be silently grandfathered in.
+                            # Reproduced: an existing file containing only the
+                            # plain-English warning "never run rm -rf on this
+                            # folder" let a brand-new
+                            # `subprocess.call("rm -rf /", shell=True)` through
+                            # as if it were a harmless pre-existing pattern.
+                            # The compound pattern only genuinely pre-exists
+                            # if BOTH halves were already present together.
+                            if _preexisting(danger) and _preexisting("subprocess"):
                                 logger.info(
                                     "coder._check_content_safety: subprocess+%r "
                                     "pre-exists in the target file — edit "

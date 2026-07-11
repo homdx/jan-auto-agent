@@ -915,6 +915,22 @@ def run_auto(
 
     try:
         return controller.run()
+    except RuntimeError as exc:
+        # BUGFIX: StateStore.initialise()'s "plan already holds a different
+        # goal — refusing to silently resume it" guard raises RuntimeError
+        # with a deliberately clear, multi-line, actionable message (existing
+        # goal / new goal / exactly what to do about it). That guard runs
+        # inside controller.run() (state.initialise() is called there, not
+        # in __init__), so it fell into the branch below meant for genuinely
+        # unexpected crashes: logger.exception() dumped a full Python
+        # traceback to the console, then the same message was printed again
+        # under an alarming "Fatal error:" banner. A deliberate, well-
+        # designed safety check ended up looking exactly like an internal
+        # bug in the tool instead of the guard it actually is. Give it the
+        # same clean, traceback-free "Error: ..." treatment as the
+        # constructor's own known-error cases just above.
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
     except Exception as exc:  # pragma: no cover
         logger.exception("Unhandled error in autonomous run: %s", exc)
         print(f"Fatal error: {exc}", file=sys.stderr)
