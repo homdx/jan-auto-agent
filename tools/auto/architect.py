@@ -14,7 +14,7 @@ Public surface consumed by controller.py / the Architect stage:
     # candidates: list[CandidateTask] — pre-filtered, grounded
 
 Each call is traced via agent_trace and uses strip_think so reasoning-model
-<think> blocks are silently discarded before JSON parsing.  The call is
+"think" blocks are silently discarded before JSON parsing.  The call is
 fail-closed: a bad/missing JSON response is logged and produces zero candidates
 for that cluster rather than crashing the run.
 
@@ -379,7 +379,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
         self._num_ctx                = config.getint(f"api_{active_profile}", "num_ctx", fallback=0)
         # AUTO-FIX (fable follow-up): mirrors the gate1_filter.py fix — a
         # thinking model (e.g. qwen3) wraps its JSON task array in
-        # <think>...</think> by default. If that reasoning consumes the
+        # a "think" reasoning block by default. If that reasoning consumes the
         # whole max_tokens budget, strip_think() discards everything and
         # architect produces 0 candidates (observed live: architect call
         # returned a totally empty response after ~5 minutes on qwen3:8b).
@@ -594,6 +594,30 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                             "review_clusters: could not write checkpoint %s: %s",
                             checkpoint_path, exc,
                         )
+
+            # AUTO-BUG fix: batches use a sub-cluster named
+            # "<cluster.name> (batch N/M)" (see `sub = ... RepoCluster(name=...)`
+            # above) so each batch can be checkpointed independently. That
+            # suffixed name must never leak onto CandidateTask.cluster: it is
+            # stored there verbatim by _parse_candidates (called from
+            # _review_one_cluster with `sub.name`/`cluster.name` as seen from
+            # inside that helper), and tools/auto/pipeline.py's cluster_files
+            # lookup — used by Gate 1 to catch hallucinated file citations —
+            # is keyed by the plain, un-suffixed cluster name straight from
+            # repo_ingest. `cluster_files.get(candidate.cluster, set())` then
+            # silently returns an empty set for every candidate from a
+            # batched review, and gate1_filter.py's `if known and loc.file
+            # not in known:` guard — an empty set is falsy — never runs, so
+            # the "catch hallucinated paths before filesystem I/O" safety net
+            # is disabled for every cluster large enough to need more than
+            # one review batch, which in practice is the common case. Apply
+            # this once, after the batch loop, so it repairs candidates from
+            # BOTH the live-LLM branch above (`cluster_candidates.extend(
+            # batch_results)`) AND any restored from an on-disk checkpoint
+            # written before this fix existed (`cluster_candidates.extend(
+            # restored)` on a checkpoint hit) — not just one of the two.
+            for _c in cluster_candidates:
+                _c.cluster = cluster.name
 
             print(f"   → {len(cluster_candidates)} grounded candidate(s)")
 
