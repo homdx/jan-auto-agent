@@ -33,6 +33,27 @@ def _line_start_index(source: str, char_index: int) -> int:
     return 0 if nl < 0 else nl + 1
 
 
+def _effective_match_start(source: str, raw_start: int) -> int:
+    """
+    Several _brace_candidate_patterns entries begin with a "^\\s*"-shaped
+    prefix, and regex "\\s" matches newlines too — so when a definition is
+    preceded by a blank line, `^\\s*` can match starting at that blank
+    line and sweep across it into the signature's real first line, putting
+    match.start() on the blank line rather than on the line the signature
+    is actually visible on. Left uncorrected this shows up two ways: a
+    spurious leading blank line in the text _extract_brace_block returns,
+    and get_context_lines() being off by one line (its "before" window
+    ends up anchored to the blank line instead of the definition itself).
+    Return the start of the line containing the first non-whitespace
+    character at/after raw_start instead.
+    """
+    i = raw_start
+    n = len(source)
+    while i < n and source[i] in " \t\r\n":
+        i += 1
+    return _line_start_index(source, i if i < n else raw_start)
+
+
 def _unique_preserve_order(items: Iterable[str]) -> list[str]:
     return list(dict.fromkeys(item for item in items if item))
 
@@ -176,12 +197,16 @@ def _extract_python_block_fallback(source: str, target_name: str) -> str:
 # Brace-based strategy
 # ----------------------------
 
-def _brace_scan_end(source: str, open_brace_index: int) -> int:
+def _brace_scan_end(source: str, open_brace_index: int, open_ch: str = "{", close_ch: str = "}") -> int:
     """
-    Scan from the opening brace and return the index just after the matching
-    closing brace. Braces inside strings/comments are ignored.
+    Scan from the opening bracket character (open_ch, default "{") and return
+    the index just after its matching close_ch (default "}"). Brackets
+    inside strings/comments are ignored.
 
     This is generic enough for JS/TS/Go/Java/C/C++/Rust-style block syntax.
+    Also reused with open_ch="(", close_ch=")" to skip a balanced argument
+    list (see _find_definition_open_brace) — the string/comment handling is
+    identical either way, only the bracket pair being counted changes.
     """
     n = len(source)
     i = open_brace_index
@@ -245,9 +270,9 @@ def _brace_scan_end(source: str, open_brace_index: int) -> int:
             i += 1
             continue
 
-        if ch == "{":
+        if ch == open_ch:
             depth += 1
-        elif ch == "}":
+        elif ch == close_ch:
             depth -= 1
             if depth == 0:
                 return i + 1
@@ -255,6 +280,129 @@ def _brace_scan_end(source: str, open_brace_index: int) -> int:
         i += 1
 
     return n
+
+
+# A real signature-to-brace gap (return types, throws/generic/implements
+# clauses, annotations) is always far shorter than this. Used to bound the
+# scan in _find_definition_open_brace so a false-positive match (a plain
+# call statement, or a brace-less single-expression arrow function) can't
+# walk arbitrarily far into the file looking for *some* "{" to latch onto.
+_DEFINITION_SCAN_BOUND = 400
+
+
+def _find_definition_open_brace(source: str, scan_from: int, has_arg_list: bool) -> Optional[int]:
+    """
+    Starting at `scan_from` (the position right after a regex match for a
+    candidate definition signature), determine whether this location is a
+    genuine definition with a braced body — as opposed to a plain call/
+    reference statement, or a brace-less single-expression arrow body — and
+    if so, return the index of its opening "{". Returns None otherwise.
+
+    AUTO-BUG (found during review, no prior test caught it precisely — see
+    test_block_extractor_brace_langs.py::test_no_false_positive_on_call_site,
+    which passes today for the wrong reason, asserted below): the "(...)"-
+    shaped patterns in _brace_candidate_patterns match an ordinary function
+    CALL just as easily as a definition — "helper(1, 2);" matches the exact
+    same regex as "function helper(1, 2) {" — and the arrow-function
+    pattern matches a brace-less single-expression body just as easily as a
+    braced one. Both used to fall through to an unbounded "scan for the
+    next { anywhere later in the file" search with no way to tell it apart
+    from a real match, so a call site (or brace-less arrow) appearing
+    BEFORE the real definition would walk straight past the rest of its own
+    enclosing function, across any other, unrelated code, and return
+    whichever "{" happened to come first — silently extracting (and, in
+    auto mode, potentially handing an LLM to edit) the wrong block, or a
+    block that starts at the call site and improperly spans into an
+    unrelated definition. Confirmed with a reproducing case: searching for
+    "helper" in a file that calls `helper(1, 2)` inside main() before
+    helper() is actually defined returned main()'s tail plus an entire
+    unrelated function, and never reached the real helper() body at all.
+
+    Fix: a real definition's "{" always follows its signature within a
+    short span containing only whitespace/comments and, for the paren-form
+    patterns, the balanced argument list plus perhaps a short return-type/
+    throws/generic annotation — never a ";" (a call's statement terminator,
+    or a body-less prototype declaration). So: skip the balanced arg list
+    when there is one, then require the next significant character to be
+    "{" and not ";", within a bounded window.
+    """
+    n = len(source)
+    i = scan_from
+
+    if has_arg_list:
+        # scan_from is right after the arg list's opening "(" (every
+        # pattern that matches a call-like signature ends in "\("): skip to
+        # ITS matching ")" first, so a default value or nested call inside
+        # the arg list can't be mistaken for the end of the signature.
+        close_paren = _brace_scan_end(source, i - 1, "(", ")")
+        if close_paren >= n:
+            return None
+        i = close_paren
+
+    state = "code"
+    escape = False
+    bound = min(n, i + _DEFINITION_SCAN_BOUND)
+
+    while i < bound:
+        ch = source[i]
+        nxt = source[i + 1] if i + 1 < n else ""
+
+        if state == "line_comment":
+            if ch == "\n":
+                state = "code"
+            i += 1
+            continue
+        if state == "block_comment":
+            if ch == "*" and nxt == "/":
+                state = "code"
+                i += 2
+            else:
+                i += 1
+            continue
+        if state in {"single", "double", "backtick", "char"}:
+            if escape:
+                escape = False
+                i += 1
+                continue
+            if ch == "\\":
+                escape = True
+                i += 1
+                continue
+            quote = {"single": "'", "double": '"', "backtick": "`", "char": "'"}[state]
+            if ch == quote:
+                state = "code"
+            i += 1
+            continue
+
+        if ch == "/" and nxt == "/":
+            state = "line_comment"
+            i += 2
+            continue
+        if ch == "/" and nxt == "*":
+            state = "block_comment"
+            i += 2
+            continue
+        if ch == "'":
+            state = "single"
+            i += 1
+            continue
+        if ch == '"':
+            state = "double"
+            i += 1
+            continue
+        if ch == "`":
+            state = "backtick"
+            i += 1
+            continue
+
+        if ch == "{":
+            return i
+        if ch == ";":
+            return None
+
+        i += 1
+
+    return None
 
 
 def _brace_candidate_patterns(target_name: str) -> list[re.Pattern[str]]:
@@ -295,93 +443,62 @@ def _brace_candidate_patterns(target_name: str) -> list[re.Pattern[str]]:
     ]
 
 
-def _extract_brace_block(source: str, target_name: str) -> str:
+def _find_earliest_genuine_definition(source: str, target_name: str) -> Optional[tuple]:
+    """
+    Search every brace-language candidate pattern for `target_name` and
+    return (match_start, open_brace_index, close_brace_end_index) for the
+    EARLIEST genuine definition in the file — i.e. the earliest match for
+    which _find_definition_open_brace actually confirms a "{" follows
+    nearby, discarding call sites and brace-less arrow-function matches
+    along the way. Returns None if no pattern yields a genuine definition
+    anywhere in the source.
+
+    Shared by _extract_brace_block (the block-extraction path) and
+    _find_block_start_line_fallback (get_context_lines' fallback path) so
+    both give the same, correct answer about where a definition really is
+    instead of two separately-maintained search strategies drifting apart
+    — which is exactly how _find_block_start_line_fallback ended up with
+    the same call-site false-positive bug _extract_brace_block had, except
+    worse: it used `pattern.search()` (first match of the first pattern
+    that matches ANYWHERE in the file, tried in a fixed pattern order) with
+    no genuineness check and no "earliest wins" comparison at all, so a
+    call site appearing anywhere could pre-empt patterns later in the list
+    even when they'd have found the real, correctly-ordered definition.
+    """
     patterns = _brace_candidate_patterns(target_name)
     best_start = None
+    best_match_start = None
     best_open_brace = None
 
     for pat in patterns:
         for match in pat.finditer(source):
-            # Search for the first opening brace after the signature begins.
-            scan_from = match.start()
-            open_idx = None
-
-            # Simple char-by-char scan to the first real "{"
-            state = "code"
-            escape = False
-            i = scan_from
-            while i < len(source):
-                ch = source[i]
-                nxt = source[i + 1] if i + 1 < len(source) else ""
-
-                if state == "line_comment":
-                    if ch == "\n":
-                        state = "code"
-                    i += 1
-                    continue
-                if state == "block_comment":
-                    if ch == "*" and nxt == "/":
-                        state = "code"
-                        i += 2
-                    else:
-                        i += 1
-                    continue
-                if state in {"single", "double", "backtick", "char"}:
-                    if escape:
-                        escape = False
-                        i += 1
-                        continue
-                    if ch == "\\":
-                        escape = True
-                        i += 1
-                        continue
-                    quote = {"single": "'", "double": '"', "backtick": "`", "char": "'"}[state]
-                    if ch == quote:
-                        state = "code"
-                    i += 1
-                    continue
-
-                # code
-                if ch == "/" and nxt == "/":
-                    state = "line_comment"
-                    i += 2
-                    continue
-                if ch == "/" and nxt == "*":
-                    state = "block_comment"
-                    i += 2
-                    continue
-                if ch == "'":
-                    state = "single"
-                    i += 1
-                    continue
-                if ch == '"':
-                    state = "double"
-                    i += 1
-                    continue
-                if ch == "`":
-                    state = "backtick"
-                    i += 1
-                    continue
-                if ch == "{":
-                    open_idx = i
-                    break
-
-                i += 1
-
+            has_arg_list = match.group(0).rstrip().endswith("(")
+            open_idx = _find_definition_open_brace(source, match.end(), has_arg_list)
             if open_idx is None:
                 continue
 
-            start = _line_start_index(source, match.start())
-            end = _brace_scan_end(source, open_idx)
+            effective_start = _effective_match_start(source, match.start())
+            start = _line_start_index(source, effective_start)
             if best_start is None or start < best_start:
                 best_start = start
-                best_open_brace = (open_idx, end)
+                best_match_start = effective_start
+                best_open_brace = open_idx
 
-    if best_start is None or best_open_brace is None:
+    if best_start is None:
+        return None
+
+    end = _brace_scan_end(source, best_open_brace)
+    return (best_match_start, best_open_brace, end)
+
+
+def _extract_brace_block(source: str, target_name: str) -> str:
+    found = _find_earliest_genuine_definition(source, target_name)
+    if found is None:
         return ""
 
-    _, end = best_open_brace
-    return source[best_start:end]
+    match_start, open_idx, end = found
+    start = _line_start_index(source, match_start)
+    return source[start:end]
 
 
 # Prose strategy (.md/.txt, AUTO-CR-6) locates "block named X" via heading
@@ -796,9 +913,21 @@ def _find_block_start_line_fallback(source: str, target_name: str, file_ext: str
                 return j
         return None
 
-    patterns = _brace_candidate_patterns(target_name)
-    for pat in patterns:
-        m = pat.search(source)
-        if m:
-            return source.count("\n", 0, m.start()) + 1
-    return None
+    # AUTO-BUG: this used to be `for pat in patterns: m = pat.search(source);
+    # if m: return ...` — the first pattern (in a fixed list order) that
+    # matched ANYWHERE in the file, with no check that a "{" genuinely
+    # follows and no comparison across patterns for which match is actually
+    # earliest/real. A plain call to `target_name(...)` matches the same
+    # "(...)"-shaped patterns a real definition does (see
+    # _find_definition_open_brace's docstring), so a call site appearing
+    # before, after, or instead of the real definition could pre-empt it —
+    # get_context_lines() would then return the lines before the WRONG
+    # location (e.g. before a call site instead of before the actual
+    # definition), silently feeding an LLM misleading "what comes before
+    # this function" context. Reuse the same verified search
+    # _extract_brace_block uses so both agree on where the definition is.
+    found = _find_earliest_genuine_definition(source, target_name)
+    if found is None:
+        return None
+    match_start, _open_idx, _end = found
+    return source.count("\n", 0, match_start) + 1
