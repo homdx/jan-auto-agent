@@ -379,6 +379,25 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                 return False, f"new_file path escapes base_dir: {loc.file!r}", ""
             if candidate_path.is_dir():
                 return False, f"new_file path is an existing directory: {loc.file!r}", ""
+            # BUGFIX: new_file's entire premise is "this path does not exist
+            # yet and this task creates it" — that's *why* the checks below
+            # (which exist to catch citations of content that was never
+            # real) are skipped, and why Stage B is handed an empty block
+            # instead of the file's actual content. If the architect (or a
+            # confused/hallucinating model) marks new_file=true for a path
+            # that already exists as a regular file, none of that logic
+            # holds: the coder would still just overwrite target_files
+            # normally, but now with zero visibility into what's already
+            # there — silently clobbering real content instead of raising a
+            # legitimate "already exists" existence failure the way an
+            # ordinary (non-new_file) citation of that same path would.
+            if candidate_path.is_file():
+                return (
+                    False,
+                    f"new_file={loc.file!r} but this path already exists — "
+                    f"not a new file; drop new_file or cite the real content",
+                    "",
+                )
             return (
                 True,
                 f"new file (not yet created): {loc.file!r} — existence check skipped",

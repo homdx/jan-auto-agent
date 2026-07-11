@@ -441,6 +441,166 @@ class TestTicketStorePathSanitization:
 
 # ── selfhost pilot: tests-mandate gate ────────────────────────────────────────
 
+class TestCoderTargetFilesDotfileCollision:
+    """Coder._write_files' target_files allow-list guard must not let a
+    disallowed dotfile slip through by colliding, after normalisation, with
+    an allowed non-dotfile name (or vice versa)."""
+
+    def _coder(self):
+        import configparser
+        from tools.auto.coder import Coder
+        cfg = configparser.ConfigParser()
+        cfg.read_dict({
+            "api":       {"active": "local", "verify_ssl": "true"},
+            "api_local": {"base_url": "http://localhost:9999", "model": "x", "api_key": ""},
+            "coder":     {"temperature": "0.2", "max_tokens": "1024"},
+            "loop":      {"timeout_seconds": "60"},
+        })
+        return Coder(cfg, "http://localhost:9999", "", "x")
+
+    def test_dotfile_not_authorised_is_rejected(self, tmp_path):
+        coder = self._coder()
+        allowed = frozenset({"notes.md"})
+        written, _ = coder._write_files(
+            [{"path": ".notes.md", "content": "sneaky"}],
+            tmp_path, "T1", allowed_paths=allowed,
+        )
+        assert written == [], (
+            ".notes.md must NOT be treated as the same target as the "
+            "approved notes.md — the allow-list guard must not collapse "
+            "distinct filenames that merely share a suffix after a leading "
+            "dot/slash is stripped"
+        )
+        assert not (tmp_path / ".notes.md").exists()
+
+    def test_leading_dot_slash_is_still_normalised(self, tmp_path):
+        """A genuine "./" prefix (not a bare leading dot) must still be
+        stripped so the intended normalisation keeps working."""
+        coder = self._coder()
+        allowed = frozenset({"notes.md"})
+        written, _ = coder._write_files(
+            [{"path": "./notes.md", "content": "hello"}],
+            tmp_path, "T1", allowed_paths=allowed,
+        )
+        assert written == ["./notes.md"]
+        assert (tmp_path / "notes.md").read_text(encoding="utf-8") == "hello"
+
+
+class TestCanonValidatorPreservesNumbers:
+    """CanonValidator._extract_claims must not eat a claim's own leading
+    digits (ages, years, counts) while stripping list-marker prefixes."""
+
+    def _extractor(self, llm_reply):
+        from tools.auto.canon_validator import CanonValidator
+        cv = CanonValidator.__new__(CanonValidator)
+        cv._llm = lambda system, user: llm_reply
+        return cv
+
+    def test_leading_number_in_claim_is_preserved(self):
+        cv = self._extractor("3.5 million people lived there")
+        claims = cv._extract_claims("chapter text")
+        assert claims == ["3.5 million people lived there"]
+
+    def test_numbered_marker_is_still_stripped(self):
+        cv = self._extractor("1. She was born in 1990")
+        claims = cv._extract_claims("chapter text")
+        assert claims == ["She was born in 1990"]
+
+    def test_bulleted_marker_is_still_stripped(self):
+        cv = self._extractor("- Anna is 42 years old")
+        claims = cv._extract_claims("chapter text")
+        assert claims == ["Anna is 42 years old"]
+
+
+class TestStoryBibleAtomicWrites:
+    """StoryBible must persist the bible file and pending-corrections state
+    via atomic_write_text, not a plain (truncate-then-write) write_text."""
+
+    def test_write_uses_atomic_write_text(self, tmp_path, monkeypatch):
+        import tools.auto.story_bible as story_bible_mod
+
+        calls = []
+        original = story_bible_mod.atomic_write_text
+
+        def spy(path, content):
+            calls.append(path)
+            return original(path, content)
+
+        monkeypatch.setattr(story_bible_mod, "atomic_write_text", spy)
+
+        sb = story_bible_mod.StoryBible.__new__(story_bible_mod.StoryBible)
+        sb._path = tmp_path / "story_bible.md"
+        sb._write("• some fact")
+
+        assert calls, "StoryBible._write must go through atomic_write_text"
+        assert sb._path.read_text(encoding="utf-8") == "• some fact"
+
+    def test_no_plain_write_text_on_bible_path(self, tmp_path, monkeypatch):
+        """A crash mid-write (simulated by making write_text raise) must not
+        leave a corrupted file — plain write_text offers no such guarantee,
+        atomic_write_text (temp file + os.replace) does."""
+        import tools.auto.story_bible as story_bible_mod
+        from pathlib import Path
+
+        target = tmp_path / "story_bible.md"
+        target.write_text("ORIGINAL", encoding="utf-8")
+
+        def boom(self, *a, **k):
+            raise OSError("disk full mid-write")
+
+        monkeypatch.setattr(Path, "write_text", boom)
+
+        sb = story_bible_mod.StoryBible.__new__(story_bible_mod.StoryBible)
+        sb._path = target
+        sb._write("NEW CONTENT")
+
+        # atomic_write_text uses fdopen/os.replace, not Path.write_text, so
+        # the patched write_text should never even be called — content must
+        # have been fully replaced, not truncated or left stale.
+        assert target.read_text(encoding="utf-8") == "NEW CONTENT"
+
+class TestSearchAgentEmptyLLMResponseFailsOpen:
+    """SearchAgent._evaluate_with_llm's documented contract is fail-open on
+    ANY filter failure. An empty JSON list ("[]") is syntactically valid so
+    it must not silently reject every reference."""
+
+    def test_empty_list_triggers_fail_open(self):
+        from unittest.mock import patch
+        from tools.search_agent import SearchAgent
+
+        agent = SearchAgent(
+            model="test-model", base_url="http://fake-host", api_key="x", timeout=5,
+        )
+        found_refs = {
+            "ref1": {"code": "def ref1(): pass"},
+            "ref2": {"code": "def ref2(): pass"},
+        }
+        with patch("tools.search_agent._request_completion", return_value="[]"):
+            result = agent._evaluate_with_llm(found_refs)
+
+        assert result == ["ref1", "ref2"], (
+            "an empty LLM verdict must fail-open (approve all), not silently "
+            "reject every reference"
+        )
+
+    def test_nonempty_list_still_filters_normally(self):
+        from unittest.mock import patch
+        from tools.search_agent import SearchAgent
+
+        agent = SearchAgent(
+            model="test-model", base_url="http://fake-host", api_key="x", timeout=5,
+        )
+        found_refs = {
+            "ref1": {"code": "real dependency"},
+            "ref2": {"code": "stdlib wrapper"},
+            "ref3": {"code": "another real dep"},
+        }
+        with patch("tools.search_agent._request_completion", return_value='["ref1", "ref3"]'):
+            result = agent._evaluate_with_llm(found_refs)
+
+        assert result == ["ref1", "ref3"]
+
+
 class TestTestsMandateGate:
     class _Coder:
         def __init__(self, base, drafts):
@@ -761,15 +921,23 @@ class TestNewFileCreation:
         assert not ok
         assert "directory" in reason
 
-    def test_existing_file_still_uses_normal_symbol_lookup(self, tmp_path):
-        # new_file=True on a file that DOES exist must not read disk
-        # content - the new_file branch returns early by design.
+    def test_new_file_rejected_when_path_already_exists(self, tmp_path):
+        # BUGFIX: new_file=True used to return early — "existence check
+        # skipped" — for ANY path, including one that already exists as a
+        # real file with real content. That handed the coder a target file
+        # to overwrite with zero visibility into what was already there
+        # (block was always ""), silently clobbering it. new_file's whole
+        # premise is "this path does not exist yet"; if it does exist,
+        # that premise is false and the candidate must be rejected, not
+        # waved through.
         (tmp_path / "app.py").write_text("def hello():\n    return 'hi'\n")
         gate = _gate1()
         cand = _candidate(new_file=True, file="app.py")
         ok, reason, block = gate._check_existence(cand, tmp_path, cluster_files=None)
-        assert ok
-        assert block == ""  # new_file path never reads file content
+        assert not ok
+        assert "already exists" in reason
+        # And the file itself must be left completely untouched by the check.
+        assert (tmp_path / "app.py").read_text(encoding="utf-8") == "def hello():\n    return 'hi'\n"
 
     def test_checkpoint_roundtrip_preserves_new_file(self):
         from tools.auto.architect import _serialise_candidates, _deserialise_candidates
