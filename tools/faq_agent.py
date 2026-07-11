@@ -718,11 +718,24 @@ class FaqAgent:
 
         used = 0
         skipped: list[str] = []
-        for name, content in docs:
+        for i, (name, content) in enumerate(docs):
             block = f"=== {name} ===\n{content.strip()}"
             if budget_chars and used + len(block) > budget_chars and parts:
-                skipped.append(name)
-                continue
+                # BUGFIX: this used to be `skipped.append(name); continue`,
+                # which only skips THIS doc and keeps probing later ones in
+                # the ranked list. Since docs are passed in relevance order,
+                # that let a lower-ranked-but-small doc later in the list
+                # get included while a higher-ranked-but-large one right
+                # here gets dropped — e.g. [small#2, LARGE#1, small#3] could
+                # end up keeping #2 and #3 while dropping #1, the single
+                # most relevant document, purely because of its size and
+                # position. That breaks this function's own promise above
+                # ("the tail we drop is the least relevant part"): the
+                # dropped set is only guaranteed to be a relevance-ordered
+                # tail if we stop here entirely, so every kept doc remains
+                # provably more relevant than every dropped one.
+                skipped.extend(n for n, _ in docs[i:])
+                break
             parts.append(block)
             used += len(block) + 2
         if skipped:
