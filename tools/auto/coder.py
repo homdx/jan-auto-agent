@@ -1407,6 +1407,23 @@ class Coder(_llm_stream.LLMClientBase):
         def _preexisting(token: str) -> bool:
             return bool(_existing_lower) and token.lower() in _existing_lower
 
+        def _strip_py_line_comment(line: str) -> str:
+            """Strip everything from the first unquoted # to end of line.
+            Prevents comment text (e.g. the explanation comment inside this
+            very method) from triggering the same-line co-occurrence check
+            in _preexisting_combo — a comment about a dangerous pattern is
+            not the same as real code that uses it.
+            """
+            in_single = in_double = False
+            for i, ch in enumerate(line):
+                if ch == "'" and not in_double:
+                    in_single = not in_single
+                elif ch == '"' and not in_single:
+                    in_double = not in_double
+                elif ch == '#' and not in_single and not in_double:
+                    return line[:i]
+            return line
+
         def _preexisting_combo(token_a: str, token_b: str) -> bool:
             """True if *token_a* and *token_b* already co-occur on the same
             line somewhere in the old file — not just each independently
@@ -1427,7 +1444,10 @@ class Coder(_llm_stream.LLMClientBase):
             separate mentions almost never share a line by chance.
             """
             token_a, token_b = token_a.lower(), token_b.lower()
-            return any(token_a in ln and token_b in ln for ln in _existing_lines)
+            return any(
+                token_a in code and token_b in code
+                for code in (_strip_py_line_comment(ln) for ln in _existing_lines)
+            )
 
         for label, pattern in active_patterns:
             pat_lower = pattern.lower()
