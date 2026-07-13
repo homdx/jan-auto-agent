@@ -367,7 +367,7 @@ class AutoController:
         self.run_trace.log_run_start(self.goal, self.base_dir)
 
         # AUTO-F1: Setup progress display
-        self.progress_display = make_progress_display(self.state, cfg)
+        self.progress_display = make_progress_display(self.state, cfg, task_mode=self.task_mode)
         self.progress_display.code_total = len(self.state.all_tasks())
 
         # AUTO-E1/E2: Setup metrics stream and auto tuner
