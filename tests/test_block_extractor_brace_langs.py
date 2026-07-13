@@ -62,6 +62,41 @@ def test_java_method_with_generic_return_type():
     assert _found("names")
 
 
+# BUGFIX: the return-type generics group used to be a single, non-nesting
+# `<[^>{}]*>` — `[^>]*` stops at the FIRST `>`, so a NESTED generic return
+# type like `Map<String, List<Integer>>` (extremely common in real Java —
+# any Map/Optional/List of a parameterized type) only consumed up through
+# the INNER closing `>`, left the outer `>` unconsumed right before the
+# required whitespace, and the whole pattern failed to match. Every other
+# candidate pattern requires the method name to be the first token on the
+# line, which it isn't when a return type precedes it — so the method was
+# unfindable by ANY pattern, not just this one.
+JAVA_NESTED_GENERICS = """\
+public class DataService {
+
+    public Map<String, List<Integer>> getData() {
+        return new HashMap<>();
+    }
+
+    public Optional<Map<String, List<Long>>> deep() {
+        return Optional.empty();
+    }
+}
+"""
+
+
+def test_java_method_with_nested_generic_return_type():
+    blk = extract_block(JAVA_NESTED_GENERICS, "getData", ".java")
+    assert "public Map<String, List<Integer>> getData()" in blk
+    assert "new HashMap<>()" in blk
+
+
+def test_java_method_with_doubly_nested_generic_return_type():
+    blk = extract_block(JAVA_NESTED_GENERICS, "deep", ".java")
+    assert "public Optional<Map<String, List<Long>>> deep()" in blk
+    assert "Optional.empty()" in blk
+
+
 def test_java_constructor():
     assert _found("App")  # class declaration or constructor — either is fine
 

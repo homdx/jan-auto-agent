@@ -423,13 +423,30 @@ def _brace_candidate_patterns(target_name: str) -> list[re.Pattern[str]]:
         #   public String foo(    static int foo(    void foo(    List<X> foo(    int[] foo(
         # Allows optional annotations + modifiers, then a return-type token
         # (identifier with optional generics / array / dotted name), then `foo(`.
+        #
+        # BUGFIX: the generics group used to be a single, non-nesting
+        # `<[^>{}]*>` — fine for `List<X>`, but `[^>]*` stops at the FIRST
+        # `>` it meets, so a NESTED generic return type like
+        # `Map<String, List<Integer>>` (extremely common in real Java —
+        # any Map/Optional/List of a parameterized type) only consumed up
+        # through the INNER closing `>`, left the outer `>` unconsumed
+        # right before the required `\s+`, and the whole pattern failed to
+        # match — meaning `extract_block` couldn't find the method AT ALL
+        # (every other candidate pattern requires the method name to be
+        # the first token on the line, which it isn't when a return type
+        # precedes it). Reproduced: `Map<String, List<Integer>> getData()`
+        # returned "" from extract_block. Two explicit levels of nesting
+        # (a `<...>` whose contents may contain a `<...>` pair that may
+        # itself contain another `<...>` pair — e.g.
+        # Optional<Map<K, List<V>>>) covers the realistic depth ceiling
+        # for a method signature without needing a recursive regex engine.
         re.compile(
             rf"(?m)^\s*"
             rf"(?:@[\w.]+(?:\([^)]*\))?\s*)*"
             rf"(?:(?:public|private|protected|static|final|abstract|synchronized|"
             rf"native|default|transient|volatile|strictfp|export|async|inline|"
             rf"virtual|const|extern|unsafe|suspend|open|override|fun|fn|pub)\s+)*"
-            rf"[A-Za-z_$][\w$.]*(?:<[^>{{}}]*>)?(?:\[\s*\])*\s+"
+            rf"[A-Za-z_$][\w$.]*(?:<(?:[^<>]|<(?:[^<>]|<[^<>]*>)*>)*>)?(?:\[\s*\])*\s+"
             rf"{name}\s*\("
         ),
         # class X { foo(...) { ... } }
