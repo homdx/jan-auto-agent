@@ -1402,9 +1402,32 @@ class Coder(_llm_stream.LLMClientBase):
         # scanner still stops a model from smuggling deletions into clean
         # files. New files (existing_content is None) get no grandfathering.
         _existing_lower = (existing_content or "").lower()
+        _existing_lines = _existing_lower.splitlines()
 
         def _preexisting(token: str) -> bool:
             return bool(_existing_lower) and token.lower() in _existing_lower
+
+        def _preexisting_combo(token_a: str, token_b: str) -> bool:
+            """True if *token_a* and *token_b* already co-occur on the same
+            line somewhere in the old file — not just each independently
+            appearing anywhere in it.
+
+            AUTO-BUG (follow-up): `_preexisting(danger) and
+            _preexisting("subprocess")` still passes for a file where the
+            two tokens never actually appeared together — e.g. `import
+            subprocess  # for git commands` on one line and a plain-English
+            `# never run rm -rf here` warning on another, unrelated line.
+            Neither mention is dangerous on its own, but together they were
+            enough to grandfather in a brand-new, genuinely dangerous
+            subprocess+rm-rf call introduced by this edit. Requiring
+            same-line co-occurrence is a reasonable, cheap proxy for "this
+            was already a real combined usage" without needing a full
+            parser: actual dangerous calls are written on one line
+            (`subprocess.run(["rm", "-rf", path])`), while incidental
+            separate mentions almost never share a line by chance.
+            """
+            token_a, token_b = token_a.lower(), token_b.lower()
+            return any(token_a in ln and token_b in ln for ln in _existing_lines)
 
         for label, pattern in active_patterns:
             pat_lower = pattern.lower()
@@ -1433,8 +1456,11 @@ class Coder(_llm_stream.LLMClientBase):
                             # `subprocess.call("rm -rf /", shell=True)` through
                             # as if it were a harmless pre-existing pattern.
                             # The compound pattern only genuinely pre-exists
-                            # if BOTH halves were already present together.
-                            if _preexisting(danger) and _preexisting("subprocess"):
+                            # if BOTH halves were already present together —
+                            # checked here by same-line co-occurrence, not
+                            # just each token independently appearing
+                            # somewhere in the file (see _preexisting_combo).
+                            if _preexisting_combo("subprocess", danger):
                                 logger.info(
                                     "coder._check_content_safety: subprocess+%r "
                                     "pre-exists in the target file — edit "

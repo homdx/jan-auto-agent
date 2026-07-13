@@ -381,6 +381,20 @@ class CanonValidator:
         in ascending order (canon = what came before).
         """
         idx = CanonValidator.chapter_index(chapter_file)
+        if idx is None:
+            # BUGFIX: this used to fall through to `idx is None or cidx < idx`
+            # below, which is trivially True for every file regardless of
+            # cidx — so a legitimately non-numeric filename (prologue.md,
+            # epilogue.md, notes.md; all common in creative-writing projects)
+            # got EVERY numbered chapter back as "earlier canon", including
+            # ones written much later in the story. Reproduced: checking
+            # "prologue.md" against chapter_01/02/10.md returned chapter_10
+            # (the twist ending) as established earlier canon — the exact
+            # inverse of this function's own contract, "canon = what came
+            # before". Without a reliable index for the current file, there's
+            # no safe way to know which chapters actually came before it, so
+            # return nothing rather than something actively backwards.
+            return []
         out: list[tuple[int, str]] = []
         for p in base_dir.glob("*"):
             if p.suffix.lower() not in (".md", ".txt"):
@@ -388,7 +402,7 @@ class CanonValidator:
             cidx = CanonValidator.chapter_index(p.name)
             if cidx is None:
                 continue
-            if idx is None or cidx < idx:
+            if cidx < idx:
                 out.append((cidx, p.name))
         out.sort()
         return [name for _, name in out]

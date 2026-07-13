@@ -205,11 +205,24 @@ class PlanEmitter:
     # ── Private ───────────────────────────────────────────────────────────────
 
     def _save_cluster_hashes(self, clusters: "list[RepoCluster]") -> None:
-        """Persist current cluster fingerprints to .agent/cluster_hashes.json."""
+        """Persist current cluster fingerprints to .agent/cluster_hashes.json.
+
+        BUGFIX: was a plain ``self._hashes_path.write_text(...)``. A crash
+        mid-write here doesn't corrupt anything unsafely -- _load_cluster_
+        hashes() already catches JSONDecodeError and falls back to `{}` --
+        but that fallback means changed_clusters() then reports EVERY
+        cluster as stale, silently discarding this whole module's reason
+        for existing (this module's own docstring: "re-run cheapness ...
+        if only one cluster changed, one LLM call is made instead of
+        four"). Use the same atomic write (temp file + os.replace) already
+        applied to plan.json/progress.json (state.py) and synopsis.md/
+        story_bible.md (summary_memory.py) for the identical reason.
+        """
+        from tools.auto.utils import atomic_write_text
         hashes = {c.name: _cluster_hash(c, self._base_dir) for c in clusters}
-        self._hashes_path.write_text(
+        atomic_write_text(
+            self._hashes_path,
             json.dumps(hashes, indent=2, ensure_ascii=False),
-            encoding="utf-8",
         )
         logger.debug("_save_cluster_hashes: wrote %d entry/entries", len(hashes))
 

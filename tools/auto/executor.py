@@ -514,7 +514,21 @@ class Executor:
             if part.startswith("-"):
                 continue  # flag — skip
             if "/" in part or "\\" in part:
-                return command  # already has a path component — nothing to do
+                # BUGFIX: this used to be `return command` — aborting the
+                # ENTIRE scan the moment ANY earlier non-flag token happened
+                # to already be path-qualified, even when that token has
+                # nothing to do with the rewrite and a genuine bare-filename
+                # match exists later in the command. E.g.
+                # "python tests/run_report.py generateAllureReport.sh" would
+                # never rewrite generateAllureReport.sh, because the
+                # already-qualified "tests/run_report.py" token came first —
+                # reproducing the exact "file not found" failure this
+                # function exists to prevent (see its own docstring
+                # example). This token just isn't a rewrite candidate;
+                # treat it the same as the "zero/multiple matches" case
+                # below and keep scanning, rather than as a hard stop like
+                # a genuine shell operator.
+                continue  # already path-qualified — not a candidate, keep scanning
             if part in _SHELL_OPS:
                 return command  # compound command — stop scanning; no safe rewrite
             # `part` is a bare argument token.  Check whether its basename

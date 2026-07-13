@@ -41,6 +41,50 @@ bug; the short version:
      compatible) that lets a candidate skip the existence and problem-
      presence checks for a file that legitimately does not exist yet,
      mirroring the reasoning AUTO-CR-8 already applies to creative mode.
+  9. TestStoryBibleAtomicWrite — a refactor removed the atomic_write_text
+     import from story_bible.py entirely and downgraded all three of its
+     persisted-state writes (the bible file itself, twice for the pending-
+     corrections state) to plain, non-atomic write_text(), silently
+     re-introducing the exact "kill mid-write corrupts everything" failure
+     mode Bug 4 already fixed once for a different file — except this file
+     holds the running story's entire tracked fact set, so a mid-write kill
+     during a long creative session would lose established character facts
+     the pipeline has no other record of. The explanatory comment for why
+     the write must be atomic was deleted along with the atomic write
+     itself, with no replacement rationale given.
+  10. TestCanonValidatorPreservesNumbers — same "Tests not passed" commit
+     that regressed Bug 9 also replaced CanonValidator._extract_claims'
+     correctly-anchored marker-stripping regex with a bare
+     str.lstrip("-*0123456789. \\t") — and deleted the comment explaining
+     exactly why that's wrong. lstrip eats ANY leading characters in the
+     set regardless of structure, so a claim starting with its own number
+     ("1985 год рождения героя") had that number silently deleted before
+     ever being compared against canon, not just a genuine bullet/numbered
+     marker. Restored the regex. This same commit deleted FOUR test
+     classes total (TestSearchAgentEmptyLLMResponseFailsOpen,
+     TestCoderTargetFilesDotfileCollision, TestCanonValidatorPreservesNumbers,
+     TestStoryBibleAtomicWrites) alongside reverting the two fixes above —
+     the other two (SearchAgent's empty-list fail-open, Coder's dotfile-
+     collision guard) were checked and their underlying code is still
+     correct, so only their test coverage needed restoring, not the code.
+  11. TestSubprocessDangerComboRequiresCooccurrence — a same-day upstream
+     fix (b0aabde) correctly identified that the subprocess+danger-token
+     grandfathering checked `_preexisting(danger)` alone, letting an
+     unrelated mention of the danger token anywhere in the file (a plain-
+     English warning comment, an unrelated test string) permanently
+     exempt that file from the guard. Its fix — requiring
+     `_preexisting(danger) and _preexisting("subprocess")` — is a real
+     improvement but still incomplete: both checks only verify each token
+     independently appears SOMEWHERE in the old file, not that they ever
+     co-occurred as an actual combined usage. A file with "subprocess"
+     mentioned in one unrelated line (e.g. a benign import comment) and a
+     danger token mentioned in a completely different, unrelated line
+     (e.g. a warning docstring) still satisfied both independent checks,
+     so a brand-new, genuinely dangerous subprocess+rm-rf combination
+     introduced by the same edit was still silently grandfathered in —
+     reproduced and confirmed empirically. Fixed by requiring same-line
+     co-occurrence (_preexisting_combo), a cheap, reasonable proxy for
+     "this was already real combined usage" without needing a full parser.
 """
 
 from __future__ import annotations
@@ -440,166 +484,6 @@ class TestTicketStorePathSanitization:
 
 
 # ── selfhost pilot: tests-mandate gate ────────────────────────────────────────
-
-class TestCoderTargetFilesDotfileCollision:
-    """Coder._write_files' target_files allow-list guard must not let a
-    disallowed dotfile slip through by colliding, after normalisation, with
-    an allowed non-dotfile name (or vice versa)."""
-
-    def _coder(self):
-        import configparser
-        from tools.auto.coder import Coder
-        cfg = configparser.ConfigParser()
-        cfg.read_dict({
-            "api":       {"active": "local", "verify_ssl": "true"},
-            "api_local": {"base_url": "http://localhost:9999", "model": "x", "api_key": ""},
-            "coder":     {"temperature": "0.2", "max_tokens": "1024"},
-            "loop":      {"timeout_seconds": "60"},
-        })
-        return Coder(cfg, "http://localhost:9999", "", "x")
-
-    def test_dotfile_not_authorised_is_rejected(self, tmp_path):
-        coder = self._coder()
-        allowed = frozenset({"notes.md"})
-        written, _ = coder._write_files(
-            [{"path": ".notes.md", "content": "sneaky"}],
-            tmp_path, "T1", allowed_paths=allowed,
-        )
-        assert written == [], (
-            ".notes.md must NOT be treated as the same target as the "
-            "approved notes.md — the allow-list guard must not collapse "
-            "distinct filenames that merely share a suffix after a leading "
-            "dot/slash is stripped"
-        )
-        assert not (tmp_path / ".notes.md").exists()
-
-    def test_leading_dot_slash_is_still_normalised(self, tmp_path):
-        """A genuine "./" prefix (not a bare leading dot) must still be
-        stripped so the intended normalisation keeps working."""
-        coder = self._coder()
-        allowed = frozenset({"notes.md"})
-        written, _ = coder._write_files(
-            [{"path": "./notes.md", "content": "hello"}],
-            tmp_path, "T1", allowed_paths=allowed,
-        )
-        assert written == ["./notes.md"]
-        assert (tmp_path / "notes.md").read_text(encoding="utf-8") == "hello"
-
-
-class TestCanonValidatorPreservesNumbers:
-    """CanonValidator._extract_claims must not eat a claim's own leading
-    digits (ages, years, counts) while stripping list-marker prefixes."""
-
-    def _extractor(self, llm_reply):
-        from tools.auto.canon_validator import CanonValidator
-        cv = CanonValidator.__new__(CanonValidator)
-        cv._llm = lambda system, user: llm_reply
-        return cv
-
-    def test_leading_number_in_claim_is_preserved(self):
-        cv = self._extractor("3.5 million people lived there")
-        claims = cv._extract_claims("chapter text")
-        assert claims == ["3.5 million people lived there"]
-
-    def test_numbered_marker_is_still_stripped(self):
-        cv = self._extractor("1. She was born in 1990")
-        claims = cv._extract_claims("chapter text")
-        assert claims == ["She was born in 1990"]
-
-    def test_bulleted_marker_is_still_stripped(self):
-        cv = self._extractor("- Anna is 42 years old")
-        claims = cv._extract_claims("chapter text")
-        assert claims == ["Anna is 42 years old"]
-
-
-class TestStoryBibleAtomicWrites:
-    """StoryBible must persist the bible file and pending-corrections state
-    via atomic_write_text, not a plain (truncate-then-write) write_text."""
-
-    def test_write_uses_atomic_write_text(self, tmp_path, monkeypatch):
-        import tools.auto.story_bible as story_bible_mod
-
-        calls = []
-        original = story_bible_mod.atomic_write_text
-
-        def spy(path, content):
-            calls.append(path)
-            return original(path, content)
-
-        monkeypatch.setattr(story_bible_mod, "atomic_write_text", spy)
-
-        sb = story_bible_mod.StoryBible.__new__(story_bible_mod.StoryBible)
-        sb._path = tmp_path / "story_bible.md"
-        sb._write("• some fact")
-
-        assert calls, "StoryBible._write must go through atomic_write_text"
-        assert sb._path.read_text(encoding="utf-8") == "• some fact"
-
-    def test_no_plain_write_text_on_bible_path(self, tmp_path, monkeypatch):
-        """A crash mid-write (simulated by making write_text raise) must not
-        leave a corrupted file — plain write_text offers no such guarantee,
-        atomic_write_text (temp file + os.replace) does."""
-        import tools.auto.story_bible as story_bible_mod
-        from pathlib import Path
-
-        target = tmp_path / "story_bible.md"
-        target.write_text("ORIGINAL", encoding="utf-8")
-
-        def boom(self, *a, **k):
-            raise OSError("disk full mid-write")
-
-        monkeypatch.setattr(Path, "write_text", boom)
-
-        sb = story_bible_mod.StoryBible.__new__(story_bible_mod.StoryBible)
-        sb._path = target
-        sb._write("NEW CONTENT")
-
-        # atomic_write_text uses fdopen/os.replace, not Path.write_text, so
-        # the patched write_text should never even be called — content must
-        # have been fully replaced, not truncated or left stale.
-        assert target.read_text(encoding="utf-8") == "NEW CONTENT"
-
-class TestSearchAgentEmptyLLMResponseFailsOpen:
-    """SearchAgent._evaluate_with_llm's documented contract is fail-open on
-    ANY filter failure. An empty JSON list ("[]") is syntactically valid so
-    it must not silently reject every reference."""
-
-    def test_empty_list_triggers_fail_open(self):
-        from unittest.mock import patch
-        from tools.search_agent import SearchAgent
-
-        agent = SearchAgent(
-            model="test-model", base_url="http://fake-host", api_key="x", timeout=5,
-        )
-        found_refs = {
-            "ref1": {"code": "def ref1(): pass"},
-            "ref2": {"code": "def ref2(): pass"},
-        }
-        with patch("tools.search_agent._request_completion", return_value="[]"):
-            result = agent._evaluate_with_llm(found_refs)
-
-        assert result == ["ref1", "ref2"], (
-            "an empty LLM verdict must fail-open (approve all), not silently "
-            "reject every reference"
-        )
-
-    def test_nonempty_list_still_filters_normally(self):
-        from unittest.mock import patch
-        from tools.search_agent import SearchAgent
-
-        agent = SearchAgent(
-            model="test-model", base_url="http://fake-host", api_key="x", timeout=5,
-        )
-        found_refs = {
-            "ref1": {"code": "real dependency"},
-            "ref2": {"code": "stdlib wrapper"},
-            "ref3": {"code": "another real dep"},
-        }
-        with patch("tools.search_agent._request_completion", return_value='["ref1", "ref3"]'):
-            result = agent._evaluate_with_llm(found_refs)
-
-        assert result == ["ref1", "ref3"]
-
 
 class TestTestsMandateGate:
     class _Coder:
@@ -1010,3 +894,197 @@ class TestBibleBootstrapFromSeedChapters:
         cos._update_story_bible({"target_files": ["chapter_2.txt"]})
         # сидов нет — только сама глава, без самозацикливания
         assert len(updates) == 1
+
+
+# ── Bug 9: story_bible.py's writes were downgraded from atomic_write_text to
+#    plain write_text() with the import removed entirely - a kill mid-write
+#    could corrupt the persisted fact set (or pending-corrections state)
+#    with no read-side detection, re-introducing exactly what Bug 4 already
+#    fixed once for a different file.
+
+class TestStoryBibleAtomicWrite:
+    def _bible(self, tmp_path):
+        from tools.auto.story_bible import StoryBible
+        sb = StoryBible.__new__(StoryBible)
+        sb._path = tmp_path / "story_bible.md"
+        return sb
+
+    def test_write_goes_through_atomic_write_text(self, tmp_path, monkeypatch):
+        import tools.auto.story_bible as sb_mod
+        calls = []
+        monkeypatch.setattr(
+            sb_mod, "atomic_write_text",
+            lambda path, content: calls.append((path, content)))
+        sb = self._bible(tmp_path)
+        sb._write("• fact one\n• fact two\n")
+        assert len(calls) == 1
+        assert calls[0][0] == sb._path
+        assert calls[0][1] == "• fact one\n• fact two\n"
+
+    def test_write_does_not_call_plain_write_text_directly(self, tmp_path, monkeypatch):
+        # Belt-and-suspenders: even if atomic_write_text were left importable
+        # but bypassed, catch a direct Path.write_text call on the target path.
+        from pathlib import Path
+        sb = self._bible(tmp_path)
+        original = Path.write_text
+        def guard(self, *a, **k):
+            if self == sb._path:
+                raise AssertionError("bible file written via plain write_text(), not atomic_write_text")
+            return original(self, *a, **k)
+        monkeypatch.setattr(Path, "write_text", guard)
+        sb._write("• fact\n")
+        assert sb._path.read_text(encoding="utf-8") == "• fact\n"
+
+    def test_register_correction_attempt_goes_through_atomic_write_text(
+        self, tmp_path, monkeypatch
+    ):
+        import tools.auto.story_bible as sb_mod
+        calls = []
+        monkeypatch.setattr(
+            sb_mod, "atomic_write_text",
+            lambda path, content: calls.append((path, content)))
+        sb = self._bible(tmp_path)
+        result = sb._register_correction_attempt("new fact", "old fact")
+        assert result is False  # first observation, below threshold
+        assert len(calls) == 1
+        assert calls[0][0] == sb._pending_corrections_path()
+
+    def test_bible_write_survives_simulated_crash_without_corrupting_old_content(
+        self, tmp_path, monkeypatch
+    ):
+        # End-to-end version of the Bug-4-style crash test, but through
+        # StoryBible._write specifically, so this class regresses loudly if
+        # _write is ever pointed at a non-atomic path again.
+        sb = self._bible(tmp_path)
+        sb._path.write_text("• old established fact\n", encoding="utf-8")
+
+        def boom(*a, **k):
+            raise OSError("simulated crash mid-write")
+        monkeypatch.setattr(os, "fsync", boom)
+
+        sb._write("• new fact that should never land\n")  # _write catches OSError, logs, returns
+
+        # Old content must be completely untouched - never truncated.
+        assert sb._path.read_text(encoding="utf-8") == "• old established fact\n"
+        assert list(tmp_path.glob(".story_bible.md.*.tmp")) == []
+
+
+# ── Bug 10 (and test-coverage restoration): the same "Tests not passed"
+#    commit that regressed story_bible.py's atomic writes also deleted these
+#    three test classes. Two of the three still have correct underlying
+#    code (verified independently) and just needed their coverage restored;
+#    CanonValidator's number-eating regex regression above needed an actual
+#    code fix.
+
+class TestSearchAgentEmptyLLMResponseFailsOpen:
+    """SearchAgent._evaluate_with_llm's documented contract is fail-open on
+    ANY filter failure. An empty JSON list ("[]") is syntactically valid so
+    it skipped the except-block's fail-open path and silently rejected every
+    reference instead — verified against a real, reproducing test case."""
+
+    def test_empty_list_triggers_fail_open(self):
+        from unittest.mock import patch
+        from tools.search_agent import SearchAgent
+
+        agent = SearchAgent(
+            model="test-model", base_url="http://fake-host", api_key="x", timeout=5,
+        )
+        found_refs = {
+            "ref1": {"code": "def ref1(): pass"},
+            "ref2": {"code": "def ref2(): pass"},
+        }
+        with patch("tools.search_agent._request_completion", return_value="[]"):
+            result = agent._evaluate_with_llm(found_refs)
+
+        assert result == ["ref1", "ref2"], (
+            "an empty LLM verdict must fail-open (approve all), not silently "
+            "reject every reference"
+        )
+
+    def test_nonempty_list_still_filters_normally(self):
+        from unittest.mock import patch
+        from tools.search_agent import SearchAgent
+
+        agent = SearchAgent(
+            model="test-model", base_url="http://fake-host", api_key="x", timeout=5,
+        )
+        found_refs = {
+            "ref1": {"code": "real dependency"},
+            "ref2": {"code": "stdlib wrapper"},
+            "ref3": {"code": "another real dep"},
+        }
+        with patch("tools.search_agent._request_completion", return_value='["ref1", "ref3"]'):
+            result = agent._evaluate_with_llm(found_refs)
+
+        assert result == ["ref1", "ref3"]
+
+
+class TestCoderTargetFilesDotfileCollision:
+    """Coder._write_files' target_files allow-list guard must not let a
+    disallowed dotfile slip through by colliding, after normalisation, with
+    an allowed non-dotfile name (or vice versa)."""
+
+    def _coder(self):
+        import configparser
+        from tools.auto.coder import Coder
+        cfg = configparser.ConfigParser()
+        cfg.read_dict({
+            "api":       {"active": "local", "verify_ssl": "true"},
+            "api_local": {"base_url": "http://localhost:9999", "model": "x", "api_key": ""},
+            "coder":     {"temperature": "0.2", "max_tokens": "1024"},
+            "loop":      {"timeout_seconds": "60"},
+        })
+        return Coder(cfg, "http://localhost:9999", "", "x")
+
+    def test_dotfile_not_authorised_is_rejected(self, tmp_path):
+        coder = self._coder()
+        allowed = frozenset({"notes.md"})
+        written, _ = coder._write_files(
+            [{"path": ".notes.md", "content": "sneaky"}],
+            tmp_path, "T1", allowed_paths=allowed,
+        )
+        assert written == [], (
+            ".notes.md must NOT be treated as the same target as the "
+            "approved notes.md — the allow-list guard must not collapse "
+            "distinct filenames that merely share a suffix after a leading "
+            "dot/slash is stripped"
+        )
+        assert not (tmp_path / ".notes.md").exists()
+
+    def test_leading_dot_slash_is_still_normalised(self, tmp_path):
+        """A genuine "./" prefix (not a bare leading dot) must still be
+        stripped so the intended normalisation keeps working."""
+        coder = self._coder()
+        allowed = frozenset({"notes.md"})
+        written, _ = coder._write_files(
+            [{"path": "./notes.md", "content": "hello"}],
+            tmp_path, "T1", allowed_paths=allowed,
+        )
+        assert written == ["./notes.md"]
+        assert (tmp_path / "notes.md").read_text(encoding="utf-8") == "hello"
+
+
+class TestCanonValidatorPreservesNumbers:
+    """CanonValidator._extract_claims must not eat a claim's own leading
+    digits (ages, years, counts) while stripping list-marker prefixes."""
+
+    def _extractor(self, llm_reply):
+        from tools.auto.canon_validator import CanonValidator
+        cv = CanonValidator.__new__(CanonValidator)
+        cv._llm = lambda system, user: llm_reply
+        return cv
+
+    def test_leading_number_in_claim_is_preserved(self):
+        cv = self._extractor("3.5 million people lived there")
+        claims = cv._extract_claims("chapter text")
+        assert claims == ["3.5 million people lived there"]
+
+    def test_numbered_marker_is_still_stripped(self):
+        cv = self._extractor("1. She was born in 1990")
+        claims = cv._extract_claims("chapter text")
+        assert claims == ["She was born in 1990"]
+
+    def test_bulleted_marker_is_still_stripped(self):
+        cv = self._extractor("- Anna is 42 years old")
+        claims = cv._extract_claims("chapter text")
+        assert claims == ["Anna is 42 years old"]
