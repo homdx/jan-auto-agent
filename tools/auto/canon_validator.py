@@ -289,9 +289,15 @@ class CanonValidator:
             logger.warning("CanonValidator: claim extraction failed: %s", exc)
             return []
         claims: list[str] = []
-        # Marker strip uses a regex, not str.lstrip(chars) (which removes
-        # any of the given characters repeatedly, eating a claim's own
-        # leading number: "3.5 million people..." -> "million people...").
+        # Bugfix: this used to be
+        #   line = raw.strip().lstrip("-*0123456789. \t").strip()
+        # str.lstrip(chars) removes ANY of the given characters from the
+        # left, repeatedly — it has no concept of "a marker" versus "the
+        # claim's own leading digits". A claim that legitimately starts
+        # with a number (an age, a year, a population count — precisely
+        # what a CANON validator exists to protect) had that number
+        # silently eaten: "3.5 million people lived there" became "million
+        # people lived there" before ever reaching the conflict check.
         _marker_re = re.compile(r"^\s*(?:[-*]|\d+[.)])\s+")
         for raw in reply.splitlines():
             line = _marker_re.sub("", raw.strip(), count=1).strip()
@@ -344,9 +350,15 @@ class CanonValidator:
         if self._broker is None:
             return ""
         # Salient tokens: capitalised words (names/places) are the cheapest,
-        # most useful query terms for an entity-based prose pull. Cyrillic
-        # ranges included so Russian character names (Иван, Мария, ...)
-        # aren't silently dropped — Python's \b is already Unicode-aware.
+        # most useful query terms for an entity-based prose pull.
+        # BUGFIX: [A-Z][a-zA-Z]{2,} is ASCII-only, so it matched nothing at
+        # all for Cyrillic character names (Иван, Мария, Андрей, ...) —
+        # every Russian-fiction claim hit the `if not tokens: return ""`
+        # guard below, silently dropping the earlier-chapter excerpt from
+        # every canon-conflict message. The coder was told WHAT conflicted
+        # but never WHERE the conflicting canon was established. Python 3's
+        # \b is already Unicode-aware, so adding the Cyrillic ranges to the
+        # character class is enough — no extra flags needed.
         tokens = re.findall(r"\b[A-ZА-ЯЁ][a-zA-Zа-яёА-ЯЁ]{2,}\b", claim)
         if not tokens:
             return ""
@@ -369,6 +381,20 @@ class CanonValidator:
         in ascending order (canon = what came before).
         """
         idx = CanonValidator.chapter_index(chapter_file)
+        if idx is None:
+            # BUGFIX: this used to fall through to `idx is None or cidx < idx`
+            # below, which is trivially True for every file regardless of
+            # cidx — so a legitimately non-numeric filename (prologue.md,
+            # epilogue.md, notes.md; all common in creative-writing projects)
+            # got EVERY numbered chapter back as "earlier canon", including
+            # ones written much later in the story. Reproduced: checking
+            # "prologue.md" against chapter_01/02/10.md returned chapter_10
+            # (the twist ending) as established earlier canon — the exact
+            # inverse of this function's own contract, "canon = what came
+            # before". Without a reliable index for the current file, there's
+            # no safe way to know which chapters actually came before it, so
+            # return nothing rather than something actively backwards.
+            return []
         out: list[tuple[int, str]] = []
         for p in base_dir.glob("*"):
             if p.suffix.lower() not in (".md", ".txt"):
@@ -376,7 +402,7 @@ class CanonValidator:
             cidx = CanonValidator.chapter_index(p.name)
             if cidx is None:
                 continue
-            if idx is None or cidx < idx:
+            if cidx < idx:
                 out.append((cidx, p.name))
         out.sort()
         return [name for _, name in out]

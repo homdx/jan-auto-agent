@@ -86,6 +86,7 @@ def _cand(
     acceptance_check: str = "python -m pytest tests/ -q",
     cluster: str = "agents",
     target_files: list[str] | None = None,
+    new_file: bool = False,
 ) -> CandidateTask:
     return CandidateTask(
         title            = title,
@@ -97,9 +98,11 @@ def _cand(
             symbol     = symbol,
             line_start = line_start,
             line_end   = line_end,
+            new_file   = new_file,
         ),
         cluster = cluster,
     )
+
 
 
 def _rt(
@@ -358,6 +361,46 @@ class TestCrossFileSymbolDependency:
         task_b = next(t for t in backlog.auto_tasks if t.title == "Task B")
         assert not task_b.dependencies
 
+    # Bugfix regression: the chapter-order rule (rule 3) and the
+    # symbol-ref rule (rule 2) can disagree about direction when a symbol
+    # cited in a later chapter happens to be named in an earlier chapter's
+    # instruction text (e.g. foreshadowing). Rule 3 says chapter_1 depends
+    # on nothing and chapter_2 depends on chapter_1; rule 2, read in
+    # isolation, says chapter_1's task depends on chapter_2's task (the
+    # citer of the symbol). Adding both edges produces a 2-node cycle that
+    # _topological_sort() can only resolve by discarding order guarantees
+    # for both tasks entirely. The chapter-order edge (the more reliable,
+    # deterministic rule) must win and the conflicting symbol-ref edge must
+    # be dropped rather than silently creating a cycle.
+    def test_symbol_ref_does_not_reverse_chapter_order(self) -> None:
+        a = _cand(
+            title="fix ch2 Bob", file="chapter_2.md", symbol="Bob",
+            instruction="Introduce Bob properly.",
+            target_files=["chapter_2.md"],
+            acceptance_check="pytest",
+        )
+        b = _cand(
+            title="fix ch1 mentions Bob", file="chapter_1.md", symbol=None,
+            instruction="Foreshadow Bob before he appears.",
+            target_files=["chapter_1.md"],
+            acceptance_check="pytest",
+        )
+        backlog = build_backlog([a, b])
+        task_a = next(t for t in backlog.auto_tasks if t.title == "fix ch2 Bob")
+        task_b = next(t for t in backlog.auto_tasks if t.title == "fix ch1 mentions Bob")
+
+        # No cycle: exactly one direction of dependency exists between them.
+        assert not (task_a.task_id in task_b.dependencies
+                    and task_b.task_id in task_a.dependencies)
+        # Chapter order wins: chapter_2's task depends on chapter_1's task
+        # (correct causal direction), and chapter_1's task has no reverse
+        # dependency back on chapter_2's task (which the symbol-ref rule,
+        # read in isolation, would have incorrectly added).
+        assert task_a.dependencies == [task_b.task_id]
+        assert task_a.task_id not in task_b.dependencies
+        # The correct chapter order is preserved in the final ordering.
+        assert backlog.auto_tasks.index(task_b) < backlog.auto_tasks.index(task_a)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Topological sort
@@ -489,6 +532,21 @@ class TestStateTaskConversion:
         backlog = build_backlog([c])
         t = backlog.to_state_tasks(status="in_progress")[0]
         assert t["status"] == "in_progress"
+
+    # Bugfix regression: new_file used to be silently dropped when a
+    # candidate was converted into a persisted task dict.
+    def test_new_file_flag_preserved(self) -> None:
+        c = _cand(file="tools/brand_new.py", symbol=None, line_start=None,
+                   line_end=None, acceptance_check="pytest", new_file=True)
+        backlog = build_backlog([c])
+        t = backlog.to_state_tasks()[0]
+        assert t["cited_locations"][0]["new_file"] is True
+
+    def test_new_file_flag_defaults_false(self) -> None:
+        c = _cand(acceptance_check="pytest")  # new_file not passed -> False
+        backlog = build_backlog([c])
+        t = backlog.to_state_tasks()[0]
+        assert t["cited_locations"][0]["new_file"] is False
 
 
 # ─────────────────────────────────────────────────────────────────────────────

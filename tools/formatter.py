@@ -1,10 +1,24 @@
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, List, TYPE_CHECKING
 
 # Prevent circular imports if ParsedPrompt type hints are resolved statically
 if TYPE_CHECKING:
     from tools.prompt_parser import ParsedPrompt
+
+# BUGFIX: was `str(x).lstrip("-* ")` at both call sites below. str.lstrip(chars)
+# removes ANY of the given characters from the left, repeatedly — it has no
+# concept of "a bullet marker" versus "the text's own leading punctuation".
+# An LLM-reported issue/change that legitimately starts with a minus sign
+# (e.g. "-1 is returned instead of raising an IndexError") had that sign
+# silently eaten, becoming "1 is returned instead of raising an IndexError"
+# and flipping the reported meaning in the console output the user reads.
+# Same bug class already found and fixed in canon_validator.py's claim
+# extraction; reuse the same "marker + required trailing whitespace" shape
+# so a real "- " or "* " bullet prefix is stripped but a bare leading "-"
+# or "*" attached to actual content is left alone.
+_BULLET_MARKER_RE = re.compile(r"^\s*[-*]\s+")
 
 
 class OutputFormatter:
@@ -112,7 +126,7 @@ class OutputFormatter:
             issues = improvement.get("issues", [])
             if issues:
                 for issue in issues:
-                    clean_issue = str(issue).lstrip("-* ").strip()
+                    clean_issue = _BULLET_MARKER_RE.sub("", str(issue), count=1).strip()
                     if clean_issue:
                         print(f"- {clean_issue}")
             else:
@@ -131,7 +145,7 @@ class OutputFormatter:
             changes = improvement.get("changes", [])
             if changes:
                 for change in changes:
-                    clean_change = str(change).lstrip("-* ").strip()
+                    clean_change = _BULLET_MARKER_RE.sub("", str(change), count=1).strip()
                     if clean_change:
                         print(f"- {clean_change}")
             else:

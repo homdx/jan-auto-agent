@@ -249,6 +249,42 @@ class CommitOnSuccess:
                 "cannot update bible for %s.", target_files,
             )
             return
+        # novel14 experiment fix: BOOTSTRAP the bible from pre-existing
+        # chapters. The documented Creative.MD workflow starts from a
+        # hand-written chapter_1.txt; it never passes through this hook, so
+        # every fact established ONLY there (инструмент, мамины смены, ...)
+        # never enters the bible — the continuity gate has nothing to defend,
+        # the first generation window without a recent mention confabulates,
+        # and the wrong value self-perpetuates through later chapters. Run
+        # extraction once over the seed chapters before the first update.
+        # (Same class of bug as the creative language pre-gate bootstrap fix.)
+        try:
+            bible_path = getattr(self._story_bible, "_path", None)
+            bible_empty = (bible_path is None
+                           or not bible_path.exists()
+                           or not bible_path.read_text(
+                               encoding="utf-8", errors="replace").strip())
+        except OSError:
+            bible_empty = True
+        if bible_empty:
+            _written = {str(f) for f in target_files}
+            _reserved = {"synopsis.md", "story_bible.md", "IMPROVEMENTS.md"}
+            _seeds = [pf for pf in sorted(base_dir.glob("*.txt"))
+                      if pf.name not in _written and pf.name not in _reserved]
+            for _seed in _seeds[:10]:
+                try:
+                    _seed_text = _seed.read_text(encoding="utf-8",
+                                                 errors="replace")
+                except OSError:
+                    continue
+                if _seed_text.strip():
+                    logger.info(
+                        "CommitOnSuccess: bootstrapping story bible from "
+                        "pre-existing chapter %s (bible was empty).",
+                        _seed.name,
+                    )
+                    self._story_bible.update(_seed_text)
+
         for chapter_file in target_files:
             chapter_path = base_dir / chapter_file
             try:
@@ -292,9 +328,18 @@ def make_commit_on_success(
     state_store:
         The active ``StateStore`` for this run.
     """
-    # Normalise task_mode the same way controller.py does, so a config
-    # typo/case variant ("Creative") doesn't silently skip the
-    # summary_memory / story_bible wiring below.
+    # AUTO-BUG: this used to read task_mode with a plain config.get() and
+    # compare it with `== "creative"` — an exact, case-sensitive match. Every
+    # other entry point (controller.py) normalises task_mode through
+    # normalize_task_mode() so a config typo/case variant like "Creative" or
+    # "creativ" still resolves to "creative". This factory's raw read did
+    # not, so if it is ever reached with an unnormalised value (e.g. this
+    # factory called directly, or the controller's own commit_on_success is
+    # None and make_bug_fix_loop falls back to building one here) the
+    # summary_memory / story_bible wiring below would silently never fire —
+    # the run proceeds in creative mode everywhere else but synopsis.md and
+    # story_bible.md are never updated after a chapter commit, with no
+    # error logged. Route through the same normaliser everyone else uses.
     from tools.auto.utils import normalize_task_mode
     _raw_task_mode = config.get("auto", "task_mode", fallback="code")
     task_mode, _ = normalize_task_mode(_raw_task_mode)

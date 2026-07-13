@@ -165,10 +165,20 @@ class BugFixLoop:
             )
             return BugFixResult(ticket_id, fix_id, fixed=True, skipped=True)
 
-        # A "deferred" ticket (a prior attempt exhausted its fix budget)
-        # short-circuits too, same as "fixed" — otherwise every later
-        # commit re-runs the full fix cycle on a regression already known
-        # not to resolve. Reset status to "open" to retry manually.
+        # Bugfix: a "deferred" ticket (a prior fix attempt already exhausted
+        # its full OuterLoop rounds/rewrites budget) had no short-circuit —
+        # only "fixed" did. controller._check_regressions re-runs EVERY
+        # previously-DONE task's acceptance check after EVERY subsequent
+        # commit for the rest of the run; a persistent, hard-to-fix
+        # regression's status never changes, so every later commit
+        # re-triggered this exact same expensive fix loop again from
+        # scratch — burning a full attempt budget on a regression already
+        # known not to resolve, over and over, for the rest of the run.
+        # Once deferred, an operator is expected to look at the ticket and
+        # decide whether to retry (exactly the manual ``status="open"``
+        # reset already exercised by
+        # test_existing_open_ticket_reused_not_duplicated) rather than the
+        # system re-attempting it automatically on every unrelated commit.
         if existing and existing.get("status") == "deferred":
             logger.info(
                 "BugFixLoop: ticket %s already deferred — skipping "
@@ -234,9 +244,16 @@ class BugFixLoop:
                 outer_result.knowledge() if hasattr(outer_result, "knowledge")
                 else "", _MAX_OUTPUT_CHARS
             )
-            # Re-fetch defensively: the ticket could have been deleted
-            # externally during the long-running fix attempt above; a bare
-            # None subscript would crash the whole bug-fix loop.
+            # BUGFIX: TicketStore.get() does a fresh disk read here and
+            # returns None if the ticket file is absent — and self._outer
+            # .run_task() above can run for a long time (many LLM calls /
+            # retries), during which the ticket file could be deleted
+            # externally (an operator cleaning up a stuck ticket, a
+            # concurrent process, a filesystem hiccup). The ticket having
+            # existed or been created earlier in this same call doesn't
+            # guarantee it still exists now — a bare `[...]["body"]`
+            # subscript on None would raise TypeError and crash the whole
+            # bug-fix loop instead of just this one deferred update.
             _existing_ticket = self._tickets.get(ticket_id) or {}
             self._tickets.update(
                 ticket_id,

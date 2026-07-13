@@ -13,8 +13,10 @@ AUTO-G10 — Dry-run + safety verification
   AC-BLOCKLIST — A blocked shell token (``rm``, ``sudo``, ``curl``, etc.) in
                   an acceptance_check is rejected by the executor at runtime:
                   the result is not a crash but a ``passed=False`` result, and
-                  the executor falls back to ``pytest`` rather than running the
-                  dangerous command.
+                  the executor falls back to ``false`` (always fails) rather
+                  than running the dangerous command or bare ``pytest``
+                  (which could spuriously pass on an unrelated pre-existing
+                  test suite mirrored into the workspace).
 
   AC-PATHTRAVERSAL — A path-traversal task id (``../../evil``) is sanitised
                   before it is used as a workspace directory name; no directory
@@ -303,9 +305,16 @@ class TestExecutorBlocklist:
 
         # The executor must not raise; it falls back and returns passed=False.
         result = executor.run(task)
-        # Blocked commands fall back to `pytest`, which will fail in tmp_path
-        # (no tests), so passed=False is expected.  What matters is that the
-        # dangerous command itself was not attempted (no side-effects + no crash).
+        # AUTO-BUG (fixed): a blocked command used to fall back to bare
+        # `pytest`, which collects and runs every OTHER pre-existing test
+        # in the mirrored workspace (see _prepare_workspace's AUTO-FIX-1) —
+        # in a repo with its own healthy test suite that reliably exits 0
+        # regardless of the current task, letting an unverified task pass.
+        # It now falls back to `false`, which always exits 1 independent of
+        # repo contents, so passed=False is guaranteed here, not incidental
+        # to tmp_path happening to have no tests. What matters either way:
+        # the dangerous command itself was never attempted (no side-effects,
+        # no crash).
         assert not result.passed, (
             f"A task with a blocked command ({dangerous_cmd!r}) must not pass"
         )
@@ -322,15 +331,23 @@ class TestExecutorBlocklist:
         assert safe
         assert reason == ""
 
-    def test_blocked_command_falls_back_to_pytest(self, tmp_path):
-        """AC-BLOCKLIST: executor resolves a blocked command to 'pytest' (not the cmd)."""
+    def test_blocked_command_falls_back_to_guaranteed_fail(self, tmp_path):
+        """AC-BLOCKLIST: executor resolves a blocked command to something that
+        always fails ('false'), not bare 'pytest' (which can spuriously pass
+        on an unrelated pre-existing test suite mirrored into the workspace)
+        and not the blocked command itself."""
         executor = Executor(base_dir=tmp_path, timeout_sec=10)
         # Access the internal resolver directly to confirm fallback path.
         cmd = executor._resolve_command("rm -rf /", [], tmp_path)
         assert "rm" not in cmd, (
-            "_resolve_command should fall back to pytest, not return the blocked command"
+            "_resolve_command should not return the blocked command"
         )
-        assert "pytest" in cmd or sys.executable in cmd
+        assert cmd == "false", (
+            "a blocked acceptance_check must fall back to a command that "
+            "always fails, not 'pytest' — pytest collects and runs every "
+            "other pre-existing test in the mirrored workspace, so it can "
+            "pass for reasons unrelated to the task ever being verified"
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────

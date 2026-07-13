@@ -14,7 +14,7 @@ Public surface consumed by controller.py / the Architect stage:
     # candidates: list[CandidateTask] — pre-filtered, grounded
 
 Each call is traced via agent_trace and uses strip_think so reasoning-model
-<think> blocks are silently discarded before JSON parsing.  The call is
+"think" blocks are silently discarded before JSON parsing.  The call is
 fail-closed: a bad/missing JSON response is logged and produces zero candidates
 for that cluster rather than crashing the run.
 
@@ -155,7 +155,11 @@ STRICT RULES:
    functions to it.
 3. Ground every task in the actual code shown (cite a real file and the symbol \
    or line range where the change belongs), but a task MAY add behavior the code \
-   does not yet have — that is expected when the goal asks for new features.
+   does not yet have — that is expected when the goal asks for new features. If the \
+   goal genuinely requires a file that does not exist yet, you MAY propose creating \
+   it: set "new_file": true in cited_location and leave "symbol"/"line_start"/ \
+   "line_end" null (there is nothing to anchor to yet). Only do this when no listed \
+   file is a reasonable place for the change — prefer extending an existing file.
 4. Keep each task small enough to be implemented and tested independently.
 5. Return an empty array [] ONLY if the goal is ALREADY fully implemented in the \
    code shown.  If the goal asks for behavior the code does not yet have, that \
@@ -178,17 +182,18 @@ Each element of the JSON array must match this schema exactly (no extra keys):
     "target_files": ["<exact path from the list below>"],
     "acceptance_check": "<shell command that exits 0 when the task is done — a real runnable command using the project's own test/build runner (e.g. 'pytest tests/test_foo.py', 'python main.py --name Alice', './gradlew test', 'mvn -q test', 'npm test', 'go test ./...', 'cargo test'), or 'true' if no automated check fits. For a Python CLI flag --flag use 'python script.py --flag value', NOT a positional argument>",
     "cited_location": {{
-      "file": "<exact path from the list below>",
+      "file": "<exact path from the list below, UNLESS new_file is true>",
       "symbol": "<function or class name, or null>",
       "line_start": <integer or null>,
-      "line_end":   <integer or null>
+      "line_end":   <integer or null>,
+      "new_file": <true ONLY if this file does not exist yet and this task creates it, otherwise false>
     }}
   }}
 ]
 
-REMINDER — the ONLY file paths you may put in "target_files" or \
-"cited_location.file" are these, copied character-for-character. \
-Any other path will be rejected:
+REMINDER — every path in "target_files" or "cited_location.file" MUST either (a) be \
+copied character-for-character from the list below, or (b) be a brand-new path AND \
+have "cited_location.new_file" set to true. Any other path will be rejected:
 {file_listing}
 
 Now produce ONLY the JSON array of up to {max_tasks} concrete tasks that IMPLEMENT the \
@@ -272,17 +277,22 @@ class CitedLocation:
     symbol: str | None = None
     line_start: int | None = None
     line_end: int | None = None
+    new_file: bool = False
 
     def is_valid(self, task_mode: str = "code") -> bool:
         """A location is valid when it has a file AND at least one anchor.
 
         For docs/creative modes, a file alone is sufficient grounding —
-        no symbol or line range is required.
+        no symbol or line range is required. For code mode, a task that
+        explicitly declares ``new_file=True`` is also valid without a
+        symbol/line anchor: a file that does not exist yet has nothing to
+        anchor to, by definition (AUTO-BUG: new-file creation was
+        previously impossible to ground — see gate1_filter._check_existence).
         """
         if not self.file:
             return False
         if task_mode == "code":
-            return bool(self.symbol) or self.line_start is not None
+            return self.new_file or bool(self.symbol) or self.line_start is not None
         # docs / creative: file alone is sufficient grounding
         return True
 
@@ -369,7 +379,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
         self._num_ctx                = config.getint(f"api_{active_profile}", "num_ctx", fallback=0)
         # AUTO-FIX (fable follow-up): mirrors the gate1_filter.py fix — a
         # thinking model (e.g. qwen3) wraps its JSON task array in
-        # <think>...</think> by default. If that reasoning consumes the
+        # a "think" reasoning block by default. If that reasoning consumes the
         # whole max_tokens budget, strip_think() discards everything and
         # architect produces 0 candidates (observed live: architect call
         # returned a totally empty response after ~5 minutes on qwen3:8b).
@@ -585,11 +595,40 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                             checkpoint_path, exc,
                         )
 
+            # AUTO-BUG fix: batches use a sub-cluster named
+            # "<cluster.name> (batch N/M)" (see `sub = ... RepoCluster(name=...)`
+            # above) so each batch can be checkpointed independently. That
+            # suffixed name must never leak onto CandidateTask.cluster: it is
+            # stored there verbatim by _parse_candidates (called from
+            # _review_one_cluster with `sub.name`/`cluster.name` as seen from
+            # inside that helper), and tools/auto/pipeline.py's cluster_files
+            # lookup — used by Gate 1 to catch hallucinated file citations —
+            # is keyed by the plain, un-suffixed cluster name straight from
+            # repo_ingest. `cluster_files.get(candidate.cluster, set())` then
+            # silently returns an empty set for every candidate from a
+            # batched review, and gate1_filter.py's `if known and loc.file
+            # not in known:` guard — an empty set is falsy — never runs, so
+            # the "catch hallucinated paths before filesystem I/O" safety net
+            # is disabled for every cluster large enough to need more than
+            # one review batch, which in practice is the common case. Apply
+            # this once, after the batch loop, so it repairs candidates from
+            # BOTH the live-LLM branch above (`cluster_candidates.extend(
+            # batch_results)`) AND any restored from an on-disk checkpoint
+            # written before this fix existed (`cluster_candidates.extend(
+            # restored)` on a checkpoint hit) — not just one of the two.
+            for _c in cluster_candidates:
+                _c.cluster = cluster.name
+
             print(f"   → {len(cluster_candidates)} grounded candidate(s)")
 
-            # AUTO-BUG-3: when a cluster splits into multiple batches, two
-            # batches can propose the identical task — dedup here too, as
-            # a cheap local belt-and-braces alongside Gate-1's own dedup.
+            # AUTO-BUG-3 fix: when a cluster is large enough to be split into
+            # multiple batches, each batch is reviewed independently and can
+            # (and in practice does, e.g. in creative mode with a single
+            # target file) propose the *identical* task. Gate-1 has its own
+            # fingerprint-based dedup, but de-duplicating right here — before
+            # candidates from different batches of the same cluster are even
+            # merged — is a cheap, local belt-and-braces fix that does not
+            # depend on downstream Gate-1 behaving as expected.
             if len(batches) > 1 and len(cluster_candidates) > 1:
                 from tools.auto.gate1_filter import _fingerprint, _target_fingerprint  # noqa: PLC0415
                 _seen: set[str] = set()
@@ -647,11 +686,16 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
         Parameters
         ----------
         all_files
-            AUTO-BUG-9: full file listing shown to the model even when this
-            batch's contents only cover a subset — without it, "what's the
-            next chapter" logic could see a stale listing and propose
-            regenerating an already-completed chapter. Defaults to
-            cluster.files when not given.
+            AUTO-BUG-9 fix: the FULL set of files in the cluster this batch
+            belongs to (names only), used for the file listing shown to the
+            model even when this call's file contents only cover one
+            batch's subset (cluster.files). Without this, a batched review
+            of a growing creative-writing repo only ever sees a partial
+            file listing, and "what's the next chapter number" logic can
+            conclude a stale/wrong answer -- observed in practice: it
+            proposed regenerating an already-completed middle chapter
+            instead of only ever extending the book forward. Defaults to
+            cluster.files (old behaviour) when not given.
 
         Returns
         -------
@@ -696,8 +740,10 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                     "cluster": cluster.name},
         )
 
-        # AUTO-BUG-8: configurable retry backoff (was hardcoded [5,15,30]s
-        # regardless of deployment, e.g. a local Ollama still loading).
+        # AUTO-BUG-8 fix: configurable retry backoff. Previously hardcoded to
+        # [5, 15, 30] (~50s total) regardless of deployment — for a local
+        # Ollama instance still loading a model into memory, that's ~50s of
+        # silent retrying inside this call before the cluster fails open.
         _delays_raw = self._config.get("architect", "retry_delays_sec", fallback="5,15,30")
         try:
             _RETRY_DELAYS = [float(x.strip()) for x in _delays_raw.split(",") if x.strip()]
@@ -939,6 +985,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 symbol     = (loc_raw.get("symbol") or None),
                 line_start = _to_int_or_none(loc_raw.get("line_start")),
                 line_end   = _to_int_or_none(loc_raw.get("line_end")),
+                new_file   = bool(loc_raw.get("new_file", False)),
             )
 
             if not cited.is_valid(self._task_mode):
@@ -1137,6 +1184,7 @@ def _serialise_candidates(candidates: list[CandidateTask]) -> list[dict]:
                 "symbol":     c.cited_location.symbol,
                 "line_start": c.cited_location.line_start,
                 "line_end":   c.cited_location.line_end,
+                "new_file":   c.cited_location.new_file,
             },
             "raw": c.raw,
         })
@@ -1159,6 +1207,7 @@ def _deserialise_candidates(data: list[dict]) -> list[CandidateTask]:
                 symbol     = loc.get("symbol"),
                 line_start = loc.get("line_start"),
                 line_end   = loc.get("line_end"),
+                new_file   = bool(loc.get("new_file", False)),
             ),
             raw = item.get("raw", {}),
         ))

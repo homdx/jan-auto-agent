@@ -298,10 +298,32 @@ def make_progress_display(
     *,
     arch_total: int = 0,
     code_total: int = 0,
+    task_mode: str = "code",
     out: Optional[IO[str]] = None,
 ) -> ProgressDisplay:
-    """Build a ProgressDisplay from a StateStore and agents.ini config."""
-    max_attempts = config.getint("auto", "max_attempts_per_task", fallback=_MAX_ATTEMPTS_DEFAULT)
+    """Build a ProgressDisplay from a StateStore and agents.ini config.
+
+    BUGFIX: max_attempts used to be read with a plain
+    ``config.getint("auto", "max_attempts_per_task", ...)``, ignoring the
+    mode-specific override (``max_attempts_per_task_creative``) that
+    inner_loop.py itself reads via ``_cfg_mode`` for the REAL cap enforced
+    on creative-mode tasks. Since agents.ini ships
+    ``max_attempts_per_task = 5`` alongside
+    ``max_attempts_per_task_creative = 8``, a creative-mode run legitimately
+    reaching attempt 6 of its real 8-attempt budget displayed the nonsensical
+    "attempt 6/5" — a perfectly valid in-progress attempt rendered as if the
+    loop had somehow overrun its own cap. ``task_mode`` must be threaded
+    through from the caller (``AutoController`` already knows it) so the
+    same ``_cfg_mode`` lookup inner_loop.py uses picks the matching value.
+    ``max_rounds_per_task`` has no such per-mode override anywhere in this
+    codebase, so it's unaffected and stays a plain read.
+    """
+    from tools.auto.utils import _cfg_mode
+    max_attempts = _cfg_mode(
+        config, "auto", "max_attempts_per_task", task_mode,
+        fallback=_MAX_ATTEMPTS_DEFAULT,
+    )
+    max_attempts = int(max_attempts)
     max_rounds   = config.getint("auto", "max_rounds_per_task",   fallback=_MAX_ROUNDS_DEFAULT)
     return ProgressDisplay(
         state        = state,

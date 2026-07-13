@@ -41,8 +41,18 @@ STATE_FILE: Path = Path("pipeline_state.json")
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 def backoff_seconds(consecutive_error_index: int) -> int:
-    """Return wait time (s) for the nth consecutive API error (0-indexed)."""
-    return BACKOFF_SERIES[min(consecutive_error_index, len(BACKOFF_SERIES) - 1)]
+    """Return wait time (s) for the nth consecutive API error (0-indexed).
+
+    Hardening: the index is clamped into ``[0, len-1]``. Without the lower
+    clamp a negative index (e.g. a caller that computed ``count - 1`` before
+    incrementing ``count``) would hit ``BACKOFF_SERIES[-1]`` — Python's
+    negative indexing — and silently return the 1024 s CAP as the *first*
+    wait instead of 1 s. All current callers increment before calling, so
+    this is defensive, but a public helper must not turn an off-by-one at a
+    call site into a 17-minute stall.
+    """
+    idx = max(0, min(consecutive_error_index, len(BACKOFF_SERIES) - 1))
+    return BACKOFF_SERIES[idx]
 
 
 def _now() -> str:
@@ -64,9 +74,19 @@ def load_state(path: Path = STATE_FILE) -> Optional[Dict[str, Any]]:
         return None
     try:
         with open(path, encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
     except (json.JSONDecodeError, OSError):
         return None
+    # Hardening: a checkpoint is always written as a JSON object by
+    # save_state(). A file that parses cleanly but holds a JSON list / string
+    # / number / null (hand-edited or truncated-then-rewritten) used to be
+    # returned as-is, and every consumer immediately calls ``.get(...)`` on
+    # it — so main.py's resume path would crash with AttributeError on a
+    # non-dict instead of treating the state as absent/corrupt (which is the
+    # documented contract: "None if the file is absent / corrupt").
+    if not isinstance(data, dict):
+        return None
+    return data
 
 
 def clear_state(path: Path = STATE_FILE) -> None:

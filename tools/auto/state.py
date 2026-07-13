@@ -168,11 +168,34 @@ class StateStore:
         bool
             ``True`` if a brand-new run was created; ``False`` if existing
             state was loaded (resume path).
+
+        Raises
+        ------
+        RuntimeError
+            If a plan already exists on disk but was created for a
+            *different* goal. Silently resuming it would execute leftover
+            tasks for the old goal while the caller believes it is working
+            on the new one, with no warning anywhere — see AUTO-BUG:
+            StateStore.initialise() previously never compared the incoming
+            goal against the stored plan's goal on the resume path.
         """
         self._ensure_dirs()
 
         if self._plan_path.exists():
             self._load_existing()
+            stored_goal = self.get_goal().strip()
+            incoming_goal = (goal or "").strip()
+            if stored_goal != incoming_goal:
+                raise RuntimeError(
+                    f"StateStore.initialise: {self._plan_path} already holds a plan "
+                    f"for a different goal — refusing to silently resume it under a "
+                    f"new goal.\n"
+                    f"  existing goal: {stored_goal!r}\n"
+                    f"  new goal:      {incoming_goal!r}\n"
+                    f"Point --base at a fresh directory for the new goal, or "
+                    f"intentionally remove {self.agent_dir} first if you mean to "
+                    f"discard the existing plan."
+                )
             self.log("StateStore loaded — resuming existing run")
             return False
 

@@ -234,6 +234,99 @@ class TestRetryOnTransientErrors:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# BATCH CLUSTER-NAME NORMALISATION (AUTO-T1 regression)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestBatchClusterNameNormalisation:
+    """A cluster large enough to need more than one review batch must still
+    return candidates whose ``.cluster`` is the plain, un-suffixed cluster
+    name — not "<name> (batch N/M)".
+
+    tools/auto/pipeline.py builds the ``cluster_files`` dict Gate 1 uses to
+    catch hallucinated file citations as ``{c.name: set(c.files) for c in
+    clusters}``, keyed by the plain name repo_ingest assigned. If a
+    batch-suffixed name ever leaks onto ``CandidateTask.cluster``,
+    ``cluster_files.get(candidate.cluster, set())`` silently returns an
+    empty set and gate1_filter.py's hallucinated-path guard (``if known and
+    loc.file not in known:``) never runs, since an empty set is falsy.
+    """
+
+    def test_batched_review_normalises_cluster_name(self, tmp_path: Path) -> None:
+        (tmp_path / "tools").mkdir()
+        (tmp_path / "tools" / "a.py").write_text("def a(): pass\n", encoding="utf-8")
+        (tmp_path / "tools" / "b.py").write_text("def b(): pass\n", encoding="utf-8")
+        cluster = RepoCluster(
+            name="agents",
+            patterns=["tools/*"],
+            files=["tools/a.py", "tools/b.py"],
+        )
+
+        cfg = configparser.ConfigParser()
+        cfg.read_dict({
+            "api":       {"active": "local", "verify_ssl": "false"},
+            "api_local": {
+                "base_url":   "http://localhost:1337/v1",
+                "api_key":    "test",
+                "model":      "test-model",
+                "api_format": "openai",
+            },
+            "architect": {
+                "temperature": "0.2", "max_tokens": "512",
+                # Force 2 batches (one file each) for this 2-file cluster.
+                "max_files_per_review": "1",
+            },
+            "loop": {"timeout_seconds": "10"},
+        })
+        reviewer = ClusterReviewer(
+            config=cfg,
+            base_url="http://localhost:1337/v1",
+            api_key="test",
+            model="test-model",
+            api_format="openai",
+            verify_ssl=False,
+        )
+
+        # Batch 1/2 is only shown tools/a.py, but the LLM cites tools/b.py —
+        # a real file belonging to the SAME cluster, just not to the batch
+        # actually under review. Batch 2/2 (tools/b.py) reports nothing.
+        cross_batch_payload = json.dumps([{
+            "title": "Cross-batch citation",
+            "instruction": "Do the fix.",
+            "target_files": ["tools/b.py"],
+            "acceptance_check": "pytest tests/",
+            "cited_location": {
+                "file": "tools/b.py",
+                "symbol": "b",
+                "line_start": 1,
+                "line_end": 1,
+            },
+        }])
+
+        with patch(
+            "tools.llm_stream.request_completion",
+            side_effect=[cross_batch_payload, "[]"],
+        ):
+            results = reviewer.review_clusters([cluster], tmp_path, goal="improve code")
+
+        assert len(results) == 1
+        assert results[0].cluster == "agents"
+        assert "(batch" not in results[0].cluster
+
+    # Guards against a regression in the other direction: a cluster small
+    # enough to fit in a single batch never had a suffix to strip, so the
+    # fix must be a true no-op for the common (non-batched) case.
+    def test_single_batch_cluster_name_unaffected(
+        self, reviewer: ClusterReviewer, cluster_and_base
+    ) -> None:
+        cluster, base_dir = cluster_and_base
+        with patch("tools.llm_stream.request_completion", return_value=_good_payload()):
+            results = reviewer.review_clusters([cluster], base_dir, goal="improve code")
+
+        assert len(results) == 1
+        assert results[0].cluster == "agents"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # CHECKPOINT — AC-C1 through AC-C9
 # ─────────────────────────────────────────────────────────────────────────────
 

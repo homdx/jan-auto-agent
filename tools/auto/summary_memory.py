@@ -65,7 +65,7 @@ import ssl
 from pathlib import Path
 from typing import Callable
 
-from tools.auto.utils import chars_per_token
+from tools.auto.utils import atomic_write_text, chars_per_token
 
 logger = logging.getLogger(__name__)
 
@@ -171,10 +171,15 @@ def _clean_bullet_list(reply: str) -> str:
     accepted as facts. A stray 'FIX:' prefix is tolerated, and AUTO-CR-16
     meta-commentary parentheticals are stripped.
 
-    AUTO-BUG-5: if NO line has a marker, fall back to treating each short
-    line as one fact (a small model may ignore the bullet-per-line
-    instruction) — still fails open on anything that looks like prose,
-    not a fact list.
+    AUTO-BUG-5 fix: if NO line has a marker at all, fall back to treating
+    each short, non-empty line as one fact — a small local model very
+    plausibly ignores the "one bullet per line" formatting instruction and
+    just writes plain sentences, one fact per line. Without this fallback
+    that entire (otherwise perfectly usable) extraction was silently
+    discarded and the caller kept believing there were "no new facts". The
+    fallback still fails open (returns "") when the reply doesn't look like
+    a short fact list — e.g. full narrative prose / a refusal — to avoid
+    accidentally ingesting chapter text as "facts".
 
     Returns bullets joined with newlines, each prefixed '• '.
     """
@@ -453,11 +458,31 @@ class SummaryMemory:
         cleaned = _clean_bullet_list(verified)
         body = cleaned or verified
 
-        # AUTO-BUG-6: refuse to write a bare verdict word ("APPROVED" etc.)
-        # or implausibly short text as if it were a real summary — this
-        # was observed leaking a grader verdict into synopsis.md.
+        # AUTO-BUG-6 fix: previously `cleaned or verified` would happily
+        # persist whatever `verified` was even when it was obviously not a
+        # summary at all (observed in practice: the literal grader verdict
+        # "APPROVED" ended up written into synopsis.md as a chapter's
+        # "durable fact summary"). Refuse to write anything that looks like
+        # a bare verdict word or is implausibly short for a summary, and
+        # leave the previous section (if any) untouched instead.
         _stripped = body.strip()
-        if not _stripped or _stripped.upper().rstrip(".:!") in {"APPROVED", "OK", "REVISE"}:
+        _is_bare_verdict = _stripped.upper().rstrip(".:!") in {"APPROVED", "OK", "REVISE"}
+        # BUGFIX (generalizes AUTO-BUG-6): the check above only ever caught
+        # those 3 literal words — but _clean_bullet_list's own no-marker
+        # fallback already refuses to treat a reply as a fact list unless it
+        # has at least 2 non-empty lines (a single line can never plausibly
+        # be "one fact per line"; see its docstring). When `cleaned` is ""
+        # for exactly that reason, `body` silently falls back to the raw
+        # single-line text, so ANY short single-line reply — not just
+        # "APPROVED"/"OK"/"REVISE" — slipped past this guard and got
+        # persisted to synopsis.md as if it were a real multi-fact summary.
+        # Observed in practice: verifier/summarizer error strings like
+        # "Unable to summarize this chapter." or "N/A" writing straight into
+        # continuity memory that later chapters rely on. A single line that
+        # bullet-cleaning couldn't parse can only be a verdict, refusal, or
+        # error string — never a genuine summary — so reject it the same way.
+        _single_line_and_unclean = (not cleaned) and len(_stripped.splitlines()) <= 1
+        if not _stripped or _is_bare_verdict or _single_line_and_unclean:
             logger.warning(
                 "SummaryMemory.update: summary for %s looks invalid (%r) — "
                 "not writing it to synopsis.md (keeping previous content, if any).",
@@ -585,7 +610,13 @@ class SummaryMemory:
 
         try:
             self._synopsis_path.parent.mkdir(parents=True, exist_ok=True)
-            self._synopsis_path.write_text(new_content, encoding="utf-8")
+            # Bugfix: was plain write_text() — same class as the story_bible.md
+            # fix.  synopsis.md is rewritten wholesale each update (pattern.sub
+            # produces a full new string, not an append), so a kill mid-write
+            # truncates it silently.  The next chapter's coder then receives an
+            # incomplete continuity context with no error anywhere.
+            # atomic_write_text (temp-file + os.replace) is the one-line fix.
+            atomic_write_text(self._synopsis_path, new_content)
             logger.info(
                 "SummaryMemory: wrote synopsis section for %s → %s",
                 chapter_file, self._synopsis_path,

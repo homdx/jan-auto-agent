@@ -62,7 +62,9 @@ import ast
 import configparser
 import json
 import logging
+import os
 import re
+import stat
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -70,7 +72,7 @@ from typing import Optional
 
 from tools.block_extractor import extract_block as _block_extractor_extract_block
 # SearchAgent is imported lazily inside Coder._fetch_needed
-from tools.auto.utils import _cfg_mode
+from tools.auto.utils import _cfg_mode, atomic_write_text
 from tools.auto.context_assembler import ContextAssembler
 
 from tools.agent_trace import tracer
@@ -736,17 +738,15 @@ class Coder(_llm_stream.LLMClientBase):
         Returns ``""`` when nothing was found.  Never raises.
         """
         try:
-            from tools.search_agent import SearchAgent as _SearchAgent  # lazy import
-            active  = self._config.get("api", "active", fallback="local")
-            section = f"api_{active}"
-            agent = _SearchAgent(
-                model      = self._config.get(section, "model",      fallback=None),
-                base_url   = self._config.get(section, "base_url",   fallback=None),
-                api_key    = self._config.get(section, "api_key",    fallback=""),
-                api_format = self._config.get(section, "api_format", fallback="openai"),
-                timeout    = int(self._config.get("loop", "timeout_seconds", fallback="120")),
-                ssl_context = self._ssl_context,
-            )
+            from tools.search_agent import make_search_agent  # lazy import
+            # AUTO-BUG: this used to construct SearchAgent directly, reading
+            # only model/base_url/api_key/api_format/timeout — silently
+            # ignoring [search] skip_dirs/max_depth/max_file_kb and
+            # [api] verify_ssl, the exact config keys make_search_agent
+            # exists to read consistently with main.py's own SearchAgent
+            # (see its docstring). A self-signed-cert HTTPS profile or a
+            # customised skip_dirs list was silently not honoured here.
+            agent = make_search_agent(self._config, str(base_dir))
         except Exception as exc:
             logger.warning("coder._fetch_needed: could not create SearchAgent: %s", exc)
             return ""
@@ -1402,9 +1402,72 @@ class Coder(_llm_stream.LLMClientBase):
         # scanner still stops a model from smuggling deletions into clean
         # files. New files (existing_content is None) get no grandfathering.
         _existing_lower = (existing_content or "").lower()
+        _existing_lines = _existing_lower.splitlines()
 
         def _preexisting(token: str) -> bool:
             return bool(_existing_lower) and token.lower() in _existing_lower
+
+        def _strip_py_line_comment(line: str) -> str:
+            """Strip everything from the first unquoted # to end of line.
+            Prevents comment text (e.g. the explanation comment inside this
+            very method) from triggering the same-line co-occurrence check
+            in _preexisting_combo — a comment about a dangerous pattern is
+            not the same as real code that uses it.
+
+            BUGFIX: a backslash-escaped quote inside a string (e.g. the `\\"`
+            in `x = "say \\"hi\\""  # comment`) was counted as a real
+            delimiter, toggling in_single/in_double the same as an
+            unescaped one. An ODD number of such quote characters before
+            the actual `#` desyncs the tracked state, so the scanner
+            believes it is still "inside a string" right when the real
+            comment starts — and returns the line completely unstripped,
+            comment and all. That silently reopens the exact hole this
+            helper was written to close: comment text (which can freely
+            mention two dangerous tokens together, e.g. explaining why NOT
+            to combine them) counts toward the same-line co-occurrence
+            check again, for any existing line shaped this way. Track a
+            pending backslash so an escaped quote toggles nothing.
+            """
+            in_single = in_double = False
+            escaped = False
+            for i, ch in enumerate(line):
+                if escaped:
+                    escaped = False
+                    continue
+                if ch == "\\" and (in_single or in_double):
+                    escaped = True
+                elif ch == "'" and not in_double:
+                    in_single = not in_single
+                elif ch == '"' and not in_single:
+                    in_double = not in_double
+                elif ch == '#' and not in_single and not in_double:
+                    return line[:i]
+            return line
+
+        def _preexisting_combo(token_a: str, token_b: str) -> bool:
+            """True if *token_a* and *token_b* already co-occur on the same
+            line somewhere in the old file — not just each independently
+            appearing anywhere in it.
+
+            AUTO-BUG (follow-up): `_preexisting(danger) and
+            _preexisting("subprocess")` still passes for a file where the
+            two tokens never actually appeared together — e.g. `import
+            subprocess  # for git commands` on one line and a plain-English
+            `# never run rm -rf here` warning on another, unrelated line.
+            Neither mention is dangerous on its own, but together they were
+            enough to grandfather in a brand-new, genuinely dangerous
+            subprocess+rm-rf call introduced by this edit. Requiring
+            same-line co-occurrence is a reasonable, cheap proxy for "this
+            was already a real combined usage" without needing a full
+            parser: actual dangerous calls are written on one line
+            (`subprocess.run(["rm", "-rf", path])`), while incidental
+            separate mentions almost never share a line by chance.
+            """
+            token_a, token_b = token_a.lower(), token_b.lower()
+            return any(
+                token_a in code and token_b in code
+                for code in (_strip_py_line_comment(ln) for ln in _existing_lines)
+            )
 
         for label, pattern in active_patterns:
             pat_lower = pattern.lower()
@@ -1415,7 +1478,29 @@ class Coder(_llm_stream.LLMClientBase):
                 if "subprocess" in lower:
                     for danger in cls._SUBPROCESS_DANGER_TOKENS:
                         if danger.lower() in lower:
-                            if _preexisting(danger):
+                            # BUGFIX: this used to be `_preexisting(danger)` —
+                            # checking only whether the danger TOKEN string
+                            # appeared anywhere in the old file, with no
+                            # requirement that it co-occurred with
+                            # "subprocess". A file with an entirely unrelated
+                            # mention of the token text (e.g. a comment
+                            # "# warning: never run rm -rf here", or a test
+                            # asserting a shutdown handler works) permanently
+                            # exempted that file from this guard for every
+                            # future edit — a genuinely NEW subprocess+rm-rf
+                            # (or +sudo, +shutdown, ...) combination introduced
+                            # later would be silently grandfathered in.
+                            # Reproduced: an existing file containing only the
+                            # plain-English warning "never run rm -rf on this
+                            # folder" let a brand-new
+                            # `subprocess.call("rm -rf /", shell=True)` through
+                            # as if it were a harmless pre-existing pattern.
+                            # The compound pattern only genuinely pre-exists
+                            # if BOTH halves were already present together —
+                            # checked here by same-line co-occurrence, not
+                            # just each token independently appearing
+                            # somewhere in the file (see _preexisting_combo).
+                            if _preexisting_combo("subprocess", danger):
                                 logger.info(
                                     "coder._check_content_safety: subprocess+%r "
                                     "pre-exists in the target file — edit "
@@ -1650,8 +1735,17 @@ class Coder(_llm_stream.LLMClientBase):
             try:
                 dest.parent.mkdir(parents=True, exist_ok=True)
 
+                # Preserve the existing file's permission bits (e.g. the
+                # executable bit on a shell script or CLI entry point) —
+                # see the BUGFIX note below for why this matters.
+                existing_mode: "int | None" = None
+
                 # Back up existing file before overwriting (reversible).
                 if dest.exists():
+                    try:
+                        existing_mode = stat.S_IMODE(dest.stat().st_mode)
+                    except OSError:
+                        existing_mode = None
                     backup = dest.with_suffix(dest.suffix + ".coder.bak")
                     backup.write_text(
                         dest.read_text(encoding="utf-8", errors="replace"),
@@ -1662,7 +1756,31 @@ class Coder(_llm_stream.LLMClientBase):
                         task_id, dest, backup,
                     )
 
-                dest.write_text(content, encoding="utf-8")
+                # BUGFIX: was `dest.write_text(content, encoding="utf-8")` —
+                # a plain, non-atomic write. If the process is killed mid-
+                # write (SIGKILL, OOM-kill, power loss) while writing the
+                # user's actual code file, the file is left truncated with
+                # no detection anywhere — unlike the JSON state files this
+                # codebase already protects, there's no parse step to even
+                # notice a corrupted source file. Same failure class already
+                # found and fixed for synopsis.md and story_bible.md
+                # elsewhere in this branch; this write is the single
+                # highest-stakes one in the whole pipeline (the user's real,
+                # possibly hand-written, source file) and was the one place
+                # still using the unsafe plain write.
+                # atomic_write_text's temp-file-plus-os.replace() approach
+                # creates the temp file via tempfile.mkstemp (mode 0600), so
+                # replacing over an existing file would otherwise silently
+                # reset its permission bits on every single edit — restore
+                # them explicitly so this fix doesn't trade a corruption bug
+                # for a permissions bug.
+                atomic_write_text(dest, content)
+                if existing_mode is not None:
+                    try:
+                        os.chmod(dest, existing_mode)
+                    except OSError:
+                        pass
+
                 written.append(rel)
                 logger.info(
                     "coder._write_files [%s]: wrote %s (%d chars)",

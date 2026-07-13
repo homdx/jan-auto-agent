@@ -464,10 +464,26 @@ class Executor:
         if acceptance_check:
             safe, reason = self._check_command_safety(acceptance_check)
             if not safe:
+                # AUTO-BUG: this used to fall back to bare "pytest" — but
+                # _prepare_workspace mirrors the WHOLE base_dir into the
+                # workspace (AUTO-FIX-1 above), so bare "pytest" collects
+                # and runs every OTHER pre-existing test in the repo too.
+                # In any repo with a healthy existing test suite (this one
+                # included — 2000+ passing tests), that reliably exits 0
+                # regardless of whether the current task's actual goal was
+                # ever met. Reproduced: a task whose real check would have
+                # caught a function still raising NotImplementedError was
+                # marked passed and committed, because an unrelated
+                # existing test happened to pass. A blocked acceptance_check
+                # must fail its task, not risk a spurious pass from
+                # whatever else happens to already be green — "false"
+                # always exits 1, with no dependency on repo contents.
                 logger.error(
-                    "_resolve_command: [SAFETY] %s — falling back to pytest", reason
+                    "_resolve_command: [SAFETY] %s — acceptance_check "
+                    "blocked; failing the check rather than substituting "
+                    "an unrelated one that could spuriously pass", reason,
                 )
-                return "pytest"
+                return "false"
             resolved = self._resolve_bare_filename(acceptance_check, target_files)
             return self._rewrite_python(resolved)
 
@@ -514,7 +530,21 @@ class Executor:
             if part.startswith("-"):
                 continue  # flag — skip
             if "/" in part or "\\" in part:
-                return command  # already has a path component — nothing to do
+                # BUGFIX: this used to be `return command` — aborting the
+                # ENTIRE scan the moment ANY earlier non-flag token happened
+                # to already be path-qualified, even when that token has
+                # nothing to do with the rewrite and a genuine bare-filename
+                # match exists later in the command. E.g.
+                # "python tests/run_report.py generateAllureReport.sh" would
+                # never rewrite generateAllureReport.sh, because the
+                # already-qualified "tests/run_report.py" token came first —
+                # reproducing the exact "file not found" failure this
+                # function exists to prevent (see its own docstring
+                # example). This token just isn't a rewrite candidate;
+                # treat it the same as the "zero/multiple matches" case
+                # below and keep scanning, rather than as a hard stop like
+                # a genuine shell operator.
+                continue  # already path-qualified — not a candidate, keep scanning
             if part in _SHELL_OPS:
                 return command  # compound command — stop scanning; no safe rewrite
             # `part` is a bare argument token.  Check whether its basename
@@ -528,10 +558,17 @@ class Executor:
                     # would misquote them.  Do a safe word-boundary string
                     # substitution on the original command string instead.
                     #
-                    # Callable replacement, not a string one — re.sub
-                    # interprets backslashes in a string replacement as
-                    # backreferences, which would break on a path
-                    # containing an ordinary backslash.
+                    # Bugfix: full_path must NOT be passed as re.sub's string
+                    # replacement argument — re.sub interprets backslash
+                    # sequences in a *string* replacement as backreferences
+                    # (\1, \g<n>, ...). This pattern has no capture groups, so
+                    # a target path containing an ordinary backslash (a
+                    # Windows-style path, or any oddly-named file) would raise
+                    # `re.error: invalid group reference` instead of
+                    # substituting cleanly. Same root cause already fixed in
+                    # tools/auto/summary_memory.py — a callable replacement
+                    # sidesteps this entirely, since re.sub never interprets
+                    # backslash escapes in a function's return value.
                     import re as _re_local
                     rewritten = _re_local.sub(
                         r"(?<!\S)" + _re_local.escape(basename) + r"(?!\S)",

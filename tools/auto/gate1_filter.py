@@ -295,6 +295,15 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             presence_passed = [(c, f"existence check passed ({_why})") for c, _ in existence_passed]
         else:
             for c, block in existence_passed:
+                if c.cited_location.new_file:
+                    # AUTO-BUG (new_file): same reasoning as AUTO-CR-8 above —
+                    # a file that does not exist yet has no existing content
+                    # to check problem-presence against. "Is this problem
+                    # present in: [nothing]" is meaningless here and would
+                    # incorrectly reject every legitimate new-file task.
+                    presence_passed.append(
+                        (c, "new file — existence check sufficient"))
+                    continue
                 ok, reason = self._check_presence(c, block)
                 if ok:
                     presence_passed.append((c, reason))
@@ -356,6 +365,44 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         on failure).
         """
         loc = candidate.cited_location
+
+        # AUTO-BUG: new_file candidates declare that this path does not exist
+        # yet and this task is what creates it — the existence/hallucination
+        # checks below exist to catch citations of content that was never
+        # real, which does not apply here. Still confirm the path resolves
+        # inside base_dir (no ../ escape) and isn't already a directory.
+        if loc.new_file:
+            candidate_path = (base_dir / loc.file).resolve()
+            try:
+                candidate_path.relative_to(base_dir.resolve())
+            except ValueError:
+                return False, f"new_file path escapes base_dir: {loc.file!r}", ""
+            if candidate_path.is_dir():
+                return False, f"new_file path is an existing directory: {loc.file!r}", ""
+            # BUGFIX: new_file's entire premise is "this path does not exist
+            # yet and this task creates it" — that's *why* the checks below
+            # (which exist to catch citations of content that was never
+            # real) are skipped, and why Stage B is handed an empty block
+            # instead of the file's actual content. If the architect (or a
+            # confused/hallucinating model) marks new_file=true for a path
+            # that already exists as a regular file, none of that logic
+            # holds: the coder would still just overwrite target_files
+            # normally, but now with zero visibility into what's already
+            # there — silently clobbering real content instead of raising a
+            # legitimate "already exists" existence failure the way an
+            # ordinary (non-new_file) citation of that same path would.
+            if candidate_path.is_file():
+                return (
+                    False,
+                    f"new_file={loc.file!r} but this path already exists — "
+                    f"not a new file; drop new_file or cite the real content",
+                    "",
+                )
+            return (
+                True,
+                f"new file (not yet created): {loc.file!r} — existence check skipped",
+                "",
+            )
 
         # 0. Cluster membership check — catch hallucinated paths before filesystem I/O.
         if cluster_files is not None:
@@ -679,13 +726,29 @@ def _fingerprint(c: CandidateTask) -> str:
 def _target_fingerprint(c: CandidateTask) -> "str | None":
     """AUTO-BUG-3: secondary dedup key based on the file(s) being WRITTEN.
 
-    ``_fingerprint`` alone keys on ``cited_location``, which is largely
-    arbitrary for creative-generation tasks (no meaningful symbol/line in a
-    chapter that doesn't exist yet) and can differ between two batches
-    proposing to write the same target file. The key is the target file set
-    alone (not the title too — independently-generated batches rarely
-    phrase the same "write chapter_4" task identically, so a title-inclusive
-    key let real duplicates through). Returns ``None`` with no target files.
+    ``_fingerprint`` alone keys on ``cited_location`` — the SOURCE the
+    candidate references — which is the right disambiguator for code tasks
+    (two different fixes can legitimately cite the same file at different
+    symbols/lines). For creative-generation tasks, though, ``cited_location``
+    is largely arbitrary (there's no meaningful symbol/line in a chapter
+    that doesn't exist yet) and can differ between two batches of the same
+    cluster even when both are proposing to write the exact same target
+    file — which is exactly the "two independent tasks generate chapter_4"
+    duplication observed in practice.
+
+    AUTO-BUG fix: the key used to also include the normalised title, on the
+    theory that "same target + same title" was enough to call it a
+    duplicate. In practice two *independent* architect batches essentially
+    never phrase a "write chapter_4" task identically — different wording,
+    different framing — so titles almost always differ even when the
+    target file is the exact same one, and the title-inclusive key silently
+    let the very duplication this function exists to catch straight
+    through. A chapter file being generated fresh has no legitimate reason
+    for two independent tasks to both target it in the same run (unlike
+    code, where "same file, same title" undersells how differently two
+    code fixes on one file can legitimately coexist) — so for creative
+    mode the target file set alone is a safe, sufficient duplicate key.
+    Returns ``None`` when there are no target files to key on.
     """
     if not c.target_files:
         return None

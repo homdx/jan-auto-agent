@@ -461,6 +461,28 @@ class TestProgress:
         assert p["done_count"] == 1
         assert p["pending_count"] == 1
 
+    # AUTO-BUG regression: resuming under a genuinely different goal must
+    # raise, never silently keep executing the old goal's leftover tasks.
+    def test_resume_with_different_goal_raises(self, tmp_path):
+        agent_dir = tmp_path / ".agent"
+        s1 = StateStore(agent_dir)
+        s1.initialise("goal A", tmp_path)
+
+        s2 = StateStore(agent_dir)
+        with pytest.raises(RuntimeError):
+            s2.initialise("goal B", tmp_path)
+
+    # Same-goal resume (the normal case) must be completely unaffected by
+    # the fix above: still returns False, still does not raise.
+    def test_resume_with_same_goal_still_works(self, tmp_path):
+        agent_dir = tmp_path / ".agent"
+        s1 = StateStore(agent_dir)
+        s1.initialise("goal", tmp_path)
+
+        s2 = StateStore(agent_dir)
+        is_fresh = s2.initialise("goal", tmp_path)
+        assert is_fresh is False
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # resume_info
