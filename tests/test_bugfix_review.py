@@ -1137,6 +1137,54 @@ class TestSubprocessDangerComboRequiresCooccurrence:
         assert not safe
 
 
+# ── Bug 11b: _preexisting_combo's own comment-stripper (_strip_py_line_
+#    comment, added alongside Bug 11) tracks quote state naively, with no
+#    concept of a backslash-escaped quote. A line with an ODD number of
+#    quote characters preceding the real "#" — e.g. an escaped quote inside
+#    a string literal — desyncs that tracking so the scanner still believes
+#    it is "inside a string" right when the actual comment starts, and
+#    returns the line completely unstripped. That silently reopens the
+#    exact hole Bug 11 exists to close: a comment on such a line can once
+#    again make an unrelated same-line mention count as genuine co-
+#    occurrence, letting a brand-new dangerous combo be grandfathered in.
+
+class TestPreexistingComboCommentStripHandlesEscapedQuotes:
+    def test_escaped_quote_before_comment_does_not_grandfather(self):
+        # Both dangerous tokens appear ONLY inside this line's comment text,
+        # never in real code — but an escaped quote earlier on the SAME
+        # line (leaving an ODD count of quote characters before the "#")
+        # is what desyncs the naive tracker. If comment-stripping works,
+        # this line contributes nothing to the co-occurrence check; if it
+        # desyncs, the whole line (comment included) counts.
+        existing = (
+            'y = "she said \\"hi"'
+            '  # never combine subprocess with rm -rf\n'
+        )
+        malicious = existing + (
+            '\n'
+            'def sneaky_cleanup():\n'
+            '    subprocess.call("rm -rf /", shell=True)\n'
+        )
+        safe, reason = Coder._check_content_safety(
+            malicious, "code", existing_content=existing)
+        assert not safe, (
+            "a comment reachable only via a backslash-escaped-quote line "
+            "must not count toward same-line co-occurrence — the escaped "
+            "quote must not desync the comment stripper into leaving the "
+            "comment text in scope"
+        )
+
+    def test_genuine_combined_usage_after_escaped_quote_line_still_grandfathered(self):
+        existing = (
+            'x = "he said \\"hello\\""  # just a greeting\n'
+            'def cleanup_old_data():\n'
+            '    subprocess.run(["rm", "-rf", tmp_dir], check=False)\n'
+        )
+        safe, reason = Coder._check_content_safety(
+            existing, "code", existing_content=existing)
+        assert safe, reason
+
+
 # ── Bug 12: a blocked acceptance_check used to fall back to bare `pytest`,
 #    which _prepare_workspace's whole-repo mirror (AUTO-FIX-1) means picks
 #    up and runs every OTHER pre-existing test too - so in any repo with a

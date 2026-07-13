@@ -1413,10 +1413,30 @@ class Coder(_llm_stream.LLMClientBase):
             very method) from triggering the same-line co-occurrence check
             in _preexisting_combo — a comment about a dangerous pattern is
             not the same as real code that uses it.
+
+            BUGFIX: a backslash-escaped quote inside a string (e.g. the `\\"`
+            in `x = "say \\"hi\\""  # comment`) was counted as a real
+            delimiter, toggling in_single/in_double the same as an
+            unescaped one. An ODD number of such quote characters before
+            the actual `#` desyncs the tracked state, so the scanner
+            believes it is still "inside a string" right when the real
+            comment starts — and returns the line completely unstripped,
+            comment and all. That silently reopens the exact hole this
+            helper was written to close: comment text (which can freely
+            mention two dangerous tokens together, e.g. explaining why NOT
+            to combine them) counts toward the same-line co-occurrence
+            check again, for any existing line shaped this way. Track a
+            pending backslash so an escaped quote toggles nothing.
             """
             in_single = in_double = False
+            escaped = False
             for i, ch in enumerate(line):
-                if ch == "'" and not in_double:
+                if escaped:
+                    escaped = False
+                    continue
+                if ch == "\\" and (in_single or in_double):
+                    escaped = True
+                elif ch == "'" and not in_double:
                     in_single = not in_single
                 elif ch == '"' and not in_single:
                     in_double = not in_double
