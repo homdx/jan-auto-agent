@@ -56,15 +56,39 @@ def _build_payload(payload: dict, api_format: str, stream: bool) -> dict:
     """
     Return a copy of payload shaped for the target API format.
 
-    openai : top-level temperature, stream flag, standard messages array.
-    ollama : temperature moves into options{}, num_ctx added if present,
-             /api/chat expects {"model", "messages", "stream", "options"}.
+    openai : top-level temperature, max_tokens, stream flag, standard
+             messages array.
+    ollama : temperature AND max_tokens both move into options{} (the
+             latter renamed to Ollama's own "num_predict"), num_ctx added
+             if present, /api/chat expects
+             {"model", "messages", "stream", "options"}.
     """
     body = dict(payload)
     if api_format == "ollama":
         options = {}
         if "temperature" in body:
             options["temperature"] = body.pop("temperature")
+        if "max_tokens" in body:
+            # AUTO-BUG: this key used to be left untouched here, so a
+            # caller that builds its own OpenAI-shaped payload directly
+            # (ImprovementAgent.process, OrchestratorActions._edit_file_
+            # content when [file_editor] max_tokens is set, and several
+            # call sites in FAQAgent — everyone who calls
+            # request_completion() themselves instead of going through
+            # build_chat_request(), which already handles this correctly)
+            # had "max_tokens" sent as a stray TOP-LEVEL field. Ollama's
+            # /api/chat does not recognize a top-level "max_tokens" — it
+            # silently ignores unknown fields — so the configured cap was
+            # never enforced at all against an Ollama backend, which is
+            # this project's *default* profile (agents.ini's shipped
+            # [api_local] section: api_format = ollama). Confirmed with a
+            # direct call: max_tokens stayed in the body but never reached
+            # options.num_predict. Renaming/moving it here fixes every
+            # affected caller at once, the same way build_chat_request
+            # already does for its own payload-construction path.
+            _mt = body.pop("max_tokens")
+            if _mt:
+                options["num_predict"] = _mt
         if "num_ctx" in body:
             # 0 / falsy means "use server default" everywhere in this
             # project — never forward it, or Ollama would treat it as a
