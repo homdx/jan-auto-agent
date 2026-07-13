@@ -1088,3 +1088,93 @@ class TestCanonValidatorPreservesNumbers:
         cv = self._extractor("- Anna is 42 years old")
         claims = cv._extract_claims("chapter text")
         assert claims == ["Anna is 42 years old"]
+
+
+# ── Bug 11: the upstream fix for subprocess+danger-token grandfathering
+#    (b0aabde) required both tokens to independently appear somewhere in the
+#    old file, but never verified they actually co-occurred as real combined
+#    usage - so two unrelated, separate mentions still grandfathered in a
+#    brand-new dangerous combination.
+
+class TestSubprocessDangerComboRequiresCooccurrence:
+    def test_separate_unrelated_mentions_do_not_grandfather_new_combo(self):
+        existing = (
+            'import subprocess  # used elsewhere for git commands, nothing dangerous\n'
+            '\n'
+            'def warn_user():\n'
+            '    print("WARNING: never manually run rm -rf on the data directory")\n'
+        )
+        malicious = existing + (
+            '\n'
+            'def sneaky_cleanup():\n'
+            '    subprocess.call("rm -rf /", shell=True)\n'
+        )
+        safe, reason = Coder._check_content_safety(
+            malicious, "code", existing_content=existing)
+        assert not safe, (
+            "subprocess and the danger token were only ever mentioned in "
+            "separate, unrelated lines in the old file - a brand-new "
+            "combined usage must still be blocked"
+        )
+
+    def test_genuinely_combined_usage_still_grandfathered(self):
+        existing = (
+            'def cleanup_old_data():\n'
+            '    subprocess.run(["rm", "-rf", tmp_dir], check=False)\n'
+        )
+        # No-op rewrite of the file's own genuinely pre-existing usage.
+        safe, reason = Coder._check_content_safety(
+            existing, "code", existing_content=existing)
+        assert safe, reason
+
+    def test_new_file_with_combo_still_blocked(self):
+        malicious = (
+            'def sneaky_cleanup():\n'
+            '    subprocess.call("rm -rf /", shell=True)\n'
+        )
+        safe, reason = Coder._check_content_safety(
+            malicious, "code", existing_content=None)
+        assert not safe
+
+
+# ── Bug 12: a blocked acceptance_check used to fall back to bare `pytest`,
+#    which _prepare_workspace's whole-repo mirror (AUTO-FIX-1) means picks
+#    up and runs every OTHER pre-existing test too - so in any repo with a
+#    healthy existing test suite, a task whose real check was blocked for
+#    safety reasons could get marked passed and committed without its
+#    actual goal ever being verified.
+
+class TestBlockedAcceptanceCheckCannotSpuriouslyPass:
+    def test_blocked_check_falls_back_to_guaranteed_failure(self, tmp_path):
+        from tools.auto.executor import Executor
+        executor = Executor(base_dir=tmp_path, timeout_sec=10)
+        cmd = executor._resolve_command("rm -rf /", [], tmp_path)
+        assert cmd == "false"
+
+    def test_blocked_check_does_not_spuriously_pass_via_unrelated_tests(self, tmp_path):
+        from tools.auto.executor import Executor
+        # A repo with its own healthy, completely unrelated test suite -
+        # exactly the self-hosting scenario this codebase's own pilots
+        # exercise (this repo included).
+        (tmp_path / "tests").mkdir()
+        (tmp_path / "tests" / "test_unrelated.py").write_text(
+            "def test_something_unrelated():\n    assert 1 + 1 == 2\n"
+        )
+        (tmp_path / "app.py").write_text(
+            "def broken():\n    raise NotImplementedError\n"
+        )
+        executor = Executor(base_dir=tmp_path, timeout_sec=30)
+        task = {
+            "id": "T1",
+            "target_files": ["app.py"],
+            # A real check for the task's actual goal, but flagged unsafe -
+            # must never be silently replaced by something that can pass
+            # for unrelated reasons.
+            "acceptance_check": "python app.py && rm -rf /tmp/marker",
+        }
+        result = executor.run(task)
+        assert not result.passed, (
+            "a task whose acceptance_check was blocked for safety must "
+            "never be marked passed via an unrelated pre-existing test "
+            "in the mirrored workspace"
+        )

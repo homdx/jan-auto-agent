@@ -464,10 +464,26 @@ class Executor:
         if acceptance_check:
             safe, reason = self._check_command_safety(acceptance_check)
             if not safe:
+                # AUTO-BUG: this used to fall back to bare "pytest" — but
+                # _prepare_workspace mirrors the WHOLE base_dir into the
+                # workspace (AUTO-FIX-1 above), so bare "pytest" collects
+                # and runs every OTHER pre-existing test in the repo too.
+                # In any repo with a healthy existing test suite (this one
+                # included — 2000+ passing tests), that reliably exits 0
+                # regardless of whether the current task's actual goal was
+                # ever met. Reproduced: a task whose real check would have
+                # caught a function still raising NotImplementedError was
+                # marked passed and committed, because an unrelated
+                # existing test happened to pass. A blocked acceptance_check
+                # must fail its task, not risk a spurious pass from
+                # whatever else happens to already be green — "false"
+                # always exits 1, with no dependency on repo contents.
                 logger.error(
-                    "_resolve_command: [SAFETY] %s — falling back to pytest", reason
+                    "_resolve_command: [SAFETY] %s — acceptance_check "
+                    "blocked; failing the check rather than substituting "
+                    "an unrelated one that could spuriously pass", reason,
                 )
-                return "pytest"
+                return "false"
             resolved = self._resolve_bare_filename(acceptance_check, target_files)
             return self._rewrite_python(resolved)
 
