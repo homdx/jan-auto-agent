@@ -825,6 +825,37 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
                 reason = rest if rest else "validator rejected (no reason given)"
                 return False, reason, False
 
+        # ── English verdict on a LATER line (behind a preamble) ──────────
+        # AUTO-BUG: the two English checks above only fire when the token is
+        # the FIRST token of the whole candidate string. The candidate list
+        # is [first_non_empty_line, whole_text] precisely so a verdict that
+        # isn't on line 1 can still be found via the whole-text fallback —
+        # but that fallback only ever helped RUSSIAN verdicts, because the
+        # Russian rules below use substring .search() over the whole text
+        # while the English rules use .startswith(). Result: a validator that
+        # emits a perfectly clear English "REVISE:/REJECT:/NO:" but prepends
+        # ANY preamble line ("Here is my verdict:\nREVISE: fix the ending")
+        # had its rejection silently dropped and the chapter fail-opened to
+        # APPROVED — while the identical reply in Russian was correctly
+        # REVISE. The protocol is "first token of a LINE", so scan each line
+        # rather than only the candidate's own start. Kept AFTER the two
+        # startswith checks and BEFORE the Russian heuristics: every input
+        # that already returned a definite verdict is byte-for-byte
+        # unchanged, and an explicit English protocol token outranks the
+        # fuzzy Russian keyword match (a bare «одобряю» elsewhere in the text
+        # must not override an explicit "REVISE:" line).
+        for _line in raw.splitlines():
+            _lu = _line.strip().upper()
+            if not _lu:
+                continue
+            if _lu.startswith("APPROVED") or _re.match(r"^OK\b", _lu):
+                return True, "", False
+            for token in ("REVISE", "REJECT", "NO"):
+                if _lu.startswith(token):
+                    rest = _line.strip()[len(token):].lstrip(": ").strip()
+                    reason = rest if rest else "validator rejected (no reason given)"
+                    return False, reason, False
+
         # ── Russian APPROVED (order matters — negated first) ──────────────
         for pat in _RU_APPROVED:
             if pat.search(norm):
