@@ -312,6 +312,27 @@ class BacklogPrioritiser:
            the lower-chapter task is a prerequisite of the higher one so that
            a failed chapter N blocks chapter N+1 rather than leaving a silent
            narrative gap.
+
+        Bugfix: rules 2 and 3 can disagree about direction. E.g. a task
+        citing symbol "Bob" in chapter_2.md, and a *separate* chapter_1.md
+        task whose instruction happens to mention "Bob" (perfectly normal —
+        "foreshadow Bob before he appears") — rule 3 says chapter_1 → chapter_2
+        (lower chapter is a prerequisite of the higher one), but rule 2 reads
+        that same "Bob" mention backwards and says chapter_2 → chapter_1
+        (the citer of a symbol depends on whoever's instruction mentions it).
+        Both edges get added independently since each rule only checks its
+        own dependencies list for a pre-existing edge in the *same*
+        direction, not the reverse — producing a genuine 2-node cycle that
+        _topological_sort() can only "fix" by discarding both tasks' order
+        guarantees entirely and falling back to original_index, silently
+        defeating the very ordering these rules exist to establish. Guard
+        every edge addition with a reachability check: an edge A → B is only
+        added if B does not already (transitively) depend on A — i.e. if it
+        would not immediately close a cycle. Rule 3 (chapter order) is the
+        most reliable of the three (deterministic from filenames, not prone
+        to incidental text matches) and is applied first with no existing
+        edges to conflict with, so it always wins ties against the softer
+        same-file/symbol-ref heuristics that run after it.
         """
         # Rule 3: filename-derived chapter edges (additive with rules 1 & 2).
         chapter_edges = _chapter_dependencies(tasks)
@@ -325,6 +346,31 @@ class BacklogPrioritiser:
                         dep_id, task_id,
                     )
 
+        id_to_task: dict[str, ReadyTask] = {t.task_id: t for t in tasks}
+
+        def _add_edge(dep_task: ReadyTask, dependent_task: ReadyTask, rule: str) -> None:
+            """Add dep_task → dependent_task unless it would close a cycle."""
+            if dep_task.task_id in dependent_task.dependencies:
+                return  # already registered
+            if _depends_on(dep_task, dependent_task.task_id, id_to_task):
+                # dep_task already (transitively) depends on dependent_task —
+                # adding the reverse edge would create a 2+-node cycle.
+                # A more reliable earlier rule already established the
+                # opposite direction; drop this weaker/later edge instead
+                # of letting the topological sort discover the cycle and
+                # discard both.
+                logger.debug(
+                    "dep [%s]: skipped %s → %s — would create a cycle "
+                    "(conflicts with an already-established edge)",
+                    rule, dep_task.task_id, dependent_task.task_id,
+                )
+                return
+            dependent_task.dependencies.append(dep_task.task_id)
+            logger.debug(
+                "dep [%s]: %s → %s",
+                rule, dep_task.task_id, dependent_task.task_id,
+            )
+
         for i, task_b in enumerate(tasks):
             for j, task_a in enumerate(tasks):
                 if i == j:
@@ -333,19 +379,11 @@ class BacklogPrioritiser:
                     continue  # already registered
 
                 if self._same_file_upstream(task_a, task_b):
-                    task_b.dependencies.append(task_a.task_id)
-                    logger.debug(
-                        "dep [same-file]: %s → %s",
-                        task_a.task_id, task_b.task_id,
-                    )
+                    _add_edge(task_a, task_b, "same-file")
                     continue
 
                 if self._cross_file_symbol_ref(task_a, task_b):
-                    task_b.dependencies.append(task_a.task_id)
-                    logger.debug(
-                        "dep [symbol-ref]: %s → %s",
-                        task_a.task_id, task_b.task_id,
-                    )
+                    _add_edge(task_a, task_b, "symbol-ref")
 
     # ── Dependency heuristics ─────────────────────────────────────────────────
 
@@ -387,6 +425,33 @@ class BacklogPrioritiser:
         # Require a whole-word match so "parse" doesn't match "parse_config".
         pattern = re.compile(rf"\b{re.escape(symbol_a)}\b")
         return bool(pattern.search(task_b.instruction))
+
+
+def _depends_on(
+    task: ReadyTask,
+    target_id: str,
+    id_to_task: dict[str, ReadyTask],
+    _seen: set[str] | None = None,
+) -> bool:
+    """True if *task* already (directly or transitively) depends on *target_id*.
+
+    Used by :meth:`BacklogPrioritiser._infer_dependencies` to guard against
+    adding an edge that would close a cycle. ``_seen`` guards against
+    infinite recursion if a cycle somehow already exists (defensive only —
+    the whole point of this helper is to prevent that from happening).
+    """
+    if _seen is None:
+        _seen = set()
+    if task.task_id in _seen:
+        return False
+    _seen.add(task.task_id)
+    for dep_id in task.dependencies:
+        if dep_id == target_id:
+            return True
+        dep_task = id_to_task.get(dep_id)
+        if dep_task is not None and _depends_on(dep_task, target_id, id_to_task, _seen):
+            return True
+    return False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
