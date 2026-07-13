@@ -175,6 +175,22 @@ class PrioritisedBacklog:
                 "symbol":     loc.symbol,
                 "line_start": loc.line_start,
                 "line_end":   loc.line_end,
+                # Bugfix: this dict literal predates CitedLocation.new_file
+                # and was never updated when that field was added, so every
+                # task built here silently forgot whether its citation was a
+                # not-yet-created file. Nothing in today's control flow
+                # re-reads cited_locations[0]["new_file"] after planning (Gate
+                # 1's existence check runs on the CandidateTask itself, before
+                # this conversion), so the loss is currently inert, but the
+                # persisted task dict is the on-disk source of truth for the
+                # task (plan.json) and silently dropping a real field from it
+                # is a correctness bug regardless of whether anything reads it
+                # today — the checkpoint serialiser in architect.py
+                # (_serialise_candidates) already preserves this same field
+                # for the same CitedLocation, which is the asymmetry that
+                # gives this away as an oversight rather than a deliberate
+                # omission.
+                "new_file":   loc.new_file,
             }
             result.append(make_task(
                 id               = rt.task_id,

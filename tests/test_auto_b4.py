@@ -86,6 +86,7 @@ def _cand(
     acceptance_check: str = "python -m pytest tests/ -q",
     cluster: str = "agents",
     target_files: list[str] | None = None,
+    new_file: bool = False,
 ) -> CandidateTask:
     return CandidateTask(
         title            = title,
@@ -97,9 +98,11 @@ def _cand(
             symbol     = symbol,
             line_start = line_start,
             line_end   = line_end,
+            new_file   = new_file,
         ),
         cluster = cluster,
     )
+
 
 
 def _rt(
@@ -489,6 +492,21 @@ class TestStateTaskConversion:
         backlog = build_backlog([c])
         t = backlog.to_state_tasks(status="in_progress")[0]
         assert t["status"] == "in_progress"
+
+    # Bugfix regression: new_file used to be silently dropped when a
+    # candidate was converted into a persisted task dict.
+    def test_new_file_flag_preserved(self) -> None:
+        c = _cand(file="tools/brand_new.py", symbol=None, line_start=None,
+                   line_end=None, acceptance_check="pytest", new_file=True)
+        backlog = build_backlog([c])
+        t = backlog.to_state_tasks()[0]
+        assert t["cited_locations"][0]["new_file"] is True
+
+    def test_new_file_flag_defaults_false(self) -> None:
+        c = _cand(acceptance_check="pytest")  # new_file not passed -> False
+        backlog = build_backlog([c])
+        t = backlog.to_state_tasks()[0]
+        assert t["cited_locations"][0]["new_file"] is False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
