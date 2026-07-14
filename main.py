@@ -629,6 +629,9 @@ def _parse_args():
     parser.add_argument("--module", metavar="PATH", default=None,
                         help="With --collect: incrementally re-scan only this one module path "
                              "and patch it into the existing artifact + manifest.")
+    parser.add_argument("--no-llm", action="store_true", default=False,
+                        help="With --collect: skip Pass B (LLM module summaries) even if "
+                             "[collect] llm_summaries is true — a purely structural build.")
     # JSON output flag — used together with --faq
     parser.add_argument("--json", action="store_true", default=False,
                         help="With --faq: print ONLY a JSON object to stdout and suppress "
@@ -662,6 +665,7 @@ def main():
     # ── COLLECT ONE-SHOT MODE (COLLECT-19) ──────────────────────────────
     if args.collect:
         from tools.collect.cli import CollectCliError, run as collect_run
+        from tools.collect.summarizer import make_summarizer_call, should_run_pass_b
 
         if args.module is not None:
             action = "module"
@@ -675,9 +679,26 @@ def main():
         config = configparser.ConfigParser(inline_comment_prefixes=(';', '#'))
         if os.path.exists(args.config):
             config.read(args.config, encoding="utf-8")
+
+        # BUGFIX: `make_summarizer_call`/`should_run_pass_b` are the
+        # documented COLLECT-19 entry points `summarizer.py` describes
+        # ("Public entry point CLI code (COLLECT-19) uses to get a Pass B
+        # LlmCall from agents.ini") — but nothing here ever called them,
+        # so `collect_run` always received `llm_call=None` and Pass B
+        # (module summaries) / Pass C (their verification) silently never
+        # ran, regardless of `[collect] llm_summaries` (default true) or
+        # any flag, since `--no-llm` didn't even exist yet. A "full
+        # build" therefore finished in ~1s on a real repo — Pass B, the
+        # only part of the pipeline that makes a network call, was dead
+        # code from this entry point.
+        llm_call = None
+        if action != "check" and not args.no_llm and should_run_pass_b(config):
+            llm_call = make_summarizer_call(config)
+
         try:
             result = collect_run(
-                base_dir, action, config=config, config_path=args.config, module_path=args.module,
+                base_dir, action, config=config, config_path=args.config,
+                module_path=args.module, llm_call=llm_call,
             )
             print(f"collect {result.action}: {result.message}")
             sys.exit(0)
@@ -850,13 +871,22 @@ def main():
             # [collect] dir (default .collect/).
             if user_input.startswith("/collect"):
                 from tools.collect.cli import CollectCliError, parse_collect_args, run as collect_run
+                from tools.collect.summarizer import make_summarizer_call, should_run_pass_b
 
                 body = user_input[len("/collect"):].strip()
                 argv = body.split() if body else []
                 try:
                     kwargs = parse_collect_args(argv)
+                    # BUGFIX: same gap as --collect above — this never
+                    # passed llm_call either, so /collect's Pass B
+                    # (module summaries) silently never ran.
+                    llm_call = None
+                    no_llm = "--no-llm" in argv
+                    if kwargs.get("action") != "check" and not no_llm and should_run_pass_b(orchestrator.config):
+                        llm_call = make_summarizer_call(orchestrator.config)
                     result = collect_run(
-                        base_dir, config=orchestrator.config, config_path=args.config, **kwargs
+                        base_dir, config=orchestrator.config, config_path=args.config,
+                        llm_call=llm_call, **kwargs
                     )
                     print(f"[{_ts()}] 🗂  collect {result.action}: {result.message}")
                 except CollectCliError as exc:
