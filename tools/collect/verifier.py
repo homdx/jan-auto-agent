@@ -421,17 +421,38 @@ def verify_repo(
     kept_count = 0
 
     for m in modules:
+        # BUGFIX: kept_count used to be recomputed by re-running
+        # extract_claims on the *rejoined* (already-filtered) purpose/notes
+        # text — but sentence-splitting doesn't round-trip through that
+        # rejoin. `_verify_text` reassembles surviving claims by joining
+        # their `.text` with a single space, so newline-separated,
+        # unpunctuated claims (a real Pass B idiom for bullet-style notes,
+        # e.g. "Handles retries\nLogs failures") collapse back into one
+        # sentence on re-split, since the split regex's `\n+` alternative
+        # no longer has a newline to match and the joined text has no
+        # terminal punctuation to trigger the other alternative either.
+        # Three surviving claims could silently get reported as one kept
+        # claim — undermining the "kept/dropped count for transparency"
+        # guarantee this report exists for (COLLECT-17 AC). Fixed by
+        # counting kept-by-subtraction against the *original* claim count
+        # instead: every claim `verify_claims` sees is either kept or
+        # recorded in `dropped`, nothing vanishes silently, so
+        # `total - len(dropped)` is exact by construction and needs no
+        # round-trip through reconstructed text at all.
+        total_claims = 0
+        if m.summary is not None:
+            total_claims = len(
+                extract_claims(m.summary.purpose, m.path, known_symbols)
+            ) + len(
+                extract_claims(m.summary.notes, m.path, known_symbols)
+            )
+
         verified, dropped = verify_module(
             m, known_symbols=known_symbols, line_counts=line_counts, fail_open_locs=fail_open_locs,
         )
         verified_modules.append(verified)
         all_dropped.extend(dropped)
-        if verified.summary is not None:
-            kept_count += len(
-                extract_claims(verified.summary.purpose, m.path, known_symbols)
-            ) + len(
-                extract_claims(verified.summary.notes, m.path, known_symbols)
-            )
+        kept_count += total_claims - len(dropped)
 
     report = build_verification_report(all_dropped, kept_count=kept_count)
     return verified_modules, report

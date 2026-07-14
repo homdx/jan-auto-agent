@@ -81,14 +81,37 @@ def _block_terminates(body: List[ast.stmt]) -> bool:
 def _falsy_guard_targets(test: ast.expr) -> "Tuple[Set[str], Set[Tuple[str, object]]]":
     """Names and `(name, key)` pairs a boolean test guards-as-falsy.
 
-    Recognizes, anywhere inside an `and`/`or` combination:
-    `not x`, `not x.get(k)` (-> pair), `len(x) == 0`, `x is None`.
+    Recognizes `not x`, `not x.get(k)` (-> pair), `len(x) == 0`, `x is None`
+    at the top level, and inside any nesting depth of `or`-combinations —
+    but *not* inside an `and`.
+
+    That `and` exclusion is load-bearing, not an oversight: this function
+    is only ever called on the test of an `if` whose body terminates
+    (`_block_terminates`), so what it's computing is "what do we know for
+    sure once we're past this `if` without having terminated" — i.e. once
+    `test` evaluated False. For `test = A or B`, `test` False means both
+    `A` and `B` were individually False (De Morgan), so every falsy-check
+    found inside an `or` chain is individually refuted and its name/pair
+    is genuinely guaranteed truthy afterward — recursing through nested
+    `or`s is correct. But for `test = A and B`, `test` False only means
+    *at least one* of `A`/`B` was False — not which one — so no
+    individual name inside an `and` can be marked guaranteed. BUGFIX: this
+    function used to recurse into `ast.BoolOp` regardless of `.op`,
+    treating `if not a and not b: raise` the same as `if not a or not b:
+    raise` and marking *both* `a` and `b` guaranteed truthy afterward.
+    They are not: `a=[]`, `b=[1]` makes `not a and not b` False (so the
+    guard doesn't fire) while leaving `a` empty, so a later `a[0]` still
+    raises `IndexError` even though it was being recorded GUARDED —
+    poisoning exactly the anti-hallucination guarantee this module exists
+    to provide (COLLECT-7).
     """
     names: Set[str] = set()
     pairs: Set[Tuple[str, object]] = set()
 
     def visit(node: ast.expr) -> None:
         if isinstance(node, ast.BoolOp):
+            if not isinstance(node.op, ast.Or):
+                return  # `and`: false-as-a-whole doesn't refute any single operand
             for value in node.values:
                 visit(value)
             return

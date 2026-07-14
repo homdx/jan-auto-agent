@@ -16,6 +16,8 @@ import ast
 from pathlib import Path
 from typing import Dict, Set, Tuple
 
+import pytest
+
 from tools.collect.dataflow import extract_guarded_accesses
 from tools.collect.model import Provenance
 
@@ -327,3 +329,80 @@ def test_negated_numeric_subscript_still_works():
     accesses = _accesses(source, "m.py")
     reprs = {a.access for a in accesses}
     assert reprs == {"x[-1]", "x[-1.5]"}
+
+
+# ── BUGFIX regression: `and`-combined falsy guards must not be treated ─────
+# ── the same as `or`-combined ones ──────────────────────────────────────
+#
+# `if not a and not b: raise` only guarantees "a or b truthy" once past
+# it (De Morgan), never that `a` specifically is safe — `a=[]`, `b=[1]`
+# makes the guard's test False (so it doesn't fire) while `a` is still
+# empty. `_falsy_guard_targets` used to recurse into `ast.BoolOp`
+# regardless of whether it was `and` or `or`, so it wrongly marked both
+# names guaranteed-truthy for an `and`-combined test too — this is the
+# exact "wrongly claimed guard poisons the antihallucination guarantee"
+# failure mode COLLECT-7's own module docstring warns against.
+
+
+def test_and_combined_falsy_guard_does_not_mark_either_name_guarded():
+    source = (
+        "def f(a, b):\n"
+        "    if not a and not b:\n"
+        "        raise ValueError('both missing')\n"
+        "    return a[0]\n"
+    )
+    accesses = _accesses(source, "m.py")
+    assert len(accesses) == 1
+    assert accesses[0].access == "a[0]"
+    assert accesses[0].status == "UNGUARDED"
+    assert accesses[0].guard is None
+
+
+def test_and_combined_falsy_guard_actually_unsafe_at_runtime():
+    # Ground truth for the test above: a=[] (falsy), b=[1] (truthy) makes
+    # `not a and not b` False, so the guard doesn't fire, and `a[0]` does
+    # raise — confirming UNGUARDED is the correct classification, not an
+    # overcautious one.
+    def f(a, b):
+        if not a and not b:
+            raise ValueError("both missing")
+        return a[0]
+
+    with pytest.raises(IndexError):
+        f([], [1])
+
+
+def test_or_combined_falsy_guard_still_marks_both_names_guarded():
+    # The correct, pre-existing behavior this fix must not regress:
+    # `if not a or not b: raise` genuinely does guarantee both `a` and
+    # `b` truthy afterward (De Morgan on a falsified `or`).
+    source = (
+        "def f(a, b):\n"
+        "    if not a or not b:\n"
+        "        raise ValueError('missing')\n"
+        "    return a[0], b[0]\n"
+    )
+    accesses = _accesses(source, "m.py")
+    assert {a.access: a.status for a in accesses} == {
+        "a[0]": "GUARDED",
+        "b[0]": "GUARDED",
+    }
+
+
+def test_and_nested_inside_or_does_not_leak_names_out():
+    # `not a or (not b and not c)`: `a` is individually refuted (top-level
+    # `or` operand), but `b`/`c` are not — they're inside a nested `and`,
+    # so no per-name guarantee can be derived for either of them even
+    # though the whole expression is reached via `or`.
+    source = (
+        "def f(a, b, c):\n"
+        "    if not a or (not b and not c):\n"
+        "        raise ValueError('missing')\n"
+        "    return a[0], b[0], c[0]\n"
+    )
+    accesses = _accesses(source, "m.py")
+    assert {a.access: a.status for a in accesses} == {
+        "a[0]": "GUARDED",
+        "b[0]": "UNGUARDED",
+        "c[0]": "UNGUARDED",
+    }
