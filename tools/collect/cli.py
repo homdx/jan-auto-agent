@@ -383,7 +383,8 @@ def action_check(root: Path, *, config: Optional[configparser.ConfigParser] = No
             message=f"manifest at {manifest_path} is unreadable ({exc}) — treat as stale",
             collect_dir=collect_dir,
         )
-    fresh = manifest_mod.is_fresh(existing, root)
+    current_paths = [m.path for m in scan_repo(root, config=config)]
+    fresh = manifest_mod.is_fresh(existing, root, files=current_paths)
     return CollectResult(
         action="check", wrote=False, fresh=fresh,
         message="up to date" if fresh else "stale — a tracked file changed since the last collect run",
