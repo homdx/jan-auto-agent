@@ -41,6 +41,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Tuple
 
@@ -126,6 +127,27 @@ _CRASH_WORDS_RE = re.compile(
 _SILENT_WORDS_RE = re.compile(r"\b(silent(?:ly)?|swallow(?:s|ed|ing)?)\b", re.IGNORECASE)
 
 
+@lru_cache(maxsize=8)
+def _symbol_patterns(known_symbols: FrozenSet[str]) -> Tuple[Tuple[str, "re.Pattern[str]"], ...]:
+    """Precompile one `\\bshort\\b` regex per known symbol, once per distinct
+    `known_symbols` set.
+
+    `extract_claims` used to build a fresh `re.search(rf"\\b{...}\\b", ...)`
+    pattern for *every symbol* on *every sentence* — with `known_symbols` in
+    the low thousands and hundreds of claim sentences, that's up to
+    millions of regex compilations for a single `verify_repo()` run (Pass C
+    was observed stuck inside `re/_compiler.py` because of this). Caching
+    the compiled patterns here, keyed by the (hashable, frozen) symbol set,
+    means each distinct symbol set is only ever compiled once.
+    """
+    patterns = []
+    for sym in known_symbols:
+        short = sym.split(":")[-1]
+        if short:
+            patterns.append((sym, re.compile(rf"\b{re.escape(short)}\b")))
+    return tuple(patterns)
+
+
 def extract_claims(
     text: str,
     module_path: str,
@@ -158,9 +180,8 @@ def extract_claims(
         access = access_match.group(1) if access_match else None
 
         symbol = None
-        for sym in known_symbols:
-            short = sym.split(":")[-1]
-            if short and re.search(rf"\b{re.escape(short)}\b", sentence):
+        for sym, pattern in _symbol_patterns(known_symbols):
+            if pattern.search(sentence):
                 symbol = sym
                 break
 
