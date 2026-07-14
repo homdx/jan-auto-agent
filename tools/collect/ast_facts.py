@@ -22,7 +22,7 @@ from __future__ import annotations
 import ast
 from typing import Any, List, Optional
 
-from tools.collect.model import ConfigRead, FunctionRecord
+from tools.collect.model import ConfigRead, ExceptSite, FunctionRecord
 
 #: AST node types that count as a "public symbol" for COLLECT-4 — top-level
 #: functions/classes. Nested defs (methods, closures) are intentionally out
@@ -36,6 +36,14 @@ _SYMBOL_NODE_TYPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
 #: unrelated `.get(...)` call (e.g. `dict.get`), so that keyword is
 #: required, not just the method name.
 _CONFIG_READ_METHODS = frozenset({"get", "getint", "getboolean", "getfloat"})
+
+#: Attribute-call method names COLLECT-6 treats as "this except body logs
+#: the error" — i.e. not silent, even though it doesn't re-raise. Matches
+#: both the stdlib `logging` API and the common `logger.*`/`self.logger.*`
+#: call-site idiom this codebase uses (the method name is what's checked,
+#: not the receiver, since a dedicated logger instance's import alias
+#: varies module to module).
+_LOG_METHODS = frozenset({"debug", "info", "warning", "warn", "error", "exception", "critical", "log"})
 
 
 
@@ -233,3 +241,110 @@ def extract_config_reads(tree: ast.Module, module_path: str) -> List[ConfigRead]
         )
     # Stable order (COLLECT-3 determinism): by section then key.
     return sorted(reads, key=lambda r: (r.section, r.key))
+
+
+def _exception_type_name(handler: ast.ExceptHandler) -> str:
+    """Render an `except` handler's type expression as a string.
+
+    Bare `except:` (no type at all) becomes `"*"` — it is a distinct,
+    broader thing from `except Exception:` and shouldn't be conflated with
+    it. A tuple of types (`except (KeyError, TypeError):`) is rendered as
+    the `|`-joined dotted names, in source order.
+    """
+    node = handler.type
+    if node is None:
+        return "*"
+    if isinstance(node, ast.Tuple):
+        return "|".join(_dotted_name(elt) or "?" for elt in node.elts)
+    return _dotted_name(node) or "?"
+
+
+def _is_log_call(node: ast.AST) -> bool:
+    """Whether `node` is a call to a logging-shaped method — `logger.warning(...)`,
+    `self._logger.error(...)`, `logging.exception(...)`, etc. Only the final
+    attribute name is checked (see `_LOG_METHODS`), not the receiver, since
+    the receiver's name/import alias varies module to module."""
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in _LOG_METHODS
+    )
+
+
+def _classify_except_body(body: List[ast.stmt]) -> "tuple[str, bool]":
+    """`(body_kind, is_fail_open)` for one except handler's body (COLLECT-6).
+
+    Priority, evaluated over every statement in the body (`ast.walk`, so a
+    logged/raised/continued/returned statement nested one level inside an
+    `if` inside the handler still counts):
+
+    1. A bare `raise` (no exception expression, i.e. re-raise-the-caught-one)
+       anywhere -> ``"re-raise"``. Never fail-open: the exception keeps
+       propagating.
+    2. A logging call anywhere -> ``"log"``. Not silent: someone will see it.
+    3. A `continue` anywhere -> ``"continue"``. Control flow, not a silent
+       swallow — the loop keeps going, but visibly (COLLECT-6 AC:
+       `coder.py:866`'s `except OSError: continue` is *not* fail-open).
+    4. A `return` anywhere -> ``"return"``. Also control flow, not silence.
+    5. Anything else (including a bare `pass`, or any body that doesn't hit
+       1-4) -> ``"pass"``, ``is_fail_open=True``: nothing observable happens
+       and execution just falls through past the except block. This is the
+       category responsible for the majority of false positives in bug
+       hunts (COLLECT-6's whole reason for existing).
+    """
+    has_bare_raise = False
+    has_log = False
+    has_continue = False
+    has_return = False
+    for stmt in body:
+        for sub in ast.walk(stmt):
+            if isinstance(sub, ast.Raise) and sub.exc is None:
+                has_bare_raise = True
+            elif _is_log_call(sub):
+                has_log = True
+            elif isinstance(sub, ast.Continue):
+                has_continue = True
+            elif isinstance(sub, ast.Return):
+                has_return = True
+    if has_bare_raise:
+        return "re-raise", False
+    if has_log:
+        return "log", False
+    if has_continue:
+        return "continue", False
+    if has_return:
+        return "return", False
+    return "pass", True
+
+
+def extract_except_sites(tree: ast.Module, module_path: str) -> List[ExceptSite]:
+    """Every `except` handler in `tree`, classified (COLLECT-6).
+
+    For each `ast.ExceptHandler`: the exception type it catches
+    (`_exception_type_name`), how its body reacts (`_classify_except_body`),
+    and whether that reaction is fail-open (silent swallow — `is_fail_open`).
+    This is pure AST, so every `ExceptSite` is `provenance="static"` by
+    construction (COLLECT-1) — Pass B/the LLM never touches this list.
+
+    `location` is `"{module_path}:{lineno}"`, where `lineno` is the
+    handler's own line (the `except ...:` line), matching the convention
+    the AC references (`coder.py:718`, `coder.py:866`) use.
+    """
+    handlers = [n for n in ast.walk(tree) if isinstance(n, ast.ExceptHandler)]
+    # Stable order (COLLECT-3 determinism): by source line, numerically —
+    # not by the formatted `location` string, which would sort "...:10"
+    # before "...:9".
+    handlers.sort(key=lambda h: h.lineno)
+
+    sites: List[ExceptSite] = []
+    for node in handlers:
+        body_kind, is_fail_open = _classify_except_body(node.body)
+        sites.append(
+            ExceptSite(
+                location=f"{module_path}:{node.lineno}",
+                exception_type=_exception_type_name(node),
+                body_kind=body_kind,
+                is_fail_open=is_fail_open,
+            )
+        )
+    return sites

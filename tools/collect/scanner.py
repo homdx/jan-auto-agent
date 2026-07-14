@@ -24,7 +24,12 @@ from pathlib import Path
 from typing import List, Optional
 
 from tools.auto.repo_ingest import RepoIngestor
-from tools.collect.ast_facts import extract_config_reads, extract_imports, extract_symbols
+from tools.collect.ast_facts import (
+    extract_config_reads,
+    extract_except_sites,
+    extract_imports,
+    extract_symbols,
+)
 from tools.collect.model import ModuleRecord
 
 
@@ -45,6 +50,7 @@ def scan_module(source: str, module_path: str) -> ModuleRecord:
         public_symbols=tuple(extract_symbols(tree, module_path)),
         imports=tuple(extract_imports(tree)),
         config_reads=tuple(extract_config_reads(tree, module_path)),
+        except_sites=tuple(extract_except_sites(tree, module_path)),
     )
 
 
