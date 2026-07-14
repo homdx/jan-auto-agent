@@ -16,16 +16,29 @@ Two edge kinds:
   loader/query-API in EPIC G actually wants to consume).
 
 * **Call edges** (`build_call_edges`) — a second, explicitly *heuristic*
-  pass: for each module, walk its own source for `ast.Call` sites and
-  check whether the called name is an **unambiguous** public symbol
-  (COLLECT-4) owned by exactly one *other* module. If so, record an edge
-  from the caller's module to that owner. Any call name that maps to zero
-  or more-than-one module is skipped — an ambiguous guess is worse than a
+  pass: for each module, walk its own source for call sites and check
+  whether the called name is an **unambiguous** public symbol (COLLECT-4)
+  owned by exactly one *other* module. If so, record an edge from the
+  caller's module to that owner. Any call name that maps to zero or
+  more-than-one module is skipped — an ambiguous guess is worse than a
   missing edge (the same "skip rather than misattribute" principle
   `ast_facts._simple_literal_assignments` already uses). This is a
   best-effort call graph, not a claim of exhaustive resolution; it is not
   used anywhere in the antihallucination chain (COLLECT-17/22 rely on
   `guarded_accesses` and the fail-open/contract registries, not on this).
+
+  COLLECT-29 extends this same function to Java modules rather than
+  forking a parallel `java_graph.py`: the owner map, the "unambiguous
+  short name only" resolution rule, and the "skip on ambiguity" fallback
+  are identical in spirit for both languages, so only the *source of
+  call sites* differs (`ast.Call` nodes vs. tree-sitter
+  `method_invocation`/`object_creation_expression` nodes) — see
+  `_java_call_names` below. Java call resolution (overloading,
+  inheritance, interface dispatch) is meaningfully harder than the
+  Python heuristic, so the bar stays the same or higher: an edge is
+  only recorded when a called method/constructor's bare name maps
+  unambiguously to exactly one class *in the whole scanned set*, never
+  via overload or virtual-dispatch reasoning.
 
 ``imported_by`` is the reverse index of `import_edges` — the COLLECT-8 AC
 is that it's available for *every* module, including modules with zero
@@ -42,6 +55,8 @@ import ast
 from pathlib import Path
 from typing import Dict, FrozenSet, Iterable, List, Optional, Set
 
+from tools.collect.java_parser import parse_java
+from tools.collect.lang import Language
 from tools.collect.model import ModuleRecord
 
 #: Dict[module_path, frozenset[module_path]] — the shape every graph in
@@ -171,18 +186,103 @@ def _called_name(node: ast.Call) -> Optional[str]:
     return None
 
 
+def _short_symbol_name(qualname: str) -> str:
+    """The bare trailing name of a `FunctionRecord.qualname`.
+
+    Python qualnames are flat (`"pkg/mod.py:do_thing"` -> `"do_thing"` —
+    COLLECT-4 only records top-level symbols, so there's never a dot to
+    strip). Java qualnames carry the containing-type chain
+    (`"Foo.java:Circle.area"` — COLLECT-26), and a Java call site never
+    spells that chain out (`area()`, not `Circle.area()`, is what a method
+    body actually calls) — so COLLECT-29 needs the last dot-component,
+    `"area"`, to line up with what `_java_call_names` extracts from a call
+    site below. Taking the last component unconditionally is a no-op for
+    Python and the exact fix needed for Java, so one helper serves both.
+    """
+    after_colon = qualname.split(":")[-1]
+    return after_colon.rsplit(".", 1)[-1]
+
+
 def _unambiguous_symbol_owners(modules: Iterable[ModuleRecord]) -> Dict[str, str]:
     """`{short_symbol_name: owning_module_path}`, restricted to symbol names
     owned by exactly one module in `modules`. A name defined in two or more
-    modules (e.g. two different `run()` functions) is deliberately left out
-    — skip rather than misattribute (see module docstring).
+    modules (e.g. two different `run()` functions, or two Java classes
+    that both declare an `area()` method — even in the same file, as
+    `Circle`/`Square` do in the mini-repo fixture) is deliberately left out
+    — skip rather than misattribute (see module docstring). This is the
+    one owner map both the Python and Java halves of `build_call_edges`
+    share (COLLECT-29): a name ambiguous across languages is skipped the
+    same as a name ambiguous within one.
     """
     owners: Dict[str, Set[str]] = {}
     for m in modules:
         for sym in m.public_symbols:
-            name = sym.qualname.split(":")[-1]
+            name = _short_symbol_name(sym.qualname)
             owners.setdefault(name, set()).add(m.path)
     return {name: next(iter(paths)) for name, paths in owners.items() if len(paths) == 1}
+
+
+#: tree-sitter-java node types that name-call something: an ordinary
+#: method call (`foo()` / `obj.foo()` — only the `name` field is read,
+#: the receiver is ignored, the same "final attribute only" convention
+#: `_called_name` uses for Python's `obj.foo()`) and a constructor call
+#: (`new Circle(...)`), whose "called name" is the type being
+#: instantiated rather than a method identifier.
+_JAVA_CALL_NODE_TYPES = frozenset({"method_invocation", "object_creation_expression"})
+
+
+def _java_called_name(node) -> Optional[str]:
+    """The bare name a single Java call-site `node` calls, or `None` for
+    a shape this heuristic doesn't attempt to resolve (e.g. a
+    `object_creation_expression` with no readable `type` field).
+
+    `method_invocation` -> its `name` field, verbatim (`capitalize`,
+    `isEmpty`, ...). `object_creation_expression` -> the constructor's
+    owning type's simple name: `type` may be a plain `type_identifier`
+    (`Circle`), a `generic_type` (`ArrayList<String>`), or a
+    `scoped_type_identifier` (`java.util.ArrayList`) — stripping any
+    `<...>` generic-argument suffix and taking the last `.`-component
+    reduces all three to the same simple name `_unambiguous_symbol_owners`
+    already keys Java constructors by (a constructor's `qualname` ends in
+    `.<ClassName>` — COLLECT-26's `_method_name` uses the class name
+    itself when a `constructor_declaration` node has no distinct `name`
+    field).
+    """
+    if node.type == "method_invocation":
+        name_node = node.child_by_field_name("name")
+        if name_node is None:
+            return None
+        return name_node.text.decode("utf-8", errors="replace")
+    if node.type == "object_creation_expression":
+        type_node = node.child_by_field_name("type")
+        if type_node is None:
+            return None
+        text = type_node.text.decode("utf-8", errors="replace")
+        text = text.split("<", 1)[0].strip()
+        if not text:
+            return None
+        return text.rsplit(".", 1)[-1]
+    return None
+
+
+def _walk_java_tree(node):
+    yield node
+    for child in node.children:
+        yield from _walk_java_tree(child)
+
+
+def _java_call_names(tree) -> Iterable[str]:
+    """Every name a Java source `tree` calls, in encounter order —
+    method calls and constructor calls alike (COLLECT-29). Duplicates are
+    left in; `build_call_edges` only cares about set membership against
+    `owners`, so re-walking into a `frozenset` downstream is cheaper than
+    deduplicating here for no benefit.
+    """
+    for node in _walk_java_tree(tree.root_node):
+        if node.type in _JAVA_CALL_NODE_TYPES:
+            name = _java_called_name(node)
+            if name:
+                yield name
 
 
 def build_call_edges(root: Path, modules: Iterable[ModuleRecord]) -> Graph:
@@ -207,6 +307,30 @@ def build_call_edges(root: Path, modules: Iterable[ModuleRecord]) -> Graph:
     for m in modules:
         if m.parse_error:
             continue
+
+        if m.language == Language.JAVA:
+            # COLLECT-29: same "re-read, re-parse, walk, look up in
+            # owners, skip anything that doesn't cleanly resolve"
+            # structure as the Python branch below, just against a
+            # tree-sitter tree instead of `ast`. A module that fails to
+            # read, or that tree-sitter can't hand back a usable tree
+            # for (library not installed, a hard parser error), is
+            # silently skipped for call-edge purposes — the same "one
+            # broken/unavailable file can't take down the scan" contract
+            # COLLECT-25 established for `scan_java_module`.
+            try:
+                source = (root / m.path).read_text(encoding="utf-8")
+            except OSError:
+                continue
+            result = parse_java(source, m.path)
+            if result.error is not None or result.tree is None:
+                continue
+            for name in _java_call_names(result.tree):
+                target = owners.get(name)
+                if target is not None and target != m.path:
+                    edges[m.path].add(target)
+            continue
+
         try:
             source = (root / m.path).read_text(encoding="utf-8")
             tree = ast.parse(source, filename=m.path)
