@@ -99,7 +99,71 @@ class CollectResult:
         }
 
 
-# ── config plumbing ─────────────────────────────────────────────────────────
+# ── config plumbing (COLLECT-20: `[collect]` section) ───────────────────────
+
+VALID_STALENESS = frozenset({"warn", "refresh", "ignore"})
+DEFAULT_STALENESS = "warn"
+
+
+@dataclass(frozen=True)
+class CollectSettings:
+    """Everything `[collect]` in `agents.ini` can configure, each with a
+    safe default equal to what happens when the section is absent
+    entirely. Read via `read_collect_settings` — nothing else in this
+    module or `main.py` should call `config.get("collect", ...)` directly,
+    so there is exactly one place that has to know the key names and
+    defaults."""
+
+    enabled: bool = True
+    dir: str = DEFAULT_COLLECT_DIR
+    use_in_auto: bool = False
+    use_in_doc: bool = False
+    use_in_bughunt: bool = False
+    staleness: str = DEFAULT_STALENESS
+    llm_summaries: bool = True
+    think: bool = False
+
+
+def _get_bool(config: configparser.ConfigParser, key: str, default: bool) -> bool:
+    """`ConfigParser.getboolean` raises `ValueError` on an unparseable
+    value (e.g. `enabled = maybe`) — COLLECT-20's AC is that a bad value
+    falls back to the default rather than crashing the whole run, same
+    posture as the `staleness` fallback below."""
+    try:
+        return config.getboolean("collect", key, fallback=default)
+    except ValueError:
+        return default
+
+
+def read_collect_settings(config: Optional[configparser.ConfigParser]) -> CollectSettings:
+    """`[collect]` section reader. A missing section — or a missing
+    `agents.ini` entirely (``config=None``) — returns every default
+    unchanged, which by construction is "today's behavior": nothing in
+    this module or `main.py` treats collect mode as active unless a
+    human explicitly configured it (or accepted the ``enabled=true``
+    default) *and* ran `--collect`/`/collect`. An invalid `staleness`
+    (typo, stale value) falls back to `"warn"` rather than raising —
+    config authoring mistakes should degrade to the safest mode, not
+    take down the run."""
+    if config is None or not config.has_section("collect"):
+        return CollectSettings()
+
+    dir_value = config.get("collect", "dir", fallback=DEFAULT_COLLECT_DIR).strip() or DEFAULT_COLLECT_DIR
+
+    staleness = config.get("collect", "staleness", fallback=DEFAULT_STALENESS).strip().lower()
+    if staleness not in VALID_STALENESS:
+        staleness = DEFAULT_STALENESS
+
+    return CollectSettings(
+        enabled=_get_bool(config, "enabled", True),
+        dir=dir_value,
+        use_in_auto=_get_bool(config, "use_in_auto", False),
+        use_in_doc=_get_bool(config, "use_in_doc", False),
+        use_in_bughunt=_get_bool(config, "use_in_bughunt", False),
+        staleness=staleness,
+        llm_summaries=_get_bool(config, "llm_summaries", True),
+        think=_get_bool(config, "think", False),
+    )
 
 
 def resolve_collect_dir(root: Path, config: Optional[configparser.ConfigParser]) -> Path:
@@ -107,10 +171,8 @@ def resolve_collect_dir(root: Path, config: Optional[configparser.ConfigParser])
     given as a relative path. This is the *only* function in this module
     that decides where writes may land — every write path in this module
     is built from its return value."""
-    dir_value = DEFAULT_COLLECT_DIR
-    if config is not None:
-        dir_value = config.get("collect", "dir", fallback=DEFAULT_COLLECT_DIR).strip() or DEFAULT_COLLECT_DIR
-    path = Path(dir_value)
+    settings = read_collect_settings(config)
+    path = Path(settings.dir)
     if not path.is_absolute():
         path = Path(root) / path
     return path
@@ -475,6 +537,14 @@ def run(
     root = Path(root)
     if action == "check":
         return action_check(root, config=config)
+
+    settings = read_collect_settings(config)
+    if not settings.enabled and action != "check":
+        return CollectResult(
+            action=action, wrote=False, fresh=None,
+            message="collect is disabled ([collect] enabled = false) — nothing done",
+            collect_dir=resolve_collect_dir(root, config),
+        )
     if action == "refresh":
         return action_refresh(root, config=config, config_path=config_path, llm_call=llm_call)
     if action == "module":
