@@ -1,0 +1,45 @@
+# tools/collect/contracts_seed.yaml — COLLECT-10 seed CONTRACTS.
+#
+# Hand-maintained data, not code: each entry is one cross-module invariant
+# that a human has verified by reading the source, not something inferred
+# by Pass A or guessed by an LLM. `build_seed_contracts` (registries.py)
+# loads this file and runs a citation-check against Pass A's own symbol
+# index (COLLECT-3/4) before turning an entry into a `ContractRecord`: a
+# seed whose `known_edge` no longer names a real top-level symbol fails
+# loudly instead of quietly going stale.
+#
+# Fields per entry:
+#   name         short machine identifier, unique in this file
+#   description  the invariant, in plain language
+#   known_edge   "path/to/module.py:TopLevelSymbol" — must resolve against
+#                the scanned repo's public_symbols (module- or class-level;
+#                COLLECT-4 only inventories top-level defs/classes, so a
+#                contract about a method cites its enclosing class)
+
+- name: build_chat_request_two_message_list
+  description: >
+    build_chat_request always sends exactly two chat messages — one
+    system, one user — for every api_format; it never accumulates
+    multi-turn history.
+  known_edge: "tools/llm_stream.py:build_chat_request"
+
+- name: ollama_max_tokens_is_num_predict
+  description: >
+    When api_format is "ollama", build_chat_request maps max_tokens to
+    options.num_predict rather than a top-level max_tokens field, since
+    Ollama's chat API has no such top-level key.
+  known_edge: "tools/llm_stream.py:build_chat_request"
+
+- name: parse_verdict_soft_fail_open
+  description: >
+    _parse_verdict_soft treats an unparseable/malformed verdict as
+    approved (fail-open) rather than rejecting the attempt, so a gate
+    parser hiccup never blocks progress outright.
+  known_edge: "tools/auto/inner_loop.py:_parse_verdict_soft"
+
+- name: prompt_store_atomic_save
+  description: >
+    PromptStore._save writes through a temp file plus an atomic replace
+    (mirroring MetricsCollector.record's helper), so a crash mid-write can
+    never leave prompts.json truncated or corrupted.
+  known_edge: "tools/prompt_store.py:PromptStore"

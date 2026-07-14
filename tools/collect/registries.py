@@ -37,7 +37,27 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
 
-from tools.collect.model import ModuleRecord, Provenance
+import yaml
+
+from tools.collect.model import ContractRecord, ModuleRecord, Provenance
+
+#: Default location of the hand-maintained seed-contract data file
+#: (COLLECT-10). Relative to this module, not the CWD, so
+#: `build_seed_contracts` works regardless of where the caller's process
+#: happens to be running from.
+DEFAULT_CONTRACTS_SEED_PATH = Path(__file__).parent / "contracts_seed.yaml"
+
+
+class ContractCitationError(RuntimeError):
+    """Raised when a seed contract's `known_edge` no longer names a real
+    top-level symbol in the scanned repo.
+
+    This is COLLECT-10's whole point: a seed is *data*, not code, so
+    nothing stops it from silently rotting as the codebase changes out
+    from under it — a renamed/removed function, a typo'd path. Rather than
+    let a stale citation sit there looking authoritative, loading a seed
+    whose citation doesn't resolve is a hard failure, not a warning.
+    """
 
 
 @dataclass(frozen=True)
@@ -172,3 +192,87 @@ def fail_open_locations(registry: Iterable[FailOpenEntry]) -> frozenset:
     `FailOpenEntry` objects themselves.
     """
     return frozenset(e.location for e in registry)
+
+
+# ── COLLECT-10: CONTRACTS builder (seed) ───────────────────────────────────────
+
+
+def _known_symbols(modules: Iterable[ModuleRecord]) -> frozenset:
+    """`{"path:Name", ...}` for every top-level symbol Pass A found, across
+    `modules` — the citation-check's source of truth. Only structural facts
+    (COLLECT-4's `public_symbols`) count; there is nothing LLM-derived in
+    this set, so a citation that resolves here is resolving against ground
+    truth, not prose.
+    """
+    return frozenset(sym.qualname for m in modules for sym in m.public_symbols)
+
+
+def _load_seed_entries(seed_path: Path) -> List[Dict[str, object]]:
+    """Raw `{name, description, known_edge}` dicts from the seed YAML.
+
+    An absent or empty file yields an empty list rather than raising —
+    seeding is optional data, not a required input — but a *present*,
+    non-empty file that fails to parse as YAML is a real authoring error
+    and is allowed to raise.
+    """
+    if not seed_path.exists():
+        return []
+    raw = yaml.safe_load(seed_path.read_text(encoding="utf-8"))
+    if not raw:
+        return []
+    if not isinstance(raw, list):
+        raise ContractCitationError(
+            f"{seed_path}: expected a YAML list of contract entries, got {type(raw).__name__}"
+        )
+    return raw
+
+
+def build_seed_contracts(
+    modules: Iterable[ModuleRecord],
+    seed_path: Path = DEFAULT_CONTRACTS_SEED_PATH,
+) -> List[ContractRecord]:
+    """The seed half of CONTRACTS (COLLECT-10): load `seed_path`, run each
+    entry's `known_edge` through a citation-check against `modules`' own
+    symbol index, and return one `ContractRecord` (provenance=static) per
+    entry — sorted by `name` for determinism (COLLECT-3).
+
+    Every entry's `known_edge` must resolve to a real top-level symbol in
+    `modules`, or this raises `ContractCitationError` — per COLLECT-10's
+    AC, a seed contract can never quietly go stale; it fails the run
+    instead. This also means an entry missing `name`/`description` or
+    lacking a `known_edge` entirely is itself a citation failure: a
+    "known" contract with nothing to check it against isn't a fact, it's
+    an assertion, and this builder doesn't traffic in those.
+    """
+    modules = list(modules)
+    known = _known_symbols(modules)
+    entries = _load_seed_entries(seed_path)
+
+    contracts: List[ContractRecord] = []
+    for entry in entries:
+        name = entry.get("name")
+        description = entry.get("description")
+        known_edge = entry.get("known_edge")
+        if not name or not description or not known_edge:
+            raise ContractCitationError(
+                f"{seed_path}: seed entry {entry!r} is missing one of "
+                "name/description/known_edge"
+            )
+        if known_edge not in known:
+            raise ContractCitationError(
+                f"{seed_path}: seed contract {name!r} cites {known_edge!r}, "
+                "which does not resolve to a top-level symbol in the "
+                "scanned repo (renamed, removed, or a typo — this seed is "
+                "stale and must be fixed or dropped)"
+            )
+        contracts.append(
+            ContractRecord(
+                name=str(name),
+                description=str(description).strip(),
+                kind="seed",
+                known_edge=str(known_edge),
+            )
+        )
+
+    contracts.sort(key=lambda c: c.name)
+    return contracts
