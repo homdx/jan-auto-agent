@@ -90,7 +90,13 @@ def _loc(root: Optional[Path], module: ModuleRecord) -> int:
         return 0
     try:
         source = (Path(root) / module.path).read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, UnicodeDecodeError):
+        # BUGFIX: same class of bug as scanner.scan_repo/graph.build_call_edges
+        # — a file that isn't valid UTF-8 (e.g. it changed on disk between
+        # the scan and this risk-index pass) raised a bare
+        # UnicodeDecodeError here, contradicting this function's own
+        # docstring ("degrades to 'no size signal' rather than raising and
+        # taking down the whole index").
         return 0
     return len(source.splitlines())
 

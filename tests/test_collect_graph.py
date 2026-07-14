@@ -177,6 +177,24 @@ def test_build_call_edges_skips_parse_error_modules_without_crashing(tmp_path):
     assert set(edges) == {"pkg/__init__.py", "pkg/broken.py", "pkg/good.py"}
 
 
+def test_build_call_edges_java_branch_skips_undecodable_file_without_crashing(tmp_path):
+    """BUGFIX regression: the Java branch of `build_call_edges` used to
+    catch only `OSError` around its re-read of the source, so a `.java`
+    file that isn't valid UTF-8 raised a bare `UnicodeDecodeError`
+    straight out of `build_call_edges` — contradicting that branch's own
+    comment ("one broken/unavailable file can't take down the scan") and
+    the Python branch right below it, which already caught both. A
+    `ModuleRecord` with no `parse_error` is used here (rather than going
+    through `scan_repo`, which now itself catches this at read time) to
+    exercise `build_call_edges`'s own defense-in-depth directly.
+    """
+    from tools.collect.lang import Language
+    (tmp_path / "Bad.java").write_bytes(b"class Bad { void m() { \xff\xfe } }")
+    modules = [ModuleRecord(path="Bad.java", language=Language.JAVA)]
+    edges = build_call_edges(tmp_path, modules)
+    assert edges == {"Bad.java": frozenset()}
+
+
 # ── COLLECT-26: mixed Python + Java repo, imported_by symmetric for both ───
 
 

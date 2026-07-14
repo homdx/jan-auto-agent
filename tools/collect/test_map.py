@@ -132,7 +132,14 @@ def build_test_map(
     for t in test_modules:
         try:
             source = (root / t.path).read_text(encoding="utf-8")
-        except OSError:
+        except (OSError, UnicodeDecodeError):
+            # BUGFIX: same class of bug as scanner.scan_repo/graph.
+            # build_call_edges/risk._loc/cli._sources_for — only OSError
+            # was caught here, so a test file that isn't valid UTF-8
+            # raised a bare UnicodeDecodeError out of build_test_map
+            # instead of being "silently skipped for matching purposes",
+            # exactly the contract this function's own docstring
+            # describes for a test file that fails to re-read/re-parse.
             continue
         for dotted in _rich_import_targets(source):
             resolved = resolve_import(dotted, index)

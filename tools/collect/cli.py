@@ -215,7 +215,14 @@ def _sources_for(root: Path, modules: List[ModuleRecord]) -> Dict[str, str]:
             continue
         try:
             sources[m.path] = (Path(root) / m.path).read_text(encoding="utf-8")
-        except OSError:
+        except (OSError, UnicodeDecodeError):
+            # BUGFIX: same class of bug as scanner.scan_repo/graph.
+            # build_call_edges/risk._loc — only OSError was caught here,
+            # so a file that changed to invalid UTF-8 on disk between the
+            # scan and this re-read (or otherwise slipped through without
+            # a `parse_error`) crashed Pass B/C instead of just being
+            # skipped, the same "strictly read-only, best-effort" contract
+            # this function's own docstring describes.
             continue
     return sources
 
@@ -472,11 +479,22 @@ def action_refresh(
     settings = read_collect_settings(config)
     summarized_by_path: Dict[str, ModuleRecord] = {}
     if llm_call is not None and settings.llm_summaries and to_summarize:
-        sources_for_summary = {
-            m.path: (root / m.path).read_text(encoding="utf-8")
-            for m in to_summarize
-            if m.parse_error is None
-        }
+        sources_for_summary: Dict[str, str] = {}
+        for m in to_summarize:
+            if m.parse_error is not None:
+                continue
+            try:
+                sources_for_summary[m.path] = (root / m.path).read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                # BUGFIX: this was an unguarded dict-comprehension read —
+                # a file that changed on disk (deleted, permissions,
+                # became invalid UTF-8) in the window between scan_repo's
+                # own read a few lines up and this re-read for the
+                # summarizer prompt crashed the whole refresh instead of
+                # just leaving that one module out of this round's
+                # summarization batch, the same fail-open posture
+                # `_sources_for` (Pass C) already gives the same situation.
+                continue
         summarized_by_path = {
             m.path: m for m in summarize_repo(to_summarize, sources_for_summary, llm_call)
         }
@@ -577,7 +595,16 @@ def action_module(
     abs_module = root / module_path
     if not abs_module.is_file():
         raise CollectCliError(f"--module path does not exist under {root}: {module_path}")
-    source = abs_module.read_text(encoding="utf-8")
+    try:
+        source = abs_module.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        # BUGFIX: this used to be a bare `read_text()` call — a permission
+        # error or a file that isn't valid UTF-8 raised straight out of
+        # action_module as an unhandled exception (a raw traceback) rather
+        # than the clean CollectCliError every other user-facing failure
+        # in this function (a missing path just above, an unreadable
+        # artifact just above that) already gets.
+        raise CollectCliError(f"--module path is unreadable: {module_path}: {exc}") from exc
     patched = scan_file(source, module_path)
 
     if module_path not in by_path:

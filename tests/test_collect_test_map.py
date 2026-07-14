@@ -83,6 +83,24 @@ def test_test_modules_are_never_keys_in_the_map(tmp_path):
     assert "tests/test_target.py" not in test_map
 
 
+def test_undecodable_test_file_is_skipped_without_crashing(tmp_path):
+    """BUGFIX regression: `build_test_map` used to catch only `OSError`
+    around its re-read of each test file's source, so a test file that
+    isn't valid UTF-8 raised a bare `UnicodeDecodeError` straight out of
+    `build_test_map` instead of contributing "no edges" the way this
+    function's own docstring says a test file that fails to re-read
+    should ("silently skipped for matching purposes")."""
+    _write(tmp_path, "pkg/__init__.py", "")
+    _write(tmp_path, "pkg/target.py", "def run():\n    return 1\n")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_bad.py").write_bytes(
+        b"import pkg.target\n# not valid utf-8: \xff\xfe\n"
+    )
+    modules = scan_repo(tmp_path)
+    test_map = build_test_map(tmp_path, modules)
+    assert test_map["pkg/target.py"] == ()  # not credited to the unreadable test
+
+
 def test_map_is_total_over_source_modules_even_with_zero_coverage(tmp_path):
     _write(tmp_path, "pkg/__init__.py", "")
     _write(tmp_path, "pkg/lonely.py", "x = 1\n")

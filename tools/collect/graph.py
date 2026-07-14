@@ -320,7 +320,14 @@ def build_call_edges(root: Path, modules: Iterable[ModuleRecord]) -> Graph:
             # COLLECT-25 established for `scan_java_module`.
             try:
                 source = (root / m.path).read_text(encoding="utf-8")
-            except OSError:
+            except (OSError, UnicodeDecodeError):
+                # BUGFIX: this used to catch only OSError — a `.java` file
+                # that simply isn't valid UTF-8 raised a bare
+                # UnicodeDecodeError straight out of build_call_edges,
+                # contradicting this branch's own comment ("one broken/
+                # unavailable file can't take down the scan") and the
+                # Python branch below, which already catches both. Same
+                # fix, same reasoning.
                 continue
             result = parse_java(source, m.path)
             if result.error is not None or result.tree is None:

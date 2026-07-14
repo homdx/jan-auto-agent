@@ -165,3 +165,16 @@ def test_real_repo_index_is_sorted_and_total():
     assert {e.path for e in index} == {m.path for m in modules}
     scores = [e.score for e in index]
     assert scores == sorted(scores, reverse=True)
+
+
+def test_loc_degrades_to_zero_on_undecodable_source_instead_of_raising(tmp_path):
+    """BUGFIX regression: `_loc` used to catch only `OSError`, so a
+    module whose file on disk isn't valid UTF-8 (e.g. it changed between
+    the scan and this risk-index pass) raised a bare `UnicodeDecodeError`
+    out of `compute_risk_index` — contradicting `_loc`'s own docstring
+    ("degrades to 'no size signal' rather than raising and taking down
+    the whole index")."""
+    (tmp_path / "bad.py").write_bytes(b"x = 1\n# not valid utf-8: \xff\xfe\n")
+    modules = [_module("bad.py")]
+    index = compute_risk_index(modules, imported_by={}, root=tmp_path)
+    assert index[0].loc == 0

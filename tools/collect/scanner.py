@@ -186,7 +186,24 @@ def scan_repo(
 
     modules: List[ModuleRecord] = []
     for rel in scannable:
-        source = (root / rel).read_text(encoding="utf-8")
+        try:
+            source = (root / rel).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            # BUGFIX: an unreadable file (permission error, a broken
+            # symlink, a file deleted in a race between the walk above and
+            # this read, or — most commonly — a `.py`/`.java` file that
+            # simply isn't valid UTF-8) used to propagate straight out of
+            # `scan_repo`, aborting the *entire* scan and losing every
+            # already-collected module along with it. That directly
+            # contradicts this module's own documented contract (see the
+            # module docstring and `scan_module`'s `SyntaxError` handling):
+            # one broken file must never take down coverage of the rest of
+            # the tree. Record it the same way an unparseable file already
+            # is — `parse_error` set, empty structural fields — and keep
+            # going, instead of letting the read failure crash the run.
+            language = Language.JAVA if _language(rel) == Language.JAVA else Language.PYTHON
+            modules.append(ModuleRecord(path=rel, parse_error=f"{rel}: {exc}", language=language))
+            continue
         if _language(rel) == Language.JAVA:
             modules.append(scan_java_module(source, rel))
         else:

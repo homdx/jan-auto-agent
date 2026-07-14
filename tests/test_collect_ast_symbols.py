@@ -79,6 +79,27 @@ def test_scan_repo_skips_no_module_on_one_broken_file(tmp_path):
     assert [s.qualname for s in by_path["pkg/good.py"].public_symbols] == ["pkg/good.py:ok"]
 
 
+def test_scan_repo_skips_no_module_on_one_unreadable_file(tmp_path):
+    """BUGFIX regression: a file that raises on *read* (not on parse) —
+    here, one that isn't valid UTF-8 — used to propagate a
+    `UnicodeDecodeError` straight out of `scan_repo`, aborting the whole
+    scan and losing every already-collected module with it. It must
+    instead degrade to a recorded `parse_error`, the same "one broken
+    file can't take down the pass" contract a `SyntaxError` already gets.
+    """
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "good.py").write_text("def ok():\n    pass\n", encoding="utf-8")
+    (pkg / "bad_encoding.py").write_bytes(b"x = 1\n# not valid utf-8: \xff\xfe\n")
+
+    modules = scan_repo(tmp_path)
+    by_path = {m.path: m for m in modules}
+    assert set(by_path) == {"pkg/good.py", "pkg/bad_encoding.py"}
+    assert by_path["pkg/bad_encoding.py"].parse_error is not None
+    assert by_path["pkg/good.py"].parse_error is None
+    assert [s.qualname for s in by_path["pkg/good.py"].public_symbols] == ["pkg/good.py:ok"]
+
+
 def test_scan_repo_covers_this_repo_without_crashing():
     modules = scan_repo(REPO_ROOT)
     assert len(modules) >= 51

@@ -212,6 +212,19 @@ def test_module_rejects_nonexistent_path(mini_repo):
         action_module(mini_repo, "pkg/does_not_exist.py")
 
 
+def test_module_raises_clean_error_on_undecodable_file(mini_repo):
+    """BUGFIX regression: `action_module` used to `read_text()` the
+    target file with no guard at all — a present-but-undecodable file
+    (not valid UTF-8) raised a bare `UnicodeDecodeError` straight out of
+    `action_module` instead of the clean `CollectCliError` every other
+    user-facing failure in this function already gets (a missing path,
+    an unreadable existing artifact)."""
+    action_collect(mini_repo)
+    (mini_repo / "pkg" / "a.py").write_bytes(b"x = 1\n# not valid utf-8: \xff\xfe\n")
+    with pytest.raises(CollectCliError):
+        action_module(mini_repo, "pkg/a.py")
+
+
 # ── COLLECT-28: --module dispatches by language, not just Python ───────────
 #
 # action_module used to call scan_module (the Python-only, ast.parse-based
