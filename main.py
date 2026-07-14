@@ -534,6 +534,9 @@ Available commands
   /help, /?            Show this help
   /auto <goal>         Run autonomous improvement mode (AUTO-A1).
                        e.g. /auto improve current code
+  /collect             Build/refresh the structural project model into
+                       [collect] dir (default .collect/). Read-only to the
+                       source tree; freshness-gated (no-op if up to date).
   /faq <question>      Search the knowledge folder and answer the question.
                        Replies NOT FOUND if no matching entry exists.
                        e.g. /faq how do I reset my password?
@@ -613,6 +616,22 @@ def _parse_args():
                         help="One-shot FAQ lookup against the knowledge folder, then exit. "
                              "Exit code 0 = answer found, 1 = NOT FOUND. "
                              "e.g. --faq \"how do I reset my password?\"")
+    # COLLECT-19: `/collect` command / `--collect` flag + subcommands.
+    # Producer is read-only to the source tree; writes land only under
+    # [collect] dir (default .collect/).
+    parser.add_argument("--collect", action="store_true", default=False,
+                        help="One-shot: build the structural project model into [collect] dir "
+                             "if missing/stale (no-op if already fresh), then exit.")
+    parser.add_argument("--check", action="store_true", default=False,
+                        help="With --collect: only check freshness — writes nothing, anywhere.")
+    parser.add_argument("--refresh", action="store_true", default=False,
+                        help="With --collect: unconditional full rebuild, ignoring freshness.")
+    parser.add_argument("--module", metavar="PATH", default=None,
+                        help="With --collect: incrementally re-scan only this one module path "
+                             "and patch it into the existing artifact + manifest.")
+    parser.add_argument("--no-llm", action="store_true", default=False,
+                        help="With --collect: skip Pass B (LLM module summaries) even if "
+                             "[collect] llm_summaries is true — a purely structural build.")
     # JSON output flag — used together with --faq
     parser.add_argument("--json", action="store_true", default=False,
                         help="With --faq: print ONLY a JSON object to stdout and suppress "
@@ -642,6 +661,50 @@ def main():
             dry_run=args.dry_run,
         )
         sys.exit(exit_code)
+
+    # ── COLLECT ONE-SHOT MODE (COLLECT-19) ──────────────────────────────
+    if args.collect:
+        from tools.collect.cli import CollectCliError, run as collect_run
+        from tools.collect.summarizer import make_summarizer_call, should_run_pass_b
+
+        if args.module is not None:
+            action = "module"
+        elif args.refresh:
+            action = "refresh"
+        elif args.check:
+            action = "check"
+        else:
+            action = "collect"
+
+        config = configparser.ConfigParser(inline_comment_prefixes=(';', '#'))
+        if os.path.exists(args.config):
+            config.read(args.config, encoding="utf-8")
+
+        # BUGFIX: `make_summarizer_call`/`should_run_pass_b` are the
+        # documented COLLECT-19 entry points `summarizer.py` describes
+        # ("Public entry point CLI code (COLLECT-19) uses to get a Pass B
+        # LlmCall from agents.ini") — but nothing here ever called them,
+        # so `collect_run` always received `llm_call=None` and Pass B
+        # (module summaries) / Pass C (their verification) silently never
+        # ran, regardless of `[collect] llm_summaries` (default true) or
+        # any flag, since `--no-llm` didn't even exist yet. A "full
+        # build" therefore finished in ~1s on a real repo — Pass B, the
+        # only part of the pipeline that makes a network call, was dead
+        # code from this entry point.
+        llm_call = None
+        if action != "check" and not args.no_llm and should_run_pass_b(config):
+            llm_call = make_summarizer_call(config)
+
+        try:
+            result = collect_run(
+                base_dir, action, config=config, config_path=args.config,
+                module_path=args.module, llm_call=llm_call,
+            )
+            print(f"collect {result.action}: {result.message}")
+            sys.exit(0)
+        except CollectCliError as exc:
+            print(f"collect: {exc}", file=sys.stderr)
+            sys.exit(1)
 
     # ── FAQ ONE-SHOT MODE ──────────────────────────────────────────────
     if args.faq is not None:
@@ -800,6 +863,34 @@ def main():
                         # REPL); surface the failure as a visible warning instead.
                         print(f"⚠️  autonomous run finished with exit code {_rc} "
                               f"(see logs / .agent trace for details).")
+                continue
+
+            # COLLECT-19: /collect [--check|--refresh|--module <path>] —
+            # build/refresh the structural project model. Producer is
+            # read-only to the source tree; writes land only under
+            # [collect] dir (default .collect/).
+            if user_input.startswith("/collect"):
+                from tools.collect.cli import CollectCliError, parse_collect_args, run as collect_run
+                from tools.collect.summarizer import make_summarizer_call, should_run_pass_b
+
+                body = user_input[len("/collect"):].strip()
+                argv = body.split() if body else []
+                try:
+                    kwargs = parse_collect_args(argv)
+                    # BUGFIX: same gap as --collect above — this never
+                    # passed llm_call either, so /collect's Pass B
+                    # (module summaries) silently never ran.
+                    llm_call = None
+                    no_llm = "--no-llm" in argv
+                    if kwargs.get("action") != "check" and not no_llm and should_run_pass_b(orchestrator.config):
+                        llm_call = make_summarizer_call(orchestrator.config)
+                    result = collect_run(
+                        base_dir, config=orchestrator.config, config_path=args.config,
+                        llm_call=llm_call, **kwargs
+                    )
+                    print(f"[{_ts()}] 🗂  collect {result.action}: {result.message}")
+                except CollectCliError as exc:
+                    print(f"[{_ts()}] ❌ collect: {exc}")
                 continue
 
             # ── FAQ resolver ───────────────────────────────────────────────────
