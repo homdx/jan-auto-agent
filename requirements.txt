@@ -1,0 +1,6 @@
+# COLLECT-25 (EPIC H — Java 17+ support): optional Java parsing backend.
+# Not required for the existing Python-only collect pipeline; scanner.py
+# degrades .java files to a recorded parse_error if these aren't installed
+# (tools/collect/java_parser.py:is_available()).
+tree-sitter>=0.23
+tree-sitter-java>=0.23

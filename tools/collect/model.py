@@ -298,6 +298,7 @@ class ModuleRecord:
     guarded_accesses: Tuple[GuardedAccess, ...] = ()
     parse_error: Optional[str] = None
     summary: Optional[LLMSummary] = None
+    language: str = "python"
 
     def with_llm_summary(self, summary: LLMSummary) -> "ModuleRecord":
         if not isinstance(summary, LLMSummary):
@@ -313,6 +314,7 @@ class ModuleRecord:
             "except_sites",
             "guarded_accesses",
             "parse_error",
+            "language",
         )
         prov = {name: Provenance.STATIC for name in static_fields}
         if self.summary is not None:
@@ -330,6 +332,7 @@ class ModuleRecord:
             "guarded_accesses": [dataclasses.asdict(g) for g in self.guarded_accesses],
             "parse_error": self.parse_error,
             "summary": dataclasses.asdict(self.summary) if self.summary else None,
+            "language": self.language,
         }
 
     @classmethod
@@ -350,6 +353,7 @@ class ModuleRecord:
             guarded_accesses=guarded_accesses,
             parse_error=d.get("parse_error"),
             summary=summary,
+            language=d.get("language", "python"),
         )
 
 
