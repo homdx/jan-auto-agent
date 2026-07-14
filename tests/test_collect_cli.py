@@ -53,7 +53,7 @@ def _empty_seeds(monkeypatch):
     orchestration (COLLECT-19), not seed content (COLLECT-10/15), so the
     seeds are neutralized to empty for every test here.
     """
-    monkeypatch.setattr(cli_mod.registries_mod, "build_seed_contracts", lambda modules: [])
+    monkeypatch.setattr(cli_mod.registries_mod, "build_seed_contracts", lambda modules, root=None: [])
     monkeypatch.setattr(cli_mod.gates_mod, "build_gates_map", lambda modules, root: [])
 
 

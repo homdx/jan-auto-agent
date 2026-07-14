@@ -41,7 +41,7 @@ def _empty_seeds(monkeypatch):
     have. This file tests [collect] config plumbing (COLLECT-20), not
     seed content, so the seed builders are neutralized for full-build
     tests here."""
-    monkeypatch.setattr(cli_mod.registries_mod, "build_seed_contracts", lambda modules: [])
+    monkeypatch.setattr(cli_mod.registries_mod, "build_seed_contracts", lambda modules, root=None: [])
     monkeypatch.setattr(cli_mod.gates_mod, "build_gates_map", lambda modules, root: [])
 
 

@@ -22,7 +22,7 @@ def _git(root: Path, *args: str) -> subprocess.CompletedProcess:
 
 @pytest.fixture(autouse=True)
 def _empty_seeds(monkeypatch):
-    monkeypatch.setattr(cli_mod.registries_mod, "build_seed_contracts", lambda modules: [])
+    monkeypatch.setattr(cli_mod.registries_mod, "build_seed_contracts", lambda modules, root=None: [])
     monkeypatch.setattr(cli_mod.gates_mod, "build_gates_map", lambda modules, root: [])
 
 

@@ -48,6 +48,14 @@ from tools.collect.model import ContractRecord, ModuleRecord, Provenance
 #: happens to be running from.
 DEFAULT_CONTRACTS_SEED_PATH = Path(__file__).parent / "contracts_seed.yaml"
 
+#: The repo `contracts_seed.yaml` actually documents — this package's own
+#: source tree (`tools/collect/registries.py` -> `tools/collect` ->
+#: `tools` -> repo root). Used by `build_seed_contracts` to tell a
+#: self-scan (`collect` run against this very repo, where the seed's
+#: citations are meaningful) apart from `--base <some other repo>` (where
+#: they describe code that was never scanned and can never resolve).
+_SEED_REPO_ROOT = Path(__file__).resolve().parents[2]
+
 
 class ContractCitationError(RuntimeError):
     """Raised when a seed contract's `known_edge` no longer names a real
@@ -231,6 +239,8 @@ def _load_seed_entries(seed_path: Path) -> List[Dict[str, object]]:
 def build_seed_contracts(
     modules: Iterable[ModuleRecord],
     seed_path: Path = DEFAULT_CONTRACTS_SEED_PATH,
+    *,
+    root: Optional[Path] = None,
 ) -> List[ContractRecord]:
     """The seed half of CONTRACTS (COLLECT-10): load `seed_path`, run each
     entry's `known_edge` through a citation-check against `modules`' own
@@ -244,7 +254,28 @@ def build_seed_contracts(
     lacking a `known_edge` entirely is itself a citation failure: a
     "known" contract with nothing to check it against isn't a fact, it's
     an assertion, and this builder doesn't traffic in those.
+
+    BUGFIX: that strict citation-check is only meaningful for a *self*-
+    scan — `contracts_seed.yaml` is hand-maintained data describing this
+    package's own source (jan-auto-agent's own fail-open call sites), not
+    whatever repo `collect --base <path>` happens to point at. Before
+    this fix, running collect against any other repo loaded this same
+    bundled seed and validated it against that foreign repo's symbol
+    index, where none of the seed's `known_edge`s could possibly resolve
+    — every `--base <other repo>` run hit `ContractCitationError`
+    unconditionally, on the very first seed entry, regardless of that
+    repo's own code. `root` (the directory actually being scanned) lets
+    this tell the two cases apart: when it doesn't match this package's
+    own repo root, the seed data plainly isn't about the repo being
+    scanned, so it's skipped entirely (empty contracts) rather than
+    "citation-failed" — same fail-open posture `_load_seed_entries`
+    already gives an absent seed file. The strict, run-failing check
+    still applies in full whenever `root` is unset (existing callers/
+    tests) or does resolve to this repo, exactly as before.
     """
+    if root is not None and Path(root).resolve() != _SEED_REPO_ROOT:
+        return []
+
     modules = list(modules)
     known = _known_symbols(modules)
     entries = _load_seed_entries(seed_path)

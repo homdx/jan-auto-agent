@@ -44,6 +44,16 @@ from tools.collect.model import ModuleRecord, Provenance
 #: Fail-mode vocabulary `GateEntry.fail_mode` is restricted to.
 FAIL_MODES = frozenset({"open", "closed"})
 
+#: The repo `_GATE_SEED` actually documents — this package's own source
+#: tree (`tools/collect/gates.py` -> `tools/collect` -> `tools` -> repo
+#: root). Used by `build_gates_map` the same way
+#: `registries._SEED_REPO_ROOT` is used for CONTRACTS: to tell a self-scan
+#: (where the seed's citations are meaningful) apart from
+#: `collect --base <some other repo>` (where `_GATE_SEED` names gates
+#: this codebase's `auto` pipeline has and a foreign repo, by definition,
+#: does not).
+_SEED_REPO_ROOT = Path(__file__).resolve().parents[2]
+
 
 class GateCitationError(RuntimeError):
     """Raised when a seeded gate's `module` isn't a path Pass A actually
@@ -258,7 +268,25 @@ def build_gates_map(
     just unchecked — the same graceful-degradation posture COLLECT-13's
     `_loc` takes without a `root`: a caller assembling the artifact who
     hasn't done a real scan yet still gets the structural shape of GATES.
+
+    BUGFIX: `_GATE_SEED` is hand-curated data describing *this* package's
+    own `auto` pipeline (`gate1`, `verdict`, `continuity`, ...) — it has
+    nothing to say about whatever repo `collect --base <path>` points at.
+    Before this fix, `build_gates_map` citation-checked this same fixed
+    seed against *any* scanned repo unconditionally, so every `--base
+    <other repo>` run hit `GateCitationError` on the very first entry
+    (`gate1` citing `tools/auto/gate1_filter.py`, a module the foreign
+    repo obviously never scanned) — the collector couldn't be pointed at
+    any repo but this one. When `root` doesn't resolve to this package's
+    own repo, GATES plainly isn't about the repo being scanned, so it's
+    skipped entirely (empty list) rather than citation-failed — same
+    fail-open posture `registries.build_seed_contracts` now gives the
+    identical situation for CONTRACTS. Self-scans (`root` unset, or
+    resolving to this repo) keep the full strict check, unchanged.
     """
+    if root is not None and modules is not None and Path(root).resolve() != _SEED_REPO_ROOT:
+        return []
+
     verify = modules is not None and root is not None
     module_paths = {m.path for m in modules} if modules is not None else set()
     modules_list = list(modules) if modules is not None else []

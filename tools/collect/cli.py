@@ -266,7 +266,7 @@ def build_context(
     entries = graph_mod.entry_points(edges, reverse)
 
     fail_open = registries_mod.build_fail_open_registry(modules, root=root)
-    contracts = registries_mod.build_seed_contracts(modules)
+    contracts = registries_mod.build_seed_contracts(modules, root=root)
     gates = gates_mod.build_gates_map(modules, root)
 
     tmap = test_map_mod.build_test_map(root, modules)

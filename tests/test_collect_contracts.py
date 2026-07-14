@@ -153,3 +153,39 @@ def test_empty_seed_file_yields_no_contracts(tmp_path):
     empty = tmp_path / "contracts_seed.yaml"
     empty.write_text("", encoding="utf-8")
     assert build_seed_contracts(modules, seed_path=empty) == []
+
+
+# ── BUGFIX: `--base <other repo>` must not validate this repo's own seed ────
+
+
+def test_foreign_repo_skips_seed_instead_of_raising(tmp_path):
+    """`contracts_seed.yaml` describes this package's own source (e.g. it
+    cites `tools/llm_stream.py:build_chat_request`, a real symbol *here*).
+    Before this fix, `build_seed_contracts` validated that same bundled
+    seed against any scanned repo unconditionally, so `collect --base
+    <some other repo>` always raised `ContractCitationError` on the first
+    entry — a foreign repo obviously never defines this package's own
+    symbols. Scanning a repo that isn't this one must degrade to "no
+    contracts to report" instead of crashing.
+    """
+    (tmp_path / "app.py").write_text("def handler():\n    return 1\n", encoding="utf-8")
+    modules = scan_repo(tmp_path)
+    assert build_seed_contracts(modules, root=tmp_path) == []
+
+
+def test_self_scan_with_root_still_raises_on_a_real_citation_break(tmp_path):
+    """The foreign-repo skip must not weaken the self-scan check: with
+    `root` resolving to *this* repo, a genuinely stale seed entry still
+    raises, same as `root` being omitted entirely."""
+    modules = scan_repo(REPO_ROOT)
+    bad_seed = tmp_path / "contracts_seed.yaml"
+    bad_seed.write_text(
+        """
+- name: bogus_contract
+  description: cites a function that has never existed
+  known_edge: "tools/llm_stream.py:this_function_does_not_exist"
+""",
+        encoding="utf-8",
+    )
+    with pytest.raises(ContractCitationError):
+        build_seed_contracts(modules, seed_path=bad_seed, root=REPO_ROOT)

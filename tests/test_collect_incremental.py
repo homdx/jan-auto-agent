@@ -39,7 +39,7 @@ def _empty_seeds(monkeypatch):
     data cites real jan-auto-agent symbols that don't exist in these
     synthetic mini repos — this file tests refresh orchestration
     (COLLECT-24), not seed content."""
-    monkeypatch.setattr(cli_mod.registries_mod, "build_seed_contracts", lambda modules: [])
+    monkeypatch.setattr(cli_mod.registries_mod, "build_seed_contracts", lambda modules, root=None: [])
     monkeypatch.setattr(cli_mod.gates_mod, "build_gates_map", lambda modules, root: [])
 
 

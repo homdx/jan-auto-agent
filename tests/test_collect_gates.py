@@ -171,6 +171,21 @@ def test_bad_parser_citation_raises():
         build_gates_map(modules, REPO_ROOT, seed=bad_seed)
 
 
+def test_foreign_repo_skips_seed_instead_of_raising(tmp_path):
+    """BUGFIX regression: `_GATE_SEED` describes this package's own
+    `auto` pipeline — before this fix, `build_gates_map` citation-checked
+    it against *any* scanned repo unconditionally, so `collect --base
+    <some other repo>` always raised `GateCitationError` on the first
+    entry (a foreign repo obviously never scanned
+    `tools/auto/gate1_filter.py`). Scanning a repo that isn't this one
+    must degrade to "no gates to report" instead of crashing.
+    """
+    (tmp_path / "app.py").write_text("def handler():\n    return 1\n", encoding="utf-8")
+    modules = scan_repo(tmp_path)
+    entries = build_gates_map(modules, tmp_path)
+    assert entries == []
+
+
 def test_method_qualified_parser_resolves_via_bare_name():
     # "CanonValidator._ground_claim" must resolve by searching for a
     # method named `_ground_claim`, not by literally finding that
