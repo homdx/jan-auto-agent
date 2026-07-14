@@ -53,6 +53,7 @@ from tools.collect.registries import FailOpenEntry, SafetyAnswer
 from tools.collect.gates import GateEntry
 from tools.collect.risk import RiskEntry
 from tools.collect.config_map import ConfigMapEntry
+from tools.collect.scanner import scan_repo
 
 VALID_STALENESS = frozenset({"warn", "refresh", "ignore"})
 DEFAULT_STALENESS = "warn"
@@ -281,7 +282,8 @@ def load(
     except (OSError, ValueError):
         return _absent(collect_dir, "manifest is unreadable — treated as absent")
 
-    fresh = manifest_mod.is_fresh(existing_manifest, root)
+    current_paths = [m.path for m in scan_repo(root, config=config)]
+    fresh = manifest_mod.is_fresh(existing_manifest, root, files=current_paths)
     if fresh:
         return _load_from_dir(collect_dir, status=STATUS_FRESH)
 
