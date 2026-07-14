@@ -27,8 +27,13 @@ Actions
 ``collect`` — one-shot (`--collect` / `/collect`): build if `.collect/` is
               missing or stale, otherwise a no-op. This is what running
               `collect` "just in case" should cost: nothing, once fresh.
-``refresh`` — unconditional full rebuild (`--refresh`), ignoring current
-              freshness.
+``refresh`` — diff-driven incremental rebuild (`--refresh`), regardless of
+              current freshness: Pass A always re-runs (cheap, no LLM),
+              but Pass B (`llm_call`) only runs for modules whose content
+              hash changed since the last manifest — every unchanged
+              module's record, summary included, is reused verbatim
+              (COLLECT-24). Falls back to a full build when there is no
+              prior artifact to diff against.
 ``module``  — incremental (`--module <path>`): re-scan *only* that file,
               patch its record into the existing artifact (every other
               module's `ModuleRecord` is reused, not re-parsed), and patch
@@ -41,7 +46,7 @@ from __future__ import annotations
 import configparser
 import json
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -409,12 +414,105 @@ def action_refresh(
     config_path: Optional[str] = None,
     llm_call: Optional[LlmCall] = None,
 ) -> CollectResult:
-    """`--refresh`: unconditional full rebuild, regardless of freshness."""
-    collect_dir, written, _ctx = _full_build(root, config=config, config_path=config_path, llm_call=llm_call)
+    """`--refresh`: diff-driven incremental rebuild (COLLECT-24).
+
+    Pass A (AST scan) is always cheap and re-runs over the whole tree —
+    it does no network I/O and is byte-deterministic (COLLECT-3), so
+    there's nothing to gain by trying to skip it file-by-file. What *is*
+    expensive is Pass B (`llm_call`), so that's the part this function
+    actually makes incremental: the fresh Pass A scan is diffed against
+    the previous manifest's file hashes, and only the paths that come
+    back `added`/`modified` (`manifest.diff_files`) are handed to Pass B.
+    Every unchanged module — the common case on a typical re-run — keeps
+    its previous `ModuleRecord` verbatim, `summary` (and thus `purpose`)
+    included, so it is never re-sent to an LLM.
+
+    Pass C (`verifier.verify_repo`) still runs over the full merged
+    module list on every call, because a citation check needs the
+    *current* whole-repo symbol table to be correct — but Pass C is pure
+    computation (no LLM call), so this costs nothing extra by the
+    `--refresh`-costs-zero-LLM-calls-on-an-unchanged-tree measure
+    (COLLECT-24 AC).
+
+    Falls back to an unconditional full build — today's previous
+    behaviour — when there is no existing manifest+artifact pair to diff
+    against; there is nothing to be "incremental" relative to.
+    """
+    root = Path(root)
+    collect_dir = resolve_collect_dir(root, config)
+    manifest_path = collect_dir / MANIFEST_FILENAME
+    artifact_path = collect_dir / ARTIFACT_FILENAME
+
+    previous_manifest: Optional[manifest_mod.Manifest] = None
+    previous_by_path: Dict[str, ModuleRecord] = {}
+    if manifest_path.exists() and artifact_path.exists():
+        try:
+            previous_manifest = manifest_mod.read_manifest(manifest_path)
+            payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+            previous_by_path = {d["path"]: ModuleRecord.from_dict(d) for d in payload.get("modules", [])}
+        except (OSError, ValueError, KeyError):
+            previous_manifest = None
+            previous_by_path = {}
+
+    if previous_manifest is None:
+        collect_dir, written, _ctx = _full_build(root, config=config, config_path=config_path, llm_call=llm_call)
+        return CollectResult(
+            action="refresh", wrote=True, fresh=True,
+            message=f"no prior artifact to diff against — full build: rebuilt {len(written)} file(s) in {collect_dir}",
+            collect_dir=collect_dir, written_files=tuple(written),
+        )
+
+    current_modules = scan_repo(root, config=config)
+    current_hashes = manifest_mod.hash_tree(root, [m.path for m in current_modules])
+    changes = manifest_mod.diff_files(previous_manifest.file_hashes, current_hashes)
+
+    to_summarize = [m for m in current_modules if m.path in changes.changed]
+
+    settings = read_collect_settings(config)
+    summarized_by_path: Dict[str, ModuleRecord] = {}
+    if llm_call is not None and settings.llm_summaries and to_summarize:
+        sources_for_summary = {
+            m.path: (root / m.path).read_text(encoding="utf-8")
+            for m in to_summarize
+            if m.parse_error is None
+        }
+        summarized_by_path = {
+            m.path: m for m in summarize_repo(to_summarize, sources_for_summary, llm_call)
+        }
+
+    merged: List[ModuleRecord] = []
+    for m in current_modules:
+        if m.path in changes.changed:
+            merged.append(summarized_by_path.get(m.path, m))
+        else:
+            # Unchanged since the last manifest: reuse the previous
+            # record verbatim (summary included) rather than the
+            # freshly re-parsed one — this is what keeps an unchanged
+            # module's `purpose` byte-identical across `--refresh` runs.
+            merged.append(previous_by_path.get(m.path, m))
+    merged.sort(key=lambda m: m.path)
+
+    ctx = build_context(root, merged, config=config, config_path=config_path, llm_call=None)
+    if any(m.summary is not None for m in merged):
+        sources = _sources_for(root, merged)
+        verified_modules, report = verifier_mod.verify_repo(merged, sources, root=root)
+        ctx = replace(ctx, modules=verified_modules, verification_report=report)
+
+    written = _write_artifact(collect_dir, ctx)
+    _write_manifest(root, collect_dir, ctx.modules)
+    written = sorted(set(written) | {MANIFEST_FILENAME})
+
+    if changes.is_empty():
+        message = f"tree unchanged — recomputed derived artifacts only, wrote {len(written)} file(s) in {collect_dir}"
+    else:
+        message = (
+            f"incrementally refreshed {len(changes.changed)} changed and "
+            f"{len(changes.removed)} removed module(s); wrote {len(written)} file(s) in {collect_dir}"
+        )
+
     return CollectResult(
         action="refresh", wrote=True, fresh=True,
-        message=f"rebuilt {len(written)} file(s) in {collect_dir}",
-        collect_dir=collect_dir, written_files=tuple(written),
+        message=message, collect_dir=collect_dir, written_files=tuple(written),
     )
 
 

@@ -232,6 +232,48 @@ def is_fresh(
     return current == manifest.file_hashes
 
 
+@dataclass(frozen=True)
+class FileChanges:
+    """The result of diffing two `{path: sha256}` maps (COLLECT-24).
+
+    Used by `--refresh`'s incremental path to decide, for each file the
+    collector knows about, whether it needs re-scanning: `added`/`modified`
+    do, `removed` drops the file's record entirely, and anything in
+    neither set — the overwhelming majority on a typical re-run — is
+    reused verbatim, LLM summary included.
+    """
+
+    added: frozenset
+    modified: frozenset
+    removed: frozenset
+
+    @property
+    def changed(self) -> frozenset:
+        """`added | modified` — the set of paths that need re-scanning."""
+        return self.added | self.modified
+
+    def is_empty(self) -> bool:
+        return not (self.added or self.modified or self.removed)
+
+
+def diff_files(previous: Dict[str, str], current: Dict[str, str]) -> FileChanges:
+    """Diff a previous `{path: sha256}` map (typically `manifest.file_hashes`)
+    against a freshly-hashed current one.
+
+    A path present in both with an unchanged hash is neither added,
+    modified, nor removed — it's simply absent from every set on the
+    returned `FileChanges`, which is exactly "nothing to do for this file".
+    """
+    prev_paths = set(previous)
+    cur_paths = set(current)
+    added = frozenset(cur_paths - prev_paths)
+    removed = frozenset(prev_paths - cur_paths)
+    modified = frozenset(
+        path for path in (prev_paths & cur_paths) if previous[path] != current[path]
+    )
+    return FileChanges(added=added, modified=modified, removed=removed)
+
+
 def refresh_manifest(root: Path, previous: Manifest) -> Manifest:
     """Rebuild a manifest for `root` using the *same file set* `previous`
     tracked, plus any new files discovered under `root`.
