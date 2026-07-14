@@ -72,6 +72,66 @@ _DEFAULT_BIBLE_BUDGET_CHARS = 700
 
 _BIBLE_HEADER = "STORY FACTS (must not contradict):"
 
+# COLLECT-23: header for the opt-in collect-context injection block (see
+# `build_collect_context_block` below). Kept distinct from the story-bible
+# header above so a prompt log can tell the two apart at a glance.
+_COLLECT_HEADER = "COLLECT MODEL (static facts, do not contradict):"
+
+
+def build_collect_context_block(model, target_file: str, task_mode: str = "code") -> str:
+    """AUTO-CR-23/COLLECT-23: the opt-in `collect`-derived context block for
+    `target_file` — its structural module record, any contracts that cite
+    it, and config reads whose mode-override applies to `task_mode`.
+
+    Purely additive and read-only: this never touches a file on disk, and
+    returns `""` (no block at all) whenever there is nothing to say, so a
+    caller that always calls this and concatenates the result loses nothing
+    when the model is absent/stale-ignored or the target file is unknown to
+    `collect` — the exact "context as today" regression COLLECT-23's AC
+    requires when the feature is off or has nothing to contribute.
+
+    `model` is a `tools.collect.loader.CollectModel` (or any absent stand-in
+    with the same `.available`/`.module`/`.contracts_for` surface) — not
+    imported by type here to avoid a hard dependency from `tools.auto` on
+    `tools.collect` at import time; callers that don't use collect at all
+    never pay for the import.
+    """
+    if model is None or not getattr(model, "available", False):
+        return ""
+
+    record = model.module(target_file)
+    if record is None:
+        return ""
+
+    lines = [_COLLECT_HEADER, f"module: {record.path}"]
+
+    if record.parse_error:
+        lines.append(f"parse_error: {record.parse_error}")
+
+    if record.public_symbols:
+        symbols = ", ".join(s.qualname for s in record.public_symbols[:20])
+        lines.append(f"public_symbols: {symbols}")
+
+    contracts = list(model.contracts_for(target_file))
+    # also surface contracts cited against a symbol defined in this file
+    for sym in record.public_symbols:
+        contracts.extend(c for c in model.contracts_for(sym.qualname) if c not in contracts)
+    if contracts:
+        for c in sorted(contracts, key=lambda c: c.name):
+            lines.append(f"contract {c.name}: {c.description}")
+
+    config_reads = list(record.config_reads)
+    if config_reads:
+        for cr in config_reads:
+            mode_note = " (mode-override)" if cr.has_mode_override else ""
+            lines.append(f"config_read [{cr.section}] {cr.key}{mode_note} (fallback={cr.fallback!r})")
+
+    if len(lines) == 2 and not record.public_symbols:
+        # Only the header + bare module line — nothing substantive to add.
+        return ""
+
+    return "\n".join(lines)
+
 
 def _chapter_number(filename: str) -> "int | None":
     """Extract the integer chapter number from a filename, or ``None`` if it

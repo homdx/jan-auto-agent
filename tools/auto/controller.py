@@ -887,6 +887,44 @@ class AutoController:
         else:
             self.state.log("run limits: none configured")
 
+    # ── COLLECT-23: opt-in collect-context injection ────────────────────
+
+    def _collect_use_flag(self) -> bool:
+        """`[collect] use_in_doc` for `task_mode == "docs"`, else
+        `[collect] use_in_auto` — both default `false`, matching
+        `agents.ini`'s own documented default (turning collect on never
+        changes behaviour until this flag is also explicitly set)."""
+        key = "use_in_doc" if self.task_mode == "docs" else "use_in_auto"
+        return self.config.getboolean("collect", key, fallback=False)
+
+    def collect_context_for(self, target_file: str) -> str:
+        """The opt-in COLLECT-23 context block for `target_file`: its
+        `collect` module record, contracts, and config reads — or `""`
+        when the feature is off, the artifact is unavailable, or there is
+        nothing to say about this file.
+
+        Nothing calls this unless `[collect] use_in_auto`/`use_in_doc` is
+        `true` *and* a caller actually invokes it — with the flag left at
+        its default `false`, every call short-circuits before ever
+        touching `tools.collect`, so a disabled run's context is
+        byte-for-byte what it was before COLLECT-23 (this method's own
+        AC).
+        """
+        if not self._collect_use_flag():
+            return ""
+        try:
+            from tools.collect.loader import load as load_collect_model
+            from tools.auto.context_assembler import build_collect_context_block
+        except Exception as exc:  # noqa: BLE001 — opt-in feature, never fatal
+            logger.warning("controller: collect context injection unavailable: %s", exc)
+            return ""
+        try:
+            model = load_collect_model(self.base_dir, config=self.config, config_path=self.config_path)
+            return build_collect_context_block(model, target_file, task_mode=self.task_mode)
+        except Exception as exc:  # noqa: BLE001 — same fail-open stance as SummaryMemory/StoryBible above
+            logger.warning("controller: collect context injection failed for %s: %s", target_file, exc)
+            return ""
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Convenience wrapper used by main.py
