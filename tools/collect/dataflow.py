@@ -143,6 +143,8 @@ def _subscript_key(slice_node: ast.expr) -> Optional[object]:
         isinstance(slice_node, ast.UnaryOp)
         and isinstance(slice_node.op, ast.USub)
         and isinstance(slice_node.operand, ast.Constant)
+        and isinstance(slice_node.operand.value, (int, float, complex))
+        and not isinstance(slice_node.operand.value, bool)
     ):
         return -slice_node.operand.value
     return None

@@ -50,7 +50,7 @@ mapping (provenance included) for the manifest/consumer side (EPIC F/G).
 from __future__ import annotations
 
 import dataclasses
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass, fields
 from typing import Any, Dict, Optional, Tuple
 
 

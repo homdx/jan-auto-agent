@@ -28,7 +28,6 @@ tree — even rebuilt at a different timestamp — compares equal.
 
 from __future__ import annotations
 
-import dataclasses
 import hashlib
 import json
 import subprocess

@@ -43,7 +43,7 @@ import configparser
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from tools.collect import cli as cli_mod
 from tools.collect import manifest as manifest_mod

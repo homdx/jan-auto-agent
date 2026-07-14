@@ -102,7 +102,7 @@ def _line_comments(source: str) -> Dict[int, str]:
                 text = tok.string.lstrip("#").strip()
                 if text:
                     comments[tok.start[0]] = text
-    except (tokenize.TokenizeError, SyntaxError, IndentationError):
+    except (tokenize.TokenError, SyntaxError, IndentationError):
         return {}
     return comments
 

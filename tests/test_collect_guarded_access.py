@@ -288,3 +288,42 @@ def test_accesses_sorted_by_line_then_access():
     accesses = _accesses(source, "m.py")
     linenos = [int(a.location.rsplit(':', 1)[-1]) for a in accesses]
     assert linenos == sorted(linenos)
+
+
+# ── regression: non-numeric constant under unary minus ─────────────────────
+#
+# `x[-<constant>]` is syntactically valid for *any* constant, not just
+# numbers — `x[-"a"]`, `x[-None]`, `x[-b"a"]` all parse fine even though
+# they'd raise TypeError if actually executed. Since collect only parses
+# (never executes) the scanned repo's source, a file containing one of
+# these was enough to crash the whole scan: `_subscript_key` unconditionally
+# computed `-slice_node.operand.value`, so on a non-numeric constant that
+# raised TypeError with nothing upstream (`scan_module` only catches
+# SyntaxError) to stop it taking down the entire collect pass.
+
+
+def test_scan_module_survives_negated_string_subscript():
+    from tools.collect.scanner import scan_module
+
+    source = "def f(x):\n    return x[-\"a\"]\n"
+    record = scan_module(source, "weird.py")  # must not raise
+    assert record.parse_error is None
+    assert len(record.guarded_accesses) == 1
+    assert record.guarded_accesses[0].status == "UNGUARDED"
+
+
+def test_scan_module_survives_negated_none_and_bytes_subscript():
+    from tools.collect.scanner import scan_module
+
+    for literal in ('None', 'b"a"'):
+        source = f"def f(x):\n    return x[-{literal}]\n"
+        record = scan_module(source, "weird.py")  # must not raise
+        assert record.parse_error is None
+        assert len(record.guarded_accesses) == 1
+
+
+def test_negated_numeric_subscript_still_works():
+    source = "def f(x):\n    return x[-1] + x[-1.5]\n"
+    accesses = _accesses(source, "m.py")
+    reprs = {a.access for a in accesses}
+    assert reprs == {"x[-1]", "x[-1.5]"}
