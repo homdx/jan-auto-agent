@@ -165,7 +165,10 @@ def _run_plan_phase(controller: "AutoController", cfg: configparser.ConfigParser
 
     # ── Step 1: Repo ingest ───────────────────────────────────────────────────
     logger.info("plan_phase: ingesting repo at %s", controller.base_dir)
-    clusters = ingest_repo(controller.base_dir, cfg)
+    clusters = ingest_repo(
+        controller.base_dir, cfg,
+        task_mode=getattr(controller, "task_mode", "code"),
+    )
     logger.info("plan_phase: produced %d cluster(s)", len(clusters))
     controller.state.log(f"plan phase: ingested {len(clusters)} cluster(s)")
 
