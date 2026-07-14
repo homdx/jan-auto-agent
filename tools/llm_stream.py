@@ -114,14 +114,21 @@ def _build_payload(payload: dict, api_format: str, stream: bool) -> dict:
 def ollama_chat_url(base_url: str) -> str:
     """Return the correct Ollama /api/chat URL from *base_url*.
 
-    Handles two conventions:
+    Handles three conventions:
+      - base_url is already the full chat endpoint
+        (ends with ``/api/chat``)   → returned unchanged
       - base_url already ends with ``/api``  → append ``/chat`` only
       - base_url does not end with ``/api``  → append ``/api/chat``
 
-    This avoids both the doubled ``/api/api/chat`` and the broken
-    ``/chat`` that stripping produced for non-auto callers.
+    This avoids the doubled ``/api/api/chat`` (and ``/api/chat/api/chat``)
+    that resulted when a caller's ``base_url`` was configured as the
+    complete chat endpoint rather than the bare host/``/api`` root, as
+    well as the broken ``/chat`` that stripping produced for non-auto
+    callers.
     """
     base = base_url.rstrip("/")
+    if base.endswith("/api/chat"):
+        return base
     if base.endswith("/api"):
         return f"{base}/chat"
     return f"{base}/api/chat"
