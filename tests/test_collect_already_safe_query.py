@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from tools.collect.model import ContractRecord, GuardedAccess, ModuleRecord, Provenance
+from tools.collect.model import ContractRecord, FunctionRecord, GuardedAccess, ModuleRecord, Provenance
 from tools.collect.registries import (
     SafetyAnswer,
     build_already_safe_index,
@@ -30,7 +30,7 @@ def _real_repo_index():
     modules = scan_repo(REPO_ROOT)
     fail_open = build_fail_open_registry(modules, root=REPO_ROOT)
     contracts = build_seed_contracts(modules)
-    return build_already_safe_index(modules, fail_open, contracts)
+    return build_already_safe_index(modules, fail_open, contracts, root=REPO_ROOT)
 
 
 # ── guarded access: prompt_store.get_current's stack[-1] ───────────────────
@@ -142,3 +142,164 @@ def test_unknown_location_is_not_safe_and_not_guessed():
     assert answer.safe is False
     assert answer.reason == "unknown"
     assert answer.detail is None
+
+
+# ── ambiguous location: multiple distinct accesses, mixed guard status ─────
+#
+# `AlreadySafeIndex` used to key `guarded_accesses` purely by `location`
+# and answer "guarded" if *any* entry there was GUARDED — so a line with
+# two different subscript expressions, one guarded and one not, would
+# report the whole location "safe: guarded", which could wrongly suppress
+# a real finding about the *other*, unguarded expression on that same
+# line. Real in this repo: `tools/prompt_store.py:182` is
+# `data[agent_name]["current_version"] = stack[-1]["version"] if stack
+# else 0` — `data[agent_name]` is UNGUARDED, `stack[-1]` is GUARDED (via
+# the `entry.get("stack")` alias two lines up).
+
+
+def test_real_mixed_line_without_access_is_ambiguous_not_optimistically_guarded():
+    index = _real_repo_index()
+    answer = index.query("tools/prompt_store.py:182")
+    assert answer.safe is False
+    assert answer.reason == "ambiguous_location"
+    assert "data[agent_name]" in answer.detail
+    assert "stack[-1]" in answer.detail
+
+
+def test_real_mixed_line_disambiguated_via_access_resolves_the_guarded_one():
+    index = _real_repo_index()
+    answer = index.query("tools/prompt_store.py:182", access="stack[-1]")
+    assert answer.safe is True
+    assert answer.reason == "guarded"
+
+
+def test_real_mixed_line_disambiguated_via_access_does_not_falsely_clear_the_unguarded_one():
+    # data[agent_name] itself isn't in guarded_accesses as UNGUARDED at
+    # this exact citation in isolation from contract coverage — the
+    # precise point is just that asking specifically about it must never
+    # come back "guarded" (borrowing stack[-1]'s status), whatever else it
+    # resolves to.
+    index = _real_repo_index()
+    answer = index.query("tools/prompt_store.py:182", access="data[agent_name]")
+    assert answer.reason != "guarded"
+
+
+def test_synthetic_mixed_line_ambiguous_without_access_disambiguated_with_it():
+    modules = [
+        ModuleRecord(
+            path="pkg/mixed.py",
+            guarded_accesses=(
+                GuardedAccess(location="pkg/mixed.py:5", access="a[-1]", status="GUARDED", guard="g"),
+                GuardedAccess(location="pkg/mixed.py:5", access="b[0]", status="UNGUARDED"),
+            ),
+        )
+    ]
+    index = build_already_safe_index(modules, fail_open_registry=[], contracts=[])
+
+    ambiguous = index.query("pkg/mixed.py:5")
+    assert ambiguous.safe is False
+    assert ambiguous.reason == "ambiguous_location"
+
+    guarded = index.query("pkg/mixed.py:5", access="a[-1]")
+    assert guarded.safe is True
+    assert guarded.reason == "guarded"
+
+    unguarded = index.query("pkg/mixed.py:5", access="b[0]")
+    assert unguarded.safe is False
+    assert unguarded.reason == "unguarded"
+
+
+def test_access_that_does_not_exist_at_a_real_location_is_unknown_not_unguarded():
+    # Asking about an access that was never recorded at this location
+    # (typo, or fabricated) must not silently borrow a different real
+    # access's detail text at the same location.
+    modules = [
+        ModuleRecord(
+            path="pkg/mixed.py",
+            guarded_accesses=(
+                GuardedAccess(location="pkg/mixed.py:5", access="a[-1]", status="GUARDED", guard="g"),
+            ),
+        )
+    ]
+    index = build_already_safe_index(modules, fail_open_registry=[], contracts=[])
+    answer = index.query("pkg/mixed.py:5", access="nonexistent[0]")
+    assert answer.reason == "unknown"
+
+
+# ── class-level contract narrowing: a method-specific guarantee must not ───
+# ── vouch for the whole class ───────────────────────────────────────────────
+#
+# COLLECT-4 only inventories top-level defs/classes, so a contract whose
+# guarantee is about one method (`prompt_store_atomic_save`, about
+# `PromptStore._save` specifically) is forced to cite the *class* as
+# `known_edge`. Unnarrowed, `_enclosing_symbol_qualname` resolves *every*
+# line anywhere in that class — every other method included — to the same
+# class-wide symbol, so the contract matched (and reported "safe") for
+# code that has nothing to do with atomic saving at all.
+
+
+def test_real_prompt_store_unrelated_methods_no_longer_falsely_match_save_contract():
+    index = _real_repo_index()
+    # Lines inside get_store_summary/get_version_label/push/rollback —
+    # none of them call _save or touch its atomic-write behavior.
+    for line in (90, 100, 130, 150):
+        answer = index.query(f"tools/prompt_store.py:{line}")
+        assert answer.reason != "contract", (
+            f"line {line} (not inside _save) falsely matched a contract "
+            f"that only guarantees _save's behavior: {answer!r}"
+        )
+
+
+def test_real_prompt_store_save_body_still_matches_its_own_contract():
+    index = _real_repo_index()
+    # A line actually inside _save's try block (the os.replace call).
+    answer = index.query("tools/prompt_store.py:222")
+    assert answer.safe is True
+    assert answer.reason == "contract"
+    assert "prompt_store_atomic_save" in answer.detail
+
+
+def test_class_level_contract_without_root_does_not_overmatch_either():
+    # The conservative fallback: without `root` to verify a method's
+    # range, a method-referencing class-level contract must not match
+    # anywhere in the class — matching everywhere (the old behavior) is
+    # exactly the false "safe" claim this fix closes; the only acceptable
+    # degradation is matching nowhere.
+    modules = scan_repo(REPO_ROOT)
+    fail_open = build_fail_open_registry(modules, root=REPO_ROOT)
+    contracts = build_seed_contracts(modules)
+    index = build_already_safe_index(modules, fail_open, contracts)  # no root
+    for line in (90, 100, 130, 150, 222):
+        answer = index.query(f"tools/prompt_store.py:{line}")
+        assert answer.reason != "contract"
+
+
+def test_class_level_contract_with_no_method_reference_still_matches_class_wide():
+    # A class-level contract whose description names no specific method
+    # (unlike prompt_store_atomic_save) genuinely means the whole class —
+    # that existing, correct behavior must be unaffected by this fix.
+    modules = [
+        ModuleRecord(
+            path="pkg/widget.py",
+            public_symbols=(
+                FunctionRecord(
+                    qualname="pkg/widget.py:Widget",
+                    module="pkg/widget.py",
+                    lineno=1,
+                    signature="class Widget",
+                ),
+            ),
+        )
+    ]
+    contracts = [
+        ContractRecord(
+            name="widget_thread_safe",
+            description="Widget is safe to use from multiple threads.",
+            kind="seed",
+            known_edge="pkg/widget.py:Widget",
+        )
+    ]
+    index = build_already_safe_index(modules, fail_open_registry=[], contracts=contracts)
+    answer = index.query("pkg/widget.py:50")
+    assert answer.safe is True
+    assert answer.reason == "contract"

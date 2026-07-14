@@ -32,10 +32,11 @@ from __future__ import annotations
 
 import ast
 import io
+import re
 import tokenize
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import yaml
 
@@ -289,11 +290,12 @@ class SafetyAnswer:
     (loader's `safe ли X?` in EPIC G, bughunt-suppression in COLLECT-22)
     never has to walk all three itself.
 
-    `reason` is one of "guarded", "fail_open", "contract", "unguarded", or
-    "unknown". `detail` carries whatever concrete evidence backs that
-    reason (the guard description, the rationale/exception type, the
-    contract name(s), or the bare access expression) so a caller can
-    explain *why* a candidate was suppressed, not just that it was.
+    `reason` is one of "guarded", "fail_open", "contract", "unguarded",
+    "ambiguous_location", or "unknown". `detail` carries whatever concrete
+    evidence backs that reason (the guard description, the
+    rationale/exception type, the contract name(s), or the bare access
+    expression) so a caller can explain *why* a candidate was suppressed,
+    not just that it was.
     `provenance` is always `static` or `derived` — never `llm` — because
     every source this draws from is (COLLECT-1's isolation holds
     transitively).
@@ -326,6 +328,60 @@ def _enclosing_symbol_qualname(module: ModuleRecord, line: int) -> Optional[str]
     return enclosing.qualname if enclosing is not None else None
 
 
+_METHOD_REF_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)\b")
+
+
+def _referenced_method(description: str, class_short_name: str) -> Optional[str]:
+    """If `description` mentions `<class_short_name>.<method>` (e.g. the
+    `prompt_store_atomic_save` seed entry's "PromptStore._save writes
+    through..."), return `<method>`; else `None`.
+
+    Exists because COLLECT-4 only inventories top-level defs/classes, so a
+    contract whose actual guarantee is about one method is forced to cite
+    its *enclosing class* as `known_edge` (`contracts_seed.yaml`'s own
+    comment says as much). Left unnarrowed, that class-level reference
+    would make `AlreadySafeIndex.query()` report "safe: contract" for
+    *any* line anywhere in the class — every other method included — since
+    nothing separates one method's lines from another's once COLLECT-4
+    has collapsed them all into a single class-wide symbol. This detects
+    when a narrower target was actually intended, so the caller can go
+    look for it instead of trusting the class-wide range at face value.
+    """
+    for cls, method in _METHOD_REF_RE.findall(description):
+        if cls == class_short_name:
+            return method
+    return None
+
+
+def _method_line_range(source: str, class_name: str, method_name: str) -> Optional[Tuple[int, int]]:
+    """`(first_line, last_line)` (inclusive) of `method_name` inside
+    `class_name` in `source`, via a direct, one-off AST scan — or `None`
+    if either isn't found or `source` doesn't parse.
+
+    Deliberately independent of COLLECT-4's `public_symbols` (which, as
+    above, never tracks methods at all): this is the narrower fact that
+    data structurally can't represent, computed fresh from the same
+    source text Pass A already read. `end_lineno` is populated by
+    `ast.parse` on every Python version this project targets, so the
+    range is exact, not an approximation the way `_enclosing_symbol_
+    qualname`'s "next top-level symbol" inference is.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == class_name:
+            for item in node.body:
+                if (
+                    isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and item.name == method_name
+                ):
+                    end = getattr(item, "end_lineno", None) or item.lineno
+                    return (item.lineno, end)
+    return None
+
+
 class AlreadySafeIndex:
     """The unified "already-safe" surface COLLECT-11 builds: one object
     that answers `query(location)` by checking, in order, whether
@@ -343,6 +399,8 @@ class AlreadySafeIndex:
         modules: Iterable[ModuleRecord],
         fail_open_registry: Iterable[FailOpenEntry],
         contracts: Iterable[ContractRecord],
+        *,
+        root: Optional[Path] = None,
     ) -> None:
         self._modules_by_path: Dict[str, ModuleRecord] = {}
         self._guarded_by_location: Dict[str, List] = {}
@@ -356,11 +414,47 @@ class AlreadySafeIndex:
         self._fail_open_by_location = {e.location: e for e in fail_open_registry}
 
         self._contracts_by_edge: Dict[str, List[ContractRecord]] = {}
+        # (known_edge, contract.name) -> (first_line, last_line), populated
+        # only for contracts whose description names a specific method of
+        # a class-shaped known_edge — see `_referenced_method`. A
+        # class-level known_edge with no such reference never enters
+        # either of the two sets below: it means the contract genuinely
+        # intends its whole known_edge range, not one method within it, so
+        # `query()` keeps matching at that (correct, class-wide) grain.
+        self._contract_line_range: Dict[Tuple[str, str], Tuple[int, int]] = {}
+        # (known_edge, contract.name) pairs whose description named a
+        # specific method but whose range this __init__ could not resolve
+        # (no `root`, file missing, method not found). `query()` must
+        # treat these as *not* matching rather than silently falling back
+        # to the class-wide range — that fallback is exactly the false
+        # "safe: contract" claim for unrelated methods this fix exists to
+        # close (found on the real `PromptStore`/`_save` seed contract:
+        # every line in every other method of the class matched too).
+        self._contract_wants_narrowing: set = set()
         for c in contracts:
-            if c.known_edge:
-                self._contracts_by_edge.setdefault(c.known_edge, []).append(c)
+            if not c.known_edge:
+                continue
+            self._contracts_by_edge.setdefault(c.known_edge, []).append(c)
 
-    def query(self, location: str) -> SafetyAnswer:
+            path, _, short = c.known_edge.rpartition(":")
+            method = _referenced_method(c.description, short)
+            if method is None:
+                continue
+            self._contract_wants_narrowing.add((c.known_edge, c.name))
+            if root is None:
+                continue
+            src_path = root / path
+            if not src_path.is_file():
+                continue
+            try:
+                source = src_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            rng = _method_line_range(source, short, method)
+            if rng is not None:
+                self._contract_line_range[(c.known_edge, c.name)] = rng
+
+    def query(self, location: str, access: Optional[str] = None) -> SafetyAnswer:
         """Is `location` (a `"path/to/module.py:line"` string, matching
         `GuardedAccess.location`/`ExceptSite.location`) already known to be
         safe? Checked in order — guard, fail-open, contract — since each
@@ -368,12 +462,50 @@ class AlreadySafeIndex:
         Pass A recorded an indexed access here and marked it unguarded,
         and `unknown` when this location isn't in any of the three
         sources at all (e.g. it's not an indexed access or except site).
+
+        `access` (e.g. `"stack[-1]"`) disambiguates a location that has
+        *more than one* distinct indexed access on the same physical line
+        — real in this codebase (e.g. `data[agent_name][...] = stack[-1]
+        [...]`, one guarded, one not) — by filtering to the exact access
+        cited before deciding. Callers that already know which expression
+        they're asking about (COLLECT-17's `Claim.access`, a future
+        COLLECT-22 candidate) should always pass it.
+
+        Without `access`, a location where every recorded entry agrees
+        (all `GUARDED`, or duplicates of one real site — COLLECT-7's
+        determinism guarantee) still answers unambiguously. A location
+        where recorded entries *disagree* — some `GUARDED`, some
+        `UNGUARDED`, for genuinely different accesses sharing a line — has
+        no single honest yes/no answer: optimistically returning "guarded"
+        risks suppressing a real finding about the other, unguarded access
+        on that same line, which is exactly the wrong direction for a
+        tool whose purpose is to never let a static fact wrongly vouch for
+        something it doesn't actually cover. That case answers
+        `ambiguous_location` instead — `safe=False`, so a caller who
+        ignores `reason` and only checks `safe` still fails closed.
         """
         accesses = self._guarded_by_location.get(location)
-        if accesses:
-            guarded = next((a for a in accesses if a.status == "GUARDED"), None)
-            if guarded is not None:
+        relevant = accesses
+        if access is not None:
+            relevant = [a for a in accesses if a.access == access] if accesses else []
+
+        if relevant:
+            statuses = {a.status for a in relevant}
+            if statuses == {"GUARDED"}:
+                guarded = relevant[0]
                 return SafetyAnswer(True, "guarded", detail=guarded.guard)
+            if "GUARDED" in statuses and "UNGUARDED" in statuses:
+                # Only reachable with access=None on a genuinely mixed
+                # line: distinct accesses whose guard status disagrees.
+                cited = ", ".join(sorted({f"{a.access}={a.status}" for a in relevant}))
+                return SafetyAnswer(
+                    False,
+                    "ambiguous_location",
+                    detail=(
+                        f"{location} has multiple distinct accesses with differing "
+                        f"guard status ({cited}); pass `access=` to disambiguate"
+                    ),
+                )
 
         if location in self._fail_open_locations:
             entry = self._fail_open_by_location[location]
@@ -386,16 +518,34 @@ class AlreadySafeIndex:
         path, _, line_str = location.rpartition(":")
         module = self._modules_by_path.get(path)
         if module is not None and line_str.isdigit():
-            symbol = _enclosing_symbol_qualname(module, int(line_str))
+            line_num = int(line_str)
+            symbol = _enclosing_symbol_qualname(module, line_num)
             if symbol is not None and symbol in self._contracts_by_edge:
-                names = ", ".join(c.name for c in self._contracts_by_edge[symbol])
-                return SafetyAnswer(True, "contract", detail=names, provenance=Provenance.DERIVED)
+                matched = []
+                for c in self._contracts_by_edge[symbol]:
+                    key = (symbol, c.name)
+                    rng = self._contract_line_range.get(key)
+                    if rng is not None:
+                        if rng[0] <= line_num <= rng[1]:
+                            matched.append(c)
+                    elif key not in self._contract_wants_narrowing:
+                        # No specific method named in the description at
+                        # all — the class-wide known_edge is genuinely
+                        # what this contract means to cover.
+                        matched.append(c)
+                    # else: description named a method but the range
+                    # couldn't be resolved (no root, file missing, method
+                    # not found) — do not match; see __init__ comment.
+                if matched:
+                    names = ", ".join(c.name for c in matched)
+                    return SafetyAnswer(True, "contract", detail=names, provenance=Provenance.DERIVED)
 
-        if accesses:
-            # We have a recorded access at this location and none of it
-            # was GUARDED — this is a confirmed unguarded site, not an
-            # absence of data.
-            return SafetyAnswer(False, "unguarded", detail=accesses[0].access)
+        if relevant:
+            # Every entry reaching here is UNGUARDED (the GUARDED-only and
+            # mixed-status cases already returned above) — and, when
+            # `access` was given, specifically the entry for that access,
+            # not some other one sharing the same location.
+            return SafetyAnswer(False, "unguarded", detail=relevant[0].access)
 
         return SafetyAnswer(False, "unknown")
 
@@ -404,10 +554,19 @@ def build_already_safe_index(
     modules: Iterable[ModuleRecord],
     fail_open_registry: Iterable[FailOpenEntry],
     contracts: Iterable[ContractRecord],
+    *,
+    root: Optional[Path] = None,
 ) -> AlreadySafeIndex:
     """Construct the COLLECT-11 "already-safe" query surface from Pass A's
     modules (for `guarded_accesses`), COLLECT-9's `FAIL_OPEN_REGISTRY`, and
     COLLECT-10's `CONTRACTS` — the three static/derived sources EPIC G's
     loader and bughunt-suppression (COLLECT-21/22) will query against.
+
+    `root`, when given, lets a class-level contract whose description
+    names one specific method (e.g. `prompt_store_atomic_save`'s
+    "PromptStore._save writes through...") be verified against that
+    method's actual line range instead of matching anywhere in the whole
+    class — see `AlreadySafeIndex.__init__`. Omitting `root` still works;
+    such contracts just won't match at all rather than over-matching.
     """
-    return AlreadySafeIndex(modules, fail_open_registry, contracts)
+    return AlreadySafeIndex(modules, fail_open_registry, contracts, root=root)

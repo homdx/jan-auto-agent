@@ -140,3 +140,109 @@ def test_real_repo_config_read_coverage_does_not_regress():
     # without real dataflow (out of scope for COLLECT-5).
     assert extracted_total <= grep_total
     assert extracted_total >= 0.7 * grep_total
+
+
+# ── _cfg_mode helper recognition (the mode-override blind spot) ────────────
+#
+# This codebase's actual `{key}_{task_mode}` mode-override convention
+# almost never appears as a literal `config.get(section, f"{key}_
+# {task_mode}", ...)` at the call site — it goes through the shared
+# `_cfg_mode(config, section, key, task_mode, fallback=...)` helper
+# instead (`tools.auto.utils`), which does that same `config.get` call
+# one module away, inside its own body, with a non-literal key expression
+# `extract_config_reads` correctly can't resolve from there. A version of
+# this extractor that only recognized literal `config.get*()` shapes
+# recorded exactly zero mode-override reads anywhere on the real repo —
+# not because the convention isn't used, but because every real call site
+# (`coder.py`, `architect.py`, `inner_loop.py`, `summary_memory.py`,
+# `canon_validator.py`, `progress_display.py`, `tools/collect/
+# summarizer.py` itself — 13+ sites) goes through `_cfg_mode`, and none of
+# them is a literal `.get(...)` call at all.
+
+
+def test_cfg_mode_call_is_recognized_as_mode_override():
+    source = (
+        "def f(config, task_mode):\n"
+        "    return int(_cfg_mode(config, 'coder', 'max_tokens', task_mode, fallback='2048'))\n"
+    )
+    record = scan_module(source, "pkg/x.py")
+    assert len(record.config_reads) == 1
+    c = record.config_reads[0]
+    assert c.section == "coder"
+    assert c.key == "max_tokens_{task_mode}"
+    assert c.has_mode_override is True
+    assert c.fallback == "2048"
+
+
+def test_cfg_mode_call_with_positional_fallback_is_recognized():
+    source = (
+        "def f(config, task_mode):\n"
+        "    return _cfg_mode(config, 'coder', 'num_ctx', task_mode, None)\n"
+    )
+    record = scan_module(source, "pkg/x.py")
+    assert len(record.config_reads) == 1
+    assert record.config_reads[0].fallback is None
+    assert record.config_reads[0].has_mode_override is True
+
+
+def test_cfg_mode_call_with_section_alias_is_resolved():
+    source = (
+        "def f(config, task_mode):\n"
+        "    arch = 'architect'\n"
+        "    return _cfg_mode(config, arch, 'max_tokens', task_mode, fallback='2048')\n"
+    )
+    record = scan_module(source, "pkg/x.py")
+    assert len(record.config_reads) == 1
+    assert record.config_reads[0].section == "architect"
+
+
+def test_cfg_mode_call_with_dynamic_key_is_skipped_not_guessed():
+    # Real instance in this repo (repo_ingest.py): `key` is a loop
+    # variable taking on multiple literal values, not a single-assignment
+    # alias — genuinely unresolvable statically, same as the direct-call
+    # dynamic-key case already tested above.
+    source = (
+        "def f(config, task_mode):\n"
+        "    for key in ('a', 'b'):\n"
+        "        _cfg_mode(config, 'architect', key, task_mode, fallback=None)\n"
+    )
+    record = scan_module(source, "pkg/x.py")
+    assert record.config_reads == ()
+
+
+def test_unrelated_function_named_similarly_is_not_matched():
+    # Only the exact helper name is recognized — a same-shaped call to a
+    # different function must not be misattributed as a config read.
+    source = (
+        "def f(config, task_mode):\n"
+        "    return _cfg_mode_other(config, 'coder', 'max_tokens', task_mode, fallback='1')\n"
+    )
+    record = scan_module(source, "pkg/x.py")
+    assert record.config_reads == ()
+
+
+def test_real_repo_cfg_mode_reads_are_recognized_and_grouped():
+    modules = scan_repo(REPO_ROOT)
+    overrides = [
+        c
+        for m in modules
+        for c in m.config_reads
+        if c.has_mode_override and c.reader_module in ("tools/auto/coder.py", "tools/auto/architect.py")
+    ]
+    assert overrides, "expected at least one real _cfg_mode-based mode-override read"
+    assert any(c.key == "max_tokens_{task_mode}" for c in overrides)
+
+
+def test_real_repo_cfg_mode_reads_feed_config_map_expansion():
+    from tools.collect.config_map import build_config_map
+
+    modules = scan_repo(REPO_ROOT)
+    cmap = build_config_map(modules)
+    entry = next(
+        (e for e in cmap if e.section == "coder" and e.key_template == "max_tokens_{task_mode}"),
+        None,
+    )
+    assert entry is not None, "coder.max_tokens_{task_mode} should surface in CONFIG_MAP"
+    assert entry.has_mode_override is True
+    assert set(entry.concrete_keys) == {"max_tokens_code", "max_tokens_creative", "max_tokens_docs"}
+    assert "tools/auto/coder.py" in entry.readers

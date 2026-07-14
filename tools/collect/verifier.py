@@ -191,6 +191,7 @@ def citation_check(
     claim: Claim,
     known_symbols: FrozenSet[str],
     line_counts: Dict[str, int],
+    known_accesses: FrozenSet[str] = frozenset(),
 ) -> Optional[str]:
     """Return `None` if `claim` cites something real, else a detail string
     explaining what didn't resolve.
@@ -199,9 +200,20 @@ def citation_check(
       COLLECT-4's `public_symbols`, nothing derived or LLM-sourced).
     * A cited `location` (`path:line`) must name a scanned module and a
       line number within that file's actual line count.
-    A claim citing neither is not a citation-check failure — it simply has
-    nothing to check (handled by the caller: only claims with a citation
-    at all go through this gate meaningfully; see `verify_claims`).
+    * An `access_crash` claim's cited `access` (e.g. `"cache[-1]"`) must be
+      one COLLECT-7's dataflow pass actually recorded for this module — in
+      `known_accesses`, regardless of GUARDED/UNGUARDED status. Without
+      this, a claim about an access that doesn't correspond to any real
+      subscript site in the code at all (not merely a guarded one) has
+      nothing in `contradiction_check` to match against, finds no
+      contradiction, and survives — which is a fabrication reaching the
+      artifact exactly as much as a fabricated symbol or line would be.
+      Scoped to `kind="access_crash"` specifically: a claim that merely
+      *mentions* bracket syntax in passing, without asserting a crash, was
+      never claiming that access is a cataloged site in the first place.
+    A claim citing none of the above is not a citation-check failure — it
+    simply has nothing to check (handled by the caller: only claims with a
+    citation at all go through this gate meaningfully; see `verify_claims`).
     """
     if claim.symbol is not None and claim.symbol not in known_symbols:
         return f"cited symbol {claim.symbol!r} not found in Pass A index"
@@ -216,6 +228,13 @@ def citation_check(
             return f"cited module {path!r} not found in Pass A index"
         if line < 1 or line > max_line:
             return f"cited line {line} out of range for {path!r} (1..{max_line})"
+
+    if claim.kind == "access_crash" and claim.access is not None:
+        if claim.access not in known_accesses:
+            return (
+                f"cited access {claim.access!r} does not correspond to any "
+                f"indexed access site in Pass A's guarded_accesses for this module"
+            )
 
     return None
 
@@ -273,15 +292,16 @@ def verify_claims(
 ) -> Tuple[List[Claim], List[DroppedClaim]]:
     """Run every check in order on each of `claims`; return `(kept, dropped)`.
 
-    Citation runs before contradiction: a claim citing a location/symbol
-    that doesn't even exist is a fabrication regardless of what it says
-    about it, so there's no reason to also ask whether its (nonexistent)
-    citation contradicts anything.
+    Citation runs before contradiction: a claim citing a location/symbol/
+    access that doesn't even exist is a fabrication regardless of what it
+    says about it, so there's no reason to also ask whether its
+    (nonexistent) citation contradicts anything.
     """
+    known_accesses = frozenset(ga.access for ga in module.guarded_accesses)
     kept: List[Claim] = []
     dropped: List[DroppedClaim] = []
     for claim in claims:
-        no_citation = citation_check(claim, known_symbols, line_counts)
+        no_citation = citation_check(claim, known_symbols, line_counts, known_accesses)
         if no_citation is not None:
             dropped.append(DroppedClaim(claim=claim, reason=REASON_NO_CITATION, detail=no_citation))
             continue
