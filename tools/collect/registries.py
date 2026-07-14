@@ -276,3 +276,138 @@ def build_seed_contracts(
 
     contracts.sort(key=lambda c: c.name)
     return contracts
+
+
+# ── COLLECT-11: "already-safe" query surface ───────────────────────────────────
+
+
+@dataclass(frozen=True)
+class SafetyAnswer:
+    """The result of asking "is `location` already safe?" — COLLECT-11's
+    единый query, stitched together from three static/derived sources
+    (guarded_accesses, FAIL_OPEN_REGISTRY, CONTRACTS) so the consumer side
+    (loader's `safe ли X?` in EPIC G, bughunt-suppression in COLLECT-22)
+    never has to walk all three itself.
+
+    `reason` is one of "guarded", "fail_open", "contract", "unguarded", or
+    "unknown". `detail` carries whatever concrete evidence backs that
+    reason (the guard description, the rationale/exception type, the
+    contract name(s), or the bare access expression) so a caller can
+    explain *why* a candidate was suppressed, not just that it was.
+    `provenance` is always `static` or `derived` — never `llm` — because
+    every source this draws from is (COLLECT-1's isolation holds
+    transitively).
+    """
+
+    safe: bool
+    reason: str
+    detail: Optional[str] = None
+    provenance: str = Provenance.STATIC
+
+
+def _enclosing_symbol_qualname(module: ModuleRecord, line: int) -> Optional[str]:
+    """The qualname of the top-level symbol in `module` that `line` falls
+    inside, or `None` if `line` precedes every symbol (module-level code
+    before the first def/class) or `module` has no symbols at all.
+
+    COLLECT-4 only inventories top-level defs/classes and doesn't track
+    each symbol's end line, so this is necessarily approximate: it picks
+    the closest-preceding symbol, which is exact for well-formed source
+    (no top-level statements interleaved between two defs at the same
+    indent) and is the same approximation COLLECT-4's own ordering already
+    relies on.
+    """
+    enclosing = None
+    for sym in module.public_symbols:  # already sorted by lineno (COLLECT-4)
+        if sym.lineno <= line:
+            enclosing = sym
+        else:
+            break
+    return enclosing.qualname if enclosing is not None else None
+
+
+class AlreadySafeIndex:
+    """The unified "already-safe" surface COLLECT-11 builds: one object
+    that answers `query(location)` by checking, in order, whether
+    `location` is a documented `GUARDED` access, a registered fail-open
+    site, or covered by a seed/derived contract — before ever falling
+    back to "unguarded" or "unknown".
+
+    Built once via `build_already_safe_index` and then queried as many
+    times as the consumer needs; nothing here re-scans the repo or talks
+    to an LLM.
+    """
+
+    def __init__(
+        self,
+        modules: Iterable[ModuleRecord],
+        fail_open_registry: Iterable[FailOpenEntry],
+        contracts: Iterable[ContractRecord],
+    ) -> None:
+        self._modules_by_path: Dict[str, ModuleRecord] = {}
+        self._guarded_by_location: Dict[str, List] = {}
+        for m in modules:
+            self._modules_by_path[m.path] = m
+            for g in m.guarded_accesses:
+                self._guarded_by_location.setdefault(g.location, []).append(g)
+
+        fail_open_registry = list(fail_open_registry)
+        self._fail_open_locations = fail_open_locations(fail_open_registry)
+        self._fail_open_by_location = {e.location: e for e in fail_open_registry}
+
+        self._contracts_by_edge: Dict[str, List[ContractRecord]] = {}
+        for c in contracts:
+            if c.known_edge:
+                self._contracts_by_edge.setdefault(c.known_edge, []).append(c)
+
+    def query(self, location: str) -> SafetyAnswer:
+        """Is `location` (a `"path/to/module.py:line"` string, matching
+        `GuardedAccess.location`/`ExceptSite.location`) already known to be
+        safe? Checked in order — guard, fail-open, contract — since each
+        is independently sufficient; `unguarded` is only returned when
+        Pass A recorded an indexed access here and marked it unguarded,
+        and `unknown` when this location isn't in any of the three
+        sources at all (e.g. it's not an indexed access or except site).
+        """
+        accesses = self._guarded_by_location.get(location)
+        if accesses:
+            guarded = next((a for a in accesses if a.status == "GUARDED"), None)
+            if guarded is not None:
+                return SafetyAnswer(True, "guarded", detail=guarded.guard)
+
+        if location in self._fail_open_locations:
+            entry = self._fail_open_by_location[location]
+            return SafetyAnswer(
+                True,
+                "fail_open",
+                detail=entry.rationale or f"except {entry.exception_type}",
+            )
+
+        path, _, line_str = location.rpartition(":")
+        module = self._modules_by_path.get(path)
+        if module is not None and line_str.isdigit():
+            symbol = _enclosing_symbol_qualname(module, int(line_str))
+            if symbol is not None and symbol in self._contracts_by_edge:
+                names = ", ".join(c.name for c in self._contracts_by_edge[symbol])
+                return SafetyAnswer(True, "contract", detail=names, provenance=Provenance.DERIVED)
+
+        if accesses:
+            # We have a recorded access at this location and none of it
+            # was GUARDED — this is a confirmed unguarded site, not an
+            # absence of data.
+            return SafetyAnswer(False, "unguarded", detail=accesses[0].access)
+
+        return SafetyAnswer(False, "unknown")
+
+
+def build_already_safe_index(
+    modules: Iterable[ModuleRecord],
+    fail_open_registry: Iterable[FailOpenEntry],
+    contracts: Iterable[ContractRecord],
+) -> AlreadySafeIndex:
+    """Construct the COLLECT-11 "already-safe" query surface from Pass A's
+    modules (for `guarded_accesses`), COLLECT-9's `FAIL_OPEN_REGISTRY`, and
+    COLLECT-10's `CONTRACTS` — the three static/derived sources EPIC G's
+    loader and bughunt-suppression (COLLECT-21/22) will query against.
+    """
+    return AlreadySafeIndex(modules, fail_open_registry, contracts)
