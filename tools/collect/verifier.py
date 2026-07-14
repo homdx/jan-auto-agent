@@ -263,6 +263,9 @@ def citation_check(
 # ── check 2: contradiction ──────────────────────────────────────────────────────
 
 
+REASON_CONTRADICTS_NOT_SILENT = "dropped:contradicts-not-silent"
+
+
 def contradiction_check(
     claim: Claim,
     module: ModuleRecord,
@@ -276,10 +279,31 @@ def contradiction_check(
       that Pass A recorded as `GUARDED` contradicts the claim outright —
       this is the `stack[-1]` false-positive killer COLLECT-7 built the
       data for.
-    * `kind="silent_except"` claims are checked against `fail_open_locs`
-      (COLLECT-9's registry): a cited location that's already a documented
-      fail-open site is not a new discovery, so the claim is suppressed
-      the same way.
+    * `kind="silent_except"` claims get two checks against `module`'s own
+      `except_sites` (COLLECT-6)/`fail_open_locs` (COLLECT-9's registry),
+      genuinely mirroring the `access_crash` check above rather than only
+      covering half of it:
+
+      1. **Redundancy** — a cited location that's already a documented
+         fail-open site is not a new discovery, so the claim is
+         suppressed.
+      2. **Falsehood** (BUGFIX) — a cited location that Pass A's own
+         `except_sites` classified with `is_fail_open=False` (it logs,
+         re-raises, or `continue`s — COLLECT-6 already proved it is *not*
+         silent) directly contradicts a "silently swallows" claim about
+         that exact site, the same way a `GUARDED` access contradicts an
+         `access_crash` claim. Before this fix, the only check here was
+         redundancy-against-`fail_open_locs`, which by construction can
+         only ever agree with a *true* "this is silent" claim (a location
+         in that set already *is* fail-open) — there was no check at all
+         for the more dangerous case of a claim asserting silence about a
+         location Pass A proved logs/re-raises/`continue`s, so a
+         fabricated "site X silently swallows the exception" survived to
+         the artifact untouched whenever X was a real `except` handler
+         Pass A had already classified as *not* silent. This is exactly
+         the class of unchecked assertion COLLECT-17 exists to catch —
+         the module's own docstring already claimed this check was
+         "symmetric" with the access_crash one; now it actually is.
     """
     if claim.kind == "access_crash" and claim.access:
         for ga in module.guarded_accesses:
@@ -296,6 +320,13 @@ def contradiction_check(
                 REASON_CONTRADICTS_FAIL_OPEN,
                 f"{claim.location} is already a documented fail-open site",
             )
+        for site in module.except_sites:
+            if site.location == claim.location and not site.is_fail_open:
+                return (
+                    REASON_CONTRADICTS_NOT_SILENT,
+                    f"{claim.location} is classified {site.body_kind!r} "
+                    "(not silent) by Pass A's except-site analysis",
+                )
 
     return None
 
