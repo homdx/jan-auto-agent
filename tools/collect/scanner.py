@@ -115,7 +115,12 @@ def scan_java_module(source: str, module_path: str) -> ModuleRecord:
     )
 
 
-def scan_file(source: str, module_path: str) -> ModuleRecord:
+def scan_file(
+    source: str,
+    module_path: str,
+    *,
+    config: Optional[configparser.ConfigParser] = None,
+) -> ModuleRecord:
     """Dispatch to `scan_java_module` or `scan_module` by `module_path`'s
     extension (COLLECT-28).
 
@@ -129,13 +134,31 @@ def scan_file(source: str, module_path: str) -> ModuleRecord:
     perfectly valid Java file as unparseable code in the wrong language
     entirely.
 
-    An extension `detect_language` doesn't recognize falls back to the
-    Python path (`scan_module`) rather than raising — matches this
-    function's callers, which only ever invoke it for a path they've
-    already decided is scannable one way or another; this is a last-
-    resort default, not a silent misclassification of a file nothing
-    upstream would have selected in the first place.
+    `config` is accepted (and should be passed by every caller that has
+    one) for the exact same reason `scan_repo`'s own `_language()` helper
+    checks `java_extensions_from_config(config)` before falling back to
+    `detect_language`: a project with a non-default `[collect]
+    java_extensions` (e.g. `.jav`) would otherwise hit this function's
+    `detect_language`-only check, fail to recognize the file as Java, and
+    reproduce the exact "valid Java recorded as broken Python"
+    misclassification this function exists to prevent — just for a
+    custom extension instead of the default one. BUGFIX: `scan_file` used
+    to ignore `config` entirely (it didn't even accept the parameter),
+    so `cli.action_module`'s `--module <path>` on a custom-extension Java
+    file silently overwrote a correct `language="java"` record with a
+    bogus `language="python"`/`parse_error` one, even though a full
+    `scan_repo` pass on the same tree got it right.
+
+    An extension neither `java_extensions_from_config(config)` nor
+    `detect_language` recognizes falls back to the Python path
+    (`scan_module`) rather than raising — matches this function's
+    callers, which only ever invoke it for a path they've already
+    decided is scannable one way or another; this is a last-resort
+    default, not a silent misclassification of a file nothing upstream
+    would have selected in the first place.
     """
+    if Path(module_path).suffix.lower() in java_extensions_from_config(config):
+        return scan_java_module(source, module_path)
     if detect_language(module_path) == Language.JAVA:
         return scan_java_module(source, module_path)
     return scan_module(source, module_path)

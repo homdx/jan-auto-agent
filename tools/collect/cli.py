@@ -605,7 +605,7 @@ def action_module(
         # in this function (a missing path just above, an unreadable
         # artifact just above that) already gets.
         raise CollectCliError(f"--module path is unreadable: {module_path}: {exc}") from exc
-    patched = scan_file(source, module_path)
+    patched = scan_file(source, module_path, config=config)
 
     if module_path not in by_path:
         modules.append(patched)
