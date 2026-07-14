@@ -235,13 +235,25 @@ class LLMSummary:
 
 @dataclass(frozen=True, kw_only=True)
 class FunctionRecord:
-    """One public symbol (function/class) found by Pass A (COLLECT-4).
+    """One public symbol (function/class) found by Pass A (COLLECT-4;
+    Java support COLLECT-25+ reuses this same type — see `access_modifier`).
 
     All fields below `summary` are structural/static and write-once: this is
     a frozen dataclass, so there is no setter for them at all, from Pass B
     or anywhere else. The only field an LLM summarizer can populate is
     `summary`, and only by attaching a whole new `LLMSummary` instance via
     `with_llm_summary` — it can never reach `qualname`, `signature`, etc.
+
+    `access_modifier` is `None` for every Python symbol (the language has
+    no such keyword; `is_private` alone already captures its one binary
+    `_x` convention) and one of `"public"`/`"protected"`/`"package-private"`/
+    `"private"` for a Java one (COLLECT-26) — the finer 4-way distinction
+    Java actually has, alongside `is_private`, which stays the
+    language-neutral "is this part of the public surface" signal both
+    extractors populate: for Java, `is_private` is `True` for anything
+    that isn't `public` (`protected`/package-private/`private` are all,
+    like Python's leading underscore, "not a guaranteed external API"),
+    with `access_modifier` preserving which one it actually was.
     """
 
     qualname: str
@@ -250,6 +262,7 @@ class FunctionRecord:
     signature: str
     docstring_first_line: str = ""
     is_private: bool = False
+    access_modifier: Optional[str] = None
     summary: Optional[LLMSummary] = None
 
     def with_llm_summary(self, summary: LLMSummary) -> "FunctionRecord":

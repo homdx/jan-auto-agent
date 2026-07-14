@@ -50,13 +50,29 @@ Graph = Dict[str, FrozenSet[str]]
 
 
 def _module_dotted_name(path: str) -> str:
-    """`"tools/collect/model.py"` -> `"tools.collect.model"`.
+    """`"tools/collect/model.py"` -> `"tools.collect.model"`;
+    `"com/example/Point.java"` -> `"com.example.Point"` (COLLECT-26).
 
     A package's `__init__.py` maps to the *package's* dotted name
     (`"tools/collect/__init__.py"` -> `"tools.collect"`), since that's what
     both `import tools.collect` and the coarser `from tools.collect import
     model` (recorded by `ast_facts.extract_imports` as just `"tools.collect"`
     — see that module's docstring) actually refer to.
+
+    No separate Java branch exists here on purpose, not by oversight: Java
+    has no `__init__.py`-equivalent "this file stands for the whole
+    package" special case to account for, so the same "replace the file's
+    own stem, dot-join the path" rule that already handles every other
+    Python file also produces exactly Java's own package+class-name FQN
+    convention for a `.java` file — `com/example/Point.java`'s stem is
+    `Point`, and `"com.example.Point"` is precisely what `import
+    com.example.Point;` (COLLECT-26's `java_facts.extract_java_imports`)
+    and a static import's class-qualified prefix both already look like.
+    `resolve_import`'s longest-prefix fallback then handles a Java static
+    import's trailing `.member` (`import static com.example.Utils.
+    helper;` -> `"com.example.Utils.helper"`) the same way it already
+    handles Python's `from x.y import z` coarsening — stripping one
+    trailing component at a time until a real module matches.
     """
     p = Path(path)
     parts = list(p.parts)

@@ -212,6 +212,42 @@ def test_module_rejects_nonexistent_path(mini_repo):
         action_module(mini_repo, "pkg/does_not_exist.py")
 
 
+# ── COLLECT-28: --module dispatches by language, not just Python ───────────
+#
+# action_module used to call scan_module (the Python-only, ast.parse-based
+# path) directly, so `--module Foo.java` would `ast.parse` valid Java
+# source, get a SyntaxError, and record a perfectly valid Java file as
+# broken *Python*. Fixed by routing through scan_file (the same
+# language-dispatching entry point scan_repo's own loop uses).
+
+
+def test_module_on_java_file_is_parsed_as_java_not_broken_python(mini_repo):
+    from tools.collect.java_parser import is_available
+
+    if not is_available():
+        pytest.skip("tree-sitter-java not installed")
+
+    action_collect(mini_repo)  # existing Python-only artifact
+    (mini_repo / "Greeting.java").write_text(
+        "public class Greeting {\n    public String hello() { return \"hi\"; }\n}\n",
+        encoding="utf-8",
+    )
+    result = action_module(mini_repo, "Greeting.java")
+    assert result.action == "module"
+
+    import json
+
+    artifact = json.loads((result.collect_dir / ARTIFACT_FILENAME).read_text(encoding="utf-8"))
+    by_path = {m["path"]: m for m in artifact["modules"]}
+    assert "Greeting.java" in by_path
+    record = by_path["Greeting.java"]
+    assert record["language"] == "java"
+    assert record["parse_error"] is None
+    qualnames = {s["qualname"] for s in record["public_symbols"]}
+    assert "Greeting.java:Greeting" in qualnames
+    assert "Greeting.java:Greeting.hello" in qualnames
+
+
 # ── [collect] dir config plumbing ───────────────────────────────────────────
 
 

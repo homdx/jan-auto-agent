@@ -16,6 +16,8 @@
 
 from pathlib import Path
 
+import pytest
+
 from tools.collect.graph import (
     build_call_edges,
     entry_points,
@@ -173,3 +175,83 @@ def test_build_call_edges_skips_parse_error_modules_without_crashing(tmp_path):
     edges = build_call_edges(tmp_path, modules)
     assert edges["pkg/broken.py"] == frozenset()
     assert set(edges) == {"pkg/__init__.py", "pkg/broken.py", "pkg/good.py"}
+
+
+# ── COLLECT-26: mixed Python + Java repo, imported_by symmetric for both ───
+
+
+def test_mixed_python_java_repo_imported_by_is_symmetric(tmp_path):
+    import configparser
+
+    from tools.collect.java_parser import is_available
+
+    if not is_available():
+        pytest.skip("tree-sitter-java not installed")
+
+    java_pkg = tmp_path / "com" / "example"
+    java_pkg.mkdir(parents=True)
+    (java_pkg / "Point.java").write_text(
+        "package com.example;\npublic class Point { int x; }\n", encoding="utf-8"
+    )
+    other_pkg = tmp_path / "other"
+    other_pkg.mkdir()
+    (other_pkg / "Consumer.java").write_text(
+        "package other;\n"
+        "import com.example.Point;\n"
+        "public class Consumer { Point p; }\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "helper.py").write_text("def f():\n    pass\n", encoding="utf-8")
+
+    config = configparser.ConfigParser()
+    config["collect"] = {"languages": "python,java"}
+    modules = scan_repo(tmp_path, config=config)
+    assert {m.path for m in modules} == {
+        "com/example/Point.java",
+        "other/Consumer.java",
+        "helper.py",
+    }
+
+    edges = import_edges(modules)
+    reverse = imported_by(edges)
+
+    # The real cross-package Java import resolves to a genuine edge...
+    assert edges["other/Consumer.java"] == frozenset({"com/example/Point.java"})
+    assert reverse["com/example/Point.java"] == frozenset({"other/Consumer.java"})
+
+    # ...and the unrelated Python file neither imports nor is imported by
+    # either Java file — languages don't bleed into each other's edges.
+    assert edges["helper.py"] == frozenset()
+    assert reverse["helper.py"] == frozenset()
+
+    # Full symmetry, both directions, across all three modules at once —
+    # the COLLECT-26 AC, verbatim ("imported_by is symmetric for both
+    # languages at once"), not just spot-checked on the one real edge.
+    for a in edges:
+        for b in edges:
+            assert (b in reverse[a]) == (a in edges.get(b, frozenset()))
+
+
+def test_java_cannot_import_python_module_no_crash_no_edge(tmp_path):
+    # "Java can't import .py here or vice versa" (COLLECT-26 AC): a
+    # same-named module in the other language must not accidentally
+    # resolve — resolve_import works purely off each language's own
+    # dotted-name index, so there's no shared namespace for a collision
+    # to even occur in, but this pins that explicitly rather than by
+    # inference.
+    import configparser
+
+    from tools.collect.java_parser import is_available
+
+    if not is_available():
+        pytest.skip("tree-sitter-java not installed")
+
+    (tmp_path / "Shared.java").write_text(
+        "public class Shared { void f() {} }\n", encoding="utf-8"
+    )
+    (tmp_path / "shared.py").write_text("def f():\n    pass\n", encoding="utf-8")
+    config = configparser.ConfigParser()
+    config["collect"] = {"languages": "python,java"}
+    modules = scan_repo(tmp_path, config=config)
+    edges = import_edges(modules)
+    assert edges == {"Shared.java": frozenset(), "shared.py": frozenset()}

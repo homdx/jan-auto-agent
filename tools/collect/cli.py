@@ -61,7 +61,7 @@ from tools.collect import test_map as test_map_mod
 from tools.collect import verifier as verifier_mod
 from tools.collect._determinism import canonical_dumps
 from tools.collect.model import ModuleRecord
-from tools.collect.scanner import scan_module, scan_repo
+from tools.collect.scanner import scan_file, scan_repo
 from tools.collect.summarizer import LlmCall, summarize_repo
 
 DEFAULT_COLLECT_DIR = ".collect"
@@ -577,7 +577,7 @@ def action_module(
     if not abs_module.is_file():
         raise CollectCliError(f"--module path does not exist under {root}: {module_path}")
     source = abs_module.read_text(encoding="utf-8")
-    patched = scan_module(source, module_path)
+    patched = scan_file(source, module_path)
 
     if module_path not in by_path:
         modules.append(patched)
