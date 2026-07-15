@@ -90,6 +90,67 @@ def test_real_view_trace_find_trace_file_is_guarded_via_sys_exit():
     assert site.guard
 
 
+# ── reassignment invalidates a stale guard ──────────────────────────────────
+
+
+def test_reassigned_name_loses_its_guard():
+    # BUGFIX (found via self-play collect-mode session on this repo):
+    # `if not x: return` proves the *original* x truthy; rebinding x to a
+    # fresh value afterward (`x = other_func()`) must drop that guarantee
+    # for x, not carry it forward to a completely different object that
+    # could well be empty. Before the fix this was recorded GUARDED,
+    # citing the now-irrelevant early return, and Pass C's
+    # contradiction_check (COLLECT-17) would use that stale GUARDED
+    # record to auto-drop a correct "this crashes" claim about the site
+    # as `dropped:contradicts-guard` — turning a real bug report into a
+    # suppressed false positive.
+    source = (
+        "def f(entry):\n"
+        "    if not entry or not entry.get('queue'):\n"
+        "        return None\n"
+        "    queue = entry['queue']\n"
+        "    queue = refresh(queue)\n"
+        "    return queue[-1]\n"
+    )
+    accesses = _accesses(source, "pkg/reassign.py")
+    by_access = {(a.location, a.access): a for a in accesses}
+    site = by_access[("pkg/reassign.py:6", "queue[-1]")]
+    assert site.status == "UNGUARDED"
+    assert site.guard is None
+
+
+def test_reassigned_name_end_to_end_survives_verification():
+    # Same scenario, run through the full Pass A -> Pass C chain (not just
+    # dataflow.py in isolation): a Pass B claim that the reassigned access
+    # crashes must survive `verify_claims` rather than being dropped as
+    # `contradicts-guard`, since the crash claim is actually true.
+    from tools.collect.scanner import scan_module
+    from tools.collect.verifier import extract_claims, verify_claims
+
+    mod_path = "pkg/reassign.py"
+    source = (
+        "def f(entry):\n"
+        "    if not entry or not entry.get('queue'):\n"
+        "        return None\n"
+        "    queue = entry['queue']\n"
+        "    queue = refresh(queue)\n"
+        "    return queue[-1]\n"
+    )
+    module = scan_module(source, mod_path)
+    known_symbols = frozenset(s.qualname for s in module.public_symbols)
+
+    claims = extract_claims(
+        "queue[-1] crashes with IndexError when refresh(queue) returns an empty list.",
+        mod_path, known_symbols,
+    )
+    kept, dropped = verify_claims(
+        claims, module=module, known_symbols=known_symbols,
+        line_counts={mod_path: source.count("\n") + 1}, fail_open_locs=frozenset(),
+    )
+    assert dropped == []
+    assert len(kept) == 1
+
+
 # ── guard-shape coverage ────────────────────────────────────────────────────
 
 

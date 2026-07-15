@@ -295,6 +295,57 @@ class _FunctionGuardWalker:
                     )
                 )
 
+    def _invalidate_reassigned(
+        self,
+        stmt: ast.stmt,
+        guarded_names: Set[str],
+        guarded_pairs: Set[Tuple[str, object]],
+        guard_desc: Dict[str, str],
+    ) -> None:
+        """Drop any guarantee this walker holds about a name that `stmt`
+        rebinds, *before* `_propagate_alias` gets a chance to reinstate it
+        from the new right-hand side.
+
+        BUGFIX (COLLECT-7 follow-up): `guarded_names`/`guarded_pairs` were
+        only ever added to, never removed from — a name proven safe by an
+        early-return guard stayed marked GUARDED for the rest of the
+        function even after being rebound to a completely different value.
+        Concretely: `if not x: return` proves the *original* `x` truthy;
+        `x = other_func()` immediately after replaces that object with
+        whatever `other_func()` returns, which the guard says nothing
+        about, yet the walker kept citing the stale early-return as the
+        reason `x[-1]` afterward was GUARDED. Confirmed against this exact
+        codebase: `tools/prompt_store.py`'s `rollback()` calls
+        `entry["stack"].pop()` (which can empty the list) and *then*
+        `stack = entry["stack"]` — before this fix, that second assignment
+        re-triggered `_propagate_alias`'s pair rule (`stack` aliasing the
+        already-guarded `(entry, "stack")` pair) and re-marked `stack`
+        GUARDED with no awareness that `.pop()` had just run, citing the
+        function's original entry guard as justification for a site that
+        guard no longer establishes anything about. A `GuardedAccess` this
+        wrong is worse than a missed one (see module docstring): Pass C's
+        `contradiction_check` (COLLECT-17) trusts `status="GUARDED"`
+        unconditionally and drops any Pass B claim that the access can
+        crash as `dropped:contradicts-guard` — so a real, correctly
+        reported crash-site claim about a rebound name gets silently
+        thrown away as a supposed false positive.
+
+        Only a bare `x = <expr>` (single `Name` target) rebinds a name;
+        `x[i] = ...`/`x.attr = ...`/tuple-unpacking targets don't replace
+        what `x` itself refers to, so they're left alone here (and were
+        never something `_propagate_alias` recognized as a target either).
+        """
+        if not (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name)):
+            return
+        target = stmt.targets[0].id
+        guarded_names.discard(target)
+        guard_desc.pop(target, None)
+        # `target` no longer denotes whatever dict it used to alias, so any
+        # `(target, key)` pair guarantee is stale too — a later `target[k]`
+        # alias-propagation must not be able to resurrect it.
+        for pair in {p for p in guarded_pairs if p[0] == target}:
+            guarded_pairs.discard(pair)
+
     def _propagate_alias(
         self,
         stmt: ast.stmt,
@@ -338,6 +389,7 @@ class _FunctionGuardWalker:
                 continue  # separate dataflow scope — handled on its own pass
 
             self._record_accesses_in_stmt(stmt, guarded_names, guard_desc)
+            self._invalidate_reassigned(stmt, guarded_names, guarded_pairs, guard_desc)
             self._propagate_alias(stmt, guarded_names, guarded_pairs, guard_desc)
 
             if isinstance(stmt, ast.If):
