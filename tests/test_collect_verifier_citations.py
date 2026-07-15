@@ -19,6 +19,7 @@ from tools.collect.model import GuardedAccess, ModuleRecord, Provenance
 from tools.collect.scanner import scan_module
 from tools.collect.verifier import (
     REASON_NO_CITATION,
+    REASON_SIBLING_CITATION_FAILED,
     Claim,
     citation_check,
     extract_claims,
@@ -115,6 +116,12 @@ def test_cross_module_hallucination_end_to_end_is_dropped():
     # Full extract -> verify path (not just citation_check in isolation),
     # using two real modules from this repo, mirroring exactly the
     # self-play repro that found the bug.
+    #
+    # NOTE: this sentence cites *two* separate things from the wrong
+    # module (a symbol and a location) — since the multi-citation fix,
+    # `extract_claims` correctly produces one `Claim` per citation instead
+    # of only the first, so both get independently caught and dropped
+    # (previously this test only asserted on the first of the two).
     mod_a_path = "tools/formatter.py"
     mod_b_path = "tools/backoff.py"
     repo_root = Path(__file__).parent.parent
@@ -133,8 +140,9 @@ def test_cross_module_hallucination_end_to_end_is_dropped():
         line_counts={mod_a_path: 999, mod_b_path: 999}, fail_open_locs=frozenset(),
     )
     assert kept == []
-    assert len(dropped) == 1
-    assert dropped[0].reason == REASON_NO_CITATION
+    assert len(dropped) == 2
+    assert {d.reason for d in dropped} == {REASON_NO_CITATION}
+    assert any("belongs to module" in d.detail and mod_b_path in d.detail for d in dropped)
 
 
 def test_claim_citing_real_in_range_line_passes_citation_check():
@@ -458,3 +466,109 @@ def test_full_pipeline_distinguishes_fabricated_from_real_unindexed_names():
 
     reasons = {d["reason"] for d in report["dropped"]}
     assert REASON_NO_CITATION in reasons
+
+
+# ── multiple citations in one sentence (COLLECT-17 follow-up) ─────────────────
+#
+# `extract_claims` used to capture only the *first* location/symbol/access
+# match per sentence via `.search()`. A sentence citing two things of the
+# same kind — one real, one fabricated — only ever produced one `Claim`,
+# carrying the real citation; the fabricated one was never extracted into
+# anything `citation_check` could see, so it survived verbatim right next
+# to the real citation that (from the verifier's perspective) "vouched for"
+# the whole sentence.
+
+
+def test_two_symbol_citations_one_sentence_real_and_fabricated_both_dropped():
+    mod_path = "tools/collect/summarizer.py"
+    source = (REPO_ROOT / mod_path).read_text(encoding="utf-8")
+    module = scan_module(source, mod_path)
+    known_symbols = frozenset(sym.qualname for sym in module.public_symbols)
+    real_symbol = "make_summarizer_call"
+    assert any(s.endswith(f":{real_symbol}") for s in known_symbols)  # sanity
+    known_names = _known_names(source)
+
+    text = (
+        f"{real_symbol} and {mod_path}:_totally_invented_helper_fn "
+        "both live in this module."
+    )
+    claims = extract_claims(text, mod_path, known_symbols, known_names)
+    assert len(claims) == 2  # one per citation, not one for the whole sentence
+
+    kept, dropped = verify_claims(
+        claims, module=module, known_symbols=known_symbols,
+        line_counts={mod_path: source.count("\n") + 1}, fail_open_locs=frozenset(),
+    )
+    # The real citation alone would have survived on its own — but its
+    # sentence also makes a fabricated claim, so neither survives.
+    assert kept == []
+    assert len(dropped) == 2
+    reasons = {d.reason for d in dropped}
+    assert REASON_NO_CITATION in reasons
+    assert REASON_SIBLING_CITATION_FAILED in reasons
+
+
+def test_two_location_citations_one_sentence_real_and_out_of_range_both_dropped():
+    mod_path = "tools/collect/summarizer.py"
+    source = (REPO_ROOT / mod_path).read_text(encoding="utf-8")
+    module = scan_module(source, mod_path)
+    known_symbols = frozenset(sym.qualname for sym in module.public_symbols)
+    known_names = _known_names(source)
+
+    text = (
+        f"See {mod_path}:1 for the header, and also "
+        f"{mod_path}:999999 for the retry policy."
+    )
+    claims = extract_claims(text, mod_path, known_symbols, known_names)
+    assert len(claims) == 2
+
+    kept, dropped = verify_claims(
+        claims, module=module, known_symbols=known_symbols,
+        line_counts={mod_path: source.count("\n") + 1}, fail_open_locs=frozenset(),
+    )
+    assert kept == []
+    assert len(dropped) == 2
+    reasons = {d.reason for d in dropped}
+    assert REASON_NO_CITATION in reasons
+    assert REASON_SIBLING_CITATION_FAILED in reasons
+
+
+def test_two_real_citations_one_sentence_both_survive_without_duplicating_text():
+    # Sanity/non-regression: a sentence citing *two real* things must
+    # still fully survive, and the reconstructed artifact text must not
+    # end up with the sentence duplicated (one `Claim` per citation means
+    # `kept` now legitimately contains 2 `Claim`s sharing this sentence's
+    # `.text` -- `_verify_text` must dedupe when rejoining them).
+    mod_path = "tools/collect/summarizer.py"
+    source = (REPO_ROOT / mod_path).read_text(encoding="utf-8")
+    from tools.collect.model import LLMSummary
+    module = scan_module(source, mod_path).with_llm_summary(
+        LLMSummary(
+            purpose="make_summarizer_call and summarize_repo both live in this module.",
+            notes="",
+        )
+    )
+    verified, report = verify_repo([module], {mod_path: source})
+    assert report["dropped_count"] == 0
+    assert report["kept_count"] == 2  # two citations, two surviving claims
+    assert verified[0].summary.purpose == (
+        "make_summarizer_call and summarize_repo both live in this module."
+    )  # exactly once, not duplicated
+
+
+def test_sentence_with_no_citations_still_produces_exactly_one_generic_claim():
+    # Non-regression: the multi-citation rewrite must not turn an ordinary
+    # unfalsifiable sentence into zero claims (or several).
+    mod_path = "tools/collect/summarizer.py"
+    source = (REPO_ROOT / mod_path).read_text(encoding="utf-8")
+    module = scan_module(source, mod_path)
+    known_symbols = frozenset(sym.qualname for sym in module.public_symbols)
+    known_names = _known_names(source)
+
+    text = "This module coordinates Pass B summarization."
+    claims = extract_claims(text, mod_path, known_symbols, known_names)
+    assert len(claims) == 1
+    assert claims[0].symbol is None
+    assert claims[0].location is None
+    assert claims[0].access is None
+    assert claims[0].kind == "generic"

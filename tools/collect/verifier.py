@@ -55,6 +55,7 @@ from tools.collect.registries import build_fail_open_registry, fail_open_locatio
 REASON_NO_CITATION = "dropped:no-citation"
 REASON_CONTRADICTS_GUARD = "dropped:contradicts-guard"
 REASON_CONTRADICTS_FAIL_OPEN = "dropped:contradicts-fail-open"
+REASON_SIBLING_CITATION_FAILED = "dropped:sibling-citation-failed"
 
 
 # ── Claim: the one type Pass C ever hands prose into ───────────────────────────
@@ -177,6 +178,21 @@ def extract_claims(
     sentence with no location/symbol/access naturally ends up `kind=
     "generic"` and, having nothing checkable in it, always survives.
 
+    One sentence can produce *more than one* `Claim` — every distinct
+    location, symbol, and access citation found in the sentence gets its
+    own `Claim` (all sharing that sentence's `.text`/`.kind`), not just
+    the first of each. BUGFIX (found via self-play hallucination review):
+    earlier versions used a single `.search()` per field, so a sentence
+    citing two things of the same kind ("make_summarizer_call and
+    tools/collect/summarizer.py:_totally_invented_helper_fn both live in
+    this module") only ever extracted the *first* — a real citation
+    sitting next to a fabricated one in the same sentence vouched for the
+    fabrication too, since the fabrication was never even turned into
+    something `citation_check` could see. `verify_claims` (see its own
+    docstring) enforces that a sentence's citations sink or swim
+    together — one fabricated citation drops the whole sentence from the
+    artifact, not just the `Claim` that carried it.
+
     `known_names` — BUGFIX (found via self-play hallucination review of an
     earlier version of this exact fix): a sentence can cite a symbol via
     `path.py:identifier` syntax naming something that appears *nowhere* in
@@ -197,15 +213,16 @@ def extract_claims(
     `def`/`class`/assigned anywhere in the module, any nesting depth) is
     the broader, permissive check that tells those two cases apart: a
     `path.py:identifier` citation is only treated as a checkable citation
-    at all — i.e. only gets `claim.symbol` set from this fallback — when
+    at all — i.e. only gets a `Claim.symbol` set from this fallback — when
     the identifier does *not* appear in `known_names` for that same
     `path`, or when `path` isn't this module at all (a cross-module
     citation always gets flagged, real-but-unindexed-elsewhere or not,
     because Pass B was never shown another module's facts to have
     legitimately cited it from — see the cross-module citation-check fix
     this session already landed). A same-module citation of a real,
-    merely-unindexed name is left `symbol=None` (`kind="generic"`) — the
-    same "nothing to check, so it survives" treatment any other
+    merely-unindexed name contributes no `Claim` for that citation at all
+    (`kind="generic"` if it's the sentence's only citation) — the same
+    "nothing to check, so it survives" treatment any other
     unverifiable-but-plausible prose already gets; it isn't promoted to a
     *verified* citation either, since `known_names` was never meant to be
     an authoritative index the way `known_symbols` is.
@@ -219,50 +236,67 @@ def extract_claims(
         if not sentence:
             continue
 
-        loc_match = _LOCATION_RE.search(sentence)
-        location = f"{loc_match.group(1)}:{loc_match.group(2)}" if loc_match else None
+        # BUGFIX (found via self-play hallucination review): every field
+        # below used to be captured with a single `.search()` — the first
+        # match in the sentence, full stop. A sentence citing *two* things
+        # of the same kind ("make_summarizer_call and
+        # tools/collect/summarizer.py:_totally_invented_helper_fn both
+        # live in this module") only ever produced ONE `Claim`, carrying
+        # only the first citation found (`make_summarizer_call`, real) —
+        # the second, fabricated one was never extracted into anything
+        # `citation_check` could see at all, so it survived verbatim
+        # alongside the real citation that vouched for the sentence as a
+        # whole. Same failure mode for two `path.py:line` citations in one
+        # sentence (a real, in-range one plus a fabricated, out-of-range
+        # one). Fixed by finding *every* location/symbol/access citation
+        # in the sentence (not just the first of each) and emitting one
+        # `Claim` per citation — all sharing this sentence's `.text`/
+        # `.kind`, so `verify_claims` can (and does, below) enforce that
+        # the whole sentence only survives into the artifact if *every*
+        # citation it makes does.
+        locations = [f"{m.group(1)}:{m.group(2)}" for m in _LOCATION_RE.finditer(sentence)]
+        accesses = [m.group(1) for m in _ACCESS_RE.finditer(sentence)]
 
-        access_match = _ACCESS_RE.search(sentence)
-        access = access_match.group(1) if access_match else None
-
-        symbol = None
+        symbols: List[str] = []
         for sym, pattern in _symbol_patterns(known_symbols):
             if pattern.search(sentence):
-                symbol = sym
-                break
+                symbols.append(sym)
 
-        if symbol is None:
-            # No *known* symbol name appears in this sentence — but the
-            # sentence may still be citing one explicitly via
-            # `path.py:identifier` syntax, naming something that isn't in
-            # `known_symbols`. That's not automatically "nothing to check"
-            # (kind="generic"): it's an attempted citation, and gets
-            # routed into `citation_check` UNLESS `known_names` shows the
-            # identifier is a real (just unindexed) name in that same
-            # module — see this function's own docstring above.
-            sym_citation_match = _SYMBOL_CITATION_RE.search(sentence)
-            if sym_citation_match:
-                cited_path, cited_ident = sym_citation_match.group(1), sym_citation_match.group(2)
-                if not (cited_path == module_path and cited_ident in known_names):
-                    symbol = f"{cited_path}:{cited_ident}"
+        for sym_citation_match in _SYMBOL_CITATION_RE.finditer(sentence):
+            cited_path, cited_ident = sym_citation_match.group(1), sym_citation_match.group(2)
+            exact_qualname = f"{cited_path}:{cited_ident}"
+            if exact_qualname in symbols:
+                continue  # already captured via the known-symbol branch above
+            if cited_path == module_path and cited_ident in known_names:
+                continue  # real-but-unindexed name in this module — not a citation to check
+            symbols.append(exact_qualname)
 
-        if access and _CRASH_WORDS_RE.search(sentence):
+        if accesses and _CRASH_WORDS_RE.search(sentence):
             kind = "access_crash"
         elif _SILENT_WORDS_RE.search(sentence):
             kind = "silent_except"
         else:
             kind = "generic"
 
-        claims.append(
-            Claim(
-                text=sentence,
-                module=module_path,
-                kind=kind,
-                symbol=symbol,
-                location=location,
-                access=access,
-            )
+        citation_fields: List[Dict[str, Optional[str]]] = (
+            [{"location": loc} for loc in locations]
+            + [{"symbol": sym} for sym in symbols]
+            + [{"access": acc} for acc in accesses]
         )
+        if not citation_fields:
+            citation_fields = [{}]  # nothing checkable — one plain generic claim, as before
+
+        for fields in citation_fields:
+            claims.append(
+                Claim(
+                    text=sentence,
+                    module=module_path,
+                    kind=kind,
+                    symbol=fields.get("symbol"),
+                    location=fields.get("location"),
+                    access=fields.get("access"),
+                )
+            )
     return claims
 
 
@@ -445,9 +479,29 @@ def verify_claims(
     access that doesn't even exist is a fabrication regardless of what it
     says about it, so there's no reason to also ask whether its
     (nonexistent) citation contradicts anything.
+
+    Two passes. Pass 1 checks every claim independently, exactly as
+    before. Pass 2 — BUGFIX (found via self-play hallucination review) —
+    enforces that claims sharing the same sentence (`claim.text`, which
+    `extract_claims` now sets identically for every citation pulled out of
+    one sentence — see its docstring) sink or swim *together*: if any
+    citation from a sentence failed Pass 1, every *other* claim from that
+    same sentence is reclassified as dropped too, even though it
+    individually checked out. Without this, "make_summarizer_call and
+    tools/collect/summarizer.py:_totally_invented_helper_fn both live in
+    this module" would keep the real citation's `Claim` in `kept` and only
+    drop the fabricated one's `Claim` — but both `Claim`s carry the exact
+    same sentence as `.text`, so the *sentence itself* (fabrication
+    included) would still end up back in the reconstructed artifact text
+    once `_verify_text` rejoins whatever's in `kept`. A sentence is only
+    as trustworthy as its least trustworthy citation.
+
+    Every claim ends up in exactly one of `kept`/`dropped` either way —
+    the same "nothing vanishes silently" invariant `verify_repo`'s
+    `kept_count` bookkeeping already depends on (see its own BUGFIX note).
     """
     known_accesses = frozenset(ga.access for ga in module.guarded_accesses)
-    kept: List[Claim] = []
+    provisionally_kept: List[Claim] = []
     dropped: List[DroppedClaim] = []
     for claim in claims:
         no_citation = citation_check(claim, known_symbols, line_counts, known_accesses)
@@ -461,7 +515,21 @@ def verify_claims(
             dropped.append(DroppedClaim(claim=claim, reason=reason, detail=detail))
             continue
 
-        kept.append(claim)
+        provisionally_kept.append(claim)
+
+    failed_sentences = {d.claim.text for d in dropped}
+    kept: List[Claim] = []
+    for claim in provisionally_kept:
+        if claim.text in failed_sentences:
+            dropped.append(
+                DroppedClaim(
+                    claim=claim,
+                    reason=REASON_SIBLING_CITATION_FAILED,
+                    detail="a different citation in the same sentence did not verify",
+                )
+            )
+        else:
+            kept.append(claim)
     return kept, dropped
 
 
@@ -484,7 +552,13 @@ def _verify_text(
         line_counts=line_counts,
         fail_open_locs=fail_open_locs,
     )
-    filtered_text = " ".join(c.text for c in kept)
+    # BUGFIX (companion to `verify_claims`'s "sink or swim together" fix
+    # above): a sentence with *multiple* citations that all individually
+    # survived now has multiple `Claim`s in `kept` sharing the exact same
+    # `.text` — naively joining every kept claim's text would duplicate
+    # that sentence once per surviving citation. `dict.fromkeys` dedupes
+    # while preserving first-seen order (plain `set` would not).
+    filtered_text = " ".join(dict.fromkeys(c.text for c in kept))
     return filtered_text, dropped
 
 
@@ -601,12 +675,29 @@ def verify_repo(
         # recorded in `dropped`, nothing vanishes silently, so
         # `total - len(dropped)` is exact by construction and needs no
         # round-trip through reconstructed text at all.
+        # BUGFIX: `known_names` (the real-but-unindexed-name exemption
+        # guard) must be identical here to what `verify_module` uses
+        # internally below, or this count and `len(dropped)` stop being
+        # counts of the *same* claim set. Before multi-citation sentences
+        # existed (one `Claim` per sentence, always), a mismatched
+        # `known_names` could only change *which* field a sentence's lone
+        # `Claim` carried, never how many `Claim`s a sentence produced —
+        # so this call getting the default (empty) `known_names` instead
+        # of the module's real one was silently harmless. Now that one
+        # sentence can produce several `Claim`s (one per citation), a
+        # sentence combining an exempt (real-but-unindexed) citation with
+        # a genuine one produces a *different claim count* depending on
+        # whether the exemption fires — so an inconsistent `known_names`
+        # here would desync this count from what `verify_module` actually
+        # processes, breaking the `total - len(dropped) == len(kept)`
+        # invariant this whole block exists to guarantee.
         total_claims = 0
         if m.summary is not None:
+            m_known_names = known_names_by_module.get(m.path, frozenset())
             total_claims = len(
-                extract_claims(m.summary.purpose, m.path, known_symbols)
+                extract_claims(m.summary.purpose, m.path, known_symbols, m_known_names)
             ) + len(
-                extract_claims(m.summary.notes, m.path, known_symbols)
+                extract_claims(m.summary.notes, m.path, known_symbols, m_known_names)
             )
 
         verified, dropped = verify_module(
