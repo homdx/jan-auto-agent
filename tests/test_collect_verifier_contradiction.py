@@ -22,6 +22,7 @@ from tools.collect.model import GuardedAccess, ModuleRecord
 from tools.collect.registries import build_fail_open_registry, fail_open_locations
 from tools.collect.scanner import scan_module, scan_repo
 from tools.collect.verifier import (
+    REASON_CONTRADICTS_CRASH,
     REASON_CONTRADICTS_FAIL_OPEN,
     REASON_CONTRADICTS_GUARD,
     REASON_CONTRADICTS_NOT_SILENT,
@@ -111,6 +112,81 @@ def test_unguarded_access_claim_is_not_suppressed_by_contradiction_check():
         access="items[0]",
     )
     assert contradiction_check(claim, module, frozenset()) is None
+
+
+# ── access_safe vs UNGUARDED (mirror of access_crash vs GUARDED) ───────────────
+# Found via stub-test/run_hallucination_selfplay_v2.py's NEGATION-FLIP pattern:
+# before this check existed, a claim asserting an access is SAFE ("is fully
+# guarded", "cannot raise") about a genuinely UNGUARDED (crashing) access had
+# no checkable `kind` at all (_CRASH_WORDS_RE doesn't match affirmative-safety
+# language) and reached the artifact completely unverified.
+
+
+def test_false_safety_claim_on_ungarded_access_is_dropped_as_contradicts_crash():
+    module = ModuleRecord(
+        path="pkg/real_bug.py",
+        guarded_accesses=(
+            GuardedAccess(location="pkg/real_bug.py:10", access="items[0]", status="UNGUARDED"),
+        ),
+    )
+    claim = Claim(
+        text="items[0] is safely guarded and cannot raise",
+        module=module.path,
+        kind="access_safe",
+        access="items[0]",
+    )
+    result = contradiction_check(claim, module, frozenset())
+    assert result is not None
+    reason, detail = result
+    assert reason == REASON_CONTRADICTS_CRASH
+    assert "UNGUARDED" in detail
+
+
+def test_true_safety_claim_on_guarded_access_is_not_suppressed():
+    module = _prompt_store_module()
+    ga = next(g for g in module.guarded_accesses if g.access == "stack[-1]")
+    assert ga.status == "GUARDED"  # sanity
+
+    claim = Claim(
+        text="stack[-1] is fully guarded and cannot raise",
+        module=module.path,
+        kind="access_safe",
+        access="stack[-1]",
+    )
+    assert contradiction_check(claim, module, frozenset()) is None
+
+
+def test_extract_claims_recognizes_access_safe_pattern():
+    module = _prompt_store_module()
+    text = "stack[-1] is safely guarded and cannot raise."
+    claims = extract_claims(text, module.path, frozenset())
+    assert len(claims) == 1
+    assert claims[0].kind == "access_safe"
+    assert claims[0].access == "stack[-1]"
+
+
+def test_false_safety_claim_dropped_end_to_end_via_verify_claims():
+    module = ModuleRecord(
+        path="pkg/real_bug.py",
+        guarded_accesses=(
+            GuardedAccess(location="pkg/real_bug.py:10", access="items[0]", status="UNGUARDED"),
+        ),
+    )
+    known = frozenset()
+    line_counts = {module.path: 20}
+    claim = Claim(
+        text="items[0] is safely guarded and cannot raise",
+        module=module.path,
+        kind="access_safe",
+        access="items[0]",
+    )
+    kept, dropped = verify_claims(
+        [claim], module=module, known_symbols=known, line_counts=line_counts,
+        fail_open_locs=frozenset(),
+    )
+    assert kept == []
+    assert len(dropped) == 1
+    assert dropped[0].reason == REASON_CONTRADICTS_CRASH
 
 
 # ── silent_except vs FAIL_OPEN_REGISTRY ────────────────────────────────────────

@@ -56,6 +56,11 @@ REASON_NO_CITATION = "dropped:no-citation"
 REASON_CONTRADICTS_GUARD = "dropped:contradicts-guard"
 REASON_CONTRADICTS_FAIL_OPEN = "dropped:contradicts-fail-open"
 REASON_SIBLING_CITATION_FAILED = "dropped:sibling-citation-failed"
+# COLLECT-17 follow-up (self-play round 2): the mirror image of
+# REASON_CONTRADICTS_GUARD. A claim that an access is *safe* ("is fully
+# guarded", "cannot raise") is checked against a real UNGUARDED status the
+# same way a claim that an access *crashes* is checked against GUARDED.
+REASON_CONTRADICTS_CRASH = "dropped:contradicts-crash-risk"
 
 
 # ── Claim: the one type Pass C ever hands prose into ───────────────────────────
@@ -74,7 +79,7 @@ class Claim:
 
     text: str
     module: str
-    kind: str = "generic"  # "access_crash" | "silent_except" | "generic"
+    kind: str = "generic"  # "access_crash" | "access_safe" | "silent_except" | "generic"
     symbol: Optional[str] = None  # e.g. "pkg/foo.py:some_function"
     location: Optional[str] = None  # e.g. "pkg/foo.py:79"
     access: Optional[str] = None  # e.g. "stack[-1]", for kind="access_crash"
@@ -138,6 +143,22 @@ _CRASH_WORDS_RE = re.compile(
     re.IGNORECASE,
 )
 _SILENT_WORDS_RE = re.compile(r"\b(silent(?:ly)?|swallow(?:s|ed|ing)?)\b", re.IGNORECASE)
+# COLLECT-17 follow-up (self-play round 2, found via
+# stub-test/run_hallucination_selfplay_v2.py's NEGATION-FLIP pattern): the
+# mirror image of _CRASH_WORDS_RE. Before this, a sentence citing an access
+# and asserting it is SAFE ("is fully guarded", "cannot raise", "will not
+# crash") fell through to kind="generic" — it has an access citation, but
+# _CRASH_WORDS_RE doesn't match affirmative-safety language, so
+# citation_check never checked the access against known_accesses and
+# contradiction_check's access_crash branch never ran at all. A false safety
+# claim about a genuinely UNGUARDED (crashing) access therefore survived
+# into the artifact completely unchecked — arguably worse than a false
+# crash claim, since it actively tells a reader a real risk is handled.
+_SAFE_WORDS_RE = re.compile(
+    r"\b(safe(?:ly)?|guarded|cannot\s+(?:raise|crash|fail)|"
+    r"will\s+not\s+(?:raise|crash|fail)|no\s+risk\s+of)\b",
+    re.IGNORECASE,
+)
 
 
 @lru_cache(maxsize=8)
@@ -273,6 +294,12 @@ def extract_claims(
 
         if accesses and _CRASH_WORDS_RE.search(sentence):
             kind = "access_crash"
+        elif accesses and _SAFE_WORDS_RE.search(sentence):
+            # access_safe: the mirror image of access_crash (see
+            # _SAFE_WORDS_RE). Checked below the crash branch so a sentence
+            # that (unusually) contains both crash and safety language
+            # keeps the existing access_crash behavior unchanged.
+            kind = "access_safe"
         elif _SILENT_WORDS_RE.search(sentence):
             kind = "silent_except"
         else:
@@ -327,9 +354,11 @@ def citation_check(
       nothing in `contradiction_check` to match against, finds no
       contradiction, and survives — which is a fabrication reaching the
       artifact exactly as much as a fabricated symbol or line would be.
-      Scoped to `kind="access_crash"` specifically: a claim that merely
-      *mentions* bracket syntax in passing, without asserting a crash, was
-      never claiming that access is a cataloged site in the first place.
+      Scoped to `kind="access_crash"` (and, symmetrically, `kind=
+      "access_safe"` — see contradiction_check's mirror-image check below)
+      specifically: a claim that merely *mentions* bracket syntax in
+      passing, without asserting a crash or safety verdict, was never
+      claiming that access is a cataloged site in the first place.
     A claim citing none of the above is not a citation-check failure — it
     simply has nothing to check (handled by the caller: only claims with a
     citation at all go through this gate meaningfully; see `verify_claims`).
@@ -381,7 +410,7 @@ def citation_check(
         if line < 1 or line > max_line:
             return f"cited line {line} out of range for {path!r} (1..{max_line})"
 
-    if claim.kind == "access_crash" and claim.access is not None:
+    if claim.kind in ("access_crash", "access_safe") and claim.access is not None:
         if claim.access not in known_accesses:
             return (
                 f"cited access {claim.access!r} does not correspond to any "
@@ -443,6 +472,22 @@ def contradiction_check(
                 return (
                     REASON_CONTRADICTS_GUARD,
                     f"{claim.access} at {ga.location} is GUARDED ({guard_desc})",
+                )
+
+    if claim.kind == "access_safe" and claim.access:
+        # Mirror image of the access_crash check above: a claim that an
+        # access is safe/guarded, checked against a real UNGUARDED status.
+        # Found via stub-test/run_hallucination_selfplay_v2.py's
+        # NEGATION-FLIP pattern — before this branch existed, this claim
+        # kind was never even constructed (see _SAFE_WORDS_RE), so a false
+        # "X is safely guarded" claim about a genuinely crashing access
+        # reached the artifact unchecked in every module tested.
+        for ga in module.guarded_accesses:
+            if ga.access == claim.access and ga.status == "UNGUARDED":
+                return (
+                    REASON_CONTRADICTS_CRASH,
+                    f"{claim.access} at {ga.location} is UNGUARDED "
+                    "(Pass A's dataflow found no guard - this is a real crash risk)",
                 )
 
     if claim.kind == "silent_except" and claim.location:
