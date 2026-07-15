@@ -218,9 +218,12 @@ def citation_check(
     explaining what didn't resolve.
 
     * A cited `symbol` must be in `known_symbols` (Pass A's own index —
-      COLLECT-4's `public_symbols`, nothing derived or LLM-sourced).
+      COLLECT-4's `public_symbols`, nothing derived or LLM-sourced) *and*
+      must belong to the same module this claim is about (`claim.module`)
+      — see the BUGFIX note below.
     * A cited `location` (`path:line`) must name a scanned module and a
-      line number within that file's actual line count.
+      line number within that file's actual line count, and that module
+      must be `claim.module` itself — same BUGFIX, same reasoning.
     * An `access_crash` claim's cited `access` (e.g. `"cache[-1]"`) must be
       one COLLECT-7's dataflow pass actually recorded for this module — in
       `known_accesses`, regardless of GUARDED/UNGUARDED status. Without
@@ -235,18 +238,51 @@ def citation_check(
     A claim citing none of the above is not a citation-check failure — it
     simply has nothing to check (handled by the caller: only claims with a
     citation at all go through this gate meaningfully; see `verify_claims`).
+
+    BUGFIX (found via self-play hallucination session on this repo):
+    `known_symbols`/`line_counts` (built by `verify_repo`) are *repo-wide*
+    — every module's symbols and every file's line count, all in one flat
+    table — because that's the cheapest way to build them once per run.
+    But `summarizer.py`'s own prompt only ever shows Pass B *one module's*
+    facts and source (`_facts_block` — COLLECT-16's whole antihallucination
+    premise is that Pass B never sees another module at all), so any claim
+    about module A that cites a symbol or `path:line` actually belonging to
+    module B was never grounded in anything Pass B was shown — it can only
+    be a fabrication (or, worst case, a prompt-injection payload lifted
+    from a docstring). Before this fix, `citation_check` verified only
+    "does this symbol/location exist *somewhere* in the repo," not "does it
+    belong to *this* module" — so `citation_check` (and thus
+    `contradiction_check`, which trusts a claim's citation once it survives
+    this gate) happily laundered a claim like "this module implements
+    `backoff_seconds`, defined at tools/backoff.py:1" while summarizing
+    `tools/formatter.py`, purely because `backoff_seconds` and that line
+    are real *somewhere*. That is exactly the class of fabrication
+    COLLECT-17 exists to catch — a citation that resolves globally but not
+    locally is not a citation of this module at all.
     """
-    if claim.symbol is not None and claim.symbol not in known_symbols:
-        return f"cited symbol {claim.symbol!r} not found in Pass A index"
+    if claim.symbol is not None:
+        if claim.symbol not in known_symbols:
+            return f"cited symbol {claim.symbol!r} not found in Pass A index"
+        symbol_module, _, _ = claim.symbol.partition(":")
+        if symbol_module != claim.module:
+            return (
+                f"cited symbol {claim.symbol!r} belongs to module "
+                f"{symbol_module!r}, not {claim.module!r}"
+            )
 
     if claim.location is not None:
         path, _, line_str = claim.location.rpartition(":")
         if not line_str.isdigit():
             return f"malformed location {claim.location!r}"
-        line = int(line_str)
         max_line = line_counts.get(path)
         if max_line is None:
             return f"cited module {path!r} not found in Pass A index"
+        if path != claim.module:
+            return (
+                f"cited location {claim.location!r} belongs to module "
+                f"{path!r}, not {claim.module!r}"
+            )
+        line = int(line_str)
         if line < 1 or line > max_line:
             return f"cited line {line} out of range for {path!r} (1..{max_line})"
 

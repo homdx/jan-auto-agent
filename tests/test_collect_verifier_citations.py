@@ -69,6 +69,70 @@ def test_claim_citing_unknown_module_fails_citation_check():
     assert "not found" in detail
 
 
+def test_claim_citing_real_symbol_from_a_different_module_fails_citation_check():
+    # BUGFIX (found via self-play hallucination session on this repo):
+    # `known_symbols` is the whole repo's flat symbol table (built once by
+    # `verify_repo`), so a symbol that's real *somewhere* used to pass
+    # `citation_check` even when it belongs to a module Pass B was never
+    # shown while summarizing this one (`summarizer.py`'s prompt is scoped
+    # to a single module's facts/source — COLLECT-16). A claim like "this
+    # module implements backoff_seconds" while summarizing formatter.py is
+    # a pure fabrication even though `backoff_seconds` genuinely exists in
+    # tools/backoff.py — citation_check must require the citation to
+    # belong to the module the claim is actually about.
+    known = frozenset({
+        "pkg/prompt_store.py:get_current",
+        "pkg/other_module.py:some_function",
+    })
+    claim = Claim(
+        text="foo", module="pkg/prompt_store.py",
+        symbol="pkg/other_module.py:some_function",
+    )
+    detail = citation_check(claim, known, {"pkg/prompt_store.py": 20, "pkg/other_module.py": 20})
+    assert detail is not None
+    assert "pkg/other_module.py" in detail and "pkg/prompt_store.py" in detail
+
+
+def test_claim_citing_real_location_from_a_different_module_fails_citation_check():
+    # Same fabrication shape, via a `path:line` citation instead of a
+    # symbol name: the line is genuinely in range for *some* scanned
+    # module, just not the one this claim's `purpose`/`notes` field was
+    # attached to.
+    claim = Claim(
+        text="foo", module="pkg/prompt_store.py",
+        location="pkg/other_module.py:5",
+    )
+    detail = citation_check(claim, frozenset(), {"pkg/prompt_store.py": 20, "pkg/other_module.py": 20})
+    assert detail is not None
+    assert "pkg/other_module.py" in detail and "pkg/prompt_store.py" in detail
+
+
+def test_cross_module_hallucination_end_to_end_is_dropped():
+    # Full extract -> verify path (not just citation_check in isolation),
+    # using two real modules from this repo, mirroring exactly the
+    # self-play repro that found the bug.
+    mod_a_path = "tools/formatter.py"
+    mod_b_path = "tools/backoff.py"
+    repo_root = Path(__file__).parent.parent
+    module_a = scan_module((repo_root / mod_a_path).read_text(encoding="utf-8"), mod_a_path)
+    module_b = scan_module((repo_root / mod_b_path).read_text(encoding="utf-8"), mod_b_path)
+    known_symbols = frozenset(
+        sym.qualname for m in (module_a, module_b) for sym in m.public_symbols
+    )
+    fake_symbol = module_b.public_symbols[0].qualname
+    claims = extract_claims(
+        f"This module implements {fake_symbol}, defined at {mod_b_path}:1.",
+        mod_a_path, known_symbols,
+    )
+    kept, dropped = verify_claims(
+        claims, module=module_a, known_symbols=known_symbols,
+        line_counts={mod_a_path: 999, mod_b_path: 999}, fail_open_locs=frozenset(),
+    )
+    assert kept == []
+    assert len(dropped) == 1
+    assert dropped[0].reason == REASON_NO_CITATION
+
+
 def test_claim_citing_real_in_range_line_passes_citation_check():
     module, source = _prompt_store_module()
     line_counts = {module.path: source.count("\n") + 1}
