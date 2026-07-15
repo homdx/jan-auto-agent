@@ -11,8 +11,10 @@
 
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 
+from tools.collect.ast_facts import extract_all_defined_names
 from tools.collect.model import GuardedAccess, ModuleRecord, Provenance
 from tools.collect.scanner import scan_module
 from tools.collect.verifier import (
@@ -21,9 +23,11 @@ from tools.collect.verifier import (
     citation_check,
     extract_claims,
     verify_claims,
+    verify_repo,
 )
 
 FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "collect_mini_repo"
+REPO_ROOT = Path(__file__).parent.parent
 
 
 def _prompt_store_module():
@@ -294,3 +298,163 @@ def test_real_unguarded_finding_still_survives_after_access_citation_check():
     claim = Claim(text="x", module=module.path, kind="access_crash", access="items[0]")
     known_accesses = frozenset(ga.access for ga in module.guarded_accesses)
     assert citation_check(claim, frozenset(), {module.path: 20}, known_accesses) is None
+
+
+# ── fabricated `path.py:identifier` symbol citations (COLLECT-17 follow-up) ───
+#
+# `extract_claims` only ever set `claim.symbol` by matching a sentence
+# against a name already in `known_symbols` (`_symbol_patterns`) — an
+# outright *invented* symbol never matches any of those patterns, so it
+# fell through as `kind="generic"` with `symbol=None` and survived
+# untouched, indistinguishable from ordinary unfalsifiable prose. A first
+# attempt at closing that gap (routing any `path.py:identifier`-shaped
+# mention into `citation_check`) over-corrected: it also caught *real*
+# names Pass A's `public_symbols` index doesn't track by design — module-
+# level constants and class methods, both out of `extract_symbols`'
+# deliberately top-level-only scope (COLLECT-4). The fix has to
+# distinguish "invented" from "real but unindexed", via
+# `ast_facts.extract_all_defined_names` — a broader, permissive
+# "does this name appear anywhere in the module's source" check used only
+# to *decline* to flag something, never to positively verify a claim.
+
+
+def _known_names(source: str) -> "frozenset[str]":
+    return extract_all_defined_names(ast.parse(source))
+
+
+def test_fabricated_symbol_citation_is_flagged_and_dropped():
+    module, source = _prompt_store_module()
+    known_symbols = frozenset(sym.qualname for sym in module.public_symbols)
+    known_names = _known_names(source)
+
+    text = f"It relies on {module.path}:_totally_invented_helper_fn for caching."
+    claims = extract_claims(text, module.path, known_symbols, known_names)
+    assert len(claims) == 1
+    assert claims[0].symbol == f"{module.path}:_totally_invented_helper_fn"
+
+    kept, dropped = verify_claims(
+        claims, module=module, known_symbols=known_symbols,
+        line_counts={module.path: source.count("\n") + 1}, fail_open_locs=frozenset(),
+    )
+    assert kept == []
+    assert len(dropped) == 1
+    assert dropped[0].reason == REASON_NO_CITATION
+    assert "_totally_invented_helper_fn" in dropped[0].detail
+
+
+def test_real_but_unindexed_module_level_constant_is_not_flagged():
+    # BUGFIX: found via review of the first attempt at this fix.
+    # `tools/collect/summarizer.py:DEFAULT_NUM_CTX` is a real, genuine
+    # constant — just not a "public symbol" by COLLECT-4's own top-level-
+    # only definition. A citation of it must not be dropped as if it were
+    # a fabrication.
+    mod_path = "tools/collect/summarizer.py"
+    source = (REPO_ROOT / mod_path).read_text(encoding="utf-8")
+    assert "DEFAULT_NUM_CTX" in source  # sanity: the constant is real
+    module = scan_module(source, mod_path)
+    known_symbols = frozenset(sym.qualname for sym in module.public_symbols)
+    assert f"{mod_path}:DEFAULT_NUM_CTX" not in known_symbols  # and genuinely unindexed
+    known_names = _known_names(source)
+
+    text = f"It reads {mod_path}:DEFAULT_NUM_CTX as the context-window fallback."
+    claims = extract_claims(text, mod_path, known_symbols, known_names)
+    assert claims[0].symbol is None  # not routed into citation_check at all
+    assert claims[0].kind == "generic"
+
+    kept, dropped = verify_claims(
+        claims, module=module, known_symbols=known_symbols,
+        line_counts={mod_path: source.count("\n") + 1}, fail_open_locs=frozenset(),
+    )
+    assert dropped == []
+    assert len(kept) == 1
+
+
+def test_real_but_unindexed_class_method_is_not_flagged():
+    # Same false-positive shape, via a class method instead of a
+    # module-level constant — `render` is a real method of
+    # `OutputFormatter`, just nested (out of `public_symbols`' top-level
+    # scope) rather than fabricated.
+    mod_path = "tools/formatter.py"
+    source = (REPO_ROOT / mod_path).read_text(encoding="utf-8")
+    module = scan_module(source, mod_path)
+    known_symbols = frozenset(sym.qualname for sym in module.public_symbols)
+    assert f"{mod_path}:render" not in known_symbols
+    known_names = _known_names(source)
+
+    text = f"See {mod_path}:render for the actual formatting logic."
+    claims = extract_claims(text, mod_path, known_symbols, known_names)
+    assert claims[0].symbol is None
+    kept, dropped = verify_claims(
+        claims, module=module, known_symbols=known_symbols,
+        line_counts={mod_path: source.count("\n") + 1}, fail_open_locs=frozenset(),
+    )
+    assert dropped == []
+    assert len(kept) == 1
+
+
+def test_cross_module_citation_of_real_unindexed_name_still_dropped():
+    # The `known_names` guard is scoped to the module actually being
+    # summarized — it must not let a citation of some *other* module's
+    # real-but-unindexed name through, since Pass B was never shown that
+    # other module's facts/source to have legitimately known that name
+    # from in the first place (same reasoning as the cross-module
+    # citation-check fix this guard sits alongside).
+    mod_a, mod_b = "tools/collect/summarizer.py", "tools/formatter.py"
+    src_a = (REPO_ROOT / mod_a).read_text(encoding="utf-8")
+    src_b = (REPO_ROOT / mod_b).read_text(encoding="utf-8")
+    module_a = scan_module(src_a, mod_a)
+    known_symbols = frozenset(sym.qualname for sym in module_a.public_symbols)
+    known_names_a = _known_names(src_a)  # only module A's own names
+
+    text = f"This mirrors {mod_b}:render exactly."
+    claims = extract_claims(text, mod_a, known_symbols, known_names_a)
+    assert claims[0].symbol == f"{mod_b}:render"  # not suppressed — wrong module
+
+    kept, dropped = verify_claims(
+        claims, module=module_a, known_symbols=known_symbols,
+        line_counts={mod_a: src_a.count("\n") + 1, mod_b: src_b.count("\n") + 1},
+        fail_open_locs=frozenset(),
+    )
+    assert kept == []
+    assert dropped[0].reason == REASON_NO_CITATION
+
+
+def test_full_pipeline_distinguishes_fabricated_from_real_unindexed_names():
+    # End-to-end via the real `verify_repo` orchestration (not just
+    # `extract_claims`/`verify_claims` in isolation): scans two real
+    # modules from this repo, attaches one fabricated and one real-but-
+    # unindexed claim to each, and checks the verification report gets
+    # both right in a single run.
+    mod_a, mod_b = "tools/collect/summarizer.py", "tools/formatter.py"
+    src_a = (REPO_ROOT / mod_a).read_text(encoding="utf-8")
+    src_b = (REPO_ROOT / mod_b).read_text(encoding="utf-8")
+    from tools.collect.model import LLMSummary
+    module_a = scan_module(src_a, mod_a).with_llm_summary(
+        LLMSummary(
+            purpose=(
+                f"It relies on {mod_a}:_totally_invented_helper_fn for caching. "
+                f"It reads {mod_a}:DEFAULT_NUM_CTX as the context-window fallback."
+            ),
+            notes="",
+        )
+    )
+    module_b = scan_module(src_b, mod_b).with_llm_summary(
+        LLMSummary(purpose=f"See {mod_b}:render for the actual formatting logic.", notes="")
+    )
+
+    verified, report = verify_repo(
+        [module_a, module_b], {mod_a: src_a, mod_b: src_b},
+    )
+    by_path = {m.path: m for m in verified}
+
+    # Fabricated citation dropped...
+    assert "_totally_invented_helper_fn" not in by_path[mod_a].summary.purpose
+    # ...real-but-unindexed constant survives...
+    assert "DEFAULT_NUM_CTX" in by_path[mod_a].summary.purpose
+    # ...and a real-but-unindexed method in a completely different,
+    # LLM-summary-free module survives too (no citation to fail, since it
+    # wasn't a known symbol OR flagged as fabricated).
+    assert "render" in by_path[mod_b].summary.purpose
+
+    reasons = {d["reason"] for d in report["dropped"]}
+    assert REASON_NO_CITATION in reasons

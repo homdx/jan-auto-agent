@@ -38,6 +38,7 @@ so a human can see exactly what Pass B claimed and why it didn't survive.
 
 from __future__ import annotations
 
+import ast
 import json
 import re
 from dataclasses import dataclass
@@ -45,6 +46,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Tuple
 
+from tools.collect.ast_facts import extract_all_defined_names
 from tools.collect.model import LLMSummary, ModuleRecord, Provenance, ProvenanceViolation
 from tools.collect.registries import build_fail_open_registry, fail_open_locations
 
@@ -119,6 +121,16 @@ class DroppedClaim:
 
 _SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+|\n+")
 _LOCATION_RE = re.compile(r"([\w./\\-]+\.py):(\d+)")
+# A `path.py:identifier` citation — the same "file:thing" shape as
+# `_LOCATION_RE`, but naming a symbol instead of a line number (identifier
+# starts with a letter/underscore, so it can never collide with the
+# all-digit line-number form above). This is what lets `extract_claims`
+# recognize an *invented* symbol name as an attempted citation at all — see
+# the `known_names` guard where this is used below, which is what keeps
+# this pattern from also flagging a *real* name Pass A's narrower
+# `public_symbols` index just doesn't happen to track (a module-level
+# constant, a class method).
+_SYMBOL_CITATION_RE = re.compile(r"([\w./\\-]+\.py):([A-Za-z_]\w*)\b")
 _ACCESS_RE = re.compile(r"([A-Za-z_][\w.]*\[[^\]]+\])")
 _CRASH_WORDS_RE = re.compile(
     r"\b(crash(?:es|ed|ing)?|will fail|throws?|raises?\s+\w*Error|unguarded)\b",
@@ -152,6 +164,7 @@ def extract_claims(
     text: str,
     module_path: str,
     known_symbols: FrozenSet[str] = frozenset(),
+    known_names: FrozenSet[str] = frozenset(),
 ) -> List[Claim]:
     """Split `text` (Pass B's raw ``purpose``/``notes`` prose) into
     sentence-level `Claim`s, tagging each with whatever a claim needs to be
@@ -163,6 +176,39 @@ def extract_claims(
     cite, not to guess what it meant when it cited nothing at all — a
     sentence with no location/symbol/access naturally ends up `kind=
     "generic"` and, having nothing checkable in it, always survives.
+
+    `known_names` — BUGFIX (found via self-play hallucination review of an
+    earlier version of this exact fix): a sentence can cite a symbol via
+    `path.py:identifier` syntax naming something that appears *nowhere* in
+    `known_symbols` for two very different reasons — (1) it's an outright
+    invented name (the fabrication this parameter's check exists to still
+    catch), or (2) it's a perfectly real name Pass A's `public_symbols`
+    index just doesn't track, because COLLECT-4 deliberately scopes that
+    index to top-level functions/classes only — a module-level constant or
+    a class method is real but was never going to be in `known_symbols`.
+    Treating both cases identically (flag it, let `citation_check` drop it
+    as "not found") makes the *fix* itself a false-positive generator:
+    `tools/collect/summarizer.py:DEFAULT_NUM_CTX` (a real constant) and
+    `tools/formatter.py:render` (a real method) would both get dropped as
+    fabrications alongside genuinely invented names, and the
+    `verification_report.json` row would flatly assert "not found in Pass
+    A index" about something that, in fact, is right there in the source.
+    `known_names` (`ast_facts.extract_all_defined_names` — every name
+    `def`/`class`/assigned anywhere in the module, any nesting depth) is
+    the broader, permissive check that tells those two cases apart: a
+    `path.py:identifier` citation is only treated as a checkable citation
+    at all — i.e. only gets `claim.symbol` set from this fallback — when
+    the identifier does *not* appear in `known_names` for that same
+    `path`, or when `path` isn't this module at all (a cross-module
+    citation always gets flagged, real-but-unindexed-elsewhere or not,
+    because Pass B was never shown another module's facts to have
+    legitimately cited it from — see the cross-module citation-check fix
+    this session already landed). A same-module citation of a real,
+    merely-unindexed name is left `symbol=None` (`kind="generic"`) — the
+    same "nothing to check, so it survives" treatment any other
+    unverifiable-but-plausible prose already gets; it isn't promoted to a
+    *verified* citation either, since `known_names` was never meant to be
+    an authoritative index the way `known_symbols` is.
     """
     if not text or not text.strip():
         return []
@@ -184,6 +230,21 @@ def extract_claims(
             if pattern.search(sentence):
                 symbol = sym
                 break
+
+        if symbol is None:
+            # No *known* symbol name appears in this sentence — but the
+            # sentence may still be citing one explicitly via
+            # `path.py:identifier` syntax, naming something that isn't in
+            # `known_symbols`. That's not automatically "nothing to check"
+            # (kind="generic"): it's an attempted citation, and gets
+            # routed into `citation_check` UNLESS `known_names` shows the
+            # identifier is a real (just unindexed) name in that same
+            # module — see this function's own docstring above.
+            sym_citation_match = _SYMBOL_CITATION_RE.search(sentence)
+            if sym_citation_match:
+                cited_path, cited_ident = sym_citation_match.group(1), sym_citation_match.group(2)
+                if not (cited_path == module_path and cited_ident in known_names):
+                    symbol = f"{cited_path}:{cited_ident}"
 
         if access and _CRASH_WORDS_RE.search(sentence):
             kind = "access_crash"
@@ -411,10 +472,11 @@ def _verify_text(
     known_symbols: FrozenSet[str],
     line_counts: Dict[str, int],
     fail_open_locs: FrozenSet[str],
+    known_names: FrozenSet[str] = frozenset(),
 ) -> Tuple[str, List[DroppedClaim]]:
     """Extract + verify claims from one prose field (`purpose` or `notes`),
     return the reconstructed (filtered) text and whatever got dropped."""
-    claims = extract_claims(text, module.path, known_symbols)
+    claims = extract_claims(text, module.path, known_symbols, known_names)
     kept, dropped = verify_claims(
         claims,
         module=module,
@@ -432,6 +494,7 @@ def verify_module(
     known_symbols: FrozenSet[str],
     line_counts: Dict[str, int],
     fail_open_locs: FrozenSet[str],
+    known_names: FrozenSet[str] = frozenset(),
 ) -> Tuple[ModuleRecord, List[DroppedClaim]]:
     """Run Pass C on one already-summarized module.
 
@@ -440,6 +503,14 @@ def verify_module(
     `notes` are each independently filtered down to their surviving claims
     and reattached as a fresh `LLMSummary` (COLLECT-1's whitelist — still,
     and always, `provenance="llm"`).
+
+    `known_names` — this module's own broader "every name defined
+    anywhere" set (`ast_facts.extract_all_defined_names`), used only to
+    keep `extract_claims`'s `path.py:identifier` fabrication check from
+    flagging a real-but-unindexed name (see `extract_claims`'s docstring).
+    Defaults to empty, same fail-safe posture as an absent artifact: no
+    broader set to check against just means this guard can't help, not
+    that anything crashes.
     """
     if module.summary is None:
         return module, []
@@ -448,11 +519,13 @@ def verify_module(
         module.summary.purpose,
         module=module, known_symbols=known_symbols,
         line_counts=line_counts, fail_open_locs=fail_open_locs,
+        known_names=known_names,
     )
     verified_notes, dropped_notes = _verify_text(
         module.summary.notes,
         module=module, known_symbols=known_symbols,
         line_counts=line_counts, fail_open_locs=fail_open_locs,
+        known_names=known_names,
     )
 
     verified_summary = LLMSummary(purpose=verified_purpose, notes=verified_notes)
@@ -467,9 +540,12 @@ def verify_repo(
 ) -> Tuple[List[ModuleRecord], Dict[str, Any]]:
     """Run Pass C over every summarized module in `modules`.
 
-    `sources` maps module path -> its source text, used only to compute
-    each file's line count for the citation-check's range test (the same
-    text Pass A/B already had; nothing new is read here beyond that).
+    `sources` maps module path -> its source text, used to compute each
+    file's line count for the citation-check's range test, and (COLLECT-17
+    fabricated-symbol-citation fix) to build each module's broader
+    "every name defined anywhere" set that keeps that same check from
+    flagging a real-but-unindexed name — the same text Pass A/B already
+    had; nothing new is read here beyond that.
 
     Returns `(verified_modules, report)`, where `report` is the
     JSON-serializable ``verification_report.json`` payload: every dropped
@@ -479,6 +555,25 @@ def verify_repo(
     modules = list(modules)
     known_symbols = frozenset(sym.qualname for m in modules for sym in m.public_symbols)
     line_counts = {m.path: sources.get(m.path, "").count("\n") + 1 for m in modules}
+
+    # Broader "every name this module defines anywhere" index (COLLECT-17
+    # fabricated-symbol-citation fix), one per module, built directly from
+    # `sources` here rather than stored on `ModuleRecord` — it is a Pass-C
+    # -only heuristic guard against false-positive drops, never a
+    # structural fact COLLECT-1's provenance contract would need to track.
+    # A module whose source fails to re-parse (shouldn't happen — Pass A
+    # already parsed it — but `sources` is caller-supplied, so fail open to
+    # an empty set exactly like `line_counts`/`fail_open_registry` already
+    # do elsewhere in this function, rather than let one bad source string
+    # abort the whole verification run).
+    known_names_by_module: Dict[str, FrozenSet[str]] = {}
+    for m in modules:
+        try:
+            known_names_by_module[m.path] = extract_all_defined_names(
+                ast.parse(sources.get(m.path, ""), filename=m.path)
+            )
+        except (SyntaxError, ValueError):
+            known_names_by_module[m.path] = frozenset()
 
     fail_open_registry = build_fail_open_registry(modules, root=root)
     fail_open_locs = fail_open_locations(fail_open_registry)
@@ -516,6 +611,7 @@ def verify_repo(
 
         verified, dropped = verify_module(
             m, known_symbols=known_symbols, line_counts=line_counts, fail_open_locs=fail_open_locs,
+            known_names=known_names_by_module.get(m.path, frozenset()),
         )
         verified_modules.append(verified)
         all_dropped.extend(dropped)

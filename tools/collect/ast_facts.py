@@ -76,6 +76,104 @@ def extract_symbols(tree: ast.Module, module_path: str) -> List[FunctionRecord]:
     return sorted(symbols, key=lambda s: (s.lineno, s.qualname))
 
 
+def extract_all_defined_names(tree: ast.Module) -> "frozenset[str]":
+    """Every bare identifier `tree` defines *anywhere* — not just the
+    top-level functions/classes `extract_symbols` (COLLECT-4) indexes as
+    "public symbols", but also nested `def`s (methods, closures at any
+    depth) and assignment targets at module or class-body scope (module-
+    level constants, class attributes, `Annotated` constants via
+    `AnnAssign`).
+
+    This is deliberately a *different, broader* notion of "exists" than
+    `extract_symbols`'s "public symbol" — COLLECT-4 scopes `public_symbols`
+    to the top-level surface on purpose ("nested defs... are intentionally
+    out of scope for this task; they're not part of a module's public
+    surface"), and this function does not change that scoping or feed
+    `public_symbols`/`ModuleRecord` at all. It exists purely as a cheap,
+    reusable "does this name appear anywhere in the source at all" check
+    for callers (COLLECT-17's verifier, specifically) that need to tell a
+    genuinely fabricated identifier apart from a real one Pass A's public
+    surface just doesn't happen to track — e.g. a module-level constant or
+    a class method, both 100% real, neither a "public symbol" by COLLECT-4's
+    own definition.
+
+    Permissive in what counts as "defined": every `FunctionDef`/
+    `AsyncFunctionDef`/`ClassDef` name at any nesting depth, plus every
+    simple `Name` target of an `Assign`/`AnnAssign` *at module or
+    class-body scope* — but NOT inside a function/method body.
+
+    BUGFIX (found via adversarial review of an earlier version of this
+    exact function): the first version used `ast.walk(tree)`, which visits
+    every node regardless of enclosing scope, so an `Assign` target inside
+    *any* function body — an ordinary local variable, completely
+    unrelated to the module's citable surface — was added to this set the
+    same as a module-level constant. That reopened exactly the hole this
+    function exists to close: a fabricated citation like
+    `"module.py:result"` (`result` being nothing more than some unrelated
+    function's local variable somewhere in the file) would be excused as
+    "real but unindexed" instead of flagged, because *some* local variable
+    in the module happened to share that name — and in a module of any
+    real size, generic names like `result`/`data`/`ctx`/`done` are close
+    to guaranteed to collide with *something*. A citable name has to be
+    reachable via `module.py:name` syntax in the first place; a local
+    variable buried inside an unrelated function's body never is, so it
+    must not count as "real but unindexed" here. Function/method/class
+    *names* themselves are still collected at any nesting depth (a nested
+    method or closure is a legitimate thing to cite by name), only their
+    *bodies'* local assignments are excluded.
+
+    BUGFIX 2 (found via review of the fix above): a `class` statement's
+    own body is always its own scope — its attributes are real, citable
+    names — regardless of what *encloses* the `class` statement itself.
+    A class defined inside a function (`def f(): class Local: ATTR = 1`)
+    was inheriting that function's "local, non-citable" scope for its own
+    body, so `Local.ATTR` got excluded the same as an ordinary local
+    variable, even though it's a genuine class attribute. A class body
+    now always resets to module-like (non-function) scope for its own
+    `Assign`/`AnnAssign` targets, no matter where the `class` statement
+    sits; only a further-nested `def` (a method) beneath it reintroduces
+    function-local scope for names assigned inside *that*.
+    """
+    names: set = set()
+
+    def _walk(node: ast.AST, in_function_body: bool) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                names.add(child.name)
+                _walk(child, in_function_body=True)
+            elif isinstance(child, ast.ClassDef):
+                names.add(child.name)
+                # A class body always executes at class-definition time as
+                # its own scope — same as module scope — regardless of
+                # *where* the `class` statement itself sits. BUGFIX: this
+                # used to pass through the enclosing `in_function_body`
+                # unchanged, so a class defined *inside* a function (e.g.
+                # `def f(): class Local: ATTR = 1`) incorrectly inherited
+                # that function's "local, non-citable" scope for its own
+                # body, excluding `Local`'s own attributes (`ATTR`) the
+                # same as if they were the enclosing function's local
+                # variables. A class's own attributes are real, citable
+                # names (`module.py:ATTR`-style) no matter how the class
+                # itself is nested, so its body always resets to `False`
+                # here — only a further-nested `def` inside that class
+                # (a method) reintroduces function-local scope beneath it.
+                _walk(child, in_function_body=False)
+            elif isinstance(child, ast.Assign) and not in_function_body:
+                for target in child.targets:
+                    if isinstance(target, ast.Name):
+                        names.add(target.id)
+                _walk(child, in_function_body)
+            elif isinstance(child, ast.AnnAssign) and not in_function_body:
+                if isinstance(child.target, ast.Name):
+                    names.add(child.target.id)
+                _walk(child, in_function_body)
+            else:
+                _walk(child, in_function_body)
+
+    _walk(tree, in_function_body=False)
+    return frozenset(names)
+
+
 def extract_imports(tree: ast.Module) -> List[str]:
     """Sorted, deduplicated list of module names imported anywhere in `tree`.
 

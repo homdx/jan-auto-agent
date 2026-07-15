@@ -10,6 +10,9 @@
 
 from pathlib import Path
 
+import ast
+
+from tools.collect.ast_facts import extract_all_defined_names
 from tools.collect.scanner import scan_module, scan_repo
 
 FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "collect_mini_repo"
@@ -106,3 +109,115 @@ def test_scan_repo_covers_this_repo_without_crashing():
     errors = [m.path for m in modules if m.parse_error]
     assert errors == [], f"unexpected parse errors: {errors}"
     assert any(m.path == "main.py" for m in modules)
+
+
+# ── extract_all_defined_names (COLLECT-17 fabricated-citation follow-up) ──────
+
+
+def test_extract_all_defined_names_includes_nested_methods_and_constants():
+    source = (
+        "TOP_LEVEL_CONST = 1\n"
+        "\n"
+        "def top_level_fn():\n"
+        "    pass\n"
+        "\n"
+        "class Foo:\n"
+        "    CLASS_ATTR: int = 2\n"
+        "\n"
+        "    def method(self):\n"
+        "        def nested_closure():\n"
+        "            pass\n"
+        "        return nested_closure\n"
+    )
+    names = extract_all_defined_names(ast.parse(source))
+    assert names == {
+        "TOP_LEVEL_CONST", "top_level_fn", "Foo",
+        "CLASS_ATTR", "method", "nested_closure",
+    }
+
+
+def test_extract_all_defined_names_excludes_fabricated_name():
+    source = "def real_fn():\n    pass\n"
+    names = extract_all_defined_names(ast.parse(source))
+    assert "_totally_invented_helper_fn" not in names
+    assert "real_fn" in names
+
+
+def test_extract_all_defined_names_excludes_function_local_variables():
+    # BUGFIX (found via adversarial review of the first version of this
+    # function): `ast.walk` visits every node regardless of enclosing
+    # scope, so an ordinary local variable assigned inside a function body
+    # — completely unrelated to anything citable via `module.py:name`
+    # syntax — was being added to this set the same as a module-level
+    # constant. In a module of any real size, generic local-variable names
+    # (`result`, `data`, `ctx`, ...) are close to guaranteed to collide
+    # with *something*, silently excusing a large class of fabricated
+    # `path.py:identifier` citations that happen to reuse one of those
+    # names — reopening exactly the hole this function exists to close.
+    source = (
+        "def unrelated_helper():\n"
+        "    result = compute()\n"
+        "    return result\n"
+    )
+    names = extract_all_defined_names(ast.parse(source))
+    assert "unrelated_helper" in names  # the function itself is citable
+    assert "result" not in names  # its local variable is not
+
+
+def test_extract_all_defined_names_keeps_class_body_attributes_but_not_method_locals():
+    source = (
+        "class Foo:\n"
+        "    CLASS_ATTR = 1\n"
+        "\n"
+        "    def method(self):\n"
+        "        local_var = 2\n"
+        "        return local_var\n"
+    )
+    names = extract_all_defined_names(ast.parse(source))
+    assert "CLASS_ATTR" in names  # class-body scope, like module scope
+    assert "method" in names  # method name itself is citable
+    assert "local_var" not in names  # but its body's local var is not
+
+
+def test_extract_all_defined_names_keeps_attrs_of_a_function_local_class():
+    # BUGFIX: found via review of the local-variable fix above. A class
+    # statement's own body is always its own scope (attributes are real,
+    # citable names) regardless of what *encloses* the `class` statement
+    # — including a function. Before this fix, a class defined inside a
+    # function inherited that function's "local, non-citable" scope for
+    # its own body, so `Local.ATTR` was wrongly excluded the same as an
+    # ordinary local variable, even though it's a genuine class attribute.
+    source = (
+        "def f():\n"
+        "    class Local:\n"
+        "        ATTR = 1\n"
+        "\n"
+        "        def m(self):\n"
+        "            local_var = 2\n"
+        "            return local_var\n"
+        "    return Local\n"
+    )
+    names = extract_all_defined_names(ast.parse(source))
+    assert "f" in names
+    assert "Local" in names
+    assert "ATTR" in names  # class attribute, citable despite the enclosing function
+    assert "m" in names  # method name itself is citable
+    assert "local_var" not in names  # but the method's own local var is not
+
+
+def test_extract_all_defined_names_broader_than_public_symbols():
+    # The whole point of this function: it must see names `extract_symbols`
+    # (COLLECT-4's public-surface index) deliberately doesn't track.
+    source = (
+        "MAX_RETRIES = 3\n"
+        "\n"
+        "class Handler:\n"
+        "    def handle(self):\n"
+        "        pass\n"
+    )
+    module = scan_module(source, "pkg/handler.py")
+    public = {s.qualname.split(":")[-1] for s in module.public_symbols}
+    broad = extract_all_defined_names(ast.parse(source))
+    assert public == {"Handler"}  # top-level class only
+    assert broad == {"MAX_RETRIES", "Handler", "handle"}
+    assert broad > public
