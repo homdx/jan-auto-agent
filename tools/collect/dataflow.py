@@ -427,6 +427,7 @@ class _FunctionGuardWalker:
         guarded_names: Set[str],
         guarded_pairs: Set[Tuple[str, object]],
         guard_desc: Dict[str, str],
+        nested_lists: Optional[List[List[ast.stmt]]] = None,
     ) -> None:
         """After recursing into `stmt`'s own nested statement list(s)
         (`if`/`for`/`while`/`with`/`try`) with a *copy* of the guard state,
@@ -435,9 +436,26 @@ class _FunctionGuardWalker:
         `_rebound_names_in`'s docstring for why this can't just be left to
         `_invalidate_reassigned`, which only ever looks at `stmt` itself,
         never its nested body.
+
+        `nested_lists` — BUGFIX: for `ast.If`, a rebind inside a branch
+        that *terminates* (`_block_terminates`) can never reach any
+        statement after this `if` — control flow never falls through a
+        terminating branch, it always returns/raises/continues/breaks
+        instead. The default (`None`, used by every non-`If` caller)
+        still invalidates on every nested statement list unconditionally,
+        since a `for`/`while`/`with`/`try` body can always fall through
+        to what follows it. `_walk`'s `ast.If` branch passes an explicit,
+        pre-filtered list that excludes any branch (`body`/`orelse`) that
+        terminates, so a rebind like `if not x: x = None; return x` no
+        longer invalidates the exact guard its own terminating body just
+        used to justify that same `return` — before this, that common
+        idiom (`if not x: x = default_or_log(); return x`) lost its guard
+        for every access after the `if`, even though the branch
+        containing the rebind can never share a control-flow path with
+        anything after it.
         """
         rebound: Set[str] = set()
-        for nested in _nested_stmt_lists(stmt):
+        for nested in (nested_lists if nested_lists is not None else _nested_stmt_lists(stmt)):
             rebound |= _rebound_names_in(nested)
         if not rebound:
             return
@@ -519,7 +537,20 @@ class _FunctionGuardWalker:
                     guarded_pairs |= pairs
                 self._walk(stmt.body, body_guarded_names, body_guarded_pairs, body_guard_desc)
                 self._walk(stmt.orelse, set(guarded_names), set(guarded_pairs), dict(guard_desc))
-                self._invalidate_rebinds_in_nested_block(stmt, guarded_names, guarded_pairs, guard_desc)
+                # BUGFIX: a rebind inside a branch that terminates can
+                # never fall through to any statement after this `if` —
+                # so it must not invalidate the outer guard state. Only
+                # feed non-terminating branches into the rebind check;
+                # see `_invalidate_rebinds_in_nested_block`'s `nested_lists`
+                # docstring for the concrete idiom this fixes.
+                if_nested_lists = []
+                if not _block_terminates(stmt.body):
+                    if_nested_lists.append(stmt.body)
+                if not _block_terminates(stmt.orelse):
+                    if_nested_lists.append(stmt.orelse)
+                self._invalidate_rebinds_in_nested_block(
+                    stmt, guarded_names, guarded_pairs, guard_desc, nested_lists=if_nested_lists
+                )
             elif isinstance(stmt, (ast.For, ast.AsyncFor, ast.While)):
                 for attr in ("body", "orelse"):
                     self._walk(getattr(stmt, attr, []), set(guarded_names), set(guarded_pairs), dict(guard_desc))

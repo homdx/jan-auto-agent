@@ -186,6 +186,29 @@ _SAFE_WORDS_RE = re.compile(
 )
 
 
+# BUGFIX: `dataflow.py` catalogs a string-key subscript's `access` field
+# via Python `repr()` on the key literal — which always renders with
+# single quotes (`entry['stack']`) — while Pass B prose naturally quotes
+# the same access the way it appears in the actual source, which is
+# whatever quote style that source file used (`entry["stack"]`). Compared
+# literally, those two strings never match, so *every* claim about a
+# double-quoted string-key access — crash or safety, doesn't matter — was
+# dropped by `citation_check` as "does not correspond to any indexed
+# access site", even though the exact same site is sitting right there in
+# `known_accesses` under the single-quoted spelling. `_normalize_access`
+# collapses both quote characters to one canonical form before any
+# access-citation comparison, on both sides, so quote style stops being
+# load-bearing for whether a real, correctly-cited claim survives.
+def _normalize_access(access: str) -> str:
+    """Canonicalize an access-citation string for comparison purposes:
+    fold both `'` and `"` to a single quote character. Only used for
+    equality checks (`known_accesses` membership, `GuardedAccess.access`
+    matching) — never surfaces to the user, so which quote character
+    "wins" is arbitrary as long as it's applied identically everywhere.
+    """
+    return access.replace('"', "'")
+
+
 def _iter_access_citations(sentence: str) -> List[str]:
     """Every `name[...]`-shaped access citation in `sentence`, with full,
     correctly-balanced bracket content — including one level (or more) of
@@ -485,7 +508,7 @@ def citation_check(
             return f"cited line {line} out of range for {path!r} (1..{max_line})"
 
     if claim.kind in ("access_crash", "access_safe") and claim.access is not None:
-        if claim.access not in known_accesses:
+        if _normalize_access(claim.access) not in known_accesses:
             return (
                 f"cited access {claim.access!r} does not correspond to any "
                 f"indexed access site in Pass A's guarded_accesses for this module"
@@ -540,8 +563,9 @@ def contradiction_check(
          "symmetric" with the access_crash one; now it actually is.
     """
     if claim.kind == "access_crash" and claim.access:
+        cited = _normalize_access(claim.access)
         for ga in module.guarded_accesses:
-            if ga.access == claim.access and ga.status == "GUARDED":
+            if _normalize_access(ga.access) == cited and ga.status == "GUARDED":
                 guard_desc = ga.guard or "guarded"
                 return (
                     REASON_CONTRADICTS_GUARD,
@@ -556,8 +580,9 @@ def contradiction_check(
         # kind was never even constructed (see _SAFE_WORDS_RE), so a false
         # "X is safely guarded" claim about a genuinely crashing access
         # reached the artifact unchecked in every module tested.
+        cited = _normalize_access(claim.access)
         for ga in module.guarded_accesses:
-            if ga.access == claim.access and ga.status == "UNGUARDED":
+            if _normalize_access(ga.access) == cited and ga.status == "UNGUARDED":
                 return (
                     REASON_CONTRADICTS_CRASH,
                     f"{claim.access} at {ga.location} is UNGUARDED "
@@ -619,7 +644,7 @@ def verify_claims(
     the same "nothing vanishes silently" invariant `verify_repo`'s
     `kept_count` bookkeeping already depends on (see its own BUGFIX note).
     """
-    known_accesses = frozenset(ga.access for ga in module.guarded_accesses)
+    known_accesses = frozenset(_normalize_access(ga.access) for ga in module.guarded_accesses)
     provisionally_kept: List[Claim] = []
     dropped: List[DroppedClaim] = []
     for claim in claims:
