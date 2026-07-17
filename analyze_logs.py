@@ -1190,8 +1190,25 @@ def render_timeline(run: dict, max_events: int = 40) -> None:
         elif kind == "phase_transition" and params.get("phase") == "files_preparing":
             task_fp    = params.get("task", "")
             file_count = params.get("file_count", 0)
-            files      = params.get("files", [])
-            preview    = ", ".join(files[:3])
+            files_raw  = params.get("files", [])
+            if isinstance(files_raw, str):
+                # Tracer._sanitize() JSON-stringifies list params before writing
+                # to JSONL, so it usually comes back here as a string, not a list.
+                if "…[+" in files_raw:
+                    # Truncated mid-JSON — can't recover the real list, just
+                    # show the count we do have and skip the preview.
+                    files = []
+                else:
+                    try:
+                        parsed = json.loads(files_raw)
+                        files = parsed if isinstance(parsed, list) else []
+                    except (json.JSONDecodeError, TypeError):
+                        files = []
+            elif isinstance(files_raw, list):
+                files = files_raw
+            else:
+                files = []
+            preview = ", ".join(str(f) for f in files[:3])
             if len(files) > 3:
                 preview += dim(f" … +{len(files)-3}")
             label = cyan(bold("⧉ files preparing"))
