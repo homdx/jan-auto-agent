@@ -524,18 +524,32 @@ def _walk_own_scope(node: ast.AST):
     there on its own.
 
     Also walks a def/lambda's `decorator_list` and default-argument
-    expressions (via its `arguments` node) rather than skipping them along
-    with the body — both run at the def/lambda statement's own execution
-    time, in the enclosing scope, not when the function is later called
+    expressions (via its `arguments` node), and a def's return-type
+    annotation (`node.returns`), rather than skipping them along with the
+    body — all run at the def/lambda statement's own execution time, in
+    the enclosing scope, not when the function is later called
     (e.g. `@log_and_register(logger.info("registering"))` logs right now,
     not "only if called later"; same for a `def handler(x=logger.error(...))`
-    default value).
+    default value or a `def handler() -> logger.error(...):` return
+    annotation).
     """
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
         yield node
         for deco in node.decorator_list:
             yield from _walk_own_scope(deco)
         yield from _walk_own_scope(node.args)
+        # BUGFIX: `node.returns` (the `-> ...` return-type annotation) is
+        # evaluated eagerly at def-statement time, in the enclosing scope
+        # — exactly like `decorator_list` and the argument defaults above,
+        # and for the same reason (it must exist before the function
+        # object is even callable). It was left out of this branch, so a
+        # call hidden there (e.g. `def handler() -> logger.error(...):`)
+        # was silently missed by `_classify_except_body`, misclassifying
+        # a handler that does log at the except site as `"pass"`/
+        # `is_fail_open=True`. `ast.Lambda` has no return annotation, so
+        # no matching gap exists in that branch below.
+        if node.returns is not None:
+            yield from _walk_own_scope(node.returns)
         return
     if isinstance(node, ast.Lambda):
         yield node
