@@ -274,12 +274,12 @@ def test_real_view_trace_site_appears_exactly_once():
 
 def test_real_analyze_logs_done_site_appears_exactly_once_and_is_guarded():
     # A second real instance of the same shape, found while regression-
-    # testing the fix above: `done[-1]` at analyze_logs.py:1251, guarded by
-    # `if not done: return ...` at line 1249, nested inside an unrelated
+    # testing the fix above: `done[-1]` at analyze_logs.py:1268, guarded by
+    # `if not done: continue` at line 1266, nested inside an unrelated
     # outer block.
     source = (REPO_ROOT / "analyze_logs.py").read_text(encoding="utf-8")
     accesses = _accesses(source, "analyze_logs.py")
-    matches = [a for a in accesses if (a.location, a.access) == ("analyze_logs.py:1251", "done[-1]")]
+    matches = [a for a in accesses if (a.location, a.access) == ("analyze_logs.py:1268", "done[-1]")]
     assert len(matches) == 1, f"expected exactly one record, got {matches!r}"
     assert matches[0].status == "GUARDED"
 
