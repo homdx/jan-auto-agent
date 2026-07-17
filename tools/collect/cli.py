@@ -420,10 +420,13 @@ def _full_build(
     # collector's own new/changed output files would make `git status
     # --porcelain` non-empty and `dirty` would read True on every full
     # build regardless of whether the tracked source tree is clean.
-    provenance = manifest_mod.capture_provenance(root)
+    # The dir itself is passed so *previous* runs' untracked output is
+    # excluded by path too — ordering alone only protects the very first
+    # build (see `manifest.is_dirty`).
+    collect_dir = resolve_collect_dir(root, config)
+    provenance = manifest_mod.capture_provenance(root, collect_dir=collect_dir)
     modules = scan_repo(root, config=config)
     ctx = build_context(root, modules, config=config, config_path=config_path, llm_call=llm_call)
-    collect_dir = resolve_collect_dir(root, config)
     written = _write_artifact(collect_dir, ctx)
     _write_manifest(root, collect_dir, ctx.modules, provenance=provenance)
     written = sorted(set(written) | {MANIFEST_FILENAME})
@@ -486,8 +489,10 @@ def action_refresh(
         )
 
     # Same ordering requirement as `_full_build`: capture provenance now,
-    # before `_write_artifact` below writes anything under `.collect/`.
-    provenance = manifest_mod.capture_provenance(root)
+    # before `_write_artifact` below writes anything under `.collect/` —
+    # and exclude the collect dir by path, since the *previous* run's
+    # output is already untracked before this run writes anything.
+    provenance = manifest_mod.capture_provenance(root, collect_dir=collect_dir)
 
     current_modules = scan_repo(root, config=config)
     current_hashes = manifest_mod.hash_tree(root, [m.path for m in current_modules])
@@ -637,7 +642,8 @@ def action_module(
     # bug as `_full_build` otherwise: `.collect/` isn't git-ignored, so
     # computing this after the write would see the write's own untracked
     # output and report `dirty=True` regardless of the tracked tree.
-    git_sha, dirty = manifest_mod.capture_provenance(root)
+    # `collect_dir` is passed so prior runs' output is excluded by path.
+    git_sha, dirty = manifest_mod.capture_provenance(root, collect_dir=collect_dir)
 
     ctx = build_context(root, modules, config=config, config_path=config_path, llm_call=llm_call)
     written = _write_artifact(collect_dir, ctx)

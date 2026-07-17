@@ -126,11 +126,22 @@ def get_git_sha(root: Path) -> Optional[str]:
     return _run_git(root, "rev-parse", "HEAD") or None
 
 
-def is_dirty(root: Path) -> bool:
+def is_dirty(root: Path, exclude_dir: Optional[Path] = None) -> bool:
     """True if the working tree has uncommitted changes. False (not
     unknown) if git is unavailable or `root` isn't a repo — a manifest built
     outside git has nothing to report here, and that's not the same claim
     as "the tree is dirty".
+
+    `exclude_dir`, if given, is the collector's own output directory
+    (`resolve_collect_dir(...)`): any porcelain entry whose path lies under
+    it is ignored. The call-ordering contract below protects only against
+    output written by the *current* run; a *previous* run's `.collect/`
+    output is already sitting untracked when this run starts, which made
+    `dirty` read True on every build after the first — i.e. on effectively
+    every real `refresh`. Filtering by path is the only fix that holds
+    across runs, and it must use the *configured* dir (the location is
+    `[collect] dir`-configurable), which is why the exclusion is a
+    parameter rather than a hardcoded `.collect`.
 
     CALLER CONTRACT: must be called *before* the collector writes any
     output (artifact.json, the manifest itself, rendered pages) to disk.
@@ -142,10 +153,33 @@ def is_dirty(root: Path) -> bool:
     `get_git_sha`/`is_dirty` directly, to make this ordering hard to get
     wrong."""
     status = _run_git(root, "status", "--porcelain")
-    return bool(status)
+    if not status:
+        return False
+    if exclude_dir is None:
+        return True
+    try:
+        rel = Path(exclude_dir).resolve().relative_to(Path(root).resolve())
+    except ValueError:
+        # Collect dir configured outside the repo — nothing it writes can
+        # show up in this repo's porcelain output, so no filtering needed.
+        return True
+    prefix = rel.as_posix().rstrip("/") + "/"
+    for line in status.splitlines():
+        # Porcelain v1: 2-char status, space, then the path. Renames are
+        # `old -> new`; either side under the collect dir is the
+        # collector's own doing.
+        payload = line[3:] if len(line) > 3 else ""
+        paths = payload.split(" -> ") if " -> " in payload else [payload]
+        for p in paths:
+            p = p.strip().strip('"')
+            if not (p.startswith(prefix) or p == prefix.rstrip("/")):
+                return True
+    return False
 
 
-def capture_provenance(root: Path) -> Tuple[Optional[str], bool]:
+def capture_provenance(
+    root: Path, collect_dir: Optional[Path] = None
+) -> Tuple[Optional[str], bool]:
     """Snapshot `(git_sha, dirty)` right now, at a single call site meant
     to run *before* writing any collector output under `root`.
 
@@ -155,8 +189,16 @@ def capture_provenance(root: Path) -> Tuple[Optional[str], bool]:
     inline after output has already been written — which is what silently
     made `dirty` report `True` on every fresh full build, since `.collect/`
     isn't git-ignored and its own new files count as untracked changes.
+
+    `collect_dir` should be the resolved output directory
+    (`resolve_collect_dir(root, config)`): output from *previous* runs is
+    already untracked before this run writes anything, so the
+    capture-before-write ordering alone only kept the very first build
+    honest — every subsequent build read `dirty=True` from the prior run's
+    leftovers. Passing the dir lets `is_dirty` exclude it by path, which
+    holds across runs.
     """
-    return get_git_sha(root), is_dirty(root)
+    return get_git_sha(root), is_dirty(root, exclude_dir=collect_dir)
 
 
 @dataclass(frozen=True)
