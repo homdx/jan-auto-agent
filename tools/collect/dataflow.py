@@ -174,27 +174,53 @@ def _subscript_key(slice_node: ast.expr) -> Optional[object]:
 
 
 def _subscript_index_repr(slice_node: ast.expr) -> str:
-    """Human-readable index for the `access` field, e.g. `-1`, `0`, `i`."""
+    """Human-readable index for the `access` field, e.g. `-1`, `0`, `i`,
+    or (BUGFIX, see `_is_indexed_access`) `keys[0]` for a nested subscript
+    index like `cache[keys[0]]`."""
     literal = _subscript_key(slice_node)
     if literal is not None or isinstance(slice_node, ast.Constant):
         return repr(literal) if isinstance(literal, str) else str(literal)
     if isinstance(slice_node, ast.Name):
         return slice_node.id
+    if (
+        isinstance(slice_node, ast.Subscript)
+        and isinstance(slice_node.value, ast.Name)
+        and _is_indexed_access(slice_node)
+    ):
+        return f"{slice_node.value.id}[{_subscript_index_repr(slice_node.slice)}]"
     return "?"
 
 
 def _is_indexed_access(node: ast.Subscript) -> bool:
     """Whether `node` is a single-element indexed access (`x[i]`, `x[-1]`,
     `x[0]`) on a bare name — not a slice (`x[a:b]`) and not a deeper
-    attribute/call chain, which COLLECT-7 is scoped to leave alone."""
+    attribute/call chain, which COLLECT-7 is scoped to leave alone.
+
+    BUGFIX: a nested indexed access as the slice itself — `cache[keys[0]]`
+    — used to fail every branch here (its slice is an `ast.Subscript`, not
+    a `Constant`/`Name`/negated-`Constant`), so the *outer* access was
+    silently never cataloged at all: only the inner `keys[0]` showed up in
+    `guarded_accesses`, even though `cache[...]` is exactly as much a
+    crash-capable indexed access (`KeyError`/`IndexError`) as any other
+    site COLLECT-7 tracks, and it's the one a guard on `cache` (or on the
+    aliased pair) is actually about. Recursing through `_is_indexed_access`
+    on a nested `Subscript` slice keeps this scoped to chains of the same
+    "name, indexed by something itself in this shape" pattern — not an
+    open door to arbitrary expressions like `cache[func()]` or
+    `cache[a + b]`, which remain out of scope exactly as before.
+    """
     if not isinstance(node.value, ast.Name):
         return False
     sl = node.slice
     if isinstance(sl, ast.Slice):
         return False
-    return isinstance(sl, ast.Constant) or isinstance(sl, ast.Name) or (
-        isinstance(sl, ast.UnaryOp) and isinstance(sl.op, ast.USub)
-    )
+    if isinstance(sl, ast.Constant) or isinstance(sl, ast.Name):
+        return True
+    if isinstance(sl, ast.UnaryOp) and isinstance(sl.op, ast.USub):
+        return True
+    if isinstance(sl, ast.Subscript):
+        return _is_indexed_access(sl)
+    return False
 
 
 #: Statement types whose `body` (and, where present, `orelse`/`handlers`/
@@ -251,6 +277,55 @@ def _own_scan_sources(stmt: ast.stmt) -> List[ast.AST]:
         elif value is not None:
             sources.append(value)
     return sources
+
+
+def _nested_stmt_lists(stmt: ast.stmt) -> List[List[ast.stmt]]:
+    """Every nested statement-list `_walk` recurses into for `stmt` — i.e.
+    exactly the lists a *rebind buried inside them* could be invisible to
+    the enclosing scope if we only ever mutated the copy handed to that
+    recursive call."""
+    lists: List[List[ast.stmt]] = []
+    for attr in ("body", "orelse", "finalbody"):
+        value = getattr(stmt, attr, None)
+        if isinstance(value, list):
+            lists.append(value)
+    for handler in getattr(stmt, "handlers", []):
+        lists.append(handler.body)
+    return lists
+
+
+def _rebound_names_in(stmts: List[ast.stmt]) -> Set[str]:
+    """Names any statement in `stmts` — at any nesting depth, but never
+    crossing into a nested function/class's own separate dataflow scope —
+    rebinds via a bare `x = <expr>` (the same shape `_invalidate_reassigned`
+    recognizes for the top-level, same-block case).
+
+    BUGFIX: `_walk`'s recursive descent into a compound statement's own
+    body (`try`/`for`/`while`/`with`) hands that recursive call a *copy* of
+    `guarded_names`/`guarded_pairs`/`guard_desc` — correct for guards
+    discovered inside the block (they shouldn't leak out), but it also
+    means a rebind *inside* that block only ever invalidated the copy, so
+    the outer scope kept citing the pre-rebind guard for every statement
+    after the block ends. Concretely: `if not x: raise ValueError` then
+    `try: x = maybe()\\n except Exception: pass` then `return x[-1]` — the
+    guard on `x` is stale the moment `x = maybe()` runs, on *any* path
+    through the `try` (even the exceptional one, conservatively), but
+    without this the walker kept citing the pre-`try` guard for `x[-1]`
+    after it. Worst-case-conservative by design (same posture as the rest
+    of this module, see docstring): a rebind found anywhere in the nested
+    block invalidates the guard for what follows, regardless of whether
+    that particular sub-path actually executes it — a missed guard
+    (false positive downstream) is acceptable, a wrongly-kept one is not.
+    """
+    names: Set[str] = set()
+    for s in stmts:
+        if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            continue  # separate dataflow scope — a rebind there is irrelevant here
+        if isinstance(s, ast.Assign) and len(s.targets) == 1 and isinstance(s.targets[0], ast.Name):
+            names.add(s.targets[0].id)
+        for nested in _nested_stmt_lists(s):
+            names |= _rebound_names_in(nested)
+    return names
 
 
 class _FunctionGuardWalker:
@@ -346,6 +421,32 @@ class _FunctionGuardWalker:
         for pair in {p for p in guarded_pairs if p[0] == target}:
             guarded_pairs.discard(pair)
 
+    def _invalidate_rebinds_in_nested_block(
+        self,
+        stmt: ast.stmt,
+        guarded_names: Set[str],
+        guarded_pairs: Set[Tuple[str, object]],
+        guard_desc: Dict[str, str],
+    ) -> None:
+        """After recursing into `stmt`'s own nested statement list(s)
+        (`if`/`for`/`while`/`with`/`try`) with a *copy* of the guard state,
+        drop the guarantee — in the *outer*, still-live guard state — for
+        any name that copy's walk saw rebound anywhere inside. See
+        `_rebound_names_in`'s docstring for why this can't just be left to
+        `_invalidate_reassigned`, which only ever looks at `stmt` itself,
+        never its nested body.
+        """
+        rebound: Set[str] = set()
+        for nested in _nested_stmt_lists(stmt):
+            rebound |= _rebound_names_in(nested)
+        if not rebound:
+            return
+        for name in rebound:
+            guarded_names.discard(name)
+            guard_desc.pop(name, None)
+        for pair in {p for p in guarded_pairs if p[0] in rebound}:
+            guarded_pairs.discard(pair)
+
     def _propagate_alias(
         self,
         stmt: ast.stmt,
@@ -393,6 +494,22 @@ class _FunctionGuardWalker:
             self._propagate_alias(stmt, guarded_names, guarded_pairs, guard_desc)
 
             if isinstance(stmt, ast.If):
+                # BUGFIX: `stmt.body` runs on exactly the *opposite* polarity
+                # from what a terminating guard proves — `if not x: ... `
+                # proves `x` truthy only for code that runs *after* this
+                # `if` (or in its `orelse`), never for the guard's own body,
+                # where `test` was True, i.e. `x` is the very thing the test
+                # found falsy. Snapshot the pre-guard state for the body's
+                # walk *before* adding the new guard below, so an access
+                # inside the guard's own body (e.g. `if not x: y = x[0];
+                # return y`) is walked with the guard state as it stood
+                # before this `if`, not after — the body sees no guard on
+                # `x` at all (correctly: the true fact there is that `x` is
+                # falsy, not that it's guarded-truthy), while `orelse` and
+                # every sibling statement after this `if` correctly do.
+                body_guarded_names = set(guarded_names)
+                body_guarded_pairs = set(guarded_pairs)
+                body_guard_desc = dict(guard_desc)
                 names, pairs = _falsy_guard_targets(stmt.test)
                 if _block_terminates(stmt.body) and (names or pairs):
                     desc = f"early-return at {self.module_path}:{stmt.lineno}"
@@ -400,18 +517,22 @@ class _FunctionGuardWalker:
                         guarded_names.add(n)
                         guard_desc.setdefault(n, desc)
                     guarded_pairs |= pairs
-                self._walk(stmt.body, set(guarded_names), set(guarded_pairs), dict(guard_desc))
+                self._walk(stmt.body, body_guarded_names, body_guarded_pairs, body_guard_desc)
                 self._walk(stmt.orelse, set(guarded_names), set(guarded_pairs), dict(guard_desc))
+                self._invalidate_rebinds_in_nested_block(stmt, guarded_names, guarded_pairs, guard_desc)
             elif isinstance(stmt, (ast.For, ast.AsyncFor, ast.While)):
                 for attr in ("body", "orelse"):
                     self._walk(getattr(stmt, attr, []), set(guarded_names), set(guarded_pairs), dict(guard_desc))
+                self._invalidate_rebinds_in_nested_block(stmt, guarded_names, guarded_pairs, guard_desc)
             elif isinstance(stmt, (ast.With, ast.AsyncWith)):
                 self._walk(stmt.body, set(guarded_names), set(guarded_pairs), dict(guard_desc))
+                self._invalidate_rebinds_in_nested_block(stmt, guarded_names, guarded_pairs, guard_desc)
             elif isinstance(stmt, ast.Try):
                 for attr in _COMPOUND_BODY_ATTRS:
                     self._walk(getattr(stmt, attr, []), set(guarded_names), set(guarded_pairs), dict(guard_desc))
                 for handler in stmt.handlers:
                     self._walk(handler.body, set(guarded_names), set(guarded_pairs), dict(guard_desc))
+                self._invalidate_rebinds_in_nested_block(stmt, guarded_names, guarded_pairs, guard_desc)
 
 
 def extract_guarded_accesses(tree: ast.Module, module_path: str) -> List[GuardedAccess]:

@@ -137,7 +137,32 @@ _LOCATION_RE = re.compile(r"([\w./\\-]+\.py):(\d+)")
 # `public_symbols` index just doesn't happen to track (a module-level
 # constant, a class method).
 _SYMBOL_CITATION_RE = re.compile(r"([\w./\\-]+\.py):([A-Za-z_]\w*)\b")
-_ACCESS_RE = re.compile(r"([A-Za-z_][\w.]*\[[^\]]+\])")
+# Matches only the *start* of a candidate access citation — `name[` — so we
+# can then hand-walk the brackets with `_iter_access_citations` below
+# rather than trying to express "balanced, possibly-nested brackets" as a
+# single regex. (BUGFIX, see `_iter_access_citations`'s docstring for why
+# this replaced a plain single-pattern `_ACCESS_RE`.)
+_ACCESS_START_RE = re.compile(r"[A-Za-z_][\w.]*(?=\[)")
+# Base names that are typing/builtin generic containers, not variables —
+# BUGFIX (found via self-play): a sentence like "parse_config returns
+# dict[str, int] and raises ValueError on bad input" was previously read
+# by `_ACCESS_RE` as citing an access `dict[str, int]`; combined with
+# "raises...Error" tripping `_CRASH_WORDS_RE`, that turned an ordinary,
+# entirely correct type-annotation sentence into an `access_crash` claim
+# whose cited "access" can never appear in `known_accesses` (COLLECT-7's
+# catalog only ever holds real indexed-access sites, never type
+# expressions) — so `citation_check` dropped the whole sentence as a
+# fabrication, even though nothing in it was fabricated. Any candidate
+# citation whose base name is one of these is never treated as an access
+# citation at all, the same "nothing to check, so it survives" treatment
+# any other non-citation prose gets.
+_TYPING_BASE_NAMES = frozenset({
+    "dict", "list", "set", "tuple", "frozenset", "type",
+    "Dict", "List", "Set", "Tuple", "FrozenSet", "Type",
+    "Optional", "Union", "Callable", "Iterable", "Iterator",
+    "Sequence", "MutableSequence", "Mapping", "MutableMapping",
+    "Any", "ClassVar", "Literal", "Final", "Annotated",
+})
 _CRASH_WORDS_RE = re.compile(
     r"\b(crash(?:es|ed|ing)?|will fail|throws?|raises?\s+\w*Error|unguarded)\b",
     re.IGNORECASE,
@@ -159,6 +184,55 @@ _SAFE_WORDS_RE = re.compile(
     r"will\s+not\s+(?:raise|crash|fail)|no\s+risk\s+of)\b",
     re.IGNORECASE,
 )
+
+
+def _iter_access_citations(sentence: str) -> List[str]:
+    """Every `name[...]`-shaped access citation in `sentence`, with full,
+    correctly-balanced bracket content — including one level (or more) of
+    nesting like `cache[keys[0]]` — and with known typing/builtin generic
+    bases (`dict[str, int]`, `Optional[int]`, ...) excluded entirely.
+
+    BUGFIX (two independent defects the old `_ACCESS_RE =
+    r"([A-Za-z_][\\w.]*\\[[^\\]]+\\])"` had):
+
+    1. `[^\\]]+` is non-greedy in effect for nested brackets — it stops at
+       the *first* `]`, so `"cache[keys[0]] is unguarded"` was captured as
+       the truncated, syntactically-unbalanced `"cache[keys[0]"`. That
+       string can never equal the real catalog entry `"cache[keys[0]]"`
+       (see `dataflow._subscript_index_repr`'s own nested-subscript fix),
+       so a true, correctly-cited claim about the *outer* access was
+       dropped by `citation_check` as an uncatalogued fabrication — even
+       though it was neither uncatalogued nor fabricated, just mismatched
+       on a truncated string. Walking the brackets with an explicit depth
+       counter instead of a regex character class captures the whole
+       balanced span regardless of nesting depth.
+    2. The old pattern had no way to tell a real access apart from a type
+       annotation using the same subscript syntax (`dict[str, int]`) —
+       see `_TYPING_BASE_NAMES`'s docstring above.
+    """
+    citations: List[str] = []
+    for m in _ACCESS_START_RE.finditer(sentence):
+        base = m.group(0)
+        if base.rsplit(".", 1)[-1] in _TYPING_BASE_NAMES:
+            continue
+        start = m.end()  # index of the opening '['
+        depth = 0
+        end = None
+        i = start
+        while i < len(sentence):
+            ch = sentence[i]
+            if ch == "[":
+                depth += 1
+            elif ch == "]":
+                depth -= 1
+                if depth == 0:
+                    end = i
+                    break
+            i += 1
+        if end is None:
+            continue  # unbalanced — not a real subscript citation
+        citations.append(sentence[m.start():end + 1])
+    return citations
 
 
 @lru_cache(maxsize=8)
@@ -276,7 +350,7 @@ def extract_claims(
         # the whole sentence only survives into the artifact if *every*
         # citation it makes does.
         locations = [f"{m.group(1)}:{m.group(2)}" for m in _LOCATION_RE.finditer(sentence)]
-        accesses = [m.group(1) for m in _ACCESS_RE.finditer(sentence)]
+        accesses = _iter_access_citations(sentence)
 
         symbols: List[str] = []
         for sym, pattern in _symbol_patterns(known_symbols):
