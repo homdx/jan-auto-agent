@@ -85,18 +85,19 @@ def _falsy_guard_targets(test: ast.expr) -> "Tuple[Set[str], Set[Tuple[str, obje
     at the top level, and inside any nesting depth of `or`-combinations —
     but *not* inside an `and`.
 
-    That `and` exclusion is load-bearing, not an oversight: this function
-    is only ever called on the test of an `if` whose body terminates
-    (`_block_terminates`), so what it's computing is "what do we know for
-    sure once we're past this `if` without having terminated" — i.e. once
-    `test` evaluated False. For `test = A or B`, `test` False means both
-    `A` and `B` were individually False (De Morgan), so every falsy-check
-    found inside an `or` chain is individually refuted and its name/pair
-    is genuinely guaranteed truthy afterward — recursing through nested
-    `or`s is correct. But for `test = A and B`, `test` False only means
-    *at least one* of `A`/`B` was False — not which one — so no
-    individual name inside an `and` can be marked guaranteed. BUGFIX: this
-    function used to recurse into `ast.BoolOp` regardless of `.op`,
+    That `and` exclusion is load-bearing, not an oversight: what this
+    function computes is "what do we know for sure once `test` has
+    evaluated False" — i.e. either inside the `orelse` branch of the `if`,
+    or (when `stmt.body` terminates) in whatever follows the `if`
+    entirely. For `test = A or B`, `test` False means both `A` and `B`
+    were individually False (De Morgan), so every falsy-check found
+    inside an `or` chain is individually refuted and its name/pair is
+    genuinely guaranteed truthy — recursing through nested `or`s is
+    correct. But for `test = A and B`, `test` False only means *at least
+    one* of `A`/`B` was False — not which one — so no individual name
+    inside an `and` can be marked guaranteed, regardless of which of the
+    two cases above we're computing it for. BUGFIX: this function used to
+    recurse into `ast.BoolOp` regardless of `.op`,
     treating `if not a and not b: raise` the same as `if not a or not b:
     raise` and marking *both* `a` and `b` guaranteed truthy afterward.
     They are not: `a=[]`, `b=[1]` makes `not a and not b` False (so the
@@ -529,6 +530,26 @@ class _FunctionGuardWalker:
                 body_guarded_pairs = set(guarded_pairs)
                 body_guard_desc = dict(guard_desc)
                 names, pairs = _falsy_guard_targets(stmt.test)
+                # BUGFIX: reaching `orelse` at all already proves `test` was
+                # False (i.e. the named target(s) are truthy) — that's true
+                # unconditionally, independent of whether `stmt.body`
+                # terminates. Termination only matters for whether the
+                # guarantee may persist *past* the whole if/else for
+                # sibling statements that follow it (handled below via
+                # `guarded_names`/`guard_desc`, which the walk after this
+                # `if` reuses) — it must not gate whether `orelse` itself,
+                # walked right here, gets the guard.
+                if names or pairs:
+                    desc = f"else-branch at {self.module_path}:{stmt.lineno}"
+                    orelse_guarded_names = set(guarded_names) | names
+                    orelse_guard_desc = dict(guard_desc)
+                    for n in names:
+                        orelse_guard_desc.setdefault(n, desc)
+                    orelse_guarded_pairs = set(guarded_pairs) | pairs
+                else:
+                    orelse_guarded_names = set(guarded_names)
+                    orelse_guarded_pairs = set(guarded_pairs)
+                    orelse_guard_desc = dict(guard_desc)
                 if _block_terminates(stmt.body) and (names or pairs):
                     desc = f"early-return at {self.module_path}:{stmt.lineno}"
                     for n in names:
@@ -536,7 +557,7 @@ class _FunctionGuardWalker:
                         guard_desc.setdefault(n, desc)
                     guarded_pairs |= pairs
                 self._walk(stmt.body, body_guarded_names, body_guarded_pairs, body_guard_desc)
-                self._walk(stmt.orelse, set(guarded_names), set(guarded_pairs), dict(guard_desc))
+                self._walk(stmt.orelse, orelse_guarded_names, orelse_guarded_pairs, orelse_guard_desc)
                 # BUGFIX: a rebind inside a branch that terminates can
                 # never fall through to any statement after this `if` —
                 # so it must not invalidate the outer guard state. Only
