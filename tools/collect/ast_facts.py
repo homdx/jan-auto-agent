@@ -478,11 +478,17 @@ def _is_log_call(node: ast.AST) -> bool:
 
 
 def _walk_own_scope(node: ast.AST):
-    """Like `ast.walk`, but never descends into a nested function/class/
-    lambda's own body — those are a separate execution scope, so a
-    statement inside one doesn't run as part of the node being walked.
+    """Like `ast.walk`, but never descends into a nested function/lambda's
+    own *body* (a deferred scope — its statements don't run until the
+    function is called), while still walking everything that actually
+    executes right now, as part of the statement `node` itself: a class's
+    own body (a class statement runs its whole body immediately, to build
+    the class's namespace — it's not deferred at all), and a def/lambda's
+    own decorators and default-argument expressions (evaluated eagerly,
+    at def-statement time, in the *enclosing* scope, before the function
+    object even exists).
 
-    BUGFIX (found via adversarial review, same bug class already fixed
+    BUGFIX 1 (found via adversarial review, same bug class already fixed
     elsewhere in this codebase — see `dataflow._walk`'s
     `(FunctionDef, AsyncFunctionDef, ClassDef, Lambda)` scope skip and
     `extract_all_defined_names`'s `in_function_body` tracking):
@@ -500,9 +506,40 @@ def _walk_own_scope(node: ast.AST):
     downstream, letting a real "this except silently swallows the error"
     Pass B claim about that exact site get dropped by COLLECT-17's
     contradiction_check as a false positive).
+
+    BUGFIX 2 (found via adversarial review of BUGFIX 1's own first cut):
+    that first cut stopped descending on `ClassDef` exactly the same way
+    as `FunctionDef`/`Lambda` — but a `class` statement's body is *not*
+    deferred the way a function body is; it runs immediately, right where
+    the `class` statement sits, to build the class object (this is the
+    exact same distinction `extract_all_defined_names`'s own "BUGFIX 2"
+    already documents for a different reason). `except Exception:\\n
+    class Deferred:\\n        logger.error(...)` really does log at the
+    except site — the class statement executing *is* what runs that log
+    call — so stopping at `ClassDef` produced a fresh false "pass"/
+    fail-open classification for a handler that, in fact, logs. Only a
+    *further*-nested `def`/`lambda` inside that class body (an actual
+    method) is still deferred, and that's handled automatically: the
+    recursive call reaches the method as an ordinary child and stops
+    there on its own.
+
+    Also walks a def/lambda's `decorator_list` and default-argument
+    expressions (via its `arguments` node) rather than skipping them along
+    with the body — both run at the def/lambda statement's own execution
+    time, in the enclosing scope, not when the function is later called
+    (e.g. `@log_and_register(logger.info("registering"))` logs right now,
+    not "only if called later"; same for a `def handler(x=logger.error(...))`
+    default value).
     """
-    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
-        yield node  # yield the def/class/lambda header itself, but not its own body
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        yield node
+        for deco in node.decorator_list:
+            yield from _walk_own_scope(deco)
+        yield from _walk_own_scope(node.args)
+        return
+    if isinstance(node, ast.Lambda):
+        yield node
+        yield from _walk_own_scope(node.args)
         return
     yield node
     for child in ast.iter_child_nodes(node):
