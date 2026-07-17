@@ -1236,8 +1236,8 @@ def render_files_preparing(run: dict) -> None:
         by_task[r["task"]].append(r)
 
     done_recs = [r for r in records if r.get("status") == "done"]
-    total_copied  = sum(r.get("files_copied",  0) for r in done_recs)
-    total_missing = sum(r.get("files_missing", 0) for r in done_recs)
+    total_copied  = sum(int(r.get("files_copied",  0)) for r in done_recs)
+    total_missing = sum(int(r.get("files_missing", 0)) for r in done_recs)
 
     print_section(
         f"FILES PREPARING  ({len(done_recs)} workspace setup(s)  "
