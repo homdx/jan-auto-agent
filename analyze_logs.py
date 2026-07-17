@@ -876,8 +876,8 @@ def render_run_summary(run: dict) -> None:
     _fp_recs = run.get("files_preparing", [])
     _fp_done = [r for r in _fp_recs if r.get("status") == "done"]
     if _fp_done:
-        _fp_copied  = sum(r.get("files_copied",  0) for r in _fp_done)
-        _fp_missing = sum(r.get("files_missing", 0) for r in _fp_done)
+        _fp_copied  = sum(int(r.get("files_copied",  0)) for r in _fp_done)
+        _fp_missing = sum(int(r.get("files_missing", 0)) for r in _fp_done)
         _fp_miss_str = f"  {yellow(f'({_fp_missing} missing)')}" if _fp_missing else ""
         print(
             f"  {bold('Files prepared')}: "
