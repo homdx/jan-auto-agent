@@ -181,14 +181,53 @@ def extract_imports(tree: ast.Module) -> List[str]:
     `"x.y"` (the source module, not the imported name) — mirroring the
     convention `tests/_pass_a_stub.py` establishes and COLLECT-3's golden
     fixture already encodes.
+
+    BUGFIX (relative imports): `ast.ImportFrom.level` used to be ignored
+    entirely, with two distinct failure modes in the import graph
+    (COLLECT-8):
+
+    1. **Misattribution** — `from .model import X` inside `pkg/a.py` was
+       recorded as bare `"model"`, which `graph.resolve_import` happily
+       matched against an *unrelated top-level* `model.py` if one existed,
+       producing a phantom edge to the wrong module while the real
+       dependency on `pkg/model.py` vanished. That's exactly the
+       "misattributed is worse than missing" failure `build_call_edges`'s
+       own docstring forbids, leaking into blast-radius (`imported_by`).
+    2. **Silent loss** — without such a name collision the bare `"model"`
+       resolved to nothing at all, dropping the edge and (via
+       `entry_points`) making package-internal modules look like roots.
+       And `from . import util` (`node.module is None`) was never
+       recorded in any form.
+
+    Now a relative import keeps its level as leading dots — `from .model
+    import X` -> `".model"`, `from ..pkg import y` -> `"..pkg"` — the same
+    spelling Python source itself uses, so it stays human-readable in
+    `render`/`summarizer` output. For the `from . import name` form
+    (`module is None`) each imported alias is recorded as `"." * level +
+    alias.name`: for a submodule that's precisely its relative dotted
+    name; for a plain symbol imported from the package `__init__`,
+    `graph.resolve_import`'s drop-one-trailing-part fallback still lands
+    it on the package itself rather than dropping the dependency.
+    `graph.resolve_import` resolves the leading dots against the
+    *importer's* package (which `import_edges` knows from `m.path`) —
+    never against the top-level namespace — so neither failure mode above
+    can recur.
     """
     names = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 names.add(alias.name)
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            names.add(node.module)
+        elif isinstance(node, ast.ImportFrom):
+            prefix = "." * node.level
+            if node.module:
+                names.add(prefix + node.module)
+            elif node.level:
+                # `from . import util` / `from .. import helpers` — the
+                # only surviving spelling of the dependency is the alias
+                # list itself.
+                for alias in node.names:
+                    names.add(prefix + alias.name)
     return sorted(names)
 
 

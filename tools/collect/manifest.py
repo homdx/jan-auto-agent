@@ -130,9 +130,33 @@ def is_dirty(root: Path) -> bool:
     """True if the working tree has uncommitted changes. False (not
     unknown) if git is unavailable or `root` isn't a repo — a manifest built
     outside git has nothing to report here, and that's not the same claim
-    as "the tree is dirty"."""
+    as "the tree is dirty".
+
+    CALLER CONTRACT: must be called *before* the collector writes any
+    output (artifact.json, the manifest itself, rendered pages) to disk.
+    `.collect/` is not a git-ignored directory, so a `collect` run's own
+    freshly-written, untracked output would otherwise show up in
+    `git status --porcelain` and make every full build report `dirty=True`
+    regardless of whether the tracked source tree is actually clean. See
+    `capture_provenance`, which callers should use instead of calling
+    `get_git_sha`/`is_dirty` directly, to make this ordering hard to get
+    wrong."""
     status = _run_git(root, "status", "--porcelain")
     return bool(status)
+
+
+def capture_provenance(root: Path) -> Tuple[Optional[str], bool]:
+    """Snapshot `(git_sha, dirty)` right now, at a single call site meant
+    to run *before* writing any collector output under `root`.
+
+    This exists so every caller captures provenance at one well-defined
+    point (the top of a build, before `_write_artifact`/`_write_manifest`
+    touch disk) instead of each call site re-deriving `git_sha`/`is_dirty`
+    inline after output has already been written — which is what silently
+    made `dirty` report `True` on every fresh full build, since `.collect/`
+    isn't git-ignored and its own new files count as untracked changes.
+    """
+    return get_git_sha(root), is_dirty(root)
 
 
 @dataclass(frozen=True)
@@ -179,16 +203,31 @@ def build_manifest(
     files: Optional[Iterable[str]] = None,
     *,
     collector_version: str = COLLECTOR_VERSION,
+    provenance: Optional[Tuple[Optional[str], bool]] = None,
 ) -> Manifest:
     """Build a `Manifest` for `root`. If `files` isn't given, discovers
-    `*.py` files under `root` via `discover_files`."""
+    `*.py` files under `root` via `discover_files`.
+
+    `provenance`, if given, is a pre-captured `(git_sha, dirty)` pair from
+    `capture_provenance(root)` — callers that write collector output
+    (`.collect/...`) before calling this must capture provenance first and
+    pass it in here, since `.collect/` isn't git-ignored and its own
+    freshly-written files would otherwise make `is_dirty` see a dirty tree
+    that doesn't reflect the actual tracked source. When omitted,
+    `git_sha`/`dirty` are computed now, which is only correct for callers
+    that haven't written anything yet.
+    """
     root = Path(root)
     file_list = list(files) if files is not None else discover_files(root)
+    if provenance is not None:
+        git_sha, dirty = provenance
+    else:
+        git_sha, dirty = get_git_sha(root), is_dirty(root)
     return Manifest(
         collector_version=collector_version,
         generated_at=_utc_iso_now(),
-        git_sha=get_git_sha(root),
-        dirty=is_dirty(root),
+        git_sha=git_sha,
+        dirty=dirty,
         file_hashes=hash_tree(root, file_list),
     )
 

@@ -38,6 +38,11 @@ def _git(root: Path, *args: str) -> subprocess.CompletedProcess:
 
 
 def _init_repo(root: Path) -> None:
+    # .collect/ is a build artifact directory (same category as .agent/)
+    # and is git-ignored in the real project — mirrored here so these
+    # fixtures match real-world dirty-tree behavior rather than treating
+    # collect's own untracked output as an uncommitted source change.
+    (root / ".gitignore").write_text(".collect/\n")
     _git(root, "init", "-q")
     _git(root, "config", "user.email", "test@example.com")
     _git(root, "config", "user.name", "Test")
@@ -156,6 +161,49 @@ def test_collect_rebuilds_when_stale(mini_repo):
     result = action_collect(mini_repo)
     assert result.wrote is True
     assert result.fresh is True
+
+
+# ── manifest dirty flag must reflect the tracked tree, not collect's own
+#    output (`.collect/` isn't git-ignored, so a check running *after* the
+#    write would see the write's own untracked files and misreport dirty)
+#    ─────────────────────────────────────────────────────────────────────
+
+
+def _manifest_dirty(collect_dir: Path) -> bool:
+    import json as _json
+
+    payload = _json.loads((collect_dir / MANIFEST_FILENAME).read_text(encoding="utf-8"))
+    return bool(payload["dirty"])
+
+
+def test_collect_full_build_reports_clean_on_clean_tree(mini_repo):
+    """Regression: a full `--collect` build on a freshly committed, clean
+    tree must record `dirty=False`. This used to be unconditionally True
+    because provenance was captured after `_write_artifact` had already
+    dropped untracked files into `.collect/`."""
+    result = action_collect(mini_repo)
+    assert _manifest_dirty(result.collect_dir) is False
+
+
+def test_refresh_incremental_reports_clean_on_clean_tree(mini_repo):
+    """Same regression, exercised via the incremental branch of
+    `action_refresh` (a second `--refresh` against an existing artifact),
+    which captures provenance independently of the full-build path."""
+    action_collect(mini_repo)
+    result = action_refresh(mini_repo)
+    assert _manifest_dirty(result.collect_dir) is False
+
+
+def test_module_patch_reports_clean_on_clean_tree(mini_repo):
+    """Same regression again, exercised via `action_module`'s hand-built
+    patched manifest, which used to compute provenance after its own
+    `_write_artifact` call too."""
+    action_collect(mini_repo)
+    (mini_repo / "pkg" / "a.py").write_text("def a():\n    return 42\n")
+    _git(mini_repo, "add", "-A")
+    _git(mini_repo, "commit", "-q", "-m", "update a.py")
+    result = action_module(mini_repo, "pkg/a.py")
+    assert _manifest_dirty(result.collect_dir) is False
 
 
 # ── --refresh: unconditional rebuild ────────────────────────────────────────

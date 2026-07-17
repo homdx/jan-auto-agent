@@ -362,9 +362,18 @@ def _write_artifact(collect_dir: Path, ctx: CollectContext) -> List[str]:
     return sorted(written)
 
 
-def _write_manifest(root: Path, collect_dir: Path, modules: List[ModuleRecord]) -> None:
+def _write_manifest(
+    root: Path,
+    collect_dir: Path,
+    modules: List[ModuleRecord],
+    *,
+    provenance: Optional[Tuple[Optional[str], bool]] = None,
+) -> None:
+    """`provenance`, if given, must be a `(git_sha, dirty)` pair captured
+    via `manifest_mod.capture_provenance(root)` *before* `_write_artifact`
+    ran — see that function's docstring for why the ordering matters."""
     files = sorted(m.path for m in modules)
-    manifest = manifest_mod.build_manifest(root, files)
+    manifest = manifest_mod.build_manifest(root, files, provenance=provenance)
     manifest_mod.write_manifest(manifest, collect_dir / MANIFEST_FILENAME)
 
 
@@ -406,11 +415,17 @@ def _full_build(
     config_path: Optional[str],
     llm_call: Optional[LlmCall],
 ) -> Tuple[Path, List[str], CollectContext]:
+    # Captured before anything under `[collect] dir` is written: `.collect/`
+    # isn't git-ignored, so if this ran *after* `_write_artifact`, the
+    # collector's own new/changed output files would make `git status
+    # --porcelain` non-empty and `dirty` would read True on every full
+    # build regardless of whether the tracked source tree is clean.
+    provenance = manifest_mod.capture_provenance(root)
     modules = scan_repo(root, config=config)
     ctx = build_context(root, modules, config=config, config_path=config_path, llm_call=llm_call)
     collect_dir = resolve_collect_dir(root, config)
     written = _write_artifact(collect_dir, ctx)
-    _write_manifest(root, collect_dir, ctx.modules)
+    _write_manifest(root, collect_dir, ctx.modules, provenance=provenance)
     written = sorted(set(written) | {MANIFEST_FILENAME})
     return collect_dir, written, ctx
 
@@ -470,6 +485,10 @@ def action_refresh(
             collect_dir=collect_dir, written_files=tuple(written),
         )
 
+    # Same ordering requirement as `_full_build`: capture provenance now,
+    # before `_write_artifact` below writes anything under `.collect/`.
+    provenance = manifest_mod.capture_provenance(root)
+
     current_modules = scan_repo(root, config=config)
     current_hashes = manifest_mod.hash_tree(root, [m.path for m in current_modules])
     changes = manifest_mod.diff_files(previous_manifest.file_hashes, current_hashes)
@@ -518,7 +537,7 @@ def action_refresh(
         ctx = replace(ctx, modules=verified_modules, verification_report=report)
 
     written = _write_artifact(collect_dir, ctx)
-    _write_manifest(root, collect_dir, ctx.modules)
+    _write_manifest(root, collect_dir, ctx.modules, provenance=provenance)
     written = sorted(set(written) | {MANIFEST_FILENAME})
 
     if changes.is_empty():
@@ -613,6 +632,13 @@ def action_module(
         modules = [patched if m.path == module_path else m for m in modules]
     modules.sort(key=lambda m: m.path)
 
+    # Captured before `_write_artifact` below writes anything under
+    # `.collect/` — see `capture_provenance`'s docstring. Same ordering
+    # bug as `_full_build` otherwise: `.collect/` isn't git-ignored, so
+    # computing this after the write would see the write's own untracked
+    # output and report `dirty=True` regardless of the tracked tree.
+    git_sha, dirty = manifest_mod.capture_provenance(root)
+
     ctx = build_context(root, modules, config=config, config_path=config_path, llm_call=llm_call)
     written = _write_artifact(collect_dir, ctx)
 
@@ -632,8 +658,8 @@ def action_module(
     patched_manifest = manifest_mod.Manifest(
         collector_version=manifest_mod.COLLECTOR_VERSION,
         generated_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        git_sha=manifest_mod.get_git_sha(root),
-        dirty=manifest_mod.is_dirty(root),
+        git_sha=git_sha,
+        dirty=dirty,
         file_hashes=hashes,
     )
     manifest_mod.write_manifest(patched_manifest, manifest_path)

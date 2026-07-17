@@ -30,6 +30,11 @@ def _git(root: Path, *args: str) -> subprocess.CompletedProcess:
 
 
 def _init_repo(root: Path) -> None:
+    # .collect/ is a build artifact directory (same category as .agent/)
+    # and is git-ignored in the real project — mirrored here so these
+    # fixtures match real-world dirty-tree behavior rather than treating
+    # collect's own untracked output as an uncommitted source change.
+    (root / ".gitignore").write_text(".collect/\n")
     _git(root, "init", "-q")
     _git(root, "config", "user.email", "test@example.com")
     _git(root, "config", "user.name", "Test")
@@ -90,6 +95,42 @@ def test_build_manifest_detects_dirty_tree(mini_repo: Path):
     manifest = build_manifest(mini_repo)
     assert manifest.dirty is True
     assert is_dirty(mini_repo) is True
+
+
+def test_dirty_is_false_even_when_untracked_collect_output_exists(mini_repo: Path):
+    """Regression: `.collect/` is not git-ignored (by design — it's a
+    build artifact directory, same category as `.agent/`, but nothing
+    stops a caller from checking dirty status with it already present).
+    `is_dirty`/`build_manifest`, called on a tree whose *tracked* files
+    are all clean, must not be tripped up by an untracked `.collect/`
+    directory sitting next to them — that untracked output is not the
+    same thing as "the tree has uncommitted changes" and must not be
+    conflated with it by a naive `git status --porcelain` check that
+    runs after the output already exists on disk."""
+    (mini_repo / ".collect").mkdir()
+    (mini_repo / ".collect" / "artifact.json").write_text("{}\n")
+    assert is_dirty(mini_repo) is False
+    manifest = build_manifest(mini_repo)
+    assert manifest.dirty is False
+
+
+def test_capture_provenance_matches_get_git_sha_and_is_dirty(mini_repo: Path):
+    from tools.collect.manifest import capture_provenance
+
+    sha, dirty = capture_provenance(mini_repo)
+    assert sha == get_git_sha(mini_repo)
+    assert dirty is False
+
+
+def test_build_manifest_uses_precomputed_provenance_when_given(mini_repo: Path):
+    """`build_manifest(..., provenance=...)` must trust the passed-in
+    pair rather than recomputing — this is what lets a caller snapshot
+    `(git_sha, dirty)` before writing collector output, then hand that
+    snapshot through instead of re-deriving a now-stale-by-definition
+    dirty flag after its own writes have landed on disk."""
+    manifest = build_manifest(mini_repo, provenance=("deadbeef" * 5, True))
+    assert manifest.git_sha == "deadbeef" * 5
+    assert manifest.dirty is True
 
 
 def test_manifest_json_roundtrip(mini_repo: Path, tmp_path: Path):
