@@ -138,3 +138,100 @@ def test_all_sites_are_provenance_static():
     tree = ast.parse(source, filename="pkg/error_handling.py")
     sites = extract_except_sites(tree, "pkg/error_handling.py")
     assert all(s.provenance == Provenance.STATIC for s in sites)
+
+
+# ── BUGFIX regression: a nested def/class inside the except body is a ──────
+# ── separate execution scope, not part of the handler's own reaction ──────
+#
+# `_classify_except_body` used to call plain `ast.walk(stmt)` over every
+# statement in the body, which visits descendants regardless of enclosing
+# scope. An except body that only *defines* a nested callback containing a
+# bare `raise` (or a `log`/`continue`/`return`) doesn't react that way at
+# the except site itself — the callback's body only runs later, if and when
+# something calls it — so the actual handler is a silent swallow (fail-open)
+# exactly like a bare `pass`, and was being misclassified as the opposite.
+
+
+def test_bare_raise_inside_nested_def_does_not_count_as_re_raise():
+    source = (
+        "def f():\n"
+        "    try:\n"
+        "        risky()\n"
+        "    except Exception:\n"
+        "        def handler():\n"
+        "            raise\n"
+        "        register(handler)\n"
+    )
+    sites = _sites_by_location(source, "m.py")
+    site = sites["m.py:4"]
+    assert site.body_kind == "pass"
+    assert site.is_fail_open is True
+
+
+def test_bare_raise_inside_def_nested_deeper_in_an_if_still_excluded():
+    source = (
+        "def f(cond):\n"
+        "    try:\n"
+        "        risky()\n"
+        "    except Exception:\n"
+        "        if cond:\n"
+        "            def handler():\n"
+        "                raise\n"
+        "        else:\n"
+        "            pass\n"
+    )
+    sites = _sites_by_location(source, "m.py")
+    site = sites["m.py:4"]
+    assert site.body_kind == "pass"
+    assert site.is_fail_open is True
+
+
+def test_log_call_inside_nested_class_method_does_not_count_as_log():
+    source = (
+        "def f():\n"
+        "    try:\n"
+        "        risky()\n"
+        "    except Exception:\n"
+        "        class Deferred:\n"
+        "            def run(self):\n"
+        "                logger.error('boom')\n"
+        "        register(Deferred())\n"
+    )
+    sites = _sites_by_location(source, "m.py")
+    site = sites["m.py:4"]
+    assert site.body_kind == "pass"
+    assert site.is_fail_open is True
+
+
+def test_genuine_top_level_raise_still_detected():
+    # Regression guard: the fix above must not stop recognizing an actual
+    # bare `raise` that is a direct (non-nested-scope) statement.
+    source = (
+        "def f():\n"
+        "    try:\n"
+        "        risky()\n"
+        "    except Exception:\n"
+        "        raise\n"
+    )
+    sites = _sites_by_location(source, "m.py")
+    site = sites["m.py:4"]
+    assert site.body_kind == "re-raise"
+    assert site.is_fail_open is False
+
+
+def test_return_nested_inside_a_real_if_block_still_detected():
+    # Regression guard: control-flow statements (`if`/`for`/`while`/`try`)
+    # are not a separate scope, unlike `def`/`class`/`lambda` — a `return`
+    # nested inside one must still count.
+    source = (
+        "def f(cond):\n"
+        "    try:\n"
+        "        risky()\n"
+        "    except Exception:\n"
+        "        if cond:\n"
+        "            return None\n"
+    )
+    sites = _sites_by_location(source, "m.py")
+    site = sites["m.py:4"]
+    assert site.body_kind == "return"
+    assert site.is_fail_open is False

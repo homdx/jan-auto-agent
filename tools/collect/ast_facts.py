@@ -477,6 +477,38 @@ def _is_log_call(node: ast.AST) -> bool:
     )
 
 
+def _walk_own_scope(node: ast.AST):
+    """Like `ast.walk`, but never descends into a nested function/class/
+    lambda's own body — those are a separate execution scope, so a
+    statement inside one doesn't run as part of the node being walked.
+
+    BUGFIX (found via adversarial review, same bug class already fixed
+    elsewhere in this codebase — see `dataflow._walk`'s
+    `(FunctionDef, AsyncFunctionDef, ClassDef, Lambda)` scope skip and
+    `extract_all_defined_names`'s `in_function_body` tracking):
+    `_classify_except_body` used to call plain `ast.walk(stmt)`, which
+    visits every descendant regardless of enclosing scope. An except body
+    that merely *defines* a nested function containing a bare `raise` (a
+    deferred/callback error handler, e.g. `except Exception:\\n    def
+    handler(): raise\\n    register(handler)`) doesn't re-raise anything at
+    the except site itself — the handler body only runs later, if and when
+    something calls it — so the actual except block is a silent swallow
+    (fail-open) exactly like a bare `pass` would be. `ast.walk` saw the
+    `raise` nested three levels down inside `handler`'s own body and
+    classified the whole site `"re-raise", is_fail_open=False` anyway,
+    hiding a genuine silent-failure site from COLLECT-6's detector (and,
+    downstream, letting a real "this except silently swallows the error"
+    Pass B claim about that exact site get dropped by COLLECT-17's
+    contradiction_check as a false positive).
+    """
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+        yield node  # yield the def/class/lambda header itself, but not its own body
+        return
+    yield node
+    for child in ast.iter_child_nodes(node):
+        yield from _walk_own_scope(child)
+
+
 def _classify_except_body(body: List[ast.stmt]) -> "tuple[str, bool]":
     """`(body_kind, is_fail_open)` for one except handler's body (COLLECT-6).
 
@@ -503,7 +535,7 @@ def _classify_except_body(body: List[ast.stmt]) -> "tuple[str, bool]":
     has_continue = False
     has_return = False
     for stmt in body:
-        for sub in ast.walk(stmt):
+        for sub in _walk_own_scope(stmt):
             if isinstance(sub, ast.Raise) and sub.exc is None:
                 has_bare_raise = True
             elif _is_log_call(sub):
