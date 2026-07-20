@@ -71,6 +71,12 @@ class RunLimits:
         *execution constraint* (how long a single ``python``/test run may take),
         distinct from the whole-session ``max_runtime_sec`` cap.  ``0`` (or
         negative) means no per-execution timeout.  Default is 120s.
+    workspace_retain_count:
+        Max number of per-task ``.agent/workspace/<task_id>/`` mirrors (each
+        a full repo copy, see executor.py AUTO-FIX-1) kept on disk at once.
+        Without this bound, a long auto-mode run (AUTO-T1, AUTO-T2, ... plus
+        AUTO-G5 regression re-checks) fills the disk with one full repo copy
+        per task.  ``0`` disables pruning.  Default is 5.
     """
 
     def __init__(
@@ -78,10 +84,12 @@ class RunLimits:
         max_runtime_sec: float = 0,
         max_tasks_per_run: int = 0,
         exec_timeout_sec: float = 120,
+        workspace_retain_count: int = 5,
     ) -> None:
         self.max_runtime_sec   = max(0.0, float(max_runtime_sec))
         self.max_tasks_per_run = max(0, int(max_tasks_per_run))
         self.exec_timeout_sec  = max(0.0, float(exec_timeout_sec))
+        self.workspace_retain_count = max(0, int(workspace_retain_count))
 
     @classmethod
     def from_config(cls, config: configparser.ConfigParser) -> "RunLimits":
@@ -89,10 +97,12 @@ class RunLimits:
         max_min   = config.getfloat("auto", "max_runtime_min",   fallback=0)
         max_tasks = config.getint  ("auto", "max_tasks_per_run", fallback=0)
         exec_to   = config.getfloat("auto", "exec_timeout_sec",  fallback=120)
+        ws_retain = config.getint  ("auto", "workspace_retain_count", fallback=5)
         return cls(
             max_runtime_sec   = max_min * 60,
             max_tasks_per_run = max_tasks,
             exec_timeout_sec  = exec_to,
+            workspace_retain_count = ws_retain,
         )
 
     @property
@@ -542,6 +552,7 @@ class AutoController:
         executor = make_executor(
             self.base_dir,
             timeout_sec=self.limits.exec_timeout_sec,
+            max_retained_workspaces=self.limits.workspace_retain_count,
         )
         bug_fix_loop = make_bug_fix_loop(
             cfg, self.base_dir, self.state,
