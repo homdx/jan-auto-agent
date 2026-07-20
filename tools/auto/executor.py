@@ -402,6 +402,23 @@ class Executor:
             },
         )
 
+        # AUTO-FIX-2: shutil.copytree's default copy_function (copy2) copies
+        # *metadata* — including mtime — from base_dir onto the workspace
+        # directory itself. Every task's workspace therefore inherits
+        # base_dir's (static) mtime instead of getting a fresh one, so
+        # _prune_old_workspaces' "oldest mtime first" sort is meaningless
+        # (all workspaces compare equal) and evicts an effectively random
+        # sibling rather than the actually-oldest one. Stamp the workspace
+        # with the current time after population so pruning below — and any
+        # future caller — sees a real, monotonically increasing recency.
+        try:
+            os.utime(workspace, None)
+        except OSError as exc:
+            logger.warning(
+                "_prepare_workspace: could not refresh mtime for %s (%s) — "
+                "workspace pruning order may be unreliable", workspace, exc,
+            )
+
         self._prune_old_workspaces(keep=workspace)
 
         return workspace
