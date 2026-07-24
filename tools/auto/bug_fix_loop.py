@@ -58,7 +58,7 @@ from tools.auto.ticket_store import (
     TicketStore, make_ticket, TicketAlreadyExists, TicketNotFound,
 )
 
-from tools.auto.state import STATUS_BLOCKED
+from tools.auto.state import STATUS_BLOCKED, STATUS_DONE
 
 logger = logging.getLogger(__name__)
 
@@ -194,8 +194,20 @@ class BugFixLoop:
         re-registers the fix task as TODO through the normal path, so this
         does not make a retry impossible.
         """
+        # A fix task only exists once an attempt has been started, so on the
+        # terminal gates there is usually nothing to park.  Check first
+        # rather than relying on the except, so the common case stays quiet.
+        existing_task = self._state.get_task(fix_id)
+        if existing_task is None:
+            return
+        if existing_task.get("status") in (STATUS_DONE, STATUS_BLOCKED):
+            return                          # already settled — nothing to do
         try:
             self._state.set_task_status(fix_id, STATUS_BLOCKED)
+            logger.info(
+                "BugFixLoop: parked fix task %s as BLOCKED (its regression is "
+                "not resolvable without a human)", fix_id,
+            )
         except Exception as exc:            # pragma: no cover — defensive
             logger.warning(
                 "BugFixLoop: could not park fix task %s: %s", fix_id, exc
@@ -295,6 +307,21 @@ class BugFixLoop:
         status   = (existing or {}).get("status")
         attempts = self._attempts_of(existing)
 
+        # An existing ticket back at "open" can only be an operator reset:
+        # a ticket is moved to "in-progress" immediately after its attempt is
+        # claimed, so the normal flow never leaves one "open" with attempts
+        # already spent.  Reset is the explicit "try this again" signal, so
+        # the budget must be restored with it — carrying the stale counter
+        # over meant the retry got a single attempt (and logged the nonsense
+        # "attempt 3/2"), then deferred again immediately, no matter how many
+        # times the operator reset it.
+        if status == "open" and attempts:
+            logger.info(
+                "BugFixLoop: ticket %s was reset to open — restoring the fix "
+                "attempt budget (was %d)", ticket_id, attempts,
+            )
+            attempts = 0
+
         # "fixed" + a failing check is a contradiction, and silently skipping
         # it was how a run could finish green over a permanently broken test.
         # The old code returned fixed=True here, so the controller logged
@@ -326,6 +353,7 @@ class BugFixLoop:
                 "bug_fix_loop", "controller", "verification_failed",
                 params={"ticket_id": ticket_id, "triggering_task": trig_id},
             )
+            self._park_fix_task(fix_id)
             return BugFixResult(
                 ticket_id, fix_id, fixed=False,
                 skipped=True, verification_failed=True,
@@ -336,6 +364,7 @@ class BugFixLoop:
                 "BugFixLoop: ticket %s already verification-failed — skipping "
                 "(reset its status to retry)", ticket_id,
             )
+            self._park_fix_task(fix_id)
             return BugFixResult(
                 ticket_id, fix_id, fixed=False,
                 skipped=True, verification_failed=True,
@@ -350,6 +379,7 @@ class BugFixLoop:
                 "BugFixLoop: ticket %s already deferred — skipping "
                 "(reset its status to retry)", ticket_id,
             )
+            self._park_fix_task(fix_id)
             return BugFixResult(
                 ticket_id, fix_id, fixed=False, exhausted=True, skipped=True,
             )
@@ -379,6 +409,7 @@ class BugFixLoop:
                 "bug_fix_loop", "controller", "attempts_exhausted",
                 params={"ticket_id": ticket_id, "attempts": attempts},
             )
+            self._park_fix_task(fix_id)
             return BugFixResult(
                 ticket_id, fix_id, fixed=False, exhausted=True, skipped=True,
             )

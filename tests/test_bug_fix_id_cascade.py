@@ -43,7 +43,8 @@ from tools.auto.bug_fix_loop import (
     BugFixLoop, MAX_FIX_ATTEMPTS, _root_task_id,
 )
 from tools.auto.state import StateStore
-from tools.auto.ticket_store import make_ticket_store
+from tools.auto.state import STATUS_DONE
+from tools.auto.ticket_store import make_ticket, make_ticket_store
 from tools.auto.utils import safe_filename_component, atomic_write_text
 
 
@@ -425,3 +426,122 @@ class TestFixTaskDoesNotSurviveInTheQueue:
         bfl._outer.run_task.return_value = FakeOuterResult(passed=True)
         r = bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
         assert r.fixed is True
+
+
+# ── 5. Defects found reviewing the parking / budget fix itself ───────────────
+
+class TestOperatorResetRestoresBudget:
+    """Resetting a ticket to "open" must restore a FULL attempt budget.
+
+    fix_attempts persists across the reset, so carrying it over meant the
+    retry got a single attempt before deferring again — and logged the
+    nonsense "attempt 3/2" — no matter how many times the operator reset it.
+    A ticket goes to "in-progress" the moment its attempt is claimed, so an
+    existing ticket sitting at "open" can only be a deliberate reset.
+    """
+
+    def test_reset_grants_full_budget_again(self, tmp_path):
+        bfl, tickets, _ = _bfl(tmp_path, FakeOuterResult(passed=False, exhausted=False))
+        for _ in range(MAX_FIX_ATTEMPTS):
+            bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
+        assert tickets.get("BUG-AUTO-T168")["status"] == "deferred"
+
+        tickets.update("BUG-AUTO-T168", status="open")
+        base = bfl._outer.run_task.call_count
+        for _ in range(MAX_FIX_ATTEMPTS + 3):
+            bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
+        assert bfl._outer.run_task.call_count - base == MAX_FIX_ATTEMPTS
+
+    def test_reset_is_still_bounded(self, tmp_path):
+        """Restoring the budget must not reopen the unbounded path."""
+        bfl, tickets, _ = _bfl(tmp_path, FakeOuterResult(passed=False, exhausted=False))
+        for _ in range(20):
+            bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
+        assert bfl._outer.run_task.call_count == MAX_FIX_ATTEMPTS
+        assert tickets.get("BUG-AUTO-T168")["status"] == "deferred"
+
+    def test_fresh_ticket_unaffected(self, tmp_path):
+        bfl, tickets, _ = _bfl(tmp_path, FakeOuterResult(passed=False, exhausted=True))
+        bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
+        assert tickets.get("BUG-AUTO-T168")["fix_attempts"] == 1
+
+
+class TestTerminalGatesAlsoParkFixTask:
+    """Parking on 4b/4c was not enough — the early-return gates matter too.
+
+    If a run is killed after the attempt is claimed but before OuterLoop
+    returns a verdict, the fix task is left TODO.  On resume the ticket gate
+    fires and returns early, so 4b/4c never run — and without parking here
+    the fix task stays pending and the main queue re-runs the regression
+    that was just deferred, bypassing the short-circuit entirely.
+    """
+
+    @staticmethod
+    def _crash_then_resume(tmp_path, resume_outer):
+        state   = StateStore(tmp_path / ".agent")
+        state.initialise("fix regressions", tmp_path)
+        tickets = make_ticket_store(tmp_path / ".agent")
+        cos     = MagicMock()
+
+        class Boom(Exception):
+            pass
+
+        dying = MagicMock()
+        dying.run_task.side_effect = Boom("run killed mid-OuterLoop")
+        try:
+            BugFixLoop(dying, cos, tickets, state, max_fix_attempts=1) \
+                .handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
+        except Boom:
+            pass
+        assert state.get_task("BUG-FIX-AUTO-T168")["status"] == "todo"
+
+        outer = MagicMock()
+        outer.run_task.return_value = resume_outer
+        bfl = BugFixLoop(outer, cos, tickets, state, max_fix_attempts=1)
+        result = bfl.handle_regression(
+            _task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path
+        )
+        pending = [t["id"] for t in state.resume_info()["pending"]]
+        return result, pending, tickets, outer
+
+    def test_attempts_exhausted_gate_parks(self, tmp_path):
+        result, pending, tickets, outer = self._crash_then_resume(
+            tmp_path, FakeOuterResult(passed=True)
+        )
+        assert result.skipped is True
+        assert tickets.get("BUG-AUTO-T168")["status"] == "deferred"
+        assert "BUG-FIX-AUTO-T168" not in pending
+        outer.run_task.assert_not_called()
+
+    def test_deferred_gate_parks(self, tmp_path):
+        state   = StateStore(tmp_path / ".agent")
+        state.initialise("fix regressions", tmp_path)
+        tickets = make_ticket_store(tmp_path / ".agent")
+        outer   = MagicMock()
+        outer.run_task.return_value = FakeOuterResult(passed=False, exhausted=True)
+        bfl = BugFixLoop(outer, MagicMock(), tickets, state)
+        bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
+        # Un-park by hand to model a fix task revived by an external edit.
+        state.set_task_status("BUG-FIX-AUTO-T168", "todo")
+        bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
+        pending = [t["id"] for t in state.resume_info()["pending"]]
+        assert "BUG-FIX-AUTO-T168" not in pending
+
+    def test_parking_absent_task_is_a_quiet_noop(self, tmp_path):
+        """Terminal gates usually run with no fix task in state at all."""
+        bfl, tickets, state = _bfl(tmp_path, FakeOuterResult(passed=True))
+        tickets.create(make_ticket(
+            id="BUG-AUTO-T999", type="bug", linked_task="AUTO-T999",
+            title="t", body="b", status="deferred",
+        ))
+        r = bfl.handle_regression(_task("AUTO-T999"), FakeExecResult(), base_dir=tmp_path)
+        assert r.skipped is True
+        assert state.get_task("BUG-FIX-AUTO-T999") is None
+
+    def test_parking_does_not_disturb_a_committed_fix_task(self, tmp_path):
+        """A DONE fix task must stay DONE, not be dragged back to BLOCKED."""
+        bfl, tickets, state = _bfl(tmp_path, FakeOuterResult(passed=True))
+        bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
+        state.set_task_status("BUG-FIX-AUTO-T168", STATUS_DONE)
+        bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
+        assert state.get_task("BUG-FIX-AUTO-T168")["status"] == STATUS_DONE
