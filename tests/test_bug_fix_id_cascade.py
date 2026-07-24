@@ -43,7 +43,7 @@ from tools.auto.bug_fix_loop import (
     BugFixLoop, MAX_FIX_ATTEMPTS, _root_task_id,
 )
 from tools.auto.state import StateStore
-from tools.auto.state import STATUS_DONE
+from tools.auto.state import STATUS_BLOCKED, STATUS_DONE, STATUS_TODO, make_task
 from tools.auto.ticket_store import make_ticket, make_ticket_store
 from tools.auto.utils import safe_filename_component, atomic_write_text
 
@@ -294,27 +294,33 @@ class TestControllerSkipKeepsCoverage:
 
     @staticmethod
     def _kept(all_tasks, just_committed_id="OTHER"):
-        from tools.auto.bug_fix_loop import _FIX_PREFIX, _root_task_id
-        from tools.auto.state import STATUS_DONE
-        by_id = {t["id"]: t for t in all_tasks}
+        """Which tasks does the REAL _check_regressions actually re-check?
 
-        def redundant(t):
-            tid = t["id"]
-            if not tid.startswith(_FIX_PREFIX):
-                return False
-            root = by_id.get(_root_task_id(tid))
-            return (
-                root is not None
-                and root.get("status") == STATUS_DONE
-                and root["id"] != just_committed_id
-                and root.get("acceptance_check", "") == t.get("acceptance_check", "")
-            )
+        This drives AutoController._check_regressions itself and reports the
+        tasks it handed to the executor.  An earlier version of this helper
+        re-implemented the filter inside the test file, which made every
+        assertion below tautological: it passed identically on fixed and
+        unfixed production code, so it could not have caught the bug it was
+        written for.  Never re-implement the logic under test.
+        """
+        import configparser
+        from unittest.mock import MagicMock
+        from tools.auto.controller import AutoController
 
-        return [
-            t["id"] for t in all_tasks
-            if t["status"] == STATUS_DONE and t["id"] != just_committed_id
-            and t.get("acceptance_check", "").strip() and not redundant(t)
-        ]
+        state = MagicMock()
+        state.all_tasks.return_value = all_tasks
+
+        stub = MagicMock()
+        stub.state = state
+        stub.is_runtime_exceeded.return_value = False
+
+        executor = MagicMock()
+        executor.run.return_value = MagicMock(passed=True)   # no regressions
+
+        AutoController._check_regressions(
+            stub, just_committed_id, executor, MagicMock()
+        )
+        return [c.args[0]["id"] for c in executor.run.call_args_list]
 
     CHK = "pytest tests/test_x.py -q"
 
@@ -779,3 +785,97 @@ class TestNoGitMode:
         for _ in range(10):
             bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
         assert outer.run_task.call_count == MAX_FIX_ATTEMPTS
+
+
+# ── 8. Parking must survive the startup reset ───────────────────────────────
+
+class TestParkingSurvivesStartupReset:
+    """Controller._reset_resettable_blocked_tasks was undoing the parking.
+
+    That method resets BLOCKED tasks to TODO at every startup so unmet
+    dependencies get re-evaluated, skipping only tasks that have burned all
+    their OuterLoop rounds.  A fix task parked by BugFixLoop has usually
+    burned none — a run killed mid-fix, or an inconclusive attempt — so it
+    was reset on every resume, put straight back into the pending queue, and
+    executed by the main loop outside the ticket short-circuit and outside
+    the fix_attempts bound.  Parking was undone in exactly the cases it
+    exists for.
+
+    Fix tasks carry no depends_on, so the dependency case cannot apply to
+    them; BLOCKED on a BUG-FIX-* task always means parked or round-exhausted,
+    and neither benefits from a reset.
+    """
+
+    @staticmethod
+    def _real_startup_reset(state):
+        """Invoke the REAL AutoController._reset_resettable_blocked_tasks.
+
+        The first version of this helper replayed the method's logic inside
+        the test file.  That made the whole class tautological — it passed on
+        unfixed production code, which is precisely the failure mode these
+        tests exist to rule out.
+        """
+        import configparser
+        from unittest.mock import MagicMock
+        from tools.auto.controller import AutoController
+
+        cfg = configparser.ConfigParser()
+        cfg.add_section("auto")
+        stub = MagicMock()
+        stub.state = state
+        AutoController._reset_resettable_blocked_tasks(stub, cfg)
+
+    def test_parked_fix_task_stays_parked_across_restart(self, tmp_path):
+        bfl, _t, state = _bfl(tmp_path, FakeOuterResult(passed=False, exhausted=False))
+        bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
+        assert state.get_task("BUG-FIX-AUTO-T168")["status"] == STATUS_BLOCKED
+
+        self._real_startup_reset(state)
+
+        assert state.get_task("BUG-FIX-AUTO-T168")["status"] == STATUS_BLOCKED
+        pending = [t["id"] for t in state.resume_info()["pending"]]
+        assert "BUG-FIX-AUTO-T168" not in pending
+
+    def test_parked_after_crash_stays_parked(self, tmp_path):
+        """The crash case has burned no rounds, so case 2 would not save it."""
+        state = StateStore(tmp_path / ".agent")
+        state.initialise("fix regressions", tmp_path)
+        tickets = make_ticket_store(tmp_path / ".agent")
+
+        class Boom(Exception):
+            pass
+
+        outer = MagicMock()
+        outer.run_task.side_effect = Boom("killed mid-fix")
+        with pytest.raises(Boom):
+            BugFixLoop(outer, MagicMock(), tickets, state).handle_regression(
+                _task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path
+            )
+        self._real_startup_reset(state)
+        pending = [t["id"] for t in state.resume_info()["pending"]]
+        assert "BUG-FIX-AUTO-T168" not in pending
+
+    def test_ordinary_blocked_task_is_still_reset(self, tmp_path):
+        """The dependency case must keep working — don't over-broaden."""
+        state = StateStore(tmp_path / ".agent")
+        state.initialise("g", tmp_path)
+        state.upsert_task(make_task(
+            id="AUTO-T9", title="blocked on a dependency", instruction="i",
+            target_files=["a.py"], acceptance_check="true",
+        ))
+        state.set_task_status("AUTO-T9", STATUS_BLOCKED)
+
+        self._real_startup_reset(state)
+
+        assert state.get_task("AUTO-T9")["status"] == STATUS_TODO
+
+    def test_operator_reset_still_revives_the_fix_task(self, tmp_path):
+        """Skipping the reset must not make a deliberate retry impossible."""
+        bfl, tickets, state = _bfl(tmp_path, FakeOuterResult(passed=False, exhausted=True))
+        bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
+        self._real_startup_reset(state)
+
+        tickets.update("BUG-AUTO-T168", status="open")
+        bfl._outer.run_task.return_value = FakeOuterResult(passed=True)
+        r = bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
+        assert r.fixed is True

@@ -14,7 +14,7 @@ from unittest.mock import MagicMock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tools.auto.bug_fix_loop import BugFixLoop, MAX_FIX_ATTEMPTS
-from tools.auto.state import StateStore, STATUS_DONE, STATUS_BLOCKED
+from tools.auto.state import StateStore, STATUS_DONE, STATUS_BLOCKED, STATUS_TODO
 from tools.auto.ticket_store import make_ticket_store
 
 @dataclass
@@ -79,6 +79,20 @@ def one_run(seed):
         elif act < 0.20:
             if st.get_task("BUG-FIX-AUTO-T1"):
                 st.set_task_status("BUG-FIX-AUTO-T1", "todo"); events.append("task revived")
+        elif act < 0.30:
+            # Controller._reset_resettable_blocked_tasks, replayed verbatim.
+            # Runs at EVERY startup; undoing parking here is what reopened
+            # the main-queue bypass on resume.
+            from tools.auto.utils import highest_completed_round
+            for _t in st.all_tasks():
+                if _t["status"] != STATUS_BLOCKED:
+                    continue
+                if _t["id"].startswith("BUG-FIX-"):
+                    continue
+                if highest_completed_round(st.task_dir(_t["id"])) >= 10:
+                    continue
+                st.set_task_status(_t["id"], STATUS_TODO)
+            events.append("startup reset")
         try:
             res = bfl.handle_regression(task(trig), ER(), base_dir=d)
             events.append(f"{trig} -> {res.ticket_id}/{res.fix_task_id}")

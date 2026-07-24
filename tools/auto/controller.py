@@ -862,9 +862,30 @@ class AutoController:
         honestly reflects reality. Only genuinely-resettable tasks (case 1,
         or anything that hasn't used up its rounds) are reset.
         """
+        from tools.auto.bug_fix_loop import _FIX_PREFIX
+
         max_rounds_cfg = cfg.getint("auto", "max_rounds_per_task", fallback=10)
         for task in self.state.all_tasks():
             if task["status"] != STATUS_BLOCKED:
+                continue
+            # Case 3: a synthetic BUG-FIX-* task parked by BugFixLoop.
+            #
+            # BugFixLoop marks these BLOCKED precisely to keep an unresolvable
+            # regression out of the pending queue — otherwise the main loop
+            # picks the fix task up next session and re-runs it directly,
+            # outside the ticket short-circuit and outside the fix_attempts
+            # bound.  Resetting it here undid that on EVERY startup, reopening
+            # the bypass for exactly the cases parking exists for (a run
+            # killed mid-fix, or an inconclusive attempt), since neither has
+            # burned enough rounds to trip the case-2 check below.
+            #
+            # Fix tasks carry no depends_on, so case 1 (unmet dependency)
+            # cannot apply to them: BLOCKED here always means parked or
+            # round-exhausted, and neither benefits from a reset.  BugFixLoop
+            # owns their lifecycle and re-upserts the task (restoring TODO)
+            # when the ticket gate authorises another attempt, so skipping
+            # them does not make a retry impossible.
+            if task["id"].startswith(_FIX_PREFIX):
                 continue
             if highest_completed_round(self.state.task_dir(task["id"])) >= max_rounds_cfg:
                 continue  # round-exhausted — resetting would not help
