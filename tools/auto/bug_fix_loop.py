@@ -511,14 +511,33 @@ class BugFixLoop:
             #
             # Treat it as an inconclusive attempt — the same bounded
             # retry-then-defer machinery as branch 4c — rather than a fix.
-            if not sha:
+            # `sha` alone is the WRONG discriminator here, and treating it as
+            # one was a bug: commit() returns None for TWO different outcomes.
+            #
+            #   * nothing staged — an empty diff.  CommitOnSuccess handles
+            #     this deliberately (commit_on_success.py, the `else` after
+            #     `if sha:`): it logs "nothing staged", marks the task DONE
+            #     with commit="" and returns None.  The acceptance check
+            #     passed and the tree is already correct, so this IS a
+            #     success — it is what a flaky regression that resolves
+            #     itself looks like.
+            #   * GitError — rejected pre-commit hook, detached HEAD, missing
+            #     identity, lock contention.  commit() returns None EARLY,
+            #     without marking anything, so the fix task is still TODO.
+            #     This is a genuine failure.
+            #
+            # The task's own status separates them without changing
+            # commit()'s contract: DONE means the commit path settled it,
+            # by either route.
+            settled = (self._state.get_task(fix_id) or {}).get("status") == STATUS_DONE
+            if not sha and not settled:
                 logger.error(
-                    "BugFixLoop: fix task %s passed its check but nothing was "
-                    "committed (empty diff or git error) — NOT marking %s "
-                    "fixed", fix_id, ticket_id,
+                    "BugFixLoop: fix task %s passed its check but the commit "
+                    "failed (git error) — NOT marking %s fixed",
+                    fix_id, ticket_id,
                 )
                 self._state.log(
-                    f"bug {ticket_id} fix passed but produced no commit "
+                    f"bug {ticket_id} fix passed but the commit failed "
                     f"(attempt {attempts}/{self._max_fix_attempts}) — "
                     f"not marking fixed"
                 )

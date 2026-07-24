@@ -51,8 +51,13 @@ def one_run(seed):
     o = MagicMock(); o.run_task.side_effect = outer_behaviour
     cos = MagicMock()
     def commit(t_, r_):
-        if rnd.random() < 0.25:
-            return None                      # empty diff / GitError
+        # Faithful to CommitOnSuccess: THREE outcomes, not two.
+        r = rnd.random()
+        if r < 0.15:
+            return None                              # GitError: nothing settled
+        if r < 0.30:
+            st.set_task_status(t_["id"], STATUS_DONE, commit="")
+            return None                              # nothing staged: settled
         st.set_task_status(t_["id"], STATUS_DONE, commit="deadbeefcafe")
         return "deadbeefcafe"
     cos.commit.side_effect = commit

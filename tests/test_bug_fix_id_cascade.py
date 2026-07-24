@@ -599,6 +599,43 @@ class TestPassedButNotCommitted:
         assert outer.run_task.call_count == MAX_FIX_ATTEMPTS
         assert tickets.get("BUG-AUTO-T168")["status"] == "deferred"
 
+    def test_nothing_staged_is_a_SUCCESS_not_a_failure(self, tmp_path):
+        """commit() returns None for two different outcomes — don't conflate.
+
+        On an empty diff, CommitOnSuccess deliberately marks the task DONE
+        with commit="" and returns None (commit_on_success.py, the `else`
+        after `if sha:`).  The acceptance check passed and the tree is
+        already correct — that is exactly what a flaky regression resolving
+        itself looks like, and it is a success.  Only a GitError returns None
+        while leaving the task unsettled.
+        """
+        state = StateStore(tmp_path / ".agent")
+        state.initialise("fix regressions", tmp_path)
+        tickets = make_ticket_store(tmp_path / ".agent")
+        outer = MagicMock()
+        outer.run_task.return_value = FakeOuterResult(passed=True)
+        cos = MagicMock()
+
+        def nothing_staged(task_, result_):
+            state.set_task_status(task_["id"], STATUS_DONE, commit="")
+            return None
+
+        cos.commit.side_effect = nothing_staged
+        bfl = BugFixLoop(outer, cos, tickets, state)
+        r = bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
+
+        assert r.fixed is True
+        assert tickets.get("BUG-AUTO-T168")["status"] == "fixed"
+        assert outer.run_task.call_count == 1      # not retried as inconclusive
+
+    def test_git_error_is_still_treated_as_failure(self, tmp_path):
+        """The other None: commit() returns early, nothing is settled."""
+        bfl, tickets, state, _o = self._bfl_no_commit(tmp_path)
+        r = bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
+        assert r.fixed is False
+        assert state.get_task("BUG-FIX-AUTO-T168")["status"] != STATUS_DONE
+        assert tickets.get("BUG-AUTO-T168")["status"] != "fixed"
+
     def test_real_commit_still_marks_fixed(self, tmp_path):
         """The guard must not break the ordinary success path."""
         bfl, tickets, _ = _bfl(tmp_path, FakeOuterResult(passed=True))
