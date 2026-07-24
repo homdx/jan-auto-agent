@@ -459,11 +459,85 @@ class BugFixLoop:
         logger.info(
             "BugFixLoop: running fix loop for %s → %s", ticket_id, fix_id
         )
-        outer_result = self._outer.run_task(fix_task, base_dir)
+        try:
+            outer_result = self._outer.run_task(fix_task, base_dir)
+        except BaseException:
+            # The fix task is registered STATUS_TODO and only the outcome
+            # branches below settle it.  If OuterLoop raises — LLM timeout,
+            # API error, MemoryError, KeyboardInterrupt — the exception
+            # propagates out of handle_regression and the task is left TODO,
+            # which resume_info() reports as pending.  The RESUMED run's main
+            # queue then executes the fix task directly, outside this loop:
+            # the fix_attempts bound is bypassed, the ticket is never moved to
+            # "fixed" even if that run succeeds, and a failure routes to
+            # ExhaustionHandler, which opens a SECOND ticket
+            # (TICKET-BUG-FIX-...) for the same underlying bug.
+            #
+            # Park before re-raising so the crashed attempt cannot leak into
+            # the main queue.  The attempt has already been charged, and a
+            # later handle_regression with attempts remaining re-upserts the
+            # task (upsert_task replaces wholesale, restoring TODO), so this
+            # does not block a legitimate retry.
+            self._park_fix_task(fix_id)
+            # If this crash consumed the last attempt the ticket will never be
+            # retried, so leaving it "in-progress" misreports live work to
+            # anyone reading .agent/tickets/ during an incident.  Settle the
+            # label now; the behaviour is unchanged either way, since the
+            # gate would defer it on the next entry regardless.
+            if attempts >= self._max_fix_attempts:
+                self._safe_update(ticket_id, status="deferred")
+                self._state.log(
+                    f"bug {ticket_id} deferred — fix loop crashed on its "
+                    f"last attempt ({attempts}/{self._max_fix_attempts})"
+                )
+            raise
 
         # ── 4a. Fix passed — commit and close ticket ──────────────────────────
         if getattr(outer_result, "passed", False):
             sha = self._cos.commit(fix_task, outer_result)
+
+            # CommitOnSuccess.commit() returns None on GitError AND when
+            # nothing was staged, and only calls set_task_status(DONE) when a
+            # sha actually came back.  So "passed but not committed" left the
+            # fix task TODO — pending — for the main queue to pick up on the
+            # next run, outside this loop's attempt accounting.  Marking the
+            # ticket "fixed" on top of that claimed a repair that exists only
+            # in the working tree, or nowhere at all.
+            #
+            # This is not an exotic path: a flaky check that regresses and
+            # then passes again without the coder needing to change anything
+            # produces an empty diff, hence no sha.  A failing pre-commit
+            # hook, a detached HEAD or missing git identity produce the same.
+            #
+            # Treat it as an inconclusive attempt — the same bounded
+            # retry-then-defer machinery as branch 4c — rather than a fix.
+            if not sha:
+                logger.error(
+                    "BugFixLoop: fix task %s passed its check but nothing was "
+                    "committed (empty diff or git error) — NOT marking %s "
+                    "fixed", fix_id, ticket_id,
+                )
+                self._state.log(
+                    f"bug {ticket_id} fix passed but produced no commit "
+                    f"(attempt {attempts}/{self._max_fix_attempts}) — "
+                    f"not marking fixed"
+                )
+                tracer.event(
+                    "bug_fix_loop", "controller", "fix_not_committed",
+                    params={"ticket_id": ticket_id, "fix_task": fix_id},
+                )
+                self._park_fix_task(fix_id)
+                if attempts >= self._max_fix_attempts:
+                    self._safe_update(ticket_id, status="deferred")
+                    self._state.log(
+                        f"bug {ticket_id} deferred — fix attempts exhausted "
+                        f"without a commit"
+                    )
+                    return BugFixResult(
+                        ticket_id, fix_id, fixed=False, exhausted=True,
+                    )
+                return BugFixResult(ticket_id, fix_id, fixed=False)
+
             self._safe_update(ticket_id, status="fixed")
             self._state.log(
                 f"bug {ticket_id} FIXED — commit {sha[:10] if sha else 'none'} "

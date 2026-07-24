@@ -493,7 +493,11 @@ class TestTerminalGatesAlsoParkFixTask:
                 .handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
         except Boom:
             pass
-        assert state.get_task("BUG-FIX-AUTO-T168")["status"] == "todo"
+        # An in-process exception now parks the task on its way out, so force
+        # it back to model the harder case the gate must still cover: SIGKILL
+        # / power loss, where no Python runs and the task is left TODO on disk
+        # with no opportunity to clean up.
+        state.set_task_status("BUG-FIX-AUTO-T168", "todo")
 
         outer = MagicMock()
         outer.run_task.return_value = resume_outer
@@ -545,3 +549,113 @@ class TestTerminalGatesAlsoParkFixTask:
         state.set_task_status("BUG-FIX-AUTO-T168", STATUS_DONE)
         bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
         assert state.get_task("BUG-FIX-AUTO-T168")["status"] == STATUS_DONE
+
+
+# ── 6. Defects found by randomised state-machine fuzzing ────────────────────
+
+class TestPassedButNotCommitted:
+    """CommitOnSuccess.commit() can return None — "passed" is not "committed".
+
+    commit() returns None on GitError AND when nothing was staged, and only
+    calls set_task_status(DONE) when a sha actually comes back.  So a fix
+    that passed but produced no commit left the fix task TODO — pending —
+    for the next run's MAIN queue to execute outside this loop's accounting,
+    while the ticket was marked "fixed" for a repair that exists only in the
+    working tree, or nowhere.
+
+    Not exotic: a flaky check that regresses and then passes again without
+    the coder changing anything yields an empty diff, hence no sha.  A
+    failing pre-commit hook, detached HEAD or missing git identity do too.
+    """
+
+    @staticmethod
+    def _bfl_no_commit(tmp_path, max_attempts=MAX_FIX_ATTEMPTS):
+        state = StateStore(tmp_path / ".agent")
+        state.initialise("fix regressions", tmp_path)
+        tickets = make_ticket_store(tmp_path / ".agent")
+        outer = MagicMock()
+        outer.run_task.return_value = FakeOuterResult(passed=True)
+        cos = MagicMock()
+        cos.commit.return_value = None          # empty diff / GitError
+        return BugFixLoop(outer, cos, tickets, state, max_fix_attempts=max_attempts), \
+               tickets, state, outer
+
+    def test_ticket_not_marked_fixed_without_a_commit(self, tmp_path):
+        bfl, tickets, _s, _o = self._bfl_no_commit(tmp_path)
+        r = bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
+        assert r.fixed is False
+        assert tickets.get("BUG-AUTO-T168")["status"] != "fixed"
+
+    def test_fix_task_not_left_pending(self, tmp_path):
+        bfl, _t, state, _o = self._bfl_no_commit(tmp_path)
+        bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
+        pending = [t["id"] for t in state.resume_info()["pending"]]
+        assert "BUG-FIX-AUTO-T168" not in pending
+
+    def test_bounded_then_deferred(self, tmp_path):
+        bfl, tickets, _s, outer = self._bfl_no_commit(tmp_path)
+        for _ in range(12):
+            bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
+        assert outer.run_task.call_count == MAX_FIX_ATTEMPTS
+        assert tickets.get("BUG-AUTO-T168")["status"] == "deferred"
+
+    def test_real_commit_still_marks_fixed(self, tmp_path):
+        """The guard must not break the ordinary success path."""
+        bfl, tickets, _ = _bfl(tmp_path, FakeOuterResult(passed=True))
+        r = bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
+        assert r.fixed is True
+        assert r.commit_hash
+        assert tickets.get("BUG-AUTO-T168")["status"] == "fixed"
+
+
+class TestCrashDuringOuterLoop:
+    """An exception out of OuterLoop must not leak the fix task."""
+
+    class Boom(Exception):
+        pass
+
+    def _crashing(self, tmp_path, max_attempts=MAX_FIX_ATTEMPTS):
+        state = StateStore(tmp_path / ".agent")
+        state.initialise("fix regressions", tmp_path)
+        tickets = make_ticket_store(tmp_path / ".agent")
+        outer = MagicMock()
+        outer.run_task.side_effect = self.Boom("LLM timeout / OOM / API error")
+        return BugFixLoop(outer, MagicMock(), tickets, state,
+                          max_fix_attempts=max_attempts), tickets, state
+
+    def test_exception_propagates(self, tmp_path):
+        bfl, _t, _s = self._crashing(tmp_path)
+        with pytest.raises(self.Boom):
+            bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
+
+    def test_fix_task_parked_not_pending(self, tmp_path):
+        bfl, _t, state = self._crashing(tmp_path)
+        with pytest.raises(self.Boom):
+            bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
+        pending = [t["id"] for t in state.resume_info()["pending"]]
+        assert "BUG-FIX-AUTO-T168" not in pending
+
+    def test_attempt_still_charged(self, tmp_path):
+        """The crashed attempt must not be free, or crashes become a loop."""
+        bfl, tickets, _s = self._crashing(tmp_path)
+        with pytest.raises(self.Boom):
+            bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
+        assert tickets.get("BUG-AUTO-T168")["fix_attempts"] == 1
+
+    def test_crash_on_last_attempt_settles_the_ticket(self, tmp_path):
+        """Otherwise .agent/tickets/ misreports live work during an incident."""
+        bfl, tickets, _s = self._crashing(tmp_path, max_attempts=1)
+        with pytest.raises(self.Boom):
+            bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
+        assert tickets.get("BUG-AUTO-T168")["status"] == "deferred"
+
+    def test_crash_with_budget_left_stays_retryable(self, tmp_path):
+        bfl, tickets, _s = self._crashing(tmp_path, max_attempts=3)
+        with pytest.raises(self.Boom):
+            bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
+        assert tickets.get("BUG-AUTO-T168")["status"] == "in-progress"
+
+        bfl._outer.run_task.side_effect = None
+        bfl._outer.run_task.return_value = FakeOuterResult(passed=True)
+        r = bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
+        assert r.fixed is True
