@@ -335,7 +335,22 @@ class TestFixTaskRegistration:
 # ── idempotency ───────────────────────────────────────────────────────────────
 
 class TestIdempotency:
-    def test_already_fixed_ticket_skipped(self, tmp_path):
+    def test_already_fixed_ticket_escalates_not_silently_reaffirmed(self, tmp_path):
+        """A "fixed" ticket whose check fails AGAIN is a verification failure.
+
+        This test previously asserted ``result.fixed is True`` — i.e. that
+        handle_regression re-affirmed the fix purely because the ticket said
+        so, while the acceptance check it was handed had just failed.  That
+        is how a run could finish green over a permanently broken test: the
+        controller logged "already fixed — skipped" and moved on, forever,
+        and nothing ever surfaced the contradiction.
+
+        Reaching handle_regression *means* the check failed, so "fixed" plus
+        arrival here is proof the recorded fix did not hold.  The cheap
+        short-circuit is kept (OuterLoop must NOT re-run on the same inputs
+        that produced the bad pass), but the outcome is now an escalation to
+        the terminal ``verification-failed`` state instead of a false green.
+        """
         bfl, tickets, _ = _make_bfl(tmp_path, FakeOuterResult(passed=True))
         task = _make_triggering_task()
         exec_result = FakeExecResult()
@@ -351,7 +366,9 @@ class TestIdempotency:
         result = bfl2.handle_regression(task, exec_result, base_dir=tmp_path)
 
         assert result.skipped is True
-        assert result.fixed is True
+        assert result.fixed is False
+        assert result.verification_failed is True
+        assert tickets.get("BUG-AUTO-T1")["status"] == "verification-failed"
         outer.run_task.assert_not_called()
         cos.commit.assert_not_called()
 

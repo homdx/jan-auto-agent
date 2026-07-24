@@ -1,0 +1,427 @@
+"""tests/test_bug_fix_id_cascade.py — runaway ``BUG-FIX-`` prefix cascade.
+
+Observed in a real run (2026-07-22): a synthetic fix task committed by
+BugFixLoop becomes a DONE task carrying the same acceptance check as the task
+it repaired. ``controller._check_regressions`` re-runs every DONE task's check
+after every later commit, so an unresolved regression made the *fix task*
+regress too — and ids were derived from that fix task's own id, producing a
+new generation on every commit:
+
+    AUTO-T168
+    BUG-FIX-AUTO-T168
+    BUG-FIX-BUG-FIX-AUTO-T168
+    ...
+
+Each generation had a brand-new ticket id, so the "already fixed" /
+"already deferred" short-circuits never fired, and the ticket *filename* grew
+8 chars per generation until::
+
+    OSError: [Errno 36] File name too long
+
+killed the whole run.
+
+Two independent defences are asserted here:
+  1. id canonicalisation in bug_fix_loop (the cascade never starts), and
+  2. a hard length cap in safe_filename_component (no id can ever again
+     produce ENAMETOOLONG, whatever generates it).
+"""
+
+from __future__ import annotations
+
+import sys
+from dataclasses import dataclass, field as dc_field
+from pathlib import Path
+from unittest.mock import MagicMock
+
+import pytest
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from tools.auto.bug_fix_loop import (
+    BugFixLoop, MAX_FIX_ATTEMPTS, _root_task_id,
+)
+from tools.auto.state import StateStore
+from tools.auto.ticket_store import make_ticket_store
+from tools.auto.utils import safe_filename_component, atomic_write_text
+
+
+@dataclass
+class FakeExecResult:
+    passed:    bool = False
+    exit_code: int = 4
+    stdout:    str = "FAILED"
+    stderr:    str = ""
+    traceback: str = ""
+    timed_out: bool = False
+
+
+@dataclass
+class FakeOuterResult:
+    task_id:        str = "BUG-FIX-AUTO-T168"
+    passed:         bool = False
+    exhausted:      bool = True
+    rounds_used:    int = 3
+    feedback_files: list = dc_field(default_factory=list)
+
+    def knowledge(self) -> str:
+        return "still failing"
+
+
+def _task(tid: str) -> dict:
+    return {
+        "id": tid,
+        "title": "hc java opts casing",
+        "instruction": "fix it",
+        "target_files": ["roles/hc/defaults/main.yml"],
+        "acceptance_check": "pytest tests/test_config_validation.py -q",
+    }
+
+
+def _bfl(tmp_path: Path, outer_result: FakeOuterResult):
+    state = StateStore(tmp_path / ".agent")
+    state.initialise("fix regressions", tmp_path)
+    tickets = make_ticket_store(tmp_path / ".agent")
+    outer = MagicMock()
+    outer.run_task.return_value = outer_result
+    cos = MagicMock()
+    cos.commit.return_value = "abc123def456"
+    return BugFixLoop(outer, cos, tickets, state), tickets, state
+
+
+# ── 1. id canonicalisation ───────────────────────────────────────────────────
+
+class TestRootTaskId:
+    def test_plain_id_unchanged(self):
+        assert _root_task_id("AUTO-T168") == "AUTO-T168"
+
+    def test_single_prefix_stripped(self):
+        assert _root_task_id("BUG-FIX-AUTO-T168") == "AUTO-T168"
+
+    def test_repeated_prefixes_all_stripped(self):
+        assert _root_task_id("BUG-FIX-" * 25 + "AUTO-T168") == "AUTO-T168"
+
+    def test_bare_prefix_does_not_yield_empty(self):
+        assert _root_task_id("BUG-FIX-") == "BUG-FIX-"
+
+    def test_empty_id_safe(self):
+        assert _root_task_id("") == "UNKNOWN"
+
+
+class TestNoIdGrowth:
+    def test_regression_in_fix_task_reuses_root_ticket(self, tmp_path):
+        bfl, _tickets, _state = _bfl(tmp_path, FakeOuterResult())
+        result = bfl.handle_regression(
+            _task("BUG-FIX-AUTO-T168"), FakeExecResult(), base_dir=tmp_path
+        )
+        # NOT "BUG-BUG-FIX-AUTO-T168"
+        assert result.ticket_id == "BUG-AUTO-T168"
+        assert result.fix_task_id == "BUG-FIX-AUTO-T168"
+
+    def test_deferred_root_ticket_short_circuits_fix_task_regression(self, tmp_path):
+        """The cascade's actual kill-switch: generation 2 hits the dedup."""
+        bfl, tickets, _state = _bfl(tmp_path, FakeOuterResult())
+
+        # Generation 1: original task regresses, fix exhausts → deferred.
+        r1 = bfl.handle_regression(
+            _task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path
+        )
+        assert r1.exhausted is True
+        assert tickets.get("BUG-AUTO-T168")["status"] == "deferred"
+        calls_after_gen1 = bfl._outer.run_task.call_count
+
+        # Generation 2: the synthetic fix task now "regresses" as well.
+        r2 = bfl.handle_regression(
+            _task("BUG-FIX-AUTO-T168"), FakeExecResult(), base_dir=tmp_path
+        )
+        assert r2.skipped is True
+        assert r2.ticket_id == "BUG-AUTO-T168"
+        # No further expensive OuterLoop work was burned.
+        assert bfl._outer.run_task.call_count == calls_after_gen1
+
+    def test_no_extra_ticket_files_created(self, tmp_path):
+        bfl, _tickets, _state = _bfl(tmp_path, FakeOuterResult())
+        for tid in ("AUTO-T168", "BUG-FIX-AUTO-T168",
+                    "BUG-FIX-BUG-FIX-AUTO-T168"):
+            bfl.handle_regression(_task(tid), FakeExecResult(), base_dir=tmp_path)
+        files = sorted(p.name for p in (tmp_path / ".agent" / "tickets").glob("*.json"))
+        assert files == ["BUG-AUTO-T168.json"]
+
+
+# ── 2. filename length cap ───────────────────────────────────────────────────
+
+class TestFilenameLengthCap:
+    def test_short_name_untouched(self):
+        assert safe_filename_component("BUG-AUTO-T168") == "BUG-AUTO-T168"
+
+    def test_long_name_capped(self):
+        long_id = "BUG-" + "BUG-FIX-" * 30 + "AUTO-T169"
+        out = safe_filename_component(long_id)
+        assert len(out) <= 200
+
+    def test_capping_is_deterministic(self):
+        long_id = "BUG-" + "BUG-FIX-" * 30 + "AUTO-T169"
+        assert safe_filename_component(long_id) == safe_filename_component(long_id)
+
+    def test_capping_avoids_collisions(self):
+        a = "BUG-" + "BUG-FIX-" * 30 + "AUTO-T169"
+        b = "BUG-" + "BUG-FIX-" * 30 + "AUTO-T170"
+        assert safe_filename_component(a) != safe_filename_component(b)
+
+    def test_ticket_write_survives_absurd_id(self, tmp_path):
+        """The exact crash: Errno 36 out of atomic_write_text."""
+        tickets = make_ticket_store(tmp_path / ".agent")
+        absurd = "BUG-" + "BUG-FIX-" * 40 + "AUTO-T169"
+        path = tickets.path(absurd)
+        atomic_write_text(path, "{}")          # must not raise OSError(36)
+        assert path.exists()
+        assert len(path.name) < 255
+
+
+# ── 3. Bounded state machine: every path must terminate ──────────────────────
+
+class TestEveryBranchTerminates:
+    """The invariant: handle_regression must never leave a ticket in a state
+    that neither short-circuits nor progresses. _check_regressions re-enters
+    after EVERY later commit, so a non-terminal state is an unbounded
+    OuterLoop (LLM budget) leak even when it no longer crashes."""
+
+    @pytest.mark.parametrize("outer_kwargs,label", [
+        ({"passed": True},                    "4a passed"),
+        ({"passed": False, "exhausted": True}, "4b exhausted"),
+        ({"passed": False, "exhausted": False}, "4c no verdict"),
+    ])
+    def test_outer_loop_calls_are_bounded(self, tmp_path, outer_kwargs, label):
+        bfl, tickets, _ = _bfl(tmp_path, FakeOuterResult(**outer_kwargs))
+        tid = "AUTO-T168"
+        for _ in range(12):          # simulate 12 subsequent commits
+            r = bfl.handle_regression(_task(tid), FakeExecResult(), base_dir=tmp_path)
+            tid = r.fix_task_id
+        assert bfl._outer.run_task.call_count <= MAX_FIX_ATTEMPTS, (
+            f"{label}: unbounded OuterLoop work "
+            f"({bfl._outer.run_task.call_count} calls)"
+        )
+        assert tickets.get("BUG-AUTO-T168")["status"] in {
+            "deferred", "verification-failed",
+        }
+
+    def test_partial_failure_defers_after_attempts_spent(self, tmp_path):
+        """Branch 4c: previously left 'in-progress' forever with no gate."""
+        bfl, tickets, _ = _bfl(tmp_path, FakeOuterResult(passed=False, exhausted=False))
+        for _ in range(MAX_FIX_ATTEMPTS):
+            bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
+        assert tickets.get("BUG-AUTO-T168")["status"] == "deferred"
+
+        calls = bfl._outer.run_task.call_count
+        r = bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
+        assert r.skipped is True
+        assert bfl._outer.run_task.call_count == calls
+
+    def test_attempt_counter_claimed_before_outer_loop_runs(self, tmp_path):
+        """A run killed mid-OuterLoop must not resume with a free attempt."""
+        seen = {}
+        bfl, tickets, _ = _bfl(tmp_path, FakeOuterResult(passed=False, exhausted=False))
+        def spy(task, base_dir):
+            seen["attempts"] = tickets.get("BUG-AUTO-T168")["fix_attempts"]
+            return FakeOuterResult(passed=False, exhausted=False)
+        bfl._outer.run_task.side_effect = spy
+        bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
+        assert seen["attempts"] == 1
+
+
+class TestVerificationFailure:
+    def test_fixed_but_still_failing_escalates(self, tmp_path):
+        bfl, tickets, _ = _bfl(tmp_path, FakeOuterResult(passed=True))
+        bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
+        assert tickets.get("BUG-AUTO-T168")["status"] == "fixed"
+
+        r = bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
+        assert r.fixed is False
+        assert r.verification_failed is True
+        assert tickets.get("BUG-AUTO-T168")["status"] == "verification-failed"
+        assert "VERIFICATION FAILED" in r.summary()
+
+    def test_escalation_does_not_rerun_outer_loop(self, tmp_path):
+        bfl, tickets, _ = _bfl(tmp_path, FakeOuterResult(passed=True))
+        bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
+        calls = bfl._outer.run_task.call_count
+        bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
+        assert bfl._outer.run_task.call_count == calls
+
+    def test_verification_failed_is_terminal(self, tmp_path):
+        bfl, tickets, _ = _bfl(tmp_path, FakeOuterResult(passed=True))
+        for _ in range(4):
+            r = bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
+        assert r.skipped is True
+        assert r.verification_failed is True
+        assert bfl._outer.run_task.call_count == 1
+
+    def test_operator_reset_to_open_allows_retry(self, tmp_path):
+        """'open' is the explicit operator-reset signal and is never gated."""
+        bfl, tickets, _ = _bfl(tmp_path, FakeOuterResult(passed=False, exhausted=True))
+        bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
+        assert tickets.get("BUG-AUTO-T168")["status"] == "deferred"
+        calls = bfl._outer.run_task.call_count
+
+        tickets.update("BUG-AUTO-T168", status="open")
+        bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
+        assert bfl._outer.run_task.call_count == calls + 1
+
+
+class TestTicketLinkage:
+    def test_linked_task_is_canonical_root(self, tmp_path):
+        bfl, tickets, _ = _bfl(tmp_path, FakeOuterResult(passed=False, exhausted=True))
+        bfl.handle_regression(
+            _task("BUG-FIX-AUTO-T168"), FakeExecResult(), base_dir=tmp_path
+        )
+        assert tickets.get("BUG-AUTO-T168")["linked_task"] == "AUTO-T168"
+        assert tickets.list_by_task("AUTO-T168")
+
+
+# ── 4. Defects found reviewing the state-machine fix itself ──────────────────
+
+class TestControllerSkipKeepsCoverage:
+    """The BUG-FIX-* skip must never drop the last check covering a command.
+
+    The first version of the filter only asked whether the root task EXISTED.
+    But the root is only actually re-checked if it is DONE and is not the
+    task just committed — so when the root had been re-planned or reset, the
+    root was excluded AND its fix task was skipped as redundant, and the
+    acceptance check ran nowhere at all.
+    """
+
+    @staticmethod
+    def _kept(all_tasks, just_committed_id="OTHER"):
+        from tools.auto.bug_fix_loop import _FIX_PREFIX, _root_task_id
+        from tools.auto.state import STATUS_DONE
+        by_id = {t["id"]: t for t in all_tasks}
+
+        def redundant(t):
+            tid = t["id"]
+            if not tid.startswith(_FIX_PREFIX):
+                return False
+            root = by_id.get(_root_task_id(tid))
+            return (
+                root is not None
+                and root.get("status") == STATUS_DONE
+                and root["id"] != just_committed_id
+                and root.get("acceptance_check", "") == t.get("acceptance_check", "")
+            )
+
+        return [
+            t["id"] for t in all_tasks
+            if t["status"] == STATUS_DONE and t["id"] != just_committed_id
+            and t.get("acceptance_check", "").strip() and not redundant(t)
+        ]
+
+    CHK = "pytest tests/test_x.py -q"
+
+    def test_redundant_fix_task_skipped_when_root_is_done(self):
+        from tools.auto.state import STATUS_DONE
+        tasks = [{"id": "AUTO-T1", "status": STATUS_DONE, "acceptance_check": self.CHK},
+                 {"id": "BUG-FIX-AUTO-T1", "status": STATUS_DONE, "acceptance_check": self.CHK}]
+        assert self._kept(tasks) == ["AUTO-T1"]
+
+    def test_fix_task_kept_when_root_not_done(self):
+        from tools.auto.state import STATUS_DONE
+        tasks = [{"id": "AUTO-T1", "status": "todo", "acceptance_check": self.CHK},
+                 {"id": "BUG-FIX-AUTO-T1", "status": STATUS_DONE, "acceptance_check": self.CHK}]
+        assert self._kept(tasks) == ["BUG-FIX-AUTO-T1"], "coverage silently dropped"
+
+    def test_fix_task_kept_when_root_is_the_just_committed_task(self):
+        from tools.auto.state import STATUS_DONE
+        tasks = [{"id": "AUTO-T1", "status": STATUS_DONE, "acceptance_check": self.CHK},
+                 {"id": "BUG-FIX-AUTO-T1", "status": STATUS_DONE, "acceptance_check": self.CHK}]
+        assert self._kept(tasks, just_committed_id="AUTO-T1") == ["BUG-FIX-AUTO-T1"]
+
+    def test_fix_task_kept_when_checks_differ(self):
+        from tools.auto.state import STATUS_DONE
+        tasks = [{"id": "AUTO-T1", "status": STATUS_DONE, "acceptance_check": self.CHK},
+                 {"id": "BUG-FIX-AUTO-T1", "status": STATUS_DONE,
+                  "acceptance_check": "pytest tests/test_other.py -q"}]
+        assert self._kept(tasks) == ["AUTO-T1", "BUG-FIX-AUTO-T1"]
+
+
+class TestBookkeepingWritesAreNonFatal:
+    """A vanished ticket file must not kill the run from a status write."""
+
+    def test_deleted_ticket_during_fix_does_not_raise(self, tmp_path):
+        bfl, tickets, _ = _bfl(tmp_path, FakeOuterResult(passed=True))
+
+        def delete_then_pass(task, base_dir):
+            tickets.delete("BUG-AUTO-T168")     # operator cleanup mid-fix
+            return FakeOuterResult(passed=True)
+
+        bfl._outer.run_task.side_effect = delete_then_pass
+        r = bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
+        assert r.fixed is True
+
+    def test_deleted_ticket_on_exhaustion_does_not_raise(self, tmp_path):
+        bfl, tickets, _ = _bfl(tmp_path, FakeOuterResult(passed=False, exhausted=True))
+
+        def delete_then_exhaust(task, base_dir):
+            tickets.delete("BUG-AUTO-T168")
+            return FakeOuterResult(passed=False, exhausted=True)
+
+        bfl._outer.run_task.side_effect = delete_then_exhaust
+        r = bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
+        assert r.exhausted is True
+
+
+class TestAttemptCounterIsRobust:
+    """fix_attempts is persisted JSON — it may be absent, stale, or edited."""
+
+    @pytest.mark.parametrize("raw,expected", [
+        (None, 0), (0, 0), (2, 2), ("3", 3), ("", 0), ("abc", 0), (-5, 0), ([], 0),
+    ])
+    def test_unreadable_counter_degrades_to_zero(self, raw, expected):
+        assert BugFixLoop._attempts_of({"fix_attempts": raw}) == expected
+
+    def test_missing_field_on_legacy_ticket(self):
+        assert BugFixLoop._attempts_of({}) == 0
+        assert BugFixLoop._attempts_of(None) == 0
+
+    def test_hand_edited_garbage_does_not_crash_the_gate(self, tmp_path):
+        bfl, tickets, _ = _bfl(tmp_path, FakeOuterResult(passed=False, exhausted=False))
+        bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
+        tickets.update("BUG-AUTO-T168", fix_attempts="corrupted")
+        r = bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
+        assert r is not None
+
+
+class TestFixTaskDoesNotSurviveInTheQueue:
+    """A deferred regression must not be re-run via the main task queue.
+
+    _build_fix_task registers BUG-FIX-* with the default STATUS_TODO and only
+    the success path clears it.  resume_info() treats everything that is not
+    DONE or BLOCKED as pending, so a resumed run pulled the fix task out of
+    the queue and spent a fresh full OuterLoop budget on the regression that
+    had just been deferred as unfixable — bypassing the ticket short-circuit,
+    which only guards re-entry through _check_regressions.
+    """
+
+    @staticmethod
+    def _pending_ids(state):
+        return [t["id"] for t in state.resume_info()["pending"]]
+
+    def test_exhausted_fix_task_not_pending_on_resume(self, tmp_path):
+        bfl, _t, state = _bfl(tmp_path, FakeOuterResult(passed=False, exhausted=True))
+        bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
+        assert "BUG-FIX-AUTO-T168" not in self._pending_ids(state)
+
+    def test_no_verdict_fix_task_not_pending_on_resume(self, tmp_path):
+        bfl, _t, state = _bfl(tmp_path, FakeOuterResult(passed=False, exhausted=False))
+        bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
+        assert "BUG-FIX-AUTO-T168" not in self._pending_ids(state)
+
+    def test_operator_reset_re_registers_the_fix_task(self, tmp_path):
+        """Parking must not make a deliberate retry impossible."""
+        bfl, tickets, state = _bfl(tmp_path, FakeOuterResult(passed=False, exhausted=True))
+        bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
+        assert "BUG-FIX-AUTO-T168" not in self._pending_ids(state)
+
+        tickets.update("BUG-AUTO-T168", status="open")
+        bfl._outer.run_task.return_value = FakeOuterResult(passed=True)
+        r = bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
+        assert r.fixed is True

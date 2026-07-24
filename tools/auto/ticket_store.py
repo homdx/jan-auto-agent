@@ -9,6 +9,7 @@ Ticket schema
     id          str  — unique ticket identifier, e.g. "TICKET-AUTO-T1"
     type        str  — "bug" | "investigation"
     status      str  — "open" | "in-progress" | "fixed" | "deferred"
+                       | "verification-failed"
     linked_task str  — task id this ticket concerns (may be empty string)
     title       str  — short human-readable description
     body        str  — full detail / knowledge text
@@ -66,7 +67,14 @@ logger = logging.getLogger(__name__)
 # ── Valid field values ────────────────────────────────────────────────────────
 
 TICKET_TYPES   = {"bug", "investigation"}
-TICKET_STATUSES = {"open", "in-progress", "fixed", "deferred"}
+# "verification-failed" is terminal-but-loud: a fix was recorded as passing and
+# committed, yet the acceptance check fails again on a later re-check. The
+# recorded fix did not hold, so neither "fixed" (a lie — the run would report
+# green over a broken check) nor "deferred" (implies the agent gave up while
+# trying, not that it wrongly believed it had succeeded) describes it. An
+# operator resets it to "open" to allow another attempt.
+TICKET_STATUSES = {"open", "in-progress", "fixed", "deferred",
+                   "verification-failed"}
 
 # ── Required fields (str) in a ticket dict ───────────────────────────────────
 

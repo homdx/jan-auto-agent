@@ -711,11 +711,48 @@ class AutoController:
         bug_fix_loop:
             Ready :class:`~tools.auto.bug_fix_loop.BugFixLoop` instance.
         """
+        from tools.auto.bug_fix_loop import _FIX_PREFIX, _root_task_id
+
+        all_tasks = self.state.all_tasks()
+        by_id     = {t["id"]: t for t in all_tasks}
+
+        def _is_redundant_fix_task(t: dict) -> bool:
+            """True for a synthetic BUG-FIX-* task that duplicates its root.
+
+            BugFixLoop registers ``BUG-FIX-<id>`` carrying a *copy* of the
+            root task's acceptance_check, so once committed it appears here
+            as a second DONE task running the identical command.  Checking
+            both doubles the executor work for zero extra coverage, and it
+            was the entry point for the runaway id cascade: a fix task that
+            "regressed" fed its own id back into BugFixLoop, generating
+            BUG-FIX-BUG-FIX-... until the ticket filename blew past NAME_MAX.
+            Only skip when the root really is present with the same check —
+            otherwise the fix task is the only thing covering it, and
+            dropping it would lose real coverage.
+            """
+            tid = t["id"]
+            if not tid.startswith(_FIX_PREFIX):
+                return False
+            root = by_id.get(_root_task_id(tid))
+            # The root must be something this same filter will actually KEEP,
+            # otherwise the check runs nowhere.  Merely existing is not
+            # enough: a root that is not DONE (re-planned, reset, still in
+            # progress) is excluded from done_tasks below, so skipping its
+            # fix task too would silently drop the only remaining coverage
+            # of that acceptance check.
+            return (
+                root is not None
+                and root.get("status") == STATUS_DONE
+                and root["id"] != just_committed_id
+                and root.get("acceptance_check", "") == t.get("acceptance_check", "")
+            )
+
         done_tasks = [
-            t for t in self.state.all_tasks()
+            t for t in all_tasks
             if t["status"] == STATUS_DONE
             and t["id"] != just_committed_id
             and t.get("acceptance_check", "").strip()
+            and not _is_redundant_fix_task(t)
         ]
         for done_task in done_tasks:
             # Bug 6: respect the run's time budget here too.  _run_task_loop
