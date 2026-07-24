@@ -696,3 +696,86 @@ class TestCrashDuringOuterLoop:
         bfl._outer.run_task.return_value = FakeOuterResult(passed=True)
         r = bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
         assert r.fixed is True
+
+
+# ── 7. No-git mode ──────────────────────────────────────────────────────────
+
+class TestNoGitMode:
+    """A git failure is explicitly non-fatal — BugFixLoop must honour that.
+
+    Controller._setup_git catches GitError/OSError, sets self.git = None and
+    logs "continuing without git": Epic A is documented as usable without
+    git, with commits simply not happening.  It then derives
+    commit_helper = None and passes that straight to make_bug_fix_loop.
+
+    Two separate breakages followed from that None:
+      * make_bug_fix_loop treated it as "not supplied" and rebuilt one,
+        re-running the SAME make_git_manager call the controller had just
+        guarded — unguarded this time, so the swallowed GitError was raised
+        again and aborted the run at construction.
+      * BugFixLoop then dereferenced self._cos unconditionally, so even a
+        successfully-constructed no-git loop died with AttributeError on the
+        first regression it tried to fix.
+    """
+
+    def test_loop_constructs_without_git(self, tmp_path, monkeypatch):
+        import configparser
+        from tools.auto import bug_fix_loop as bfl_mod
+        from tools.auto.git_manager import GitError
+
+        state = StateStore(tmp_path / ".agent")
+        state.initialise("g", tmp_path)
+        cfg = configparser.ConfigParser()
+        cfg.add_section("auto")
+
+        def boom(*a, **kw):
+            raise GitError("git init failed")
+
+        monkeypatch.setattr(
+            "tools.auto.commit_on_success.make_commit_on_success", boom
+        )
+        loop = bfl_mod.make_bug_fix_loop(
+            cfg, tmp_path, state, outer_loop=object(), commit_on_success=None
+        )
+        assert loop is not None
+        assert loop._cos is None
+
+    def test_fix_succeeds_without_a_commit_helper(self, tmp_path):
+        state = StateStore(tmp_path / ".agent")
+        state.initialise("fix regressions", tmp_path)
+        tickets = make_ticket_store(tmp_path / ".agent")
+        outer = MagicMock()
+        outer.run_task.return_value = FakeOuterResult(passed=True)
+
+        bfl = BugFixLoop(outer, None, tickets, state)     # no-git
+        r = bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
+
+        assert r.fixed is True
+        assert r.commit_hash is None
+        assert tickets.get("BUG-AUTO-T168")["status"] == "fixed"
+
+    def test_fix_task_settled_not_left_pending_without_git(self, tmp_path):
+        state = StateStore(tmp_path / ".agent")
+        state.initialise("fix regressions", tmp_path)
+        tickets = make_ticket_store(tmp_path / ".agent")
+        outer = MagicMock()
+        outer.run_task.return_value = FakeOuterResult(passed=True)
+
+        BugFixLoop(outer, None, tickets, state).handle_regression(
+            _task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path
+        )
+        assert state.get_task("BUG-FIX-AUTO-T168")["status"] == STATUS_DONE
+        pending = [t["id"] for t in state.resume_info()["pending"]]
+        assert "BUG-FIX-AUTO-T168" not in pending
+
+    def test_no_git_still_bounded_on_failure(self, tmp_path):
+        state = StateStore(tmp_path / ".agent")
+        state.initialise("fix regressions", tmp_path)
+        tickets = make_ticket_store(tmp_path / ".agent")
+        outer = MagicMock()
+        outer.run_task.return_value = FakeOuterResult(passed=False, exhausted=False)
+
+        bfl = BugFixLoop(outer, None, tickets, state)
+        for _ in range(10):
+            bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
+        assert outer.run_task.call_count == MAX_FIX_ATTEMPTS

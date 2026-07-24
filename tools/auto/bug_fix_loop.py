@@ -494,7 +494,26 @@ class BugFixLoop:
 
         # ── 4a. Fix passed — commit and close ticket ──────────────────────────
         if getattr(outer_result, "passed", False):
-            sha = self._cos.commit(fix_task, outer_result)
+            if self._cos is not None:
+                sha = self._cos.commit(fix_task, outer_result)
+            else:
+                # No-git mode.  The controller treats a git setup failure as
+                # non-fatal (self.git = None, "Epic A stays usable without
+                # git") and marks tasks DONE by hand in that case; mirror
+                # exactly that here instead of dereferencing None, which
+                # would raise AttributeError from inside a regression fix.
+                sha = None
+                try:
+                    self._state.set_task_status(fix_id, STATUS_DONE)
+                except Exception as exc:        # pragma: no cover — defensive
+                    logger.warning(
+                        "BugFixLoop: could not mark fix task %s DONE: %s",
+                        fix_id, exc,
+                    )
+                self._state.log(
+                    f"bug {ticket_id} fix passed — marked DONE without a "
+                    f"commit (no-git mode)"
+                )
 
             # CommitOnSuccess.commit() returns None on GitError AND when
             # nothing was staged, and only calls set_task_status(DONE) when a
@@ -741,9 +760,29 @@ def make_bug_fix_loop(
         outer_loop = make_outer_loop(config, base_dir, state_store)
 
     if commit_on_success is None:
-        commit_on_success = make_commit_on_success(
-            config, base_dir, state_store
-        )
+        # A None here is ambiguous: it can mean "not supplied, please build
+        # one", or it can mean "the caller already decided there is no git".
+        # The controller means the SECOND — it sets commit_helper to None
+        # precisely when its own guarded make_git_manager() failed and it
+        # logged "continuing without git".  Rebuilding one here re-ran that
+        # same failing call UNGUARDED, so the GitError the controller had
+        # deliberately swallowed was raised again from make_bug_fix_loop and
+        # aborted the run — defeating the documented no-git mode outright.
+        #
+        # Try to build one for the genuine "not supplied" callers, but treat
+        # failure the way the controller already treats it: log, continue
+        # without a commit helper.
+        from tools.auto.git_manager import GitError
+        try:
+            commit_on_success = make_commit_on_success(
+                config, base_dir, state_store
+            )
+        except (GitError, OSError) as exc:
+            logger.warning(
+                "make_bug_fix_loop: git unavailable (%s) — bug fixes will be "
+                "marked DONE without commits", exc,
+            )
+            commit_on_success = None
 
     if ticket_store is None:
         ticket_store = make_ticket_store(state_store.agent_dir)

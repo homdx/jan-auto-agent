@@ -49,6 +49,7 @@ def one_run(seed):
         return OR(passed=False, exhausted=False)     # 4c no verdict
 
     o = MagicMock(); o.run_task.side_effect = outer_behaviour
+    no_git = rnd.random() < 0.15
     cos = MagicMock()
     def commit(t_, r_):
         # Faithful to CommitOnSuccess: THREE outcomes, not two.
@@ -65,7 +66,8 @@ def one_run(seed):
     trig = "AUTO-T1"
     events = []
     for step in range(rnd.randint(3, 25)):
-        bfl = BugFixLoop(o, cos, tk, st)       # fresh instance = new process
+        # 15% of runs exercise no-git mode (commit helper is None)
+        bfl = BugFixLoop(o, None if no_git else cos, tk, st)
         # randomly perturb like an operator / crash would
         act = rnd.random()
         if act < 0.10:
