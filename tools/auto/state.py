@@ -488,13 +488,37 @@ class StateStore:
         self._validate_loaded_plan()
         if self._prog_path.exists():
             try:
-                self._progress = json.loads(
+                loaded = json.loads(
                     self._prog_path.read_text(encoding="utf-8")
                 )
-                return
-            except json.JSONDecodeError as exc:
+                # A file that PARSES is not necessarily usable.  Only the
+                # JSONDecodeError case was handled, so valid JSON of the wrong
+                # shape — a list, a string, null — was accepted here and then
+                # crashed on the first write to self._progress, far from the
+                # cause and with nothing naming the file:
+                #
+                #   list   -> TypeError: list indices must be integers
+                #   string -> TypeError: 'str' object does not support item
+                #             assignment
+                #   null   -> TypeError: 'NoneType' object does not support
+                #             item assignment
+                #
+                # No need to fail on it, though: the rebuild path below is
+                # already the right answer, because progress counts are fully
+                # derivable from the plan.  So a wrong-shape file recovers
+                # exactly like a corrupt one instead of poisoning the run.
+                if isinstance(loaded, dict):
+                    self._progress = loaded
+                    return
                 logger.warning(
-                    "StateStore: progress.json is corrupted (%s) — rebuilding "
+                    "StateStore: progress.json holds a %s, not an object — "
+                    "rebuilding from plan.json instead (progress counts are "
+                    "fully derivable from the plan, so no data is lost).",
+                    type(loaded).__name__,
+                )
+            except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
+                logger.warning(
+                    "StateStore: progress.json is unreadable (%s) — rebuilding "
                     "from plan.json instead (progress counts are fully "
                     "derivable from the plan, so no data is lost).", exc,
                 )
