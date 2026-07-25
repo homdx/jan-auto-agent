@@ -795,10 +795,26 @@ def _safe_dir_name(name: str) -> str:
 
     Keeps only alphanumeric chars, hyphens, and underscores so a task id
     like ``"../../evil"`` cannot escape the workspace root.
+
+    BUGFIX: this used to be a second, independent copy of the same
+    sanitisation logic as ``tools.auto.utils.safe_filename_component`` — same
+    regex, same ``.strip("_") or "task"`` fallback — and it duplicated that
+    function's exact defect too: characters were sanitised but length never
+    was.  A long task id (a verbose LLM-generated id, or any id chained
+    through several ``BUG-FIX-`` generations before that cascade was
+    canonicalised) produced a workspace directory name over the 255-byte
+    NAME_MAX and crashed with the very same error that started this whole
+    round of hardening::
+
+        OSError: [Errno 36] File name too long
+
+    Delegating to the already-hardened, already-tested function closes this
+    copy of the bug and — just as importantly — means the two can no longer
+    drift: a future fix to one sanitiser reaching only one of two call sites
+    is exactly how this gap opened in the first place.
     """
-    import re as _re
-    safe = _re.sub(r"[^A-Za-z0-9_\-]", "_", name)
-    return safe.strip("_") or "task"
+    from tools.auto.utils import safe_filename_component
+    return safe_filename_component(name)
 
 
 def _truncate(text: str, max_chars: int) -> str:
