@@ -879,3 +879,81 @@ class TestParkingSurvivesStartupReset:
         bfl._outer.run_task.return_value = FakeOuterResult(passed=True)
         r = bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
         assert r.fixed is True
+
+
+# ── 9. The operator retry must be a REAL retry ──────────────────────────────
+
+class TestOperatorRetryIsReal:
+    """Restoring the attempt budget is not enough on its own.
+
+    OuterLoop does not read its starting round from task state — it counts
+    feedback_round_*.md files on disk (start_round = done_rounds + 1) and
+    returns "already exhausted" immediately once that exceeds max_rounds.  So
+    after an exhausted fix attempt, every later attempt returned exhausted
+    instantly having done NO work, which made the documented operator reset
+    (ticket -> "open", which restores the budget) completely inert.
+
+    This is the same trap _reset_resettable_blocked_tasks documents for
+    BLOCKED tasks: "a bare status reset never touches" the files OuterLoop
+    reads.  The rounds are archived, not deleted, so accumulated feedback
+    stays inspectable.
+    """
+
+    @staticmethod
+    def _exhaust_with_real_feedback_files(tmp_path, rounds=10):
+        from tools.auto.utils import highest_completed_round
+        state = StateStore(tmp_path / ".agent")
+        state.initialise("fix regressions", tmp_path)
+        tickets = make_ticket_store(tmp_path / ".agent")
+        outer = MagicMock()
+
+        def burn_rounds(task_, base_dir):
+            for n in range(1, rounds + 1):
+                state.write_task_file(task_["id"], f"feedback_round_{n}.md", "fb")
+            return FakeOuterResult(passed=False, exhausted=True)
+
+        outer.run_task.side_effect = burn_rounds
+        bfl = BugFixLoop(outer, MagicMock(), tickets, state)
+        bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
+        assert highest_completed_round(state.task_dir("BUG-FIX-AUTO-T168")) == rounds
+        return bfl, tickets, state
+
+    def test_reset_clears_the_round_counter(self, tmp_path):
+        from tools.auto.utils import highest_completed_round
+        bfl, tickets, state = self._exhaust_with_real_feedback_files(tmp_path)
+
+        tickets.update("BUG-AUTO-T168", status="open")
+        bfl._outer.run_task.side_effect = None
+        bfl._outer.run_task.return_value = FakeOuterResult(passed=True)
+        bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
+
+        # start_round = 0 + 1 = 1, so OuterLoop does real work again
+        assert highest_completed_round(state.task_dir("BUG-FIX-AUTO-T168")) == 0
+
+    def test_feedback_is_archived_not_destroyed(self, tmp_path):
+        bfl, tickets, state = self._exhaust_with_real_feedback_files(tmp_path)
+        tickets.update("BUG-AUTO-T168", status="open")
+        bfl._outer.run_task.side_effect = None
+        bfl._outer.run_task.return_value = FakeOuterResult(passed=True)
+        bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
+
+        tdir = state.task_dir("BUG-FIX-AUTO-T168")
+        archives = [p for p in tdir.iterdir() if p.is_dir()
+                    and p.name.startswith("previous_attempt_")]
+        assert len(archives) == 1
+        assert len(list(archives[0].glob("feedback_round_*.md"))) == 10
+
+    def test_ordinary_attempts_do_not_archive(self, tmp_path):
+        """Only an operator reset clears rounds — not every in-run attempt."""
+        bfl, _t, state = self._exhaust_with_real_feedback_files(tmp_path)
+        tdir = state.task_dir("BUG-FIX-AUTO-T168")
+        assert not [p for p in tdir.iterdir()
+                    if p.is_dir() and p.name.startswith("previous_attempt_")]
+
+    def test_no_feedback_files_is_a_noop(self, tmp_path):
+        bfl, tickets, state = _bfl(tmp_path, FakeOuterResult(passed=False, exhausted=True))
+        bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
+        tickets.update("BUG-AUTO-T168", status="open")
+        bfl._outer.run_task.return_value = FakeOuterResult(passed=True)
+        r = bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
+        assert r.fixed is True

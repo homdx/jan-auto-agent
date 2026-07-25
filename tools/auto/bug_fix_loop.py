@@ -49,6 +49,7 @@ existing open ticket).
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -175,6 +176,50 @@ class BugFixLoop:
         self._max_fix_attempts = max(1, int(max_fix_attempts))
 
     # ── Public API ───────────────────────────────────────────────────────────
+
+    def _clear_stale_fix_rounds(self, fix_id: str) -> None:
+        """Archive a fix task's feedback rounds so a retry is a REAL retry.
+
+        OuterLoop does not derive its starting round from task state — it
+        counts ``feedback_round_*.md`` files on disk (``start_round =
+        done_rounds + 1``) and returns "already exhausted" immediately when
+        that exceeds ``max_rounds``.  So once a fix attempt has burned its
+        rounds, every later attempt returns exhausted instantly having done
+        no work at all:
+
+            highest_completed_round = 10, max_rounds = 10
+            -> start_round = 11 > 10 -> instant exhausted, ZERO new work
+
+        That made the operator reset (ticket status -> "open", which restores
+        the attempt budget) completely inert — the documented way to give a
+        stuck regression another chance silently did nothing.  This is the
+        same trap ``_reset_resettable_blocked_tasks`` documents for BLOCKED
+        tasks: "a bare status reset never touches" the files OuterLoop reads.
+
+        The rounds are moved aside rather than deleted, so the accumulated
+        feedback stays inspectable next to the task instead of being thrown
+        away to buy a retry.
+        """
+        try:
+            tdir = self._state.task_dir(fix_id)
+            rounds = sorted(tdir.glob("feedback_round_*.md"))
+            if not rounds:
+                return
+            stamp   = datetime.now().strftime("%Y%m%dT%H%M%S")
+            archive = tdir / f"previous_attempt_{stamp}"
+            archive.mkdir(parents=True, exist_ok=True)
+            for f in rounds:
+                f.rename(archive / f.name)
+            logger.info(
+                "BugFixLoop: archived %d stale feedback round(s) for %s to %s "
+                "so the retry starts from round 1",
+                len(rounds), fix_id, archive.name,
+            )
+        except OSError as exc:
+            logger.warning(
+                "BugFixLoop: could not archive stale rounds for %s: %s — the "
+                "retry may return exhausted without doing work", fix_id, exc,
+            )
 
     def _park_fix_task(self, fix_id: str) -> None:
         """Mark a non-succeeding synthetic fix task BLOCKED.
@@ -321,6 +366,8 @@ class BugFixLoop:
                 "attempt budget (was %d)", ticket_id, attempts,
             )
             attempts = 0
+            # Restoring the counter alone is not enough — see the helper.
+            self._clear_stale_fix_rounds(fix_id)
 
         # "fixed" + a failing check is a contradiction, and silently skipping
         # it was how a run could finish green over a permanently broken test.
