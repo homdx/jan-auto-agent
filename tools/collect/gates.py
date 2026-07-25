@@ -199,7 +199,25 @@ _GATE_SEED: Dict[str, Dict[str, object]] = {
         "module": "tools/auto/coder.py",
         "parser": "_find_non_ascii_identifiers",
         "protocol": "deterministic: tokenize written identifiers, reject any containing a non-ASCII character",
-        "fail_mode": "closed",
+        # Measured, not assumed: _find_non_ascii_identifiers catches
+        # TokenError/IndentationError/SyntaxError/ValueError and returns an
+        # EMPTY SET, which its caller (coder._write_files) reads as "no bad
+        # identifiers found" and passes the file.  So content this gate cannot
+        # tokenize is ACCEPTED, not rejected:
+        #
+        #   parseable, non-ASCII idents : {'привет'} -> gate REJECTS
+        #   syntax error, same idents   : set()      -> gate PASSES
+        #
+        # That behaviour is defensible for a style gate — do not block on a
+        # file you were unable to analyse, and invalid syntax is caught by the
+        # acceptance check and the other write guards anyway — so the code is
+        # right and this entry was wrong.  It read "closed", which is the one
+        # claim in this table build_gates_map cannot verify: `module` and
+        # `parser` are citation-checked against a real Pass A scan, but no
+        # amount of name resolution reveals how a caller treats a parse
+        # failure.  A consumer of the gates map trusting "closed" would have
+        # believed unanalysable content was rejected.
+        "fail_mode": "open",
         # Pure AST/tokenize check on already-generated content — no LLM
         # call of its own.
         "extra_llm_call": False,
