@@ -30,8 +30,9 @@ from __future__ import annotations
 
 import sys
 from dataclasses import dataclass, field as dc_field
+from datetime import datetime
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -1155,3 +1156,113 @@ class TestArchivePruning:
         tdir = state.task_dir("BUG-FIX-AUTO-T168")
         archives = [p for p in tdir.iterdir() if p.is_dir()] if tdir.exists() else []
         assert archives == []
+
+
+# ── 12. Same-second archiving must not silently overwrite prior content ─────
+
+class _FrozenDatetime(datetime):
+    """A ``datetime`` subclass whose ``now()`` always returns a fixed instant.
+
+    Used to simulate two ``_clear_stale_fix_rounds`` calls landing in the
+    same wall-clock second — the second-resolution stamp makes this always
+    possible in principle, and trivially reproducible with a frozen clock,
+    regardless of how unlikely real LLM-call latency makes it in practice.
+    """
+    _FIXED = datetime(2026, 7, 26, 12, 0, 0)
+
+    @classmethod
+    def now(cls, tz=None):
+        return cls._FIXED
+
+
+class TestArchiveCollisionSameSecond:
+    """``_clear_stale_fix_rounds`` stamps its archive directory with
+    second-resolution time. Before this fix, two archiving calls for the
+    same fix task within the same second reused the same directory
+    (``mkdir(..., exist_ok=True)``) and ``Path.rename`` onto an existing
+    destination silently overwrites it — so the first attempt's feedback
+    was clobbered by the second's with no error, no warning, nothing: pure
+    silent data loss in the exact forensic trail this archiving exists to
+    preserve. Reachable with no human action, purely inside the automated
+    handle_regression → _clear_stale_fix_rounds path.
+    """
+
+    def test_two_archives_in_the_same_second_both_survive(self, tmp_path):
+        state = StateStore(tmp_path / ".agent")
+        state.initialise("g", tmp_path)
+        tickets = make_ticket_store(tmp_path / ".agent")
+        bfl = BugFixLoop(MagicMock(), MagicMock(), tickets, state)
+        fix_id = "BUG-FIX-AUTO-T1"
+        tdir = state.task_dir(fix_id)
+        tdir.mkdir(parents=True, exist_ok=True)
+
+        with patch("tools.auto.bug_fix_loop.datetime", _FrozenDatetime):
+            (tdir / "feedback_round_1.md").write_text("CONTENT-A", encoding="utf-8")
+            bfl._clear_stale_fix_rounds(fix_id)
+
+            # FAILS on unfixed code: same frozen second → same archive dir →
+            # this second call's feedback_round_1.md overwrites the first.
+            (tdir / "feedback_round_1.md").write_text("CONTENT-B", encoding="utf-8")
+            bfl._clear_stale_fix_rounds(fix_id)
+
+        archives = sorted(p for p in tdir.iterdir() if p.is_dir())
+        assert len(archives) == 2, (
+            f"expected two distinct archive directories, got {len(archives)}: "
+            f"{[a.name for a in archives]}"
+        )
+        contents = sorted(
+            (arc / "feedback_round_1.md").read_text(encoding="utf-8")
+            for arc in archives
+        )
+        assert contents == ["CONTENT-A", "CONTENT-B"], (
+            "an archive from an earlier call was overwritten — data lost"
+        )
+
+    def test_three_collisions_in_the_same_second_all_survive(self, tmp_path):
+        state = StateStore(tmp_path / ".agent")
+        state.initialise("g", tmp_path)
+        tickets = make_ticket_store(tmp_path / ".agent")
+        bfl = BugFixLoop(MagicMock(), MagicMock(), tickets, state)
+        fix_id = "BUG-FIX-AUTO-T1"
+        tdir = state.task_dir(fix_id)
+        tdir.mkdir(parents=True, exist_ok=True)
+
+        with patch("tools.auto.bug_fix_loop.datetime", _FrozenDatetime):
+            for label in ("A", "B", "C"):
+                (tdir / "feedback_round_1.md").write_text(
+                    f"CONTENT-{label}", encoding="utf-8"
+                )
+                bfl._clear_stale_fix_rounds(fix_id)
+
+        archives = sorted(p for p in tdir.iterdir() if p.is_dir())
+        assert len(archives) == 3
+        contents = sorted(
+            (arc / "feedback_round_1.md").read_text(encoding="utf-8")
+            for arc in archives
+        )
+        assert contents == ["CONTENT-A", "CONTENT-B", "CONTENT-C"]
+
+    def test_collision_archives_still_sort_chronologically(self, tmp_path):
+        """The pruning helper relies on name-sort order to find the oldest
+        archives; disambiguated same-second names must not break that."""
+        state = StateStore(tmp_path / ".agent")
+        state.initialise("g", tmp_path)
+        tickets = make_ticket_store(tmp_path / ".agent")
+        bfl = BugFixLoop(MagicMock(), MagicMock(), tickets, state)
+        fix_id = "BUG-FIX-AUTO-T1"
+        tdir = state.task_dir(fix_id)
+        tdir.mkdir(parents=True, exist_ok=True)
+
+        with patch("tools.auto.bug_fix_loop.datetime", _FrozenDatetime):
+            for label in ("A", "B", "C"):
+                (tdir / "feedback_round_1.md").write_text(
+                    f"CONTENT-{label}", encoding="utf-8"
+                )
+                bfl._clear_stale_fix_rounds(fix_id)
+
+        names = sorted(p.name for p in tdir.iterdir() if p.is_dir())
+        assert names == [
+            "previous_attempt_20260726T120000",
+            "previous_attempt_20260726T120000-001",
+            "previous_attempt_20260726T120000-002",
+        ]
