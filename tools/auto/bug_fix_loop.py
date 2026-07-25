@@ -49,6 +49,7 @@ existing open ticket).
 from __future__ import annotations
 
 import logging
+import shutil
 from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
@@ -215,6 +216,7 @@ class BugFixLoop:
                 "so the retry starts from round 1",
                 len(rounds), fix_id, archive.name,
             )
+            self._prune_old_archives(tdir)
         except OSError as exc:
             logger.warning(
                 "BugFixLoop: could not archive stale rounds for %s: %s — the "
@@ -261,6 +263,38 @@ class BugFixLoop:
                 "BugFixLoop: could not discard residue for %s: %s — its edits "
                 "may be swept into the next commit", fix_id, exc,
             )
+
+    def _prune_old_archives(self, tdir: Path, *, keep: int = 3) -> None:
+        """Cap the ``previous_attempt_*`` directories _clear_stale_fix_rounds
+        creates, mirroring Executor._prune_old_workspaces for the same
+        reason: an operator repeatedly resetting a persistently-broken
+        ticket — precisely the scenario the reset exists for — creates one
+        more archive per reset with no bound, so a ticket that takes many
+        resets to finally resolve (or one that is reset periodically and
+        never resolves) accumulates archive directories forever, one full
+        MAX_FIX_ATTEMPTS-worth of round files each.
+
+        Kept small deliberately: unlike a task workspace (a full repo copy,
+        expensive to keep many of), each archive is a handful of small
+        markdown files, so the retention count favours a longer forensic
+        trail over disk savings.  Oldest-first by directory name, which
+        sorts chronologically because the timestamp format
+        (``%Y%m%dT%H%M%S``) is lexicographically ordered.
+        """
+        try:
+            archives = sorted(
+                p for p in tdir.iterdir()
+                if p.is_dir() and p.name.startswith("previous_attempt_")
+            )
+        except OSError:
+            return
+        for old in archives[:-keep] if keep > 0 else archives:
+            try:
+                shutil.rmtree(old)
+            except OSError as exc:
+                logger.warning(
+                    "BugFixLoop: could not prune old archive %s: %s", old, exc
+                )
 
     def _park_fix_task(self, fix_id: str) -> None:
         """Mark a non-succeeding synthetic fix task BLOCKED.

@@ -1071,3 +1071,87 @@ class TestFailedFixDiscardsResidue:
         bfl._cos = None
         r = bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
         assert r.exhausted is True
+
+
+# ── 11. Archive directories from operator resets must not grow forever ──────
+
+class TestArchivePruning:
+    """_clear_stale_fix_rounds (see section 9) creates one previous_attempt_*
+    directory per operator reset with no bound of its own — mirroring the
+    exact class of bug this session has now found three times: a shared
+    utility (Executor._prune_old_workspaces) hardened one call site while an
+    equivalent one, added later by a different fix, was never given the same
+    treatment. An operator repeatedly resetting a persistently-broken ticket
+    — precisely the scenario the reset exists for — accumulates archives
+    forever without this.
+    """
+
+    def test_prune_keeps_only_the_most_recent(self, tmp_path):
+        state = StateStore(tmp_path / ".agent")
+        state.initialise("g", tmp_path)
+        tickets = make_ticket_store(tmp_path / ".agent")
+        bfl = BugFixLoop(MagicMock(), MagicMock(), tickets, state)
+        tdir = state.task_dir("BUG-FIX-AUTO-T1")
+        tdir.mkdir(parents=True, exist_ok=True)
+        for i in range(8):
+            (tdir / f"previous_attempt_2026072{i}T000000").mkdir()
+
+        bfl._prune_old_archives(tdir, keep=3)
+
+        kept = sorted(p.name for p in tdir.iterdir() if p.is_dir())
+        assert len(kept) == 3
+        assert kept == [
+            "previous_attempt_20260725T000000",
+            "previous_attempt_20260726T000000",
+            "previous_attempt_20260727T000000",
+        ]
+
+    def test_prune_is_a_noop_under_the_limit(self, tmp_path):
+        state = StateStore(tmp_path / ".agent")
+        state.initialise("g", tmp_path)
+        tickets = make_ticket_store(tmp_path / ".agent")
+        bfl = BugFixLoop(MagicMock(), MagicMock(), tickets, state)
+        tdir = state.task_dir("BUG-FIX-AUTO-T1")
+        tdir.mkdir(parents=True, exist_ok=True)
+        (tdir / "previous_attempt_20260725T000000").mkdir()
+
+        bfl._prune_old_archives(tdir, keep=3)
+
+        assert len(list(tdir.iterdir())) == 1
+
+    def test_repeated_resets_stay_bounded(self, tmp_path):
+        """The actual reachable scenario: many operator resets in sequence."""
+        state = StateStore(tmp_path / ".agent")
+        state.initialise("fix regressions", tmp_path)
+        tickets = make_ticket_store(tmp_path / ".agent")
+        outer = MagicMock()
+
+        counter = {"n": 0}
+        def burn(task_, base_dir):
+            counter["n"] += 1
+            state.write_task_file(
+                task_["id"], f"feedback_round_{counter['n']}.md", "fb"
+            )
+            return FakeOuterResult(passed=False, exhausted=True)
+        outer.run_task.side_effect = burn
+
+        bfl = BugFixLoop(outer, MagicMock(), tickets, state, max_fix_attempts=1)
+        tdir = state.task_dir("BUG-FIX-AUTO-T168")
+        for i in range(12):
+            bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
+            tickets.update("BUG-AUTO-T168", status="open")
+            if tdir.exists():
+                for j, arc in enumerate(sorted(tdir.glob("previous_attempt_*"))):
+                    arc.rename(arc.parent / f"previous_attempt_2026{i:02d}{j:02d}01T000000")
+
+        archives = [p for p in tdir.iterdir() if p.is_dir()
+                    and p.name.startswith("previous_attempt_")]
+        assert len(archives) <= 3, f"unbounded growth: {len(archives)} archives after 12 resets"
+
+    def test_fresh_ticket_never_creates_or_prunes_archives(self, tmp_path):
+        """The common case — no reset ever happened — must stay untouched."""
+        bfl, _t, state = _bfl(tmp_path, FakeOuterResult(passed=True))
+        bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
+        tdir = state.task_dir("BUG-FIX-AUTO-T168")
+        archives = [p for p in tdir.iterdir() if p.is_dir()] if tdir.exists() else []
+        assert archives == []
