@@ -957,3 +957,117 @@ class TestOperatorRetryIsReal:
         bfl._outer.run_task.return_value = FakeOuterResult(passed=True)
         r = bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
         assert r.fixed is True
+
+
+# ── 10. Failed fix attempts must not leave dirty residue ────────────────────
+
+class TestFailedFixDiscardsResidue:
+    """The documented "Bug 2" hazard, unguarded for fix attempts.
+
+    controller.py already handles it for main tasks: the coder writes its
+    candidate into base_dir BEFORE validation, so a task that ends without a
+    commit leaves that edit dirty — and commit() stages everything
+    (git add -u && git add .), sweeping it into the NEXT successful task's
+    commit.  BugFixLoop had no git access at all and never cleaned up, so for
+    a fix attempt the swept-in edit is code that FAILED its acceptance check:
+    broken work lands silently under an unrelated task's message.
+    """
+
+    @staticmethod
+    def _bfl_with_spy_git(tmp_path, outer_result, side_effect=None):
+        state = StateStore(tmp_path / ".agent")
+        state.initialise("fix regressions", tmp_path)
+        tickets = make_ticket_store(tmp_path / ".agent")
+        git = MagicMock()
+        cos = MagicMock()
+        cos._git = git
+        cos.commit.return_value = None
+        outer = MagicMock()
+        if side_effect is not None:
+            outer.run_task.side_effect = side_effect
+        else:
+            outer.run_task.return_value = outer_result
+        return BugFixLoop(outer, cos, tickets, state), git, tickets, state
+
+    def test_exhausted_attempt_discards(self, tmp_path):
+        bfl, git, _t, _s = self._bfl_with_spy_git(
+            tmp_path, FakeOuterResult(passed=False, exhausted=True)
+        )
+        bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
+        git.discard_working_changes.assert_called_once()
+
+    def test_no_verdict_attempt_discards(self, tmp_path):
+        bfl, git, _t, _s = self._bfl_with_spy_git(
+            tmp_path, FakeOuterResult(passed=False, exhausted=False)
+        )
+        bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
+        git.discard_working_changes.assert_called_once()
+
+    def test_crash_discards(self, tmp_path):
+        class Boom(Exception):
+            pass
+
+        bfl, git, _t, _s = self._bfl_with_spy_git(tmp_path, None, side_effect=Boom())
+        with pytest.raises(Boom):
+            bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
+        git.discard_working_changes.assert_called_once()
+
+    def test_failed_commit_discards(self, tmp_path):
+        """passed but GitError — the edits were never recorded anywhere."""
+        bfl, git, _t, _s = self._bfl_with_spy_git(
+            tmp_path, FakeOuterResult(passed=True)
+        )
+        bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
+        git.discard_working_changes.assert_called_once()
+
+    def test_successful_fix_does_NOT_discard(self, tmp_path):
+        """Committed work must never be thrown away."""
+        state = StateStore(tmp_path / ".agent")
+        state.initialise("fix regressions", tmp_path)
+        tickets = make_ticket_store(tmp_path / ".agent")
+        git = MagicMock()
+        cos = MagicMock()
+        cos._git = git
+
+        def commit(task_, result_):
+            state.set_task_status(task_["id"], STATUS_DONE, commit="abc123")
+            return "abc123"
+
+        cos.commit.side_effect = commit
+        outer = MagicMock()
+        outer.run_task.return_value = FakeOuterResult(passed=True)
+
+        r = BugFixLoop(outer, cos, tickets, state).handle_regression(
+            _task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path
+        )
+        assert r.fixed is True
+        git.discard_working_changes.assert_not_called()
+
+    def test_nothing_staged_success_does_NOT_discard(self, tmp_path):
+        """An empty diff is a success — there is nothing to clean."""
+        state = StateStore(tmp_path / ".agent")
+        state.initialise("fix regressions", tmp_path)
+        tickets = make_ticket_store(tmp_path / ".agent")
+        git = MagicMock()
+        cos = MagicMock()
+        cos._git = git
+
+        def commit(task_, result_):
+            state.set_task_status(task_["id"], STATUS_DONE, commit="")
+            return None
+
+        cos.commit.side_effect = commit
+        outer = MagicMock()
+        outer.run_task.return_value = FakeOuterResult(passed=True)
+
+        r = BugFixLoop(outer, cos, tickets, state).handle_regression(
+            _task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path
+        )
+        assert r.fixed is True
+        git.discard_working_changes.assert_not_called()
+
+    def test_no_git_mode_is_a_noop(self, tmp_path):
+        bfl, _t, state = _bfl(tmp_path, FakeOuterResult(passed=False, exhausted=True))
+        bfl._cos = None
+        r = bfl.handle_regression(_task("AUTO-T168"), FakeExecResult(), base_dir=tmp_path)
+        assert r.exhausted is True

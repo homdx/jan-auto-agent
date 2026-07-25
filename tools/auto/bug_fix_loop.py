@@ -221,6 +221,47 @@ class BugFixLoop:
                 "retry may return exhausted without doing work", fix_id, exc,
             )
 
+    def _discard_fix_residue(self, fix_id: str) -> None:
+        """Drop a failed fix attempt's uncommitted edits.
+
+        This is the documented "Bug 2" hazard, which the controller already
+        guards for main tasks but nobody guarded for fix attempts:
+
+            the coder writes its candidate into base_dir BEFORE validation, so
+            an attempt that ends without a commit leaves that edit dirty — and
+            commit() stages everything (git add -u && git add .), which sweeps
+            it into the NEXT successful task's commit.
+
+        For a fix attempt the consequence is worse than mis-attribution: the
+        edit that gets swept in is code that FAILED its acceptance check, so
+        broken work lands silently under an unrelated task's message.
+        Reproduced on a real repo before this fix:
+
+            fix attempt exhausted (acceptance check FAILED)
+              git status: M f.py
+              f.py      : BROKEN half-finished fix
+
+        Safe by the same argument the controller relies on: handle_regression
+        is entered from _check_regressions immediately after a commit, so the
+        working tree is HEAD plus only this fix attempt's edits.  Resetting to
+        HEAD therefore discards exactly that residue and nothing already
+        committed.  A no-op when git is unavailable.
+        """
+        git = getattr(self._cos, "_git", None) if self._cos is not None else None
+        if git is None:
+            return                      # no-git mode — nothing to clean
+        try:
+            git.discard_working_changes()
+            self._state.log(
+                f"fix task {fix_id} uncommitted edits discarded "
+                f"(attempt ended without a commit)"
+            )
+        except Exception as exc:        # pragma: no cover — defensive
+            logger.warning(
+                "BugFixLoop: could not discard residue for %s: %s — its edits "
+                "may be swept into the next commit", fix_id, exc,
+            )
+
     def _park_fix_task(self, fix_id: str) -> None:
         """Mark a non-succeeding synthetic fix task BLOCKED.
 
@@ -525,6 +566,7 @@ class BugFixLoop:
             # later handle_regression with attempts remaining re-upserts the
             # task (upsert_task replaces wholesale, restoring TODO), so this
             # does not block a legitimate retry.
+            self._discard_fix_residue(fix_id)
             self._park_fix_task(fix_id)
             # If this crash consumed the last attempt the ticket will never be
             # retried, so leaving it "in-progress" misreports live work to
@@ -611,6 +653,7 @@ class BugFixLoop:
                     "bug_fix_loop", "controller", "fix_not_committed",
                     params={"ticket_id": ticket_id, "fix_task": fix_id},
                 )
+                self._discard_fix_residue(fix_id)
                 self._park_fix_task(fix_id)
                 if attempts >= self._max_fix_attempts:
                     self._safe_update(ticket_id, status="deferred")
@@ -665,6 +708,7 @@ class BugFixLoop:
                 "bug_fix_loop", "controller", "exhausted",
                 params={"ticket_id": ticket_id},
             )
+            self._discard_fix_residue(fix_id)
             self._park_fix_task(fix_id)
             return BugFixResult(
                 ticket_id, fix_id, fixed=False, exhausted=True
@@ -692,10 +736,12 @@ class BugFixLoop:
                 f"bug {ticket_id} deferred — fix attempts exhausted with no "
                 f"verdict"
             )
+            self._discard_fix_residue(fix_id)
             self._park_fix_task(fix_id)
             return BugFixResult(
                 ticket_id, fix_id, fixed=False, exhausted=True,
             )
+        self._discard_fix_residue(fix_id)
         self._park_fix_task(fix_id)
         return BugFixResult(ticket_id, fix_id, fixed=False)
 
