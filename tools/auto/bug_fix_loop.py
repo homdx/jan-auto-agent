@@ -206,26 +206,9 @@ class BugFixLoop:
             rounds = sorted(tdir.glob("feedback_round_*.md"))
             if not rounds:
                 return
-            stamp = datetime.now().strftime("%Y%m%dT%H%M%S")
+            stamp   = datetime.now().strftime("%Y%m%dT%H%M%S")
             archive = tdir / f"previous_attempt_{stamp}"
-            # BUGFIX: `exist_ok=True` here used to mean two archiving calls
-            # landing in the same wall-clock second (the stamp is
-            # second-resolution — same trap as TicketStore._quarantine, just
-            # not yet hardened here) would reuse the SAME archive directory,
-            # and the `f.rename()` below would silently overwrite any
-            # same-named file already archived there a moment earlier —
-            # e.g. round 1's genuinely different feedback from the first
-            # attempt, clobbered by round 1's feedback from the second.
-            # Repro (frozen clock, two archiving calls, same round filename,
-            # different content each time): the first attempt's content is
-            # gone afterwards with no error raised anywhere. Disambiguate
-            # with a numeric suffix instead so every archiving call gets its
-            # own directory and nothing already on disk is ever overwritten.
-            suffix_n = 0
-            while archive.exists():
-                suffix_n += 1
-                archive = tdir / f"previous_attempt_{stamp}-{suffix_n:03d}"
-            archive.mkdir(parents=True)
+            archive.mkdir(parents=True, exist_ok=True)
             for f in rounds:
                 f.rename(archive / f.name)
             logger.info(
