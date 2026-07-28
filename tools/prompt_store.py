@@ -192,14 +192,74 @@ class PromptStore:
     # ------------------------------------------------------------------ #
 
     def _load(self) -> dict:
+        """Load the store, or an empty dict if it is missing or unusable.
+
+        BUGFIX: an unusable file used to be silently treated as "empty" and
+        push() unconditionally calls _save() at the end of every call — so
+        the VERY NEXT push, for ANY agent, overwrote the file with just that
+        one agent's single new entry, silently destroying every other
+        agent's entire rollback history with no exception raised and only a
+        log.error line easily missed:
+
+            BEFORE: real history for 2 agents, 3 total versions on disk
+            AFTER one push() on top of a corrupt file:
+              {"theme_validator": {"stack": [{"version": 1, ...}]}}
+              architect's 2-version history: False
+              coder's history: False
+
+        Unlike progress.json (tools/auto/state.py), this data is NOT
+        derivable from anywhere else — there is no plan to rebuild prompt
+        version history from — so silent "rebuild and continue" is the wrong
+        recovery here.  The file is quarantined instead, the same pattern
+        TicketStore.get() uses for exactly this reason: keep the damaged
+        original for inspection, and clear the path so the very next _save()
+        starts a fresh file instead of destroying evidence.
+
+        The load also only guarded json.JSONDecodeError/IOError, so a file
+        that PARSES but holds the wrong shape (a list, a string, null) sailed
+        through and crashed later, inside push()/rollback(), on whatever line
+        first indexed into it as a dict — not here, and with nothing naming
+        the file.
+        """
         if not self.store_path.exists():
             return {}
         try:
             with open(self.store_path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, IOError) as e:
-            logger.error(f"PromptStore failed to read {self.store_path}: {e}")
+                data = json.load(f)
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError) as e:
+            self._quarantine(str(e))
             return {}
+        if not isinstance(data, dict):
+            self._quarantine(f"expected a JSON object, got {type(data).__name__}")
+            return {}
+        return data
+
+    def _quarantine(self, reason: str) -> None:
+        """Move an unusable prompts.json aside and log why.
+
+        Renaming rather than deleting preserves the damaged file for
+        inspection.  Renaming rather than leaving it under the original name
+        matters because the caller that receives {} back is about to push a
+        single new entry and unconditionally _save() it — without moving the
+        old file out of the way first, that save would land on the original
+        path and permanently destroy whatever was actually recoverable in it.
+        """
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+        dest  = self.store_path.with_suffix(f".json.corrupt-{stamp}")
+        try:
+            self.store_path.rename(dest)
+            logger.warning(
+                "PromptStore: %s is unusable (%s) — quarantined as %s; "
+                "starting a fresh store (prior prompt history is preserved "
+                "in the quarantined file, not lost)",
+                self.store_path.name, reason, dest.name,
+            )
+        except OSError as exc:
+            logger.error(
+                "PromptStore: %s is unusable (%s) and could not be "
+                "quarantined (%s) — the next push() will overwrite it",
+                self.store_path.name, reason, exc,
+            )
 
     def _save(self, data: dict) -> None:
         try:
