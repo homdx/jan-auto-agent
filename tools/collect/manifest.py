@@ -106,12 +106,41 @@ def hash_tree(root: Path, files: Iterable[str]) -> Dict[str, str]:
 
 
 def _run_git(root: Path, *args: str) -> Optional[str]:
+    """Run one git subcommand under *root* and return its stripped stdout,
+    or ``None`` on any failure (missing git, not a repo, timeout, non-zero
+    exit) — every caller in this module already treats a git-unavailable
+    environment as "nothing to report", never an error to propagate.
+
+    BUGFIX: ``-c core.quotepath=false`` disables git's default behaviour of
+    octal-escaping non-ASCII path bytes in porcelain/status output (e.g. a
+    Cyrillic filename renders as ``"\320\263\320\273..."`` rather than the
+    real UTF-8 text). ``is_dirty``'s path-based exclusion filtering compares
+    these strings directly against a plain Python path string built from
+    ``exclude_dir`` — so when the EXCLUDED directory's own name contains
+    non-ASCII characters (a non-default, non-English ``[collect] dir``
+    config value — plausible for a non-English-language project, which this
+    one is), the escaped path never matches the plain prefix, and
+    ``is_dirty`` reports True for output that is entirely the collector's
+    own, exactly the "dirty on every refresh" bug this module's docstrings
+    already describe fixing once, reopened here for one case they missed.
+    Reproduced directly:
+
+        exclude_dir = root / "выход"    (a Cyrillic collect-output dir)
+        is_dirty(root, exclude_dir) == True   (WRONG — nothing outside
+                                               "выход/" changed)
+
+    Passing this flag on every call (not just the status/porcelain one) is
+    harmless for the other subcommands this helper serves (``rev-parse``,
+    ``log``) — it only affects how PATHS are quoted in output, and none of
+    them emit paths.
+    """
     try:
         proc = subprocess.run(
-            ["git", *args],
+            ["git", "-c", "core.quotepath=false", *args],
             cwd=str(root),
             capture_output=True,
             text=True,
+            encoding="utf-8",
             timeout=10,
         )
     except (OSError, subprocess.SubprocessError):
