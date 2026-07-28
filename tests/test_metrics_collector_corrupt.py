@@ -121,3 +121,40 @@ class TestMissingFileStillWorks:
         MetricsCollector(metrics_path=mp).record(_record("t1"))
         assert mp.exists()
         assert list(tmp_path.glob("*.corrupt-*")) == []
+
+
+class TestQuarantineSameSecondCollision:
+    """Same defect as TicketStore._quarantine's sibling case: the stamp is
+    second-resolution and MetricsCollector has only ONE metrics_path, so
+    two quarantines of it within the same wall-clock second collide on one
+    destination — Path.rename() silently replaces an existing file on
+    POSIX. Reproducible without any clock mocking (confirmed across
+    multiple real runs); narrower reachability than the ticket case (needs
+    the single shared file corrupted, recovered, and corrupted again all
+    within one second) but the same fix.
+    """
+
+    def test_two_quarantines_same_second_both_survive(self, tmp_path):
+        mp = tmp_path / "metrics.json"
+        mp.write_text("CORRUPT-A", encoding="utf-8")
+        mc = MetricsCollector(metrics_path=mp)
+        mc._quarantine("first corruption")
+
+        mp.write_text("CORRUPT-B", encoding="utf-8")
+        mc._quarantine("second corruption")
+
+        quarantined = sorted(tmp_path.glob("*.corrupt-*"))
+        assert len(quarantined) == 2, (
+            f"expected two distinct quarantine files, got {len(quarantined)}"
+        )
+
+    def test_both_files_content_preserved(self, tmp_path):
+        mp = tmp_path / "metrics.json"
+        mp.write_text("CORRUPT-A", encoding="utf-8")
+        mc = MetricsCollector(metrics_path=mp)
+        mc._quarantine("first corruption")
+        mp.write_text("CORRUPT-B", encoding="utf-8")
+        mc._quarantine("second corruption")
+
+        contents = {p.read_text(encoding="utf-8") for p in tmp_path.glob("*.corrupt-*")}
+        assert contents == {"CORRUPT-A", "CORRUPT-B"}

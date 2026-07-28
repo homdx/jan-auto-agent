@@ -181,6 +181,15 @@ class MetricsCollector:
         """
         stamp = __import__("datetime").datetime.now().strftime("%Y%m%dT%H%M%S")
         dest  = self.metrics_path.with_suffix(f".json.corrupt-{stamp}")
+        # Same-second collision guard — see TicketStore._quarantine for the
+        # reasoning and the reproduction. Narrower here than the ticket case
+        # (there is only one metrics_path, not one per id), but reproducible
+        # the same way: two quarantines of this file within the same
+        # wall-clock second otherwise silently overwrite each other.
+        suffix_n = 0
+        while dest.exists():
+            suffix_n += 1
+            dest = self.metrics_path.with_suffix(f".json.corrupt-{stamp}-{suffix_n:03d}")
         try:
             self.metrics_path.rename(dest)
             logger.warning(

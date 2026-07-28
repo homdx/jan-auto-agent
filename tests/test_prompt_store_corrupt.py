@@ -118,3 +118,40 @@ class TestMissingFileStillWorks:
         PromptStore(store_path=sp).push("agent", "p", 0.5)
         assert sp.exists()
         assert list(tmp_path.glob("*.corrupt-*")) == []
+
+
+class TestQuarantineSameSecondCollision:
+    """Same defect as TicketStore._quarantine's sibling case: the stamp is
+    second-resolution and PromptStore has only ONE store_path, so two
+    quarantines of it within the same wall-clock second collide on one
+    destination — Path.rename() silently replaces an existing file on
+    POSIX. Reproducible without any clock mocking (confirmed across
+    multiple real runs); narrower reachability than the ticket case (needs
+    the single shared file corrupted, recovered, and corrupted again all
+    within one second) but the same fix.
+    """
+
+    def test_two_quarantines_same_second_both_survive(self, tmp_path):
+        sp = tmp_path / "prompts.json"
+        sp.write_text("CORRUPT-A", encoding="utf-8")
+        store = PromptStore(store_path=sp)
+        store._quarantine("first corruption")
+
+        sp.write_text("CORRUPT-B", encoding="utf-8")
+        store._quarantine("second corruption")
+
+        quarantined = sorted(tmp_path.glob("*.corrupt-*"))
+        assert len(quarantined) == 2, (
+            f"expected two distinct quarantine files, got {len(quarantined)}"
+        )
+
+    def test_both_files_content_preserved(self, tmp_path):
+        sp = tmp_path / "prompts.json"
+        sp.write_text("CORRUPT-A", encoding="utf-8")
+        store = PromptStore(store_path=sp)
+        store._quarantine("first corruption")
+        sp.write_text("CORRUPT-B", encoding="utf-8")
+        store._quarantine("second corruption")
+
+        contents = {p.read_text(encoding="utf-8") for p in tmp_path.glob("*.corrupt-*")}
+        assert contents == {"CORRUPT-A", "CORRUPT-B"}
