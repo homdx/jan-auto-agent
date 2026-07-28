@@ -73,6 +73,25 @@ class _PythonTargetFinder(ast.NodeVisitor):
     def __init__(self, target_name: str):
         self.target_name = target_name
         self.found: Optional[_PythonTarget] = None
+        # BUGFIX: this class's only match rule used to be `node.name ==
+        # self.target_name` — a bare-name check. That correctly finds a
+        # nested def/class by its own short name (e.g. "cached_method"
+        # inside class Foo), but a *dotted*-qualified target — "Foo.
+        # cached_method", or "Outer.Inner.deep_async_method" for a
+        # doubly-nested class — never equals any single node's `.name`,
+        # so lookup silently returned "" (treated as "symbol not found"
+        # by every caller). Dotted symbols are exactly how a method is
+        # naturally referred to once its bare name is ambiguous (the same
+        # method name defined in two different classes) or how an
+        # upstream citation (gate1_filter's architect-proposed
+        # `cited_location.symbol`, context_broker's dependency resolution)
+        # is reasonably likely to spell it, so this was a real, silent
+        # "symbol not found" false negative, not just a theoretical gap.
+        # `_path_stack` tracks the enclosing def/class names on the walk
+        # down so a full dotted qualname can be compared, while the
+        # original bare-name behavior (first DFS match wins) is kept
+        # completely unchanged for every target that has no dot in it.
+        self._path_stack: list[str] = []
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         self._check(node)
@@ -84,10 +103,24 @@ class _PythonTargetFinder(ast.NodeVisitor):
         self._check(node)
 
     def _check(self, node: ast.AST) -> None:
-        if self.found is None and node.name == self.target_name:
+        if self.found is not None:
+            return
+        qualname = ".".join([*self._path_stack, node.name])
+        is_match = (
+            node.name == self.target_name
+            or qualname == self.target_name
+            # A dotted target may also be a *suffix* of the full path
+            # ("Inner.method" should still resolve inside "Outer.Inner.
+            # method") — the same forgiving behavior a bare name already
+            # gets regardless of how deeply it's nested.
+            or ("." in self.target_name and qualname.endswith("." + self.target_name))
+        )
+        if is_match:
             self.found = _PythonTarget(node=node, start_line=self._start_line(node), end_line=getattr(node, "end_lineno", node.lineno))
-        if self.found is None:
-            self.generic_visit(node)
+            return
+        self._path_stack.append(node.name)
+        self.generic_visit(node)
+        self._path_stack.pop()
 
     @staticmethod
     def _start_line(node: ast.AST) -> int:
