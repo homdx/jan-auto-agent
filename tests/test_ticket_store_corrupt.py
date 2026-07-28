@@ -147,3 +147,115 @@ class TestRegressionPathSurvives:
         )
         assert result is not None
         assert len(_quarantined(tmp_path)) == 1
+
+
+class TestQuarantineSameSecondCollision:
+    """Two quarantines of the SAME ticket id within the same wall-clock
+    second must not collide on one destination path.
+
+    The stamp is second-resolution, so path.with_suffix(f".json.corrupt-
+    {stamp}") is identical for two calls in the same second — and
+    Path.rename() silently replaces an existing destination on POSIX, so
+    the second quarantine call overwrote the first's evidence with no
+    error raised anywhere.  Reproducible with two ordinary back-to-back
+    calls, no clock freezing required (confirmed separately); the frozen
+    clock here just makes the collision deterministic for the test.
+
+    Same shape as the previously-found (and, for the sibling case in
+    bug_fix_loop.py's _clear_stale_fix_rounds, deliberately not fixed —
+    judged not worth the added complexity) same-second timestamp
+    collision.  Fixed here with the identical numeric-suffix
+    disambiguation technique.
+    """
+
+    def test_two_quarantines_same_second_both_survive(self, tmp_path, monkeypatch):
+        import tools.auto.ticket_store as ticket_store_module
+        from datetime import datetime as real_datetime
+
+        class _Frozen(real_datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return real_datetime(2026, 7, 26, 12, 0, 0)
+
+        monkeypatch.setattr(ticket_store_module, "datetime", _Frozen)
+
+        store = _store(tmp_path)
+        path = _plant(tmp_path, "BUG-AUTO-T1", "CORRUPT-A")
+        store._quarantine(path, "first corruption")
+
+        # A fresh file recreated at the same id, itself found corrupt
+        # within the same frozen second.
+        path = _plant(tmp_path, "BUG-AUTO-T1", "CORRUPT-B")
+        store._quarantine(path, "second corruption")
+
+        quarantined = _quarantined(tmp_path)
+        assert len(quarantined) == 2, (
+            f"expected two distinct quarantine files, got {len(quarantined)}: "
+            f"{quarantined}"
+        )
+
+    def test_both_files_content_preserved(self, tmp_path, monkeypatch):
+        """Not just two files — the ACTUAL content of each must survive."""
+        import tools.auto.ticket_store as ticket_store_module
+        from datetime import datetime as real_datetime
+
+        class _Frozen(real_datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return real_datetime(2026, 7, 26, 12, 0, 0)
+
+        monkeypatch.setattr(ticket_store_module, "datetime", _Frozen)
+
+        store = _store(tmp_path)
+        path = _plant(tmp_path, "BUG-AUTO-T1", "CORRUPT-A")
+        store._quarantine(path, "first corruption")
+        path = _plant(tmp_path, "BUG-AUTO-T1", "CORRUPT-B")
+        store._quarantine(path, "second corruption")
+
+        contents = {
+            p.read_text(encoding="utf-8")
+            for p in (tmp_path / ".agent" / "tickets").glob("*.corrupt-*")
+        }
+        assert contents == {"CORRUPT-A", "CORRUPT-B"}
+
+    def test_third_collision_in_the_same_second_also_survives(self, tmp_path, monkeypatch):
+        import tools.auto.ticket_store as ticket_store_module
+        from datetime import datetime as real_datetime
+
+        class _Frozen(real_datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return real_datetime(2026, 7, 26, 12, 0, 0)
+
+        monkeypatch.setattr(ticket_store_module, "datetime", _Frozen)
+
+        store = _store(tmp_path)
+        for i in range(3):
+            path = _plant(tmp_path, "BUG-AUTO-T1", f"CORRUPT-{i}")
+            store._quarantine(path, f"corruption {i}")
+
+        assert len(_quarantined(tmp_path)) == 3
+
+    def test_different_ticket_ids_never_collide_regardless_of_clock(self, tmp_path, monkeypatch):
+        """Sanity check: the fix must not change behaviour for the common
+        case of two DIFFERENT tickets quarantined in the same second."""
+        import tools.auto.ticket_store as ticket_store_module
+        from datetime import datetime as real_datetime
+
+        class _Frozen(real_datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return real_datetime(2026, 7, 26, 12, 0, 0)
+
+        monkeypatch.setattr(ticket_store_module, "datetime", _Frozen)
+
+        store = _store(tmp_path)
+        store._quarantine(_plant(tmp_path, "BUG-AUTO-T1", "A"), "r1")
+        store._quarantine(_plant(tmp_path, "BUG-AUTO-T2", "B"), "r2")
+
+        names = _quarantined(tmp_path)
+        assert len(names) == 2
+        assert any(n.startswith("BUG-AUTO-T1") for n in names)
+        assert any(n.startswith("BUG-AUTO-T2") for n in names)
+        # neither should have needed the numeric disambiguation suffix
+        assert not any("-001" in n for n in names)

@@ -122,11 +122,76 @@ class MetricsCollector:
         }
 
     def _load_all(self) -> list:
+        """Load all recorded runs, or [] if the file is missing or unusable.
+
+        BUGFIX: an unusable file used to be silently treated as "empty", and
+        record() unconditionally appends and re-saves at the end of every
+        call — so the VERY NEXT record(), for any run, overwrote the whole
+        file with just that one new entry, destroying every prior run's
+        metrics with no exception raised and only a log.error line easy to
+        miss over a long autonomous session:
+
+            BEFORE: 3 real run records on disk
+            AFTER one record() call on top of a corrupt file: 1 record(s)
+
+        The same defect as PromptStore._load (tools/prompt_store.py) — same
+        author, same era, and this module's own docstring is what
+        prompt_store's atomic-write comment cites as the pattern to imitate
+        for the WRITE side; the read side had the identical gap.  This is
+        the fourth instance of this exact shape found this session (ticket
+        store, plan.json, progress.json, prompt_store.py); it is a systemic
+        pattern in this codebase's hand-rolled JSON stores, not an isolated
+        mistake, and other JSON-backed stores are worth the same check.
+
+        Metrics feed the prompt optimizer's summarize_failures(), not live
+        task/commit state, so history here (like prompt_store's) is not
+        derivable from anywhere else and not correctness-critical — the fix
+        quarantines rather than raising, so a damaged file degrades the
+        optimizer's view instead of crashing a run over telemetry.
+
+        Also widens the exception match to catch a file that PARSES but
+        holds the wrong shape (a dict, a string, null instead of a list),
+        which used to sail through here and crash later, inside record(),
+        with an unhelpful AttributeError:
+
+            dict   RAISED AttributeError: 'dict' object has no attribute 'append'
+            string RAISED AttributeError: 'str' object has no attribute 'append'
+        """
         if not self.metrics_path.exists():
             return []
         try:
             with open(self.metrics_path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, IOError) as e:
-            logger.error(f"MetricsCollector failed to read metrics: {e}")
+                data = json.load(f)
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError) as e:
+            self._quarantine(str(e))
             return []
+        if not isinstance(data, list):
+            self._quarantine(f"expected a JSON array, got {type(data).__name__}")
+            return []
+        return data
+
+    def _quarantine(self, reason: str) -> None:
+        """Move an unusable metrics.json aside and log why.
+
+        Same pattern as TicketStore.get() / PromptStore._load: rename rather
+        than delete, so the damaged original is preserved for inspection,
+        and rename rather than leave-in-place, so the very next record()
+        starts a fresh file instead of landing on top of (and destroying)
+        whatever was still recoverable in the original.
+        """
+        stamp = __import__("datetime").datetime.now().strftime("%Y%m%dT%H%M%S")
+        dest  = self.metrics_path.with_suffix(f".json.corrupt-{stamp}")
+        try:
+            self.metrics_path.rename(dest)
+            logger.warning(
+                "MetricsCollector: %s is unusable (%s) — quarantined as %s; "
+                "starting a fresh metrics file (prior history is preserved "
+                "in the quarantined file, not lost)",
+                self.metrics_path.name, reason, dest.name,
+            )
+        except OSError as exc:
+            logger.error(
+                "MetricsCollector: %s is unusable (%s) and could not be "
+                "quarantined (%s) — the next record() will overwrite it",
+                self.metrics_path.name, reason, exc,
+            )

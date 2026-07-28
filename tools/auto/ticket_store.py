@@ -291,9 +291,23 @@ class TicketStore:
         renaming rather than leaving it in place means a caller that decides
         to open a fresh ticket with the same id will not silently overwrite
         the only evidence of the problem.
+
+        The stamp is second-resolution, so two quarantines of the SAME
+        ticket id within the same wall-clock second would otherwise collide
+        on one destination path — the second rename landing on the first
+        silently overwrites it, since Path.rename() replaces an existing
+        destination on POSIX with no error.  Low severity in practice (both
+        files are already-discarded corrupt tickets; nothing downstream
+        distinguishes one quarantine copy from two), but reproducible with
+        two ordinary back-to-back calls, no mocking required.  A numeric
+        suffix disambiguates so neither call's evidence is destroyed.
         """
         stamp = datetime.now().strftime("%Y%m%dT%H%M%S")
         dest  = path.with_suffix(f".json.corrupt-{stamp}")
+        suffix_n = 0
+        while dest.exists():
+            suffix_n += 1
+            dest = path.with_suffix(f".json.corrupt-{stamp}-{suffix_n:03d}")
         try:
             path.rename(dest)
             logger.warning(
