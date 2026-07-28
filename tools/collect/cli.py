@@ -45,10 +45,13 @@ from __future__ import annotations
 
 import configparser
 import json
+import logging
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 from tools.collect import config_map as config_map_mod
 from tools.collect import gates as gates_mod
@@ -479,6 +482,32 @@ def action_refresh(
         except (OSError, ValueError, KeyError):
             previous_manifest = None
             previous_by_path = {}
+
+    # BUGFIX: manifest.py's own docstring documents `collector_version`
+    # as existing "so a format change can be detected" — but nothing
+    # anywhere in this codebase ever actually COMPARED it. Every field in
+    # ModuleRecord.from_dict() (and its nested records) degrades
+    # gracefully via `.get(key, default)` rather than raising on a
+    # missing key, which is the right behaviour for a genuinely corrupt
+    # or hand-edited file — but it also means a SCHEMA CHANGE (a new field
+    # added to ModuleRecord after `previous_manifest` was written) was
+    # silently absorbed here: an unchanged file's reused `previous_by_path`
+    # record would be missing/defaulted for the new field while a
+    # genuinely-changed file's freshly-scanned record has it populated,
+    # producing an internally inconsistent `merged` list with no warning
+    # that it happened. Treating a version mismatch exactly like the
+    # existing "no previous manifest" case — fall back to a full build —
+    # closes it the same way that case is already closed, and is the
+    # literal mechanism the docstring already promised existed.
+    if previous_manifest is not None and previous_manifest.collector_version != manifest_mod.COLLECTOR_VERSION:
+        logger.info(
+            "collect --refresh: manifest was built by collector_version=%r, "
+            "current is %r — falling back to a full build instead of "
+            "reusing possibly schema-mismatched records",
+            previous_manifest.collector_version, manifest_mod.COLLECTOR_VERSION,
+        )
+        previous_manifest = None
+        previous_by_path = {}
 
     if previous_manifest is None:
         collect_dir, written, _ctx = _full_build(root, config=config, config_path=config_path, llm_call=llm_call)
