@@ -319,22 +319,48 @@ def is_fresh(
     *,
     files: Optional[Iterable[str]] = None,
 ) -> bool:
-    """True iff `root`'s current content hashes exactly match `manifest`'s.
+    """True iff `manifest` was built by the CURRENT collector_version AND
+    `root`'s current content hashes exactly match `manifest`'s.
 
-    By default this re-*discovers* the file set under `root` (rather than
-    only re-hashing the paths the manifest already knows about), so a file
-    added since the manifest was built shows up as an extra key and makes
-    the comparison fail — not just edits to already-tracked files. Removing
-    or editing a tracked file is caught the same way: any difference in the
-    resulting `{path: hash}` dict, whether it's a missing key, an extra
-    key, or a changed value, means "not fresh". A tree rebuilt with no
-    changes at all — even at a different timestamp — compares equal and is
-    fresh.
+    By default the hash comparison re-*discovers* the file set under `root`
+    (rather than only re-hashing the paths the manifest already knows
+    about), so a file added since the manifest was built shows up as an
+    extra key and makes the comparison fail — not just edits to
+    already-tracked files. Removing or editing a tracked file is caught the
+    same way: any difference in the resulting `{path: hash}` dict, whether
+    it's a missing key, an extra key, or a changed value, means "not
+    fresh". A tree rebuilt with no changes at all — even at a different
+    timestamp — compares equal and is fresh.
+
+    BUGFIX: this module's own module-level docstring documents
+    `collector_version` as existing "so a format change can be detected" —
+    but nothing anywhere in this package ever actually COMPARED it, on any
+    of this function's four call sites (cli.action_check — and, through
+    it, action_collect, which skips rebuilding ENTIRELY on fresh=True;
+    loader's consumer-facing freshness check, which returns a
+    schema-mismatched artifact labelled STATUS_FRESH to whatever downstream
+    code depends on it). Every field in ModuleRecord.from_dict() degrades
+    gracefully via `.get(key, default)` on a missing key — correct for a
+    corrupt/hand-edited file, but it silently absorbed a genuine SCHEMA
+    CHANGE the same way: a manifest built by an older collector_version
+    could report "fresh" against an unchanged tree even though records
+    built under the new version would carry a field the reused ones don't
+    have.  Reproduced directly:
+
+        action_check after a hand-simulated version bump:
+          fresh: True                 <- WRONG, should be False
+          message: up to date
+
+    Checking `collector_version` here, once, closes it at every call site
+    rather than needing four separate fixes (action_refresh already got its
+    own version check separately, since it doesn't call is_fresh at all).
 
     Pass `files` explicitly to freshness-check against a specific file set
     instead of a fresh directory walk (e.g. when the caller already has the
     scanner's own file list from EPIC B).
     """
+    if manifest.collector_version != COLLECTOR_VERSION:
+        return False
     root = Path(root)
     current_files = list(files) if files is not None else discover_files(root)
     current = hash_tree(root, current_files)

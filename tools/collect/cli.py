@@ -629,6 +629,7 @@ def action_module(
     root = Path(root)
     collect_dir = resolve_collect_dir(root, config)
     artifact_path = collect_dir / ARTIFACT_FILENAME
+    manifest_path = collect_dir / MANIFEST_FILENAME
     if not artifact_path.exists():
         result = action_refresh(root, config=config, config_path=config_path, llm_call=llm_call)
         return CollectResult(
@@ -636,6 +637,33 @@ def action_module(
             message=f"no existing artifact — ran a full refresh instead ({result.message})",
             collect_dir=result.collect_dir, written_files=result.written_files,
         )
+
+    # BUGFIX: same collector_version gap fixed for manifest.is_fresh and
+    # action_refresh — this function reuses every OTHER module's record
+    # from the existing artifact verbatim and never calls is_fresh at all,
+    # so it needs its own check. Without it, patching one module under an
+    # artifact built by an older collector_version would silently merge
+    # the freshly-scanned module (current schema) with every reused record
+    # (old schema) into one inconsistent artifact.
+    if manifest_path.exists():
+        try:
+            existing_manifest = manifest_mod.read_manifest(manifest_path)
+        except (OSError, ValueError):
+            existing_manifest = None
+        if existing_manifest is not None and existing_manifest.collector_version != manifest_mod.COLLECTOR_VERSION:
+            logger.info(
+                "collect --module: existing artifact was built by "
+                "collector_version=%r, current is %r — running a full "
+                "refresh instead of patching one module into a "
+                "possibly schema-mismatched artifact",
+                existing_manifest.collector_version, manifest_mod.COLLECTOR_VERSION,
+            )
+            result = action_refresh(root, config=config, config_path=config_path, llm_call=llm_call)
+            return CollectResult(
+                action="module", wrote=result.wrote, fresh=result.fresh,
+                message=f"collector_version mismatch — ran a full refresh instead ({result.message})",
+                collect_dir=result.collect_dir, written_files=result.written_files,
+            )
 
     try:
         payload = json.loads(artifact_path.read_text(encoding="utf-8"))
