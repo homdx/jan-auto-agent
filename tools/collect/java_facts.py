@@ -207,7 +207,10 @@ def _walk_type_body(
 ) -> None:
     for child in body_node.children:
         if child.type in _TYPE_DECL_TYPES:
-            _record_type_decl(child, module_path, containing_qualname, symbols)
+            _record_type_decl(
+                child, module_path, containing_qualname, symbols,
+                default_access=member_default_access,
+            )
         elif child.type in _METHOD_DECL_TYPES:
             _record_method_decl(
                 child, module_path, containing_qualname, symbols, default_access=member_default_access
@@ -223,10 +226,37 @@ def _record_type_decl(
     module_path: str,
     containing_qualname: Optional[str],
     symbols: List[FunctionRecord],
+    *,
+    default_access: str = "package-private",
 ) -> None:
+    """Record `node` (a class/interface/enum/record declaration) and recurse
+    into its body.
+
+    BUGFIX (JLS 9.4): a member TYPE declared directly inside an interface
+    body — a nested interface or class with no explicit access keyword — is
+    implicitly public, exactly the same rule already applied to member
+    METHODS of an interface (see the comment on `member_default` below).
+    `_walk_type_body` was already computing and threading that correct
+    default through to `_record_method_decl` via `member_default_access`,
+    but never passed it to THIS function for the type declaration's own
+    modifier, which fell back to `_access_modifier`'s hardcoded
+    "package-private" regardless of enclosing context. Confirmed on a real
+    tree-sitter-java parse:
+
+        interface Shape {
+            interface Nested { ... }   // no modifier
+            class Helper { ... }       // no modifier
+        }
+
+        Shape.Nested   access=package-private   (WRONG — should be public)
+        Shape.Helper   access=package-private   (WRONG — should be public)
+
+    `default_access` is that same context-dependent default, now threaded
+    through identically to `_record_method_decl`'s existing parameter.
+    """
     name = _text(node.child_by_field_name("name"))
     qualname = f"{containing_qualname}.{name}" if containing_qualname else name
-    access = _access_modifier(node)
+    access = _access_modifier(node, default=default_access)
     symbols.append(
         FunctionRecord(
             qualname=f"{module_path}:{qualname}",

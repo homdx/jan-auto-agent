@@ -101,10 +101,31 @@ def test_gate1_is_fail_closed():
     assert entries["gate1"].fail_mode == "closed"
 
 
-def test_language_gate_is_fail_closed_and_spends_no_llm_call():
+def test_language_gate_is_fail_open_and_spends_no_llm_call():
+    """The language gate accepts what it cannot tokenize — measured, not assumed.
+
+    This test previously asserted fail_mode == "closed".  It compared the seed
+    value to itself: build_gates_map() reads _GATE_SEED, so the assertion
+    pinned the documentation rather than the behaviour and could not detect
+    that the claim was false.
+
+    By this module's own definition, "open" means an unparseable/errored
+    verdict is treated as PASS.  _find_non_ascii_identifiers catches
+    TokenError/IndentationError/SyntaxError/ValueError and returns an empty
+    set, which coder._write_files reads as "no bad identifiers found" and
+    accepts:
+
+        parseable, non-ASCII idents : {'привет'} -> gate REJECTS
+        syntax error, same idents   : set()      -> gate PASSES
+
+    So the gate is fail-open.  That is defensible for a style gate — do not
+    block on a file you were unable to analyse — so the code is right and the
+    table was wrong.  See tests/test_gates_fail_mode_truth.py, which pins every
+    fail_mode against the real implementation so the two cannot drift again.
+    """
     entries = _by_name(build_gates_map())
     language = entries["language"]
-    assert language.fail_mode == "closed"
+    assert language.fail_mode == "open"
     assert language.extra_llm_call is False
 
 

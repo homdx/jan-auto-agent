@@ -16,6 +16,8 @@ import ast
 from pathlib import Path
 from typing import Dict, Set, Tuple
 
+import pytest
+
 from tools.collect.dataflow import extract_guarded_accesses
 from tools.collect.model import Provenance
 
@@ -86,6 +88,67 @@ def test_real_view_trace_find_trace_file_is_guarded_via_sys_exit():
     site = by_access[("tools/auto/view_trace.py:176", "candidates[-1]")]
     assert site.status == "GUARDED"
     assert site.guard
+
+
+# ── reassignment invalidates a stale guard ──────────────────────────────────
+
+
+def test_reassigned_name_loses_its_guard():
+    # BUGFIX (found via self-play collect-mode session on this repo):
+    # `if not x: return` proves the *original* x truthy; rebinding x to a
+    # fresh value afterward (`x = other_func()`) must drop that guarantee
+    # for x, not carry it forward to a completely different object that
+    # could well be empty. Before the fix this was recorded GUARDED,
+    # citing the now-irrelevant early return, and Pass C's
+    # contradiction_check (COLLECT-17) would use that stale GUARDED
+    # record to auto-drop a correct "this crashes" claim about the site
+    # as `dropped:contradicts-guard` — turning a real bug report into a
+    # suppressed false positive.
+    source = (
+        "def f(entry):\n"
+        "    if not entry or not entry.get('queue'):\n"
+        "        return None\n"
+        "    queue = entry['queue']\n"
+        "    queue = refresh(queue)\n"
+        "    return queue[-1]\n"
+    )
+    accesses = _accesses(source, "pkg/reassign.py")
+    by_access = {(a.location, a.access): a for a in accesses}
+    site = by_access[("pkg/reassign.py:6", "queue[-1]")]
+    assert site.status == "UNGUARDED"
+    assert site.guard is None
+
+
+def test_reassigned_name_end_to_end_survives_verification():
+    # Same scenario, run through the full Pass A -> Pass C chain (not just
+    # dataflow.py in isolation): a Pass B claim that the reassigned access
+    # crashes must survive `verify_claims` rather than being dropped as
+    # `contradicts-guard`, since the crash claim is actually true.
+    from tools.collect.scanner import scan_module
+    from tools.collect.verifier import extract_claims, verify_claims
+
+    mod_path = "pkg/reassign.py"
+    source = (
+        "def f(entry):\n"
+        "    if not entry or not entry.get('queue'):\n"
+        "        return None\n"
+        "    queue = entry['queue']\n"
+        "    queue = refresh(queue)\n"
+        "    return queue[-1]\n"
+    )
+    module = scan_module(source, mod_path)
+    known_symbols = frozenset(s.qualname for s in module.public_symbols)
+
+    claims = extract_claims(
+        "queue[-1] crashes with IndexError when refresh(queue) returns an empty list.",
+        mod_path, known_symbols,
+    )
+    kept, dropped = verify_claims(
+        claims, module=module, known_symbols=known_symbols,
+        line_counts={mod_path: source.count("\n") + 1}, fail_open_locs=frozenset(),
+    )
+    assert dropped == []
+    assert len(kept) == 1
 
 
 # ── guard-shape coverage ────────────────────────────────────────────────────
@@ -211,12 +274,12 @@ def test_real_view_trace_site_appears_exactly_once():
 
 def test_real_analyze_logs_done_site_appears_exactly_once_and_is_guarded():
     # A second real instance of the same shape, found while regression-
-    # testing the fix above: `done[-1]` at analyze_logs.py:1251, guarded by
-    # `if not done: return ...` at line 1249, nested inside an unrelated
+    # testing the fix above: `done[-1]` at analyze_logs.py:1268, guarded by
+    # `if not done: continue` at line 1266, nested inside an unrelated
     # outer block.
     source = (REPO_ROOT / "analyze_logs.py").read_text(encoding="utf-8")
     accesses = _accesses(source, "analyze_logs.py")
-    matches = [a for a in accesses if (a.location, a.access) == ("analyze_logs.py:1251", "done[-1]")]
+    matches = [a for a in accesses if (a.location, a.access) == ("analyze_logs.py:1268", "done[-1]")]
     assert len(matches) == 1, f"expected exactly one record, got {matches!r}"
     assert matches[0].status == "GUARDED"
 
@@ -327,3 +390,162 @@ def test_negated_numeric_subscript_still_works():
     accesses = _accesses(source, "m.py")
     reprs = {a.access for a in accesses}
     assert reprs == {"x[-1]", "x[-1.5]"}
+
+
+# ── BUGFIX regression: `and`-combined falsy guards must not be treated ─────
+# ── the same as `or`-combined ones ──────────────────────────────────────
+#
+# `if not a and not b: raise` only guarantees "a or b truthy" once past
+# it (De Morgan), never that `a` specifically is safe — `a=[]`, `b=[1]`
+# makes the guard's test False (so it doesn't fire) while `a` is still
+# empty. `_falsy_guard_targets` used to recurse into `ast.BoolOp`
+# regardless of whether it was `and` or `or`, so it wrongly marked both
+# names guaranteed-truthy for an `and`-combined test too — this is the
+# exact "wrongly claimed guard poisons the antihallucination guarantee"
+# failure mode COLLECT-7's own module docstring warns against.
+
+
+def test_and_combined_falsy_guard_does_not_mark_either_name_guarded():
+    source = (
+        "def f(a, b):\n"
+        "    if not a and not b:\n"
+        "        raise ValueError('both missing')\n"
+        "    return a[0]\n"
+    )
+    accesses = _accesses(source, "m.py")
+    assert len(accesses) == 1
+    assert accesses[0].access == "a[0]"
+    assert accesses[0].status == "UNGUARDED"
+    assert accesses[0].guard is None
+
+
+def test_and_combined_falsy_guard_actually_unsafe_at_runtime():
+    # Ground truth for the test above: a=[] (falsy), b=[1] (truthy) makes
+    # `not a and not b` False, so the guard doesn't fire, and `a[0]` does
+    # raise — confirming UNGUARDED is the correct classification, not an
+    # overcautious one.
+    def f(a, b):
+        if not a and not b:
+            raise ValueError("both missing")
+        return a[0]
+
+    with pytest.raises(IndexError):
+        f([], [1])
+
+
+def test_or_combined_falsy_guard_still_marks_both_names_guarded():
+    # The correct, pre-existing behavior this fix must not regress:
+    # `if not a or not b: raise` genuinely does guarantee both `a` and
+    # `b` truthy afterward (De Morgan on a falsified `or`).
+    source = (
+        "def f(a, b):\n"
+        "    if not a or not b:\n"
+        "        raise ValueError('missing')\n"
+        "    return a[0], b[0]\n"
+    )
+    accesses = _accesses(source, "m.py")
+    assert {a.access: a.status for a in accesses} == {
+        "a[0]": "GUARDED",
+        "b[0]": "GUARDED",
+    }
+
+
+def test_and_nested_inside_or_does_not_leak_names_out():
+    # `not a or (not b and not c)`: `a` is individually refuted (top-level
+    # `or` operand), but `b`/`c` are not — they're inside a nested `and`,
+    # so no per-name guarantee can be derived for either of them even
+    # though the whole expression is reached via `or`.
+    source = (
+        "def f(a, b, c):\n"
+        "    if not a or (not b and not c):\n"
+        "        raise ValueError('missing')\n"
+        "    return a[0], b[0], c[0]\n"
+    )
+    accesses = _accesses(source, "m.py")
+    assert {a.access: a.status for a in accesses} == {
+        "a[0]": "GUARDED",
+        "b[0]": "UNGUARDED",
+        "c[0]": "UNGUARDED",
+    }
+
+
+def test_mutating_pop_after_guard_invalidates_it():
+    # Bug reproduction: `if not stack: return None` proves `stack` truthy,
+    # but `stack.pop()` right after can empty it again with no reassignment
+    # to trigger `_invalidate_reassigned` — before the fix, `stack[-1]`
+    # here was wrongly reported GUARDED, citing the now-stale early-return.
+    source = (
+        "def rollback(stack):\n"
+        "    if not stack:\n"
+        "        return None\n"
+        "    stack.pop()\n"
+        "    return stack[-1]\n"
+    )
+    accesses = _accesses(source, "m.py")
+    assert {a.access: a.status for a in accesses} == {"stack[-1]": "UNGUARDED"}
+
+
+def test_del_after_guard_invalidates_it():
+    source = (
+        "def g(d, keys):\n"
+        "    if not d:\n"
+        "        return None\n"
+        "    del d[keys[0]]\n"
+        "    return d[keys[0]]\n"
+    )
+    accesses = _accesses(source, "m.py")
+    statuses = {a.access: a.status for a in accesses}
+    assert statuses["d[keys[0]]"] == "UNGUARDED"
+
+
+def test_pop_before_guard_is_unaffected():
+    # Sanity: mutation *before* the guard must not spuriously invalidate
+    # anything (there's nothing to invalidate yet), and the guard still
+    # applies normally to what follows it.
+    source = (
+        "def f(stack):\n"
+        "    stack.append(1)\n"
+        "    if not stack:\n"
+        "        return None\n"
+        "    return stack[-1]\n"
+    )
+    accesses = _accesses(source, "m.py")
+    assert {a.access: a.status for a in accesses} == {"stack[-1]": "GUARDED"}
+
+
+def test_pairs_only_guard_alias_does_not_crash_and_is_guarded():
+    # Bug reproduction: a guard that is *only* a pairs-shaped test (e.g.
+    # `if not entry.get("stack"):` with no bare `not entry` alongside it,
+    # unlike the real prompt_store.get_current, which combines both) used
+    # to crash the whole collect run with an unhandled ValueError, because
+    # `_propagate_alias` added the alias to `guarded_names` without ever
+    # giving it a `guard_desc` entry — violating GuardedAccess's own
+    # invariant that GUARDED requires a description.
+    source = (
+        "def rollback(entry):\n"
+        "    if not entry.get('stack'):\n"
+        "        return None\n"
+        "    stack = entry['stack']\n"
+        "    return stack[-1]\n"
+    )
+    accesses = _accesses(source, "m.py")  # must not raise
+    by_access = {a.access: a for a in accesses}
+    assert by_access["stack[-1]"].status == "GUARDED"
+    assert by_access["stack[-1]"].guard is not None
+
+
+def test_pairs_and_names_combined_guard_still_works():
+    # The real prompt_store.get_current shape: combining a bare-name check
+    # with a pairs check in the same `or` must keep working exactly as
+    # before this fix.
+    source = (
+        "def get_current(entry):\n"
+        "    if not entry or not entry.get('stack'):\n"
+        "        return None\n"
+        "    stack = entry['stack']\n"
+        "    return stack[-1]\n"
+    )
+    accesses = _accesses(source, "m.py")
+    by_access = {a.access: a for a in accesses}
+    assert by_access["stack[-1]"].status == "GUARDED"
+    assert by_access["stack[-1]"].guard == "early-return at m.py:2"

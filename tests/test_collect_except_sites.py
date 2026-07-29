@@ -138,3 +138,194 @@ def test_all_sites_are_provenance_static():
     tree = ast.parse(source, filename="pkg/error_handling.py")
     sites = extract_except_sites(tree, "pkg/error_handling.py")
     assert all(s.provenance == Provenance.STATIC for s in sites)
+
+
+# ── BUGFIX regression: a nested def/class inside the except body is a ──────
+# ── separate execution scope, not part of the handler's own reaction ──────
+#
+# `_classify_except_body` used to call plain `ast.walk(stmt)` over every
+# statement in the body, which visits descendants regardless of enclosing
+# scope. An except body that only *defines* a nested callback containing a
+# bare `raise` (or a `log`/`continue`/`return`) doesn't react that way at
+# the except site itself — the callback's body only runs later, if and when
+# something calls it — so the actual handler is a silent swallow (fail-open)
+# exactly like a bare `pass`, and was being misclassified as the opposite.
+
+
+def test_bare_raise_inside_nested_def_does_not_count_as_re_raise():
+    source = (
+        "def f():\n"
+        "    try:\n"
+        "        risky()\n"
+        "    except Exception:\n"
+        "        def handler():\n"
+        "            raise\n"
+        "        register(handler)\n"
+    )
+    sites = _sites_by_location(source, "m.py")
+    site = sites["m.py:4"]
+    assert site.body_kind == "pass"
+    assert site.is_fail_open is True
+
+
+def test_bare_raise_inside_def_nested_deeper_in_an_if_still_excluded():
+    source = (
+        "def f(cond):\n"
+        "    try:\n"
+        "        risky()\n"
+        "    except Exception:\n"
+        "        if cond:\n"
+        "            def handler():\n"
+        "                raise\n"
+        "        else:\n"
+        "            pass\n"
+    )
+    sites = _sites_by_location(source, "m.py")
+    site = sites["m.py:4"]
+    assert site.body_kind == "pass"
+    assert site.is_fail_open is True
+
+
+def test_log_call_inside_nested_class_method_does_not_count_as_log():
+    source = (
+        "def f():\n"
+        "    try:\n"
+        "        risky()\n"
+        "    except Exception:\n"
+        "        class Deferred:\n"
+        "            def run(self):\n"
+        "                logger.error('boom')\n"
+        "        register(Deferred())\n"
+    )
+    sites = _sites_by_location(source, "m.py")
+    site = sites["m.py:4"]
+    assert site.body_kind == "pass"
+    assert site.is_fail_open is True
+
+
+def test_genuine_top_level_raise_still_detected():
+    # Regression guard: the fix above must not stop recognizing an actual
+    # bare `raise` that is a direct (non-nested-scope) statement.
+    source = (
+        "def f():\n"
+        "    try:\n"
+        "        risky()\n"
+        "    except Exception:\n"
+        "        raise\n"
+    )
+    sites = _sites_by_location(source, "m.py")
+    site = sites["m.py:4"]
+    assert site.body_kind == "re-raise"
+    assert site.is_fail_open is False
+
+
+def test_return_nested_inside_a_real_if_block_still_detected():
+    # Regression guard: control-flow statements (`if`/`for`/`while`/`try`)
+    # are not a separate scope, unlike `def`/`class`/`lambda` — a `return`
+    # nested inside one must still count.
+    source = (
+        "def f(cond):\n"
+        "    try:\n"
+        "        risky()\n"
+        "    except Exception:\n"
+        "        if cond:\n"
+        "            return None\n"
+    )
+    sites = _sites_by_location(source, "m.py")
+    site = sites["m.py:4"]
+    assert site.body_kind == "return"
+    assert site.is_fail_open is False
+
+
+# ── BUGFIX regression #2: a class body is NOT a deferred scope the way a ───
+# ── function/lambda body is — it executes immediately, to build the class ──
+#
+# The fix for the bug above initially stopped descending on `ClassDef`
+# exactly like `FunctionDef`/`Lambda`, which is itself wrong: a `class`
+# statement's body runs right where it sits (building the class's
+# namespace), not later when something is called. A log call directly in a
+# nested class's own body is a real, immediate reaction from the except
+# handler, not a deferred one — only a *further*-nested `def`/`lambda`
+# (an actual method) inside that class body is still deferred.
+
+
+def test_log_call_directly_in_nested_class_body_counts_as_log():
+    source = (
+        "def f():\n"
+        "    try:\n"
+        "        risky()\n"
+        "    except Exception:\n"
+        "        class Deferred:\n"
+        "            logger.error('defining Deferred')\n"
+    )
+    sites = _sites_by_location(source, "m.py")
+    site = sites["m.py:4"]
+    assert site.body_kind == "log"
+    assert site.is_fail_open is False
+
+
+# ── BUGFIX regression #3: decorators and default-argument values are ───────
+# ── evaluated eagerly (at def-statement time), not deferred with the body ──
+
+
+def test_log_call_in_decorator_expression_counts_as_log():
+    source = (
+        "def f():\n"
+        "    try:\n"
+        "        risky()\n"
+        "    except Exception:\n"
+        "        @register(logger.info('registering'))\n"
+        "        def handler():\n"
+        "            pass\n"
+    )
+    sites = _sites_by_location(source, "m.py")
+    site = sites["m.py:4"]
+    assert site.body_kind == "log"
+    assert site.is_fail_open is False
+
+
+def test_log_call_in_default_argument_value_counts_as_log():
+    source = (
+        "def f():\n"
+        "    try:\n"
+        "        risky()\n"
+        "    except Exception:\n"
+        "        def handler(x=logger.error('boom')):\n"
+        "            pass\n"
+    )
+    sites = _sites_by_location(source, "m.py")
+    site = sites["m.py:4"]
+    assert site.body_kind == "log"
+    assert site.is_fail_open is False
+
+
+def test_log_call_in_lambda_default_argument_counts_as_log():
+    source = (
+        "def f():\n"
+        "    try:\n"
+        "        risky()\n"
+        "    except Exception:\n"
+        "        h = lambda x=logger.error('boom'): x\n"
+        "        register(h)\n"
+    )
+    sites = _sites_by_location(source, "m.py")
+    site = sites["m.py:4"]
+    assert site.body_kind == "log"
+    assert site.is_fail_open is False
+
+
+def test_log_call_in_lambda_body_itself_is_still_deferred():
+    # The lambda BODY (as opposed to its default-argument values) is the
+    # deferred part — it only runs when the lambda is called.
+    source = (
+        "def f():\n"
+        "    try:\n"
+        "        risky()\n"
+        "    except Exception:\n"
+        "        h = lambda: logger.error('boom')\n"
+        "        register(h)\n"
+    )
+    sites = _sites_by_location(source, "m.py")
+    site = sites["m.py:4"]
+    assert site.body_kind == "pass"
+    assert site.is_fail_open is True

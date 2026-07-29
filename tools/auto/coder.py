@@ -950,7 +950,41 @@ class Coder(_llm_stream.LLMClientBase):
             cands: list[Path] = []
             for pat in ("chapter_*.md", "chapter_*.txt", "chapter*.md", "chapter*.txt"):
                 cands.extend(cdir.glob(pat))
-            for p in sorted(cands, reverse=True):
+
+            # BUGFIX: `sorted(cands, reverse=True)` sorted by full PATH STRING
+            # — lexicographic, not numeric. For any project with 10+
+            # unpadded chapter numbers, this picks the wrong "latest"
+            # predecessor: "chapter_9.md" sorts AFTER "chapter_10.md" in
+            # reverse lexicographic order (comparing the character '9'
+            # against '1'), so a new chapter_11 looked at chapter_9 for its
+            # language sample instead of the true latest, chapter_10.
+            # Reproduced directly:
+            #
+            #   chapter_9.md  = "ENGLISH: chapter nine content"
+            #   chapter_10.md = "глава десять — русский текст"  (true latest)
+            #   target: chapter_11.md
+            #   sample picked: chapter_9.md's ENGLISH text        <- WRONG
+            #
+            # architect.py's _latest_chapter_file already solves this exact
+            # problem correctly (regex out the number, sort numerically) —
+            # this mirrors that approach rather than importing across
+            # modules, since the two aren't otherwise coupled. Note for a
+            # future pass: chapter-number extraction is now independently
+            # reimplemented in at least architect.py, context_broker.py,
+            # continuity_validator.py and here — the same
+            # near-duplicate-logic risk flagged elsewhere in this codebase's
+            # own fix history, worth consolidating into one shared utility.
+            def _chapter_num(path: Path) -> "int | None":
+                m = re.search(r"chapter[_\-\s]?(\d+)", path.name, re.IGNORECASE)
+                return int(m.group(1)) if m else None
+
+            numbered = [(n, p) for p in cands if (n := _chapter_num(p)) is not None]
+            ordered = (
+                [p for _, p in sorted(numbered, key=lambda t: t[0], reverse=True)]
+                if numbered
+                else sorted(cands, reverse=True)
+            )
+            for p in ordered:
                 if tgt is None or p.name != tgt.name:
                     txt = p.read_text(encoding="utf-8", errors="replace")
                     if txt.strip():

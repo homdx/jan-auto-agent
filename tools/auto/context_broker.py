@@ -147,7 +147,7 @@ class ContextBroker:
         # request to the requested file's full (capped) content directly.
         if remaining:
             for sym in list(remaining):
-                whole = self._resolve_whole_file(sym, base_dir)
+                whole = self._resolve_whole_file(sym, base_dir, target_files)
                 if whole:
                     capped = self._cap(whole)
                     resolved[sym] = capped
@@ -204,24 +204,56 @@ class ContextBroker:
 
         return resolved
 
-    def _resolve_whole_file(self, sym: str, base_dir: Path) -> str:
+    def _resolve_whole_file(
+        self, sym: str, base_dir: Path, target_files: Sequence[str] = (),
+    ) -> str:
         """AUTO-CR-19-2: if *sym* names a chapter/prose FILE, return its full
         text; else "". Matches a request like ``chapter_2``, ``chapter_2.txt``,
         or ``chapter 2`` against existing ``chapter_*`` files by number, and any
         token ending in a prose extension against that exact filename. Only
         prose extensions are considered, so a code symbol never accidentally
         resolves to a file here.
+
+        BUGFIX: candidates are now filtered to exclude *target_files* — files
+        this SAME task is actively rewriting. Without this, a whole-file
+        match against a target file was cached unconditionally by the caller
+        (resolve()'s Pass 0), silently violating the documented "target-file
+        hits are never cached" invariant that Pass 1/Pass 2 both honour (Pass
+        2 already excludes target_files for exactly this reason — see
+        _iter_project_files below). The cached copy then outlived the
+        target file's own rewrite: a later attempt within the SAME task
+        (reset_cache() runs once per run_task(), not per attempt) requesting
+        the same symbol received the file's PRE-REWRITE content instead of
+        what the coder had since written. Reproduced directly:
+
+            attempt 1 resolve: ORIGINAL chapter 2 content...
+            [chapter_2.md rewritten by the coder]
+            attempt 2 resolve: ORIGINAL chapter 2 content...   <- stale
+
+        Reachable specifically in multi-target-file creative tasks with
+        cross-chapter references — a supported, tested shape (see
+        commit_on_success.py's _update_synopsis docstring on AUTO-CR-16
+        multi-chapter edits) — where one target file's CONTEXT_REQUEST names
+        ANOTHER file that is also a target of this same task.
         """
         token = (sym or "").strip()
         if not token:
             return ""
+
+        target_set = {str(Path(t)) for t in target_files}
+
+        def _is_target(path: Path) -> bool:
+            try:
+                return str(path.relative_to(base_dir)) in target_set
+            except ValueError:
+                return False
 
         candidates: list[Path] = []
         # Direct filename (with prose extension).
         low = token.lower()
         if low.endswith((".md", ".txt", ".markdown")):
             p = base_dir / token
-            if p.is_file():
+            if p.is_file() and not _is_target(p):
                 candidates.append(p)
         # Chapter-number reference (chapter_2, chapter 2, Chapter_02 …).
         m = _CHAPTER_RE.search(token)
@@ -232,6 +264,8 @@ class ContextBroker:
                     continue
                 if path.suffix.lower() not in _PROSE_EXTS:
                     continue
+                if _is_target(path):
+                    continue
                 cm = _CHAPTER_RE.search(path.name)
                 if cm and int(cm.group(1)) == want:
                     candidates.append(path)
@@ -240,7 +274,7 @@ class ContextBroker:
         if not candidates:
             for path in base_dir.rglob("*"):
                 if path.is_file() and path.suffix.lower() in _PROSE_EXTS \
-                        and path.stem.lower() == low:
+                        and path.stem.lower() == low and not _is_target(path):
                     candidates.append(path)
                     break
 

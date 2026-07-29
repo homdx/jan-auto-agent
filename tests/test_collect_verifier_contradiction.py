@@ -22,8 +22,10 @@ from tools.collect.model import GuardedAccess, ModuleRecord
 from tools.collect.registries import build_fail_open_registry, fail_open_locations
 from tools.collect.scanner import scan_module, scan_repo
 from tools.collect.verifier import (
+    REASON_CONTRADICTS_CRASH,
     REASON_CONTRADICTS_FAIL_OPEN,
     REASON_CONTRADICTS_GUARD,
+    REASON_CONTRADICTS_NOT_SILENT,
     Claim,
     contradiction_check,
     extract_claims,
@@ -112,6 +114,81 @@ def test_unguarded_access_claim_is_not_suppressed_by_contradiction_check():
     assert contradiction_check(claim, module, frozenset()) is None
 
 
+# ── access_safe vs UNGUARDED (mirror of access_crash vs GUARDED) ───────────────
+# Found via stub-test/run_hallucination_selfplay_v2.py's NEGATION-FLIP pattern:
+# before this check existed, a claim asserting an access is SAFE ("is fully
+# guarded", "cannot raise") about a genuinely UNGUARDED (crashing) access had
+# no checkable `kind` at all (_CRASH_WORDS_RE doesn't match affirmative-safety
+# language) and reached the artifact completely unverified.
+
+
+def test_false_safety_claim_on_ungarded_access_is_dropped_as_contradicts_crash():
+    module = ModuleRecord(
+        path="pkg/real_bug.py",
+        guarded_accesses=(
+            GuardedAccess(location="pkg/real_bug.py:10", access="items[0]", status="UNGUARDED"),
+        ),
+    )
+    claim = Claim(
+        text="items[0] is safely guarded and cannot raise",
+        module=module.path,
+        kind="access_safe",
+        access="items[0]",
+    )
+    result = contradiction_check(claim, module, frozenset())
+    assert result is not None
+    reason, detail = result
+    assert reason == REASON_CONTRADICTS_CRASH
+    assert "UNGUARDED" in detail
+
+
+def test_true_safety_claim_on_guarded_access_is_not_suppressed():
+    module = _prompt_store_module()
+    ga = next(g for g in module.guarded_accesses if g.access == "stack[-1]")
+    assert ga.status == "GUARDED"  # sanity
+
+    claim = Claim(
+        text="stack[-1] is fully guarded and cannot raise",
+        module=module.path,
+        kind="access_safe",
+        access="stack[-1]",
+    )
+    assert contradiction_check(claim, module, frozenset()) is None
+
+
+def test_extract_claims_recognizes_access_safe_pattern():
+    module = _prompt_store_module()
+    text = "stack[-1] is safely guarded and cannot raise."
+    claims = extract_claims(text, module.path, frozenset())
+    assert len(claims) == 1
+    assert claims[0].kind == "access_safe"
+    assert claims[0].access == "stack[-1]"
+
+
+def test_false_safety_claim_dropped_end_to_end_via_verify_claims():
+    module = ModuleRecord(
+        path="pkg/real_bug.py",
+        guarded_accesses=(
+            GuardedAccess(location="pkg/real_bug.py:10", access="items[0]", status="UNGUARDED"),
+        ),
+    )
+    known = frozenset()
+    line_counts = {module.path: 20}
+    claim = Claim(
+        text="items[0] is safely guarded and cannot raise",
+        module=module.path,
+        kind="access_safe",
+        access="items[0]",
+    )
+    kept, dropped = verify_claims(
+        [claim], module=module, known_symbols=known, line_counts=line_counts,
+        fail_open_locs=frozenset(),
+    )
+    assert kept == []
+    assert len(dropped) == 1
+    assert dropped[0].reason == REASON_CONTRADICTS_CRASH
+
+
 # ── silent_except vs FAIL_OPEN_REGISTRY ────────────────────────────────────────
 
 
@@ -143,6 +220,73 @@ def test_silent_except_claim_not_in_registry_is_not_suppressed():
         location="pkg/error_handling.py:999",
     )
     assert contradiction_check(claim, module, frozenset()) is None
+
+
+# ── BUGFIX regression: silent_except vs an except_site Pass A proved is ────
+# ── NOT silent (logs/re-raises/continues) — the genuine mirror of the ─────
+# ── access_crash-vs-GUARDED check, previously missing entirely ────────────
+#
+# The pre-fix `contradiction_check` only checked `fail_open_locs` for
+# `silent_except` claims — which, by construction, can only ever *agree*
+# with a claim that happens to be true (the location really is fail-open).
+# There was no check at all for the more dangerous case: a fabricated
+# "site X silently swallows the exception" about a location Pass A's own
+# `except_sites` already classified as logged/re-raised/`continue`d (i.e.
+# proven NOT silent) sailed through untouched.
+
+
+def test_silent_except_claim_dropped_when_site_proven_not_silent():
+    module = _error_handling_module()
+    log_site = next(s for s in module.except_sites if s.body_kind == "log")
+    assert not log_site.is_fail_open  # sanity: this is the reference case
+
+    claim = Claim(
+        text=f"the handler at {log_site.location} silently swallows the exception",
+        module=module.path,
+        kind="silent_except",
+        location=log_site.location,
+    )
+    result = contradiction_check(claim, module, frozenset())
+    assert result is not None
+    reason, detail = result
+    assert reason == REASON_CONTRADICTS_NOT_SILENT
+    assert log_site.location in detail
+    assert "log" in detail
+
+
+def test_silent_except_claim_dropped_for_re_raise_site_too():
+    module = _error_handling_module()
+    reraise_site = next(s for s in module.except_sites if s.body_kind == "re-raise")
+
+    claim = Claim(
+        text=f"the handler at {reraise_site.location} silently swallows the exception",
+        module=module.path,
+        kind="silent_except",
+        location=reraise_site.location,
+    )
+    reason, detail = contradiction_check(claim, module, frozenset())
+    assert reason == REASON_CONTRADICTS_NOT_SILENT
+
+
+def test_silent_except_claim_dropped_end_to_end_via_verify_claims():
+    module = _error_handling_module()
+    log_site = next(s for s in module.except_sites if s.body_kind == "log")
+    known = frozenset(sym.qualname for sym in module.public_symbols)
+    line_counts = {module.path: 50}
+
+    claim = Claim(
+        text=f"the handler at {log_site.location} silently swallows the exception",
+        module=module.path,
+        kind="silent_except",
+        location=log_site.location,
+    )
+    kept, dropped = verify_claims(
+        [claim], module=module, known_symbols=known, line_counts=line_counts,
+        fail_open_locs=frozenset(),
+    )
+    assert kept == []
+    assert len(dropped) == 1
+    assert dropped[0].reason == REASON_CONTRADICTS_NOT_SILENT
 
 
 def test_extract_claims_recognizes_silent_except_pattern():

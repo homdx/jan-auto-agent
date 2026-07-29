@@ -1632,6 +1632,7 @@ def make_inner_loop(
     val_temp     = config.getfloat("validator_agent", "temperature",    fallback=0.1)
     val_timeout  = config.getint("loop",              "timeout_seconds", fallback=300)
     exec_timeout = config.getint("auto",              "exec_timeout_sec", fallback=120)
+    ws_retain    = config.getint("auto",              "workspace_retain_count", fallback=5)
 
     # ── Coder ─────────────────────────────────────────────────────────────────
     if coder is None:
@@ -1646,7 +1647,10 @@ def make_inner_loop(
     if executor is None:
         try:
             from tools.auto.executor import make_executor  # type: ignore
-            executor = make_executor(base_dir=base_dir, timeout_sec=exec_timeout)
+            executor = make_executor(
+                base_dir=base_dir, timeout_sec=exec_timeout,
+                max_retained_workspaces=ws_retain,
+            )
         except ImportError:
             logger.warning("Executor not found — using _StubExecutor (tests only)")
             executor = _StubExecutor()

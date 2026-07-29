@@ -103,7 +103,9 @@ def build_module_index(modules: Iterable[ModuleRecord]) -> Dict[str, str]:
     return {_module_dotted_name(m.path): m.path for m in modules}
 
 
-def resolve_import(dotted: str, index: Dict[str, str]) -> Optional[str]:
+def resolve_import(
+    dotted: str, index: Dict[str, str], importer_path: Optional[str] = None
+) -> Optional[str]:
     """Resolve one imported dotted name to a local module path, or `None`
     if it names something outside this repo (stdlib/third-party).
 
@@ -115,7 +117,49 @@ def resolve_import(dotted: str, index: Dict[str, str]) -> Optional[str]:
     for `from tools.collect import model` (just `"tools.collect"`) still
     resolves to the package's `__init__.py` instead of being dropped as
     external.
+
+    BUGFIX (relative imports): a `dotted` name starting with `.` is the
+    relative-import spelling `extract_imports` now preserves (see its
+    docstring for the two failure modes the old level-stripping caused:
+    phantom edges to same-named *top-level* modules, and silently lost
+    package-internal edges). Such a name is resolved strictly against the
+    `importer_path`'s own package — one leading dot anchors at the
+    importer's package, each additional dot ascends one package level —
+    and **never** falls through to absolute resolution: a relative name
+    that doesn't land inside this repo is simply external/unresolvable,
+    not an invitation to guess a coincidentally-named module elsewhere.
+    The only fallback applied is dropping a single trailing part, which
+    maps `from . import SOME_NAME` (a symbol living in the package
+    `__init__`) onto the package itself — the same "coarser form resolves
+    to the package" convention the absolute prefix fallback above already
+    encodes, restricted to one step so an arbitrary miss can't crawl up
+    to an unrelated ancestor package.
     """
+    if dotted.startswith("."):
+        if importer_path is None:
+            return None
+        level = len(dotted) - len(dotted.lstrip("."))
+        remainder = dotted[level:]
+        # Package parts of the importer: directory path components.
+        pkg_parts = importer_path.split("/")[:-1]
+        # Level 1 = importer's own package; each extra dot ascends one.
+        ascend = level - 1
+        if ascend > len(pkg_parts):
+            return None  # more dots than package depth — malformed/external
+        base_parts = pkg_parts[: len(pkg_parts) - ascend] if ascend else pkg_parts
+        rel_parts = [p for p in remainder.split(".") if p]
+        full_parts = base_parts + rel_parts
+        candidate = ".".join(full_parts)
+        if candidate and candidate in index:
+            return index[candidate]
+        # `from . import NAME` where NAME is a symbol in the package
+        # `__init__`, not a submodule: drop one trailing part and try the
+        # package itself (exactly one step, see docstring).
+        if len(full_parts) > 1:
+            parent = ".".join(full_parts[:-1])
+            if parent in index:
+                return index[parent]
+        return None
     if dotted in index:
         return index[dotted]
     parts = dotted.split(".")
@@ -139,7 +183,7 @@ def import_edges(modules: Iterable[ModuleRecord]) -> Graph:
     edges: Dict[str, Set[str]] = {m.path: set() for m in modules}
     for m in modules:
         for dotted in m.imports:
-            resolved = resolve_import(dotted, index)
+            resolved = resolve_import(dotted, index, importer_path=m.path)
             if resolved is not None and resolved != m.path:
                 edges[m.path].add(resolved)
     return {path: frozenset(targets) for path, targets in edges.items()}

@@ -253,7 +253,7 @@ def test_real_prompt_store_unrelated_methods_no_longer_falsely_match_save_contra
 def test_real_prompt_store_save_body_still_matches_its_own_contract():
     index = _real_repo_index()
     # A line actually inside _save's try block (the os.replace call).
-    answer = index.query("tools/prompt_store.py:222")
+    answer = index.query("tools/prompt_store.py:284")  # os.replace line; shifted from 222 by the PromptStore._load quarantine fix — see tests/test_prompt_store_corrupt.py
     assert answer.safe is True
     assert answer.reason == "contract"
     assert "prompt_store_atomic_save" in answer.detail

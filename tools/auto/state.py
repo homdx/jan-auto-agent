@@ -485,15 +485,40 @@ class StateStore:
 
     def _load_existing(self) -> None:
         self._plan = self._load_json_with_backup(self._plan_path, "plan.json")
+        self._validate_loaded_plan()
         if self._prog_path.exists():
             try:
-                self._progress = json.loads(
+                loaded = json.loads(
                     self._prog_path.read_text(encoding="utf-8")
                 )
-                return
-            except json.JSONDecodeError as exc:
+                # A file that PARSES is not necessarily usable.  Only the
+                # JSONDecodeError case was handled, so valid JSON of the wrong
+                # shape — a list, a string, null — was accepted here and then
+                # crashed on the first write to self._progress, far from the
+                # cause and with nothing naming the file:
+                #
+                #   list   -> TypeError: list indices must be integers
+                #   string -> TypeError: 'str' object does not support item
+                #             assignment
+                #   null   -> TypeError: 'NoneType' object does not support
+                #             item assignment
+                #
+                # No need to fail on it, though: the rebuild path below is
+                # already the right answer, because progress counts are fully
+                # derivable from the plan.  So a wrong-shape file recovers
+                # exactly like a corrupt one instead of poisoning the run.
+                if isinstance(loaded, dict):
+                    self._progress = loaded
+                    return
                 logger.warning(
-                    "StateStore: progress.json is corrupted (%s) — rebuilding "
+                    "StateStore: progress.json holds a %s, not an object — "
+                    "rebuilding from plan.json instead (progress counts are "
+                    "fully derivable from the plan, so no data is lost).",
+                    type(loaded).__name__,
+                )
+            except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
+                logger.warning(
+                    "StateStore: progress.json is unreadable (%s) — rebuilding "
                     "from plan.json instead (progress counts are fully "
                     "derivable from the plan, so no data is lost).", exc,
                 )
@@ -501,6 +526,60 @@ class StateStore:
         self._progress = {"status": "idle", "updated_at": _ts(),
                           "done_count": 0, "pending_count": 0}
         self._refresh_progress()
+
+    def _validate_loaded_plan(self) -> None:
+        """Check the SHAPE of a loaded plan, not just that it parsed.
+
+        _load_json_with_backup already recovers from a corrupt file and, when
+        recovery fails, raises a clear ``plan.json ... is corrupted`` error.
+        But a file that is valid JSON of the WRONG SHAPE sailed straight past
+        that guard and crashed later, raw and far from the cause:
+
+            plan.json is a list           -> AttributeError: 'list' object has
+                                             no attribute 'get'
+            "tasks" is a string           -> TypeError: string indices must be
+                                             integers
+            a task missing "status"       -> KeyError: 'status'
+
+        The schema is enforced on WRITE (upsert_task -> _validate_task_schema)
+        and was simply never enforced on READ, so anything that reaches
+        plan.json by another route — a hand edit, which this project's own
+        recovery advice invites when it tells operators to reset a ticket
+        status by hand; a partially-migrated schema; a file restored from an
+        older version — produced an unactionable traceback instead of the
+        clean, already-written diagnostic.
+
+        Raising the same error type as the corruption path keeps the resume
+        contract uniform: either the state is usable, or the operator is told
+        which file is wrong and why.
+        """
+        if not isinstance(self._plan, dict):
+            raise RuntimeError(
+                f"plan.json ({self._plan_path}) is not a JSON object "
+                f"(found {type(self._plan).__name__}) — the file is not a "
+                f"usable plan"
+            )
+
+        tasks = self._plan.get("tasks", [])
+        if not isinstance(tasks, list):
+            raise RuntimeError(
+                f"plan.json ({self._plan_path}) has a 'tasks' field of type "
+                f"{type(tasks).__name__}, expected a list"
+            )
+
+        for idx, task in enumerate(tasks):
+            if not isinstance(task, dict):
+                raise RuntimeError(
+                    f"plan.json ({self._plan_path}) task #{idx} is "
+                    f"{type(task).__name__}, expected an object"
+                )
+            try:
+                _validate_task_schema(task)
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"plan.json ({self._plan_path}) task #{idx} "
+                    f"({task.get('id', '<no id>')}): {exc}"
+                ) from exc
 
     def _load_json_with_backup(self, path: Path, what: str) -> dict:
         """Load JSON from *path*; on corruption, recover from the ``.bak``

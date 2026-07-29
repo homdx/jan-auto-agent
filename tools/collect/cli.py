@@ -45,10 +45,13 @@ from __future__ import annotations
 
 import configparser
 import json
+import logging
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 from tools.collect import config_map as config_map_mod
 from tools.collect import gates as gates_mod
@@ -362,9 +365,18 @@ def _write_artifact(collect_dir: Path, ctx: CollectContext) -> List[str]:
     return sorted(written)
 
 
-def _write_manifest(root: Path, collect_dir: Path, modules: List[ModuleRecord]) -> None:
+def _write_manifest(
+    root: Path,
+    collect_dir: Path,
+    modules: List[ModuleRecord],
+    *,
+    provenance: Optional[Tuple[Optional[str], bool]] = None,
+) -> None:
+    """`provenance`, if given, must be a `(git_sha, dirty)` pair captured
+    via `manifest_mod.capture_provenance(root)` *before* `_write_artifact`
+    ran — see that function's docstring for why the ordering matters."""
     files = sorted(m.path for m in modules)
-    manifest = manifest_mod.build_manifest(root, files)
+    manifest = manifest_mod.build_manifest(root, files, provenance=provenance)
     manifest_mod.write_manifest(manifest, collect_dir / MANIFEST_FILENAME)
 
 
@@ -406,11 +418,20 @@ def _full_build(
     config_path: Optional[str],
     llm_call: Optional[LlmCall],
 ) -> Tuple[Path, List[str], CollectContext]:
+    # Captured before anything under `[collect] dir` is written: `.collect/`
+    # isn't git-ignored, so if this ran *after* `_write_artifact`, the
+    # collector's own new/changed output files would make `git status
+    # --porcelain` non-empty and `dirty` would read True on every full
+    # build regardless of whether the tracked source tree is clean.
+    # The dir itself is passed so *previous* runs' untracked output is
+    # excluded by path too — ordering alone only protects the very first
+    # build (see `manifest.is_dirty`).
+    collect_dir = resolve_collect_dir(root, config)
+    provenance = manifest_mod.capture_provenance(root, collect_dir=collect_dir)
     modules = scan_repo(root, config=config)
     ctx = build_context(root, modules, config=config, config_path=config_path, llm_call=llm_call)
-    collect_dir = resolve_collect_dir(root, config)
     written = _write_artifact(collect_dir, ctx)
-    _write_manifest(root, collect_dir, ctx.modules)
+    _write_manifest(root, collect_dir, ctx.modules, provenance=provenance)
     written = sorted(set(written) | {MANIFEST_FILENAME})
     return collect_dir, written, ctx
 
@@ -462,6 +483,32 @@ def action_refresh(
             previous_manifest = None
             previous_by_path = {}
 
+    # BUGFIX: manifest.py's own docstring documents `collector_version`
+    # as existing "so a format change can be detected" — but nothing
+    # anywhere in this codebase ever actually COMPARED it. Every field in
+    # ModuleRecord.from_dict() (and its nested records) degrades
+    # gracefully via `.get(key, default)` rather than raising on a
+    # missing key, which is the right behaviour for a genuinely corrupt
+    # or hand-edited file — but it also means a SCHEMA CHANGE (a new field
+    # added to ModuleRecord after `previous_manifest` was written) was
+    # silently absorbed here: an unchanged file's reused `previous_by_path`
+    # record would be missing/defaulted for the new field while a
+    # genuinely-changed file's freshly-scanned record has it populated,
+    # producing an internally inconsistent `merged` list with no warning
+    # that it happened. Treating a version mismatch exactly like the
+    # existing "no previous manifest" case — fall back to a full build —
+    # closes it the same way that case is already closed, and is the
+    # literal mechanism the docstring already promised existed.
+    if previous_manifest is not None and previous_manifest.collector_version != manifest_mod.COLLECTOR_VERSION:
+        logger.info(
+            "collect --refresh: manifest was built by collector_version=%r, "
+            "current is %r — falling back to a full build instead of "
+            "reusing possibly schema-mismatched records",
+            previous_manifest.collector_version, manifest_mod.COLLECTOR_VERSION,
+        )
+        previous_manifest = None
+        previous_by_path = {}
+
     if previous_manifest is None:
         collect_dir, written, _ctx = _full_build(root, config=config, config_path=config_path, llm_call=llm_call)
         return CollectResult(
@@ -469,6 +516,12 @@ def action_refresh(
             message=f"no prior artifact to diff against — full build: rebuilt {len(written)} file(s) in {collect_dir}",
             collect_dir=collect_dir, written_files=tuple(written),
         )
+
+    # Same ordering requirement as `_full_build`: capture provenance now,
+    # before `_write_artifact` below writes anything under `.collect/` —
+    # and exclude the collect dir by path, since the *previous* run's
+    # output is already untracked before this run writes anything.
+    provenance = manifest_mod.capture_provenance(root, collect_dir=collect_dir)
 
     current_modules = scan_repo(root, config=config)
     current_hashes = manifest_mod.hash_tree(root, [m.path for m in current_modules])
@@ -518,7 +571,7 @@ def action_refresh(
         ctx = replace(ctx, modules=verified_modules, verification_report=report)
 
     written = _write_artifact(collect_dir, ctx)
-    _write_manifest(root, collect_dir, ctx.modules)
+    _write_manifest(root, collect_dir, ctx.modules, provenance=provenance)
     written = sorted(set(written) | {MANIFEST_FILENAME})
 
     if changes.is_empty():
@@ -576,6 +629,7 @@ def action_module(
     root = Path(root)
     collect_dir = resolve_collect_dir(root, config)
     artifact_path = collect_dir / ARTIFACT_FILENAME
+    manifest_path = collect_dir / MANIFEST_FILENAME
     if not artifact_path.exists():
         result = action_refresh(root, config=config, config_path=config_path, llm_call=llm_call)
         return CollectResult(
@@ -583,6 +637,33 @@ def action_module(
             message=f"no existing artifact — ran a full refresh instead ({result.message})",
             collect_dir=result.collect_dir, written_files=result.written_files,
         )
+
+    # BUGFIX: same collector_version gap fixed for manifest.is_fresh and
+    # action_refresh — this function reuses every OTHER module's record
+    # from the existing artifact verbatim and never calls is_fresh at all,
+    # so it needs its own check. Without it, patching one module under an
+    # artifact built by an older collector_version would silently merge
+    # the freshly-scanned module (current schema) with every reused record
+    # (old schema) into one inconsistent artifact.
+    if manifest_path.exists():
+        try:
+            existing_manifest = manifest_mod.read_manifest(manifest_path)
+        except (OSError, ValueError):
+            existing_manifest = None
+        if existing_manifest is not None and existing_manifest.collector_version != manifest_mod.COLLECTOR_VERSION:
+            logger.info(
+                "collect --module: existing artifact was built by "
+                "collector_version=%r, current is %r — running a full "
+                "refresh instead of patching one module into a "
+                "possibly schema-mismatched artifact",
+                existing_manifest.collector_version, manifest_mod.COLLECTOR_VERSION,
+            )
+            result = action_refresh(root, config=config, config_path=config_path, llm_call=llm_call)
+            return CollectResult(
+                action="module", wrote=result.wrote, fresh=result.fresh,
+                message=f"collector_version mismatch — ran a full refresh instead ({result.message})",
+                collect_dir=result.collect_dir, written_files=result.written_files,
+            )
 
     try:
         payload = json.loads(artifact_path.read_text(encoding="utf-8"))
@@ -613,7 +694,57 @@ def action_module(
         modules = [patched if m.path == module_path else m for m in modules]
     modules.sort(key=lambda m: m.path)
 
-    ctx = build_context(root, modules, config=config, config_path=config_path, llm_call=llm_call)
+    # BUGFIX: `action_module`'s whole point is to be incremental — patch
+    # ONE file, reuse every other module's record verbatim.  But the
+    # previous `build_context(..., llm_call=llm_call)` call below handed
+    # the entire `modules` list to `build_context`, which forwarded it to
+    # `summarize_repo`.  `summarize_repo` has no guard for a module that
+    # already carries a `summary` (it only skips parse-error modules and
+    # checkpoint hits), so it called the LLM once per module in the whole
+    # codebase — O(N) LLM calls for what should be exactly 1.
+    #
+    # Fix: mirror `action_refresh`'s own incremental pattern.  Run Pass B
+    # (the LLM summarizer) only on `patched` — the one freshly-scanned
+    # module (summary=None) — using the `source` already in scope, then
+    # splice the result back into `modules`.  Pass `llm_call=None` to
+    # `build_context` so it never calls `summarize_repo` again.  Pass C
+    # (verifier) still runs inside `build_context` the same way it does in
+    # `action_refresh` (via the `any(m.summary is not None …)` branch
+    # there), so verification of the newly-updated summary is not skipped.
+    settings = read_collect_settings(config)
+    if llm_call is not None and settings.llm_summaries and patched.parse_error is None:
+        summarized = summarize_repo([patched], {module_path: source}, llm_call)
+        if summarized and summarized[0].summary is not None:
+            patched = summarized[0]
+            modules = [patched if m.path == module_path else m for m in modules]
+
+    # Captured before `_write_artifact` below writes anything under
+    # `.collect/` — see `capture_provenance`'s docstring. Same ordering
+    # bug as `_full_build` otherwise: `.collect/` isn't git-ignored, so
+    # computing this after the write would see the write's own untracked
+    # output and report `dirty=True` regardless of the tracked tree.
+    # `collect_dir` is passed so prior runs' output is excluded by path.
+    git_sha, dirty = manifest_mod.capture_provenance(root, collect_dir=collect_dir)
+
+    ctx = build_context(root, modules, config=config, config_path=config_path, llm_call=None)
+
+    # BUGFIX: `build_context` only runs Pass C (`verifier.verify_repo`) in
+    # the branch guarded by `if llm_call is not None`, and this call passes
+    # `llm_call=None` (Pass B was already run above, directly, against just
+    # `patched`) — so without this block, `--module` never verified
+    # anything: a fabricated citation in the freshly-summarized module's
+    # `purpose`/`notes` (or a stale fabrication in any reused module) would
+    # survive straight into artifact.json, silently. `action_refresh` avoids
+    # exactly this by re-running `verify_repo` itself right after its own
+    # `build_context(..., llm_call=None)` call, gated on
+    # `any(m.summary is not None for m in modules)` — mirrored here so
+    # `--module` gets the same guarantee.
+    if any(m.summary is not None for m in modules):
+        sources = _sources_for(root, modules)
+        verified_modules, report = verifier_mod.verify_repo(modules, sources, root=root)
+        modules = verified_modules
+        ctx = replace(ctx, modules=verified_modules, verification_report=report)
+
     written = _write_artifact(collect_dir, ctx)
 
     # Patch only the changed file's manifest entry rather than rehashing
@@ -632,8 +763,8 @@ def action_module(
     patched_manifest = manifest_mod.Manifest(
         collector_version=manifest_mod.COLLECTOR_VERSION,
         generated_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        git_sha=manifest_mod.get_git_sha(root),
-        dirty=manifest_mod.is_dirty(root),
+        git_sha=git_sha,
+        dirty=dirty,
         file_hashes=hashes,
     )
     manifest_mod.write_manifest(patched_manifest, manifest_path)

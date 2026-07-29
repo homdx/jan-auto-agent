@@ -76,6 +76,104 @@ def extract_symbols(tree: ast.Module, module_path: str) -> List[FunctionRecord]:
     return sorted(symbols, key=lambda s: (s.lineno, s.qualname))
 
 
+def extract_all_defined_names(tree: ast.Module) -> "frozenset[str]":
+    """Every bare identifier `tree` defines *anywhere* — not just the
+    top-level functions/classes `extract_symbols` (COLLECT-4) indexes as
+    "public symbols", but also nested `def`s (methods, closures at any
+    depth) and assignment targets at module or class-body scope (module-
+    level constants, class attributes, `Annotated` constants via
+    `AnnAssign`).
+
+    This is deliberately a *different, broader* notion of "exists" than
+    `extract_symbols`'s "public symbol" — COLLECT-4 scopes `public_symbols`
+    to the top-level surface on purpose ("nested defs... are intentionally
+    out of scope for this task; they're not part of a module's public
+    surface"), and this function does not change that scoping or feed
+    `public_symbols`/`ModuleRecord` at all. It exists purely as a cheap,
+    reusable "does this name appear anywhere in the source at all" check
+    for callers (COLLECT-17's verifier, specifically) that need to tell a
+    genuinely fabricated identifier apart from a real one Pass A's public
+    surface just doesn't happen to track — e.g. a module-level constant or
+    a class method, both 100% real, neither a "public symbol" by COLLECT-4's
+    own definition.
+
+    Permissive in what counts as "defined": every `FunctionDef`/
+    `AsyncFunctionDef`/`ClassDef` name at any nesting depth, plus every
+    simple `Name` target of an `Assign`/`AnnAssign` *at module or
+    class-body scope* — but NOT inside a function/method body.
+
+    BUGFIX (found via adversarial review of an earlier version of this
+    exact function): the first version used `ast.walk(tree)`, which visits
+    every node regardless of enclosing scope, so an `Assign` target inside
+    *any* function body — an ordinary local variable, completely
+    unrelated to the module's citable surface — was added to this set the
+    same as a module-level constant. That reopened exactly the hole this
+    function exists to close: a fabricated citation like
+    `"module.py:result"` (`result` being nothing more than some unrelated
+    function's local variable somewhere in the file) would be excused as
+    "real but unindexed" instead of flagged, because *some* local variable
+    in the module happened to share that name — and in a module of any
+    real size, generic names like `result`/`data`/`ctx`/`done` are close
+    to guaranteed to collide with *something*. A citable name has to be
+    reachable via `module.py:name` syntax in the first place; a local
+    variable buried inside an unrelated function's body never is, so it
+    must not count as "real but unindexed" here. Function/method/class
+    *names* themselves are still collected at any nesting depth (a nested
+    method or closure is a legitimate thing to cite by name), only their
+    *bodies'* local assignments are excluded.
+
+    BUGFIX 2 (found via review of the fix above): a `class` statement's
+    own body is always its own scope — its attributes are real, citable
+    names — regardless of what *encloses* the `class` statement itself.
+    A class defined inside a function (`def f(): class Local: ATTR = 1`)
+    was inheriting that function's "local, non-citable" scope for its own
+    body, so `Local.ATTR` got excluded the same as an ordinary local
+    variable, even though it's a genuine class attribute. A class body
+    now always resets to module-like (non-function) scope for its own
+    `Assign`/`AnnAssign` targets, no matter where the `class` statement
+    sits; only a further-nested `def` (a method) beneath it reintroduces
+    function-local scope for names assigned inside *that*.
+    """
+    names: set = set()
+
+    def _walk(node: ast.AST, in_function_body: bool) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                names.add(child.name)
+                _walk(child, in_function_body=True)
+            elif isinstance(child, ast.ClassDef):
+                names.add(child.name)
+                # A class body always executes at class-definition time as
+                # its own scope — same as module scope — regardless of
+                # *where* the `class` statement itself sits. BUGFIX: this
+                # used to pass through the enclosing `in_function_body`
+                # unchanged, so a class defined *inside* a function (e.g.
+                # `def f(): class Local: ATTR = 1`) incorrectly inherited
+                # that function's "local, non-citable" scope for its own
+                # body, excluding `Local`'s own attributes (`ATTR`) the
+                # same as if they were the enclosing function's local
+                # variables. A class's own attributes are real, citable
+                # names (`module.py:ATTR`-style) no matter how the class
+                # itself is nested, so its body always resets to `False`
+                # here — only a further-nested `def` inside that class
+                # (a method) reintroduces function-local scope beneath it.
+                _walk(child, in_function_body=False)
+            elif isinstance(child, ast.Assign) and not in_function_body:
+                for target in child.targets:
+                    if isinstance(target, ast.Name):
+                        names.add(target.id)
+                _walk(child, in_function_body)
+            elif isinstance(child, ast.AnnAssign) and not in_function_body:
+                if isinstance(child.target, ast.Name):
+                    names.add(child.target.id)
+                _walk(child, in_function_body)
+            else:
+                _walk(child, in_function_body)
+
+    _walk(tree, in_function_body=False)
+    return frozenset(names)
+
+
 def extract_imports(tree: ast.Module) -> List[str]:
     """Sorted, deduplicated list of module names imported anywhere in `tree`.
 
@@ -83,14 +181,53 @@ def extract_imports(tree: ast.Module) -> List[str]:
     `"x.y"` (the source module, not the imported name) — mirroring the
     convention `tests/_pass_a_stub.py` establishes and COLLECT-3's golden
     fixture already encodes.
+
+    BUGFIX (relative imports): `ast.ImportFrom.level` used to be ignored
+    entirely, with two distinct failure modes in the import graph
+    (COLLECT-8):
+
+    1. **Misattribution** — `from .model import X` inside `pkg/a.py` was
+       recorded as bare `"model"`, which `graph.resolve_import` happily
+       matched against an *unrelated top-level* `model.py` if one existed,
+       producing a phantom edge to the wrong module while the real
+       dependency on `pkg/model.py` vanished. That's exactly the
+       "misattributed is worse than missing" failure `build_call_edges`'s
+       own docstring forbids, leaking into blast-radius (`imported_by`).
+    2. **Silent loss** — without such a name collision the bare `"model"`
+       resolved to nothing at all, dropping the edge and (via
+       `entry_points`) making package-internal modules look like roots.
+       And `from . import util` (`node.module is None`) was never
+       recorded in any form.
+
+    Now a relative import keeps its level as leading dots — `from .model
+    import X` -> `".model"`, `from ..pkg import y` -> `"..pkg"` — the same
+    spelling Python source itself uses, so it stays human-readable in
+    `render`/`summarizer` output. For the `from . import name` form
+    (`module is None`) each imported alias is recorded as `"." * level +
+    alias.name`: for a submodule that's precisely its relative dotted
+    name; for a plain symbol imported from the package `__init__`,
+    `graph.resolve_import`'s drop-one-trailing-part fallback still lands
+    it on the package itself rather than dropping the dependency.
+    `graph.resolve_import` resolves the leading dots against the
+    *importer's* package (which `import_edges` knows from `m.path`) —
+    never against the top-level namespace — so neither failure mode above
+    can recur.
     """
     names = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
                 names.add(alias.name)
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            names.add(node.module)
+        elif isinstance(node, ast.ImportFrom):
+            prefix = "." * node.level
+            if node.module:
+                names.add(prefix + node.module)
+            elif node.level:
+                # `from . import util` / `from .. import helpers` — the
+                # only surviving spelling of the dependency is the alias
+                # list itself.
+                for alias in node.names:
+                    names.add(prefix + alias.name)
     return sorted(names)
 
 
@@ -340,6 +477,89 @@ def _is_log_call(node: ast.AST) -> bool:
     )
 
 
+def _walk_own_scope(node: ast.AST):
+    """Like `ast.walk`, but never descends into a nested function/lambda's
+    own *body* (a deferred scope — its statements don't run until the
+    function is called), while still walking everything that actually
+    executes right now, as part of the statement `node` itself: a class's
+    own body (a class statement runs its whole body immediately, to build
+    the class's namespace — it's not deferred at all), and a def/lambda's
+    own decorators and default-argument expressions (evaluated eagerly,
+    at def-statement time, in the *enclosing* scope, before the function
+    object even exists).
+
+    BUGFIX 1 (found via adversarial review, same bug class already fixed
+    elsewhere in this codebase — see `dataflow._walk`'s
+    `(FunctionDef, AsyncFunctionDef, ClassDef, Lambda)` scope skip and
+    `extract_all_defined_names`'s `in_function_body` tracking):
+    `_classify_except_body` used to call plain `ast.walk(stmt)`, which
+    visits every descendant regardless of enclosing scope. An except body
+    that merely *defines* a nested function containing a bare `raise` (a
+    deferred/callback error handler, e.g. `except Exception:\\n    def
+    handler(): raise\\n    register(handler)`) doesn't re-raise anything at
+    the except site itself — the handler body only runs later, if and when
+    something calls it — so the actual except block is a silent swallow
+    (fail-open) exactly like a bare `pass` would be. `ast.walk` saw the
+    `raise` nested three levels down inside `handler`'s own body and
+    classified the whole site `"re-raise", is_fail_open=False` anyway,
+    hiding a genuine silent-failure site from COLLECT-6's detector (and,
+    downstream, letting a real "this except silently swallows the error"
+    Pass B claim about that exact site get dropped by COLLECT-17's
+    contradiction_check as a false positive).
+
+    BUGFIX 2 (found via adversarial review of BUGFIX 1's own first cut):
+    that first cut stopped descending on `ClassDef` exactly the same way
+    as `FunctionDef`/`Lambda` — but a `class` statement's body is *not*
+    deferred the way a function body is; it runs immediately, right where
+    the `class` statement sits, to build the class object (this is the
+    exact same distinction `extract_all_defined_names`'s own "BUGFIX 2"
+    already documents for a different reason). `except Exception:\\n
+    class Deferred:\\n        logger.error(...)` really does log at the
+    except site — the class statement executing *is* what runs that log
+    call — so stopping at `ClassDef` produced a fresh false "pass"/
+    fail-open classification for a handler that, in fact, logs. Only a
+    *further*-nested `def`/`lambda` inside that class body (an actual
+    method) is still deferred, and that's handled automatically: the
+    recursive call reaches the method as an ordinary child and stops
+    there on its own.
+
+    Also walks a def/lambda's `decorator_list` and default-argument
+    expressions (via its `arguments` node), and a def's return-type
+    annotation (`node.returns`), rather than skipping them along with the
+    body — all run at the def/lambda statement's own execution time, in
+    the enclosing scope, not when the function is later called
+    (e.g. `@log_and_register(logger.info("registering"))` logs right now,
+    not "only if called later"; same for a `def handler(x=logger.error(...))`
+    default value or a `def handler() -> logger.error(...):` return
+    annotation).
+    """
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        yield node
+        for deco in node.decorator_list:
+            yield from _walk_own_scope(deco)
+        yield from _walk_own_scope(node.args)
+        # BUGFIX: `node.returns` (the `-> ...` return-type annotation) is
+        # evaluated eagerly at def-statement time, in the enclosing scope
+        # — exactly like `decorator_list` and the argument defaults above,
+        # and for the same reason (it must exist before the function
+        # object is even callable). It was left out of this branch, so a
+        # call hidden there (e.g. `def handler() -> logger.error(...):`)
+        # was silently missed by `_classify_except_body`, misclassifying
+        # a handler that does log at the except site as `"pass"`/
+        # `is_fail_open=True`. `ast.Lambda` has no return annotation, so
+        # no matching gap exists in that branch below.
+        if node.returns is not None:
+            yield from _walk_own_scope(node.returns)
+        return
+    if isinstance(node, ast.Lambda):
+        yield node
+        yield from _walk_own_scope(node.args)
+        return
+    yield node
+    for child in ast.iter_child_nodes(node):
+        yield from _walk_own_scope(child)
+
+
 def _classify_except_body(body: List[ast.stmt]) -> "tuple[str, bool]":
     """`(body_kind, is_fail_open)` for one except handler's body (COLLECT-6).
 
@@ -366,7 +586,7 @@ def _classify_except_body(body: List[ast.stmt]) -> "tuple[str, bool]":
     has_continue = False
     has_return = False
     for stmt in body:
-        for sub in ast.walk(stmt):
+        for sub in _walk_own_scope(stmt):
             if isinstance(sub, ast.Raise) and sub.exc is None:
                 has_bare_raise = True
             elif _is_log_call(sub):

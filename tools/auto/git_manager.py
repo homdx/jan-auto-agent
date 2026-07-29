@@ -204,7 +204,59 @@ class GitManager:
         if self.get_current_hash() is None:
             return
         self._run(["git", "reset", "--hard", "HEAD"], "git reset --hard failed")
+
+        # `git clean -fd` removes UNTRACKED files.  The docstring above assumes
+        # .gitignore shields internal agent state from it — but
+        # ensure_gitignore_committed() is best-effort: on OSError (read-only
+        # .gitignore, permissions, full disk) it logs a warning and returns,
+        # leaving ".agent/" un-ignored.  In that state this clean deletes the
+        # entire run: plan.json, tickets, feedback rounds, run.log.  Verified:
+        #
+        #   .agent/plan.json exists before: True
+        #   .agent/plan.json exists after : False
+        #   .agent dir exists after       : False
+        #
+        # `git reset --hard` above already reverts every TRACKED edit, which is
+        # the residue this method exists to remove.  So when the shield is not
+        # actually in place, skip the clean and keep the state: leaving some
+        # untracked residue behind is a far smaller harm than destroying the
+        # run's own bookkeeping mid-flight.
+        if not self._agent_state_is_ignored():
+            logger.warning(
+                "discard_working_changes: .agent/ is not covered by .gitignore "
+                "— skipping `git clean -fd` to avoid deleting run state. "
+                "Untracked residue is left in place; check that .gitignore is "
+                "writable."
+            )
+            return
         self._run(["git", "clean", "-fd"], "git clean failed")
+
+    def _agent_state_is_ignored(self) -> bool:
+        """Return True only if git will actually ignore ``.agent/``.
+
+        Uses ``git check-ignore``, which consults every ignore source (repo
+        .gitignore, .git/info/exclude, global core.excludesFile) rather than
+        trusting that ensure_gitignore_committed() succeeded.  Fails CLOSED:
+        anything unexpected returns False, so a clean is skipped rather than
+        risked.
+        """
+        try:
+            result = subprocess.run(
+                ["git", "check-ignore", "-q", ".agent"],
+                cwd=self.repo_dir,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=30,
+            )
+            return result.returncode == 0
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            logger.warning(
+                "_agent_state_is_ignored: check-ignore failed (%s) — assuming "
+                "NOT ignored", exc,
+            )
+            return False
 
     def has_staged_changes(self) -> bool:
         """Return ``True`` if there is at least one staged change."""

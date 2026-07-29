@@ -445,6 +445,7 @@ class RepoIngestor:
 def ingest_repo(
     base_dir: str | Path,
     config: configparser.ConfigParser | None = None,
+    task_mode: str = "code",
 ) -> list[RepoCluster]:
     """Create a :class:`RepoIngestor`, walk the repo, and return clusters.
 
@@ -456,10 +457,18 @@ def ingest_repo(
         Root of the project to walk.
     config:
         Parsed ``agents.ini``.  Pass ``None`` to use all defaults.
+    task_mode:
+        BUGFIX: was missing entirely, so RepoIngestor always defaulted to
+        "code" here regardless of the run's actual mode. That silently
+        disabled the AUTO-CR-3 max_file_kb_creative override (and any other
+        mode-suffixed [architect]/[search] key) for every real pipeline run,
+        since pipeline.py's only call site — ``ingest_repo(controller.base_dir,
+        cfg)`` — had no way to pass it through. Forward the controller's
+        task_mode so creative-mode file-size overrides actually apply.
 
     Returns
     -------
     list[RepoCluster]
         Ordered list of clusters ready for per-cluster Architect review.
     """
-    return RepoIngestor(base_dir, config).ingest()
+    return RepoIngestor(base_dir, config, task_mode=task_mode).ingest()

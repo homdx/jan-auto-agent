@@ -49,7 +49,23 @@ def _extract_content(raw: dict, api_format: str) -> str:
     if api_format == "ollama":
         return raw["message"]["content"].strip()
     # openai (default)
-    return raw["choices"][0]["message"]["content"].strip()
+    # BUGFIX: mirror the streaming path's empty-choices guard (introduced in
+    # the "Fix llm stream" commit).  Some OpenAI-compatible backends — Jan,
+    # LiteLLM, vLLM, Azure proxy wrappers — return a non-streaming response
+    # with `"choices": []` when the request is filtered/blocked instead of
+    # returning an HTTP error.  The raw `raw["choices"][0]` access raises
+    # IndexError in that case, which callers that only catch broad
+    # `except Exception` misclassify as a generic API failure rather than a
+    # distinct "response arrived but was empty/filtered" outcome.
+    # Raising a descriptive ValueError keeps the failure distinguishable for
+    # logging and for the AUTO-BUG pattern in validator_agent.py.
+    choices = raw.get("choices") or []
+    if not choices:
+        raise ValueError(
+            f"LLM response had no choices — likely blocked/filtered by the "
+            f"backend (raw keys: {list(raw.keys())})"
+        )
+    return choices[0]["message"]["content"].strip()
 
 
 def _build_payload(payload: dict, api_format: str, stream: bool) -> dict:
@@ -279,7 +295,27 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
                     break
                 try:
                     chunk = json.loads(data)
-                    token = chunk["choices"][0]["delta"].get("content", "")
+                    # BUGFIX: some OpenAI-COMPATIBLE backends (this branch
+                    # supports any base_url speaking the openai format, not
+                    # just literal OpenAI) send an SSE chunk with an EMPTY
+                    # choices array — a real usage-reporting chunk shape
+                    # OpenAI itself sends when stream_options.include_usage
+                    # is set, and also seen from various proxy/gateway
+                    # wrappers regardless of client request options.
+                    # `chunk["choices"][0]` on an empty list raises
+                    # IndexError, which the except clause below did NOT
+                    # catch (only JSONDecodeError/KeyError) — so this chunk
+                    # crashed the WHOLE streaming request with an unhandled
+                    # exception, losing every token already accumulated in
+                    # `parts`, rather than just being skipped like any other
+                    # unparseable chunk. Reproduced directly:
+                    #
+                    #   lines = [..normal tokens.., '{"choices": [],
+                    #            "usage": {...}}', "[DONE]"]
+                    #   -> IndexError: list index out of range
+                    #      (uncaught, propagates out of request_completion)
+                    choices = chunk.get("choices") or []
+                    token = choices[0]["delta"].get("content", "") if choices else ""
                     done  = False
                 except (json.JSONDecodeError, KeyError):
                     continue

@@ -34,7 +34,7 @@ import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 COLLECTOR_VERSION = "1"
 
@@ -106,12 +106,41 @@ def hash_tree(root: Path, files: Iterable[str]) -> Dict[str, str]:
 
 
 def _run_git(root: Path, *args: str) -> Optional[str]:
+    """Run one git subcommand under *root* and return its stripped stdout,
+    or ``None`` on any failure (missing git, not a repo, timeout, non-zero
+    exit) — every caller in this module already treats a git-unavailable
+    environment as "nothing to report", never an error to propagate.
+
+    BUGFIX: ``-c core.quotepath=false`` disables git's default behaviour of
+    octal-escaping non-ASCII path bytes in porcelain/status output (e.g. a
+    Cyrillic filename renders as ``"\320\263\320\273..."`` rather than the
+    real UTF-8 text). ``is_dirty``'s path-based exclusion filtering compares
+    these strings directly against a plain Python path string built from
+    ``exclude_dir`` — so when the EXCLUDED directory's own name contains
+    non-ASCII characters (a non-default, non-English ``[collect] dir``
+    config value — plausible for a non-English-language project, which this
+    one is), the escaped path never matches the plain prefix, and
+    ``is_dirty`` reports True for output that is entirely the collector's
+    own, exactly the "dirty on every refresh" bug this module's docstrings
+    already describe fixing once, reopened here for one case they missed.
+    Reproduced directly:
+
+        exclude_dir = root / "выход"    (a Cyrillic collect-output dir)
+        is_dirty(root, exclude_dir) == True   (WRONG — nothing outside
+                                               "выход/" changed)
+
+    Passing this flag on every call (not just the status/porcelain one) is
+    harmless for the other subcommands this helper serves (``rev-parse``,
+    ``log``) — it only affects how PATHS are quoted in output, and none of
+    them emit paths.
+    """
     try:
         proc = subprocess.run(
-            ["git", *args],
+            ["git", "-c", "core.quotepath=false", *args],
             cwd=str(root),
             capture_output=True,
             text=True,
+            encoding="utf-8",
             timeout=10,
         )
     except (OSError, subprocess.SubprocessError):
@@ -126,13 +155,79 @@ def get_git_sha(root: Path) -> Optional[str]:
     return _run_git(root, "rev-parse", "HEAD") or None
 
 
-def is_dirty(root: Path) -> bool:
+def is_dirty(root: Path, exclude_dir: Optional[Path] = None) -> bool:
     """True if the working tree has uncommitted changes. False (not
     unknown) if git is unavailable or `root` isn't a repo — a manifest built
     outside git has nothing to report here, and that's not the same claim
-    as "the tree is dirty"."""
+    as "the tree is dirty".
+
+    `exclude_dir`, if given, is the collector's own output directory
+    (`resolve_collect_dir(...)`): any porcelain entry whose path lies under
+    it is ignored. The call-ordering contract below protects only against
+    output written by the *current* run; a *previous* run's `.collect/`
+    output is already sitting untracked when this run starts, which made
+    `dirty` read True on every build after the first — i.e. on effectively
+    every real `refresh`. Filtering by path is the only fix that holds
+    across runs, and it must use the *configured* dir (the location is
+    `[collect] dir`-configurable), which is why the exclusion is a
+    parameter rather than a hardcoded `.collect`.
+
+    CALLER CONTRACT: must be called *before* the collector writes any
+    output (artifact.json, the manifest itself, rendered pages) to disk.
+    `.collect/` is not a git-ignored directory, so a `collect` run's own
+    freshly-written, untracked output would otherwise show up in
+    `git status --porcelain` and make every full build report `dirty=True`
+    regardless of whether the tracked source tree is actually clean. See
+    `capture_provenance`, which callers should use instead of calling
+    `get_git_sha`/`is_dirty` directly, to make this ordering hard to get
+    wrong."""
     status = _run_git(root, "status", "--porcelain")
-    return bool(status)
+    if not status:
+        return False
+    if exclude_dir is None:
+        return True
+    try:
+        rel = Path(exclude_dir).resolve().relative_to(Path(root).resolve())
+    except ValueError:
+        # Collect dir configured outside the repo — nothing it writes can
+        # show up in this repo's porcelain output, so no filtering needed.
+        return True
+    prefix = rel.as_posix().rstrip("/") + "/"
+    for line in status.splitlines():
+        # Porcelain v1: 2-char status, space, then the path. Renames are
+        # `old -> new`; either side under the collect dir is the
+        # collector's own doing.
+        payload = line[3:] if len(line) > 3 else ""
+        paths = payload.split(" -> ") if " -> " in payload else [payload]
+        for p in paths:
+            p = p.strip().strip('"')
+            if not (p.startswith(prefix) or p == prefix.rstrip("/")):
+                return True
+    return False
+
+
+def capture_provenance(
+    root: Path, collect_dir: Optional[Path] = None
+) -> Tuple[Optional[str], bool]:
+    """Snapshot `(git_sha, dirty)` right now, at a single call site meant
+    to run *before* writing any collector output under `root`.
+
+    This exists so every caller captures provenance at one well-defined
+    point (the top of a build, before `_write_artifact`/`_write_manifest`
+    touch disk) instead of each call site re-deriving `git_sha`/`is_dirty`
+    inline after output has already been written — which is what silently
+    made `dirty` report `True` on every fresh full build, since `.collect/`
+    isn't git-ignored and its own new files count as untracked changes.
+
+    `collect_dir` should be the resolved output directory
+    (`resolve_collect_dir(root, config)`): output from *previous* runs is
+    already untracked before this run writes anything, so the
+    capture-before-write ordering alone only kept the very first build
+    honest — every subsequent build read `dirty=True` from the prior run's
+    leftovers. Passing the dir lets `is_dirty` exclude it by path, which
+    holds across runs.
+    """
+    return get_git_sha(root), is_dirty(root, exclude_dir=collect_dir)
 
 
 @dataclass(frozen=True)
@@ -179,16 +274,31 @@ def build_manifest(
     files: Optional[Iterable[str]] = None,
     *,
     collector_version: str = COLLECTOR_VERSION,
+    provenance: Optional[Tuple[Optional[str], bool]] = None,
 ) -> Manifest:
     """Build a `Manifest` for `root`. If `files` isn't given, discovers
-    `*.py` files under `root` via `discover_files`."""
+    `*.py` files under `root` via `discover_files`.
+
+    `provenance`, if given, is a pre-captured `(git_sha, dirty)` pair from
+    `capture_provenance(root)` — callers that write collector output
+    (`.collect/...`) before calling this must capture provenance first and
+    pass it in here, since `.collect/` isn't git-ignored and its own
+    freshly-written files would otherwise make `is_dirty` see a dirty tree
+    that doesn't reflect the actual tracked source. When omitted,
+    `git_sha`/`dirty` are computed now, which is only correct for callers
+    that haven't written anything yet.
+    """
     root = Path(root)
     file_list = list(files) if files is not None else discover_files(root)
+    if provenance is not None:
+        git_sha, dirty = provenance
+    else:
+        git_sha, dirty = get_git_sha(root), is_dirty(root)
     return Manifest(
         collector_version=collector_version,
         generated_at=_utc_iso_now(),
-        git_sha=get_git_sha(root),
-        dirty=is_dirty(root),
+        git_sha=git_sha,
+        dirty=dirty,
         file_hashes=hash_tree(root, file_list),
     )
 
@@ -209,22 +319,48 @@ def is_fresh(
     *,
     files: Optional[Iterable[str]] = None,
 ) -> bool:
-    """True iff `root`'s current content hashes exactly match `manifest`'s.
+    """True iff `manifest` was built by the CURRENT collector_version AND
+    `root`'s current content hashes exactly match `manifest`'s.
 
-    By default this re-*discovers* the file set under `root` (rather than
-    only re-hashing the paths the manifest already knows about), so a file
-    added since the manifest was built shows up as an extra key and makes
-    the comparison fail — not just edits to already-tracked files. Removing
-    or editing a tracked file is caught the same way: any difference in the
-    resulting `{path: hash}` dict, whether it's a missing key, an extra
-    key, or a changed value, means "not fresh". A tree rebuilt with no
-    changes at all — even at a different timestamp — compares equal and is
-    fresh.
+    By default the hash comparison re-*discovers* the file set under `root`
+    (rather than only re-hashing the paths the manifest already knows
+    about), so a file added since the manifest was built shows up as an
+    extra key and makes the comparison fail — not just edits to
+    already-tracked files. Removing or editing a tracked file is caught the
+    same way: any difference in the resulting `{path: hash}` dict, whether
+    it's a missing key, an extra key, or a changed value, means "not
+    fresh". A tree rebuilt with no changes at all — even at a different
+    timestamp — compares equal and is fresh.
+
+    BUGFIX: this module's own module-level docstring documents
+    `collector_version` as existing "so a format change can be detected" —
+    but nothing anywhere in this package ever actually COMPARED it, on any
+    of this function's four call sites (cli.action_check — and, through
+    it, action_collect, which skips rebuilding ENTIRELY on fresh=True;
+    loader's consumer-facing freshness check, which returns a
+    schema-mismatched artifact labelled STATUS_FRESH to whatever downstream
+    code depends on it). Every field in ModuleRecord.from_dict() degrades
+    gracefully via `.get(key, default)` on a missing key — correct for a
+    corrupt/hand-edited file, but it silently absorbed a genuine SCHEMA
+    CHANGE the same way: a manifest built by an older collector_version
+    could report "fresh" against an unchanged tree even though records
+    built under the new version would carry a field the reused ones don't
+    have.  Reproduced directly:
+
+        action_check after a hand-simulated version bump:
+          fresh: True                 <- WRONG, should be False
+          message: up to date
+
+    Checking `collector_version` here, once, closes it at every call site
+    rather than needing four separate fixes (action_refresh already got its
+    own version check separately, since it doesn't call is_fresh at all).
 
     Pass `files` explicitly to freshness-check against a specific file set
     instead of a fresh directory walk (e.g. when the caller already has the
     scanner's own file list from EPIC B).
     """
+    if manifest.collector_version != COLLECTOR_VERSION:
+        return False
     root = Path(root)
     current_files = list(files) if files is not None else discover_files(root)
     current = hash_tree(root, current_files)

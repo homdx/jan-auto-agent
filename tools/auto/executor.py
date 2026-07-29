@@ -184,6 +184,19 @@ class Executor:
         Python interpreter used when the acceptance check is a bare
         ``pytest`` or starts with ``python``.  Defaults to ``sys.executable``
         so the same interpreter that runs the agent is used.
+    max_retained_workspaces:
+        Every call to :meth:`run` mirrors the *entire* repo (AUTO-FIX-1)
+        into ``<workspace_root>/<task_id>/`` and that directory is never
+        removed on its own — it sticks around after the run returns so a
+        failing acceptance check can be inspected on disk. In auto mode
+        each task gets its own id (AUTO-T1, AUTO-T2, ...) and
+        ``_check_regressions`` re-runs the executor for every already-DONE
+        task after each commit, so without a bound the workspace directory
+        accumulates one full copy of the repo per task/regression-check
+        forever, filling the disk on any run with more than a handful of
+        tasks. After each :meth:`run`, the oldest sibling task workspaces
+        beyond this count are pruned (the one just created is always kept).
+        ``0`` disables pruning entirely (old behaviour). Default ``5``.
     """
 
     def __init__(
@@ -192,6 +205,7 @@ class Executor:
         workspace_root: Optional[str | Path] = None,
         timeout_sec:    float = 120,
         python_bin:     Optional[str] = None,
+        max_retained_workspaces: int = 5,
     ) -> None:
         self._base_dir      = Path(base_dir).resolve()
         self._workspace_root = (
@@ -201,6 +215,7 @@ class Executor:
         )
         self._timeout_sec = max(0.0, float(timeout_sec))
         self._python_bin  = python_bin or sys.executable
+        self._max_retained_workspaces = max(0, int(max_retained_workspaces))
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -387,7 +402,59 @@ class Executor:
             },
         )
 
+        # AUTO-FIX-2: shutil.copytree's default copy_function (copy2) copies
+        # *metadata* — including mtime — from base_dir onto the workspace
+        # directory itself. Every task's workspace therefore inherits
+        # base_dir's (static) mtime instead of getting a fresh one, so
+        # _prune_old_workspaces' "oldest mtime first" sort is meaningless
+        # (all workspaces compare equal) and evicts an effectively random
+        # sibling rather than the actually-oldest one. Stamp the workspace
+        # with the current time after population so pruning below — and any
+        # future caller — sees a real, monotonically increasing recency.
+        try:
+            os.utime(workspace, None)
+        except OSError as exc:
+            logger.warning(
+                "_prepare_workspace: could not refresh mtime for %s (%s) — "
+                "workspace pruning order may be unreliable", workspace, exc,
+            )
+
+        self._prune_old_workspaces(keep=workspace)
+
         return workspace
+
+    def _prune_old_workspaces(self, keep: Path) -> None:
+        """Remove old per-task workspace mirrors beyond the retention limit.
+
+        Each task workspace is a full copy of the repo (AUTO-FIX-1). Auto
+        mode runs many tasks (AUTO-T1, AUTO-T2, ...) and re-runs the
+        executor for every DONE task on each commit (AUTO-G5 regression
+        checks), so without pruning these directories accumulate forever
+        and fill the disk. Keep only the ``max_retained_workspaces`` most
+        recently modified sibling directories (plus the one just built).
+        """
+        if self._max_retained_workspaces <= 0:
+            return
+        try:
+            siblings = [
+                p for p in self._workspace_root.iterdir()
+                if p.is_dir() and p != keep
+            ]
+        except (OSError, FileNotFoundError):
+            return
+        # Oldest first among the *other* task workspaces.
+        siblings.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0)
+        # "keep" always survives, so the other siblings we may retain is
+        # (limit - 1); anything beyond that, starting with the oldest, goes.
+        excess = len(siblings) - max(self._max_retained_workspaces - 1, 0)
+        for old in siblings[:max(excess, 0)]:
+            try:
+                shutil.rmtree(old)
+                logger.debug("_prune_old_workspaces: removed stale workspace %s", old)
+            except OSError as exc:
+                logger.warning(
+                    "_prune_old_workspaces: could not remove %s (%s)", old, exc
+                )
 
     # ── Command resolution ────────────────────────────────────────────────────
 
@@ -728,10 +795,26 @@ def _safe_dir_name(name: str) -> str:
 
     Keeps only alphanumeric chars, hyphens, and underscores so a task id
     like ``"../../evil"`` cannot escape the workspace root.
+
+    BUGFIX: this used to be a second, independent copy of the same
+    sanitisation logic as ``tools.auto.utils.safe_filename_component`` — same
+    regex, same ``.strip("_") or "task"`` fallback — and it duplicated that
+    function's exact defect too: characters were sanitised but length never
+    was.  A long task id (a verbose LLM-generated id, or any id chained
+    through several ``BUG-FIX-`` generations before that cascade was
+    canonicalised) produced a workspace directory name over the 255-byte
+    NAME_MAX and crashed with the very same error that started this whole
+    round of hardening::
+
+        OSError: [Errno 36] File name too long
+
+    Delegating to the already-hardened, already-tested function closes this
+    copy of the bug and — just as importantly — means the two can no longer
+    drift: a future fix to one sanitiser reaching only one of two call sites
+    is exactly how this gap opened in the first place.
     """
-    import re as _re
-    safe = _re.sub(r"[^A-Za-z0-9_\-]", "_", name)
-    return safe.strip("_") or "task"
+    from tools.auto.utils import safe_filename_component
+    return safe_filename_component(name)
 
 
 def _truncate(text: str, max_chars: int) -> str:
@@ -778,6 +861,7 @@ def make_executor(
     workspace_root: Optional[str | Path] = None,
     timeout_sec:    float = 120,
     python_bin:     Optional[str] = None,
+    max_retained_workspaces: int = 5,
 ) -> Executor:
     """Create and return an :class:`Executor` with the given configuration.
 
@@ -791,10 +875,15 @@ def make_executor(
         From ``RunLimits.exec_timeout_sec`` (``agents.ini [auto] exec_timeout_sec``).
     python_bin:
         Python interpreter binary path.  Defaults to ``sys.executable``.
+    max_retained_workspaces:
+        From ``agents.ini [auto] workspace_retain_count`` (default 5).
+        Bounds how many per-task workspace mirrors (each a full repo copy,
+        see AUTO-FIX-1) are kept on disk at once. ``0`` disables pruning.
     """
     return Executor(
         base_dir       = base_dir,
         workspace_root = workspace_root,
         timeout_sec    = timeout_sec,
         python_bin     = python_bin,
+        max_retained_workspaces = max_retained_workspaces,
     )

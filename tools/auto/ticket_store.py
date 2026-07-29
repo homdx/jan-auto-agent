@@ -9,6 +9,7 @@ Ticket schema
     id          str  — unique ticket identifier, e.g. "TICKET-AUTO-T1"
     type        str  — "bug" | "investigation"
     status      str  — "open" | "in-progress" | "fixed" | "deferred"
+                       | "verification-failed"
     linked_task str  — task id this ticket concerns (may be empty string)
     title       str  — short human-readable description
     body        str  — full detail / knowledge text
@@ -56,6 +57,7 @@ AC (from Jira story AUTO-D1):
 from __future__ import annotations
 
 import json
+from datetime import datetime
 import logging
 from tools.auto.utils import _ts, atomic_write_text, safe_filename_component
 from pathlib import Path
@@ -66,7 +68,14 @@ logger = logging.getLogger(__name__)
 # ── Valid field values ────────────────────────────────────────────────────────
 
 TICKET_TYPES   = {"bug", "investigation"}
-TICKET_STATUSES = {"open", "in-progress", "fixed", "deferred"}
+# "verification-failed" is terminal-but-loud: a fix was recorded as passing and
+# committed, yet the acceptance check fails again on a later re-check. The
+# recorded fix did not hold, so neither "fixed" (a lie — the run would report
+# green over a broken check) nor "deferred" (implies the agent gave up while
+# trying, not that it wrongly believed it had succeeded) describes it. An
+# operator resets it to "open" to allow another attempt.
+TICKET_STATUSES = {"open", "in-progress", "fixed", "deferred",
+                   "verification-failed"}
 
 # ── Required fields (str) in a ticket dict ───────────────────────────────────
 
@@ -235,11 +244,83 @@ class TicketStore:
     # ── Read ─────────────────────────────────────────────────────────────────
 
     def get(self, ticket_id: str) -> Optional[dict]:
-        """Return the ticket dict for *ticket_id*, or ``None`` if not found."""
+        """Return the ticket dict for *ticket_id*, or ``None`` if unusable.
+
+        Unreadable files are quarantined rather than raised.  ``list_all()``
+        already treats one bad ticket as a thing to skip and warn about, not a
+        reason to fail — but ``get()`` called ``_read()`` bare, so the same
+        file that ``list_all()`` shrugs off killed the run through ``get()``:
+
+            list_all() with a corrupt ticket: 0 tickets (skipped gracefully)
+            get(): JSONDecodeError ...
+            handle_regression: RAISED JSONDecodeError
+
+        That path matters because BugFixLoop's status gate calls ``get()`` on
+        every regression, so a single damaged ticket file took down the whole
+        run from inside ``_check_regressions`` — the same asymmetry as the
+        write path, where ``update()`` raising ``TicketNotFound`` had to be
+        guarded for exactly this reason.
+
+        ``_read()`` also returned whatever ``json.loads`` produced, so a file
+        that is valid JSON of the wrong shape (a list, a string) passed
+        through and failed later on ``.get()``.  Both cases are handled here.
+
+        The bad file is renamed aside instead of being overwritten, so a
+        caller that goes on to open a fresh ticket cannot destroy the evidence
+        of what went wrong.
+        """
         path = self._path(ticket_id)
         if not path.exists():
             return None
-        return self._read(path)
+        try:
+            ticket = self._read(path)
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
+            self._quarantine(path, str(exc))
+            return None
+        if not isinstance(ticket, dict):
+            self._quarantine(
+                path, f"expected a JSON object, got {type(ticket).__name__}"
+            )
+            return None
+        return ticket
+
+    def _quarantine(self, path: Path, reason: str) -> None:
+        """Move an unusable ticket aside and log why.
+
+        Renaming rather than deleting keeps the damaged file for inspection;
+        renaming rather than leaving it in place means a caller that decides
+        to open a fresh ticket with the same id will not silently overwrite
+        the only evidence of the problem.
+
+        The stamp is second-resolution, so two quarantines of the SAME
+        ticket id within the same wall-clock second would otherwise collide
+        on one destination path — the second rename landing on the first
+        silently overwrites it, since Path.rename() replaces an existing
+        destination on POSIX with no error.  Low severity in practice (both
+        files are already-discarded corrupt tickets; nothing downstream
+        distinguishes one quarantine copy from two), but reproducible with
+        two ordinary back-to-back calls, no mocking required.  A numeric
+        suffix disambiguates so neither call's evidence is destroyed.
+        """
+        stamp = datetime.now().strftime("%Y%m%dT%H%M%S")
+        dest  = path.with_suffix(f".json.corrupt-{stamp}")
+        suffix_n = 0
+        while dest.exists():
+            suffix_n += 1
+            dest = path.with_suffix(f".json.corrupt-{stamp}-{suffix_n:03d}")
+        try:
+            path.rename(dest)
+            logger.warning(
+                "TicketStore: %s is unusable (%s) — quarantined as %s; "
+                "treating the ticket as absent",
+                path.name, reason, dest.name,
+            )
+        except OSError as exc:
+            logger.warning(
+                "TicketStore: %s is unusable (%s) and could not be "
+                "quarantined (%s) — treating the ticket as absent",
+                path.name, reason, exc,
+            )
 
     def list_all(self) -> list[dict]:
         """Return all tickets sorted by ``created_at`` (ascending)."""

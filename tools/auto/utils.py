@@ -11,6 +11,12 @@ from pathlib import Path
 from typing import Any
 
 
+# Longest sanitised name component we will hand to the filesystem. NAME_MAX is
+# 255 bytes on ext4/xfs/APFS; the headroom covers caller suffixes and the
+# temp-file name atomic_write_text derives from it.
+_MAX_FILENAME_COMPONENT = 200
+
+
 def _ts() -> str:
     """Return the current local time as an ISO-8601 string (YYYY-MM-DDTHH:MM:SS)."""
     return datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
@@ -28,6 +34,20 @@ def safe_filename_component(value: str) -> str:
     """
     safe = re.sub(r"[^A-Za-z0-9_\-]", "_", value)
     safe = safe.strip("_") or "task"
+
+    # Bugfix: sanitising for *characters* was not enough — nothing capped
+    # *length*. A runaway id (see the BUG-FIX- prefix cascade fixed in
+    # bug_fix_loop._root_task_id) grew past the 255-byte NAME_MAX and
+    # atomic_write_text died with `OSError: [Errno 36] File name too long`,
+    # taking down the entire run. The budget is deliberately conservative:
+    # callers append a suffix (".json") and atomic_write_text writes a
+    # sibling temp file with a leading "." and a ~14-char random tail.
+    # Truncation is made collision-safe by appending a digest of the full
+    # original value, and stays deterministic so repeated calls for the same
+    # id always resolve to the same path.
+    if len(safe) > _MAX_FILENAME_COMPONENT:
+        digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+        safe = f"{safe[:_MAX_FILENAME_COMPONENT - len(digest) - 1]}_{digest}"
     return safe
 
 

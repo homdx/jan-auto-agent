@@ -71,6 +71,12 @@ class RunLimits:
         *execution constraint* (how long a single ``python``/test run may take),
         distinct from the whole-session ``max_runtime_sec`` cap.  ``0`` (or
         negative) means no per-execution timeout.  Default is 120s.
+    workspace_retain_count:
+        Max number of per-task ``.agent/workspace/<task_id>/`` mirrors (each
+        a full repo copy, see executor.py AUTO-FIX-1) kept on disk at once.
+        Without this bound, a long auto-mode run (AUTO-T1, AUTO-T2, ... plus
+        AUTO-G5 regression re-checks) fills the disk with one full repo copy
+        per task.  ``0`` disables pruning.  Default is 5.
     """
 
     def __init__(
@@ -78,10 +84,12 @@ class RunLimits:
         max_runtime_sec: float = 0,
         max_tasks_per_run: int = 0,
         exec_timeout_sec: float = 120,
+        workspace_retain_count: int = 5,
     ) -> None:
         self.max_runtime_sec   = max(0.0, float(max_runtime_sec))
         self.max_tasks_per_run = max(0, int(max_tasks_per_run))
         self.exec_timeout_sec  = max(0.0, float(exec_timeout_sec))
+        self.workspace_retain_count = max(0, int(workspace_retain_count))
 
     @classmethod
     def from_config(cls, config: configparser.ConfigParser) -> "RunLimits":
@@ -89,10 +97,12 @@ class RunLimits:
         max_min   = config.getfloat("auto", "max_runtime_min",   fallback=0)
         max_tasks = config.getint  ("auto", "max_tasks_per_run", fallback=0)
         exec_to   = config.getfloat("auto", "exec_timeout_sec",  fallback=120)
+        ws_retain = config.getint  ("auto", "workspace_retain_count", fallback=5)
         return cls(
             max_runtime_sec   = max_min * 60,
             max_tasks_per_run = max_tasks,
             exec_timeout_sec  = exec_to,
+            workspace_retain_count = ws_retain,
         )
 
     @property
@@ -542,6 +552,7 @@ class AutoController:
         executor = make_executor(
             self.base_dir,
             timeout_sec=self.limits.exec_timeout_sec,
+            max_retained_workspaces=self.limits.workspace_retain_count,
         )
         bug_fix_loop = make_bug_fix_loop(
             cfg, self.base_dir, self.state,
@@ -700,11 +711,48 @@ class AutoController:
         bug_fix_loop:
             Ready :class:`~tools.auto.bug_fix_loop.BugFixLoop` instance.
         """
+        from tools.auto.bug_fix_loop import _FIX_PREFIX, _root_task_id
+
+        all_tasks = self.state.all_tasks()
+        by_id     = {t["id"]: t for t in all_tasks}
+
+        def _is_redundant_fix_task(t: dict) -> bool:
+            """True for a synthetic BUG-FIX-* task that duplicates its root.
+
+            BugFixLoop registers ``BUG-FIX-<id>`` carrying a *copy* of the
+            root task's acceptance_check, so once committed it appears here
+            as a second DONE task running the identical command.  Checking
+            both doubles the executor work for zero extra coverage, and it
+            was the entry point for the runaway id cascade: a fix task that
+            "regressed" fed its own id back into BugFixLoop, generating
+            BUG-FIX-BUG-FIX-... until the ticket filename blew past NAME_MAX.
+            Only skip when the root really is present with the same check —
+            otherwise the fix task is the only thing covering it, and
+            dropping it would lose real coverage.
+            """
+            tid = t["id"]
+            if not tid.startswith(_FIX_PREFIX):
+                return False
+            root = by_id.get(_root_task_id(tid))
+            # The root must be something this same filter will actually KEEP,
+            # otherwise the check runs nowhere.  Merely existing is not
+            # enough: a root that is not DONE (re-planned, reset, still in
+            # progress) is excluded from done_tasks below, so skipping its
+            # fix task too would silently drop the only remaining coverage
+            # of that acceptance check.
+            return (
+                root is not None
+                and root.get("status") == STATUS_DONE
+                and root["id"] != just_committed_id
+                and root.get("acceptance_check", "") == t.get("acceptance_check", "")
+            )
+
         done_tasks = [
-            t for t in self.state.all_tasks()
+            t for t in all_tasks
             if t["status"] == STATUS_DONE
             and t["id"] != just_committed_id
             and t.get("acceptance_check", "").strip()
+            and not _is_redundant_fix_task(t)
         ]
         for done_task in done_tasks:
             # Bug 6: respect the run's time budget here too.  _run_task_loop
@@ -814,9 +862,30 @@ class AutoController:
         honestly reflects reality. Only genuinely-resettable tasks (case 1,
         or anything that hasn't used up its rounds) are reset.
         """
+        from tools.auto.bug_fix_loop import _FIX_PREFIX
+
         max_rounds_cfg = cfg.getint("auto", "max_rounds_per_task", fallback=10)
         for task in self.state.all_tasks():
             if task["status"] != STATUS_BLOCKED:
+                continue
+            # Case 3: a synthetic BUG-FIX-* task parked by BugFixLoop.
+            #
+            # BugFixLoop marks these BLOCKED precisely to keep an unresolvable
+            # regression out of the pending queue — otherwise the main loop
+            # picks the fix task up next session and re-runs it directly,
+            # outside the ticket short-circuit and outside the fix_attempts
+            # bound.  Resetting it here undid that on EVERY startup, reopening
+            # the bypass for exactly the cases parking exists for (a run
+            # killed mid-fix, or an inconclusive attempt), since neither has
+            # burned enough rounds to trip the case-2 check below.
+            #
+            # Fix tasks carry no depends_on, so case 1 (unmet dependency)
+            # cannot apply to them: BLOCKED here always means parked or
+            # round-exhausted, and neither benefits from a reset.  BugFixLoop
+            # owns their lifecycle and re-upserts the task (restoring TODO)
+            # when the ticket gate authorises another attempt, so skipping
+            # them does not make a retry impossible.
+            if task["id"].startswith(_FIX_PREFIX):
                 continue
             if highest_completed_round(self.state.task_dir(task["id"])) >= max_rounds_cfg:
                 continue  # round-exhausted — resetting would not help

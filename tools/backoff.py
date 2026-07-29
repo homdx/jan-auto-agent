@@ -13,6 +13,8 @@ On KeyboardInterrupt *during* a sleep the caller's loop state is written to
 program will detect the file and offer to resume from the saved iteration.
 """
 import json
+import os
+import tempfile
 import sys
 import time
 import datetime
@@ -63,9 +65,50 @@ def _now() -> str:
 # ── state persistence ─────────────────────────────────────────────────────────
 
 def save_state(state: Dict[str, Any], path: Path = STATE_FILE) -> None:
-    """Write loop checkpoint to JSON (utf-8, pretty-printed)."""
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2, ensure_ascii=False)
+    """Write loop checkpoint to JSON (utf-8, pretty-printed).
+
+    BUGFIX: this used to open *path* directly with mode "w", which
+    TRUNCATES the target to zero bytes before writing a single byte of the
+    new content. Every consumer of this checkpoint exists specifically to
+    survive a crash/interrupt mid-run (tools/collect/summarizer.py's Pass B
+    batch, tools/faq_agent.py, tools/actions.py) — but a crash, SIGKILL, or
+    full disk during THIS write left a truncated, unparseable state.json,
+    which load_state()'s error handling correctly treats as "corrupt" and
+    discards. The mechanism whose entire purpose is surviving an
+    interruption was itself destroyed by one. Reproduced directly:
+
+        BEFORE crash: real checkpoint saved, {"loop": ..., "modules": {"a.py": ...
+        [write interrupted mid-flight]
+        AFTER crash mid-write, load_state() returns: None
+          -> entire checkpoint treated as absent; ALL prior progress lost
+
+    For summarize_repo specifically, this is called after every single
+    module in a batch that can run for a long time against a real LLM —
+    exactly the kind of long-running operation most likely to be
+    interrupted, and where losing all prior progress is most costly.
+
+    Fixed with the same write-to-temp-then-os.replace pattern already used
+    throughout tools/auto/ (utils.atomic_write_text) — not imported from
+    there to avoid a tools.backoff -> tools.auto dependency this module
+    doesn't otherwise have; the pattern itself is a few lines.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 def load_state(path: Path = STATE_FILE) -> Optional[Dict[str, Any]]:
