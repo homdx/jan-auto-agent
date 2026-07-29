@@ -727,6 +727,24 @@ def action_module(
     git_sha, dirty = manifest_mod.capture_provenance(root, collect_dir=collect_dir)
 
     ctx = build_context(root, modules, config=config, config_path=config_path, llm_call=None)
+
+    # BUGFIX: `build_context` only runs Pass C (`verifier.verify_repo`) in
+    # the branch guarded by `if llm_call is not None`, and this call passes
+    # `llm_call=None` (Pass B was already run above, directly, against just
+    # `patched`) — so without this block, `--module` never verified
+    # anything: a fabricated citation in the freshly-summarized module's
+    # `purpose`/`notes` (or a stale fabrication in any reused module) would
+    # survive straight into artifact.json, silently. `action_refresh` avoids
+    # exactly this by re-running `verify_repo` itself right after its own
+    # `build_context(..., llm_call=None)` call, gated on
+    # `any(m.summary is not None for m in modules)` — mirrored here so
+    # `--module` gets the same guarantee.
+    if any(m.summary is not None for m in modules):
+        sources = _sources_for(root, modules)
+        verified_modules, report = verifier_mod.verify_repo(modules, sources, root=root)
+        modules = verified_modules
+        ctx = replace(ctx, modules=verified_modules, verification_report=report)
+
     written = _write_artifact(collect_dir, ctx)
 
     # Patch only the changed file's manifest entry rather than rehashing

@@ -35,6 +35,7 @@ from tools.collect.cli import (
     ARTIFACT_FILENAME,
     action_collect,
     action_module,
+    action_refresh,
 )
 
 
@@ -192,4 +193,38 @@ class TestModuleIncrementalSummaryContent:
         assert "PATCHED" in after["pkg/a.py"]["summary"]["purpose"], (
             "Expected the patched module's summary to come from the action_module "
             "LLM call, not the earlier action_collect call."
+        )
+
+
+class TestModuleRunsVerification:
+    """Bug reproduction: `action_module` called `build_context(...,
+    llm_call=None)` (Pass B already ran separately above it) but, unlike
+    `action_refresh`, never re-ran `verifier_mod.verify_repo` afterward —
+    so `build_context`'s own `if llm_call is not None` guard meant Pass C
+    silently never ran for `--module` at all. A fabricated citation in the
+    freshly-summarized module's `purpose`/`notes` would survive straight
+    into artifact.json, unlike `--refresh`, which strips it.
+    """
+
+    def _fabricating_llm_call(self, system: str, user: str) -> str:
+        return json.dumps(
+            {"purpose": "Relies on pkg/a.py:totally_invented_helper for its logic.", "notes": ""}
+        )
+
+    def test_module_strips_fabricated_citation_like_refresh_does(self, multi_module_repo):
+        action_collect(multi_module_repo, llm_call=self._fabricating_llm_call)
+
+        (multi_module_repo / "pkg" / "a.py").write_text(
+            "def a():\n    return 42\n"
+        )
+        result = action_module(
+            multi_module_repo, "pkg/a.py", llm_call=self._fabricating_llm_call
+        )
+        after = _artifact_modules(result.collect_dir)
+
+        purpose = after["pkg/a.py"]["summary"]["purpose"]
+        assert "totally_invented_helper" not in purpose, (
+            "action_module must run Pass C (verify_repo) the same way "
+            "action_refresh does, dropping a fabricated citation instead "
+            f"of writing it straight into the artifact. Got: {purpose!r}"
         )
