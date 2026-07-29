@@ -208,7 +208,27 @@ class BugFixLoop:
                 return
             stamp   = datetime.now().strftime("%Y%m%dT%H%M%S")
             archive = tdir / f"previous_attempt_{stamp}"
-            archive.mkdir(parents=True, exist_ok=True)
+            # BUGFIX: two archive calls for the same fix_id within the same
+            # wall-clock second land on an identical `archive` path. With
+            # `exist_ok=True` that used to just reuse the existing
+            # directory — and because feedback rounds are re-numbered from
+            # round 1 on every retry, a second collision within the second
+            # doesn't merely reuse an empty dir: `f.rename(archive /
+            # f.name)` silently OVERWRITES the first attempt's
+            # feedback_round_1.md (etc.) with the second attempt's own,
+            # destroying exactly the inspectable history this function
+            # exists to preserve ("moved aside rather than deleted... so
+            # the accumulated feedback stays inspectable"). The identical
+            # same-second collision was reproduced and fixed this same way
+            # in TicketStore._quarantine and MetricsCollector's corrupt-file
+            # quarantine (and, from there, PromptStore) — apply the same
+            # disambiguating-suffix guard here rather than leaving this one
+            # call site as the odd one out.
+            suffix_n = 0
+            while archive.exists():
+                suffix_n += 1
+                archive = tdir / f"previous_attempt_{stamp}-{suffix_n:03d}"
+            archive.mkdir(parents=True)
             for f in rounds:
                 f.rename(archive / f.name)
             logger.info(

@@ -254,6 +254,58 @@ _HEAD_ONLY_FIELDS: Dict[type, Tuple[str, ...]] = {
 }
 
 
+#: Method names that mutate their receiver in place such that a prior
+#: "truthy"/"non-empty" guarantee about it can no longer be trusted
+#: afterward — `.pop()`, `.clear()`, `.popitem()`, `.remove()` can all
+#: turn a previously-guarded non-empty container empty again.
+_INVALIDATING_MUTATOR_METHODS = frozenset({"pop", "clear", "popitem", "remove"})
+
+
+def _mutated_name_in_stmt(stmt: ast.stmt) -> Optional[str]:
+    """The bare name `stmt` mutates in place well enough to invalidate a
+    prior truthy guard about it, or `None` if `stmt` isn't one of the
+    recognized shapes.
+
+    BUGFIX: `_invalidate_reassigned` only clears a guard on a bare
+    `x = <expr>` *rebind* — it has no notion of `x` being mutated in place
+    with no reassignment at all. Concretely: `if not stack: return None`
+    followed by `stack.pop()` then `return stack[-1]` kept citing the
+    early-return as proof `stack` is GUARDED for `stack[-1]`, even though
+    a single-element stack becomes empty after `.pop()` and `stack[-1]`
+    raises `IndexError` — exactly the "wrongly claimed guard" this
+    module's own docstring says is worse than a missed one, since
+    COLLECT-17's `contradiction_check` trusts `status="GUARDED"`
+    unconditionally and silently drops a correct crash-site claim about
+    such a site. Two shapes are recognized, matching `_invalidate_reassigned`'s
+    own scope (a bare name receiver, not an attribute/subscript chain):
+    a `.pop()`/`.clear()`/`.popitem()`/`.remove()` call on a bare `Name`
+    (as a standalone `Expr` statement, or as the value of a `Name = ...`
+    rebind, which the rebind branch below already invalidates via its own
+    path but is included here for `x = stack.pop()` where `stack` itself,
+    not `x`, needs invalidating), and `del name[...]`.
+    """
+    call: Optional[ast.Call] = None
+    if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
+        call = stmt.value
+    elif (
+        isinstance(stmt, ast.Assign)
+        and isinstance(stmt.value, ast.Call)
+    ):
+        call = stmt.value
+    if (
+        call is not None
+        and isinstance(call.func, ast.Attribute)
+        and call.func.attr in _INVALIDATING_MUTATOR_METHODS
+        and isinstance(call.func.value, ast.Name)
+    ):
+        return call.func.value.id
+    if isinstance(stmt, ast.Delete):
+        for target in stmt.targets:
+            if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name):
+                return target.value.id
+    return None
+
+
 def _own_scan_sources(stmt: ast.stmt) -> List[ast.AST]:
     """AST nodes `_record_accesses_in_stmt` should scan for `stmt` itself.
 
@@ -324,6 +376,9 @@ def _rebound_names_in(stmts: List[ast.stmt]) -> Set[str]:
             continue  # separate dataflow scope — a rebind there is irrelevant here
         if isinstance(s, ast.Assign) and len(s.targets) == 1 and isinstance(s.targets[0], ast.Name):
             names.add(s.targets[0].id)
+        mutated = _mutated_name_in_stmt(s)
+        if mutated is not None:
+            names.add(mutated)
         for nested in _nested_stmt_lists(s):
             names |= _rebound_names_in(nested)
     return names
@@ -494,8 +549,30 @@ class _FunctionGuardWalker:
             key = value.args[0].value
         if base is not None and (base, key) in guarded_pairs:
             guarded_names.add(target)
-            if base in guard_desc:
-                guard_desc.setdefault(target, guard_desc[base])
+            # BUGFIX: this used to be `if base in guard_desc:
+            # guard_desc.setdefault(target, guard_desc[base])` — silently
+            # doing nothing when `base` itself was never added to
+            # `guard_desc`, which happens whenever the guard that put
+            # `(base, key)` into `guarded_pairs` was a *pairs-only* test
+            # (e.g. `if not entry.get("stack"): return` alone, with no
+            # `not entry`/`or` alongside it) — the `ast.If` branch below
+            # only populates `guard_desc` for entries in `names`, never
+            # for `pairs`. The result: `target` lands in `guarded_names`
+            # (so `is_guarded=True` at the access site) with no
+            # description in `guard_desc`, and `GuardedAccess.__post_init__`
+            # requires exactly the opposite for `status="GUARDED"` —
+            # `model.py`'s own invariant — so this crashed the *entire*
+            # collect run (an unhandled `ValueError`) the moment a
+            # pairs-only guard's alias was ever indexed, rather than
+            # degrading to a missed guard the way every other edge case
+            # in this module does. `known_symbols`/the antihallucination
+            # guarantee only ever discussed this as *wrongly marking*
+            # something guarded — an outright crash is strictly worse.
+            # Falling back to a generic description whenever `base` has
+            # none keeps every path that grants `guarded_names.add(target)`
+            # in lockstep with a path that also satisfies the model's
+            # description requirement.
+            guard_desc.setdefault(target, guard_desc.get(base, f"guard on {base}[{key!r}]"))
 
     def _walk(
         self,
@@ -511,6 +588,13 @@ class _FunctionGuardWalker:
             self._record_accesses_in_stmt(stmt, guarded_names, guard_desc)
             self._invalidate_reassigned(stmt, guarded_names, guarded_pairs, guard_desc)
             self._propagate_alias(stmt, guarded_names, guarded_pairs, guard_desc)
+
+            mutated = _mutated_name_in_stmt(stmt)
+            if mutated is not None:
+                guarded_names.discard(mutated)
+                guard_desc.pop(mutated, None)
+                for pair in {p for p in guarded_pairs if p[0] == mutated}:
+                    guarded_pairs.discard(pair)
 
             if isinstance(stmt, ast.If):
                 # BUGFIX: `stmt.body` runs on exactly the *opposite* polarity

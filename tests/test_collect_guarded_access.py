@@ -467,3 +467,85 @@ def test_and_nested_inside_or_does_not_leak_names_out():
         "b[0]": "UNGUARDED",
         "c[0]": "UNGUARDED",
     }
+
+
+def test_mutating_pop_after_guard_invalidates_it():
+    # Bug reproduction: `if not stack: return None` proves `stack` truthy,
+    # but `stack.pop()` right after can empty it again with no reassignment
+    # to trigger `_invalidate_reassigned` — before the fix, `stack[-1]`
+    # here was wrongly reported GUARDED, citing the now-stale early-return.
+    source = (
+        "def rollback(stack):\n"
+        "    if not stack:\n"
+        "        return None\n"
+        "    stack.pop()\n"
+        "    return stack[-1]\n"
+    )
+    accesses = _accesses(source, "m.py")
+    assert {a.access: a.status for a in accesses} == {"stack[-1]": "UNGUARDED"}
+
+
+def test_del_after_guard_invalidates_it():
+    source = (
+        "def g(d, keys):\n"
+        "    if not d:\n"
+        "        return None\n"
+        "    del d[keys[0]]\n"
+        "    return d[keys[0]]\n"
+    )
+    accesses = _accesses(source, "m.py")
+    statuses = {a.access: a.status for a in accesses}
+    assert statuses["d[keys[0]]"] == "UNGUARDED"
+
+
+def test_pop_before_guard_is_unaffected():
+    # Sanity: mutation *before* the guard must not spuriously invalidate
+    # anything (there's nothing to invalidate yet), and the guard still
+    # applies normally to what follows it.
+    source = (
+        "def f(stack):\n"
+        "    stack.append(1)\n"
+        "    if not stack:\n"
+        "        return None\n"
+        "    return stack[-1]\n"
+    )
+    accesses = _accesses(source, "m.py")
+    assert {a.access: a.status for a in accesses} == {"stack[-1]": "GUARDED"}
+
+
+def test_pairs_only_guard_alias_does_not_crash_and_is_guarded():
+    # Bug reproduction: a guard that is *only* a pairs-shaped test (e.g.
+    # `if not entry.get("stack"):` with no bare `not entry` alongside it,
+    # unlike the real prompt_store.get_current, which combines both) used
+    # to crash the whole collect run with an unhandled ValueError, because
+    # `_propagate_alias` added the alias to `guarded_names` without ever
+    # giving it a `guard_desc` entry — violating GuardedAccess's own
+    # invariant that GUARDED requires a description.
+    source = (
+        "def rollback(entry):\n"
+        "    if not entry.get('stack'):\n"
+        "        return None\n"
+        "    stack = entry['stack']\n"
+        "    return stack[-1]\n"
+    )
+    accesses = _accesses(source, "m.py")  # must not raise
+    by_access = {a.access: a for a in accesses}
+    assert by_access["stack[-1]"].status == "GUARDED"
+    assert by_access["stack[-1]"].guard is not None
+
+
+def test_pairs_and_names_combined_guard_still_works():
+    # The real prompt_store.get_current shape: combining a bare-name check
+    # with a pairs check in the same `or` must keep working exactly as
+    # before this fix.
+    source = (
+        "def get_current(entry):\n"
+        "    if not entry or not entry.get('stack'):\n"
+        "        return None\n"
+        "    stack = entry['stack']\n"
+        "    return stack[-1]\n"
+    )
+    accesses = _accesses(source, "m.py")
+    by_access = {a.access: a for a in accesses}
+    assert by_access["stack[-1]"].status == "GUARDED"
+    assert by_access["stack[-1]"].guard == "early-return at m.py:2"
