@@ -694,6 +694,30 @@ def action_module(
         modules = [patched if m.path == module_path else m for m in modules]
     modules.sort(key=lambda m: m.path)
 
+    # BUGFIX: `action_module`'s whole point is to be incremental — patch
+    # ONE file, reuse every other module's record verbatim.  But the
+    # previous `build_context(..., llm_call=llm_call)` call below handed
+    # the entire `modules` list to `build_context`, which forwarded it to
+    # `summarize_repo`.  `summarize_repo` has no guard for a module that
+    # already carries a `summary` (it only skips parse-error modules and
+    # checkpoint hits), so it called the LLM once per module in the whole
+    # codebase — O(N) LLM calls for what should be exactly 1.
+    #
+    # Fix: mirror `action_refresh`'s own incremental pattern.  Run Pass B
+    # (the LLM summarizer) only on `patched` — the one freshly-scanned
+    # module (summary=None) — using the `source` already in scope, then
+    # splice the result back into `modules`.  Pass `llm_call=None` to
+    # `build_context` so it never calls `summarize_repo` again.  Pass C
+    # (verifier) still runs inside `build_context` the same way it does in
+    # `action_refresh` (via the `any(m.summary is not None …)` branch
+    # there), so verification of the newly-updated summary is not skipped.
+    settings = read_collect_settings(config)
+    if llm_call is not None and settings.llm_summaries and patched.parse_error is None:
+        summarized = summarize_repo([patched], {module_path: source}, llm_call)
+        if summarized and summarized[0].summary is not None:
+            patched = summarized[0]
+            modules = [patched if m.path == module_path else m for m in modules]
+
     # Captured before `_write_artifact` below writes anything under
     # `.collect/` — see `capture_provenance`'s docstring. Same ordering
     # bug as `_full_build` otherwise: `.collect/` isn't git-ignored, so
@@ -702,7 +726,7 @@ def action_module(
     # `collect_dir` is passed so prior runs' output is excluded by path.
     git_sha, dirty = manifest_mod.capture_provenance(root, collect_dir=collect_dir)
 
-    ctx = build_context(root, modules, config=config, config_path=config_path, llm_call=llm_call)
+    ctx = build_context(root, modules, config=config, config_path=config_path, llm_call=None)
     written = _write_artifact(collect_dir, ctx)
 
     # Patch only the changed file's manifest entry rather than rehashing
