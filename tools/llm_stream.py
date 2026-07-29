@@ -49,7 +49,23 @@ def _extract_content(raw: dict, api_format: str) -> str:
     if api_format == "ollama":
         return raw["message"]["content"].strip()
     # openai (default)
-    return raw["choices"][0]["message"]["content"].strip()
+    # BUGFIX: mirror the streaming path's empty-choices guard (introduced in
+    # the "Fix llm stream" commit).  Some OpenAI-compatible backends — Jan,
+    # LiteLLM, vLLM, Azure proxy wrappers — return a non-streaming response
+    # with `"choices": []` when the request is filtered/blocked instead of
+    # returning an HTTP error.  The raw `raw["choices"][0]` access raises
+    # IndexError in that case, which callers that only catch broad
+    # `except Exception` misclassify as a generic API failure rather than a
+    # distinct "response arrived but was empty/filtered" outcome.
+    # Raising a descriptive ValueError keeps the failure distinguishable for
+    # logging and for the AUTO-BUG pattern in validator_agent.py.
+    choices = raw.get("choices") or []
+    if not choices:
+        raise ValueError(
+            f"LLM response had no choices — likely blocked/filtered by the "
+            f"backend (raw keys: {list(raw.keys())})"
+        )
+    return choices[0]["message"]["content"].strip()
 
 
 def _build_payload(payload: dict, api_format: str, stream: bool) -> dict:
