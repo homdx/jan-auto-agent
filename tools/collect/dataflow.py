@@ -371,14 +371,49 @@ def _rebound_names_in(stmts: List[ast.stmt]) -> Set[str]:
     (false positive downstream) is acceptable, a wrongly-kept one is not.
     """
     names: Set[str] = set()
+    # BUGFIX: `_mutated_name_in_stmt` invalidates the guard for the exact
+    # bare name a mutator method is called ON — but a guard on `stack`
+    # survived a mutation reached through a same-scope ALIAS of it:
+    #
+    #     if not stack: return None
+    #     alt = stack
+    #     alt.pop()
+    #     return stack[-1]         # still claimed GUARDED — wrong
+    #
+    # `alt` and `stack` are the same object; `alt.pop()` can empty a
+    # single-element `stack` exactly as `stack.pop()` would, so `stack[-1]`
+    # can genuinely IndexError. `alt` is invalidated (it's the name the
+    # mutator method is called on) but `stack` — the name the ACCESS and
+    # the GUARD are actually about — never sees it, because nothing
+    # connects the two bare names.
+    #
+    # This tracks exactly one hop of bare-Name-to-bare-Name aliasing
+    # (`alt = stack`), matching the same "bare name receiver, not an
+    # attribute/subscript chain" scope `_invalidate_reassigned` and
+    # `_mutated_name_in_stmt` already use — not general alias analysis.
+    # A mutation reached through either name invalidates BOTH, which is
+    # the conservative direction this module's own docstring already
+    # commits to elsewhere in this function: "a missed guard (false
+    # positive downstream) is acceptable, a wrongly-kept one is not."
+    aliases: Dict[str, str] = {}
     for s in stmts:
         if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
             continue  # separate dataflow scope — a rebind there is irrelevant here
         if isinstance(s, ast.Assign) and len(s.targets) == 1 and isinstance(s.targets[0], ast.Name):
             names.add(s.targets[0].id)
+            target = s.targets[0].id
+            if isinstance(s.value, ast.Name):
+                aliases[target] = s.value.id
+            else:
+                aliases.pop(target, None)  # rebound to something else — alias broken
         mutated = _mutated_name_in_stmt(s)
         if mutated is not None:
             names.add(mutated)
+            if mutated in aliases:
+                names.add(aliases[mutated])
+            for alias_name, source_name in aliases.items():
+                if source_name == mutated:
+                    names.add(alias_name)
         for nested in _nested_stmt_lists(s):
             names |= _rebound_names_in(nested)
     return names
@@ -399,8 +434,21 @@ class _FunctionGuardWalker:
     def __init__(self, module_path: str) -> None:
         self.module_path = module_path
         self.results: List[GuardedAccess] = []
+        # BUGFIX: bare-Name-to-bare-Name alias tracking (`alt = stack`) for
+        # the SEQUENTIAL, same-block mutation-invalidation case in _walk —
+        # see the comment at that discard site for the exact scenario this
+        # closes. One instance per function (extract_guarded_accesses makes
+        # a fresh _FunctionGuardWalker per top-level FunctionDef, so this
+        # never leaks across functions), reset once here in run() rather
+        # than per-nested-block: an alias discovered inside one branch
+        # remaining "known" in a sibling branch can only ever cause an
+        # EXTRA invalidation there, never a wrongly-kept guard — the same
+        # conservative direction _rebound_names_in's own docstring already
+        # commits to for nested-block rebinds.
+        self._aliases: Dict[str, str] = {}
 
     def run(self, func: "ast.FunctionDef | ast.AsyncFunctionDef") -> List[GuardedAccess]:
+        self._aliases = {}
         self._walk(func.body, set(), set(), {})
         return self.results
 
@@ -589,12 +637,40 @@ class _FunctionGuardWalker:
             self._invalidate_reassigned(stmt, guarded_names, guarded_pairs, guard_desc)
             self._propagate_alias(stmt, guarded_names, guarded_pairs, guard_desc)
 
+            # BUGFIX: `alt = stack` then `alt.pop()` never invalidated a
+            # guard on `stack` itself, even though they name the same
+            # object — `stack[-1]` after that kept citing an early
+            # `if not stack: return` as proof it's GUARDED, when a
+            # single-element `stack` genuinely empties via `alt.pop()`.
+            # Track this one bare-Name-to-bare-Name hop so a mutation
+            # reached through either name invalidates both — see __init__
+            # for why this is a per-function instance attribute rather
+            # than a `_walk` parameter, and why leaking across sibling
+            # branches is the acceptable, conservative direction.
+            if (
+                isinstance(stmt, ast.Assign)
+                and len(stmt.targets) == 1
+                and isinstance(stmt.targets[0], ast.Name)
+            ):
+                alias_target = stmt.targets[0].id
+                if isinstance(stmt.value, ast.Name):
+                    self._aliases[alias_target] = stmt.value.id
+                else:
+                    self._aliases.pop(alias_target, None)
+
             mutated = _mutated_name_in_stmt(stmt)
             if mutated is not None:
-                guarded_names.discard(mutated)
-                guard_desc.pop(mutated, None)
-                for pair in {p for p in guarded_pairs if p[0] == mutated}:
-                    guarded_pairs.discard(pair)
+                to_invalidate = {mutated}
+                if mutated in self._aliases:
+                    to_invalidate.add(self._aliases[mutated])
+                to_invalidate.update(
+                    alias for alias, source in self._aliases.items() if source == mutated
+                )
+                for name in to_invalidate:
+                    guarded_names.discard(name)
+                    guard_desc.pop(name, None)
+                    for pair in {p for p in guarded_pairs if p[0] == name}:
+                        guarded_pairs.discard(pair)
 
             if isinstance(stmt, ast.If):
                 # BUGFIX: `stmt.body` runs on exactly the *opposite* polarity
