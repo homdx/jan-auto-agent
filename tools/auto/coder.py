@@ -1343,6 +1343,30 @@ class Coder(_llm_stream.LLMClientBase):
         ("fork bomb py",        "os.fork()"),
     )
 
+    # AUTO-BUG (sibling of executor.py's _check_command_safety fix): the
+    # ":|:&" fragment above is intentionally BROADER than the full fork
+    # bomb literal ":(){:|:&};:" — it's meant to catch the dangerous
+    # colon/pipe/colon/ampersand payload even outside a complete function
+    # wrapper (e.g. embedded inside other shell constructs). But as a plain
+    # substring it inherits the same whitespace-bypass weakness fixed in
+    # executor.py: bash allows whitespace anywhere between these tokens
+    # (e.g. ":|: &", ": | :&"), which is equally dangerous once wrapped in
+    # a function definition, but never matched the exact substring. Matched
+    # here with a dedicated, whitespace-tolerant regex over the same four
+    # tokens instead of a literal substring; still fires unconditionally
+    # (_BLOCKED_ALWAYS scope — every task_mode), and still respects the
+    # existing pre-existing-content grandfathering mechanism below.
+    _FORK_BOMB_SHELL_RE = None  # compiled lazily to avoid a module-level re import
+
+    @classmethod
+    def _content_has_fork_bomb_shell(cls, lower_content: str) -> bool:
+        import re as _re
+        if cls._FORK_BOMB_SHELL_RE is None:
+            cls._FORK_BOMB_SHELL_RE = _re.compile(
+                r":\s*\|\s*:\s*&"
+            )
+        return bool(cls._FORK_BOMB_SHELL_RE.search(lower_content))
+
     # Patterns checked only in code mode.  These have high false-positive rates
     # in documentation or creative writing:
     #   - A tutorial might teach "sudo apt install nginx"
@@ -1503,8 +1527,29 @@ class Coder(_llm_stream.LLMClientBase):
                 for code in (_strip_py_line_comment(ln) for ln in _existing_lines)
             )
 
+        # Fork-bomb shell check runs first, unconditionally (same
+        # _BLOCKED_ALWAYS scope as every other task_mode): a whitespace
+        # variant of ":(){:|:&};:" is just as dangerous as the canonical
+        # form and must be caught regardless of code/docs/creative mode.
+        if cls._content_has_fork_bomb_shell(lower):
+            if cls._content_has_fork_bomb_shell(_existing_lower):
+                logger.info(
+                    "coder._check_content_safety: fork-bomb-shell pattern "
+                    "pre-exists in the target file — edit permitted "
+                    "(grandfathered)."
+                )
+            else:
+                return False, "blocked content pattern fork-bomb-signature (fork bomb shell)"
+
         for label, pattern in active_patterns:
             pat_lower = pattern.lower()
+
+            # "fork bomb shell" is handled above by the whitespace-tolerant
+            # regex check (_content_has_fork_bomb_shell), which supersedes
+            # this literal substring — skip it here to avoid a second,
+            # weaker pass over the same pattern.
+            if label == "fork bomb shell":
+                continue
 
             # Special case: subprocess alone is fine; only block when paired
             # with a shell-deletion token in the same file.

@@ -476,23 +476,15 @@ class Executor:
         "systemctl",                 # service control
     )
 
-    # BUGFIX: the fork bomb was blocked as an EXACT-substring literal
-    # (":(){:|:&};:"), but that structure is a bash function definition —
-    # arbitrary whitespace is valid syntax anywhere inside it. Any of these
-    # are equally valid, equally dangerous, and NONE matched the literal:
-    #
-    #   ":(){ :|:& };:"        (spaces inside the braces)
-    #   ":() { :|:& };:"       (space before the brace)
-    #   ": ( ) { : | : & } ; :"   (spaces everywhere)
-    #
-    # A successful fork bomb can hang or crash the ENTIRE host, not just
-    # fail the one sandboxed task — the highest-severity failure mode this
-    # defense-in-depth blocklist exists to catch, defeated here by a single
-    # extra space. Checked as a whitespace-tolerant regex instead of a
-    # literal, matching every variant above while still not flagging
-    # unrelated brace/paren syntax (a Python function def, an `if (x) {...}`
-    # block) — verified directly against both classes before landing this.
-    _FORKBOMB_RE = re.compile(r":\s*\(\s*\)\s*\{[^}]*:\s*\|\s*:[^}]*\}\s*;\s*:")
+    # The classic fork-bomb ``:(){:|:&};:`` is a bash *function definition* —
+    # arbitrary whitespace is valid syntax anywhere between its tokens (inside
+    # the parens/braces, before the brace, between the pipe and ampersand,
+    # etc). An exact-substring literal is trivially defeated by a single
+    # extra space (e.g. ``:() { :|:& };:``) while remaining equally
+    # dangerous bash. Matched separately, before the literal-pattern loop,
+    # with a whitespace-tolerant regex over the fixed token sequence
+    # ``:`` ``(`` ``)`` ``{`` ``:`` ``|`` ``:`` ``&`` ``}`` ``;`` ``:``.
+    _FORK_BOMB_RE = None  # set lazily below to avoid a module-level re import
 
     @staticmethod
     def _check_command_safety(command: str) -> tuple[bool, str]:
@@ -505,8 +497,12 @@ class Executor:
         """
         import re as _re
         lower = command.lower()
-        if Executor._FORKBOMB_RE.search(lower):
-            return False, "blocked pattern: fork bomb in acceptance_check"
+        if Executor._FORK_BOMB_RE is None:
+            Executor._FORK_BOMB_RE = _re.compile(
+                r":\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:"
+            )
+        if Executor._FORK_BOMB_RE.search(lower):
+            return False, "blocked pattern fork-bomb-signature in acceptance_check"
         for pattern in Executor._BLOCKED_COMMAND_PATTERNS:
             token = pattern.strip().lower()
             if token.isalpha():

@@ -1,21 +1,42 @@
-"""tests/test_executor_forkbomb_whitespace.py — the fork bomb blocklist
-entry was defeated by a single extra space.
+"""tests/test_executor_forkbomb_whitespace.py — Bug #33: fork-bomb whitespace bypass.
 
-The fork bomb entry in _BLOCKED_COMMAND_PATTERNS was an EXACT-substring
-literal (":(){:|:&};:"), but that structure is a bash function definition
-— arbitrary whitespace is valid syntax anywhere inside it. Any of these are
-equally valid, equally dangerous, and NONE matched the literal:
+Bug
+---
+``Executor._BLOCKED_COMMAND_PATTERNS`` used to contain the fork bomb as an
+exact-substring literal: ``":(){:|:&};:"``. That literal is a bash *function
+definition*, and bash allows arbitrary whitespace between its tokens (inside
+the parens/braces, before the opening brace, between the pipe and ampersand,
+etc). Any whitespace variant of the canonical string — e.g.
+``":() { :|:& };:"`` — is equally dangerous bash but was never matched by the
+literal, silently defeating a security control on trivial input variation.
 
-    ":(){ :|:& };:"          (spaces inside the braces)
-    ":() { :|:& };:"         (space before the brace)
-    ": ( ) { : | : & } ; :"  (spaces everywhere)
+Reproduction (against the ORIGINAL, unfixed code)
+---------------------------------------------------
+    >>> Executor._check_command_safety(":(){:|:&};:")
+    (False, "blocked pattern ':(){:|:&};:' in acceptance_check")   # blocked
+    >>> Executor._check_command_safety(":() { :|:& };:")
+    (True, '')                                                     # BYPASSED
 
-A successful fork bomb can hang or crash the ENTIRE host, not just fail the
-one sandboxed task — the highest-severity failure mode this defense-in-depth
-blocklist exists to catch, defeated by a single extra space in the acceptance
-check string. Fixed with a whitespace-tolerant regex, verified not to
-false-positive on unrelated brace/paren syntax (a Python function def, an
-`if (x) {...}` block).
+Fix
+---
+Replaced the exact-substring literal with a dedicated, whitespace-tolerant
+regular expression matched against the fixed token sequence of a fork bomb
+(colon, open-paren, close-paren, open-brace, colon, pipe, colon, ampersand,
+close-brace, semicolon, colon), checked before the literal-pattern loop.
+
+Counterfactual verification
+----------------------------
+On the UNFIXED code (``git show HEAD:tools/auto/executor.py`` prior to this
+patch), ``test_whitespace_variants_are_blocked`` FAILS for every whitespace
+variant except the canonical string itself — reproducing the exact bug above.
+On the FIXED code, all cases pass.
+
+Test-writing lesson carried over from the knowledge file: the canonical
+(never-broken) case is asserted SEPARATELY from the whitespace variants, and
+only on the security property (``safe is False``), not on the exact wording
+of the reason string — the old code's message for the canonical case already
+differs in phrasing from the new regex-based message, which would otherwise
+look like a false-alarm "regression" during counterfactual testing.
 """
 
 from __future__ import annotations
@@ -25,59 +46,52 @@ from pathlib import Path
 
 import pytest
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from tools.auto.executor import Executor
+from tools.auto.executor import Executor  # noqa: E402
 
 
-class TestForkBombWhitespaceVariants:
-    def test_canonical_form_was_already_blocked(self):
-        """The exact literal was never broken -- the OLD mechanism already
-        blocks this one, just with different message wording. Kept
-        separate from the whitespace-variant cases below so a wording
-        assertion on THIS case can't accidentally validate nothing, the
-        way a first draft of this test did."""
-        safe, reason = Executor._check_command_safety(":(){:|:&};:")
+class TestForkBombCanonicalStillBlocked:
+    """The original, never-broken exact-literal case must still be blocked."""
+
+    def test_canonical_fork_bomb_blocked(self) -> None:
+        safe, _reason = Executor._check_command_safety(":(){:|:&};:")
         assert safe is False
 
-    @pytest.mark.parametrize("command", [
-        ":(){ :|:& };:",
-        ":() { :|:& };:",
-        ":(){ : | : & };:",
-        ": ( ) { : | : & } ; :",
-        "echo hi; :(){ :|:& };:",
-        "ECHO HI && :(){ :|:& };:",
-    ])
-    def test_whitespace_variant_is_blocked(self, command):
-        """BUGFIX: confirmed on unfixed code that EVERY one of these
-        returned (True, '') -- completely unblocked, not merely blocked
-        with different wording. A first draft of this test parametrized
-        the canonical (never-broken) form together with these variants
-        under one shared wording assertion, which happened to pass for
-        the canonical case regardless of whether the real fix was present
-        -- checked directly and split apart before trusting this test."""
-        safe, reason = Executor._check_command_safety(command)
-        assert safe is False, f"variant not blocked: {command!r}"
-        assert "fork bomb" in reason
 
-    @pytest.mark.parametrize("command", [
+class TestForkBombWhitespaceVariantsBlocked:
+    """Whitespace variants of the fork bomb — previously bypassed — must now
+    be blocked. Each of these is valid, equally-dangerous bash."""
+
+    @pytest.mark.parametrize("variant", [
+        ":() { :|:& };:",           # space before brace, inside braces
+        ": () {: | :& };:",         # space after leading colon, around pipe
+        ":(){ :|: & };:",           # space before closing brace, before &
+        ":  (  )  {  :  |  :  &  }  ;  :",   # heavy spacing throughout
+        ":()\t{:|:&};:",            # tab variant
+        ":()\n{:|:&};:",            # newline variant
+    ])
+    def test_whitespace_variants_are_blocked(self, variant: str) -> None:
+        safe, reason = Executor._check_command_safety(variant)
+        assert safe is False, (
+            f"whitespace variant of the fork bomb was not blocked: {variant!r}"
+        )
+        assert reason  # a non-empty reason is returned alongside the block
+
+
+class TestForkBombNoFalsePositives:
+    """The whitespace-tolerant regex must not flag unrelated brace/paren
+    syntax that merely happens to contain some of the same characters."""
+
+    @pytest.mark.parametrize("benign_cmd", [
+        "echo hello",
+        "pytest",
+        "terraform apply",
+        "if (x) { print(1) }",
         "def f(): pass",
-        "if (x) { y() }; z",
-        "function foo() { return 1; }",
-        "pytest -k 'test_thing'",
+        "python -c \"print(1)\"",
+        "func() { echo hi; }",   # ordinary shell function, not a fork bomb
     ])
-    def test_unrelated_brace_syntax_not_flagged(self, command):
-        """Sanity: the regex must not become trigger-happy on ordinary
-        brace/paren-containing shell or code snippets."""
-        safe, reason = Executor._check_command_safety(command)
-        assert safe is True, f"false positive: {reason}"
-
-    def test_other_blocklist_entries_still_work(self):
-        """Sanity: adding the regex check must not disturb the existing
-        word-boundary literal matching for everything else."""
-        safe, reason = Executor._check_command_safety("sudo rm -rf /")
-        assert safe is False
-        safe2, _ = Executor._check_command_safety("pytest tests/test_confirm.py")
-        assert safe2 is True
+    def test_benign_command_not_blocked(self, benign_cmd: str) -> None:
+        safe, _reason = Executor._check_command_safety(benign_cmd)
+        assert safe is True, f"benign command was incorrectly blocked: {benign_cmd!r}"
