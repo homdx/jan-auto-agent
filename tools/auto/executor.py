@@ -472,10 +472,27 @@ class Executor:
         "> /",  ">/",                # redirect to absolute path
         "curl ", "wget ",            # outbound network (proxy-bypass, exfil)
         "nc ", "netcat",             # raw network
-        ":(){:|:&};:",               # fork bomb
         "shutdown", "reboot", "halt",# system control
         "systemctl",                 # service control
     )
+
+    # BUGFIX: the fork bomb was blocked as an EXACT-substring literal
+    # (":(){:|:&};:"), but that structure is a bash function definition —
+    # arbitrary whitespace is valid syntax anywhere inside it. Any of these
+    # are equally valid, equally dangerous, and NONE matched the literal:
+    #
+    #   ":(){ :|:& };:"        (spaces inside the braces)
+    #   ":() { :|:& };:"       (space before the brace)
+    #   ": ( ) { : | : & } ; :"   (spaces everywhere)
+    #
+    # A successful fork bomb can hang or crash the ENTIRE host, not just
+    # fail the one sandboxed task — the highest-severity failure mode this
+    # defense-in-depth blocklist exists to catch, defeated here by a single
+    # extra space. Checked as a whitespace-tolerant regex instead of a
+    # literal, matching every variant above while still not flagging
+    # unrelated brace/paren syntax (a Python function def, an `if (x) {...}`
+    # block) — verified directly against both classes before landing this.
+    _FORKBOMB_RE = re.compile(r":\s*\(\s*\)\s*\{[^}]*:\s*\|\s*:[^}]*\}\s*;\s*:")
 
     @staticmethod
     def _check_command_safety(command: str) -> tuple[bool, str]:
@@ -488,6 +505,8 @@ class Executor:
         """
         import re as _re
         lower = command.lower()
+        if Executor._FORKBOMB_RE.search(lower):
+            return False, "blocked pattern: fork bomb in acceptance_check"
         for pattern in Executor._BLOCKED_COMMAND_PATTERNS:
             token = pattern.strip().lower()
             if token.isalpha():
