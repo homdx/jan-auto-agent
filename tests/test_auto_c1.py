@@ -547,9 +547,20 @@ class TestErrorHandling:
             ex.run({"id": "   ", "acceptance_check": "exit 0", "target_files": []})
 
     def test_oserror_returns_result_no_raise(self, tmp_path: Path) -> None:
+        """BUGFIX: this used to patch subprocess.run — but the executor
+        switched to subprocess.Popen (start_new_session=True, so a timeout
+        can kill the whole process group, not just the shell — see
+        tests/test_executor_timeout_process_group.py). Patching
+        subprocess.run no longer intercepts anything the executor calls, so
+        this test silently stopped testing what it claimed to: the real
+        command ran normally (exit 0) instead of the injected OSError ever
+        being reached, and the assertion below would have failed loudly —
+        caught by running the full suite after the process-group fix,
+        not by anything in this test file itself.
+        """
         _setup_repo(tmp_path)
         ex = _executor(tmp_path)
-        with patch("subprocess.run", side_effect=OSError("shell not found")):
+        with patch("subprocess.Popen", side_effect=OSError("shell not found")):
             result = ex.run(_task())
         assert result.exit_code == -1
         assert "shell not found" in result.stderr

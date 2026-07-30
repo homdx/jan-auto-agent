@@ -56,6 +56,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -697,20 +698,63 @@ class Executor:
         # explicit form below makes the intent unmistakable.
         timeout = self._timeout_sec if self._timeout_sec > 0 else None
 
+        # BUGFIX: subprocess.run(shell=True, timeout=...) only kills the
+        # DIRECT child on timeout — the shell (`/bin/sh -c "command"`).  Any
+        # process that shell spawns (a backgrounded job with `&`, a test
+        # runner's own subprocess, a daemon a Makefile target starts) is
+        # NOT in that process, so killing the shell does not kill it — it
+        # keeps running, orphaned, past the timeout that exists specifically
+        # to bound how long an acceptance_check can run.  Reproduced
+        # directly: `sleep 60 &` inside the command, with a 1s timeout,
+        # left `sleep 60` running as a live process well after
+        # TimeoutExpired fired and this method had already returned.
+        #
+        # This matters here more than in most subprocess call sites in this
+        # codebase: acceptance_check is an LLM-authored or operator-supplied
+        # shell string, executed specifically UNDER a timeout because it is
+        # not trusted to terminate on its own — the one enforcement
+        # mechanism this class exists to provide is exactly what a
+        # backgrounded or forked grandchild process escapes.
+        #
+        # Fixed with the standard pattern for this well-known Python
+        # subprocess gotcha: start the shell in its own session
+        # (`start_new_session=True`, i.e. `os.setsid()` in the child before
+        # exec), which puts it AND every process it spawns into one new
+        # process group — then, on timeout, signal that whole GROUP via
+        # `os.killpg`, not just the one process `Popen.kill()` would reach.
+        # subprocess.run()'s convenience wrapper does not expose the Popen
+        # object on TimeoutExpired, so this uses Popen directly to retain
+        # that access.
         try:
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 command,
                 shell=True,
                 cwd=str(cwd),
                 env=env,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                timeout=timeout,
+                start_new_session=True,
             )
-            stdout = _truncate(proc.stdout, _MAX_OUTPUT_CHARS)
-            stderr = _truncate(proc.stderr, _MAX_OUTPUT_CHARS)
+        except OSError as exc:
+            logger.error("_execute: failed to start command task=%s cmd=%r: %s",
+                        task_id, command, exc)
+            return ExecutionResult(
+                exit_code = -1,
+                stdout    = "",
+                stderr    = str(exc),
+                timed_out = False,
+                traceback = None,
+                command   = command,
+                task_id   = task_id,
+            )
+
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+            stdout = _truncate(stdout, _MAX_OUTPUT_CHARS)
+            stderr = _truncate(stderr, _MAX_OUTPUT_CHARS)
             return ExecutionResult(
                 exit_code = proc.returncode,
                 stdout    = stdout,
@@ -722,17 +766,43 @@ class Executor:
             )
 
         except subprocess.TimeoutExpired as exc:
-            # The process was killed; collect whatever partial output we have.
-            stdout = _truncate(
-                (exc.stdout or b"").decode("utf-8", errors="replace")
-                if isinstance(exc.stdout, bytes) else (exc.stdout or ""),
-                _MAX_OUTPUT_CHARS,
-            )
-            stderr = _truncate(
-                (exc.stderr or b"").decode("utf-8", errors="replace")
-                if isinstance(exc.stderr, bytes) else (exc.stderr or ""),
-                _MAX_OUTPUT_CHARS,
-            )
+            # Kill the ENTIRE process group, not just the shell — see the
+            # comment above the Popen call for why this matters here.
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except ProcessLookupError:
+                pass  # already exited between the timeout firing and here
+            except OSError as kill_exc:
+                logger.warning(
+                    "_execute: could not kill process group for task=%s "
+                    "pid=%s: %s — a child process may still be running",
+                    task_id, proc.pid, kill_exc,
+                )
+            # Drain whatever output had already been buffered; communicate()
+            # after a kill returns promptly rather than blocking.
+            try:
+                drained_out, drained_err = proc.communicate(timeout=5)
+            except (subprocess.TimeoutExpired, ValueError):
+                drained_out, drained_err = "", ""
+
+            # TimeoutExpired's own stdout/stderr attributes can carry raw
+            # bytes despite `text=True` on the Popen — the text-decoding
+            # wrapper applies to communicate()'s successful RETURN value,
+            # not to what gets attached to the exception when it fires
+            # mid-read. Confirmed directly: a real timeout here raised
+            # "TypeError: can't concat str to bytes" the first time this
+            # fix was written without this guard, which the ORIGINAL
+            # subprocess.run()-based code already carried for exactly this
+            # reason — dropped by accident when rewriting this block to add
+            # process-group cleanup, and caught only by actually exercising
+            # the timeout path rather than trusting the diff.
+            def _as_text(value: "str | bytes | None") -> str:
+                if isinstance(value, bytes):
+                    return value.decode("utf-8", errors="replace")
+                return value or ""
+
+            stdout = _truncate(_as_text(exc.stdout) + _as_text(drained_out), _MAX_OUTPUT_CHARS)
+            stderr = _truncate(_as_text(exc.stderr) + _as_text(drained_err), _MAX_OUTPUT_CHARS)
             logger.warning(
                 "_execute: TIMEOUT task=%s cmd=%r timeout=%.1fs",
                 task_id, command, self._timeout_sec,
