@@ -264,7 +264,9 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         # ── Stage A: existence checks ─────────────────────────────────────────
         existence_passed: list[tuple[CandidateTask, str]] = []  # (task, code_block)
 
-        for c in candidates:
+        n_candidates = len(candidates)
+        for i, c in enumerate(candidates, 1):
+            print(f"  [{i}/{n_candidates}] existence check: {c.title}")
             ok, reason, block = self._check_existence(c, base_dir, cluster_files)
             if ok:
                 existence_passed.append((c, block))
@@ -272,7 +274,12 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                 all_results.append(FilterResult(
                     candidate=c, accepted=False, stage="existence", reason=reason,
                 ))
-                logger.warning(
+                # AUTO-LOG-1: existence has no "the call failed" failure mode
+                # of its own (no LLM, no network) — a rejection here always
+                # means the citation genuinely doesn't resolve (or, with
+                # cluster_files, was hallucinated), which is Gate 1 doing
+                # its job, not an anomaly. INFO, not WARNING.
+                logger.info(
                     "Gate1[existence] REJECTED %r — %s", c.title, reason,
                 )
 
@@ -294,7 +301,8 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             _why = "LLM skipped" if self._skip_llm else "creative mode — existence only"
             presence_passed = [(c, f"existence check passed ({_why})") for c, _ in existence_passed]
         else:
-            for c, block in existence_passed:
+            n_presence = len(existence_passed)
+            for i, (c, block) in enumerate(existence_passed, 1):
                 if c.cited_location.new_file:
                     # AUTO-BUG (new_file): same reasoning as AUTO-CR-8 above —
                     # a file that does not exist yet has no existing content
@@ -304,16 +312,38 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                     presence_passed.append(
                         (c, "new file — existence check sufficient"))
                     continue
+                print(f"  [{i}/{n_presence}] presence check: {c.title}")
                 ok, reason = self._check_presence(c, block)
                 if ok:
                     presence_passed.append((c, reason))
+                    # AUTO-LOG-1: symmetric with REJECTED below — a
+                    # confirmation used to be entirely silent (no log line
+                    # at all), which made "why don't I see the ones that
+                    # passed?" a fair question with no answer. Same level
+                    # (INFO) as a genuine rejection: both are ordinary
+                    # outcomes of the same check.
+                    logger.info(
+                        "Gate1[presence] CONFIRMED %r — %s", c.title, reason,
+                    )
                 else:
                     all_results.append(FilterResult(
                         candidate=c, accepted=False, stage="presence", reason=reason,
                     ))
-                    logger.warning(
-                        "Gate1[presence] REJECTED %r — %s", c.title, reason,
-                    )
+                    # AUTO-LOG-1: only an actual call/parse failure (see
+                    # _is_technical_failure) is a WARNING — that's a real
+                    # anomaly (network hiccup, malformed response) worth
+                    # standing out from routine output. An LLM reading the
+                    # code and genuinely disagreeing with the claim is
+                    # Gate 1 working correctly, logged at INFO like its
+                    # CONFIRMED counterpart just above.
+                    if _is_technical_failure(reason):
+                        logger.warning(
+                            "Gate1[presence] REJECTED %r — %s", c.title, reason,
+                        )
+                    else:
+                        logger.info(
+                            "Gate1[presence] REJECTED %r — %s", c.title, reason,
+                        )
 
         print(
             f"🔎 Gate 1 presence: "
@@ -711,6 +741,34 @@ def filter_candidates(
 # ─────────────────────────────────────────────────────────────────────────────
 # Internal helpers
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _is_technical_failure(reason: str) -> bool:
+    """Return True when *reason* names a call/parse failure, not a genuine
+    LLM verdict.
+
+    AUTO-LOG-1: ``filter()`` used to log every rejection at WARNING,
+    whether it was Gate 1 doing its job (the LLM read the code and
+    disagreed with the claim — an ordinary, expected outcome) or a real
+    technical hiccup (the call failed, the response wasn't valid JSON).
+    Conflating the two made a normal run's console/log look like it was
+    full of problems, and made a genuine failure no easier to spot than
+    routine business output. This distinguishes the two so callers can
+    log at the right level: WARNING for an actual anomaly worth noticing,
+    INFO for "the LLM looked and said no" — a state of the *request*
+    (confirmed/rejected), not a fault in it.
+
+    Matches the exact reason prefixes ``_check_presence`` /
+    ``_parse_presence_response`` produce on failure. A genuine LLM
+    "reason" field is free-text from the model and, in practice, never
+    coincidentally starts with one of these.
+    """
+    return reason.startswith((
+        "LLM call failed:",
+        "JSON decode failed",
+        "expected JSON object,",
+        "unrecognised verdict ",
+    ))
+
 
 def _fingerprint(c: CandidateTask) -> str:
     """Stable deduplication key for a candidate, based on cited location.

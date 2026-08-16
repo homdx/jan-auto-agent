@@ -221,11 +221,18 @@ class TestBogusCandidateDropped:
     def test_rejected_reason_logged(
         self, filt: Gate1Filter, repo: Path, caplog
     ) -> None:
-        """The rejection reason appears in the log."""
+        """The rejection reason appears in the log.
+
+        AUTO-LOG-1: an existence-stage rejection for a genuinely-missing
+        symbol is Gate 1 doing its job, not an anomaly — it's logged at
+        INFO now, not WARNING (that level is reserved for an actual
+        call/parse failure — see _is_technical_failure). The reason text
+        itself is unchanged and still fully present in the log either way.
+        """
         c = _make_candidate(symbol="nonexistent_function")
 
         import logging
-        with caplog.at_level(logging.WARNING, logger="tools.auto.gate1_filter"):
+        with caplog.at_level(logging.INFO, logger="tools.auto.gate1_filter"):
             accepted, rejected = filt.filter([c], repo)
 
         assert any("nonexistent_function" in msg for msg in caplog.messages)

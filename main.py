@@ -593,6 +593,8 @@ def _parse_args():
               python main.py --once "/edit fix grammar in readme.md" --base /srv/app
               python main.py --faq "how do I reset my password?"
               python main.py --faq "question" --base /path/to/project
+              python main.py --auto "harden error handling" --dry-run
+              python main.py --validate-plan --base /path/to/project
         """),
     )
     parser.add_argument("base_dir_positional", nargs="?", default=None, metavar="base_dir",
@@ -611,6 +613,19 @@ def _parse_args():
     parser.add_argument("--dry-run", action="store_true", default=False,
                         help="With --auto: build the plan and emit IMPROVEMENTS.md, "
                              "but do not execute any tasks or make any commits.")
+    # AUTO-H1: re-validate an existing plan against the current code, no goal needed
+    parser.add_argument("--validate-plan", action="store_true", default=False,
+                        help="Re-check an existing .agent/plan.json: every todo/"
+                             "in_progress task is re-run through the same Gate 1 "
+                             "existence + LLM problem-presence check the Architect "
+                             "uses at plan time. Confirmed false positives (the "
+                             "claimed gap is already closed, or the citation no "
+                             "longer resolves) are removed from the plan and logged "
+                             "to IMPROVEMENTS-FALSE.md instead of being executed. "
+                             "Requires a plan already built via "
+                             "--auto \"<goal>\" --dry-run (or a full run); does not "
+                             "build one and does not execute any tasks itself. "
+                             "e.g. --validate-plan --base /srv/app")
     # FAQ one-shot flag
     parser.add_argument("--faq", metavar="QUESTION", default=None,
                         help="One-shot FAQ lookup against the knowledge folder, then exit. "
@@ -646,6 +661,11 @@ def _parse_args():
 def main():
     args = _parse_args()
     base_dir = os.path.abspath(args.base or args.base_dir_positional or os.getcwd())
+
+    # ── VALIDATE-PLAN MODE (AUTO-H1) ────────────────────────────────────
+    if args.validate_plan:
+        from tools.auto.plan_validator import run_validate
+        sys.exit(run_validate(base_dir=base_dir, config_path=args.config))
 
     # ── AUTONOMOUS MODE (AUTO-A1) ──────────────────────────────────────
     if args.auto is not None:

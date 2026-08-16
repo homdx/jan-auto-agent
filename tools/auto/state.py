@@ -18,6 +18,7 @@ Public surface consumed by controller.py:
     store.update_progress(status="capped", stop_reason="runtime_cap")   # AUTO-A4
     store.upsert_task(make_task(...))
     store.set_task_status("AUTO-T1", STATUS_DONE, commit="abc123")
+    store.remove_task("AUTO-T4")          # AUTO-H1: quarantine a false positive
     store.log("something happened")
 
 plan.json task schema (enforced by _validate_task_schema):
@@ -298,6 +299,62 @@ class StateStore:
                 return
 
         raise ValueError(f"Task '{task_id}' not found in plan")
+
+    def remove_task(self, task_id: str) -> bool:
+        """Remove a task from plan.json entirely and persist.
+
+        AUTO-H1: used by ``tools.auto.plan_validator`` to drop a task that a
+        re-validation pass confirmed is a false positive (the claimed gap is
+        already closed, or its citation no longer resolves) — such a task
+        must never be picked up by the execute loop again.
+
+        This does NOT just flip the status to BLOCKED. A freshly-quarantined
+        false-positive task has round == 0 (it never ran) and no
+        ``BUG-FIX-`` prefix, which is exactly the shape
+        ``AutoController._reset_resettable_blocked_tasks`` treats as safe to
+        reset back to TODO at the start of the next session (its case 1:
+        "unmet dependency" — see that method's docstring). Leaving the task
+        BLOCKED would silently un-quarantine it on the very next ``--auto``
+        invocation. Deleting the entry from plan.json is the only state that
+        stays quarantined across sessions.
+
+        Any OTHER task's ``dependencies`` list that still names *task_id* has
+        that entry stripped too. A removed task was judged unnecessary — its
+        target state already holds in the codebase — so anything that was
+        only waiting on it can be treated as unblocked rather than left
+        referencing a dependency that can now never become DONE, which would
+        otherwise wedge the dependent task in BLOCKED forever (see the
+        ``if not dep or dep["status"] != STATUS_DONE`` check in
+        ``AutoController._run_task_loop``).
+
+        Returns
+        -------
+        bool
+            ``True`` if a task with *task_id* was found and removed;
+            ``False`` if no such task existed (no-op).
+        """
+        tasks = self._plan.get("tasks", [])
+        idx = next((i for i, t in enumerate(tasks) if t["id"] == task_id), None)
+        if idx is None:
+            return False
+
+        del tasks[idx]
+
+        cleared_from: list[str] = []
+        for t in tasks:
+            deps = t.get("dependencies") or []
+            if task_id in deps:
+                t["dependencies"] = [d for d in deps if d != task_id]
+                cleared_from.append(t["id"])
+
+        self._save_plan()
+        self._refresh_progress()
+        self.log(
+            f"task {task_id} removed from plan"
+            + (f" (cleared as a dependency of: {', '.join(cleared_from)})"
+               if cleared_from else "")
+        )
+        return True
 
     def increment_task_counters(
         self,
