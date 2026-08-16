@@ -216,6 +216,7 @@ def summarize_repo(
     sleep_fn: Callable[[float], None] = time.sleep,
     on_error: Optional[Callable[[str, Exception, int], None]] = None,
     checkpoint_path: Optional[Path] = None,
+    progress_fn: Optional[Callable[[int, int, str], None]] = None,
 ) -> List[ModuleRecord]:
     """Run Pass B over every module, in order.
 
@@ -233,6 +234,11 @@ def summarize_repo(
 
     `sleep_fn` defaults to `time.sleep` but is injectable so tests can run
     the retry path without actually waiting.
+
+    `progress_fn(done_count, total_count, module_path)` — if given, called
+    once after each module that actually needs an LLM call finishes (cached
+    or parse-error modules don't count toward the total, since nothing is
+    sent for them). Pass a no-op lambda to silence progress reporting.
     """
     from tools.backoff import backoff_seconds, clear_state, load_state, save_state
 
@@ -241,6 +247,13 @@ def summarize_repo(
         state = load_state(checkpoint_path)
         if state and state.get("loop") == "collect_summarize":
             done = dict(state.get("modules", {}))
+
+    # Modules that will actually need an LLM call (used for progress totals).
+    total = sum(
+        1 for m in modules
+        if m.parse_error is None and done.get(m.path) is None
+    )
+    sent = 0
 
     out: List[ModuleRecord] = []
     for module in modules:
@@ -283,6 +296,9 @@ def summarize_repo(
                 sleep_fn(wait)
 
         out.append(result)
+        sent += 1
+        if progress_fn is not None:
+            progress_fn(sent, total, module.path)
         if checkpoint_path is not None and result.summary is not None:
             done[result.path] = {
                 "purpose": result.summary.purpose,
@@ -356,6 +372,16 @@ def _make_llm_call(config, task_mode: str = "code") -> LlmCall:
     # re-enables it (strip_think below still cleans up either way).
     think = config.getboolean("collect", "think", fallback=False)
 
+    # Per-request HTTP retry (429/5xx) — was previously hardcoded to
+    # request_completion()'s own defaults (error_retries=2,
+    # error_retry_wait_sec=60.0, max_retry_after_sec=180.0) regardless of
+    # what a profile's .ini said. Now config-driven via [collect], falling
+    # back to those same defaults when unset so existing profiles behave
+    # exactly as before.
+    error_retries = config.getint("collect", "error_retries", fallback=2)
+    error_retry_wait_sec = config.getfloat("collect", "error_retry_wait_sec", fallback=60.0)
+    max_retry_after_sec = config.getfloat("collect", "max_retry_after_sec", fallback=180.0)
+
     ssl_context = _llm_stream.make_unverified_context() if not verify_ssl else None
 
     def _call(system: str, user: str) -> str:
@@ -368,10 +394,25 @@ def _make_llm_call(config, task_mode: str = "code") -> LlmCall:
             _llm_stream.request_completion(
                 url=url, headers=headers, payload=payload, timeout=timeout,
                 api_format=api_format, ssl_context=ssl_context,
+                error_retries=error_retries,
+                error_retry_wait_sec=error_retry_wait_sec,
+                max_retry_after_sec=max_retry_after_sec,
+                on_retry=logger.warning,
             ) or ""
         )
 
     return _call
+
+
+def collect_max_retries(config) -> int:
+    """`[collect] max_retries` (default `DEFAULT_MAX_RETRIES`) — the outer,
+    per-module retry count `summarize_repo` uses (♻️ `tools.backoff`'s fixed
+    1/2/4/8… schedule), separate from and layered on top of the inner
+    per-HTTP-request retry read in `_make_llm_call` above. Previously this
+    was never read from any .ini — always the hardcoded default."""
+    if config is None:
+        return DEFAULT_MAX_RETRIES
+    return config.getint("collect", "max_retries", fallback=DEFAULT_MAX_RETRIES)
 
 
 def make_summarizer_call(config, task_mode: str = "code") -> LlmCall:

@@ -49,9 +49,20 @@ def strip_think(text: str) -> str:
 
 
 def _extract_content(raw: dict, api_format: str) -> str:
-    """Extract assistant message text from a non-streaming response dict."""
+    """Extract assistant message text from a non-streaming response dict.
+
+    BUGFIX: a message's `content` can legitimately come back JSON `null`
+    instead of an empty string — e.g. some OpenAI-compatible gateways
+    (reasoning/tool-call-only turns, certain filtered/empty replies) send
+    `"content": null` with HTTP 200 rather than omitting the key or using
+    `""`. `raw["message"]["content"].strip()` / `choices[0]["message"]
+    ["content"].strip()` then raised `AttributeError: 'NoneType' object
+    has no attribute 'strip'` — a response that arrived successfully was
+    crashing the whole call instead of degrading to an empty reply the
+    same way a filtered/empty `choices` list already does below.
+    """
     if api_format == "ollama":
-        return raw["message"]["content"].strip()
+        return (raw["message"]["content"] or "").strip()
     # openai (default)
     # BUGFIX: mirror the streaming path's empty-choices guard (introduced in
     # the "Fix llm stream" commit).  Some OpenAI-compatible backends — Jan,
@@ -69,7 +80,7 @@ def _extract_content(raw: dict, api_format: str) -> str:
             f"LLM response had no choices — likely blocked/filtered by the "
             f"backend (raw keys: {list(raw.keys())})"
         )
-    return choices[0]["message"]["content"].strip()
+    return (choices[0]["message"]["content"] or "").strip()
 
 
 def _build_payload(payload: dict, api_format: str, stream: bool) -> dict:
