@@ -284,9 +284,29 @@ def validate_plan(
         logger.warning("validate_plan: %s", warning)
         print(f"⚠️  {warning}")
 
+    # AUTO-H2-4: optional independent verification model. Re-confirming a
+    # candidate with the SAME model that proposed it (the default — no
+    # [gate1_validate] section) is a consistency check, not independent
+    # verification: a model's own systematic blind spot (this session found
+    # three false positives from one such blind spot, see AUTO-H2 epic)
+    # reproduces identically on a second call with the same weights and
+    # temperature=0. Setting [gate1_validate] model (and optionally active)
+    # in the config passed to --validate-plan points this specific re-check
+    # at a different model without touching live --auto's Gate 1 at all —
+    # tools/auto/pipeline.py's call site never passes these overrides.
+    model_override  = cfg.get("gate1_validate", "model",  fallback=None)
+    active_override = cfg.get("gate1_validate", "active", fallback=None)
+    if model_override or active_override:
+        logger.info(
+            "validate_plan: using independent verification model (active=%s, model=%s)",
+            active_override or "<same as [api] active>",
+            model_override or "<default for that active profile>",
+        )
+
     print(f"\n🔎 Re-validating {len(pending)} pending task(s) against current code...")
     accepted, rejected = filter_candidates(
         candidates, base_path, cfg, cluster_files=None, task_mode=task_mode,
+        model_override=model_override, active_override=active_override,
     )
 
     removed: list[RemovedTask] = []

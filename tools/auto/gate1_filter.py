@@ -61,7 +61,8 @@ from typing import Any
 
 from tools.agent_trace import tracer
 from tools.auto.architect import CandidateTask
-from tools.block_extractor import extract_block
+from tools.auto.gate1_grounding import callee_context, config_fallback_note, target_file_context
+from tools.block_extractor import extract_block, extract_module_docstring
 import tools.llm_stream as _llm_stream
 from tools.llm_stream import strip_think
 
@@ -117,7 +118,7 @@ Code at that location:
 ```
 {code_block}
 ```
-
+{grounding_notes}
 Is the claimed problem actually present in the code shown above, \
 and NOT already fixed?
 
@@ -313,7 +314,10 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                         (c, "new file — existence check sufficient"))
                     continue
                 print(f"  [{i}/{n_presence}] presence check: {c.title}")
-                ok, reason = self._check_presence(c, block)
+                module_docstring = self._module_docstring_for(c, base_dir)
+                ok, reason = self._check_presence(
+                    c, block, module_docstring=module_docstring, base_dir=base_dir,
+                )
                 if ok:
                     presence_passed.append((c, reason))
                     # AUTO-LOG-1: symmetric with REJECTED below — a
@@ -525,12 +529,122 @@ class Gate1Filter(_llm_stream.LLMClientBase):
 
     # ── Stage B helpers ───────────────────────────────────────────────────────
 
+    def _module_docstring_for(self, candidate: CandidateTask, base_dir: Path) -> str:
+        """AUTO-H2-2 helper. Deliberately re-reads the cited file rather
+        than threading a return value through ``_check_existence`` — that
+        method's 3-tuple ``(ok, reason, code_block)`` signature is used
+        directly by existing tests (tests/test_bugfix_review.py) and by
+        design should not need to change shape just because Stage B wants
+        one more piece of (cheap, optional) context. Never raises: any
+        failure here just means no docstring context, not a broken run.
+        """
+        loc = candidate.cited_location
+        if loc.new_file:
+            return ""
+        try:
+            source = (base_dir / loc.file).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+        file_ext = Path(loc.file).suffix or ".py"
+        try:
+            return extract_module_docstring(source, file_ext)
+        except Exception:  # pragma: no cover - defensive, see docstring
+            return ""
+
+    def _build_grounding_notes(
+        self,
+        candidate: CandidateTask,
+        code_block: str,
+        module_docstring: str,
+        base_dir: "Path | None",
+    ) -> str:
+        """AUTO-H2-1/-2/-3/-6: assemble Stage A2's deterministic evidence into
+        the text block injected into Stage B's prompt via
+        ``{grounding_notes}``.
+
+        Every piece here is *evidence for the LLM to weigh*, never a
+        decision by itself — Stage A2 does not reject candidates. See
+        ``gate1_grounding.py``'s module docstring for the reasoning: a
+        heuristic that misfires and auto-rejects trades a false positive
+        for a false negative, which is not obviously a win. Returns ""
+        when nothing fires, which renders as a harmless blank line in the
+        template — no behavior change for candidates none of this applies to.
+        """
+        notes: list[str] = []
+
+        if module_docstring:
+            notes.append(
+                f"Module docstring for this file (context the code block above "
+                f"doesn't repeat):\n\"\"\"\n{module_docstring}\n\"\"\"\n"
+                f"If that docstring states the code was written on purpose as "
+                f"an incorrect/uncovered example for testing some OTHER part "
+                f"of the system (not as production logic meant to work "
+                f"correctly), that is strong evidence the claimed problem "
+                f"should NOT be fixed here even if it is technically present "
+                f"— reject in that case. Otherwise this note is just "
+                f"background."
+            )
+
+        fb_note = config_fallback_note(candidate.instruction, code_block)
+        if fb_note:
+            notes.append(fb_note)
+
+        loc = candidate.cited_location
+        if base_dir is not None and not loc.new_file:
+            try:
+                tf_note = target_file_context(
+                    candidate.target_files, loc.file, loc.symbol,
+                    candidate.instruction, base_dir,
+                )
+            except Exception as exc:  # pragma: no cover - defensive, see docstring
+                # AUTO-H2-6, same contract as AUTO-H2-3: best-effort context
+                # enrichment must never take down Stage B over a bug in the
+                # repo-wide search.
+                logger.warning("Gate1._build_grounding_notes: target_file_context failed (%s) — skipping", exc)
+                tf_note = None
+            if tf_note:
+                notes.append(tf_note)
+
+        if base_dir is not None:
+            try:
+                cc_note = callee_context(
+                    candidate.instruction, code_block,
+                    candidate.cited_location.file, base_dir,
+                )
+            except Exception as exc:  # pragma: no cover - defensive, see docstring
+                # AUTO-H2-3 is best-effort context enrichment. A bug in the
+                # repo-wide search must never take down Stage B, which is
+                # the actual check that matters here.
+                logger.warning("Gate1._build_grounding_notes: callee_context failed (%s) — skipping", exc)
+                cc_note = None
+            if cc_note:
+                notes.append(cc_note)
+
+        if not notes:
+            return ""
+        return "\n" + "\n\n".join(notes) + "\n"
+
     def _check_presence(
         self,
         candidate: CandidateTask,
         code_block: str,
+        *,
+        module_docstring: str = "",
+        base_dir: "Path | None" = None,
     ) -> tuple[bool, str]:
         """Call the LLM to confirm the claimed problem is present.
+
+        Parameters
+        ----------
+        module_docstring:
+            AUTO-H2-2. Top-of-module docstring for the cited file, if any.
+            Injected as extra context — see ``block_extractor.extract_module_docstring``.
+        base_dir:
+            AUTO-H2-3. Project root, used for best-effort one-hop callee
+            lookup when the instruction claims a downstream crash. ``None``
+            (the default) skips this lookup entirely — every existing
+            caller that doesn't pass it gets identical behavior to before
+            this parameter existed.
 
         Returns (confirmed: bool, reason: str).
         Fail-closed: any error → (False, reason).
@@ -538,10 +652,15 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         loc = candidate.cited_location
         location_str = _location_str(loc)
 
+        grounding_notes = self._build_grounding_notes(
+            candidate, code_block, module_docstring, base_dir,
+        )
+
         user_msg = _USER_PROMPT_TMPL.format(
             instruction=candidate.instruction,
             location=location_str,
             code_block=code_block,
+            grounding_notes=grounding_notes,
         )
 
         def _call(msg: str) -> str:
@@ -692,8 +811,10 @@ def filter_candidates(
     config: configparser.ConfigParser,
     cluster_files: "dict[str, set[str]] | None" = None,
     task_mode: str = "code",
+    model_override: "str | None" = None,
+    active_override: "str | None" = None,
 ) -> tuple[list[CandidateTask], list[FilterResult]]:
-    """One-call entry point for ``AutoController``.
+    """One-call entry point for ``AutoController`` (and ``plan_validator``).
 
     Reads API settings from *config* (same ``[api]`` / ``[api_local]`` /
     ``[api_remote]`` convention) and delegates to :class:`Gate1Filter`.
@@ -710,6 +831,17 @@ def filter_candidates(
         Optional mapping of cluster name → set of known relative file paths.
         Built from the ingestor clusters and passed through to Gate1Filter so
         hallucinated paths are caught before any filesystem I/O.
+    model_override, active_override:
+        AUTO-H2-4. When set, use this model / this ``[api_*]`` profile
+        instead of ``[api] active`` and that profile's ``model`` key. Both
+        default to ``None`` — the live ``--auto`` call site
+        (``tools/auto/pipeline.py``) never passes these, so its behavior is
+        completely unchanged by this parameter existing. ``plan_validator``
+        is the only caller that ever sets them, and only when
+        ``[gate1_validate]`` is present in the config it was given — see
+        that module's docstring for why re-verifying with the *same* model
+        that proposed a candidate is weaker evidence than an independent
+        model would be.
 
     Returns
     -------
@@ -718,11 +850,11 @@ def filter_candidates(
     rejected : list[FilterResult]
         Rejected candidates with stage and reason.
     """
-    active    = config.get("api", "active", fallback="local")
+    active    = active_override or config.get("api", "active", fallback="local")
     section   = f"api_{active}"
     base_url  = config.get(section, "base_url")
     api_key   = config.get(section, "api_key",    fallback="")
-    model     = config.get(section, "model")
+    model     = model_override or config.get(section, "model")
     api_fmt   = config.get(section, "api_format", fallback="openai")
     verify_ssl = config.getboolean("api", "verify_ssl", fallback=True)
 
