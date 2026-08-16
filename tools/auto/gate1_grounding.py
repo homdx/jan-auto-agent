@@ -173,8 +173,43 @@ _CONFIG_GET_RE = re.compile(
     re.VERBOSE,
 )
 
+# AUTO-H2-7: one-hop wrapper resolution for config_fallback_note. Confirmed
+# in production: AUTO-T3's __init__ calls self._read_int('max_depth', 2) —
+# a wrapper method — not config.getint(...) directly. The fallback= lives
+# inside _read_int's own body, one call-hop away from what's extracted for
+# __init__, so the direct check below never sees it. Same class of gap as
+# callee_context's documented one-hop limit, just for this check instead.
+_WRAPPER_CALL_RE = re.compile(r"\bself\.([a-z_][a-z0-9_]*)\(")
 
-def config_fallback_note(instruction: str, code_block: str) -> Optional[str]:
+
+def _wrapper_fallback_note(instruction: str, code_block: str, full_source: str) -> Optional[str]:
+    if not full_source:
+        return None
+    for m in _WRAPPER_CALL_RE.finditer(code_block):
+        name = m.group(1)
+        body_match = re.search(
+            rf"def\s+{re.escape(name)}\s*\(([^)]*)\)(?:\s*->\s*[^:]+)?:(.*?)(?=\n    def |\nclass |\Z)",
+            full_source, re.S,
+        )
+        if not body_match:
+            continue
+        body = body_match.group(2)
+        get_match = _CONFIG_GET_RE.search(body)
+        if get_match and "fallback" in get_match.group("rest"):
+            return (
+                f"NOTE (automated, not from the candidate's author): the code above "
+                f"calls the wrapper method `{name}(...)`, defined elsewhere in this "
+                f"same file. That wrapper's own body already calls .get(...) for "
+                f"[{get_match.group('section')}] '{get_match.group('key')}' with "
+                f"fallback= — per configparser's docs, this never raises "
+                f"NoSectionError/NoOptionError regardless of whether the section/"
+                f"option exists. Does the claimed crash still hold given this? If "
+                f"not, reject."
+            )
+    return None
+
+
+def config_fallback_note(instruction: str, code_block: str, full_source: str = "") -> Optional[str]:
     """Return a counter-fact string if *instruction* warns of a config
     section/option crash that *code_block* already guards against with
     ``fallback=``, else ``None``.
@@ -184,13 +219,19 @@ def config_fallback_note(instruction: str, code_block: str) -> Optional[str]:
     in the same block, silently picking the "wrong" one and injecting a
     misleading counter-fact would be worse than saying nothing, so multiple
     ambiguous matches are skipped rather than guessed at.
+
+    *full_source* (AUTO-H2-7, optional): when the direct check finds
+    nothing, and *code_block* calls a same-file wrapper method
+    (``self._read_int(...)`` etc.) whose own body does the real
+    ``.get(..., fallback=...)`` call, resolve one hop through it. Omit to
+    keep the old direct-only behavior.
     """
     if not _SECTION_ERROR_CUES.search(instruction):
         return None
 
     matches = list(_CONFIG_GET_RE.finditer(code_block))
     if not matches:
-        return None
+        return _wrapper_fallback_note(instruction, code_block, full_source)
 
     relevant = [
         m for m in matches
@@ -198,7 +239,7 @@ def config_fallback_note(instruction: str, code_block: str) -> Optional[str]:
     ]
     candidates = relevant or (matches if len(matches) == 1 else [])
     if not candidates:
-        return None
+        return _wrapper_fallback_note(instruction, code_block, full_source)
 
     for m in candidates:
         if "fallback" in m.group("rest"):
@@ -211,7 +252,7 @@ def config_fallback_note(instruction: str, code_block: str) -> Optional[str]:
                 f"section/option exists — it returns X. Does the claimed crash "
                 f"still hold given this? If not, reject."
             )
-    return None
+    return _wrapper_fallback_note(instruction, code_block, full_source)
 
 
 # ── AUTO-H2-3: one-hop callee context for call-chain-dependent claims ─────────

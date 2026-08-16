@@ -529,6 +529,25 @@ class Gate1Filter(_llm_stream.LLMClientBase):
 
     # ── Stage B helpers ───────────────────────────────────────────────────────
 
+    def _full_source_for(self, candidate: CandidateTask, base_dir: "Path | None") -> str:
+        """AUTO-H2-7 helper. Same read-it-again pattern as
+        ``_module_docstring_for`` and for the same reason: keeps
+        ``_check_existence``'s tuple contract untouched. Full file text
+        (not just the extracted symbol block) so ``config_fallback_note``
+        can resolve a one-hop same-file wrapper method's body. Never
+        raises: a failure here just means no wrapper resolution, not a
+        broken run.
+        """
+        if base_dir is None:
+            return ""
+        loc = candidate.cited_location
+        if loc.new_file:
+            return ""
+        try:
+            return (base_dir / loc.file).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+
     def _module_docstring_for(self, candidate: CandidateTask, base_dir: Path) -> str:
         """AUTO-H2-2 helper. Deliberately re-reads the cited file rather
         than threading a return value through ``_check_existence`` — that
@@ -585,7 +604,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                 f"background."
             )
 
-        fb_note = config_fallback_note(candidate.instruction, code_block)
+        fb_note = config_fallback_note(candidate.instruction, code_block, self._full_source_for(candidate, base_dir))
         if fb_note:
             notes.append(fb_note)
 
