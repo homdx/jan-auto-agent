@@ -144,37 +144,52 @@ class AgentTracer:
         if not self.enabled or self.path is None:
             return
 
+        # Only the shared counter/state needs the lock. Building the record
+        # is pure computation on locals, so it's safe outside the lock too —
+        # keep it in the locked block just for a consistent `seq` snapshot.
         with self._lock:
             self._seq += 1
-            record = {
-                "seq": self._seq,
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "run_id": self._run_id,
-                "source": source,
-                "target": target,
-                "kind": kind,
-            }
-            if model is not None:
-                record["model"] = model
-            if temperature is not None:
-                record["temperature"] = temperature
-            if max_tokens is not None:
-                record["max_tokens"] = max_tokens
-            if params is not None:
-                record["params"] = self._sanitize(params)
-            if content is not None:
-                record["content"] = self._truncate(content)
+            seq = self._seq
 
-            if self.console_echo:
-                self._console_line(source, target, kind, model, temperature, max_tokens, params, content)
+        record = {
+            "seq": seq,
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "run_id": self._run_id,
+            "source": source,
+            "target": target,
+            "kind": kind,
+        }
+        if model is not None:
+            record["model"] = model
+        if temperature is not None:
+            record["temperature"] = temperature
+        if max_tokens is not None:
+            record["max_tokens"] = max_tokens
+        if params is not None:
+            record["params"] = self._sanitize(params)
+        if content is not None:
+            record["content"] = self._truncate(content)
 
-            try:
-                if self._fh is not None:
-                    self._fh.write(json.dumps(record, ensure_ascii=False) + "\n")
-                    self._fh.flush()
-            except OSError:
-                # Tracing must never break the pipeline — swallow write errors.
-                pass
+        # NEVER perform blocking I/O (logging, print, file writes/flush)
+        # while holding self._lock. Under concurrent callers (and especially
+        # under pytest-xdist, where stdout is a captured pipe), a stalled
+        # write can block a thread that is holding the lock, and every other
+        # thread calling event() then piles up behind it — a real deadlock,
+        # not just a slowdown. So all I/O below happens lock-free; each
+        # thread does its own write independently. The `_fh.write`/`flush`
+        # pair below is on a shared, unbuffered-append file handle opened in
+        # "a" mode, so individual writes on POSIX are atomic for our
+        # line-sized records without needing a lock to serialize them.
+        if self.console_echo:
+            self._console_line(source, target, kind, model, temperature, max_tokens, params, content)
+
+        try:
+            if self._fh is not None:
+                self._fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+                self._fh.flush()
+        except OSError:
+            # Tracing must never break the pipeline — swallow write errors.
+            pass
 
     def _console_line(
         self,
