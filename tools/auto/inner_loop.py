@@ -941,12 +941,18 @@ class InnerLoop:
         task_mode: str = "code",
         max_task_seconds: int = 0,
         run_goal: str = "",
+        collect_bridge=None,
     ):
         self.coder        = coder
         self.executor     = executor
         self.validator    = validator
         self.max_attempts = max(1, int(max_attempts))
         self._broker      = context_broker or ContextBroker()
+        # COLLECT-24: tools.auto.collect_bridge.CollectBridge or None.
+        # Used both for the static per-task block prepended below in
+        # run_task(), and (already wired into self._broker by the caller,
+        # typically make_inner_loop) for pull-model symbol resolution.
+        self._collect_bridge = collect_bridge
         # AUTO-CR-7: optional periodic canon/fact gate (creative mode only).
         self.canon_validator = canon_validator
         # AUTO-CR-20: optional per-task fact-compliance gate (creative mode only).
@@ -1040,6 +1046,15 @@ class InnerLoop:
         base_dir_path = Path(base_dir)
         target_files  = task.get("target_files", []) or []
         self._broker.reset_cache()  # clear per-task cache; Pass-2 hits re-accumulate fresh
+
+        # COLLECT-24: static per-task collect context, computed once per task
+        # (not per attempt) and seeded into prefetched_context before the
+        # first coder call. Purely additive: "" when no bridge was wired in,
+        # the model is absent/stale, or target_files have no collect record.
+        if self._collect_bridge is not None:
+            _collect_block = self._collect_bridge.context_for_many(target_files)
+            if _collect_block:
+                prefetched_context = _collect_block + "\n\n"
         _start_time = time.monotonic()  # AUTO-CR-21-4: wall-clock guard reference point
         # AUTO-CR-33: prefer a task-wide deadline shared across rounds; fall back
         # to a per-call budget when called standalone (no deadline passed).
@@ -1593,6 +1608,7 @@ def make_inner_loop(
     validator=None,
     task_mode: str = "code",
     run_goal: str = "",
+    collect_bridge=None,
 ) -> InnerLoop:
     """Construct an :class:`InnerLoop` with real agents from *config*.
 
@@ -1674,8 +1690,12 @@ def make_inner_loop(
         )
 
     # ── ContextBroker ─────────────────────────────────────────────────────────
+    # COLLECT-24: collect_bridge is threaded into the broker so pull-model
+    # symbol resolution (Pass 3) can answer from collect facts, in addition
+    # to InnerLoop.run_task's own static per-task block using the same bridge.
     broker = ContextBroker(
         max_symbols=config.getint("context_broker", "max_symbols", fallback=20),
+        collect_bridge=collect_bridge,
     )
 
     # ── AUTO-CR-7: periodic canon/fact gate (creative mode only) ──────────────
@@ -1748,7 +1768,7 @@ def make_inner_loop(
                      theme_validator=theme_validator,
                      require_tests=require_tests,
                      task_mode=task_mode, max_task_seconds=max_task_seconds,
-                     run_goal=run_goal)
+                     run_goal=run_goal, collect_bridge=collect_bridge)
 
 
 # ── Stubs for environments without real agents (unit tests) ──────────────────

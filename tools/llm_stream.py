@@ -496,7 +496,30 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
     )
     sleep = _sleep_fn or time.sleep
 
+    # AUTO-REASONING-1: `build_chat_request`'s think=False path sends an
+    # OpenRouter-style `reasoning: {"effort": "low", "exclude": true}`
+    # field, documented there as "expected to be silently ignored by a
+    # provider that doesn't recognise it" — true for OpenRouter/kenari-style
+    # aggregators, false for strict OpenAI-schema validators. Confirmed
+    # live: Gemini's openai-compat endpoint
+    # (generativelanguage.googleapis.com/v1beta/openai/chat/completions)
+    # rejects it outright with HTTP 400 "Unknown name \"reasoning\": Cannot
+    # find field.", which is NOT in `_is_retryable_status` and would
+    # otherwise fail the whole call closed on every single request to a
+    # strict provider. `_reasoning_stripped` tracks whether this one-time,
+    # no-budget-cost fallback (drop the field, rebuild the body, retry
+    # immediately) has already fired for this call — it's a payload-shape
+    # fix, not a transient error, so it must never repeat or consume
+    # `error_retries`.
+    _reasoning_stripped = False
+
+    def _looks_like_unknown_reasoning_field(detail: str) -> bool:
+        low = detail.lower()
+        return "reasoning" in low and ("unknown name" in low or "cannot find field" in low
+                                        or "unrecognized" in low or "not supported" in low)
+
     def _open():
+        nonlocal body, req, _reasoning_stripped
         attempt = 0
         while True:
             try:
@@ -507,6 +530,30 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
                     detail = e.read().decode("utf-8", errors="replace")[:500]
                 except Exception:
                     pass
+
+                # AUTO-REASONING-1: strict-schema provider rejected the
+                # `reasoning` field outright — strip it and retry ONCE,
+                # immediately, without touching error_retries/backoff (this
+                # isn't a rate limit or a transient server error).
+                if (e.code == 400 and not _reasoning_stripped
+                        and isinstance(body, dict) and "reasoning" in body
+                        and _looks_like_unknown_reasoning_field(detail)):
+                    _reasoning_stripped = True
+                    body = {k: v for k, v in body.items() if k != "reasoning"}
+                    req = urllib.request.Request(
+                        url, data=json.dumps(body).encode("utf-8"),
+                        headers=headers, method="POST",
+                    )
+                    msg = (
+                        f"HTTP 400 from {url}: provider rejected the "
+                        f"'reasoning' field — retrying once without it "
+                        f"(this provider needs [api_...] to not rely on "
+                        f"OpenRouter-style think=false suppression)"
+                    )
+                    logger.warning("request_completion: %s", msg)
+                    if on_retry:
+                        on_retry(msg)
+                    continue
 
                 if not _is_retryable_status(e.code) or attempt >= error_retries:
                     raise RuntimeError(f"HTTP {e.code} from {url}: {detail or e.reason}") from None

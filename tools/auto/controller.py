@@ -493,8 +493,15 @@ class AutoController:
         from tools.auto.executor import make_executor
         from tools.auto.bug_fix_loop import make_bug_fix_loop
 
+        # COLLECT-24: built ONCE per run (not per task) — see
+        # tests/test_collect_bridge_wiring.py::test_collect_model_loaded_once_per_run.
+        # Replaces the old COLLECT-23 collect_context_for() method, which was
+        # correct but never actually called from this loop.
+        collect_bridge = self._get_collect_bridge(task_mode)
+
         outer_loop = make_outer_loop(cfg, self.base_dir, self.state,
-                                       task_mode=task_mode, run_goal=self.goal)
+                                       task_mode=task_mode, run_goal=self.goal,
+                                       collect_bridge=collect_bridge)
         # AUTO-CR-14: the bare CommitOnSuccess left summary_memory=None, so the
         # creative synopsis hook (CR-5) never fired — starving continuity (each
         # chapter only saw the previous one) and disabling the canon gate. Wire
@@ -966,33 +973,54 @@ class AutoController:
         key = "use_in_doc" if self.task_mode == "docs" else "use_in_auto"
         return self.config.getboolean("collect", key, fallback=False)
 
-    def collect_context_for(self, target_file: str) -> str:
-        """The opt-in COLLECT-23 context block for `target_file`: its
-        `collect` module record, contracts, and config reads — or `""`
-        when the feature is off, the artifact is unavailable, or there is
-        nothing to say about this file.
+    def _get_collect_bridge(self, task_mode: str):
+        """COLLECT-24: lazily build (and cache for the lifetime of this
+        Controller / this `--auto` run) the `CollectBridge` used to inject
+        collect context into every task in `_run_task_loop`.
 
-        Nothing calls this unless `[collect] use_in_auto`/`use_in_doc` is
-        `true` *and* a caller actually invokes it — with the flag left at
-        its default `false`, every call short-circuits before ever
-        touching `tools.collect`, so a disabled run's context is
-        byte-for-byte what it was before COLLECT-23 (this method's own
-        AC).
+        Cached per `task_mode` since `use_in_auto` vs `use_in_doc` and the
+        summarizer's own mode-aware settings can legitimately differ; in
+        practice a single `Controller` only ever runs one `task_mode` per
+        `run()`, so this is a single load in normal operation — the
+        per-task-loop-call cache is what `test_collect_model_loaded_once_per_run`
+        actually pins down (`tools.collect.loader.load` called exactly once
+        for N tasks in one `_run_task_loop` invocation).
         """
-        if not self._collect_use_flag():
+        cache = getattr(self, "_collect_bridge_cache", None)
+        if cache is None:
+            cache = {}
+            self._collect_bridge_cache = cache
+        if task_mode in cache:
+            return cache[task_mode]
+        # Defensive: some tests build AutoController via __new__() and never
+        # run __init__, so self.config may be absent — behave exactly like
+        # "no [collect] section" (bridge disabled) rather than raising.
+        cfg = getattr(self, "config", None)
+        if cfg is None:
+            cache[task_mode] = None
+            return None
+        from tools.auto.collect_bridge import make_collect_bridge
+        bridge = make_collect_bridge(
+            self.base_dir, cfg, getattr(self, "config_path", None), task_mode=task_mode,
+        )
+        cache[task_mode] = bridge
+        return bridge
+
+    def collect_context_for(self, target_file: str) -> str:
+        """The opt-in COLLECT-23 context block for `target_file` — kept for
+        backward compatibility with anything calling this directly (e.g.
+        `/doc` mode, older tests). `_run_task_loop` no longer calls this;
+        it uses `_get_collect_bridge()` + `CollectBridge.context_for()`
+        instead (COLLECT-24), which adds budget-aware shrinking and a
+        run-scoped cache this method never had.
+
+        Returns `""` when the feature is off, the artifact is unavailable
+        or stale, or there is nothing to say about this file.
+        """
+        bridge = self._get_collect_bridge(self.task_mode)
+        if bridge is None:
             return ""
-        try:
-            from tools.collect.loader import load as load_collect_model
-            from tools.auto.context_assembler import build_collect_context_block
-        except Exception as exc:  # noqa: BLE001 — opt-in feature, never fatal
-            logger.warning("controller: collect context injection unavailable: %s", exc)
-            return ""
-        try:
-            model = load_collect_model(self.base_dir, config=self.config, config_path=self.config_path)
-            return build_collect_context_block(model, target_file, task_mode=self.task_mode)
-        except Exception as exc:  # noqa: BLE001 — same fail-open stance as SummaryMemory/StoryBible above
-            logger.warning("controller: collect context injection failed for %s: %s", target_file, exc)
-            return ""
+        return bridge.context_for(target_file)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -463,6 +463,7 @@ def make_outer_loop(
     inner_loop=None,
     task_mode: str = "code",
     run_goal: str = "",
+    collect_bridge=None,
 ) -> OuterLoop:
     """Build an :class:`OuterLoop`, constructing the inner loop from config
     unless one is injected (tests / the controller may supply their own).
@@ -495,7 +496,8 @@ def make_outer_loop(
 
     if inner_loop is None:
         inner_loop = make_inner_loop(config, base_dir, task_mode=task_mode,
-                                      run_goal=run_goal)  # AUTO-DM-1 / AUTO-CR-22-1
+                                      run_goal=run_goal,   # AUTO-DM-1 / AUTO-CR-22-1
+                                      collect_bridge=collect_bridge)  # COLLECT-24
 
     # LOOP-2: build a TaskRewriter only if rewrite keys + max_rewrites > 0 are
     # configured. AUTO-CR-27: skip it in creative mode — its code-test-framed

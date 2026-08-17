@@ -91,9 +91,17 @@ class ContextBroker:
         self,
         max_block_chars: int = 3_000,
         max_symbols: int = 8,
+        collect_bridge=None,
     ) -> None:
         self._max_block_chars = max_block_chars
         self._max_symbols = max_symbols
+        # COLLECT-24: optional tools.auto.collect_bridge.CollectBridge.
+        # When set, a symbol still unresolved after the code-search passes
+        # below is tried against the collect structural model as a third,
+        # additive pass — so the SAME pull-model channel (context_request /
+        # missing_context) that already resolves code now also resolves
+        # collect facts, rather than needing a second, separate mechanism.
+        self._collect_bridge = collect_bridge
         # Only PROJECT-SCAN (Pass-2) hits are cached — they live in files the
         # current task doesn't edit (dependencies), so they stay valid across
         # attempts, and the rglob scan that finds them is the expensive part.
@@ -195,6 +203,23 @@ class ContextBroker:
                         found_now.append(sym)
                 for sym in found_now:
                     remaining.remove(sym)
+
+        # ── Pass 3: collect structural model (COLLECT-24) ─────────────────────
+        # Tried last, after real source has had its chance — code is ground
+        # truth; collect facts are a fallback for symbols that live outside
+        # target_files/base_dir's own scan (e.g. summarized-only modules) or
+        # simply as a cheaper structural answer (signature + contracts,
+        # skips reading/parsing whole files). No-op whenever no bridge was
+        # wired in, or the bridge's model isn't fresh (see CollectBridge.usable).
+        if remaining and self._collect_bridge is not None:
+            for sym in list(remaining):
+                block = self._collect_bridge.pull_symbol(sym)
+                if block:
+                    capped = self._cap(block)
+                    resolved[sym] = capped
+                    self._resolved_cache[sym] = capped
+                    remaining.remove(sym)
+                    logger.debug("ContextBroker: resolved %r from collect model", sym)
 
         if remaining:
             logger.debug(
