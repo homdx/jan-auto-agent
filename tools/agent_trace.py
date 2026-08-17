@@ -30,6 +30,7 @@ Long fields (prompts, model responses) are truncated to `max_field_chars`
 from __future__ import annotations
 
 import json
+import os
 import sys
 import threading
 import uuid
@@ -62,6 +63,11 @@ class AgentTracer:
         self.enabled: bool = False
         self.console_echo: bool = False   # print inter-agent calls live to stdout
         self.console_preview_chars: int = 600  # how many prompt/response chars to show
+        # LLM_DEBUG=2 forces the FULL, untruncated prompt header to stdout for
+        # every llm_request, even when console_echo is off / max_field_chars
+        # would otherwise truncate it. LLM_DEBUG=1 (or unset) leaves the
+        # normal head/tail preview behavior untouched.
+        self.llm_debug: int = int(os.environ.get("LLM_DEBUG", "0") or 0)
         self.path: Optional[Path] = None
         self.max_field_chars: int = 4000
         self._seq: int = 0
@@ -180,7 +186,7 @@ class AgentTracer:
         # pair below is on a shared, unbuffered-append file handle opened in
         # "a" mode, so individual writes on POSIX are atomic for our
         # line-sized records without needing a lock to serialize them.
-        if self.console_echo:
+        if self.console_echo or (self.llm_debug >= 2 and kind == "llm_request"):
             self._console_line(source, target, kind, model, temperature, max_tokens, params, content)
 
         try:
@@ -230,6 +236,16 @@ class AgentTracer:
             if not text:
                 return
             text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+            def _indent(s: str) -> str:
+                return "\n".join(f"    {l}" for l in s.splitlines())
+
+            if label == "PROMPT" and self.llm_debug >= 2:
+                # Full, untruncated prompt header — no HEAD/TAIL skipping.
+                sys.stdout.write(f"  {dim}{label} (FULL, LLM_DEBUG=2):{rst}\n")
+                sys.stdout.write(_indent(text) + "\n")
+                return
+
             HEAD = 120          # always show first N chars so you know which prompt it is
             TAIL = PREVIEW_CHARS  # show last N chars — the actual task/question lives here
 
@@ -242,9 +258,6 @@ class AgentTracer:
                 skipped   = len(text) - HEAD - TAIL
                 mid       = f"\n    {dim}  … [{skipped} chars skipped] …{rst}"
                 snippet   = None
-
-            def _indent(s: str) -> str:
-                return "\n".join(f"    {l}" for l in s.splitlines())
 
             sys.stdout.write(f"  {dim}{label}:{rst}\n")
             if snippet is not None:

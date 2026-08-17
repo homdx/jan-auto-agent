@@ -824,7 +824,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 cluster.name, _attempt, last_exc,
             )
             tracer.event(
-                source="architect", target="llm", kind="llm_response",
+                source="llm", target="architect", kind="llm_response",
                 content=f"[ERROR] {last_exc}", params={"cluster": cluster.name},
             )
             # Return None (not []) so callers can distinguish "call failed" from
