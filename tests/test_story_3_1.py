@@ -14,6 +14,18 @@ from unittest.mock import MagicMock, patch
 
 from tools.prompt_optimizer import PromptOptimizer, OPTIMIZER_META_PROMPT
 
+# AUTO-RATE-1 added real retry-with-backoff (time.sleep) to request_completion()
+# for retryable HTTP statuses (429/402/5xx). Section [5] below mocks urlopen to
+# always return a 500, which is retryable, so without this patch the script
+# blocks for two REAL 60s sleeps (error_retries=2 default) before falling back.
+# That's a genuine ~120s stall with no timeout anywhere above it (this script
+# is run as a bare subprocess by conftest.py's ScriptTestFile, and pytest sets
+# no per-test timeout by default) — under pytest-xdist every other worker
+# finishes and the whole run just hangs waiting on this one test. This test
+# only cares about the fallback behavior on error, not the retry timing, so
+# the backoff sleep itself is faked out.
+patch("tools.llm_stream.time.sleep", lambda *_a, **_kw: None).start()
+
 PASS = "\033[32mPASS\033[0m"
 FAIL = "\033[31mFAIL\033[0m"
 _failures = []

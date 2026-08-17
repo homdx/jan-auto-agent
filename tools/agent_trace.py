@@ -30,6 +30,7 @@ Long fields (prompts, model responses) are truncated to `max_field_chars`
 from __future__ import annotations
 
 import json
+import os
 import sys
 import threading
 import uuid
@@ -62,6 +63,11 @@ class AgentTracer:
         self.enabled: bool = False
         self.console_echo: bool = False   # print inter-agent calls live to stdout
         self.console_preview_chars: int = 600  # how many prompt/response chars to show
+        # LLM_DEBUG=2 forces the FULL, untruncated prompt header to stdout for
+        # every llm_request, even when console_echo is off / max_field_chars
+        # would otherwise truncate it. LLM_DEBUG=1 (or unset) leaves the
+        # normal head/tail preview behavior untouched.
+        self.llm_debug: int = int(os.environ.get("LLM_DEBUG", "0") or 0)
         self.path: Optional[Path] = None
         self.max_field_chars: int = 4000
         self._seq: int = 0
@@ -144,37 +150,52 @@ class AgentTracer:
         if not self.enabled or self.path is None:
             return
 
+        # Only the shared counter/state needs the lock. Building the record
+        # is pure computation on locals, so it's safe outside the lock too —
+        # keep it in the locked block just for a consistent `seq` snapshot.
         with self._lock:
             self._seq += 1
-            record = {
-                "seq": self._seq,
-                "ts": datetime.now(timezone.utc).isoformat(),
-                "run_id": self._run_id,
-                "source": source,
-                "target": target,
-                "kind": kind,
-            }
-            if model is not None:
-                record["model"] = model
-            if temperature is not None:
-                record["temperature"] = temperature
-            if max_tokens is not None:
-                record["max_tokens"] = max_tokens
-            if params is not None:
-                record["params"] = self._sanitize(params)
-            if content is not None:
-                record["content"] = self._truncate(content)
+            seq = self._seq
 
-            if self.console_echo:
-                self._console_line(source, target, kind, model, temperature, max_tokens, params, content)
+        record = {
+            "seq": seq,
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "run_id": self._run_id,
+            "source": source,
+            "target": target,
+            "kind": kind,
+        }
+        if model is not None:
+            record["model"] = model
+        if temperature is not None:
+            record["temperature"] = temperature
+        if max_tokens is not None:
+            record["max_tokens"] = max_tokens
+        if params is not None:
+            record["params"] = self._sanitize(params)
+        if content is not None:
+            record["content"] = self._truncate(content)
 
-            try:
-                if self._fh is not None:
-                    self._fh.write(json.dumps(record, ensure_ascii=False) + "\n")
-                    self._fh.flush()
-            except OSError:
-                # Tracing must never break the pipeline — swallow write errors.
-                pass
+        # NEVER perform blocking I/O (logging, print, file writes/flush)
+        # while holding self._lock. Under concurrent callers (and especially
+        # under pytest-xdist, where stdout is a captured pipe), a stalled
+        # write can block a thread that is holding the lock, and every other
+        # thread calling event() then piles up behind it — a real deadlock,
+        # not just a slowdown. So all I/O below happens lock-free; each
+        # thread does its own write independently. The `_fh.write`/`flush`
+        # pair below is on a shared, unbuffered-append file handle opened in
+        # "a" mode, so individual writes on POSIX are atomic for our
+        # line-sized records without needing a lock to serialize them.
+        if self.console_echo or (self.llm_debug >= 2 and kind == "llm_request"):
+            self._console_line(source, target, kind, model, temperature, max_tokens, params, content)
+
+        try:
+            if self._fh is not None:
+                self._fh.write(json.dumps(record, ensure_ascii=False) + "\n")
+                self._fh.flush()
+        except OSError:
+            # Tracing must never break the pipeline — swallow write errors.
+            pass
 
     def _console_line(
         self,
@@ -215,6 +236,16 @@ class AgentTracer:
             if not text:
                 return
             text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+            def _indent(s: str) -> str:
+                return "\n".join(f"    {l}" for l in s.splitlines())
+
+            if label == "PROMPT" and self.llm_debug >= 2:
+                # Full, untruncated prompt header — no HEAD/TAIL skipping.
+                sys.stdout.write(f"  {dim}{label} (FULL, LLM_DEBUG=2):{rst}\n")
+                sys.stdout.write(_indent(text) + "\n")
+                return
+
             HEAD = 120          # always show first N chars so you know which prompt it is
             TAIL = PREVIEW_CHARS  # show last N chars — the actual task/question lives here
 
@@ -227,9 +258,6 @@ class AgentTracer:
                 skipped   = len(text) - HEAD - TAIL
                 mid       = f"\n    {dim}  … [{skipped} chars skipped] …{rst}"
                 snippet   = None
-
-            def _indent(s: str) -> str:
-                return "\n".join(f"    {l}" for l in s.splitlines())
 
             sys.stdout.write(f"  {dim}{label}:{rst}\n")
             if snippet is not None:

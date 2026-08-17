@@ -65,7 +65,21 @@ from tools.collect import verifier as verifier_mod
 from tools.collect._determinism import canonical_dumps
 from tools.collect.model import ModuleRecord
 from tools.collect.scanner import scan_file, scan_repo
-from tools.collect.summarizer import LlmCall, summarize_repo
+from tools.collect.summarizer import LlmCall, collect_max_retries, summarize_repo
+
+
+def _print_summarize_progress(done: int, total: int, module_path: str) -> None:
+    """Simple `[done/total]` progress line printed to stdout after each
+    module's LLM call finishes (COLLECT Pass B)."""
+    print(f"[{done}/{total}] summarized {module_path}", flush=True)
+
+
+def _print_summarize_error(module_path: str, exc: Exception, error_count: int) -> None:
+    """Printed once per *outer* retry (a module whose LLM call raised),
+    on top of the per-HTTP-request retries `request_completion` already
+    logs itself — so a module that's about to be retried shows up in the
+    same progress stream instead of just going quiet for a while."""
+    print(f"  ! {module_path}: {exc} (retry {error_count})", flush=True)
 
 DEFAULT_COLLECT_DIR = ".collect"
 ARTIFACT_FILENAME = "artifact.json"
@@ -261,7 +275,12 @@ def build_context(
 
     verification_report: Optional[Dict[str, Any]] = None
     if llm_call is not None:
-        summarized = summarize_repo(modules, sources, llm_call)
+        summarized = summarize_repo(
+            modules, sources, llm_call,
+            max_retries=collect_max_retries(config),
+            progress_fn=_print_summarize_progress,
+            on_error=_print_summarize_error,
+        )
         modules, verification_report = verifier_mod.verify_repo(summarized, sources, root=root)
 
     edges = graph_mod.import_edges(modules)
@@ -549,7 +568,12 @@ def action_refresh(
                 # `_sources_for` (Pass C) already gives the same situation.
                 continue
         summarized_by_path = {
-            m.path: m for m in summarize_repo(to_summarize, sources_for_summary, llm_call)
+            m.path: m for m in summarize_repo(
+                to_summarize, sources_for_summary, llm_call,
+                max_retries=collect_max_retries(config),
+                progress_fn=_print_summarize_progress,
+                on_error=_print_summarize_error,
+            )
         }
 
     merged: List[ModuleRecord] = []
@@ -713,7 +737,12 @@ def action_module(
     # there), so verification of the newly-updated summary is not skipped.
     settings = read_collect_settings(config)
     if llm_call is not None and settings.llm_summaries and patched.parse_error is None:
-        summarized = summarize_repo([patched], {module_path: source}, llm_call)
+        summarized = summarize_repo(
+            [patched], {module_path: source}, llm_call,
+            max_retries=collect_max_retries(config),
+            progress_fn=_print_summarize_progress,
+            on_error=_print_summarize_error,
+        )
         if summarized and summarized[0].summary is not None:
             patched = summarized[0]
             modules = [patched if m.path == module_path else m for m in modules]

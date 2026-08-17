@@ -690,6 +690,46 @@ def extract_block(source: str, target_name: str, file_ext: str) -> str:
     return _extract_brace_block(source, target_name)
 
 
+def extract_module_docstring(source: str, file_ext: str, max_chars: int = 500) -> str:
+    """AUTO-H2-2: Return the file's top-of-module docstring, or "" if there
+    isn't one.
+
+    Why this exists: ``extract_block`` deliberately returns only the named
+    symbol's own body — that's the right default for keeping Stage B's
+    prompt small. But a module docstring commonly carries context the named
+    symbol's body itself never states, most importantly "this code is
+    intentionally bad" (a test fixture built to exercise a static analyzer,
+    a documented negative/control case, a toy example). A reviewer — human
+    or LLM — judging whether a symbol needs hardening cannot make that call
+    correctly without seeing why the file exists in the first place, and
+    right now nothing in Gate 1's pipeline surfaces that even when it's a
+    single ``\"\"\"...\"\"\"`` block away from the code being reviewed.
+
+    Only implements the Python path (``ast.get_docstring``) — the false
+    positives that motivated this (AUTO-T8/AUTO-T9, see gate1_grounding.py)
+    were both Python fixtures, and Python is where nearly all of this
+    codebase's own "intentionally bad" fixtures live
+    (tests/fixtures/collect_mini_repo/). Extend to other languages only if
+    a real false positive of this shape shows up there — speculative
+    coverage for a failure mode nobody has hit yet isn't worth the parser
+    complexity for non-Python languages.
+    """
+    ext = _normalize_ext(file_ext)
+    if ext != ".py":
+        return ""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return ""
+    doc = ast.get_docstring(tree, clean=True)
+    if not doc:
+        return ""
+    doc = doc.strip()
+    if len(doc) > max_chars:
+        doc = doc[:max_chars].rstrip() + " …(truncated)"
+    return doc
+
+
 def _split_braced_names(inner: str, alias_sep: str) -> list[str]:
     """
     Split a comma-separated ``{a, b as c}``-style clause into bound names,

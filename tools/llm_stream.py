@@ -11,12 +11,44 @@ in real time while still receiving the complete text to json.loads() at the end.
 """
 
 import json
+import logging
 import re
 import ssl
+import time
 import urllib.request
 import urllib.error
 
+logger = logging.getLogger(__name__)
+
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+
+# MASK-KEY-1: matches an ini-style `api_key = <value>` assignment line,
+# including comment-prefixed variants such as `### api_key = ...` or
+# `; api_key = ...` (any leading whitespace, optional comment chars
+# [#;]+ before the key name; case-insensitive key name) so a real or
+# test secret pasted/read into a prompt (agents.ini contents, a config
+# dump, etc.) never reaches the LLM verbatim. Captures the prefix
+# (indent + optional comment + "api_key = ") separately so the value
+# alone is swapped for the placeholder.
+_API_KEY_LINE_RE = re.compile(
+    r'(?im)^([ \t]*(?:[#;]+[ \t]*)?api_key[ \t]*=[ \t]*)(\S+)([ \t]*)$'
+)
+
+
+def mask_api_key(text: str) -> str:
+    """Replace every ``api_key = <value>`` line in *text* with
+    ``api_key = here_your_key``, regardless of what the value actually is
+    (a placeholder like "test", a real key, anything non-blank).
+
+    This is a plain string transform with no knowledge of *which* key is
+    "real" — it masks unconditionally so a secret embedded in file content
+    that gets pulled into a prompt can't leak to the LLM. Non-string input
+    (``None``, already-masked text, text with no such line) is returned
+    unchanged.
+    """
+    if not text:
+        return text
+    return _API_KEY_LINE_RE.sub(r"\1here_your_key\3", text)
 
 
 def strip_think(text: str) -> str:
@@ -45,9 +77,20 @@ def strip_think(text: str) -> str:
 
 
 def _extract_content(raw: dict, api_format: str) -> str:
-    """Extract assistant message text from a non-streaming response dict."""
+    """Extract assistant message text from a non-streaming response dict.
+
+    BUGFIX: a message's `content` can legitimately come back JSON `null`
+    instead of an empty string — e.g. some OpenAI-compatible gateways
+    (reasoning/tool-call-only turns, certain filtered/empty replies) send
+    `"content": null` with HTTP 200 rather than omitting the key or using
+    `""`. `raw["message"]["content"].strip()` / `choices[0]["message"]
+    ["content"].strip()` then raised `AttributeError: 'NoneType' object
+    has no attribute 'strip'` — a response that arrived successfully was
+    crashing the whole call instead of degrading to an empty reply the
+    same way a filtered/empty `choices` list already does below.
+    """
     if api_format == "ollama":
-        return raw["message"]["content"].strip()
+        return (raw["message"]["content"] or "").strip()
     # openai (default)
     # BUGFIX: mirror the streaming path's empty-choices guard (introduced in
     # the "Fix llm stream" commit).  Some OpenAI-compatible backends — Jan,
@@ -65,7 +108,7 @@ def _extract_content(raw: dict, api_format: str) -> str:
             f"LLM response had no choices — likely blocked/filtered by the "
             f"backend (raw keys: {list(raw.keys())})"
         )
-    return choices[0]["message"]["content"].strip()
+    return (choices[0]["message"]["content"] or "").strip()
 
 
 def _build_payload(payload: dict, api_format: str, stream: bool) -> dict:
@@ -127,6 +170,48 @@ def _build_payload(payload: dict, api_format: str, stream: bool) -> dict:
     return body
 
 
+def _mask_payload_secrets(payload: dict) -> dict:
+    """Return a copy of *payload* with `mask_api_key` applied to every
+    string message ``content`` field.
+
+    MASK-KEY-1: every caller in this project (Coder, Gate1Filter,
+    ClusterReviewer, TaskRewriter via ``build_chat_request``, and the
+    handful of agents — ImprovementAgent, FaqAgent, OrchestratorActions,
+    ...  — that assemble their own OpenAI-shaped payload directly) ends up
+    calling ``request_completion`` to actually make the HTTP call. Masking
+    here, right before the request body is built, is the one place that
+    catches an ``api_key = ...`` line regardless of which agent's prompt
+    it came from (e.g. a file's contents — agents.ini or similar — pulled
+    into context) without needing every call site to remember to mask it
+    itself.
+
+    Returns *payload* unchanged (no copy) if nothing needed masking, so
+    callers that don't touch config-shaped text pay no extra cost.
+    """
+    messages = payload.get("messages")
+    if not messages:
+        return payload
+
+    changed = False
+    new_messages = []
+    for msg in messages:
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if isinstance(content, str):
+            masked = mask_api_key(content)
+            if masked != content:
+                changed = True
+                new_messages.append({**msg, "content": masked})
+                continue
+        new_messages.append(msg)
+
+    if not changed:
+        return payload
+
+    out = dict(payload)
+    out["messages"] = new_messages
+    return out
+
+
 def ollama_chat_url(base_url: str) -> str:
     """Return the correct Ollama /api/chat URL from *base_url*.
 
@@ -167,6 +252,82 @@ def make_unverified_context() -> ssl.SSLContext:
     return ctx
 
 
+# ── AUTO-RATE-1: rate-limit / transient-error retry ──────────────────────────
+#
+# request_completion() previously raised on the very first non-2xx response,
+# with no concept of a rate limit being a "wait and try again" situation
+# rather than a hard failure. Confirmed real-world impact: Gate1Filter's
+# presence check (tools/auto/gate1_filter.py) fails a candidate CLOSED on
+# ANY exception from this function — so a single transient HTTP 429 from a
+# free-tier gateway (e.g. kenari.id: "free_quota_rpm ... slow down and
+# retry") was silently indistinguishable from "the LLM confirmed this task
+# is already fixed", and a real, still-needed task could be wrongly dropped
+# from an --auto plan or --validate-plan pass purely because the gateway
+# was rate-limiting a burst of calls, not because anything was actually
+# wrong with the task.
+#
+# _parse_retry_after / the retry loop below are ported from the sibling
+# learn-in-play1 project's llm_client.py (its own docstring: "Логика и
+# формат payload'ов взяты ... из tools/llm_stream.py проекта jan-auto-agent"
+# — llm_client.py started as a simplified copy of THIS file and was
+# hardened independently against real Groq/Gemini/HuggingFace 429s; this
+# brings that hardening back to its origin).
+_RETRY_AFTER_MS_RE = re.compile(r"(?:try again|retry)\s+in\s+([\d.]+)\s*ms", re.IGNORECASE)
+_RETRY_AFTER_S_RE = re.compile(r"(?:try again|retry)\s+in\s+([\d.]+)\s*s(?:econds?)?\b", re.IGNORECASE)
+
+# Status codes worth waiting and retrying: 429 (rate limit) and 402
+# ("payment required" — several gateways, e.g. HuggingFace's router, use
+# this for a transient billing hiccup, not just a genuinely exhausted
+# quota) and 5xx (server-side, plausibly transient). Deliberately NOT
+# other 4xx codes (400 bad request, 401/403 auth, 404 not found, ...) —
+# those describe something wrong with THIS request that a wait can't fix;
+# retrying them only wastes error_retry_wait_sec for a guaranteed repeat
+# failure.
+def _is_retryable_status(code: int) -> bool:
+    return code == 429 or code == 402 or 500 <= code < 600
+
+
+def _parse_retry_after(e: urllib.error.HTTPError, detail: str) -> "float | None":
+    """Return how long the server asked us to wait before retrying, in
+    seconds, or ``None`` if no hint was found anywhere.
+
+    Checked in order:
+      1. The standard ``Retry-After`` HTTP header, when present.
+      2. A millisecond hint in the error body text — e.g. Groq's
+         ``"Please try again in 820ms"`` — some gateways send an exact
+         figure in the body even when they don't set the header.
+      3. A seconds hint in the error body text — e.g. Google Gemini's
+         ``"Please retry in 57.062042596s."`` (a different verb, "retry"
+         rather than "try again", and no header at all — the two regexes
+         below cover both phrasings).
+
+    Only meaningful for 429s in practice — other retryable codes (402,
+    5xx) don't reliably carry a precise wait hint in this shape, so
+    callers should only consult this for ``e.code == 429`` and fall back
+    to a fixed wait otherwise.
+    """
+    if e.headers:
+        retry_after = e.headers.get("Retry-After")
+        if retry_after:
+            try:
+                return max(0.1, float(retry_after))
+            except ValueError:
+                pass
+    m = _RETRY_AFTER_MS_RE.search(detail)
+    if m:
+        try:
+            return max(0.1, float(m.group(1)) / 1000.0)
+        except ValueError:
+            pass
+    m = _RETRY_AFTER_S_RE.search(detail)
+    if m:
+        try:
+            return max(0.1, float(m.group(1)))
+        except ValueError:
+            pass
+    return None
+
+
 class LLMClientBase:
     """Shared constructor for Coder, Gate1Filter, ClusterReviewer, and
     TaskRewriter: the connection fields and SSL context are identical
@@ -195,23 +356,37 @@ def build_chat_request(
     the same single-turn system+user request and only differ in which
     model/temperature/system prompt they configure.
 
-    *think*, when not ``None`` and *api_format* is ``"ollama"``, is passed as
-    the top-level ``"think"`` field Ollama uses to toggle a reasoning model's
-    (e.g. qwen3) internal ``<think>...</think>`` chain-of-thought. Callers
-    that don't need the model's reasoning in the reply (short, deterministic
-    classification calls like Gate 1's presence check) should pass
-    ``think=False``: otherwise a small ``max_tokens`` cap can truncate the
-    reply mid-``<think>``, before any usable answer is emitted, and the
-    caller sees an empty/unparseable response. Ignored for non-Ollama
-    formats and omitted entirely when ``None`` (server/model default).
+    *think*, when not ``None``, asks the server to suppress (``False``) or
+    allow (``True``) a reasoning model's hidden chain-of-thought, so a small
+    ``max_tokens`` budget meant for a short, deterministic answer (e.g.
+    Gate 1's presence check) doesn't get consumed by reasoning before any
+    usable reply is written — leaving an empty or truncated response.
+
+    ``api_format="ollama"``: passed as the top-level ``"think"`` field.
+
+    ``api_format="openai"`` (or any other non-Ollama value): ``think=False``
+    sends OpenRouter's unified ``reasoning: {"effort": "low", "exclude":
+    true}`` object — the closest thing to a de-facto standard across
+    OpenAI-compatible aggregators (the free-tier gateways this project
+    targets, e.g. kenari.id, follow the same convention). A provider that
+    doesn't recognise the field is expected to silently ignore it rather
+    than reject the request. ``think=True`` sends nothing extra — most
+    models reason by default; only *suppressing* it needs an explicit
+    field. Omitted entirely (both branches) when ``think`` is ``None``
+    (server/model default either way).
     """
     headers = {
         "Content-Type":  "application/json",
         "Authorization": f"Bearer {api_key}",
     }
+    # MASK-KEY-1: mask any `api_key = ...` line that ended up inside the
+    # system/user text itself (e.g. agents.ini contents pulled into
+    # context) — NOT *api_key* the parameter above, which is the caller's
+    # own credential for THIS request and is used as-is in the
+    # Authorization header.
     messages = [
-        {"role": "system", "content": system},
-        {"role": "user",   "content": user_msg},
+        {"role": "system", "content": mask_api_key(system)},
+        {"role": "user",   "content": mask_api_key(user_msg)},
     ]
     if api_format == "ollama":
         url = ollama_chat_url(base_url)
@@ -227,11 +402,44 @@ def build_chat_request(
             "model": model, "temperature": temperature, "max_tokens": max_tokens,
             "messages": messages,
         }
+        # AUTO-THINK-1: *think* used to be read by every caller
+        # (Gate1Filter / Coder / ClusterReviewer / TaskRewriter — each
+        # defaults its own [section] think = false out of the box, no user
+        # action needed) but only ever forwarded into the payload above,
+        # in the Ollama branch. Against any OpenAI-compatible remote
+        # gateway (api_format=openai) fronting a reasoning model, the
+        # think=False request was silently dropped: the model still
+        # emitted its hidden chain-of-thought, which can consume most or
+        # all of a tight max_tokens budget (Gate 1 wants a tiny,
+        # deterministic JSON verdict, e.g. 512 tokens) before any usable
+        # answer is written — the reply comes back empty, or truncated
+        # mid-JSON. Confirmed directly: a real kenari.id / deepseek 429-
+        # free-tier run produced `{"verdict": "confirmed", "reason` — a
+        # genuine, otherwise-valid answer cut off mid-string by the token
+        # cap, not a network or parsing bug.
+        #
+        # `reasoning` (OpenRouter's own unified reasoning-control object)
+        # is deliberately the ONLY field sent here, not the fuller set the
+        # sibling learn-in-play1 project's llm_client.py sends (which also
+        # tries `reasoning_effort` and a vLLM/SGLang-specific
+        # `chat_template_kwargs`): that project found `chat_template_kwargs`
+        # produces a hard HTTP 400 on at least one real gateway (Groq), and
+        # recovering from that needs a per-server "this field is rejected,
+        # stop sending it" memory this stateless function doesn't have. A
+        # provider that doesn't recognise `reasoning` is expected to
+        # silently ignore the unknown field rather than reject the whole
+        # request — keeping this a plain, best-effort addition with no new
+        # failure mode of its own.
+        if think is False:
+            payload["reasoning"] = {"effort": "low", "exclude": True}
     return url, headers, payload
 
 
 def request_completion(url, headers, payload, timeout, stream=False, on_token=None,
-                       api_format: str = "openai", ssl_context: ssl.SSLContext | None = None):
+                       api_format: str = "openai", ssl_context: "ssl.SSLContext | None" = None,
+                       error_retries: int = 2, error_retry_wait_sec: float = 60.0,
+                       max_retry_after_sec: float = 180.0, on_retry=None,
+                       _sleep_fn=None):
     """
     POST a chat-completions request and return the assistant message text.
 
@@ -242,8 +450,42 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
     stream=True  : reads the token stream; calls on_token(tok) for each token
                    (if provided) and returns the accumulated content.
 
-    Raises urllib errors / network exceptions to the caller.
+    AUTO-RATE-1: on a retryable HTTP status (429, 402, 5xx — see
+    ``_is_retryable_status``), waits and retries the SAME request up to
+    ``error_retries`` times before giving up, instead of raising on the
+    very first non-2xx response. For 429 specifically, the wait is the
+    server's OWN requested delay when it provides one (``_parse_retry_after``
+    — the ``Retry-After`` header, or a "retry/try again in Ns/Nms" hint in
+    the body); otherwise (or for 402/5xx) ``error_retry_wait_sec``.
+
+    A requested wait longer than ``max_retry_after_sec`` is treated as a
+    daily/monthly quota reset, not a transient rate limit, and raises
+    immediately rather than blocking the caller for minutes or hours — a
+    free-tier gateway can legitimately ask for a ``Retry-After`` in the
+    thousands of seconds on a TPD (tokens-per-day) limit, and sleeping
+    through that would stall an entire ``--auto``/``--validate-plan`` run
+    on one call instead of surfacing the failure so the caller can move on.
+
+    Pass ``error_retries=0`` to restore the pre-AUTO-RATE-1 fail-fast
+    behavior (raise immediately on the first error, no wait).
+
+    ``on_retry``, if given, is called with a one-line human-readable
+    string before each wait, mirroring the retry callbacks already used
+    elsewhere in this codebase (e.g. OuterLoop/Coder) — so a caller can
+    surface "retrying in Ns" to its own progress display. Every retry is
+    also logged via this module's logger regardless of ``on_retry``.
+    ``_sleep_fn``, if given, replaces ``time.sleep`` — for tests that need
+    to exercise the retry/backoff paths without a real wait (same
+    injectable-for-tests convention as ``AutoController``'s ``_time_fn``).
+
+    Raises urllib errors / network exceptions to the caller once retries
+    (if any) are exhausted, or immediately for a non-retryable status.
     """
+    # MASK-KEY-1: mask any `api_key = ...` line in the outgoing message
+    # content *last*, right before the body is shaped/serialized — this is
+    # the one point every caller passes through, regardless of how its
+    # payload/messages were assembled upstream.
+    payload = _mask_payload_secrets(payload)
     body = _build_payload(payload, api_format, stream)
 
     req = urllib.request.Request(
@@ -252,17 +494,50 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
         headers=headers,
         method="POST",
     )
+    sleep = _sleep_fn or time.sleep
 
     def _open():
-        try:
-            return urllib.request.urlopen(req, timeout=timeout, context=ssl_context)
-        except urllib.error.HTTPError as e:
-            detail = ""
+        attempt = 0
+        while True:
             try:
-                detail = e.read().decode("utf-8", errors="replace")[:500]
-            except Exception:
-                pass
-            raise RuntimeError(f"HTTP {e.code} from {url}: {detail or e.reason}") from None
+                return urllib.request.urlopen(req, timeout=timeout, context=ssl_context)
+            except urllib.error.HTTPError as e:
+                detail = ""
+                try:
+                    detail = e.read().decode("utf-8", errors="replace")[:500]
+                except Exception:
+                    pass
+
+                if not _is_retryable_status(e.code) or attempt >= error_retries:
+                    raise RuntimeError(f"HTTP {e.code} from {url}: {detail or e.reason}") from None
+
+                wait_s = _parse_retry_after(e, detail) if e.code == 429 else None
+                if wait_s is None:
+                    wait_s = error_retry_wait_sec
+
+                if wait_s > max_retry_after_sec:
+                    msg = (
+                        f"HTTP {e.code} from {url}: server asked for a "
+                        f"{wait_s:.0f}s wait, longer than the "
+                        f"{max_retry_after_sec:.0f}s cap (looks like a daily/"
+                        f"monthly quota reset, not a transient rate limit) "
+                        f"— not waiting"
+                    )
+                    logger.warning("request_completion: %s", msg)
+                    if on_retry:
+                        on_retry(msg)
+                    raise RuntimeError(f"HTTP {e.code} from {url}: {detail or e.reason}") from None
+
+                msg = (
+                    f"HTTP {e.code} from {url} ({detail or e.reason}), "
+                    f"waiting {wait_s:.1f}s and retrying "
+                    f"(attempt {attempt + 1}/{error_retries})"
+                )
+                logger.warning("request_completion: %s", msg)
+                if on_retry:
+                    on_retry(msg)
+                sleep(wait_s)
+                attempt += 1
 
     if not stream:
         with _open() as response:

@@ -28,6 +28,31 @@ class RunRecord:
 class MetricsCollector:
     def __init__(self, metrics_path: Path = METRICS_PATH):
         self.metrics_path = metrics_path
+        # Perf cache for record(): avoids a full read+parse of the whole
+        # file on every single call. Without this, N sequential record()
+        # calls (e.g. from many worker threads serialised through a caller's
+        # lock, as in AutoMetricsStream) cost O(N^2) instead of O(N), which
+        # is slow enough under CPU contention (parallel test runners, etc.)
+        # to look like a hang/deadlock even though no lock is actually
+        # circularly held.
+        # Invalidated automatically if the file's mtime changes underneath
+        # us (e.g. another process writes it), so correctness for
+        # multi-process access is unaffected — this only skips the re-read
+        # when we already know the in-memory copy matches disk.
+        self._cache: Optional[list] = None
+        self._cache_mtime: Optional[float] = None
+
+    def _load_all_cached(self) -> list:
+        try:
+            mtime = self.metrics_path.stat().st_mtime
+        except OSError:
+            mtime = None
+        if self._cache is not None and mtime == self._cache_mtime:
+            return self._cache
+        records = self._load_all()
+        self._cache = records
+        self._cache_mtime = mtime
+        return records
 
     def record(self, run: RunRecord) -> None:
         """Append a RunRecord to metrics.json, creating the file if needed.
@@ -37,7 +62,8 @@ class MetricsCollector:
         therefore leaves the previous metrics.json intact rather than producing
         a truncated file that would silence the prompt optimizer on the next run.
         """
-        records = self._load_all()
+        records = self._load_all_cached()
+        records = list(records)  # don't mutate the cached list in place
         records.append(asdict(run))
         try:
             dir_ = self.metrics_path.parent
@@ -52,6 +78,12 @@ class MetricsCollector:
                 os.unlink(tmp_path)
                 raise
             os.replace(tmp_path, self.metrics_path)
+            self._cache = records
+            try:
+                self._cache_mtime = self.metrics_path.stat().st_mtime
+            except OSError:
+                self._cache = None
+                self._cache_mtime = None
         except Exception as e:
             logger.error(f"MetricsCollector failed to write metrics: {e}")
 

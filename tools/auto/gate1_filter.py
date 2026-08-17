@@ -61,7 +61,8 @@ from typing import Any
 
 from tools.agent_trace import tracer
 from tools.auto.architect import CandidateTask
-from tools.block_extractor import extract_block
+from tools.auto.gate1_grounding import callee_context, config_fallback_note, target_file_context
+from tools.block_extractor import extract_block, extract_module_docstring
 import tools.llm_stream as _llm_stream
 from tools.llm_stream import strip_think
 
@@ -117,7 +118,7 @@ Code at that location:
 ```
 {code_block}
 ```
-
+{grounding_notes}
 Is the claimed problem actually present in the code shown above, \
 and NOT already fixed?
 
@@ -264,7 +265,9 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         # ── Stage A: existence checks ─────────────────────────────────────────
         existence_passed: list[tuple[CandidateTask, str]] = []  # (task, code_block)
 
-        for c in candidates:
+        n_candidates = len(candidates)
+        for i, c in enumerate(candidates, 1):
+            print(f"  [{i}/{n_candidates}] existence check: {c.title}")
             ok, reason, block = self._check_existence(c, base_dir, cluster_files)
             if ok:
                 existence_passed.append((c, block))
@@ -272,7 +275,12 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                 all_results.append(FilterResult(
                     candidate=c, accepted=False, stage="existence", reason=reason,
                 ))
-                logger.warning(
+                # AUTO-LOG-1: existence has no "the call failed" failure mode
+                # of its own (no LLM, no network) — a rejection here always
+                # means the citation genuinely doesn't resolve (or, with
+                # cluster_files, was hallucinated), which is Gate 1 doing
+                # its job, not an anomaly. INFO, not WARNING.
+                logger.info(
                     "Gate1[existence] REJECTED %r — %s", c.title, reason,
                 )
 
@@ -294,7 +302,8 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             _why = "LLM skipped" if self._skip_llm else "creative mode — existence only"
             presence_passed = [(c, f"existence check passed ({_why})") for c, _ in existence_passed]
         else:
-            for c, block in existence_passed:
+            n_presence = len(existence_passed)
+            for i, (c, block) in enumerate(existence_passed, 1):
                 if c.cited_location.new_file:
                     # AUTO-BUG (new_file): same reasoning as AUTO-CR-8 above —
                     # a file that does not exist yet has no existing content
@@ -304,16 +313,41 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                     presence_passed.append(
                         (c, "new file — existence check sufficient"))
                     continue
-                ok, reason = self._check_presence(c, block)
+                print(f"  [{i}/{n_presence}] presence check: {c.title}")
+                module_docstring = self._module_docstring_for(c, base_dir)
+                ok, reason = self._check_presence(
+                    c, block, module_docstring=module_docstring, base_dir=base_dir,
+                )
                 if ok:
                     presence_passed.append((c, reason))
+                    # AUTO-LOG-1: symmetric with REJECTED below — a
+                    # confirmation used to be entirely silent (no log line
+                    # at all), which made "why don't I see the ones that
+                    # passed?" a fair question with no answer. Same level
+                    # (INFO) as a genuine rejection: both are ordinary
+                    # outcomes of the same check.
+                    logger.info(
+                        "Gate1[presence] CONFIRMED %r — %s", c.title, reason,
+                    )
                 else:
                     all_results.append(FilterResult(
                         candidate=c, accepted=False, stage="presence", reason=reason,
                     ))
-                    logger.warning(
-                        "Gate1[presence] REJECTED %r — %s", c.title, reason,
-                    )
+                    # AUTO-LOG-1: only an actual call/parse failure (see
+                    # _is_technical_failure) is a WARNING — that's a real
+                    # anomaly (network hiccup, malformed response) worth
+                    # standing out from routine output. An LLM reading the
+                    # code and genuinely disagreeing with the claim is
+                    # Gate 1 working correctly, logged at INFO like its
+                    # CONFIRMED counterpart just above.
+                    if _is_technical_failure(reason):
+                        logger.warning(
+                            "Gate1[presence] REJECTED %r — %s", c.title, reason,
+                        )
+                    else:
+                        logger.info(
+                            "Gate1[presence] REJECTED %r — %s", c.title, reason,
+                        )
 
         print(
             f"🔎 Gate 1 presence: "
@@ -495,12 +529,141 @@ class Gate1Filter(_llm_stream.LLMClientBase):
 
     # ── Stage B helpers ───────────────────────────────────────────────────────
 
+    def _full_source_for(self, candidate: CandidateTask, base_dir: "Path | None") -> str:
+        """AUTO-H2-7 helper. Same read-it-again pattern as
+        ``_module_docstring_for`` and for the same reason: keeps
+        ``_check_existence``'s tuple contract untouched. Full file text
+        (not just the extracted symbol block) so ``config_fallback_note``
+        can resolve a one-hop same-file wrapper method's body. Never
+        raises: a failure here just means no wrapper resolution, not a
+        broken run.
+        """
+        if base_dir is None:
+            return ""
+        loc = candidate.cited_location
+        if loc.new_file:
+            return ""
+        try:
+            return (base_dir / loc.file).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+
+    def _module_docstring_for(self, candidate: CandidateTask, base_dir: Path) -> str:
+        """AUTO-H2-2 helper. Deliberately re-reads the cited file rather
+        than threading a return value through ``_check_existence`` — that
+        method's 3-tuple ``(ok, reason, code_block)`` signature is used
+        directly by existing tests (tests/test_bugfix_review.py) and by
+        design should not need to change shape just because Stage B wants
+        one more piece of (cheap, optional) context. Never raises: any
+        failure here just means no docstring context, not a broken run.
+        """
+        loc = candidate.cited_location
+        if loc.new_file:
+            return ""
+        try:
+            source = (base_dir / loc.file).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return ""
+        file_ext = Path(loc.file).suffix or ".py"
+        try:
+            return extract_module_docstring(source, file_ext)
+        except Exception:  # pragma: no cover - defensive, see docstring
+            return ""
+
+    def _build_grounding_notes(
+        self,
+        candidate: CandidateTask,
+        code_block: str,
+        module_docstring: str,
+        base_dir: "Path | None",
+    ) -> str:
+        """AUTO-H2-1/-2/-3/-6: assemble Stage A2's deterministic evidence into
+        the text block injected into Stage B's prompt via
+        ``{grounding_notes}``.
+
+        Every piece here is *evidence for the LLM to weigh*, never a
+        decision by itself — Stage A2 does not reject candidates. See
+        ``gate1_grounding.py``'s module docstring for the reasoning: a
+        heuristic that misfires and auto-rejects trades a false positive
+        for a false negative, which is not obviously a win. Returns ""
+        when nothing fires, which renders as a harmless blank line in the
+        template — no behavior change for candidates none of this applies to.
+        """
+        notes: list[str] = []
+
+        if module_docstring:
+            notes.append(
+                f"Module docstring for this file (context the code block above "
+                f"doesn't repeat):\n\"\"\"\n{module_docstring}\n\"\"\"\n"
+                f"If that docstring states the code was written on purpose as "
+                f"an incorrect/uncovered example for testing some OTHER part "
+                f"of the system (not as production logic meant to work "
+                f"correctly), that is strong evidence the claimed problem "
+                f"should NOT be fixed here even if it is technically present "
+                f"— reject in that case. Otherwise this note is just "
+                f"background."
+            )
+
+        fb_note = config_fallback_note(candidate.instruction, code_block, self._full_source_for(candidate, base_dir))
+        if fb_note:
+            notes.append(fb_note)
+
+        loc = candidate.cited_location
+        if base_dir is not None and not loc.new_file:
+            try:
+                tf_note = target_file_context(
+                    candidate.target_files, loc.file, loc.symbol,
+                    candidate.instruction, base_dir,
+                )
+            except Exception as exc:  # pragma: no cover - defensive, see docstring
+                # AUTO-H2-6, same contract as AUTO-H2-3: best-effort context
+                # enrichment must never take down Stage B over a bug in the
+                # repo-wide search.
+                logger.warning("Gate1._build_grounding_notes: target_file_context failed (%s) — skipping", exc)
+                tf_note = None
+            if tf_note:
+                notes.append(tf_note)
+
+        if base_dir is not None:
+            try:
+                cc_note = callee_context(
+                    candidate.instruction, code_block,
+                    candidate.cited_location.file, base_dir,
+                )
+            except Exception as exc:  # pragma: no cover - defensive, see docstring
+                # AUTO-H2-3 is best-effort context enrichment. A bug in the
+                # repo-wide search must never take down Stage B, which is
+                # the actual check that matters here.
+                logger.warning("Gate1._build_grounding_notes: callee_context failed (%s) — skipping", exc)
+                cc_note = None
+            if cc_note:
+                notes.append(cc_note)
+
+        if not notes:
+            return ""
+        return "\n" + "\n\n".join(notes) + "\n"
+
     def _check_presence(
         self,
         candidate: CandidateTask,
         code_block: str,
+        *,
+        module_docstring: str = "",
+        base_dir: "Path | None" = None,
     ) -> tuple[bool, str]:
         """Call the LLM to confirm the claimed problem is present.
+
+        Parameters
+        ----------
+        module_docstring:
+            AUTO-H2-2. Top-of-module docstring for the cited file, if any.
+            Injected as extra context — see ``block_extractor.extract_module_docstring``.
+        base_dir:
+            AUTO-H2-3. Project root, used for best-effort one-hop callee
+            lookup when the instruction claims a downstream crash. ``None``
+            (the default) skips this lookup entirely — every existing
+            caller that doesn't pass it gets identical behavior to before
+            this parameter existed.
 
         Returns (confirmed: bool, reason: str).
         Fail-closed: any error → (False, reason).
@@ -508,10 +671,15 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         loc = candidate.cited_location
         location_str = _location_str(loc)
 
+        grounding_notes = self._build_grounding_notes(
+            candidate, code_block, module_docstring, base_dir,
+        )
+
         user_msg = _USER_PROMPT_TMPL.format(
             instruction=candidate.instruction,
             location=location_str,
             code_block=code_block,
+            grounding_notes=grounding_notes,
         )
 
         def _call(msg: str) -> str:
@@ -662,8 +830,10 @@ def filter_candidates(
     config: configparser.ConfigParser,
     cluster_files: "dict[str, set[str]] | None" = None,
     task_mode: str = "code",
+    model_override: "str | None" = None,
+    active_override: "str | None" = None,
 ) -> tuple[list[CandidateTask], list[FilterResult]]:
-    """One-call entry point for ``AutoController``.
+    """One-call entry point for ``AutoController`` (and ``plan_validator``).
 
     Reads API settings from *config* (same ``[api]`` / ``[api_local]`` /
     ``[api_remote]`` convention) and delegates to :class:`Gate1Filter`.
@@ -680,6 +850,17 @@ def filter_candidates(
         Optional mapping of cluster name → set of known relative file paths.
         Built from the ingestor clusters and passed through to Gate1Filter so
         hallucinated paths are caught before any filesystem I/O.
+    model_override, active_override:
+        AUTO-H2-4. When set, use this model / this ``[api_*]`` profile
+        instead of ``[api] active`` and that profile's ``model`` key. Both
+        default to ``None`` — the live ``--auto`` call site
+        (``tools/auto/pipeline.py``) never passes these, so its behavior is
+        completely unchanged by this parameter existing. ``plan_validator``
+        is the only caller that ever sets them, and only when
+        ``[gate1_validate]`` is present in the config it was given — see
+        that module's docstring for why re-verifying with the *same* model
+        that proposed a candidate is weaker evidence than an independent
+        model would be.
 
     Returns
     -------
@@ -688,11 +869,11 @@ def filter_candidates(
     rejected : list[FilterResult]
         Rejected candidates with stage and reason.
     """
-    active    = config.get("api", "active", fallback="local")
+    active    = active_override or config.get("api", "active", fallback="local")
     section   = f"api_{active}"
     base_url  = config.get(section, "base_url")
     api_key   = config.get(section, "api_key",    fallback="")
-    model     = config.get(section, "model")
+    model     = model_override or config.get(section, "model")
     api_fmt   = config.get(section, "api_format", fallback="openai")
     verify_ssl = config.getboolean("api", "verify_ssl", fallback=True)
 
@@ -711,6 +892,34 @@ def filter_candidates(
 # ─────────────────────────────────────────────────────────────────────────────
 # Internal helpers
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _is_technical_failure(reason: str) -> bool:
+    """Return True when *reason* names a call/parse failure, not a genuine
+    LLM verdict.
+
+    AUTO-LOG-1: ``filter()`` used to log every rejection at WARNING,
+    whether it was Gate 1 doing its job (the LLM read the code and
+    disagreed with the claim — an ordinary, expected outcome) or a real
+    technical hiccup (the call failed, the response wasn't valid JSON).
+    Conflating the two made a normal run's console/log look like it was
+    full of problems, and made a genuine failure no easier to spot than
+    routine business output. This distinguishes the two so callers can
+    log at the right level: WARNING for an actual anomaly worth noticing,
+    INFO for "the LLM looked and said no" — a state of the *request*
+    (confirmed/rejected), not a fault in it.
+
+    Matches the exact reason prefixes ``_check_presence`` /
+    ``_parse_presence_response`` produce on failure. A genuine LLM
+    "reason" field is free-text from the model and, in practice, never
+    coincidentally starts with one of these.
+    """
+    return reason.startswith((
+        "LLM call failed:",
+        "JSON decode failed",
+        "expected JSON object,",
+        "unrecognised verdict ",
+    ))
+
 
 def _fingerprint(c: CandidateTask) -> str:
     """Stable deduplication key for a candidate, based on cited location.

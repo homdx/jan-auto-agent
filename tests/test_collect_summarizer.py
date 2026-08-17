@@ -397,7 +397,7 @@ def test_make_summarizer_call_builds_ollama_request(monkeypatch):
 
     captured = {}
 
-    def fake_request_completion(*, url, headers, payload, timeout, api_format, ssl_context):
+    def fake_request_completion(*, url, headers, payload, timeout, api_format, ssl_context, **_kw):
         captured["url"] = url
         captured["payload"] = payload
         captured["api_format"] = api_format
