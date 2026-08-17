@@ -354,3 +354,108 @@ def callee_context(
             f"the claim references `{name}(...)`, defined in {rel}:\n```\n{snippet}\n```"
         )
     return None
+
+
+# ── GATE1-CTX-1: collect-model contract note ────────────────────────────────
+
+def collect_contract_note(collect_bridge, symbol: "str | None") -> Optional[str]:
+    """GATE1-CTX-1: when `collect_bridge` (a
+    `tools.auto.collect_bridge.CollectBridge`, or `None`) knows a static
+    `collect`-derived contract for the cited symbol — e.g. a seeded
+    "fail-open by design" contract — surface it as evidence.
+
+    Purely additive and read-only, same non-rejecting pattern as every
+    other note in this module (`# Every piece here is evidence for the LLM
+    to weigh, never a decision by itself` — see gate1_filter.py's
+    `_build_grounding_notes` docstring). Returns `None` when there's no
+    bridge, no symbol, or nothing to say.
+    """
+    if collect_bridge is None or not symbol:
+        return None
+    try:
+        contracts = collect_bridge.contracts_for_symbol(symbol)
+    except Exception:  # noqa: BLE001 — best-effort context, never fatal
+        return None
+    if not contracts:
+        return None
+    lines = [
+        f"Static analysis contract(s) already on record for `{symbol}` "
+        f"(from `collect`, independent of the code excerpt above — "
+        f"treat as strong evidence, not proof, since contracts can be "
+        f"stale or scoped differently than the claim):"
+    ]
+    for c in sorted(contracts, key=lambda c: c.name):
+        lines.append(f"  - {c.name}: {c.description}")
+    return "\n".join(lines)
+
+
+# ── GATE1-CTX-2: existing-test-coverage note ────────────────────────────────
+
+def existing_test_coverage_note(collect_bridge, cited_file: str) -> Optional[str]:
+    """GATE1-CTX-2: when `collect_bridge` knows which test file(s) already
+    import the cited module (`CollectModel.test_map`, module-level
+    granularity — COLLECT's own coverage pass), surface that list so a
+    "no test exists for X" claim can be weighed against what's already
+    there, even when the citation itself is the SOURCE file (not the test
+    file), which today's citation-only code_block would otherwise never
+    reveal.
+
+    Returns `None` when there's no bridge, no cited file, or the module
+    has zero covering tests on record (nothing extra to say — a genuine
+    "no test exists" claim then has no counter-evidence, exactly as
+    today).
+    """
+    if collect_bridge is None or not cited_file:
+        return None
+    try:
+        tests = collect_bridge.tests_covering(cited_file)
+    except Exception:  # noqa: BLE001
+        return None
+    if not tests:
+        return None
+    listing = ", ".join(f"`{t}`" for t in sorted(tests))
+    return (
+        f"Existing test coverage on record (from `collect`) for `{cited_file}`: "
+        f"{listing}. If the claim is about MISSING tests, check whether one of "
+        f"these files already covers the specific behavior described before "
+        f"confirming — module-level coverage existing doesn't by itself prove "
+        f"the exact claim is covered, but it's a strong hint to look closely."
+    )
+
+
+# ── GATE1-CTX-3: truncation-safety note ─────────────────────────────────────
+
+# Mirrors gate1_filter.py's own _truncate() marker text exactly — kept as a
+# separate constant here (not imported) so this module has no import-time
+# dependency on gate1_filter.py, matching every other function in this file.
+_TRUNCATION_MARKER = "... [truncated"
+
+
+def truncation_safety_note(code_block: str) -> Optional[str]:
+    """GATE1-CTX-3: when `code_block` was clipped by gate1_filter.py's own
+    `_truncate()` (visible in-band as a `"... [truncated — N more chars]"`
+    marker at the tail), name that fact explicitly as background — a
+    truncated block can hide error handling that exists just past the cut,
+    so "I didn't see it" is weaker evidence of absence than for an
+    untruncated block. This is deliberately NEUTRAL, not a push toward
+    rejecting: most truncated blocks are still perfectly judgeable from
+    what's shown (a large legitimate function truncated at a generous
+    budget is the common case, not the exception), and steering the model
+    to reject merely because a block was truncated would trade false
+    positives for false negatives on exactly the well-grounded, legitimate
+    tasks this module exists to protect — see `_build_grounding_notes`'s
+    own "evidence to weigh, never a decision by itself" policy.
+
+    Returns `None` when the block wasn't truncated (the common case).
+    """
+    if _TRUNCATION_MARKER not in code_block:
+        return None
+    return (
+        "Background: the code block above was truncated to fit the context "
+        "budget, so it may not show the full function/class. This alone is "
+        "not a reason to reject or confirm — judge from what IS shown as "
+        "usual — but if the claim specifically hinges on code you cannot "
+        "see (e.g. whether a later line in the same block handles the "
+        "error), weigh that uncertainty into your reason rather than "
+        "assuming either way."
+    )

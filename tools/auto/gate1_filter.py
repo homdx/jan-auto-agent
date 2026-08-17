@@ -61,7 +61,10 @@ from typing import Any
 
 from tools.agent_trace import tracer
 from tools.auto.architect import CandidateTask
-from tools.auto.gate1_grounding import callee_context, config_fallback_note, target_file_context
+from tools.auto.gate1_grounding import (
+    callee_context, config_fallback_note, target_file_context,
+    collect_contract_note, existing_test_coverage_note, truncation_safety_note,
+)
 from tools.block_extractor import extract_block, extract_module_docstring
 import tools.llm_stream as _llm_stream
 from tools.llm_stream import strip_think
@@ -75,6 +78,11 @@ _SYSTEM_PROMPT_CODE = (
     "You will be shown a code excerpt and a description of a claimed problem. "
     "Your ONLY job is to verify whether the described problem is actually present "
     "in the code shown, and has NOT already been fixed. "
+    "GATE1-CTX-4: look specifically for existing try/except blocks, "
+    "error-handling comments (e.g. 'fail-open', 'noqa: BLE001'), or tests "
+    "already covering the claim, in the code shown and any grounding notes "
+    "below it — a claim about missing error handling or missing test "
+    "coverage is REJECTED if that handling/coverage already exists. "
     "Do NOT suggest improvements. Do NOT run the code. "
     "Return ONLY a JSON object — no prose, no markdown fences, no preamble."
 )
@@ -195,9 +203,14 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         api_format: str = "openai",
         verify_ssl: bool = True,
         task_mode: str = "code",
+        collect_bridge=None,
     ) -> None:
         super().__init__(config, base_url, api_key, model, api_format, verify_ssl)
         self._task_mode  = task_mode
+        # GATE1-CTX-1/-2: tools.auto.collect_bridge.CollectBridge or None.
+        # Feeds two additive grounding notes (collect contracts, existing
+        # test coverage) in _build_grounding_notes — see that method.
+        self._collect_bridge = collect_bridge
 
         sec = "gate1"
         self._temperature    = float(config.get(sec, "temperature", fallback="0.0"))
@@ -639,6 +652,32 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             if cc_note:
                 notes.append(cc_note)
 
+        # GATE1-CTX-1: collect-derived static contract for the cited symbol.
+        try:
+            contract_note = collect_contract_note(self._collect_bridge, loc.symbol)
+        except Exception as exc:  # noqa: BLE001 — best-effort, never fatal
+            logger.warning("Gate1._build_grounding_notes: collect_contract_note failed (%s) — skipping", exc)
+            contract_note = None
+        if contract_note:
+            notes.append(contract_note)
+
+        # GATE1-CTX-2: existing test coverage for the cited module, from
+        # collect's test_map — surfaces coverage even when the citation
+        # itself is the SOURCE file, not a test file.
+        try:
+            coverage_note = existing_test_coverage_note(self._collect_bridge, loc.file)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Gate1._build_grounding_notes: existing_test_coverage_note failed (%s) — skipping", exc)
+            coverage_note = None
+        if coverage_note:
+            notes.append(coverage_note)
+
+        # GATE1-CTX-3: flag a truncated code_block explicitly rather than
+        # relying on the model to notice the in-band "...[truncated]" marker.
+        trunc_note = truncation_safety_note(code_block)
+        if trunc_note:
+            notes.append(trunc_note)
+
         if not notes:
             return ""
         return "\n" + "\n\n".join(notes) + "\n"
@@ -832,6 +871,7 @@ def filter_candidates(
     task_mode: str = "code",
     model_override: "str | None" = None,
     active_override: "str | None" = None,
+    collect_bridge=None,
 ) -> tuple[list[CandidateTask], list[FilterResult]]:
     """One-call entry point for ``AutoController`` (and ``plan_validator``).
 
@@ -861,6 +901,13 @@ def filter_candidates(
         that module's docstring for why re-verifying with the *same* model
         that proposed a candidate is weaker evidence than an independent
         model would be.
+    collect_bridge:
+        GATE1-CTX-1/-2. A ``tools.auto.collect_bridge.CollectBridge`` (or
+        ``None``, the default) — feeds two additive grounding notes into
+        Stage B (collect-derived contracts, existing test coverage). Build
+        it once per run (same rule as COLLECT-24's own caller in
+        ``AutoController._get_collect_bridge``); never build one per
+        candidate.
 
     Returns
     -------
@@ -885,6 +932,7 @@ def filter_candidates(
         api_format=api_fmt,
         verify_ssl=verify_ssl,
         task_mode=task_mode,
+        collect_bridge=collect_bridge,
     )
     return filt.filter(candidates, base_dir, cluster_files=cluster_files)
 

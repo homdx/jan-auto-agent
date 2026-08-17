@@ -253,3 +253,78 @@ def test_use_in_auto_false_prompt_is_byte_for_byte_unchanged(mini_repo):
         if block:
             prefetched_context = block + "\n\n"
     assert prefetched_context == ""
+
+
+# ── GATE1-CTX-1/-2: plan_validator.py builds and threads a CollectBridge ──
+
+
+def test_validate_plan_builds_collect_bridge_and_passes_to_filter_candidates(mini_repo, monkeypatch):
+    """validate_plan() must build a CollectBridge from the SAME config it
+    was given and pass it into filter_candidates() — not silently drop
+    COLLECT-24/GATE1-CTX wiring for the --validate-plan entry point."""
+    cli_mod.action_collect(mini_repo)
+    config_path = _write_agents_ini(mini_repo, use_in_auto=True)
+
+    agent_dir = mini_repo / ".agent"
+    agent_dir.mkdir()
+    plan = {
+        "goal": "test goal",
+        "tasks": [{
+            "id": "T1", "title": "t", "instruction": "i",
+            "target_files": ["pkg/a.py"], "acceptance_check": "true",
+            "status": "todo", "round": 0, "attempt": 0, "impl_version": 1,
+            "cited_locations": [{"file": "pkg/a.py", "symbol": "a", "new_file": False}],
+            "dependencies": [],
+        }],
+    }
+    import json as _json
+    (agent_dir / "plan.json").write_text(_json.dumps(plan), encoding="utf-8")
+
+    from tools.auto import plan_validator as pv_mod
+
+    captured = {}
+
+    def _fake_filter_candidates(candidates, base_dir, cfg, **kwargs):
+        captured["collect_bridge"] = kwargs.get("collect_bridge")
+        return candidates, []
+
+    monkeypatch.setattr(pv_mod, "filter_candidates", _fake_filter_candidates)
+
+    pv_mod.validate_plan(mini_repo, str(config_path))
+
+    assert captured["collect_bridge"] is not None
+    assert captured["collect_bridge"].usable is True
+
+
+def test_validate_plan_use_in_auto_false_passes_none_bridge(mini_repo, monkeypatch):
+    cli_mod.action_collect(mini_repo)
+    config_path = _write_agents_ini(mini_repo, use_in_auto=False)
+
+    agent_dir = mini_repo / ".agent"
+    agent_dir.mkdir()
+    plan = {
+        "goal": "test goal",
+        "tasks": [{
+            "id": "T1", "title": "t", "instruction": "i",
+            "target_files": ["pkg/a.py"], "acceptance_check": "true",
+            "status": "todo", "round": 0, "attempt": 0, "impl_version": 1,
+            "cited_locations": [{"file": "pkg/a.py", "symbol": "a", "new_file": False}],
+            "dependencies": [],
+        }],
+    }
+    import json as _json
+    (agent_dir / "plan.json").write_text(_json.dumps(plan), encoding="utf-8")
+
+    from tools.auto import plan_validator as pv_mod
+
+    captured = {}
+
+    def _fake_filter_candidates(candidates, base_dir, cfg, **kwargs):
+        captured["collect_bridge"] = kwargs.get("collect_bridge")
+        return candidates, []
+
+    monkeypatch.setattr(pv_mod, "filter_candidates", _fake_filter_candidates)
+
+    pv_mod.validate_plan(mini_repo, str(config_path))
+
+    assert captured["collect_bridge"] is None

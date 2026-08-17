@@ -188,6 +188,43 @@ class CollectBridge:
             lines.append(f"contract {c.name}: {c.description}")
         return "\n".join(lines)
 
+    # ── GATE1-CTX-1/-2: read-only queries for Gate1's grounding notes ──────
+
+    def contracts_for_symbol(self, symbol_name: str):
+        """Every `ContractRecord` naming `symbol_name` (bare name, dotted
+        suffix, or full qualname), or `[]` when unusable/unknown. Read-only
+        variant of `pull_symbol` for a caller (Gate1) that wants the
+        contract objects themselves, not a pre-formatted text block."""
+        if not self.usable or not symbol_name:
+            return []
+        name = symbol_name.strip()
+        if not name:
+            return []
+        try:
+            for module in self._model.modules:
+                for sym in module.public_symbols:
+                    qn = sym.qualname
+                    if qn == name or qn.endswith("." + name) or qn.split(".")[-1] == name:
+                        return list(self._model.contracts_for(qn))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("CollectBridge.contracts_for_symbol(%s): failed: %s", symbol_name, exc)
+        return []
+
+    def tests_covering(self, file_path: str):
+        """Tuple of test-file paths that import module `file_path`, per
+        collect's `test_map` (COLLECT built this as part of the coverage
+        pass — module-level granularity, not symbol-level). `()` when
+        unusable, the file has no entry, or it genuinely has zero covering
+        tests (all three cases collapse to "nothing to report" for a
+        grounding note either way)."""
+        if not self.usable or not file_path:
+            return ()
+        try:
+            return tuple(self._model.test_map.get(file_path, ()))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("CollectBridge.tests_covering(%s): failed: %s", file_path, exc)
+            return ()
+
 
 # ── factory ──────────────────────────────────────────────────────────────
 

@@ -281,10 +281,13 @@ def _run_plan_phase(controller: "AutoController", cfg: configparser.ConfigParser
     cluster_files: dict[str, set[str]] = {
         c.name: set(c.files) for c in clusters
     }
+    _get_bridge = getattr(controller, "_get_collect_bridge", None)
+    collect_bridge = _get_bridge(getattr(controller, "task_mode", "code")) if _get_bridge else None
     accepted, rejected = filter_candidates(
         candidates, controller.base_dir, cfg,
         cluster_files=cluster_files,
         task_mode=getattr(controller, "task_mode", "code"),   # AUTO-DM-1
+        collect_bridge=collect_bridge,  # GATE1-CTX-1
     )
     logger.info(
         "plan_phase: gate1 accepted=%d rejected=%d",

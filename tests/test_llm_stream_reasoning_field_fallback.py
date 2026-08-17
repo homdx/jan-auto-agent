@@ -29,7 +29,18 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from tools.llm_stream import request_completion
+from tools.llm_stream import request_completion, build_chat_request
+import tools.llm_stream as llm_stream_mod
+
+
+@pytest.fixture(autouse=True)
+def _reset_reasoning_cache():
+    """AUTO-REASONING-2's unsupported-URL memory is process-lifetime global
+    state — reset it before/after every test so tests don't leak into each
+    other regardless of run order."""
+    llm_stream_mod._REASONING_UNSUPPORTED_URLS.clear()
+    yield
+    llm_stream_mod._REASONING_UNSUPPORTED_URLS.clear()
 
 
 class _RecordingHandler(http.server.BaseHTTPRequestHandler):
@@ -222,3 +233,96 @@ class TestReasoningFieldFallback:
             server.shutdown()
         assert len(messages) == 1
         assert "reasoning" in messages[0]
+
+
+class TestReasoningUnsupportedProcessCache:
+    """AUTO-REASONING-2: after the FIRST 400 for a given endpoint, every
+    subsequent build_chat_request() call to that same URL must skip the
+    `reasoning` field outright — no repeat round trip for a call the
+    process already knows will fail."""
+
+    def test_build_chat_request_skips_field_after_marked_unsupported(self):
+        url = "https://example.test/v1/chat/completions"
+        _, _, payload_before = build_chat_request(
+            base_url="https://example.test/v1", api_key="k", model="m",
+            api_format="openai", temperature=0.1, max_tokens=100,
+            system="s", user_msg="u", think=False,
+        )
+        assert "reasoning" in payload_before
+
+        llm_stream_mod.mark_reasoning_field_unsupported(url)
+
+        _, _, payload_after = build_chat_request(
+            base_url="https://example.test/v1", api_key="k", model="m",
+            api_format="openai", temperature=0.1, max_tokens=100,
+            system="s", user_msg="u", think=False,
+        )
+        assert "reasoning" not in payload_after
+
+    def test_end_to_end_second_call_never_sends_reasoning_after_first_400(self):
+        """Full integration: build_chat_request() -> request_completion()
+        twice in a row against the same endpoint. First call pays the one
+        retry; second call's OUTGOING payload never has 'reasoning' at
+        all — build_chat_request() itself omits it, no 400 involved."""
+        server, port, handler_cls = _serve_script([
+            ("error", 400, _GEMINI_400_BODY, {}),  # call 1, attempt 1: rejected
+            ("ok", _OK_BODY),                        # call 1, attempt 2: succeeds
+            ("ok", _OK_BODY),                        # call 2: succeeds first try
+        ])
+        try:
+            base_url = f"http://127.0.0.1:{port}/v1beta/openai"
+            url1, headers1, payload1 = build_chat_request(
+                base_url=base_url, api_key="k", model="gemini-x",
+                api_format="openai", temperature=0.1, max_tokens=100,
+                system="s", user_msg="u", think=False,
+            )
+            assert "reasoning" in payload1
+            request_completion(url1, headers1, payload1, timeout=5,
+                                stream=False, api_format="openai")
+
+            # Second call: build_chat_request must now omit the field.
+            url2, headers2, payload2 = build_chat_request(
+                base_url=base_url, api_key="k", model="gemini-x",
+                api_format="openai", temperature=0.1, max_tokens=100,
+                system="s", user_msg="u", think=False,
+            )
+            assert "reasoning" not in payload2
+            request_completion(url2, headers2, payload2, timeout=5,
+                                stream=False, api_format="openai")
+        finally:
+            server.shutdown()
+
+        assert handler_cls.request_count == 3  # 2 (call1) + 1 (call2)
+        assert "reasoning" not in handler_cls.received_bodies[2]
+
+    def test_reasoning_field_is_supported_true_for_untried_url(self):
+        assert llm_stream_mod.reasoning_field_is_supported(
+            "https://never-seen.example/v1/chat/completions") is True
+
+    def test_marking_one_url_does_not_affect_another(self):
+        llm_stream_mod.mark_reasoning_field_unsupported("https://a.example/v1/chat/completions")
+        assert llm_stream_mod.reasoning_field_is_supported(
+            "https://a.example/v1/chat/completions") is False
+        assert llm_stream_mod.reasoning_field_is_supported(
+            "https://b.example/v1/chat/completions") is True
+
+    def test_think_true_never_sends_reasoning_regardless_of_cache_state(self):
+        """think=True never sent the field in the first place — the cache
+        only ever affects the think=False path."""
+        _, _, payload = build_chat_request(
+            base_url="https://example.test/v1", api_key="k", model="m",
+            api_format="openai", temperature=0.1, max_tokens=100,
+            system="s", user_msg="u", think=True,
+        )
+        assert "reasoning" not in payload
+
+    def test_ollama_format_unaffected_by_the_cache(self):
+        """The cache/field only exist on the openai branch; ollama's own
+        top-level 'think' field is a completely different mechanism."""
+        _, _, payload = build_chat_request(
+            base_url="http://localhost:11434", api_key="k", model="m",
+            api_format="ollama", temperature=0.1, max_tokens=100,
+            system="s", user_msg="u", think=False,
+        )
+        assert "reasoning" not in payload
+        assert payload["think"] is False

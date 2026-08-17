@@ -22,6 +22,35 @@ logger = logging.getLogger(__name__)
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 
+# AUTO-REASONING-2: process-lifetime memory of which openai-format chat
+# endpoints have already told us (via HTTP 400) that they don't recognise
+# the `reasoning` field build_chat_request() sends for think=False. Keyed
+# by the exact `{base_url}/chat/completions` URL build_chat_request()
+# would construct — the same string request_completion() receives as
+# `url`, so both sides agree on identity without either needing to know
+# about "providers" as a concept. This is exactly the "per-server 'stop
+# sending it' memory" build_chat_request()'s own AUTO-THINK-1 docstring
+# said a stateless function doesn't have — now it does, at module scope,
+# so after the FIRST 400 anywhere in this process, every subsequent call
+# to the same endpoint skips the field outright instead of paying for
+# another guaranteed-to-fail round trip.
+_REASONING_UNSUPPORTED_URLS: set = set()
+
+
+def mark_reasoning_field_unsupported(url: str) -> None:
+    """Record that *url* rejects the `reasoning` field, so future
+    `build_chat_request()` calls targeting it never send it again this
+    process. Idempotent; safe to call from any thread (set.add is atomic
+    under the GIL for this simple case)."""
+    _REASONING_UNSUPPORTED_URLS.add(url)
+
+
+def reasoning_field_is_supported(url: str) -> bool:
+    """`False` once `mark_reasoning_field_unsupported(url)` has fired for
+    this exact endpoint URL in this process; `True` otherwise (including
+    for URLs never tried)."""
+    return url not in _REASONING_UNSUPPORTED_URLS
+
 # MASK-KEY-1: matches an ini-style `api_key = <value>` assignment line,
 # including comment-prefixed variants such as `### api_key = ...` or
 # `; api_key = ...` (any leading whitespace, optional comment chars
@@ -370,10 +399,14 @@ def build_chat_request(
     OpenAI-compatible aggregators (the free-tier gateways this project
     targets, e.g. kenari.id, follow the same convention). A provider that
     doesn't recognise the field is expected to silently ignore it rather
-    than reject the request. ``think=True`` sends nothing extra — most
-    models reason by default; only *suppressing* it needs an explicit
-    field. Omitted entirely (both branches) when ``think`` is ``None``
-    (server/model default either way).
+    than reject the request — but AUTO-REASONING-2: if this exact endpoint
+    already told us otherwise (a prior ``request_completion()`` call hit an
+    HTTP 400 rejecting the field and called
+    ``mark_reasoning_field_unsupported(url)``), the field is skipped
+    outright here rather than repeating a guaranteed-to-fail round trip.
+    ``think=True`` sends nothing extra — most models reason by default;
+    only *suppressing* it needs an explicit field. Omitted entirely (both
+    branches) when ``think`` is ``None`` (server/model default either way).
     """
     headers = {
         "Content-Type":  "application/json",
@@ -397,7 +430,16 @@ def build_chat_request(
         if think is not None:
             payload["think"] = think
     else:
-        url = f"{base_url}/chat/completions"
+        # AUTO-URL-1: normalize a trailing slash on base_url before
+        # concatenating — without this, `base_url = ".../v1beta/openai/"`
+        # (trailing slash) produced `".../v1beta/openai//chat/completions"`
+        # (double slash), which strict routers (confirmed live: Gemini's
+        # openai-compat endpoint) 404 on rather than normalizing away.
+        # ollama_chat_url() above already does the equivalent `.rstrip("/")`
+        # for the Ollama branch — this brings the openai branch to the same
+        # standard instead of trusting every caller's base_url to be
+        # slash-free.
+        url = f"{base_url.rstrip('/')}/chat/completions"
         payload = {
             "model": model, "temperature": temperature, "max_tokens": max_tokens,
             "messages": messages,
@@ -430,7 +472,7 @@ def build_chat_request(
         # silently ignore the unknown field rather than reject the whole
         # request — keeping this a plain, best-effort addition with no new
         # failure mode of its own.
-        if think is False:
+        if think is False and reasoning_field_is_supported(url):
             payload["reasoning"] = {"effort": "low", "exclude": True}
     return url, headers, payload
 
@@ -539,6 +581,11 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
                         and isinstance(body, dict) and "reasoning" in body
                         and _looks_like_unknown_reasoning_field(detail)):
                     _reasoning_stripped = True
+                    # AUTO-REASONING-2: remember this endpoint for the rest
+                    # of the process — every future build_chat_request()
+                    # call against the same URL now skips the field
+                    # outright instead of repeating this exact 400.
+                    mark_reasoning_field_unsupported(url)
                     body = {k: v for k, v in body.items() if k != "reasoning"}
                     req = urllib.request.Request(
                         url, data=json.dumps(body).encode("utf-8"),

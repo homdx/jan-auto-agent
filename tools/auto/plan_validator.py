@@ -304,9 +304,18 @@ def validate_plan(
         )
 
     print(f"\n🔎 Re-validating {len(pending)} pending task(s) against current code...")
+    # GATE1-CTX-1/-2: same collect wiring as --auto's live Gate 1 call site
+    # (tools/auto/pipeline.py via AutoController._get_collect_bridge) — a
+    # single bridge built once for this whole validate-plan run, never per
+    # candidate. None when [collect] use_in_auto/use_in_doc is off or the
+    # artifact is unavailable/stale — every note it feeds degrades to "" in
+    # that case, identical to today's behavior.
+    from tools.auto.collect_bridge import make_collect_bridge
+    collect_bridge = make_collect_bridge(base_path, cfg, config_path, task_mode=task_mode)
     accepted, rejected = filter_candidates(
         candidates, base_path, cfg, cluster_files=None, task_mode=task_mode,
         model_override=model_override, active_override=active_override,
+        collect_bridge=collect_bridge,
     )
 
     removed: list[RemovedTask] = []

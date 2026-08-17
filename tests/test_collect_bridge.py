@@ -190,6 +190,59 @@ def test_pull_symbol_empty_name_returns_empty():
     assert bridge.pull_symbol("   ") == ""
 
 
+# ── GATE1-CTX-1/-2: contracts_for_symbol / tests_covering ───────────────
+
+
+def test_contracts_for_symbol_returns_matching_contracts():
+    module = _module("pkg/a.py", [_symbol("pkg.a.foo")])
+    contract = ContractRecord(
+        name="fail_open", known_edge="pkg.a.foo", description="never raises",
+    )
+    model = _fresh_model([module], contracts=[contract])
+    bridge = CollectBridge(model)
+    contracts = bridge.contracts_for_symbol("foo")
+    assert len(contracts) == 1
+    assert contracts[0].name == "fail_open"
+
+
+def test_contracts_for_symbol_unknown_returns_empty_list():
+    model = _fresh_model([_module("pkg/a.py", [_symbol("pkg.a.foo")])])
+    bridge = CollectBridge(model)
+    assert bridge.contracts_for_symbol("nope") == []
+
+
+def test_contracts_for_symbol_stale_model_returns_empty():
+    module = _module("pkg/a.py", [_symbol("pkg.a.foo")])
+    contract = ContractRecord(name="x", known_edge="pkg.a.foo", description="y")
+    stale = CollectModel(status=STATUS_STALE, modules=(module,), contracts=(contract,))
+    bridge = CollectBridge(stale)
+    assert bridge.contracts_for_symbol("foo") == []
+
+
+def test_tests_covering_returns_tuple_from_test_map():
+    model = CollectModel(status=STATUS_FRESH, test_map={"pkg/a.py": ("tests/test_a.py",)})
+    bridge = CollectBridge(model)
+    assert bridge.tests_covering("pkg/a.py") == ("tests/test_a.py",)
+
+
+def test_tests_covering_missing_file_returns_empty_tuple():
+    model = CollectModel(status=STATUS_FRESH, test_map={})
+    bridge = CollectBridge(model)
+    assert bridge.tests_covering("pkg/nope.py") == ()
+
+
+def test_tests_covering_stale_model_returns_empty():
+    stale = CollectModel(status=STATUS_STALE, test_map={"pkg/a.py": ("tests/test_a.py",)})
+    bridge = CollectBridge(stale)
+    assert bridge.tests_covering("pkg/a.py") == ()
+
+
+def test_tests_covering_empty_file_arg_returns_empty():
+    model = CollectModel(status=STATUS_FRESH, test_map={"pkg/a.py": ("tests/test_a.py",)})
+    bridge = CollectBridge(model)
+    assert bridge.tests_covering("") == ()
+
+
 # ── make_collect_bridge factory ─────────────────────────────────────────
 
 
