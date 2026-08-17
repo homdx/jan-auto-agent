@@ -22,6 +22,30 @@ logger = logging.getLogger(__name__)
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 
+# MASK-KEY-1: matches an ini-style `api_key = <value>` assignment line
+# (any leading whitespace, e.g. inside a `[api_local]` block; case-
+# insensitive key name) so a real or test secret pasted/read into a
+# prompt (agents.ini contents, a config dump, etc.) never reaches the LLM
+# verbatim. Captures the "api_key = " prefix separately so the value alone
+# is swapped for the placeholder.
+_API_KEY_LINE_RE = re.compile(r'(?im)^([ \t]*api_key[ \t]*=[ \t]*)(\S+)([ \t]*)$')
+
+
+def mask_api_key(text: str) -> str:
+    """Replace every ``api_key = <value>`` line in *text* with
+    ``api_key = here_your_key``, regardless of what the value actually is
+    (a placeholder like "test", a real key, anything non-blank).
+
+    This is a plain string transform with no knowledge of *which* key is
+    "real" — it masks unconditionally so a secret embedded in file content
+    that gets pulled into a prompt can't leak to the LLM. Non-string input
+    (``None``, already-masked text, text with no such line) is returned
+    unchanged.
+    """
+    if not text:
+        return text
+    return _API_KEY_LINE_RE.sub(r"\1here_your_key\3", text)
+
 
 def strip_think(text: str) -> str:
     """
@@ -140,6 +164,48 @@ def _build_payload(payload: dict, api_format: str, stream: bool) -> dict:
         if stream:
             body["stream"] = True
     return body
+
+
+def _mask_payload_secrets(payload: dict) -> dict:
+    """Return a copy of *payload* with `mask_api_key` applied to every
+    string message ``content`` field.
+
+    MASK-KEY-1: every caller in this project (Coder, Gate1Filter,
+    ClusterReviewer, TaskRewriter via ``build_chat_request``, and the
+    handful of agents — ImprovementAgent, FaqAgent, OrchestratorActions,
+    ...  — that assemble their own OpenAI-shaped payload directly) ends up
+    calling ``request_completion`` to actually make the HTTP call. Masking
+    here, right before the request body is built, is the one place that
+    catches an ``api_key = ...`` line regardless of which agent's prompt
+    it came from (e.g. a file's contents — agents.ini or similar — pulled
+    into context) without needing every call site to remember to mask it
+    itself.
+
+    Returns *payload* unchanged (no copy) if nothing needed masking, so
+    callers that don't touch config-shaped text pay no extra cost.
+    """
+    messages = payload.get("messages")
+    if not messages:
+        return payload
+
+    changed = False
+    new_messages = []
+    for msg in messages:
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if isinstance(content, str):
+            masked = mask_api_key(content)
+            if masked != content:
+                changed = True
+                new_messages.append({**msg, "content": masked})
+                continue
+        new_messages.append(msg)
+
+    if not changed:
+        return payload
+
+    out = dict(payload)
+    out["messages"] = new_messages
+    return out
 
 
 def ollama_chat_url(base_url: str) -> str:
@@ -309,9 +375,14 @@ def build_chat_request(
         "Content-Type":  "application/json",
         "Authorization": f"Bearer {api_key}",
     }
+    # MASK-KEY-1: mask any `api_key = ...` line that ended up inside the
+    # system/user text itself (e.g. agents.ini contents pulled into
+    # context) — NOT *api_key* the parameter above, which is the caller's
+    # own credential for THIS request and is used as-is in the
+    # Authorization header.
     messages = [
-        {"role": "system", "content": system},
-        {"role": "user",   "content": user_msg},
+        {"role": "system", "content": mask_api_key(system)},
+        {"role": "user",   "content": mask_api_key(user_msg)},
     ]
     if api_format == "ollama":
         url = ollama_chat_url(base_url)
@@ -406,6 +477,11 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
     Raises urllib errors / network exceptions to the caller once retries
     (if any) are exhausted, or immediately for a non-retryable status.
     """
+    # MASK-KEY-1: mask any `api_key = ...` line in the outgoing message
+    # content *last*, right before the body is shaped/serialized — this is
+    # the one point every caller passes through, regardless of how its
+    # payload/messages were assembled upstream.
+    payload = _mask_payload_secrets(payload)
     body = _build_payload(payload, api_format, stream)
 
     req = urllib.request.Request(
