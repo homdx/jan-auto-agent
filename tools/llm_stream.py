@@ -22,13 +22,17 @@ logger = logging.getLogger(__name__)
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 
-# MASK-KEY-1: matches an ini-style `api_key = <value>` assignment line
-# (any leading whitespace, e.g. inside a `[api_local]` block; case-
-# insensitive key name) so a real or test secret pasted/read into a
-# prompt (agents.ini contents, a config dump, etc.) never reaches the LLM
-# verbatim. Captures the "api_key = " prefix separately so the value alone
-# is swapped for the placeholder.
-_API_KEY_LINE_RE = re.compile(r'(?im)^([ \t]*api_key[ \t]*=[ \t]*)(\S+)([ \t]*)$')
+# MASK-KEY-1: matches an ini-style `api_key = <value>` assignment line,
+# including comment-prefixed variants such as `### api_key = ...` or
+# `; api_key = ...` (any leading whitespace, optional comment chars
+# [#;]+ before the key name; case-insensitive key name) so a real or
+# test secret pasted/read into a prompt (agents.ini contents, a config
+# dump, etc.) never reaches the LLM verbatim. Captures the prefix
+# (indent + optional comment + "api_key = ") separately so the value
+# alone is swapped for the placeholder.
+_API_KEY_LINE_RE = re.compile(
+    r'(?im)^([ \t]*(?:[#;]+[ \t]*)?api_key[ \t]*=[ \t]*)(\S+)([ \t]*)$'
+)
 
 
 def mask_api_key(text: str) -> str:

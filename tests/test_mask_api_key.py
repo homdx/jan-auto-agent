@@ -90,6 +90,45 @@ class TestMaskApiKeyPure:
         text = "not_api_key_at_all = foo\n"
         assert mask_api_key(text) == text
 
+    # ── comment-prefix variants ───────────────────────────────────────────
+
+    def test_masks_hash_comment_prefix(self):
+        """``### api_key = mykey1`` — hash-commented assignment is masked."""
+        assert mask_api_key("### api_key = mykey1") == "### api_key = here_your_key"
+
+    def test_masks_single_hash_prefix(self):
+        assert mask_api_key("# api_key = secret") == "# api_key = here_your_key"
+
+    def test_masks_semicolon_comment_prefix(self):
+        """``;  api_key = otherkey`` — semicolon-commented assignment is masked."""
+        assert mask_api_key("; api_key = otherkey") == "; api_key = here_your_key"
+
+    def test_masks_commented_line_inside_ini_block(self):
+        """Both active and commented-out api_key lines inside a block are masked."""
+        text = (
+            "[api_local]\n"
+            "base_url = http://localhost:11434\n"
+            "api_key = active_key\n"
+            "# api_key = backup_key\n"
+            "### api_key = another_key\n"
+            "; api_key = semicolon_key\n"
+            "model = llama3.1:8b\n"
+        )
+        out = mask_api_key(text)
+        assert out.count("api_key = here_your_key") == 4
+        for secret in ("active_key", "backup_key", "another_key", "semicolon_key"):
+            assert secret not in out
+        # unrelated lines survive untouched
+        assert "base_url = http://localhost:11434" in out
+        assert "model = llama3.1:8b" in out
+
+    def test_masked_comment_prefix_preserved_verbatim(self):
+        """The comment prefix itself (e.g. '###') is kept in the output."""
+        out = mask_api_key("###api_key = nospace")
+        assert out.startswith("###")
+        assert "here_your_key" in out
+        assert "nospace" not in out
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # build_chat_request() — masking applied to system/user content
