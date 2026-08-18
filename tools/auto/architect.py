@@ -33,6 +33,7 @@ from __future__ import annotations
 import configparser
 import json
 import logging
+import math
 import re as _re
 import sys
 import time
@@ -714,136 +715,221 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
             if self._task_mode == "creative"
             else _USER_PROMPT_TMPL
         )
-        user_msg = _tmpl.format(
-            goal=goal,
-            cluster=cluster.name,
-            file_listing=file_listing,
-            file_contents=file_contents,
-            max_tasks=(1 if self._task_mode == "creative" else 5),
-        )
 
+        _base_max_tasks = 1 if self._task_mode == "creative" else 5
 
-        url, headers, payload = _llm_stream.build_chat_request(
-            base_url=self._base_url, api_key=self._api_key, model=self._model,
-            api_format=self._api_format, temperature=self._temperature,
-            max_tokens=self._max_tokens, system=self._system, user_msg=user_msg,
-            num_ctx=self._num_ctx, think=self._think,
-        )
-
-        # Trace the outgoing call.
-        tracer.event(
-            source="architect",
-            target="llm",
-            kind="llm_request",
-            content=user_msg,
-            params={"model": self._model, "temperature": self._temperature,
-                    "cluster": cluster.name},
-        )
-
-        # AUTO-BUG-8 fix: configurable retry backoff. Previously hardcoded to
-        # [5, 15, 30] (~50s total) regardless of deployment — for a local
-        # Ollama instance still loading a model into memory, that's ~50s of
-        # silent retrying inside this call before the cluster fails open.
-        _delays_raw = self._config.get("architect", "retry_delays_sec", fallback="5,15,30")
+        # AUTO-H4: shrink-retry on truncation. A "confirmed" candidate array
+        # cut off mid-object (see _parse_candidates_ex's truncated flag) means
+        # the model tried to fit more tasks into this response than its
+        # output-token budget allowed — the fix that actually addresses the
+        # cause is asking for FEWER tasks (a smaller JSON array is less likely
+        # to overflow the same max_tokens cap), not just re-sending the same
+        # over-ambitious request and hoping for a shorter roll. Each shrink
+        # halves the requested task count (floor 1) and is a fresh, independent
+        # LLM call — not a merge with the previous partial result, since a
+        # re-ask under a smaller budget is meant to complete cleanly on its
+        # own, and mixing salvaged fragments from two different requests risks
+        # duplicate/inconsistent candidates.
+        #
+        # Configurable via [architect]:
+        #   truncation_retry_max    — how many shrink attempts after the
+        #                             first try (default 2; 0 disables this
+        #                             and preserves the old "keep whatever
+        #                             was salvaged from the first response"
+        #                             behaviour).
+        #   truncation_shrink_factor — multiplier applied to max_tasks on each
+        #                              shrink (default 0.5; clamped to (0, 1)
+        #                              and to never fail to shrink at all).
+        _retry_max = self._config.getint("architect", "truncation_retry_max", fallback=2)
+        _retry_max = max(0, _retry_max)
         try:
-            _RETRY_DELAYS = [float(x.strip()) for x in _delays_raw.split(",") if x.strip()]
+            _shrink_factor = float(
+                self._config.get("architect", "truncation_shrink_factor", fallback="0.5")
+            )
         except ValueError:
-            logger.warning(
-                "architect: invalid [architect] retry_delays_sec=%r — using default [5, 15, 30].",
-                _delays_raw,
+            _shrink_factor = 0.5
+        if not (0.0 < _shrink_factor < 1.0):
+            _shrink_factor = 0.5
+
+        def _shrink(n: int) -> int:
+            """Reduce max_tasks by _shrink_factor, always making forward
+            progress: never returns a value >= n when n > 1, floors at 1."""
+            reduced = math.floor(n * _shrink_factor)
+            if reduced >= n:
+                reduced = n - 1
+            return max(1, reduced)
+
+        def _call_and_parse(max_tasks: int) -> "tuple[list[CandidateTask] | None, bool]":
+            """One LLM call + parse at a given max_tasks budget.
+
+            Returns ``(candidates_or_None, truncated)``. ``None`` candidates
+            means the call itself failed after all transient-error retries
+            (unrelated to truncation — see the network-retry loop below);
+            ``truncated`` is only meaningful when candidates is not None.
+            """
+            user_msg = _tmpl.format(
+                goal=goal,
+                cluster=cluster.name,
+                file_listing=file_listing,
+                file_contents=file_contents,
+                max_tasks=max_tasks,
             )
-            _RETRY_DELAYS = [5, 15, 30]
 
-        raw_text = ""
-        last_exc: Exception | None = None
-
-        for _attempt, _delay in enumerate([0] + _RETRY_DELAYS, start=1):
-            if _delay:
-                logger.warning(
-                    "review_one_cluster: retrying cluster %r in %ds "
-                    "(attempt %d/%d) after: %s",
-                    cluster.name, _delay, _attempt, 1 + len(_RETRY_DELAYS), last_exc,
-                )
-                time.sleep(_delay)
-
-            try:
-                tokens_list: list[str] = []
-
-                def streaming_callback(token: str) -> None:
-                    sys.stdout.write(token)
-                    sys.stdout.flush()
-                    tokens_list.append(token)
-
-                print("\n🧠 [LIVE ARCHITECT STREAMING THINKING & RESPONSE]:")
-                returned = _llm_stream.request_completion(
-                    url=url,
-                    headers=headers,
-                    payload=payload,
-                    timeout=self._timeout,
-                    stream=True,
-                    on_token=streaming_callback,
-                    api_format=self._api_format,
-                    ssl_context=self._ssl_context,
-                )
-                # request_completion returns the full accumulated response; prefer it
-                # and fall back to the streamed tokens if the return is empty.
-                raw_text = returned or "".join(tokens_list)
-                print("\n" + "═" * 80 + "\n")
-                last_exc = None
-                break  # success — exit retry loop
-
-            except Exception as exc:
-                last_exc = exc
-                exc_str = str(exc)
-                # Only retry on transient server-side errors (5xx) or connection
-                # failures, not deterministic 4xx client errors. Prefer the real
-                # status from exc.code (urllib's HTTPError); only fall back to a
-                # word-boundary scan of the message for non-HTTP errors, to avoid
-                # false positives from substrings like a model name "gpt-4-5000".
-                _http_status: int = 0
-                _code = getattr(exc, "code", None)
-                if isinstance(_code, int):
-                    _http_status = _code
-                else:
-                    _status_match = _re.search(r"\b([1-5]\d{2})\b", exc_str)
-                    if _status_match:
-                        _http_status = int(_status_match.group(1))
-                _is_transient = (
-                    (500 <= _http_status <= 599)
-                    or "ConnectionRefused" in exc_str
-                    or "Connection refused" in exc_str
-                    or "timed out" in exc_str.lower()
-                    or "timeout" in exc_str.lower()
-                )
-                if not _is_transient or _attempt > len(_RETRY_DELAYS):
-                    break  # non-retryable or retries exhausted — fall through
-
-        if last_exc is not None:
-            logger.warning(
-                "review_one_cluster: LLM call failed for cluster %r after %d attempt(s): %s",
-                cluster.name, _attempt, last_exc,
+            url, headers, payload = _llm_stream.build_chat_request(
+                base_url=self._base_url, api_key=self._api_key, model=self._model,
+                api_format=self._api_format, temperature=self._temperature,
+                max_tokens=self._max_tokens, system=self._system, user_msg=user_msg,
+                num_ctx=self._num_ctx, think=self._think,
             )
+
+            # Trace the outgoing call.
             tracer.event(
-                source="llm", target="architect", kind="llm_response",
-                content=f"[ERROR] {last_exc}", params={"cluster": cluster.name},
+                source="architect",
+                target="llm",
+                kind="llm_request",
+                content=user_msg,
+                params={"model": self._model, "temperature": self._temperature,
+                        "cluster": cluster.name, "max_tasks": max_tasks},
             )
-            # Return None (not []) so callers can distinguish "call failed" from
-            # "call succeeded but LLM produced no valid candidates".  The checkpoint
-            # must NOT record a failed batch; returning None signals that.
-            return None
 
-        # Strip reasoning tokens before JSON parsing.
-        cleaned = strip_think(raw_text)
+            # AUTO-BUG-8 fix: configurable retry backoff. Previously hardcoded to
+            # [5, 15, 30] (~50s total) regardless of deployment — for a local
+            # Ollama instance still loading a model into memory, that's ~50s of
+            # silent retrying inside this call before the cluster fails open.
+            _delays_raw = self._config.get("architect", "retry_delays_sec", fallback="5,15,30")
+            try:
+                _RETRY_DELAYS = [float(x.strip()) for x in _delays_raw.split(",") if x.strip()]
+            except ValueError:
+                logger.warning(
+                    "architect: invalid [architect] retry_delays_sec=%r — using default [5, 15, 30].",
+                    _delays_raw,
+                )
+                _RETRY_DELAYS = [5, 15, 30]
 
-        tracer.event(
-            source="llm",
-            target="architect",
-            kind="llm_response",
-            content=cleaned,
-            params={"cluster": cluster.name},
-        )
+            raw_text = ""
+            last_exc: Exception | None = None
+            _attempt = 1
 
-        return self._parse_candidates(cleaned, cluster.name, cluster.files)
+            for _attempt, _delay in enumerate([0] + _RETRY_DELAYS, start=1):
+                if _delay:
+                    logger.warning(
+                        "review_one_cluster: retrying cluster %r in %ds "
+                        "(attempt %d/%d) after: %s",
+                        cluster.name, _delay, _attempt, 1 + len(_RETRY_DELAYS), last_exc,
+                    )
+                    time.sleep(_delay)
+
+                try:
+                    tokens_list: list[str] = []
+
+                    def streaming_callback(token: str) -> None:
+                        sys.stdout.write(token)
+                        sys.stdout.flush()
+                        tokens_list.append(token)
+
+                    print("\n🧠 [LIVE ARCHITECT STREAMING THINKING & RESPONSE]:")
+                    returned = _llm_stream.request_completion(
+                        url=url,
+                        headers=headers,
+                        payload=payload,
+                        timeout=self._timeout,
+                        stream=True,
+                        on_token=streaming_callback,
+                        api_format=self._api_format,
+                        ssl_context=self._ssl_context,
+                    )
+                    # request_completion returns the full accumulated response; prefer it
+                    # and fall back to the streamed tokens if the return is empty.
+                    raw_text = returned or "".join(tokens_list)
+                    print("\n" + "═" * 80 + "\n")
+                    last_exc = None
+                    break  # success — exit retry loop
+
+                except Exception as exc:
+                    last_exc = exc
+                    exc_str = str(exc)
+                    # Only retry on transient server-side errors (5xx) or connection
+                    # failures, not deterministic 4xx client errors. Prefer the real
+                    # status from exc.code (urllib's HTTPError); only fall back to a
+                    # word-boundary scan of the message for non-HTTP errors, to avoid
+                    # false positives from substrings like a model name "gpt-4-5000".
+                    _http_status: int = 0
+                    _code = getattr(exc, "code", None)
+                    if isinstance(_code, int):
+                        _http_status = _code
+                    else:
+                        _status_match = _re.search(r"\b([1-5]\d{2})\b", exc_str)
+                        if _status_match:
+                            _http_status = int(_status_match.group(1))
+                    _is_transient = (
+                        (500 <= _http_status <= 599)
+                        or "ConnectionRefused" in exc_str
+                        or "Connection refused" in exc_str
+                        or "timed out" in exc_str.lower()
+                        or "timeout" in exc_str.lower()
+                    )
+                    if not _is_transient or _attempt > len(_RETRY_DELAYS):
+                        break  # non-retryable or retries exhausted — fall through
+
+            if last_exc is not None:
+                logger.warning(
+                    "review_one_cluster: LLM call failed for cluster %r after %d attempt(s): %s",
+                    cluster.name, _attempt, last_exc,
+                )
+                tracer.event(
+                    source="llm", target="architect", kind="llm_response",
+                    content=f"[ERROR] {last_exc}", params={"cluster": cluster.name},
+                )
+                # None (not []) so callers can distinguish "call failed" from
+                # "call succeeded but LLM produced no valid candidates".  The
+                # checkpoint must NOT record a failed batch; None signals that.
+                return None, False
+
+            # Strip reasoning tokens before JSON parsing.
+            cleaned = strip_think(raw_text)
+
+            tracer.event(
+                source="llm",
+                target="architect",
+                kind="llm_response",
+                content=cleaned,
+                params={"cluster": cluster.name, "max_tasks": max_tasks},
+            )
+
+            return self._parse_candidates_ex(cleaned, cluster.name, cluster.files)
+
+        max_tasks = _base_max_tasks
+        candidates, truncated = _call_and_parse(max_tasks)
+
+        _shrink_attempts = 0
+        while (
+            candidates is not None
+            and truncated
+            and _shrink_attempts < _retry_max
+            and max_tasks > 1
+        ):
+            new_max_tasks = _shrink(max_tasks)
+            _shrink_attempts += 1
+            logger.warning(
+                "review_one_cluster [%s]: response truncated at max_tasks=%d "
+                "(shrink-retry %d/%d) — re-asking with max_tasks=%d.",
+                cluster.name, max_tasks, _shrink_attempts, _retry_max, new_max_tasks,
+            )
+            max_tasks = new_max_tasks
+            candidates, truncated = _call_and_parse(max_tasks)
+
+        if candidates is not None and truncated:
+            # Retries exhausted (or disabled via truncation_retry_max=0) and
+            # the LAST attempt was still truncated — keep whatever got
+            # salvaged rather than discarding it outright; this matches the
+            # pre-AUTO-H4 fail-open behaviour for the final attempt.
+            logger.warning(
+                "review_one_cluster [%s]: still truncated after %d shrink-retry "
+                "attempt(s) (max_tasks=%d) — keeping %d salvaged candidate(s).",
+                cluster.name, _shrink_attempts, max_tasks, len(candidates),
+            )
+
+        return candidates
 
     def _parse_candidates(
         self, text: str, cluster_name: str, cluster_files: "list[str] | None" = None
@@ -854,6 +940,29 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
         logged and dropped.  Any parse error is logged and returns [].
 
         Fail-closed: never returns a partially-constructed candidate on error.
+
+        Thin backward-compatible wrapper around :meth:`_parse_candidates_ex`,
+        which additionally reports whether the JSON array looked truncated
+        (used by ``_review_one_cluster``'s AUTO-H4 shrink-retry). Kept
+        separate so existing callers (tests included) that only want the
+        candidate list don't need to unpack a tuple.
+        """
+        candidates, _truncated = self._parse_candidates_ex(text, cluster_name, cluster_files)
+        return candidates
+
+    def _parse_candidates_ex(
+        self, text: str, cluster_name: str, cluster_files: "list[str] | None" = None
+    ) -> "tuple[list[CandidateTask], bool]":
+        """Same parsing as :meth:`_parse_candidates`, additionally returning
+        whether the raw text looked like a truncated JSON array (mid-object
+        cutoff salvaged via ``_salvage_json_objects``) rather than either a
+        clean parse or a wholesale garbage/non-JSON response.
+
+        AUTO-H4: this distinction feeds ``_review_one_cluster``'s shrink-retry
+        — only a genuine truncation (the model ran out of output tokens
+        mid-array) justifies re-asking with a smaller ``max_tasks`` budget;
+        a non-JSON reply or an empty valid array is a different failure mode
+        and shrinking the request wouldn't address it.
         """
         # Strip optional markdown code fences the model may emit despite instructions.
         stripped = text.strip()
@@ -865,6 +974,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 inner_lines = inner_lines[:-1]
             stripped = "\n".join(inner_lines).strip()
 
+        truncated = False
         try:
             data = json.loads(stripped)
         except json.JSONDecodeError as exc:
@@ -875,6 +985,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
             # finish and drop only the truncated tail.
             salvaged = _salvage_json_objects(stripped)
             if salvaged:
+                truncated = True
                 logger.warning(
                     "_parse_candidates [%s]: array was truncated (%s) — "
                     "salvaged %d complete task object(s) from the prefix.",
@@ -886,14 +997,14 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                     "_parse_candidates [%s]: JSON decode failed: %s\nRaw text: %.400s",
                     cluster_name, exc, text,
                 )
-                return []
+                return [], False
 
         if not isinstance(data, list):
             logger.warning(
                 "_parse_candidates [%s]: expected JSON array, got %s",
                 cluster_name, type(data).__name__,
             )
-            return []
+            return [], False
 
         candidates: list[CandidateTask] = []
         for i, item in enumerate(data):
@@ -1058,7 +1169,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 )
                 candidates = candidates[:cap]
 
-        return candidates
+        return candidates, truncated
 
     def _build_file_contents(self, files: list[str], base_dir: Path) -> str:
         """Read and annotate file contents for the prompt.
