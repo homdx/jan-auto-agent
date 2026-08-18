@@ -343,8 +343,16 @@ class TestShrinkRetryDoesNotOverfire:
         self, cfg, cluster_and_base
     ) -> None:
         """AC-H4-6: non-JSON, non-salvageable text is a different failure
-        mode — shrinking max_tasks wouldn't fix a model ignoring the
-        format instructions, so this must not be retried either."""
+        mode from AUTO-H4's truncation — max_tasks must NOT shrink for it
+        (this is what this test actually guards; see the shrink-retry
+        tests above for how a shrink would look). It IS still eligible
+        for AUTO-H5's plain retry (same request, same max_tasks) — a
+        model ignoring the JSON-only instruction is exactly the
+        "unsalvageable" bucket AUTO-H5 exists to plain-retry, since it's
+        often a one-off decoding hiccup rather than a structural budget
+        problem. With the default empty_response_retry_max=2, a garbage
+        response that never changes is retried twice (3 calls total)
+        before the batch gives up with 0 candidates."""
         cluster, base_dir = cluster_and_base
         reviewer = _reviewer(cfg)
         with patch(
@@ -352,8 +360,14 @@ class TestShrinkRetryDoesNotOverfire:
         ) as mock_llm:
             results = reviewer.review_clusters([cluster], base_dir, goal="improve code")
 
-        assert mock_llm.call_count == 1
+        # AUTO-H5's default plain-retry budget: 1 initial + 2 retries.
+        assert mock_llm.call_count == 3
         assert results == []
+        # The actual AC-H4-6 claim: max_tasks must stay fixed across all
+        # attempts — this is what distinguishes "unsalvageable, plain
+        # retry" from AUTO-H4's shrink-retry, not merely the call count.
+        msgs = _user_messages(mock_llm)
+        assert all("up to 5 concrete tasks" in m for m in msgs)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

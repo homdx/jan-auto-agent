@@ -244,15 +244,22 @@ def test_agents_ini_has_creative_coder_keys():
     cfg.read("agents.ini")
     assert cfg.has_option("coder", "num_ctx_creative"),    "missing [coder] num_ctx_creative"
     assert cfg.has_option("coder", "max_tokens_creative"), "missing [coder] max_tokens_creative"
+    # NOTE: agents.ini was retuned for an 8192-token base context (was 4096
+    # when this test was first written); num_ctx_creative is now equal to
+    # the base num_ctx (see agents.ini's own comment on why it's kept
+    # explicit rather than removed) and max_tokens_creative was rescaled
+    # accordingly. See agents.ini's [coder] section for the current math.
     assert int(cfg.get("coder", "num_ctx_creative"))    == 8192
-    assert int(cfg.get("coder", "max_tokens_creative")) == 2048
+    assert int(cfg.get("coder", "max_tokens_creative")) == 2800
 
 
 def test_agents_ini_has_creative_search_key():
     cfg = configparser.ConfigParser()
     cfg.read("agents.ini")
     assert cfg.has_option("search", "max_file_kb_creative"), "missing [search] max_file_kb_creative"
-    assert int(cfg.get("search", "max_file_kb_creative")) == 400
+    # NOTE: rescaled from 400 when agents.ini moved from a 4096- to an
+    # 8192-token base context — see agents.ini's [search] section.
+    assert int(cfg.get("search", "max_file_kb_creative")) == 550
 
 
 def test_agents_ini_has_auto_creative_keys():
