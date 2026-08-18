@@ -759,13 +759,35 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 reduced = n - 1
             return max(1, reduced)
 
-        def _call_and_parse(max_tasks: int) -> "tuple[list[CandidateTask] | None, bool]":
+        # AUTO-H5: plain retry on an unsalvageable (empty/garbage/degenerate)
+        # response — a distinct failure mode from AUTO-H4's truncation.
+        # There's no partial content here to blame on a tight max_tasks
+        # budget, so shrinking wouldn't help; the SAME request is re-sent
+        # as-is, since this is typically a one-off decoding hiccup (a
+        # model that degenerates into repeating "title": "title": ... until
+        # it hits its token cap, or a flaky upstream/proxy returning an
+        # empty body) rather than a structural sizing problem.
+        #
+        # Configurable via [architect]:
+        #   empty_response_retry_max — how many plain retries after the
+        #                              first try when a response is
+        #                              unsalvageable (default 2; 0 disables
+        #                              this and preserves the old "0
+        #                              candidates from this batch, move on"
+        #                              behaviour for that failure mode).
+        _empty_retry_max = self._config.getint("architect", "empty_response_retry_max", fallback=2)
+        _empty_retry_max = max(0, _empty_retry_max)
+
+        def _call_and_parse(max_tasks: int) -> "tuple[list[CandidateTask] | None, bool, bool]":
             """One LLM call + parse at a given max_tasks budget.
 
-            Returns ``(candidates_or_None, truncated)``. ``None`` candidates
-            means the call itself failed after all transient-error retries
-            (unrelated to truncation — see the network-retry loop below);
-            ``truncated`` is only meaningful when candidates is not None.
+            Returns ``(candidates_or_None, truncated, unsalvageable)``.
+            ``None`` candidates means the call itself failed after all
+            transient-error retries (unrelated to either AUTO-H4/H5 —
+            see the network-retry loop below); ``truncated`` and
+            ``unsalvageable`` are only meaningful when candidates is not
+            ``None``, and are mutually exclusive (see
+            ``_parse_candidates_ex``'s docstring).
             """
             user_msg = _tmpl.format(
                 goal=goal,
@@ -883,7 +905,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 # None (not []) so callers can distinguish "call failed" from
                 # "call succeeded but LLM produced no valid candidates".  The
                 # checkpoint must NOT record a failed batch; None signals that.
-                return None, False
+                return None, False, False
 
             # Strip reasoning tokens before JSON parsing.
             cleaned = strip_think(raw_text)
@@ -899,34 +921,62 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
             return self._parse_candidates_ex(cleaned, cluster.name, cluster.files)
 
         max_tasks = _base_max_tasks
-        candidates, truncated = _call_and_parse(max_tasks)
+        candidates, truncated, unsalvageable = _call_and_parse(max_tasks)
 
         _shrink_attempts = 0
-        while (
-            candidates is not None
-            and truncated
-            and _shrink_attempts < _retry_max
-            and max_tasks > 1
-        ):
-            new_max_tasks = _shrink(max_tasks)
-            _shrink_attempts += 1
-            logger.warning(
-                "review_one_cluster [%s]: response truncated at max_tasks=%d "
-                "(shrink-retry %d/%d) — re-asking with max_tasks=%d.",
-                cluster.name, max_tasks, _shrink_attempts, _retry_max, new_max_tasks,
-            )
-            max_tasks = new_max_tasks
-            candidates, truncated = _call_and_parse(max_tasks)
+        _empty_attempts = 0
+        # Single adaptive loop: on each iteration, react to whichever
+        # failure mode THIS attempt actually hit — a batch can legitimately
+        # flip between them (e.g. truncated on attempt 1, unsalvageable on
+        # a shrunk attempt 2) — rather than committing to one strategy for
+        # the whole retry budget upfront. Each failure mode has its own
+        # independent attempt budget so one doesn't steal retries from the
+        # other.
+        while candidates is not None and (truncated or unsalvageable):
+            if truncated:
+                if _shrink_attempts >= _retry_max or max_tasks <= 1:
+                    break
+                max_tasks = _shrink(max_tasks)
+                _shrink_attempts += 1
+                logger.warning(
+                    "review_one_cluster [%s]: response truncated "
+                    "(shrink-retry %d/%d) — re-asking with max_tasks=%d.",
+                    cluster.name, _shrink_attempts, _retry_max, max_tasks,
+                )
+            else:  # unsalvageable
+                if _empty_attempts >= _empty_retry_max:
+                    break
+                _empty_attempts += 1
+                logger.warning(
+                    "review_one_cluster [%s]: response unsalvageable (empty, "
+                    "degenerate, or non-JSON) — plain retry %d/%d at the "
+                    "same max_tasks=%d.",
+                    cluster.name, _empty_attempts, _empty_retry_max, max_tasks,
+                )
+            candidates, truncated, unsalvageable = _call_and_parse(max_tasks)
 
         if candidates is not None and truncated:
-            # Retries exhausted (or disabled via truncation_retry_max=0) and
-            # the LAST attempt was still truncated — keep whatever got
-            # salvaged rather than discarding it outright; this matches the
-            # pre-AUTO-H4 fail-open behaviour for the final attempt.
+            # Shrink-retries exhausted (or disabled via
+            # truncation_retry_max=0) and the LAST attempt was still
+            # truncated — keep whatever got salvaged rather than
+            # discarding it outright; this matches the pre-AUTO-H4
+            # fail-open behaviour for the final attempt.
             logger.warning(
                 "review_one_cluster [%s]: still truncated after %d shrink-retry "
                 "attempt(s) (max_tasks=%d) — keeping %d salvaged candidate(s).",
                 cluster.name, _shrink_attempts, max_tasks, len(candidates),
+            )
+        if candidates is not None and unsalvageable:
+            # Plain retries exhausted (or disabled via
+            # empty_response_retry_max=0) and the response is still
+            # unsalvageable — nothing to keep this time; fail open with 0
+            # candidates for this batch, same as the pre-AUTO-H5 behaviour,
+            # but only after actually trying instead of giving up on the
+            # first empty/garbage reply.
+            logger.warning(
+                "review_one_cluster [%s]: still unsalvageable after %d plain "
+                "retry attempt(s) — giving up on this batch with 0 candidates.",
+                cluster.name, _empty_attempts,
             )
 
         return candidates
@@ -943,26 +993,43 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
 
         Thin backward-compatible wrapper around :meth:`_parse_candidates_ex`,
         which additionally reports whether the JSON array looked truncated
-        (used by ``_review_one_cluster``'s AUTO-H4 shrink-retry). Kept
-        separate so existing callers (tests included) that only want the
-        candidate list don't need to unpack a tuple.
+        (AUTO-H4 shrink-retry) or was unsalvageable garbage/empty (AUTO-H5
+        plain retry). Kept separate so existing callers (tests included)
+        that only want the candidate list don't need to unpack a tuple.
         """
-        candidates, _truncated = self._parse_candidates_ex(text, cluster_name, cluster_files)
+        candidates, _truncated, _unsalvageable = self._parse_candidates_ex(
+            text, cluster_name, cluster_files,
+        )
         return candidates
 
     def _parse_candidates_ex(
         self, text: str, cluster_name: str, cluster_files: "list[str] | None" = None
-    ) -> "tuple[list[CandidateTask], bool]":
+    ) -> "tuple[list[CandidateTask], bool, bool]":
         """Same parsing as :meth:`_parse_candidates`, additionally returning
-        whether the raw text looked like a truncated JSON array (mid-object
-        cutoff salvaged via ``_salvage_json_objects``) rather than either a
-        clean parse or a wholesale garbage/non-JSON response.
+        two failure-classification flags consumed by ``_review_one_cluster``:
 
-        AUTO-H4: this distinction feeds ``_review_one_cluster``'s shrink-retry
-        — only a genuine truncation (the model ran out of output tokens
-        mid-array) justifies re-asking with a smaller ``max_tasks`` budget;
-        a non-JSON reply or an empty valid array is a different failure mode
-        and shrinking the request wouldn't address it.
+        ``truncated`` (AUTO-H4): the raw text looked like a JSON array cut
+        off mid-object (at least one complete object was salvaged via
+        ``_salvage_json_objects`` from an otherwise-unparseable tail). This
+        means the model tried to fit more into this response than its
+        output-token budget allowed — shrinking ``max_tasks`` and re-asking
+        is the appropriate fix.
+
+        ``unsalvageable`` (AUTO-H5): the raw text was NOT valid JSON and
+        NOTHING could be salvaged from it at all — an empty response, a
+        degenerate/repetitive non-JSON ramble, or valid JSON that wasn't
+        even a list. This is a different failure mode from truncation:
+        there's no partial content to blame on a tight token budget, so
+        shrinking ``max_tasks`` wouldn't address it — a plain retry of the
+        SAME request is the appropriate fix, since it's often a one-off
+        decoding hiccup (or, over a flaky proxy/router, a genuinely empty
+        upstream response) rather than a structural budget problem.
+
+        The two flags are mutually exclusive: ``truncated`` implies at
+        least one usable candidate was salvaged; ``unsalvageable`` implies
+        zero. A clean parse (including a clean, validly-empty ``"[]"``
+        response — the model legitimately found nothing to propose) sets
+        both to ``False`` and must NOT be retried by either mechanism.
         """
         # Strip optional markdown code fences the model may emit despite instructions.
         stripped = text.strip()
@@ -993,18 +1060,29 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 )
                 data = salvaged
             else:
+                # AUTO-H5: nothing salvageable at all — an empty response
+                # (`text == ""`), a degenerate repetitive ramble that never
+                # produces one complete `{...}` object, or garbage that
+                # isn't JSON in the first place. Distinct from `truncated`
+                # above precisely because there is no partial content to
+                # build on; flagged so the caller can retry the SAME
+                # request rather than shrinking a budget that isn't the
+                # actual problem here.
                 logger.warning(
                     "_parse_candidates [%s]: JSON decode failed: %s\nRaw text: %.400s",
                     cluster_name, exc, text,
                 )
-                return [], False
+                return [], False, True
 
         if not isinstance(data, list):
+            # Valid JSON, but not the array shape we asked for (e.g. a bare
+            # object or string) — equally unsalvageable: there is no
+            # per-item content to extract from a non-list top level.
             logger.warning(
                 "_parse_candidates [%s]: expected JSON array, got %s",
                 cluster_name, type(data).__name__,
             )
-            return [], False
+            return [], False, True
 
         candidates: list[CandidateTask] = []
         for i, item in enumerate(data):
@@ -1169,7 +1247,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 )
                 candidates = candidates[:cap]
 
-        return candidates, truncated
+        return candidates, truncated, False
 
     def _build_file_contents(self, files: list[str], base_dir: Path) -> str:
         """Read and annotate file contents for the prompt.

@@ -664,6 +664,14 @@ def main():
 
     # ── VALIDATE-PLAN MODE (AUTO-H1) ────────────────────────────────────
     if args.validate_plan:
+        if not os.path.exists(args.config):
+            print(
+                f"Error: --config file not found: {args.config!r}. "
+                f"Check the path and extension (a common mistake is a typo "
+                f"like 'agents_128k.in' instead of 'agents_128k.ini').",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         from tools.auto.plan_validator import run_validate
         sys.exit(run_validate(base_dir=base_dir, config_path=args.config))
 
@@ -672,6 +680,25 @@ def main():
         goal = args.auto.strip()
         if not goal:
             print("Error: --auto requires a non-empty goal string.", file=sys.stderr)
+            sys.exit(1)
+        # A missing/misspelled --config path used to fail silently deep
+        # inside the pipeline (ConfigParser.read() on a nonexistent file
+        # is a no-op, not an error) and only surfaced several steps later,
+        # once the architect stage tried to read API settings from an
+        # empty config, as a confusing "NoSectionError: No section:
+        # 'api_local'" with a traceback pointing nowhere near the actual
+        # cause. Fail loudly here instead, at the one place that knows the
+        # path came straight from the user's command line — this check is
+        # deliberately NOT inside AutoController itself, since tests
+        # construct it directly with a nonexistent config_path on purpose
+        # (as shorthand for "use coded defaults").
+        if not os.path.exists(args.config):
+            print(
+                f"Error: --config file not found: {args.config!r}. "
+                f"Check the path and extension (a common mistake is a typo "
+                f"like 'agents_128k.in' instead of 'agents_128k.ini').",
+                file=sys.stderr,
+            )
             sys.exit(1)
         from tools.auto.controller import run_auto
         exit_code = run_auto(

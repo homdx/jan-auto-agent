@@ -105,6 +105,20 @@ the files it was shown.
   just losing the truncated tail task. Each re-ask is a fresh, independent
   call — results are never merged across attempts, only the last
   attempt's outcome is kept.
+- **AUTO-H5 — plain retry on an unsalvageable response.** A different
+  failure mode from AUTO-H4: an empty response, a degenerate/repetitive
+  non-JSON ramble (a model stuck repeating `"title": "title": ...` until
+  it hits its token cap), prose instead of JSON, or JSON that isn't even a
+  list — nothing at all could be salvaged, as opposed to AUTO-H4's "at
+  least one task was salvaged from an otherwise-cut-off array." Since
+  there's no partial content to blame on a tight budget, shrinking
+  `max_tasks` wouldn't help; the batch is instead **re-asked with the
+  SAME request unchanged** (`[architect] empty_response_retry_max`,
+  default 2 attempts) — this is typically a one-off decoding hiccup or a
+  flaky upstream/proxy returning an empty body, not a sizing problem. The
+  two mechanisms are independent (separate attempt budgets) and can both
+  fire across different attempts of the same batch if the failure mode
+  changes between retries.
 - **Architect checkpoint** — see [Resumability](#resumability).
 
 ### 4. Gate 1 — filtering candidate tasks (before any code is written)

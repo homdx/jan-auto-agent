@@ -259,6 +259,15 @@ class AutoController:
         # (defaults to "code", so existing configs are unaffected). self.config
         # is likewise parsed exactly once and reused everywhere, instead of
         # re-reading agents.ini from disk on each call.
+        #
+        # NOTE: a nonexistent config_path is intentionally NOT an error here
+        # — self.config just stays empty and every getter below falls back
+        # to its coded default. Many tests rely on this ("none.ini" as
+        # shorthand for "use defaults"), and AutoController itself has no
+        # way to distinguish "user made a typo" from "test wants defaults
+        # on purpose". The CLI entry point (main.py) is where a real path
+        # typo should be caught loudly instead — see main.py's --config
+        # handling for --auto/--validate-plan.
         self.config = configparser.ConfigParser(inline_comment_prefixes=(';', '#'))
         if Path(config_path).exists():
             self.config.read(config_path, encoding="utf-8")
