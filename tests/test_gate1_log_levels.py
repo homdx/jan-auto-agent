@@ -28,7 +28,9 @@ before each candidate, for both stages.
 from __future__ import annotations
 
 import configparser
+import json
 import logging
+import re
 import sys
 import textwrap
 from pathlib import Path
@@ -136,6 +138,19 @@ def _candidate(*, symbol: str, title: str = "Add input validation") -> Candidate
     )
 
 
+def _confirmed_for_prompt(url, headers, payload, **kwargs):
+    """AUTO-H3-compatible mock: always confirms, grounded in a real line
+    pulled from whatever code block Stage B was actually shown — needed
+    here because a single fixed evidence string wouldn't match every
+    symbol (parse_config vs. stable_func have different bodies)."""
+    messages = payload.get("messages", [])
+    user = next((m.get("content", "") for m in messages if m.get("role") == "user"), "")
+    m = re.search(r"```\n(.*?)\n```", user, re.S)
+    code = m.group(1) if m else ""
+    evidence = next((ln.strip() for ln in code.splitlines() if ln.strip()), "def ")
+    return json.dumps({"verdict": "confirmed", "evidence": evidence, "reason": "x"})
+
+
 class TestExistenceRejectionIsInfoNotWarning:
 
     def test_missing_symbol_logs_at_info(self, filt, repo, caplog):
@@ -160,7 +175,8 @@ class TestPresenceConfirmedIsLoggedAtInfo:
         with caplog.at_level(logging.INFO, logger="tools.auto.gate1_filter"):
             with patch(
                 "tools.llm_stream.request_completion",
-                return_value='{"verdict": "confirmed", "reason": "still missing validation"}',
+                return_value='{"verdict": "confirmed", "evidence": "return raw", '
+                             '"reason": "still missing validation"}',
             ):
                 accepted, rejected = filt.filter([c], repo)
         assert len(accepted) == 1
@@ -173,7 +189,8 @@ class TestPresenceConfirmedIsLoggedAtInfo:
         with caplog.at_level(logging.WARNING, logger="tools.auto.gate1_filter"):
             with patch(
                 "tools.llm_stream.request_completion",
-                return_value='{"verdict": "confirmed", "reason": "still missing validation"}',
+                return_value='{"verdict": "confirmed", "evidence": "return raw", '
+                             '"reason": "still missing validation"}',
             ):
                 filt.filter([c], repo)
         assert not any("CONFIRMED" in r.message for r in caplog.records)
@@ -230,7 +247,7 @@ class TestProgressOutput:
         c2 = _candidate(symbol="stable_func", title="Task Two")
         with patch(
             "tools.llm_stream.request_completion",
-            return_value='{"verdict": "confirmed", "reason": "x"}',
+            side_effect=_confirmed_for_prompt,
         ):
             filt.filter([c1, c2], repo)
         out = capsys.readouterr().out
@@ -242,7 +259,7 @@ class TestProgressOutput:
         c2 = _candidate(symbol="stable_func", title="Task Two")
         with patch(
             "tools.llm_stream.request_completion",
-            return_value='{"verdict": "confirmed", "reason": "x"}',
+            side_effect=_confirmed_for_prompt,
         ):
             filt.filter([c1, c2], repo)
         out = capsys.readouterr().out
@@ -257,7 +274,7 @@ class TestProgressOutput:
         c2 = _candidate(symbol="parse_config", title="Real")
         with patch(
             "tools.llm_stream.request_completion",
-            return_value='{"verdict": "confirmed", "reason": "x"}',
+            side_effect=_confirmed_for_prompt,
         ):
             filt.filter([c1, c2], repo)
         out = capsys.readouterr().out

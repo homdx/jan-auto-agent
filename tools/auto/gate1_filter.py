@@ -64,6 +64,7 @@ from tools.auto.architect import CandidateTask
 from tools.auto.gate1_grounding import (
     callee_context, config_fallback_note, target_file_context,
     collect_contract_note, existing_test_coverage_note, truncation_safety_note,
+    intentional_design_note, test_helper_note,
 )
 from tools.block_extractor import extract_block, extract_module_docstring
 import tools.llm_stream as _llm_stream
@@ -83,6 +84,11 @@ _SYSTEM_PROMPT_CODE = (
     "already covering the claim, in the code shown and any grounding notes "
     "below it — a claim about missing error handling or missing test "
     "coverage is REJECTED if that handling/coverage already exists. "
+    "A confident, specific-sounding claim is not evidence — plan-generating "
+    "models regularly reference the wrong function, describe a bug a nearby "
+    "comment already documents as fixed, or restate what a docstring/comment "
+    "says instead of what the code does. Trust only what you can quote "
+    "verbatim from the code block. "
     "Do NOT suggest improvements. Do NOT run the code. "
     "Return ONLY a JSON object — no prose, no markdown fences, no preamble."
 )
@@ -93,6 +99,8 @@ _SYSTEM_PROMPT_DOCS = (
     "Your ONLY job is to verify whether the described problem is actually present "
     "in the text shown, and has NOT already been fixed. "
     "Do NOT suggest improvements. Treat the content as documentation, not code. "
+    "Trust only what you can quote verbatim from the text shown, not how "
+    "confident the claim sounds. "
     "Return ONLY a JSON object — no prose, no markdown fences, no preamble."
 )
 
@@ -102,6 +110,8 @@ _SYSTEM_PROMPT_CREATIVE = (
     "Your ONLY job is to verify whether the described issue is actually present "
     "in the text shown, and has NOT already been addressed. "
     "Do NOT suggest improvements. Treat the content as creative writing, not code. "
+    "Trust only what you can quote verbatim from the text shown, not how "
+    "confident the claim sounds. "
     "Return ONLY a JSON object — no prose, no markdown fences, no preamble."
 )
 
@@ -130,8 +140,19 @@ Code at that location:
 Is the claimed problem actually present in the code shown above, \
 and NOT already fixed?
 
-Return ONLY this JSON (no extra keys):
-{{"verdict": "confirmed" | "rejected", "reason": "<one sentence explaining your decision>"}}
+Before answering, find the SPECIFIC line(s) in the code above that the \
+claim depends on. If you cannot point to an actual line that supports the \
+claim, the claim is not present — reject it, even if the instruction \
+sounds confident, cites a bug-tracker ID, or references a comment near \
+the code (a comment describing a bug is not evidence the bug is still \
+unfixed — check the code the comment sits next to, not just the comment).
+
+Return ONLY this JSON (no extra keys). "evidence" is REQUIRED whenever \
+verdict is "confirmed" — a substring copied verbatim from the code block \
+above that proves the claim; use "" only when rejecting:
+{{"verdict": "confirmed" | "rejected", "evidence": "<exact verbatim \
+substring from the code block above, or "" if rejecting>", \
+"reason": "<one sentence explaining your decision>"}}
 """
 
 # _MAX_CONTEXT_LINES and _MAX_BLOCK_CHARS are now read from [gate1] in
@@ -621,7 +642,16 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         if fb_note:
             notes.append(fb_note)
 
+        id_note = intentional_design_note(code_block)
+        if id_note:
+            notes.append(id_note)
+
         loc = candidate.cited_location
+
+        th_note = test_helper_note(loc.file, loc.symbol)
+        if th_note:
+            notes.append(th_note)
+
         if base_dir is not None and not loc.new_file:
             try:
                 tf_note = target_file_context(
@@ -765,7 +795,9 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             )
             return False, reason
 
-        confirmed, reason, unparseable = self._parse_presence_response(cleaned, candidate.title)
+        confirmed, reason, unparseable = self._parse_presence_response(
+            cleaned, candidate.title, code_block=code_block,
+        )
 
         # AUTO-CR-31-style re-ask: an unparseable verdict (bad JSON, wrong
         # shape, unrecognised verdict word — as opposed to a genuine
@@ -782,8 +814,8 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                 "\n\nIMPORTANT: your previous reply was not valid JSON with a "
                 "\"verdict\" field. Reply AGAIN with ONLY a JSON object of the "
                 "exact form {\"verdict\": \"confirmed\" or \"rejected\", "
-                "\"reason\": \"...\"} — no reasoning, no markdown fences, no "
-                "other text."
+                "\"evidence\": \"...\" or \"\", \"reason\": \"...\"} — no "
+                "reasoning, no markdown fences, no other text."
             )
             try:
                 cleaned2 = _call(user_msg + nudge)
@@ -794,7 +826,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                 )
                 return confirmed, reason
             confirmed2, reason2, unparseable2 = self._parse_presence_response(
-                cleaned2, candidate.title,
+                cleaned2, candidate.title, code_block=code_block,
             )
             if not unparseable2:  # second answer was clear — use it
                 return confirmed2, reason2
@@ -809,6 +841,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         self,
         text: str,
         candidate_title: str,
+        code_block: str = "",
     ) -> tuple[bool, str, bool]:
         """Parse the LLM's JSON verdict.  Fail-closed on any error.
 
@@ -819,6 +852,22 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         parse failure. Callers use this distinction to re-ask once on
         ``unparseable`` (mirroring AUTO-CR-31's Gate-2 retry) without
         biasing genuinely-rejected candidates toward acceptance.
+
+        AUTO-H3 (evidence check): whenever *code_block* is non-empty (every
+        production call site always passes it — the only caller that
+        doesn't is a direct-unit-test call with no code to check against),
+        a "confirmed" verdict is additionally required to supply a
+        non-empty ``"evidence"`` string that actually occurs in
+        *code_block* (whitespace-normalised substring match). This check is
+        unconditional on the key being present at all — the prompt template
+        in this module always asks for "evidence" in its JSON schema, so a
+        model that omits the key entirely is exhibiting the exact same
+        failure to ground its answer as one that fills it with a fabricated
+        quote, and both are treated identically as a downgrade to
+        rejection rather than as a formatting nuance eligible for the
+        unparseable/re-ask path — the JSON shape was fine, the model just
+        couldn't back up its own answer, which is itself the informative
+        outcome.
         """
         stripped = text.strip()
         # Strip optional markdown fences.
@@ -844,10 +893,21 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             logger.warning("Gate1._parse_presence_response [%s]: %s", candidate_title, reason)
             return False, reason, True
 
-        verdict = (data.get("verdict") or "").strip().lower()
-        reason  = (data.get("reason")  or "").strip()
+        verdict  = (data.get("verdict")  or "").strip().lower()
+        reason   = (data.get("reason")   or "").strip()
+        evidence = (data.get("evidence") or "").strip()
 
         if verdict == "confirmed":
+            if code_block and not _evidence_found(evidence, code_block):
+                msg = (
+                    "verdict was 'confirmed' but no matching evidence quote "
+                    f"was supplied ({evidence!r}) — treating as unsupported, "
+                    "failing closed"
+                )
+                logger.info(
+                    "Gate1._parse_presence_response [%s]: %s", candidate_title, msg,
+                )
+                return False, msg, False
             return True, reason or "LLM confirmed problem is present", False
         if verdict == "rejected":
             return False, reason or "LLM found problem absent or already fixed", False
@@ -1027,3 +1087,35 @@ def _truncate(text: str, max_chars: int = _DEFAULT_MAX_BLOCK_CHARS) -> str:
     if len(text) <= max_chars:
         return text
     return text[:max_chars] + f"\n... [truncated — {len(text) - max_chars} more chars]"
+
+
+# AUTO-H3: minimum evidence length before a quote counts as "real". Guards
+# against a model satisfying the letter of the requirement with something
+# trivially present everywhere (a single keyword like "def", a stray
+# punctuation mark) instead of an actual line that supports the verdict.
+_MIN_EVIDENCE_CHARS = 8
+
+
+def _evidence_found(evidence: str, code_block: str) -> bool:
+    """Whitespace-normalised substring check: does *evidence* actually
+    occur in *code_block*?
+
+    Deliberately simple (no fuzzy/edit-distance matching): the point is to
+    catch a model asserting "confirmed" with nothing behind it, not to be
+    lenient about minor formatting drift. A model that read the code
+    carefully enough to ground its verdict can copy a real line closely
+    enough to survive whitespace normalisation; a model that's pattern-
+    matching on the instruction text usually can't produce anything that
+    passes even this loose a bar.
+
+    Note this is a presence check, not a relevance check: it confirms the
+    quote is real, not that it actually supports the specific claim. It
+    closes the "confirmed with a fabricated citation" hole; it does not by
+    itself prove the citation is on-topic — that judgment still rests with
+    the LLM and the surrounding grounding notes.
+    """
+    ev = " ".join(evidence.split())
+    if len(ev) < _MIN_EVIDENCE_CHARS:
+        return False
+    block = " ".join(code_block.split())
+    return ev in block

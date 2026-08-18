@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import configparser
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -154,7 +155,13 @@ def _fake_gate1_llm(*args, **kwargs):
     user = next((m.get("content", "") for m in messages if m.get("role") == "user"), "")
     if "FALSE_POSITIVE_MARKER" in user:
         return json.dumps({"verdict": "rejected", "reason": "already fixed by a prior commit"})
-    return json.dumps({"verdict": "confirmed", "reason": "problem still present"})
+    m = re.search(r"```\n(.*?)\n```", user, re.S)
+    code = m.group(1) if m else ""
+    evidence = next((ln.strip() for ln in code.splitlines() if ln.strip()), "def ")
+    return json.dumps({
+        "verdict": "confirmed", "evidence": evidence,
+        "reason": "problem still present",
+    })
 
 
 def _write_matching_improvements_md(repo: Path, tasks: list[dict]) -> str:

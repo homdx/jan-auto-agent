@@ -459,3 +459,134 @@ def truncation_safety_note(code_block: str) -> Optional[str]:
         "error), weigh that uncertainty into your reason rather than "
         "assuming either way."
     )
+
+
+# ── AUTO-H3-1: documented-intentional-design cue scan ──────────────────────
+#
+# Motivated by a distinct false-positive class from AUTO-H2's: not "the
+# crash is prevented elsewhere" (callee_context) or "the config call is
+# already safe" (config_fallback_note), but "the code's own comments say
+# this exact shape is deliberate" — a ``# noqa: BLE001`` next to a broad
+# ``except Exception:``, a docstring line explaining a clamp is there on
+# purpose, etc.
+#
+# Same non-rejecting pattern as the rest of this module: flag it, let
+# Stage B weigh it. A keyword match is not proof the specific claim is
+# wrong — only that the surrounding code asserts its own shape is
+# intentional, which the LLM should read before agreeing to change it.
+#
+# Negation-aware on purpose: "not intentional", "unintentional",
+# "no longer deliberate" etc. are the OPPOSITE signal (the comment is
+# actively disclaiming design intent, often flagging a known bug), and
+# firing this note on that phrasing would push the LLM to reject a
+# genuine, author-acknowledged bug report — the exact false positive this
+# module exists to avoid, just inverted. ``_NEGATION_RE`` looks a short
+# window before the cue for a negating word and, if found, treats it as
+# not a match.
+_INTENTIONAL_DESIGN_CUES = re.compile(
+    r"\b(deliberate(?:ly)?|intentional(?:ly)?|on purpose|noqa|hardening|"
+    r"negative case|toy module|not meant to run as real code|control case)\b",
+    re.IGNORECASE,
+)
+
+_NEGATION_RE = re.compile(
+    r"\b(not|isn't|isnt|wasn't|wasnt|no longer|never|un)\W{0,3}$",
+    re.IGNORECASE,
+)
+
+_NEGATION_WINDOW_CHARS = 20
+
+
+def intentional_design_note(code_block: str) -> Optional[str]:
+    """AUTO-H3-1. Return a counter-note when *code_block* itself (comments
+    or docstring inside the cited symbol, not just the module docstring)
+    contains language asserting its current shape is deliberate.
+
+    Distinct from the module-docstring note in ``_build_grounding_notes``:
+    that one only fires for fixture files whose docstring lives at the top
+    of the module. This one catches the same intent when it's stated
+    inline, right next to the code being judged.
+
+    Skips matches where the cue is itself negated ("not intentional",
+    "unintentional side effect") — that phrasing disclaims design intent
+    rather than asserting it, and is common in comments explaining a KNOWN
+    bug, which is exactly the case this note must not suppress.
+    """
+    for m in _INTENTIONAL_DESIGN_CUES.finditer(code_block):
+        window_start = max(0, m.start() - _NEGATION_WINDOW_CHARS)
+        preceding = code_block[window_start:m.start()]
+        # "un" is checked as a tight prefix (e.g. "unintentional") rather
+        # than via the windowed search used for the other negators, since
+        # it attaches directly to the word instead of preceding it with
+        # whitespace.
+        word = m.group(0)
+        if word.lower().startswith("intentional") and code_block[
+            max(0, m.start() - 2):m.start()
+        ].lower() == "un":
+            continue
+        if _NEGATION_RE.search(preceding):
+            continue
+        return (
+            "NOTE (automated): the code above contains its own comment/docstring "
+            f"language ({word!r}) suggesting the current behavior is "
+            "deliberate, not an oversight. If the claimed problem is exactly the "
+            "behavior that comment defends, treat that as strong evidence to "
+            "reject — read the full sentence around it before confirming."
+        )
+    return None
+
+
+# ── AUTO-H3-2: test-support-helper detection (Python-specific) ─────────────
+#
+# A recurring false-positive shape found in review: candidates proposing to
+# add try/except or input validation to a *private helper inside a test
+# file* (``_git_init``, ``_make_candidate``, ``_run_with_fakes`` — anything
+# ``tests/**`` whose own name isn't ``test_*``). These already fail loudly
+# by design (e.g. ``subprocess.run(..., check=True)``, a bare dict index)
+# so a broken fixture points at the exact failing setup step. Swallowing
+# that into a try/except or a custom validation error trades a precise
+# traceback for a vaguer one.
+#
+# This heuristic is deliberately Python-only. It leans on two Python-
+# specific conventions that don't hold in other languages: a leading
+# underscore marking "not part of the public surface" (meaningless in,
+# say, Go or Java, where visibility is structural, not name-based) and
+# dotted module.symbol citations. Applying it outside Python risks
+# misreading an unrelated naming convention as this exact signal, so it
+# explicitly checks the file extension and says nothing for anything else
+# — silence, not a guess, is the safe default for a language this
+# heuristic wasn't designed for.
+_TEST_PATH_RE = re.compile(r"(^|/)tests?/")
+_PYTHON_FILE_RE = re.compile(r"\.pyi?$")
+
+
+def test_helper_note(cited_file: str, cited_symbol: "str | None") -> Optional[str]:
+    """AUTO-H3-2. Return a counter-note when the citation is a private
+    helper function living inside a Python test file, rather than a
+    ``def test_*`` case itself or production code.
+
+    Restricted to ``.py``/``.pyi`` files — see module comment above for
+    why this convention doesn't generalise to other languages.
+    """
+    if not cited_symbol or not cited_file:
+        return None
+    if not _PYTHON_FILE_RE.search(cited_file):
+        return None
+    if not _TEST_PATH_RE.search(cited_file):
+        return None
+    leaf = cited_symbol.rsplit(".", 1)[-1]
+    if leaf.startswith("test_") or not leaf.startswith("_"):
+        # A test case itself, or a public (non-underscore) helper — outside
+        # this heuristic's scope; say nothing rather than guess.
+        return None
+    return (
+        "NOTE (automated): this is a private helper function inside a Python "
+        f"test file (`{cited_file}`), not production code under test. Test "
+        "helpers conventionally fail loudly — an unhandled exception here "
+        "points precisely at the setup step that broke. Wrapping it in "
+        "try/except or adding input validation usually makes test failures "
+        "harder to diagnose, not easier, even though it reads like a "
+        "generic improvement. Only confirm if the instruction shows the "
+        "current loud failure is actually misleading (e.g. it masks the "
+        "real cause), not just that a failure is theoretically possible."
+    )

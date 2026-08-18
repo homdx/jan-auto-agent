@@ -23,6 +23,7 @@ Scope
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -173,8 +174,18 @@ def _make_fake_llm(candidates: list) -> callable:
             return json.dumps(candidates)
 
         if "static code reviewer" in system:
-            # Gate-1 LLM stage — always confirm
-            return json.dumps({"verdict": "confirmed", "reason": "Valid improvement"})
+            # Gate-1 LLM stage — always confirm, grounded in a real line
+            # from the code block shown so AUTO-H3's evidence check passes.
+            user_msg = next(
+                (m["content"] for m in messages if m.get("role") == "user"), ""
+            )
+            m = re.search(r"```\n(.*?)\n```", user_msg, re.S)
+            code = m.group(1) if m else ""
+            evidence = next((ln.strip() for ln in code.splitlines() if ln.strip()), "def ")
+            return json.dumps({
+                "verdict": "confirmed", "evidence": evidence,
+                "reason": "Valid improvement",
+            })
 
         if "code-change validator" in system:
             # Gate-2 validator — always approve

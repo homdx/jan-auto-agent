@@ -43,6 +43,7 @@ from __future__ import annotations
 import configparser
 import json
 import os
+import re
 from pathlib import Path
 from unittest.mock import patch
 
@@ -309,7 +310,18 @@ def _prompt_aware_llm(*, payload: dict, **_kwargs) -> str:
         w in user_msg.lower() for w in _FIXTURE_SIGNAL_WORDS
     ):
         return json.dumps({"verdict": "rejected", "reason": "docstring marks this as an intentional fixture"})
-    return json.dumps({"verdict": "confirmed", "reason": "no contradicting evidence found"})
+    # AUTO-H3: a "confirmed" verdict now has to back itself with a real
+    # quote from the code block Stage B was shown (see gate1_filter's
+    # evidence check) — pull the cited symbol's own def line straight out
+    # of the prompt so this mock satisfies the same contract a real,
+    # attentive model would.
+    m = re.search(r"```\n(.*?)\n```", user_msg, re.S)
+    code = m.group(1) if m else ""
+    evidence = next((ln.strip() for ln in code.splitlines() if ln.strip()), "def ")
+    return json.dumps({
+        "verdict": "confirmed", "evidence": evidence,
+        "reason": "no contradicting evidence found",
+    })
 
 
 class TestCorpusPrecisionRecall:

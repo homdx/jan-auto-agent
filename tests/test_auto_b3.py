@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import configparser
 import json
+import re
 import textwrap
 from pathlib import Path
 from unittest.mock import patch
@@ -154,8 +155,20 @@ def _make_candidate(
     )
 
 
-def _confirmed_response(reason: str = "Problem is present") -> str:
-    return json.dumps({"verdict": "confirmed", "reason": reason})
+def _confirmed_response(reason: str = "Problem is present", evidence: str = "return raw") -> str:
+    return json.dumps({"verdict": "confirmed", "evidence": evidence, "reason": reason})
+
+
+def _confirmed_response_for_prompt(*, payload: dict, **_kwargs) -> str:
+    """Mock LLM callable (for tests spanning multiple, differently-shaped
+    candidates) that grounds its "confirmed" verdict in whatever code was
+    actually shown, instead of a single fixed evidence string that may not
+    appear in every candidate's code block."""
+    user_msg = payload["messages"][-1]["content"]
+    m = re.search(r"```\n(.*?)\n```", user_msg, re.S)
+    code = m.group(1) if m else ""
+    line = next((ln.strip() for ln in code.splitlines() if ln.strip()), "def ")
+    return json.dumps({"verdict": "confirmed", "evidence": line, "reason": "Problem is present"})
 
 
 def _rejected_response(reason: str = "Problem not found") -> str:
@@ -284,7 +297,7 @@ class TestDuplicateMerging:
 
         with patch(
             "tools.llm_stream.request_completion",
-            return_value=_confirmed_response(),
+            side_effect=_confirmed_response_for_prompt,
         ):
             accepted, rejected = filt.filter([c1, c2], repo)
 
@@ -513,7 +526,7 @@ class TestIntegration:
 
         with patch(
             "tools.llm_stream.request_completion",
-            return_value=_confirmed_response(),
+            side_effect=_confirmed_response_for_prompt,
         ):
             accepted, rejected = filt.filter([c1, c2], repo)
 
