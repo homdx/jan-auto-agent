@@ -24,6 +24,7 @@ from __future__ import annotations
 import argparse
 import configparser
 import re
+import sys
 from pathlib import Path
 
 from tools.auto.summary_memory import make_summary_memory
@@ -46,13 +47,30 @@ def main() -> None:
     args = ap.parse_args()
 
     base = Path(args.base)
+    # AUTO-FIX (medium-priority audit): this script is the fast edit-run-
+    # eyeball loop for iterating on story-bible/synopsis quality — a typo'd
+    # --base used to fail confusingly deep inside the first chapter read
+    # instead of immediately and clearly.
+    if not base.exists():
+        print(f"error: --base directory does not exist: {base}", file=sys.stderr)
+        sys.exit(1)
+    if not base.is_dir():
+        print(f"error: --base is not a directory: {base}", file=sys.stderr)
+        sys.exit(1)
 
     # IMPORTANT: same loader as main.py / controller.py — strips inline ; and # comments.
     # encoding="utf-8" is REQUIRED on Windows: Python there defaults to the
     # locale codec (cp1252) and crashes on the UTF-8 bytes in the .ini
     # (UnicodeDecodeError: 'charmap' codec can't decode byte 0x90 ...).
     cfg = configparser.ConfigParser(inline_comment_prefixes=(";", "#"))
-    cfg.read(args.config, encoding="utf-8")
+    # AUTO-FIX (medium-priority audit): a malformed --config file used to
+    # raise a raw configparser.Error with no indication of which file, deep
+    # into argument setup instead of at the point of failure.
+    try:
+        cfg.read(args.config, encoding="utf-8")
+    except configparser.Error as exc:
+        print(f"error: --config {args.config} is not a valid .ini file: {exc}", file=sys.stderr)
+        sys.exit(1)
 
     if args.fresh:
         for f in ("synopsis.md", "story_bible.md"):
@@ -91,7 +109,17 @@ def main() -> None:
         print("NOTE: story_bible_creative=false — bible disabled; only synopsis will be built.")
 
     for ch in chapters:
-        text = (base / ch).read_text(encoding="utf-8")
+        # AUTO-FIX (medium-priority audit): an unreadable/missing chapter
+        # file (typo in the positional chapters list, permission issue,
+        # non-UTF-8 file) used to kill the whole run partway through —
+        # annoying specifically because this script exists for a fast
+        # iterate-and-eyeball loop where you want partial progress, not an
+        # all-or-nothing crash.
+        try:
+            text = (base / ch).read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            print(f"  [!] skipping {ch}: could not read ({exc})", file=sys.stderr)
+            continue
         print(f"\n=== processing {ch} ({len(text)} chars) ===")
         mem.update(ch, base_dir=str(base))           # synopsis section
         if bible is not None:

@@ -269,8 +269,22 @@ class AutoController:
         # typo should be caught loudly instead — see main.py's --config
         # handling for --auto/--validate-plan.
         self.config = configparser.ConfigParser(inline_comment_prefixes=(';', '#'))
+        # AUTO-FIX (medium-priority audit): the NOTE above already makes a
+        # missing config_path a non-error by design — extend the same
+        # "fall back to defaults" treatment to a config file that EXISTS
+        # but fails to parse (bad .ini syntax), rather than letting
+        # AutoController.__init__ crash on a config typo. This is a
+        # narrower fix than "catch everything": a genuinely malformed file
+        # still leaves self.config effectively empty (same end state as
+        # "missing"), so every getter's fallback still applies uniformly.
         if Path(config_path).exists():
-            self.config.read(config_path, encoding="utf-8")
+            try:
+                self.config.read(config_path, encoding="utf-8")
+            except configparser.Error as exc:
+                logger.warning(
+                    "AutoController: %s is malformed (%s) — proceeding "
+                    "with default settings", config_path, exc,
+                )
         # AUTO-CR-10: normalise task_mode (typo-tolerant) so a misspelling like
         # 'creativy' is corrected with a loud warning instead of silently
         # degrading to code mode.

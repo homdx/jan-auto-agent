@@ -236,8 +236,20 @@ def validate_plan(
         )
 
     cfg = configparser.ConfigParser(inline_comment_prefixes=(';', '#'))
+    # AUTO-FIX (medium-priority audit): a malformed (present but broken)
+    # config file used to raise a raw configparser.Error mid-validate-plan
+    # with no path context. Fall back to defaults (same as a missing file
+    # already did) rather than letting the whole --validate-plan run die
+    # on a config typo — this call only re-checks an existing plan, it
+    # doesn't need [auto]/[gate1_validate] to be perfect to do that.
     if Path(config_path).exists():
-        cfg.read(config_path, encoding="utf-8")
+        try:
+            cfg.read(config_path, encoding="utf-8")
+        except configparser.Error as exc:
+            logger.warning(
+                "validate_plan: %s is malformed (%s) — proceeding with "
+                "defaults for all config-driven options", config_path, exc,
+            )
     raw_mode = cfg.get("auto", "task_mode", fallback="code")
     task_mode, mode_warning = normalize_task_mode(raw_mode)
     if mode_warning:
@@ -249,7 +261,21 @@ def validate_plan(
     # here always takes the resume/load path and never raises the
     # "different goal" guard, regardless of what goal the plan was built
     # under.
-    stored_goal = json.loads(plan_path.read_text(encoding="utf-8")).get("goal", "")
+    # AUTO-FIX (high-priority audit): reading plan.json here used to be
+    # completely unguarded, so a corrupted plan.json (interrupted write,
+    # manual edit gone wrong) crashed --validate-plan itself — the exact
+    # command an operator runs to check a plan's health — with a bare,
+    # path-less JSONDecodeError instead of a clear, actionable message.
+    try:
+        stored_goal = json.loads(plan_path.read_text(encoding="utf-8")).get("goal", "")
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"validate_plan: {plan_path} could not be read as JSON ({exc}). "
+            f"The plan file may be corrupted or was interrupted mid-write. "
+            f"Check for a {plan_path}.bak snapshot, or re-run "
+            f'`python main.py --auto "<goal>" --dry-run --base {base_path}` '
+            f"to regenerate it."
+        ) from exc
     state.initialise(stored_goal, base_path)
 
     pending = [

@@ -204,14 +204,31 @@ class CommitOnSuccess:
                 "cannot update synopsis for %s.", target_files,
             )
             return
+        # AUTO-FIX (medium-priority audit): each file's failure was already
+        # logged individually, but for a multi-chapter creative task (a
+        # supported, tested shape — see AUTO-CR-16 in the docstring above)
+        # a second/third chapter's silently-failed synopsis update was easy
+        # to miss among per-file log lines. Collect failures and log one
+        # aggregate summary at the end so a partial failure is visible at a
+        # glance, without changing the fail-open behavior (a synopsis error
+        # still never disrupts the commit).
+        failed: list[str] = []
         for chapter_file in target_files:
             try:
                 self._summary_memory.update(chapter_file, base_dir=base_dir)
             except Exception as exc:
+                failed.append(chapter_file)
                 logger.error(
                     "CommitOnSuccess: synopsis update failed for %s: %s — "
                     "commit outcome is unaffected.", chapter_file, exc,
                 )
+        if failed:
+            logger.error(
+                "CommitOnSuccess: synopsis update failed for %d/%d target "
+                "file(s): %s — commit outcome is unaffected, but synopsis.md "
+                "may be missing updates for these chapters.",
+                len(failed), len(target_files), ", ".join(failed),
+            )
 
     # ── AUTO-CR-23-1: story bible hook ───────────────────────────────────────
 

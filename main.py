@@ -177,8 +177,20 @@ class Orchestrator(OrchestratorActions):
               f"(model={self.model}, api_format={self.api_format}, max_iter={self.max_iterations})")
 
     def load_config(self, config_path: str) -> None:
+        # AUTO-FIX (medium-priority audit): a malformed (not just missing)
+        # agents.ini used to raise a raw configparser.Error with no
+        # indication of which file was at fault — annoying with the ~8
+        # agents_*.ini variants in rotation (32k/64k/128k/256k/fast_cpu/
+        # slow_cpu/stub/base). Now a parse failure is reported with the
+        # path and re-raised as a clear, actionable error instead of a
+        # bare traceback from deep inside configparser.
         if os.path.exists(config_path):
-            self.config.read(config_path, encoding="utf-8")
+            try:
+                self.config.read(config_path, encoding="utf-8")
+            except configparser.Error as exc:
+                raise configparser.Error(
+                    f"{config_path} is not a valid .ini file: {exc}"
+                ) from exc
         
         self.max_iterations = self.config.getint("loop", "max_iterations", fallback=3)
         self.timeout_seconds = self.config.getint("loop", "timeout_seconds", fallback=240)

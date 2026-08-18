@@ -236,9 +236,35 @@ class OuterLoop:
                                        impl_versions_used)
 
             # Failed round → write ONE compact feedback file, then fresh round.
-            fpath = self._write_round_feedback(task_id, rnd, res, impl_version)
-            feedback_files.append(str(fpath))
-            self.state.log(f"{task_id}: round {rnd} failed — wrote {fpath.name}")
+            #
+            # AUTO-FIX (high-priority audit): this write went through
+            # StateStore.write_task_file with no error handling at all — a
+            # disk/permission failure here used to propagate straight out
+            # of run_task, contradicting this method's own documented
+            # "Never raises" contract and crashing the whole multi-hour
+            # --auto session on what should be a recoverable, single-round
+            # hiccup. Now the failure is logged and the round proceeds
+            # without a persisted feedback file for this round (later
+            # _build_impl_history calls degrade gracefully on a missing
+            # feedback_round_*.md — see its own file-read guard) rather
+            # than aborting the whole task.
+            try:
+                fpath = self._write_round_feedback(task_id, rnd, res, impl_version)
+                feedback_files.append(str(fpath))
+                self.state.log(f"{task_id}: round {rnd} failed — wrote {fpath.name}")
+            except OSError as exc:
+                logger.error(
+                    "OuterLoop: failed to write round-%d feedback for %s — %s "
+                    "(continuing without a persisted feedback file for this round)",
+                    rnd, task_id, exc,
+                )
+                try:
+                    self.state.log(
+                        f"{task_id}: round {rnd} failed — feedback write also "
+                        f"failed ({exc})"
+                    )
+                except OSError:
+                    pass  # run.log itself is unwritable too — already logged above
 
             # LOOP-2: check whether a rewrite is due (rnd >= 3, (rnd-1) %
             # rewrite_every_n_rounds == 0, rewrites_done < max_rewrites, and a

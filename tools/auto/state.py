@@ -701,6 +701,25 @@ class StateStore:
         the new complete file, never a partial write. The pre-write ``.bak``
         copy is best-effort (not itself atomic) but never touches *path*, so
         an interrupted backup can't put the primary file at risk.
+
+        AUTO-FIX (medium-priority audit): the temp-file write and the
+        ``os.replace`` swap used to be completely unguarded — every task-
+        status update in the whole pipeline goes through this method, so an
+        ``OSError`` here (disk full, permission denied, filesystem gone
+        read-only mid-run) propagated as a bare, path-less traceback and
+        could crash a multi-hour ``--auto`` run. Now the tmp file is
+        cleaned up on failure (mirroring ``atomic_write_text``'s existing
+        behavior in ``utils.py``) and the re-raised exception names *path*
+        explicitly.
+
+        Raises
+        ------
+        OSError
+            Re-raised (via ``from exc``, with *path* named in the message)
+            if the write or the atomic rename fails. This is intentionally
+            NOT swallowed — a silently failed state write is worse than a
+            loud one; callers that need this to be non-fatal must catch it
+            themselves.
         """
         if path.exists():
             try:
@@ -711,8 +730,15 @@ class StateStore:
                     "StateStore: could not refresh backup for %s: %s", path, exc,
                 )
         tmp_path = path.with_suffix(path.suffix + ".tmp")
-        tmp_path.write_text(content, encoding="utf-8")
-        os.replace(tmp_path, path)
+        try:
+            tmp_path.write_text(content, encoding="utf-8")
+            os.replace(tmp_path, path)
+        except OSError as exc:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise OSError(f"StateStore: failed to write {path} ({exc})") from exc
 
     def _save_plan(self) -> None:
         self._atomic_write(

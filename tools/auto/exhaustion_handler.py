@@ -232,7 +232,20 @@ class ExhaustionHandler:
         title: str,
         body: str,
     ) -> Path:
-        """Create a ticket via TicketStore (AUTO-D1) and return its path."""
+        """Create a ticket via TicketStore (AUTO-D1) and return its path.
+
+        AUTO-FIX (medium-priority audit): this had zero error handling
+        around the TicketStore calls — a disk/permission failure here used
+        to propagate straight out of the exhaustion-handling path, which is
+        itself the fallback-of-last-resort for a task that already
+        exhausted every normal attempt. Crashing here compounds an already
+        bad situation (the task's own failure investigation becomes
+        uninvestigatable). Now a ticket-store failure is logged and this
+        returns the ticket's expected path anyway so the caller's log/trace
+        messages still name a location, even though the file itself may not
+        exist — degrading gracefully instead of losing the whole BLOCKED
+        transition over a ticket-write failure.
+        """
         ts = make_ticket_store(self._state.agent_dir)
         ticket = make_ticket(
             id=ticket_id,
@@ -241,11 +254,19 @@ class ExhaustionHandler:
             title=f"Deferred: {title}",
             body=body,
         )
-        # Idempotent: if a ticket already exists (e.g. resume), skip creation.
-        if ts.exists(ticket_id):
-            logger.debug("_open_ticket: %s already exists — skipping create", ticket_id)
-        else:
-            ts.create(ticket)
+        try:
+            # Idempotent: if a ticket already exists (e.g. resume), skip creation.
+            if ts.exists(ticket_id):
+                logger.debug("_open_ticket: %s already exists — skipping create", ticket_id)
+            else:
+                ts.create(ticket)
+        except OSError as exc:
+            logger.error(
+                "ExhaustionHandler: failed to create ticket %s for task %s — %s "
+                "(the task is still marked BLOCKED; the investigation ticket "
+                "itself is missing/incomplete)",
+                ticket_id, linked_task, exc,
+            )
         return ts.path(ticket_id)
 
 

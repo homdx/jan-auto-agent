@@ -173,7 +173,17 @@ def _parse_llm_summary(raw: str) -> LLMSummary:
         return LLMSummary(purpose="", notes="")
     purpose = data.get("purpose") or ""
     notes = data.get("notes") or ""
-    return LLMSummary(purpose=str(purpose), notes=str(notes))
+    # AUTO-FIX (medium-priority audit): `str(purpose)`/`str(notes)` used to
+    # blindly coerce ANY JSON value — a list, a nested object, a number —
+    # into its Python str() representation (e.g. "[1, 2]" or "{'a': 1}")
+    # instead of treating a non-string value as the malformed reply it is.
+    # That let garbage silently pollute the cached collect artifact as if
+    # it were a legitimate purpose/notes string. Same fail-open philosophy
+    # as the rest of this function (degrade to empty, never raise) — just
+    # applied to type, not only shape.
+    if not isinstance(purpose, str) or not isinstance(notes, str):
+        return LLMSummary(purpose="", notes="")
+    return LLMSummary(purpose=purpose, notes=notes)
 
 
 # ── single-module Pass B ─────────────────────────────────────────────────────────

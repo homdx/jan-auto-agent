@@ -522,6 +522,13 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
 
     Raises urllib errors / network exceptions to the caller once retries
     (if any) are exhausted, or immediately for a non-retryable status.
+
+    AUTO-FIX (medium-priority audit): ``TimeoutError``, ``ssl.SSLError``,
+    ``ConnectionError``, and the broader ``urllib.error.URLError`` (DNS
+    failure, connection refused, etc.) are now explicitly caught and
+    retried using the same ``error_retries``/``error_retry_wait_sec``
+    budget as a retryable HTTP status, instead of propagating as a raw,
+    context-free exception on the first transient network hiccup.
     """
     # MASK-KEY-1: mask any `api_key = ...` line in the outgoing message
     # content *last*, right before the body is shaped/serialized — this is
@@ -631,6 +638,32 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
                 if on_retry:
                     on_retry(msg)
                 sleep(wait_s)
+                attempt += 1
+            except (TimeoutError, ssl.SSLError, ConnectionError, urllib.error.URLError) as e:
+                # AUTO-FIX (medium-priority audit): these previously had no
+                # explicit handling at all and propagated as a raw,
+                # low-level exception with no indication of which provider/
+                # URL was involved or how many attempts were made — easy to
+                # misread as a bug in this module rather than a flaky
+                # provider. Given several configured providers are free-tier
+                # aggregators known to drop connections under load, this
+                # reuses the same retry/backoff budget as the HTTP-status
+                # path above rather than introducing a second, divergent
+                # retry mechanism.
+                if attempt >= error_retries:
+                    raise RuntimeError(
+                        f"{type(e).__name__} calling {url}: {e} "
+                        f"(after {attempt} retr{'y' if attempt == 1 else 'ies'})"
+                    ) from e
+                msg = (
+                    f"{type(e).__name__} calling {url}: {e}, waiting "
+                    f"{error_retry_wait_sec:.1f}s and retrying "
+                    f"(attempt {attempt + 1}/{error_retries})"
+                )
+                logger.warning("request_completion: %s", msg)
+                if on_retry:
+                    on_retry(msg)
+                sleep(error_retry_wait_sec)
                 attempt += 1
 
     if not stream:
