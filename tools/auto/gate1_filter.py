@@ -735,7 +735,10 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             this parameter existed.
 
         Returns (confirmed: bool, reason: str).
-        Fail-closed: any error → (False, reason).
+        Fail-closed: any error → (False, reason), after one plain retry of
+        the LLM call itself (see AUTO-FIX comment below) — a transient
+        network/provider failure gets the same one-retry courtesy as an
+        unparseable verdict before the candidate is treated as resolved.
         """
         loc = candidate.cited_location
         location_str = _location_str(loc)
@@ -787,13 +790,38 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         try:
             cleaned = _call(user_msg)
         except Exception as exc:
-            reason = f"LLM call failed: {exc}"
-            logger.warning("Gate1._check_presence: %s — failing closed", reason)
-            tracer.event(
-                source="gate1", target="llm", kind="llm_response",
-                content=f"[ERROR] {exc}", params={"candidate": candidate.title},
+            # AUTO-FIX (found live: agents_128k.ini + kenari.id returned
+            # HTTP 400 "upstream_rejected" for three consecutive candidates
+            # within one second — a provider/config-level hiccup, not a
+            # judgment that the code was already fixed). Previously this
+            # branch had ZERO retries while the sibling "unparseable verdict"
+            # branch below already got one — an inconsistency with real
+            # consequences: a transient provider error permanently removed
+            # a possibly-still-valid task from plan.json and recorded it in
+            # IMPROVEMENTS-FALSE.md, indistinguishable from a genuine
+            # "already fixed" rejection. One plain retry (same request, no
+            # nudge needed — this isn't a formatting problem) gives a
+            # one-off network/provider blip a chance to clear before we
+            # treat the candidate as resolved.
+            logger.warning(
+                "Gate1._check_presence [%s]: LLM call failed (%s) — "
+                "retrying once before failing closed.", candidate.title, exc,
             )
-            return False, reason
+            try:
+                cleaned = _call(user_msg)
+            except Exception as exc2:
+                # NOTE: must keep the exact "LLM call failed:" prefix (see
+                # _is_technical_failure below) so this still logs at WARNING
+                # like any other real anomaly, not INFO like a routine
+                # rejection — the retry count is appended after the colon,
+                # not spliced into the matched prefix itself.
+                reason = f"LLM call failed: {exc2} (after 1 retry)"
+                logger.warning("Gate1._check_presence: %s — failing closed", reason)
+                tracer.event(
+                    source="gate1", target="llm", kind="llm_response",
+                    content=f"[ERROR] {exc2}", params={"candidate": candidate.title},
+                )
+                return False, reason
 
         confirmed, reason, unparseable = self._parse_presence_response(
             cleaned, candidate.title, code_block=code_block,
