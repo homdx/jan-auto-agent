@@ -65,6 +65,19 @@ _KEYWORD_FOR_DECL_TYPE = {
 
 
 def _text(node) -> str:
+    # AUTO-FIX (medium-priority audit, DeepSeek-plan finding): callers pass
+    # `node.child_by_field_name("name")` results straight through, and
+    # tree-sitter returns None when a grammar node is missing the
+    # requested field — a malformed parse, or simply a future grammar
+    # version adding/renaming fields. `None.text` raised an unguarded
+    # AttributeError deep inside symbol extraction, which (per
+    # scan_java_module's own contract) should degrade to a recorded
+    # parse_error, never crash the caller. Returning "" here lets every
+    # existing call site's `_text(...)` degrade gracefully — a symbol with
+    # an unrecognised name is simply an unnamed one, same handling this
+    # module already gives to other "not present in this grammar" cases.
+    if node is None:
+        return ""
     return node.text.decode("utf-8", errors="replace")
 
 

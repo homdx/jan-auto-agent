@@ -173,7 +173,25 @@ class ContextBroker:
                 continue
             found_now: list[str] = []
             for sym in remaining:
-                block = _extract(source, sym, ext)
+                # AUTO-FIX (medium-priority audit, NVIDIA-plan finding): this
+                # call used to be completely unguarded — extract_block/
+                # extract_prose_section raising on ONE file (an unusual
+                # encoding artifact, a pathological source shape) aborted
+                # resolve() for every remaining symbol across every
+                # remaining file, not just the one that triggered it. This
+                # sits on the hottest path in the whole pipeline: every
+                # Gate 1/Gate 2/coder context-injection call goes through
+                # here. Skip just the offending symbol/file pair and keep
+                # going — same fail-open posture as the rest of this method
+                # (a missing symbol is not treated as an error either).
+                try:
+                    block = _extract(source, sym, ext)
+                except Exception as exc:
+                    logger.debug(
+                        "ContextBroker: _extract failed for %r in %s (%s) — "
+                        "skipping this symbol/file pair", sym, rel, exc,
+                    )
+                    continue
                 if block.strip():
                     resolved[sym] = self._cap(block)
                     found_now.append(sym)
@@ -190,13 +208,26 @@ class ContextBroker:
                     continue
                 found_now = []
                 for sym in remaining:
-                    block = _extract(source, sym, ext)
+                    # AUTO-FIX (medium-priority audit, NVIDIA-plan finding):
+                    # same reasoning as the Pass 1 guard above — a raise here
+                    # would abort the fallback project-wide scan for every
+                    # remaining symbol over every remaining file.
+                    try:
+                        block = _extract(source, sym, ext)
+                    except Exception as exc:
+                        logger.debug(
+                            "ContextBroker: _extract failed for %r in %s "
+                            "(%s) — skipping this symbol/file pair",
+                            sym, abs_path, exc,
+                        )
+                        continue
                     if block.strip():
                         rel = str(abs_path.relative_to(base_dir))
                         capped_block = self._cap(block)
                         resolved[sym] = capped_block
                         self._resolved_cache[sym] = capped_block   # fallback hit → safe to cache
                         logger.debug(
+
                             "ContextBroker: found %r in %s (fallback search)",
                             sym, rel,
                         )

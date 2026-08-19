@@ -233,7 +233,18 @@ class LLMGate2Validator:
         self.api_key     = api_key
         self.api_format  = api_format
         self.temperature = temperature
-        self.timeout     = timeout
+        # AUTO-FIX (medium-priority audit): timeout was passed straight
+        # through with no cast/clamp, unlike max_hints just below —
+        # non-numeric or non-positive values reach urllib as-is instead of
+        # failing fast here with a clear picture of what went wrong. This
+        # is a defensive floor for direct callers (e.g. tests); the normal
+        # config-driven path already resolves a safe int upstream (the
+        # make_inner_loop factory's own try/except around config.getint)
+        # before it ever reaches here.
+        try:
+            self.timeout = max(1, int(timeout))
+        except (TypeError, ValueError):
+            self.timeout = 120
         self.max_hints   = max(1, int(max_hints))
         self.ssl_context = ssl_context
         self.base_dir    = Path(base_dir)
@@ -1632,23 +1643,57 @@ def make_inner_loop(
     active_profile = config.get("api", "active", fallback="local")
     api_section    = f"api_{active_profile}"
 
+    # AUTO-FIX (medium-priority audit): wrapped per-call, not delegated to a
+    # shared helper, so extract_config_reads (COLLECT-5) still recognizes
+    # each literal config.getX(...) call shape — see
+    # RunLimits.from_config's comment for the full reasoning. (This is the
+    # actual source of the values LLMGate2Validator.__init__ receives as
+    # plain args — the unguarded reads lived here, not in __init__ itself.)
     base_url   = config.get(api_section, "base_url",   fallback="http://localhost:1337/v1")
     api_key    = config.get(api_section, "api_key",    fallback="jan")
     model      = config.get(api_section, "model",      fallback="qwen2.5-14b-instruct")
     api_format = config.get(api_section, "api_format", fallback="openai")
-    num_ctx    = config.getint(api_section, "num_ctx",  fallback=0)
+    try:
+        num_ctx = config.getint(api_section, "num_ctx", fallback=0)
+    except ValueError as exc:
+        logger.warning("config [%s] num_ctx invalid (%s) — using 0", api_section, exc)
+        num_ctx = 0
 
-    verify_ssl = config.getboolean("api", "verify_ssl", fallback=True)
+    try:
+        verify_ssl = config.getboolean("api", "verify_ssl", fallback=True)
+    except ValueError as exc:
+        logger.warning("config [api] verify_ssl invalid (%s) — using True", exc)
+        verify_ssl = True
 
     import ssl
     from tools.llm_stream import make_unverified_context
     ssl_context: ssl.SSLContext | None = make_unverified_context() if not verify_ssl else None
 
-    max_hints    = config.getint("validator_agent", "max_hints",        fallback=3)
-    val_temp     = config.getfloat("validator_agent", "temperature",    fallback=0.1)
-    val_timeout  = config.getint("loop",              "timeout_seconds", fallback=300)
-    exec_timeout = config.getint("auto",              "exec_timeout_sec", fallback=120)
-    ws_retain    = config.getint("auto",              "workspace_retain_count", fallback=5)
+    try:
+        max_hints = config.getint("validator_agent", "max_hints", fallback=3)
+    except ValueError as exc:
+        logger.warning("config [validator_agent] max_hints invalid (%s) — using 3", exc)
+        max_hints = 3
+    try:
+        val_temp = config.getfloat("validator_agent", "temperature", fallback=0.1)
+    except ValueError as exc:
+        logger.warning("config [validator_agent] temperature invalid (%s) — using 0.1", exc)
+        val_temp = 0.1
+    try:
+        val_timeout = config.getint("loop", "timeout_seconds", fallback=300)
+    except ValueError as exc:
+        logger.warning("config [loop] timeout_seconds invalid (%s) — using 300", exc)
+        val_timeout = 300
+    try:
+        exec_timeout = config.getint("auto", "exec_timeout_sec", fallback=120)
+    except ValueError as exc:
+        logger.warning("config [auto] exec_timeout_sec invalid (%s) — using 120", exc)
+        exec_timeout = 120
+    try:
+        ws_retain = config.getint("auto", "workspace_retain_count", fallback=5)
+    except ValueError as exc:
+        logger.warning("config [auto] workspace_retain_count invalid (%s) — using 5", exc)
+        ws_retain = 5
 
     # ── Coder ─────────────────────────────────────────────────────────────────
     if coder is None:
@@ -1672,6 +1717,11 @@ def make_inner_loop(
             executor = _StubExecutor()
 
     # ── Validator ─────────────────────────────────────────────────────────────
+    try:
+        val_max_tokens = config.getint("validator_agent", "max_tokens", fallback=512)
+    except ValueError as exc:
+        logger.warning("config [validator_agent] max_tokens invalid (%s) — using 512", exc)
+        val_max_tokens = 512
     if validator is None:
         validator = LLMGate2Validator(
             base_url=base_url,
@@ -1684,7 +1734,7 @@ def make_inner_loop(
             ssl_context=ssl_context,
             base_dir=str(base_dir),
             num_ctx=num_ctx,
-            max_tokens=config.getint("validator_agent", "max_tokens", fallback=512),
+            max_tokens=val_max_tokens,
             task_mode=task_mode,
             config=config,  # AUTO-DM-5: for system prompt override lookup
         )
@@ -1693,8 +1743,13 @@ def make_inner_loop(
     # COLLECT-24: collect_bridge is threaded into the broker so pull-model
     # symbol resolution (Pass 3) can answer from collect facts, in addition
     # to InnerLoop.run_task's own static per-task block using the same bridge.
+    try:
+        _max_symbols = config.getint("context_broker", "max_symbols", fallback=20)
+    except ValueError as exc:
+        logger.warning("config [context_broker] max_symbols invalid (%s) — using 20", exc)
+        _max_symbols = 20
     broker = ContextBroker(
-        max_symbols=config.getint("context_broker", "max_symbols", fallback=20),
+        max_symbols=_max_symbols,
         collect_bridge=collect_bridge,
     )
 

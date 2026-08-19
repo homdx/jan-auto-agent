@@ -93,11 +93,38 @@ class RunLimits:
 
     @classmethod
     def from_config(cls, config: configparser.ConfigParser) -> "RunLimits":
-        """Read limits from a ``ConfigParser`` instance ([auto] section)."""
-        max_min   = config.getfloat("auto", "max_runtime_min",   fallback=0)
-        max_tasks = config.getint  ("auto", "max_tasks_per_run", fallback=0)
-        exec_to   = config.getfloat("auto", "exec_timeout_sec",  fallback=120)
-        ws_retain = config.getint  ("auto", "workspace_retain_count", fallback=5)
+        """Read limits from a ``ConfigParser`` instance ([auto] section).
+
+        AUTO-FIX (medium-priority audit): a present-but-malformed value
+        (e.g. ``max_runtime_min = abc``) used to raise a bare ValueError
+        out of configparser — fallback= only covers an absent key, not a
+        malformed one. Wrapped per-call (not delegated to a shared helper)
+        so `tools.collect.ast_facts.extract_config_reads` (COLLECT-5)
+        still recognizes each literal `config.getX(section, key,
+        fallback=...)` call site — that AST-shape matching is how the
+        `collect` static-analysis pass builds its config map, and a
+        wrapper function call would have made these reads invisible to it.
+        """
+        try:
+            max_min = config.getfloat("auto", "max_runtime_min", fallback=0)
+        except ValueError as exc:
+            logger.warning("config [auto] max_runtime_min invalid (%s) — using 0", exc)
+            max_min = 0
+        try:
+            max_tasks = config.getint("auto", "max_tasks_per_run", fallback=0)
+        except ValueError as exc:
+            logger.warning("config [auto] max_tasks_per_run invalid (%s) — using 0", exc)
+            max_tasks = 0
+        try:
+            exec_to = config.getfloat("auto", "exec_timeout_sec", fallback=120)
+        except ValueError as exc:
+            logger.warning("config [auto] exec_timeout_sec invalid (%s) — using 120", exc)
+            exec_to = 120
+        try:
+            ws_retain = config.getint("auto", "workspace_retain_count", fallback=5)
+        except ValueError as exc:
+            logger.warning("config [auto] workspace_retain_count invalid (%s) — using 5", exc)
+            ws_retain = 5
         return cls(
             max_runtime_sec   = max_min * 60,
             max_tasks_per_run = max_tasks,

@@ -140,8 +140,29 @@ class ExhaustionHandler:
             params={"task": task_id},
         )
 
+        # AUTO-FIX (high-priority audit, NVIDIA/DeepSeek-plan findings):
+        # this whole method used to have zero error handling around any of
+        # its steps — a state-write failure at ANY point (status update,
+        # knowledge-file write, run.log append) crashed handle() itself,
+        # which is already the fallback-of-last-resort path for a task
+        # that exhausted every normal retry. Losing the exhaustion-handling
+        # step ALSO means losing the investigation ticket that would have
+        # let someone diagnose why the task failed in the first place —
+        # compounding the original failure instead of degrading gracefully.
+        # Each step below is now independently guarded: a failure is logged
+        # and the method proceeds with whatever it could still produce,
+        # rather than aborting entirely partway through.
+
         # 1. Re-assert BLOCKED status (OuterLoop already sets this; idempotent).
-        self._state.set_task_status(task_id, STATUS_BLOCKED)
+        try:
+            self._state.set_task_status(task_id, STATUS_BLOCKED)
+        except Exception as exc:
+            logger.error(
+                "ExhaustionHandler: failed to set BLOCKED status for %s — %s "
+                "(continuing — the ticket/knowledge note below still give "
+                "an investigation trail even if the status write failed)",
+                task_id, exc,
+            )
 
         # 2. Build the knowledge text from accumulated round feedback.
         knowledge_text = self._build_knowledge(
@@ -149,18 +170,37 @@ class ExhaustionHandler:
         )
 
         # 3. Write .agent/tasks/<id>/knowledge.md
-        kpath = self._state.write_task_file(task_id, "knowledge.md", knowledge_text)
-        logger.info("ExhaustionHandler: wrote knowledge note → %s", kpath)
+        try:
+            kpath = self._state.write_task_file(task_id, "knowledge.md", knowledge_text)
+            logger.info("ExhaustionHandler: wrote knowledge note → %s", kpath)
+        except Exception as exc:
+            logger.error(
+                "ExhaustionHandler: failed to write knowledge.md for %s — %s",
+                task_id, exc,
+            )
+            # Fall back to the path the write *would* have used — keeps
+            # ExhaustionOutcome.knowledge_path a real Path (its own .summary()
+            # calls .name on it) even though the file itself may not exist.
+            try:
+                kpath = self._state.task_dir(task_id) / "knowledge.md"
+            except Exception:
+                kpath = Path(task_id) / "knowledge.md"
 
         # 4. Write .agent/tickets/<ticket_id>.json via TicketStore (AUTO-D1)
         tpath = self._open_ticket(ticket_id, task_id, title, knowledge_text)
         logger.info("ExhaustionHandler: opened ticket %s → %s", ticket_id, tpath)
 
         # 5. Log to run.log
-        self._state.log(
-            f"task {task_id} BLOCKED — knowledge written, "
-            f"investigation ticket {ticket_id} opened"
-        )
+        try:
+            self._state.log(
+                f"task {task_id} BLOCKED — knowledge written, "
+                f"investigation ticket {ticket_id} opened"
+            )
+        except Exception as exc:
+            logger.error(
+                "ExhaustionHandler: failed to append to run.log for %s — %s",
+                task_id, exc,
+            )
 
         tracer.event(
             "exhaustion_handler", "controller", "handled",

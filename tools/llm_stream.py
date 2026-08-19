@@ -118,8 +118,23 @@ def _extract_content(raw: dict, api_format: str) -> str:
     crashing the whole call instead of degrading to an empty reply the
     same way a filtered/empty `choices` list already does below.
     """
+    # AUTO-FIX (medium-priority audit, DeepSeek-plan finding): both
+    # dict-key accesses below (`raw["message"]`, `choices[0]["message"]`)
+    # already handle a `content` of `null` (the BUGFIX above) and an empty
+    # `choices` list (the BUGFIX below), but a genuinely malformed reply
+    # from a non-standard OpenAI-compatible backend — one missing
+    # "message" entirely, not just a null/empty content/choices field —
+    # still raised a bare KeyError with no diagnostic content. Surface the
+    # same kind of descriptive ValueError the empty-choices case already
+    # uses, rather than letting a raw KeyError propagate.
     if api_format == "ollama":
-        return (raw["message"]["content"] or "").strip()
+        try:
+            return (raw["message"]["content"] or "").strip()
+        except KeyError as exc:
+            raise ValueError(
+                f"LLM response missing expected key {exc} — raw response "
+                f"shape was unexpected (raw keys: {list(raw.keys())})"
+            ) from exc
     # openai (default)
     # BUGFIX: mirror the streaming path's empty-choices guard (introduced in
     # the "Fix llm stream" commit).  Some OpenAI-compatible backends — Jan,
@@ -137,7 +152,14 @@ def _extract_content(raw: dict, api_format: str) -> str:
             f"LLM response had no choices — likely blocked/filtered by the "
             f"backend (raw keys: {list(raw.keys())})"
         )
-    return (choices[0]["message"]["content"] or "").strip()
+    try:
+        return (choices[0]["message"]["content"] or "").strip()
+    except KeyError as exc:
+        raise ValueError(
+            f"LLM response's first choice is missing expected key {exc} — "
+            f"raw response shape was unexpected (choice keys: "
+            f"{list(choices[0].keys()) if isinstance(choices[0], dict) else type(choices[0]).__name__})"
+        ) from exc
 
 
 def _build_payload(payload: dict, api_format: str, stream: bool) -> dict:

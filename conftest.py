@@ -74,11 +74,28 @@ class ScriptTestItem(pytest.Item):
     """Runs the script in a subprocess; maps exit code to PASSED / FAILED."""
 
     def runtest(self):
-        result = subprocess.run(
-            [sys.executable, str(self.fspath)],
-            capture_output=True,
-            text=True,
-        )
+        # AUTO-FIX (medium-priority audit, DeepSeek-plan finding): no
+        # timeout= was passed to subprocess.run — a hung test_story_*.py
+        # script (an infinite loop, a stuck network call inside the
+        # script) blocked the entire test suite indefinitely with no way
+        # to recover short of killing the process manually. 300s covers
+        # every legitimate script test currently in the suite with room to
+        # spare; TimeoutExpired is reported the same way a non-zero exit
+        # already is, via ScriptTestFailed, so repr_failure's existing
+        # stdout/stderr/exit-code formatting handles it without changes.
+        try:
+            result = subprocess.run(
+                [sys.executable, str(self.fspath)],
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+        except subprocess.TimeoutExpired as exc:
+            self._stdout = exc.stdout or ""
+            self._stderr = (exc.stderr or "") + "\n[TIMEOUT] script exceeded 300s"
+            self._returncode = -1
+            raise ScriptTestFailed(-1, self._stdout, self._stderr) from exc
+
         self._stdout = result.stdout
         self._stderr = result.stderr
         self._returncode = result.returncode

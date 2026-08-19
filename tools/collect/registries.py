@@ -226,13 +226,35 @@ def _load_seed_entries(seed_path: Path) -> List[Dict[str, object]]:
     """
     if not seed_path.exists():
         return []
-    raw = yaml.safe_load(seed_path.read_text(encoding="utf-8"))
+    # AUTO-FIX (medium-priority audit, DeepSeek-plan finding): the
+    # yaml.safe_load() call itself used to be unguarded — a malformed seed
+    # YAML raised a bare yaml.YAMLError with no file-path context. This is
+    # still "allowed to raise" per the docstring above (seeding stays
+    # optional only for an *absent* file), just with a message that names
+    # the offending file.
+    try:
+        raw = yaml.safe_load(seed_path.read_text(encoding="utf-8"))
+    except yaml.YAMLError as exc:
+        raise ContractCitationError(
+            f"{seed_path}: not valid YAML ({exc})"
+        ) from exc
     if not raw:
         return []
     if not isinstance(raw, list):
         raise ContractCitationError(
             f"{seed_path}: expected a YAML list of contract entries, got {type(raw).__name__}"
         )
+    # AUTO-FIX (medium-priority audit, DeepSeek-plan finding): the list-type
+    # check above didn't verify each ELEMENT is a dict — a string or number
+    # entry passed through silently and crashed build_seed_contracts's
+    # `entry.get("name")` with an unhelpful AttributeError far from this
+    # file and with no indication of which entry (by index) was bad.
+    for i, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            raise ContractCitationError(
+                f"{seed_path}: entry {i} is a {type(entry).__name__}, "
+                f"expected a mapping with name/description/known_edge keys"
+            )
     return raw
 
 

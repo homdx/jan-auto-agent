@@ -74,7 +74,9 @@ def test_real_prompt_store_get_current_is_guarded_via_alias():
     source = (REPO_ROOT / "tools" / "prompt_store.py").read_text(encoding="utf-8")
     accesses = _accesses(source, "tools/prompt_store.py")
     by_access = {(a.location, a.access): a for a in accesses}
-    site = by_access[("tools/prompt_store.py:79", "stack[-1]")]
+    # NOTE: line number tracks the real tools/prompt_store.py::get_current
+    # source — update if that method's line position shifts.
+    site = by_access[("tools/prompt_store.py:90", "stack[-1]")]
     assert site.status == "GUARDED"
     assert site.guard
 
@@ -274,12 +276,13 @@ def test_real_view_trace_site_appears_exactly_once():
 
 def test_real_analyze_logs_done_site_appears_exactly_once_and_is_guarded():
     # A second real instance of the same shape, found while regression-
-    # testing the fix above: `done[-1]` at analyze_logs.py:1268, guarded by
-    # `if not done: continue` at line 1266, nested inside an unrelated
-    # outer block.
+    # testing the fix above: `done[-1]`, guarded by `if not done: continue`
+    # a couple of lines above it, nested inside an unrelated outer block.
+    # NOTE: line number tracks the real analyze_logs.py source — update if
+    # that function's line position shifts.
     source = (REPO_ROOT / "analyze_logs.py").read_text(encoding="utf-8")
     accesses = _accesses(source, "analyze_logs.py")
-    matches = [a for a in accesses if (a.location, a.access) == ("analyze_logs.py:1268", "done[-1]")]
+    matches = [a for a in accesses if (a.location, a.access) == ("analyze_logs.py:1282", "done[-1]")]
     assert len(matches) == 1, f"expected exactly one record, got {matches!r}"
     assert matches[0].status == "GUARDED"
 

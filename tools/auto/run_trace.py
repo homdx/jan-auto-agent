@@ -221,9 +221,24 @@ def setup_run_trace(
     trace_path = agent_dir / f"trace_{run_id}.jsonl"
 
     # ── 3–4. Configure the tracer singleton ───────────────────────────────
-    enabled         = config.getboolean("trace", "enabled",         fallback=True)
-    max_field_chars = config.getint    ("trace", "max_field_chars",  fallback=4000)
-    console_echo    = config.getboolean("trace", "console_echo",    fallback=False)
+    # AUTO-FIX (medium-priority audit): wrapped per-call, not delegated to a
+    # shared helper, so extract_config_reads (COLLECT-5) still recognizes
+    # the literal config.getX(...) call shape.
+    try:
+        enabled = config.getboolean("trace", "enabled", fallback=True)
+    except ValueError as exc:
+        logger.warning("config [trace] enabled invalid (%s) — using True", exc)
+        enabled = True
+    try:
+        max_field_chars = config.getint("trace", "max_field_chars", fallback=4000)
+    except ValueError as exc:
+        logger.warning("config [trace] max_field_chars invalid (%s) — using 4000", exc)
+        max_field_chars = 4000
+    try:
+        console_echo = config.getboolean("trace", "console_echo", fallback=False)
+    except ValueError as exc:
+        logger.warning("config [trace] console_echo invalid (%s) — using False", exc)
+        console_echo = False
 
     tracer.configure(
         enabled         = enabled,

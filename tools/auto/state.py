@@ -564,15 +564,37 @@ class StateStore:
                 # already the right answer, because progress counts are fully
                 # derivable from the plan.  So a wrong-shape file recovers
                 # exactly like a corrupt one instead of poisoning the run.
+                # AUTO-FIX (medium-priority audit, DeepSeek-plan finding):
+                # the isinstance(dict) check above accepts ANY dict, even
+                # one missing the keys this class actually depends on
+                # (done_count/pending_count/status) — e.g. progress.json
+                # truncated to just "{}" by a partial write. That silently
+                # produced a StateStore whose get_progress() callers had to
+                # each separately guess a fallback for a key that should
+                # have been there. Treat a dict missing any required key
+                # the same as a wrong-shape file: rebuild from plan.json,
+                # which is the already-established, no-data-lost recovery
+                # path for exactly this situation.
+                _required_progress_keys = {"done_count", "pending_count", "status"}
                 if isinstance(loaded, dict):
-                    self._progress = loaded
-                    return
-                logger.warning(
-                    "StateStore: progress.json holds a %s, not an object — "
-                    "rebuilding from plan.json instead (progress counts are "
-                    "fully derivable from the plan, so no data is lost).",
-                    type(loaded).__name__,
-                )
+                    _missing = _required_progress_keys - loaded.keys()
+                    if not _missing:
+                        self._progress = loaded
+                        return
+                    logger.warning(
+                        "StateStore: progress.json is missing required "
+                        "key(s) %s — rebuilding from plan.json instead "
+                        "(progress counts are fully derivable from the "
+                        "plan, so no data is lost).",
+                        sorted(_missing),
+                    )
+                else:
+                    logger.warning(
+                        "StateStore: progress.json holds a %s, not an object — "
+                        "rebuilding from plan.json instead (progress counts are "
+                        "fully derivable from the plan, so no data is lost).",
+                        type(loaded).__name__,
+                    )
             except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
                 logger.warning(
                     "StateStore: progress.json is unreadable (%s) — rebuilding "

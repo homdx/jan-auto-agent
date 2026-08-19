@@ -134,11 +134,28 @@ class CommitOnSuccess:
             logger.info(
                 "CommitOnSuccess: committed task %s → %s", task_id, sha[:12]
             )
-            self._state.set_task_status(task_id, STATUS_DONE, commit=sha)
-            self._state.log(
-                f"task {task_id} DONE — committed {sha[:12]} "
-                f"(auto({task_id}): {title})"
-            )
+            # AUTO-FIX (medium-priority audit, DeepSeek-plan finding): this
+            # state write used to be unguarded — a failure here (the same
+            # root-cause class as state.py's atomic-write gap) happened
+            # *after* the git commit had already succeeded, desyncing
+            # StateStore's view of the task (still not marked DONE) from
+            # what git history actually shows. Logging and continuing here
+            # means the commit itself — the durable, important half of this
+            # method — still stands even if the local status bookkeeping
+            # couldn't be updated.
+            try:
+                self._state.set_task_status(task_id, STATUS_DONE, commit=sha)
+                self._state.log(
+                    f"task {task_id} DONE — committed {sha[:12]} "
+                    f"(auto({task_id}): {title})"
+                )
+            except Exception as exc:
+                logger.error(
+                    "CommitOnSuccess: git commit %s succeeded for task %s, "
+                    "but updating local state failed — %s (task status may "
+                    "not reflect DONE; the commit itself is unaffected)",
+                    sha[:12], task_id, exc,
+                )
             tracer.event(
                 "commit_on_success", "controller", "committed",
                 params={"task": task_id, "sha": sha[:12]},

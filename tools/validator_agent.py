@@ -222,6 +222,33 @@ class ValidatorAgent:
             tracer.event("validator_agent", "orchestrator", "error", content=_err)
             return _err
 
+        # AUTO-FIX (medium-priority audit, DeepSeek-plan finding): valid
+        # JSON that isn't an object (a list, a string, a number) or is an
+        # object missing the required "status" key — the field the whole
+        # STRICT JSON contract described in the error message above exists
+        # to guarantee — used to sail through unchecked; the very next
+        # line's `.get("suggested_searches")` would even raise
+        # AttributeError on a non-dict reply before reaching the caller.
+        # Treat both cases the same way an unparseable reply already is —
+        # needs_fix, with feedback naming exactly what was wrong.
+        if not isinstance(parsed_result, dict) or "status" not in parsed_result:
+            logger.warning(
+                "ValidatorAgent: reply parsed as JSON but is not a valid "
+                "verdict object: %r", parsed_result,
+            )
+            _err = {
+                "status": "needs_fix",
+                "feedback": (
+                    'Your reply was valid JSON but not the required '
+                    'object shape — reply with '
+                    '{"status": "approved" | "needs_fix", "feedback": "...", '
+                    '"suggested_searches": [...]}.'
+                ),
+                "_unparseable": True,
+            }
+            tracer.event("validator_agent", "orchestrator", "error", content=_err)
+            return _err
+
         # Enforce max_hints: cap the suggested_searches list so the outer
         # loop does not expand search scope beyond the configured limit.
         if isinstance(parsed_result.get("suggested_searches"), list):

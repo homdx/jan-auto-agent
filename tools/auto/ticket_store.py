@@ -282,6 +282,22 @@ class TicketStore:
                 path, f"expected a JSON object, got {type(ticket).__name__}"
             )
             return None
+        # AUTO-FIX (medium-priority audit, DeepSeek-plan finding): a dict
+        # missing required fields (id/type/status/linked_task — the same
+        # schema make_ticket() always produces) used to pass through
+        # untouched. Callers that trust get()'s return shape (e.g.
+        # indexing ticket["status"] directly) would then crash far from
+        # here with no indication the ticket file itself was incomplete.
+        # Quarantine it the same way an unreadable or wrong-shape file
+        # already is, rather than handing back a ticket-shaped dict that
+        # isn't actually one.
+        _required_ticket_keys = {"id", "type", "status", "linked_task"}
+        _missing = _required_ticket_keys - ticket.keys()
+        if _missing:
+            self._quarantine(
+                path, f"missing required field(s) {sorted(_missing)}"
+            )
+            return None
         return ticket
 
     def _quarantine(self, path: Path, reason: str) -> None:

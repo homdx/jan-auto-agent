@@ -159,7 +159,21 @@ def sleep_with_interrupt_save(
     except KeyboardInterrupt:
         print(f"\n  💾 [{_now()}] Interrupted — "
               f"saving checkpoint to '{path}'")
-        save_state(state, path)
+        # AUTO-FIX (medium-priority audit, DeepSeek-plan finding): a
+        # save_state() failure here (disk full, permission error — exactly
+        # the kind of thing more likely mid-interrupt, e.g. a Ctrl-C
+        # during a full-disk condition) used to raise a brand-new exception
+        # from inside the KeyboardInterrupt handler, replacing the original
+        # interrupt with a confusing secondary traceback and skipping the
+        # resume-hint message and clean sys.exit(0) below. Best-effort: if
+        # the checkpoint can't be saved, say so plainly and still exit
+        # cleanly — the interrupt itself must always win.
+        try:
+            save_state(state, path)
+        except OSError as exc:
+            print(f"  ⚠  Could not save checkpoint: {exc}")
+            print("  ▶  Restart will NOT be able to resume from this point.")
+            sys.exit(0)
         loop = state.get("loop", "unknown")
         it   = state.get("iteration", "?")
         print(f"  ▶  Restart the program — "

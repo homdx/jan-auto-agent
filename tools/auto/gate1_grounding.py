@@ -121,7 +121,16 @@ def target_file_context(
 
         block = ""
         for symbol in ([cited_symbol] if cited_symbol else []) + _instruction_symbol_candidates(instruction):
-            block = extract_block(source, symbol, file_ext)
+            # AUTO-FIX (medium-priority audit, DeepSeek-plan finding): same
+            # unguarded extract_block() call as ContextBroker.resolve() —
+            # one problematic file/symbol pair shouldn't abort Gate 1
+            # grounding for the whole candidate. Fail-open by skipping this
+            # symbol, matching the loop's own fallback-to-head-of-file
+            # behavior a few lines below when nothing resolves.
+            try:
+                block = extract_block(source, symbol, file_ext)
+            except Exception:
+                continue
             if block:
                 break
         if not block:

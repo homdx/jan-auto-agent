@@ -53,6 +53,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 from tools.auto.backlog_prioritiser import PrioritisedBacklog, to_improvements_md
+from tools.auto.git_manager import GitError
 from tools.auto.utils import file_set_fingerprint
 
 if TYPE_CHECKING:  # avoid circular imports at runtime
@@ -154,7 +155,26 @@ class PlanEmitter:
         commit_msg = (
             f"auto({_COMMIT_TASK_ID}): emit plan — {n_auto} task(s)"
         )
-        commit_hash = self._git.commit(commit_msg)
+        # AUTO-FIX (medium-priority audit, DeepSeek-plan finding): unlike
+        # this module's other two real GitManager.commit()/commit_task()
+        # callers (CommitOnSuccess, plan_validator._commit_validation),
+        # this one was unguarded — a GitError here (hook rejection, git
+        # lock file, disk full) propagated straight out of emit(), even
+        # though the plan itself (plan.json/IMPROVEMENTS.md) had already
+        # been written to disk at this point. Degrade the same way the
+        # other two callers do: log and continue with the plan considered
+        # emitted, just not committed.
+        try:
+            commit_hash = self._git.commit(commit_msg)
+        except GitError as exc:
+            logger.error(
+                "emit: plan.json/IMPROVEMENTS.md were written successfully, "
+                "but the git commit failed — %s (the plan is on disk but "
+                "not committed; commit manually or re-run once the "
+                "underlying git issue is resolved)", exc,
+            )
+            self._state.log(f"emit: plan written but commit failed — {exc}")
+            commit_hash = None
         if commit_hash:
             logger.info("emit: committed as %s", commit_hash[:12])
             self._state.log(f"emit: committed plan — {commit_hash[:12]}")
