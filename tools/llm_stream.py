@@ -501,7 +501,7 @@ def build_chat_request(
 
 def request_completion(url, headers, payload, timeout, stream=False, on_token=None,
                        api_format: str = "openai", ssl_context: "ssl.SSLContext | None" = None,
-                       error_retries: int = 2, error_retry_wait_sec: float = 60.0,
+                       error_retries: int = 10, error_retry_wait_sec: float = 60.0,
                        max_retry_after_sec: float = 180.0, on_retry=None,
                        _sleep_fn=None):
     """
