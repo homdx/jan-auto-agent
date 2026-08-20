@@ -78,6 +78,35 @@ def response_format_is_supported(url: str) -> bool:
     for URLs never tried)."""
     return url not in _RESPONSE_FORMAT_UNSUPPORTED_URLS
 
+
+# AUTO-THINKDEPTH-1: per-process, per-URL "stop asking" memory for the
+# Ollama branch's *think_effort* depth string (e.g. "low"/"medium"/"high"
+# — gpt-oss-style models), mirroring AUTO-JSONMODE-1 above but scoped to
+# Ollama's own top-level "think" field specifically. NOT reused for the
+# openai branch: there, a depth request rides inside the SAME "reasoning"
+# object that think=False's suppression already uses, so a single
+# rejection of that object already means "this endpoint doesn't recognise
+# reasoning at all" and the existing _REASONING_UNSUPPORTED_URLS cache
+# already covers both directions. Ollama's plain boolean "think" field,
+# by contrast, is separate from the depth-string variant and known-good on
+# its own — so a depth-string rejection here degrades to the plain
+# boolean, not to omitting "think" altogether.
+_THINK_DEPTH_UNSUPPORTED_URLS: set = set()
+
+
+def mark_think_depth_unsupported(url: str) -> None:
+    """Record that *url* rejects a string reasoning-depth value in
+    Ollama's ``think`` field, so future ``build_chat_request()`` calls
+    targeting it send the plain boolean instead. Idempotent."""
+    _THINK_DEPTH_UNSUPPORTED_URLS.add(url)
+
+
+def think_depth_is_supported(url: str) -> bool:
+    """`False` once `mark_think_depth_unsupported(url)` has fired for this
+    exact endpoint URL in this process; `True` otherwise (including for
+    URLs never tried)."""
+    return url not in _THINK_DEPTH_UNSUPPORTED_URLS
+
 # MASK-KEY-1: matches an ini-style `api_key = <value>` assignment line,
 # including comment-prefixed variants such as `### api_key = ...` or
 # `; api_key = ...` (any leading whitespace, optional comment chars
@@ -425,7 +454,7 @@ def build_chat_request(
     *, base_url: str, api_key: str, model: str, api_format: str,
     temperature: float, max_tokens: int, system: str, user_msg: str,
     num_ctx: int = 0, think: "bool | None" = None,
-    response_format: bool = False,
+    response_format: bool = False, think_effort: "str | None" = None,
 ) -> tuple[str, dict, dict]:
     """
     Build the (url, headers, payload) triple for a one-shot system/user chat
@@ -479,6 +508,30 @@ def build_chat_request(
     handling below): a provider that has already rejected the field once
     is not asked again, and every call after the first failure silently
     falls back to the pre-existing behaviour for the rest of the run.
+
+    AUTO-THINKDEPTH-1: *think_effort* ("low" / "medium" / "high", or any
+    string the target model recognises), when given AND ``think`` is
+    ``True``, asks the server for that specific reasoning depth instead of
+    a bare on/off toggle. Driven by a single global ``[api]
+    think_effort_enabled = true`` + ``[api] think_effort = <depth>`` ini
+    pair (default disabled — a plain ``think=True/False`` on/off keeps
+    working exactly as it does today when this is off or omitted). Has NO
+    effect when ``think`` is ``False`` or ``None`` — depth only makes
+    sense once reasoning is actually enabled.
+
+    ``api_format="openai"``: rides inside the same ``reasoning`` object as
+    the ``think=False`` suppression case — ``{"effort": think_effort}``
+    (no ``exclude``, since reasoning is being requested, not suppressed).
+    Governed by the SAME ``reasoning_field_is_supported(url)`` cache as
+    the suppression case: an endpoint that has already rejected the
+    ``reasoning`` field once is not asked again in either direction.
+
+    ``api_format="ollama"``: Ollama's own top-level ``think`` field
+    accepts a depth string directly on models that support it (e.g.
+    gpt-oss), replacing the plain boolean. Governed by a separate
+    ``think_depth_is_supported(url)`` cache — a provider that rejects the
+    depth *string* still supports the plain boolean, so this degrades to
+    ``payload["think"] = think`` rather than omitting the field.
     """
     headers = {
         "Content-Type":  "application/json",
@@ -500,7 +553,10 @@ def build_chat_request(
             opts["num_ctx"] = num_ctx
         payload: dict = {"model": model, "messages": messages, "options": opts}
         if think is not None:
-            payload["think"] = think
+            if think is True and think_effort and think_depth_is_supported(url):
+                payload["think"] = think_effort
+            else:
+                payload["think"] = think
         if response_format and response_format_is_supported(url):
             payload["format"] = "json"
     else:
@@ -548,6 +604,8 @@ def build_chat_request(
         # failure mode of its own.
         if think is False and reasoning_field_is_supported(url):
             payload["reasoning"] = {"effort": "low", "exclude": True}
+        elif think is True and think_effort and reasoning_field_is_supported(url):
+            payload["reasoning"] = {"effort": think_effort}
         if response_format and response_format_is_supported(url):
             payload["response_format"] = {"type": "json_object"}
     return url, headers, payload
@@ -641,7 +699,21 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
     def _looks_like_unknown_reasoning_field(detail: str) -> bool:
         low = detail.lower()
         return "reasoning" in low and ("unknown name" in low or "cannot find field" in low
-                                        or "unrecognized" in low or "not supported" in low)
+                                        or "unrecognized" in low or "not supported" in low
+                                        or "invalid" in low)
+
+    # AUTO-THINKDEPTH-1: mirrors _reasoning_stripped/_response_format_stripped
+    # — a payload-shape fix (the endpoint doesn't accept a string depth in
+    # Ollama's "think" field), not a transient error, fires ONCE per call.
+    _think_depth_stripped = False
+
+    def _looks_like_unknown_think_depth_value(detail: str) -> bool:
+        low = detail.lower()
+        return "think" in low and (
+            "unknown name" in low or "cannot find field" in low
+            or "unrecognized" in low or "not supported" in low
+            or "invalid" in low or "unexpected" in low or "boolean" in low
+        )
 
     # AUTO-JSONMODE-1: mirrors _reasoning_stripped above — a payload-shape
     # fix (the provider doesn't support enforced JSON mode), not a
@@ -666,7 +738,7 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
         )
 
     def _open():
-        nonlocal body, req, _reasoning_stripped, _response_format_stripped
+        nonlocal body, req, _reasoning_stripped, _response_format_stripped, _think_depth_stripped
         attempt = 0
         while True:
             try:
@@ -738,6 +810,41 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
                         f"run and retrying once without it. Falling back to "
                         f"best-effort JSON parsing (as before this setting "
                         f"existed)."
+                    )
+                    logger.warning("=" * 78)
+                    logger.warning("request_completion: %s", msg)
+                    logger.warning("=" * 78)
+                    if on_retry:
+                        on_retry(msg)
+                    continue
+
+                # AUTO-THINKDEPTH-1: endpoint rejected a string depth value
+                # in Ollama's "think" field ([api] think_effort_enabled =
+                # true) — degrade to the plain boolean, which is
+                # independently known-good (this is NOT a rejection of
+                # thinking-control itself, just of the depth-string
+                # variant), retry ONCE immediately, remember the endpoint
+                # so future build_chat_request() calls send the boolean
+                # straight away, and warn loudly.
+                _think_val = isinstance(body, dict) and body.get("think")
+                _has_think_depth_field = isinstance(_think_val, str)
+                if (e.code == 400 and not _think_depth_stripped
+                        and _has_think_depth_field
+                        and _looks_like_unknown_think_depth_value(detail)):
+                    _think_depth_stripped = True
+                    mark_think_depth_unsupported(url)
+                    body = {**body, "think": True}
+                    req = urllib.request.Request(
+                        url, data=json.dumps(body).encode("utf-8"),
+                        headers=headers, method="POST",
+                    )
+                    msg = (
+                        f"HTTP 400 from {url}: provider does NOT support a "
+                        f"reasoning-depth string in the 'think' field "
+                        f"([api] think_effort_enabled = true, think_effort "
+                        f"= '{_think_val}') — falling back to plain "
+                        f"think: true for this endpoint for the rest of "
+                        f"the run and retrying once."
                     )
                     logger.warning("=" * 78)
                     logger.warning("request_completion: %s", msg)

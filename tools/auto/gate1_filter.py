@@ -287,6 +287,21 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         # HTTP 400, logs a loud warning, and falls back to today's
         # behaviour for the rest of the run — no action needed here.
         self._response_format = config.getboolean("api", "response_format", fallback=False)
+        # AUTO-THINKDEPTH-1: single GLOBAL switch + depth value, same
+        # pattern as [api] response_format above — off by default, so
+        # existing [gate1] think = true/false on/off behaviour (self._think
+        # above) is completely unaffected unless a user opts in. When on,
+        # a reasoning-depth hint ("low"/"medium"/"high", whatever the
+        # target model recognises) is forwarded alongside think=True; has
+        # no effect at all when self._think is False. If the endpoint
+        # doesn't support the depth value, build_chat_request/
+        # request_completion detect it, log a loud warning, and fall back
+        # to plain think on/off for the rest of the run.
+        self._think_effort = (
+            config.get("api", "think_effort", fallback="").strip()
+            if config.getboolean("api", "think_effort_enabled", fallback=False)
+            else None
+        ) or None
 
         # ── DM-3: select system prompt based on task_mode + ini overrides ─────
         # Priority: mode-specific ini key > legacy "system" key > built-in constant.
@@ -803,6 +818,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                 system=self._system, user_msg=msg,
                 num_ctx=self._num_ctx, think=self._think,
                 response_format=self._response_format,
+                think_effort=self._think_effort,
             )
             tracer.event(
                 source="gate1",
