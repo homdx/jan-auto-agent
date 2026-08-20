@@ -215,6 +215,11 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         Whether to verify the server's TLS certificate.
     """
 
+    # Max extra nudge-retries when the presence-check verdict comes back
+    # unparseable (bad JSON / missing "verdict" field), before failing
+    # closed on the task. Previously hardcoded to a single retry.
+    _UNPARSEABLE_MAX_RETRIES = 5
+
     def __init__(
         self,
         config: configparser.ConfigParser,
@@ -830,14 +835,10 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         # AUTO-CR-31-style re-ask: an unparseable verdict (bad JSON, wrong
         # shape, unrecognised verdict word — as opposed to a genuine
         # "rejected") is often a thinking-model (e.g. qwen3) truncated
-        # mid-<think> by a small max_tokens, not an actual answer. One
-        # retry with a hard nudge, capped at a single extra call, before
-        # falling back to fail-closed.
+        # mid-<think> by a small max_tokens, not an actual answer. Retry
+        # with a hard nudge up to _UNPARSEABLE_MAX_RETRIES extra calls
+        # before falling back to fail-closed.
         if unparseable:
-            logger.info(
-                "Gate1._check_presence [%s]: verdict unparseable — "
-                "re-asking once. raw=%r", candidate.title, cleaned[:120],
-            )
             nudge = (
                 "\n\nIMPORTANT: your previous reply was not valid JSON with a "
                 "\"verdict\" field. Reply AGAIN with ONLY a JSON object of the "
@@ -845,23 +846,36 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                 "\"evidence\": \"...\" or \"\", \"reason\": \"...\"} — no "
                 "reasoning, no markdown fences, no other text."
             )
-            try:
-                cleaned2 = _call(user_msg + nudge)
-            except Exception as exc:
-                logger.warning(
-                    "Gate1._check_presence [%s]: re-ask failed (%s) — "
-                    "keeping original fail-closed result.", candidate.title, exc,
+            last_confirmed, last_reason, last_cleaned = confirmed, reason, cleaned
+            for attempt in range(1, self._UNPARSEABLE_MAX_RETRIES + 1):
+                logger.info(
+                    "Gate1._check_presence [%s]: verdict unparseable — "
+                    "re-asking (attempt %d/%d). raw=%r",
+                    candidate.title, attempt, self._UNPARSEABLE_MAX_RETRIES,
+                    last_cleaned[:120],
                 )
-                return confirmed, reason
-            confirmed2, reason2, unparseable2 = self._parse_presence_response(
-                cleaned2, candidate.title, code_block=code_block,
-            )
-            if not unparseable2:  # second answer was clear — use it
-                return confirmed2, reason2
+                try:
+                    cleaned_n = _call(user_msg + nudge)
+                except Exception as exc:
+                    logger.warning(
+                        "Gate1._check_presence [%s]: re-ask attempt %d/%d "
+                        "failed (%s) — keeping last fail-closed result.",
+                        candidate.title, attempt, self._UNPARSEABLE_MAX_RETRIES, exc,
+                    )
+                    return last_confirmed, last_reason
+                confirmed_n, reason_n, unparseable_n = self._parse_presence_response(
+                    cleaned_n, candidate.title, code_block=code_block,
+                )
+                if not unparseable_n:  # this answer was clear — use it
+                    return confirmed_n, reason_n
+                last_confirmed, last_reason, last_cleaned = confirmed_n, reason_n, cleaned_n
+
             logger.warning(
                 "Gate1._check_presence [%s]: verdict still unparseable after "
-                "one retry — failing closed. raw=%r", candidate.title, cleaned2[:120],
+                "%d retries — failing closed. raw=%r",
+                candidate.title, self._UNPARSEABLE_MAX_RETRIES, last_cleaned[:120],
             )
+            return last_confirmed, last_reason
 
         return confirmed, reason
 
