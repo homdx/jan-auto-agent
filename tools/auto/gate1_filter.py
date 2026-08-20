@@ -276,6 +276,17 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         # num_ctx controls the total context window on Ollama; 0 means "use server default".
         _active = config.get("api", "active", fallback="local")
         self._num_ctx = config.getint(f"api_{_active}", "num_ctx", fallback=0)
+        # AUTO-JSONMODE-1: single GLOBAL switch (not per-[gate1]) — read
+        # from [api], same section that already governs `active` above, so
+        # one ini flag covers every LLM call this project makes. Default
+        # false: current best-effort JSON parsing/salvage behaviour is
+        # unchanged unless a user opts in. When true, every call this class
+        # makes asks the endpoint to enforce valid JSON at the engine level
+        # (see build_chat_request's *response_format* parameter); if that
+        # endpoint doesn't support it, request_completion() detects the
+        # HTTP 400, logs a loud warning, and falls back to today's
+        # behaviour for the rest of the run — no action needed here.
+        self._response_format = config.getboolean("api", "response_format", fallback=False)
 
         # ── DM-3: select system prompt based on task_mode + ini overrides ─────
         # Priority: mode-specific ini key > legacy "system" key > built-in constant.
@@ -791,6 +802,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                 max_tokens=self._max_tokens if max_tokens is None else max_tokens,
                 system=self._system, user_msg=msg,
                 num_ctx=self._num_ctx, think=self._think,
+                response_format=self._response_format,
             )
             tracer.event(
                 source="gate1",

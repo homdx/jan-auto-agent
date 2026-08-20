@@ -51,6 +51,33 @@ def reasoning_field_is_supported(url: str) -> bool:
     for URLs never tried)."""
     return url not in _REASONING_UNSUPPORTED_URLS
 
+
+# AUTO-JSONMODE-1: same per-process, per-URL "stop asking" memory as
+# AUTO-REASONING-2 above, but for the *response_format* / Ollama "format"
+# JSON-mode field driven by the global `[api] response_format = true` ini
+# switch (see build_chat_request's *response_format* parameter). Once a
+# given endpoint has rejected the field with HTTP 400, every subsequent
+# build_chat_request() call targeting that exact URL stops sending it for
+# the rest of the process — matching the reasoning-field fallback so a
+# provider that doesn't support enforced JSON mode never repeats a
+# guaranteed-to-fail round trip, and the rest of the run falls back to the
+# existing best-effort JSON parsing/salvage path unchanged.
+_RESPONSE_FORMAT_UNSUPPORTED_URLS: set = set()
+
+
+def mark_response_format_unsupported(url: str) -> None:
+    """Record that *url* rejects enforced JSON mode (``response_format`` /
+    Ollama ``format``), so future ``build_chat_request()`` calls targeting
+    it never send it again this process. Idempotent."""
+    _RESPONSE_FORMAT_UNSUPPORTED_URLS.add(url)
+
+
+def response_format_is_supported(url: str) -> bool:
+    """`False` once `mark_response_format_unsupported(url)` has fired for
+    this exact endpoint URL in this process; `True` otherwise (including
+    for URLs never tried)."""
+    return url not in _RESPONSE_FORMAT_UNSUPPORTED_URLS
+
 # MASK-KEY-1: matches an ini-style `api_key = <value>` assignment line,
 # including comment-prefixed variants such as `### api_key = ...` or
 # `; api_key = ...` (any leading whitespace, optional comment chars
@@ -398,6 +425,7 @@ def build_chat_request(
     *, base_url: str, api_key: str, model: str, api_format: str,
     temperature: float, max_tokens: int, system: str, user_msg: str,
     num_ctx: int = 0, think: "bool | None" = None,
+    response_format: bool = False,
 ) -> tuple[str, dict, dict]:
     """
     Build the (url, headers, payload) triple for a one-shot system/user chat
@@ -429,6 +457,28 @@ def build_chat_request(
     ``think=True`` sends nothing extra — most models reason by default;
     only *suppressing* it needs an explicit field. Omitted entirely (both
     branches) when ``think`` is ``None`` (server/model default either way).
+
+    AUTO-JSONMODE-1: *response_format*, when ``True``, asks the server to
+    enforce valid JSON at the token-sampling level instead of relying on
+    prompt instructions + this project's after-the-fact salvage parsing
+    (``_salvage_json_objects`` in ``tools/auto/architect.py``). Driven by a
+    single global ``[api] response_format = true`` ini switch (default
+    ``false`` — current best-effort parsing behaviour is unchanged unless a
+    user opts in), NOT a per-caller setting, so one flag governs every
+    caller that goes through this function (Gate1Filter today; Coder /
+    Architect / TaskRewriter can opt in the same way later).
+
+    ``api_format="openai"``: sends the OpenAI-standard
+    ``response_format: {"type": "json_object"}``.
+    ``api_format="ollama"``: sends Ollama's own ``format: "json"`` field
+    (Ollama does not use the OpenAI ``response_format`` shape).
+
+    Skipped outright — regardless of the flag — once
+    ``mark_response_format_unsupported(url)`` has already fired for this
+    exact endpoint URL in this process (see ``request_completion``'s 400
+    handling below): a provider that has already rejected the field once
+    is not asked again, and every call after the first failure silently
+    falls back to the pre-existing behaviour for the rest of the run.
     """
     headers = {
         "Content-Type":  "application/json",
@@ -451,6 +501,8 @@ def build_chat_request(
         payload: dict = {"model": model, "messages": messages, "options": opts}
         if think is not None:
             payload["think"] = think
+        if response_format and response_format_is_supported(url):
+            payload["format"] = "json"
     else:
         # AUTO-URL-1: normalize a trailing slash on base_url before
         # concatenating — without this, `base_url = ".../v1beta/openai/"`
@@ -496,6 +548,8 @@ def build_chat_request(
         # failure mode of its own.
         if think is False and reasoning_field_is_supported(url):
             payload["reasoning"] = {"effort": "low", "exclude": True}
+        if response_format and response_format_is_supported(url):
+            payload["response_format"] = {"type": "json_object"}
     return url, headers, payload
 
 
@@ -589,8 +643,30 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
         return "reasoning" in low and ("unknown name" in low or "cannot find field" in low
                                         or "unrecognized" in low or "not supported" in low)
 
+    # AUTO-JSONMODE-1: mirrors _reasoning_stripped above — a payload-shape
+    # fix (the provider doesn't support enforced JSON mode), not a
+    # transient error, so it fires ONCE per call, immediately, without
+    # touching error_retries/backoff.
+    _response_format_stripped = False
+
+    def _looks_like_unknown_response_format_field(detail: str) -> bool:
+        low = detail.lower()
+        # Match "format" as a mention of the field name loosely — error
+        # bodies quote it in inconsistent ways (`"format"`, `\"format\"`
+        # inside a JSON-encoded message string, unquoted, ...) — so check
+        # the bare word rather than a specific quoting style. Combined
+        # with the caller's _has_rf_field check (the outgoing payload
+        # actually had the field) and the rejection-keyword check below,
+        # this stays specific enough not to misfire on unrelated 400s.
+        has_field_name = "response_format" in low or "format" in low
+        return has_field_name and (
+            "unknown name" in low or "cannot find field" in low
+            or "unrecognized" in low or "not supported" in low
+            or "invalid" in low or "unexpected" in low
+        )
+
     def _open():
-        nonlocal body, req, _reasoning_stripped
+        nonlocal body, req, _reasoning_stripped, _response_format_stripped
         attempt = 0
         while True:
             try:
@@ -627,6 +703,45 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
                         f"OpenRouter-style think=false suppression)"
                     )
                     logger.warning("request_completion: %s", msg)
+                    if on_retry:
+                        on_retry(msg)
+                    continue
+
+                # AUTO-JSONMODE-1: provider rejected enforced-JSON-mode
+                # field ("response_format" on openai-format, "format" on
+                # ollama) outright — strip it and retry ONCE, immediately,
+                # same shape as the reasoning-field fallback above. Then
+                # remember this endpoint for the rest of the process (via
+                # mark_response_format_unsupported) and fall back to the
+                # existing best-effort JSON parsing/salvage path for every
+                # subsequent call — this provider simply doesn't support
+                # engine-level JSON enforcement.
+                _has_rf_field = (
+                    isinstance(body, dict)
+                    and ("response_format" in body or body.get("format") == "json")
+                )
+                if (e.code == 400 and not _response_format_stripped
+                        and _has_rf_field
+                        and _looks_like_unknown_response_format_field(detail)):
+                    _response_format_stripped = True
+                    mark_response_format_unsupported(url)
+                    body = {k: v for k, v in body.items()
+                            if k != "response_format" and k != "format"}
+                    req = urllib.request.Request(
+                        url, data=json.dumps(body).encode("utf-8"),
+                        headers=headers, method="POST",
+                    )
+                    msg = (
+                        f"HTTP 400 from {url}: provider does NOT support "
+                        f"enforced JSON mode ([api] response_format = true) — "
+                        f"disabling it for this endpoint for the rest of the "
+                        f"run and retrying once without it. Falling back to "
+                        f"best-effort JSON parsing (as before this setting "
+                        f"existed)."
+                    )
+                    logger.warning("=" * 78)
+                    logger.warning("request_completion: %s", msg)
+                    logger.warning("=" * 78)
                     if on_retry:
                         on_retry(msg)
                     continue
