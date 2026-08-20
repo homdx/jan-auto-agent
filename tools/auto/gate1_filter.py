@@ -220,6 +220,25 @@ class Gate1Filter(_llm_stream.LLMClientBase):
     # closed on the task. Previously hardcoded to a single retry.
     _UNPARSEABLE_MAX_RETRIES = 5
 
+    # Empty raw='' responses on retry are usually a thinking model (e.g.
+    # qwen3) burning its whole max_tokens budget on <think> and never
+    # reaching the JSON answer. Each nudge attempt doubles the token
+    # budget so there's real headroom left after the thinking trace, and
+    # nudges temperature down a little to reduce rambling.
+    #
+    # The floor and ceiling are NOT derived from self._max_tokens: a
+    # small configured max_tokens (e.g. 512) is exactly the thing causing
+    # the truncation, so multiplying it stays small too (512 -> 768 ->
+    # 1024 -> ... was observed live and never escaped the failure). The
+    # ceiling instead tracks self._num_ctx (the model's actual context
+    # profile — e.g. 128k), since that's the real budget available.
+    _UNPARSEABLE_TOKENS_FLOOR = 4096
+    _UNPARSEABLE_TOKENS_STEP_MULT = 2.0
+    _UNPARSEABLE_TOKENS_DEFAULT_CEILING = 32768
+    _UNPARSEABLE_TOKENS_CTX_FRACTION = 0.5
+    _UNPARSEABLE_TEMPERATURE_STEP = 0.1
+    _UNPARSEABLE_TEMPERATURE_FLOOR = 0.0
+
     def __init__(
         self,
         config: configparser.ConfigParser,
@@ -759,11 +778,18 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             grounding_notes=grounding_notes,
         )
 
-        def _call(msg: str) -> str:
+        def _call(
+            msg: str,
+            *,
+            max_tokens: "int | None" = None,
+            temperature: "float | None" = None,
+        ) -> str:
             url, headers, payload = _llm_stream.build_chat_request(
                 base_url=self._base_url, api_key=self._api_key, model=self._model,
-                api_format=self._api_format, temperature=self._temperature,
-                max_tokens=self._max_tokens, system=self._system, user_msg=msg,
+                api_format=self._api_format,
+                temperature=self._temperature if temperature is None else temperature,
+                max_tokens=self._max_tokens if max_tokens is None else max_tokens,
+                system=self._system, user_msg=msg,
                 num_ctx=self._num_ctx, think=self._think,
             )
             tracer.event(
@@ -847,15 +873,44 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                 "reasoning, no markdown fences, no other text."
             )
             last_confirmed, last_reason, last_cleaned = confirmed, reason, cleaned
+            # Ceiling tracks the model's real context profile (num_ctx),
+            # not the (possibly tiny) configured max_tokens — e.g. a
+            # 128k-context profile should be allowed to actually use a
+            # meaningful chunk of that on a stuck retry, not just a few
+            # hundred tokens more than a small default.
+            ctx_ceiling = (
+                int(self._num_ctx * self._UNPARSEABLE_TOKENS_CTX_FRACTION)
+                if self._num_ctx
+                else self._UNPARSEABLE_TOKENS_DEFAULT_CEILING
+            )
+            base_temp = self._temperature
             for attempt in range(1, self._UNPARSEABLE_MAX_RETRIES + 1):
+                # Doubling from a healthy floor: attempt 1 already jumps
+                # straight to the floor (covers the common "starved on a
+                # small configured max_tokens" case in one shot), then
+                # doubles each further attempt, capped at ctx_ceiling.
+                attempt_tokens = min(
+                    self._UNPARSEABLE_TOKENS_FLOOR
+                    * int(self._UNPARSEABLE_TOKENS_STEP_MULT ** (attempt - 1)),
+                    ctx_ceiling,
+                )
+                attempt_temp = max(
+                    base_temp - attempt * self._UNPARSEABLE_TEMPERATURE_STEP,
+                    self._UNPARSEABLE_TEMPERATURE_FLOOR,
+                )
                 logger.info(
                     "Gate1._check_presence [%s]: verdict unparseable — "
-                    "re-asking (attempt %d/%d). raw=%r",
+                    "re-asking (attempt %d/%d, max_tokens=%d, temperature=%.2f). "
+                    "raw=%r",
                     candidate.title, attempt, self._UNPARSEABLE_MAX_RETRIES,
-                    last_cleaned[:120],
+                    attempt_tokens, attempt_temp, last_cleaned[:120],
                 )
                 try:
-                    cleaned_n = _call(user_msg + nudge)
+                    cleaned_n = _call(
+                        user_msg + nudge,
+                        max_tokens=attempt_tokens,
+                        temperature=attempt_temp,
+                    )
                 except Exception as exc:
                     logger.warning(
                         "Gate1._check_presence [%s]: re-ask attempt %d/%d "
