@@ -119,7 +119,7 @@ class TestGate1ForwardsThinkEffort:
             num_ctx=filt._num_ctx, think=filt._think,
             response_format=filt._response_format, think_effort=filt._think_effort,
         )
-        assert payload.get("reasoning") == {"effort": "medium"}
+        assert payload.get("reasoning_effort") == "medium"
 
     def test_enabled_has_no_effect_when_thinking_off(self):
         """[gate1] think is false (default) — global depth switch must not
