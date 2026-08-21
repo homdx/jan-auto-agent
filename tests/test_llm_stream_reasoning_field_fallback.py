@@ -35,12 +35,12 @@ import tools.llm_stream as llm_stream_mod
 
 @pytest.fixture(autouse=True)
 def _reset_reasoning_cache():
-    """AUTO-REASONING-2's unsupported-URL memory is process-lifetime global
-    state — reset it before/after every test so tests don't leak into each
-    other regardless of run order."""
-    llm_stream_mod._REASONING_UNSUPPORTED_URLS.clear()
+    """AUTO-REASONING-2's unsupported-(url, model) memory is process-lifetime
+    global state — reset it before/after every test so tests don't leak into
+    each other regardless of run order."""
+    llm_stream_mod._REASONING_UNSUPPORTED_KEYS.clear()
     yield
-    llm_stream_mod._REASONING_UNSUPPORTED_URLS.clear()
+    llm_stream_mod._REASONING_UNSUPPORTED_KEYS.clear()
 
 
 class _RecordingHandler(http.server.BaseHTTPRequestHandler):
@@ -250,7 +250,7 @@ class TestReasoningUnsupportedProcessCache:
         )
         assert "reasoning" in payload_before
 
-        llm_stream_mod.mark_reasoning_field_unsupported(url)
+        llm_stream_mod.mark_reasoning_field_unsupported(url, "m")
 
         _, _, payload_after = build_chat_request(
             base_url="https://example.test/v1", api_key="k", model="m",
@@ -305,6 +305,86 @@ class TestReasoningUnsupportedProcessCache:
             "https://a.example/v1/chat/completions") is False
         assert llm_stream_mod.reasoning_field_is_supported(
             "https://b.example/v1/chat/completions") is True
+
+    # ── GATE1-PROVIDER-1: keyed by (url, model), not url alone ─────────────
+
+    def test_marking_one_model_does_not_affect_another_model_same_url(self):
+        """A router that fronts several models behind one URL (kenari.id,
+        bynara.id, NaraRouter, ...): model A rejecting `reasoning` must not
+        poison model B at the exact same endpoint."""
+        url = "https://router.example/v1/chat/completions"
+        llm_stream_mod.mark_reasoning_field_unsupported(url, "model-a")
+        assert llm_stream_mod.reasoning_field_is_supported(url, "model-a") is False
+        assert llm_stream_mod.reasoning_field_is_supported(url, "model-b") is True
+
+    def test_marking_one_url_for_a_model_does_not_affect_same_model_elsewhere(self):
+        """The reverse direction: the SAME model name hosted at two
+        different providers/URLs keeps independent verdicts — one rejects
+        `reasoning`, the other may still accept it."""
+        model = "same-model-name"
+        llm_stream_mod.mark_reasoning_field_unsupported(
+            "https://provider-a.example/v1/chat/completions", model)
+        assert llm_stream_mod.reasoning_field_is_supported(
+            "https://provider-a.example/v1/chat/completions", model) is False
+        assert llm_stream_mod.reasoning_field_is_supported(
+            "https://provider-b.example/v1/chat/completions", model) is True
+
+    def test_build_chat_request_only_skips_for_the_marked_model(self):
+        """End-to-end via build_chat_request(): marking one model unsupported
+        at a URL must not change the payload built for a different model at
+        that same base_url."""
+        url = "https://router.example/v1/chat/completions"
+        llm_stream_mod.mark_reasoning_field_unsupported(url, "model-a")
+
+        _, _, payload_a = build_chat_request(
+            base_url="https://router.example/v1", api_key="k", model="model-a",
+            api_format="openai", temperature=0.1, max_tokens=100,
+            system="s", user_msg="u", think=False,
+        )
+        assert "reasoning" not in payload_a
+
+        _, _, payload_b = build_chat_request(
+            base_url="https://router.example/v1", api_key="k", model="model-b",
+            api_format="openai", temperature=0.1, max_tokens=100,
+            system="s", user_msg="u", think=False,
+        )
+        assert "reasoning" in payload_b
+
+    def test_end_to_end_400_on_one_model_does_not_affect_sibling_model(self):
+        """Full integration: model A's 400 (real HTTP round trip) must not
+        cause model B's very next call, against the same router URL, to
+        have `reasoning` stripped pre-emptively — B gets its own honest
+        first try."""
+        server, port, handler_cls = _serve_script([
+            ("error", 400, _GEMINI_400_BODY, {}),  # model A, attempt 1: rejected
+            ("ok", _OK_BODY),                        # model A, attempt 2: succeeds
+            ("ok", _OK_BODY),                        # model B: succeeds first try
+        ])
+        try:
+            base_url = f"http://127.0.0.1:{port}/v1beta/openai"
+            url_a, headers_a, payload_a = build_chat_request(
+                base_url=base_url, api_key="k", model="model-a",
+                api_format="openai", temperature=0.1, max_tokens=100,
+                system="s", user_msg="u", think=False,
+            )
+            assert "reasoning" in payload_a
+            request_completion(url_a, headers_a, payload_a, timeout=5,
+                                stream=False, api_format="openai")
+
+            # Different model, same base_url: must still try the field.
+            url_b, headers_b, payload_b = build_chat_request(
+                base_url=base_url, api_key="k", model="model-b",
+                api_format="openai", temperature=0.1, max_tokens=100,
+                system="s", user_msg="u", think=False,
+            )
+            assert "reasoning" in payload_b
+            request_completion(url_b, headers_b, payload_b, timeout=5,
+                                stream=False, api_format="openai")
+        finally:
+            server.shutdown()
+
+        assert handler_cls.request_count == 3
+        assert "reasoning" in handler_cls.received_bodies[2]
 
     def test_think_true_never_sends_reasoning_regardless_of_cache_state(self):
         """think=True never sent the field in the first place — the cache

@@ -276,32 +276,6 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         # num_ctx controls the total context window on Ollama; 0 means "use server default".
         _active = config.get("api", "active", fallback="local")
         self._num_ctx = config.getint(f"api_{_active}", "num_ctx", fallback=0)
-        # AUTO-JSONMODE-1: single GLOBAL switch (not per-[gate1]) — read
-        # from [api], same section that already governs `active` above, so
-        # one ini flag covers every LLM call this project makes. Default
-        # false: current best-effort JSON parsing/salvage behaviour is
-        # unchanged unless a user opts in. When true, every call this class
-        # makes asks the endpoint to enforce valid JSON at the engine level
-        # (see build_chat_request's *response_format* parameter); if that
-        # endpoint doesn't support it, request_completion() detects the
-        # HTTP 400, logs a loud warning, and falls back to today's
-        # behaviour for the rest of the run — no action needed here.
-        self._response_format = config.getboolean("api", "response_format", fallback=False)
-        # AUTO-THINKDEPTH-1: single GLOBAL switch + depth value, same
-        # pattern as [api] response_format above — off by default, so
-        # existing [gate1] think = true/false on/off behaviour (self._think
-        # above) is completely unaffected unless a user opts in. When on,
-        # a reasoning-depth hint ("low"/"medium"/"high", whatever the
-        # target model recognises) is forwarded alongside think=True; has
-        # no effect at all when self._think is False. If the endpoint
-        # doesn't support the depth value, build_chat_request/
-        # request_completion detect it, log a loud warning, and fall back
-        # to plain think on/off for the rest of the run.
-        self._think_effort = (
-            config.get("api", "think_effort", fallback="").strip()
-            if config.getboolean("api", "think_effort_enabled", fallback=False)
-            else None
-        ) or None
 
         # ── DM-3: select system prompt based on task_mode + ini overrides ─────
         # Priority: mode-specific ini key > legacy "system" key > built-in constant.
@@ -311,6 +285,114 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         else:
             built_in = _SYSTEM_PROMPTS.get(task_mode, _SYSTEM_PROMPT_CODE)
             self._system = config.get(sec, "system", fallback=built_in).strip()
+
+        self._init_presence_provider(config, sec, base_url, api_key, model,
+                                      api_format, verify_ssl)
+
+    # GATE1-PROVIDER-2: split out of __init__ (rather than inlined) so the
+    # provider-selection logic — the part with the actual "which section
+    # wins" decisions — has one clear entry/exit point to read and to test
+    # against, instead of being interleaved with the dozen unrelated
+    # [gate1] scalar reads above it.
+    def _init_presence_provider(
+        self, config: configparser.ConfigParser, sec: str,
+        base_url: str, api_key: str, model: str, api_format: str,
+        verify_ssl: bool,
+    ) -> None:
+        """Resolve which provider/model the presence check (`_check_presence`,
+        the only LLM call Gate1Filter makes — existence checks are pure
+        filesystem/AST and never touch an LLM) actually talks to, and populate
+        ``self._presence_*``.
+
+        Two modes, selected by ``[gate1] presence_llm_profile``:
+
+        - **Unset (default)** — ``self._presence_*`` are exact copies of the
+          constructor-passed ``base_url``/``api_key``/``model``/``api_format``
+          and this instance's own ``[gate1]`` ``think``/``temperature``/
+          ``max_tokens``/``num_ctx``. Byte-for-byte the pre-existing
+          behaviour; nothing about a config file without this key changes.
+
+        - **Set to a section name** (e.g. ``presence_llm_profile = gate1_llm``)
+          — presence-check calls instead use THAT section's own
+          ``base_url``/``api_key``/``model`` (required — raises a clear
+          ``ValueError`` naming the missing key(s) rather than silently
+          falling back to the shared provider, since silently reusing a
+          different provider's credential against a URL it was never meant
+          for is a worse failure than a loud one at startup) and
+          ``api_format``/``verify_ssl`` (optional, default ``"openai"`` /
+          ``True``).
+
+          ``think``/``temperature``/``max_tokens``/``num_ctx`` are each read
+          from the PROFILE section first; any one of them the profile
+          doesn't set falls back to THIS instance's own ``[gate1]`` value —
+          never to a hardcoded default and never to a different profile's
+          value. This is the crux of the "don't conflict with another
+          model's saved settings" requirement: a profile tuned for a
+          thinking-capable model (``think = true``) and the default
+          non-thinking ``[gate1]`` setting coexist without either bleeding
+          into the other, and two DIFFERENT profiles never share settings
+          with each other either — each is read independently, from its own
+          section, every time.
+
+        The module-level ``(url, model)``-keyed "does this endpoint accept
+        the `reasoning` field" memory (see ``tools.llm_stream.
+        mark_reasoning_field_unsupported``) already gives the presence
+        profile's own (possibly different) url+model an independent verdict
+        from whatever the shared provider's url+model has recorded — no
+        extra wiring needed here for that part.
+        """
+        profile_name = config.get(sec, "presence_llm_profile", fallback="").strip()
+        if not profile_name:
+            self._presence_base_url    = self._base_url
+            self._presence_api_key     = self._api_key
+            self._presence_model       = self._model
+            self._presence_api_format  = self._api_format
+            self._presence_ssl_context = self._ssl_context
+            self._presence_think       = self._think
+            self._presence_temperature = self._temperature
+            self._presence_max_tokens  = self._max_tokens
+            self._presence_num_ctx     = self._num_ctx
+            return
+
+        if not config.has_section(profile_name):
+            raise ValueError(
+                f"[gate1] presence_llm_profile = {profile_name!r} but the "
+                f"config has no [{profile_name}] section. Add one with at "
+                f"least base_url/api_key/model, or remove "
+                f"presence_llm_profile to use the shared provider."
+            )
+        required = [k for k in ("base_url", "api_key", "model")
+                    if not config.has_option(profile_name, k)]
+        if required:
+            raise ValueError(
+                f"[{profile_name}] (gate1 presence_llm_profile) is missing "
+                f"required option(s): {', '.join(required)}. A presence "
+                f"profile must fully specify its own connection details — "
+                f"it never silently inherits base_url/api_key/model from "
+                f"the shared provider, since that could send a different "
+                f"provider's credential to the wrong host."
+            )
+        self._presence_base_url   = config.get(profile_name, "base_url").rstrip("/")
+        self._presence_api_key    = config.get(profile_name, "api_key")
+        self._presence_model      = config.get(profile_name, "model")
+        self._presence_api_format = config.get(profile_name, "api_format", fallback="openai")
+        _verify_ssl = config.getboolean(profile_name, "verify_ssl", fallback=verify_ssl)
+        self._presence_ssl_context = (
+            _llm_stream.make_unverified_context() if not _verify_ssl else None
+        )
+        # Each falls back to THIS instance's own [gate1] value (self._think
+        # etc., already resolved above) when the profile doesn't set it —
+        # deliberately never a hardcoded True/False/0 default, and never
+        # another profile's value: fallback is always "what [gate1] itself
+        # says", scoped to this one Gate1Filter instance.
+        self._presence_think = config.getboolean(
+            profile_name, "think", fallback=self._think)
+        self._presence_temperature = float(config.get(
+            profile_name, "temperature", fallback=str(self._temperature)))
+        self._presence_max_tokens = int(config.get(
+            profile_name, "max_tokens", fallback=str(self._max_tokens)))
+        self._presence_num_ctx = config.getint(
+            profile_name, "num_ctx", fallback=self._num_ctx)
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -811,21 +893,20 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             temperature: "float | None" = None,
         ) -> str:
             url, headers, payload = _llm_stream.build_chat_request(
-                base_url=self._base_url, api_key=self._api_key, model=self._model,
-                api_format=self._api_format,
-                temperature=self._temperature if temperature is None else temperature,
-                max_tokens=self._max_tokens if max_tokens is None else max_tokens,
+                base_url=self._presence_base_url, api_key=self._presence_api_key,
+                model=self._presence_model,
+                api_format=self._presence_api_format,
+                temperature=self._presence_temperature if temperature is None else temperature,
+                max_tokens=self._presence_max_tokens if max_tokens is None else max_tokens,
                 system=self._system, user_msg=msg,
-                num_ctx=self._num_ctx, think=self._think,
-                response_format=self._response_format,
-                think_effort=self._think_effort,
+                num_ctx=self._presence_num_ctx, think=self._presence_think,
             )
             tracer.event(
                 source="gate1",
                 target="llm",
                 kind="llm_request",
                 content=msg,
-                params={"model": self._model, "candidate": candidate.title},
+                params={"model": self._presence_model, "candidate": candidate.title},
             )
             text = _llm_stream.request_completion(
                 url=url,
@@ -833,8 +914,8 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                 payload=payload,
                 timeout=self._timeout,
                 stream=True,
-                api_format=self._api_format,
-                ssl_context=self._ssl_context,
+                api_format=self._presence_api_format,
+                ssl_context=self._presence_ssl_context,
             )
             cleaned = strip_think(text)
             tracer.event(
@@ -907,11 +988,11 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             # meaningful chunk of that on a stuck retry, not just a few
             # hundred tokens more than a small default.
             ctx_ceiling = (
-                int(self._num_ctx * self._UNPARSEABLE_TOKENS_CTX_FRACTION)
-                if self._num_ctx
+                int(self._presence_num_ctx * self._UNPARSEABLE_TOKENS_CTX_FRACTION)
+                if self._presence_num_ctx
                 else self._UNPARSEABLE_TOKENS_DEFAULT_CEILING
             )
-            base_temp = self._temperature
+            base_temp = self._presence_temperature
             for attempt in range(1, self._UNPARSEABLE_MAX_RETRIES + 1):
                 # Doubling from a healthy floor: attempt 1 already jumps
                 # straight to the floor (covers the common "starved on a

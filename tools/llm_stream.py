@@ -22,122 +22,44 @@ logger = logging.getLogger(__name__)
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 
-# AUTO-REASONING-2: process-lifetime memory of which openai-format chat
-# endpoints have already told us (via HTTP 400) that they don't recognise
-# the `reasoning` field build_chat_request() sends for think=False. Keyed
-# by the exact `{base_url}/chat/completions` URL build_chat_request()
-# would construct — the same string request_completion() receives as
-# `url`, so both sides agree on identity without either needing to know
-# about "providers" as a concept. This is exactly the "per-server 'stop
-# sending it' memory" build_chat_request()'s own AUTO-THINK-1 docstring
-# said a stateless function doesn't have — now it does, at module scope,
-# so after the FIRST 400 anywhere in this process, every subsequent call
-# to the same endpoint skips the field outright instead of paying for
-# another guaranteed-to-fail round trip.
-_REASONING_UNSUPPORTED_URLS: set = set()
+# AUTO-REASONING-2: process-lifetime memory of which (endpoint, model)
+# pairs have already told us (via HTTP 400) that they don't recognise the
+# `reasoning` field build_chat_request() sends for think=False.
+#
+# GATE1-PROVIDER-1: keyed by (url, model), NOT url alone. Many of this
+# project's free-tier gateways (kenari.id, bynara.id, NaraRouter, ...)
+# route several different *models* through the exact same
+# `{base_url}/chat/completions` endpoint. Keying by url alone means one
+# model's 400 would incorrectly poison every other model behind that same
+# router — e.g. `deepseek-r1` on kenari.id rejects `reasoning` but
+# `llama-3.3` on the SAME kenari.id URL might accept it fine; the reverse
+# (same model, different provider/URL, different support) was already
+# handled correctly before this change since url was part of the key —
+# this extends that same "don't assume, remember per-endpoint" principle
+# to also cover "don't assume, remember per-model-at-that-endpoint".
+# `model` is whatever string identifies the model to that endpoint (the
+# payload's "model" field) — an empty/None model still works as an
+# ordinary dict key, it just means "no model info available", which never
+# collides with a real model name that happens to be the empty string.
+_REASONING_UNSUPPORTED_KEYS: set = set()
 
 
-def mark_reasoning_field_unsupported(url: str) -> None:
-    """Record that *url* rejects the `reasoning` field, so future
-    `build_chat_request()` calls targeting it never send it again this
-    process. Idempotent; safe to call from any thread (set.add is atomic
-    under the GIL for this simple case)."""
-    _REASONING_UNSUPPORTED_URLS.add(url)
+def mark_reasoning_field_unsupported(url: str, model=None) -> None:
+    """Record that *model* on *url* rejects the `reasoning` field, so
+    future `build_chat_request()` calls targeting this exact (url, model)
+    pair never send it again this process. Idempotent; safe to call from
+    any thread (set.add is atomic under the GIL for this simple case).
+    Does NOT affect a different model at the same url, or the same model
+    at a different url — see GATE1-PROVIDER-1 above."""
+    _REASONING_UNSUPPORTED_KEYS.add((url, model))
 
 
-def reasoning_field_is_supported(url: str) -> bool:
-    """`False` once `mark_reasoning_field_unsupported(url)` has fired for
-    this exact endpoint URL in this process; `True` otherwise (including
-    for URLs never tried)."""
-    return url not in _REASONING_UNSUPPORTED_URLS
-
-
-# AUTO-THINKDEPTH-2: process-lifetime memory, mirroring
-# _REASONING_UNSUPPORTED_URLS above, but for the top-level
-# `reasoning_effort` string field — the actual OpenAI/Gemini-compat
-# Chat Completions standard (flat `"reasoning_effort": "low"`), which is
-# DIFFERENT from OpenRouter's nested `"reasoning": {"effort": "low"}`
-# shape that `_REASONING_UNSUPPORTED_URLS` already tracks. This is tier 1
-# of a three-tier cascade for `think_effort` on the openai branch:
-#   1. top-level `reasoning_effort` (OpenAI/Gemini standard) — tried first
-#   2. nested `reasoning: {"effort": ...}` (OpenRouter) — fallback if (1)
-#      is rejected
-#   3. no depth field at all, plain `think`-only mode — fallback if both
-#      (1) and (2) are rejected
-# Each tier has its own per-URL "stop asking" memory so a provider that
-# rejects tier 1 but accepts tier 2 keeps getting tier 2 forever, without
-# re-paying for a guaranteed-to-fail tier-1 round trip on every call.
-_REASONING_EFFORT_TOPLEVEL_UNSUPPORTED_URLS: set = set()
-
-
-def mark_reasoning_effort_toplevel_unsupported(url: str) -> None:
-    """Record that *url* rejects the top-level `reasoning_effort` field,
-    so future `build_chat_request()` calls targeting it go straight to
-    tier 2 (nested `reasoning: {"effort": ...}`) instead. Idempotent."""
-    _REASONING_EFFORT_TOPLEVEL_UNSUPPORTED_URLS.add(url)
-
-
-def reasoning_effort_toplevel_is_supported(url: str) -> bool:
-    """`False` once `mark_reasoning_effort_toplevel_unsupported(url)` has
-    fired for this exact endpoint URL in this process; `True` otherwise
-    (including for URLs never tried)."""
-    return url not in _REASONING_EFFORT_TOPLEVEL_UNSUPPORTED_URLS
-
-
-# AUTO-JSONMODE-1: same per-process, per-URL "stop asking" memory as
-# AUTO-REASONING-2 above, but for the *response_format* / Ollama "format"
-# JSON-mode field driven by the global `[api] response_format = true` ini
-# switch (see build_chat_request's *response_format* parameter). Once a
-# given endpoint has rejected the field with HTTP 400, every subsequent
-# build_chat_request() call targeting that exact URL stops sending it for
-# the rest of the process — matching the reasoning-field fallback so a
-# provider that doesn't support enforced JSON mode never repeats a
-# guaranteed-to-fail round trip, and the rest of the run falls back to the
-# existing best-effort JSON parsing/salvage path unchanged.
-_RESPONSE_FORMAT_UNSUPPORTED_URLS: set = set()
-
-
-def mark_response_format_unsupported(url: str) -> None:
-    """Record that *url* rejects enforced JSON mode (``response_format`` /
-    Ollama ``format``), so future ``build_chat_request()`` calls targeting
-    it never send it again this process. Idempotent."""
-    _RESPONSE_FORMAT_UNSUPPORTED_URLS.add(url)
-
-
-def response_format_is_supported(url: str) -> bool:
-    """`False` once `mark_response_format_unsupported(url)` has fired for
-    this exact endpoint URL in this process; `True` otherwise (including
-    for URLs never tried)."""
-    return url not in _RESPONSE_FORMAT_UNSUPPORTED_URLS
-
-
-# AUTO-THINKDEPTH-1: per-process, per-URL "stop asking" memory for the
-# Ollama branch's *think_effort* depth string (e.g. "low"/"medium"/"high"
-# — gpt-oss-style models), mirroring AUTO-JSONMODE-1 above but scoped to
-# Ollama's own top-level "think" field specifically. NOT reused for the
-# openai branch: there, a depth request rides inside the SAME "reasoning"
-# object that think=False's suppression already uses, so a single
-# rejection of that object already means "this endpoint doesn't recognise
-# reasoning at all" and the existing _REASONING_UNSUPPORTED_URLS cache
-# already covers both directions. Ollama's plain boolean "think" field,
-# by contrast, is separate from the depth-string variant and known-good on
-# its own — so a depth-string rejection here degrades to the plain
-# boolean, not to omitting "think" altogether.
-_THINK_DEPTH_UNSUPPORTED_URLS: set = set()
-
-
-def mark_think_depth_unsupported(url: str) -> None:
-    """Record that *url* rejects a string reasoning-depth value in
-    Ollama's ``think`` field, so future ``build_chat_request()`` calls
-    targeting it send the plain boolean instead. Idempotent."""
-    _THINK_DEPTH_UNSUPPORTED_URLS.add(url)
-
-
-def think_depth_is_supported(url: str) -> bool:
-    """`False` once `mark_think_depth_unsupported(url)` has fired for this
-    exact endpoint URL in this process; `True` otherwise (including for
-    URLs never tried)."""
-    return url not in _THINK_DEPTH_UNSUPPORTED_URLS
+def reasoning_field_is_supported(url: str, model=None) -> bool:
+    """`False` once `mark_reasoning_field_unsupported(url, model)` has
+    fired for this exact (url, model) pair in this process; `True`
+    otherwise (including for pairs never tried, and for the same url
+    with a different model)."""
+    return (url, model) not in _REASONING_UNSUPPORTED_KEYS
 
 # MASK-KEY-1: matches an ini-style `api_key = <value>` assignment line,
 # including comment-prefixed variants such as `### api_key = ...` or
@@ -486,7 +408,6 @@ def build_chat_request(
     *, base_url: str, api_key: str, model: str, api_format: str,
     temperature: float, max_tokens: int, system: str, user_msg: str,
     num_ctx: int = 0, think: "bool | None" = None,
-    response_format: bool = False, think_effort: "str | None" = None,
 ) -> tuple[str, dict, dict]:
     """
     Build the (url, headers, payload) triple for a one-shot system/user chat
@@ -501,6 +422,10 @@ def build_chat_request(
     ``max_tokens`` budget meant for a short, deterministic answer (e.g.
     Gate 1's presence check) doesn't get consumed by reasoning before any
     usable reply is written — leaving an empty or truncated response.
+    GATE1-PROVIDER-1: the "does this endpoint accept the field" memory
+    (see ``reasoning_field_is_supported``) is keyed by ``(url, model)``,
+    not ``url`` alone — a different model behind the same router URL gets
+    its own independent answer.
 
     ``api_format="ollama"``: passed as the top-level ``"think"`` field.
 
@@ -518,68 +443,6 @@ def build_chat_request(
     ``think=True`` sends nothing extra — most models reason by default;
     only *suppressing* it needs an explicit field. Omitted entirely (both
     branches) when ``think`` is ``None`` (server/model default either way).
-
-    AUTO-JSONMODE-1: *response_format*, when ``True``, asks the server to
-    enforce valid JSON at the token-sampling level instead of relying on
-    prompt instructions + this project's after-the-fact salvage parsing
-    (``_salvage_json_objects`` in ``tools/auto/architect.py``). Driven by a
-    single global ``[api] response_format = true`` ini switch (default
-    ``false`` — current best-effort parsing behaviour is unchanged unless a
-    user opts in), NOT a per-caller setting, so one flag governs every
-    caller that goes through this function (Gate1Filter today; Coder /
-    Architect / TaskRewriter can opt in the same way later).
-
-    ``api_format="openai"``: sends the OpenAI-standard
-    ``response_format: {"type": "json_object"}``.
-    ``api_format="ollama"``: sends Ollama's own ``format: "json"`` field
-    (Ollama does not use the OpenAI ``response_format`` shape).
-
-    Skipped outright — regardless of the flag — once
-    ``mark_response_format_unsupported(url)`` has already fired for this
-    exact endpoint URL in this process (see ``request_completion``'s 400
-    handling below): a provider that has already rejected the field once
-    is not asked again, and every call after the first failure silently
-    falls back to the pre-existing behaviour for the rest of the run.
-
-    AUTO-THINKDEPTH-1: *think_effort* ("low" / "medium" / "high", or any
-    string the target model recognises), when given AND ``think`` is
-    ``True``, asks the server for that specific reasoning depth instead of
-    a bare on/off toggle. Driven by a single global ``[api]
-    think_effort_enabled = true`` + ``[api] think_effort = <depth>`` ini
-    pair (default disabled — a plain ``think=True/False`` on/off keeps
-    working exactly as it does today when this is off or omitted). Has NO
-    effect when ``think`` is ``False`` or ``None`` — depth only makes
-    sense once reasoning is actually enabled.
-
-    ``api_format="openai"``: AUTO-THINKDEPTH-2 three-tier cascade, each
-    tier gated by its own per-URL "stop asking" cache so a provider that
-    has already rejected a tier is never asked again this process:
-
-      1. Top-level ``reasoning_effort: <depth>`` — the flat string field
-         OpenAI's own Chat Completions API and Gemini's OpenAI-compat
-         layer both document
-         (https://ai.google.dev/gemini-api/docs/openai#thinking). Tried
-         first. Governed by ``reasoning_effort_toplevel_is_supported(url)``.
-      2. Nested ``reasoning: {"effort": <depth>}`` — OpenRouter's own
-         unified reasoning-control shape (no ``exclude``, unlike the
-         ``think=False`` suppression case above, since reasoning is being
-         *requested* here, not suppressed). Tried once tier 1 has been
-         marked unsupported for this URL. Governed by the SAME
-         ``reasoning_field_is_supported(url)`` cache as the suppression
-         case: an endpoint that has already rejected the ``reasoning``
-         object in either direction is not asked again.
-      3. Neither field sent — falls through to whatever the plain
-         ``think`` on/off handling already put in the payload (or
-         nothing). Reached once both tier 1 and tier 2 are marked
-         unsupported for this URL: the model still thinks, at its own
-         default depth, no crash, no manual intervention needed.
-
-    ``api_format="ollama"``: Ollama's own top-level ``think`` field
-    accepts a depth string directly on models that support it (e.g.
-    gpt-oss), replacing the plain boolean. Governed by a separate
-    ``think_depth_is_supported(url)`` cache — a provider that rejects the
-    depth *string* still supports the plain boolean, so this degrades to
-    ``payload["think"] = think`` rather than omitting the field.
     """
     headers = {
         "Content-Type":  "application/json",
@@ -601,12 +464,7 @@ def build_chat_request(
             opts["num_ctx"] = num_ctx
         payload: dict = {"model": model, "messages": messages, "options": opts}
         if think is not None:
-            if think is True and think_effort and think_depth_is_supported(url):
-                payload["think"] = think_effort
-            else:
-                payload["think"] = think
-        if response_format and response_format_is_supported(url):
-            payload["format"] = "json"
+            payload["think"] = think
     else:
         # AUTO-URL-1: normalize a trailing slash on base_url before
         # concatenating — without this, `base_url = ".../v1beta/openai/"`
@@ -650,42 +508,14 @@ def build_chat_request(
         # silently ignore the unknown field rather than reject the whole
         # request — keeping this a plain, best-effort addition with no new
         # failure mode of its own.
-        if think is False and reasoning_field_is_supported(url):
+        if think is False and reasoning_field_is_supported(url, model):
             payload["reasoning"] = {"effort": "low", "exclude": True}
-        elif think is True and think_effort:
-            # AUTO-THINKDEPTH-2: three-tier cascade, each tier gated by
-            # its own per-URL memory so a provider that has already
-            # rejected a tier doesn't pay for that guaranteed-to-fail
-            # round trip again:
-            #   1. top-level `reasoning_effort` — OpenAI/Gemini-compat
-            #      standard flat string field. Tried first; this is what
-            #      Gemini's own OpenAI-compatibility layer documents
-            #      (https://ai.google.dev/gemini-api/docs/openai#thinking)
-            #      and what real OpenAI accepts too.
-            #   2. nested `reasoning: {"effort": ...}` — OpenRouter's
-            #      unified reasoning-control shape. Tried only once tier 1
-            #      has been marked unsupported for this URL (via a real
-            #      HTTP 400 — see request_completion below).
-            #   3. neither field sent at all — falls through to whatever
-            #      `think`'s own on/off handling already put in the
-            #      payload (or nothing, if `think` is None/unset): the
-            #      model still thinks, just at its own default depth, no
-            #      crash, no manual intervention. Reached once BOTH tier 1
-            #      and tier 2 have been marked unsupported for this URL.
-            if reasoning_effort_toplevel_is_supported(url):
-                payload["reasoning_effort"] = think_effort
-            elif reasoning_field_is_supported(url):
-                payload["reasoning"] = {"effort": think_effort}
-            # else: both tiers exhausted for this URL — send nothing,
-            # plain thinking mode, no depth hint (tier 3).
-        if response_format and response_format_is_supported(url):
-            payload["response_format"] = {"type": "json_object"}
     return url, headers, payload
 
 
 def request_completion(url, headers, payload, timeout, stream=False, on_token=None,
                        api_format: str = "openai", ssl_context: "ssl.SSLContext | None" = None,
-                       error_retries: int = 3, error_retry_wait_sec: float = 60.0,
+                       error_retries: int = 10, error_retry_wait_sec: float = 60.0,
                        max_retry_after_sec: float = 180.0, on_retry=None,
                        _sleep_fn=None):
     """
@@ -771,65 +601,10 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
     def _looks_like_unknown_reasoning_field(detail: str) -> bool:
         low = detail.lower()
         return "reasoning" in low and ("unknown name" in low or "cannot find field" in low
-                                        or "unrecognized" in low or "not supported" in low
-                                        or "invalid" in low)
-
-    # AUTO-THINKDEPTH-2: tier 1 of the three-tier think_effort cascade —
-    # payload-shape fix (this endpoint doesn't accept the top-level
-    # `reasoning_effort` string field), not a transient error, fires ONCE
-    # per call, immediately, without touching error_retries/backoff. On
-    # rejection this does NOT give up on depth entirely — it downgrades to
-    # tier 2 (nested `reasoning: {"effort": ...}`, OpenRouter's shape) in
-    # the SAME retry, which the existing tier-2 block below then handles
-    # exactly like it always has (including its own further fallback to
-    # tier 3 if tier 2 also gets rejected).
-    _reasoning_effort_toplevel_stripped = False
-
-    def _looks_like_unknown_reasoning_effort_field(detail: str) -> bool:
-        low = detail.lower()
-        return "reasoning_effort" in low and (
-            "unknown name" in low or "cannot find field" in low
-            or "unrecognized" in low or "not supported" in low
-            or "invalid" in low or "unexpected" in low
-        )
-
-    # AUTO-THINKDEPTH-1: mirrors _reasoning_stripped/_response_format_stripped
-    # — a payload-shape fix (the endpoint doesn't accept a string depth in
-    # Ollama's "think" field), not a transient error, fires ONCE per call.
-    _think_depth_stripped = False
-
-    def _looks_like_unknown_think_depth_value(detail: str) -> bool:
-        low = detail.lower()
-        return "think" in low and (
-            "unknown name" in low or "cannot find field" in low
-            or "unrecognized" in low or "not supported" in low
-            or "invalid" in low or "unexpected" in low or "boolean" in low
-        )
-
-    # AUTO-JSONMODE-1: mirrors _reasoning_stripped above — a payload-shape
-    # fix (the provider doesn't support enforced JSON mode), not a
-    # transient error, so it fires ONCE per call, immediately, without
-    # touching error_retries/backoff.
-    _response_format_stripped = False
-
-    def _looks_like_unknown_response_format_field(detail: str) -> bool:
-        low = detail.lower()
-        # Match "format" as a mention of the field name loosely — error
-        # bodies quote it in inconsistent ways (`"format"`, `\"format\"`
-        # inside a JSON-encoded message string, unquoted, ...) — so check
-        # the bare word rather than a specific quoting style. Combined
-        # with the caller's _has_rf_field check (the outgoing payload
-        # actually had the field) and the rejection-keyword check below,
-        # this stays specific enough not to misfire on unrelated 400s.
-        has_field_name = "response_format" in low or "format" in low
-        return has_field_name and (
-            "unknown name" in low or "cannot find field" in low
-            or "unrecognized" in low or "not supported" in low
-            or "invalid" in low or "unexpected" in low
-        )
+                                        or "unrecognized" in low or "not supported" in low)
 
     def _open():
-        nonlocal body, req, _reasoning_stripped, _response_format_stripped, _think_depth_stripped, _reasoning_effort_toplevel_stripped
+        nonlocal body, req, _reasoning_stripped
         attempt = 0
         while True:
             try:
@@ -841,45 +616,6 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
                 except Exception:
                     pass
 
-                # AUTO-THINKDEPTH-2: tier 1 — strict-schema provider
-                # rejected the top-level `reasoning_effort` string field
-                # outright. Strip it and downgrade to tier 2 (nested
-                # `reasoning: {"effort": ...}`) in the SAME retry, rather
-                # than giving up on depth entirely — a provider that
-                # doesn't speak the OpenAI-standard flat field (e.g. an
-                # OpenRouter-style aggregator) may still understand the
-                # nested shape, so tier 2 gets a real chance before
-                # falling through to plain thinking mode.
-                if (e.code == 400 and not _reasoning_effort_toplevel_stripped
-                        and isinstance(body, dict) and "reasoning_effort" in body
-                        and _looks_like_unknown_reasoning_effort_field(detail)):
-                    _reasoning_effort_toplevel_stripped = True
-                    # Remember this endpoint for the rest of the process —
-                    # every future build_chat_request() call against the
-                    # same URL now goes straight to tier 2 instead of
-                    # repeating this exact 400.
-                    mark_reasoning_effort_toplevel_unsupported(url)
-                    _depth = body.get("reasoning_effort")
-                    body = {k: v for k, v in body.items() if k != "reasoning_effort"}
-                    body["reasoning"] = {"effort": _depth}
-                    req = urllib.request.Request(
-                        url, data=json.dumps(body).encode("utf-8"),
-                        headers=headers, method="POST",
-                    )
-                    msg = (
-                        f"HTTP 400 from {url}: provider rejected the "
-                        f"top-level 'reasoning_effort' field used for "
-                        f"[api] think_effort (depth={_depth!r}) — "
-                        f"disabling it for this endpoint for the rest of "
-                        f"the run, downgrading to the nested "
-                        f"'reasoning: {{\"effort\": ...}}' shape "
-                        f"(OpenRouter-style) and retrying once."
-                    )
-                    logger.warning("request_completion: %s", msg)
-                    if on_retry:
-                        on_retry(msg)
-                    continue
-
                 # AUTO-REASONING-1: strict-schema provider rejected the
                 # `reasoning` field outright — strip it and retry ONCE,
                 # immediately, without touching error_retries/backoff (this
@@ -888,117 +624,27 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
                         and isinstance(body, dict) and "reasoning" in body
                         and _looks_like_unknown_reasoning_field(detail)):
                     _reasoning_stripped = True
-                    # AUTO-REASONING-2: remember this endpoint for the rest
-                    # of the process — every future build_chat_request()
-                    # call against the same URL now skips the field
-                    # outright instead of repeating this exact 400.
-                    mark_reasoning_field_unsupported(url)
-                    # Distinguish which caller put "reasoning" in the
-                    # payload — AUTO-REASONING-1's think=false suppression
-                    # (`{"effort": "low", "exclude": True}`) vs
-                    # AUTO-THINKDEPTH-1's think_effort depth hint
-                    # (`{"effort": <configured depth>}`, no "exclude") —
-                    # purely for an accurate log message; both share the
-                    # same field name, cache, and strip/retry mechanics.
-                    _rf = body.get("reasoning")
-                    _is_effort_mode = isinstance(_rf, dict) and "exclude" not in _rf
+                    # AUTO-REASONING-2 / GATE1-PROVIDER-1: remember this
+                    # exact (endpoint, model) pair for the rest of the
+                    # process — every future build_chat_request() call
+                    # against the same URL AND the same model now skips
+                    # the field outright instead of repeating this exact
+                    # 400. A different model routed through this same URL
+                    # is untouched — its own first call still tries the
+                    # field, since it hasn't earned the same verdict yet.
+                    mark_reasoning_field_unsupported(url, body.get("model"))
                     body = {k: v for k, v in body.items() if k != "reasoning"}
                     req = urllib.request.Request(
                         url, data=json.dumps(body).encode("utf-8"),
                         headers=headers, method="POST",
                     )
-                    if _is_effort_mode:
-                        msg = (
-                            f"HTTP 400 from {url}: provider rejected the "
-                            f"'reasoning' field used for [api] think_effort "
-                            f"(depth={_rf.get('effort')!r}) — disabling "
-                            f"think_effort for this endpoint for the rest "
-                            f"of the run and retrying once without it. "
-                            f"Falling back to plain think=true (no depth "
-                            f"hint)."
-                        )
-                    else:
-                        msg = (
-                            f"HTTP 400 from {url}: provider rejected the "
-                            f"'reasoning' field — retrying once without it "
-                            f"(this provider needs [api_...] to not rely on "
-                            f"OpenRouter-style think=false suppression)"
-                        )
-                    logger.warning("request_completion: %s", msg)
-                    if on_retry:
-                        on_retry(msg)
-                    continue
-
-                # AUTO-JSONMODE-1: provider rejected enforced-JSON-mode
-                # field ("response_format" on openai-format, "format" on
-                # ollama) outright — strip it and retry ONCE, immediately,
-                # same shape as the reasoning-field fallback above. Then
-                # remember this endpoint for the rest of the process (via
-                # mark_response_format_unsupported) and fall back to the
-                # existing best-effort JSON parsing/salvage path for every
-                # subsequent call — this provider simply doesn't support
-                # engine-level JSON enforcement.
-                _has_rf_field = (
-                    isinstance(body, dict)
-                    and ("response_format" in body or body.get("format") == "json")
-                )
-                if (e.code == 400 and not _response_format_stripped
-                        and _has_rf_field
-                        and _looks_like_unknown_response_format_field(detail)):
-                    _response_format_stripped = True
-                    mark_response_format_unsupported(url)
-                    body = {k: v for k, v in body.items()
-                            if k != "response_format" and k != "format"}
-                    req = urllib.request.Request(
-                        url, data=json.dumps(body).encode("utf-8"),
-                        headers=headers, method="POST",
-                    )
                     msg = (
-                        f"HTTP 400 from {url}: provider does NOT support "
-                        f"enforced JSON mode ([api] response_format = true) — "
-                        f"disabling it for this endpoint for the rest of the "
-                        f"run and retrying once without it. Falling back to "
-                        f"best-effort JSON parsing (as before this setting "
-                        f"existed)."
+                        f"HTTP 400 from {url}: provider rejected the "
+                        f"'reasoning' field — retrying once without it "
+                        f"(this provider needs [api_...] to not rely on "
+                        f"OpenRouter-style think=false suppression)"
                     )
-                    logger.warning("=" * 78)
                     logger.warning("request_completion: %s", msg)
-                    logger.warning("=" * 78)
-                    if on_retry:
-                        on_retry(msg)
-                    continue
-
-                # AUTO-THINKDEPTH-1: endpoint rejected a string depth value
-                # in Ollama's "think" field ([api] think_effort_enabled =
-                # true) — degrade to the plain boolean, which is
-                # independently known-good (this is NOT a rejection of
-                # thinking-control itself, just of the depth-string
-                # variant), retry ONCE immediately, remember the endpoint
-                # so future build_chat_request() calls send the boolean
-                # straight away, and warn loudly.
-                _think_val = isinstance(body, dict) and body.get("think")
-                _has_think_depth_field = isinstance(_think_val, str)
-                if (e.code == 400 and not _think_depth_stripped
-                        and _has_think_depth_field
-                        and _looks_like_unknown_think_depth_value(detail)):
-                    _think_depth_stripped = True
-                    mark_think_depth_unsupported(url)
-                    body = {**body, "think": True}
-                    req = urllib.request.Request(
-                        url, data=json.dumps(body).encode("utf-8"),
-                        headers=headers, method="POST",
-                    )
-                    msg = (
-                        f"HTTP 400 from {url}: provider does NOT support a "
-                        f"reasoning-depth string in the 'think' field "
-                        f"([api] think_effort_enabled = true, think_effort "
-                        f"= '{_think_val}') — falling back to plain "
-                        f"think: true for this endpoint for the rest of "
-                        f"the run and retrying once."
-                    )
-                    logger.warning("=" * 78)
-                    logger.warning("request_completion: %s", msg)
-                    logger.warning("=" * 78)
                     if on_retry:
                         on_retry(msg)
                     continue
