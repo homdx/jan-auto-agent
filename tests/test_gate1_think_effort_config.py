@@ -104,11 +104,11 @@ class TestGate1ForwardsThinkEffort:
 
     @pytest.fixture(autouse=True)
     def _reset_caches(self):
-        llm_stream_mod._REASONING_UNSUPPORTED_URLS.clear()
-        llm_stream_mod._THINK_DEPTH_UNSUPPORTED_URLS.clear()
+        llm_stream_mod._REASONING_UNSUPPORTED_KEYS.clear()
+        llm_stream_mod._THINK_DEPTH_UNSUPPORTED_KEYS.clear()
         yield
-        llm_stream_mod._REASONING_UNSUPPORTED_URLS.clear()
-        llm_stream_mod._THINK_DEPTH_UNSUPPORTED_URLS.clear()
+        llm_stream_mod._REASONING_UNSUPPORTED_KEYS.clear()
+        llm_stream_mod._THINK_DEPTH_UNSUPPORTED_KEYS.clear()
 
     def test_enabled_reaches_payload_when_thinking_on(self):
         filt = _make_filter(_config(gate1_think="true", think_effort_enabled="true", think_effort="medium"))

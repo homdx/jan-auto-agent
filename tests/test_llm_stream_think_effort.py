@@ -41,13 +41,13 @@ import tools.llm_stream as llm_stream_mod
 
 @pytest.fixture(autouse=True)
 def _reset_caches():
-    llm_stream_mod._REASONING_UNSUPPORTED_URLS.clear()
-    llm_stream_mod._THINK_DEPTH_UNSUPPORTED_URLS.clear()
-    llm_stream_mod._REASONING_EFFORT_TOPLEVEL_UNSUPPORTED_URLS.clear()
+    llm_stream_mod._REASONING_UNSUPPORTED_KEYS.clear()
+    llm_stream_mod._THINK_DEPTH_UNSUPPORTED_KEYS.clear()
+    llm_stream_mod._REASONING_EFFORT_TOPLEVEL_UNSUPPORTED_KEYS.clear()
     yield
-    llm_stream_mod._REASONING_UNSUPPORTED_URLS.clear()
-    llm_stream_mod._THINK_DEPTH_UNSUPPORTED_URLS.clear()
-    llm_stream_mod._REASONING_EFFORT_TOPLEVEL_UNSUPPORTED_URLS.clear()
+    llm_stream_mod._REASONING_UNSUPPORTED_KEYS.clear()
+    llm_stream_mod._THINK_DEPTH_UNSUPPORTED_KEYS.clear()
+    llm_stream_mod._REASONING_EFFORT_TOPLEVEL_UNSUPPORTED_KEYS.clear()
 
 
 class _RecordingHandler(http.server.BaseHTTPRequestHandler):
@@ -199,7 +199,7 @@ class TestBuildChatRequestThinkEffort:
         )
         assert payload_before["think"] == "high"
 
-        llm_stream_mod.mark_think_depth_unsupported(url)
+        llm_stream_mod.mark_think_depth_unsupported(url, "m")
 
         _, _, payload_after = build_chat_request(
             base_url="http://localhost:11434", api_key="ollama", model="m",
@@ -217,8 +217,8 @@ class TestBuildChatRequestThinkEffort:
             api_format="openai", temperature=0.0, max_tokens=100,
             system="s", user_msg="u", think=False,
         )
-        llm_stream_mod.mark_reasoning_effort_toplevel_unsupported(url)
-        llm_stream_mod.mark_reasoning_field_unsupported(url)
+        llm_stream_mod.mark_reasoning_effort_toplevel_unsupported(url, "m")
+        llm_stream_mod.mark_reasoning_field_unsupported(url, "m")
 
         _, _, payload = build_chat_request(
             base_url="https://api.example.com/v1", api_key="k", model="m",
@@ -239,7 +239,7 @@ class TestBuildChatRequestThinkEffort:
         )
         assert payload_before.get("reasoning_effort") == "high"
 
-        llm_stream_mod.mark_reasoning_effort_toplevel_unsupported(url)
+        llm_stream_mod.mark_reasoning_effort_toplevel_unsupported(url, "m")
 
         _, _, payload_after = build_chat_request(
             base_url="https://api.example.com/v1", api_key="k", model="m",

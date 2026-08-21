@@ -90,9 +90,9 @@ class TestGate1ForwardsFlagToBuildChatRequest:
 
     @pytest.fixture(autouse=True)
     def _reset_cache(self):
-        llm_stream_mod._RESPONSE_FORMAT_UNSUPPORTED_URLS.clear()
+        llm_stream_mod._RESPONSE_FORMAT_UNSUPPORTED_KEYS.clear()
         yield
-        llm_stream_mod._RESPONSE_FORMAT_UNSUPPORTED_URLS.clear()
+        llm_stream_mod._RESPONSE_FORMAT_UNSUPPORTED_KEYS.clear()
 
     def _make_filter(self, response_format_value):
         return Gate1Filter(

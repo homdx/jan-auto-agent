@@ -276,6 +276,32 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         # num_ctx controls the total context window on Ollama; 0 means "use server default".
         _active = config.get("api", "active", fallback="local")
         self._num_ctx = config.getint(f"api_{_active}", "num_ctx", fallback=0)
+        # AUTO-JSONMODE-1: single GLOBAL switch (not per-[gate1]) — read
+        # from [api], same section that already governs `active` above, so
+        # one ini flag covers every LLM call this project makes. Default
+        # false: current best-effort JSON parsing/salvage behaviour is
+        # unchanged unless a user opts in. When true, every call this class
+        # makes asks the endpoint to enforce valid JSON at the engine level
+        # (see build_chat_request's *response_format* parameter); if that
+        # endpoint doesn't support it, request_completion() detects the
+        # HTTP 400, logs a loud warning, and falls back to today's
+        # behaviour for the rest of the run — no action needed here.
+        self._response_format = config.getboolean("api", "response_format", fallback=False)
+        # AUTO-THINKDEPTH-1: single GLOBAL switch + depth value, same
+        # pattern as [api] response_format above — off by default, so
+        # existing [gate1] think = true/false on/off behaviour (self._think
+        # above) is completely unaffected unless a user opts in. When on,
+        # a reasoning-depth hint ("low"/"medium"/"high", whatever the
+        # target model recognises) is forwarded alongside think=True; has
+        # no effect at all when self._think is False. If the endpoint
+        # doesn't support the depth value, build_chat_request/
+        # request_completion detect it, log a loud warning, and fall back
+        # to plain think on/off for the rest of the run.
+        self._think_effort = (
+            config.get("api", "think_effort", fallback="").strip()
+            if config.getboolean("api", "think_effort_enabled", fallback=False)
+            else None
+        ) or None
 
         # ── DM-3: select system prompt based on task_mode + ini overrides ─────
         # Priority: mode-specific ini key > legacy "system" key > built-in constant.
@@ -308,9 +334,11 @@ class Gate1Filter(_llm_stream.LLMClientBase):
 
         - **Unset (default)** — ``self._presence_*`` are exact copies of the
           constructor-passed ``base_url``/``api_key``/``model``/``api_format``
-          and this instance's own ``[gate1]`` ``think``/``temperature``/
-          ``max_tokens``/``num_ctx``. Byte-for-byte the pre-existing
-          behaviour; nothing about a config file without this key changes.
+          and this instance's own ``think``/``temperature``/``max_tokens``/
+          ``num_ctx`` ([gate1]) and ``response_format``/``think_effort``
+          (global [api], AUTO-JSONMODE-1 / AUTO-THINKDEPTH-1). Byte-for-byte
+          the pre-existing behaviour; nothing about a config file without
+          this key changes.
 
         - **Set to a section name** (e.g. ``presence_llm_profile = gate1_llm``)
           — presence-check calls instead use THAT section's own
@@ -322,36 +350,45 @@ class Gate1Filter(_llm_stream.LLMClientBase):
           ``api_format``/``verify_ssl`` (optional, default ``"openai"`` /
           ``True``).
 
-          ``think``/``temperature``/``max_tokens``/``num_ctx`` are each read
-          from the PROFILE section first; any one of them the profile
-          doesn't set falls back to THIS instance's own ``[gate1]`` value —
-          never to a hardcoded default and never to a different profile's
-          value. This is the crux of the "don't conflict with another
-          model's saved settings" requirement: a profile tuned for a
-          thinking-capable model (``think = true``) and the default
-          non-thinking ``[gate1]`` setting coexist without either bleeding
-          into the other, and two DIFFERENT profiles never share settings
-          with each other either — each is read independently, from its own
-          section, every time.
+          ``think``/``temperature``/``max_tokens``/``num_ctx``/
+          ``response_format``/``think_effort_enabled``+``think_effort`` are
+          each read from the PROFILE section first; any one the profile
+          doesn't set falls back to THIS instance's own resolved value
+          (``self._think`` etc., ``self._response_format``,
+          ``self._think_effort``) — never to a hardcoded default and never
+          to a different profile's value. This is the crux of the "don't
+          conflict with another model's saved settings" requirement: a
+          profile tuned for a thinking-capable model (``think = true``) and
+          the default non-thinking ``[gate1]`` setting coexist without
+          either bleeding into the other; a profile for a provider that
+          doesn't support enforced JSON mode can set
+          ``response_format = false`` even while the global ``[api]
+          response_format = true`` switch is on for every other caller; and
+          two DIFFERENT profiles never share settings with each other
+          either — each is read independently, from its own section, every
+          time.
 
         The module-level ``(url, model)``-keyed "does this endpoint accept
-        the `reasoning` field" memory (see ``tools.llm_stream.
-        mark_reasoning_field_unsupported``) already gives the presence
-        profile's own (possibly different) url+model an independent verdict
-        from whatever the shared provider's url+model has recorded — no
-        extra wiring needed here for that part.
+        field X" memories (see ``tools.llm_stream.
+        mark_reasoning_field_unsupported`` and its three siblings for
+        response_format / think_effort / think_depth) already give the
+        presence profile's own (possibly different) url+model an
+        independent verdict from whatever the shared provider's url+model
+        has recorded — no extra wiring needed here for that part.
         """
         profile_name = config.get(sec, "presence_llm_profile", fallback="").strip()
         if not profile_name:
-            self._presence_base_url    = self._base_url
-            self._presence_api_key     = self._api_key
-            self._presence_model       = self._model
-            self._presence_api_format  = self._api_format
-            self._presence_ssl_context = self._ssl_context
-            self._presence_think       = self._think
-            self._presence_temperature = self._temperature
-            self._presence_max_tokens  = self._max_tokens
-            self._presence_num_ctx     = self._num_ctx
+            self._presence_base_url      = self._base_url
+            self._presence_api_key       = self._api_key
+            self._presence_model         = self._model
+            self._presence_api_format    = self._api_format
+            self._presence_ssl_context   = self._ssl_context
+            self._presence_think         = self._think
+            self._presence_temperature   = self._temperature
+            self._presence_max_tokens    = self._max_tokens
+            self._presence_num_ctx       = self._num_ctx
+            self._presence_response_format = self._response_format
+            self._presence_think_effort  = self._think_effort
             return
 
         if not config.has_section(profile_name):
@@ -380,11 +417,11 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         self._presence_ssl_context = (
             _llm_stream.make_unverified_context() if not _verify_ssl else None
         )
-        # Each falls back to THIS instance's own [gate1] value (self._think
-        # etc., already resolved above) when the profile doesn't set it —
-        # deliberately never a hardcoded True/False/0 default, and never
-        # another profile's value: fallback is always "what [gate1] itself
-        # says", scoped to this one Gate1Filter instance.
+        # Each falls back to THIS instance's own resolved value when the
+        # profile doesn't set it — deliberately never a hardcoded
+        # True/False/0/None default, and never another profile's value:
+        # fallback is always "what this Gate1Filter instance itself
+        # resolved", scoped to this one instance.
         self._presence_think = config.getboolean(
             profile_name, "think", fallback=self._think)
         self._presence_temperature = float(config.get(
@@ -393,6 +430,17 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             profile_name, "max_tokens", fallback=str(self._max_tokens)))
         self._presence_num_ctx = config.getint(
             profile_name, "num_ctx", fallback=self._num_ctx)
+        self._presence_response_format = config.getboolean(
+            profile_name, "response_format", fallback=self._response_format)
+        if config.has_option(profile_name, "think_effort_enabled"):
+            _profile_effort_enabled = config.getboolean(
+                profile_name, "think_effort_enabled")
+            self._presence_think_effort = (
+                config.get(profile_name, "think_effort", fallback="").strip()
+                if _profile_effort_enabled else None
+            ) or None
+        else:
+            self._presence_think_effort = self._think_effort
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -900,6 +948,8 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                 max_tokens=self._presence_max_tokens if max_tokens is None else max_tokens,
                 system=self._system, user_msg=msg,
                 num_ctx=self._presence_num_ctx, think=self._presence_think,
+                response_format=self._presence_response_format,
+                think_effort=self._presence_think_effort,
             )
             tracer.event(
                 source="gate1",

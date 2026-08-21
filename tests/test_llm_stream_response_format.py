@@ -34,9 +34,9 @@ def _reset_response_format_cache():
     """AUTO-JSONMODE-1's unsupported-URL memory is process-lifetime global
     state — reset it before/after every test so tests don't leak into each
     other regardless of run order."""
-    llm_stream_mod._RESPONSE_FORMAT_UNSUPPORTED_URLS.clear()
+    llm_stream_mod._RESPONSE_FORMAT_UNSUPPORTED_KEYS.clear()
     yield
-    llm_stream_mod._RESPONSE_FORMAT_UNSUPPORTED_URLS.clear()
+    llm_stream_mod._RESPONSE_FORMAT_UNSUPPORTED_KEYS.clear()
 
 
 class _RecordingHandler(http.server.BaseHTTPRequestHandler):
@@ -164,7 +164,7 @@ class TestBuildChatRequestResponseFormat:
         )
         assert "response_format" in payload_before
 
-        llm_stream_mod.mark_response_format_unsupported(url)
+        llm_stream_mod.mark_response_format_unsupported(url, "m")
 
         _, _, payload_after = build_chat_request(
             base_url="https://api.example.com/v1", api_key="k", model="m",
