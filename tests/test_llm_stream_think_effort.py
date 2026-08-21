@@ -250,6 +250,82 @@ class TestBuildChatRequestThinkEffort:
         assert payload_after.get("reasoning") == {"effort": "high"}
 
 
+class TestThinkEffortModelIndependence:
+    """GATE1-PROVIDER-1: both _REASONING_EFFORT_TOPLEVEL_UNSUPPORTED_KEYS
+    (openai tier 1) and _THINK_DEPTH_UNSUPPORTED_KEYS (ollama) are keyed
+    by (url, model), not url alone — a router endpoint that fronts
+    several models must give each model its own independent verdict, in
+    both directions."""
+
+    def test_toplevel_marking_one_model_does_not_affect_sibling_model(self):
+        url = "https://router.example/v1/chat/completions"
+        llm_stream_mod.mark_reasoning_effort_toplevel_unsupported(url, "model-a")
+        assert llm_stream_mod.reasoning_effort_toplevel_is_supported(
+            url, "model-a") is False
+        assert llm_stream_mod.reasoning_effort_toplevel_is_supported(
+            url, "model-b") is True
+
+    def test_toplevel_marking_one_url_does_not_affect_same_model_elsewhere(self):
+        model = "same-model-name"
+        llm_stream_mod.mark_reasoning_effort_toplevel_unsupported(
+            "https://provider-a.example/v1/chat/completions", model)
+        assert llm_stream_mod.reasoning_effort_toplevel_is_supported(
+            "https://provider-a.example/v1/chat/completions", model) is False
+        assert llm_stream_mod.reasoning_effort_toplevel_is_supported(
+            "https://provider-b.example/v1/chat/completions", model) is True
+
+    def test_toplevel_build_chat_request_only_downgrades_the_marked_model(self):
+        url = "https://router.example/v1/chat/completions"
+        llm_stream_mod.mark_reasoning_effort_toplevel_unsupported(url, "model-a")
+
+        _, _, payload_a = build_chat_request(
+            base_url="https://router.example/v1", api_key="k", model="model-a",
+            api_format="openai", temperature=0.0, max_tokens=100,
+            system="s", user_msg="u", think=True, think_effort="high",
+        )
+        assert "reasoning_effort" not in payload_a
+        assert payload_a.get("reasoning") == {"effort": "high"}  # degrades to tier 2
+
+        _, _, payload_b = build_chat_request(
+            base_url="https://router.example/v1", api_key="k", model="model-b",
+            api_format="openai", temperature=0.0, max_tokens=100,
+            system="s", user_msg="u", think=True, think_effort="high",
+        )
+        assert payload_b.get("reasoning_effort") == "high"  # still tier 1
+
+    def test_think_depth_marking_one_model_does_not_affect_sibling_model(self):
+        url = llm_stream_mod.ollama_chat_url("http://router.example:11434")
+        llm_stream_mod.mark_think_depth_unsupported(url, "model-a")
+        assert llm_stream_mod.think_depth_is_supported(url, "model-a") is False
+        assert llm_stream_mod.think_depth_is_supported(url, "model-b") is True
+
+    def test_think_depth_marking_one_url_does_not_affect_same_model_elsewhere(self):
+        model = "same-model-name"
+        url_a = llm_stream_mod.ollama_chat_url("http://provider-a.example:11434")
+        url_b = llm_stream_mod.ollama_chat_url("http://provider-b.example:11434")
+        llm_stream_mod.mark_think_depth_unsupported(url_a, model)
+        assert llm_stream_mod.think_depth_is_supported(url_a, model) is False
+        assert llm_stream_mod.think_depth_is_supported(url_b, model) is True
+
+    def test_think_depth_build_chat_request_only_degrades_the_marked_model(self):
+        url = llm_stream_mod.ollama_chat_url("http://router.example:11434")
+        llm_stream_mod.mark_think_depth_unsupported(url, "model-a")
+
+        _, _, payload_a = build_chat_request(
+            base_url="http://router.example:11434", api_key="ollama", model="model-a",
+            api_format="ollama", temperature=0.0, max_tokens=100,
+            system="s", user_msg="u", think=True, think_effort="high",
+        )
+        assert payload_a.get("think") is True  # degraded to plain bool
+
+        _, _, payload_b = build_chat_request(
+            base_url="http://router.example:11434", api_key="ollama", model="model-b",
+            api_format="ollama", temperature=0.0, max_tokens=100,
+            system="s", user_msg="u", think=True, think_effort="high",
+        )
+        assert payload_b.get("think") == "high"  # still gets the depth string
+
+
 class TestThinkEffort400Fallback:
 
     def test_ollama_400_strips_depth_and_retries_with_bool(self, caplog):
@@ -298,6 +374,32 @@ class TestThinkEffort400Fallback:
             system="s", user_msg="u", think=True, think_effort="high",
         )
         assert next_payload["think"] is True
+
+    def test_ollama_endpoint_remembered_only_for_the_rejecting_model(self):
+        """Model A's 400 (real HTTP round trip) must not cause model B's
+        very next call, against the same router URL, to have its depth
+        string stripped pre-emptively — B gets its own honest first try."""
+        server, port, handler_cls = _serve_script([
+            ("error", 400, _REJECT_THINK_DEPTH_400, {}),  # model A: rejected
+            ("ok", _OK_BODY_OLLAMA),                         # model A retry: ok
+        ])
+        try:
+            request_completion(
+                f"http://127.0.0.1:{port}/api/chat",
+                {"Content-Type": "application/json"},
+                {"model": "model-a", "messages": [], "think": "high"},
+                timeout=5, stream=False, api_format="ollama",
+            )
+        finally:
+            server.shutdown()
+
+        # Different model, same base_url: must still try the depth string.
+        _, _, payload_b = build_chat_request(
+            base_url=f"http://127.0.0.1:{port}", api_key="k", model="model-b",
+            api_format="ollama", temperature=0.0, max_tokens=100,
+            system="s", user_msg="u", think=True, think_effort="high",
+        )
+        assert payload_b["think"] == "high"
 
     def test_ollama_only_retries_once_second_400_raises(self):
         server, port, handler_cls = _serve_script([

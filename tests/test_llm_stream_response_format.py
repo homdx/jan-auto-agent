@@ -174,6 +174,66 @@ class TestBuildChatRequestResponseFormat:
         assert "response_format" not in payload_after
 
 
+class TestResponseFormatModelIndependence:
+    """GATE1-PROVIDER-1: _RESPONSE_FORMAT_UNSUPPORTED_KEYS is keyed by
+    (url, model), not url alone — a router endpoint (kenari.id,
+    bynara.id, NaraRouter, ...) that fronts several models must give each
+    model its own independent verdict, in both directions."""
+
+    def test_marking_one_model_does_not_affect_sibling_model_same_url(self):
+        url = "https://router.example/v1/chat/completions"
+        llm_stream_mod.mark_response_format_unsupported(url, "model-a")
+        assert llm_stream_mod.response_format_is_supported(url, "model-a") is False
+        assert llm_stream_mod.response_format_is_supported(url, "model-b") is True
+
+    def test_marking_one_url_does_not_affect_same_model_elsewhere(self):
+        model = "same-model-name"
+        llm_stream_mod.mark_response_format_unsupported(
+            "https://provider-a.example/v1/chat/completions", model)
+        assert llm_stream_mod.response_format_is_supported(
+            "https://provider-a.example/v1/chat/completions", model) is False
+        assert llm_stream_mod.response_format_is_supported(
+            "https://provider-b.example/v1/chat/completions", model) is True
+
+    def test_build_chat_request_only_skips_for_the_marked_model(self):
+        url = "https://router.example/v1/chat/completions"
+        llm_stream_mod.mark_response_format_unsupported(url, "model-a")
+
+        _, _, payload_a = build_chat_request(
+            base_url="https://router.example/v1", api_key="k", model="model-a",
+            api_format="openai", temperature=0.0, max_tokens=100,
+            system="s", user_msg="u", response_format=True,
+        )
+        assert "response_format" not in payload_a
+
+        _, _, payload_b = build_chat_request(
+            base_url="https://router.example/v1", api_key="k", model="model-b",
+            api_format="openai", temperature=0.0, max_tokens=100,
+            system="s", user_msg="u", response_format=True,
+        )
+        assert "response_format" in payload_b
+
+    def test_ollama_format_field_also_keyed_by_model(self):
+        """Same independence for the Ollama-branch 'format' field, not
+        just the openai-branch 'response_format' field."""
+        url = llm_stream_mod.ollama_chat_url("http://router.example:11434")
+        llm_stream_mod.mark_response_format_unsupported(url, "model-a")
+
+        _, _, payload_a = build_chat_request(
+            base_url="http://router.example:11434", api_key="ollama", model="model-a",
+            api_format="ollama", temperature=0.0, max_tokens=100,
+            system="s", user_msg="u", response_format=True,
+        )
+        assert "format" not in payload_a
+
+        _, _, payload_b = build_chat_request(
+            base_url="http://router.example:11434", api_key="ollama", model="model-b",
+            api_format="ollama", temperature=0.0, max_tokens=100,
+            system="s", user_msg="u", response_format=True,
+        )
+        assert payload_b.get("format") == "json"
+
+
 class TestResponseFormat400Fallback:
 
     def test_openai_400_strips_response_format_and_retries_once(self, caplog):
@@ -253,6 +313,34 @@ class TestResponseFormat400Fallback:
             system="s", user_msg="u", response_format=True,
         )
         assert "response_format" not in next_payload
+
+    def test_endpoint_remembered_only_for_the_rejecting_model(self):
+        """Full integration: model A's 400 (real HTTP round trip) must not
+        cause model B's very next call, against the same router URL, to
+        have response_format stripped pre-emptively — B gets its own
+        honest first try."""
+        server, port, handler_cls = _serve_script([
+            ("error", 400, _REJECT_RESPONSE_FORMAT_400, {}),  # model A: rejected
+            ("ok", _OK_BODY),                                    # model A retry: ok
+        ])
+        try:
+            request_completion(
+                f"http://127.0.0.1:{port}/chat/completions",
+                {"Content-Type": "application/json"},
+                {"model": "model-a", "messages": [],
+                 "response_format": {"type": "json_object"}},
+                timeout=5, stream=False, api_format="openai",
+            )
+        finally:
+            server.shutdown()
+
+        # Different model, same base_url: must still try the field.
+        _, _, payload_b = build_chat_request(
+            base_url=f"http://127.0.0.1:{port}", api_key="k", model="model-b",
+            api_format="openai", temperature=0.0, max_tokens=100,
+            system="s", user_msg="u", response_format=True,
+        )
+        assert "response_format" in payload_b
 
     def test_only_retries_once_second_400_raises(self):
         server, port, handler_cls = _serve_script([

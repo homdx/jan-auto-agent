@@ -244,6 +244,157 @@ class TestProfilePartialOverrideFallsBackToGate1():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# response_format / think_effort: same independent-override contract as
+# think/temperature/max_tokens/num_ctx above, extended to the two GLOBAL
+# ([api]) switches added after this profile mechanism was first built.
+# This is the direct scenario the feature was requested for: "[api]
+# response_format = true / think_effort_enabled = true everywhere, but the
+# presence profile's model doesn't support one or the other while the main
+# model does" — each setting must be resolvable independently per profile.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestProfileResponseFormatAndThinkEffortOverride:
+
+    def _cfg(self, *, api_overrides=None, profile_overrides=None,
+             gate1_overrides=None) -> dict:
+        d = _base_dict(presence_llm_profile="gate1_llm",
+                        **(gate1_overrides or {}))
+        d["api"].update(api_overrides or {})
+        profile = {
+            "base_url":   "https://fallback.example/v1",
+            "api_key":    "fallback-key",
+            "model":      "fallback-model",
+            "api_format": "openai",
+        }
+        profile.update(profile_overrides or {})
+        d["gate1_llm"] = profile
+        return d
+
+    # ── No profile override: presence mirrors the resolved global value ──
+
+    def test_no_profile_override_response_format_true_mirrors_global(self):
+        d = _base_dict()  # no presence_llm_profile at all
+        d["api"]["response_format"] = "true"
+        filt = _make_filter(d)
+        assert filt._presence_response_format is True
+
+    def test_no_profile_override_response_format_false_mirrors_global(self):
+        d = _base_dict()
+        filt = _make_filter(d)  # [api] response_format absent -> False
+        assert filt._presence_response_format is False
+
+    def test_no_profile_override_think_effort_mirrors_global_enabled(self):
+        d = _base_dict()
+        d["api"]["think_effort_enabled"] = "true"
+        d["api"]["think_effort"] = "medium"
+        filt = _make_filter(d)
+        assert filt._presence_think_effort == "medium"
+
+    def test_no_profile_override_think_effort_mirrors_global_disabled(self):
+        d = _base_dict()
+        filt = _make_filter(d)  # think_effort_enabled absent -> None
+        assert filt._presence_think_effort is None
+
+    # ── Profile sets its own response_format — wins over global, either
+    #    direction ──
+
+    def test_profile_response_format_false_wins_over_global_true(self):
+        """The scenario the feature exists for: global JSON-mode is on for
+        every other caller, but this profile's model doesn't support it."""
+        filt = _make_filter(self._cfg(
+            api_overrides={"response_format": "true"},
+            profile_overrides={"response_format": "false"},
+        ))
+        assert filt._response_format is True          # global unaffected
+        assert filt._presence_response_format is False  # profile wins
+
+    def test_profile_response_format_true_wins_over_global_false(self):
+        filt = _make_filter(self._cfg(
+            profile_overrides={"response_format": "true"},
+        ))
+        assert filt._response_format is False
+        assert filt._presence_response_format is True
+
+    # ── Profile sets its own think_effort — wins over global, either
+    #    direction ──
+
+    def test_profile_think_effort_wins_over_global_disabled(self):
+        filt = _make_filter(self._cfg(
+            profile_overrides={"think_effort_enabled": "true",
+                                "think_effort": "high"},
+        ))
+        assert filt._think_effort is None              # global unaffected
+        assert filt._presence_think_effort == "high"    # profile wins
+
+    def test_profile_think_effort_disabled_wins_over_global_enabled(self):
+        """The reverse: global depth is on, but this profile's model
+        doesn't support a depth hint at all."""
+        filt = _make_filter(self._cfg(
+            api_overrides={"think_effort_enabled": "true",
+                            "think_effort": "high"},
+            profile_overrides={"think_effort_enabled": "false"},
+        ))
+        assert filt._think_effort == "high"     # global unaffected
+        assert filt._presence_think_effort is None  # profile wins
+
+    def test_profile_think_effort_enabled_but_empty_depth_is_none(self):
+        filt = _make_filter(self._cfg(
+            profile_overrides={"think_effort_enabled": "true",
+                                "think_effort": ""},
+        ))
+        assert filt._presence_think_effort is None
+
+    # ── Profile omits the key entirely — falls back to THIS instance's
+    #    resolved global value, not a hardcoded default ──
+
+    def test_profile_without_response_format_key_falls_back_to_global(self):
+        filt = _make_filter(self._cfg(
+            api_overrides={"response_format": "true"},
+            # profile itself has no "response_format" key
+        ))
+        assert filt._presence_response_format is True
+
+    def test_profile_without_think_effort_enabled_key_falls_back_to_global(self):
+        filt = _make_filter(self._cfg(
+            api_overrides={"think_effort_enabled": "true",
+                            "think_effort": "low"},
+            # profile itself has no "think_effort_enabled" key
+        ))
+        assert filt._presence_think_effort == "low"
+
+    # ── End-to-end: build_chat_request actually receives the profile's
+    #    values, not the global ones ──
+
+    def test_end_to_end_build_chat_request_receives_profile_values(self, repo):
+        filt = _make_filter(self._cfg(
+            api_overrides={"response_format": "true",
+                            "think_effort_enabled": "true",
+                            "think_effort": "high"},
+            profile_overrides={"response_format": "false",
+                                "think_effort_enabled": "true",
+                                "think_effort": "low",
+                                "think": "true"},
+        ))
+        real_build = llm_stream_mod.build_chat_request
+        captured: dict = {}
+
+        def _capture(**kwargs):
+            captured.update(kwargs)
+            return real_build(**kwargs)
+
+        with patch("tools.llm_stream.build_chat_request", side_effect=_capture), \
+             patch(
+                "tools.llm_stream.request_completion",
+                return_value='{"verdict": "confirmed", "evidence": "return raw", '
+                             '"reason": "y"}',
+             ):
+            filt.filter([_candidate()], repo)
+
+        assert captured["response_format"] is False   # profile's, not global's True
+        assert captured["think_effort"] == "low"        # profile's, not global's "high"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Misconfiguration fails loudly, never silently reuses the shared provider
 # ─────────────────────────────────────────────────────────────────────────────
 
