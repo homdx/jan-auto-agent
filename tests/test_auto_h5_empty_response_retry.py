@@ -160,6 +160,17 @@ def _user_messages(mock_llm) -> list[str]:
     return out
 
 
+def _payloads(mock_llm) -> list[dict]:
+    """Extract the full outgoing payload dict for each call, in call
+    order — used to inspect max_tokens/temperature actually sent per
+    attempt (AUTO-H5-ESCALATE-1)."""
+    out = []
+    for c in mock_llm.call_args_list:
+        payload = c.kwargs.get("payload") or c.args[2]
+        out.append(payload)
+    return out
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # AC-H5-1 / AC-H5-2 / AC-H5-3 — unsalvageable responses are retried
 # ─────────────────────────────────────────────────────────────────────────────
@@ -224,9 +235,12 @@ class TestRetryExhaustionAndConfig:
     def test_still_unsalvageable_after_all_retries_gives_up_with_zero(
         self, cfg, cluster_and_base
     ) -> None:
-        """AC-H5-4: default empty_response_retry_max=2 → 3 total attempts
-        (1 + 2 retries). If ALL are unsalvageable, the batch fails open
-        with 0 candidates rather than raising or aborting the whole run."""
+        """AC-H5-4: default empty_response_retry_max=5 → 6 total attempts
+        (1 + 5 retries, was 2 retries / 3 total before AUTO-H5-ESCALATE-1
+        raised the default alongside adding escalation — see the class
+        docstring in architect.py). If ALL are unsalvageable, the batch
+        fails open with 0 candidates rather than raising or aborting the
+        whole run."""
         cluster, base_dir = cluster_and_base
         reviewer = _reviewer(cfg)
         with patch(
@@ -234,7 +248,7 @@ class TestRetryExhaustionAndConfig:
         ) as mock_llm:
             results = reviewer.review_clusters([cluster], base_dir, goal="improve code")
 
-        assert mock_llm.call_count == 3  # 1 initial + 2 retries (default max)
+        assert mock_llm.call_count == 6  # 1 initial + 5 retries (default max)
         assert results == []
 
     def test_empty_response_retry_max_zero_disables_retry(
@@ -283,6 +297,151 @@ class TestRetryExhaustionAndConfig:
             # value itself is simply invalid input.
             with pytest.raises(ValueError):
                 reviewer.review_clusters([cluster], base_dir, goal="improve code")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AUTO-H5-ESCALATE-1 — max_tokens/temperature escalate across AUTO-H5
+# retries, mirroring Gate1Filter's own unparseable-retry escalation
+# (tools/auto/gate1_filter.py). An unsalvageable response is very often
+# the model's thinking channel consuming the entire ORIGINAL budget, not
+# a one-off decoding hiccup a same-settings retry can fix — see field
+# report in the ClusterReviewer class docstring.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestEmptyResponseRetryEscalation:
+
+    def test_max_tokens_doubles_from_floor_each_attempt(
+        self, cfg, cluster_and_base
+    ) -> None:
+        """[architect] max_tokens=512 (this fixture's cfg) is deliberately
+        NOT the base the escalation multiplies from — same rationale as
+        Gate1Filter: a small configured budget is exactly the thing
+        causing the exhaustion, so multiplying it stays small too. The
+        floor (4096) and doubling are fixed regardless of the configured
+        base."""
+        cluster, base_dir = cluster_and_base
+        reviewer = _reviewer(cfg)
+        with patch(
+            "tools.llm_stream.request_completion", return_value=_EMPTY_PAYLOAD
+        ) as mock_llm:
+            reviewer.review_clusters([cluster], base_dir, goal="improve code")
+
+        payloads = _payloads(mock_llm)
+        assert len(payloads) == 6  # 1 initial + 5 retries (default max)
+        assert payloads[0]["max_tokens"] == 512    # initial: unescalated base config
+        assert payloads[1]["max_tokens"] == 4096   # retry 1: floor
+        assert payloads[2]["max_tokens"] == 8192   # retry 2: floor * 2
+        assert payloads[3]["max_tokens"] == 16384  # retry 3: floor * 4
+        assert payloads[4]["max_tokens"] == 32768  # retry 4: floor * 8
+        assert payloads[5]["max_tokens"] == 32768  # retry 5: floor * 16, capped
+
+    def test_temperature_decreases_each_attempt_floored_at_zero(
+        self, cfg, cluster_and_base
+    ) -> None:
+        """cfg's [architect] temperature = 0.2 — each retry steps down by
+        0.1, floored at 0.0 (never negative)."""
+        cluster, base_dir = cluster_and_base
+        reviewer = _reviewer(cfg)
+        with patch(
+            "tools.llm_stream.request_completion", return_value=_EMPTY_PAYLOAD
+        ) as mock_llm:
+            reviewer.review_clusters([cluster], base_dir, goal="improve code")
+
+        payloads = _payloads(mock_llm)
+        assert payloads[0]["temperature"] == pytest.approx(0.2)   # initial: unescalated
+        assert payloads[1]["temperature"] == pytest.approx(0.1)
+        assert payloads[2]["temperature"] == pytest.approx(0.0)
+        assert payloads[3]["temperature"] == pytest.approx(0.0)   # floored, not negative
+        assert payloads[4]["temperature"] == pytest.approx(0.0)
+        assert payloads[5]["temperature"] == pytest.approx(0.0)
+
+    def test_ceiling_tracks_num_ctx_when_configured(
+        self, cfg, cluster_and_base
+    ) -> None:
+        """When [api_local] num_ctx is set, the ceiling is num_ctx * 0.5,
+        not the flat 32768 default — matches Gate1Filter's own ctx-aware
+        ceiling so a small-context model doesn't get an unrealistic
+        token request."""
+        cfg["api_local"]["num_ctx"] = "20000"
+        cluster, base_dir = cluster_and_base
+        reviewer = _reviewer(cfg)
+        with patch(
+            "tools.llm_stream.request_completion", return_value=_EMPTY_PAYLOAD
+        ) as mock_llm:
+            reviewer.review_clusters([cluster], base_dir, goal="improve code")
+
+        payloads = _payloads(mock_llm)
+        # ceiling = int(20000 * 0.5) = 10000
+        assert payloads[1]["max_tokens"] == 4096    # under ceiling: unaffected
+        assert payloads[2]["max_tokens"] == 8192    # under ceiling: unaffected
+        assert payloads[3]["max_tokens"] == 10000   # would be 16384 — capped
+        assert payloads[4]["max_tokens"] == 10000   # would be 32768 — capped
+        assert payloads[5]["max_tokens"] == 10000   # would be 65536 — capped
+
+    def test_ceiling_defaults_to_flat_value_when_num_ctx_unset(
+        self, cfg, cluster_and_base
+    ) -> None:
+        """No [api_local] num_ctx at all (this fixture's default) — the
+        ceiling falls back to the flat 32768 default, not e.g. 0 (which
+        would collapse every escalated attempt down to the floor)."""
+        cluster, base_dir = cluster_and_base
+        reviewer = _reviewer(cfg)
+        with patch(
+            "tools.llm_stream.request_completion", return_value=_EMPTY_PAYLOAD
+        ) as mock_llm:
+            reviewer.review_clusters([cluster], base_dir, goal="improve code")
+
+        payloads = _payloads(mock_llm)
+        assert payloads[4]["max_tokens"] == 32768  # reaches the flat ceiling
+        assert payloads[5]["max_tokens"] == 32768  # stays capped there
+
+    def test_recovers_mid_escalation_when_a_later_attempt_succeeds(
+        self, cfg, cluster_and_base
+    ) -> None:
+        """The escalation isn't just cosmetic — a wider budget on a later
+        attempt can be the actual reason a previously-empty response
+        starts producing valid JSON."""
+        cluster, base_dir = cluster_and_base
+        reviewer = _reviewer(cfg)
+        side_effects = [_EMPTY_PAYLOAD, _EMPTY_PAYLOAD, _good_payload("Recovered task")]
+        with patch(
+            "tools.llm_stream.request_completion", side_effect=side_effects
+        ) as mock_llm:
+            results = reviewer.review_clusters([cluster], base_dir, goal="improve code")
+
+        payloads = _payloads(mock_llm)
+        assert mock_llm.call_count == 3
+        assert payloads[2]["max_tokens"] == 8192  # the attempt that succeeded
+        assert [r.title for r in results] == ["Recovered task"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AUTO-H5-ESCALATE-1 must NOT leak into AUTO-H4's shrink-retry path
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestEscalationDoesNotAffectTruncatedRetries:
+
+    def test_truncated_retry_keeps_base_tokens_and_temperature(
+        self, cfg, cluster_and_base
+    ) -> None:
+        """AUTO-H4's shrink-retry (a truncated, partially-salvaged
+        response) has its own, unrelated remedy — shrinking max_tasks —
+        and must keep using the base config's max_tokens/temperature
+        unchanged. Only AUTO-H5's unsalvageable branch escalates."""
+        cluster, base_dir = cluster_and_base
+        reviewer = _reviewer(cfg)
+        side_effects = [
+            _truncated_payload("A", "B", "C", "D", "E"),
+            _good_payload("Recovered"),
+        ]
+        with patch(
+            "tools.llm_stream.request_completion", side_effect=side_effects
+        ) as mock_llm:
+            reviewer.review_clusters([cluster], base_dir, goal="improve code")
+
+        payloads = _payloads(mock_llm)
+        assert payloads[1]["max_tokens"] == 512          # cfg's base, not escalated
+        assert payloads[1]["temperature"] == pytest.approx(0.2)  # cfg's base
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -353,6 +353,25 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
         Whether to verify the server's TLS certificate.
     """
 
+    # AUTO-H5-ESCALATE-1: mirrors gate1_filter.py's Gate1Filter
+    # _UNPARSEABLE_* escalation — an "unsalvageable" (empty/degenerate/
+    # non-JSON) response on a reasoning-heavy model is often the SAME
+    # root cause Gate 1 already handles: the model's thinking channel
+    # (see AUTO-ZAITHINK-1 / AUTO-THINKDEPTH-2 in tools/llm_stream.py)
+    # consumed the entire max_tokens budget before any JSON was written,
+    # not a one-off decoding hiccup a same-settings plain retry can fix.
+    # Each retry (bounded by [architect] empty_response_retry_max, same
+    # config key as before — just now escalating instead of static) both
+    # widens the token budget and lowers temperature, exactly like Gate
+    # 1's presence-check retry. Floor/ceiling/step deliberately match
+    # Gate1Filter's constants — same failure mode, same fix.
+    _UNSALVAGEABLE_TOKENS_FLOOR = 4096
+    _UNSALVAGEABLE_TOKENS_STEP_MULT = 2.0
+    _UNSALVAGEABLE_TOKENS_DEFAULT_CEILING = 32768
+    _UNSALVAGEABLE_TOKENS_CTX_FRACTION = 0.5
+    _UNSALVAGEABLE_TEMPERATURE_STEP = 0.1
+    _UNSALVAGEABLE_TEMPERATURE_FLOOR = 0.0
+
     def __init__(
         self,
         config: configparser.ConfigParser,
@@ -759,26 +778,43 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 reduced = n - 1
             return max(1, reduced)
 
-        # AUTO-H5: plain retry on an unsalvageable (empty/garbage/degenerate)
-        # response — a distinct failure mode from AUTO-H4's truncation.
-        # There's no partial content here to blame on a tight max_tasks
-        # budget, so shrinking wouldn't help; the SAME request is re-sent
-        # as-is, since this is typically a one-off decoding hiccup (a
-        # model that degenerates into repeating "title": "title": ... until
-        # it hits its token cap, or a flaky upstream/proxy returning an
-        # empty body) rather than a structural sizing problem.
+        # AUTO-H5 / AUTO-H5-ESCALATE-1: retry on an unsalvageable
+        # (empty/garbage/degenerate) response — a distinct failure mode
+        # from AUTO-H4's truncation. There's no partial content here to
+        # blame on a tight max_tasks budget, so shrinking wouldn't help.
+        # Originally a same-settings plain retry (typical "one-off
+        # decoding hiccup" cause: a model repeating "title": "title": ...
+        # until it hits its cap, or a flaky upstream/proxy returning an
+        # empty body) — now ALSO escalates max_tokens/temperature each
+        # attempt (see the class docstring's AUTO-H5-ESCALATE-1 note),
+        # since a genuinely empty response is just as often a
+        # reasoning-heavy model (GLM-5.2 and similar) burning the entire
+        # budget on <think>/thinking-channel output before writing any
+        # JSON — a plain identical retry never recovers from that, an
+        # escalating one usually does.
         #
         # Configurable via [architect]:
-        #   empty_response_retry_max — how many plain retries after the
-        #                              first try when a response is
-        #                              unsalvageable (default 2; 0 disables
-        #                              this and preserves the old "0
-        #                              candidates from this batch, move on"
-        #                              behaviour for that failure mode).
-        _empty_retry_max = self._config.getint("architect", "empty_response_retry_max", fallback=2)
+        #   empty_response_retry_max — how many escalating retries after
+        #                              the first try when a response is
+        #                              unsalvageable (default 5; 0
+        #                              disables this and preserves the
+        #                              old "0 candidates from this batch,
+        #                              move on" behaviour for that
+        #                              failure mode). Previously 2 — the
+        #                              cap didn't matter much when every
+        #                              attempt used identical settings,
+        #                              but each of the now-escalating
+        #                              attempts has a real chance to
+        #                              recover, so more of them are
+        #                              worth spending.
+        _empty_retry_max = self._config.getint("architect", "empty_response_retry_max", fallback=5)
         _empty_retry_max = max(0, _empty_retry_max)
 
-        def _call_and_parse(max_tasks: int) -> "tuple[list[CandidateTask] | None, bool, bool]":
+        def _call_and_parse(
+            max_tasks: int, *,
+            max_tokens: "int | None" = None,
+            temperature: "float | None" = None,
+        ) -> "tuple[list[CandidateTask] | None, bool, bool]":
             """One LLM call + parse at a given max_tasks budget.
 
             Returns ``(candidates_or_None, truncated, unsalvageable)``.
@@ -788,6 +824,13 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
             ``unsalvageable`` are only meaningful when candidates is not
             ``None``, and are mutually exclusive (see
             ``_parse_candidates_ex``'s docstring).
+
+            *max_tokens*/*temperature*, when given, override this
+            instance's own ``self._max_tokens``/``self._temperature`` for
+            just this one call — used by the AUTO-H5-ESCALATE-1 retry
+            loop below to widen the budget on an unsalvageable response
+            without touching the AUTO-H4 truncation path, which has its
+            own, unrelated remedy (shrink max_tasks).
             """
             user_msg = _tmpl.format(
                 goal=goal,
@@ -799,10 +842,19 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
 
             url, headers, payload = _llm_stream.build_chat_request(
                 base_url=self._base_url, api_key=self._api_key, model=self._model,
-                api_format=self._api_format, temperature=self._temperature,
-                max_tokens=self._max_tokens, system=self._system, user_msg=user_msg,
+                api_format=self._api_format,
+                temperature=self._temperature if temperature is None else temperature,
+                max_tokens=self._max_tokens if max_tokens is None else max_tokens,
+                system=self._system, user_msg=user_msg,
                 num_ctx=self._num_ctx, think=self._think,
             )
+
+            # AUTO-H5-ESCALATE-1: the effective temperature actually sent
+            # this call — computed directly rather than read back out of
+            # `payload`, since the ollama branch nests it under
+            # payload["options"]["temperature"] (no top-level key there),
+            # which would have silently traced the wrong value.
+            _effective_temperature = self._temperature if temperature is None else temperature
 
             # Trace the outgoing call.
             tracer.event(
@@ -810,7 +862,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 target="llm",
                 kind="llm_request",
                 content=user_msg,
-                params={"model": self._model, "temperature": self._temperature,
+                params={"model": self._model, "temperature": _effective_temperature,
                         "cluster": cluster.name, "max_tasks": max_tasks},
             )
 
@@ -933,6 +985,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
         # independent attempt budget so one doesn't steal retries from the
         # other.
         while candidates is not None and (truncated or unsalvageable):
+            _call_kwargs: dict = {}
             if truncated:
                 if _shrink_attempts >= _retry_max or max_tasks <= 1:
                     break
@@ -947,13 +1000,39 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 if _empty_attempts >= _empty_retry_max:
                     break
                 _empty_attempts += 1
+                # AUTO-H5-ESCALATE-1: mirrors gate1_filter.py's
+                # Gate1Filter unparseable-retry escalation exactly — an
+                # unsalvageable (empty/degenerate/non-JSON) response is
+                # very often the SAME thinking-budget-exhaustion failure
+                # Gate 1 already handles (see the class docstring above),
+                # not a one-off decoding hiccup a same-settings plain
+                # retry fixes. Doubles from a healthy floor each attempt
+                # (capped at a fraction of num_ctx, or a flat default when
+                # num_ctx is unset), and nudges temperature down a little
+                # to reduce rambling.
+                _ctx_ceiling = (
+                    int(self._num_ctx * self._UNSALVAGEABLE_TOKENS_CTX_FRACTION)
+                    if self._num_ctx
+                    else self._UNSALVAGEABLE_TOKENS_DEFAULT_CEILING
+                )
+                _attempt_tokens = min(
+                    self._UNSALVAGEABLE_TOKENS_FLOOR
+                    * int(self._UNSALVAGEABLE_TOKENS_STEP_MULT ** (_empty_attempts - 1)),
+                    _ctx_ceiling,
+                )
+                _attempt_temp = max(
+                    self._temperature - _empty_attempts * self._UNSALVAGEABLE_TEMPERATURE_STEP,
+                    self._UNSALVAGEABLE_TEMPERATURE_FLOOR,
+                )
+                _call_kwargs = {"max_tokens": _attempt_tokens, "temperature": _attempt_temp}
                 logger.warning(
                     "review_one_cluster [%s]: response unsalvageable (empty, "
                     "degenerate, or non-JSON) — plain retry %d/%d at the "
-                    "same max_tasks=%d.",
+                    "same max_tasks=%d (max_tokens=%d, temperature=%.2f).",
                     cluster.name, _empty_attempts, _empty_retry_max, max_tasks,
+                    _attempt_tokens, _attempt_temp,
                 )
-            candidates, truncated, unsalvageable = _call_and_parse(max_tasks)
+            candidates, truncated, unsalvageable = _call_and_parse(max_tasks, **_call_kwargs)
 
         if candidates is not None and truncated:
             # Shrink-retries exhausted (or disabled via

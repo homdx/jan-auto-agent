@@ -346,13 +346,15 @@ class TestShrinkRetryDoesNotOverfire:
         mode from AUTO-H4's truncation — max_tasks must NOT shrink for it
         (this is what this test actually guards; see the shrink-retry
         tests above for how a shrink would look). It IS still eligible
-        for AUTO-H5's plain retry (same request, same max_tasks) — a
-        model ignoring the JSON-only instruction is exactly the
-        "unsalvageable" bucket AUTO-H5 exists to plain-retry, since it's
-        often a one-off decoding hiccup rather than a structural budget
-        problem. With the default empty_response_retry_max=2, a garbage
-        response that never changes is retried twice (3 calls total)
-        before the batch gives up with 0 candidates."""
+        for AUTO-H5's retry (same request, escalating max_tokens/
+        temperature since AUTO-H5-ESCALATE-1 — see architect.py's class
+        docstring) — a model ignoring the JSON-only instruction is
+        exactly the "unsalvageable" bucket AUTO-H5 exists to retry, since
+        it's often the same thinking-budget-exhaustion cause Gate 1
+        already handles rather than a structural max_tasks-sizing
+        problem. With the default empty_response_retry_max=5, a garbage
+        response that never changes is retried five times (6 calls
+        total) before the batch gives up with 0 candidates."""
         cluster, base_dir = cluster_and_base
         reviewer = _reviewer(cfg)
         with patch(
@@ -360,8 +362,8 @@ class TestShrinkRetryDoesNotOverfire:
         ) as mock_llm:
             results = reviewer.review_clusters([cluster], base_dir, goal="improve code")
 
-        # AUTO-H5's default plain-retry budget: 1 initial + 2 retries.
-        assert mock_llm.call_count == 3
+        # AUTO-H5's default retry budget: 1 initial + 5 retries.
+        assert mock_llm.call_count == 6
         assert results == []
         # The actual AC-H4-6 claim: max_tasks must stay fixed across all
         # attempts — this is what distinguishes "unsalvageable, plain

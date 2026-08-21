@@ -164,6 +164,44 @@ def think_depth_is_supported(url: str, model=None) -> bool:
     return (url, model) not in _THINK_DEPTH_UNSUPPORTED_KEYS
 
 
+# AUTO-ZAITHINK-1: per-process, per-(url, model) "stop asking" memory for
+# Z.ai/GLM's own top-level ``thinking: {"type": "enabled" | "disabled"}``
+# object — a THIRD, distinct thinking-control convention alongside
+# OpenRouter's nested ``reasoning: {"effort": ..., "exclude": ...}``
+# (AUTO-REASONING-1) and the OpenAI/Gemini-compat flat ``reasoning_effort``
+# string (AUTO-THINKDEPTH-2). Confirmed live: a GLM-5.2 endpoint ignored
+# both existing fields outright (neither is Z.ai's documented shape) and
+# defaulted to its own "Max" reasoning effort, exhausting a modest
+# max_tokens budget on <think> alone and leaving `content` genuinely
+# empty — the same failure signature AUTO-REASONING-1 exists to prevent,
+# just via a field this codebase didn't send yet.
+#
+# Sent ADDITIVELY alongside the existing reasoning/reasoning_effort
+# fields (never instead of them) — a provider that doesn't recognise
+# `thinking` is expected to silently ignore the unknown field, same
+# assumption the other three fields already rely on, so trying all three
+# conventions costs nothing extra against a provider that only speaks
+# one of them. Keyed by (url, model) from the start, matching the other
+# four caches — a router fronting several models must give each an
+# independent verdict.
+_ZAI_THINKING_UNSUPPORTED_KEYS: set = set()
+
+
+def mark_zai_thinking_unsupported(url: str, model=None) -> None:
+    """Record that *model* on *url* rejects the top-level
+    ``thinking: {"type": ...}`` object, so future ``build_chat_request()``
+    calls targeting this exact (url, model) pair never send it again this
+    process. Idempotent."""
+    _ZAI_THINKING_UNSUPPORTED_KEYS.add((url, model))
+
+
+def zai_thinking_is_supported(url: str, model=None) -> bool:
+    """`False` once `mark_zai_thinking_unsupported(url, model)` has fired
+    for this exact (url, model) pair in this process; `True` otherwise
+    (including for pairs never tried)."""
+    return (url, model) not in _ZAI_THINKING_UNSUPPORTED_KEYS
+
+
 # MASK-KEY-1: matches an ini-style `api_key = <value>` assignment line,
 # including comment-prefixed variants such as `### api_key = ...` or
 # `; api_key = ...` (any leading whitespace, optional comment chars
@@ -616,6 +654,20 @@ def build_chat_request(
     rejects the depth *string* still supports the plain boolean, so this
     degrades to ``payload["think"] = think`` rather than omitting the
     field.
+
+    AUTO-ZAITHINK-1: on the ``openai`` branch, whenever ``think`` is not
+    ``None``, an ADDITIONAL top-level ``thinking: {"type": "enabled" |
+    "disabled"}`` object is also sent — Z.ai/GLM's own thinking-control
+    convention, distinct from both fields above (neither OpenRouter's
+    ``reasoning`` object nor the OpenAI/Gemini ``reasoning_effort``
+    string is recognised by Z.ai's API). Sent alongside, never instead
+    of, the other fields: a provider that doesn't recognise ``thinking``
+    is expected to silently ignore it, so trying all three conventions
+    at once costs nothing against a provider that only speaks one.
+    Governed by ``zai_thinking_is_supported(url, model)`` — a provider
+    that rejects the field outright with an HTTP 400 has it stripped for
+    the rest of the process for that exact (url, model) pair, same
+    mechanics as the other four capability caches in this module.
     """
     headers = {
         "Content-Type":  "application/json",
@@ -714,6 +766,19 @@ def build_chat_request(
                 payload["reasoning"] = {"effort": think_effort}
             # else: both tiers exhausted for this URL — send nothing,
             # plain thinking mode, no depth hint (tier 3).
+        if think is not None and zai_thinking_is_supported(url, model):
+            # AUTO-ZAITHINK-1: Z.ai/GLM's own thinking-control convention
+            # — a top-level `thinking: {"type": "enabled"|"disabled"}`
+            # object, distinct from both fields above. Sent ADDITIONALLY,
+            # never instead of them: a provider that doesn't recognise
+            # this exact shape is expected to silently ignore it, same
+            # assumption `reasoning`/`reasoning_effort` already rely on.
+            # Confirmed live: without this, a GLM-5.2 endpoint ignored
+            # both existing fields, defaulted to its own "Max" reasoning
+            # effort, and exhausted a modest max_tokens budget on <think>
+            # alone before any JSON was written — `content` came back
+            # genuinely empty every attempt.
+            payload["thinking"] = {"type": "enabled" if think else "disabled"}
         if response_format and response_format_is_supported(url, model):
             payload["response_format"] = {"type": "json_object"}
     return url, headers, payload
@@ -864,8 +929,26 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
             or "invalid" in low or "unexpected" in low
         )
 
+    # AUTO-ZAITHINK-1: mirrors _reasoning_stripped above — a payload-shape
+    # fix (this endpoint rejects the top-level `thinking: {"type": ...}`
+    # object outright, rather than silently ignoring it), not a transient
+    # error, so it fires ONCE per call, immediately, without touching
+    # error_retries/backoff. Sent additively alongside `reasoning`/
+    # `reasoning_effort`, so stripping it never removes those — a strict
+    # provider that rejects `thinking` but still accepts one of the other
+    # two keeps working exactly as it did before this field existed.
+    _zai_thinking_stripped = False
+
+    def _looks_like_unknown_zai_thinking_field(detail: str) -> bool:
+        low = detail.lower()
+        return "thinking" in low and (
+            "unknown name" in low or "cannot find field" in low
+            or "unrecognized" in low or "not supported" in low
+            or "invalid" in low or "unexpected" in low
+        )
+
     def _open():
-        nonlocal body, req, _reasoning_stripped, _response_format_stripped, _think_depth_stripped, _reasoning_effort_toplevel_stripped
+        nonlocal body, req, _reasoning_stripped, _response_format_stripped, _think_depth_stripped, _reasoning_effort_toplevel_stripped, _zai_thinking_stripped
         attempt = 0
         while True:
             try:
@@ -1000,6 +1083,39 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
                     logger.warning("=" * 78)
                     logger.warning("request_completion: %s", msg)
                     logger.warning("=" * 78)
+                    if on_retry:
+                        on_retry(msg)
+                    continue
+
+                # AUTO-ZAITHINK-1: provider rejected the top-level
+                # `thinking: {"type": ...}` object outright — strip ONLY
+                # that field and retry ONCE, immediately, same shape as
+                # the other payload-shape fixes above. The `reasoning`/
+                # `reasoning_effort` fields (if either was also sent)
+                # stay untouched — this is purely "this one extra field
+                # isn't recognised", not a rejection of thinking-control
+                # in general.
+                _has_zai_thinking_field = (
+                    isinstance(body, dict) and "thinking" in body
+                )
+                if (e.code == 400 and not _zai_thinking_stripped
+                        and _has_zai_thinking_field
+                        and _looks_like_unknown_zai_thinking_field(detail)):
+                    _zai_thinking_stripped = True
+                    mark_zai_thinking_unsupported(url, body.get("model"))
+                    body = {k: v for k, v in body.items() if k != "thinking"}
+                    req = urllib.request.Request(
+                        url, data=json.dumps(body).encode("utf-8"),
+                        headers=headers, method="POST",
+                    )
+                    msg = (
+                        f"HTTP 400 from {url}: provider rejected the "
+                        f"top-level 'thinking' field (Z.ai/GLM-style "
+                        f"thinking-control) — disabling it for this "
+                        f"endpoint for the rest of the run and retrying "
+                        f"once without it."
+                    )
+                    logger.warning("request_completion: %s", msg)
                     if on_retry:
                         on_retry(msg)
                     continue
