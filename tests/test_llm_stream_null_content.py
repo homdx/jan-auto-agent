@@ -20,11 +20,31 @@ import sys
 import threading
 from pathlib import Path
 
+import pytest
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from tools.llm_stream import request_completion
+
+# AUTO-XDIST-PORT-RACE-1: this module binds a real http.server.HTTPServer
+# on an OS-assigned ephemeral port (port 0). Under pytest-xdist with 2+
+# workers, two DIFFERENT worker processes can genuinely bind/release
+# overlapping ports at the same wall-clock moment — a real race that a
+# single-process run can never hit. Confirmed live: one specific test in
+# a sibling module (test_llm_stream_think_effort.py) failed intermittently
+# ONLY in full-suite runs with multiple xdist workers, never standalone or
+# single-worker, and the failure pattern (a stale unsupported-field cache
+# entry for a URL/port that should have been fresh) matches port reuse
+# colliding with another worker's recently-closed server. xdist_group
+# pins every test in this module to the SAME worker, so it can never race
+# against ITSELF across workers; see the other 8 files in
+# tests/test_llm_stream_*.py / test_mask_api_key.py that also bind real
+# servers, all sharing this exact group name for the same reason — two
+# tests in DIFFERENT files binding at the same instant is exactly what
+# this prevents.
+pytestmark = pytest.mark.xdist_group(name="port_bound_http_servers")
 
 
 class _NonStreamHandler(http.server.BaseHTTPRequestHandler):

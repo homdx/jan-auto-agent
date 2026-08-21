@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import configparser
 import json
+import logging
 import sys
 import textwrap
 from pathlib import Path
@@ -546,3 +547,53 @@ class TestPresenceProfileReasoningCacheIndependence:
 
         assert llm_stream_mod.reasoning_field_is_supported(
             "http://main.example/v1/chat/completions", "main-model") is True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AUTO-PRESENCE-LOG-1: which provider presence-check calls will actually
+# hit must be visible at startup, in one line, without reverse-engineering
+# it from request URLs buried in a much larger run log.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestPresenceProviderStartupLog:
+
+    def test_no_profile_logs_the_shared_provider(self, caplog):
+        with caplog.at_level(logging.INFO, logger="tools.auto.gate1_filter"):
+            _make_filter(_base_dict())
+        assert any(
+            "presence-check provider" in r.message
+            and "http://main.example/v1" in r.message
+            and "main-model" in r.message
+            and "shared provider" in r.message
+            for r in caplog.records
+        )
+
+    def test_profile_logs_the_profile_provider_and_its_name(self, caplog):
+        d = _base_dict(presence_llm_profile="gate1_llm")
+        d["gate1_llm"] = {
+            "base_url": "https://fallback.example/v1",
+            "api_key":  "fallback-key",
+            "model":    "fallback-model",
+        }
+        with caplog.at_level(logging.INFO, logger="tools.auto.gate1_filter"):
+            _make_filter(d)
+        assert any(
+            "presence-check provider" in r.message
+            and "https://fallback.example/v1" in r.message
+            and "fallback-model" in r.message
+            and "[gate1_llm]" in r.message
+            for r in caplog.records
+        )
+
+    def test_log_never_leaks_the_api_key(self, caplog):
+        d = _base_dict(presence_llm_profile="gate1_llm")
+        d["gate1_llm"] = {
+            "base_url": "https://fallback.example/v1",
+            "api_key":  "super-secret-token-do-not-leak",
+            "model":    "fallback-model",
+        }
+        with caplog.at_level(logging.INFO, logger="tools.auto.gate1_filter"):
+            _make_filter(d)
+        assert not any(
+            "super-secret-token-do-not-leak" in r.message for r in caplog.records
+        )

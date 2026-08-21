@@ -429,6 +429,18 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             self._presence_num_ctx       = self._num_ctx
             self._presence_response_format = self._response_format
             self._presence_think_effort  = self._think_effort
+            # AUTO-PRESENCE-LOG-1: field report — a run's presence-check
+            # requests went to a URL that matched neither [api_*] section
+            # in the config the user was looking at, and there was no way
+            # to tell from the log alone whether presence_llm_profile was
+            # even in effect for that run without reverse-engineering it
+            # from request URLs buried in a much larger log. One clear
+            # line at startup removes the guesswork.
+            logger.info(
+                "Gate1Filter: presence-check provider = %s (%s) — shared "
+                "provider (no presence_llm_profile configured)",
+                self._presence_base_url, self._presence_model,
+            )
             return
 
         if not config.has_section(profile_name):
@@ -481,6 +493,15 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             ) or None
         else:
             self._presence_think_effort = self._think_effort
+
+        # AUTO-PRESENCE-LOG-1: see the no-profile branch's sibling log
+        # above — this is the other exit point, so both cases always log
+        # exactly which provider presence-check calls will actually hit.
+        logger.info(
+            "Gate1Filter: presence-check provider = %s (%s) — via "
+            "presence_llm_profile = [%s]",
+            self._presence_base_url, self._presence_model, profile_name,
+        )
 
     # ── Public API ────────────────────────────────────────────────────────────
 

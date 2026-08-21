@@ -24,11 +24,20 @@ import sys
 import threading
 from pathlib import Path
 
+import pytest
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from tools.llm_stream import build_chat_request, mask_api_key, request_completion
+
+# AUTO-XDIST-PORT-RACE-1: see test_llm_stream_null_content.py's matching
+# comment — this module also binds a real http.server on an OS-assigned
+# ephemeral port; sharing this xdist_group with the other 8 files that do
+# the same pins them all to one worker, so none of them can ever race
+# another for the same port across concurrent xdist workers.
+pytestmark = pytest.mark.xdist_group(name="port_bound_http_servers")
 
 
 # ─────────────────────────────────────────────────────────────────────────────

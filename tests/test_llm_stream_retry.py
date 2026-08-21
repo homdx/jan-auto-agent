@@ -52,6 +52,18 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from tools.llm_stream import _is_retryable_status, _parse_retry_after, request_completion
 
+# AUTO-XDIST-PORT-RACE-1: this module binds a real http.server on an
+# OS-assigned ephemeral port. Under pytest-xdist with 2+ workers, two
+# DIFFERENT worker processes can genuinely bind/release overlapping
+# ports at the same wall-clock moment -- confirmed live as the cause
+# of an intermittent failure in this exact file, full-suite-only,
+# never standalone. xdist_group pins every test in this module (and
+# the 8 sibling files that also bind real servers, sharing this same
+# group name) to the SAME worker, so none of them can ever race
+# another for a port across concurrent workers.
+pytestmark = pytest.mark.xdist_group(name="port_bound_http_servers")
+
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # _parse_retry_after — pure unit tests, no server needed

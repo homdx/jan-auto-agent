@@ -38,6 +38,18 @@ import pytest
 from tools.llm_stream import request_completion, build_chat_request
 import tools.llm_stream as llm_stream_mod
 
+# AUTO-XDIST-PORT-RACE-1: this module binds a real http.server on an
+# OS-assigned ephemeral port. Under pytest-xdist with 2+ workers, two
+# DIFFERENT worker processes can genuinely bind/release overlapping
+# ports at the same wall-clock moment -- confirmed live as the cause
+# of an intermittent failure in this exact file, full-suite-only,
+# never standalone. xdist_group pins every test in this module (and
+# the 8 sibling files that also bind real servers, sharing this same
+# group name) to the SAME worker, so none of them can ever race
+# another for a port across concurrent workers.
+pytestmark = pytest.mark.xdist_group(name="port_bound_http_servers")
+
+
 
 @pytest.fixture(autouse=True)
 def _reset_caches():
