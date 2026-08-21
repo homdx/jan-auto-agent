@@ -361,16 +361,27 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
     # consumed the entire max_tokens budget before any JSON was written,
     # not a one-off decoding hiccup a same-settings plain retry can fix.
     # Each retry (bounded by [architect] empty_response_retry_max, same
-    # config key as before — just now escalating instead of static) both
-    # widens the token budget and lowers temperature, exactly like Gate
-    # 1's presence-check retry. Floor/ceiling/step deliberately match
+    # config key as before — just now escalating instead of static)
+    # widens the token budget; temperature cycles a fixed, absolute
+    # schedule at each token tier (AUTO-RETRY-TEMP-1 — see
+    # _UNSALVAGEABLE_TEMPERATURES below), exactly like Gate 1's
+    # presence-check retry. Floor/ceiling/step deliberately match
     # Gate1Filter's constants — same failure mode, same fix.
     _UNSALVAGEABLE_TOKENS_FLOOR = 4096
     _UNSALVAGEABLE_TOKENS_STEP_MULT = 2.0
     _UNSALVAGEABLE_TOKENS_DEFAULT_CEILING = 32768
     _UNSALVAGEABLE_TOKENS_CTX_FRACTION = 0.5
-    _UNSALVAGEABLE_TEMPERATURE_STEP = 0.1
-    _UNSALVAGEABLE_TEMPERATURE_FLOOR = 0.0
+    # AUTO-RETRY-TEMP-1: fixed, ABSOLUTE temperatures tried at EACH token
+    # tier before escalating to the next tier — deliberately NOT relative
+    # to the configured base [architect] temperature. Subtracting a step
+    # from base repeatedly hits the 0.0 floor after 1-2 attempts and
+    # stays there for every remaining retry — at temp=0.0 the model is
+    # deterministic, so a repeated escaping/formatting mistake reproduces
+    # byte-for-byte on every further attempt regardless of token budget
+    # (confirmed live via Gate1Filter's identical bug). Retry-recovery
+    # mode uses its own low, fixed schedule instead. See Gate1Filter's
+    # own _UNPARSEABLE_TEMPERATURES for the full tier/temperature table.
+    _UNSALVAGEABLE_TEMPERATURES = (0.0, 0.1)
 
     def __init__(
         self,
@@ -796,18 +807,21 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
         # Configurable via [architect]:
         #   empty_response_retry_max — how many escalating retries after
         #                              the first try when a response is
-        #                              unsalvageable (default 5; 0
+        #                              unsalvageable (default 6; 0
         #                              disables this and preserves the
         #                              old "0 candidates from this batch,
         #                              move on" behaviour for that
-        #                              failure mode). Previously 2 — the
-        #                              cap didn't matter much when every
-        #                              attempt used identical settings,
-        #                              but each of the now-escalating
-        #                              attempts has a real chance to
-        #                              recover, so more of them are
-        #                              worth spending.
-        _empty_retry_max = self._config.getint("architect", "empty_response_retry_max", fallback=5)
+        #                              failure mode). Previously 2, then
+        #                              5 — 6 is deliberately an even
+        #                              multiple of len(
+        #                              _UNSALVAGEABLE_TEMPERATURES) (2),
+        #                              so every token tier the ladder
+        #                              reaches — including the LAST one —
+        #                              gets both temperatures tried
+        #                              before escalating further; an odd
+        #                              max leaves the final tier's
+        #                              second temperature untried.
+        _empty_retry_max = self._config.getint("architect", "empty_response_retry_max", fallback=6)
         _empty_retry_max = max(0, _empty_retry_max)
 
         def _call_and_parse(
@@ -1000,30 +1014,47 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 if _empty_attempts >= _empty_retry_max:
                     break
                 _empty_attempts += 1
-                # AUTO-H5-ESCALATE-1: mirrors gate1_filter.py's
-                # Gate1Filter unparseable-retry escalation exactly — an
-                # unsalvageable (empty/degenerate/non-JSON) response is
-                # very often the SAME thinking-budget-exhaustion failure
-                # Gate 1 already handles (see the class docstring above),
-                # not a one-off decoding hiccup a same-settings plain
-                # retry fixes. Doubles from a healthy floor each attempt
-                # (capped at a fraction of num_ctx, or a flat default when
-                # num_ctx is unset), and nudges temperature down a little
-                # to reduce rambling.
+                # AUTO-H5-ESCALATE-1 / AUTO-RETRY-TEMP-1: mirrors
+                # gate1_filter.py's Gate1Filter unparseable-retry
+                # escalation exactly — an unsalvageable (empty/
+                # degenerate/non-JSON) response is very often the SAME
+                # thinking-budget-exhaustion failure Gate 1 already
+                # handles (see the class docstring above), not a one-off
+                # decoding hiccup a same-settings plain retry fixes.
+                # Every temperature in _UNSALVAGEABLE_TEMPERATURES is
+                # tried at the CURRENT token tier before the tier
+                # doubles — see that constant's docstring for why this
+                # is a fixed absolute schedule, not a step down from the
+                # configured base temperature.
                 _ctx_ceiling = (
                     int(self._num_ctx * self._UNSALVAGEABLE_TOKENS_CTX_FRACTION)
                     if self._num_ctx
                     else self._UNSALVAGEABLE_TOKENS_DEFAULT_CEILING
                 )
-                _attempt_tokens = min(
+                _n_temps = len(self._UNSALVAGEABLE_TEMPERATURES)
+                _tier_index = (_empty_attempts - 1) // _n_temps
+                _temp_index = (_empty_attempts - 1) % _n_temps
+                _uncapped_tokens = (
                     self._UNSALVAGEABLE_TOKENS_FLOOR
-                    * int(self._UNSALVAGEABLE_TOKENS_STEP_MULT ** (_empty_attempts - 1)),
-                    _ctx_ceiling,
+                    * int(self._UNSALVAGEABLE_TOKENS_STEP_MULT ** _tier_index)
                 )
-                _attempt_temp = max(
-                    self._temperature - _empty_attempts * self._UNSALVAGEABLE_TEMPERATURE_STEP,
-                    self._UNSALVAGEABLE_TEMPERATURE_FLOOR,
-                )
+                _attempt_tokens = min(_uncapped_tokens, _ctx_ceiling)
+                if _attempt_tokens < _uncapped_tokens:
+                    # AUTO-CTX-CAP-WARN-1: see gate1_filter.py's sibling
+                    # warning — a stale/small num_ctx silently capping
+                    # escalation has bitten in the field more than once.
+                    logger.warning(
+                        "review_one_cluster [%s]: escalation wants "
+                        "max_tokens=%d but is capped at %d by "
+                        "num_ctx=%s (ceiling = num_ctx * %.1f). If this "
+                        "model's real context window is bigger, raise "
+                        "num_ctx in the active [api_*] section to let "
+                        "escalation actually use it.",
+                        cluster.name, _uncapped_tokens, _attempt_tokens,
+                        self._num_ctx or "unset",
+                        self._UNSALVAGEABLE_TOKENS_CTX_FRACTION,
+                    )
+                _attempt_temp = self._UNSALVAGEABLE_TEMPERATURES[_temp_index]
                 _call_kwargs = {"max_tokens": _attempt_tokens, "temperature": _attempt_temp}
                 logger.warning(
                     "review_one_cluster [%s]: response unsalvageable (empty, "

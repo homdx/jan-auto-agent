@@ -235,12 +235,15 @@ class TestRetryExhaustionAndConfig:
     def test_still_unsalvageable_after_all_retries_gives_up_with_zero(
         self, cfg, cluster_and_base
     ) -> None:
-        """AC-H5-4: default empty_response_retry_max=5 → 6 total attempts
-        (1 + 5 retries, was 2 retries / 3 total before AUTO-H5-ESCALATE-1
-        raised the default alongside adding escalation — see the class
-        docstring in architect.py). If ALL are unsalvageable, the batch
-        fails open with 0 candidates rather than raising or aborting the
-        whole run."""
+        """AC-H5-4: default empty_response_retry_max=6 → 7 total attempts
+        (1 + 6 retries — 6 is deliberately an even multiple of the
+        2-entry AUTO-RETRY-TEMP-1 temperature schedule, so the highest
+        token tier reached also gets both temperatures tried; was 2
+        retries / 3 total before AUTO-H5-ESCALATE-1 raised the default
+        alongside adding escalation — see the class docstring in
+        architect.py). If ALL are unsalvageable, the batch fails open
+        with 0 candidates rather than raising or aborting the whole
+        run."""
         cluster, base_dir = cluster_and_base
         reviewer = _reviewer(cfg)
         with patch(
@@ -248,7 +251,7 @@ class TestRetryExhaustionAndConfig:
         ) as mock_llm:
             results = reviewer.review_clusters([cluster], base_dir, goal="improve code")
 
-        assert mock_llm.call_count == 6  # 1 initial + 5 retries (default max)
+        assert mock_llm.call_count == 7  # 1 initial + 6 retries (default max)
         assert results == []
 
     def test_empty_response_retry_max_zero_disables_retry(
@@ -310,7 +313,7 @@ class TestRetryExhaustionAndConfig:
 
 class TestEmptyResponseRetryEscalation:
 
-    def test_max_tokens_doubles_from_floor_each_attempt(
+    def test_max_tokens_doubles_every_two_attempts(
         self, cfg, cluster_and_base
     ) -> None:
         """[architect] max_tokens=512 (this fixture's cfg) is deliberately
@@ -318,7 +321,9 @@ class TestEmptyResponseRetryEscalation:
         Gate1Filter: a small configured budget is exactly the thing
         causing the exhaustion, so multiplying it stays small too. The
         floor (4096) and doubling are fixed regardless of the configured
-        base."""
+        base. AUTO-RETRY-TEMP-1: each token TIER is tried at every
+        temperature in the schedule (2 by default) before doubling, so
+        the token value repeats for 2 consecutive retries."""
         cluster, base_dir = cluster_and_base
         reviewer = _reviewer(cfg)
         with patch(
@@ -327,19 +332,26 @@ class TestEmptyResponseRetryEscalation:
             reviewer.review_clusters([cluster], base_dir, goal="improve code")
 
         payloads = _payloads(mock_llm)
-        assert len(payloads) == 6  # 1 initial + 5 retries (default max)
+        assert len(payloads) == 7  # 1 initial + 6 retries (default max)
         assert payloads[0]["max_tokens"] == 512    # initial: unescalated base config
-        assert payloads[1]["max_tokens"] == 4096   # retry 1: floor
-        assert payloads[2]["max_tokens"] == 8192   # retry 2: floor * 2
-        assert payloads[3]["max_tokens"] == 16384  # retry 3: floor * 4
-        assert payloads[4]["max_tokens"] == 32768  # retry 4: floor * 8
-        assert payloads[5]["max_tokens"] == 32768  # retry 5: floor * 16, capped
+        assert payloads[1]["max_tokens"] == 4096   # retry 1: tier 0
+        assert payloads[2]["max_tokens"] == 4096   # retry 2: tier 0 (2nd temp)
+        assert payloads[3]["max_tokens"] == 8192   # retry 3: tier 1
+        assert payloads[4]["max_tokens"] == 8192   # retry 4: tier 1 (2nd temp)
+        assert payloads[5]["max_tokens"] == 16384  # retry 5: tier 2
+        assert payloads[6]["max_tokens"] == 16384  # retry 6: tier 2 (2nd temp)
 
-    def test_temperature_decreases_each_attempt_floored_at_zero(
+    def test_temperature_cycles_fixed_schedule_per_tier(
         self, cfg, cluster_and_base
     ) -> None:
-        """cfg's [architect] temperature = 0.2 — each retry steps down by
-        0.1, floored at 0.0 (never negative)."""
+        """AUTO-RETRY-TEMP-1: temperature is a FIXED (0.0, 0.1) schedule,
+        cycled at every token tier — NOT a step down from cfg's
+        [architect] temperature=0.2. At temp=0.0 the model is
+        deterministic, so a retry that only raises max_tokens without
+        ever varying temperature can reproduce the exact same broken
+        output forever (confirmed live) — this is why retry-recovery
+        mode uses its own schedule instead of following the happy-path
+        base temperature down to a permanent 0.0 floor."""
         cluster, base_dir = cluster_and_base
         reviewer = _reviewer(cfg)
         with patch(
@@ -348,12 +360,59 @@ class TestEmptyResponseRetryEscalation:
             reviewer.review_clusters([cluster], base_dir, goal="improve code")
 
         payloads = _payloads(mock_llm)
-        assert payloads[0]["temperature"] == pytest.approx(0.2)   # initial: unescalated
-        assert payloads[1]["temperature"] == pytest.approx(0.1)
-        assert payloads[2]["temperature"] == pytest.approx(0.0)
-        assert payloads[3]["temperature"] == pytest.approx(0.0)   # floored, not negative
-        assert payloads[4]["temperature"] == pytest.approx(0.0)
-        assert payloads[5]["temperature"] == pytest.approx(0.0)
+        assert payloads[0]["temperature"] == pytest.approx(0.2)   # initial: unescalated base
+        assert payloads[1]["temperature"] == pytest.approx(0.0)   # retry 1: tier 0, temp 0.0
+        assert payloads[2]["temperature"] == pytest.approx(0.1)   # retry 2: tier 0, temp 0.1
+        assert payloads[3]["temperature"] == pytest.approx(0.0)   # retry 3: tier 1, temp 0.0
+        assert payloads[4]["temperature"] == pytest.approx(0.1)   # retry 4: tier 1, temp 0.1
+        assert payloads[5]["temperature"] == pytest.approx(0.0)   # retry 5: tier 2, temp 0.0
+        assert payloads[6]["temperature"] == pytest.approx(0.1)   # retry 6: tier 2, temp 0.1
+
+    def test_temperature_schedule_is_identical_even_when_base_is_already_zero(
+        self, cfg, cluster_and_base
+    ) -> None:
+        """The bug this replaces: with a [architect] temperature=0.0 base,
+        the old "subtract a step from base" formula was permanently
+        floored at 0.0 for every single retry — escalating tokens alone
+        never changes a deterministic (temp=0.0) generation that fails
+        for a non-budget reason. The new fixed schedule must vary
+        regardless of what the base temperature happens to be."""
+        cfg["architect"]["temperature"] = "0.0"
+        cluster, base_dir = cluster_and_base
+        reviewer = _reviewer(cfg)
+        with patch(
+            "tools.llm_stream.request_completion", return_value=_EMPTY_PAYLOAD
+        ) as mock_llm:
+            reviewer.review_clusters([cluster], base_dir, goal="improve code")
+
+        payloads = _payloads(mock_llm)
+        temps = [p["temperature"] for p in payloads[1:]]  # retries only
+        assert temps == [0.0, 0.1, 0.0, 0.1, 0.0, 0.1]
+        assert any(t > 0.0 for t in temps), (
+            "at least one retry must use a non-zero temperature even "
+            "when the base config temperature is 0.0 — otherwise every "
+            "retry is a no-op against a deterministic failure"
+        )
+
+    def test_last_tier_gets_both_temperatures(
+        self, cfg, cluster_and_base
+    ) -> None:
+        """empty_response_retry_max=6 is deliberately an even multiple of
+        the 2-entry temperature schedule, so the LAST token tier the
+        ladder reaches also gets both temperatures tried."""
+        cluster, base_dir = cluster_and_base
+        reviewer = _reviewer(cfg)
+        with patch(
+            "tools.llm_stream.request_completion", return_value=_EMPTY_PAYLOAD
+        ) as mock_llm:
+            reviewer.review_clusters([cluster], base_dir, goal="improve code")
+
+        payloads = _payloads(mock_llm)
+        last_two = payloads[-2:]
+        assert [p["max_tokens"] for p in last_two] == [16384, 16384]
+        assert [p["temperature"] for p in last_two] == [
+            pytest.approx(0.0), pytest.approx(0.1),
+        ]
 
     def test_ceiling_tracks_num_ctx_when_configured(
         self, cfg, cluster_and_base
@@ -372,18 +431,23 @@ class TestEmptyResponseRetryEscalation:
 
         payloads = _payloads(mock_llm)
         # ceiling = int(20000 * 0.5) = 10000
-        assert payloads[1]["max_tokens"] == 4096    # under ceiling: unaffected
-        assert payloads[2]["max_tokens"] == 8192    # under ceiling: unaffected
-        assert payloads[3]["max_tokens"] == 10000   # would be 16384 — capped
-        assert payloads[4]["max_tokens"] == 10000   # would be 32768 — capped
-        assert payloads[5]["max_tokens"] == 10000   # would be 65536 — capped
+        assert payloads[1]["max_tokens"] == 4096    # tier 0: under ceiling
+        assert payloads[2]["max_tokens"] == 4096    # tier 0: under ceiling
+        assert payloads[3]["max_tokens"] == 8192    # tier 1: under ceiling
+        assert payloads[4]["max_tokens"] == 8192    # tier 1: under ceiling
+        assert payloads[5]["max_tokens"] == 10000   # tier 2 would be 16384 — capped
+        assert payloads[6]["max_tokens"] == 10000   # tier 2 would be 16384 — capped
 
     def test_ceiling_defaults_to_flat_value_when_num_ctx_unset(
         self, cfg, cluster_and_base
     ) -> None:
         """No [api_local] num_ctx at all (this fixture's default) — the
         ceiling falls back to the flat 32768 default, not e.g. 0 (which
-        would collapse every escalated attempt down to the floor)."""
+        would collapse every escalated attempt down to the floor). With
+        only 6 retries (2 per tier) the ladder reaches tier 2 (16384) at
+        most and never actually hits 32768 — raise the retry budget to
+        actually exercise the cap itself."""
+        cfg["architect"]["empty_response_retry_max"] = "10"
         cluster, base_dir = cluster_and_base
         reviewer = _reviewer(cfg)
         with patch(
@@ -392,15 +456,22 @@ class TestEmptyResponseRetryEscalation:
             reviewer.review_clusters([cluster], base_dir, goal="improve code")
 
         payloads = _payloads(mock_llm)
-        assert payloads[4]["max_tokens"] == 32768  # reaches the flat ceiling
-        assert payloads[5]["max_tokens"] == 32768  # stays capped there
+        # retries 7-8 (tier 3) = 4096 * 8 = 32768 exactly — matches the
+        # flat ceiling without exceeding it, so no capping happens yet.
+        assert payloads[7]["max_tokens"] == 32768
+        assert payloads[8]["max_tokens"] == 32768
+        # retries 9-10 (tier 4) would be 4096 * 16 = 65536 uncapped —
+        # THIS is where the flat ceiling actually clips something.
+        assert payloads[9]["max_tokens"] == 32768   # capped from 65536
+        assert payloads[10]["max_tokens"] == 32768  # capped from 65536
 
     def test_recovers_mid_escalation_when_a_later_attempt_succeeds(
         self, cfg, cluster_and_base
     ) -> None:
-        """The escalation isn't just cosmetic — a wider budget on a later
-        attempt can be the actual reason a previously-empty response
-        starts producing valid JSON."""
+        """The escalation isn't just cosmetic — a wider budget or a
+        different temperature on a later attempt can be the actual
+        reason a previously-empty response starts producing valid
+        JSON."""
         cluster, base_dir = cluster_and_base
         reviewer = _reviewer(cfg)
         side_effects = [_EMPTY_PAYLOAD, _EMPTY_PAYLOAD, _good_payload("Recovered task")]
@@ -411,7 +482,8 @@ class TestEmptyResponseRetryEscalation:
 
         payloads = _payloads(mock_llm)
         assert mock_llm.call_count == 3
-        assert payloads[2]["max_tokens"] == 8192  # the attempt that succeeded
+        assert payloads[2]["max_tokens"] == 4096          # retry 2: tier 0
+        assert payloads[2]["temperature"] == pytest.approx(0.1)  # 2nd temp in the tier
         assert [r.title for r in results] == ["Recovered task"]
 
 

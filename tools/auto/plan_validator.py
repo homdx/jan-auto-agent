@@ -69,7 +69,7 @@ from pathlib import Path
 from typing import Optional
 
 from tools.auto.architect import CandidateTask, CitedLocation
-from tools.auto.gate1_filter import filter_candidates
+from tools.auto.gate1_filter import filter_candidates, _is_technical_failure
 from tools.auto.git_manager import GitError, make_git_manager
 from tools.auto.plan_emitter import IMPROVEMENTS_FILENAME
 from tools.auto.state import STATUS_IN_PROGRESS, STATUS_TODO, StateStore
@@ -125,6 +125,13 @@ class ValidationReport:
     removed: list[RemovedTask]
     presence_check_skipped: bool = False
     presence_check_skip_reason: str = ""
+    # AUTO-REMOVE-GUARD-1: tasks Gate 1 could not reach a verdict on this
+    # run (an LLM-call technical failure survived every retry — see
+    # gate1_filter.py's AUTO-RETRY-BACKOFF-1) — left completely untouched
+    # in plan.json (still `todo`), NOT removed. Reusing RemovedTask's
+    # shape purely for its title/instruction/target_files/reason fields;
+    # nothing in this list was actually removed from anywhere.
+    inconclusive: "list[RemovedTask]" = field(default_factory=list)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -345,16 +352,34 @@ def validate_plan(
     )
 
     removed: list[RemovedTask] = []
+    inconclusive: list[RemovedTask] = []
     for fr in rejected:
         tid = task_id_of[id(fr.candidate)]
-        removed.append(RemovedTask(
+        record = RemovedTask(
             task_id=tid,
             title=fr.candidate.title,
             instruction=fr.candidate.instruction,
             target_files=list(fr.candidate.target_files),
             stage=fr.stage,
             reason=fr.reason,
-        ))
+        )
+        if _is_technical_failure(fr.reason):
+            # AUTO-REMOVE-GUARD-1: a technical failure (LLM call/parse
+            # error surviving every retry — see gate1_filter.py's
+            # AUTO-RETRY-BACKOFF-1) is NOT evidence the task is already
+            # fixed; it just means Gate 1 couldn't reach a verdict this
+            # run, e.g. a provider outage. Removing it from plan.json
+            # here would be indistinguishable from a genuine "confirmed
+            # already fixed" rejection, but WRONG — the task might still
+            # be fully real and unaddressed. Leave it completely
+            # untouched (still `todo`, no plan.json/IMPROVEMENTS.md/
+            # IMPROVEMENTS-FALSE.md writes at all) so the next
+            # --validate-plan run re-checks JUST this one instead of
+            # either silently discarding it or forcing a full re-run of
+            # the whole plan from scratch.
+            inconclusive.append(record)
+            continue
+        removed.append(record)
 
     kept = [task_id_of[id(c)] for c in accepted]
 
@@ -365,15 +390,27 @@ def validate_plan(
         _append_false_positives(base_path, removed)
         _commit_validation(base_path, cfg, removed)
 
+    if inconclusive:
+        logger.warning(
+            "validate_plan: %d task(s) left unchanged (still todo) after "
+            "a technical failure — re-run --validate-plan to retry just "
+            "these: %s",
+            len(inconclusive), ", ".join(r.task_id for r in inconclusive),
+        )
+
     state.log(
         f"validate-plan: checked {len(pending)} task(s) — "
-        f"{len(kept)} confirmed, {len(removed)} removed as false positive(s)"
+        f"{len(kept)} confirmed, {len(removed)} removed as false "
+        f"positive(s)"
+        + (f", {len(inconclusive)} left unresolved (technical failure)"
+           if inconclusive else "")
     )
 
     return ValidationReport(
         checked=len(pending), kept=kept, removed=removed,
         presence_check_skipped=bool(skip_reason),
         presence_check_skip_reason=skip_reason,
+        inconclusive=inconclusive,
     )
 
 
@@ -607,7 +644,10 @@ def run_validate(
     print(
         f"Checked {report.checked} task(s): "
         f"{len(report.kept)} confirmed still needed, "
-        f"{len(report.removed)} removed as false positive(s)."
+        f"{len(report.removed)} removed as false positive(s)"
+        + (f", {len(report.inconclusive)} left unresolved (technical failure)"
+           if report.inconclusive else "")
+        + "."
     )
     if report.presence_check_skipped:
         print(
@@ -624,5 +664,16 @@ def run_validate(
             f"Removed from IMPROVEMENTS.md and plan.json; recorded in "
             f"{IMPROVEMENTS_FALSE_FILENAME}. Committed."
         )
+    if report.inconclusive:
+        # AUTO-REMOVE-GUARD-1: these were left completely untouched in
+        # plan.json (still `todo`) — nothing to commit, nothing removed.
+        print(
+            f"⚠️  {len(report.inconclusive)} task(s) could not be checked "
+            f"due to a technical failure (network/provider error surviving "
+            f"every retry) and were left unchanged in plan.json:"
+        )
+        for r in report.inconclusive:
+            print(f"  - {r.task_id}: {r.reason}")
+        print("Re-run --validate-plan to retry just these.")
 
     return 0

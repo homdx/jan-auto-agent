@@ -55,6 +55,7 @@ from __future__ import annotations
 import configparser
 import json
 import logging
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -217,14 +218,18 @@ class Gate1Filter(_llm_stream.LLMClientBase):
 
     # Max extra nudge-retries when the presence-check verdict comes back
     # unparseable (bad JSON / missing "verdict" field), before failing
-    # closed on the task. Previously hardcoded to a single retry.
-    _UNPARSEABLE_MAX_RETRIES = 5
+    # closed on the task. Previously hardcoded to a single retry, then 5.
+    # AUTO-RETRY-TEMP-1: with _UNPARSEABLE_TEMPERATURES having 2 entries,
+    # 6 is deliberately an even multiple of that — every token tier the
+    # ladder reaches gets BOTH temperatures tried (0.0 then 0.1) before
+    # escalating further, including the last one; an odd max would leave
+    # the final tier's second temperature untried.
+    _UNPARSEABLE_MAX_RETRIES = 6
 
     # Empty raw='' responses on retry are usually a thinking model (e.g.
     # qwen3) burning its whole max_tokens budget on <think> and never
-    # reaching the JSON answer. Each nudge attempt doubles the token
-    # budget so there's real headroom left after the thinking trace, and
-    # nudges temperature down a little to reduce rambling.
+    # reaching the JSON answer. Each token TIER doubles the budget so
+    # there's real headroom left after the thinking trace.
     #
     # The floor and ceiling are NOT derived from self._max_tokens: a
     # small configured max_tokens (e.g. 512) is exactly the thing causing
@@ -236,8 +241,23 @@ class Gate1Filter(_llm_stream.LLMClientBase):
     _UNPARSEABLE_TOKENS_STEP_MULT = 2.0
     _UNPARSEABLE_TOKENS_DEFAULT_CEILING = 32768
     _UNPARSEABLE_TOKENS_CTX_FRACTION = 0.5
-    _UNPARSEABLE_TEMPERATURE_STEP = 0.1
-    _UNPARSEABLE_TEMPERATURE_FLOOR = 0.0
+    # AUTO-RETRY-TEMP-1: fixed, ABSOLUTE temperatures tried at EACH token
+    # tier before escalating to the next tier — deliberately NOT computed
+    # relative to the configured base temperature (subtracting a step
+    # from an already-0.0 base is a no-op forever, which is exactly the
+    # bug this replaces: confirmed live, a [gate1_llm] temperature=0.0
+    # profile produced byte-for-byte IDENTICAL broken JSON on every one
+    # of 5 retries, because at temp=0.0 the model is deterministic and
+    # more max_tokens alone doesn't change tokens the model already
+    # committed to earlier in the same greedy decode — only a genuinely
+    # different sampling temperature can escape a deterministic dead end
+    # like a repeated escaping mistake). Retry-recovery mode uses its own
+    # low, fixed schedule regardless of what temperature the happy path
+    # was configured with. Each token tier is tried once at EVERY value
+    # in this tuple, in order, before the tier doubles — e.g. with the
+    # default (0.0, 0.1) and 5 total attempts: (4096, 0.0), (4096, 0.1),
+    # (8192, 0.0), (8192, 0.1), (16384, 0.0).
+    _UNPARSEABLE_TEMPERATURES = (0.0, 0.1)
 
     def __init__(
         self,
@@ -262,6 +282,26 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         self._max_tokens     = int(config.get(sec, "max_tokens",   fallback="512"))
         self._skip_llm       = config.getboolean(sec, "skip_llm", fallback=False)
         self._timeout        = float(config.get("loop", "timeout_seconds", fallback="300"))
+        # AUTO-RETRY-BACKOFF-1: how many extra attempts (after the first)
+        # a plain LLM-call EXCEPTION (network error, HTTP 4xx/5xx that
+        # bubbled up as an exception — NOT an unparseable-but-received
+        # verdict, which has its own separate _UNPARSEABLE_MAX_RETRIES
+        # escalation above) gets before this candidate fails closed as a
+        # technical failure. Previously hardcoded to a single immediate
+        # retry with no wait at all — real field reports showed brief
+        # provider outages (a few consecutive HTTP 400/5xx) outlasting
+        # that single instant retry, and every candidate hit during the
+        # outage window was marked REJECTED — indistinguishable in
+        # plan.json from a genuine "already fixed" verdict unless someone
+        # manually re-read the run log (see _is_technical_failure and its
+        # use in plan_validator.py, which now excludes exactly these
+        # failures from ever removing a task from plan.json — this retry
+        # budget exists to make hitting that safety net less common in
+        # the first place, not instead of it).
+        self._llm_call_retry_max = max(0, config.getint(
+            sec, "llm_call_retry_max", fallback=3))
+        self._llm_call_retry_wait_sec = max(0.0, float(config.get(
+            sec, "llm_call_retry_wait_sec", fallback="60")))
         self._max_context_lines = int(config.get(sec, "max_context_lines", fallback=str(_DEFAULT_MAX_CONTEXT_LINES)))
         self._max_block_chars   = int(config.get(sec, "max_block_chars",   fallback=str(_DEFAULT_MAX_BLOCK_CHARS)))
         # AUTO-FIX: Gate 1's presence check wants a tiny, deterministic JSON
@@ -899,6 +939,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         *,
         module_docstring: str = "",
         base_dir: "Path | None" = None,
+        _sleep_fn=None,
     ) -> tuple[bool, str]:
         """Call the LLM to confirm the claimed problem is present.
 
@@ -913,12 +954,18 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             (the default) skips this lookup entirely — every existing
             caller that doesn't pass it gets identical behavior to before
             this parameter existed.
+        _sleep_fn:
+            Injected in tests to replace ``time.sleep`` with something
+            that doesn't actually block — see AUTO-RETRY-BACKOFF-1 below.
+            ``None`` (the default) uses the real ``time.sleep``.
 
         Returns (confirmed: bool, reason: str).
-        Fail-closed: any error → (False, reason), after one plain retry of
-        the LLM call itself (see AUTO-FIX comment below) — a transient
-        network/provider failure gets the same one-retry courtesy as an
-        unparseable verdict before the candidate is treated as resolved.
+        Fail-closed: any error → (False, reason), after
+        ``self._llm_call_retry_max`` retries of the LLM call itself (see
+        AUTO-RETRY-BACKOFF-1 below), each separated by a real
+        ``self._llm_call_retry_wait_sec``-second pause — a transient
+        network/provider outage gets a real chance to clear before the
+        candidate is treated as resolved.
         """
         loc = candidate.cited_location
         location_str = _location_str(loc)
@@ -977,41 +1024,52 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             )
             return cleaned
 
-        try:
-            cleaned = _call(user_msg)
-        except Exception as exc:
-            # AUTO-FIX (found live: agents_128k.ini + kenari.id returned
-            # HTTP 400 "upstream_rejected" for three consecutive candidates
-            # within one second — a provider/config-level hiccup, not a
-            # judgment that the code was already fixed). Previously this
-            # branch had ZERO retries while the sibling "unparseable verdict"
-            # branch below already got one — an inconsistency with real
-            # consequences: a transient provider error permanently removed
-            # a possibly-still-valid task from plan.json and recorded it in
-            # IMPROVEMENTS-FALSE.md, indistinguishable from a genuine
-            # "already fixed" rejection. One plain retry (same request, no
-            # nudge needed — this isn't a formatting problem) gives a
-            # one-off network/provider blip a chance to clear before we
-            # treat the candidate as resolved.
-            logger.warning(
-                "Gate1._check_presence [%s]: LLM call failed (%s) — "
-                "retrying once before failing closed.", candidate.title, exc,
-            )
+        # AUTO-RETRY-BACKOFF-1 (field report: agents_128k.ini + kenari.id
+        # returned HTTP 400 "upstream_rejected" for three consecutive
+        # candidates within one second — a provider/config-level outage,
+        # not a judgment that the code was already fixed; a later report
+        # showed the SAME pattern against a different provider ("api.ai")
+        # outlasting a single instant retry). Previously a single
+        # immediate retry with no wait — not enough for an outage that
+        # takes longer than an instant to clear. Each retry after the
+        # first sleeps self._llm_call_retry_wait_sec seconds first, giving
+        # a real window for the provider to recover. Still fail-closed —
+        # returns (False, reason) after all retries are exhausted — but
+        # plan_validator.py's removal logic (AUTO-REMOVE-GUARD-1) now
+        # never lets a technical failure like this one actually delete a
+        # task from plan.json; this retry budget exists to make hitting
+        # that safety net less common in the first place, not instead of
+        # it.
+        sleep = _sleep_fn or time.sleep
+        last_exc: "Exception | None" = None
+        cleaned = ""
+        for attempt in range(self._llm_call_retry_max + 1):
+            if attempt > 0:
+                logger.warning(
+                    "Gate1._check_presence [%s]: LLM call failed (%s) — "
+                    "retrying in %.0fs (attempt %d/%d).",
+                    candidate.title, last_exc, self._llm_call_retry_wait_sec,
+                    attempt, self._llm_call_retry_max,
+                )
+                sleep(self._llm_call_retry_wait_sec)
             try:
                 cleaned = _call(user_msg)
-            except Exception as exc2:
-                # NOTE: must keep the exact "LLM call failed:" prefix (see
-                # _is_technical_failure below) so this still logs at WARNING
-                # like any other real anomaly, not INFO like a routine
-                # rejection — the retry count is appended after the colon,
-                # not spliced into the matched prefix itself.
-                reason = f"LLM call failed: {exc2} (after 1 retry)"
-                logger.warning("Gate1._check_presence: %s — failing closed", reason)
-                tracer.event(
-                    source="gate1", target="llm", kind="llm_response",
-                    content=f"[ERROR] {exc2}", params={"candidate": candidate.title},
-                )
-                return False, reason
+                last_exc = None
+                break
+            except Exception as exc:
+                last_exc = exc
+        if last_exc is not None:
+            # NOTE: must keep the exact "LLM call failed:" prefix (see
+            # _is_technical_failure below) so this still logs at WARNING
+            # like any other real anomaly, not INFO like a routine
+            # rejection.
+            reason = f"LLM call failed: {last_exc} (after {self._llm_call_retry_max} retries)"
+            logger.warning("Gate1._check_presence: %s — failing closed", reason)
+            tracer.event(
+                source="gate1", target="llm", kind="llm_response",
+                content=f"[ERROR] {last_exc}", params={"candidate": candidate.title},
+            )
+            return False, reason
 
         confirmed, reason, unparseable = self._parse_presence_response(
             cleaned, candidate.title, code_block=code_block,
@@ -1042,21 +1100,40 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                 if self._presence_num_ctx
                 else self._UNPARSEABLE_TOKENS_DEFAULT_CEILING
             )
-            base_temp = self._presence_temperature
+            _n_temps = len(self._UNPARSEABLE_TEMPERATURES)
             for attempt in range(1, self._UNPARSEABLE_MAX_RETRIES + 1):
-                # Doubling from a healthy floor: attempt 1 already jumps
-                # straight to the floor (covers the common "starved on a
-                # small configured max_tokens" case in one shot), then
-                # doubles each further attempt, capped at ctx_ceiling.
-                attempt_tokens = min(
+                # AUTO-RETRY-TEMP-1: 2-D grid — every temperature in
+                # _UNPARSEABLE_TEMPERATURES is tried at the CURRENT token
+                # tier before the tier doubles. tier_index and temp_index
+                # both derive from the same attempt counter, so this
+                # needs no extra state beyond the loop variable itself.
+                tier_index = (attempt - 1) // _n_temps
+                temp_index = (attempt - 1) % _n_temps
+                _uncapped_tokens = (
                     self._UNPARSEABLE_TOKENS_FLOOR
-                    * int(self._UNPARSEABLE_TOKENS_STEP_MULT ** (attempt - 1)),
-                    ctx_ceiling,
+                    * int(self._UNPARSEABLE_TOKENS_STEP_MULT ** tier_index)
                 )
-                attempt_temp = max(
-                    base_temp - attempt * self._UNPARSEABLE_TEMPERATURE_STEP,
-                    self._UNPARSEABLE_TEMPERATURE_FLOOR,
-                )
+                attempt_tokens = min(_uncapped_tokens, ctx_ceiling)
+                if attempt_tokens < _uncapped_tokens:
+                    # AUTO-CTX-CAP-WARN-1: a stale/small num_ctx silently
+                    # capping escalation below what it should be has
+                    # bitten in the field more than once — this makes
+                    # the cap itself loud and actionable instead of
+                    # something only visible by reverse-engineering the
+                    # token numbers in the log by hand.
+                    logger.warning(
+                        "Gate1._check_presence [%s]: escalation wants "
+                        "max_tokens=%d but is capped at %d by "
+                        "num_ctx=%s (ceiling = num_ctx * %.1f). If this "
+                        "model's real context window is bigger, raise "
+                        "num_ctx in the active [api_*] section (or this "
+                        "candidate's presence_llm_profile) to let "
+                        "escalation actually use it.",
+                        candidate.title, _uncapped_tokens, attempt_tokens,
+                        self._presence_num_ctx or "unset",
+                        self._UNPARSEABLE_TOKENS_CTX_FRACTION,
+                    )
+                attempt_temp = self._UNPARSEABLE_TEMPERATURES[temp_index]
                 logger.info(
                     "Gate1._check_presence [%s]: verdict unparseable — "
                     "re-asking (attempt %d/%d, max_tokens=%d, temperature=%.2f). "

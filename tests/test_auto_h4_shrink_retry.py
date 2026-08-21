@@ -352,8 +352,8 @@ class TestShrinkRetryDoesNotOverfire:
         exactly the "unsalvageable" bucket AUTO-H5 exists to retry, since
         it's often the same thinking-budget-exhaustion cause Gate 1
         already handles rather than a structural max_tasks-sizing
-        problem. With the default empty_response_retry_max=5, a garbage
-        response that never changes is retried five times (6 calls
+        problem. With the default empty_response_retry_max=6, a garbage
+        response that never changes is retried six times (7 calls
         total) before the batch gives up with 0 candidates."""
         cluster, base_dir = cluster_and_base
         reviewer = _reviewer(cfg)
@@ -362,8 +362,8 @@ class TestShrinkRetryDoesNotOverfire:
         ) as mock_llm:
             results = reviewer.review_clusters([cluster], base_dir, goal="improve code")
 
-        # AUTO-H5's default retry budget: 1 initial + 5 retries.
-        assert mock_llm.call_count == 6
+        # AUTO-H5's default retry budget: 1 initial + 6 retries.
+        assert mock_llm.call_count == 7
         assert results == []
         # The actual AC-H4-6 claim: max_tasks must stay fixed across all
         # attempts — this is what distinguishes "unsalvageable, plain
