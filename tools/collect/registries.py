@@ -304,6 +304,18 @@ def build_seed_contracts(
 
     contracts: List[ContractRecord] = []
     for entry in entries:
+        if not isinstance(entry, dict):
+            # AUTO-REG-GUARD-1: a stray non-dict item in the seed YAML
+            # (e.g. a bare string/list entry from a typo'd list) would
+            # otherwise raise a raw, confusing AttributeError from
+            # entry.get(...) below. Same failure posture as the
+            # missing-field case just below — a malformed seed entry is
+            # itself a citation failure, not something to skip silently.
+            raise ContractCitationError(
+                f"{seed_path}: seed entry {entry!r} is not a mapping "
+                f"(expected name/description/known_edge keys, got "
+                f"{type(entry).__name__})"
+            )
         name = entry.get("name")
         description = entry.get("description")
         known_edge = entry.get("known_edge")

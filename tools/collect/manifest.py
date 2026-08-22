@@ -30,11 +30,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
 
 COLLECTOR_VERSION = "1"
 
@@ -95,13 +98,24 @@ def _walk(root: Path, skip_dirs: set):
 def hash_tree(root: Path, files: Iterable[str]) -> Dict[str, str]:
     """`{relative_path: sha256_hex}` for every path in `files`, resolved
     relative to `root`. Missing files are simply absent from the result —
-    callers (i.e. `is_fresh`) treat a missing key as a mismatch."""
+    callers (i.e. `is_fresh`) treat a missing key as a mismatch.
+
+    AUTO-MANIFEST-GUARD-1: a file that exists (passes is_file()) but isn't
+    readable (permissions changed after the check, or from the start) hit
+    an unguarded `open()` inside hash_file() and crashed the whole
+    freshness check. Treated the same as "missing" — omitted from the
+    result, with a warning — rather than aborting every other file's hash
+    over one unreadable path.
+    """
     root = Path(root)
     result: Dict[str, str] = {}
     for rel in files:
         p = root / rel
         if p.is_file():
-            result[rel] = hash_file(p)
+            try:
+                result[rel] = hash_file(p)
+            except OSError as exc:
+                logger.warning("hash_tree: skipping unreadable file %s: %s", p, exc)
     return result
 
 
@@ -256,9 +270,24 @@ class Manifest:
 
     @classmethod
     def from_dict(cls, d: dict) -> "Manifest":
+        # AUTO-MANIFEST-GUARD-2: d["collector_version"]/d["generated_at"]
+        # used to raise a raw KeyError on a truncated/malformed manifest.
+        # Every read_manifest() call site already catches (OSError,
+        # ValueError) and treats the manifest as stale/absent — KeyError
+        # isn't a ValueError subclass, so it slipped past that existing
+        # guard at 3 of 4 call sites and crashed instead. Raising
+        # ValueError here (json.JSONDecodeError from from_json() below is
+        # already a ValueError subclass, so that half was already covered)
+        # makes every existing call site's guard work as originally
+        # intended, with no call-site changes needed.
+        try:
+            collector_version = d["collector_version"]
+            generated_at = d["generated_at"]
+        except KeyError as exc:
+            raise ValueError(f"manifest is missing required field {exc}") from exc
         return cls(
-            collector_version=d["collector_version"],
-            generated_at=d["generated_at"],
+            collector_version=collector_version,
+            generated_at=generated_at,
             git_sha=d.get("git_sha"),
             dirty=bool(d.get("dirty", False)),
             file_hashes=dict(d.get("file_hashes", {})),

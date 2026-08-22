@@ -118,7 +118,12 @@ def load_state(path: Path = STATE_FILE) -> Optional[Dict[str, Any]]:
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
-    except (json.JSONDecodeError, OSError):
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+        # AUTO-BACKOFF-GUARD-1: UnicodeDecodeError (raised when the file's
+        # bytes aren't valid UTF-8 — e.g. a checkpoint truncated mid-write
+        # inside a multi-byte character) is a ValueError subclass, NOT an
+        # OSError, so it wasn't caught here despite this function's own
+        # documented "corrupt -> None" contract.
         return None
     # Hardening: a checkpoint is always written as a JSON object by
     # save_state(). A file that parses cleanly but holds a JSON list / string

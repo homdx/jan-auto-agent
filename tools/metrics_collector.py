@@ -4,7 +4,7 @@ import os
 import re
 import tempfile
 from collections import Counter
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, fields
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
@@ -88,10 +88,29 @@ class MetricsCollector:
             logger.error(f"MetricsCollector failed to write metrics: {e}")
 
     def load_recent(self, n: int) -> List[RunRecord]:
-        """Return the last N RunRecord entries."""
+        """Return the last N RunRecord entries.
+
+        AUTO-METRICS-GUARD-1: `RunRecord(**r)` used to raise TypeError if a
+        stored record had extra keys (e.g. a newer schema than this build
+        expects) or was missing a required one (an older schema, or a
+        hand-edited/corrupted entry) — a single such record crashed the
+        whole call instead of just being skipped, the same "one bad item
+        must not take down the batch" principle already applied elsewhere
+        in this file (_load_all's per-file quarantine).
+        """
         records = self._load_all()
         recent = records[-n:] if len(records) >= n else records
-        return [RunRecord(**r) for r in recent]
+        _fields = {f.name for f in fields(RunRecord)}
+        out: List[RunRecord] = []
+        for r in recent:
+            try:
+                out.append(RunRecord(**{k: v for k, v in r.items() if k in _fields}))
+            except TypeError as exc:
+                logger.warning(
+                    "MetricsCollector.load_recent: skipping record with "
+                    "mismatched schema (%s): %r", exc, r,
+                )
+        return out
 
     def summarize_failures(self, n: int) -> Dict[str, Any]:
         """
@@ -117,7 +136,7 @@ class MetricsCollector:
                 "worst_intent": None,
             }
 
-        avg_iterations = sum(r["iterations_used"] for r in window) / total
+        avg_iterations = sum(r.get("iterations_used", 0) for r in window) / total
 
         improvement_runs = [r for r in window if r.get("improvement_json_ok") is not None]
         if improvement_runs:
@@ -140,9 +159,17 @@ class MetricsCollector:
         top_phrases = [phrase for phrase, _ in Counter(meaningful).most_common(3)]
 
         # Intent with the highest average iteration count
+        # AUTO-METRICS-GUARD-1: direct r["intent"]/r["iterations_used"]
+        # raised KeyError on a partial/old-shape record — record() already
+        # quarantines corrupt *files*, but a stored record missing a key
+        # (e.g. after a schema change) is a different failure shape that
+        # wasn't covered. "<unknown>" groups any such records together
+        # rather than crashing the whole summary.
         intent_iters: Dict[str, List[int]] = {}
         for r in window:
-            intent_iters.setdefault(r["intent"], []).append(r["iterations_used"])
+            intent_iters.setdefault(
+                r.get("intent", "<unknown>"), []
+            ).append(r.get("iterations_used", 0))
         worst_intent = max(intent_iters, key=lambda k: sum(intent_iters[k]) / len(intent_iters[k]))
 
         return {

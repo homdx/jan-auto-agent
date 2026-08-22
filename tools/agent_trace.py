@@ -216,8 +216,13 @@ class AgentTracer:
             if self._fh is not None:
                 self._fh.write(json.dumps(record, ensure_ascii=False) + "\n")
                 self._fh.flush()
-        except OSError:
-            # Tracing must never break the pipeline — swallow write errors.
+        except (OSError, TypeError):
+            # Tracing must never break the pipeline — swallow write errors
+            # (OSError) AND serialization errors (TypeError, e.g. an
+            # unserializable object that slipped past _sanitize/_truncate
+            # into params/content — more likely to actually happen under
+            # LLM_DEBUG=2, which is exactly when unusual objects are most
+            # likely to reach here).
             pass
 
     def _console_line(

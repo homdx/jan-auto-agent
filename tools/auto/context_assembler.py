@@ -194,8 +194,25 @@ class ContextAssembler:
         # Tolerate 0 / missing values (e.g. num_ctx=0 meaning "server
         # default") with sane fallbacks rather than producing a zero or
         # negative budget.
-        self._num_ctx = int(num_ctx) if num_ctx else 4096
-        self._max_tokens = int(max_tokens) if max_tokens else 800
+        # AUTO-CTXASM-GUARD-1: a non-numeric string (an already-loose
+        # caller passing something other than 0/missing/a real number)
+        # raised a raw ValueError from int(...) — same "tolerate a bad
+        # value, don't crash" spirit as the 0/missing case right above,
+        # just for a different kind of bad value.
+        try:
+            self._num_ctx = int(num_ctx) if num_ctx else 4096
+        except (ValueError, TypeError):
+            logger.warning(
+                "ContextAssembler: invalid num_ctx=%r — using 4096", num_ctx,
+            )
+            self._num_ctx = 4096
+        try:
+            self._max_tokens = int(max_tokens) if max_tokens else 800
+        except (ValueError, TypeError):
+            logger.warning(
+                "ContextAssembler: invalid max_tokens=%r — using 800", max_tokens,
+            )
+            self._max_tokens = 800
         self._base_dir = Path(base_dir)
         self._synopsis_path = self._base_dir / synopsis_path
         self._bible_path = self._base_dir / bible_path

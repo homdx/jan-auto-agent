@@ -216,7 +216,32 @@ class OuterLoop:
             )
             if _inner_accepts_deadline:
                 _rt_kwargs["deadline"] = _task_deadline   # AUTO-CR-33: shared budget
-            res = self.inner_loop.run_task(task, base_dir, **_rt_kwargs)
+            try:
+                res = self.inner_loop.run_task(task, base_dir, **_rt_kwargs)
+            except Exception as exc:
+                # AUTO-OUTER-GUARD-1: previously unguarded — any exception
+                # inner_loop.run_task doesn't already handle itself
+                # propagated straight out of THIS run_task (the per-task
+                # body of the whole --auto loop), crashing the entire
+                # multi-task run instead of just failing this one task.
+                # Fail this task closed (BLOCKED, same status the
+                # runtime-cap-exhausted branch above already uses) and
+                # let the caller move on to the next task in the plan.
+                logger.exception(
+                    "%s: inner_loop.run_task raised in round %d — %s",
+                    task_id, rnd, exc,
+                )
+                self.state.set_task_status(task_id, STATUS_BLOCKED)
+                self.state.log(
+                    f"{task_id}: inner_loop.run_task raised in round {rnd} "
+                    f"— {exc}"
+                )
+                tracer.event("outer_loop", "controller", "result",
+                             params={"task": task_id, "passed": False,
+                                     "round": rnd, "error": str(exc)})
+                return OuterLoopResult(task_id, False, rnd, True,
+                                       feedback_files, inner_results,
+                                       impl_versions_used)
             inner_results.append(res)
             # round is set authoritatively above via set_task_status(round=rnd);
             # here we only accumulate the attempt count.

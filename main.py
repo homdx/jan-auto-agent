@@ -172,7 +172,23 @@ class Orchestrator(OrchestratorActions):
     def reload_agents(self) -> None:
         """Re-read agents.ini and rebuild all agents mid-session (no restart)."""
         logger.info("reload_agents: re-reading %s …", self._config_path)
-        self._build_agents()
+        # AUTO-FIX (medium-priority audit): _build_agents() is unguarded at
+        # __init__ too, but a raise there just fails object construction —
+        # normal "fail fast at startup" behaviour. Here it runs mid-session
+        # in response to the interactive /reload command; before this fix,
+        # a malformed agents.ini (or any other _build_agents failure —
+        # config.read() re-raises configparser.Error, and several nested
+        # constructors also read numeric config directly) crashed the
+        # entire chat session instead of just failing the reload. The
+        # previously-built agents are left exactly as they were on
+        # failure, so the session keeps working with the last-good config.
+        try:
+            self._build_agents()
+        except Exception as exc:
+            logger.warning("reload_agents: failed to rebuild agents — %s", exc)
+            print(f"[{_ts()}] ⚠️  Reload failed: {exc}\n"
+                  f"    Still using the previously loaded agents/config.")
+            return
         print(f"[{_ts()}] 🔄 Agents reloaded from {self._config_path} "
               f"(model={self.model}, api_format={self.api_format}, max_iter={self.max_iterations})")
 

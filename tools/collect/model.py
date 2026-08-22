@@ -292,10 +292,24 @@ class FunctionRecord:
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "FunctionRecord":
+        # AUTO-MODEL-GUARD-1: LLMSummary(**summary_d) / cls(**d) raised a
+        # raw TypeError on a persisted artifact whose summary/record keys
+        # don't match this build's current schema (an older/newer
+        # collect_artifact.json after a tool version upgrade). Every
+        # caller of ModuleRecord.from_dict (which calls this per symbol)
+        # already catches ValueError around the equivalent manifest-read
+        # path — TypeError isn't a ValueError subclass, so it slipped
+        # past that existing guard. Re-raising as ValueError makes those
+        # existing guards work as intended, with no call-site changes.
         d = dict(d)
         summary_d = d.pop("summary", None)
-        summary = LLMSummary(**summary_d) if summary_d else None
-        return cls(summary=summary, **d)
+        try:
+            summary = LLMSummary(**summary_d) if summary_d else None
+            return cls(summary=summary, **d)
+        except TypeError as exc:
+            raise ValueError(
+                f"FunctionRecord.from_dict: schema mismatch ({exc})"
+            ) from exc
 
 
 @dataclass(frozen=True, kw_only=True)
