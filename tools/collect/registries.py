@@ -57,6 +57,29 @@ DEFAULT_CONTRACTS_SEED_PATH = Path(__file__).parent / "contracts_seed.yaml"
 _SEED_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
+def _looks_like_this_repo(known: "frozenset[str]") -> bool:
+    """Content-based counterpart to the `_SEED_REPO_ROOT` path-identity
+    check: do any of the *default* seed file's own `known_edge` citations
+    resolve against `known` (the scanned repo's own symbol index)? True
+    for a clone of this repo at any location on disk; false for a
+    genuinely different project — the distinction `_SEED_REPO_ROOT` was
+    trying, and for a same-repo scan at another path failing, to draw by
+    directory identity instead of by content. Deliberately checks the
+    *default* seed regardless of whatever `seed_path` the caller passed
+    to `build_seed_contracts` — "is this repo the one the seed data
+    describes" is a different question from "is this particular seed
+    file's content still valid", and conflating them would make a test
+    fixture's deliberately-broken entry look like a foreign repo instead
+    of a real citation failure.
+    """
+    try:
+        default_entries = _load_seed_entries(DEFAULT_CONTRACTS_SEED_PATH)
+    except ContractCitationError:
+        return False
+    edges = [e.get("known_edge") for e in default_entries if isinstance(e, dict)]
+    return any(edge in known for edge in edges)
+
+
 class ContractCitationError(RuntimeError):
     """Raised when a seed contract's `known_edge` no longer names a real
     top-level symbol in the scanned repo.
@@ -286,20 +309,39 @@ def build_seed_contracts(
     index, where none of the seed's `known_edge`s could possibly resolve
     — every `--base <other repo>` run hit `ContractCitationError`
     unconditionally, on the very first seed entry, regardless of that
-    repo's own code. `root` (the directory actually being scanned) lets
-    this tell the two cases apart: when it doesn't match this package's
-    own repo root, the seed data plainly isn't about the repo being
-    scanned, so it's skipped entirely (empty contracts) rather than
-    "citation-failed" — same fail-open posture `_load_seed_entries`
-    already gives an absent seed file. The strict, run-failing check
-    still applies in full whenever `root` is unset (existing callers/
-    tests) or does resolve to this repo, exactly as before.
-    """
-    if root is not None and Path(root).resolve() != _SEED_REPO_ROOT:
-        return []
+    repo's own code. `root` (the directory actually being scanned) was
+    meant to tell the two cases apart.
 
+    BUGFIX (found via forensic comparison of two real collect runs
+    against this repo, both showing an empty CONTRACTS registry): the
+    original fix used `Path(root).resolve() != _SEED_REPO_ROOT` — literal
+    path identity with wherever *this installed copy* of the collect tool
+    happens to live on disk — as a proxy for "is the scanned repo this
+    project". That's the wrong test. `--base` pointing at a *separate
+    clone* of jan-auto-agent itself (a benchmarking harness's scratch
+    checkout, a second local clone, a CI workspace) is a completely
+    ordinary, common way to run collect against this very project, and
+    every one of those legitimately-self-scan runs silently got the empty
+    "must be a foreign repo" treatment, because none of them are
+    literally the one directory `_SEED_REPO_ROOT` happens to point at.
+    The thing that actually matters was sitting right here already:
+    whether the seed's own citations resolve against what was actually
+    scanned. `_looks_like_this_repo` answers that directly, against the
+    *default* seed (independent of whatever `seed_path` this particular
+    call is validating, which may itself be a test fixture deliberately
+    exercising a broken entry) — true for a clone of this repo at any
+    path, false for a genuinely unrelated one. The strict, run-failing
+    check still applies in full whenever `root` is unset (existing
+    callers/tests), does resolve to `_SEED_REPO_ROOT` exactly (unchanged
+    fast path), or resolves to any other on-disk copy of this same repo.
+    """
     modules = list(modules)
     known = _known_symbols(modules)
+
+    if root is not None and Path(root).resolve() != _SEED_REPO_ROOT:
+        if not _looks_like_this_repo(known):
+            return []
+
     entries = _load_seed_entries(seed_path)
 
     contracts: List[ContractRecord] = []

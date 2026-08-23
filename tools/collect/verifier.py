@@ -375,8 +375,55 @@ def extract_claims(
         locations = [f"{m.group(1)}:{m.group(2)}" for m in _LOCATION_RE.finditer(sentence)]
         accesses = _iter_access_citations(sentence)
 
+        # BUGFIX (bare short-name over-matching, found via self-play
+        # hallucination review against this repo's own collect run):
+        # `known_symbols` is the whole repo's flat table — in the low
+        # thousands per `_symbol_patterns`' own docstring — so a bare
+        # `\bshort\b` match with no `path.py:` prefix at all routinely hit
+        # short names that are *also* everyday English words ("task",
+        # "main", "check", "run", "repo"), coincidentally defined
+        # *somewhere* in a few-hundred-file repo's test suite. A sentence
+        # merely discussing "task metrics" or "the repo" got treated as an
+        # attempted citation of some unrelated test fixture's `task`/`repo`
+        # symbol and dropped as an unverifiable cross-module reference —
+        # even though the sentence made no code reference at all; "Entry
+        # point is main() via argparse" fared no better, flagged once per
+        # *other* file that also happens to define its own `main`.
+        #
+        # The distinguishing signal isn't call syntax (real citations this
+        # mechanism is *for* — "make_summarizer_call and summarize_repo
+        # both live in this module" — are bare, parenthesis-free prose
+        # too) — it's that a plain, single, undecorated lowercase word is
+        # both (a) indistinguishable from ordinary English and (b) exactly
+        # the shape of a generic, likely-non-unique local name (a stray
+        # test fixture, a parameter), so a bare match on one is low-signal
+        # either way. A real function/class name worth treating as a
+        # citation candidate is virtually always multi-word — snake_case
+        # (`make_summarizer_call`) or CamelCase (`AutoController`) — which
+        # ordinary prose doesn't spontaneously produce. Restricting bare
+        # (unprefixed) matching to that shape, while leaving the explicit
+        # `path.py:identifier` branch below completely untouched, keeps the
+        # mechanism's actual intended catch (a real multi-word helper name
+        # dropped into prose without its module prefix) while dropping the
+        # false-positive-prone single-word case entirely — it isn't lost,
+        # it just falls through as ordinary unverifiable prose, the same
+        # "nothing to check, so it survives" treatment any other
+        # unfalsifiable sentence already gets. An outright *invented*
+        # short name never matched `known_symbols` to begin with and is
+        # unaffected either way.
         symbols: List[str] = []
         for sym, pattern in _symbol_patterns(known_symbols):
+            # AUDIT NOTE: matches `_symbol_patterns`' own `sym.split(":")[-1]`
+            # exactly (rather than `split(":", 1)[1]`, which would silently
+            # disagree with it if a qualname ever contained a second colon)
+            # — currently equivalent in practice, since `ast_facts.py`/
+            # `java_facts.py` both build every qualname as exactly one
+            # colon (`f"{module_path}:{name}"`), but there's no reason for
+            # this loop to compute `short` any way other than the one the
+            # regex it's about to reuse was itself keyed by.
+            short = sym.split(":")[-1]
+            if "_" not in short and short == short.lower():
+                continue  # bare single lowercase word — too generic to trust
             if pattern.search(sentence):
                 symbols.append(sym)
 

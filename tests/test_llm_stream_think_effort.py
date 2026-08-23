@@ -357,6 +357,7 @@ class TestThinkEffort400Fallback:
                 )
         finally:
             server.shutdown()
+            server.server_close()
 
         assert result == '{"ok": true}'
         assert handler_cls.request_count == 2
@@ -379,6 +380,7 @@ class TestThinkEffort400Fallback:
             )
         finally:
             server.shutdown()
+            server.server_close()
 
         _, _, next_payload = build_chat_request(
             base_url=f"http://127.0.0.1:{port}", api_key="k", model="m",
@@ -404,6 +406,7 @@ class TestThinkEffort400Fallback:
             )
         finally:
             server.shutdown()
+            server.server_close()
 
         # Different model, same base_url: must still try the depth string.
         _, _, payload_b = build_chat_request(
@@ -428,6 +431,7 @@ class TestThinkEffort400Fallback:
                 )
         finally:
             server.shutdown()
+            server.server_close()
         assert handler_cls.request_count == 2
 
     def test_ollama_plain_bool_think_is_never_touched_by_this_fallback(self):
@@ -447,6 +451,7 @@ class TestThinkEffort400Fallback:
                 )
         finally:
             server.shutdown()
+            server.server_close()
         assert handler_cls.request_count == 1
 
     def test_openai_reasoning_effort_400_falls_back_via_existing_cache(self):
@@ -467,6 +472,7 @@ class TestThinkEffort400Fallback:
             )
         finally:
             server.shutdown()
+            server.server_close()
         assert result == '{"ok": true}'
         assert handler_cls.request_count == 2
         assert "reasoning" in handler_cls.received_bodies[0]
@@ -492,6 +498,7 @@ class TestThinkEffort400Fallback:
                 )
         finally:
             server.shutdown()
+            server.server_close()
 
         assert result == '{"ok": true}'
         assert handler_cls.request_count == 2
@@ -521,6 +528,7 @@ class TestThinkEffort400Fallback:
             )
         finally:
             server.shutdown()
+            server.server_close()
 
         assert result == '{"ok": true}'
         assert handler_cls.request_count == 3
@@ -547,6 +555,7 @@ class TestThinkEffort400Fallback:
             )
         finally:
             server.shutdown()
+            server.server_close()
 
         _, _, next_payload = build_chat_request(
             base_url=f"http://127.0.0.1:{port}", api_key="k", model="m",

@@ -26,6 +26,7 @@ from tools.collect.scanner import scan_module
 from tools.collect.summarizer import (
     DEFAULT_MAX_TOKENS,
     DEFAULT_NUM_CTX,
+    EmptyReplyError,
     _budget_chars,
     _parse_llm_summary,
     _truncate_source,
@@ -146,6 +147,84 @@ def test_summarize_module_never_raises_on_malformed_reply():
     stub_llm = lambda system, user: "the model rambled instead of returning JSON"  # noqa: E731
     result = summarize_module(module, _source(), stub_llm)
     assert result.summary == LLMSummary(purpose="", notes="")
+
+
+# ── empty replies are retry-worthy, not silently accepted (COLLECT-16 follow-up) ─
+#
+# Found via forensic comparison of two real collect runs against this repo:
+# a blank completion — the shape a flaky/rate-limited provider route tends
+# to fail with — used to reach `_parse_llm_summary` exactly like any other
+# reply and degrade to an empty summary with zero retries and zero trace of
+# what happened. `EmptyReplyError` gives it the same retry-with-backoff
+# treatment a raised network error already gets.
+
+
+@pytest.mark.parametrize("raw", ["", "   ", "\n\t \n"])
+def test_summarize_module_raises_empty_reply_error_on_blank_reply(raw):
+    module = _module()
+    stub_llm = lambda system, user: raw  # noqa: E731
+    with pytest.raises(EmptyReplyError):
+        summarize_module(module, _source(), stub_llm)
+
+
+def test_summarize_module_does_not_raise_on_well_formed_but_empty_summary():
+    # Non-regression: a *real*, well-formed reply that just happens to say
+    # nothing (a model's deliberate "no purpose/notes worth writing" for a
+    # near-empty file) is not the failure this exception targets — it's
+    # indistinguishable from a legitimate answer and must not be retried.
+    module = _module()
+    reply = json.dumps({"purpose": "", "notes": ""})
+    stub_llm = lambda system, user: reply  # noqa: E731
+    result = summarize_module(module, _source(), stub_llm)
+    assert result.summary == LLMSummary(purpose="", notes="")
+
+
+def test_summarize_repo_retries_blank_reply_then_succeeds():
+    module = _module()
+    sources = {"pkg/error_handling.py": _source()}
+    attempts = {"n": 0}
+    sleeps = []
+
+    def blank_then_recovers(system, user):
+        attempts["n"] += 1
+        if attempts["n"] < 3:
+            return ""  # the provider-flakiness shape this fix targets
+        return json.dumps({"purpose": "recovered after blank replies", "notes": ""})
+
+    out = summarize_repo(
+        [module], sources, blank_then_recovers,
+        sleep_fn=lambda s: sleeps.append(s),
+        max_retries=5,
+    )
+
+    assert out[0].summary.purpose == "recovered after blank replies"
+    assert attempts["n"] == 3
+    assert len(sleeps) == 2  # one sleep per blank attempt before success
+
+
+def test_summarize_repo_gives_up_gracefully_after_persistent_blank_replies():
+    # Same fail-open guarantee as a persistently-raising LLM
+    # (`test_summarize_repo_gives_up_after_max_retries_without_aborting_batch`)
+    # — retries are bounded, and exhausting them against an always-blank
+    # reply must still settle on a structural-only module, never raise out
+    # of `summarize_repo` itself.
+    module = _module()
+    sources = {"pkg/error_handling.py": _source()}
+    errors_seen = []
+
+    def always_blank(system, user):
+        return ""
+
+    out = summarize_repo(
+        [module], sources, always_blank,
+        max_retries=2,
+        sleep_fn=lambda s: None,
+        on_error=lambda path, exc, count: errors_seen.append((path, count)),
+    )
+
+    assert out[0].summary is None
+    assert len(errors_seen) == 3  # 1 initial + max_retries(2) retries
+    assert all(isinstance(e[1], int) for e in errors_seen)
 
 
 # ── antihallucination AC: never writes structural fields ──────────────────────

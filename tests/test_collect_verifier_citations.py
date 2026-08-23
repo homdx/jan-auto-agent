@@ -572,3 +572,128 @@ def test_sentence_with_no_citations_still_produces_exactly_one_generic_claim():
     assert claims[0].location is None
     assert claims[0].access is None
     assert claims[0].kind == "generic"
+
+
+# ── bare short-name over-matching against common words (COLLECT-17 follow-up) ─
+#
+# Found via forensic comparison of two real collect runs against this repo:
+# `known_symbols` is a repo-wide flat table, so a bare (unprefixed) mention
+# of a short symbol name matched *any* symbol anywhere with that name, not
+# just ones plausibly meant by the sentence. Two distinct false-positive
+# shapes, both from real verification_report.json rows on this exact repo.
+
+
+def test_bare_mention_of_own_modules_main_is_not_flagged_against_other_mains():
+    # Real repro: `analyze_logs.py` genuinely defines its own `main`, but
+    # so do several *other* top-level scripts in this repo (`main.py`,
+    # `restore_synapse.py`, `tools/collect/cli.py`, ...). The old bare-name
+    # loop flagged "Entry point is main() via argparse." as a failed
+    # citation to *every one* of those other files' `main` — six separate
+    # drops for one true, local, unremarkable sentence.
+    mod_a_path, mod_b_path = "analyze_logs.py", "main.py"
+    src_a = (REPO_ROOT / mod_a_path).read_text(encoding="utf-8")
+    src_b = (REPO_ROOT / mod_b_path).read_text(encoding="utf-8")
+    module_a = scan_module(src_a, mod_a_path)
+    module_b = scan_module(src_b, mod_b_path)
+    known_symbols = frozenset(
+        sym.qualname for m in (module_a, module_b) for sym in m.public_symbols
+    )
+    assert f"{mod_a_path}:main" in known_symbols and f"{mod_b_path}:main" in known_symbols
+
+    text = "Entry point is main() via argparse (build_parser)."
+    claims = extract_claims(text, mod_a_path, known_symbols)
+    kept, dropped = verify_claims(
+        claims, module=module_a, known_symbols=known_symbols,
+        line_counts={mod_a_path: 999, mod_b_path: 999}, fail_open_locs=frozenset(),
+    )
+    assert dropped == []
+    assert len(kept) == 1
+    assert kept[0].text == text
+
+
+def test_bare_mention_of_generic_word_matching_unrelated_symbol_is_not_flagged():
+    # Real repro: some far-off test file happens to define a top-level
+    # `task` symbol; that's the *only* module anywhere that has one, so it
+    # isn't even ambiguous — yet the old bare-name loop matched the word
+    # "task" in ordinary prose about a completely unrelated module ("task
+    # metrics", "task planning") as a failed citation to that one file,
+    # over and over, for any module whose summary happened to use the
+    # word. A single undecorated lowercase word is too generic a match to
+    # trust as a citation either way.
+    mod_path = "analyze_logs.py"
+    src = (REPO_ROOT / mod_path).read_text(encoding="utf-8")
+    module = scan_module(src, mod_path)
+    known_symbols = frozenset(sym.qualname for sym in module.public_symbols) | {
+        "tests/test_bug_fix_loop_fuzz.py:task",
+    }
+
+    text = "Includes tools for extracting task metrics and timeline rendering."
+    claims = extract_claims(text, mod_path, known_symbols)
+    kept, dropped = verify_claims(
+        claims, module=module, known_symbols=known_symbols,
+        line_counts={mod_path: 999, "tests/test_bug_fix_loop_fuzz.py": 999},
+        fail_open_locs=frozenset(),
+    )
+    assert dropped == []
+    assert len(kept) == 1
+
+
+def test_bare_mention_of_real_multiword_helper_still_checked_cross_module():
+    # Non-regression: the narrowing must not swallow the mechanism's actual
+    # intended catch. A real, *distinctive* (multi-word) symbol borrowed
+    # from a module Pass B was never shown facts for is still exactly the
+    # kind of cross-module fabrication this checker exists to drop — same
+    # shape as `test_cross_module_hallucination_end_to_end_is_dropped`,
+    # pinned separately here so it can't regress alongside the bare-name
+    # narrowing above.
+    mod_a_path, mod_b_path = "tools/formatter.py", "tools/backoff.py"
+    src_a = (REPO_ROOT / mod_a_path).read_text(encoding="utf-8")
+    src_b = (REPO_ROOT / mod_b_path).read_text(encoding="utf-8")
+    module_a = scan_module(src_a, mod_a_path)
+    module_b = scan_module(src_b, mod_b_path)
+    known_symbols = frozenset(
+        sym.qualname for m in (module_a, module_b) for sym in m.public_symbols
+    )
+    real_symbol = next(
+        s.qualname.split(":", 1)[1] for s in module_b.public_symbols if "_" in s.qualname
+    )
+
+    text = f"This module reimplements {real_symbol} locally for its own use."
+    claims = extract_claims(text, mod_a_path, known_symbols)
+    kept, dropped = verify_claims(
+        claims, module=module_a, known_symbols=known_symbols,
+        line_counts={mod_a_path: 999, mod_b_path: 999}, fail_open_locs=frozenset(),
+    )
+    assert kept == []
+    assert len(dropped) == 1
+    assert dropped[0].reason == REASON_NO_CITATION
+    assert mod_b_path in dropped[0].detail
+
+
+def test_bare_mention_of_real_camelcase_class_still_checked_cross_module():
+    # Same non-regression as above, for the *other* shape my narrowing
+    # deliberately keeps checkable: a single-word CamelCase class name
+    # (no underscore at all) — `short == short.lower()` is what actually
+    # exempts it, not the underscore check, so this needs its own case
+    # rather than assuming the snake_case test above covers it.
+    mod_a_path, mod_b_path = "tools/backoff.py", "tools/formatter.py"
+    src_a = (REPO_ROOT / mod_a_path).read_text(encoding="utf-8")
+    src_b = (REPO_ROOT / mod_b_path).read_text(encoding="utf-8")
+    module_a = scan_module(src_a, mod_a_path)
+    module_b = scan_module(src_b, mod_b_path)
+    known_symbols = frozenset(
+        sym.qualname for m in (module_a, module_b) for sym in m.public_symbols
+    )
+    camel_symbol = module_b.public_symbols[0].qualname.split(":", 1)[1]
+    assert "_" not in camel_symbol and camel_symbol != camel_symbol.lower()  # sanity check
+
+    text = f"Delegates rendering to a local {camel_symbol} instance."
+    claims = extract_claims(text, mod_a_path, known_symbols)
+    kept, dropped = verify_claims(
+        claims, module=module_a, known_symbols=known_symbols,
+        line_counts={mod_a_path: 999, mod_b_path: 999}, fail_open_locs=frozenset(),
+    )
+    assert kept == []
+    assert len(dropped) == 1
+    assert dropped[0].reason == REASON_NO_CITATION
+    assert mod_b_path in dropped[0].detail
