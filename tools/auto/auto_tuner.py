@@ -143,8 +143,30 @@ class AutoTuner:
             )
 
         if eval_result.promoted:
-            # Push to store
-            self.prompt_store.push(self.agent_name, candidate, eval_result.score)
+            # Push to store.
+            # FOLLOW-UP (JAN-BUG-03 regression): PromptStore._save() now
+            # raises RuntimeError on a write failure instead of silently
+            # swallowing it (see prompt_store.py). That's correct for
+            # push()/rollback() callers who need to know a save didn't
+            # happen — but it means this call, which used to be a no-op
+            # on disk-full/permission errors, can now raise here. Left
+            # unguarded that would escape maybe_tune() (which is
+            # documented "never raises") and abort the whole --auto run
+            # over an optional prompt-tuning write. Fail closed instead:
+            # log it, report the tuning cycle as failed, and let the run
+            # continue on the prompt version already active in memory.
+            try:
+                self.prompt_store.push(self.agent_name, candidate, eval_result.score)
+            except Exception as exc:
+                logger.error(
+                    "AutoTuner: fail-closed — could not persist promoted "
+                    "prompt for '%s': %s", self.agent_name, exc,
+                )
+                return TuneOutcome(
+                    agent_name=self.agent_name,
+                    triggered=True,
+                    reason=f"fail-closed: promotion evaluated but not persisted — {exc}",
+                )
             tracer.event(
                 source="auto_tuner",
                 target="prompt_evaluator",
@@ -194,9 +216,26 @@ class AutoTuner:
         Roll back the active prompt to the previous version.
 
         Returns True if a version was rolled back (and reload_agents_fn fired),
-        False if already at hardcoded baseline (no reload fired).
+        False if already at hardcoded baseline (no reload fired) OR if the
+        store write for the rollback itself failed (fail-closed — see below).
+
+        FOLLOW-UP (JAN-BUG-03 regression, matches the maybe_tune() guard
+        above): PromptStore.rollback() now raises RuntimeError on a write
+        failure instead of silently swallowing it. This method has no
+        surrounding try/except like maybe_tune() does, so an unguarded
+        call here would propagate straight out of AutoTuner — the same
+        "an optional tuning feature must not abort the run" contract
+        maybe_tune() upholds. Fail closed: log and report no rollback
+        occurred rather than crash the caller.
         """
-        rolled = self.prompt_store.rollback(self.agent_name)
+        try:
+            rolled = self.prompt_store.rollback(self.agent_name)
+        except Exception as exc:
+            logger.error(
+                "AutoTuner: fail-closed — rollback of '%s' could not be "
+                "persisted: %s", self.agent_name, exc,
+            )
+            return False
         if not rolled:
             return False
         if self.reload_agents_fn is not None:

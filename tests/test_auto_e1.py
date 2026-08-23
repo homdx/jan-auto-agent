@@ -402,10 +402,72 @@ class TestFailClosed:
         outcome = tuner.maybe_tune()   # must not raise
         assert outcome.promoted is True
 
+    def test_push_exception_does_not_raise(self, tmp_path):
+        """REVIEW-FOLLOWUP: PromptStore._save() (and therefore push())
+        can raise RuntimeError on a write failure (disk full, permission
+        denied, etc.) — see prompt_store.py. maybe_tune() is documented
+        "never raises"; a promoted-but-unpersisted candidate must degrade
+        to a reported failure, not an uncaught exception out of --auto.
+        """
+        tuner = _make_tuner(
+            tmp_path, min_runs=5, trigger_avg_iter=2.0,
+            records=self._records(), evaluator_promoted=True,
+        )
+        with patch.object(
+            tuner.prompt_store, "push",
+            side_effect=RuntimeError("disk full"),
+        ):
+            outcome = tuner.maybe_tune()  # must not raise
+        assert outcome.triggered is True
+        assert outcome.promoted is False
+        assert "fail-closed" in outcome.reason.lower()
+
+    def test_push_exception_does_not_fire_reload(self, tmp_path):
+        """The reload must not fire for a version that was never
+        actually persisted — the active in-memory prompt is unchanged."""
+        reload_fn = MagicMock()
+        tuner = _make_tuner(
+            tmp_path, min_runs=5, trigger_avg_iter=2.0,
+            records=self._records(), evaluator_promoted=True,
+            reload_fn=reload_fn,
+        )
+        with patch.object(
+            tuner.prompt_store, "push",
+            side_effect=RuntimeError("disk full"),
+        ):
+            tuner.maybe_tune()
+        reload_fn.assert_not_called()
+
 
 # ── rollback ──────────────────────────────────────────────────────────────────
 
 class TestRollback:
+    def test_rollback_store_exception_does_not_raise(self, tmp_path):
+        """REVIEW-FOLLOWUP: PromptStore.rollback() can raise RuntimeError
+        the same way push() can (both end in _save()). AutoTuner.rollback()
+        had no guard at all before this fix — an unguarded raise here would
+        propagate straight out to any caller (including main.py's /rollback
+        REPL command)."""
+        tuner = _make_tuner(tmp_path)
+        tuner.prompt_store.push("validator", "v2 prompt", 0.8)
+        with patch.object(
+            tuner.prompt_store, "rollback",
+            side_effect=RuntimeError("disk full"),
+        ):
+            result = tuner.rollback()  # must not raise
+        assert result is False
+
+    def test_rollback_store_exception_does_not_fire_reload(self, tmp_path):
+        reload_fn = MagicMock()
+        tuner = _make_tuner(tmp_path, reload_fn=reload_fn)
+        tuner.prompt_store.push("validator", "v2 prompt", 0.8)
+        with patch.object(
+            tuner.prompt_store, "rollback",
+            side_effect=RuntimeError("disk full"),
+        ):
+            tuner.rollback()
+        reload_fn.assert_not_called()
+
     def test_rollback_at_hardcoded_returns_false(self, tmp_path):
         tuner = _make_tuner(tmp_path)
         assert tuner.rollback() is False

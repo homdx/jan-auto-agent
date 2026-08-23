@@ -431,7 +431,23 @@ class AutoController:
         self.progress_display.code_total = len(self.state.all_tasks())
 
         # AUTO-E1/E2: Setup metrics stream and auto tuner
-        self.metrics_stream = AutoMetricsStream(self.agent_dir)
+        # FOLLOW-UP (JAN-BUG-04 residual): AutoMetricsStream.__init__ now
+        # raises a clear RuntimeError instead of a bare OSError when its
+        # directory can't be created — better diagnostics, but this call
+        # site was still unguarded, so the improved error still aborted
+        # the entire --auto run over a metrics sidecar failure, exactly
+        # what JAN-BUG-04 said must not happen ("metrics loss is
+        # acceptable; aborting the run is not"). Guard it here: log and
+        # continue with metrics disabled (every downstream use already
+        # checks `if self.metrics_stream`) rather than crash startup.
+        try:
+            self.metrics_stream = AutoMetricsStream(self.agent_dir)
+        except Exception as exc:
+            logger.warning(
+                "AutoMetricsStream unavailable (%s) — continuing this run "
+                "with metrics recording disabled", exc,
+            )
+            self.metrics_stream = None
         self.auto_tuner = make_auto_tuner(cfg, self.agent_dir)
 
         # ──────────────────────────────────────────────────────────────────
