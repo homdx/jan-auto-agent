@@ -72,7 +72,19 @@ class AutoMetricsStream:
 
     def __init__(self, agent_dir: Path) -> None:
         # Auto-create the directory (mirroring the draft's _load() behaviour).
-        Path(agent_dir).mkdir(parents=True, exist_ok=True)
+        # Guarded: a permission error, a read-only filesystem, or agent_dir
+        # colliding with an existing file all raise OSError here. Left
+        # unguarded, construction dies with a bare traceback pointing at
+        # pathlib internals instead of naming the directory that couldn't
+        # be created — surface a clear, actionable error instead.
+        try:
+            Path(agent_dir).mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise RuntimeError(
+                f"AutoMetricsStream: could not create agent directory "
+                f"{agent_dir!s} ({exc}). Check permissions and that the "
+                f"path does not already exist as a file."
+            ) from exc
 
         metrics_path = Path(agent_dir) / "metrics.json"
 

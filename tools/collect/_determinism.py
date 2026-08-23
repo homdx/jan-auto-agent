@@ -101,8 +101,32 @@ def write_golden(path: Path, obj: Any) -> None:
 
 def load_golden_bytes(path: Path) -> bytes:
     """Read back a golden fixture written by `write_golden` (trailing
-    newline stripped, so it compares equal to a fresh `canonical_bytes` call)."""
-    return Path(path).read_bytes().rstrip(b"\n")
+    newline stripped, so it compares equal to a fresh `canonical_bytes` call).
+
+    Guarded: a missing golden (never generated, or renamed) and a
+    permissions failure (read-only CI artifact store) both propagate as a
+    bare OSError with only a system-generated message — indistinguishable
+    from each other and useless without already knowing this codebase.
+    Re-raise as a RuntimeError that names the path, the failure kind, and
+    the remediation, so a CI failure is self-documenting instead of a raw
+    traceback.
+    """
+    path = Path(path)
+    try:
+        return path.read_bytes().rstrip(b"\n")
+    except FileNotFoundError as e:
+        raise RuntimeError(
+            f"golden file not found at {path} — it was never generated, "
+            f"renamed, or removed by `git clean`; regenerate it with "
+            f"`write_golden` (e.g. via pytest --update-goldens) before "
+            f"comparing against it"
+        ) from e
+    except PermissionError as e:
+        raise RuntimeError(
+            f"golden file at {path} could not be read due to a permissions "
+            f"error ({e}) — check that the CI artifact store/checkout is "
+            f"readable"
+        ) from e
 
 
 def run_twice_and_compare(build_fn: Callable[[], Any]) -> Tuple[bytes, bytes]:

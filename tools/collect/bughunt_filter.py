@@ -32,7 +32,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Sequence
 
-from tools.collect.loader import CollectModel, load
+from tools.collect.loader import STATUS_ABSENT, CollectModel, load
 from tools.collect.registries import SafetyAnswer
 
 logger = logging.getLogger(__name__)
@@ -148,6 +148,26 @@ def suppress_for_root(
     `loader.load` once and reusing the resulting `CollectModel` across many
     bughunt runs instead of this, when the caller already has one on hand
     — this exists for callers (a future `/bughunt` integration, an
-    ad-hoc script) that don't."""
-    model = load(root, config=config, config_path=config_path)
+    ad-hoc script) that don't.
+
+    Guarded: unlike `suppress()`, which only ever touches an
+    already-loaded, in-memory `CollectModel`, this convenience wrapper
+    performs the disk read itself via `load()` — a corrupted artifact, an
+    unmounted root, or a permissions change mid-scan can raise. Losing
+    every suppression verdict for a whole bughunt pass over one I/O
+    hiccup is disproportionate, so on failure this degrades to an absent
+    model (the same fail-open stance `make_collect_bridge` already takes
+    around this exact call in tools/auto/collect_bridge.py) — every
+    candidate then survives, unsuppressed, for human review rather than
+    disappearing silently.
+    """
+    try:
+        model = load(root, config=config, config_path=config_path)
+    except Exception as exc:  # noqa: BLE001 — same fail-open stance as make_collect_bridge
+        logger.error("suppress_for_root: load() failed for %s: %s", root, exc)
+        model = CollectModel(
+            status=STATUS_ABSENT,
+            collect_dir=root,
+            reason=f"load() failed: {exc}",
+        )
     return suppress(candidates, model, root=root)

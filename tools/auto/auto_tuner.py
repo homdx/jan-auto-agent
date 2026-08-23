@@ -236,30 +236,54 @@ def make_auto_tuner(
     if metrics_collector is None:
         metrics_collector = MetricsCollector(metrics_path=agent_dir / "metrics.json")
 
-    # Tuner settings
-    enabled = config.getboolean("prompt_optimizer", "enabled", fallback=True)
-    min_runs = config.getint("prompt_optimizer", "min_runs_before_optimize", fallback=5)
-    trigger_avg_iter = config.getfloat("prompt_optimizer", "trigger_avg_iterations", fallback=2.0)
-    trigger_json_fail = config.getfloat("prompt_optimizer", "trigger_json_fail_rate", fallback=0.30)
+    # Tuner settings + PromptOptimizer/PromptEvaluator construction.
+    # Guarded: configparser's `fallback=` only covers a MISSING key — a
+    # malformed value that IS present ("enabled = yes-please",
+    # "min_runs_before_optimize = three") still raises ValueError straight
+    # past it. PromptOptimizer/PromptEvaluator construction can likewise
+    # raise (bad model name, malformed API key, missing config section).
+    # The auto-tuner is an optional optimisation on top of --auto, not a
+    # dependency of it — a misconfiguration here must degrade to "tuner
+    # disabled for this run" rather than aborting the whole autonomous run
+    # before a single task is attempted.
+    try:
+        enabled = config.getboolean("prompt_optimizer", "enabled", fallback=True)
+        min_runs = config.getint("prompt_optimizer", "min_runs_before_optimize", fallback=5)
+        trigger_avg_iter = config.getfloat("prompt_optimizer", "trigger_avg_iterations", fallback=2.0)
+        trigger_json_fail = config.getfloat("prompt_optimizer", "trigger_json_fail_rate", fallback=0.30)
 
-    # Build PromptOptimizer from api config
-    from tools.prompt_optimizer import PromptOptimizer
-    active_api = config.get("api", "active", fallback="local")
-    api_section = f"api_{active_api}"
-    base_url = config.get(api_section, "base_url", fallback="http://localhost:1337/v1")
-    api_key = config.get(api_section, "api_key", fallback="")
-    model = config.get(api_section, "model", fallback="")
-    optimizer = PromptOptimizer(model=model, base_url=base_url, api_key=api_key)
+        # Build PromptOptimizer from api config
+        from tools.prompt_optimizer import PromptOptimizer
+        active_api = config.get("api", "active", fallback="local")
+        api_section = f"api_{active_api}"
+        base_url = config.get(api_section, "base_url", fallback="http://localhost:1337/v1")
+        api_key = config.get(api_section, "api_key", fallback="")
+        model = config.get(api_section, "model", fallback="")
+        optimizer = PromptOptimizer(model=model, base_url=base_url, api_key=api_key)
 
-    # Build PromptEvaluator — no shadow ValidatorAgent in auto mode (safe default)
-    from tools.prompt_evaluator import PromptEvaluator
-    max_iter = config.getint("loop", "max_iterations", fallback=3)
-    evaluator = PromptEvaluator(
-        prompt_store=prompt_store,
-        metrics_collector=metrics_collector,
-        validator_agent=None,
-        max_iter=max_iter,
-    )
+        # Build PromptEvaluator — no shadow ValidatorAgent in auto mode (safe default)
+        from tools.prompt_evaluator import PromptEvaluator
+        max_iter = config.getint("loop", "max_iterations", fallback=3)
+        evaluator = PromptEvaluator(
+            prompt_store=prompt_store,
+            metrics_collector=metrics_collector,
+            validator_agent=None,
+            max_iter=max_iter,
+        )
+    except Exception as exc:  # noqa: BLE001 — optional feature, never fatal to --auto
+        logger.warning(
+            "make_auto_tuner: prompt optimizer/evaluator init failed (%s) — "
+            "auto-tuner disabled for this run", exc
+        )
+        return AutoTuner(
+            prompt_store=prompt_store,
+            metrics_collector=metrics_collector,
+            prompt_optimizer=None,
+            prompt_evaluator=None,
+            agent_name="validator",
+            reload_agents_fn=reload_fn,
+            enabled=False,
+        )
 
     return AutoTuner(
         prompt_store=prompt_store,

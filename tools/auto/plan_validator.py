@@ -152,8 +152,8 @@ def _task_to_candidate(task: dict) -> CandidateTask:
     check will require that file to exist.
     """
     locs = task.get("cited_locations") or []
-    if locs:
-        loc0 = locs[0]
+    loc0 = locs[0] if locs else None
+    if isinstance(loc0, dict):
         cited_location = CitedLocation(
             file=loc0.get("file", ""),
             symbol=loc0.get("symbol"),
@@ -162,6 +162,10 @@ def _task_to_candidate(task: dict) -> CandidateTask:
             new_file=bool(loc0.get("new_file", False)),
         )
     else:
+        # No citation at all, OR a malformed cited_locations[0] that isn't
+        # the expected dict shape (e.g. a bare string from a hand-edited
+        # plan.json). Either way, fall back to the first target_files entry
+        # with no anchor rather than crashing on loc0.get(...).
         target = task.get("target_files") or [""]
         cited_location = CitedLocation(file=target[0])
 

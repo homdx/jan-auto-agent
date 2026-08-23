@@ -251,6 +251,31 @@ class ContextAssembler:
         a recognizable ``chapter_<N>`` filename, returns ``""`` — just the
         task framing, no errors.
         """
+        # Top-level guard: this method is documented ("never raises") to
+        # fail open on any missing/malformed input. The individual helpers
+        # below each guard their own file reads, but nothing previously
+        # guarded the assembly logic itself (chapter ordering, budget
+        # arithmetic, section merging) — an unexpected error there escaped
+        # as a raw exception, breaking the documented contract and aborting
+        # the whole chapter-generation task over a context-assembly nicety.
+        try:
+            return self._build_creative_context_inner(target_file, all_chapter_files)
+        except Exception:
+            logger.exception(
+                "ContextAssembler.build_creative_context failed for %r; "
+                "degrading to no extra context (fail-open, per contract)",
+                target_file,
+            )
+            return ""
+
+    def _build_creative_context_inner(
+        self,
+        target_file: str,
+        all_chapter_files: "list[str]",
+    ) -> str:
+        """Unguarded body of build_creative_context — see that method's
+        docstring for behaviour. Split out so the top-level try/except can
+        wrap the whole thing in one place."""
         target_num = _chapter_number(target_file)
         if target_num is None:
             return ""
