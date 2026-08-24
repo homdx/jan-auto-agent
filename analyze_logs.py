@@ -208,7 +208,12 @@ def find_trace_files(path: str) -> list[Path]:
 
 def load_events(path: Path) -> list[dict]:
     events = []
-    with path.open("r", encoding="utf-8") as fh:
+    # BUGFIX: same root cause as tools/auto/view_trace.py::load_events — a
+    # trace file truncated mid-write can end mid multi-byte UTF-8 character.
+    # `errors="replace"` avoids an uncaught UnicodeDecodeError that would
+    # otherwise kill analyze_logs.py at the CLI entry point instead of
+    # showing the partial run it was asked to analyze.
+    with path.open("r", encoding="utf-8", errors="replace") as fh:
         for lineno, line in enumerate(fh, 1):
             line = line.strip()
             if not line:

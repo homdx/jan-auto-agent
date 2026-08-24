@@ -1,0 +1,1 @@
+../tests/test_progress_display_malformed_config.py

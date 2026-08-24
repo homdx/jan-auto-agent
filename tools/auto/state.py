@@ -475,10 +475,36 @@ class StateStore:
         self._save_progress()
 
     def log(self, msg: str) -> None:
-        """Append a timestamped line to run.log."""
+        """Append a timestamped line to run.log.
+
+        BUGFIX (report §4, item 7): previously an unguarded file write — any
+        OSError (disk full, permissions, run.log's parent directory removed
+        mid-run) propagated straight out of every .log() call site, 62 of
+        them across the codebase. The most damaging is inside
+        outer_loop.py's AUTO-OUTER-GUARD-1 handler, whose entire documented
+        purpose is "any exception inner_loop.run_task doesn't already
+        handle itself shouldn't crash the whole multi-task run" — that
+        handler itself calls self.state.log(...) unguarded, so an OSError
+        from logging could defeat the very safety net it exists to
+        provide.
+
+        Unlike _atomic_write (used for plan.json/progress.json, where a
+        silently failed state write is intentionally NOT swallowed because
+        it's worse than a loud one), run.log is a best-effort diagnostic
+        trail, not authoritative state — losing one line to a warning beats
+        crashing the run that line was trying to record. Callers that need
+        a write failure to be fatal already have _atomic_write /
+        _save_plan / _save_progress for that.
+        """
         line = f"[{_ts()}] {msg}\n"
-        with self._log_path.open("a", encoding="utf-8") as fh:
-            fh.write(line)
+        try:
+            with self._log_path.open("a", encoding="utf-8") as fh:
+                fh.write(line)
+        except OSError as exc:
+            logger.warning(
+                "StateStore: failed to write to %s: %s — log line dropped: %s",
+                self._log_path, exc, msg,
+            )
 
     @staticmethod
     def _safe_task_id(task_id: str) -> str:

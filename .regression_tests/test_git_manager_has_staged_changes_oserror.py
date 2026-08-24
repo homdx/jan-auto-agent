@@ -1,0 +1,1 @@
+../tests/test_git_manager_has_staged_changes_oserror.py

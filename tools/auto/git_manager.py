@@ -260,6 +260,24 @@ class GitManager:
 
     def has_staged_changes(self) -> bool:
         """Return ``True`` if there is at least one staged change."""
+        # BUGFIX (report §4, item 10): missing an OSError catch (e.g. the
+        # git binary itself is missing, or unusable) for a subprocess call
+        # of the same class as _run()'s — inconsistent with the sibling
+        # method _agent_state_is_ignored() just above, which already
+        # catches (subprocess.TimeoutExpired, OSError).
+        #
+        # Deliberately NOT fail-closed like _agent_state_is_ignored(),
+        # though: that method guards a best-effort optional cleanup step
+        # (skip .agent/ cleaning if unsure), where returning False on
+        # failure is safe. has_staged_changes() gates whether commit()
+        # actually commits — commit() calls self._run(["git", "commit", ...])
+        # right after, which itself raises GitError (not caught) if git is
+        # genuinely unusable. Failing closed here would just relabel that
+        # same problem as "nothing to commit — skipping" and silently
+        # no-op the commit instead of surfacing that git is broken. Raise
+        # a GitError instead, matching _run()'s own established pattern
+        # for this exact class of subprocess failure (see the
+        # TimeoutExpired branch a few lines below).
         try:
             result = subprocess.run(
                 ["git", "diff", "--cached", "--quiet"],
@@ -274,6 +292,11 @@ class GitManager:
             raise GitError(
                 "git diff --cached --quiet timed out after 60s "
                 "(possible stale .git/index.lock or hung hook)"
+            ) from exc
+        except OSError as exc:
+            raise GitError(
+                f"git diff --cached --quiet failed to run ({exc}) — is git "
+                "installed and on PATH?"
             ) from exc
         # exit 0 → nothing staged; exit 1 → changes staged
         return result.returncode != 0

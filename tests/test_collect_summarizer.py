@@ -466,6 +466,43 @@ def test_collect_llm_budget_prefers_collect_section_override():
     assert max_tokens == 300
 
 
+# ── §2.3 regression: malformed values must degrade, not crash ─────────────────
+# `fallback=` on a configparser read only covers a *missing* key, not a
+# malformed *value* — a non-numeric num_ctx/max_tokens used to raise a raw
+# ValueError straight out of collect_llm_budget(), which crashed both the
+# `--collect` CLI action (unguarded call site) and the interactive `/collect`
+# REPL command (whose `except CollectCliError` doesn't catch ValueError).
+
+
+def test_collect_llm_budget_malformed_collect_num_ctx_falls_back_to_zero():
+    cfg = _cfg("[collect]\nnum_ctx = not_a_number\n")
+    num_ctx, max_tokens = collect_llm_budget(cfg)
+    assert num_ctx == 0
+    assert max_tokens == DEFAULT_MAX_TOKENS
+
+
+def test_collect_llm_budget_malformed_api_profile_num_ctx_falls_back_to_zero():
+    cfg = _cfg("[api]\nactive = local\n\n[api_local]\nnum_ctx = garbage\n")
+    num_ctx, _ = collect_llm_budget(cfg)
+    assert num_ctx == 0
+
+
+def test_collect_llm_budget_malformed_max_tokens_falls_back_to_default():
+    cfg = _cfg("[collect]\nmax_tokens = nope\n")
+    num_ctx, max_tokens = collect_llm_budget(cfg)
+    assert max_tokens == DEFAULT_MAX_TOKENS
+    assert num_ctx == 0
+
+
+def test_collect_llm_budget_malformed_values_do_not_affect_the_other_field():
+    # A bad num_ctx shouldn't stop a valid max_tokens from being read, and
+    # vice versa — each field degrades independently.
+    cfg = _cfg("[collect]\nnum_ctx = bogus\nmax_tokens = 128\n")
+    num_ctx, max_tokens = collect_llm_budget(cfg)
+    assert num_ctx == 0
+    assert max_tokens == 128
+
+
 def test_make_summarizer_call_builds_ollama_request(monkeypatch):
     cfg = _cfg(
         "[api]\nactive = local\nverify_ssl = true\n\n"

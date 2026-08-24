@@ -1,0 +1,1 @@
+/home/renat/Project/opensource/github/agent-offline/qwen25/tests/test_load_events_truncated_utf8.py

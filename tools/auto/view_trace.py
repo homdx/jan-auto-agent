@@ -181,7 +181,12 @@ def find_trace_file(path_arg: str) -> Path:
 
 def load_events(trace_file: Path) -> list[dict]:
     events = []
-    with trace_file.open(encoding="utf-8") as fh:
+    # BUGFIX: a trace file truncated mid-write (crashed/killed run) can end
+    # mid multi-byte UTF-8 character. `errors="replace"` decodes the rest of
+    # the file (substituting U+FFFD for the broken tail) instead of raising
+    # an uncaught UnicodeDecodeError that would discard every event already
+    # read — exactly the crashed-run scenario this tool exists to diagnose.
+    with trace_file.open(encoding="utf-8", errors="replace") as fh:
         for lineno, line in enumerate(fh, 1):
             line = line.strip()
             if not line:

@@ -379,12 +379,29 @@ def collect_llm_budget(config, task_mode: str = "code") -> "tuple[int, int]":
     num_ctx_str = _cfg_mode(config, "collect", "num_ctx", task_mode, fallback=None)
     if num_ctx_str is None:
         num_ctx_str = config.get(api_sec, "num_ctx", fallback="0")
-    num_ctx = int(num_ctx_str)
+    # BUGFIX: `fallback=` on configparser reads only covers a *missing* key,
+    # not a malformed *value* — a non-numeric num_ctx/max_tokens raised a raw
+    # ValueError straight out of this function, crashing both the `--collect`
+    # CLI action (unguarded call site) and the interactive `/collect` REPL
+    # command (whose `except CollectCliError` doesn't catch ValueError).
+    # Mirrors the existing try/except-around-int() pattern used by
+    # tools/auto/repo_ingest.py::_read_int.
+    try:
+        num_ctx = int(num_ctx_str)
+    except (ValueError, TypeError):
+        logger.warning("config num_ctx invalid (%r) — using 0", num_ctx_str)
+        num_ctx = 0
 
     max_tokens_str = _cfg_mode(
         config, "collect", "max_tokens", task_mode, fallback=str(DEFAULT_MAX_TOKENS)
     )
-    max_tokens = int(max_tokens_str)
+    try:
+        max_tokens = int(max_tokens_str)
+    except (ValueError, TypeError):
+        logger.warning(
+            "config max_tokens invalid (%r) — using %d", max_tokens_str, DEFAULT_MAX_TOKENS
+        )
+        max_tokens = DEFAULT_MAX_TOKENS
     return num_ctx, max_tokens
 
 

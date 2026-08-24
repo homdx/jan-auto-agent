@@ -545,7 +545,13 @@ def action_refresh(
             previous_manifest = manifest_mod.read_manifest(manifest_path)
             payload = json.loads(artifact_path.read_text(encoding="utf-8"))
             previous_by_path = {d["path"]: ModuleRecord.from_dict(d) for d in payload.get("modules", [])}
-        except (OSError, ValueError, KeyError):
+        # BUGFIX: ConfigRead/ExceptSite/GuardedAccess are frozen dataclasses
+        # with required (no-default) fields, so a stored artifact.json missing
+        # one of those keys (schema drift, hand-edited file, partial/corrupted
+        # write) raises TypeError, not OSError/ValueError/KeyError. Matches
+        # loader.py::_load_from_dir's existing (correct) guard so a corrupt
+        # artifact degrades to "no previous manifest" instead of crashing.
+        except (OSError, ValueError, KeyError, TypeError):
             previous_manifest = None
             previous_by_path = {}
 
@@ -741,7 +747,21 @@ def action_module(
     except (OSError, ValueError) as exc:
         raise CollectCliError(f"existing artifact at {artifact_path} is unreadable: {exc}") from exc
 
-    modules = [ModuleRecord.from_dict(d) for d in payload.get("modules", [])]
+    # BUGFIX: ConfigRead/ExceptSite/GuardedAccess are frozen dataclasses with
+    # required (no-default) fields, so a stored artifact.json missing one of
+    # those keys (schema drift, hand-edited file, partial/corrupted write)
+    # raised TypeError/KeyError straight out of this list comprehension —
+    # previously completely unguarded, unlike every other from_dict() call
+    # site in this file (action_refresh above, loader.py::_load_from_dir).
+    # `--module`'s whole point is patching into an *existing* artifact (see
+    # the `if not artifact_path.exists()` full-refresh fallback above), so
+    # there's no sensible silent-degrade here — raise the same clean
+    # CollectCliError the JSON-read guard just above already uses for other
+    # forms of a broken artifact.
+    try:
+        modules = [ModuleRecord.from_dict(d) for d in payload.get("modules", [])]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise CollectCliError(f"existing artifact at {artifact_path} is malformed: {exc}") from exc
     by_path = {m.path: m for m in modules}
 
     abs_module = root / module_path
