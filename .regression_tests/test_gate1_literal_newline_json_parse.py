@@ -1,1 +1,1 @@
-/home/renat/Project/opensource/github/agent-offline/qwen25/tests/test_gate1_literal_newline_json_parse.py
+../tests/test_gate1_literal_newline_json_parse.py
