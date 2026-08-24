@@ -77,6 +77,41 @@ curated by hand. `tests/test_tier_symlinks.py` asserts the invariants
 tiers complete, manifest has no stale entries) so a regression shows up as
 a red test rather than as quiet coverage loss.
 
+## Pre-commit hook
+
+The repository ships a hook that runs the `--check` above before every
+commit. Enable it once per clone:
+
+```bash
+git config core.hooksPath githooks
+```
+
+That single command is the whole installation — the hook lives in
+`githooks/pre-commit`, which is version-controlled, so it updates with
+`git pull` and needs no re-copying. (`core.hooksPath` requires git 2.9+.)
+
+It takes ~40ms and is read-only: it never rewrites the working tree or
+stages anything for you. It checks two things:
+
+1. **Tier integrity** — via `sync_test_tiers.py --check`. Catches a new
+   test with no symlink, a link left behind by a deleted test, and links
+   that are absolute, dangling, or mistargeted.
+2. **Stray Python files in the repository root** — but only files *added*
+   by the commit in question, so a pre-existing root script never blocks
+   an unrelated commit. A genuinely new top-level script goes in the
+   `ALLOWED_ROOT_PY` list inside the hook.
+
+Both checks exist because these failures are invisible to the test suite:
+a missing test cannot fail, and a dangling symlink is skipped silently.
+`.smoke_tests/fixtures` went missing exactly this way and was only caught
+after it had been pushed.
+
+To bypass for one commit:
+
+```bash
+git commit --no-verify
+```
+
 ## Adding a test
 
 1. Write the file in `tests/`.
