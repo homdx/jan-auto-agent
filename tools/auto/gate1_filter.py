@@ -1235,12 +1235,39 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         try:
             data = json.loads(stripped)
         except json.JSONDecodeError as exc:
-            reason = f"JSON decode failed ({exc}) — failing closed"
-            logger.warning(
-                "Gate1._parse_presence_response [%s]: %s  raw=%.200s",
-                candidate_title, reason, text,
-            )
-            return False, reason, True
+            # AUTO-CTRLCHAR-1: field report — the model sometimes pastes a
+            # multi-line docstring straight into a string value (e.g.
+            # "evidence") with a literal newline instead of an escaped
+            # "\n". Strict JSON forbids raw control characters inside
+            # strings, so this is REJECTED here even though it's not a
+            # truncation problem (more max_tokens is a no-op) and not
+            # reliably a sampling problem either (a different temperature
+            # can still copy the exact same substring from the
+            # deterministic source shown to the model, hitting this same
+            # failure again on retry). Retry json.loads with strict=False,
+            # which accepts literal control characters inside strings per
+            # Python's documented relaxation of the JSON spec, before
+            # giving up. This only recovers the *encoding* of characters
+            # that were already going to be in the string — it doesn't
+            # change which keys/values are present, so the AUTO-H3
+            # evidence-substring check below still applies unchanged.
+            try:
+                data = json.loads(stripped, strict=False)
+            except json.JSONDecodeError:
+                reason = f"JSON decode failed ({exc}) — failing closed"
+                logger.warning(
+                    "Gate1._parse_presence_response [%s]: %s  raw=%.200s",
+                    candidate_title, reason, text,
+                )
+                return False, reason, True
+            else:
+                logger.info(
+                    "Gate1._parse_presence_response [%s]: strict JSON "
+                    "decode failed (%s) but recovered with strict=False "
+                    "(literal control character inside a string value, "
+                    "e.g. an unescaped newline) — treating as parsed.",
+                    candidate_title, exc,
+                )
 
         if not isinstance(data, dict):
             reason = f"expected JSON object, got {type(data).__name__} — failing closed"
