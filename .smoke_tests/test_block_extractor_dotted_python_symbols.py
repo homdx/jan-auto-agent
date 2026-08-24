@@ -1,0 +1,1 @@
+../tests/test_block_extractor_dotted_python_symbols.py

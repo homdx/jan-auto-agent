@@ -1,0 +1,1 @@
+../tests/test_cr2_gate2_soft.py

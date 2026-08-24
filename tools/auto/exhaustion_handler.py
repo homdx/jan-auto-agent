@@ -63,6 +63,7 @@ from pathlib import Path
 from tools.agent_trace import tracer
 from tools.auto.state import StateStore, STATUS_BLOCKED
 from tools.auto.ticket_store import (
+    TicketError,
     make_ticket,
     make_ticket_store,
 )
@@ -300,7 +301,7 @@ class ExhaustionHandler:
                 logger.debug("_open_ticket: %s already exists — skipping create", ticket_id)
             else:
                 ts.create(ticket)
-        except OSError as exc:
+        except (OSError, TicketError) as exc:
             logger.error(
                 "ExhaustionHandler: failed to create ticket %s for task %s — %s "
                 "(the task is still marked BLOCKED; the investigation ticket "

@@ -1,0 +1,1 @@
+../tests/test_t1_load_config_malformed.py

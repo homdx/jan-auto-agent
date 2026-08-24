@@ -1,0 +1,1 @@
+../tests/test_collect_already_safe_query.py

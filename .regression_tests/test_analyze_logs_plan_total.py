@@ -1,0 +1,1 @@
+../tests/test_analyze_logs_plan_total.py

@@ -237,7 +237,16 @@ class TicketStore:
             raise TicketAlreadyExists(
                 f"Ticket '{ticket['id']}' already exists at {path}"
             )
-        self._ensure_dir()
+        # AUTO-T37 FIX: _ensure_dir() (mkdir) can raise OSError on permission
+        # errors or read-only file systems.  Convert to TicketError so callers
+        # get a domain exception rather than a raw OS error — and can catch it
+        # alongside TicketAlreadyExists without also swallowing unrelated errors.
+        try:
+            self._ensure_dir()
+        except OSError as exc:
+            raise TicketError(
+                f"Could not create ticket directory '{self._dir}': {exc}"
+            ) from exc
         self._write(path, ticket)
         logger.debug("TicketStore.create: %s", ticket["id"])
 

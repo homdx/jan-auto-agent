@@ -1,0 +1,1 @@
+../tests/test_cr7_canon_validator.py

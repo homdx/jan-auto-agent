@@ -103,11 +103,11 @@ class Orchestrator(OrchestratorActions):
         PromptStore + MetricsCollector are preserved."""
         self.load_config(self._config_path)
         self.prompt_store.store_path   = Path(self.config.get("prompt_store", "store_path", fallback="prompts.json"))
-        self.prompt_store.max_versions = self.config.getint("prompt_store", "max_versions", fallback=3)
+        self.prompt_store.max_versions = self._getint("prompt_store", "max_versions", 3)
 
         self.prompt_optimizer = PromptOptimizer(
             model=self.model,
-            temperature=self.config.getfloat("prompt_optimizer", "temperature", fallback=0.4),
+            temperature=self._getfloat("prompt_optimizer", "temperature", 0.4),
             base_url=self.base_url,
             api_key=self.api_key,
             timeout=self.timeout_seconds,
@@ -117,7 +117,7 @@ class Orchestrator(OrchestratorActions):
         _raw_skip = self.config.get("search", "skip_dirs", fallback="")
         _skip_dirs = [d.strip() for d in _raw_skip.split(",") if d.strip()] or None
         self.search_agent = SearchAgent(
-            max_file_kb=self.config.getint("search", "max_file_kb", fallback=500),
+            max_file_kb=self._getint("search", "max_file_kb", 500),
             model=self.model,
             base_url=self.base_url,
             api_key=self.api_key,
@@ -125,21 +125,21 @@ class Orchestrator(OrchestratorActions):
             timeout=self.timeout_seconds,
             ssl_context=self.ssl_context,
             skip_dirs=_skip_dirs,
-            max_depth=self.config.getint("search", "max_depth", fallback=2),
+            max_depth=self._getint("search", "max_depth", 2),
         )
         self.validator_agent = ValidatorAgent(
             max_iter=self.max_iterations,
-            temperature=self.config.getfloat("validator_agent", "temperature", fallback=0.1),
+            temperature=self._getfloat("validator_agent", "temperature", 0.1),
             model=self.model,
             base_url=self.base_url,
             api_key=self.api_key,
             timeout=self.timeout_seconds,
             prompt_store=self.prompt_store,
-            stream=self.config.getboolean("output", "stream_agents", fallback=False),
+            stream=self._getboolean("output", "stream_agents", False),
             api_format=self.api_format,
             num_ctx=self.num_ctx,
             ssl_context=self.ssl_context,
-            max_hints=self.config.getint("validator_agent", "max_hints", fallback=3),
+            max_hints=self._getint("validator_agent", "max_hints", 3),
         )
         self.prompt_evaluator = PromptEvaluator(
             prompt_store=self.prompt_store,
@@ -208,8 +208,12 @@ class Orchestrator(OrchestratorActions):
                     f"{config_path} is not a valid .ini file: {exc}"
                 ) from exc
         
-        self.max_iterations = self.config.getint("loop", "max_iterations", fallback=3)
-        self.timeout_seconds = self.config.getint("loop", "timeout_seconds", fallback=240)
+        # AUTO-T1 FIX: fallback= only handles MISSING keys; a present-but-malformed
+        # value (e.g. max_iterations = abc) raises ValueError with a raw traceback.
+        # Use the typed helpers below for every getint/getfloat/getboolean call so
+        # malformed values degrade gracefully to the coded default instead of aborting.
+        self.max_iterations = self._getint("loop", "max_iterations", 3)
+        self.timeout_seconds = self._getint("loop", "timeout_seconds", 240)
         self.new_chat_key = self.config.get("chat", "new_chat_key", fallback="/new").strip()
         self.exit_key = self.config.get("chat", "exit_key", fallback="/exit").strip()
 
@@ -223,11 +227,11 @@ class Orchestrator(OrchestratorActions):
         self.base_url   = self.config.get(section, "base_url",   fallback="http://localhost:1337/v1")
         self.api_key    = self.config.get(section, "api_key",    fallback="jan")
         self.api_format = self.config.get(section, "api_format", fallback="openai")
-        self.num_ctx    = self.config.getint(section, "num_ctx",  fallback=0)
+        self.num_ctx    = self._getint(section, "num_ctx", 0)
 
         # SSL verification — set verify_ssl = false in [api] to skip cert checks.
         # Applies to all HTTPS API calls (agents, optimizer, direct chat).
-        verify_ssl = self.config.getboolean("api", "verify_ssl", fallback=True)
+        verify_ssl = self._getboolean("api", "verify_ssl", True)
         if not verify_ssl:
             self.ssl_context = make_unverified_context()
             logger.warning("SSL certificate verification DISABLED (verify_ssl = false in agents.ini)")
@@ -237,15 +241,51 @@ class Orchestrator(OrchestratorActions):
         logger.info(f"API profile: [{section}] format={self.api_format} url={self.base_url}")
 
         # Optimizer gate thresholds (read from agents.ini)
-        self.optimizer_enabled         = self.config.getboolean("prompt_optimizer", "enabled",                  fallback=True)
-        self.optimizer_min_runs        = self.config.getint    ("prompt_optimizer", "min_runs_before_optimize",  fallback=3)
-        self.optimizer_trigger_avg_iter= self.config.getfloat  ("prompt_optimizer", "trigger_avg_iterations",   fallback=2.0)
-        self.optimizer_trigger_json_fail=self.config.getfloat  ("prompt_optimizer", "trigger_json_fail_rate",   fallback=0.30)
+        self.optimizer_enabled          = self._getboolean("prompt_optimizer", "enabled",                 True)
+        self.optimizer_min_runs         = self._getint    ("prompt_optimizer", "min_runs_before_optimize", 3)
+        self.optimizer_trigger_avg_iter = self._getfloat  ("prompt_optimizer", "trigger_avg_iterations",  2.0)
+        self.optimizer_trigger_json_fail= self._getfloat  ("prompt_optimizer", "trigger_json_fail_rate",  0.30)
 
         # Agent streaming and search budget (used by OrchestratorActions mixin)
-        self.stream_agents = self.config.getboolean("output", "stream_agents", fallback=False)
-        self.search_full_file_max_chars = self.config.getint("search", "full_file_max_chars", fallback=12000)
-        self.file_editor_max_tokens = self.config.getint("file_editor", "max_tokens", fallback=0)
+        self.stream_agents = self._getboolean("output", "stream_agents", False)
+        self.search_full_file_max_chars = self._getint("search", "full_file_max_chars", 12000)
+        self.file_editor_max_tokens = self._getint("file_editor", "max_tokens", 0)
+
+    # ── Typed config helpers (AUTO-T1) ──────────────────────────────────────
+    # configparser's fallback= only handles ABSENT keys; a present-but-malformed
+    # value raises ValueError with no useful context (which key, which file).
+    # These helpers catch ValueError, emit a contextual warning, and return the
+    # coded default — so a single bad line in agents.ini never aborts startup.
+
+    def _getint(self, section: str, key: str, fallback: int) -> int:
+        try:
+            return self.config.getint(section, key, fallback=fallback)
+        except ValueError as exc:
+            logger.warning(
+                "config [%s] %s is malformed (%s) — using default %r",
+                section, key, exc, fallback,
+            )
+            return fallback
+
+    def _getfloat(self, section: str, key: str, fallback: float) -> float:
+        try:
+            return self.config.getfloat(section, key, fallback=fallback)
+        except ValueError as exc:
+            logger.warning(
+                "config [%s] %s is malformed (%s) — using default %r",
+                section, key, exc, fallback,
+            )
+            return fallback
+
+    def _getboolean(self, section: str, key: str, fallback: bool) -> bool:
+        try:
+            return self.config.getboolean(section, key, fallback=fallback)
+        except ValueError as exc:
+            logger.warning(
+                "config [%s] %s is malformed (%s) — using default %r",
+                section, key, exc, fallback,
+            )
+            return fallback
 
     def execute_direct_chat(self, user_input: str) -> None:
         """

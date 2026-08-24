@@ -1,0 +1,1 @@
+../tests/test_cr10_taskmode_and_grounding.py
