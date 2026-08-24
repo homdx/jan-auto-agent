@@ -5,3 +5,6 @@ __pycache__/
 .agent/
 .collect/
 .coverage
+*.patch
+*.zip
+*.diff

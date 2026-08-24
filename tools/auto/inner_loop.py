@@ -40,7 +40,9 @@ import json
 import logging
 import time
 from tools.auto.context_broker import ContextBroker
-from tools.auto.gate_registry import GATES, build_validators, run_gates  # GATES-1
+from tools.auto.gate_registry import (  # GATES-1 / GATES-2
+    GATES, build_validators, resolve_gate_order, run_gates,
+)
 from tools.agent_trace import tracer   # AUTO-CR-27: per-stage decision tracing
 
 from dataclasses import dataclass, field
@@ -1468,6 +1470,9 @@ def make_inner_loop(
     _gate_validators = build_validators(
         config, base_dir, task_mode=task_mode, broker=broker,
     )
+    # GATES-2: resolved once here rather than per attempt, and attached to
+    # the loop so run_gates honours the configured [gates] order.
+    _gate_order = resolve_gate_order(config, task_mode)
 
 
     # ── AUTO-CR-21-4: hard per-task wall-clock guard ───────────────────────────
@@ -1475,12 +1480,18 @@ def make_inner_loop(
     require_tests = config.getboolean("inner_loop", "require_tests_code",
                                       fallback=False)
 
-    return InnerLoop(coder, executor, validator, max_attempts=max_attempts,
+    loop = InnerLoop(coder, executor, validator, max_attempts=max_attempts,
                      context_broker=broker,
                      **_gate_validators,
                      require_tests=require_tests,
                      task_mode=task_mode, max_task_seconds=max_task_seconds,
                      run_goal=run_goal, collect_bridge=collect_bridge)
+    loop.gate_order = _gate_order
+    logger.info(
+        "InnerLoop: Gate-3 order for %s mode — %s",
+        task_mode, ", ".join(s.name for s in _gate_order) or "(none)",
+    )
+    return loop
 
 
 # ── Stubs for environments without real agents (unit tests) ──────────────────

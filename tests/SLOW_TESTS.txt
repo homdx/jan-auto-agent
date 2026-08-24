@@ -1,0 +1,45 @@
+# SLOW_TESTS.txt — the heavy tier (TIERS-1).
+#
+# One test filename per line, relative to tests/. Everything in tests/
+# NOT listed here is fast and lands in .smoke_tests/ instead.
+# Blank lines and #-comments are ignored.
+#
+# Regenerate the measurements with:
+#   python3 -m pytest tests/ -q -n 4 --durations=0
+# and re-tier anything that crosses the 2.0s-per-FILE threshold.
+# Measured 2026-08-24: these 34 files account for ~611s of ~645s total.
+
+test_architect_domain.py
+test_architect_resilience.py
+test_auto_1.py
+test_auto_3.py
+test_auto_b2.py
+test_auto_b3.py
+test_auto_c1.py
+test_auto_e2.py
+test_auto_g11.py
+test_auto_g9.py
+test_auto_h1.py
+test_auto_h5_empty_response_retry.py
+test_bug_fix_loop_fuzz.py
+test_collect_already_safe_query.py
+test_collect_ast_symbols.py
+test_collect_config_languages.py
+test_collect_config_reads.py
+test_collect_contracts.py
+test_collect_fail_open_registry.py
+test_collect_gates.py
+test_collect_graph.py
+test_collect_guarded_access.py
+test_collect_risk.py
+test_collect_test_map.py
+test_collect_verifier_contradiction.py
+test_executor_workspace_prune_order.py
+test_faq_agent_validate.py
+test_gate1_presence_llm_profile.py
+test_llm_stream_empty_choices.py
+test_llm_stream_reasoning_field_fallback.py
+test_llm_stream_response_format.py
+test_llm_stream_retry.py
+test_llm_stream_think_effort.py
+test_llm_stream_zai_thinking.py

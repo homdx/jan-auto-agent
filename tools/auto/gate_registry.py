@@ -248,6 +248,72 @@ class GateRejection:
     record_text: str     # what goes into the AttemptRecord
 
 
+#: Gate name → spec, for config lookups.
+GATES_BY_NAME: dict[str, GateSpec] = {spec.name: spec for spec in GATES}
+
+
+def resolve_gate_order(config, task_mode: str) -> tuple[GateSpec, ...]:
+    """Return the gates to run for *task_mode*, in execution order.
+
+    GATES-2. Reads an optional ``[gates]`` section whose keys are task
+    modes::
+
+        [gates]
+        creative = canon, fact, continuity, theme, prosody
+        code     =
+
+    Semantics, chosen so that every existing config keeps its current
+    behaviour without being edited:
+
+    * **No ``[gates]`` section, or no key for this mode** — fall back to
+      :data:`GATES` filtered by each spec's ``modes``. This is exactly
+      the hard-coded behaviour that predates this function, so an
+      untouched ``agents.ini`` is unaffected.
+    * **Key present but empty** — no gates at all. Distinct from an
+      absent key on purpose: ``creative =`` is how you turn the whole
+      Gate-3 layer off (useful when benchmarking validators, where the
+      gates are the thing being measured rather than applied).
+    * **Unknown gate name** — logged and skipped, not raised. A typo in
+      a config file must not abort a run that would otherwise work; the
+      warning names the offending entry and lists what is available.
+    * **Duplicate name** — kept once, at its first position, so a
+      copy-paste slip can't make a gate spend its revision cap twice per
+      attempt.
+
+    When the key IS present, the listed order wins and each spec's
+    ``modes`` field is not consulted: the config key already names the
+    mode, so re-filtering would silently drop a gate the user asked for
+    by name, which is the opposite of what an explicit list means.
+    """
+    if config is None or not config.has_section("gates"):
+        return tuple(s for s in GATES if task_mode in s.modes)
+    if not config.has_option("gates", task_mode):
+        return tuple(s for s in GATES if task_mode in s.modes)
+
+    try:
+        raw = config.get("gates", task_mode)
+    except Exception as exc:  # noqa: BLE001 — never block the run on config
+        logger.warning("config [gates] %s unreadable (%s) — using defaults", task_mode, exc)
+        return tuple(s for s in GATES if task_mode in s.modes)
+
+    order: list[GateSpec] = []
+    seen: set[str] = set()
+    for token in raw.split(","):
+        name = token.strip()
+        if not name or name in seen:
+            continue
+        spec = GATES_BY_NAME.get(name)
+        if spec is None:
+            logger.warning(
+                "config [gates] %s: unknown gate %r — skipped (known: %s)",
+                task_mode, name, ", ".join(GATES_BY_NAME),
+            )
+            continue
+        seen.add(name)
+        order.append(spec)
+    return tuple(order)
+
+
 def build_validators(config, base_dir, *, task_mode: str, broker=None) -> dict:
     """Construct every gate validator applicable to *task_mode*.
 
@@ -259,9 +325,14 @@ def build_validators(config, base_dir, *, task_mode: str, broker=None) -> dict:
     Returns a dict keyed by :attr:`GateSpec.attr`, ready to splat into
     ``InnerLoop(...)`` as keyword arguments.
     """
+    # GATES-2: only build validators for gates the config actually enables.
+    # Every other gate's attr is set to None, which run_gates reads as
+    # "off" — so a disabled gate costs nothing at construction time
+    # either (no LLM client, no story-bible read).
+    enabled = {s.name for s in resolve_gate_order(config, task_mode)}
     out: dict = {}
     for spec in GATES:
-        if task_mode not in spec.modes:
+        if spec.name not in enabled:
             out[spec.attr] = None
             continue
         try:
@@ -313,9 +384,18 @@ def run_gates(
     if not target_files:
         return None
 
-    for spec in GATES:
-        if loop.task_mode not in spec.modes:
-            continue
+    # GATES-2: the loop carries its resolved order when make_inner_loop
+    # built it. Falling back to the mode-filtered registry keeps every
+    # directly-constructed InnerLoop (tests, embedders) working unchanged.
+    # ``is None``, not truthiness: an EMPTY order means "every gate is
+    # switched off" (config `creative =`) and must NOT fall back to the
+    # registry default. Testing `if not order` here silently re-enabled
+    # every gate for exactly the config that asked for none.
+    order = getattr(loop, "gate_order", None)
+    if order is None:
+        order = tuple(s for s in GATES if loop.task_mode in s.modes)
+
+    for spec in order:
         validator = getattr(loop, spec.attr, None)
         if validator is None:
             continue
