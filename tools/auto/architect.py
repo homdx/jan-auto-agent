@@ -696,14 +696,38 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
 
         Uses the same ``_make_llm_call`` factory as SummaryMemory / CanonValidator.
         Falls back to a no-op that always returns ``""`` (fail-open) if the
-        import fails, so __init__ never raises.
+        import fails, so __init__ never raises for that reason.
+
+        GATE3-PROFILE-3: also resolves ``[architect] plan_llm_profile``,
+        falling back straight to ``[api_{active}]`` when unset — the plan
+        validator is architect's own, single call site, with no shared
+        ``validator_llm_profile``-style middle step to inherit from first.
+        Profile resolution (the ``from ... import`` below plus
+        ``resolve_llm_profile`` itself) is deliberately OUTSIDE the
+        ``except Exception`` below: that block exists only to keep a
+        broken/missing ``summary_memory`` import from taking down
+        ``ClusterReviewer`` construction, not to swallow a profile the
+        operator named and mis-typed. A malformed ``plan_llm_profile``
+        must raise here — at construction, before any task runs — never
+        be discovered mid-run. Unset, it resolves to the exact same
+        :func:`~tools.auto.summary_memory._default_llm_settings` defaults
+        ``_make_llm_call`` has always computed inline, so default
+        behaviour is unchanged.
         """
         try:
-            from tools.auto.summary_memory import _make_llm_call  # noqa: PLC0415
-            return _make_llm_call(self._config, task_mode=self._task_mode)
+            from tools.auto.summary_memory import (  # noqa: PLC0415
+                _default_llm_settings, _make_llm_call,
+            )
+            from tools.auto.llm_profile import resolve_llm_profile  # noqa: PLC0415
         except Exception as exc:  # noqa: BLE001
             logger.warning("ClusterReviewer._build_llm_call failed — validate_plan will fail-open: %s", exc)
             return lambda system, user: ""
+
+        defaults = _default_llm_settings(self._config, self._task_mode)
+        settings, _ = resolve_llm_profile(
+            self._config, "architect", "plan_llm_profile", defaults=defaults,
+        )
+        return _make_llm_call(self._config, task_mode=self._task_mode, settings=settings)
 
     def _review_one_cluster(
         self,

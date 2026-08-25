@@ -794,8 +794,23 @@ def make_summary_memory(
 
     Reads ``[auto] max_compression_passes`` and ``max_fidelity_rounds``;
     reads creative-mode token budget from ``[coder]`` via ``_cfg_mode``.
+
+    GATE3-PROFILE-3: also resolves ``[summary] llm_profile`` — SummaryMemory
+    runs once per task (not once per attempt, like the five Gate-3
+    validators), so it gets a single profile key rather than the
+    ``<gate>_llm_profile`` fan-out, falling back straight to
+    ``[api_{active}]`` when unset (there is no shared
+    ``validator_llm_profile``-style middle step for a call site of one).
+    Resolution happens here, via :func:`~tools.auto.llm_profile.
+    resolve_llm_profile`, and is deliberately NOT wrapped in a
+    try/except: a misconfigured profile must raise here, at construction,
+    before any task runs — never be discovered mid-run. A config without
+    ``llm_profile`` resolves straight back to the same
+    :func:`_default_llm_settings` defaults ``_make_llm_call`` has always
+    used, so default behaviour is unchanged, field for field.
     """
     from tools.auto.utils import _cfg_mode
+    from tools.auto.llm_profile import resolve_llm_profile
 
     max_passes  = config.getint("auto", "max_compression_passes", fallback=2)
     max_fidelity = config.getint("auto", "max_fidelity_rounds",   fallback=2)
@@ -808,7 +823,11 @@ def make_summary_memory(
 
     max_tokens = int(_cfg_mode(config, "coder", "max_tokens", task_mode, fallback="800"))
 
-    llm_call = _make_llm_call(config, task_mode=task_mode)
+    defaults = _default_llm_settings(config, task_mode)
+    settings, _ = resolve_llm_profile(
+        config, "summary", "llm_profile", defaults=defaults,
+    )
+    llm_call = _make_llm_call(config, task_mode=task_mode, settings=settings)
 
     return SummaryMemory(
         llm_call,
