@@ -4,10 +4,71 @@ Three skill flows, one per mechanical base. Every command below has been run
 against this repository; the "what to expect" sections describe what actually
 happened, not what should happen in theory.
 
-`tests/test_hello_world_runbook.py` parses this file and checks each command
+The runbook test in the parent repository (tests/test_hello_world_runbook.py) parses this file and checks each command
 is still valid — the skill exists, the profile exists and clears the skill's
 context budget, the flags are real, and the documented gate sets match the
 adapters. If you edit a command here, run that test.
+
+## Running everything at once
+
+```bash
+scripts/run_flows.sh                      # all three flows, then validate
+scripts/run_flows.sh 2                    # just task 2
+scripts/run_flows.sh --config agents_128k.ini
+scripts/run_flows.sh --runner proxychains4
+scripts/run_flows.sh --check-only         # validate previous runs, run nothing
+```
+
+Each flow gets its **own** sandbox, rebuilt from the committed baseline
+before it starts:
+
+```
+examples/task1/hello-world/     hello-code
+examples/task2/hello-world/     hello-docs
+examples/task3/hello-world/     hello-creative
+```
+
+The isolation matters. The flows commit into their base directory, so running
+all three against the shared `examples/hello-world/` means task 2 inspects
+task 1's output — the results stop being independent, and a passing task 2
+might only be passing because task 1 created the file it wanted.
+
+These directories are gitignored: they are run output.
+
+The script refuses a profile below the skills' 16384 floor before starting,
+which costs a second instead of a whole run.
+
+## Validating a run
+
+`pytest` proves the machinery is wired. It cannot prove a *run* produced the
+right artefact, because the artefact is written by a model at runtime.
+
+```bash
+python3 scripts/check_runbook.py --task 2
+python3 scripts/check_runbook.py --all
+python3 scripts/check_runbook.py --all --json
+```
+
+Every check is **deterministic — no LLM, no network.** "Does `test_main.py`
+exist", "did `README.md` change", "is the seed changelog entry still there"
+all have exact answers on disk. That matters twice: the checks cost nothing,
+and they cannot themselves hallucinate a pass. Judging prose *quality* is
+deliberately out of scope — the Gate-3 gates do that during the run.
+
+Each task is checked against its own sandbox if one exists, otherwise against
+the shared `examples/hello-world/`.
+
+| Task | Checks |
+|---|---|
+| 1 | main.py still prints `Hello world`; module and `main()` docstrings; return annotation; a test file exists and passes |
+| 2 | README.md actually changed; has a Usage section; no `.py` file targeted; no references to missing files (via the shipped `existence` gate) |
+| 3 | a new entry exists; the seed entry survived; canon fact intact; prose only; main.py untouched |
+
+Exit code is 0 only when everything passes.
+
+**This is not hypothetical.** A docs run was once judged working because it
+exited 0 and committed. It had written a Python test file and never touched
+`README.md`. The checker reports that as four separate failures.
 
 ## Before you start
 
@@ -201,7 +262,7 @@ Relying on the builtin is correct here. `[validator_agent] system_{mode}`
 skill there would turn the validator into an author: it would stop emitting
 the `{"approved": ..., "feedback": ...}` verdict and Gate 2 would fail-closed
 on every attempt. No shipped adapter injects into `validator_agent`, and
-`tests/test_skills_hello_world_regressions.py` asserts none ever does.
+the skill regression test in the parent repository asserts none ever does.
 
 ## Collecting evidence
 

@@ -215,6 +215,55 @@ class SkillOverlay:
         return estimate_tokens(self.injected_body)
 
 
+def builtin_prompt(agent: str, base: str) -> str:
+    """The agent's own system prompt for *base* mode, or "" if unavailable.
+
+    SKILLS-2. This exists because ``[<agent>] system_{mode}`` REPLACES the
+    built-in prompt rather than adding to it — and the built-in is where the
+    operational contract lives. The coder's says, in effect, "reply with
+    ``{"files": [...]}``"; the architect's defines the candidate schema.
+
+    Overwriting it cost a whole run. A docs flow whose coder prompt had been
+    replaced by a skill body answered with ``{"modified_files": [...]}``,
+    failed the parse on every one of five attempts across ten feedback
+    rounds, and ended EXHAUSTED with a ticket — 436 seconds to produce
+    nothing. The user message still said "Return ONLY the JSON object
+    described in the system prompt", and by then the system prompt no longer
+    described one. A sibling run got away with it only because the model
+    happened to guess the right key.
+
+    So the skill body is APPENDED to this, never substituted for it.
+    Returning "" (unknown agent) is safe: the caller then writes the body
+    alone, which is the old behaviour, and logs a warning.
+    """
+    try:
+        if agent == "coder":
+            from tools.auto.coder import (  # noqa: PLC0415
+                _CODER_SYSTEM_PROMPTS, _SYSTEM_PROMPT_CODE,
+            )
+            return (_CODER_SYSTEM_PROMPTS.get(base) or _SYSTEM_PROMPT_CODE or "").strip()
+        if agent == "architect":
+            from tools.auto.architect import (  # noqa: PLC0415
+                _SYSTEM_PROMPTS, _SYSTEM_PROMPT_CODE,
+            )
+            return (_SYSTEM_PROMPTS.get(base) or _SYSTEM_PROMPT_CODE or "").strip()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("skills: could not read %s built-in prompt — %s", agent, exc)
+    return ""
+
+
+#: Header separating the agent's own contract from the skill's guidance, so a
+#: model reading the composed prompt can tell which part is non-negotiable.
+SKILL_SECTION_HEADER = (
+    "\n\n"
+    "====================================================================\n"
+    "SKILL GUIDANCE - {name}\n"
+    "Follow everything below. It refines HOW to do the work; it does NOT\n"
+    "change the output format required above, which still applies exactly.\n"
+    "====================================================================\n\n"
+)
+
+
 def _adapter_path(skill: str, base_dir: Path, skills_dir: Path) -> Path:
     """Resolve *skill* to an adapter file.
 
@@ -427,7 +476,17 @@ def load_skill(
             f"injects nothing has no effect"
         )
     for agent in targets:
-        entries.append((agent, prompt_key, injected))
+        base_prompt = builtin_prompt(agent, base)
+        if base_prompt:
+            composed = base_prompt + SKILL_SECTION_HEADER.format(name=name) + injected
+        else:
+            logger.warning(
+                "skills: no built-in prompt known for %s — injecting the skill "
+                "body alone. If that agent has an output contract, it is now "
+                "gone from its system prompt.", agent,
+            )
+            composed = injected
+        entries.append((agent, prompt_key, composed))
 
     if adapter.has_section("skill.overlay"):
         for dotted, value in adapter.items("skill.overlay"):

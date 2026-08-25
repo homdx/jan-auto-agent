@@ -304,7 +304,7 @@ def _run_plan_phase(controller: "AutoController", cfg: configparser.ConfigParser
             # overwrite the original cache entry.
             augmented_goal = controller.goal + f"\n\nPLAN FEEDBACK: {reason}"
             try:
-                candidates = review_clusters(
+                revised = review_clusters(
                     clusters_to_review, controller.base_dir, cfg,
                     goal=augmented_goal,
                     on_cluster_done=_on_cluster_done,
@@ -316,6 +316,27 @@ def _run_plan_phase(controller: "AutoController", cfg: configparser.ConfigParser
                     "plan_phase: review_clusters re-run raised — %s; keeping previous candidates.", exc
                 )
                 break
+            # AUTO-FIX (plan-revision): an EMPTY revision must not wipe the
+            # plan. The exception path above already keeps the previous
+            # candidates; assigning unconditionally here meant the *empty*
+            # path did the opposite, and that asymmetry cost a whole run.
+            # Observed: two candidates, validate_plan said REVISE "Duplicate
+            # task", the architect answered "[]", and the run finished with
+            # zero tasks in twelve seconds. Deduplicating two identical tasks
+            # should leave one, never none.
+            if not revised and candidates:
+                logger.warning(
+                    "plan_phase: plan revision returned an EMPTY plan — keeping "
+                    "the %d candidate(s) from before the revision. Gate 1 will "
+                    "still filter them, and its duplicate check removes the "
+                    "overlap that triggered this.", len(candidates),
+                )
+                controller.state.log(
+                    "plan phase: revision returned an empty plan — kept "
+                    f"{len(candidates)} previous candidate(s)"
+                )
+                break
+            candidates = revised
         else:
             # Loop exited because _plan_revisions reached the cap without a break.
             logger.warning(

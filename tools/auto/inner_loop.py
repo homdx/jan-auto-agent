@@ -153,15 +153,25 @@ _GATE2_SYSTEM_CREATIVE = (
     "author copies such sentences verbatim, and your terse phrasing then becomes "
     "flat 'telling' prose, which loops. ONLY for a factual value (a name, gender, "
     "age, date, place) may you give the exact corrected value.\n"
-    "Example of the FORMAT (generic — describe the real problems in the chapter, "
-    "do not reuse this wording):\n"
+    # AUTO-FIX (language-leak): these three example bullets used to be written
+    # in Russian. Models copy the language of the example rather than obeying
+    # "write in the chapter's language" a few lines above, so an entirely
+    # English project got its whole critique in Russian — observed across 61
+    # consecutive rejections on an English CHANGELOG.md. The examples are now
+    # language-neutral English AND the caller injects the resolved language
+    # explicitly (see _language_directive), because "the chapter's language"
+    # asks the model to infer something the system already knows for certain.
+    "Example of the FORMAT ONLY. Its language carries no meaning — write your "
+    "own reply in the chapter's language, whatever that is, and do not reuse "
+    "this wording:\n"
     "REVISE:\n"
-    "1. Реплика персонажа в абзаце 2 не отвечает заданию — оживить как короткий "
-    "диалог по теме задания (своими словами).\n"
-    "2. Описание сцены дословно повторяет другую главу — сократить до одной "
-    "фразы или убрать.\n"
-    "3. Персонаж назван «он», хотя по фактам это женщина — привести местоимения "
-    "и глаголы к женскому роду («она/стояла»)."
+    "1. The character's line in paragraph 2 does not answer the task — turn it "
+    "into a short exchange of direct speech on the task's subject, in your own "
+    "words.\n"
+    "2. The scene description repeats another chapter word for word — cut it to "
+    "a single phrase or remove it.\n"
+    "3. The character is called \"he\" although the facts say she is a woman — "
+    "bring every pronoun and verb form into agreement."
 )
 
 # Backward-compatibility alias
@@ -368,6 +378,54 @@ class LLMGate2Validator:
                 pass
         return "\n\n".join(parts)
 
+    def _language_directive(self, coder_result, base_dir) -> str:
+        """An explicit "reply in <language>" line for the critique, or "".
+
+        AUTO-FIX (language-leak). The creative system prompt says to write the
+        problem list "in the chapter's language", which asks the model to infer
+        something this process already knows for certain — and the model got it
+        wrong. On an entirely English project the whole critique came back in
+        Russian, 61 rejections in a row, because the prompt's own example
+        bullets happened to be written in Russian.
+
+        Those examples are language-neutral now, but removing a nudge is not
+        the same as giving an answer. This states it outright, using the same
+        ``resolve_creative_language`` the coder's language lock uses, so the
+        two can never disagree about what the chapter's language is.
+
+        Returns "" whenever the language cannot be resolved: an unresolved
+        language must not become a confidently wrong instruction, and the
+        prompt's own "in the chapter's language" wording still applies.
+        """
+        if self.task_mode != "creative":
+            return ""
+        try:
+            from pathlib import Path as _Path  # noqa: PLC0415
+            from tools.auto.utils import resolve_creative_language  # noqa: PLC0415
+
+            sample = ""
+            for rel in (getattr(coder_result, "files", None) or []):
+                try:
+                    sample = (_Path(base_dir) / str(rel)).read_text(
+                        encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+                if sample.strip():
+                    break
+            if not sample.strip():
+                return ""
+            language = resolve_creative_language(
+                self._config, sample, task_mode="creative")
+            if not language:
+                return ""
+            return (
+                f"\n\nLANGUAGE: write your entire reply in {language}. "
+                f"The verdict word (APPROVED / REVISE) stays in English."
+            )
+        except Exception as exc:  # noqa: BLE001 — advisory only, never blocks
+            logger.debug("Gate2 language directive skipped: %s", exc)
+            return ""
+
     def _creative_language_mismatch(self, coder_result, base_dir) -> "str | None":
         """Deterministic (non-LLM) language pre-gate for creative mode.
 
@@ -502,6 +560,9 @@ class LLMGate2Validator:
                 "Authorization": f"Bearer {self.api_key}",
             }
 
+            _system_msg = self._system + self._language_directive(
+                coder_result, base_dir)
+
             _exec_stderr = getattr(exec_result, 'stderr', '') or ''
             _exec_stdout = getattr(exec_result, 'stdout', '') or ''
             _stderr_section = f"stderr:\n{_exec_stderr[:2000]}\n\n" if _exec_stderr.strip() else ""
@@ -537,7 +598,7 @@ class LLMGate2Validator:
                     _payload = {
                         "model": self.model,
                         "messages": [
-                            {"role": "system",  "content": self._system},
+                            {"role": "system",  "content": _system_msg},
                             {"role": "user",    "content": um},
                         ],
                         "options": _val_opts,
@@ -547,7 +608,7 @@ class LLMGate2Validator:
                     _payload = {
                         "model": self.model,
                         "messages": [
-                            {"role": "system",  "content": self._system},
+                            {"role": "system",  "content": _system_msg},
                             {"role": "user",    "content": um},
                         ],
                         "temperature": self.temperature,
@@ -1321,6 +1382,100 @@ class InnerLoop:
 # Factory
 # ─────────────────────────────────────────────────────────────────────────────
 
+def resolve_validator_llm_profile(config, *, base_url, api_key, model,
+                                  api_format, num_ctx, verify_ssl,
+                                  temperature, max_tokens, think):
+    """Resolve the Gate-2 critic's own LLM settings. GATE2-PROFILE-1.
+
+    Mirrors ``[gate1] presence_llm_profile`` exactly, for the same reason it
+    exists there: the critic is a different job from the author, and wanting a
+    different model for it is normal — a cheap fast model writes the prose
+    while a stronger one judges it, or vice versa.
+
+    Until now the critic silently reused ``[api_{active}]``. A run hit that
+    provider's free-tier rate limit (HTTP 429, "free_quota_rpm") on the
+    critique call specifically, and there was no way to point the critique
+    somewhere else without moving every other agent with it.
+
+    Two modes, chosen by ``[validator_agent] validator_llm_profile``:
+
+    * **Unset (default)** — every value is the one passed in, byte for byte.
+      A config without this key behaves exactly as before.
+    * **Set to a section name** — ``base_url``/``api_key``/``model`` come from
+      THAT section and are REQUIRED. A missing one raises rather than falling
+      back, because sending one provider's credential to another provider's
+      URL is a worse failure than a loud stop at startup. ``api_format``,
+      ``verify_ssl``, ``temperature``, ``max_tokens``, ``num_ctx`` and
+      ``think`` are optional and each falls back to the value passed in —
+      never to a hardcoded default, and never to another profile's value.
+
+    Returns a dict of keyword arguments for :class:`LLMGate2Validator`.
+    """
+    resolved = dict(
+        base_url=base_url, api_key=api_key, model=model,
+        api_format=api_format, num_ctx=num_ctx,
+        temperature=temperature, max_tokens=max_tokens,
+    )
+    name = config.get("validator_agent", "validator_llm_profile", fallback="").strip()
+    if not name:
+        logger.info(
+            "LLMGate2Validator: critique provider = %s (%s) — shared provider "
+            "(no validator_llm_profile configured)", base_url, model,
+        )
+        return resolved, verify_ssl, think
+
+    if not config.has_section(name):
+        raise ValueError(
+            f"[validator_agent] validator_llm_profile = {name!r} but the config "
+            f"has no [{name}] section. Add one with at least "
+            f"base_url/api_key/model, or remove validator_llm_profile to use "
+            f"the shared provider."
+        )
+    missing = [k for k in ("base_url", "api_key", "model")
+               if not config.has_option(name, k)]
+    if missing:
+        raise ValueError(
+            f"[{name}] (validator_llm_profile) is missing required option(s): "
+            f"{', '.join(missing)}. A critique profile must fully specify its "
+            f"own connection details — it never silently inherits "
+            f"base_url/api_key/model from the shared provider, since that "
+            f"could send a different provider's credential to the wrong host."
+        )
+    resolved["base_url"]   = config.get(name, "base_url").rstrip("/")
+    resolved["api_key"]    = config.get(name, "api_key")
+    resolved["model"]      = config.get(name, "model")
+    resolved["api_format"] = config.get(name, "api_format", fallback=api_format)
+    try:
+        resolved["temperature"] = float(config.get(
+            name, "temperature", fallback=str(temperature)))
+    except ValueError:
+        logger.warning("[%s] temperature invalid — keeping %s", name, temperature)
+    try:
+        resolved["max_tokens"] = config.getint(
+            name, "max_tokens", fallback=max_tokens)
+    except ValueError:
+        logger.warning("[%s] max_tokens invalid — keeping %s", name, max_tokens)
+    try:
+        resolved["num_ctx"] = config.getint(name, "num_ctx", fallback=num_ctx)
+    except ValueError:
+        logger.warning("[%s] num_ctx invalid — keeping %s", name, num_ctx)
+    try:
+        profile_verify_ssl = config.getboolean(name, "verify_ssl", fallback=verify_ssl)
+    except ValueError:
+        profile_verify_ssl = verify_ssl
+    try:
+        profile_think = config.getboolean(name, "think", fallback=think)
+    except ValueError:
+        profile_think = think
+
+    logger.info(
+        "LLMGate2Validator: critique provider = %s (%s) — via "
+        "validator_llm_profile = [%s]",
+        resolved["base_url"], resolved["model"], name,
+    )
+    return resolved, profile_verify_ssl, profile_think
+
+
 def make_inner_loop(
     config:   configparser.ConfigParser,
     base_dir: str | Path,
@@ -1434,20 +1589,32 @@ def make_inner_loop(
         logger.warning("config [validator_agent] max_tokens invalid (%s) — using 512", exc)
         val_max_tokens = 512
     if validator is None:
+        # GATE2-PROFILE-1: the critic may run on its own provider/model.
+        try:
+            _val_think = config.getboolean("validator_agent", "think", fallback=False)
+        except ValueError:
+            _val_think = False
+        _val_kwargs, _val_verify_ssl, _val_think = resolve_validator_llm_profile(
+            config,
+            base_url=base_url, api_key=api_key, model=model,
+            api_format=api_format, num_ctx=num_ctx, verify_ssl=verify_ssl,
+            temperature=val_temp, max_tokens=val_max_tokens, think=_val_think,
+        )
+        from tools.llm_stream import (  # noqa: PLC0415
+            make_unverified_context as _make_unverified_context,
+        )
+        _val_ssl_context = (
+            ssl_context if _val_verify_ssl == verify_ssl
+            else (None if _val_verify_ssl else _make_unverified_context())
+        )
         validator = LLMGate2Validator(
-            base_url=base_url,
-            model=model,
-            api_key=api_key,
-            api_format=api_format,
-            temperature=val_temp,
             timeout=val_timeout,
             max_hints=max_hints,
-            ssl_context=ssl_context,
+            ssl_context=_val_ssl_context,
             base_dir=str(base_dir),
-            num_ctx=num_ctx,
-            max_tokens=val_max_tokens,
             task_mode=task_mode,
             config=config,  # AUTO-DM-5: for system prompt override lookup
+            **_val_kwargs,
         )
 
     # ── ContextBroker ─────────────────────────────────────────────────────────

@@ -11,7 +11,7 @@ to read the whole trace by hand and see which gates fired.
 
 `RUNBOOK.md` has the three validated commands — one per mechanical base —
 with what to expect from each, the sandbox reset step, and how to tell
-whether Gate-3 actually ran. `tests/test_hello_world_runbook.py` parses it
+whether Gate-3 actually ran. the runbook test in the parent repository (tests/test_hello_world_runbook.py) parses it
 and fails if any documented command stops being valid.
 
 ## Changelog
