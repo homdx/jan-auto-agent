@@ -5,6 +5,18 @@ description: Write a short narrative changelog entry about a program, in prose, 
 
 # Narrative Changelog
 
+## Where to write
+
+Every entry goes into `CHANGELOG.md`, and **only** into `CHANGELOG.md`.
+Append the new entry directly beneath the `# Changelog` heading, above the
+entries already there — newest first.
+
+Never target a `.py` file. A task whose target file is source code is the
+wrong task: propose one against `CHANGELOG.md` instead. This is not a style
+preference. The validator judges the produced file against the request, so
+writing prose into a source file (or code into the changelog) is rejected
+on every attempt and the task cannot converge.
+
 ## Overview
 
 You are writing a narrative changelog: each entry is a few paragraphs of
@@ -36,6 +48,7 @@ you.
 
 ## Constraints
 
+- Target `CHANGELOG.md`. Never modify `.py` files.
 - Prose only. No code blocks, no bullet lists inside an entry.
 - Never contradict an earlier entry in the same file.
 - One entry per task.

@@ -6,3 +6,8 @@ end to end. `main.py` prints `Hello world` and nothing else.
 Kept minimal on purpose: with one function and no dependencies, the
 Architect has exactly one place to propose work, so a run is short enough
 to read the whole trace by hand and see which gates fired.
+
+## Changelog
+
+Narrative entries live in `CHANGELOG.md`, newest first. They are prose, not
+bullet lists, and are written by the `hello-creative` skill.

@@ -195,6 +195,94 @@ The startup log line names the resolved skill:
 skill 'hello-creative' loaded — base=creative, ~279 tokens injected into architect, coder
 ```
 
+## Lessons from the first three real runs
+
+All three flows were run against `examples/hello-world` on `agents_128k.ini`.
+The overlay machinery worked in every case — the skills loaded, `task_mode`
+came from `base`, and the `[gates]` overlay reached the registry:
+
+```
+InnerLoop: Gate-3 order for creative mode — canon, continuity
+```
+
+The failures were in the SKILL.md files, not the loader. Each is worth
+knowing about before you write your own.
+
+### A creative skill must name its target file
+
+The changelog run burned 10 feedback rounds and 84 Gate-2 decisions without
+ever reaching Gate-3, and it read as "the gates are broken". They were not.
+The skill never said *where* to write, the repository contained only
+`main.py` and `README.md`, and so the Architect assigned
+`target_files=['main.py']` to a changelog task. The coder wrote code, Gate 2
+correctly refused it — every attempt, forever.
+
+**Gate-3 sits after Gate 2 in the attempt loop.** While Gate 2 rejects,
+Gate-3 is unreachable by construction. A silent Gate-3 usually means Gate 2
+never passed, not that Gate-3 is misconfigured.
+
+Two things fix it, and you need both:
+
+- a prose target that already exists in the repo (`CHANGELOG.md`, with a
+  seed entry — `continuity` has nothing to compare against on an empty file);
+- an explicit directive in the SKILL.md, stated *before* the style guidance.
+
+### Gate 1 cannot catch invented prose
+
+The docs run produced this, for a repository with no test file at all:
+
+> Run the tests by executing `python -m unittest test_main.py`
+
+Gate 1 passed it, and could not have done otherwise: **Gate 1 judges the
+planned task, not the prose the coder emits.** The skill body forbidding
+invented features is guidance, not enforcement.
+
+The gate that does catch it is `fact`, so `hello-docs` now enables it:
+
+```ini
+[skill.overlay]
+validator_agent.fact_check_creative = true
+validator_agent.max_fact_revisions = 2
+
+[gates]
+docs = fact
+```
+
+Note the feature flag. `fact` declares `modes=("creative",)`, but an
+explicit `[gates]` list deliberately bypasses the mode filter — and
+`make_fact_validator` sits behind `fact_check_creative`. Listing the gate
+without the flag leaves the factory returning `None` and the gate silently
+absent, which looks exactly like not having configured it.
+
+### Never inject a skill into `validator_agent`
+
+`[skill.inject] validator_agent = body` is accepted by the format but is
+almost always wrong. `[validator_agent] system_{mode}` **replaces** the
+Gate-2 critique prompt outright. Feeding it an authoring skill turns the
+validator into an author: it stops emitting the
+`{"approved": ..., "feedback": ...}` verdict and Gate 2 fail-closes on every
+attempt with "validator unavailable".
+
+This also means the startup warning is expected and harmless:
+
+```
+[validator_agent] system is code-specific but task_mode=creative;
+set system_creative or rely on the builtin (AUTO-CR-19-1)
+```
+
+Relying on the builtin is the correct choice here.
+
+### Match the task cap to the skill's own task budget
+
+The code run stopped at `stop_reason=task_cap`, 3 of 6 tasks done — a
+half-hardened file that reads as a crash but was the cap working as
+configured. The Architect had also produced a duplicate pair ("add a pytest
+test" / "create a test file asserting the output").
+
+So the skill now bounds its own task count and the adapter's cap matches it.
+If you set `auto.max_tasks_per_run` below what your SKILL.md asks for, the
+run truncates and says so only in `progress.json`.
+
 ## Known limitation
 
 You get the mechanics of one of three bases, not an arbitrary mix. If a

@@ -1,0 +1,4 @@
+
+# auto-agent safety entries
+.agent/
+*.coder.bak
