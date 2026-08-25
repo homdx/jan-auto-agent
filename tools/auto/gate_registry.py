@@ -67,6 +67,11 @@ def _check_continuity(validator, *, text, rel_path, task, loop, base_dir_path):
     return validator.check(known_facts, text)
 
 
+def _check_existence(validator, *, text, rel_path, task, loop, base_dir_path):
+    """GATES-3: the only adapter whose gate makes no LLM call at all."""
+    return validator.check(text, base_dir_path, rel_path=rel_path)
+
+
 def _check_theme(validator, *, text, rel_path, task, loop, base_dir_path):
     return validator.check(text)
 
@@ -203,6 +208,23 @@ GATES: tuple[GateSpec, ...] = (
         ),
         factory_module="tools.auto.continuity_validator",
         factory_name="make_continuity_validator",
+    ),
+    GateSpec(
+        name="existence",
+        attr="existence_validator",
+        cap_attr="max_existence_revisions",
+        default_cap=2,
+        check=_check_existence,
+        is_rejection=_rejected_by_approved,
+        reject_label="existence rejected",
+        reject_log="InnerLoop: attempt %d existence rejected (%d/%d) — %s",
+        cap_log=(
+            "InnerLoop: existence revision cap (%d) reached — "
+            "accepting document that still references missing files."
+        ),
+        factory_module="tools.auto.existence_validator",
+        factory_name="make_existence_validator",
+        modes=("docs",),
     ),
     GateSpec(
         name="theme",

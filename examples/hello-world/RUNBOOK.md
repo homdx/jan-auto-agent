@@ -86,24 +86,34 @@ python3 main.py --auto "Write user documentation for this project" \
 `Create documentation file` candidate because `README.md` already exists —
 that rejection is correct behaviour, not a failure.
 
-**Known defect — read this before judging the output.** Both observed runs
-documented a test suite that does not exist:
+**What the `existence` gate catches here.** Both earlier runs documented a
+test suite that does not exist:
 
 ```
+Run the tests by executing `python -m unittest test_main.py`
 Run `python -m unittest discover` to execute the test suite.
 ```
 
-There is no test file in the baseline repository. The `fact` gate is enabled
-for this flow and it approved the text anyway, because `fact` compares the
-text against facts stated in the *task*, not against the contents of the
-repository — it has no file list to check against. It is the right gate for
-"this chapter contradicts the story bible" and the wrong one for "this
-document describes a file that isn't there". Closing that gap needs either a
-repo-aware extension to `fact` or a separate existence gate for docs mode;
-neither exists yet.
+There is no test file in the baseline repository. Gate 1 passed both and
+could not have caught them — it judges the planned task, not the emitted
+prose. Gate-3 `fact` was tried and also passed them, because its prompt
+compares the text against facts stated in the *task*, so it has no file list.
 
-So: **expect an invented test-suite line, and do not read it as a skill
-failure.** It is a known limitation with a known cause.
+`existence` (GATES-3) closes that gap. It reads the filesystem, makes **no
+LLM call**, and reports two kinds of finding: a referenced path that is not
+in the repository, and a document that tells the reader to run tests when
+there are no test files at all. The second is what catches
+`unittest discover`, which names no file.
+
+Expect a Gate-3 rejection with feedback naming the reference, and the coder
+removing the testing section on the next attempt. If the run instead ends
+with an accepted README still claiming a test suite, check that the gate was
+built:
+
+```
+ExistenceValidator: enabled (max_existence_revisions=2, no LLM).
+InnerLoop: Gate-3 order for docs mode — existence
+```
 
 ## Flow 3 — narrative changelog
 
@@ -149,8 +159,16 @@ grep -nE "executor run:|attempt [0-9]+ (APPROVED|rejected)|Strict chain" \
 
 Observed: flow 3 attempt 1 made one call and was rejected; attempt 2 made two
 and was approved. That is Gate 2 rejecting, then Gate 2 passing and
-`continuity` running. Flow 2 attempt 2 likewise made two calls — Gate 2 plus
-`fact`.
+`continuity` running. Flow 2 made two calls per attempt back when it ran the
+`fact` gate.
+
+This counting trick no longer applies to flow 2: `existence` is deterministic
+and makes no API call at all, so a docs attempt shows **one** call (Gate 2)
+whether or not the gate ran. Read the startup line instead:
+
+```
+ExistenceValidator: enabled (max_existence_revisions=2, no LLM).
+```
 
 **Gate-3 sits after Gate 2 in the attempt loop.** While Gate 2 rejects,
 Gate-3 is unreachable by construction. A silent Gate-3 nearly always means
@@ -165,7 +183,7 @@ filter skips the file until the cadence comes round. That is expected.
 | Flow | Skill | `base` | Gate-3 |
 |---|---|---|---|
 | 1 | `hello-code` | `code` | *(none)* |
-| 2 | `hello-docs` | `docs` | `fact` |
+| 2 | `hello-docs` | `docs` | `existence` |
 | 3 | `hello-creative` | `creative` | `canon`, `continuity` |
 
 Confirm from the startup log rather than from this table — the adapters are

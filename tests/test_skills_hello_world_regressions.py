@@ -80,33 +80,36 @@ def test_creative_skill_forbids_python_targets_explicitly():
 
 # ── the docs flow needs a gate that judges the produced prose ────────────────
 
-def test_docs_skill_enables_the_fact_gate():
-    """Gate 1 cannot catch an invented test file; `fact` can."""
-    cfg = _applied("hello-docs")
-    assert [g.name for g in resolve_gate_order(cfg, "docs")] == ["fact"]
+def test_docs_skill_uses_the_existence_gate():
+    """`fact` was tried here first and could not work.
 
-
-def test_docs_skill_sets_the_fact_feature_flag():
-    """Listing the gate is not enough — make_fact_validator is behind a flag.
-
-    Without it the factory returns None and the gate is silently absent,
-    which looks identical to not having configured it at all.
+    Its prompt compares the text against facts stated in the TASK, so it has
+    no file list and approved "run `python -m unittest discover`" for a
+    repository with no tests — twice. GATES-3 replaced it with `existence`,
+    which reads the filesystem instead.
     """
     cfg = _applied("hello-docs")
-    assert cfg.getboolean("validator_agent", "fact_check_creative") is True
+    assert [g.name for g in resolve_gate_order(cfg, "docs")] == ["existence"]
 
 
-def test_docs_skill_sets_a_fact_revision_cap():
+def test_docs_skill_sets_an_existence_revision_cap():
     cfg = _applied("hello-docs")
-    assert cfg.getint("validator_agent", "max_fact_revisions") >= 1
+    assert cfg.getint("validator_agent", "max_existence_revisions") >= 1
 
 
-def test_fact_gate_is_addressable_outside_its_declared_modes():
-    """`fact` declares modes=("creative",) but an explicit list must win.
+def test_existence_gate_needs_no_feature_flag():
+    """The `fact` gate sat behind fact_check_creative = false, so naming it in
+    [gates] produced a gate that was silently absent. Not repeated."""
+    from tools.auto.existence_validator import make_existence_validator
 
-    resolve_gate_order deliberately skips the modes filter when the config
-    names gates by hand — otherwise this docs configuration would be dropped
-    without a word.
+    assert make_existence_validator(_cfg()) is not None
+
+
+def test_gates_are_addressable_outside_their_declared_modes():
+    """An explicit [gates] list must win over a spec's `modes` filter.
+
+    Without this, naming a gate by hand for a mode it does not declare would
+    drop it without a word.
     """
     assert "creative" in GATES_BY_NAME["fact"].modes
     cfg = _cfg()
@@ -166,7 +169,7 @@ def test_no_skill_injects_into_the_validator(skill):
     "skill,mode,gates",
     [
         ("hello-code", "code", []),
-        ("hello-docs", "docs", ["fact"]),
+        ("hello-docs", "docs", ["existence"]),
         ("hello-creative", "creative", ["canon", "continuity"]),
     ],
 )

@@ -951,6 +951,7 @@ class InnerLoop:
         prosody_validator=None,
         continuity_validator=None,
         theme_validator=None,
+        existence_validator=None,   # GATES-3: docs-mode file-reference check
         require_tests: bool = False,
         task_mode: str = "code",
         max_task_seconds: int = 0,
@@ -980,6 +981,7 @@ class InnerLoop:
         # (creative mode only) — the one gate that judges WHAT the chapter
         # says, not whether it is consistent.
         self.theme_validator = theme_validator
+        self.existence_validator = existence_validator
         # selfhost pilot: deterministic tests-mandate gate for code mode.
         self.require_tests = bool(require_tests)
         self.task_mode    = str(task_mode)
