@@ -629,18 +629,28 @@ class SummaryMemory:
 
 # ── Factory ───────────────────────────────────────────────────────────────────
 
-def _make_llm_call(
+def _default_llm_settings(
     config: configparser.ConfigParser,
     task_mode: str = "creative",
-) -> LlmCall:
-    """Build a ``(system, user) -> str`` callable from *config*.
+) -> "LlmSettings":
+    """Build the shared-provider :class:`LlmSettings` exactly as
+    ``_make_llm_call`` used to compute its locals inline.
 
-    Uses the same API profile / format / SSL logic as the rest of the
-    pipeline.  The LLM call is non-streaming (blocking), matching the
-    validator pattern.
+    GATE3-PROFILE-2. Split out so :func:`_make_llm_call` and
+    :func:`tools.auto.gate_registry.build_validators` compute the *same*
+    defaults the same way — the latter needs them as the innermost
+    fallback of the ``<gate>_llm_profile → validator_llm_profile →
+    [api_{active}]`` chain, without duplicating this parsing.
+
+    Deliberately does NOT strip ``base_url``'s trailing slash (unlike a
+    resolved named profile, where :func:`tools.auto.llm_profile.
+    resolve_llm_profile` strips it): the ollama branch below passes
+    ``base_url`` as-is into ``ollama_chat_url``, and stripping it here
+    would be an observable, untested behaviour change for every existing
+    config that predates GATE3-PROFILE-2.
     """
+    from tools.auto.llm_profile import LlmSettings
     from tools.auto.utils import _cfg_mode
-    import tools.llm_stream as _llm_stream
 
     active = config.get("api", "active", fallback="local")
     api_sec = f"api_{active}"
@@ -660,7 +670,6 @@ def _make_llm_call(
     max_tokens = int(max_tokens_str)
 
     temperature = config.getfloat("inner_loop", "temperature", fallback=0.2)
-    timeout     = config.getint("loop", "timeout_seconds", fallback=300)
     # AUTO-FIX (fable follow-up 3): thinking models (qwen3) prepend a
     # <think> block; if it truncates against num_predict the synopsis update
     # comes back empty, and if it doesn't, the reasoning text is WRITTEN
@@ -669,6 +678,57 @@ def _make_llm_call(
     # gate1/architect/coder: default off, [summary_memory] think = true
     # re-enables it.
     think = config.getboolean("summary_memory", "think", fallback=False)
+
+    return LlmSettings(
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        api_format=api_format,
+        verify_ssl=verify_ssl,
+        think=think,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        num_ctx=num_ctx,
+    )
+
+
+def _make_llm_call(
+    config: configparser.ConfigParser,
+    task_mode: str = "creative",
+    settings: "LlmSettings | None" = None,
+) -> LlmCall:
+    """Build a ``(system, user) -> str`` callable from *config*.
+
+    Uses the same API profile / format / SSL logic as the rest of the
+    pipeline.  The LLM call is non-streaming (blocking), matching the
+    validator pattern.
+
+    GATE3-PROFILE-2: *settings* is optional. When absent (every call site
+    that hasn't opted into a per-validator profile yet), it is built from
+    *config* via :func:`_default_llm_settings` — the exact same reads,
+    in the exact same order, that used to live inline here — so a config
+    without any ``*_llm_profile`` key produces a byte-for-byte identical
+    request to before this change. When present (GATE3-PROFILE-2 callers
+    that resolved a ``<gate>_llm_profile``/``validator_llm_profile``),
+    *settings* is used as-is and *config* is only consulted for the
+    request timeout, which is not a per-provider setting.
+    """
+    import tools.llm_stream as _llm_stream
+
+    if settings is None:
+        settings = _default_llm_settings(config, task_mode)
+
+    base_url   = settings.base_url
+    api_key    = settings.api_key
+    model      = settings.model
+    api_format = settings.api_format
+    verify_ssl = settings.verify_ssl
+    num_ctx    = settings.num_ctx
+    max_tokens = settings.max_tokens
+    temperature = settings.temperature
+    think      = settings.think
+
+    timeout = config.getint("loop", "timeout_seconds", fallback=300)
 
     ssl_context: ssl.SSLContext | None = _llm_stream.make_unverified_context() if not verify_ssl else None
 

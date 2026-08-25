@@ -109,11 +109,18 @@ class ThemeValidator:
         return ThemeVerdict(approved=approved, reason=reason, unparseable=unparseable)
 
 
-def make_theme_validator(config) -> "ThemeValidator | None":
+def make_theme_validator(config, *, settings=None) -> "ThemeValidator | None":
     """Build a :class:`ThemeValidator` from *config*, or ``None`` when disabled.
 
-    Same one-argument-factory shape as
+    Same factory shape as
     :func:`tools.auto.continuity_validator.make_continuity_validator`.
+
+    GATE3-PROFILE-2: *settings*, an optional
+    :class:`tools.auto.llm_profile.LlmSettings`, is passed straight through
+    to ``_make_llm_call``. ``None`` (the default) reproduces today's
+    behaviour exactly — only :func:`tools.auto.gate_registry.
+    build_validators` passes a resolved value, via ``[validator_agent]
+    theme_llm_profile``.
     """
     # AUTO-FIX (medium-priority audit): wrapped per-call, not delegated to a
     # shared helper, so extract_config_reads (COLLECT-5) still recognizes
@@ -149,7 +156,13 @@ def make_theme_validator(config) -> "ThemeValidator | None":
 
     try:
         from tools.auto.summary_memory import _make_llm_call  # noqa: PLC0415
-        llm_call = _make_llm_call(config, task_mode="creative")
+        # GATE3-PROFILE-2: only pass settings= when a profile was actually
+        # resolved — see the identical comment in canon_validator.py.
+        llm_call = (
+            _make_llm_call(config, task_mode="creative", settings=settings)
+            if settings is not None
+            else _make_llm_call(config, task_mode="creative")
+        )
     except Exception as exc:  # noqa: BLE001 — never block the loop on setup
         logger.warning("make_theme_validator: could not build LLM call — %s", exc)
         return None

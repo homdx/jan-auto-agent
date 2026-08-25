@@ -180,6 +180,7 @@ def make_fact_validator(
     api_key: str = "",
     model: str = "",
     api_format: str = "",
+    settings=None,
 ) -> "FactValidator | None":
     """Build a :class:`FactValidator` from *config*, or ``None`` when disabled.
 
@@ -190,6 +191,13 @@ def make_fact_validator(
     arguments are accepted for call-site compatibility with the InnerLoop
     factory signature; the LLM callable is built from *config* (the same way
     :func:`tools.auto.canon_validator.make_canon_validator` works).
+
+    GATE3-PROFILE-2: *settings*, an optional
+    :class:`tools.auto.llm_profile.LlmSettings`, is passed straight through
+    to ``_make_llm_call``. ``None`` (the default) reproduces today's
+    behaviour exactly — only :func:`tools.auto.gate_registry.
+    build_validators` passes a resolved value, via ``[validator_agent]
+    fact_llm_profile``.
 
     Returns ``None`` when the feature flag is off so the wiring in
     :func:`tools.auto.inner_loop.make_inner_loop` can remain a no-op with a
@@ -204,7 +212,13 @@ def make_fact_validator(
 
     try:
         from tools.auto.summary_memory import _make_llm_call  # noqa: PLC0415
-        llm_call = _make_llm_call(config, task_mode="creative")
+        # GATE3-PROFILE-2: only pass settings= when a profile was actually
+        # resolved — see the identical comment in canon_validator.py.
+        llm_call = (
+            _make_llm_call(config, task_mode="creative", settings=settings)
+            if settings is not None
+            else _make_llm_call(config, task_mode="creative")
+        )
     except Exception as exc:  # noqa: BLE001 — never block the loop on setup
         logger.warning("make_fact_validator: could not build LLM call — %s", exc)
         return None
