@@ -110,6 +110,11 @@ Cuts at a section boundary until the body fits. Never mid-sentence.
 
 ## Trying it on hello-world
 
+The full, validated walkthrough lives in `examples/hello-world/RUNBOOK.md`:
+the three commands, the sandbox reset that has to happen between runs, the
+known defects in each flow, and how to read whether Gate-3 fired. Start
+there; the summary below is the short version.
+
 `examples/hello-world/` is a deliberately tiny project: `main.py` prints
 `Hello world` and nothing else. With one function there is exactly one
 place for the Architect to propose work, so a run is short enough to read
