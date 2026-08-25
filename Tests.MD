@@ -79,12 +79,52 @@ a red test rather than as quiet coverage loss.
 
 ## Pre-commit hook
 
+### Installing it
+
 The repository ships a hook that runs the `--check` above before every
-commit. Enable it once per clone:
+commit. **It is not active until you enable it** — git does not run hooks
+from a version-controlled directory by default. One command, once per clone:
 
 ```bash
 git config core.hooksPath githooks
 ```
+
+That is the entire installation. Verify it took:
+
+```bash
+git config --get core.hooksPath     # -> githooks
+bash githooks/pre-commit && echo OK  # -> OK on a clean tree
+```
+
+`core.hooksPath` is used instead of copying into `.git/hooks/` so the hook is
+**version-controlled**: it arrives with `git pull`, changes to it show up in
+review, and a fresh clone needs only the one command above rather than a
+copy step somebody will forget. It requires git 2.9 or newer.
+
+To bypass it for a single commit:
+
+```bash
+git commit --no-verify
+```
+
+To turn it off entirely:
+
+```bash
+git config --unset core.hooksPath
+```
+
+### Why it exists
+
+The hook has already caught two real losses that no test run could have
+found, because both make tests disappear rather than fail:
+
+- `.smoke_tests/fixtures` went missing during a commit and was noticed only
+  after it had been pushed;
+- `.smoke_tests/test_hello_world_runbook.py` went missing the same way, one
+  commit later.
+
+Both were `git add` not picking up a new symlink. A missing test cannot fail,
+so nothing else would have reported it.
 
 That single command is the whole installation — the hook lives in
 `githooks/pre-commit`, which is version-controlled, so it updates with

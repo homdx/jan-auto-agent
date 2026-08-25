@@ -8,3 +8,7 @@ __pycache__/
 *.patch
 *.zip
 *.diff
+
+# CHECK-1: per-task sandboxes created by scripts/run_flows.sh. They are run
+# output, rebuilt from the committed baseline on every run.
+examples/task*/

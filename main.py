@@ -678,6 +678,11 @@ def _parse_args():
                         help="Run in autonomous mode with the given goal, then exit. "
                              "e.g. --auto \"improve current code\"")
     # AUTO-G10: dry-run flag — plan only (review + emit IMPROVEMENTS.md), no code, no commits
+    parser.add_argument("--skill", metavar="NAME", default=None,
+                        help="SKILLS-1: run with a skill overlay from skills/<NAME>.skill.ini "
+                             "(use --list-skills to see what is available)")
+    parser.add_argument("--list-skills", action="store_true", default=False,
+                        help="SKILLS-1: list available skill adapters and exit")
     parser.add_argument("--dry-run", action="store_true", default=False,
                         help="With --auto: build the plan and emit IMPROVEMENTS.md, "
                              "but do not execute any tasks or make any commits.")
@@ -730,6 +735,17 @@ def main():
     args = _parse_args()
     base_dir = os.path.abspath(args.base or args.base_dir_positional or os.getcwd())
 
+    # ── SKILLS-1: --list-skills ─────────────────────────────────────────
+    if args.list_skills:
+        from tools.skills import list_skills
+        names = list_skills("skills")
+        if not names:
+            print("No skill adapters found in skills/ (expected *.skill.ini).")
+        else:
+            for _n in names:
+                print(_n)
+        sys.exit(0)
+
     # ── VALIDATE-PLAN MODE (AUTO-H1) ────────────────────────────────────
     if args.validate_plan:
         if not os.path.exists(args.config):
@@ -774,6 +790,7 @@ def main():
             base_dir=base_dir,
             config_path=args.config,
             dry_run=args.dry_run,
+            skill=args.skill,
         )
         sys.exit(exit_code)
 
