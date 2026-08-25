@@ -1,25 +1,38 @@
 #!/usr/bin/env bash
-# scripts/run_flows.sh — CHECK-1: run all three skill flows and validate them.
+# scripts/run_flows.sh — CHECK-1: run the skill flows and validate them.
 #
 # Each flow gets its OWN sandbox:
 #
-#     examples/task1/hello-world/     hello-code      (base = code)
-#     examples/task2/hello-world/     hello-docs      (base = docs)
-#     examples/task3/hello-world/     hello-creative  (base = creative)
+#     examples/task1/hello-world/     hello-code            (base = code)
+#     examples/task2/hello-world/     hello-docs            (base = docs)
+#     examples/task3/hello-world/     hello-creative        (base = creative)
+#     examples/task4/hello-world/     hello-creative-split  (base = creative,
+#                                                             canon/continuity
+#                                                             on a 2nd provider)
 #
 # That isolation is the point. The flows commit into their base directory, so
-# running all three against the shared examples/hello-world/ means task 2
-# inspects task 1's output — the results stop being independent and a passing
-# task 2 might only be passing because task 1 created the file it wanted.
+# running several against the shared examples/hello-world/ means a later task
+# inspects an earlier task's output — the results stop being independent and
+# a passing check might only be passing because an earlier task already
+# created the file it wanted.
 #
 # Every sandbox is rebuilt from the committed baseline before its flow runs,
 # so a re-run never starts from the previous run's output.
 #
+# Task 4 (GATE3-PROFILE-5) is deliberately NOT part of the default set: it
+# needs a [task4_provider_b] section — a second real, reachable LLM
+# endpoint — added to $CONFIG by the operator first (see RUNBOOK.md "Flow
+# 4"), which the other three flows don't require. Run it explicitly once
+# that's in place: `scripts/run_flows.sh 4`.
+#
 # Validation is scripts/check_runbook.py: deterministic, no LLM, no network.
+# Task 4's provider-split evidence is a WARN rather than a FAIL when only one
+# provider is actually configured/reachable — see check_task4's docstring.
 #
 # Usage:
-#     scripts/run_flows.sh                 # all three, then validate
+#     scripts/run_flows.sh                 # tasks 1-3, then validate
 #     scripts/run_flows.sh 2               # only task 2
+#     scripts/run_flows.sh 4               # task 4 (needs [task4_provider_b])
 #     scripts/run_flows.sh --check-only    # validate without running
 #     scripts/run_flows.sh --config agents_32k.ini
 #     scripts/run_flows.sh --keep          # do not rebuild sandboxes
@@ -41,16 +54,18 @@ TASKS=()
 GOAL_1="Harden main.py: docstrings, type hints, a pytest test"
 GOAL_2="Write user documentation for this project"
 GOAL_3="Write a narrative changelog entry for the greeting"
+GOAL_4="Write a narrative changelog entry for the greeting"
 
 SKILL_1="hello-code"
 SKILL_2="hello-docs"
 SKILL_3="hello-creative"
+SKILL_4="hello-creative-split"
 
 BASELINE_FILES=(main.py README.md CHANGELOG.md RUNBOOK.md)
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        1|2|3)         TASKS+=("$1") ;;
+        1|2|3|4)       TASKS+=("$1") ;;
         --config)      CONFIG="$2"; shift ;;
         --keep)        KEEP=1 ;;
         --check-only)  CHECK_ONLY=1 ;;

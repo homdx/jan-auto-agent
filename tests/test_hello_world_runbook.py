@@ -39,9 +39,10 @@ RUNBOOK = HELLO_WORLD / "RUNBOOK.md"
 SKILLS_DIR = REPO_ROOT / "skills"
 
 #: How many `python3 main.py --auto ... --skill ...` invocations the runbook
-#: is expected to document — one per mechanical base. Pinned so that losing a
-#: flow to a bad edit is a failure rather than a smaller, still-green run.
-EXPECTED_FLOWS = 3
+#: is expected to document — one per mechanical base, plus Flow 4's
+#: same-base provider-split variant (GATE3-PROFILE-5). Pinned so that losing
+#: a flow to a bad edit is a failure rather than a smaller, still-green run.
+EXPECTED_FLOWS = 4
 
 
 # ─────────────────────────────────────────────────────────────────────────────

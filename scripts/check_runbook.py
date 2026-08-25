@@ -25,11 +25,22 @@ shared one::
     examples/task1/hello-world/   → used for task 1 if present
     examples/task2/hello-world/   → used for task 2 if present
     examples/task3/hello-world/   → used for task 3 if present
+    examples/task4/hello-world/   → used for task 4 if present
     examples/hello-world/         → fallback for any task without its own
 
 Separate sandboxes are strongly preferred: the flows commit into their base
-directory, so running all three against one directory means task 2 inspects
-task 1's output and the results are not independent.
+directory, so running several against one directory means a later task
+inspects an earlier task's output and the results are not independent.
+
+Task 4 (GATE3-PROFILE-5) reuses every check from task 3 — same skill body,
+same base — plus one more: evidence from the console log that canon and
+continuity actually resolved to a DIFFERENT provider than the shared one the
+coder and Gate 2 used. That extra finding is a WARN, not a FAIL, when the
+console log shows every validator on the same provider — task 4 needs a
+second real, reachable LLM endpoint ([task4_provider_b]) that is not always
+available (a fresh clone, most CI), and a check that FAILS whenever that
+endpoint is absent would just be a second, noisier way of saying so. See
+check_task4's docstring.
 
 Usage
 -----
@@ -54,8 +65,11 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SHARED_SANDBOX = REPO_ROOT / "examples" / "hello-world"
 
-TASKS = (1, 2, 3)
-TASK_SKILL = {1: "hello-code", 2: "hello-docs", 3: "hello-creative"}
+TASKS = (1, 2, 3, 4)
+TASK_SKILL = {
+    1: "hello-code", 2: "hello-docs", 3: "hello-creative",
+    4: "hello-creative-split",
+}
 
 _GREEN, _RED, _YELLOW, _DIM, _RESET = (
     "\033[32m", "\033[31m", "\033[33m", "\033[2m", "\033[0m"
@@ -391,7 +405,104 @@ def check_task3(sandbox: Path) -> Report:
     return report
 
 
-CHECKS = {1: check_task1, 2: check_task2, 3: check_task3}
+# ─────────────────────────────────────────────────────────────────────────────
+# Task 4 — narrative changelog, canon/continuity on a second provider
+# ─────────────────────────────────────────────────────────────────────────────
+# GATE3-PROFILE-5: proves the GATE3-PROFILE-2 per-validator profile keys work
+# on a real run, not only in unit tests. hello-creative-split is the same
+# skill body as hello-creative (same base, same artefact contract), with
+# [validator_agent] canon_llm_profile / continuity_llm_profile pointed at
+# [task4_provider_b] via its [skill.overlay] — see skills/hello-creative-split
+# .skill.ini. So this reuses check_task3 wholesale for the artefact criteria,
+# then adds one more finding this task alone can make: did canon/continuity
+# actually go to a DIFFERENT provider than the coder and Gate 2 did.
+
+#: Matches GATE3-PROFILE-2's per-gate startup line, e.g.:
+#:   validator_agent.canon_llm_profile: provider = https://b.example/v1 (m) — via ...
+_GATE_PROVIDER_RE = re.compile(
+    r"validator_agent\.(canon|continuity)_llm_profile: provider = (\S+) \("
+)
+#: Matches the shared-provider step every enabled gate resolves through
+#: first (GATE3-PROFILE-2's `validator_llm_profile` link in the chain),
+#: which is what the coder and Gate 2 also use — the baseline "provider A".
+_SHARED_PROVIDER_RE = re.compile(
+    r"validator_agent\.validator_llm_profile: provider = (\S+) \("
+)
+
+
+def _add_provider_split_evidence(report: Report, sandbox: Path) -> None:
+    """Did canon/continuity resolve to a different provider than the coder.
+
+    A WARN (not a FAIL) whenever the evidence can't be found or shows only
+    one provider in play: this needs a second real, reachable LLM endpoint
+    ([task4_provider_b]) that the operator configures locally and that is
+    not always available. `Report.failed` excludes warned findings (see its
+    property above), so `check_runbook.py --task 4` still exits 0 on an
+    otherwise-healthy single-provider run rather than failing a check it
+    structurally cannot perform — "skip with an explicit reason" rather than
+    a silent, vacuous pass on a property that was never actually verified.
+    """
+    log = _read(sandbox.parent / "console-log.txt")
+    if not log:
+        report.add(
+            False, "canon/continuity used a second provider",
+            "no console-log.txt found next to the sandbox",
+            hint="run_flows.sh writes it automatically — run the flow "
+                 "through run_flows.sh rather than main.py directly, or "
+                 "copy your own log to examples/task4/console-log.txt",
+            warn=True,
+        )
+        return
+
+    resolved = dict(_GATE_PROVIDER_RE.findall(log))  # {"canon": url, ...}
+    if not resolved:
+        report.add(
+            False, "canon/continuity used a second provider",
+            "no canon_llm_profile/continuity_llm_profile startup line in "
+            "the console log",
+            hint="GATE3-PROFILE-2 logs one INFO line per gate naming its "
+                 "resolved provider — check the flow actually used "
+                 "skills/hello-creative-split.skill.ini",
+            warn=True,
+        )
+        return
+
+    shared_match = _SHARED_PROVIDER_RE.search(log)
+    shared_url = shared_match.group(1) if shared_match else None
+    split = {
+        gate: url for gate, url in resolved.items()
+        if shared_url is None or url != shared_url
+    }
+
+    if not split:
+        report.add(
+            False, "canon/continuity used a second provider",
+            f"canon/continuity resolved to {sorted(set(resolved.values()))}, "
+            f"same as the shared provider — [task4_provider_b] is not "
+            f"configured (or is identical to [api_{{active}}]) for this run",
+            hint="add a [task4_provider_b] section with a second real "
+                 "base_url/api_key/model to your config before running "
+                 "task 4 — see RUNBOOK.md 'Flow 4'",
+            warn=True,
+        )
+        return
+
+    report.add(
+        True, "canon/continuity used a second provider",
+        ", ".join(f"{gate}={url}" for gate, url in sorted(split.items())),
+    )
+
+
+def check_task4(sandbox: Path) -> Report:
+    report = check_task3(sandbox)
+    report.task = 4
+    report.skill = TASK_SKILL[4]
+    if _run_ran(sandbox):
+        _add_provider_split_evidence(report, sandbox)
+    return report
+
+
+CHECKS = {1: check_task1, 2: check_task2, 3: check_task3, 4: check_task4}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
