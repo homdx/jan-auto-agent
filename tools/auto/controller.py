@@ -266,6 +266,7 @@ class AutoController:
         base_dir: str | os.PathLike = ".",
         config_path: str = "agents.ini",
         dry_run: bool = False,
+        skill: Optional[str] = None,
         _time_fn: Optional[Callable[[], float]] = None,
     ) -> None:
         goal = goal.strip() if goal else ""
@@ -315,6 +316,23 @@ class AutoController:
         # AUTO-CR-10: normalise task_mode (typo-tolerant) so a misspelling like
         # 'creativy' is corrected with a loud warning instead of silently
         # degrading to code mode.
+        # ── SKILLS-1: apply the skill overlay before ANYTHING reads config ──
+        # A skill is a config overlay, not a runtime concept: it rewrites
+        # [auto] task_mode, the per-agent system_{mode} prompts, the Gate-3
+        # order and any token caps, and then every downstream component runs
+        # unmodified. It has to land here, after the file is read and before
+        # task_mode is normalised, because the overlay is what SETS task_mode.
+        self.skill = None
+        if skill:
+            from tools.skills import SkillError, apply_skill
+            try:
+                self.skill = apply_skill(self.config, skill, base_dir=self.base_dir)
+            except SkillError as exc:
+                # Fail LOUD. A skill the user named explicitly but that could
+                # not load must never degrade into "run without it" — that
+                # produces a plausible-looking run against the wrong prompts.
+                raise ValueError(f"--skill {skill!r}: {exc}") from exc
+
         from tools.auto.utils import normalize_task_mode
         _raw_mode = self.config.get("auto", "task_mode", fallback="code")
         self.task_mode, _mode_warn = normalize_task_mode(_raw_mode)
@@ -1098,6 +1116,7 @@ def run_auto(
     base_dir: str | os.PathLike = ".",
     config_path: str = "agents.ini",
     dry_run: bool = False,
+    skill: Optional[str] = None,
 ) -> int:
     """Create an :class:`AutoController` and run it.
 
@@ -1109,6 +1128,7 @@ def run_auto(
             base_dir=base_dir,
             config_path=config_path,
             dry_run=dry_run,
+            skill=skill,
         )
     except (ValueError, FileNotFoundError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
