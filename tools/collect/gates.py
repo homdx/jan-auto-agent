@@ -55,6 +55,25 @@ FAIL_MODES = frozenset({"open", "closed"})
 _SEED_REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
+def _looks_like_this_repo(module_paths: "set[str]") -> bool:
+    """Content-based counterpart to the `_SEED_REPO_ROOT` path-identity
+    check (same fix, same reasoning, as `registries._looks_like_this_repo`
+    for CONTRACTS): do any of the *default* `_GATE_SEED`'s own `module`
+    paths appear in `module_paths` (what Pass A actually scanned)? True
+    for a clone of this repo at any location on disk — `_SEED_REPO_ROOT`
+    only ever matched the one directory this installed copy of the
+    collect tool happens to live in, so `--base` pointing at any other
+    checkout of this same project (a benchmarking harness's scratch
+    clone, a second local clone, a CI workspace) previously got the empty
+    "must be a foreign repo" treatment despite genuinely being this repo.
+    False for a project that really doesn't have these modules. Always
+    checked against the *default* seed regardless of whichever `seed`
+    this particular call was given, so a test fixture's deliberately
+    broken custom seed can't masquerade as "must be a foreign repo".
+    """
+    return any(spec["module"] in module_paths for spec in _GATE_SEED.values())
+
+
 class GateCitationError(RuntimeError):
     """Raised when a seeded gate's `module` isn't a path Pass A actually
     scanned, or its `parser`'s bare function name doesn't resolve to a
@@ -301,12 +320,26 @@ def build_gates_map(
     fail-open posture `registries.build_seed_contracts` now gives the
     identical situation for CONTRACTS. Self-scans (`root` unset, or
     resolving to this repo) keep the full strict check, unchanged.
+
+    BUGFIX (found via forensic comparison of two real collect runs
+    against this repo, both showing an empty GATES registry): matching
+    `root` against `_SEED_REPO_ROOT` by literal path identity meant only
+    the one directory this installed copy of the collect tool happens to
+    live in ever counted as "this repo" — any other checkout of the exact
+    same project (a benchmarking harness's scratch clone included)
+    silently got the "must be a foreign repo" treatment instead. Swapped
+    for `_looks_like_this_repo`, which checks content instead of a path:
+    do any of `_GATE_SEED`'s own module paths actually appear in what was
+    scanned. True for this repo at any location, false for a genuinely
+    different one.
     """
+    module_paths = {m.path for m in modules} if modules is not None else set()
+
     if root is not None and modules is not None and Path(root).resolve() != _SEED_REPO_ROOT:
-        return []
+        if not _looks_like_this_repo(module_paths):
+            return []
 
     verify = modules is not None and root is not None
-    module_paths = {m.path for m in modules} if modules is not None else set()
     modules_list = list(modules) if modules is not None else []
 
     entries: List[GateEntry] = []

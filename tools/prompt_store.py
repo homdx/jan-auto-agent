@@ -53,10 +53,21 @@ class PromptStore:
         else:
             self.store_path = Path("prompts.json")
 
+        # AUTO-FIX (high-priority audit, DeepSeek-plan finding): max_versions
+        # <= 0 used to reach push() unclamped. push() appends the new entry
+        # THEN evicts down to max_versions, so max_versions=0 emptied the
+        # stack back to zero right after adding to it — the very next line,
+        # `data[agent_name]["current_version"] = stack[-1]["version"]`, then
+        # raised IndexError on the empty list. A concrete, reproducible
+        # crash (not just defense-in-depth), and also inconsistent with the
+        # "0 means no cap" convention this codebase uses elsewhere (e.g.
+        # RunLimits) — here 0 meant "always crash," not "unlimited." Clamp
+        # to a minimum of 1: a version history of at least the newest entry
+        # is the smallest value that keeps push()'s own indexing safe.
         if max_versions is not None:
-            self.max_versions = max_versions
+            self.max_versions = max(1, int(max_versions))
         elif config is not None:
-            self.max_versions = config.getint("prompt_store", "max_versions", fallback=3)
+            self.max_versions = max(1, config.getint("prompt_store", "max_versions", fallback=3))
         else:
             self.max_versions = 3
 
@@ -300,3 +311,8 @@ class PromptStore:
                 except OSError:
                     pass
             logger.error(f"PromptStore failed to write {self.store_path}: {e}")
+            # 5. Re-raise so callers (push/rollback) know the save did not
+            # happen, instead of silently returning as if it succeeded —
+            # without this, the caller believes the new state is durable
+            # while the store still holds the stale/previous data on disk.
+            raise RuntimeError(f"PromptStore failed to write {self.store_path}") from e

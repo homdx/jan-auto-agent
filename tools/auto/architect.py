@@ -33,6 +33,7 @@ from __future__ import annotations
 import configparser
 import json
 import logging
+import math
 import re as _re
 import sys
 import time
@@ -351,6 +352,36 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
     verify_ssl:
         Whether to verify the server's TLS certificate.
     """
+
+    # AUTO-H5-ESCALATE-1: mirrors gate1_filter.py's Gate1Filter
+    # _UNPARSEABLE_* escalation — an "unsalvageable" (empty/degenerate/
+    # non-JSON) response on a reasoning-heavy model is often the SAME
+    # root cause Gate 1 already handles: the model's thinking channel
+    # (see AUTO-ZAITHINK-1 / AUTO-THINKDEPTH-2 in tools/llm_stream.py)
+    # consumed the entire max_tokens budget before any JSON was written,
+    # not a one-off decoding hiccup a same-settings plain retry can fix.
+    # Each retry (bounded by [architect] empty_response_retry_max, same
+    # config key as before — just now escalating instead of static)
+    # widens the token budget; temperature cycles a fixed, absolute
+    # schedule at each token tier (AUTO-RETRY-TEMP-1 — see
+    # _UNSALVAGEABLE_TEMPERATURES below), exactly like Gate 1's
+    # presence-check retry. Floor/ceiling/step deliberately match
+    # Gate1Filter's constants — same failure mode, same fix.
+    _UNSALVAGEABLE_TOKENS_FLOOR = 4096
+    _UNSALVAGEABLE_TOKENS_STEP_MULT = 2.0
+    _UNSALVAGEABLE_TOKENS_DEFAULT_CEILING = 32768
+    _UNSALVAGEABLE_TOKENS_CTX_FRACTION = 0.5
+    # AUTO-RETRY-TEMP-1: fixed, ABSOLUTE temperatures tried at EACH token
+    # tier before escalating to the next tier — deliberately NOT relative
+    # to the configured base [architect] temperature. Subtracting a step
+    # from base repeatedly hits the 0.0 floor after 1-2 attempts and
+    # stays there for every remaining retry — at temp=0.0 the model is
+    # deterministic, so a repeated escaping/formatting mistake reproduces
+    # byte-for-byte on every further attempt regardless of token budget
+    # (confirmed live via Gate1Filter's identical bug). Retry-recovery
+    # mode uses its own low, fixed schedule instead. See Gate1Filter's
+    # own _UNPARSEABLE_TEMPERATURES for the full tier/temperature table.
+    _UNSALVAGEABLE_TEMPERATURES = (0.0, 0.1)
 
     def __init__(
         self,
@@ -714,136 +745,351 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
             if self._task_mode == "creative"
             else _USER_PROMPT_TMPL
         )
-        user_msg = _tmpl.format(
-            goal=goal,
-            cluster=cluster.name,
-            file_listing=file_listing,
-            file_contents=file_contents,
-            max_tasks=(1 if self._task_mode == "creative" else 5),
-        )
 
+        _base_max_tasks = 1 if self._task_mode == "creative" else 5
 
-        url, headers, payload = _llm_stream.build_chat_request(
-            base_url=self._base_url, api_key=self._api_key, model=self._model,
-            api_format=self._api_format, temperature=self._temperature,
-            max_tokens=self._max_tokens, system=self._system, user_msg=user_msg,
-            num_ctx=self._num_ctx, think=self._think,
-        )
-
-        # Trace the outgoing call.
-        tracer.event(
-            source="architect",
-            target="llm",
-            kind="llm_request",
-            content=user_msg,
-            params={"model": self._model, "temperature": self._temperature,
-                    "cluster": cluster.name},
-        )
-
-        # AUTO-BUG-8 fix: configurable retry backoff. Previously hardcoded to
-        # [5, 15, 30] (~50s total) regardless of deployment — for a local
-        # Ollama instance still loading a model into memory, that's ~50s of
-        # silent retrying inside this call before the cluster fails open.
-        _delays_raw = self._config.get("architect", "retry_delays_sec", fallback="5,15,30")
+        # AUTO-H4: shrink-retry on truncation. A "confirmed" candidate array
+        # cut off mid-object (see _parse_candidates_ex's truncated flag) means
+        # the model tried to fit more tasks into this response than its
+        # output-token budget allowed — the fix that actually addresses the
+        # cause is asking for FEWER tasks (a smaller JSON array is less likely
+        # to overflow the same max_tokens cap), not just re-sending the same
+        # over-ambitious request and hoping for a shorter roll. Each shrink
+        # halves the requested task count (floor 1) and is a fresh, independent
+        # LLM call — not a merge with the previous partial result, since a
+        # re-ask under a smaller budget is meant to complete cleanly on its
+        # own, and mixing salvaged fragments from two different requests risks
+        # duplicate/inconsistent candidates.
+        #
+        # Configurable via [architect]:
+        #   truncation_retry_max    — how many shrink attempts after the
+        #                             first try (default 2; 0 disables this
+        #                             and preserves the old "keep whatever
+        #                             was salvaged from the first response"
+        #                             behaviour).
+        #   truncation_shrink_factor — multiplier applied to max_tasks on each
+        #                              shrink (default 0.5; clamped to (0, 1)
+        #                              and to never fail to shrink at all).
+        _retry_max = self._config.getint("architect", "truncation_retry_max", fallback=2)
+        _retry_max = max(0, _retry_max)
         try:
-            _RETRY_DELAYS = [float(x.strip()) for x in _delays_raw.split(",") if x.strip()]
+            _shrink_factor = float(
+                self._config.get("architect", "truncation_shrink_factor", fallback="0.5")
+            )
         except ValueError:
-            logger.warning(
-                "architect: invalid [architect] retry_delays_sec=%r — using default [5, 15, 30].",
-                _delays_raw,
+            _shrink_factor = 0.5
+        if not (0.0 < _shrink_factor < 1.0):
+            _shrink_factor = 0.5
+
+        def _shrink(n: int) -> int:
+            """Reduce max_tasks by _shrink_factor, always making forward
+            progress: never returns a value >= n when n > 1, floors at 1."""
+            reduced = math.floor(n * _shrink_factor)
+            if reduced >= n:
+                reduced = n - 1
+            return max(1, reduced)
+
+        # AUTO-H5 / AUTO-H5-ESCALATE-1: retry on an unsalvageable
+        # (empty/garbage/degenerate) response — a distinct failure mode
+        # from AUTO-H4's truncation. There's no partial content here to
+        # blame on a tight max_tasks budget, so shrinking wouldn't help.
+        # Originally a same-settings plain retry (typical "one-off
+        # decoding hiccup" cause: a model repeating "title": "title": ...
+        # until it hits its cap, or a flaky upstream/proxy returning an
+        # empty body) — now ALSO escalates max_tokens/temperature each
+        # attempt (see the class docstring's AUTO-H5-ESCALATE-1 note),
+        # since a genuinely empty response is just as often a
+        # reasoning-heavy model (GLM-5.2 and similar) burning the entire
+        # budget on <think>/thinking-channel output before writing any
+        # JSON — a plain identical retry never recovers from that, an
+        # escalating one usually does.
+        #
+        # Configurable via [architect]:
+        #   empty_response_retry_max — how many escalating retries after
+        #                              the first try when a response is
+        #                              unsalvageable (default 6; 0
+        #                              disables this and preserves the
+        #                              old "0 candidates from this batch,
+        #                              move on" behaviour for that
+        #                              failure mode). Previously 2, then
+        #                              5 — 6 is deliberately an even
+        #                              multiple of len(
+        #                              _UNSALVAGEABLE_TEMPERATURES) (2),
+        #                              so every token tier the ladder
+        #                              reaches — including the LAST one —
+        #                              gets both temperatures tried
+        #                              before escalating further; an odd
+        #                              max leaves the final tier's
+        #                              second temperature untried.
+        _empty_retry_max = self._config.getint("architect", "empty_response_retry_max", fallback=6)
+        _empty_retry_max = max(0, _empty_retry_max)
+
+        def _call_and_parse(
+            max_tasks: int, *,
+            max_tokens: "int | None" = None,
+            temperature: "float | None" = None,
+        ) -> "tuple[list[CandidateTask] | None, bool, bool]":
+            """One LLM call + parse at a given max_tasks budget.
+
+            Returns ``(candidates_or_None, truncated, unsalvageable)``.
+            ``None`` candidates means the call itself failed after all
+            transient-error retries (unrelated to either AUTO-H4/H5 —
+            see the network-retry loop below); ``truncated`` and
+            ``unsalvageable`` are only meaningful when candidates is not
+            ``None``, and are mutually exclusive (see
+            ``_parse_candidates_ex``'s docstring).
+
+            *max_tokens*/*temperature*, when given, override this
+            instance's own ``self._max_tokens``/``self._temperature`` for
+            just this one call — used by the AUTO-H5-ESCALATE-1 retry
+            loop below to widen the budget on an unsalvageable response
+            without touching the AUTO-H4 truncation path, which has its
+            own, unrelated remedy (shrink max_tasks).
+            """
+            user_msg = _tmpl.format(
+                goal=goal,
+                cluster=cluster.name,
+                file_listing=file_listing,
+                file_contents=file_contents,
+                max_tasks=max_tasks,
             )
-            _RETRY_DELAYS = [5, 15, 30]
 
-        raw_text = ""
-        last_exc: Exception | None = None
-
-        for _attempt, _delay in enumerate([0] + _RETRY_DELAYS, start=1):
-            if _delay:
-                logger.warning(
-                    "review_one_cluster: retrying cluster %r in %ds "
-                    "(attempt %d/%d) after: %s",
-                    cluster.name, _delay, _attempt, 1 + len(_RETRY_DELAYS), last_exc,
-                )
-                time.sleep(_delay)
-
-            try:
-                tokens_list: list[str] = []
-
-                def streaming_callback(token: str) -> None:
-                    sys.stdout.write(token)
-                    sys.stdout.flush()
-                    tokens_list.append(token)
-
-                print("\n🧠 [LIVE ARCHITECT STREAMING THINKING & RESPONSE]:")
-                returned = _llm_stream.request_completion(
-                    url=url,
-                    headers=headers,
-                    payload=payload,
-                    timeout=self._timeout,
-                    stream=True,
-                    on_token=streaming_callback,
-                    api_format=self._api_format,
-                    ssl_context=self._ssl_context,
-                )
-                # request_completion returns the full accumulated response; prefer it
-                # and fall back to the streamed tokens if the return is empty.
-                raw_text = returned or "".join(tokens_list)
-                print("\n" + "═" * 80 + "\n")
-                last_exc = None
-                break  # success — exit retry loop
-
-            except Exception as exc:
-                last_exc = exc
-                exc_str = str(exc)
-                # Only retry on transient server-side errors (5xx) or connection
-                # failures, not deterministic 4xx client errors. Prefer the real
-                # status from exc.code (urllib's HTTPError); only fall back to a
-                # word-boundary scan of the message for non-HTTP errors, to avoid
-                # false positives from substrings like a model name "gpt-4-5000".
-                _http_status: int = 0
-                _code = getattr(exc, "code", None)
-                if isinstance(_code, int):
-                    _http_status = _code
-                else:
-                    _status_match = _re.search(r"\b([1-5]\d{2})\b", exc_str)
-                    if _status_match:
-                        _http_status = int(_status_match.group(1))
-                _is_transient = (
-                    (500 <= _http_status <= 599)
-                    or "ConnectionRefused" in exc_str
-                    or "Connection refused" in exc_str
-                    or "timed out" in exc_str.lower()
-                    or "timeout" in exc_str.lower()
-                )
-                if not _is_transient or _attempt > len(_RETRY_DELAYS):
-                    break  # non-retryable or retries exhausted — fall through
-
-        if last_exc is not None:
-            logger.warning(
-                "review_one_cluster: LLM call failed for cluster %r after %d attempt(s): %s",
-                cluster.name, _attempt, last_exc,
+            url, headers, payload = _llm_stream.build_chat_request(
+                base_url=self._base_url, api_key=self._api_key, model=self._model,
+                api_format=self._api_format,
+                temperature=self._temperature if temperature is None else temperature,
+                max_tokens=self._max_tokens if max_tokens is None else max_tokens,
+                system=self._system, user_msg=user_msg,
+                num_ctx=self._num_ctx, think=self._think,
             )
+
+            # AUTO-H5-ESCALATE-1: the effective temperature actually sent
+            # this call — computed directly rather than read back out of
+            # `payload`, since the ollama branch nests it under
+            # payload["options"]["temperature"] (no top-level key there),
+            # which would have silently traced the wrong value.
+            _effective_temperature = self._temperature if temperature is None else temperature
+
+            # Trace the outgoing call.
             tracer.event(
-                source="llm", target="architect", kind="llm_response",
-                content=f"[ERROR] {last_exc}", params={"cluster": cluster.name},
+                source="architect",
+                target="llm",
+                kind="llm_request",
+                content=user_msg,
+                params={"model": self._model, "temperature": _effective_temperature,
+                        "cluster": cluster.name, "max_tasks": max_tasks},
             )
-            # Return None (not []) so callers can distinguish "call failed" from
-            # "call succeeded but LLM produced no valid candidates".  The checkpoint
-            # must NOT record a failed batch; returning None signals that.
-            return None
 
-        # Strip reasoning tokens before JSON parsing.
-        cleaned = strip_think(raw_text)
+            # AUTO-BUG-8 fix: configurable retry backoff. Previously hardcoded to
+            # [5, 15, 30] (~50s total) regardless of deployment — for a local
+            # Ollama instance still loading a model into memory, that's ~50s of
+            # silent retrying inside this call before the cluster fails open.
+            _delays_raw = self._config.get("architect", "retry_delays_sec", fallback="5,15,30")
+            try:
+                _RETRY_DELAYS = [float(x.strip()) for x in _delays_raw.split(",") if x.strip()]
+            except ValueError:
+                logger.warning(
+                    "architect: invalid [architect] retry_delays_sec=%r — using default [5, 15, 30].",
+                    _delays_raw,
+                )
+                _RETRY_DELAYS = [5, 15, 30]
 
-        tracer.event(
-            source="llm",
-            target="architect",
-            kind="llm_response",
-            content=cleaned,
-            params={"cluster": cluster.name},
-        )
+            raw_text = ""
+            last_exc: Exception | None = None
+            _attempt = 1
 
-        return self._parse_candidates(cleaned, cluster.name, cluster.files)
+            for _attempt, _delay in enumerate([0] + _RETRY_DELAYS, start=1):
+                if _delay:
+                    logger.warning(
+                        "review_one_cluster: retrying cluster %r in %ds "
+                        "(attempt %d/%d) after: %s",
+                        cluster.name, _delay, _attempt, 1 + len(_RETRY_DELAYS), last_exc,
+                    )
+                    time.sleep(_delay)
+
+                try:
+                    tokens_list: list[str] = []
+
+                    def streaming_callback(token: str) -> None:
+                        sys.stdout.write(token)
+                        sys.stdout.flush()
+                        tokens_list.append(token)
+
+                    print("\n🧠 [LIVE ARCHITECT STREAMING THINKING & RESPONSE]:")
+                    returned = _llm_stream.request_completion(
+                        url=url,
+                        headers=headers,
+                        payload=payload,
+                        timeout=self._timeout,
+                        stream=True,
+                        on_token=streaming_callback,
+                        api_format=self._api_format,
+                        ssl_context=self._ssl_context,
+                    )
+                    # request_completion returns the full accumulated response; prefer it
+                    # and fall back to the streamed tokens if the return is empty.
+                    raw_text = returned or "".join(tokens_list)
+                    print("\n" + "═" * 80 + "\n")
+                    last_exc = None
+                    break  # success — exit retry loop
+
+                except Exception as exc:
+                    last_exc = exc
+                    exc_str = str(exc)
+                    # Only retry on transient server-side errors (5xx) or connection
+                    # failures, not deterministic 4xx client errors. Prefer the real
+                    # status from exc.code (urllib's HTTPError); only fall back to a
+                    # word-boundary scan of the message for non-HTTP errors, to avoid
+                    # false positives from substrings like a model name "gpt-4-5000".
+                    _http_status: int = 0
+                    _code = getattr(exc, "code", None)
+                    if isinstance(_code, int):
+                        _http_status = _code
+                    else:
+                        _status_match = _re.search(r"\b([1-5]\d{2})\b", exc_str)
+                        if _status_match:
+                            _http_status = int(_status_match.group(1))
+                    _is_transient = (
+                        (500 <= _http_status <= 599)
+                        or "ConnectionRefused" in exc_str
+                        or "Connection refused" in exc_str
+                        or "timed out" in exc_str.lower()
+                        or "timeout" in exc_str.lower()
+                    )
+                    if not _is_transient or _attempt > len(_RETRY_DELAYS):
+                        break  # non-retryable or retries exhausted — fall through
+
+            if last_exc is not None:
+                logger.warning(
+                    "review_one_cluster: LLM call failed for cluster %r after %d attempt(s): %s",
+                    cluster.name, _attempt, last_exc,
+                )
+                tracer.event(
+                    source="llm", target="architect", kind="llm_response",
+                    content=f"[ERROR] {last_exc}", params={"cluster": cluster.name},
+                )
+                # None (not []) so callers can distinguish "call failed" from
+                # "call succeeded but LLM produced no valid candidates".  The
+                # checkpoint must NOT record a failed batch; None signals that.
+                return None, False, False
+
+            # Strip reasoning tokens before JSON parsing.
+            cleaned = strip_think(raw_text)
+
+            tracer.event(
+                source="llm",
+                target="architect",
+                kind="llm_response",
+                content=cleaned,
+                params={"cluster": cluster.name, "max_tasks": max_tasks},
+            )
+
+            return self._parse_candidates_ex(cleaned, cluster.name, cluster.files)
+
+        max_tasks = _base_max_tasks
+        candidates, truncated, unsalvageable = _call_and_parse(max_tasks)
+
+        _shrink_attempts = 0
+        _empty_attempts = 0
+        # Single adaptive loop: on each iteration, react to whichever
+        # failure mode THIS attempt actually hit — a batch can legitimately
+        # flip between them (e.g. truncated on attempt 1, unsalvageable on
+        # a shrunk attempt 2) — rather than committing to one strategy for
+        # the whole retry budget upfront. Each failure mode has its own
+        # independent attempt budget so one doesn't steal retries from the
+        # other.
+        while candidates is not None and (truncated or unsalvageable):
+            _call_kwargs: dict = {}
+            if truncated:
+                if _shrink_attempts >= _retry_max or max_tasks <= 1:
+                    break
+                max_tasks = _shrink(max_tasks)
+                _shrink_attempts += 1
+                logger.warning(
+                    "review_one_cluster [%s]: response truncated "
+                    "(shrink-retry %d/%d) — re-asking with max_tasks=%d.",
+                    cluster.name, _shrink_attempts, _retry_max, max_tasks,
+                )
+            else:  # unsalvageable
+                if _empty_attempts >= _empty_retry_max:
+                    break
+                _empty_attempts += 1
+                # AUTO-H5-ESCALATE-1 / AUTO-RETRY-TEMP-1: mirrors
+                # gate1_filter.py's Gate1Filter unparseable-retry
+                # escalation exactly — an unsalvageable (empty/
+                # degenerate/non-JSON) response is very often the SAME
+                # thinking-budget-exhaustion failure Gate 1 already
+                # handles (see the class docstring above), not a one-off
+                # decoding hiccup a same-settings plain retry fixes.
+                # Every temperature in _UNSALVAGEABLE_TEMPERATURES is
+                # tried at the CURRENT token tier before the tier
+                # doubles — see that constant's docstring for why this
+                # is a fixed absolute schedule, not a step down from the
+                # configured base temperature.
+                _ctx_ceiling = (
+                    int(self._num_ctx * self._UNSALVAGEABLE_TOKENS_CTX_FRACTION)
+                    if self._num_ctx
+                    else self._UNSALVAGEABLE_TOKENS_DEFAULT_CEILING
+                )
+                _n_temps = len(self._UNSALVAGEABLE_TEMPERATURES)
+                _tier_index = (_empty_attempts - 1) // _n_temps
+                _temp_index = (_empty_attempts - 1) % _n_temps
+                _uncapped_tokens = (
+                    self._UNSALVAGEABLE_TOKENS_FLOOR
+                    * int(self._UNSALVAGEABLE_TOKENS_STEP_MULT ** _tier_index)
+                )
+                _attempt_tokens = min(_uncapped_tokens, _ctx_ceiling)
+                if _attempt_tokens < _uncapped_tokens:
+                    # AUTO-CTX-CAP-WARN-1: see gate1_filter.py's sibling
+                    # warning — a stale/small num_ctx silently capping
+                    # escalation has bitten in the field more than once.
+                    logger.warning(
+                        "review_one_cluster [%s]: escalation wants "
+                        "max_tokens=%d but is capped at %d by "
+                        "num_ctx=%s (ceiling = num_ctx * %.1f). If this "
+                        "model's real context window is bigger, raise "
+                        "num_ctx in the active [api_*] section to let "
+                        "escalation actually use it.",
+                        cluster.name, _uncapped_tokens, _attempt_tokens,
+                        self._num_ctx or "unset",
+                        self._UNSALVAGEABLE_TOKENS_CTX_FRACTION,
+                    )
+                _attempt_temp = self._UNSALVAGEABLE_TEMPERATURES[_temp_index]
+                _call_kwargs = {"max_tokens": _attempt_tokens, "temperature": _attempt_temp}
+                logger.warning(
+                    "review_one_cluster [%s]: response unsalvageable (empty, "
+                    "degenerate, or non-JSON) — plain retry %d/%d at the "
+                    "same max_tasks=%d (max_tokens=%d, temperature=%.2f).",
+                    cluster.name, _empty_attempts, _empty_retry_max, max_tasks,
+                    _attempt_tokens, _attempt_temp,
+                )
+            candidates, truncated, unsalvageable = _call_and_parse(max_tasks, **_call_kwargs)
+
+        if candidates is not None and truncated:
+            # Shrink-retries exhausted (or disabled via
+            # truncation_retry_max=0) and the LAST attempt was still
+            # truncated — keep whatever got salvaged rather than
+            # discarding it outright; this matches the pre-AUTO-H4
+            # fail-open behaviour for the final attempt.
+            logger.warning(
+                "review_one_cluster [%s]: still truncated after %d shrink-retry "
+                "attempt(s) (max_tasks=%d) — keeping %d salvaged candidate(s).",
+                cluster.name, _shrink_attempts, max_tasks, len(candidates),
+            )
+        if candidates is not None and unsalvageable:
+            # Plain retries exhausted (or disabled via
+            # empty_response_retry_max=0) and the response is still
+            # unsalvageable — nothing to keep this time; fail open with 0
+            # candidates for this batch, same as the pre-AUTO-H5 behaviour,
+            # but only after actually trying instead of giving up on the
+            # first empty/garbage reply.
+            logger.warning(
+                "review_one_cluster [%s]: still unsalvageable after %d plain "
+                "retry attempt(s) — giving up on this batch with 0 candidates.",
+                cluster.name, _empty_attempts,
+            )
+
+        return candidates
 
     def _parse_candidates(
         self, text: str, cluster_name: str, cluster_files: "list[str] | None" = None
@@ -854,6 +1100,46 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
         logged and dropped.  Any parse error is logged and returns [].
 
         Fail-closed: never returns a partially-constructed candidate on error.
+
+        Thin backward-compatible wrapper around :meth:`_parse_candidates_ex`,
+        which additionally reports whether the JSON array looked truncated
+        (AUTO-H4 shrink-retry) or was unsalvageable garbage/empty (AUTO-H5
+        plain retry). Kept separate so existing callers (tests included)
+        that only want the candidate list don't need to unpack a tuple.
+        """
+        candidates, _truncated, _unsalvageable = self._parse_candidates_ex(
+            text, cluster_name, cluster_files,
+        )
+        return candidates
+
+    def _parse_candidates_ex(
+        self, text: str, cluster_name: str, cluster_files: "list[str] | None" = None
+    ) -> "tuple[list[CandidateTask], bool, bool]":
+        """Same parsing as :meth:`_parse_candidates`, additionally returning
+        two failure-classification flags consumed by ``_review_one_cluster``:
+
+        ``truncated`` (AUTO-H4): the raw text looked like a JSON array cut
+        off mid-object (at least one complete object was salvaged via
+        ``_salvage_json_objects`` from an otherwise-unparseable tail). This
+        means the model tried to fit more into this response than its
+        output-token budget allowed — shrinking ``max_tasks`` and re-asking
+        is the appropriate fix.
+
+        ``unsalvageable`` (AUTO-H5): the raw text was NOT valid JSON and
+        NOTHING could be salvaged from it at all — an empty response, a
+        degenerate/repetitive non-JSON ramble, or valid JSON that wasn't
+        even a list. This is a different failure mode from truncation:
+        there's no partial content to blame on a tight token budget, so
+        shrinking ``max_tasks`` wouldn't address it — a plain retry of the
+        SAME request is the appropriate fix, since it's often a one-off
+        decoding hiccup (or, over a flaky proxy/router, a genuinely empty
+        upstream response) rather than a structural budget problem.
+
+        The two flags are mutually exclusive: ``truncated`` implies at
+        least one usable candidate was salvaged; ``unsalvageable`` implies
+        zero. A clean parse (including a clean, validly-empty ``"[]"``
+        response — the model legitimately found nothing to propose) sets
+        both to ``False`` and must NOT be retried by either mechanism.
         """
         # Strip optional markdown code fences the model may emit despite instructions.
         stripped = text.strip()
@@ -865,6 +1151,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 inner_lines = inner_lines[:-1]
             stripped = "\n".join(inner_lines).strip()
 
+        truncated = False
         try:
             data = json.loads(stripped)
         except json.JSONDecodeError as exc:
@@ -875,6 +1162,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
             # finish and drop only the truncated tail.
             salvaged = _salvage_json_objects(stripped)
             if salvaged:
+                truncated = True
                 logger.warning(
                     "_parse_candidates [%s]: array was truncated (%s) — "
                     "salvaged %d complete task object(s) from the prefix.",
@@ -882,18 +1170,29 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 )
                 data = salvaged
             else:
+                # AUTO-H5: nothing salvageable at all — an empty response
+                # (`text == ""`), a degenerate repetitive ramble that never
+                # produces one complete `{...}` object, or garbage that
+                # isn't JSON in the first place. Distinct from `truncated`
+                # above precisely because there is no partial content to
+                # build on; flagged so the caller can retry the SAME
+                # request rather than shrinking a budget that isn't the
+                # actual problem here.
                 logger.warning(
                     "_parse_candidates [%s]: JSON decode failed: %s\nRaw text: %.400s",
                     cluster_name, exc, text,
                 )
-                return []
+                return [], False, True
 
         if not isinstance(data, list):
+            # Valid JSON, but not the array shape we asked for (e.g. a bare
+            # object or string) — equally unsalvageable: there is no
+            # per-item content to extract from a non-list top level.
             logger.warning(
                 "_parse_candidates [%s]: expected JSON array, got %s",
                 cluster_name, type(data).__name__,
             )
-            return []
+            return [], False, True
 
         candidates: list[CandidateTask] = []
         for i, item in enumerate(data):
@@ -1058,7 +1357,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 )
                 candidates = candidates[:cap]
 
-        return candidates
+        return candidates, truncated, False
 
     def _build_file_contents(self, files: list[str], base_dir: Path) -> str:
         """Read and annotate file contents for the prompt.

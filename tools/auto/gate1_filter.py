@@ -55,13 +55,18 @@ from __future__ import annotations
 import configparser
 import json
 import logging
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from tools.agent_trace import tracer
 from tools.auto.architect import CandidateTask
-from tools.auto.gate1_grounding import callee_context, config_fallback_note, target_file_context
+from tools.auto.gate1_grounding import (
+    callee_context, config_fallback_note, target_file_context,
+    collect_contract_note, existing_test_coverage_note, truncation_safety_note,
+    intentional_design_note, test_helper_note,
+)
 from tools.block_extractor import extract_block, extract_module_docstring
 import tools.llm_stream as _llm_stream
 from tools.llm_stream import strip_think
@@ -75,6 +80,16 @@ _SYSTEM_PROMPT_CODE = (
     "You will be shown a code excerpt and a description of a claimed problem. "
     "Your ONLY job is to verify whether the described problem is actually present "
     "in the code shown, and has NOT already been fixed. "
+    "GATE1-CTX-4: look specifically for existing try/except blocks, "
+    "error-handling comments (e.g. 'fail-open', 'noqa: BLE001'), or tests "
+    "already covering the claim, in the code shown and any grounding notes "
+    "below it — a claim about missing error handling or missing test "
+    "coverage is REJECTED if that handling/coverage already exists. "
+    "A confident, specific-sounding claim is not evidence — plan-generating "
+    "models regularly reference the wrong function, describe a bug a nearby "
+    "comment already documents as fixed, or restate what a docstring/comment "
+    "says instead of what the code does. Trust only what you can quote "
+    "verbatim from the code block. "
     "Do NOT suggest improvements. Do NOT run the code. "
     "Return ONLY a JSON object — no prose, no markdown fences, no preamble."
 )
@@ -85,6 +100,8 @@ _SYSTEM_PROMPT_DOCS = (
     "Your ONLY job is to verify whether the described problem is actually present "
     "in the text shown, and has NOT already been fixed. "
     "Do NOT suggest improvements. Treat the content as documentation, not code. "
+    "Trust only what you can quote verbatim from the text shown, not how "
+    "confident the claim sounds. "
     "Return ONLY a JSON object — no prose, no markdown fences, no preamble."
 )
 
@@ -94,6 +111,8 @@ _SYSTEM_PROMPT_CREATIVE = (
     "Your ONLY job is to verify whether the described issue is actually present "
     "in the text shown, and has NOT already been addressed. "
     "Do NOT suggest improvements. Treat the content as creative writing, not code. "
+    "Trust only what you can quote verbatim from the text shown, not how "
+    "confident the claim sounds. "
     "Return ONLY a JSON object — no prose, no markdown fences, no preamble."
 )
 
@@ -122,8 +141,19 @@ Code at that location:
 Is the claimed problem actually present in the code shown above, \
 and NOT already fixed?
 
-Return ONLY this JSON (no extra keys):
-{{"verdict": "confirmed" | "rejected", "reason": "<one sentence explaining your decision>"}}
+Before answering, find the SPECIFIC line(s) in the code above that the \
+claim depends on. If you cannot point to an actual line that supports the \
+claim, the claim is not present — reject it, even if the instruction \
+sounds confident, cites a bug-tracker ID, or references a comment near \
+the code (a comment describing a bug is not evidence the bug is still \
+unfixed — check the code the comment sits next to, not just the comment).
+
+Return ONLY this JSON (no extra keys). "evidence" is REQUIRED whenever \
+verdict is "confirmed" — a substring copied verbatim from the code block \
+above that proves the claim; use "" only when rejecting:
+{{"verdict": "confirmed" | "rejected", "evidence": "<exact verbatim \
+substring from the code block above, or "" if rejecting>", \
+"reason": "<one sentence explaining your decision>"}}
 """
 
 # _MAX_CONTEXT_LINES and _MAX_BLOCK_CHARS are now read from [gate1] in
@@ -186,6 +216,49 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         Whether to verify the server's TLS certificate.
     """
 
+    # Max extra nudge-retries when the presence-check verdict comes back
+    # unparseable (bad JSON / missing "verdict" field), before failing
+    # closed on the task. Previously hardcoded to a single retry, then 5.
+    # AUTO-RETRY-TEMP-1: with _UNPARSEABLE_TEMPERATURES having 2 entries,
+    # 6 is deliberately an even multiple of that — every token tier the
+    # ladder reaches gets BOTH temperatures tried (0.0 then 0.1) before
+    # escalating further, including the last one; an odd max would leave
+    # the final tier's second temperature untried.
+    _UNPARSEABLE_MAX_RETRIES = 6
+
+    # Empty raw='' responses on retry are usually a thinking model (e.g.
+    # qwen3) burning its whole max_tokens budget on <think> and never
+    # reaching the JSON answer. Each token TIER doubles the budget so
+    # there's real headroom left after the thinking trace.
+    #
+    # The floor and ceiling are NOT derived from self._max_tokens: a
+    # small configured max_tokens (e.g. 512) is exactly the thing causing
+    # the truncation, so multiplying it stays small too (512 -> 768 ->
+    # 1024 -> ... was observed live and never escaped the failure). The
+    # ceiling instead tracks self._num_ctx (the model's actual context
+    # profile — e.g. 128k), since that's the real budget available.
+    _UNPARSEABLE_TOKENS_FLOOR = 4096
+    _UNPARSEABLE_TOKENS_STEP_MULT = 2.0
+    _UNPARSEABLE_TOKENS_DEFAULT_CEILING = 32768
+    _UNPARSEABLE_TOKENS_CTX_FRACTION = 0.5
+    # AUTO-RETRY-TEMP-1: fixed, ABSOLUTE temperatures tried at EACH token
+    # tier before escalating to the next tier — deliberately NOT computed
+    # relative to the configured base temperature (subtracting a step
+    # from an already-0.0 base is a no-op forever, which is exactly the
+    # bug this replaces: confirmed live, a [gate1_llm] temperature=0.0
+    # profile produced byte-for-byte IDENTICAL broken JSON on every one
+    # of 5 retries, because at temp=0.0 the model is deterministic and
+    # more max_tokens alone doesn't change tokens the model already
+    # committed to earlier in the same greedy decode — only a genuinely
+    # different sampling temperature can escape a deterministic dead end
+    # like a repeated escaping mistake). Retry-recovery mode uses its own
+    # low, fixed schedule regardless of what temperature the happy path
+    # was configured with. Each token tier is tried once at EVERY value
+    # in this tuple, in order, before the tier doubles — e.g. with the
+    # default (0.0, 0.1) and 5 total attempts: (4096, 0.0), (4096, 0.1),
+    # (8192, 0.0), (8192, 0.1), (16384, 0.0).
+    _UNPARSEABLE_TEMPERATURES = (0.0, 0.1)
+
     def __init__(
         self,
         config: configparser.ConfigParser,
@@ -195,15 +268,40 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         api_format: str = "openai",
         verify_ssl: bool = True,
         task_mode: str = "code",
+        collect_bridge=None,
     ) -> None:
         super().__init__(config, base_url, api_key, model, api_format, verify_ssl)
         self._task_mode  = task_mode
+        # GATE1-CTX-1/-2: tools.auto.collect_bridge.CollectBridge or None.
+        # Feeds two additive grounding notes (collect contracts, existing
+        # test coverage) in _build_grounding_notes — see that method.
+        self._collect_bridge = collect_bridge
 
         sec = "gate1"
         self._temperature    = float(config.get(sec, "temperature", fallback="0.0"))
         self._max_tokens     = int(config.get(sec, "max_tokens",   fallback="512"))
         self._skip_llm       = config.getboolean(sec, "skip_llm", fallback=False)
         self._timeout        = float(config.get("loop", "timeout_seconds", fallback="300"))
+        # AUTO-RETRY-BACKOFF-1: how many extra attempts (after the first)
+        # a plain LLM-call EXCEPTION (network error, HTTP 4xx/5xx that
+        # bubbled up as an exception — NOT an unparseable-but-received
+        # verdict, which has its own separate _UNPARSEABLE_MAX_RETRIES
+        # escalation above) gets before this candidate fails closed as a
+        # technical failure. Previously hardcoded to a single immediate
+        # retry with no wait at all — real field reports showed brief
+        # provider outages (a few consecutive HTTP 400/5xx) outlasting
+        # that single instant retry, and every candidate hit during the
+        # outage window was marked REJECTED — indistinguishable in
+        # plan.json from a genuine "already fixed" verdict unless someone
+        # manually re-read the run log (see _is_technical_failure and its
+        # use in plan_validator.py, which now excludes exactly these
+        # failures from ever removing a task from plan.json — this retry
+        # budget exists to make hitting that safety net less common in
+        # the first place, not instead of it).
+        self._llm_call_retry_max = max(0, config.getint(
+            sec, "llm_call_retry_max", fallback=3))
+        self._llm_call_retry_wait_sec = max(0.0, float(config.get(
+            sec, "llm_call_retry_wait_sec", fallback="60")))
         self._max_context_lines = int(config.get(sec, "max_context_lines", fallback=str(_DEFAULT_MAX_CONTEXT_LINES)))
         self._max_block_chars   = int(config.get(sec, "max_block_chars",   fallback=str(_DEFAULT_MAX_BLOCK_CHARS)))
         # AUTO-FIX: Gate 1's presence check wants a tiny, deterministic JSON
@@ -218,6 +316,32 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         # num_ctx controls the total context window on Ollama; 0 means "use server default".
         _active = config.get("api", "active", fallback="local")
         self._num_ctx = config.getint(f"api_{_active}", "num_ctx", fallback=0)
+        # AUTO-JSONMODE-1: single GLOBAL switch (not per-[gate1]) — read
+        # from [api], same section that already governs `active` above, so
+        # one ini flag covers every LLM call this project makes. Default
+        # false: current best-effort JSON parsing/salvage behaviour is
+        # unchanged unless a user opts in. When true, every call this class
+        # makes asks the endpoint to enforce valid JSON at the engine level
+        # (see build_chat_request's *response_format* parameter); if that
+        # endpoint doesn't support it, request_completion() detects the
+        # HTTP 400, logs a loud warning, and falls back to today's
+        # behaviour for the rest of the run — no action needed here.
+        self._response_format = config.getboolean("api", "response_format", fallback=False)
+        # AUTO-THINKDEPTH-1: single GLOBAL switch + depth value, same
+        # pattern as [api] response_format above — off by default, so
+        # existing [gate1] think = true/false on/off behaviour (self._think
+        # above) is completely unaffected unless a user opts in. When on,
+        # a reasoning-depth hint ("low"/"medium"/"high", whatever the
+        # target model recognises) is forwarded alongside think=True; has
+        # no effect at all when self._think is False. If the endpoint
+        # doesn't support the depth value, build_chat_request/
+        # request_completion detect it, log a loud warning, and fall back
+        # to plain think on/off for the rest of the run.
+        self._think_effort = (
+            config.get("api", "think_effort", fallback="").strip()
+            if config.getboolean("api", "think_effort_enabled", fallback=False)
+            else None
+        ) or None
 
         # ── DM-3: select system prompt based on task_mode + ini overrides ─────
         # Priority: mode-specific ini key > legacy "system" key > built-in constant.
@@ -227,6 +351,157 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         else:
             built_in = _SYSTEM_PROMPTS.get(task_mode, _SYSTEM_PROMPT_CODE)
             self._system = config.get(sec, "system", fallback=built_in).strip()
+
+        self._init_presence_provider(config, sec, base_url, api_key, model,
+                                      api_format, verify_ssl)
+
+    # GATE1-PROVIDER-2: split out of __init__ (rather than inlined) so the
+    # provider-selection logic — the part with the actual "which section
+    # wins" decisions — has one clear entry/exit point to read and to test
+    # against, instead of being interleaved with the dozen unrelated
+    # [gate1] scalar reads above it.
+    def _init_presence_provider(
+        self, config: configparser.ConfigParser, sec: str,
+        base_url: str, api_key: str, model: str, api_format: str,
+        verify_ssl: bool,
+    ) -> None:
+        """Resolve which provider/model the presence check (`_check_presence`,
+        the only LLM call Gate1Filter makes — existence checks are pure
+        filesystem/AST and never touch an LLM) actually talks to, and populate
+        ``self._presence_*``.
+
+        Two modes, selected by ``[gate1] presence_llm_profile``:
+
+        - **Unset (default)** — ``self._presence_*`` are exact copies of the
+          constructor-passed ``base_url``/``api_key``/``model``/``api_format``
+          and this instance's own ``think``/``temperature``/``max_tokens``/
+          ``num_ctx`` ([gate1]) and ``response_format``/``think_effort``
+          (global [api], AUTO-JSONMODE-1 / AUTO-THINKDEPTH-1). Byte-for-byte
+          the pre-existing behaviour; nothing about a config file without
+          this key changes.
+
+        - **Set to a section name** (e.g. ``presence_llm_profile = gate1_llm``)
+          — presence-check calls instead use THAT section's own
+          ``base_url``/``api_key``/``model`` (required — raises a clear
+          ``ValueError`` naming the missing key(s) rather than silently
+          falling back to the shared provider, since silently reusing a
+          different provider's credential against a URL it was never meant
+          for is a worse failure than a loud one at startup) and
+          ``api_format``/``verify_ssl`` (optional, default ``"openai"`` /
+          ``True``).
+
+          ``think``/``temperature``/``max_tokens``/``num_ctx``/
+          ``response_format``/``think_effort_enabled``+``think_effort`` are
+          each read from the PROFILE section first; any one the profile
+          doesn't set falls back to THIS instance's own resolved value
+          (``self._think`` etc., ``self._response_format``,
+          ``self._think_effort``) — never to a hardcoded default and never
+          to a different profile's value. This is the crux of the "don't
+          conflict with another model's saved settings" requirement: a
+          profile tuned for a thinking-capable model (``think = true``) and
+          the default non-thinking ``[gate1]`` setting coexist without
+          either bleeding into the other; a profile for a provider that
+          doesn't support enforced JSON mode can set
+          ``response_format = false`` even while the global ``[api]
+          response_format = true`` switch is on for every other caller; and
+          two DIFFERENT profiles never share settings with each other
+          either — each is read independently, from its own section, every
+          time.
+
+        The module-level ``(url, model)``-keyed "does this endpoint accept
+        field X" memories (see ``tools.llm_stream.
+        mark_reasoning_field_unsupported`` and its three siblings for
+        response_format / think_effort / think_depth) already give the
+        presence profile's own (possibly different) url+model an
+        independent verdict from whatever the shared provider's url+model
+        has recorded — no extra wiring needed here for that part.
+        """
+        profile_name = config.get(sec, "presence_llm_profile", fallback="").strip()
+        if not profile_name:
+            self._presence_base_url      = self._base_url
+            self._presence_api_key       = self._api_key
+            self._presence_model         = self._model
+            self._presence_api_format    = self._api_format
+            self._presence_ssl_context   = self._ssl_context
+            self._presence_think         = self._think
+            self._presence_temperature   = self._temperature
+            self._presence_max_tokens    = self._max_tokens
+            self._presence_num_ctx       = self._num_ctx
+            self._presence_response_format = self._response_format
+            self._presence_think_effort  = self._think_effort
+            # AUTO-PRESENCE-LOG-1: field report — a run's presence-check
+            # requests went to a URL that matched neither [api_*] section
+            # in the config the user was looking at, and there was no way
+            # to tell from the log alone whether presence_llm_profile was
+            # even in effect for that run without reverse-engineering it
+            # from request URLs buried in a much larger log. One clear
+            # line at startup removes the guesswork.
+            logger.info(
+                "Gate1Filter: presence-check provider = %s (%s) — shared "
+                "provider (no presence_llm_profile configured)",
+                self._presence_base_url, self._presence_model,
+            )
+            return
+
+        if not config.has_section(profile_name):
+            raise ValueError(
+                f"[gate1] presence_llm_profile = {profile_name!r} but the "
+                f"config has no [{profile_name}] section. Add one with at "
+                f"least base_url/api_key/model, or remove "
+                f"presence_llm_profile to use the shared provider."
+            )
+        required = [k for k in ("base_url", "api_key", "model")
+                    if not config.has_option(profile_name, k)]
+        if required:
+            raise ValueError(
+                f"[{profile_name}] (gate1 presence_llm_profile) is missing "
+                f"required option(s): {', '.join(required)}. A presence "
+                f"profile must fully specify its own connection details — "
+                f"it never silently inherits base_url/api_key/model from "
+                f"the shared provider, since that could send a different "
+                f"provider's credential to the wrong host."
+            )
+        self._presence_base_url   = config.get(profile_name, "base_url").rstrip("/")
+        self._presence_api_key    = config.get(profile_name, "api_key")
+        self._presence_model      = config.get(profile_name, "model")
+        self._presence_api_format = config.get(profile_name, "api_format", fallback="openai")
+        _verify_ssl = config.getboolean(profile_name, "verify_ssl", fallback=verify_ssl)
+        self._presence_ssl_context = (
+            _llm_stream.make_unverified_context() if not _verify_ssl else None
+        )
+        # Each falls back to THIS instance's own resolved value when the
+        # profile doesn't set it — deliberately never a hardcoded
+        # True/False/0/None default, and never another profile's value:
+        # fallback is always "what this Gate1Filter instance itself
+        # resolved", scoped to this one instance.
+        self._presence_think = config.getboolean(
+            profile_name, "think", fallback=self._think)
+        self._presence_temperature = float(config.get(
+            profile_name, "temperature", fallback=str(self._temperature)))
+        self._presence_max_tokens = int(config.get(
+            profile_name, "max_tokens", fallback=str(self._max_tokens)))
+        self._presence_num_ctx = config.getint(
+            profile_name, "num_ctx", fallback=self._num_ctx)
+        self._presence_response_format = config.getboolean(
+            profile_name, "response_format", fallback=self._response_format)
+        if config.has_option(profile_name, "think_effort_enabled"):
+            _profile_effort_enabled = config.getboolean(
+                profile_name, "think_effort_enabled")
+            self._presence_think_effort = (
+                config.get(profile_name, "think_effort", fallback="").strip()
+                if _profile_effort_enabled else None
+            ) or None
+        else:
+            self._presence_think_effort = self._think_effort
+
+        # AUTO-PRESENCE-LOG-1: see the no-profile branch's sibling log
+        # above — this is the other exit point, so both cases always log
+        # exactly which provider presence-check calls will actually hit.
+        logger.info(
+            "Gate1Filter: presence-check provider = %s (%s) — via "
+            "presence_llm_profile = [%s]",
+            self._presence_base_url, self._presence_model, profile_name,
+        )
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -608,7 +883,16 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         if fb_note:
             notes.append(fb_note)
 
+        id_note = intentional_design_note(code_block)
+        if id_note:
+            notes.append(id_note)
+
         loc = candidate.cited_location
+
+        th_note = test_helper_note(loc.file, loc.symbol)
+        if th_note:
+            notes.append(th_note)
+
         if base_dir is not None and not loc.new_file:
             try:
                 tf_note = target_file_context(
@@ -639,6 +923,32 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             if cc_note:
                 notes.append(cc_note)
 
+        # GATE1-CTX-1: collect-derived static contract for the cited symbol.
+        try:
+            contract_note = collect_contract_note(self._collect_bridge, loc.symbol)
+        except Exception as exc:  # noqa: BLE001 — best-effort, never fatal
+            logger.warning("Gate1._build_grounding_notes: collect_contract_note failed (%s) — skipping", exc)
+            contract_note = None
+        if contract_note:
+            notes.append(contract_note)
+
+        # GATE1-CTX-2: existing test coverage for the cited module, from
+        # collect's test_map — surfaces coverage even when the citation
+        # itself is the SOURCE file, not a test file.
+        try:
+            coverage_note = existing_test_coverage_note(self._collect_bridge, loc.file)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Gate1._build_grounding_notes: existing_test_coverage_note failed (%s) — skipping", exc)
+            coverage_note = None
+        if coverage_note:
+            notes.append(coverage_note)
+
+        # GATE1-CTX-3: flag a truncated code_block explicitly rather than
+        # relying on the model to notice the in-band "...[truncated]" marker.
+        trunc_note = truncation_safety_note(code_block)
+        if trunc_note:
+            notes.append(trunc_note)
+
         if not notes:
             return ""
         return "\n" + "\n\n".join(notes) + "\n"
@@ -650,6 +960,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         *,
         module_docstring: str = "",
         base_dir: "Path | None" = None,
+        _sleep_fn=None,
     ) -> tuple[bool, str]:
         """Call the LLM to confirm the claimed problem is present.
 
@@ -664,9 +975,18 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             (the default) skips this lookup entirely — every existing
             caller that doesn't pass it gets identical behavior to before
             this parameter existed.
+        _sleep_fn:
+            Injected in tests to replace ``time.sleep`` with something
+            that doesn't actually block — see AUTO-RETRY-BACKOFF-1 below.
+            ``None`` (the default) uses the real ``time.sleep``.
 
         Returns (confirmed: bool, reason: str).
-        Fail-closed: any error → (False, reason).
+        Fail-closed: any error → (False, reason), after
+        ``self._llm_call_retry_max`` retries of the LLM call itself (see
+        AUTO-RETRY-BACKOFF-1 below), each separated by a real
+        ``self._llm_call_retry_wait_sec``-second pause — a transient
+        network/provider outage gets a real chance to clear before the
+        candidate is treated as resolved.
         """
         loc = candidate.cited_location
         location_str = _location_str(loc)
@@ -682,19 +1002,29 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             grounding_notes=grounding_notes,
         )
 
-        def _call(msg: str) -> str:
+        def _call(
+            msg: str,
+            *,
+            max_tokens: "int | None" = None,
+            temperature: "float | None" = None,
+        ) -> str:
             url, headers, payload = _llm_stream.build_chat_request(
-                base_url=self._base_url, api_key=self._api_key, model=self._model,
-                api_format=self._api_format, temperature=self._temperature,
-                max_tokens=self._max_tokens, system=self._system, user_msg=msg,
-                num_ctx=self._num_ctx, think=self._think,
+                base_url=self._presence_base_url, api_key=self._presence_api_key,
+                model=self._presence_model,
+                api_format=self._presence_api_format,
+                temperature=self._presence_temperature if temperature is None else temperature,
+                max_tokens=self._presence_max_tokens if max_tokens is None else max_tokens,
+                system=self._system, user_msg=msg,
+                num_ctx=self._presence_num_ctx, think=self._presence_think,
+                response_format=self._presence_response_format,
+                think_effort=self._presence_think_effort,
             )
             tracer.event(
                 source="gate1",
                 target="llm",
                 kind="llm_request",
                 content=msg,
-                params={"model": self._model, "candidate": candidate.title},
+                params={"model": self._presence_model, "candidate": candidate.title},
             )
             text = _llm_stream.request_completion(
                 url=url,
@@ -702,8 +1032,8 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                 payload=payload,
                 timeout=self._timeout,
                 stream=True,
-                api_format=self._api_format,
-                ssl_context=self._ssl_context,
+                api_format=self._presence_api_format,
+                ssl_context=self._presence_ssl_context,
             )
             cleaned = strip_think(text)
             tracer.event(
@@ -715,54 +1045,149 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             )
             return cleaned
 
-        try:
-            cleaned = _call(user_msg)
-        except Exception as exc:
-            reason = f"LLM call failed: {exc}"
+        # AUTO-RETRY-BACKOFF-1 (field report: agents_128k.ini + kenari.id
+        # returned HTTP 400 "upstream_rejected" for three consecutive
+        # candidates within one second — a provider/config-level outage,
+        # not a judgment that the code was already fixed; a later report
+        # showed the SAME pattern against a different provider ("api.ai")
+        # outlasting a single instant retry). Previously a single
+        # immediate retry with no wait — not enough for an outage that
+        # takes longer than an instant to clear. Each retry after the
+        # first sleeps self._llm_call_retry_wait_sec seconds first, giving
+        # a real window for the provider to recover. Still fail-closed —
+        # returns (False, reason) after all retries are exhausted — but
+        # plan_validator.py's removal logic (AUTO-REMOVE-GUARD-1) now
+        # never lets a technical failure like this one actually delete a
+        # task from plan.json; this retry budget exists to make hitting
+        # that safety net less common in the first place, not instead of
+        # it.
+        sleep = _sleep_fn or time.sleep
+        last_exc: "Exception | None" = None
+        cleaned = ""
+        for attempt in range(self._llm_call_retry_max + 1):
+            if attempt > 0:
+                logger.warning(
+                    "Gate1._check_presence [%s]: LLM call failed (%s) — "
+                    "retrying in %.0fs (attempt %d/%d).",
+                    candidate.title, last_exc, self._llm_call_retry_wait_sec,
+                    attempt, self._llm_call_retry_max,
+                )
+                sleep(self._llm_call_retry_wait_sec)
+            try:
+                cleaned = _call(user_msg)
+                last_exc = None
+                break
+            except Exception as exc:
+                last_exc = exc
+        if last_exc is not None:
+            # NOTE: must keep the exact "LLM call failed:" prefix (see
+            # _is_technical_failure below) so this still logs at WARNING
+            # like any other real anomaly, not INFO like a routine
+            # rejection.
+            reason = f"LLM call failed: {last_exc} (after {self._llm_call_retry_max} retries)"
             logger.warning("Gate1._check_presence: %s — failing closed", reason)
             tracer.event(
                 source="gate1", target="llm", kind="llm_response",
-                content=f"[ERROR] {exc}", params={"candidate": candidate.title},
+                content=f"[ERROR] {last_exc}", params={"candidate": candidate.title},
             )
             return False, reason
 
-        confirmed, reason, unparseable = self._parse_presence_response(cleaned, candidate.title)
+        confirmed, reason, unparseable = self._parse_presence_response(
+            cleaned, candidate.title, code_block=code_block,
+        )
 
         # AUTO-CR-31-style re-ask: an unparseable verdict (bad JSON, wrong
         # shape, unrecognised verdict word — as opposed to a genuine
         # "rejected") is often a thinking-model (e.g. qwen3) truncated
-        # mid-<think> by a small max_tokens, not an actual answer. One
-        # retry with a hard nudge, capped at a single extra call, before
-        # falling back to fail-closed.
+        # mid-<think> by a small max_tokens, not an actual answer. Retry
+        # with a hard nudge up to _UNPARSEABLE_MAX_RETRIES extra calls
+        # before falling back to fail-closed.
         if unparseable:
-            logger.info(
-                "Gate1._check_presence [%s]: verdict unparseable — "
-                "re-asking once. raw=%r", candidate.title, cleaned[:120],
-            )
             nudge = (
                 "\n\nIMPORTANT: your previous reply was not valid JSON with a "
                 "\"verdict\" field. Reply AGAIN with ONLY a JSON object of the "
                 "exact form {\"verdict\": \"confirmed\" or \"rejected\", "
-                "\"reason\": \"...\"} — no reasoning, no markdown fences, no "
-                "other text."
+                "\"evidence\": \"...\" or \"\", \"reason\": \"...\"} — no "
+                "reasoning, no markdown fences, no other text."
             )
-            try:
-                cleaned2 = _call(user_msg + nudge)
-            except Exception as exc:
-                logger.warning(
-                    "Gate1._check_presence [%s]: re-ask failed (%s) — "
-                    "keeping original fail-closed result.", candidate.title, exc,
+            last_confirmed, last_reason, last_cleaned = confirmed, reason, cleaned
+            # Ceiling tracks the model's real context profile (num_ctx),
+            # not the (possibly tiny) configured max_tokens — e.g. a
+            # 128k-context profile should be allowed to actually use a
+            # meaningful chunk of that on a stuck retry, not just a few
+            # hundred tokens more than a small default.
+            ctx_ceiling = (
+                int(self._presence_num_ctx * self._UNPARSEABLE_TOKENS_CTX_FRACTION)
+                if self._presence_num_ctx
+                else self._UNPARSEABLE_TOKENS_DEFAULT_CEILING
+            )
+            _n_temps = len(self._UNPARSEABLE_TEMPERATURES)
+            for attempt in range(1, self._UNPARSEABLE_MAX_RETRIES + 1):
+                # AUTO-RETRY-TEMP-1: 2-D grid — every temperature in
+                # _UNPARSEABLE_TEMPERATURES is tried at the CURRENT token
+                # tier before the tier doubles. tier_index and temp_index
+                # both derive from the same attempt counter, so this
+                # needs no extra state beyond the loop variable itself.
+                tier_index = (attempt - 1) // _n_temps
+                temp_index = (attempt - 1) % _n_temps
+                _uncapped_tokens = (
+                    self._UNPARSEABLE_TOKENS_FLOOR
+                    * int(self._UNPARSEABLE_TOKENS_STEP_MULT ** tier_index)
                 )
-                return confirmed, reason
-            confirmed2, reason2, unparseable2 = self._parse_presence_response(
-                cleaned2, candidate.title,
-            )
-            if not unparseable2:  # second answer was clear — use it
-                return confirmed2, reason2
+                attempt_tokens = min(_uncapped_tokens, ctx_ceiling)
+                if attempt_tokens < _uncapped_tokens:
+                    # AUTO-CTX-CAP-WARN-1: a stale/small num_ctx silently
+                    # capping escalation below what it should be has
+                    # bitten in the field more than once — this makes
+                    # the cap itself loud and actionable instead of
+                    # something only visible by reverse-engineering the
+                    # token numbers in the log by hand.
+                    logger.warning(
+                        "Gate1._check_presence [%s]: escalation wants "
+                        "max_tokens=%d but is capped at %d by "
+                        "num_ctx=%s (ceiling = num_ctx * %.1f). If this "
+                        "model's real context window is bigger, raise "
+                        "num_ctx in the active [api_*] section (or this "
+                        "candidate's presence_llm_profile) to let "
+                        "escalation actually use it.",
+                        candidate.title, _uncapped_tokens, attempt_tokens,
+                        self._presence_num_ctx or "unset",
+                        self._UNPARSEABLE_TOKENS_CTX_FRACTION,
+                    )
+                attempt_temp = self._UNPARSEABLE_TEMPERATURES[temp_index]
+                logger.info(
+                    "Gate1._check_presence [%s]: verdict unparseable — "
+                    "re-asking (attempt %d/%d, max_tokens=%d, temperature=%.2f). "
+                    "raw=%r",
+                    candidate.title, attempt, self._UNPARSEABLE_MAX_RETRIES,
+                    attempt_tokens, attempt_temp, last_cleaned[:120],
+                )
+                try:
+                    cleaned_n = _call(
+                        user_msg + nudge,
+                        max_tokens=attempt_tokens,
+                        temperature=attempt_temp,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Gate1._check_presence [%s]: re-ask attempt %d/%d "
+                        "failed (%s) — keeping last fail-closed result.",
+                        candidate.title, attempt, self._UNPARSEABLE_MAX_RETRIES, exc,
+                    )
+                    return last_confirmed, last_reason
+                confirmed_n, reason_n, unparseable_n = self._parse_presence_response(
+                    cleaned_n, candidate.title, code_block=code_block,
+                )
+                if not unparseable_n:  # this answer was clear — use it
+                    return confirmed_n, reason_n
+                last_confirmed, last_reason, last_cleaned = confirmed_n, reason_n, cleaned_n
+
             logger.warning(
                 "Gate1._check_presence [%s]: verdict still unparseable after "
-                "one retry — failing closed. raw=%r", candidate.title, cleaned2[:120],
+                "%d retries — failing closed. raw=%r",
+                candidate.title, self._UNPARSEABLE_MAX_RETRIES, last_cleaned[:120],
             )
+            return last_confirmed, last_reason
 
         return confirmed, reason
 
@@ -770,6 +1195,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         self,
         text: str,
         candidate_title: str,
+        code_block: str = "",
     ) -> tuple[bool, str, bool]:
         """Parse the LLM's JSON verdict.  Fail-closed on any error.
 
@@ -780,6 +1206,22 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         parse failure. Callers use this distinction to re-ask once on
         ``unparseable`` (mirroring AUTO-CR-31's Gate-2 retry) without
         biasing genuinely-rejected candidates toward acceptance.
+
+        AUTO-H3 (evidence check): whenever *code_block* is non-empty (every
+        production call site always passes it — the only caller that
+        doesn't is a direct-unit-test call with no code to check against),
+        a "confirmed" verdict is additionally required to supply a
+        non-empty ``"evidence"`` string that actually occurs in
+        *code_block* (whitespace-normalised substring match). This check is
+        unconditional on the key being present at all — the prompt template
+        in this module always asks for "evidence" in its JSON schema, so a
+        model that omits the key entirely is exhibiting the exact same
+        failure to ground its answer as one that fills it with a fabricated
+        quote, and both are treated identically as a downgrade to
+        rejection rather than as a formatting nuance eligible for the
+        unparseable/re-ask path — the JSON shape was fine, the model just
+        couldn't back up its own answer, which is itself the informative
+        outcome.
         """
         stripped = text.strip()
         # Strip optional markdown fences.
@@ -793,22 +1235,60 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         try:
             data = json.loads(stripped)
         except json.JSONDecodeError as exc:
-            reason = f"JSON decode failed ({exc}) — failing closed"
-            logger.warning(
-                "Gate1._parse_presence_response [%s]: %s  raw=%.200s",
-                candidate_title, reason, text,
-            )
-            return False, reason, True
+            # AUTO-CTRLCHAR-1: field report — the model sometimes pastes a
+            # multi-line docstring straight into a string value (e.g.
+            # "evidence") with a literal newline instead of an escaped
+            # "\n". Strict JSON forbids raw control characters inside
+            # strings, so this is REJECTED here even though it's not a
+            # truncation problem (more max_tokens is a no-op) and not
+            # reliably a sampling problem either (a different temperature
+            # can still copy the exact same substring from the
+            # deterministic source shown to the model, hitting this same
+            # failure again on retry). Retry json.loads with strict=False,
+            # which accepts literal control characters inside strings per
+            # Python's documented relaxation of the JSON spec, before
+            # giving up. This only recovers the *encoding* of characters
+            # that were already going to be in the string — it doesn't
+            # change which keys/values are present, so the AUTO-H3
+            # evidence-substring check below still applies unchanged.
+            try:
+                data = json.loads(stripped, strict=False)
+            except json.JSONDecodeError:
+                reason = f"JSON decode failed ({exc}) — failing closed"
+                logger.warning(
+                    "Gate1._parse_presence_response [%s]: %s  raw=%.200s",
+                    candidate_title, reason, text,
+                )
+                return False, reason, True
+            else:
+                logger.info(
+                    "Gate1._parse_presence_response [%s]: strict JSON "
+                    "decode failed (%s) but recovered with strict=False "
+                    "(literal control character inside a string value, "
+                    "e.g. an unescaped newline) — treating as parsed.",
+                    candidate_title, exc,
+                )
 
         if not isinstance(data, dict):
             reason = f"expected JSON object, got {type(data).__name__} — failing closed"
             logger.warning("Gate1._parse_presence_response [%s]: %s", candidate_title, reason)
             return False, reason, True
 
-        verdict = (data.get("verdict") or "").strip().lower()
-        reason  = (data.get("reason")  or "").strip()
+        verdict  = (data.get("verdict")  or "").strip().lower()
+        reason   = (data.get("reason")   or "").strip()
+        evidence = (data.get("evidence") or "").strip()
 
         if verdict == "confirmed":
+            if code_block and not _evidence_found(evidence, code_block):
+                msg = (
+                    "verdict was 'confirmed' but no matching evidence quote "
+                    f"was supplied ({evidence!r}) — treating as unsupported, "
+                    "failing closed"
+                )
+                logger.info(
+                    "Gate1._parse_presence_response [%s]: %s", candidate_title, msg,
+                )
+                return False, msg, False
             return True, reason or "LLM confirmed problem is present", False
         if verdict == "rejected":
             return False, reason or "LLM found problem absent or already fixed", False
@@ -832,6 +1312,7 @@ def filter_candidates(
     task_mode: str = "code",
     model_override: "str | None" = None,
     active_override: "str | None" = None,
+    collect_bridge=None,
 ) -> tuple[list[CandidateTask], list[FilterResult]]:
     """One-call entry point for ``AutoController`` (and ``plan_validator``).
 
@@ -861,6 +1342,13 @@ def filter_candidates(
         that module's docstring for why re-verifying with the *same* model
         that proposed a candidate is weaker evidence than an independent
         model would be.
+    collect_bridge:
+        GATE1-CTX-1/-2. A ``tools.auto.collect_bridge.CollectBridge`` (or
+        ``None``, the default) — feeds two additive grounding notes into
+        Stage B (collect-derived contracts, existing test coverage). Build
+        it once per run (same rule as COLLECT-24's own caller in
+        ``AutoController._get_collect_bridge``); never build one per
+        candidate.
 
     Returns
     -------
@@ -885,6 +1373,7 @@ def filter_candidates(
         api_format=api_fmt,
         verify_ssl=verify_ssl,
         task_mode=task_mode,
+        collect_bridge=collect_bridge,
     )
     return filt.filter(candidates, base_dir, cluster_files=cluster_files)
 
@@ -979,3 +1468,35 @@ def _truncate(text: str, max_chars: int = _DEFAULT_MAX_BLOCK_CHARS) -> str:
     if len(text) <= max_chars:
         return text
     return text[:max_chars] + f"\n... [truncated — {len(text) - max_chars} more chars]"
+
+
+# AUTO-H3: minimum evidence length before a quote counts as "real". Guards
+# against a model satisfying the letter of the requirement with something
+# trivially present everywhere (a single keyword like "def", a stray
+# punctuation mark) instead of an actual line that supports the verdict.
+_MIN_EVIDENCE_CHARS = 8
+
+
+def _evidence_found(evidence: str, code_block: str) -> bool:
+    """Whitespace-normalised substring check: does *evidence* actually
+    occur in *code_block*?
+
+    Deliberately simple (no fuzzy/edit-distance matching): the point is to
+    catch a model asserting "confirmed" with nothing behind it, not to be
+    lenient about minor formatting drift. A model that read the code
+    carefully enough to ground its verdict can copy a real line closely
+    enough to survive whitespace normalisation; a model that's pattern-
+    matching on the instruction text usually can't produce anything that
+    passes even this loose a bar.
+
+    Note this is a presence check, not a relevance check: it confirms the
+    quote is real, not that it actually supports the specific claim. It
+    closes the "confirmed with a fabricated citation" hole; it does not by
+    itself prove the citation is on-topic — that judgment still rests with
+    the LLM and the surrounding grounding notes.
+    """
+    ev = " ".join(evidence.split())
+    if len(ev) < _MIN_EVIDENCE_CHARS:
+        return False
+    block = " ".join(code_block.split())
+    return ev in block

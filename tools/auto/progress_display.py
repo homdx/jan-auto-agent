@@ -319,12 +319,37 @@ def make_progress_display(
     codebase, so it's unaffected and stays a plain read.
     """
     from tools.auto.utils import _cfg_mode
-    max_attempts = _cfg_mode(
+    # BUGFIX (report §4, item 8): `fallback=` on a config read only covers a
+    # *missing* key, not a malformed *value* — a non-numeric
+    # max_attempts_per_task (or its _creative override) or max_rounds_per_task
+    # raised a raw ValueError straight out of this function. It's called
+    # unconditionally during AutoController's startup sequence, so a bad
+    # value in either key killed the whole --auto run before it even started.
+    # Mirrors the existing try/except-around-int() pattern used by
+    # tools/auto/repo_ingest.py::_read_int / _read_int_mode.
+    max_attempts_str = _cfg_mode(
         config, "auto", "max_attempts_per_task", task_mode,
         fallback=_MAX_ATTEMPTS_DEFAULT,
     )
-    max_attempts = int(max_attempts)
-    max_rounds   = config.getint("auto", "max_rounds_per_task",   fallback=_MAX_ROUNDS_DEFAULT)
+    try:
+        max_attempts = int(max_attempts_str)
+    except (ValueError, TypeError):
+        logger.warning(
+            "config max_attempts_per_task invalid (%r) — using %d",
+            max_attempts_str, _MAX_ATTEMPTS_DEFAULT,
+        )
+        max_attempts = _MAX_ATTEMPTS_DEFAULT
+    try:
+        max_rounds = config.getint(
+            "auto", "max_rounds_per_task", fallback=_MAX_ROUNDS_DEFAULT
+        )
+    except ValueError:
+        logger.warning(
+            "config max_rounds_per_task invalid (%r) — using %d",
+            config.get("auto", "max_rounds_per_task", fallback=None),
+            _MAX_ROUNDS_DEFAULT,
+        )
+        max_rounds = _MAX_ROUNDS_DEFAULT
     return ProgressDisplay(
         state        = state,
         arch_total   = arch_total,

@@ -172,49 +172,104 @@ class FaqAgent:
 
         cfg = config
         if cfg is not None:
+            # AUTO-FIX (medium-priority audit): wrapped per-call, not
+            # delegated to a shared helper, so extract_config_reads
+            # (COLLECT-5) still recognizes the literal config.getX(...)
+            # call shape.
             self.knowledge_dir = Path(
                 cfg.get("faq_agent", "knowledge_dir", fallback="./knowledge")
             )
             raw_ext = cfg.get("faq_agent", "extensions", fallback=".txt,.md")
             self.extensions = [e.strip() for e in raw_ext.split(",") if e.strip()]
-            self.temperature = cfg.getfloat("faq_agent", "temperature", fallback=0.0)
-            self.max_tokens  = cfg.getint("faq_agent", "max_tokens",    fallback=1024)
+            try:
+                self.temperature = cfg.getfloat("faq_agent", "temperature", fallback=0.0)
+            except ValueError as exc:
+                logger.warning("config [faq_agent] temperature invalid (%s) — using 0.0", exc)
+                self.temperature = 0.0
+            try:
+                self.max_tokens = cfg.getint("faq_agent", "max_tokens", fallback=1024)
+            except ValueError as exc:
+                logger.warning("config [faq_agent] max_tokens invalid (%s) — using 1024", exc)
+                self.max_tokens = 1024
             self.not_found_marker = cfg.get(
                 "faq_agent", "not_found_marker", fallback=NOT_FOUND_MARKER
             )
             self.system_prompt = cfg.get("faq_agent", "system", fallback=_DEFAULT_SYSTEM)
             _active = cfg.get("api", "active", fallback="local")
-            self.num_ctx = cfg.getint(f"api_{_active}", "num_ctx", fallback=0)
+            try:
+                self.num_ctx = cfg.getint(f"api_{_active}", "num_ctx", fallback=0)
+            except ValueError as exc:
+                logger.warning("config [api_%s] num_ctx invalid (%s) — using 0", _active, exc)
+                self.num_ctx = 0
 
             # ── answer-validation pass ──────────────────────────────────────
-            self.validate_answer_enabled = cfg.getboolean(
-                "faq_agent", "validate_answer", fallback=False
-            )
-            self.validate_temperature = cfg.getfloat(
-                "faq_agent", "validate_temperature", fallback=0.0
-            )
-            self.validate_max_tokens = cfg.getint(
-                "faq_agent", "validate_max_tokens", fallback=64
-            )
+            try:
+                self.validate_answer_enabled = cfg.getboolean(
+                    "faq_agent", "validate_answer", fallback=False
+                )
+            except ValueError as exc:
+                logger.warning("config [faq_agent] validate_answer invalid (%s) — using False", exc)
+                self.validate_answer_enabled = False
+            try:
+                self.validate_temperature = cfg.getfloat(
+                    "faq_agent", "validate_temperature", fallback=0.0
+                )
+            except ValueError as exc:
+                logger.warning("config [faq_agent] validate_temperature invalid (%s) — using 0.0", exc)
+                self.validate_temperature = 0.0
+            try:
+                self.validate_max_tokens = cfg.getint(
+                    "faq_agent", "validate_max_tokens", fallback=64
+                )
+            except ValueError as exc:
+                logger.warning("config [faq_agent] validate_max_tokens invalid (%s) — using 64", exc)
+                self.validate_max_tokens = 64
             self.validate_system = cfg.get(
                 "faq_agent", "validate_system", fallback=_DEFAULT_VALIDATE_SYSTEM
             )
 
             # ── two-stage smart-search ──────────────────────────────────────
-            self.smart_search = cfg.getboolean(
-                "faq_agent", "smart_search", fallback=False
-            )
+            # BUGFIX: same missing-guard pattern as keyword_max_tokens/
+            # max_candidates above — a non-boolean smart_search value crashed
+            # FaqAgent.__init__() outright instead of degrading to the default.
+            try:
+                self.smart_search = cfg.getboolean(
+                    "faq_agent", "smart_search", fallback=False
+                )
+            except ValueError as exc:
+                logger.warning(
+                    "config [faq_agent] smart_search invalid (%s) — using False", exc
+                )
+                self.smart_search = False
             self.keyword_system = cfg.get(
                 "faq_agent", "keyword_system", fallback=_DEFAULT_KEYWORD_SYSTEM
             )
-            self.keyword_max_tokens = cfg.getint(
-                "faq_agent", "keyword_max_tokens", fallback=64
-            )
+            # BUGFIX: matches the try/except ValueError pattern already used
+            # three lines above (temperature/max_tokens/etc. in this same
+            # constructor) — fallback= only covers a missing key, not a
+            # malformed value, so a non-numeric keyword_max_tokens crashed
+            # FaqAgent.__init__() outright, taking down the /faq REPL
+            # command and any --auto startup path that builds the FAQ agent.
+            try:
+                self.keyword_max_tokens = cfg.getint(
+                    "faq_agent", "keyword_max_tokens", fallback=64
+                )
+            except ValueError as exc:
+                logger.warning(
+                    "config [faq_agent] keyword_max_tokens invalid (%s) — using 64", exc
+                )
+                self.keyword_max_tokens = 64
             # Maximum number of top-ranked candidates tried in Stage 1.
             # 0 means unlimited (try all candidates with score > 0).
-            self.max_candidates = cfg.getint(
-                "faq_agent", "max_candidates", fallback=5
-            )
+            try:
+                self.max_candidates = cfg.getint(
+                    "faq_agent", "max_candidates", fallback=5
+                )
+            except ValueError as exc:
+                logger.warning(
+                    "config [faq_agent] max_candidates invalid (%s) — using 5", exc
+                )
+                self.max_candidates = 5
             # auto_pull: when (and whether) to POST /api/pull before inference.
             #   "auto"  (default) → only for a local Ollama daemon
             #   "true"/"false"    → force on / off
@@ -226,9 +281,18 @@ class FaqAgent:
             # Dedicated extra LLM pass confirming the answer is DIRECTLY grounded
             # in the KB for the question as asked. Related/opposite KB → answer
             # returned with an explicit caveat; irrelevant KB → NOT FOUND.
-            self.revalidate_grounding_enabled = cfg.getboolean(
-                "faq_agent", "revalidate_grounding", fallback=False
-            )
+            # BUGFIX: same missing-guard pattern as smart_search above — a
+            # non-boolean revalidate_grounding value crashed __init__()
+            # instead of degrading to the default.
+            try:
+                self.revalidate_grounding_enabled = cfg.getboolean(
+                    "faq_agent", "revalidate_grounding", fallback=False
+                )
+            except ValueError as exc:
+                logger.warning(
+                    "config [faq_agent] revalidate_grounding invalid (%s) — using False", exc
+                )
+                self.revalidate_grounding_enabled = False
             self.revalidate_grounding_system = cfg.get(
                 "faq_agent", "revalidate_grounding_system",
                 fallback=_DEFAULT_REVALIDATE_GROUNDING_SYSTEM,

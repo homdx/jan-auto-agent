@@ -46,6 +46,7 @@ from __future__ import annotations
 import configparser
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -192,11 +193,36 @@ def resolve_collect_dir(root: Path, config: Optional[configparser.ConfigParser])
     """`[collect] dir` (default `.collect`), resolved relative to `root` if
     given as a relative path. This is the *only* function in this module
     that decides where writes may land — every write path in this module
-    is built from its return value."""
+    is built from its return value.
+
+    AUTO-FIX (high-priority audit, DeepSeek-plan finding): a misconfigured
+    `[collect] dir` (e.g. `../../etc`, or an absolute path pointing
+    elsewhere entirely) used to resolve without any containment check —
+    and since this function's own docstring says every write in the
+    module derives from its return value, that meant a config typo could
+    make `_write_artifact` write files outside the project entirely.
+    `root` itself may not exist yet on a fresh checkout, so containment is
+    checked with `os.path.normpath` on the unresolved path rather than
+    `Path.resolve()`/`is_relative_to()` (which would require the path to
+    already exist to be meaningful, and can behave surprisingly around
+    symlinks) — this is a config-sanity check, not a symlink-attack
+    defense.
+    """
     settings = read_collect_settings(config)
     path = Path(settings.dir)
     if not path.is_absolute():
         path = Path(root) / path
+    normalized_path = Path(os.path.normpath(str(path)))
+    normalized_root = Path(os.path.normpath(str(root)))
+    try:
+        normalized_path.relative_to(normalized_root)
+    except ValueError:
+        raise CollectCliError(
+            f"[collect] dir resolves to {normalized_path}, which is "
+            f"outside the project root {normalized_root} — refusing to "
+            f"write there. Check the `[collect] dir` setting in your "
+            f"config for a stray absolute path or `..` traversal."
+        ) from None
     return path
 
 
@@ -346,19 +372,40 @@ def _artifact_dict(ctx: CollectContext) -> Dict[str, Any]:
 def _write_artifact(collect_dir: Path, ctx: CollectContext) -> List[str]:
     """Write `artifact.json`, `verification_report.json` (if Pass B ran),
     and all nine rendered markdown pages into `collect_dir`. This is the
-    only function in the module that ever opens a path for writing."""
-    collect_dir.mkdir(parents=True, exist_ok=True)
+    only function in the module that ever opens a path for writing.
+
+    AUTO-FIX (medium-priority audit, NVIDIA-plan finding): every write
+    below (`mkdir` + 9+ `write_text` calls) used to be completely
+    unguarded. A mid-batch failure (disk full, permission change) left a
+    partially-written `.collect/` directory — some pages from this run,
+    some stale from the last one — with only a bare, file-less stdlib
+    OSError to explain it. Every write is now wrapped so a failure names
+    exactly which file it was on before re-raising; this doesn't change
+    what happens on failure (still raises — a partial collect artifact is
+    a genuine build failure, not something to silently skip past), just
+    what the caller sees when it does.
+    """
+    try:
+        collect_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise OSError(f"could not create {collect_dir}: {exc}") from exc
     written: List[str] = []
 
+    def _write(path: Path, content: str) -> None:
+        try:
+            path.write_text(content, encoding="utf-8")
+        except OSError as exc:
+            raise OSError(f"could not write {path}: {exc}") from exc
+
     artifact_path = collect_dir / ARTIFACT_FILENAME
-    artifact_path.write_text(canonical_dumps(_artifact_dict(ctx), check_forbidden=False) + "\n", encoding="utf-8")
+    _write(artifact_path, canonical_dumps(_artifact_dict(ctx), check_forbidden=False) + "\n")
     written.append(ARTIFACT_FILENAME)
 
     if ctx.verification_report is not None:
         report_path = collect_dir / VERIFICATION_REPORT_FILENAME
-        report_path.write_text(
+        _write(
+            report_path,
             json.dumps(ctx.verification_report, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
-            encoding="utf-8",
         )
         written.append(VERIFICATION_REPORT_FILENAME)
 
@@ -378,7 +425,7 @@ def _write_artifact(collect_dir: Path, ctx: CollectContext) -> List[str]:
         sibling_gaps=ctx.sibling_gaps,
     )
     for name, content in pages.items():
-        (collect_dir / name).write_text(content, encoding="utf-8")
+        _write(collect_dir / name, content)
         written.append(name)
 
     return sorted(written)
@@ -498,7 +545,13 @@ def action_refresh(
             previous_manifest = manifest_mod.read_manifest(manifest_path)
             payload = json.loads(artifact_path.read_text(encoding="utf-8"))
             previous_by_path = {d["path"]: ModuleRecord.from_dict(d) for d in payload.get("modules", [])}
-        except (OSError, ValueError, KeyError):
+        # BUGFIX: ConfigRead/ExceptSite/GuardedAccess are frozen dataclasses
+        # with required (no-default) fields, so a stored artifact.json missing
+        # one of those keys (schema drift, hand-edited file, partial/corrupted
+        # write) raises TypeError, not OSError/ValueError/KeyError. Matches
+        # loader.py::_load_from_dir's existing (correct) guard so a corrupt
+        # artifact degrades to "no previous manifest" instead of crashing.
+        except (OSError, ValueError, KeyError, TypeError):
             previous_manifest = None
             previous_by_path = {}
 
@@ -694,7 +747,21 @@ def action_module(
     except (OSError, ValueError) as exc:
         raise CollectCliError(f"existing artifact at {artifact_path} is unreadable: {exc}") from exc
 
-    modules = [ModuleRecord.from_dict(d) for d in payload.get("modules", [])]
+    # BUGFIX: ConfigRead/ExceptSite/GuardedAccess are frozen dataclasses with
+    # required (no-default) fields, so a stored artifact.json missing one of
+    # those keys (schema drift, hand-edited file, partial/corrupted write)
+    # raised TypeError/KeyError straight out of this list comprehension —
+    # previously completely unguarded, unlike every other from_dict() call
+    # site in this file (action_refresh above, loader.py::_load_from_dir).
+    # `--module`'s whole point is patching into an *existing* artifact (see
+    # the `if not artifact_path.exists()` full-refresh fallback above), so
+    # there's no sensible silent-degrade here — raise the same clean
+    # CollectCliError the JSON-read guard just above already uses for other
+    # forms of a broken artifact.
+    try:
+        modules = [ModuleRecord.from_dict(d) for d in payload.get("modules", [])]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise CollectCliError(f"existing artifact at {artifact_path} is malformed: {exc}") from exc
     by_path = {m.path: m for m in modules}
 
     abs_module = root / module_path

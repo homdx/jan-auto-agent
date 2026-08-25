@@ -36,6 +36,7 @@ Scope
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -153,7 +154,16 @@ def _make_fake_llm(candidates: list):
         if "senior software architect" in system:
             return json.dumps(candidates)
         if "static code reviewer" in system:
-            return json.dumps({"verdict": "confirmed", "reason": "Valid improvement"})
+            user = next(
+                (m["content"] for m in messages if m.get("role") == "user"), ""
+            )
+            m = re.search(r"```\n(.*?)\n```", user, re.S)
+            code = m.group(1) if m else ""
+            evidence = next((ln.strip() for ln in code.splitlines() if ln.strip()), "def ")
+            return json.dumps({
+                "verdict": "confirmed", "evidence": evidence,
+                "reason": "Valid improvement",
+            })
         if "code-change validator" in system:
             return json.dumps({"approved": True, "feedback": ""})
         return json.dumps({

@@ -103,11 +103,11 @@ class Orchestrator(OrchestratorActions):
         PromptStore + MetricsCollector are preserved."""
         self.load_config(self._config_path)
         self.prompt_store.store_path   = Path(self.config.get("prompt_store", "store_path", fallback="prompts.json"))
-        self.prompt_store.max_versions = self.config.getint("prompt_store", "max_versions", fallback=3)
+        self.prompt_store.max_versions = self._getint("prompt_store", "max_versions", 3)
 
         self.prompt_optimizer = PromptOptimizer(
             model=self.model,
-            temperature=self.config.getfloat("prompt_optimizer", "temperature", fallback=0.4),
+            temperature=self._getfloat("prompt_optimizer", "temperature", 0.4),
             base_url=self.base_url,
             api_key=self.api_key,
             timeout=self.timeout_seconds,
@@ -117,7 +117,7 @@ class Orchestrator(OrchestratorActions):
         _raw_skip = self.config.get("search", "skip_dirs", fallback="")
         _skip_dirs = [d.strip() for d in _raw_skip.split(",") if d.strip()] or None
         self.search_agent = SearchAgent(
-            max_file_kb=self.config.getint("search", "max_file_kb", fallback=500),
+            max_file_kb=self._getint("search", "max_file_kb", 500),
             model=self.model,
             base_url=self.base_url,
             api_key=self.api_key,
@@ -125,21 +125,21 @@ class Orchestrator(OrchestratorActions):
             timeout=self.timeout_seconds,
             ssl_context=self.ssl_context,
             skip_dirs=_skip_dirs,
-            max_depth=self.config.getint("search", "max_depth", fallback=2),
+            max_depth=self._getint("search", "max_depth", 2),
         )
         self.validator_agent = ValidatorAgent(
             max_iter=self.max_iterations,
-            temperature=self.config.getfloat("validator_agent", "temperature", fallback=0.1),
+            temperature=self._getfloat("validator_agent", "temperature", 0.1),
             model=self.model,
             base_url=self.base_url,
             api_key=self.api_key,
             timeout=self.timeout_seconds,
             prompt_store=self.prompt_store,
-            stream=self.config.getboolean("output", "stream_agents", fallback=False),
+            stream=self._getboolean("output", "stream_agents", False),
             api_format=self.api_format,
             num_ctx=self.num_ctx,
             ssl_context=self.ssl_context,
-            max_hints=self.config.getint("validator_agent", "max_hints", fallback=3),
+            max_hints=self._getint("validator_agent", "max_hints", 3),
         )
         self.prompt_evaluator = PromptEvaluator(
             prompt_store=self.prompt_store,
@@ -172,16 +172,48 @@ class Orchestrator(OrchestratorActions):
     def reload_agents(self) -> None:
         """Re-read agents.ini and rebuild all agents mid-session (no restart)."""
         logger.info("reload_agents: re-reading %s …", self._config_path)
-        self._build_agents()
+        # AUTO-FIX (medium-priority audit): _build_agents() is unguarded at
+        # __init__ too, but a raise there just fails object construction —
+        # normal "fail fast at startup" behaviour. Here it runs mid-session
+        # in response to the interactive /reload command; before this fix,
+        # a malformed agents.ini (or any other _build_agents failure —
+        # config.read() re-raises configparser.Error, and several nested
+        # constructors also read numeric config directly) crashed the
+        # entire chat session instead of just failing the reload. The
+        # previously-built agents are left exactly as they were on
+        # failure, so the session keeps working with the last-good config.
+        try:
+            self._build_agents()
+        except Exception as exc:
+            logger.warning("reload_agents: failed to rebuild agents — %s", exc)
+            print(f"[{_ts()}] ⚠️  Reload failed: {exc}\n"
+                  f"    Still using the previously loaded agents/config.")
+            return
         print(f"[{_ts()}] 🔄 Agents reloaded from {self._config_path} "
               f"(model={self.model}, api_format={self.api_format}, max_iter={self.max_iterations})")
 
     def load_config(self, config_path: str) -> None:
+        # AUTO-FIX (medium-priority audit): a malformed (not just missing)
+        # agents.ini used to raise a raw configparser.Error with no
+        # indication of which file was at fault — annoying with the ~8
+        # agents_*.ini variants in rotation (32k/64k/128k/256k/fast_cpu/
+        # slow_cpu/stub/base). Now a parse failure is reported with the
+        # path and re-raised as a clear, actionable error instead of a
+        # bare traceback from deep inside configparser.
         if os.path.exists(config_path):
-            self.config.read(config_path, encoding="utf-8")
+            try:
+                self.config.read(config_path, encoding="utf-8")
+            except configparser.Error as exc:
+                raise configparser.Error(
+                    f"{config_path} is not a valid .ini file: {exc}"
+                ) from exc
         
-        self.max_iterations = self.config.getint("loop", "max_iterations", fallback=3)
-        self.timeout_seconds = self.config.getint("loop", "timeout_seconds", fallback=240)
+        # AUTO-T1 FIX: fallback= only handles MISSING keys; a present-but-malformed
+        # value (e.g. max_iterations = abc) raises ValueError with a raw traceback.
+        # Use the typed helpers below for every getint/getfloat/getboolean call so
+        # malformed values degrade gracefully to the coded default instead of aborting.
+        self.max_iterations = self._getint("loop", "max_iterations", 3)
+        self.timeout_seconds = self._getint("loop", "timeout_seconds", 240)
         self.new_chat_key = self.config.get("chat", "new_chat_key", fallback="/new").strip()
         self.exit_key = self.config.get("chat", "exit_key", fallback="/exit").strip()
 
@@ -195,11 +227,11 @@ class Orchestrator(OrchestratorActions):
         self.base_url   = self.config.get(section, "base_url",   fallback="http://localhost:1337/v1")
         self.api_key    = self.config.get(section, "api_key",    fallback="jan")
         self.api_format = self.config.get(section, "api_format", fallback="openai")
-        self.num_ctx    = self.config.getint(section, "num_ctx",  fallback=0)
+        self.num_ctx    = self._getint(section, "num_ctx", 0)
 
         # SSL verification — set verify_ssl = false in [api] to skip cert checks.
         # Applies to all HTTPS API calls (agents, optimizer, direct chat).
-        verify_ssl = self.config.getboolean("api", "verify_ssl", fallback=True)
+        verify_ssl = self._getboolean("api", "verify_ssl", True)
         if not verify_ssl:
             self.ssl_context = make_unverified_context()
             logger.warning("SSL certificate verification DISABLED (verify_ssl = false in agents.ini)")
@@ -209,15 +241,51 @@ class Orchestrator(OrchestratorActions):
         logger.info(f"API profile: [{section}] format={self.api_format} url={self.base_url}")
 
         # Optimizer gate thresholds (read from agents.ini)
-        self.optimizer_enabled         = self.config.getboolean("prompt_optimizer", "enabled",                  fallback=True)
-        self.optimizer_min_runs        = self.config.getint    ("prompt_optimizer", "min_runs_before_optimize",  fallback=3)
-        self.optimizer_trigger_avg_iter= self.config.getfloat  ("prompt_optimizer", "trigger_avg_iterations",   fallback=2.0)
-        self.optimizer_trigger_json_fail=self.config.getfloat  ("prompt_optimizer", "trigger_json_fail_rate",   fallback=0.30)
+        self.optimizer_enabled          = self._getboolean("prompt_optimizer", "enabled",                 True)
+        self.optimizer_min_runs         = self._getint    ("prompt_optimizer", "min_runs_before_optimize", 3)
+        self.optimizer_trigger_avg_iter = self._getfloat  ("prompt_optimizer", "trigger_avg_iterations",  2.0)
+        self.optimizer_trigger_json_fail= self._getfloat  ("prompt_optimizer", "trigger_json_fail_rate",  0.30)
 
         # Agent streaming and search budget (used by OrchestratorActions mixin)
-        self.stream_agents = self.config.getboolean("output", "stream_agents", fallback=False)
-        self.search_full_file_max_chars = self.config.getint("search", "full_file_max_chars", fallback=12000)
-        self.file_editor_max_tokens = self.config.getint("file_editor", "max_tokens", fallback=0)
+        self.stream_agents = self._getboolean("output", "stream_agents", False)
+        self.search_full_file_max_chars = self._getint("search", "full_file_max_chars", 12000)
+        self.file_editor_max_tokens = self._getint("file_editor", "max_tokens", 0)
+
+    # ── Typed config helpers (AUTO-T1) ──────────────────────────────────────
+    # configparser's fallback= only handles ABSENT keys; a present-but-malformed
+    # value raises ValueError with no useful context (which key, which file).
+    # These helpers catch ValueError, emit a contextual warning, and return the
+    # coded default — so a single bad line in agents.ini never aborts startup.
+
+    def _getint(self, section: str, key: str, fallback: int) -> int:
+        try:
+            return self.config.getint(section, key, fallback=fallback)
+        except ValueError as exc:
+            logger.warning(
+                "config [%s] %s is malformed (%s) — using default %r",
+                section, key, exc, fallback,
+            )
+            return fallback
+
+    def _getfloat(self, section: str, key: str, fallback: float) -> float:
+        try:
+            return self.config.getfloat(section, key, fallback=fallback)
+        except ValueError as exc:
+            logger.warning(
+                "config [%s] %s is malformed (%s) — using default %r",
+                section, key, exc, fallback,
+            )
+            return fallback
+
+    def _getboolean(self, section: str, key: str, fallback: bool) -> bool:
+        try:
+            return self.config.getboolean(section, key, fallback=fallback)
+        except ValueError as exc:
+            logger.warning(
+                "config [%s] %s is malformed (%s) — using default %r",
+                section, key, exc, fallback,
+            )
+            return fallback
 
     def execute_direct_chat(self, user_input: str) -> None:
         """
@@ -664,6 +732,14 @@ def main():
 
     # ── VALIDATE-PLAN MODE (AUTO-H1) ────────────────────────────────────
     if args.validate_plan:
+        if not os.path.exists(args.config):
+            print(
+                f"Error: --config file not found: {args.config!r}. "
+                f"Check the path and extension (a common mistake is a typo "
+                f"like 'agents_128k.in' instead of 'agents_128k.ini').",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         from tools.auto.plan_validator import run_validate
         sys.exit(run_validate(base_dir=base_dir, config_path=args.config))
 
@@ -672,6 +748,25 @@ def main():
         goal = args.auto.strip()
         if not goal:
             print("Error: --auto requires a non-empty goal string.", file=sys.stderr)
+            sys.exit(1)
+        # A missing/misspelled --config path used to fail silently deep
+        # inside the pipeline (ConfigParser.read() on a nonexistent file
+        # is a no-op, not an error) and only surfaced several steps later,
+        # once the architect stage tried to read API settings from an
+        # empty config, as a confusing "NoSectionError: No section:
+        # 'api_local'" with a traceback pointing nowhere near the actual
+        # cause. Fail loudly here instead, at the one place that knows the
+        # path came straight from the user's command line — this check is
+        # deliberately NOT inside AutoController itself, since tests
+        # construct it directly with a nonexistent config_path on purpose
+        # (as shorthand for "use coded defaults").
+        if not os.path.exists(args.config):
+            print(
+                f"Error: --config file not found: {args.config!r}. "
+                f"Check the path and extension (a common mistake is a typo "
+                f"like 'agents_128k.in' instead of 'agents_128k.ini').",
+                file=sys.stderr,
+            )
             sys.exit(1)
         from tools.auto.controller import run_auto
         exit_code = run_auto(

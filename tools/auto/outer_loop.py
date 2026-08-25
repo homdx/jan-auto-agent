@@ -216,7 +216,32 @@ class OuterLoop:
             )
             if _inner_accepts_deadline:
                 _rt_kwargs["deadline"] = _task_deadline   # AUTO-CR-33: shared budget
-            res = self.inner_loop.run_task(task, base_dir, **_rt_kwargs)
+            try:
+                res = self.inner_loop.run_task(task, base_dir, **_rt_kwargs)
+            except Exception as exc:
+                # AUTO-OUTER-GUARD-1: previously unguarded — any exception
+                # inner_loop.run_task doesn't already handle itself
+                # propagated straight out of THIS run_task (the per-task
+                # body of the whole --auto loop), crashing the entire
+                # multi-task run instead of just failing this one task.
+                # Fail this task closed (BLOCKED, same status the
+                # runtime-cap-exhausted branch above already uses) and
+                # let the caller move on to the next task in the plan.
+                logger.exception(
+                    "%s: inner_loop.run_task raised in round %d — %s",
+                    task_id, rnd, exc,
+                )
+                self.state.set_task_status(task_id, STATUS_BLOCKED)
+                self.state.log(
+                    f"{task_id}: inner_loop.run_task raised in round {rnd} "
+                    f"— {exc}"
+                )
+                tracer.event("outer_loop", "controller", "result",
+                             params={"task": task_id, "passed": False,
+                                     "round": rnd, "error": str(exc)})
+                return OuterLoopResult(task_id, False, rnd, True,
+                                       feedback_files, inner_results,
+                                       impl_versions_used)
             inner_results.append(res)
             # round is set authoritatively above via set_task_status(round=rnd);
             # here we only accumulate the attempt count.
@@ -236,9 +261,35 @@ class OuterLoop:
                                        impl_versions_used)
 
             # Failed round → write ONE compact feedback file, then fresh round.
-            fpath = self._write_round_feedback(task_id, rnd, res, impl_version)
-            feedback_files.append(str(fpath))
-            self.state.log(f"{task_id}: round {rnd} failed — wrote {fpath.name}")
+            #
+            # AUTO-FIX (high-priority audit): this write went through
+            # StateStore.write_task_file with no error handling at all — a
+            # disk/permission failure here used to propagate straight out
+            # of run_task, contradicting this method's own documented
+            # "Never raises" contract and crashing the whole multi-hour
+            # --auto session on what should be a recoverable, single-round
+            # hiccup. Now the failure is logged and the round proceeds
+            # without a persisted feedback file for this round (later
+            # _build_impl_history calls degrade gracefully on a missing
+            # feedback_round_*.md — see its own file-read guard) rather
+            # than aborting the whole task.
+            try:
+                fpath = self._write_round_feedback(task_id, rnd, res, impl_version)
+                feedback_files.append(str(fpath))
+                self.state.log(f"{task_id}: round {rnd} failed — wrote {fpath.name}")
+            except OSError as exc:
+                logger.error(
+                    "OuterLoop: failed to write round-%d feedback for %s — %s "
+                    "(continuing without a persisted feedback file for this round)",
+                    rnd, task_id, exc,
+                )
+                try:
+                    self.state.log(
+                        f"{task_id}: round {rnd} failed — feedback write also "
+                        f"failed ({exc})"
+                    )
+                except OSError:
+                    pass  # run.log itself is unwritable too — already logged above
 
             # LOOP-2: check whether a rewrite is due (rnd >= 3, (rnd-1) %
             # rewrite_every_n_rounds == 0, rewrites_done < max_rewrites, and a
@@ -463,6 +514,7 @@ def make_outer_loop(
     inner_loop=None,
     task_mode: str = "code",
     run_goal: str = "",
+    collect_bridge=None,
 ) -> OuterLoop:
     """Build an :class:`OuterLoop`, constructing the inner loop from config
     unless one is injected (tests / the controller may supply their own).
@@ -495,7 +547,8 @@ def make_outer_loop(
 
     if inner_loop is None:
         inner_loop = make_inner_loop(config, base_dir, task_mode=task_mode,
-                                      run_goal=run_goal)  # AUTO-DM-1 / AUTO-CR-22-1
+                                      run_goal=run_goal,   # AUTO-DM-1 / AUTO-CR-22-1
+                                      collect_bridge=collect_bridge)  # COLLECT-24
 
     # LOOP-2: build a TaskRewriter only if rewrite keys + max_rewrites > 0 are
     # configured. AUTO-CR-27: skip it in creative mode — its code-test-framed

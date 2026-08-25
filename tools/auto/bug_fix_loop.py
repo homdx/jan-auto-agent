@@ -57,7 +57,7 @@ from typing import Optional
 
 from tools.agent_trace import tracer
 from tools.auto.ticket_store import (
-    TicketStore, make_ticket, TicketAlreadyExists, TicketNotFound,
+    TicketStore, make_ticket, TicketAlreadyExists, TicketError, TicketNotFound,
 )
 
 from tools.auto.state import STATUS_BLOCKED, STATUS_DONE
@@ -574,6 +574,16 @@ class BugFixLoop:
                 self._tickets.create(ticket)
             except TicketAlreadyExists:
                 pass   # race-safe; continue with whatever is on disk
+            except TicketError as exc:
+                # AUTO-T37 FIX: OSError from _ensure_dir (permission denied,
+                # read-only fs) is now re-raised as TicketError by create().
+                # Losing the ticket record is acceptable; crashing the run
+                # after a commit already succeeded is not.
+                logger.warning(
+                    "BugFixLoop: ticket %s could not be persisted (%s) "
+                    "— continuing without ticket record",
+                    ticket_id, exc,
+                )
 
         # Claim this attempt BEFORE running the (long) fix loop, so the
         # counter reflects work started rather than work completed — a run

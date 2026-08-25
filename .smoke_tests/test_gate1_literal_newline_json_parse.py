@@ -1,0 +1,1 @@
+../tests/test_gate1_literal_newline_json_parse.py

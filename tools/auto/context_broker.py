@@ -91,9 +91,17 @@ class ContextBroker:
         self,
         max_block_chars: int = 3_000,
         max_symbols: int = 8,
+        collect_bridge=None,
     ) -> None:
         self._max_block_chars = max_block_chars
         self._max_symbols = max_symbols
+        # COLLECT-24: optional tools.auto.collect_bridge.CollectBridge.
+        # When set, a symbol still unresolved after the code-search passes
+        # below is tried against the collect structural model as a third,
+        # additive pass — so the SAME pull-model channel (context_request /
+        # missing_context) that already resolves code now also resolves
+        # collect facts, rather than needing a second, separate mechanism.
+        self._collect_bridge = collect_bridge
         # Only PROJECT-SCAN (Pass-2) hits are cached — they live in files the
         # current task doesn't edit (dependencies), so they stay valid across
         # attempts, and the rglob scan that finds them is the expensive part.
@@ -165,7 +173,25 @@ class ContextBroker:
                 continue
             found_now: list[str] = []
             for sym in remaining:
-                block = _extract(source, sym, ext)
+                # AUTO-FIX (medium-priority audit, NVIDIA-plan finding): this
+                # call used to be completely unguarded — extract_block/
+                # extract_prose_section raising on ONE file (an unusual
+                # encoding artifact, a pathological source shape) aborted
+                # resolve() for every remaining symbol across every
+                # remaining file, not just the one that triggered it. This
+                # sits on the hottest path in the whole pipeline: every
+                # Gate 1/Gate 2/coder context-injection call goes through
+                # here. Skip just the offending symbol/file pair and keep
+                # going — same fail-open posture as the rest of this method
+                # (a missing symbol is not treated as an error either).
+                try:
+                    block = _extract(source, sym, ext)
+                except Exception as exc:
+                    logger.debug(
+                        "ContextBroker: _extract failed for %r in %s (%s) — "
+                        "skipping this symbol/file pair", sym, rel, exc,
+                    )
+                    continue
                 if block.strip():
                     resolved[sym] = self._cap(block)
                     found_now.append(sym)
@@ -182,19 +208,49 @@ class ContextBroker:
                     continue
                 found_now = []
                 for sym in remaining:
-                    block = _extract(source, sym, ext)
+                    # AUTO-FIX (medium-priority audit, NVIDIA-plan finding):
+                    # same reasoning as the Pass 1 guard above — a raise here
+                    # would abort the fallback project-wide scan for every
+                    # remaining symbol over every remaining file.
+                    try:
+                        block = _extract(source, sym, ext)
+                    except Exception as exc:
+                        logger.debug(
+                            "ContextBroker: _extract failed for %r in %s "
+                            "(%s) — skipping this symbol/file pair",
+                            sym, abs_path, exc,
+                        )
+                        continue
                     if block.strip():
                         rel = str(abs_path.relative_to(base_dir))
                         capped_block = self._cap(block)
                         resolved[sym] = capped_block
                         self._resolved_cache[sym] = capped_block   # fallback hit → safe to cache
                         logger.debug(
+
                             "ContextBroker: found %r in %s (fallback search)",
                             sym, rel,
                         )
                         found_now.append(sym)
                 for sym in found_now:
                     remaining.remove(sym)
+
+        # ── Pass 3: collect structural model (COLLECT-24) ─────────────────────
+        # Tried last, after real source has had its chance — code is ground
+        # truth; collect facts are a fallback for symbols that live outside
+        # target_files/base_dir's own scan (e.g. summarized-only modules) or
+        # simply as a cheaper structural answer (signature + contracts,
+        # skips reading/parsing whole files). No-op whenever no bridge was
+        # wired in, or the bridge's model isn't fresh (see CollectBridge.usable).
+        if remaining and self._collect_bridge is not None:
+            for sym in list(remaining):
+                block = self._collect_bridge.pull_symbol(sym)
+                if block:
+                    capped = self._cap(block)
+                    resolved[sym] = capped
+                    self._resolved_cache[sym] = capped
+                    remaining.remove(sym)
+                    logger.debug("ContextBroker: resolved %r from collect model", sym)
 
         if remaining:
             logger.debug(

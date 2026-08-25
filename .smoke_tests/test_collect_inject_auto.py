@@ -1,0 +1,1 @@
+../tests/test_collect_inject_auto.py

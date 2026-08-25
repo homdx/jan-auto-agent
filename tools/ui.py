@@ -27,8 +27,16 @@ class Spinner:
 
     def spin(self):
         """Advance one frame (used internally by the background thread)."""
-        sys.stdout.write(f"\r{self.frames[self.idx % len(self.frames)]} {self.message}...")
-        sys.stdout.flush()
+        try:
+            sys.stdout.write(f"\r{self.frames[self.idx % len(self.frames)]} {self.message}...")
+            sys.stdout.flush()
+        except (BrokenPipeError, OSError):
+            # AUTO-UI-GUARD-1: stdout piped somewhere that closed early
+            # (`| head`, a disconnected terminal, ...) — every future call
+            # would fail identically, so stop the background thread
+            # instead of spinning forever on a dead pipe.
+            self.running = False
+            return
         self.idx += 1
 
     def _run(self):
@@ -49,8 +57,11 @@ class Spinner:
             self._thread.join(timeout=0.5)
             self._thread = None
         # Clear the spinner line so subsequent output starts cleanly.
-        sys.stdout.write("\r" + " " * (len(self.message) + 6) + "\r")
-        sys.stdout.flush()
+        try:
+            sys.stdout.write("\r" + " " * (len(self.message) + 6) + "\r")
+            sys.stdout.flush()
+        except (BrokenPipeError, OSError):
+            pass
 
     # ── context-manager support ──────────────────────────────────────────
     def __enter__(self):
@@ -82,8 +93,15 @@ def stream_tracker():
         if state["t0"] is None:
             state["t0"] = time.time()
         state["n"] += 1
-        sys.stdout.write(t)
-        sys.stdout.flush()
+        try:
+            sys.stdout.write(t)
+            sys.stdout.flush()
+        except (BrokenPipeError, OSError):
+            # AUTO-UI-GUARD-1: stdout piped somewhere that closed early —
+            # cosmetic streaming output only; the underlying LLM call and
+            # its accumulated result are unaffected, so swallow and keep
+            # tracking token stats rather than crashing mid-stream.
+            pass
 
     def stats() -> str:
         n = state["n"]

@@ -194,8 +194,25 @@ class ContextAssembler:
         # Tolerate 0 / missing values (e.g. num_ctx=0 meaning "server
         # default") with sane fallbacks rather than producing a zero or
         # negative budget.
-        self._num_ctx = int(num_ctx) if num_ctx else 4096
-        self._max_tokens = int(max_tokens) if max_tokens else 800
+        # AUTO-CTXASM-GUARD-1: a non-numeric string (an already-loose
+        # caller passing something other than 0/missing/a real number)
+        # raised a raw ValueError from int(...) — same "tolerate a bad
+        # value, don't crash" spirit as the 0/missing case right above,
+        # just for a different kind of bad value.
+        try:
+            self._num_ctx = int(num_ctx) if num_ctx else 4096
+        except (ValueError, TypeError):
+            logger.warning(
+                "ContextAssembler: invalid num_ctx=%r — using 4096", num_ctx,
+            )
+            self._num_ctx = 4096
+        try:
+            self._max_tokens = int(max_tokens) if max_tokens else 800
+        except (ValueError, TypeError):
+            logger.warning(
+                "ContextAssembler: invalid max_tokens=%r — using 800", max_tokens,
+            )
+            self._max_tokens = 800
         self._base_dir = Path(base_dir)
         self._synopsis_path = self._base_dir / synopsis_path
         self._bible_path = self._base_dir / bible_path
@@ -234,6 +251,31 @@ class ContextAssembler:
         a recognizable ``chapter_<N>`` filename, returns ``""`` — just the
         task framing, no errors.
         """
+        # Top-level guard: this method is documented ("never raises") to
+        # fail open on any missing/malformed input. The individual helpers
+        # below each guard their own file reads, but nothing previously
+        # guarded the assembly logic itself (chapter ordering, budget
+        # arithmetic, section merging) — an unexpected error there escaped
+        # as a raw exception, breaking the documented contract and aborting
+        # the whole chapter-generation task over a context-assembly nicety.
+        try:
+            return self._build_creative_context_inner(target_file, all_chapter_files)
+        except Exception:
+            logger.exception(
+                "ContextAssembler.build_creative_context failed for %r; "
+                "degrading to no extra context (fail-open, per contract)",
+                target_file,
+            )
+            return ""
+
+    def _build_creative_context_inner(
+        self,
+        target_file: str,
+        all_chapter_files: "list[str]",
+    ) -> str:
+        """Unguarded body of build_creative_context — see that method's
+        docstring for behaviour. Split out so the top-level try/except can
+        wrap the whole thing in one place."""
         target_num = _chapter_number(target_file)
         if target_num is None:
             return ""

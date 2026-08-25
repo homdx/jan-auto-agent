@@ -115,9 +115,18 @@ def make_theme_validator(config) -> "ThemeValidator | None":
     Same one-argument-factory shape as
     :func:`tools.auto.continuity_validator.make_continuity_validator`.
     """
-    enabled = config.getboolean(
-        "validator_agent", "theme_check_creative", fallback=False
-    )
+    # AUTO-FIX (medium-priority audit): wrapped per-call, not delegated to a
+    # shared helper, so extract_config_reads (COLLECT-5) still recognizes
+    # the literal config.getX(...) call shape.
+    try:
+        enabled = config.getboolean(
+            "validator_agent", "theme_check_creative", fallback=False
+        )
+    except ValueError as exc:
+        logger.warning(
+            "config [validator_agent] theme_check_creative invalid (%s) — using False", exc,
+        )
+        enabled = False
     if not enabled:
         logger.debug("ThemeValidator: disabled (theme_check_creative not set).")
         return None
@@ -130,7 +139,13 @@ def make_theme_validator(config) -> "ThemeValidator | None":
         )
         return None
 
-    max_rev = config.getint("validator_agent", "max_theme_revisions", fallback=2)
+    try:
+        max_rev = config.getint("validator_agent", "max_theme_revisions", fallback=2)
+    except ValueError as exc:
+        logger.warning(
+            "config [validator_agent] max_theme_revisions invalid (%s) — using 2", exc,
+        )
+        max_rev = 2
 
     try:
         from tools.auto.summary_memory import _make_llm_call  # noqa: PLC0415

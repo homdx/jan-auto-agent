@@ -1,6 +1,6 @@
 """tests/test_collect_already_safe_query.py — COLLECT-11.
 
-* A query for `prompt_store.py:79` (a real, GUARDED `stack[-1]` access,
+* A query for `prompt_store.py:90` (a real, GUARDED `stack[-1]` access,
   per COLLECT-7's own reference case) answers "safe: guarded".
 * A query for a fabricated UNGUARDED location answers "not safe".
 * A registered fail-open except site answers "safe: fail_open".
@@ -38,7 +38,7 @@ def _real_repo_index():
 
 def test_guarded_prompt_store_access_is_safe():
     index = _real_repo_index()
-    answer = index.query("tools/prompt_store.py:79")
+    answer = index.query("tools/prompt_store.py:90")
 
     assert isinstance(answer, SafetyAnswer)
     assert answer.safe is True
@@ -151,7 +151,7 @@ def test_unknown_location_is_not_safe_and_not_guessed():
 # two different subscript expressions, one guarded and one not, would
 # report the whole location "safe: guarded", which could wrongly suppress
 # a real finding about the *other*, unguarded expression on that same
-# line. Real in this repo: `tools/prompt_store.py:182` is
+# line. Real in this repo: `tools/prompt_store.py:193` is
 # `data[agent_name]["current_version"] = stack[-1]["version"] if stack
 # else 0` — `data[agent_name]` is UNGUARDED, `stack[-1]` is GUARDED (via
 # the `entry.get("stack")` alias two lines up).
@@ -159,7 +159,7 @@ def test_unknown_location_is_not_safe_and_not_guessed():
 
 def test_real_mixed_line_without_access_is_ambiguous_not_optimistically_guarded():
     index = _real_repo_index()
-    answer = index.query("tools/prompt_store.py:182")
+    answer = index.query("tools/prompt_store.py:193")
     assert answer.safe is False
     assert answer.reason == "ambiguous_location"
     assert "data[agent_name]" in answer.detail
@@ -168,7 +168,7 @@ def test_real_mixed_line_without_access_is_ambiguous_not_optimistically_guarded(
 
 def test_real_mixed_line_disambiguated_via_access_resolves_the_guarded_one():
     index = _real_repo_index()
-    answer = index.query("tools/prompt_store.py:182", access="stack[-1]")
+    answer = index.query("tools/prompt_store.py:193", access="stack[-1]")
     assert answer.safe is True
     assert answer.reason == "guarded"
 
@@ -180,7 +180,7 @@ def test_real_mixed_line_disambiguated_via_access_does_not_falsely_clear_the_ung
     # come back "guarded" (borrowing stack[-1]'s status), whatever else it
     # resolves to.
     index = _real_repo_index()
-    answer = index.query("tools/prompt_store.py:182", access="data[agent_name]")
+    answer = index.query("tools/prompt_store.py:193", access="data[agent_name]")
     assert answer.reason != "guarded"
 
 

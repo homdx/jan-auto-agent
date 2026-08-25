@@ -13,6 +13,57 @@ if TYPE_CHECKING:  # avoid circular imports at runtime
 
 logger = logging.getLogger(__name__)
 
+
+# AUTO-FIX (medium-priority audit, DeepSeek-plan findings T69/T70): every
+# call site below used to access controller.progress_display /
+# controller.run_trace directly. Both start out (or can be explicitly set
+# to, e.g. by a test constructing a partial controller) None, and there
+# was no guard anywhere in this module — the very first
+# ``controller.progress_display.arch_total = ...``-style access raised a
+# bare AttributeError, aborting _run_plan_phase/_run_task_loop entirely.
+# These two tiny null-object stand-ins let every call site below keep its
+# original, readable form (``_pd(controller).refresh()`` reads the same as
+# ``controller.progress_display.refresh()`` did) while degrading to a
+# harmless no-op whenever the real object isn't wired in, rather than
+# crashing the whole plan/task loop over what is purely diagnostic/UI
+# bookkeeping.
+class _NullProgressDisplay:
+    """No-op stand-in for a missing/None ProgressDisplay."""
+    code_done = 0
+    code_total = 0
+    arch_total = 0
+
+    def refresh(self) -> None:
+        pass
+
+    def tick_arch(self) -> None:
+        pass
+
+
+class _NullRunTrace:
+    """No-op stand-in for a missing/None RunTrace."""
+
+    def log_phase(self, *args, **kwargs) -> None:
+        pass
+
+    def log_gate1_rejected(self, *args, **kwargs) -> None:
+        pass
+
+
+_NULL_PROGRESS_DISPLAY = _NullProgressDisplay()
+_NULL_RUN_TRACE = _NullRunTrace()
+
+
+def _pd(controller: "AutoController"):
+    """controller.progress_display, or a harmless no-op if it's None."""
+    return controller.progress_display if controller.progress_display is not None else _NULL_PROGRESS_DISPLAY
+
+
+def _rt(controller: "AutoController"):
+    """controller.run_trace, or a harmless no-op if it's None."""
+    return controller.run_trace if controller.run_trace is not None else _NULL_RUN_TRACE
+
+
 # ── PLAN phase module imports ─────────────────────────────────────────────────
 # Imported at module level so test suites can patch via
 # ``patch("tools.auto.pipeline.<name>")``.
@@ -108,7 +159,7 @@ def run_pipeline(controller: "AutoController") -> tuple[Optional[str], int]:
         logger.info("run_pipeline: dry-run mode — skipping execution phase")
         controller.state.log("dry-run: plan phase complete; execution skipped")
         if controller.run_trace:
-            controller.run_trace.log_phase("execute", "skipped (dry-run)")
+            _rt(controller).log_phase("execute", "skipped (dry-run)")
         return None, 0  # clean finish, zero tasks executed
 
     # ── Pre-seed progress counters for resume runs ────────────────────────────
@@ -120,9 +171,9 @@ def run_pipeline(controller: "AutoController") -> tuple[Optional[str], int]:
             1 for t in controller.state.all_tasks()
             if t.get("status") == _STATUS_DONE
         )
-        if already_done > controller.progress_display.code_done:
-            controller.progress_display.code_done = already_done
-            controller.progress_display.refresh()
+        if already_done > _pd(controller).code_done:
+            _pd(controller).code_done = already_done
+            _pd(controller).refresh()
 
     # ── EXECUTE phase — G2 / G3 / G4 / G5 wired inside _run_task_loop ─────────
     return controller._run_task_loop(task_mode=getattr(controller, "task_mode", "code"), cfg=cfg)  # AUTO-DM-1
@@ -155,13 +206,13 @@ def _run_plan_phase(controller: "AutoController", cfg: configparser.ConfigParser
         logger.info("plan_phase: plan already exists — skipping (resume)")
         controller.state.log("plan phase: skipped (plan already present)")
         if controller.run_trace:
-            controller.run_trace.log_phase("plan", "skipped")
+            _rt(controller).log_phase("plan", "skipped")
         return
 
     logger.info("plan_phase: no plan found — running PLAN phase")
     controller.state.log("plan phase: starting")
     if controller.run_trace:
-        controller.run_trace.log_phase("plan", "started")
+        _rt(controller).log_phase("plan", "started")
 
     # ── Step 1: Repo ingest ───────────────────────────────────────────────────
     logger.info("plan_phase: ingesting repo at %s", controller.base_dir)
@@ -173,8 +224,8 @@ def _run_plan_phase(controller: "AutoController", cfg: configparser.ConfigParser
     controller.state.log(f"plan phase: ingested {len(clusters)} cluster(s)")
 
     if controller.progress_display:
-        controller.progress_display.arch_total = len(clusters)
-        controller.progress_display.refresh()
+        _pd(controller).arch_total = len(clusters)
+        _pd(controller).refresh()
 
     # ── Step 2: Architect review ──────────────────────────────────────────────
     logger.info("plan_phase: architect reviewing %d cluster(s)", len(clusters))
@@ -206,7 +257,7 @@ def _run_plan_phase(controller: "AutoController", cfg: configparser.ConfigParser
 
     def _on_cluster_done():
         if controller.progress_display:
-            controller.progress_display.tick_arch()
+            _pd(controller).tick_arch()
 
     candidates = review_clusters(
         clusters_to_review, controller.base_dir, cfg,
@@ -281,10 +332,13 @@ def _run_plan_phase(controller: "AutoController", cfg: configparser.ConfigParser
     cluster_files: dict[str, set[str]] = {
         c.name: set(c.files) for c in clusters
     }
+    _get_bridge = getattr(controller, "_get_collect_bridge", None)
+    collect_bridge = _get_bridge(getattr(controller, "task_mode", "code")) if _get_bridge else None
     accepted, rejected = filter_candidates(
         candidates, controller.base_dir, cfg,
         cluster_files=cluster_files,
         task_mode=getattr(controller, "task_mode", "code"),   # AUTO-DM-1
+        collect_bridge=collect_bridge,  # GATE1-CTX-1
     )
     logger.info(
         "plan_phase: gate1 accepted=%d rejected=%d",
@@ -296,7 +350,7 @@ def _run_plan_phase(controller: "AutoController", cfg: configparser.ConfigParser
 
     if controller.run_trace:
         for r in rejected:
-            controller.run_trace.log_gate1_rejected(
+            _rt(controller).log_gate1_rejected(
                 getattr(r, "candidate", None) and getattr(r.candidate, "title", "?"),
                 getattr(r, "reason", ""),
             )
@@ -314,7 +368,7 @@ def _run_plan_phase(controller: "AutoController", cfg: configparser.ConfigParser
     )
 
     if controller.progress_display:
-        controller.progress_display.code_total = len(backlog.auto_tasks)
+        _pd(controller).code_total = len(backlog.auto_tasks)
 
     # ── Step 5: Plan emit + git commit ────────────────────────────────────────
     if controller.git is None:
@@ -339,7 +393,7 @@ def _run_plan_phase(controller: "AutoController", cfg: configparser.ConfigParser
     controller.state.log("plan phase: complete")
     logger.info("plan_phase: done")
     if controller.run_trace:
-        controller.run_trace.log_phase("plan", "done")
+        _rt(controller).log_phase("plan", "done")
 
 
 def _emit_without_git(

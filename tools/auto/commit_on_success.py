@@ -134,11 +134,28 @@ class CommitOnSuccess:
             logger.info(
                 "CommitOnSuccess: committed task %s → %s", task_id, sha[:12]
             )
-            self._state.set_task_status(task_id, STATUS_DONE, commit=sha)
-            self._state.log(
-                f"task {task_id} DONE — committed {sha[:12]} "
-                f"(auto({task_id}): {title})"
-            )
+            # AUTO-FIX (medium-priority audit, DeepSeek-plan finding): this
+            # state write used to be unguarded — a failure here (the same
+            # root-cause class as state.py's atomic-write gap) happened
+            # *after* the git commit had already succeeded, desyncing
+            # StateStore's view of the task (still not marked DONE) from
+            # what git history actually shows. Logging and continuing here
+            # means the commit itself — the durable, important half of this
+            # method — still stands even if the local status bookkeeping
+            # couldn't be updated.
+            try:
+                self._state.set_task_status(task_id, STATUS_DONE, commit=sha)
+                self._state.log(
+                    f"task {task_id} DONE — committed {sha[:12]} "
+                    f"(auto({task_id}): {title})"
+                )
+            except Exception as exc:
+                logger.error(
+                    "CommitOnSuccess: git commit %s succeeded for task %s, "
+                    "but updating local state failed — %s (task status may "
+                    "not reflect DONE; the commit itself is unaffected)",
+                    sha[:12], task_id, exc,
+                )
             tracer.event(
                 "commit_on_success", "controller", "committed",
                 params={"task": task_id, "sha": sha[:12]},
@@ -204,14 +221,31 @@ class CommitOnSuccess:
                 "cannot update synopsis for %s.", target_files,
             )
             return
+        # AUTO-FIX (medium-priority audit): each file's failure was already
+        # logged individually, but for a multi-chapter creative task (a
+        # supported, tested shape — see AUTO-CR-16 in the docstring above)
+        # a second/third chapter's silently-failed synopsis update was easy
+        # to miss among per-file log lines. Collect failures and log one
+        # aggregate summary at the end so a partial failure is visible at a
+        # glance, without changing the fail-open behavior (a synopsis error
+        # still never disrupts the commit).
+        failed: list[str] = []
         for chapter_file in target_files:
             try:
                 self._summary_memory.update(chapter_file, base_dir=base_dir)
             except Exception as exc:
+                failed.append(chapter_file)
                 logger.error(
                     "CommitOnSuccess: synopsis update failed for %s: %s — "
                     "commit outcome is unaffected.", chapter_file, exc,
                 )
+        if failed:
+            logger.error(
+                "CommitOnSuccess: synopsis update failed for %d/%d target "
+                "file(s): %s — commit outcome is unaffected, but synopsis.md "
+                "may be missing updates for these chapters.",
+                len(failed), len(target_files), ", ".join(failed),
+            )
 
     # ── AUTO-CR-23-1: story bible hook ───────────────────────────────────────
 

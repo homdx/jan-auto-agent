@@ -1,0 +1,1 @@
+../tests/test_theme_validator.py

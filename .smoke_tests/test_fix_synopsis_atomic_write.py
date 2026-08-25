@@ -1,0 +1,1 @@
+../tests/test_fix_synopsis_atomic_write.py

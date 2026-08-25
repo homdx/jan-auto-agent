@@ -69,7 +69,7 @@ from pathlib import Path
 from typing import Optional
 
 from tools.auto.architect import CandidateTask, CitedLocation
-from tools.auto.gate1_filter import filter_candidates
+from tools.auto.gate1_filter import filter_candidates, _is_technical_failure
 from tools.auto.git_manager import GitError, make_git_manager
 from tools.auto.plan_emitter import IMPROVEMENTS_FILENAME
 from tools.auto.state import STATUS_IN_PROGRESS, STATUS_TODO, StateStore
@@ -125,6 +125,13 @@ class ValidationReport:
     removed: list[RemovedTask]
     presence_check_skipped: bool = False
     presence_check_skip_reason: str = ""
+    # AUTO-REMOVE-GUARD-1: tasks Gate 1 could not reach a verdict on this
+    # run (an LLM-call technical failure survived every retry — see
+    # gate1_filter.py's AUTO-RETRY-BACKOFF-1) — left completely untouched
+    # in plan.json (still `todo`), NOT removed. Reusing RemovedTask's
+    # shape purely for its title/instruction/target_files/reason fields;
+    # nothing in this list was actually removed from anywhere.
+    inconclusive: "list[RemovedTask]" = field(default_factory=list)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -145,8 +152,8 @@ def _task_to_candidate(task: dict) -> CandidateTask:
     check will require that file to exist.
     """
     locs = task.get("cited_locations") or []
-    if locs:
-        loc0 = locs[0]
+    loc0 = locs[0] if locs else None
+    if isinstance(loc0, dict):
         cited_location = CitedLocation(
             file=loc0.get("file", ""),
             symbol=loc0.get("symbol"),
@@ -155,6 +162,10 @@ def _task_to_candidate(task: dict) -> CandidateTask:
             new_file=bool(loc0.get("new_file", False)),
         )
     else:
+        # No citation at all, OR a malformed cited_locations[0] that isn't
+        # the expected dict shape (e.g. a bare string from a hand-edited
+        # plan.json). Either way, fall back to the first target_files entry
+        # with no anchor rather than crashing on loc0.get(...).
         target = task.get("target_files") or [""]
         cited_location = CitedLocation(file=target[0])
 
@@ -236,8 +247,20 @@ def validate_plan(
         )
 
     cfg = configparser.ConfigParser(inline_comment_prefixes=(';', '#'))
+    # AUTO-FIX (medium-priority audit): a malformed (present but broken)
+    # config file used to raise a raw configparser.Error mid-validate-plan
+    # with no path context. Fall back to defaults (same as a missing file
+    # already did) rather than letting the whole --validate-plan run die
+    # on a config typo — this call only re-checks an existing plan, it
+    # doesn't need [auto]/[gate1_validate] to be perfect to do that.
     if Path(config_path).exists():
-        cfg.read(config_path, encoding="utf-8")
+        try:
+            cfg.read(config_path, encoding="utf-8")
+        except configparser.Error as exc:
+            logger.warning(
+                "validate_plan: %s is malformed (%s) — proceeding with "
+                "defaults for all config-driven options", config_path, exc,
+            )
     raw_mode = cfg.get("auto", "task_mode", fallback="code")
     task_mode, mode_warning = normalize_task_mode(raw_mode)
     if mode_warning:
@@ -249,7 +272,21 @@ def validate_plan(
     # here always takes the resume/load path and never raises the
     # "different goal" guard, regardless of what goal the plan was built
     # under.
-    stored_goal = json.loads(plan_path.read_text(encoding="utf-8")).get("goal", "")
+    # AUTO-FIX (high-priority audit): reading plan.json here used to be
+    # completely unguarded, so a corrupted plan.json (interrupted write,
+    # manual edit gone wrong) crashed --validate-plan itself — the exact
+    # command an operator runs to check a plan's health — with a bare,
+    # path-less JSONDecodeError instead of a clear, actionable message.
+    try:
+        stored_goal = json.loads(plan_path.read_text(encoding="utf-8")).get("goal", "")
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"validate_plan: {plan_path} could not be read as JSON ({exc}). "
+            f"The plan file may be corrupted or was interrupted mid-write. "
+            f"Check for a {plan_path}.bak snapshot, or re-run "
+            f'`python main.py --auto "<goal>" --dry-run --base {base_path}` '
+            f"to regenerate it."
+        ) from exc
     state.initialise(stored_goal, base_path)
 
     pending = [
@@ -304,22 +341,49 @@ def validate_plan(
         )
 
     print(f"\n🔎 Re-validating {len(pending)} pending task(s) against current code...")
+    # GATE1-CTX-1/-2: same collect wiring as --auto's live Gate 1 call site
+    # (tools/auto/pipeline.py via AutoController._get_collect_bridge) — a
+    # single bridge built once for this whole validate-plan run, never per
+    # candidate. None when [collect] use_in_auto/use_in_doc is off or the
+    # artifact is unavailable/stale — every note it feeds degrades to "" in
+    # that case, identical to today's behavior.
+    from tools.auto.collect_bridge import make_collect_bridge
+    collect_bridge = make_collect_bridge(base_path, cfg, config_path, task_mode=task_mode)
     accepted, rejected = filter_candidates(
         candidates, base_path, cfg, cluster_files=None, task_mode=task_mode,
         model_override=model_override, active_override=active_override,
+        collect_bridge=collect_bridge,
     )
 
     removed: list[RemovedTask] = []
+    inconclusive: list[RemovedTask] = []
     for fr in rejected:
         tid = task_id_of[id(fr.candidate)]
-        removed.append(RemovedTask(
+        record = RemovedTask(
             task_id=tid,
             title=fr.candidate.title,
             instruction=fr.candidate.instruction,
             target_files=list(fr.candidate.target_files),
             stage=fr.stage,
             reason=fr.reason,
-        ))
+        )
+        if _is_technical_failure(fr.reason):
+            # AUTO-REMOVE-GUARD-1: a technical failure (LLM call/parse
+            # error surviving every retry — see gate1_filter.py's
+            # AUTO-RETRY-BACKOFF-1) is NOT evidence the task is already
+            # fixed; it just means Gate 1 couldn't reach a verdict this
+            # run, e.g. a provider outage. Removing it from plan.json
+            # here would be indistinguishable from a genuine "confirmed
+            # already fixed" rejection, but WRONG — the task might still
+            # be fully real and unaddressed. Leave it completely
+            # untouched (still `todo`, no plan.json/IMPROVEMENTS.md/
+            # IMPROVEMENTS-FALSE.md writes at all) so the next
+            # --validate-plan run re-checks JUST this one instead of
+            # either silently discarding it or forcing a full re-run of
+            # the whole plan from scratch.
+            inconclusive.append(record)
+            continue
+        removed.append(record)
 
     kept = [task_id_of[id(c)] for c in accepted]
 
@@ -330,15 +394,27 @@ def validate_plan(
         _append_false_positives(base_path, removed)
         _commit_validation(base_path, cfg, removed)
 
+    if inconclusive:
+        logger.warning(
+            "validate_plan: %d task(s) left unchanged (still todo) after "
+            "a technical failure — re-run --validate-plan to retry just "
+            "these: %s",
+            len(inconclusive), ", ".join(r.task_id for r in inconclusive),
+        )
+
     state.log(
         f"validate-plan: checked {len(pending)} task(s) — "
-        f"{len(kept)} confirmed, {len(removed)} removed as false positive(s)"
+        f"{len(kept)} confirmed, {len(removed)} removed as false "
+        f"positive(s)"
+        + (f", {len(inconclusive)} left unresolved (technical failure)"
+           if inconclusive else "")
     )
 
     return ValidationReport(
         checked=len(pending), kept=kept, removed=removed,
         presence_check_skipped=bool(skip_reason),
         presence_check_skip_reason=skip_reason,
+        inconclusive=inconclusive,
     )
 
 
@@ -572,7 +648,10 @@ def run_validate(
     print(
         f"Checked {report.checked} task(s): "
         f"{len(report.kept)} confirmed still needed, "
-        f"{len(report.removed)} removed as false positive(s)."
+        f"{len(report.removed)} removed as false positive(s)"
+        + (f", {len(report.inconclusive)} left unresolved (technical failure)"
+           if report.inconclusive else "")
+        + "."
     )
     if report.presence_check_skipped:
         print(
@@ -589,5 +668,16 @@ def run_validate(
             f"Removed from IMPROVEMENTS.md and plan.json; recorded in "
             f"{IMPROVEMENTS_FALSE_FILENAME}. Committed."
         )
+    if report.inconclusive:
+        # AUTO-REMOVE-GUARD-1: these were left completely untouched in
+        # plan.json (still `todo`) — nothing to commit, nothing removed.
+        print(
+            f"⚠️  {len(report.inconclusive)} task(s) could not be checked "
+            f"due to a technical failure (network/provider error surviving "
+            f"every retry) and were left unchanged in plan.json:"
+        )
+        for r in report.inconclusive:
+            print(f"  - {r.task_id}: {r.reason}")
+        print("Re-run --validate-plan to retry just these.")
 
     return 0

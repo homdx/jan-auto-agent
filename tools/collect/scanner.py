@@ -227,10 +227,31 @@ def scan_repo(
             language = Language.JAVA if _language(rel) == Language.JAVA else Language.PYTHON
             modules.append(ModuleRecord(path=rel, parse_error=f"{rel}: {exc}", language=language))
             continue
-        if _language(rel) == Language.JAVA:
-            modules.append(scan_java_module(source, rel))
-        else:
-            modules.append(scan_module(source, rel))
+        # AUTO-FIX (high-priority audit): the file-read step above is
+        # guarded so one unreadable file can't take down the whole scan
+        # (see the BUGFIX comment on that except block), but the symbol-
+        # extraction call itself was NOT — an unexpected AST shape during
+        # _walk_type_body's recursive walk (java_facts.py) would propagate
+        # straight out of scan_repo, aborting coverage of every other file
+        # already collected. That directly contradicts this loop's own
+        # documented invariant. tree-sitter's own parse failure is already
+        # handled inside scan_java_module (via parse_java's fault-tolerant
+        # contract); this catches everything else — a bug in the Python-side
+        # symbol/import extraction walking an otherwise-valid tree.
+        try:
+            if _language(rel) == Language.JAVA:
+                modules.append(scan_java_module(source, rel))
+            else:
+                modules.append(scan_module(source, rel))
+        except Exception as exc:  # noqa: BLE001 — fail-open by design, see above
+            language = Language.JAVA if _language(rel) == Language.JAVA else Language.PYTHON
+            modules.append(
+                ModuleRecord(
+                    path=rel,
+                    parse_error=f"{rel}: symbol extraction crashed — {exc}",
+                    language=language,
+                )
+            )
     return modules
 
 

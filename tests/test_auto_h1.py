@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import configparser
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -132,6 +133,40 @@ skip_llm = {"true" if skip_llm else "false"}
     return ini
 
 
+def _write_ini_fast_retry(
+    tmp: Path, *, task_mode: str = "code", filename: str = "agents.ini",
+    llm_call_retry_max: int = 1, llm_call_retry_wait_sec: float = 0,
+) -> Path:
+    """Same shape as _write_ini, but with AUTO-RETRY-BACKOFF-1's retry
+    knobs set small — tests that exercise a technical-failure candidate
+    (which retries llm_call_retry_max times, sleeping
+    llm_call_retry_wait_sec seconds before each) would otherwise really
+    wait 3*60s per candidate under the production defaults."""
+    ini = tmp / filename
+    ini.write_text(f"""
+[auto]
+git_user = agent
+git_email = agent@test
+task_mode = {task_mode}
+
+[api]
+active = local
+verify_ssl = false
+
+[api_local]
+base_url = http://localhost:11434/v1
+api_key =
+model = dummy
+api_format = openai
+
+[gate1]
+skip_llm = false
+llm_call_retry_max = {llm_call_retry_max}
+llm_call_retry_wait_sec = {llm_call_retry_wait_sec}
+""")
+    return ini
+
+
 def _git_log(repo: Path) -> list[str]:
     result = subprocess.run(
         ["git", "-C", str(repo), "log", "--oneline"],
@@ -154,7 +189,32 @@ def _fake_gate1_llm(*args, **kwargs):
     user = next((m.get("content", "") for m in messages if m.get("role") == "user"), "")
     if "FALSE_POSITIVE_MARKER" in user:
         return json.dumps({"verdict": "rejected", "reason": "already fixed by a prior commit"})
-    return json.dumps({"verdict": "confirmed", "reason": "problem still present"})
+    m = re.search(r"```\n(.*?)\n```", user, re.S)
+    code = m.group(1) if m else ""
+    evidence = next((ln.strip() for ln in code.splitlines() if ln.strip()), "def ")
+    return json.dumps({
+        "verdict": "confirmed", "evidence": evidence,
+        "reason": "problem still present",
+    })
+
+
+def _fake_gate1_llm_with_outage(*args, **kwargs):
+    """Same routing as _fake_gate1_llm, plus a TECHNICAL_FAILURE_MARKER
+    that simulates a provider outage — raises on every call for that
+    candidate, exhausting Gate1Filter's AUTO-RETRY-BACKOFF-1 retry budget
+    and returning a technical-failure reason (see gate1_filter.py's
+    _is_technical_failure). Used to test AUTO-REMOVE-GUARD-1 in
+    plan_validator.py: a technical failure must never delete a task from
+    plan.json the way a genuine "already fixed" rejection does.
+    """
+    payload = kwargs.get("payload")
+    if payload is None:
+        payload = next((a for a in args if isinstance(a, dict) and "messages" in a), {})
+    messages = payload.get("messages", [])
+    user = next((m.get("content", "") for m in messages if m.get("role") == "user"), "")
+    if "TECHNICAL_FAILURE_MARKER" in user:
+        raise RuntimeError("HTTP 400 from https://provider.example: simulated outage")
+    return _fake_gate1_llm(*args, **kwargs)
 
 
 def _write_matching_improvements_md(repo: Path, tasks: list[dict]) -> str:
@@ -645,6 +705,214 @@ class TestValidatePlanIntegration:
                    side_effect=_fake_gate1_llm) as mock_llm:
             validate_plan(repo, config_path=str(ini))
         assert mock_llm.call_count == 2
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AUTO-REMOVE-GUARD-1 — a technical failure must never delete a task
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestValidatePlanTechnicalFailureHandling:
+    """A candidate whose presence check exhausts every
+    AUTO-RETRY-BACKOFF-1 retry with a genuine LLM-call exception (network
+    error, provider outage) is NOT evidence the task is already fixed —
+    it just means Gate 1 never got a verdict this run. Unlike a genuine
+    "confirmed already fixed" rejection, this must leave the task
+    completely untouched in plan.json (still `todo`), never written to
+    IMPROVEMENTS-FALSE.md, never removed from IMPROVEMENTS.md, and never
+    committed — so the next --validate-plan run re-checks just this one.
+    """
+
+    @pytest.fixture()
+    def repo(self, tmp_path: Path) -> Path:
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        _git_init(repo)
+        return repo
+
+    @pytest.fixture()
+    def ini(self, tmp_path: Path) -> Path:
+        return _write_ini_fast_retry(tmp_path)
+
+    @pytest.fixture()
+    def seeded(self, repo: Path):
+        """One genuine false positive, one confirmed-still-needed, and
+        one that hits a simulated provider outage on every attempt."""
+        tasks = [
+            _task_kwargs(
+                "AUTO-T-KEEP", title="Validate parse_config input",
+                instruction="parse_config accepts anything with no validation — add a type check",
+                symbol="parse_config",
+            ),
+            _task_kwargs(
+                "AUTO-T-FALSEPOS", title="Add docstring to stable_func",
+                instruction="FALSE_POSITIVE_MARKER stable_func has no docstring",
+                symbol="stable_func",
+            ),
+            _task_kwargs(
+                "AUTO-T-OUTAGE", title="Add error handling to parse_config",
+                instruction="TECHNICAL_FAILURE_MARKER parse_config needs error handling",
+                symbol="parse_config",
+            ),
+        ]
+        agent_dir = repo / ".agent"
+        _seed_plan(agent_dir, goal="harden error handling", base_dir=repo, tasks=tasks)
+        _write_matching_improvements_md(repo, tasks)
+        return agent_dir, repo
+
+    def test_outage_task_left_as_todo_not_removed(self, seeded, ini: Path) -> None:
+        agent_dir, repo = seeded
+        with patch("tools.llm_stream.request_completion",
+                   side_effect=_fake_gate1_llm_with_outage):
+            validate_plan(repo, config_path=str(ini))
+
+        store = StateStore(agent_dir)
+        store.initialise("harden error handling", repo)
+        task = store.get_task("AUTO-T-OUTAGE")
+        assert task is not None, "technical failure must NOT delete the task"
+        assert task["status"] == STATUS_TODO
+
+    def test_outage_task_appears_in_inconclusive_not_removed(
+        self, seeded, ini: Path,
+    ) -> None:
+        agent_dir, repo = seeded
+        with patch("tools.llm_stream.request_completion",
+                   side_effect=_fake_gate1_llm_with_outage):
+            report = validate_plan(repo, config_path=str(ini))
+
+        assert [r.task_id for r in report.inconclusive] == ["AUTO-T-OUTAGE"]
+        assert "AUTO-T-OUTAGE" not in [r.task_id for r in report.removed]
+        assert "AUTO-T-OUTAGE" not in report.kept
+
+    def test_genuine_false_positive_still_removed_alongside_outage(
+        self, seeded, ini: Path,
+    ) -> None:
+        """AUTO-REMOVE-GUARD-1 must not weaken the existing, correct
+        removal behaviour for genuine rejections in the same run."""
+        agent_dir, repo = seeded
+        with patch("tools.llm_stream.request_completion",
+                   side_effect=_fake_gate1_llm_with_outage):
+            report = validate_plan(repo, config_path=str(ini))
+
+        assert [r.task_id for r in report.removed] == ["AUTO-T-FALSEPOS"]
+        store = StateStore(agent_dir)
+        store.initialise("harden error handling", repo)
+        assert store.get_task("AUTO-T-FALSEPOS") is None
+
+    def test_confirmed_task_still_kept_alongside_outage(
+        self, seeded, ini: Path,
+    ) -> None:
+        agent_dir, repo = seeded
+        with patch("tools.llm_stream.request_completion",
+                   side_effect=_fake_gate1_llm_with_outage):
+            report = validate_plan(repo, config_path=str(ini))
+
+        assert report.kept == ["AUTO-T-KEEP"]
+
+    def test_outage_task_not_written_to_improvements_false_md(
+        self, seeded, ini: Path,
+    ) -> None:
+        agent_dir, repo = seeded
+        with patch("tools.llm_stream.request_completion",
+                   side_effect=_fake_gate1_llm_with_outage):
+            validate_plan(repo, config_path=str(ini))
+
+        text = (repo / IMPROVEMENTS_FALSE_FILENAME).read_text(encoding="utf-8")
+        assert "### AUTO-T-OUTAGE:" not in text
+        assert "### AUTO-T-FALSEPOS:" in text  # genuine rejection still recorded
+
+    def test_outage_task_entry_survives_in_improvements_md(
+        self, seeded, ini: Path,
+    ) -> None:
+        """Untouched means untouched — its original IMPROVEMENTS.md
+        section must still be there, exactly like AUTO-T-KEEP's."""
+        agent_dir, repo = seeded
+        with patch("tools.llm_stream.request_completion",
+                   side_effect=_fake_gate1_llm_with_outage):
+            validate_plan(repo, config_path=str(ini))
+
+        text = (repo / IMPROVEMENTS_FILENAME).read_text(encoding="utf-8")
+        assert "### AUTO-T-OUTAGE:" in text
+        assert "### AUTO-T-FALSEPOS:" not in text  # genuine rejection IS removed
+
+    def test_checked_count_includes_the_outage_task(
+        self, seeded, ini: Path,
+    ) -> None:
+        agent_dir, repo = seeded
+        with patch("tools.llm_stream.request_completion",
+                   side_effect=_fake_gate1_llm_with_outage):
+            report = validate_plan(repo, config_path=str(ini))
+
+        assert report.checked == 3  # all 3 pending tasks were attempted
+
+    def test_state_log_mentions_the_unresolved_count(
+        self, seeded, ini: Path,
+    ) -> None:
+        agent_dir, repo = seeded
+        with patch("tools.llm_stream.request_completion",
+                   side_effect=_fake_gate1_llm_with_outage):
+            validate_plan(repo, config_path=str(ini))
+
+        text = (repo / ".agent" / "run.log").read_text(encoding="utf-8")
+        assert "left unresolved" in text
+        assert "1 left unresolved" in text
+
+    def test_run_validate_reports_the_outage_task_to_the_user(
+        self, seeded, ini: Path, capsys,
+    ) -> None:
+        agent_dir, repo = seeded
+        with patch("tools.llm_stream.request_completion",
+                   side_effect=_fake_gate1_llm_with_outage):
+            rc = run_validate(base_dir=repo, config_path=str(ini))
+
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "AUTO-T-OUTAGE" in out
+        assert "technical failure" in out.lower()
+        assert "left unchanged" in out.lower() or "re-run" in out.lower()
+
+    def test_only_the_genuine_removal_is_committed(
+        self, seeded, ini: Path,
+    ) -> None:
+        """The commit message / diff should reflect only the ACTUAL
+        removal (AUTO-T-FALSEPOS) — the outage task must leave no trace
+        in git at all."""
+        agent_dir, repo = seeded
+        with patch("tools.llm_stream.request_completion",
+                   side_effect=_fake_gate1_llm_with_outage):
+            validate_plan(repo, config_path=str(ini))
+
+        show = subprocess.run(
+            ["git", "-C", str(repo), "show", "--stat", "HEAD"],
+            capture_output=True, text=True, check=True,
+        ).stdout
+        assert "AUTO-T-OUTAGE" not in show
+
+    def test_no_commit_at_all_when_only_outage_no_genuine_removal(
+        self, repo: Path, ini: Path,
+    ) -> None:
+        """If NOTHING in the run is a genuine removal — only an outage
+        candidate — no validation commit should be made at all (removed
+        stays empty, and _commit_validation is only called when
+        removed is non-empty)."""
+        _seed_plan(repo / ".agent", goal="g", base_dir=repo, tasks=[
+            _task_kwargs(
+                "AUTO-T-OUTAGE", title="Add error handling to parse_config",
+                instruction="TECHNICAL_FAILURE_MARKER parse_config needs error handling",
+                symbol="parse_config",
+            ),
+        ])
+        before = _git_log(repo)
+        with patch("tools.llm_stream.request_completion",
+                   side_effect=_fake_gate1_llm_with_outage):
+            report = validate_plan(repo, config_path=str(ini))
+        after = _git_log(repo)
+
+        assert report.removed == []
+        assert [r.task_id for r in report.inconclusive] == ["AUTO-T-OUTAGE"]
+        # Only GitManager's own one-time .gitignore safety commit (if
+        # any) may appear — never an "AUTO-H1" validation commit.
+        assert not any("AUTO-H1" in line for line in after)
+        assert len(after) - len(before) <= 1
 
 
 class TestValidatePlanNoPendingTasks:

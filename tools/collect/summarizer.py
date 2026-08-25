@@ -47,6 +47,37 @@ logger = logging.getLogger(__name__)
 # so any existing `_make_llm_call`-style factory can be used interchangeably.
 LlmCall = Callable[[str, str], str]
 
+
+class EmptyReplyError(RuntimeError):
+    """Raised by `summarize_module` when the LLM call returns a blank (or
+    whitespace-only) reply — never by `_parse_llm_summary`, which keeps
+    its existing always-degrade-never-raise contract for every other
+    malformed shape (non-JSON, wrong type, missing keys).
+
+    BUGFIX (found via forensic comparison of two real collect runs
+    against this repo, one provider route coming back with a fully blank
+    Pass B summary ~4x more often than the other on the exact same
+    files): before this, an empty completion and a deliberate
+    `{"purpose": "", "notes": ""}` reply were indistinguishable by the
+    time they reached `summarize_repo`'s retry loop — both degrade to the
+    same empty `LLMSummary` inside `_parse_llm_summary`, which never
+    raises, so a "200 OK but empty body" response (a flaky/rate-limited
+    provider's typical failure shape) was accepted as a fully successful
+    call and never retried; `max_retries`/backoff only ever fires on a
+    *raised* exception. A genuinely empty completion is a much stronger
+    signal of a provider-level hiccup than of the model's own considered
+    answer — essentially no model, however terse, replies with literally
+    nothing to a direct "summarize this file" prompt about a real several-
+    hundred-line source file. Raising here routes a blank reply through
+    the exact same retry-with-backoff path a raised network error already
+    gets, at essentially zero cost: if every retry also comes back blank,
+    `summarize_repo` still settles on the same fail-open empty summary it
+    always would have (see its `except Exception` branch) — this only
+    ever buys extra attempts against a flaky call, it never changes the
+    worst case or promotes a genuinely thin/deliberate reply into a
+    retry.
+    """
+
 DEFAULT_NUM_CTX = 4096
 DEFAULT_MAX_TOKENS = 400
 DEFAULT_MAX_RETRIES = 3
@@ -173,7 +204,17 @@ def _parse_llm_summary(raw: str) -> LLMSummary:
         return LLMSummary(purpose="", notes="")
     purpose = data.get("purpose") or ""
     notes = data.get("notes") or ""
-    return LLMSummary(purpose=str(purpose), notes=str(notes))
+    # AUTO-FIX (medium-priority audit): `str(purpose)`/`str(notes)` used to
+    # blindly coerce ANY JSON value — a list, a nested object, a number —
+    # into its Python str() representation (e.g. "[1, 2]" or "{'a': 1}")
+    # instead of treating a non-string value as the malformed reply it is.
+    # That let garbage silently pollute the cached collect artifact as if
+    # it were a legitimate purpose/notes string. Same fail-open philosophy
+    # as the rest of this function (degrade to empty, never raise) — just
+    # applied to type, not only shape.
+    if not isinstance(purpose, str) or not isinstance(notes, str):
+        return LLMSummary(purpose="", notes="")
+    return LLMSummary(purpose=purpose, notes=notes)
 
 
 # ── single-module Pass B ─────────────────────────────────────────────────────────
@@ -193,11 +234,21 @@ def summarize_module(
     A module that failed to parse (`module.parse_error` set) is returned
     unchanged — there is nothing coherent to summarize, and no facts to
     ground a summary in.
+
+    Raises `EmptyReplyError` if `llm_call` returns a blank/whitespace-only
+    reply — the one reply shape treated as retry-worthy rather than being
+    handed to `_parse_llm_summary` directly (see that exception's own
+    docstring). Every other malformed shape (non-JSON prose, wrong type,
+    missing keys, an empty-but-well-formed `{"purpose": "", "notes": ""}`)
+    still goes straight through `_parse_llm_summary`'s existing degrade-
+    never-raise handling, unchanged.
     """
     if module.parse_error is not None:
         return module
     user_msg = build_summary_prompt(module, source, num_ctx=num_ctx, max_tokens=max_tokens)
     raw = llm_call(SYSTEM_PROMPT, user_msg)
+    if not (raw or "").strip():
+        raise EmptyReplyError(f"{module.path}: LLM call returned a blank reply")
     summary = _parse_llm_summary(raw)
     return module.with_llm_summary(summary)
 
@@ -221,9 +272,10 @@ def summarize_repo(
     """Run Pass B over every module, in order.
 
     Retry/resume (♻️ `tools.backoff`):
-      * A module whose LLM call raises is retried with the project's
-        standard exponential backoff schedule (`backoff_seconds`), up to
-        `max_retries` times; after that it's kept structural-only (no
+      * A module whose LLM call raises — including `EmptyReplyError` for a
+        blank reply, see that exception's docstring — is retried with the
+        project's standard exponential backoff schedule (`backoff_seconds`),
+        up to `max_retries` times; after that it's kept structural-only (no
         `summary` attached) rather than aborting the whole run — one flaky
         module must not cost every other module its summary.
       * If `checkpoint_path` is given, a summary that lands successfully is
@@ -327,12 +379,29 @@ def collect_llm_budget(config, task_mode: str = "code") -> "tuple[int, int]":
     num_ctx_str = _cfg_mode(config, "collect", "num_ctx", task_mode, fallback=None)
     if num_ctx_str is None:
         num_ctx_str = config.get(api_sec, "num_ctx", fallback="0")
-    num_ctx = int(num_ctx_str)
+    # BUGFIX: `fallback=` on configparser reads only covers a *missing* key,
+    # not a malformed *value* — a non-numeric num_ctx/max_tokens raised a raw
+    # ValueError straight out of this function, crashing both the `--collect`
+    # CLI action (unguarded call site) and the interactive `/collect` REPL
+    # command (whose `except CollectCliError` doesn't catch ValueError).
+    # Mirrors the existing try/except-around-int() pattern used by
+    # tools/auto/repo_ingest.py::_read_int.
+    try:
+        num_ctx = int(num_ctx_str)
+    except (ValueError, TypeError):
+        logger.warning("config num_ctx invalid (%r) — using 0", num_ctx_str)
+        num_ctx = 0
 
     max_tokens_str = _cfg_mode(
         config, "collect", "max_tokens", task_mode, fallback=str(DEFAULT_MAX_TOKENS)
     )
-    max_tokens = int(max_tokens_str)
+    try:
+        max_tokens = int(max_tokens_str)
+    except (ValueError, TypeError):
+        logger.warning(
+            "config max_tokens invalid (%r) — using %d", max_tokens_str, DEFAULT_MAX_TOKENS
+        )
+        max_tokens = DEFAULT_MAX_TOKENS
     return num_ctx, max_tokens
 
 

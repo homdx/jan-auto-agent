@@ -1,0 +1,1 @@
+../tests/test_manifest_is_dirty_unicode.py

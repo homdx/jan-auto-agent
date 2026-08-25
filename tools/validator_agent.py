@@ -101,11 +101,23 @@ class ValidatorAgent:
 
         # pull prompt dynamically at call time so any push()/rollback()
         # takes effect on the very next pipeline run with zero code change.
-        template = (
-            self.prompt_store.get_current("validator_agent")
-            if self.prompt_store is not None
-            else VALIDATOR_PROMPT_HARDCODED
-        )
+        # Guarded: get_current() reads from disk — a corrupted store file,
+        # a removed parent directory, or a truncated JSON payload all raise
+        # out of _load(). Left unguarded, that crashes the entire
+        # validation pass instead of just this call; fall back to the
+        # hardcoded prompt, same as the invalid-placeholder case just below.
+        try:
+            template = (
+                self.prompt_store.get_current("validator_agent")
+                if self.prompt_store is not None
+                else VALIDATOR_PROMPT_HARDCODED
+            )
+        except Exception as e:  # noqa: BLE001 — prompt store outage must not kill validation
+            logger.warning(
+                "ValidatorAgent: prompt store unavailable (%s) — "
+                "using hardcoded fallback prompt", e
+            )
+            template = VALIDATOR_PROMPT_HARDCODED
 
         try:
             prompt = template.format(
@@ -216,6 +228,33 @@ class ValidatorAgent:
                     '{"status": "approved" | "needs_fix", "feedback": "...", '
                     '"suggested_searches": [...]} — reply with JSON only, no '
                     "prose, no code fences."
+                ),
+                "_unparseable": True,
+            }
+            tracer.event("validator_agent", "orchestrator", "error", content=_err)
+            return _err
+
+        # AUTO-FIX (medium-priority audit, DeepSeek-plan finding): valid
+        # JSON that isn't an object (a list, a string, a number) or is an
+        # object missing the required "status" key — the field the whole
+        # STRICT JSON contract described in the error message above exists
+        # to guarantee — used to sail through unchecked; the very next
+        # line's `.get("suggested_searches")` would even raise
+        # AttributeError on a non-dict reply before reaching the caller.
+        # Treat both cases the same way an unparseable reply already is —
+        # needs_fix, with feedback naming exactly what was wrong.
+        if not isinstance(parsed_result, dict) or "status" not in parsed_result:
+            logger.warning(
+                "ValidatorAgent: reply parsed as JSON but is not a valid "
+                "verdict object: %r", parsed_result,
+            )
+            _err = {
+                "status": "needs_fix",
+                "feedback": (
+                    'Your reply was valid JSON but not the required '
+                    'object shape — reply with '
+                    '{"status": "approved" | "needs_fix", "feedback": "...", '
+                    '"suggested_searches": [...]}.'
                 ),
                 "_unparseable": True,
             }

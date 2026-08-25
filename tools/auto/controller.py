@@ -93,11 +93,38 @@ class RunLimits:
 
     @classmethod
     def from_config(cls, config: configparser.ConfigParser) -> "RunLimits":
-        """Read limits from a ``ConfigParser`` instance ([auto] section)."""
-        max_min   = config.getfloat("auto", "max_runtime_min",   fallback=0)
-        max_tasks = config.getint  ("auto", "max_tasks_per_run", fallback=0)
-        exec_to   = config.getfloat("auto", "exec_timeout_sec",  fallback=120)
-        ws_retain = config.getint  ("auto", "workspace_retain_count", fallback=5)
+        """Read limits from a ``ConfigParser`` instance ([auto] section).
+
+        AUTO-FIX (medium-priority audit): a present-but-malformed value
+        (e.g. ``max_runtime_min = abc``) used to raise a bare ValueError
+        out of configparser — fallback= only covers an absent key, not a
+        malformed one. Wrapped per-call (not delegated to a shared helper)
+        so `tools.collect.ast_facts.extract_config_reads` (COLLECT-5)
+        still recognizes each literal `config.getX(section, key,
+        fallback=...)` call site — that AST-shape matching is how the
+        `collect` static-analysis pass builds its config map, and a
+        wrapper function call would have made these reads invisible to it.
+        """
+        try:
+            max_min = config.getfloat("auto", "max_runtime_min", fallback=0)
+        except ValueError as exc:
+            logger.warning("config [auto] max_runtime_min invalid (%s) — using 0", exc)
+            max_min = 0
+        try:
+            max_tasks = config.getint("auto", "max_tasks_per_run", fallback=0)
+        except ValueError as exc:
+            logger.warning("config [auto] max_tasks_per_run invalid (%s) — using 0", exc)
+            max_tasks = 0
+        try:
+            exec_to = config.getfloat("auto", "exec_timeout_sec", fallback=120)
+        except ValueError as exc:
+            logger.warning("config [auto] exec_timeout_sec invalid (%s) — using 120", exc)
+            exec_to = 120
+        try:
+            ws_retain = config.getint("auto", "workspace_retain_count", fallback=5)
+        except ValueError as exc:
+            logger.warning("config [auto] workspace_retain_count invalid (%s) — using 5", exc)
+            ws_retain = 5
         return cls(
             max_runtime_sec   = max_min * 60,
             max_tasks_per_run = max_tasks,
@@ -259,9 +286,32 @@ class AutoController:
         # (defaults to "code", so existing configs are unaffected). self.config
         # is likewise parsed exactly once and reused everywhere, instead of
         # re-reading agents.ini from disk on each call.
+        #
+        # NOTE: a nonexistent config_path is intentionally NOT an error here
+        # — self.config just stays empty and every getter below falls back
+        # to its coded default. Many tests rely on this ("none.ini" as
+        # shorthand for "use defaults"), and AutoController itself has no
+        # way to distinguish "user made a typo" from "test wants defaults
+        # on purpose". The CLI entry point (main.py) is where a real path
+        # typo should be caught loudly instead — see main.py's --config
+        # handling for --auto/--validate-plan.
         self.config = configparser.ConfigParser(inline_comment_prefixes=(';', '#'))
+        # AUTO-FIX (medium-priority audit): the NOTE above already makes a
+        # missing config_path a non-error by design — extend the same
+        # "fall back to defaults" treatment to a config file that EXISTS
+        # but fails to parse (bad .ini syntax), rather than letting
+        # AutoController.__init__ crash on a config typo. This is a
+        # narrower fix than "catch everything": a genuinely malformed file
+        # still leaves self.config effectively empty (same end state as
+        # "missing"), so every getter's fallback still applies uniformly.
         if Path(config_path).exists():
-            self.config.read(config_path, encoding="utf-8")
+            try:
+                self.config.read(config_path, encoding="utf-8")
+            except configparser.Error as exc:
+                logger.warning(
+                    "AutoController: %s is malformed (%s) — proceeding "
+                    "with default settings", config_path, exc,
+                )
         # AUTO-CR-10: normalise task_mode (typo-tolerant) so a misspelling like
         # 'creativy' is corrected with a loud warning instead of silently
         # degrading to code mode.
@@ -381,7 +431,23 @@ class AutoController:
         self.progress_display.code_total = len(self.state.all_tasks())
 
         # AUTO-E1/E2: Setup metrics stream and auto tuner
-        self.metrics_stream = AutoMetricsStream(self.agent_dir)
+        # FOLLOW-UP (JAN-BUG-04 residual): AutoMetricsStream.__init__ now
+        # raises a clear RuntimeError instead of a bare OSError when its
+        # directory can't be created — better diagnostics, but this call
+        # site was still unguarded, so the improved error still aborted
+        # the entire --auto run over a metrics sidecar failure, exactly
+        # what JAN-BUG-04 said must not happen ("metrics loss is
+        # acceptable; aborting the run is not"). Guard it here: log and
+        # continue with metrics disabled (every downstream use already
+        # checks `if self.metrics_stream`) rather than crash startup.
+        try:
+            self.metrics_stream = AutoMetricsStream(self.agent_dir)
+        except Exception as exc:
+            logger.warning(
+                "AutoMetricsStream unavailable (%s) — continuing this run "
+                "with metrics recording disabled", exc,
+            )
+            self.metrics_stream = None
         self.auto_tuner = make_auto_tuner(cfg, self.agent_dir)
 
         # ──────────────────────────────────────────────────────────────────
@@ -493,8 +559,15 @@ class AutoController:
         from tools.auto.executor import make_executor
         from tools.auto.bug_fix_loop import make_bug_fix_loop
 
+        # COLLECT-24: built ONCE per run (not per task) — see
+        # tests/test_collect_bridge_wiring.py::test_collect_model_loaded_once_per_run.
+        # Replaces the old COLLECT-23 collect_context_for() method, which was
+        # correct but never actually called from this loop.
+        collect_bridge = self._get_collect_bridge(task_mode)
+
         outer_loop = make_outer_loop(cfg, self.base_dir, self.state,
-                                       task_mode=task_mode, run_goal=self.goal)
+                                       task_mode=task_mode, run_goal=self.goal,
+                                       collect_bridge=collect_bridge)
         # AUTO-CR-14: the bare CommitOnSuccess left summary_memory=None, so the
         # creative synopsis hook (CR-5) never fired — starving continuity (each
         # chapter only saw the previous one) and disabling the canon gate. Wire
@@ -966,33 +1039,54 @@ class AutoController:
         key = "use_in_doc" if self.task_mode == "docs" else "use_in_auto"
         return self.config.getboolean("collect", key, fallback=False)
 
-    def collect_context_for(self, target_file: str) -> str:
-        """The opt-in COLLECT-23 context block for `target_file`: its
-        `collect` module record, contracts, and config reads — or `""`
-        when the feature is off, the artifact is unavailable, or there is
-        nothing to say about this file.
+    def _get_collect_bridge(self, task_mode: str):
+        """COLLECT-24: lazily build (and cache for the lifetime of this
+        Controller / this `--auto` run) the `CollectBridge` used to inject
+        collect context into every task in `_run_task_loop`.
 
-        Nothing calls this unless `[collect] use_in_auto`/`use_in_doc` is
-        `true` *and* a caller actually invokes it — with the flag left at
-        its default `false`, every call short-circuits before ever
-        touching `tools.collect`, so a disabled run's context is
-        byte-for-byte what it was before COLLECT-23 (this method's own
-        AC).
+        Cached per `task_mode` since `use_in_auto` vs `use_in_doc` and the
+        summarizer's own mode-aware settings can legitimately differ; in
+        practice a single `Controller` only ever runs one `task_mode` per
+        `run()`, so this is a single load in normal operation — the
+        per-task-loop-call cache is what `test_collect_model_loaded_once_per_run`
+        actually pins down (`tools.collect.loader.load` called exactly once
+        for N tasks in one `_run_task_loop` invocation).
         """
-        if not self._collect_use_flag():
+        cache = getattr(self, "_collect_bridge_cache", None)
+        if cache is None:
+            cache = {}
+            self._collect_bridge_cache = cache
+        if task_mode in cache:
+            return cache[task_mode]
+        # Defensive: some tests build AutoController via __new__() and never
+        # run __init__, so self.config may be absent — behave exactly like
+        # "no [collect] section" (bridge disabled) rather than raising.
+        cfg = getattr(self, "config", None)
+        if cfg is None:
+            cache[task_mode] = None
+            return None
+        from tools.auto.collect_bridge import make_collect_bridge
+        bridge = make_collect_bridge(
+            self.base_dir, cfg, getattr(self, "config_path", None), task_mode=task_mode,
+        )
+        cache[task_mode] = bridge
+        return bridge
+
+    def collect_context_for(self, target_file: str) -> str:
+        """The opt-in COLLECT-23 context block for `target_file` — kept for
+        backward compatibility with anything calling this directly (e.g.
+        `/doc` mode, older tests). `_run_task_loop` no longer calls this;
+        it uses `_get_collect_bridge()` + `CollectBridge.context_for()`
+        instead (COLLECT-24), which adds budget-aware shrinking and a
+        run-scoped cache this method never had.
+
+        Returns `""` when the feature is off, the artifact is unavailable
+        or stale, or there is nothing to say about this file.
+        """
+        bridge = self._get_collect_bridge(self.task_mode)
+        if bridge is None:
             return ""
-        try:
-            from tools.collect.loader import load as load_collect_model
-            from tools.auto.context_assembler import build_collect_context_block
-        except Exception as exc:  # noqa: BLE001 — opt-in feature, never fatal
-            logger.warning("controller: collect context injection unavailable: %s", exc)
-            return ""
-        try:
-            model = load_collect_model(self.base_dir, config=self.config, config_path=self.config_path)
-            return build_collect_context_block(model, target_file, task_mode=self.task_mode)
-        except Exception as exc:  # noqa: BLE001 — same fail-open stance as SummaryMemory/StoryBible above
-            logger.warning("controller: collect context injection failed for %s: %s", target_file, exc)
-            return ""
+        return bridge.context_for(target_file)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

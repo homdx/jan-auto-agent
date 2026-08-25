@@ -237,7 +237,16 @@ class TicketStore:
             raise TicketAlreadyExists(
                 f"Ticket '{ticket['id']}' already exists at {path}"
             )
-        self._ensure_dir()
+        # AUTO-T37 FIX: _ensure_dir() (mkdir) can raise OSError on permission
+        # errors or read-only file systems.  Convert to TicketError so callers
+        # get a domain exception rather than a raw OS error — and can catch it
+        # alongside TicketAlreadyExists without also swallowing unrelated errors.
+        try:
+            self._ensure_dir()
+        except OSError as exc:
+            raise TicketError(
+                f"Could not create ticket directory '{self._dir}': {exc}"
+            ) from exc
         self._write(path, ticket)
         logger.debug("TicketStore.create: %s", ticket["id"])
 
@@ -280,6 +289,22 @@ class TicketStore:
         if not isinstance(ticket, dict):
             self._quarantine(
                 path, f"expected a JSON object, got {type(ticket).__name__}"
+            )
+            return None
+        # AUTO-FIX (medium-priority audit, DeepSeek-plan finding): a dict
+        # missing required fields (id/type/status/linked_task — the same
+        # schema make_ticket() always produces) used to pass through
+        # untouched. Callers that trust get()'s return shape (e.g.
+        # indexing ticket["status"] directly) would then crash far from
+        # here with no indication the ticket file itself was incomplete.
+        # Quarantine it the same way an unreadable or wrong-shape file
+        # already is, rather than handing back a ticket-shaped dict that
+        # isn't actually one.
+        _required_ticket_keys = {"id", "type", "status", "linked_task"}
+        _missing = _required_ticket_keys - ticket.keys()
+        if _missing:
+            self._quarantine(
+                path, f"missing required field(s) {sorted(_missing)}"
             )
             return None
         return ticket

@@ -1,0 +1,1 @@
+../tests/test_collect_fail_open_registry.py

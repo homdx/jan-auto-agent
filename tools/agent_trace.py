@@ -103,8 +103,20 @@ class AgentTracer:
         if self.enabled and self.path is not None:
             try:
                 self._fh = open(self.path, "a", encoding="utf-8")  # noqa: SIM115
-            except OSError:
+            except OSError as exc:
+                # AUTO-FIX (medium-priority audit, DeepSeek-plan finding):
+                # this used to fail completely silently — self._fh = None
+                # with no log line — so a bad trace path (permissions,
+                # missing parent dir, disk full) disabled tracing for the
+                # entire run with zero indication anything went wrong.
+                # Every subsequent tracer.event() call already no-ops
+                # cleanly on self._fh is None, so this is purely a
+                # visibility fix, not a behavior change.
                 self._fh = None
+                logger.warning(
+                    "AgentTracer: could not open trace file %s (%s) — "
+                    "tracing disabled for this run", self.path, exc,
+                )
 
     # ------------------------------------------------------------------ #
     # Run grouping                                                         #
@@ -187,14 +199,30 @@ class AgentTracer:
         # "a" mode, so individual writes on POSIX are atomic for our
         # line-sized records without needing a lock to serialize them.
         if self.console_echo or (self.llm_debug >= 2 and kind == "llm_request"):
-            self._console_line(source, target, kind, model, temperature, max_tokens, params, content)
+            # AUTO-FIX (medium-priority audit, DeepSeek-plan finding):
+            # _console_line writes directly to sys.stdout (several
+            # sys.stdout.write/.flush calls inside it, not routed through
+            # `logging`) with no guard anywhere. If stdout is piped and the
+            # reader closes early (e.g. `| head`), that raises
+            # BrokenPipeError — unlike the trace-file write below, which
+            # already treats a write failure as non-fatal, this purely
+            # diagnostic console echo was able to crash the whole run.
+            try:
+                self._console_line(source, target, kind, model, temperature, max_tokens, params, content)
+            except OSError:
+                pass
 
         try:
             if self._fh is not None:
                 self._fh.write(json.dumps(record, ensure_ascii=False) + "\n")
                 self._fh.flush()
-        except OSError:
-            # Tracing must never break the pipeline — swallow write errors.
+        except (OSError, TypeError):
+            # Tracing must never break the pipeline — swallow write errors
+            # (OSError) AND serialization errors (TypeError, e.g. an
+            # unserializable object that slipped past _sanitize/_truncate
+            # into params/content — more likely to actually happen under
+            # LLM_DEBUG=2, which is exactly when unusual objects are most
+            # likely to reach here).
             pass
 
     def _console_line(

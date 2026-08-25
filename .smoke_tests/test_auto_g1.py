@@ -1,0 +1,1 @@
+../tests/test_auto_g1.py

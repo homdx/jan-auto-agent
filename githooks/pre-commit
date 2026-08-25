@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# TIERS-1 pre-commit hook.
+#
+# Catches the two classes of rot that this repository has actually suffered
+# and that NO test run can detect, because both make tests silently vanish
+# rather than fail:
+#
+#   1. Test-tier drift — a new test with no symlink, a link left behind by a
+#      deleted test, a link with an absolute or mistargeted path. A missing
+#      test cannot fail; a dangling link is skipped silently by
+#      RepoIngestor.walk (its stat() raises). This is how .smoke_tests/fixtures
+#      went missing and was only noticed after the push.
+#
+#   2. Stray files in the repository root — a loose copy of a test file at the
+#      top level once cost a full debugging session, because
+#      tests/test_collect_ast_symbols.py scans the whole tree and reports it
+#      as a parse error under a bare filename.
+#
+# Deliberately fast (well under a second) and read-only: it never rewrites the
+# working tree or stages anything on your behalf. It tells you the command to
+# run and gets out of the way.
+#
+# Install (once per clone):
+#     git config core.hooksPath githooks
+#
+# Bypass for a single commit, when you know what you are doing:
+#     git commit --no-verify
+
+set -u
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT" || exit 0
+
+PY="${PYTHON:-python3}"
+FAILED=0
+
+# ── 1. test tiers ────────────────────────────────────────────────────────────
+if [ -f scripts/sync_test_tiers.py ]; then
+    if ! OUT="$("$PY" scripts/sync_test_tiers.py --check 2>&1)"; then
+        echo "pre-commit: test tiers are out of sync"
+        echo "$OUT" | sed 's/^/  /'
+        echo
+        echo "  fix:  $PY scripts/sync_test_tiers.py && git add .smoke_tests .regression_tests"
+        echo
+        FAILED=1
+    fi
+fi
+
+# ── 2. stray files in the repository root ────────────────────────────────────
+# Only files being ADDED by this commit are considered, so a pre-existing
+# root script never blocks an unrelated commit.
+ALLOWED_ROOT_PY="analyze_logs.py check_improvements.py conftest.py \
+emulate_stub_server_stub_llm.py main.py restore_synapse.py view_trace.py"
+
+STRAY=""
+while IFS= read -r f; do
+    case "$f" in
+        */*) continue ;;          # not at the root
+        *.py) ;;
+        *) continue ;;
+    esac
+    case " $ALLOWED_ROOT_PY " in
+        *" $f "*) continue ;;
+    esac
+    STRAY="$STRAY $f"
+done < <(git diff --cached --name-only --diff-filter=A)
+
+if [ -n "$STRAY" ]; then
+    echo "pre-commit: unexpected Python file(s) at the repository root:"
+    for f in $STRAY; do echo "  - $f"; done
+    echo
+    echo "  Test modules belong in tests/. If this really is a new top-level"
+    echo "  script, add it to ALLOWED_ROOT_PY in githooks/pre-commit."
+    echo
+    FAILED=1
+fi
+
+if [ "$FAILED" -ne 0 ]; then
+    echo "pre-commit: commit aborted (use --no-verify to override)"
+    exit 1
+fi
+
+exit 0

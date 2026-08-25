@@ -72,7 +72,12 @@ def _normalise_files(raw: str) -> frozenset[str]:
 
 
 def parse_improvements(path: Path) -> list[dict]:
-    text = path.read_text(encoding="utf-8")
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as e:
+        print(c(f"  WARNING: could not read {path}: {e}", YELLOW))
+        return []
+
     tasks = []
     blocks = re.split(r"(?=^### AUTO-T)", text, flags=re.MULTILINE)
     for block in blocks:
@@ -101,6 +106,69 @@ def parse_improvements(path: Path) -> list[dict]:
             "target_files": target_files,
             "reason":       reason,
             "instruction":  instruction,
+        })
+
+    if tasks:
+        return tasks
+
+    # AUTO-BUG (fixed): the block parser above only understands the
+    # "### AUTO-Txx: title" heading format used by IMPROVEMENTS.md /
+    # IMPROVEMENTS-FALSE.md. Curated ground-truth files
+    # (GROUND-TRUTH.md, GROUND-TRUTH-GOOGLE.md, GROUND-TRUTH-NVIDIA.md)
+    # use a *different* format — a "| ID | Location | Reason |" markdown
+    # table under a "## Confirmed FALSE POSITIVE" heading. Previously
+    # that meant parse_improvements() silently returned [] for every
+    # ground-truth file, so grade_folder() always saw "0 true false
+    # positives" and scored every agent-excluded task as a wrongly-
+    # excluded FP (0% precision), regardless of what the ground truth
+    # actually said. Fall back to the table parser before giving up.
+    return _parse_ground_truth_table(text)
+
+
+_GT_SECTION_RE = re.compile(
+    r"^##\s*Confirmed FALSE POSITIVE.*?\n(.*?)(?=^##\s|\Z)",
+    re.MULTILINE | re.DOTALL,
+)
+_GT_ROW_ID_RE = re.compile(r"^T(\d+)$")
+
+
+def _parse_ground_truth_table(text: str) -> list[dict]:
+    """Parse the curated `| ID | Location | Reason |` table format used by
+    GROUND-TRUTH*.md files under a '## Confirmed FALSE POSITIVE' heading,
+    returning tasks in the same shape parse_improvements() produces so
+    downstream code (matching, grading) doesn't need to know which format
+    the file was written in. Rows under a differently-named section (e.g.
+    '## Confirmed REAL') are intentionally not collected here — this
+    function's job is to answer "which candidate IDs does the ground
+    truth confirm as true false positives", not to catalogue everything.
+    """
+    section_match = _GT_SECTION_RE.search(text)
+    if not section_match:
+        return []
+
+    tasks = []
+    for line in section_match.group(1).splitlines():
+        line = line.strip()
+        if not line.startswith("|"):
+            continue
+        cells = [cell.strip() for cell in line.strip("|").split("|")]
+        if len(cells) < 3:
+            continue
+        m = _GT_ROW_ID_RE.match(cells[0])
+        if not m:
+            continue  # header row ("ID"), separator row ("----"), etc.
+
+        task_id = f"AUTO-T{m.group(1)}"
+        location, reason = cells[1], cells[2]
+        target_files = _normalise_files(location) | _normalise_files(reason)
+
+        tasks.append({
+            "id":           task_id,
+            "title":        location,
+            "location":     location,
+            "target_files": target_files,
+            "reason":       reason[:200],
+            "instruction":  "",
         })
     return tasks
 

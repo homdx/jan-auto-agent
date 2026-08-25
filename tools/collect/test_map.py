@@ -88,7 +88,11 @@ def _rich_import_targets(source: str) -> Set[str]:
     """
     try:
         tree = ast.parse(source)
-    except SyntaxError:
+    except (SyntaxError, ValueError):
+        # ValueError: ast.parse raises this (not SyntaxError) when source
+        # contains a null byte, e.g. an accidentally-binary or truncated
+        # file — same "can't meaningfully parse this" outcome, same
+        # fail-open response as an actual syntax error.
         return set()
     names: Set[str] = set()
     for node in ast.walk(tree):

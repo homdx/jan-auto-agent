@@ -1,0 +1,1 @@
+../tests/test_collect_scan_file_java_extensions.py

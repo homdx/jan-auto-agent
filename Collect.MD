@@ -160,7 +160,7 @@ guarantee itself.
 
 | Task | What |
 |---|---|
-| COLLECT-19 | `/collect`, `--collect`, `--check` (freshness only), `--refresh` (full rebuild), `--module <path>` (incremental) — same grain as existing `/auto`/`/edit` |
+| COLLECT-19 | `/collect`, `--collect`, `--check` (freshness only), `--refresh` (diff-driven incremental rebuild), `--module <path>` (incremental) — same grain as existing `/auto`/`/edit` |
 | COLLECT-20 | `[collect]` section in `agents.ini`: `dir`, `enabled`, `use_in_auto/doc/bughunt`, `staleness`, `llm_summaries`, `think` — all safe-fallback |
 
 ### EPIC G — Consumer: loader + bughunt + auto/doc (where the payoff lands)
@@ -206,7 +206,15 @@ and the `--auto` flag — `collect` doesn't invent a parallel system:
   artifact set for the current `--base` directory, then exit.
 - **`/collect --check`** — freshness report only, writes nothing.
 - **`/collect --module <path>`** — incremental re-collect of a single file.
-- **`/collect --refresh`** — force a full rebuild even if fresh.
+- **`/collect --refresh`** — diff-driven incremental rebuild: modules whose manifest
+  hash hasn't changed since the last run keep their existing record (including any
+  LLM-generated `purpose`/`notes`) untouched and cost zero LLM calls; only modules
+  whose hash *did* change get re-scanned/re-summarized (COLLECT-24). **Not** a full
+  rebuild — pointing `--base` at a fresh checkout of the same tree with an existing
+  `.collect/` artifact from an older commit will carry most modules' summaries
+  forward unchanged. To force every module through Pass B again regardless of what
+  changed, delete `[collect] dir` (or point `--base`/the artifact dir somewhere
+  empty) before running `--collect`.
 
 `collect` is **read-only against the source tree** — it never edits code, only writes
 under its own artifact directory (`COLLECT-19`'s AC is literally that it's physically

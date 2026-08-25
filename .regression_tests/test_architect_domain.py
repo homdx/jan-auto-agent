@@ -1,0 +1,1 @@
+../tests/test_architect_domain.py

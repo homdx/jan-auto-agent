@@ -349,7 +349,15 @@ def make_search_agent(config, base_dir="."):
     active  = config.get("api", "active", fallback="local")
     section = f"api_{active}"
 
-    verify_ssl = config.getboolean("api", "verify_ssl", fallback=True)
+    # AUTO-FIX (medium-priority audit): wrapped per-call, not delegated to a
+    # shared helper, so extract_config_reads (COLLECT-5) still recognizes
+    # the literal config.getX(...) call shape — see RunLimits.from_config's
+    # comment for the full reasoning.
+    try:
+        verify_ssl = config.getboolean("api", "verify_ssl", fallback=True)
+    except ValueError as exc:
+        logger.warning("config [api] verify_ssl invalid (%s) — using True", exc)
+        verify_ssl = True
     ssl_context = None
     if not verify_ssl:
         from tools.llm_stream import make_unverified_context
@@ -358,14 +366,30 @@ def make_search_agent(config, base_dir="."):
     raw_skip_dirs = config.get("search", "skip_dirs", fallback="")
     skip_dirs = [d.strip() for d in raw_skip_dirs.split(",") if d.strip()] or None
 
+    try:
+        _timeout = config.getint("loop", "timeout_seconds", fallback=240)
+    except ValueError as exc:
+        logger.warning("config [loop] timeout_seconds invalid (%s) — using 240", exc)
+        _timeout = 240
+    try:
+        _max_depth = config.getint("search", "max_depth", fallback=2)
+    except ValueError as exc:
+        logger.warning("config [search] max_depth invalid (%s) — using 2", exc)
+        _max_depth = 2
+    try:
+        _max_file_kb = config.getint("search", "max_file_kb", fallback=500)
+    except ValueError as exc:
+        logger.warning("config [search] max_file_kb invalid (%s) — using 500", exc)
+        _max_file_kb = 500
+
     return SearchAgent(
         model=config.get(section, "model", fallback=None),
         base_url=config.get(section, "base_url", fallback=None),
         api_key=config.get(section, "api_key", fallback=""),
         api_format=config.get(section, "api_format", fallback="openai"),
-        timeout=config.getint("loop", "timeout_seconds", fallback=240),
+        timeout=_timeout,
         ssl_context=ssl_context,
         skip_dirs=skip_dirs,
-        max_depth=config.getint("search", "max_depth", fallback=2),
-        max_file_kb=config.getint("search", "max_file_kb", fallback=500),
+        max_depth=_max_depth,
+        max_file_kb=_max_file_kb,
     )

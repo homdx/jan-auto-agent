@@ -475,10 +475,36 @@ class StateStore:
         self._save_progress()
 
     def log(self, msg: str) -> None:
-        """Append a timestamped line to run.log."""
+        """Append a timestamped line to run.log.
+
+        BUGFIX (report §4, item 7): previously an unguarded file write — any
+        OSError (disk full, permissions, run.log's parent directory removed
+        mid-run) propagated straight out of every .log() call site, 62 of
+        them across the codebase. The most damaging is inside
+        outer_loop.py's AUTO-OUTER-GUARD-1 handler, whose entire documented
+        purpose is "any exception inner_loop.run_task doesn't already
+        handle itself shouldn't crash the whole multi-task run" — that
+        handler itself calls self.state.log(...) unguarded, so an OSError
+        from logging could defeat the very safety net it exists to
+        provide.
+
+        Unlike _atomic_write (used for plan.json/progress.json, where a
+        silently failed state write is intentionally NOT swallowed because
+        it's worse than a loud one), run.log is a best-effort diagnostic
+        trail, not authoritative state — losing one line to a warning beats
+        crashing the run that line was trying to record. Callers that need
+        a write failure to be fatal already have _atomic_write /
+        _save_plan / _save_progress for that.
+        """
         line = f"[{_ts()}] {msg}\n"
-        with self._log_path.open("a", encoding="utf-8") as fh:
-            fh.write(line)
+        try:
+            with self._log_path.open("a", encoding="utf-8") as fh:
+                fh.write(line)
+        except OSError as exc:
+            logger.warning(
+                "StateStore: failed to write to %s: %s — log line dropped: %s",
+                self._log_path, exc, msg,
+            )
 
     @staticmethod
     def _safe_task_id(task_id: str) -> str:
@@ -564,15 +590,37 @@ class StateStore:
                 # already the right answer, because progress counts are fully
                 # derivable from the plan.  So a wrong-shape file recovers
                 # exactly like a corrupt one instead of poisoning the run.
+                # AUTO-FIX (medium-priority audit, DeepSeek-plan finding):
+                # the isinstance(dict) check above accepts ANY dict, even
+                # one missing the keys this class actually depends on
+                # (done_count/pending_count/status) — e.g. progress.json
+                # truncated to just "{}" by a partial write. That silently
+                # produced a StateStore whose get_progress() callers had to
+                # each separately guess a fallback for a key that should
+                # have been there. Treat a dict missing any required key
+                # the same as a wrong-shape file: rebuild from plan.json,
+                # which is the already-established, no-data-lost recovery
+                # path for exactly this situation.
+                _required_progress_keys = {"done_count", "pending_count", "status"}
                 if isinstance(loaded, dict):
-                    self._progress = loaded
-                    return
-                logger.warning(
-                    "StateStore: progress.json holds a %s, not an object — "
-                    "rebuilding from plan.json instead (progress counts are "
-                    "fully derivable from the plan, so no data is lost).",
-                    type(loaded).__name__,
-                )
+                    _missing = _required_progress_keys - loaded.keys()
+                    if not _missing:
+                        self._progress = loaded
+                        return
+                    logger.warning(
+                        "StateStore: progress.json is missing required "
+                        "key(s) %s — rebuilding from plan.json instead "
+                        "(progress counts are fully derivable from the "
+                        "plan, so no data is lost).",
+                        sorted(_missing),
+                    )
+                else:
+                    logger.warning(
+                        "StateStore: progress.json holds a %s, not an object — "
+                        "rebuilding from plan.json instead (progress counts are "
+                        "fully derivable from the plan, so no data is lost).",
+                        type(loaded).__name__,
+                    )
             except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
                 logger.warning(
                     "StateStore: progress.json is unreadable (%s) — rebuilding "
@@ -701,6 +749,25 @@ class StateStore:
         the new complete file, never a partial write. The pre-write ``.bak``
         copy is best-effort (not itself atomic) but never touches *path*, so
         an interrupted backup can't put the primary file at risk.
+
+        AUTO-FIX (medium-priority audit): the temp-file write and the
+        ``os.replace`` swap used to be completely unguarded — every task-
+        status update in the whole pipeline goes through this method, so an
+        ``OSError`` here (disk full, permission denied, filesystem gone
+        read-only mid-run) propagated as a bare, path-less traceback and
+        could crash a multi-hour ``--auto`` run. Now the tmp file is
+        cleaned up on failure (mirroring ``atomic_write_text``'s existing
+        behavior in ``utils.py``) and the re-raised exception names *path*
+        explicitly.
+
+        Raises
+        ------
+        OSError
+            Re-raised (via ``from exc``, with *path* named in the message)
+            if the write or the atomic rename fails. This is intentionally
+            NOT swallowed — a silently failed state write is worse than a
+            loud one; callers that need this to be non-fatal must catch it
+            themselves.
         """
         if path.exists():
             try:
@@ -711,8 +778,15 @@ class StateStore:
                     "StateStore: could not refresh backup for %s: %s", path, exc,
                 )
         tmp_path = path.with_suffix(path.suffix + ".tmp")
-        tmp_path.write_text(content, encoding="utf-8")
-        os.replace(tmp_path, path)
+        try:
+            tmp_path.write_text(content, encoding="utf-8")
+            os.replace(tmp_path, path)
+        except OSError as exc:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise OSError(f"StateStore: failed to write {path} ({exc})") from exc
 
     def _save_plan(self) -> None:
         self._atomic_write(

@@ -38,13 +38,25 @@ def read_file(path: str) -> str:
     if not resolved.is_file():
         raise FileNotFoundError(f"Not a file: {resolved}")
 
-    if resolved.stat().st_size == 0:
+    # AUTO-FILEREADER-GUARD-1: a file that exists and IS a regular file
+    # can still be unreadable (permissions changed after the check above,
+    # or from the start) — .stat()/.read_text() raised a raw
+    # PermissionError/OSError with no indication of which path was at
+    # fault, unlike every other failure mode this function already
+    # reports clearly.
+    try:
+        size = resolved.stat().st_size
+    except OSError as exc:
+        raise OSError(f"Cannot access {resolved}: {exc}") from exc
+    if size == 0:
         return ""
 
     try:
         return resolved.read_text(encoding="utf-8")
     except UnicodeDecodeError:
         return resolved.read_text(encoding="latin-1")
+    except OSError as exc:
+        raise OSError(f"Cannot read {resolved}: {exc}") from exc
 
 
 def list_py_files(base_dir: str, skip_dirs: list) -> list[str]:

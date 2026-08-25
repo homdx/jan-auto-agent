@@ -177,16 +177,30 @@ def magenta(s: str) -> str: return f"{c('magenta')}{s}{c('reset')}"
 
 def find_trace_files(path: str) -> list[Path]:
     """Return trace .jsonl files from a path (file or directory)."""
+    # AUTO-FIX (medium-priority audit, DeepSeek-plan finding): f.stat()
+    # inside sorted()'s key= was unguarded — a file deleted between the
+    # glob() and this stat() call (e.g. a still-actively-written trace
+    # directory, or a concurrent log-rotation) raised FileNotFoundError
+    # mid-sort and crashed the whole tool. Fall back to 0 for a file that
+    # vanished out from under us — sorting it first/oldest is harmless,
+    # analyze_logs.py's own per-file load already handles a since-deleted
+    # file gracefully.
+    def _safe_mtime(f: Path) -> float:
+        try:
+            return f.stat().st_mtime
+        except OSError:
+            return 0.0
+
     p = Path(path)
     if p.is_file():
         return [p]
     if p.is_dir():
-        files = sorted(p.glob("trace_*.jsonl"), key=lambda f: f.stat().st_mtime)
+        files = sorted(p.glob("trace_*.jsonl"), key=_safe_mtime)
         if not files:
             # also try .agent/ subdir
             agent = p / ".agent"
             if agent.is_dir():
-                files = sorted(agent.glob("trace_*.jsonl"), key=lambda f: f.stat().st_mtime)
+                files = sorted(agent.glob("trace_*.jsonl"), key=_safe_mtime)
         return files
     print(f"  [!] Path not found: {path}", file=sys.stderr)
     return []
@@ -194,7 +208,12 @@ def find_trace_files(path: str) -> list[Path]:
 
 def load_events(path: Path) -> list[dict]:
     events = []
-    with path.open("r", encoding="utf-8") as fh:
+    # BUGFIX: same root cause as tools/auto/view_trace.py::load_events — a
+    # trace file truncated mid-write can end mid multi-byte UTF-8 character.
+    # `errors="replace"` avoids an uncaught UnicodeDecodeError that would
+    # otherwise kill analyze_logs.py at the CLI entry point instead of
+    # showing the partial run it was asked to analyze.
+    with path.open("r", encoding="utf-8", errors="replace") as fh:
         for lineno, line in enumerate(fh, 1):
             line = line.strip()
             if not line:

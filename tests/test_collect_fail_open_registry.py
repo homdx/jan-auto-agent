@@ -6,7 +6,7 @@
   its body is picked up verbatim; a fail-open site with no such comment
   gets `rationale=None` rather than a guess.
 * AC: `tools/auto/auto_metrics.py:255`, `tools/auto/coder.py:718`, and
-  `tools/auto/inner_loop.py:353` are all in the registry when built from
+  `tools/auto/inner_loop.py:364` are all in the registry when built from
   this real repo.
 """
 
@@ -149,6 +149,6 @@ def test_ac_real_repo_reference_sites_are_all_registered():
     modules = scan_repo(REPO_ROOT)
     registry = build_fail_open_registry(modules, root=REPO_ROOT)
     locations = fail_open_locations(registry)
-    assert "tools/auto/auto_metrics.py:255" in locations
+    assert "tools/auto/auto_metrics.py:267" in locations  # NOTE: line tracks record_gate2_result's get_version_label bare except; update if it shifts
     assert "tools/auto/coder.py:718" in locations
-    assert "tools/auto/inner_loop.py:353" in locations
+    assert "tools/auto/inner_loop.py:367" in locations  # NOTE: line tracks _fetch_needed_flat's bare except; update if it shifts
