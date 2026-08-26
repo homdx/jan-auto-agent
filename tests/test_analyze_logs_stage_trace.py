@@ -303,3 +303,77 @@ class TestBackwardCompat:
         runs = analyze(events)
         t = runs["run1"]["tasks"]["AUTO-T1"]
         assert t["rejected"] == 1
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GATES-SYNC: theme / existence gates, and future-gate protection
+#
+# analyze_logs.py's _STAGE_ORDER / _STAGE_LABELS used to be a hand-copied
+# snapshot of tools/auto/gate_registry.py's GATES tuple and silently fell
+# behind it — "theme" and "existence" were added to the registry but never
+# made it into analyze_logs.py, so those gates rendered with a raw stage
+# name instead of a label. These tests cover the two missed gates directly,
+# and — more importantly — assert against the *live* registry so a gate
+# added after this was written fails loudly here instead of drifting apart
+# silently again.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestGateRegistrySync:
+    def test_theme_stage_is_counted(self):
+        events = [_task_start(), _stage("theme", "REJECTED", attempt=1)]
+        runs = analyze(events)
+        assert runs["run1"]["tasks"]["AUTO-T1"]["stages"]["theme"]["REJECTED"] == 1
+
+    def test_existence_stage_is_counted(self):
+        events = [_task_start(), _stage("existence", "ACCEPTED_AT_CAP", attempt=2)]
+        runs = analyze(events)
+        assert runs["run1"]["tasks"]["AUTO-T1"]["stages"]["existence"]["ACCEPTED_AT_CAP"] == 1
+
+    def test_theme_and_existence_labels_rendered(self):
+        task = {"stages": {
+            "theme":     {"REJECTED": 1, "ACCEPTED_AT_CAP": 0, "ERROR": 0,
+                          "APPROVED": 0, "EXHAUSTED": 0},
+            "existence": {"ACCEPTED_AT_CAP": 1, "REJECTED": 0, "ERROR": 0,
+                          "APPROVED": 0, "EXHAUSTED": 0},
+        }}
+        text = _capture(render_stage_breakdown, task)
+        assert "Theme" in text
+        assert "Existence" in text
+
+    def test_theme_shown_in_timeline(self):
+        events = [
+            _task_start("AUTO-T2", "chapter_01 task"),
+            _stage("theme", "REJECTED", task="AUTO-T2", attempt=1),
+        ]
+        runs = analyze(events)
+        text = _capture(render_timeline, runs["run1"])
+        assert "Theme" in text
+        assert "REJECTED" in text
+
+    def test_every_live_registry_gate_has_a_label_and_order_position(self):
+        """Fails automatically if a future gate is added to gate_registry.py
+        but analyze_logs.py's import/fallback doesn't pick it up — the
+        exact failure mode this sync fixed for theme/existence."""
+        try:
+            from tools.auto.gate_registry import GATES
+        except Exception:
+            import pytest
+            pytest.skip("tools.auto.gate_registry not importable in this environment")
+
+        import analyze_logs
+        for spec in GATES:
+            assert spec.name in analyze_logs._STAGE_LABELS, (
+                f"gate {spec.name!r} is in the live registry but has no "
+                f"display label in analyze_logs._STAGE_LABELS"
+            )
+            assert spec.name in analyze_logs._STAGE_ORDER, (
+                f"gate {spec.name!r} is in the live registry but is missing "
+                f"from analyze_logs._STAGE_ORDER"
+            )
+
+    def test_registry_import_success_reflects_in_module_state(self):
+        """Sanity check that the live import path (not just the fallback
+        snapshot) is what's actually populating the stage tables when
+        tools.auto.gate_registry is importable, which it is under pytest."""
+        import analyze_logs
+        assert analyze_logs._REGISTRY_GATES is not None
