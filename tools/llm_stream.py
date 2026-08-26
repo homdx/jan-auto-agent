@@ -872,7 +872,7 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
     def _looks_like_unknown_reasoning_field(detail: str) -> bool:
         low = detail.lower()
         return "reasoning" in low and ("unknown name" in low or "cannot find field" in low
-                                        or "unrecognized" in low or "not supported" in low
+                                        or "unrecognized" in low or "not supported" in low or "unsupported" in low
                                         or "invalid" in low)
 
     # AUTO-THINKDEPTH-2: tier 1 of the three-tier think_effort cascade —
@@ -890,7 +890,7 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
         low = detail.lower()
         return "reasoning_effort" in low and (
             "unknown name" in low or "cannot find field" in low
-            or "unrecognized" in low or "not supported" in low
+            or "unrecognized" in low or "not supported" in low or "unsupported" in low
             or "invalid" in low or "unexpected" in low
         )
 
@@ -903,7 +903,7 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
         low = detail.lower()
         return "think" in low and (
             "unknown name" in low or "cannot find field" in low
-            or "unrecognized" in low or "not supported" in low
+            or "unrecognized" in low or "not supported" in low or "unsupported" in low
             or "invalid" in low or "unexpected" in low or "boolean" in low
         )
 
@@ -925,7 +925,7 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
         has_field_name = "response_format" in low or "format" in low
         return has_field_name and (
             "unknown name" in low or "cannot find field" in low
-            or "unrecognized" in low or "not supported" in low
+            or "unrecognized" in low or "not supported" in low or "unsupported" in low
             or "invalid" in low or "unexpected" in low
         )
 
@@ -943,7 +943,7 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
         low = detail.lower()
         return "thinking" in low and (
             "unknown name" in low or "cannot find field" in low
-            or "unrecognized" in low or "not supported" in low
+            or "unrecognized" in low or "not supported" in low or "unsupported" in low
             or "invalid" in low or "unexpected" in low
         )
 
