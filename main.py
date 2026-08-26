@@ -427,6 +427,11 @@ class Orchestrator(OrchestratorActions):
             refs             = resume_state.get("refs", refs)
             already_searched = resume_state.get("already_searched", already_searched)
             search_result    = resume_state.get("search_result", search_result)
+            # refs may have grown since the checkpoint was written, so the
+            # cap computed above (from the pre-resume refs) is stale —
+            # recompute it from the restored refs or new suggestions past
+            # this point are silently discarded for the rest of the run.
+            _refs_cap = len(refs) + self.validator_agent.max_hints
             print(f"[{_ts()}] ▶  Resuming run_pipeline from iteration {iteration} "
                   f"(checkpoint restored).")
 
@@ -891,7 +896,10 @@ def main():
     orchestrator = Orchestrator(config_path=args.config)
 
     # ── Issue 7: Resume interrupted backoff session ──────────────────────
-    _saved = backoff.load_state()
+    # Skipped in non-interactive (--once) mode: prompting on stdin here
+    # would hang, or silently run the saved query instead of the one the
+    # caller just requested.
+    _saved = backoff.load_state() if args.once is None else None
     if _saved:
         _loop = _saved.get("loop", "unknown")
         _it   = _saved.get("iteration", "?")
@@ -911,8 +919,13 @@ def main():
                 try:
                     from tools.file_reader import read_file as _rf
                     _src = _rf(_fp_abs)
-                except Exception:
-                    pass
+                except Exception as _exc:
+                    # Best-effort resume-time re-read: file may have moved
+                    # or been deleted since the checkpoint was written.
+                    # Fall back to an empty source rather than aborting the
+                    # resume, but don't swallow the error silently.
+                    print(f"[{_ts()}] ⚠  Could not re-read '{_fp_abs}' for "
+                          f"resumed run_text_qa: {_exc}")
                 orchestrator.run_text_qa(
                     _saved["question"], _fp, _src,
                     _saved.get("base_dir", base_dir),
