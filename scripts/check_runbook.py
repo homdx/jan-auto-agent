@@ -164,6 +164,37 @@ def _run_ran(sandbox: Path) -> bool:
     return (sandbox / ".agent").is_dir()
 
 
+#: Directories that are not part of the sandbox's real working tree: the
+#: per-task workspace mirrors under .agent/workspace/<task_id>/ each copy
+#: the WHOLE repo (see AUTO-T*/AUTO-G* mirroring in executor.py), so an
+#: unfiltered recursive search finds every test file once per mirror on
+#: top of the real one — or, on a run where the real file never landed,
+#: finds only a stale copy inside a mirror and reports a false PASS.
+_NON_WORKTREE_DIRS = {".agent", ".git", "__pycache__", ".venv", "venv", "node_modules"}
+
+
+def _find_test_files(sandbox: Path) -> list[Path]:
+    """Every ``test_*.py`` in the sandbox's real working tree, at any depth.
+
+    CHECK-1 bug (found via a live run): the original version only checked
+    ``sandbox.glob("test_*.py")`` — the sandbox's TOP LEVEL only. A run
+    where the Architect filed the test at ``tests/test_main.py`` (a
+    perfectly normal, arguably more conventional choice) was reported as
+    "no test file created" even though the file existed and its own
+    ``acceptance_check`` (``pytest tests/test_main.py -q``) had already
+    passed during the run. Returns paths relative to *sandbox*.
+    """
+    found: list[Path] = []
+    for p in sorted(sandbox.rglob("test_*.py")):
+        if p.name.endswith(".coder.bak"):
+            continue
+        rel = p.relative_to(sandbox)
+        if any(part in _NON_WORKTREE_DIRS for part in rel.parts):
+            continue
+        found.append(rel)
+    return found
+
+
 def _plan_targets(sandbox: Path) -> list[str]:
     plan = sandbox / ".agent" / "plan.json"
     if not plan.is_file():
@@ -268,19 +299,18 @@ def check_task1(sandbox: Path) -> Report:
         report.add(ast.get_docstring(main_fn) is not None, "main() docstring")
         report.add(main_fn.returns is not None, "main() return annotation")
 
-    test_files = sorted(
-        p.name for p in sandbox.glob("test_*.py")
-        if not p.name.endswith(".coder.bak")
-    )
+    test_files = _find_test_files(sandbox)
     report.add(
-        bool(test_files), "test file created", ", ".join(test_files) or "none",
+        bool(test_files), "test file created",
+        ", ".join(str(p) for p in test_files) or "none",
         hint="the Architect never proposed one, or the task cap cut it off — "
              "check plan.json and auto.max_tasks_per_run",
     )
 
     if test_files:
+        rel = [str(p) for p in test_files]
         result = subprocess.run(
-            [sys.executable, "-m", "pytest", "-q", *test_files],
+            [sys.executable, "-m", "pytest", "-q", *rel],
             cwd=str(sandbox), capture_output=True, text=True, timeout=180,
         )
         report.add(
@@ -290,7 +320,7 @@ def check_task1(sandbox: Path) -> Report:
             if (result.stdout or result.stderr) else "",
         )
         uses_pytest = any(
-            "def test_" in _read(sandbox / name) for name in test_files
+            "def test_" in _read(sandbox / p) for p in test_files
         )
         report.add(
             uses_pytest, "test uses pytest conventions",
@@ -298,6 +328,53 @@ def check_task1(sandbox: Path) -> Report:
             warn=True,
         )
     return report
+
+
+#: Matches Gate 1's own rejection line, e.g.:
+#:   Gate1[existence] REJECTED 'Create README.md ...' — new_file='README.md'
+#:   but this path already exists — not a new file; drop new_file or cite
+#:   the real content
+_GATE1_REJECT_RE = re.compile(r"Gate1\[[a-z_]+\] REJECTED '([^']*)' — (.+)")
+#: Matches the architect fully giving up on a cluster after exhausting its
+#: empty/non-JSON retry budget (see [architect] empty_response_retry_max).
+_ARCHITECT_GIVEUP_RE = re.compile(
+    r"review_one_cluster \[([^\]]+)\]: still unsalvageable after \d+ .*?"
+    r"giving up on this batch with 0 candidates"
+)
+
+
+def _diagnose_no_candidates(sandbox: Path) -> str:
+    """Read console-log.txt for the ACTUAL reason nothing landed, instead of
+    asserting one fixed hypothesis for every occurrence of this failure.
+
+    CHECK-1 bug (found via a live run): the previous version of this check
+    hard-coded a single historical root cause ("Gate 1 cannot evidence a
+    missing Usage section with a verbatim quote") into every FAIL of
+    "README.md was modified". A subsequent run failed the same finding for
+    two entirely different reasons — Gate 1 rejecting a candidate that
+    mislabelled an existing file as new, and the architect giving up on the
+    'support' cluster after six consecutive empty/non-JSON responses over
+    ~19 minutes — neither of which matches that hard-coded story. Repeating
+    a specific-sounding but wrong diagnosis is worse than a generic pointer:
+    it sends the next person chasing the wrong fix. This is deterministic
+    (reads a log file already on disk) and degrades to "" — the caller's
+    generic fallback — when nothing recognisable is found, e.g. no console
+    log at all.
+    """
+    log = _read(sandbox.parent / "console-log.txt")
+    if not log:
+        return ""
+    reasons: list[str] = []
+    for m in _GATE1_REJECT_RE.finditer(log):
+        reasons.append(f"Gate 1 rejected {m.group(1)!r} — {m.group(2).strip()}")
+    for m in _ARCHITECT_GIVEUP_RE.finditer(log):
+        reasons.append(
+            f"architect gave up on cluster {m.group(1)!r} after repeated "
+            "empty/non-JSON responses"
+        )
+    seen: set[str] = set()
+    unique = [r for r in reasons if not (r in seen or seen.add(r))]
+    return "; ".join(unique)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -317,10 +394,11 @@ def check_task2(sandbox: Path) -> Report:
     changed = bool(baseline) and text.strip() != baseline.strip()
     report.add(
         changed, "README.md was modified",
-        hint="identical to the committed baseline — the docs flow wrote "
-             "nothing. Seen twice live: Gate 1 cannot evidence \"README "
-             "lacks a Usage section\" with a verbatim quote, so it "
-             "fail-closes and rejects the candidates the flow needs",
+        hint=_diagnose_no_candidates(sandbox) or (
+            "identical to the committed baseline — the docs flow wrote "
+            "nothing. Check the console log for 'Gate1[' rejections or "
+            "'giving up on this batch'"
+        ),
     )
 
     report.add(
@@ -359,6 +437,17 @@ def check_task2(sandbox: Path) -> Report:
 _ENTRY_RE = re.compile(r"^###\s+(.+)$", re.MULTILINE)
 
 
+def _entry_text(markdown: str, heading: str) -> str:
+    """The full text of one ``### <heading>`` entry — heading line through
+    the next ``### `` heading or end of file — or ``""`` if absent."""
+    pattern = re.compile(
+        rf"^###\s+{re.escape(heading)}\s*$.*?(?=\n###\s+|\Z)",
+        re.MULTILINE | re.DOTALL,
+    )
+    m = pattern.search(markdown)
+    return m.group(0).strip() if m else ""
+
+
 def check_task3(sandbox: Path) -> Report:
     report = Report(3, TASK_SKILL[3], sandbox)
     if not _add_run_context(report, sandbox):
@@ -380,6 +469,34 @@ def check_task3(sandbox: Path) -> Report:
              "`continuity` then has no predecessor to compare against and "
              "its approval means less than it appears to",
     )
+
+    # CHECK-1 bug (found via a live run): the check above only looks for the
+    # HEADING string. A run where the architect never saw the real
+    # CHANGELOG.md (its cluster review came back empty) reconstructed the
+    # seed entry from a guess and the coder overwrote its prose wholesale —
+    # same heading, different words — and "seed entry preserved" read as a
+    # bare PASS right next to "a new entry was added" correctly failing.
+    # This compares the actual committed seed entry (not just its heading)
+    # against what is on disk now. Skips (warn) rather than fails when there
+    # is no baseline to diff against, e.g. a repo without the usual
+    # examples/hello-world/CHANGELOG.md history.
+    baseline_changelog = _baseline("CHANGELOG.md")
+    seed_entry = _entry_text(baseline_changelog, "The first greeting")
+    if seed_entry:
+        report.add(
+            seed_entry in text, "seed entry text unchanged",
+            hint="the heading survived but the coder rewrote the seed "
+                 "entry's own prose instead of leaving it untouched and "
+                 "prepending a new entry above it — check whether the "
+                 "architect's cluster review that shows CHANGELOG.md's "
+                 "real content actually returned candidates, or came back "
+                 "empty/rate-limited and left the coder guessing",
+        )
+    else:
+        report.add(
+            True, "seed entry text unchanged",
+            "skipped: no baseline CHANGELOG.md to diff against", warn=True,
+        )
 
     report.add("Hello world" in text, "canon fact intact")
 
