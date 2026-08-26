@@ -50,6 +50,60 @@ def _dict_candidate(title: str, instruction: str) -> dict:
     return {"title": title, "instruction": instruction}
 
 
+# ── Regression: _build_llm_call fail-open contract ─────────────────────────
+#
+# Found via independent review, not by this file's existing tests: every
+# test above constructs a real ClusterReviewer and then immediately
+# overwrites reviewer._llm_call with a stub, so none of them exercise what
+# self._build_llm_call() actually returns during __init__ itself. A
+# refactor (GATE3-PROFILE-3) restructured _build_llm_call so only the
+# `from ... import` statements were guarded by try/except -- the
+# _default_llm_settings(...) and _make_llm_call(...) calls that follow ran
+# fully unguarded, so a config error with nothing to do with
+# plan_llm_profile (a malformed [coder] max_tokens, say) crashed
+# ClusterReviewer.__init__ outright, contradicting _build_llm_call's own
+# docstring ("so __init__ never raises for that reason"). These two tests
+# construct ClusterReviewer directly (no _llm_call override) to prove both
+# halves of the intended contract: general config errors fail open, a
+# genuinely malformed plan_llm_profile still raises loudly at construction.
+
+def test_build_llm_call_fails_open_on_unrelated_config_error() -> None:
+    """A bad [coder] max_tokens (nothing to do with plan_llm_profile) must
+    not crash construction -- it must fall back to the no-op fail-open
+    callable, per _build_llm_call's own docstring."""
+    cfg = configparser.ConfigParser()
+    cfg.read_dict({
+        "api":       {"active": "local"},
+        "api_local": {"base_url": "http://localhost:1234/v1",
+                      "api_key":  "x",
+                      "model":    "test-model"},
+        "coder":     {"max_tokens": "not-a-number"},
+    })
+
+    reviewer = ClusterReviewer(cfg, "http://localhost:1234/v1", "x", "test-model",
+                                task_mode="code")
+
+    assert reviewer._llm_call("system", "user") == ""
+
+
+def test_build_llm_call_still_raises_on_malformed_plan_llm_profile() -> None:
+    """A plan_llm_profile naming a section that doesn't exist is an
+    operator typo, not a transient error -- must still raise at
+    construction, not be swallowed by the fail-open fix above."""
+    cfg = configparser.ConfigParser()
+    cfg.read_dict({
+        "api":       {"active": "local"},
+        "api_local": {"base_url": "http://localhost:1234/v1",
+                      "api_key":  "x",
+                      "model":    "test-model"},
+        "architect": {"plan_llm_profile": "nonexistent_section"},
+    })
+
+    with pytest.raises(ValueError, match="plan_llm_profile"):
+        ClusterReviewer(cfg, "http://localhost:1234/v1", "x", "test-model",
+                         task_mode="code")
+
+
 # ── Tests ─────────────────────────────────────────────────────────────────────
 
 def test_plan_contradiction_revises():

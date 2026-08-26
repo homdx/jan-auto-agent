@@ -13,10 +13,14 @@ module exists to stop. ``resolve_llm_profile`` extracts the shared logic;
 callers keep whatever field names they already use and adapt through
 :class:`LlmSettings`.
 
-Deliberately NOT wired into gate1_filter.py or inner_loop.py by this
-module — see GATE3-PROFILE-6. Doing that migration in the same change
-that introduces the helper would make any regression impossible to
-bisect between "the helper is wrong" and "the migration is wrong".
+Was deliberately NOT wired into gate1_filter.py or inner_loop.py when this
+module was introduced — see GATE3-PROFILE-6's original reasoning: doing
+that migration in the same change that introduces the helper would make
+any regression impossible to bisect between "the helper is wrong" and
+"the migration is wrong". GATE3-PROFILE-6 has since landed (see
+gate1_filter.py's own ``resolve_llm_profile`` import and
+inner_loop.py's ``resolve_validator_llm_profile``) — both call sites use
+this module directly now.
 """
 
 from __future__ import annotations

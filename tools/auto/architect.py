@@ -702,17 +702,27 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
         falling back straight to ``[api_{active}]`` when unset — the plan
         validator is architect's own, single call site, with no shared
         ``validator_llm_profile``-style middle step to inherit from first.
-        Profile resolution (the ``from ... import`` below plus
-        ``resolve_llm_profile`` itself) is deliberately OUTSIDE the
-        ``except Exception`` below: that block exists only to keep a
-        broken/missing ``summary_memory`` import from taking down
-        ``ClusterReviewer`` construction, not to swallow a profile the
-        operator named and mis-typed. A malformed ``plan_llm_profile``
-        must raise here — at construction, before any task runs — never
-        be discovered mid-run. Unset, it resolves to the exact same
+        ``resolve_llm_profile`` itself is deliberately OUTSIDE any
+        ``except Exception`` below: a malformed ``plan_llm_profile`` must
+        raise here — at construction, before any task runs — never be
+        discovered mid-run. Unset, it resolves to the exact same
         :func:`~tools.auto.summary_memory._default_llm_settings` defaults
         ``_make_llm_call`` has always computed inline, so default
         behaviour is unchanged.
+
+        AUTO-FIX (regression from GATE3-PROFILE-3): the import guard above
+        was the ONLY try/except here for a while — ``_default_llm_settings``
+        and ``_make_llm_call`` ran unguarded, so a config error that has
+        nothing to do with ``plan_llm_profile`` (a malformed ``[coder]
+        max_tokens``, say) crashed ``ClusterReviewer.__init__`` outright
+        instead of degrading gracefully, contradicting this docstring's own
+        "so __init__ never raises for that reason" — confirmed by
+        reproducing it directly: same bad ``max_tokens``, ``_build_llm_call``
+        raised ``ValueError`` instead of returning the no-op fallback. Each
+        of those two calls now has its own narrow try/except, so a bad
+        profile name still raises (the GATE3-PROFILE-3 behaviour this
+        function exists to provide) while everything else fails open again
+        (the original contract this docstring has described all along).
         """
         try:
             from tools.auto.summary_memory import (  # noqa: PLC0415
@@ -723,11 +733,27 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
             logger.warning("ClusterReviewer._build_llm_call failed — validate_plan will fail-open: %s", exc)
             return lambda system, user: ""
 
-        defaults = _default_llm_settings(self._config, self._task_mode)
+        try:
+            defaults = _default_llm_settings(self._config, self._task_mode)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "ClusterReviewer._build_llm_call: could not compute default "
+                "LLM settings — validate_plan will fail-open: %s", exc,
+            )
+            return lambda system, user: ""
+
         settings, _ = resolve_llm_profile(
             self._config, "architect", "plan_llm_profile", defaults=defaults,
         )
-        return _make_llm_call(self._config, task_mode=self._task_mode, settings=settings)
+
+        try:
+            return _make_llm_call(self._config, task_mode=self._task_mode, settings=settings)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "ClusterReviewer._build_llm_call: could not build the LLM "
+                "call — validate_plan will fail-open: %s", exc,
+            )
+            return lambda system, user: ""
 
     def _review_one_cluster(
         self,
