@@ -736,9 +736,128 @@ def _parse_args():
     return parser.parse_args()
 
 
+# ── AUTO-FIX (cfg-crash-prevention): startup config validation ─────────────
+# `configparser`'s `fallback=` only covers a MISSING key — a *present-but-
+# empty* value (e.g. "verify_ssl =" with nothing after the "=") still
+# reaches `.getboolean()`/`.getint()` and raises a bare ValueError, deep
+# inside whichever agent's `__init__` happens to read it first (architect,
+# coder, gate1_filter, auto_tuner, existence_validator, ... — ~100 call
+# sites across tools/auto/). The traceback that results points at
+# `configparser.py`, not at the ini line that's actually wrong, so the
+# fix took real digging to track down each time it happened.
+#
+# Rather than hardening every call site by hand (a moving target — the
+# list grows as new agents are added), scan tools/auto/*.py for every
+# literal `config.getboolean(section, key, ...)` / `config.getint(section,
+# key, ...)` call, then check the ini file that's about to be loaded for
+# any of those (section, key) pairs present with a blank value. Fail once,
+# loudly, up front, naming every offending line — instead of crashing N
+# different ways, N different times, once per agent construction.
+_TYPED_CONFIG_METHODS = ("getboolean", "getint")
+
+
+def _scan_typed_config_call_sites(auto_dir: Path) -> List[tuple]:
+    """AST-scan every tools/auto/*.py file for `<cfg>.getboolean(...)` /
+    `<cfg>.getint(...)` calls with a literal key argument.
+
+    Returns a list of (file_path, lineno, method, section_or_None, key)
+    tuples. `section_or_None` is None when the section argument isn't a
+    plain string literal (e.g. `f"api_{active_profile}"`) — those calls
+    are still worth checking, just against every section in the file
+    rather than one we can resolve statically.
+    """
+    import ast
+
+    sites: List[tuple] = []
+    for py_file in sorted(auto_dir.glob("*.py")):
+        try:
+            source = py_file.read_text(encoding="utf-8")
+            tree = ast.parse(source, filename=str(py_file))
+        except (OSError, SyntaxError, UnicodeDecodeError):
+            continue
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+                continue
+            if node.func.attr not in _TYPED_CONFIG_METHODS:
+                continue
+            if len(node.args) < 2:
+                continue
+            section_node, key_node = node.args[0], node.args[1]
+            if not (isinstance(key_node, ast.Constant) and isinstance(key_node.value, str)):
+                continue  # dynamic key — can't resolve statically, skip
+            section = (
+                section_node.value
+                if isinstance(section_node, ast.Constant) and isinstance(section_node.value, str)
+                else None
+            )
+            sites.append((str(py_file), node.lineno, node.func.attr, section, key_node.value))
+    return sites
+
+
+def _validate_typed_config_values(config_path: str, base_dir: str) -> None:
+    """Fail fast, with an actionable message, if `config_path` has a blank
+    value for any key that tools/auto/ reads with `.getboolean()`/`.getint()`.
+
+    A no-op if the config file doesn't exist or fails to parse — those cases
+    already produce their own clear errors at the call sites that check for
+    them (missing --config path, malformed .ini syntax).
+    """
+    if not os.path.exists(config_path):
+        return
+
+    probe = configparser.ConfigParser(inline_comment_prefixes=(';', '#'))
+    try:
+        probe.read(config_path, encoding="utf-8")
+    except configparser.Error:
+        return  # load_config() / the --config existence checks report this clearly already
+
+    auto_dir = current_dir / "tools" / "auto"
+    if not auto_dir.is_dir():
+        return
+
+    sites = _scan_typed_config_call_sites(auto_dir)
+    candidate_sections = probe.sections()
+    resolve_root = base_dir if os.path.isdir(base_dir) else str(current_dir)
+
+    # (section, key) -> ["relpath:lineno (method)", ...] — a blank value can
+    # be read by more than one call site (e.g. several agents each read
+    # their own section's "think" via a variable, not a literal, section
+    # name), so collect every matching site rather than just the first one
+    # found, or the message could point at the wrong file entirely.
+    violations: Dict[tuple, List[str]] = {}
+
+    for file_path, lineno, method, section, key in sites:
+        sections_to_check = [section] if section is not None else candidate_sections
+        for sec in sections_to_check:
+            if not probe.has_option(sec, key):
+                continue
+            value = probe.get(sec, key)
+            if value is not None and value.strip() == "":
+                rel = os.path.relpath(file_path, resolve_root)
+                violations.setdefault((sec, key), []).append(f"{rel}:{lineno} ({method}())")
+
+    if violations:
+        lines = []
+        for (sec, key), locations in sorted(violations.items()):
+            where = ", ".join(sorted(set(locations)))
+            lines.append(f"  [{sec}] {key} =        (blank — read at {where})")
+        print(
+            f"Error: {config_path} has {len(violations)} setting(s) left blank that must be "
+            f"a number or true/false, not empty:\n"
+            + "\n".join(lines)
+            + f"\n\nFix: give each one an explicit value, or delete the line entirely so the "
+              f"coded default applies — an empty '=' is not the same as an absent key.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
 def main():
     args = _parse_args()
     base_dir = os.path.abspath(args.base or args.base_dir_positional or os.getcwd())
+
+    if not args.list_skills:
+        _validate_typed_config_values(args.config, base_dir)
 
     # ── SKILLS-1: --list-skills ─────────────────────────────────────────
     if args.list_skills:
