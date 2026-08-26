@@ -319,6 +319,66 @@ class TestDuplicateMerging:
         assert len(accepted) == 1
         assert len([r for r in rejected if r.stage == "duplicate"]) == 1
 
+    def test_ungrounded_creative_duplicate_loses_to_grounded_one(
+        self, tmp_path: Path, minimal_config: configparser.ConfigParser,
+    ) -> None:
+        """Regression (hello-creative-split/Flow 4, live run): creative-mode
+        target-fingerprint dedup used to keep whichever same-target
+        candidate a fixed cluster review order produced FIRST, with no
+        regard for which one actually saw the file it targets.
+
+        entry_orchestration is always reviewed before support. A goal like
+        "write a changelog entry" makes entry_orchestration's review of
+        main.py ALONE (CHANGELOG.md not even in that batch) propose a task
+        targeting CHANGELOG.md anyway, cited from main.py — a file it never
+        looked at, blind to CHANGELOG.md's real content. support's LATER
+        review, WITH CHANGELOG.md actually in view, correctly proposes the
+        real new entry, cited from CHANGELOG.md itself. Both target the
+        same file, so old dedup discarded the second (correct) one purely
+        by arrival order — this test submits them in exactly that order
+        and asserts the grounded one wins regardless.
+        """
+        (tmp_path / "main.py").write_text("print('Hello world')\n", encoding="utf-8")
+        (tmp_path / "CHANGELOG.md").write_text(
+            "# Changelog\n\n### The first greeting\n\nWe taught it to say hello.\n",
+            encoding="utf-8",
+        )
+
+        ungrounded_first = CandidateTask(
+            title="Add changelog entry for greeting",
+            instruction="Create CHANGELOG.md with '### The first greeting'...",
+            target_files=["CHANGELOG.md"],
+            acceptance_check="true",
+            cited_location=CitedLocation(file="main.py"),
+            cluster="entry_orchestration",
+        )
+        grounded_second = CandidateTask(
+            title="Prepend a new greeting changelog entry",
+            instruction="Append a new entry above the existing seed entry...",
+            target_files=["CHANGELOG.md"],
+            acceptance_check="true",
+            cited_location=CitedLocation(file="CHANGELOG.md"),
+            cluster="support",
+        )
+
+        creative_filt = Gate1Filter(
+            config=minimal_config,
+            base_url="http://localhost:1337/v1",
+            api_key="test",
+            model="test-model",
+            verify_ssl=False,
+            task_mode="creative",  # bypasses Stage B — no LLM call needed
+        )
+
+        accepted, rejected = creative_filt.filter(
+            [ungrounded_first, grounded_second], tmp_path,
+        )
+
+        assert [c.title for c in accepted] == ["Prepend a new greeting changelog entry"]
+        dup = [r for r in rejected if r.stage == "duplicate"]
+        assert len(dup) == 1
+        assert dup[0].candidate.title == "Add changelog entry for greeting"
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Existence checks

@@ -614,15 +614,62 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         )
 
         # ── Stage C: deduplication ────────────────────────────────────────────
+        # AUTO-FIX (found via a live run, hello-creative-split/Flow 4):
+        # creative-mode target-fingerprint dedup used to keep whichever
+        # candidate a FIXED cluster review order happened to produce first,
+        # with no regard for which one actually saw the file it targets.
+        # entry_orchestration is always reviewed before support, so when
+        # entry_orchestration's REVIEW OF main.py ALONE proposed a task
+        # targeting CHANGELOG.md — a file it never saw, cited_location=
+        # main.py — and support's LATER review of CHANGELOG.md itself
+        # correctly proposed the real new entry, cited_location=
+        # CHANGELOG.md — the ungrounded one always won the collision purely
+        # by review order, every time this shape of goal comes up. Now: on
+        # a target-fingerprint collision, a later candidate that IS grounded
+        # in its own target file (cited_location.file appears in
+        # target_files) replaces an earlier one that ISN'T, instead of
+        # always losing to it. Does not change dedup on the full
+        # fingerprint (`fp`) — only the creative-only target-fingerprint
+        # path (`tfp`) that this bug lives in.
         accepted: list[CandidateTask] = []
         seen_fingerprints: set[str] = set()
         seen_target_fingerprints: set[str] = set()
+        target_fp_index: dict[str, int] = {}
+
+        def _grounded_in_own_target(c: CandidateTask) -> bool:
+            return c.cited_location.file in c.target_files
 
         for c, reason in presence_passed:
             fp = _fingerprint(c)
             tfp = _target_fingerprint(c) if self._task_mode == "creative" else None
-            if fp in seen_fingerprints or (tfp is not None and tfp in seen_target_fingerprints):
-                dup_key = fp if fp in seen_fingerprints else tfp
+            is_fp_dup = fp in seen_fingerprints
+            is_tfp_dup = tfp is not None and tfp in seen_target_fingerprints
+            if is_fp_dup or is_tfp_dup:
+                dup_key = fp if is_fp_dup else tfp
+                if (
+                    not is_fp_dup and tfp in target_fp_index
+                    and _grounded_in_own_target(c)
+                    and not _grounded_in_own_target(accepted[target_fp_index[tfp]])
+                ):
+                    superseded = accepted[target_fp_index[tfp]]
+                    accepted[target_fp_index[tfp]] = c
+                    all_results.append(FilterResult(
+                        candidate=superseded, accepted=False, stage="duplicate",
+                        reason=(
+                            f"superseded by a later candidate with fingerprint "
+                            f"{dup_key!r} that is grounded in its own target "
+                            f"file ({superseded.cited_location.file!r} is not "
+                            f"in {superseded.target_files!r})"
+                        ),
+                    ))
+                    all_results.append(FilterResult(
+                        candidate=c, accepted=True, stage="presence", reason=reason,
+                    ))
+                    logger.info(
+                        "Gate1[dedup] replaced ungrounded duplicate %r with "
+                        "grounded %r", superseded.title, c.title,
+                    )
+                    continue
                 all_results.append(FilterResult(
                     candidate=c, accepted=False, stage="duplicate",
                     reason=f"duplicate of an earlier candidate with fingerprint {dup_key!r}",
@@ -632,6 +679,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             seen_fingerprints.add(fp)
             if tfp is not None:
                 seen_target_fingerprints.add(tfp)
+                target_fp_index[tfp] = len(accepted)
             accepted.append(c)
             all_results.append(FilterResult(
                 candidate=c, accepted=True, stage="presence", reason=reason,
