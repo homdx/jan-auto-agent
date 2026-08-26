@@ -1007,7 +1007,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                 source="gate1",
                 target="llm",
                 kind="llm_request",
-                content=msg,
+                content=msg, model=self._presence_model,
                 params={"model": self._presence_model, "candidate": candidate.title},
             )
             text = _llm_stream.request_completion(
@@ -1024,7 +1024,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                 source="llm",
                 target="gate1",
                 kind="llm_response",
-                content=cleaned,
+                content=cleaned, model=self._presence_model,
                 params={"candidate": candidate.title},
             )
             return cleaned
@@ -1072,7 +1072,8 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             logger.warning("Gate1._check_presence: %s — failing closed", reason)
             tracer.event(
                 source="gate1", target="llm", kind="llm_response",
-                content=f"[ERROR] {last_exc}", params={"candidate": candidate.title},
+                content=f"[ERROR] {last_exc}", model=self._presence_model,
+                params={"candidate": candidate.title},
             )
             return False, reason
 

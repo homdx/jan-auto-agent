@@ -899,7 +899,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 source="architect",
                 target="llm",
                 kind="llm_request",
-                content=user_msg,
+                content=user_msg, model=self._model,
                 params={"model": self._model, "temperature": _effective_temperature,
                         "cluster": cluster.name, "max_tasks": max_tasks},
             )
@@ -989,7 +989,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                     cluster.name, _attempt, last_exc,
                 )
                 tracer.event(
-                    source="llm", target="architect", kind="llm_response",
+                    source="llm", target="architect", kind="llm_response", model=self._model,
                     content=f"[ERROR] {last_exc}", params={"cluster": cluster.name},
                 )
                 # None (not []) so callers can distinguish "call failed" from
@@ -1004,7 +1004,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 source="llm",
                 target="architect",
                 kind="llm_response",
-                content=cleaned,
+                content=cleaned, model=self._model,
                 params={"cluster": cluster.name, "max_tasks": max_tasks},
             )
 
@@ -1715,7 +1715,7 @@ class TaskRewriter(_llm_stream.LLMClientBase):
             source="task_rewriter",
             target="llm",
             kind="llm_request",
-            content=user_msg,
+            content=user_msg, model=self._model,
             params={"model": self._model, "task": task.get("id", "?")},
         )
 
@@ -1738,7 +1738,7 @@ class TaskRewriter(_llm_stream.LLMClientBase):
             source="llm",
             target="task_rewriter",
             kind="llm_response",
-            content=cleaned,
+            content=cleaned, model=self._model,
             params={"task": task.get("id", "?")},
         )
 

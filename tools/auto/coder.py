@@ -373,7 +373,7 @@ class Coder(_llm_stream.LLMClientBase):
         )
 
         tracer.event(
-            source="coder", target="llm", kind="llm_request",
+            source="coder", target="llm", kind="llm_request", model=self._model,
             content=user_msg,
             params={"model": self._model, "temperature": self._temperature,
                     "task_id": task_id},
@@ -404,7 +404,7 @@ class Coder(_llm_stream.LLMClientBase):
             msg = f"LLM call failed: {exc}"
             logger.warning("coder.generate [%s]: %s", task_id, msg)
             tracer.event(
-                source="coder", target="llm", kind="llm_response",
+                source="coder", target="llm", kind="llm_response", model=self._model,
                 content=f"[ERROR] {exc}", params={"task_id": task_id},
             )
             return CoderResult(task_id=task_id, error=msg)
@@ -483,7 +483,7 @@ class Coder(_llm_stream.LLMClientBase):
 
         tracer.event(
             source="llm", target="coder", kind="llm_response",
-            content=cleaned, params={"task_id": task_id},
+            content=cleaned, model=self._model, params={"task_id": task_id},
         )
 
         parsed_files, parse_error = self._parse_response(
