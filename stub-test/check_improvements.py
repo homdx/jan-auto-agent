@@ -205,7 +205,13 @@ def find_false_positive(task: dict, known_fps: list[dict], overlap_ratio: float)
                     return fp, "file_overlap"
                 if best_weak is None:
                     best_weak = fp
-        elif not task["target_files"] and not fp["target_files"]:
+        elif not task["target_files"] or not fp["target_files"]:
+            # AUTO-FIX: this used to require BOTH sides to have zero
+            # target_files (`and`), contradicting the docstring's own
+            # "one/both sides have no target_files at all" — a task with
+            # no target files vs. a known-FP that does have some (or vice
+            # versa) fell through this branch entirely and silently
+            # matched nothing, even when the titles were identical.
             # Neither side has target files to compare — fall back to title.
             sim = _title_similarity(task["title"], fp["title"])
             if sim >= 0.6:

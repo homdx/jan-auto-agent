@@ -893,6 +893,26 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
         if upper.startswith("APPROVED") or _re.match(r"^OK\b", upper):
             return True, "", False
 
+        # ── English "NO, <it's all good>" discourse-filler guard ─────────
+        # AUTO-BUG: bare `upper.startswith("NO")` below misread a casual
+        # "No, it's perfect!" / "No, that's fine." / "No, all good here." —
+        # where "No" is conversational filler answering an implicit "any
+        # issues?" rather than a rejection — as a REVISE verdict, mangling
+        # the reason to ", it's perfect!". The Russian branch already has
+        # an equivalent guard for the identical discourse pattern ("Нет,
+        # всё хорошо" not misread as REVISE); this mirrors it for English
+        # so the same casual sentiment is treated consistently regardless
+        # of language. Genuine rejections opening with "No" but naming an
+        # actual problem ("No, this doesn't work", "No, fix the ending")
+        # are unaffected — only an explicit all-good phrase is excluded.
+        if _re.match(
+            r"^NO[,.]?\s*(?:IT'?S|IT IS|THAT'?S|THAT IS|EVERYTHING'?S|"
+            r"EVERYTHING IS|ALL)?\s*(?:GOOD|FINE|PERFECT|GREAT|OK|OKAY|"
+            r"CORRECT|IN ORDER)\b",
+            upper,
+        ):
+            return True, "", False
+
         # ── English REVISE / REJECT / NO ─────────────────────────────────
         for token in ("REVISE", "REJECT", "NO"):
             if upper.startswith(token):

@@ -594,7 +594,20 @@ class AlreadySafeIndex:
         accesses = self._guarded_by_location.get(location)
         relevant = accesses
         if access is not None:
-            relevant = [a for a in accesses if a.access == access] if accesses else []
+            # AUTO-FIX (COLLECT-26-class gap, mirrors verifier.py's
+            # _normalize_access): raw `a.access == access` compared quote
+            # style literally, so a guard recorded as `entry['stack']`
+            # never matched a query for `entry["stack"]` — the identical
+            # site, differing only in which quote character was used —
+            # and a correctly-guarded access was reported `unknown`
+            # instead of `guarded`. verifier.py already fixed this exact
+            # class of bug for its own access-citation comparisons; do
+            # the same quote-folding here so the two call sites agree.
+            wanted = access.replace('"', "'")
+            relevant = (
+                [a for a in accesses if a.access.replace('"', "'") == wanted]
+                if accesses else []
+            )
 
         if relevant:
             statuses = {a.status for a in relevant}

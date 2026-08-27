@@ -23,12 +23,23 @@ def _parse_via_regex(raw: str, source: str = "") -> Optional[ParsedPrompt]:
     cleaned_raw = raw.strip()
     
     # 1. Extract File Path
-    # Matches common relative/absolute path architectures ending with an extension
-    file_match = re.search(r'(?:^|\s)(?:in\s+)?([A-Za-z0-9_./\\-]+\.[A-Za-z0-9]+)\b', cleaned_raw)
-    if not file_match:
+    # Matches common relative/absolute path architectures ending with an extension.
+    #
+    # BUGFIX: a dotted symbol reference like "MyClass.foo" also matches this
+    # pattern (word.word looks identical to word.ext), so a prompt such as
+    # "explain MyClass.foo in app.py" used to grab "MyClass.foo" as the file
+    # path — the first match won, even though the user explicitly marked the
+    # real file with "in ". Collect every candidate match and prefer the ones
+    # that are explicitly introduced by "in "; only fall back to the bare
+    # first-match behavior when no explicit "in <path>" marker exists at all.
+    file_matches = list(re.finditer(r'(?:^|\s)(in\s+)?([A-Za-z0-9_./\\-]+\.[A-Za-z0-9]+)\b', cleaned_raw))
+    if not file_matches:
         return None
 
-    file_path = file_match.group(1)
+    in_matches = [m for m in file_matches if m.group(1)]
+    file_match = in_matches[0] if in_matches else file_matches[0]
+
+    file_path = file_match.group(2)
     
     # Isolate remaining text to reduce token search spaces
     matched_segment = file_match.group(0)

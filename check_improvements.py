@@ -126,10 +126,10 @@ def parse_improvements(path: Path) -> list[dict]:
 
 
 _GT_SECTION_RE = re.compile(
-    r"^##\s*Confirmed FALSE POSITIVE.*?\n(.*?)(?=^##\s|\Z)",
+    r"^##\s*(?:Bucket\s*\d+\s*[—\-–]\s*)?.*FALSE POSITIVE.*?\n(.*?)(?=^##\s|\Z)",
     re.MULTILINE | re.DOTALL,
 )
-_GT_ROW_ID_RE = re.compile(r"^T(\d+)$")
+_GT_ROW_ID_RE = re.compile(r"^T(\d+)(?:/T(\d+))*$")
 
 
 def _parse_ground_truth_table(text: str) -> list[dict]:
@@ -158,18 +158,19 @@ def _parse_ground_truth_table(text: str) -> list[dict]:
         if not m:
             continue  # header row ("ID"), separator row ("----"), etc.
 
-        task_id = f"AUTO-T{m.group(1)}"
+        ids = re.findall(r"T(\d+)", cells[0])
         location, reason = cells[1], cells[2]
         target_files = _normalise_files(location) | _normalise_files(reason)
 
-        tasks.append({
-            "id":           task_id,
-            "title":        location,
-            "location":     location,
-            "target_files": target_files,
-            "reason":       reason[:200],
-            "instruction":  "",
-        })
+        for num in ids:
+            tasks.append({
+                "id":           f"AUTO-T{num}",
+                "title":        location,
+                "location":     location,
+                "target_files": target_files,
+                "reason":       reason[:200],
+                "instruction":  "",
+            })
     return tasks
 
 
@@ -204,7 +205,13 @@ def find_false_positive(task: dict, known_fps: list[dict], overlap_ratio: float)
                     return fp, "file_overlap"
                 if best_weak is None:
                     best_weak = fp
-        elif not task["target_files"] and not fp["target_files"]:
+        elif not task["target_files"] or not fp["target_files"]:
+            # AUTO-FIX: this used to require BOTH sides to have zero
+            # target_files (`and`), contradicting the docstring's own
+            # "one/both sides have no target_files at all" — a task with
+            # no target files vs. a known-FP that does have some (or vice
+            # versa) fell through this branch entirely and silently
+            # matched nothing, even when the titles were identical.
             # Neither side has target files to compare — fall back to title.
             sim = _title_similarity(task["title"], fp["title"])
             if sim >= 0.6:

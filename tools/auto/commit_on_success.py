@@ -200,14 +200,32 @@ class CommitOnSuccess:
                     "no real change; marking BLOCKED instead of DONE.",
                     task_id, task.get("acceptance_check"),
                 )
-                self._state.set_task_status(
-                    task_id, STATUS_BLOCKED,
-                    blocked_reason="nothing_staged_trivial_acceptance_check",
-                )
-                self._state.log(
-                    f"task {task_id} BLOCKED — nothing staged and "
-                    f"acceptance_check is trivial; no real change was made"
-                )
+                # AUTO-FIX (medium-priority audit): this branch called
+                # set_task_status()/log() unguarded while the sibling
+                # `if sha:` branch above explicitly wraps the identical
+                # calls in try/except (with a comment explaining exactly
+                # why: a StateStore write hiccup here must not propagate
+                # and abort the whole run). Apply the same guard here so a
+                # disk/permission issue while marking BLOCKED can't take
+                # down the run either — the module's documented "never
+                # raises" contract should hold in every branch, not just
+                # the success path.
+                try:
+                    self._state.set_task_status(
+                        task_id, STATUS_BLOCKED,
+                        blocked_reason="nothing_staged_trivial_acceptance_check",
+                    )
+                    self._state.log(
+                        f"task {task_id} BLOCKED — nothing staged and "
+                        f"acceptance_check is trivial; no real change was made"
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "CommitOnSuccess: could not update local state to "
+                        "BLOCKED for task %s — %s (task status may not "
+                        "reflect BLOCKED)",
+                        task_id, exc,
+                    )
                 tracer.event(
                     "commit_on_success", "controller", "nothing_staged_blocked",
                     params={"task": task_id},
@@ -221,10 +239,22 @@ class CommitOnSuccess:
                     "marking DONE with empty commit hash",
                     task_id,
                 )
-                self._state.set_task_status(task_id, STATUS_DONE, commit="")
-                self._state.log(
-                    f"task {task_id} DONE — no new commit (nothing staged)"
-                )
+                # AUTO-FIX (medium-priority audit): same unguarded-write gap
+                # as the BLOCKED branch above — guard it the same way as the
+                # `if sha:` branch's set_task_status()/log() calls.
+                try:
+                    self._state.set_task_status(task_id, STATUS_DONE, commit="")
+                    self._state.log(
+                        f"task {task_id} DONE — no new commit (nothing staged)"
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "CommitOnSuccess: could not update local state to "
+                        "DONE for task %s — %s (task status may not reflect "
+                        "DONE; nothing was staged so there is no commit to "
+                        "lose)",
+                        task_id, exc,
+                    )
                 tracer.event(
                     "commit_on_success", "controller", "nothing_staged",
                     params={"task": task_id},

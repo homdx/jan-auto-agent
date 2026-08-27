@@ -169,7 +169,12 @@ class PromptEvaluator:
 
         delta = candidate_score - current_score
 
-        if delta >= 0.05:
+        # AUTO-FIX (low-priority audit): docstring and module header both
+        # document a strict threshold ("candidate_score > current_score +
+        # 0.05"), but the check used >=, silently promoting a candidate
+        # whose improvement lands exactly on the boundary instead of
+        # requiring it to exceed the threshold as documented.
+        if delta > 0.05:
             reason = (
                 f"Score improved by {delta:+.2f} "
                 f"({current_score:.2f} → {candidate_score:.2f})"
