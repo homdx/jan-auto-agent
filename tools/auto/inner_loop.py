@@ -1013,6 +1013,7 @@ class InnerLoop:
         continuity_validator=None,
         theme_validator=None,
         existence_validator=None,   # GATES-3: docs-mode file-reference check
+        delta_validator=None,       # AUTO-CR-DELTA-1: unchanged-from-HEAD check
         require_tests: bool = False,
         task_mode: str = "code",
         max_task_seconds: int = 0,

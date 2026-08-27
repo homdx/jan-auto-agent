@@ -265,36 +265,61 @@ class PromptEvaluator:
             )
             return self._projected_score()
 
-        n = len(results)
+        # AUTO-BUG (follow-up 2 / follow-up 3): the previous fix correctly
+        # excluded _api_error from the NUMERATOR of json_ok_rate (so an
+        # all-network-failure candidate can't score a false 1.0), but still
+        # divided by the full `n`, including _api_error results in the
+        # DENOMINATOR. _score_from_records (the production-run scorer just
+        # above) excludes not-applicable records from BOTH numerator and
+        # denominator — an _api_error result is the shadow-run equivalent
+        # of "not applicable" (no reply arrived to judge at all, unlike
+        # _unparseable where a reply DID arrive and failed the exact thing
+        # json_ok_rate measures). Counting _api_error in the denominator
+        # means a candidate shadow-tested during network jitter scores
+        # lower than the identical candidate tested on a stable connection
+        # purely by chance — 5 good replies + 5 _api_error = 0.5, vs. 5
+        # good + 0 errors = 1.0 — for reasons entirely unrelated to prompt
+        # quality. json_ok_rate and approved_rate below both apply this
+        # exclusion already (approved_rate: three-bugfixes.patch). iter_score
+        # is the third and last of the three sub-scores with the same bug:
+        # an _api_error result has status="needs_fix" (the dict default),
+        # so it fell into the `else: 2` branch below and was scored as a
+        # genuine full second revision iteration, even though no iteration
+        # happened at all — the call simply never reached the model. This
+        # is the highest-weighted (40%) of the three terms, so it distorts
+        # the final score more per affected call than either of the other
+        # two. Compute the exclusion filter once, up front, and use it for
+        # all three terms so an infra failure is treated identically
+        # everywhere: not a verdict, so not counted in either the
+        # numerator or the denominator of any of them.
+        _json_judged = [r for r in results if not r.get("_api_error")]
+
+        if not _json_judged:
+            # Fully-degenerate case: every shadow call returned _api_error.
+            # There is no reply here to judge at all (unlike _unparseable,
+            # where a reply DID arrive) — this is the shadow-mode analogue
+            # of "all shadow validate() calls raised" above, just returned
+            # as a result instead of raised as an exception. Fall back to
+            # the same projection heuristic for consistency, rather than
+            # building a score entirely out of results that never reached
+            # judgment.
+            logger.warning(
+                "PromptEvaluator: all shadow calls returned _api_error — "
+                "falling back to projection"
+            )
+            return self._projected_score()
 
         # Shadow runs are single-shot: approved → 1 iteration simulated; else 2
-        sim_iters = [1 if r.get("status") == "approved" else 2 for r in results]
-        avg_iter = sum(sim_iters) / n
+        sim_iters = [1 if r.get("status") == "approved" else 2 for r in _json_judged]
+        avg_iter = sum(sim_iters) / len(_json_judged)
         iter_score = max(0.0, 1.0 - (avg_iter - 1.0) / max(1, self.max_iter - 1))
 
-        # AUTO-BUG (follow-up 2): the previous fix correctly excluded
-        # _api_error from the NUMERATOR (so an all-network-failure candidate
-        # can't score a false 1.0), but still divided by the full `n`,
-        # including _api_error results in the DENOMINATOR. _score_from_records
-        # (the production-run scorer just above) excludes not-applicable
-        # records from BOTH numerator and denominator — an _api_error result
-        # is the shadow-run equivalent of "not applicable" (no reply
-        # arrived to judge at all, unlike _unparseable where a reply DID
-        # arrive and failed the exact thing json_ok_rate measures). Counting
-        # _api_error in the denominator means a candidate shadow-tested
-        # during network jitter scores lower than the identical candidate
-        # tested on a stable connection purely by chance — 5 good replies +
-        # 5 _api_error = 0.5, vs. 5 good + 0 errors = 1.0 — on the
-        # highest-weighted (35%) component of the score, for reasons
-        # entirely unrelated to prompt quality.
-        _json_judged = [r for r in results if not r.get("_api_error")]
         json_ok_rate = (
             sum(1 for r in _json_judged if not r.get("_unparseable")) / len(_json_judged)
-            if _json_judged else 0.0
         )
 
         approved_rate = (
-            sum(1 for r in results if r.get("status") == "approved") / n
+            sum(1 for r in _json_judged if r.get("status") == "approved") / len(_json_judged)
         )
 
         score = round(

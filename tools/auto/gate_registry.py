@@ -68,7 +68,12 @@ def _check_continuity(validator, *, text, rel_path, task, loop, base_dir_path):
 
 
 def _check_existence(validator, *, text, rel_path, task, loop, base_dir_path):
-    """GATES-3: the only adapter whose gate makes no LLM call at all."""
+    """GATES-3: makes no LLM call at all (see also ``_check_delta`` below)."""
+    return validator.check(text, base_dir_path, rel_path=rel_path)
+
+
+def _check_delta(validator, *, text, rel_path, task, loop, base_dir_path):
+    """AUTO-CR-DELTA-1: also makes no LLM call — a git-show-and-compare."""
     return validator.check(text, base_dir_path, rel_path=rel_path)
 
 
@@ -167,6 +172,39 @@ class GateSpec:
 #: Gate execution order. This list is the pipeline — reorder it to reorder
 #: the gates. Each entry's ``modes`` says which task modes it applies to.
 GATES: tuple[GateSpec, ...] = (
+    GateSpec(
+        name="delta",
+        attr="delta_validator",
+        cap_attr="max_delta_revisions",
+        default_cap=1,
+        check=_check_delta,
+        is_rejection=_rejected_by_approved,
+        reject_label="delta rejected",
+        reject_log="InnerLoop: attempt %d delta rejected (%d/%d) — %s",
+        cap_log=(
+            "InnerLoop: delta revision cap (%d) reached — "
+            "accepting file(s) that may still be unchanged from HEAD."
+        ),
+        factory_module="tools.auto.delta_validator",
+        factory_name="make_delta_validator",
+        modes=("creative",),
+        # Runs first deliberately: the cheapest, most unambiguous Gate-3
+        # check (no LLM call — see _check_delta) should reject an
+        # unchanged file before canon/fact/continuity/theme/prosody spend
+        # LLM calls reviewing prose that turns out to be a no-op. Scoped
+        # to creative only, where acceptance_check is routinely trivial
+        # ("true") and so provides no independent evidence real work
+        # happened — see delta_validator.py's module docstring for the
+        # production run that motivated this. Deliberately NOT "docs":
+        # the existing test suite hard-asserts docs mode's Gate-3 list is
+        # exactly ["existence"] across every agents*.ini profile, which
+        # reads as an intentional invariant, and the observed failure was
+        # creative-mode specific — extend to docs later if the same
+        # no-op pattern actually shows up there. Not "code": a code
+        # task's acceptance_check is normally a real test command, which
+        # already fails on a no-op coder response through a different,
+        # pre-existing path.
+    ),
     GateSpec(
         name="canon",
         attr="canon_validator",

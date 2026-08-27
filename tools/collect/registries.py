@@ -627,10 +627,38 @@ class AlreadySafeIndex:
         if module is not None and line_str.isdigit():
             line_num = int(line_str)
             symbol = _enclosing_symbol_qualname(module, line_num)
-            if symbol is not None and symbol in self._contracts_by_edge:
+            # AUTO-FIX (COLLECT-26 Java gap): COLLECT-4 only inventories
+            # top-level defs/classes for Python, so a Python qualname is
+            # always bare "path:TopLevelName" and this loop never runs —
+            # class-wide contracts have matched Python lines correctly
+            # all along. Java is different by design (java_facts.py):
+            # `public_symbols` also includes each method's own qualname
+            # ("Foo.java:PromptStore._save"), since Java has no top-level
+            # functions to fall back to. `_enclosing_symbol_qualname`
+            # picks the closest-preceding symbol, so a line inside a
+            # method resolves to the METHOD's qualname — which a
+            # class-wide (unnarrowed) contract's known_edge
+            # ("Foo.java:PromptStore") never equals, so every such
+            # contract silently failed to cover any of its own methods.
+            # Walk up the dotted qualname one enclosing type at a time so
+            # a method-level symbol can still reach its class-level
+            # contract; the exact symbol is tried first so an
+            # already-correct match (Python, or a Java field/initializer
+            # line with no method of its own) is unaffected.
+            candidates = []
+            if symbol is not None:
+                candidates.append(symbol)
+                mod_path, sep, qualpart = symbol.partition(":")
+                while sep and "." in qualpart:
+                    qualpart = qualpart.rsplit(".", 1)[0]
+                    candidates.append(f"{mod_path}:{qualpart}")
+
+            for candidate in candidates:
+                if candidate not in self._contracts_by_edge:
+                    continue
                 matched = []
-                for c in self._contracts_by_edge[symbol]:
-                    key = (symbol, c.name)
+                for c in self._contracts_by_edge[candidate]:
+                    key = (candidate, c.name)
                     rng = self._contract_line_range.get(key)
                     if rng is not None:
                         if rng[0] <= line_num <= rng[1]:

@@ -354,9 +354,26 @@ class TicketStore:
             return tickets
         for p in self._dir.glob("*.json"):
             try:
-                tickets.append(self._read(p))
+                ticket = self._read(p)
             except Exception as exc:  # noqa: BLE001
                 logger.warning("TicketStore.list_all: skipping %s — %s", p.name, exc)
+                continue
+            # AUTO-FIX: _read() only does json.loads — a file that is
+            # valid JSON of the wrong shape (a list, a string) used to
+            # pass this try/except (no exception raised) and get appended
+            # as-is, then blow up AttributeError on the .sort() below,
+            # which every non-dict entry reaches regardless of its own
+            # position in the glob. get() already treats this exact case
+            # ("expected a JSON object, got <type>") as unusable; skip it
+            # here too instead of contradicting get()'s quarantine design.
+            if not isinstance(ticket, dict):
+                logger.warning(
+                    "TicketStore.list_all: skipping %s — expected a JSON "
+                    "object, got %s",
+                    p.name, type(ticket).__name__,
+                )
+                continue
+            tickets.append(ticket)
         tickets.sort(key=lambda t: t.get("created_at", ""))
         return tickets
 
@@ -431,6 +448,20 @@ class TicketStore:
             raise TicketNotFound(f"Ticket '{ticket_id}' not found")
 
         ticket = self._read(path)
+        # AUTO-FIX: a file that is valid JSON of the wrong shape (a list,
+        # a string) used to reach ticket.update(fields) below and raise a
+        # raw AttributeError. get() already quarantines this exact case;
+        # do the same here and raise the TicketSchemaError this method's
+        # own docstring already documents, instead of an undocumented
+        # AttributeError leaking out of an internal implementation detail.
+        if not isinstance(ticket, dict):
+            self._quarantine(
+                path, f"expected a JSON object, got {type(ticket).__name__}"
+            )
+            raise TicketSchemaError(
+                f"Ticket '{ticket_id}' is corrupt (expected a JSON object, "
+                f"got {type(ticket).__name__}) — quarantined"
+            )
         # Protect immutable fields
         fields.pop("id", None)
         fields.pop("created_at", None)

@@ -65,6 +65,7 @@ from tools.auto.architect import CandidateTask
 from tools.auto.llm_profile import LlmSettings, resolve_llm_profile
 from tools.auto.gate1_grounding import (
     callee_context, config_fallback_note, target_file_context,
+    instruction_file_context,
     collect_contract_note, existing_test_coverage_note, truncation_safety_note,
     intentional_design_note, test_helper_note,
 )
@@ -939,6 +940,20 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                 tf_note = None
             if tf_note:
                 notes.append(tf_note)
+
+            # AUTO-H2-6b: covers the case tf_note above does not — cited_file
+            # already matches target_files (so tf_note found nothing) but
+            # neither matches what the instruction is actually about.
+            try:
+                if_note = instruction_file_context(
+                    candidate.instruction, loc.file, base_dir,
+                    already_noted=bool(tf_note),
+                )
+            except Exception as exc:  # pragma: no cover - defensive, see docstring
+                logger.warning("Gate1._build_grounding_notes: instruction_file_context failed (%s) — skipping", exc)
+                if_note = None
+            if if_note:
+                notes.append(if_note)
 
         if base_dir is not None:
             try:

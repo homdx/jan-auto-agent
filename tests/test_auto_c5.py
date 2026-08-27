@@ -23,7 +23,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from tools.auto.commit_on_success import CommitOnSuccess, make_commit_on_success
 from tools.auto.git_manager import GitError
-from tools.auto.state import StateStore, make_task, STATUS_DONE, STATUS_TODO
+from tools.auto.state import StateStore, make_task, STATUS_DONE, STATUS_TODO, STATUS_BLOCKED
 
 
 # ── helpers / fakes ──────────────────────────────────────────────────────────
@@ -143,6 +143,98 @@ class TestNothingStaged:
         CommitOnSuccess(gm, st).commit(TASK)
         log = (tmp_path / ".agent" / "run.log").read_text()
         assert "nothing staged" in log.lower() or "no new commit" in log.lower()
+
+
+# ── nothing staged + trivial acceptance_check → BLOCKED, not DONE ─────────────
+#
+# AUTO-CR-DELTA-2: confirmed in production — a creative task's
+# acceptance_check is routinely the literal string "true" (it can't fail,
+# so passing it proves nothing). When the coder also produces nothing new,
+# "nothing staged, but the check passed" used to still mean DONE, silently
+# indistinguishable from a real success. TASK above (acceptance_check =
+# "pytest -q") deliberately keeps every TestNothingStaged case above on the
+# old, still-correct DONE path — a real, non-trivial check that passed IS
+# independent evidence the tree is already correct. This class is the new
+# behaviour: only fires when the check itself could never have failed.
+
+TRIVIAL_TASK = {**TASK, "acceptance_check": "true"}
+
+
+class TestNothingStagedTrivialAcceptanceCheck:
+    """Scoped to task_mode="creative" — see the module docstring and
+    commit_on_success.py's own docstring for why non-creative tasks
+    (including this file's own TASK-based tests above) must NOT be
+    affected: "true" is a common, unrelated test-fixture convention
+    there."""
+
+    def test_returns_none_when_nothing_staged(self, tmp_path):
+        st  = _state(tmp_path)
+        gm  = FakeGitManager([None])
+        sha = CommitOnSuccess(gm, st, task_mode="creative").commit(TRIVIAL_TASK)
+        assert sha is None
+
+    def test_task_marked_blocked_not_done(self, tmp_path):
+        st  = _state(tmp_path)
+        gm  = FakeGitManager([None])
+        CommitOnSuccess(gm, st, task_mode="creative").commit(TRIVIAL_TASK)
+        assert st.get_task("AUTO-T1")["status"] == STATUS_BLOCKED
+
+    def test_blocked_reason_recorded(self, tmp_path):
+        st  = _state(tmp_path)
+        gm  = FakeGitManager([None])
+        CommitOnSuccess(gm, st, task_mode="creative").commit(TRIVIAL_TASK)
+        assert st.get_task("AUTO-T1").get("blocked_reason") == \
+            "nothing_staged_trivial_acceptance_check"
+
+    def test_commit_field_not_set_to_done_sentinel(self, tmp_path):
+        """Must not carry the DONE-path's commit='' sentinel — that would
+        make a BLOCKED task look partially-successful in the plan file."""
+        st  = _state(tmp_path)
+        gm  = FakeGitManager([None])
+        CommitOnSuccess(gm, st, task_mode="creative").commit(TRIVIAL_TASK)
+        assert st.get_task("AUTO-T1").get("commit") != ""
+
+    def test_warning_logged(self, tmp_path):
+        st  = _state(tmp_path)
+        gm  = FakeGitManager([None])
+        CommitOnSuccess(gm, st, task_mode="creative").commit(TRIVIAL_TASK)
+        log = (tmp_path / ".agent" / "run.log").read_text()
+        assert "blocked" in log.lower()
+
+    @pytest.mark.parametrize("check", ["true", " true ", "true;", ":", "exit 0", "", None])
+    def test_every_trivial_form_is_blocked(self, tmp_path, check):
+        st  = _state(tmp_path)
+        gm  = FakeGitManager([None])
+        task = {**TASK, "acceptance_check": check}
+        CommitOnSuccess(gm, st, task_mode="creative").commit(task)
+        assert st.get_task("AUTO-T1")["status"] == STATUS_BLOCKED
+
+    @pytest.mark.parametrize("check", ["pytest -q", "python -m pytest main.py -q", "npm test"])
+    def test_real_checks_keep_the_old_done_behaviour(self, tmp_path, check):
+        """Non-trivial acceptance_check is real evidence, so the pre-existing
+        DONE-with-empty-commit behaviour is exactly right and unchanged."""
+        st  = _state(tmp_path)
+        gm  = FakeGitManager([None])
+        task = {**TASK, "acceptance_check": check}
+        CommitOnSuccess(gm, st, task_mode="creative").commit(task)
+        assert st.get_task("AUTO-T1")["status"] == STATUS_DONE
+        assert st.get_task("AUTO-T1").get("commit") == ""
+
+    def test_non_creative_mode_is_unaffected_even_with_trivial_check(self, tmp_path):
+        """The scoping decision itself: task_mode defaults to "code", and a
+        trivial acceptance_check there is a common, unrelated test/stub
+        fixture convention (see this file's own TASK/TestNothingStaged
+        cases, and the controller-level fixtures in test_auto_4.py /
+        test_auto_g3.py / test_auto_g11.py that this exact test was added
+        after finding broken by an earlier, non-scoped version of this
+        fix). Default task_mode + trivial check must still take the old
+        DONE path."""
+        st  = _state(tmp_path)
+        gm  = FakeGitManager([None])
+        cos = CommitOnSuccess(gm, st)  # task_mode defaults to "code"
+        cos.commit(TRIVIAL_TASK)
+        assert st.get_task("AUTO-T1")["status"] == STATUS_DONE
+        assert st.get_task("AUTO-T1").get("commit") == ""
 
 
 # ── git error ────────────────────────────────────────────────────────────────
