@@ -303,8 +303,10 @@ def check_task1(sandbox: Path) -> Report:
     report.add(
         bool(test_files), "test file created",
         ", ".join(str(p) for p in test_files) or "none",
-        hint="the Architect never proposed one, or the task cap cut it off — "
-             "check plan.json and auto.max_tasks_per_run",
+        hint=_diagnose_no_candidates(sandbox) or (
+            "the Architect never proposed one, or the task cap cut it off — "
+            "check plan.json and auto.max_tasks_per_run"
+        ),
     )
 
     if test_files:
@@ -460,7 +462,9 @@ def check_task3(sandbox: Path) -> Report:
     entries = _ENTRY_RE.findall(text)
     report.add(
         len(entries) >= 2, "a new entry was added", f"{len(entries)} entry/entries",
-        hint="only the seed entry is present — the flow added nothing",
+        hint=_diagnose_no_candidates(sandbox) or (
+            "only the seed entry is present — the flow added nothing"
+        ),
     )
 
     report.add(
@@ -626,6 +630,131 @@ CHECKS = {1: check_task1, 2: check_task2, 3: check_task3, 4: check_task4}
 # CLI
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Weighted scoring — a percentage on top of the pass/fail findings above
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# check_task1/2 report binary findings: a run either satisfies "test suite
+# passes" or it doesn't. That's the right tool for "should CI go green", but
+# it throws away information a human reviewing a run actually wants — a run
+# that hardened main.py but forgot one docstring is not the same outcome as
+# a run that left main.py untouched, and PASS/FAIL alone can't tell them
+# apart. WEIGHTS turns the SAME findings check_task1/2 already computed into
+# a 0-100 score instead of a second, independent judgement — this can never
+# disagree with the PASS/FAIL verdict about WHAT happened, only about how
+# much a given gap should cost.
+#
+# GATES are findings whose failure caps the score outright, no matter how
+# many other points were earned: points for "wrote docstrings" mean nothing
+# if the docs run edited main.py instead of README.md, or if the code run's
+# one required behaviour (prints "Hello world") broke. A capped run can
+# still land above 0% — a gate failure means "this run violated a hard
+# constraint", not "this run did nothing".
+#
+# Only tasks 1 and 2 are weighted below. Task 3/4 (creative) are deliberately
+# left out — RUNBOOK.md is explicit that judging prose quality is out of
+# scope for this deterministic checker; a creative rubric needs a different
+# kind of criterion (canon/continuity) that belongs to the Gate-3 validators
+# at runtime, not to a percentage computed after the fact.
+
+@dataclass(frozen=True)
+class ScoreBand:
+    floor: int
+    label: str
+    meaning: str
+
+
+BANDS: tuple[ScoreBand, ...] = (
+    ScoreBand(100, "Excellent", "every weighted check passed — nothing left to fix"),
+    ScoreBand(85, "Solid", "the deliverable is there and working; only cosmetic gaps remain"),
+    ScoreBand(65, "Partial", "the deliverable landed but is noticeably incomplete"),
+    ScoreBand(40, "Weak", "the deliverable is mostly missing or badly broken"),
+    ScoreBand(0, "Failed", "a hard constraint was violated or nothing usable landed"),
+)
+
+
+def band_for(pct: float) -> ScoreBand:
+    for b in BANDS:
+        if pct >= b.floor:
+            return b
+    return BANDS[-1]  # pragma: no cover — 0 is always in range
+
+
+#: label -> points earned when that finding is present and OK. Each task's
+#: points sum to 100 so the raw total doubles as the percentage.
+WEIGHTS: dict[int, dict[str, int]] = {
+    1: {  # hello-code
+        "main.py present": 5,
+        "main.py still prints Hello world": 20,
+        "main.py parses": 5,
+        "main() defined": 10,
+        "test file created": 15,
+        "test suite passes": 25,
+        "module docstring": 7,
+        "main() docstring": 7,
+        "main() return annotation": 6,
+    },
+    2: {  # hello-docs
+        "README.md present": 5,
+        "README.md was modified": 30,
+        "README has a Usage section": 25,
+        "no .py file was targeted": 20,
+        "no references to missing files": 20,
+    },
+}
+
+#: label -> cap. If that finding fails, the score cannot exceed cap even
+#: though other points were earned.
+GATES: dict[int, dict[str, int]] = {
+    1: {
+        "main.py parses": 10,                    # broken syntax — nothing else here is trustworthy
+        "main.py still prints Hello world": 15,   # regressed the one behaviour that must survive
+    },
+    2: {
+        "no .py file was targeted": 30,           # a docs run touching code violates the skill contract
+    },
+}
+
+
+@dataclass
+class Score:
+    applicable: bool  # False when the flow never ran — nothing to grade
+    pct: float = 0.0
+    band: ScoreBand = BANDS[-1]
+    capped_by: tuple[str, ...] = ()
+
+
+def compute_score(report: Report) -> Score | None:
+    """None when task has no rubric yet (3/4). Score.applicable is False
+    when the flow never ran (score of 0 would misleadingly read as 'tried
+    and failed everything' rather than 'nothing to grade')."""
+    weights = WEIGHTS.get(report.task)
+    if weights is None:
+        return None
+    by_label = {f.label: f for f in report.findings}
+    ran = by_label.get("flow was run")
+    if ran is not None and not ran.ok:
+        return Score(applicable=False)
+
+    total = sum(weights.values())
+    earned = sum(
+        points for label, points in weights.items()
+        if (f := by_label.get(label)) is not None and f.ok
+    )
+    pct = (earned / total * 100) if total else 0.0
+
+    cap = 100
+    capped_by: list[str] = []
+    for label, cap_value in GATES.get(report.task, {}).items():
+        f = by_label.get(label)
+        if f is not None and not f.ok:
+            cap = min(cap, cap_value)
+            capped_by.append(label)
+    pct = min(pct, cap)
+
+    return Score(applicable=True, pct=pct, band=band_for(pct), capped_by=tuple(capped_by))
+
+
 def render(report: Report, colour: bool = True) -> str:
     def paint(code: str, s: str) -> str:
         return f"{code}{s}{_RESET}" if colour else s
@@ -647,6 +776,17 @@ def render(report: Report, colour: bool = True) -> str:
         lines.append(line)
     verdict = "OK" if report.passed else f"{len(report.failed)} failure(s)"
     lines.append(f"  => {paint(_GREEN if report.passed else _RED, verdict)}")
+
+    score = compute_score(report)
+    if score is not None:
+        if not score.applicable:
+            lines.append(paint(_DIM, "  => score: n/a — flow never ran"))
+        else:
+            band_code = _GREEN if score.pct >= 85 else _YELLOW if score.pct >= 40 else _RED
+            score_line = f"  => score: {score.pct:.0f}% ({score.band.label})"
+            if score.capped_by:
+                score_line += f" — capped by: {', '.join(score.capped_by)}"
+            lines.append(paint(band_code, score_line))
     return "\n".join(lines)
 
 
@@ -665,10 +805,21 @@ def main() -> int:
     reports = [CHECKS[t](sandbox_for(t)) for t in tasks]
 
     if args.json:
+        def score_json(r: Report) -> dict | None:
+            s = compute_score(r)
+            if s is None:
+                return None
+            if not s.applicable:
+                return {"applicable": False}
+            return {
+                "applicable": True, "pct": round(s.pct, 1), "band": s.band.label,
+                "capped_by": list(s.capped_by),
+            }
+
         print(json.dumps([
             {
                 "task": r.task, "skill": r.skill, "sandbox": str(r.sandbox),
-                "passed": r.passed,
+                "passed": r.passed, "score": score_json(r),
                 "findings": [
                     {
                         "ok": f.ok, "warn": f.warn, "label": f.label,
