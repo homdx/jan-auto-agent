@@ -671,11 +671,26 @@ class LLMGate2Validator:
                 # lose a multi-line critique. Feed the coder the FULL reviewer
                 # reply minus the leading verdict token instead.
                 critique = raw.strip()
-                _low = critique.lower()
-                for _tok in ("revise:", "revise", "reject:", "reject", "no:"):
-                    if _low.startswith(_tok):
-                        critique = critique[len(_tok):].lstrip(" :\n\t")
-                        break
+                import re as _re  # local import — matches _parse_verdict_soft's convention; approve() has no module-level `re` import in scope
+                # AUTO-FIX: the previous fixed-length-slice approach checked
+                # bare "revise"/"reject" as prefixes, so a validator reply in
+                # the past tense ("REVISED: ...", "REJECTED: ...") matched
+                # the bare token first and had only 6 chars sliced off,
+                # leaving a stray "D:"/"ED:" fragment prepended to the
+                # critique handed to the coder. Match the whole word (with
+                # an optional past-tense "d"/"ed" suffix) plus any trailing
+                # ":" in one regex pass instead, so every accepted spelling
+                # of the verdict is stripped cleanly regardless of tense.
+                # "no" keeps requiring an explicit colon, same as before —
+                # bare "no" alone was never a valid strip token, only "no:"
+                # was, so that narrower case is preserved unchanged.
+                critique = _re.sub(
+                    r"^(?:revise[d]?|reject(?:ed)?)\s*:?\s*|^no\s*:\s*",
+                    "",
+                    critique,
+                    count=1,
+                    flags=_re.IGNORECASE,
+                )
                 if not critique:
                     critique = reason  # fall back to the parsed reason
                 return False, f"Reason: {critique}"
