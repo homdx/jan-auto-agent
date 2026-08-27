@@ -696,13 +696,63 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
 
         Uses the same ``_make_llm_call`` factory as SummaryMemory / CanonValidator.
         Falls back to a no-op that always returns ``""`` (fail-open) if the
-        import fails, so __init__ never raises.
+        import fails, so __init__ never raises for that reason.
+
+        GATE3-PROFILE-3: also resolves ``[architect] plan_llm_profile``,
+        falling back straight to ``[api_{active}]`` when unset — the plan
+        validator is architect's own, single call site, with no shared
+        ``validator_llm_profile``-style middle step to inherit from first.
+        ``resolve_llm_profile`` itself is deliberately OUTSIDE any
+        ``except Exception`` below: a malformed ``plan_llm_profile`` must
+        raise here — at construction, before any task runs — never be
+        discovered mid-run. Unset, it resolves to the exact same
+        :func:`~tools.auto.summary_memory._default_llm_settings` defaults
+        ``_make_llm_call`` has always computed inline, so default
+        behaviour is unchanged.
+
+        AUTO-FIX (regression from GATE3-PROFILE-3): the import guard above
+        was the ONLY try/except here for a while — ``_default_llm_settings``
+        and ``_make_llm_call`` ran unguarded, so a config error that has
+        nothing to do with ``plan_llm_profile`` (a malformed ``[coder]
+        max_tokens``, say) crashed ``ClusterReviewer.__init__`` outright
+        instead of degrading gracefully, contradicting this docstring's own
+        "so __init__ never raises for that reason" — confirmed by
+        reproducing it directly: same bad ``max_tokens``, ``_build_llm_call``
+        raised ``ValueError`` instead of returning the no-op fallback. Each
+        of those two calls now has its own narrow try/except, so a bad
+        profile name still raises (the GATE3-PROFILE-3 behaviour this
+        function exists to provide) while everything else fails open again
+        (the original contract this docstring has described all along).
         """
         try:
-            from tools.auto.summary_memory import _make_llm_call  # noqa: PLC0415
-            return _make_llm_call(self._config, task_mode=self._task_mode)
+            from tools.auto.summary_memory import (  # noqa: PLC0415
+                _default_llm_settings, _make_llm_call,
+            )
+            from tools.auto.llm_profile import resolve_llm_profile  # noqa: PLC0415
         except Exception as exc:  # noqa: BLE001
             logger.warning("ClusterReviewer._build_llm_call failed — validate_plan will fail-open: %s", exc)
+            return lambda system, user: ""
+
+        try:
+            defaults = _default_llm_settings(self._config, self._task_mode)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "ClusterReviewer._build_llm_call: could not compute default "
+                "LLM settings — validate_plan will fail-open: %s", exc,
+            )
+            return lambda system, user: ""
+
+        settings, _ = resolve_llm_profile(
+            self._config, "architect", "plan_llm_profile", defaults=defaults,
+        )
+
+        try:
+            return _make_llm_call(self._config, task_mode=self._task_mode, settings=settings)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "ClusterReviewer._build_llm_call: could not build the LLM "
+                "call — validate_plan will fail-open: %s", exc,
+            )
             return lambda system, user: ""
 
     def _review_one_cluster(
@@ -875,7 +925,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 source="architect",
                 target="llm",
                 kind="llm_request",
-                content=user_msg,
+                content=user_msg, model=self._model,
                 params={"model": self._model, "temperature": _effective_temperature,
                         "cluster": cluster.name, "max_tasks": max_tasks},
             )
@@ -965,7 +1015,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                     cluster.name, _attempt, last_exc,
                 )
                 tracer.event(
-                    source="llm", target="architect", kind="llm_response",
+                    source="llm", target="architect", kind="llm_response", model=self._model,
                     content=f"[ERROR] {last_exc}", params={"cluster": cluster.name},
                 )
                 # None (not []) so callers can distinguish "call failed" from
@@ -980,7 +1030,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 source="llm",
                 target="architect",
                 kind="llm_response",
-                content=cleaned,
+                content=cleaned, model=self._model,
                 params={"cluster": cluster.name, "max_tasks": max_tasks},
             )
 
@@ -1691,7 +1741,7 @@ class TaskRewriter(_llm_stream.LLMClientBase):
             source="task_rewriter",
             target="llm",
             kind="llm_request",
-            content=user_msg,
+            content=user_msg, model=self._model,
             params={"model": self._model, "task": task.get("id", "?")},
         )
 
@@ -1714,7 +1764,7 @@ class TaskRewriter(_llm_stream.LLMClientBase):
             source="llm",
             target="task_rewriter",
             kind="llm_response",
-            content=cleaned,
+            content=cleaned, model=self._model,
             params={"task": task.get("id", "?")},
         )
 

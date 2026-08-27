@@ -819,7 +819,7 @@ def verify_repo(
     """
     modules = list(modules)
     known_symbols = frozenset(sym.qualname for m in modules for sym in m.public_symbols)
-    line_counts = {m.path: sources.get(m.path, "").count("\n") + 1 for m in modules}
+    line_counts = {m.path: len(sources.get(m.path, "").splitlines()) for m in modules}
 
     # Broader "every name this module defines anywhere" index (COLLECT-17
     # fabricated-symbol-citation fix), one per module, built directly from

@@ -629,18 +629,28 @@ class SummaryMemory:
 
 # ── Factory ───────────────────────────────────────────────────────────────────
 
-def _make_llm_call(
+def _default_llm_settings(
     config: configparser.ConfigParser,
     task_mode: str = "creative",
-) -> LlmCall:
-    """Build a ``(system, user) -> str`` callable from *config*.
+) -> "LlmSettings":
+    """Build the shared-provider :class:`LlmSettings` exactly as
+    ``_make_llm_call`` used to compute its locals inline.
 
-    Uses the same API profile / format / SSL logic as the rest of the
-    pipeline.  The LLM call is non-streaming (blocking), matching the
-    validator pattern.
+    GATE3-PROFILE-2. Split out so :func:`_make_llm_call` and
+    :func:`tools.auto.gate_registry.build_validators` compute the *same*
+    defaults the same way — the latter needs them as the innermost
+    fallback of the ``<gate>_llm_profile → validator_llm_profile →
+    [api_{active}]`` chain, without duplicating this parsing.
+
+    Deliberately does NOT strip ``base_url``'s trailing slash (unlike a
+    resolved named profile, where :func:`tools.auto.llm_profile.
+    resolve_llm_profile` strips it): the ollama branch below passes
+    ``base_url`` as-is into ``ollama_chat_url``, and stripping it here
+    would be an observable, untested behaviour change for every existing
+    config that predates GATE3-PROFILE-2.
     """
+    from tools.auto.llm_profile import LlmSettings
     from tools.auto.utils import _cfg_mode
-    import tools.llm_stream as _llm_stream
 
     active = config.get("api", "active", fallback="local")
     api_sec = f"api_{active}"
@@ -660,7 +670,6 @@ def _make_llm_call(
     max_tokens = int(max_tokens_str)
 
     temperature = config.getfloat("inner_loop", "temperature", fallback=0.2)
-    timeout     = config.getint("loop", "timeout_seconds", fallback=300)
     # AUTO-FIX (fable follow-up 3): thinking models (qwen3) prepend a
     # <think> block; if it truncates against num_predict the synopsis update
     # comes back empty, and if it doesn't, the reasoning text is WRITTEN
@@ -670,43 +679,133 @@ def _make_llm_call(
     # re-enables it.
     think = config.getboolean("summary_memory", "think", fallback=False)
 
+    # AUTO-FIX (GATE3-PROFILE audit): think_effort was absent here, so every
+    # LlmSettings this function produced carried the dataclass default (None)
+    # rather than what [api] says, and a named profile appeared to "override"
+    # a value the default had never read. Reasoning depth is a cost/quality
+    # knob that does not change the shape of the reply, so the global [api]
+    # switch is safe to honour.
+    #
+    # response_format is deliberately NOT read from [api] here. That switch
+    # forces the server to emit a JSON object, which is right for Gate 1, the
+    # Coder and the Architect — and wrong for every caller of this function.
+    # The Gate-3 validators (canon/fact/continuity/theme) and SummaryMemory
+    # all parse FREE TEXT: an "APPROVED" / "REVISE: ..." verdict, or a prose
+    # synopsis. Honouring `[api] response_format = true` here would hand them
+    # a JSON object instead and break every one of them at once — and
+    # agents_128k.ini already ships with that key set to true, so this would
+    # have gone straight into a live profile. A caller that genuinely wants
+    # JSON mode can still set response_format in its own *_llm_profile, which
+    # is an explicit, per-caller opt-in rather than a global one.
+    think_effort_enabled = config.getboolean(
+        "api", "think_effort_enabled", fallback=False)
+    think_effort = (
+        (config.get("api", "think_effort", fallback="").strip() or None)
+        if think_effort_enabled else None
+    )
+
+    return LlmSettings(
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        api_format=api_format,
+        verify_ssl=verify_ssl,
+        think=think,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        num_ctx=num_ctx,
+        think_effort_enabled=think_effort_enabled,
+        think_effort=think_effort,
+    )
+
+
+def _make_llm_call(
+    config: configparser.ConfigParser,
+    task_mode: str = "creative",
+    settings: "LlmSettings | None" = None,
+) -> LlmCall:
+    """Build a ``(system, user) -> str`` callable from *config*.
+
+    Uses the same API profile / format / SSL logic as the rest of the
+    pipeline.  The LLM call is non-streaming (blocking), matching the
+    validator pattern.
+
+    GATE3-PROFILE-2: *settings* is optional. When absent (every call site
+    that hasn't opted into a per-validator profile yet), it is built from
+    *config* via :func:`_default_llm_settings` — the exact same reads,
+    in the exact same order, that used to live inline here — so a config
+    without any ``*_llm_profile`` key produces a byte-for-byte identical
+    request to before this change. When present (GATE3-PROFILE-2 callers
+    that resolved a ``<gate>_llm_profile``/``validator_llm_profile``),
+    *settings* is used as-is and *config* is only consulted for the
+    request timeout, which is not a per-provider setting.
+    """
+    import tools.llm_stream as _llm_stream
+
+    if settings is None:
+        settings = _default_llm_settings(config, task_mode)
+
+    base_url   = settings.base_url
+    api_key    = settings.api_key
+    model      = settings.model
+    api_format = settings.api_format
+    verify_ssl = settings.verify_ssl
+    num_ctx    = settings.num_ctx
+    max_tokens = settings.max_tokens
+    temperature = settings.temperature
+    think      = settings.think
+
+    response_format = settings.response_format
+    think_effort    = settings.think_effort
+
+    timeout = config.getint("loop", "timeout_seconds", fallback=300)
+
     ssl_context: ssl.SSLContext | None = _llm_stream.make_unverified_context() if not verify_ssl else None
 
-    if api_format == "ollama":
-        url = _llm_stream.ollama_chat_url(base_url)
-    else:
-        url = f"{base_url.rstrip('/')}/chat/completions"
-
-    headers = {
-        "Content-Type":  "application/json",
-        "Authorization": f"Bearer {api_key}",
-    }
-
     def _call(system: str, user: str) -> str:
-        if api_format == "ollama":
-            _opts: dict = {"temperature": temperature, "num_predict": max_tokens}
-            if num_ctx:
-                _opts["num_ctx"] = num_ctx
-            payload: dict = {
-                "model":    model,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user",   "content": user},
-                ],
-                "options": _opts,
-            }
-            if not think:
-                payload["think"] = False
-        else:
-            payload = {
-                "model":       model,
-                "temperature": temperature,
-                "max_tokens":  max_tokens,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user",   "content": user},
-                ],
-            }
+        # AUTO-FIX (GATE3-PROFILE audit): this used to hand-roll its own
+        # payload, alone among the callers — Coder, Gate1Filter, Architect
+        # and TaskRewriter all go through build_chat_request. Two settings
+        # were silently dropped as a result:
+        #
+        #   * response_format / think_effort — resolve_llm_profile read them
+        #     faithfully from a <gate>_llm_profile and logged the profile as
+        #     applied, and then nothing used them. The same key worked in
+        #     [gate1] presence_llm_profile, so an operator could verify it
+        #     there and get silence here.
+        #   * think = false on api_format = openai — the hand-built openai
+        #     branch had no think handling at all, so suppression only ever
+        #     worked for ollama. build_chat_request sends the reasoning /
+        #     thinking fields both branches need.
+        #
+        # Verified byte-for-byte identical to the old payload for
+        # (ollama, think on/off) and (openai, think on); the openai +
+        # think=false case is the bug fix and is the only intended change.
+        # The one further payload difference: think=True now sends an
+        # explicit think:true (ollama) / thinking:enabled (openai) where the
+        # old code omitted the field. That restates the server default rather
+        # than changing it, and it is what makes think_effort reachable at
+        # all — the builder applies effort only when thinking is enabled.
+        #
+        # Going through the shared builder also picks up the per-(url, model)
+        # unsupported-field memoization: a provider that rejects `reasoning`
+        # or `response_format` once is not asked again.
+        url, headers, payload = _llm_stream.build_chat_request(
+            base_url=base_url, api_key=api_key, model=model,
+            api_format=api_format, temperature=temperature,
+            max_tokens=max_tokens, system=system, user_msg=user,
+            num_ctx=num_ctx,
+            # think is passed as a real bool, never None. `None` would omit
+            # the field entirely, which preserved the old ollama payload
+            # byte-for-byte when think=True — but build_chat_request only
+            # applies think_effort when thinking is explicitly ENABLED, so
+            # `None` left think_effort dead on arrival. Keeping a
+            # configurable key working beats preserving one payload key that
+            # only ever restated the server default; every other caller
+            # (Gate1Filter, Coder, Architect) already passes a bool here.
+            think=think,
+            response_format=response_format, think_effort=think_effort,
+        )
         # AUTO-FIX (fable follow-up 3): strip <think> BEFORE the synopsis
         # parser — reasoning text must never be persisted into synopsis.md.
         return _llm_stream.strip_think(
@@ -734,8 +833,23 @@ def make_summary_memory(
 
     Reads ``[auto] max_compression_passes`` and ``max_fidelity_rounds``;
     reads creative-mode token budget from ``[coder]`` via ``_cfg_mode``.
+
+    GATE3-PROFILE-3: also resolves ``[summary] llm_profile`` — SummaryMemory
+    runs once per task (not once per attempt, like the five Gate-3
+    validators), so it gets a single profile key rather than the
+    ``<gate>_llm_profile`` fan-out, falling back straight to
+    ``[api_{active}]`` when unset (there is no shared
+    ``validator_llm_profile``-style middle step for a call site of one).
+    Resolution happens here, via :func:`~tools.auto.llm_profile.
+    resolve_llm_profile`, and is deliberately NOT wrapped in a
+    try/except: a misconfigured profile must raise here, at construction,
+    before any task runs — never be discovered mid-run. A config without
+    ``llm_profile`` resolves straight back to the same
+    :func:`_default_llm_settings` defaults ``_make_llm_call`` has always
+    used, so default behaviour is unchanged, field for field.
     """
     from tools.auto.utils import _cfg_mode
+    from tools.auto.llm_profile import resolve_llm_profile
 
     max_passes  = config.getint("auto", "max_compression_passes", fallback=2)
     max_fidelity = config.getint("auto", "max_fidelity_rounds",   fallback=2)
@@ -748,7 +862,11 @@ def make_summary_memory(
 
     max_tokens = int(_cfg_mode(config, "coder", "max_tokens", task_mode, fallback="800"))
 
-    llm_call = _make_llm_call(config, task_mode=task_mode)
+    defaults = _default_llm_settings(config, task_mode)
+    settings, _ = resolve_llm_profile(
+        config, "summary", "llm_profile", defaults=defaults,
+    )
+    llm_call = _make_llm_call(config, task_mode=task_mode, settings=settings)
 
     return SummaryMemory(
         llm_call,

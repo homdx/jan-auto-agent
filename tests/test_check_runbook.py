@@ -102,14 +102,14 @@ def test_prefers_the_per_task_sandbox(tmp_path):
     assert "task2" in str(check_runbook.sandbox_for(2, root))
 
 
-@pytest.mark.parametrize("task", [1, 2, 3])
+@pytest.mark.parametrize("task", [1, 2, 3, 4])
 def test_each_task_resolves_independently(tmp_path, task):
     import check_runbook
 
     root = tmp_path / "repo"
     (root / "examples" / "hello-world").mkdir(parents=True)
     (root / "examples" / f"task{task}" / "hello-world").mkdir(parents=True)
-    for other in (1, 2, 3):
+    for other in (1, 2, 3, 4):
         resolved = str(check_runbook.sandbox_for(other, root))
         if other == task:
             assert f"task{task}" in resolved
@@ -121,7 +121,7 @@ def test_each_task_resolves_independently(tmp_path, task):
 # "Was it even run?"
 # ─────────────────────────────────────────────────────────────────────────────
 
-@pytest.mark.parametrize("task", [1, 2, 3])
+@pytest.mark.parametrize("task", [1, 2, 3, 4])
 def test_missing_agent_dir_is_a_failure(tmp_path, task):
     """A pristine sandbox must not read as a passing run."""
     root = tmp_path / "repo"
@@ -133,7 +133,7 @@ def test_missing_agent_dir_is_a_failure(tmp_path, task):
     assert any("flow was run" in f.label for f in report.failed)
 
 
-@pytest.mark.parametrize("task", [1, 2, 3])
+@pytest.mark.parametrize("task", [1, 2, 3, 4])
 def test_absent_sandbox_is_a_failure(tmp_path, task):
     assert not _report(task, tmp_path / "nope").passed
 
@@ -206,14 +206,35 @@ def _changelog(sandbox: Path, text: str) -> None:
 
 _GOOD_CHANGELOG = """# Changelog
 
+A narrative changelog: each entry is a few paragraphs of prose telling the
+story of one change, newest first. New entries are appended by the
+`hello-creative` skill.
+
 ### A newer entry
 
 We taught it something new. It still prints Hello world.
 
 ### The first greeting
 
-We taught this project to say Hello world.
+We taught this project to say something. Before there was anything else,
+there was a single function called `main`, and all it did was print the
+words `Hello world` to the terminal and then stop.
+
+That is genuinely all of it. There are no arguments to pass, no
+configuration to read, no failure path to worry about. Someone runs
+`python main.py` and the machine answers back. We kept it that way on
+purpose: a project this small is the only kind where you can hold the whole
+thing in your head at once, and that turns out to be useful when what you
+actually want to study is the machinery around the code rather than the
+code itself.
+
+A reader can now run the program and see it greet them.
 """
+# ^ the seed entry's prose is copied VERBATIM from
+# examples/hello-world/CHANGELOG.md@HEAD, not paraphrased — the new
+# "seed entry text unchanged" check (added alongside the heading-only
+# "seed entry preserved") diffs against that real baseline, so a fixture
+# claiming to be "good" has to actually match it.
 
 
 def test_good_changelog_passes(tmp_path):
@@ -229,6 +250,36 @@ def test_dropped_seed_entry_is_detected(tmp_path):
     sandbox = _make_sandbox(tmp_path, 3, plan_targets=["CHANGELOG.md"])
     _changelog(sandbox, "# Changelog\n\n### Only entry\n\nIt prints Hello world.\n")
     assert _check(3, sandbox)["seed entry preserved"].ok is False
+
+
+def test_seed_entry_rewritten_in_place_is_detected(tmp_path):
+    """Observed live (test-other-router run, task 3 and task 4 both): the
+    architect's 'support' cluster call — the one that shows it
+    CHANGELOG.md's real content — came back empty (upstream 429s), so its
+    only candidate was built blind. The coder faithfully "recreated" the
+    seed entry with the same heading but different prose, instead of
+    leaving it alone and prepending something new. `len(entries) == 1`
+    already catches this via "a new entry was added", but until now
+    "seed entry preserved" read as a bare PASS right beside it, because it
+    only checked for the heading text.
+    """
+    sandbox = _make_sandbox(tmp_path, 3, plan_targets=["CHANGELOG.md"])
+    _changelog(
+        sandbox,
+        "# Changelog\n\n### The first greeting\n\n"
+        "We taught this project to say something. It now prints a "
+        "friendly hello to whoever runs it.\n",
+    )
+    finding = _check(3, sandbox)["seed entry text unchanged"]
+    assert finding.ok is False
+
+
+def test_untouched_seed_entry_passes_the_text_check(tmp_path):
+    sandbox = _make_sandbox(tmp_path, 3, plan_targets=["CHANGELOG.md"])
+    _changelog(sandbox, _GOOD_CHANGELOG)
+    finding = _check(3, sandbox)["seed entry text unchanged"]
+    assert finding.ok is True
+    assert finding.warn is False
 
 
 def test_no_new_entry_is_detected(tmp_path):
@@ -254,6 +305,136 @@ def test_lost_canon_fact_is_detected(tmp_path):
     sandbox = _make_sandbox(tmp_path, 3, plan_targets=["CHANGELOG.md"])
     _changelog(sandbox, "# Changelog\n\n### New\n\nprose\n\n### The first greeting\n\nprose\n")
     assert _check(3, sandbox)["canon fact intact"].ok is False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Task 4 — creative, canon/continuity on a second provider (GATE3-PROFILE-5)
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SHARED_LINE = (
+    "validator_agent.validator_llm_profile: provider = https://a.example/v1 "
+    "(model-a) \u2014 shared provider (no validator_llm_profile configured)\n"
+)
+
+
+def _console_log(sandbox: Path, text: str) -> None:
+    (sandbox.parent / "console-log.txt").write_text(text, encoding="utf-8")
+
+
+def _split_log() -> str:
+    return _SHARED_LINE + (
+        "validator_agent.canon_llm_profile: provider = https://b.example/v1 "
+        "(model-b) \u2014 via canon_llm_profile = [task4_provider_b]\n"
+        "validator_agent.continuity_llm_profile: provider = https://b.example/v1 "
+        "(model-b) \u2014 via continuity_llm_profile = [task4_provider_b]\n"
+    )
+
+
+def _same_provider_log() -> str:
+    return _SHARED_LINE + (
+        "validator_agent.canon_llm_profile: provider = https://a.example/v1 "
+        "(model-a) \u2014 shared provider (no canon_llm_profile configured)\n"
+        "validator_agent.continuity_llm_profile: provider = https://a.example/v1 "
+        "(model-a) \u2014 shared provider (no continuity_llm_profile configured)\n"
+    )
+
+
+def test_task4_reuses_task3s_changelog_checks(tmp_path):
+    """Same skill body, same base — task 4 must not relax task 3's checks."""
+    sandbox = _make_sandbox(tmp_path, 4, plan_targets=["CHANGELOG.md"])
+    _changelog(sandbox, "# Changelog\n\n### Only entry\n\nno seed here.\n")
+    _console_log(sandbox, _split_log())
+    report = _report(4, sandbox)
+    assert report.findings, "check_task4 produced no findings at all"
+    assert not report.passed
+    assert any("seed entry preserved" in f.label for f in report.failed)
+
+
+def test_task4_reports_task_and_skill_as_its_own(tmp_path):
+    """check_task4 delegates to check_task3 internally; the RETURNED report
+    must carry task 4's own identity, not a leaked task 3."""
+    sandbox = _make_sandbox(tmp_path, 4, plan_targets=["CHANGELOG.md"])
+    _changelog(sandbox, _GOOD_CHANGELOG)
+    _console_log(sandbox, _split_log())
+    report = _report(4, sandbox)
+    assert report.task == 4
+    assert report.skill == "hello-creative-split"
+
+
+def test_split_provider_evidence_passes_on_a_real_split(tmp_path):
+    sandbox = _make_sandbox(tmp_path, 4, plan_targets=["CHANGELOG.md"])
+    _changelog(sandbox, _GOOD_CHANGELOG)
+    _console_log(sandbox, _split_log())
+    report = _report(4, sandbox)
+    finding = _check(4, sandbox)["canon/continuity used a second provider"]
+    assert finding.ok is True
+    assert finding.warn is False
+    assert "b.example" in finding.detail
+    assert report.passed
+
+
+def test_split_provider_evidence_warns_not_fails_on_a_single_provider(tmp_path):
+    """The environment-can't-verify-this case: one provider only. Must be a
+    WARN (skip with an explicit reason), never a silent PASS and never a
+    hard FAIL of a property the checker cannot actually observe."""
+    sandbox = _make_sandbox(tmp_path, 4, plan_targets=["CHANGELOG.md"])
+    _changelog(sandbox, _GOOD_CHANGELOG)
+    _console_log(sandbox, _same_provider_log())
+    finding = _check(4, sandbox)["canon/continuity used a second provider"]
+    assert finding.ok is False
+    assert finding.warn is True
+    report = _report(4, sandbox)
+    assert report.passed, "a WARN finding must not fail the report"
+
+
+def test_split_provider_evidence_warns_when_console_log_is_absent(tmp_path):
+    sandbox = _make_sandbox(tmp_path, 4, plan_targets=["CHANGELOG.md"])
+    _changelog(sandbox, _GOOD_CHANGELOG)
+    # No console-log.txt written at all.
+    finding = _check(4, sandbox)["canon/continuity used a second provider"]
+    assert finding.ok is False
+    assert finding.warn is True
+    assert _report(4, sandbox).passed
+
+
+def test_split_provider_evidence_warns_when_gate_lines_are_missing(tmp_path):
+    """A console log that exists but predates GATE3-PROFILE-2, or came from
+    a run of plain hello-creative rather than hello-creative-split."""
+    sandbox = _make_sandbox(tmp_path, 4, plan_targets=["CHANGELOG.md"])
+    _changelog(sandbox, _GOOD_CHANGELOG)
+    _console_log(sandbox, "InnerLoop: Gate-3 order for creative mode \u2014 canon, continuity\n")
+    finding = _check(4, sandbox)["canon/continuity used a second provider"]
+    assert finding.ok is False
+    assert finding.warn is True
+    assert _report(4, sandbox).passed
+
+
+def test_split_provider_evidence_skipped_when_flow_never_ran(tmp_path):
+    """No .agent/ at all — check_task3's own 'flow was run' failure already
+    explains everything; the provider finding must not also fire (there is
+    nothing to read a console log's providers FROM if the flow never ran)."""
+    root = tmp_path / "repo"
+    sandbox = root / "examples" / "task4" / "hello-world"
+    sandbox.mkdir(parents=True)
+    report = _report(4, sandbox)
+    assert not report.passed
+    assert "canon/continuity used a second provider" not in {
+        f.label for f in report.findings
+    }
+
+
+def test_task4_makes_no_network_call(monkeypatch, tmp_path):
+    import socket
+
+    def _boom(*_a, **_k):
+        raise AssertionError("check_runbook must not open a socket")
+
+    monkeypatch.setattr(socket, "socket", _boom)
+    monkeypatch.setattr(socket, "create_connection", _boom)
+    sandbox = _make_sandbox(tmp_path, 4, plan_targets=["CHANGELOG.md"])
+    _changelog(sandbox, _GOOD_CHANGELOG)
+    _console_log(sandbox, _split_log())
+    _report(4, sandbox)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -342,7 +523,7 @@ def test_checker_requires_a_target():
 def test_checker_json_output_is_parseable():
     result = _cli("--all", "--json")
     payload = json.loads(result.stdout)
-    assert [entry["task"] for entry in payload] == [1, 2, 3]
+    assert [entry["task"] for entry in payload] == [1, 2, 3, 4]
     assert all("findings" in entry for entry in payload)
 
 
@@ -353,7 +534,9 @@ def test_checker_exits_non_zero_when_a_task_fails():
 
 def test_checker_names_the_skill_per_task():
     payload = json.loads(_cli("--all", "--json").stdout)
-    assert [e["skill"] for e in payload] == ["hello-code", "hello-docs", "hello-creative"]
+    assert [e["skill"] for e in payload] == [
+        "hello-code", "hello-docs", "hello-creative", "hello-creative-split",
+    ]
 
 
 def test_checker_makes_no_network_call(monkeypatch, tmp_path):

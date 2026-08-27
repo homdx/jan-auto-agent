@@ -270,7 +270,7 @@ def find_previous_chapter_text(chapter_file: str, base_dir: "str | Path") -> str
 
 # ── Factory ───────────────────────────────────────────────────────────────────
 
-def make_continuity_validator(config) -> "ContinuityValidator | None":
+def make_continuity_validator(config, *, settings=None) -> "ContinuityValidator | None":
     """Build a :class:`ContinuityValidator` from *config*, or ``None`` when
     disabled.
 
@@ -278,9 +278,14 @@ def make_continuity_validator(config) -> "ContinuityValidator | None":
     ``false``) and ``max_continuity_revisions`` (int, default ``1``).
 
     The LLM callable is built straight from *config* (same approach as
-    :func:`tools.auto.canon_validator.make_canon_validator`), so this stays a
-    one-argument factory — the caller doesn't need to thread API settings
-    through separately.
+    :func:`tools.auto.canon_validator.make_canon_validator`).
+
+    GATE3-PROFILE-2: *settings*, an optional
+    :class:`tools.auto.llm_profile.LlmSettings`, is passed straight through
+    to ``_make_llm_call``. ``None`` (the default) reproduces today's
+    behaviour exactly — only :func:`tools.auto.gate_registry.
+    build_validators` passes a resolved value, via ``[validator_agent]
+    continuity_llm_profile``.
 
     Returns ``None`` when the feature flag is off so the wiring in
     :func:`tools.auto.inner_loop.make_inner_loop` can remain a no-op with a
@@ -295,7 +300,13 @@ def make_continuity_validator(config) -> "ContinuityValidator | None":
 
     try:
         from tools.auto.summary_memory import _make_llm_call  # noqa: PLC0415
-        llm_call = _make_llm_call(config, task_mode="creative")
+        # GATE3-PROFILE-2: only pass settings= when a profile was actually
+        # resolved — see the identical comment in canon_validator.py.
+        llm_call = (
+            _make_llm_call(config, task_mode="creative", settings=settings)
+            if settings is not None
+            else _make_llm_call(config, task_mode="creative")
+        )
     except Exception as exc:  # noqa: BLE001 — never block the loop on setup
         logger.warning("make_continuity_validator: could not build LLM call — %s", exc)
         return None

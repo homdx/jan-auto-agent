@@ -113,7 +113,7 @@ class OutputFormatter:
 
         # Section: EXPLANATION (Skipped for intent='show')
         if intent != "show":
-            explanation_text = improvement.get("explanation", "").strip()
+            explanation_text = (improvement.get("explanation") or "").strip()
             if explanation_text:
                 print("# EXPLANATION")
                 print(explanation_text)
@@ -134,7 +134,7 @@ class OutputFormatter:
             print()
 
             # Sub-Section: IMPROVED CODE
-            improved_code_text = improvement.get("improved_code", "").strip()
+            improved_code_text = (improvement.get("improved_code") or "").strip()
             if improved_code_text:
                 print("# IMPROVED CODE")
                 print(improved_code_text)

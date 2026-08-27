@@ -671,11 +671,26 @@ class LLMGate2Validator:
                 # lose a multi-line critique. Feed the coder the FULL reviewer
                 # reply minus the leading verdict token instead.
                 critique = raw.strip()
-                _low = critique.lower()
-                for _tok in ("revise:", "revise", "reject:", "reject", "no:"):
-                    if _low.startswith(_tok):
-                        critique = critique[len(_tok):].lstrip(" :\n\t")
-                        break
+                import re as _re  # local import — matches _parse_verdict_soft's convention; approve() has no module-level `re` import in scope
+                # AUTO-FIX: the previous fixed-length-slice approach checked
+                # bare "revise"/"reject" as prefixes, so a validator reply in
+                # the past tense ("REVISED: ...", "REJECTED: ...") matched
+                # the bare token first and had only 6 chars sliced off,
+                # leaving a stray "D:"/"ED:" fragment prepended to the
+                # critique handed to the coder. Match the whole word (with
+                # an optional past-tense "d"/"ed" suffix) plus any trailing
+                # ":" in one regex pass instead, so every accepted spelling
+                # of the verdict is stripped cleanly regardless of tense.
+                # "no" keeps requiring an explicit colon, same as before —
+                # bare "no" alone was never a valid strip token, only "no:"
+                # was, so that narrower case is preserved unchanged.
+                critique = _re.sub(
+                    r"^(?:revise[d]?|reject(?:ed)?)\s*:?\s*|^no\s*:\s*",
+                    "",
+                    critique,
+                    count=1,
+                    flags=_re.IGNORECASE,
+                )
                 if not critique:
                     critique = reason  # fall back to the parsed reason
                 return False, f"Reason: {critique}"
@@ -893,6 +908,26 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
         if upper.startswith("APPROVED") or _re.match(r"^OK\b", upper):
             return True, "", False
 
+        # ── English "NO, <it's all good>" discourse-filler guard ─────────
+        # AUTO-BUG: bare `upper.startswith("NO")` below misread a casual
+        # "No, it's perfect!" / "No, that's fine." / "No, all good here." —
+        # where "No" is conversational filler answering an implicit "any
+        # issues?" rather than a rejection — as a REVISE verdict, mangling
+        # the reason to ", it's perfect!". The Russian branch already has
+        # an equivalent guard for the identical discourse pattern ("Нет,
+        # всё хорошо" not misread as REVISE); this mirrors it for English
+        # so the same casual sentiment is treated consistently regardless
+        # of language. Genuine rejections opening with "No" but naming an
+        # actual problem ("No, this doesn't work", "No, fix the ending")
+        # are unaffected — only an explicit all-good phrase is excluded.
+        if _re.match(
+            r"^NO[,.]?\s*(?:IT'?S|IT IS|THAT'?S|THAT IS|EVERYTHING'?S|"
+            r"EVERYTHING IS|ALL)?\s*(?:GOOD|FINE|PERFECT|GREAT|OK|OKAY|"
+            r"CORRECT|IN ORDER)\b",
+            upper,
+        ):
+            return True, "", False
+
         # ── English REVISE / REJECT / NO ─────────────────────────────────
         for token in ("REVISE", "REJECT", "NO"):
             if upper.startswith(token):
@@ -1013,6 +1048,7 @@ class InnerLoop:
         continuity_validator=None,
         theme_validator=None,
         existence_validator=None,   # GATES-3: docs-mode file-reference check
+        delta_validator=None,       # AUTO-CR-DELTA-1: unchanged-from-HEAD check
         require_tests: bool = False,
         task_mode: str = "code",
         max_task_seconds: int = 0,
@@ -1410,70 +1446,49 @@ def resolve_validator_llm_profile(config, *, base_url, api_key, model,
       never to a hardcoded default, and never to another profile's value.
 
     Returns a dict of keyword arguments for :class:`LLMGate2Validator`.
+
+    GATE3-PROFILE-6: the field-by-field resolution below used to be a
+    second, independent copy of the same logic in
+    ``Gate1Filter._init_presence_provider``. Both now delegate to the
+    shared ``tools.auto.llm_profile.resolve_llm_profile`` (see that
+    module for the authoritative field-resolution rules); this function's
+    job is only to adapt its ``LlmSettings`` result to the
+    (dict, verify_ssl, think) shape this call site has always returned,
+    and to keep this function's own established "LLMGate2Validator:
+    critique provider" log wording, unchanged for anyone grepping
+    existing logs.
     """
-    resolved = dict(
+    from tools.auto.llm_profile import LlmSettings, resolve_llm_profile  # noqa: PLC0415
+
+    defaults = LlmSettings(
         base_url=base_url, api_key=api_key, model=model,
-        api_format=api_format, num_ctx=num_ctx,
-        temperature=temperature, max_tokens=max_tokens,
+        api_format=api_format, verify_ssl=verify_ssl,
+        think=think, temperature=temperature,
+        max_tokens=max_tokens, num_ctx=num_ctx,
     )
-    name = config.get("validator_agent", "validator_llm_profile", fallback="").strip()
-    if not name:
+    settings, profile_name = resolve_llm_profile(
+        config, "validator_agent", "validator_llm_profile", defaults=defaults)
+
+    resolved = dict(
+        base_url=settings.base_url, api_key=settings.api_key,
+        model=settings.model, api_format=settings.api_format,
+        num_ctx=settings.num_ctx, temperature=settings.temperature,
+        max_tokens=settings.max_tokens,
+    )
+
+    if profile_name is None:
         logger.info(
-            "LLMGate2Validator: critique provider = %s (%s) — shared provider "
-            "(no validator_llm_profile configured)", base_url, model,
+            "LLMGate2Validator: critique provider = %s (%s) \u2014 shared provider "
+            "(no validator_llm_profile configured)",
+            settings.base_url, settings.model,
         )
-        return resolved, verify_ssl, think
-
-    if not config.has_section(name):
-        raise ValueError(
-            f"[validator_agent] validator_llm_profile = {name!r} but the config "
-            f"has no [{name}] section. Add one with at least "
-            f"base_url/api_key/model, or remove validator_llm_profile to use "
-            f"the shared provider."
+    else:
+        logger.info(
+            "LLMGate2Validator: critique provider = %s (%s) \u2014 via "
+            "validator_llm_profile = [%s]",
+            settings.base_url, settings.model, profile_name,
         )
-    missing = [k for k in ("base_url", "api_key", "model")
-               if not config.has_option(name, k)]
-    if missing:
-        raise ValueError(
-            f"[{name}] (validator_llm_profile) is missing required option(s): "
-            f"{', '.join(missing)}. A critique profile must fully specify its "
-            f"own connection details — it never silently inherits "
-            f"base_url/api_key/model from the shared provider, since that "
-            f"could send a different provider's credential to the wrong host."
-        )
-    resolved["base_url"]   = config.get(name, "base_url").rstrip("/")
-    resolved["api_key"]    = config.get(name, "api_key")
-    resolved["model"]      = config.get(name, "model")
-    resolved["api_format"] = config.get(name, "api_format", fallback=api_format)
-    try:
-        resolved["temperature"] = float(config.get(
-            name, "temperature", fallback=str(temperature)))
-    except ValueError:
-        logger.warning("[%s] temperature invalid — keeping %s", name, temperature)
-    try:
-        resolved["max_tokens"] = config.getint(
-            name, "max_tokens", fallback=max_tokens)
-    except ValueError:
-        logger.warning("[%s] max_tokens invalid — keeping %s", name, max_tokens)
-    try:
-        resolved["num_ctx"] = config.getint(name, "num_ctx", fallback=num_ctx)
-    except ValueError:
-        logger.warning("[%s] num_ctx invalid — keeping %s", name, num_ctx)
-    try:
-        profile_verify_ssl = config.getboolean(name, "verify_ssl", fallback=verify_ssl)
-    except ValueError:
-        profile_verify_ssl = verify_ssl
-    try:
-        profile_think = config.getboolean(name, "think", fallback=think)
-    except ValueError:
-        profile_think = think
-
-    logger.info(
-        "LLMGate2Validator: critique provider = %s (%s) — via "
-        "validator_llm_profile = [%s]",
-        resolved["base_url"], resolved["model"], name,
-    )
-    return resolved, profile_verify_ssl, profile_think
+    return resolved, settings.verify_ssl, settings.think
 
 
 def make_inner_loop(

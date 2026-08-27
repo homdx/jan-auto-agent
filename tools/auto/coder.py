@@ -373,7 +373,7 @@ class Coder(_llm_stream.LLMClientBase):
         )
 
         tracer.event(
-            source="coder", target="llm", kind="llm_request",
+            source="coder", target="llm", kind="llm_request", model=self._model,
             content=user_msg,
             params={"model": self._model, "temperature": self._temperature,
                     "task_id": task_id},
@@ -404,7 +404,7 @@ class Coder(_llm_stream.LLMClientBase):
             msg = f"LLM call failed: {exc}"
             logger.warning("coder.generate [%s]: %s", task_id, msg)
             tracer.event(
-                source="coder", target="llm", kind="llm_response",
+                source="coder", target="llm", kind="llm_response", model=self._model,
                 content=f"[ERROR] {exc}", params={"task_id": task_id},
             )
             return CoderResult(task_id=task_id, error=msg)
@@ -483,7 +483,7 @@ class Coder(_llm_stream.LLMClientBase):
 
         tracer.event(
             source="llm", target="coder", kind="llm_response",
-            content=cleaned, params={"task_id": task_id},
+            content=cleaned, model=self._model, params={"task_id": task_id},
         )
 
         parsed_files, parse_error = self._parse_response(
@@ -873,6 +873,26 @@ class Coder(_llm_stream.LLMClientBase):
         """AUTO-CR-18: detect when an edit turned a chapter into a near-copy of
         another chapter (the "make identical" failure mode). Returns an
         actionable error string, or "" if all produced chapters stay distinct.
+
+        AUTO-CR-18-2 (bugfix): the cross-file comparison below only catches
+        duplication ACROSS differently-named files (chapter_2.txt vs
+        chapter_3.txt). It cannot catch the single-file case — a changelog,
+        FAQ, or any document with multiple `### `-headed entries in ONE
+        file — because ``produced`` and ``chapters`` share the same key
+        (the target file's own name), so ``oname == pname`` is always true
+        and the comparison is skipped by construction. Observed live: a
+        changelog task looped for 8 attempts across 7 rounds, each one
+        APPENDING a new near-duplicate "### Greeting <verb> Hello world"
+        entry (a synonym-swapped rewrite of the one before it) rather than
+        writing ONE entry, because nothing ever rejected the growing file —
+        it kept growing until the bloated, heavily-repetitive prompt made
+        the Gate-2 validator itself degenerate (see AUTO-BUG-empty-response
+        in inner_loop.py) and the run exhausted without ever surfacing the
+        real problem. _split_entries below adds the missing WITHIN-file
+        check: entries in the SAME file, split the same way the rest of
+        this codebase already treats a changelog/entry document (`### `
+        headings — see e.g. scripts/check_runbook.py's ``_ENTRY_RE``), are
+        pairwise-compared exactly like cross-file chapters are.
         """
         import difflib
 
@@ -918,7 +938,20 @@ class Coder(_llm_stream.LLMClientBase):
                 n2 = _norm(ocontent)
                 if len(n2) < 50:
                     continue
-                ratio = difflib.SequenceMatcher(None, n1, n2).ratio()
+                # AUTO-CR-18-2: autojunk=False. SequenceMatcher's default
+                # autojunk=True treats characters that recur heavily in a
+                # sequence over 200 chars long as "popular" and excludes
+                # them from matching blocks — for ordinary prose that is
+                # spaces and common short words, so a REAL, near-duplicate
+                # paraphrase (same structure, ~10-20% of words swapped for
+                # synonyms) can score as low as ~0.08 instead of ~0.94.
+                # Verbatim copies (ratio 1.0 either way) never exposed
+                # this; a synonym-swapped rewrite — the actual failure
+                # mode this guard exists to catch — did, completely
+                # silently. Confirmed against real duplicated changelog
+                # entries from a live run: autojunk=True scored 0.085,
+                # autojunk=False scored 0.938, thresh is 0.92.
+                ratio = difflib.SequenceMatcher(None, n1, n2, autojunk=False).ratio()
                 if ratio >= thresh:
                     return (
                         f"duplication detected: '{pname}' is {int(ratio * 100)}% "
@@ -927,6 +960,39 @@ class Coder(_llm_stream.LLMClientBase):
                         f"task names and keep '{pname}' a distinct scene with its "
                         f"own events and its own chapter heading."
                     )
+
+        # AUTO-CR-18-2: WITHIN-file check — near-duplicate `### `-headed
+        # entries in the SAME produced file (a changelog rewritten each
+        # round with one more synonym-swapped entry appended, never
+        # rejected because the check above compares files, not sections).
+        for pname, pcontent in produced.items():
+            entries = _split_creative_entries(pcontent)
+            if len(entries) < 2:
+                continue
+            for i in range(len(entries)):
+                title_a, body_a = entries[i]
+                n1 = _norm(body_a)
+                if len(n1) < 50:
+                    continue
+                for j in range(i + 1, len(entries)):
+                    title_b, body_b = entries[j]
+                    n2 = _norm(body_b)
+                    if len(n2) < 50:
+                        continue
+                    # AUTO-CR-18-2: autojunk=False — see the cross-file
+                    # comparison above for why.
+                    ratio = difflib.SequenceMatcher(None, n1, n2, autojunk=False).ratio()
+                    if ratio >= thresh:
+                        return (
+                            f"duplication detected: in '{pname}', entry "
+                            f"'{title_a}' is {int(ratio * 100)}% identical to "
+                            f"entry '{title_b}'. Do NOT add a new entry that "
+                            f"restates an existing one with different words — "
+                            f"either write ONE entry for this change, or make "
+                            f"the new entry say something genuinely different. "
+                            f"Do not copy or paraphrase text from another "
+                            f"entry in this file."
+                        )
         return ""
 
     def _creative_language_sample(self, target_files: list[str], base_dir: Path) -> str:
@@ -1154,7 +1220,7 @@ class Coder(_llm_stream.LLMClientBase):
                     task_id, i,
                 )
                 continue
-            path    = (item.get("path") or "").strip()
+            path    = str(item.get("path") or "").strip()
             content = item.get("content")
             if not path:
                 logger.warning(
@@ -1828,6 +1894,37 @@ class Coder(_llm_stream.LLMClientBase):
                     first_error = msg
 
         return written, first_error
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AUTO-CR-18-2: entry splitting for the within-file duplication check
+# ─────────────────────────────────────────────────────────────────────────────
+
+#: Matches the same "### Heading" entry marker scripts/check_runbook.py's
+#: own ``_ENTRY_RE`` uses to count changelog entries — kept in sync
+#: deliberately: both are reading the same document convention, and a
+#: format change (e.g. to "## ") would need to move in both places at once.
+_CREATIVE_ENTRY_RE = re.compile(r"^###\s+(.+)$", re.MULTILINE)
+
+
+def _split_creative_entries(text: str) -> list[tuple[str, str]]:
+    """Split *text* into ``(title, body)`` pairs at each ``### `` heading.
+
+    Returns ``[]`` when the document has fewer than two such headings (a
+    single-scene chapter with no internal structure, or an empty/malformed
+    file) — the within-file duplication check only makes sense once there
+    are at least two entries to compare against each other.
+    """
+    matches = list(_CREATIVE_ENTRY_RE.finditer(text or ""))
+    if len(matches) < 2:
+        return []
+    entries: list[tuple[str, str]] = []
+    for i, m in enumerate(matches):
+        title = m.group(1).strip()
+        start = m.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        entries.append((title, text[start:end]))
+    return entries
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -68,7 +68,12 @@ def _check_continuity(validator, *, text, rel_path, task, loop, base_dir_path):
 
 
 def _check_existence(validator, *, text, rel_path, task, loop, base_dir_path):
-    """GATES-3: the only adapter whose gate makes no LLM call at all."""
+    """GATES-3: makes no LLM call at all (see also ``_check_delta`` below)."""
+    return validator.check(text, base_dir_path, rel_path=rel_path)
+
+
+def _check_delta(validator, *, text, rel_path, task, loop, base_dir_path):
+    """AUTO-CR-DELTA-1: also makes no LLM call — a git-show-and-compare."""
     return validator.check(text, base_dir_path, rel_path=rel_path)
 
 
@@ -136,6 +141,14 @@ class GateSpec:
     record_prefixed_feedback:
         ``True`` records the prefixed feedback in the ``AttemptRecord``;
         canon records the bare conflict text.
+    profile_key:
+        GATE3-PROFILE-2. The ``[validator_agent]`` key naming this gate's
+        own optional LLM profile (e.g. ``"canon_llm_profile"``), or
+        ``None`` for a gate whose validator makes no LLM call at all
+        (``existence``; today also ``prosody`` — see
+        :func:`build_validators`). When set, :func:`build_validators`
+        resolves ``<profile_key> → validator_llm_profile → [api_{active}]``
+        and passes the result to the factory as ``settings``.
     """
 
     name: str
@@ -153,11 +166,45 @@ class GateSpec:
     file_filter_attr: Optional[str] = None
     record_prefixed_feedback: bool = True
     modes: tuple[str, ...] = ("creative",)
+    profile_key: Optional[str] = None
 
 
 #: Gate execution order. This list is the pipeline — reorder it to reorder
 #: the gates. Each entry's ``modes`` says which task modes it applies to.
 GATES: tuple[GateSpec, ...] = (
+    GateSpec(
+        name="delta",
+        attr="delta_validator",
+        cap_attr="max_delta_revisions",
+        default_cap=1,
+        check=_check_delta,
+        is_rejection=_rejected_by_approved,
+        reject_label="delta rejected",
+        reject_log="InnerLoop: attempt %d delta rejected (%d/%d) — %s",
+        cap_log=(
+            "InnerLoop: delta revision cap (%d) reached — "
+            "accepting file(s) that may still be unchanged from HEAD."
+        ),
+        factory_module="tools.auto.delta_validator",
+        factory_name="make_delta_validator",
+        modes=("creative",),
+        # Runs first deliberately: the cheapest, most unambiguous Gate-3
+        # check (no LLM call — see _check_delta) should reject an
+        # unchanged file before canon/fact/continuity/theme/prosody spend
+        # LLM calls reviewing prose that turns out to be a no-op. Scoped
+        # to creative only, where acceptance_check is routinely trivial
+        # ("true") and so provides no independent evidence real work
+        # happened — see delta_validator.py's module docstring for the
+        # production run that motivated this. Deliberately NOT "docs":
+        # the existing test suite hard-asserts docs mode's Gate-3 list is
+        # exactly ["existence"] across every agents*.ini profile, which
+        # reads as an intentional invariant, and the observed failure was
+        # creative-mode specific — extend to docs later if the same
+        # no-op pattern actually shows up there. Not "code": a code
+        # task's acceptance_check is normally a real test command, which
+        # already fails on a no-op coder response through a different,
+        # pre-existing path.
+    ),
     GateSpec(
         name="canon",
         attr="canon_validator",
@@ -176,6 +223,7 @@ GATES: tuple[GateSpec, ...] = (
         skip_check_when_capped=True,
         file_filter_attr="should_check",
         record_prefixed_feedback=False,
+        profile_key="canon_llm_profile",
     ),
     GateSpec(
         name="fact",
@@ -192,6 +240,7 @@ GATES: tuple[GateSpec, ...] = (
         ),
         factory_module="tools.auto.fact_validator",
         factory_name="make_fact_validator",
+        profile_key="fact_llm_profile",
     ),
     GateSpec(
         name="continuity",
@@ -208,6 +257,7 @@ GATES: tuple[GateSpec, ...] = (
         ),
         factory_module="tools.auto.continuity_validator",
         factory_name="make_continuity_validator",
+        profile_key="continuity_llm_profile",
     ),
     GateSpec(
         name="existence",
@@ -241,6 +291,7 @@ GATES: tuple[GateSpec, ...] = (
         ),
         factory_module="tools.auto.theme_validator",
         factory_name="make_theme_validator",
+        profile_key="theme_llm_profile",
     ),
     GateSpec(
         name="prosody",
@@ -257,6 +308,13 @@ GATES: tuple[GateSpec, ...] = (
         ),
         factory_module="tools.auto.prosody",
         factory_name="make_prosody_validator",
+        # GATE3-PROFILE-2: no profile_key. ProsodyValidator.check is pure
+        # syllable/rhyme-scheme arithmetic — make_prosody_validator never
+        # calls _make_llm_call — so there is no request to redirect. A
+        # prosody_llm_profile key would resolve and log but bind to
+        # nothing, which is worse than not offering it. Add profile_key
+        # here (and a settings= passthrough in make_prosody_validator)
+        # if prosody ever grows an LLM-backed check.
     ),
 )
 
@@ -344,19 +402,64 @@ def build_validators(config, base_dir, *, task_mode: str, broker=None) -> dict:
     ``None`` for that gate — the same never-block-the-loop-on-setup
     behaviour each block implemented individually.
 
+    GATE3-PROFILE-2: for every enabled gate whose :attr:`GateSpec.
+    profile_key` is set, resolves ``<profile_key> → validator_llm_profile
+    → [api_{active}]`` (via :func:`tools.auto.llm_profile.
+    resolve_llm_profile`, twice per gate — once for the shared
+    ``validator_llm_profile`` step, once for the gate's own key) and
+    passes the resolved :class:`~tools.auto.llm_profile.LlmSettings` to
+    the factory as ``settings``, mirroring the existing ``base_dir``/
+    ``task_mode``/``broker`` introspection below. A config with no
+    ``*_llm_profile`` keys resolves every gate straight back to
+    ``[api_{active}]``, so behaviour is unchanged from before this
+    ticket. Deliberately NOT wrapped in the per-gate ``except Exception``
+    below: a malformed profile must raise here, at construction, before
+    any task runs — never be swallowed into "gate unavailable" and
+    discovered mid-run instead.
+
     Returns a dict keyed by :attr:`GateSpec.attr`, ready to splat into
     ``InnerLoop(...)`` as keyword arguments.
     """
     # GATES-2: only build validators for gates the config actually enables.
     # Every other gate's attr is set to None, which run_gates reads as
     # "off" — so a disabled gate costs nothing at construction time
-    # either (no LLM client, no story-bible read).
+    # either (no LLM client, no story-bible read, and — GATE3-PROFILE-2 —
+    # no profile resolution or log line either).
     enabled = {s.name for s in resolve_gate_order(config, task_mode)}
+
+    # Resolved lazily and once: only computed if some enabled gate actually
+    # has a profile_key, and shared across every such gate as the middle
+    # link of the <gate> → validator_llm_profile → [api_*] chain — so a
+    # config with e.g. only canon_llm_profile set doesn't re-resolve
+    # validator_llm_profile from scratch (and re-log it) once per gate.
+    _validator_settings = None
+
+    def _validator_llm_settings():
+        nonlocal _validator_settings
+        if _validator_settings is None:
+            from tools.auto.llm_profile import resolve_llm_profile
+            from tools.auto.summary_memory import _default_llm_settings
+            defaults = _default_llm_settings(config, task_mode)
+            _validator_settings, _ = resolve_llm_profile(
+                config, "validator_agent", "validator_llm_profile",
+                defaults=defaults,
+            )
+        return _validator_settings
+
     out: dict = {}
     for spec in GATES:
         if spec.name not in enabled:
             out[spec.attr] = None
             continue
+
+        gate_settings = None
+        if spec.profile_key is not None:
+            from tools.auto.llm_profile import resolve_llm_profile
+            gate_settings, _ = resolve_llm_profile(
+                config, "validator_agent", spec.profile_key,
+                defaults=_validator_llm_settings(),
+            )
+
         try:
             module = __import__(spec.factory_module, fromlist=[spec.factory_name])
             factory = getattr(module, spec.factory_name)
@@ -372,6 +475,8 @@ def build_validators(config, base_dir, *, task_mode: str, broker=None) -> dict:
                 kwargs["task_mode"] = task_mode
             if "broker" in params:
                 kwargs["broker"] = broker
+            if "settings" in params and gate_settings is not None:
+                kwargs["settings"] = gate_settings
             out[spec.attr] = factory(config, **kwargs)
         except Exception as exc:  # noqa: BLE001 — never block the loop on setup
             logger.warning(

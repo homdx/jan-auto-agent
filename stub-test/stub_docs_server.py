@@ -40,7 +40,7 @@ import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-PLANNED = "/home/claude/docsrun/planned"
+PLANNED = os.path.join(HERE, "planned")
 LOG_PATH = os.path.join(HERE, "stub_llm.log")
 
 CODER_ATTEMPTS = {}

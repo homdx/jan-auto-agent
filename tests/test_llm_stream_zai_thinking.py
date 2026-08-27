@@ -118,6 +118,28 @@ _REJECT_THINKING_400 = json.dumps({
     }
 })
 
+# AUTO-NVIDIA-UNSUPPORTED-1: field report — a real NVIDIA NIM endpoint
+# (integrate.api.nvidia.com, meta/llama-3.3-70b-instruct AND
+# nvidia/nemotron-3-ultra-550b-a55b) rejects the `thinking` field with
+# this exact phrasing on every single call, permanently, for both the
+# Architect (plan_llm_profile) and Gate 1 (presence_llm_profile). Unlike
+# _REJECT_THINKING_400 above, the message says "Unsupported parameter(s)"
+# — one word, no space — which none of the five detection heuristics in
+# this module matched (they all checked for "not supported", with a
+# space, as a substring). Confirmed live: architect review_one_cluster
+# logged "HTTP 400 ... Unsupported parameter(s): `thinking`" on both
+# clusters of a 2-cluster repo, 0 grounded candidates were produced, and
+# the run silently completed in a few seconds having done zero work —
+# the strip-and-retry never fired because the match failed, so the same
+# 400 repeated on every call for the rest of the process.
+_REJECT_THINKING_400_NVIDIA_STYLE = json.dumps({
+    "error": {
+        "message": "Validation: Unsupported parameter(s): `thinking`",
+        "type": "Bad Request",
+        "code": 400,
+    }
+})
+
 
 class TestBuildChatRequestZaiThinking:
 
@@ -373,6 +395,36 @@ class TestZaiThinking400Fallback:
         finally:
             server.shutdown()
         assert handler_cls.request_count == 1
+
+    def test_nvidia_style_unsupported_phrasing_strips_and_retries(self, caplog):
+        """AUTO-NVIDIA-UNSUPPORTED-1 regression: "Unsupported parameter(s):
+        `thinking`" (no space between "un" and "supported") must match the
+        same way "not supported" already does — this exact phrasing is
+        what broke every architect/gate1 call against a real NVIDIA NIM
+        endpoint until the detection keyword list included it."""
+        server, port, handler_cls = _serve_script([
+            ("error", 400, _REJECT_THINKING_400_NVIDIA_STYLE, {}),
+            ("ok", _OK_BODY),
+        ])
+        sleep = MagicMock()
+        try:
+            with caplog.at_level(logging.WARNING):
+                result = request_completion(
+                    f"http://127.0.0.1:{port}/v1/chat/completions",
+                    {"Content-Type": "application/json"},
+                    {"model": "meta/llama-3.3-70b-instruct", "messages": [],
+                     "thinking": {"type": "disabled"}},
+                    timeout=5, stream=False, api_format="openai",
+                    _sleep_fn=sleep,
+                )
+        finally:
+            server.shutdown()
+
+        assert result == '{"ok": true}'
+        assert handler_cls.request_count == 2
+        assert "thinking" in handler_cls.received_bodies[0]
+        assert "thinking" not in handler_cls.received_bodies[1]
+        sleep.assert_not_called()
 
     def test_unrelated_400_is_not_treated_as_thinking_rejection(self):
         server, port, handler_cls = _serve_script([

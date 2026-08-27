@@ -28,18 +28,28 @@ here always lines up with the mode it was actually generated under:
 
 Creative mode (--mode creative or --mode auto on a creative run):
     • Story Progress: chapters in narrative order with revision counts
-    • Per-gate breakdown (Gate-2 LLM / Gate-3 fact / prosody / continuity)
-      when those validators emit tracer events
+    • Per-gate breakdown (Gate-2 LLM, plus every Gate-3 validator wired up
+      for creative tasks in tools/auto/gate_registry.py — canon, fact,
+      continuity, theme, prosody as of this writing) when those gates
+      emit tracer events
     • Non-chapter tasks shown separately
 
 Docs mode (--mode docs, or --mode auto on a task_mode=docs run) (AUTO-CR-35):
     • Documentation tasks are rendered like code tasks (docs runs use the
-      same coder → Gate-2 pipeline, with no Gate-3 prose gates), but the
-      section headers and run banner are relabelled so a docs run doesn't
-      read like a plain code run.
+      same coder → Gate-2 pipeline, plus the "existence" Gate-3 gate — a
+      no-LLM check that a doc doesn't reference a file that isn't there),
+      but the section headers and run banner are relabelled so a docs
+      run doesn't read like a plain code run.
     • Auto-detection infers "docs" when a majority of a run's tasks touch
       only prose/doc files (.md, .rst, .txt, .adoc, .mdx) and don't look
       like chapter-writing tasks.
+
+Gate-3 stage names/labels/order shown above are read live from
+tools/auto/gate_registry.py's declarative GATES registry (see GATES-SYNC
+below), so a gate added, renamed, or reordered there — including one added
+by a future custom pipeline — is picked up here automatically, with no
+further edit to this file. Falls back to a fixed snapshot of today's gates
+if that module can't be imported (e.g. this script copied out on its own).
 """
 
 from __future__ import annotations
@@ -59,9 +69,15 @@ from typing import Optional
 # Matches "chapter 1", "chapter_02", "Chapter-3", etc. in task titles / IDs.
 _CHAPTER_RE = re.compile(r"chapter[\s_\-]?(\d+)", re.IGNORECASE)
 
-# Creative gate sources — these validators run in inner_loop.py but do NOT emit
-# tracer events themselves (rejections surface only as extra coder iterations).
-# Tracked here for documentation and future tracer integration.
+# Legacy (pre-AUTO-CR-27) creative gate sources. Before inner_loop.py grew
+# _trace_stage() / tools/auto/gate_registry.py, these validators surfaced
+# their verdict as a bare kind="result" event under their own module name
+# instead of the structured kind="decision" stage event every Gate-3 gate
+# emits today. Kept only so traces recorded before that change still parse
+# (see the kind == "result" branch below) — current and future gates
+# (canon, fact, continuity, theme, existence, prosody, ...) never need an
+# entry here; they're already handled generically via the live gate
+# registry import (GATES-SYNC, near _STAGE_ORDER below).
 _CREATIVE_GATE_LABELS = {
     "validator_agent":      "Gate-2 (LLM)",
     "fact_validator":       "Gate-3 fact",
@@ -534,8 +550,15 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
         #   params={"task": id, "attempt": N, "stage": <stage>, ...},
         #   content=REJECTED|APPROVED|EXHAUSTED|ACCEPTED_AT_CAP|ERROR
         #
-        # Stages (all modes):  coder, executor, gate2, overall
-        # Stages (creative):   canon, fact, continuity, prosody
+        # Stages (all modes):    coder, executor, gate2, overall
+        # Stages (Gate-3 gates): whatever tools/auto/gate_registry.GATES
+        #   declares for the run's task_mode — canon, fact, continuity,
+        #   theme, prosody for creative; existence for docs; a future
+        #   pipeline's own gate for whatever mode it registers under.
+        #   Handled generically below via the "stage" field, so a new
+        #   registry gate needs no change here — only its display label
+        #   in _STAGE_LABELS (GATES-SYNC, further down) needs the gate
+        #   registry to be importable to pick it up automatically.
         #
         # "overall APPROVED"  → the attempt fully passed every gate
         # "overall EXHAUSTED" → all attempts used up, task fails
@@ -623,12 +646,16 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
                     g["rejected"] += 1
                 # verdict is None → count the iteration but don't skew either bucket
 
-        # ── creative-mode detection ────────────────────────────────────────
-        # Standalone check (outside the elif chain above) so it always fires
-        # regardless of which branch matched.  If any creative-specific gate
-        # source appears in this run, tag it as creative.
-        if src in _CREATIVE_GATE_LABELS and src != "validator_agent":
-            run.setdefault("detected_mode", "creative")
+        # NOTE: creative/docs-mode detection for --mode auto is handled by
+        # _detect_task_mode() (chapter-number / doc-file-extension
+        # heuristics), not by which gate sources appear in the trace — a
+        # legacy "tag as creative if a creative gate source shows up" check
+        # used to live here, but every Gate-3 gate (old and new) surfaces
+        # through the generic kind="decision" stage handling above rather
+        # than a gate-specific kind="result" source, so that check could
+        # never fire for a trace recorded after AUTO-CR-27 and was dead
+        # weight. Removed rather than "synced", since there's nothing left
+        # to detect here that _detect_task_mode() doesn't already cover.
 
         # ── llm calls ─────────────────────────────────────────────────────
         if kind == "llm_request":
@@ -713,19 +740,43 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
 
 
 # ── Stage-breakdown renderer (AUTO-CR-27) ─────────────────────────────────────
+#
+# GATES-SYNC: the Gate-3 stage names below used to be hand-copied from
+# tools/auto/gate_registry.py and silently drifted out of sync — "theme"
+# and "existence" were added to the registry (GATES-1 / GATES-3) but never
+# made it into this file, so those gates rendered with a raw, unlabeled
+# stage name and sorted after "overall" instead of alongside the other
+# gates. Importing GATES directly means any gate added, renamed, or
+# reordered in the registry from here on — including one belonging to a
+# future custom pipeline — is picked up automatically, with no further
+# edit to this file. The import is best-effort: this script is also used
+# standalone (e.g. copied out on its own to analyze a trace file without
+# the rest of the repo present), so a failed import falls back to a fixed
+# snapshot of today's six gates rather than crashing.
+try:
+    from tools.auto.gate_registry import GATES as _REGISTRY_GATES
+except Exception:  # pragma: no cover — standalone-script fallback
+    _REGISTRY_GATES = None
+
+if _REGISTRY_GATES is not None:
+    _GATE_STAGE_NAMES = [spec.name for spec in _REGISTRY_GATES]
+else:
+    _GATE_STAGE_NAMES = [
+        "canon", "fact", "continuity", "existence", "theme", "prosody",
+    ]
 
 # Pipeline order for display; unknown stages sort last.
-_STAGE_ORDER  = ["coder", "executor", "gate2", "canon", "fact",
-                 "continuity", "prosody", "overall"]
+_STAGE_ORDER  = ["coder", "executor", "gate2", *_GATE_STAGE_NAMES, "overall"]
 _STAGE_LABELS = {
-    "coder":       "Coder",
-    "executor":    "Executor",
-    "gate2":       "Gate-2 (LLM)",
-    "canon":       "Canon",
-    "fact":        "Fact",
-    "continuity":  "Continuity",
-    "prosody":     "Prosody",
-    "overall":     "Overall",
+    "coder":    "Coder",
+    "executor": "Executor",
+    "gate2":    "Gate-2 (LLM)",
+    "overall":  "Overall",
+    # Registry gate names are single lowercase words today (canon, fact, …)
+    # so title-casing is a correct, maintenance-free label for any gate a
+    # future pipeline adds too; override here only if a gate ever needs a
+    # display name that isn't just its name capitalized.
+    **{name: name.replace("_", " ").title() for name in _GATE_STAGE_NAMES},
 }
 
 

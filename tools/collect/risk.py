@@ -37,6 +37,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 from tools.collect.model import ModuleRecord
 from tools.collect.registries import FailOpenEntry
+from tools.collect.test_map import is_test_module
 
 # ── Fixed weight table (COLLECT-3: deterministic, not tuned/adaptive) ──────
 
@@ -171,7 +172,9 @@ def compute_risk_index(
         unguarded_count = _unguarded_count(m)
         undocumented_fail_open_count = undocumented_counts.get(m.path, 0)
         zero_coverage = (
-            test_map is not None and len(test_map.get(m.path, ())) == 0
+            test_map is not None
+            and not is_test_module(m.path)
+            and len(test_map.get(m.path, ())) == 0
         )
         score = _score(
             loc=loc,

@@ -67,6 +67,7 @@ Everything is logged to stub_llm.log (system/user/reply) for post-hoc audit.
 import json
 import os
 import re
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 HERE = os.path.dirname(__file__)
@@ -76,6 +77,7 @@ LOG_PATH = os.path.join(HERE, "stub_llm.log")
 
 CODER_ATTEMPTS = {}   # target_file -> call count
 BIBLE_CALLS = 0       # story_bible.extract() call count this run
+_BIBLE_CALLS_LOCK = threading.Lock()
 
 
 def _log(kind, system, user, reply):
@@ -90,7 +92,8 @@ def _chapter_num_from_text(text):
 
 
 def _read(path):
-    return open(path, encoding="utf-8").read().strip()
+    with open(path, encoding="utf-8") as f:
+        return f.read().strip()
 
 
 def _has_dup_paragraph(text: str) -> bool:
@@ -316,8 +319,10 @@ def build_reply(system: str, user: str) -> str:
     #     sobriety fact (extracted after chapter 1) is left UNCORRUPTED —
     #     that's the fact chapter_5's long-range test depends on.
     if "Extract ONLY immutable or slowly-changing facts" in system:
-        BIBLE_CALLS += 1
-        if BIBLE_CALLS == 1:
+        with _BIBLE_CALLS_LOCK:
+            BIBLE_CALLS += 1
+            call_num = BIBLE_CALLS
+        if call_num == 1:
             # After chapter 1: correct extraction, including the sobriety fact.
             reply = (
                 "• Виктор — владелец автосервиса «Мотор».\n"
@@ -327,7 +332,7 @@ def build_reply(system: str, user: str) -> str:
                 "• Виктор и Данила — старые друзья, не виделись шесть лет.\n"
                 "• Встречи происходят в баре «Маяк»."
             )
-        elif BIBLE_CALLS == 2:
+        elif call_num == 2:
             # After chapter 2: hallucinated premature "full recovery" —
             # nothing in chapter 2 said this; models a small-model mistake.
             reply = (
@@ -349,7 +354,7 @@ def build_reply(system: str, user: str) -> str:
                 "после инсульта, речь и рука ещё не полностью в порядке.\n"
                 "• Встречи происходят в баре «Маяк»."
             )
-        _log(f"story_bible(call={BIBLE_CALLS})", system, user, reply)
+        _log(f"story_bible(call={call_num})", system, user, reply)
         return reply
 
     # 10b. Story archivist — per-chapter durable-fact summary (SummaryMemory)
@@ -415,7 +420,8 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    open(LOG_PATH, "w", encoding="utf-8").close()
+    with open(LOG_PATH, "w", encoding="utf-8"):
+        pass
     server = ThreadingHTTPServer(("127.0.0.1", 11434), Handler)
     print("Adversarial stub Ollama server listening on 127.0.0.1:11434")
     server.serve_forever()

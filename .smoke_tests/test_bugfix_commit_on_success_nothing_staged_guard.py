@@ -1,0 +1,1 @@
+../tests/test_bugfix_commit_on_success_nothing_staged_guard.py

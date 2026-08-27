@@ -1,8 +1,11 @@
 # hello-world runbook
 
-Three skill flows, one per mechanical base. Every command below has been run
-against this repository; the "what to expect" sections describe what actually
-happened, not what should happen in theory.
+Four skill flows: one per mechanical base, plus a fourth that reuses the
+creative base to prove per-validator LLM profiles (GATE3-PROFILE-2) work on
+a real run — canon and continuity judged by a *second* provider while the
+coder stays on the first. Every command below has been run against this
+repository; the "what to expect" sections describe what actually happened,
+not what should happen in theory.
 
 The runbook test in the parent repository (tests/test_hello_world_runbook.py) parses this file and checks each command
 is still valid — the skill exists, the profile exists and clears the skill's
@@ -12,8 +15,9 @@ adapters. If you edit a command here, run that test.
 ## Running everything at once
 
 ```bash
-scripts/run_flows.sh                      # all three flows, then validate
+scripts/run_flows.sh                      # tasks 1-3, then validate
 scripts/run_flows.sh 2                    # just task 2
+scripts/run_flows.sh 4                    # task 4 (needs [task4_provider_b] first)
 scripts/run_flows.sh --config agents_128k.ini
 scripts/run_flows.sh --runner proxychains4
 scripts/run_flows.sh --check-only         # validate previous runs, run nothing
@@ -26,14 +30,20 @@ before it starts:
 examples/task1/hello-world/     hello-code
 examples/task2/hello-world/     hello-docs
 examples/task3/hello-world/     hello-creative
+examples/task4/hello-world/     hello-creative-split
 ```
 
 The isolation matters. The flows commit into their base directory, so running
-all three against the shared `examples/hello-world/` means task 2 inspects
-task 1's output — the results stop being independent, and a passing task 2
-might only be passing because task 1 created the file it wanted.
+several against the shared `examples/hello-world/` means a later task
+inspects an earlier task's output — the results stop being independent, and
+a passing check might only be passing because an earlier task already
+created the file it wanted.
 
 These directories are gitignored: they are run output.
+
+**Task 4 is not part of the default set.** It needs a second real, reachable
+LLM endpoint configured first — see "Flow 4" below — which the other three
+don't. Run it explicitly with `scripts/run_flows.sh 4` once that's in place.
 
 The script refuses a profile below the skills' 16384 floor before starting,
 which costs a second instead of a whole run.
@@ -45,6 +55,7 @@ right artefact, because the artefact is written by a model at runtime.
 
 ```bash
 python3 scripts/check_runbook.py --task 2
+python3 scripts/check_runbook.py --task 4
 python3 scripts/check_runbook.py --all
 python3 scripts/check_runbook.py --all --json
 ```
@@ -63,6 +74,12 @@ the shared `examples/hello-world/`.
 | 1 | main.py still prints `Hello world`; module and `main()` docstrings; return annotation; a test file exists and passes |
 | 2 | README.md actually changed; has a Usage section; no `.py` file targeted; no references to missing files (via the shipped `existence` gate) |
 | 3 | a new entry exists; the seed entry survived; canon fact intact; prose only; main.py untouched |
+| 4 | everything task 3 checks, plus: the console log shows canon/continuity resolved to a provider different from the shared one |
+
+Task 4's extra finding is a **WARN, not a FAIL,** when only one provider was
+actually in play — see "Flow 4" below. A WARN does not fail the report, so
+`check_runbook.py --task 4` still exits 0 on an otherwise-healthy single-
+provider run instead of failing a check it cannot structurally perform.
 
 Exit code is 0 only when everything passes.
 
@@ -203,6 +220,71 @@ than prepending, dropping the `### The first greeting` seed entry. When that
 happens `continuity` has no predecessor left to compare against, so its
 approval means less than it appears to. Check the seed entry survived.
 
+## Flow 4 — narrative changelog, canon/continuity on a second provider
+
+`base = creative`, same skill body and artefact contract as Flow 3. The
+difference is entirely in config: `skills/hello-creative-split.skill.ini`
+overlays `[validator_agent] canon_llm_profile` and `continuity_llm_profile`
+at `[task4_provider_b]` (GATE3-PROFILE-2), so the author (coder) stays on
+whatever `[api_{active}]` already resolves to while `canon` and `continuity`
+judge against a *second* provider. This flow exists to prove that split
+works on a real run, not only in unit tests.
+
+**Before running it**, add a `[task4_provider_b]` section — with a second
+real, reachable provider's credentials — to the config you pass with
+`--config`. Do this in your own local copy; never commit real credentials.
+For example, in a local `agents_32k.ini`:
+
+```ini
+[task4_provider_b]
+base_url = https://your-second-provider.example/v1
+api_key  = your-second-provider-key
+model    = your-second-provider-model
+```
+
+Then run:
+
+```bash
+python3 main.py --auto "Write a narrative changelog entry for the greeting" \
+  --base examples/hello-world --config agents_32k.ini --skill hello-creative-split
+```
+
+**What to expect.** Startup shows one line per Gate-3 validator naming its
+resolved provider (GATE3-PROFILE-2). With `[task4_provider_b]` configured,
+`canon` and `continuity` name it; the shared-provider line (logged once,
+regardless of whether any gate has its own key) names whatever the coder and
+Gate 2 are using:
+
+```
+validator_agent.validator_llm_profile: provider = <provider A url> (<model>) — shared provider (no validator_llm_profile configured)
+validator_agent.canon_llm_profile: provider = <provider B url> (<model>) — via canon_llm_profile = [task4_provider_b]
+validator_agent.continuity_llm_profile: provider = <provider B url> (<model>) — via continuity_llm_profile = [task4_provider_b]
+```
+
+Everything else about the run — what the task must target, the wholesale-
+rewrite defect, canon's check-cadence — is identical to Flow 3.
+
+**If provider B is unreachable.** Every Gate-3 gate is fail-open by design
+(see `tools/auto/gate_registry.run_gates`): an exception from a gate's check
+approves that file rather than failing the attempt. So an unreachable
+`[task4_provider_b]` degrades the run, it does not crash it — the affected
+gate's LLM call raises, the file is approved, and the run continues. This is
+existing Gate-3 behaviour, not something Flow 4 adds; Flow 4 only exercises
+it against a provider that might genuinely be down.
+
+**Verifying the split from the console log:**
+
+```bash
+grep -E "validator_agent\.(canon|continuity|validator)_llm_profile: provider" \
+  examples/task4/console-log.txt
+```
+
+If `canon`/`continuity`'s URL differs from the `validator_llm_profile`
+line's URL, the split worked. `python3 scripts/check_runbook.py --task 4`
+reads exactly this and reports it as a `PASS` finding — or, when only one
+provider was actually configured/reachable, as a `WARN` rather than a `FAIL`
+(see the "Validating a run" table above).
+
 ## Reading whether Gate-3 actually ran
 
 Gate-3 gates log **only** when they reject or hit their revision cap. Silence
@@ -246,6 +328,7 @@ filter skips the file until the cadence comes round. That is expected.
 | 1 | `hello-code` | `code` | *(none)* |
 | 2 | `hello-docs` | `docs` | `existence` |
 | 3 | `hello-creative` | `creative` | `canon`, `continuity` |
+| 4 | `hello-creative-split` | `creative` | `canon`, `continuity` |
 
 Confirm from the startup log rather than from this table — the adapters are
 the source of truth and this table is only a copy.

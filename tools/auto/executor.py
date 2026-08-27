@@ -245,7 +245,13 @@ class Executor:
             If *task* is missing the ``id`` field (programming error by
             the caller).
         """
-        task_id = task.get("id", "").strip()
+        # AUTO-FIX (low-priority audit): the "" default only covers a
+        # missing 'id' key — a task dict with an explicit `"id": None`
+        # made .get() return None, and None.strip() raised a raw
+        # AttributeError instead of the documented, catchable ValueError
+        # below. The sibling acceptance_check read right after this
+        # already uses `(x or "").strip()` for exactly this reason.
+        task_id = (task.get("id") or "").strip()
         if not task_id:
             raise ValueError("Executor.run(): task dict must have a non-empty 'id' field")
 

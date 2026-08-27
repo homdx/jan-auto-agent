@@ -162,6 +162,97 @@ def target_file_context(
     return None
 
 
+# ── AUTO-H2-6b: instruction names a file the citation never mentions ──────────
+#
+# AUTO-H2-6 above catches cited_location.file disagreeing with the
+# candidate's own target_files. It has nothing to say when those two
+# fields agree with EACH OTHER and are both wrong relative to what the
+# instruction is actually about — confirmed in production on a real run
+# (agents_128k.ini, architect model deepseek-v4-flash): cluster "support"
+# (legal citations: CHANGELOG.md, README.md, RUNBOOK.md only) was reviewed
+# against the run goal "Harden main.py: docstrings, type hints, a pytest
+# test". Three candidates came back with instruction text entirely about
+# main.py — a file outside that cluster, and therefore not a legal
+# citation for this call — while cited_location.file AND target_files
+# both landed on CHANGELOG.md: a legal-but-topically-wrong citation, not a
+# hallucinated path. target_file_context() found cited_file already IN
+# target_files, so it added no note; Stage B was shown only CHANGELOG.md's
+# prose and correctly rejected all three, including the one candidate
+# proposing the exact fix this run needed: a new ``tests/test_main.py``.
+_FILENAME_TOKEN_RE = re.compile(r"\b[\w][\w./-]*\.[A-Za-z][A-Za-z0-9]{0,8}\b")
+
+
+def instruction_file_context(
+    instruction: str,
+    cited_file: str,
+    base_dir: Path,
+    *,
+    already_noted: bool = False,
+    max_chars: int = 800,
+) -> Optional[str]:
+    """Return context from a real file the instruction names, when the
+    citation points somewhere else and never names the cited file at all.
+
+    Deliberately narrower than ``target_file_context`` so the two stay
+    additive instead of overlapping:
+
+      * ``already_noted`` — whether ``target_file_context`` already
+        returned a note for this candidate. When it did, this is a no-op;
+        the two checks are meant to cover disjoint cases, not double up
+        on the same one.
+      * Only fires when ``cited_file``'s own name is nowhere in the
+        instruction. A candidate that legitimately names a second file
+        for context while correctly citing the first (e.g. "match the
+        pattern main.py already uses in utils.py" while citing main.py)
+        is left alone — the cited file IS under discussion, so this isn't
+        the AUTO-H2-6b pattern.
+      * Only matches tokens that resolve to a real file under *base_dir*.
+        Prose like "e.g." or a version number never resolves to an actual
+        path, so it is silently ignored rather than misfiring.
+
+    Same non-rejecting, evidence-injection pattern as the rest of this
+    module: this never overrides Stage A, it only gives Stage B a chance
+    to judge the file the instruction actually meant.
+    """
+    if already_noted or not instruction or not cited_file:
+        return None
+
+    cited_name = Path(cited_file).name
+    if re.search(r"\b" + re.escape(cited_name) + r"\b", instruction):
+        return None  # the cited file IS named in the instruction — not this bug
+
+    seen: set[str] = set()
+    for m in _FILENAME_TOKEN_RE.finditer(instruction):
+        token = m.group(0)
+        if token in seen or token == cited_file:
+            continue
+        seen.add(token)
+
+        path = base_dir / token
+        if not path.is_file():
+            continue
+        try:
+            source = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+
+        block = "\n".join(source.splitlines()[:40])
+        snippet = block if len(block) <= max_chars else block[:max_chars] + " …(truncated)"
+        return (
+            f"NOTE (automated): the cited evidence above is from `{cited_file}`, but "
+            f"this candidate's own instruction is entirely about `{token}` — "
+            f"`{cited_file}` is never named in the instruction at all. This is the "
+            f"AUTO-H2-6b mismatch pattern (cited_location and target_files agree "
+            f"with each other and are both wrong), which the target-file check "
+            f"above does not catch. Content of `{token}` so the claim can be "
+            f"judged against the file it actually describes:\n"
+            f"```\n{snippet}\n```\n"
+            f"If the claimed problem is not actually present in `{token}` either, "
+            f"reject."
+        )
+    return None
+
+
 # ── AUTO-H2-1: config.getX(..., fallback=...) already-safe check ──────────────
 
 _SECTION_ERROR_CUES = re.compile(

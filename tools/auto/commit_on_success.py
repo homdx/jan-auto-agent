@@ -20,10 +20,28 @@ Responsibilities
    b. Log the event via the state store's ``log()`` helper.
 3. If ``commit_task`` returns ``None`` (nothing staged — should be rare but
    possible if the coder wrote nothing new):
-   a. Still mark the task DONE (the acceptance check passed, so the code is
-      already in the desired state — perhaps a prior commit already covered it).
-   b. Record ``commit=""`` to signal no new commit was made.
-   c. Log a warning.
+   a. If the task is not creative-mode, or its ``acceptance_check`` is a
+      real, non-trivial check, treat the passing check as independent
+      evidence the code is already in the desired state (perhaps a prior
+      commit already covered it) and still mark the task DONE. Record
+      ``commit=""`` to signal no new commit was made. (Scoped to
+      creative: plenty of test/stub fixtures across this codebase use
+      ``acceptance_check = "true"`` for non-creative tasks purely as a
+      "make this fixture fast and always pass" convention with a coder
+      stub that never writes real content — that is a legitimate, unrelated
+      use of "true" and must keep working exactly as before.)
+   b. If the task IS creative-mode and ``acceptance_check`` is trivial
+      (``"true"``, ``:``, or empty — see ``_is_trivial_acceptance_check``),
+      "the check passed" proves nothing there: a check that cannot fail is
+      not evidence the coder did anything, and a trivial acceptance_check
+      is the common, idiomatic case for creative tasks (see Creative.MD),
+      not a test-fixture shortcut. Mark the task BLOCKED instead of DONE
+      (AUTO-CR-DELTA-2 — confirmed in production: a creative task's coder
+      returned its target file byte-identical to HEAD, Gate 2 approved
+      it, nothing was staged, and this branch used to mark it DONE anyway
+      — indistinguishable from a real success in plan.json/progress.json
+      until an external, deterministic checker caught it after the fact).
+   c. Either way, log the outcome.
 4. Never raises on a git failure; wraps ``GitError`` and returns ``None``,
    leaving the task status unchanged so the caller can decide what to do.
 
@@ -49,7 +67,7 @@ from typing import Optional
 
 from tools.agent_trace import tracer
 from tools.auto.git_manager import GitError, GitManager, make_git_manager
-from tools.auto.state import StateStore, STATUS_DONE
+from tools.auto.state import StateStore, STATUS_DONE, STATUS_BLOCKED
 
 # AUTO-CR-5: SummaryMemory is imported lazily inside commit() to keep the
 # import graph acyclic and to avoid a hard dependency on the LLM stack for
@@ -165,23 +183,103 @@ class CommitOnSuccess:
             # AUTO-CR-23-1: update story bible after synopsis (same chapter).
             self._update_story_bible(task)
         else:
-            # Nothing new to commit — acceptance check already passed, so
-            # the working tree is in the correct state from a prior commit.
-            logger.warning(
-                "CommitOnSuccess: nothing staged for task %s; "
-                "marking DONE with empty commit hash",
-                task_id,
-            )
-            self._state.set_task_status(task_id, STATUS_DONE, commit="")
-            self._state.log(
-                f"task {task_id} DONE — no new commit (nothing staged)"
-            )
-            tracer.event(
-                "commit_on_success", "controller", "nothing_staged",
-                params={"task": task_id},
-            )
+            if self._task_mode == "creative" and self._is_trivial_acceptance_check(
+                task.get("acceptance_check")
+            ):
+                # AUTO-CR-DELTA-2: nothing staged AND the acceptance check
+                # is a no-op — the "check passed, so the code must already
+                # be correct" assumption in the other branch does not hold
+                # here, because a check that can't fail proves nothing
+                # about whether the coder did any work. Mark BLOCKED
+                # (same terminal, honestly-not-done status outer_loop.py
+                # already uses for exhausted-attempts failures) instead of
+                # silently reporting success.
+                logger.warning(
+                    "CommitOnSuccess: nothing staged for task %s and its "
+                    "acceptance_check is trivial (%r) — this task produced "
+                    "no real change; marking BLOCKED instead of DONE.",
+                    task_id, task.get("acceptance_check"),
+                )
+                # AUTO-FIX (medium-priority audit): this branch called
+                # set_task_status()/log() unguarded while the sibling
+                # `if sha:` branch above explicitly wraps the identical
+                # calls in try/except (with a comment explaining exactly
+                # why: a StateStore write hiccup here must not propagate
+                # and abort the whole run). Apply the same guard here so a
+                # disk/permission issue while marking BLOCKED can't take
+                # down the run either — the module's documented "never
+                # raises" contract should hold in every branch, not just
+                # the success path.
+                try:
+                    self._state.set_task_status(
+                        task_id, STATUS_BLOCKED,
+                        blocked_reason="nothing_staged_trivial_acceptance_check",
+                    )
+                    self._state.log(
+                        f"task {task_id} BLOCKED — nothing staged and "
+                        f"acceptance_check is trivial; no real change was made"
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "CommitOnSuccess: could not update local state to "
+                        "BLOCKED for task %s — %s (task status may not "
+                        "reflect BLOCKED)",
+                        task_id, exc,
+                    )
+                tracer.event(
+                    "commit_on_success", "controller", "nothing_staged_blocked",
+                    params={"task": task_id},
+                )
+            else:
+                # Nothing new to commit — acceptance check is a real,
+                # non-trivial check and it already passed, so the working
+                # tree is in the correct state from a prior commit.
+                logger.warning(
+                    "CommitOnSuccess: nothing staged for task %s; "
+                    "marking DONE with empty commit hash",
+                    task_id,
+                )
+                # AUTO-FIX (medium-priority audit): same unguarded-write gap
+                # as the BLOCKED branch above — guard it the same way as the
+                # `if sha:` branch's set_task_status()/log() calls.
+                try:
+                    self._state.set_task_status(task_id, STATUS_DONE, commit="")
+                    self._state.log(
+                        f"task {task_id} DONE — no new commit (nothing staged)"
+                    )
+                except Exception as exc:
+                    logger.error(
+                        "CommitOnSuccess: could not update local state to "
+                        "DONE for task %s — %s (task status may not reflect "
+                        "DONE; nothing was staged so there is no commit to "
+                        "lose)",
+                        task_id, exc,
+                    )
+                tracer.event(
+                    "commit_on_success", "controller", "nothing_staged",
+                    params={"task": task_id},
+                )
 
         return sha
+
+    @staticmethod
+    def _is_trivial_acceptance_check(check: Optional[str]) -> bool:
+        """True when *check* is a no-op shell command that passes
+        regardless of what the coder wrote, so its passing is not
+        evidence any real work happened.
+
+        Deliberately conservative — an exact match against a small, known
+        list, not a shell parser. A false negative here (an unusual real
+        check we don't recognise) just falls back to the pre-existing
+        DONE-with-empty-hash behaviour, which is safe. A false positive
+        would wrongly BLOCK a task whose genuine acceptance test happens
+        to look unusual — the worse failure mode of the two — so this
+        stays narrow on purpose.
+        """
+        if not check or not check.strip():
+            return True
+        normalized = check.strip().rstrip(";").strip()
+        return normalized in {"true", ":", "exit 0", "/bin/true"}
 
     # ── AUTO-CR-5: synopsis hook ─────────────────────────────────────────────
 

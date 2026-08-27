@@ -25,11 +25,22 @@ shared one::
     examples/task1/hello-world/   → used for task 1 if present
     examples/task2/hello-world/   → used for task 2 if present
     examples/task3/hello-world/   → used for task 3 if present
+    examples/task4/hello-world/   → used for task 4 if present
     examples/hello-world/         → fallback for any task without its own
 
 Separate sandboxes are strongly preferred: the flows commit into their base
-directory, so running all three against one directory means task 2 inspects
-task 1's output and the results are not independent.
+directory, so running several against one directory means a later task
+inspects an earlier task's output and the results are not independent.
+
+Task 4 (GATE3-PROFILE-5) reuses every check from task 3 — same skill body,
+same base — plus one more: evidence from the console log that canon and
+continuity actually resolved to a DIFFERENT provider than the shared one the
+coder and Gate 2 used. That extra finding is a WARN, not a FAIL, when the
+console log shows every validator on the same provider — task 4 needs a
+second real, reachable LLM endpoint ([task4_provider_b]) that is not always
+available (a fresh clone, most CI), and a check that FAILS whenever that
+endpoint is absent would just be a second, noisier way of saying so. See
+check_task4's docstring.
 
 Usage
 -----
@@ -54,8 +65,11 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SHARED_SANDBOX = REPO_ROOT / "examples" / "hello-world"
 
-TASKS = (1, 2, 3)
-TASK_SKILL = {1: "hello-code", 2: "hello-docs", 3: "hello-creative"}
+TASKS = (1, 2, 3, 4)
+TASK_SKILL = {
+    1: "hello-code", 2: "hello-docs", 3: "hello-creative",
+    4: "hello-creative-split",
+}
 
 _GREEN, _RED, _YELLOW, _DIM, _RESET = (
     "\033[32m", "\033[31m", "\033[33m", "\033[2m", "\033[0m"
@@ -148,6 +162,37 @@ def _prints_hello_world(sandbox: Path) -> tuple[bool, str]:
 
 def _run_ran(sandbox: Path) -> bool:
     return (sandbox / ".agent").is_dir()
+
+
+#: Directories that are not part of the sandbox's real working tree: the
+#: per-task workspace mirrors under .agent/workspace/<task_id>/ each copy
+#: the WHOLE repo (see AUTO-T*/AUTO-G* mirroring in executor.py), so an
+#: unfiltered recursive search finds every test file once per mirror on
+#: top of the real one — or, on a run where the real file never landed,
+#: finds only a stale copy inside a mirror and reports a false PASS.
+_NON_WORKTREE_DIRS = {".agent", ".git", "__pycache__", ".venv", "venv", "node_modules"}
+
+
+def _find_test_files(sandbox: Path) -> list[Path]:
+    """Every ``test_*.py`` in the sandbox's real working tree, at any depth.
+
+    CHECK-1 bug (found via a live run): the original version only checked
+    ``sandbox.glob("test_*.py")`` — the sandbox's TOP LEVEL only. A run
+    where the Architect filed the test at ``tests/test_main.py`` (a
+    perfectly normal, arguably more conventional choice) was reported as
+    "no test file created" even though the file existed and its own
+    ``acceptance_check`` (``pytest tests/test_main.py -q``) had already
+    passed during the run. Returns paths relative to *sandbox*.
+    """
+    found: list[Path] = []
+    for p in sorted(sandbox.rglob("test_*.py")):
+        if p.name.endswith(".coder.bak"):
+            continue
+        rel = p.relative_to(sandbox)
+        if any(part in _NON_WORKTREE_DIRS for part in rel.parts):
+            continue
+        found.append(rel)
+    return found
 
 
 def _plan_targets(sandbox: Path) -> list[str]:
@@ -254,19 +299,20 @@ def check_task1(sandbox: Path) -> Report:
         report.add(ast.get_docstring(main_fn) is not None, "main() docstring")
         report.add(main_fn.returns is not None, "main() return annotation")
 
-    test_files = sorted(
-        p.name for p in sandbox.glob("test_*.py")
-        if not p.name.endswith(".coder.bak")
-    )
+    test_files = _find_test_files(sandbox)
     report.add(
-        bool(test_files), "test file created", ", ".join(test_files) or "none",
-        hint="the Architect never proposed one, or the task cap cut it off — "
-             "check plan.json and auto.max_tasks_per_run",
+        bool(test_files), "test file created",
+        ", ".join(str(p) for p in test_files) or "none",
+        hint=_diagnose_no_candidates(sandbox) or (
+            "the Architect never proposed one, or the task cap cut it off — "
+            "check plan.json and auto.max_tasks_per_run"
+        ),
     )
 
     if test_files:
+        rel = [str(p) for p in test_files]
         result = subprocess.run(
-            [sys.executable, "-m", "pytest", "-q", *test_files],
+            [sys.executable, "-m", "pytest", "-q", *rel],
             cwd=str(sandbox), capture_output=True, text=True, timeout=180,
         )
         report.add(
@@ -276,7 +322,7 @@ def check_task1(sandbox: Path) -> Report:
             if (result.stdout or result.stderr) else "",
         )
         uses_pytest = any(
-            "def test_" in _read(sandbox / name) for name in test_files
+            "def test_" in _read(sandbox / p) for p in test_files
         )
         report.add(
             uses_pytest, "test uses pytest conventions",
@@ -284,6 +330,53 @@ def check_task1(sandbox: Path) -> Report:
             warn=True,
         )
     return report
+
+
+#: Matches Gate 1's own rejection line, e.g.:
+#:   Gate1[existence] REJECTED 'Create README.md ...' — new_file='README.md'
+#:   but this path already exists — not a new file; drop new_file or cite
+#:   the real content
+_GATE1_REJECT_RE = re.compile(r"Gate1\[[a-z_]+\] REJECTED '([^']*)' — (.+)")
+#: Matches the architect fully giving up on a cluster after exhausting its
+#: empty/non-JSON retry budget (see [architect] empty_response_retry_max).
+_ARCHITECT_GIVEUP_RE = re.compile(
+    r"review_one_cluster \[([^\]]+)\]: still unsalvageable after \d+ .*?"
+    r"giving up on this batch with 0 candidates"
+)
+
+
+def _diagnose_no_candidates(sandbox: Path) -> str:
+    """Read console-log.txt for the ACTUAL reason nothing landed, instead of
+    asserting one fixed hypothesis for every occurrence of this failure.
+
+    CHECK-1 bug (found via a live run): the previous version of this check
+    hard-coded a single historical root cause ("Gate 1 cannot evidence a
+    missing Usage section with a verbatim quote") into every FAIL of
+    "README.md was modified". A subsequent run failed the same finding for
+    two entirely different reasons — Gate 1 rejecting a candidate that
+    mislabelled an existing file as new, and the architect giving up on the
+    'support' cluster after six consecutive empty/non-JSON responses over
+    ~19 minutes — neither of which matches that hard-coded story. Repeating
+    a specific-sounding but wrong diagnosis is worse than a generic pointer:
+    it sends the next person chasing the wrong fix. This is deterministic
+    (reads a log file already on disk) and degrades to "" — the caller's
+    generic fallback — when nothing recognisable is found, e.g. no console
+    log at all.
+    """
+    log = _read(sandbox.parent / "console-log.txt")
+    if not log:
+        return ""
+    reasons: list[str] = []
+    for m in _GATE1_REJECT_RE.finditer(log):
+        reasons.append(f"Gate 1 rejected {m.group(1)!r} — {m.group(2).strip()}")
+    for m in _ARCHITECT_GIVEUP_RE.finditer(log):
+        reasons.append(
+            f"architect gave up on cluster {m.group(1)!r} after repeated "
+            "empty/non-JSON responses"
+        )
+    seen: set[str] = set()
+    unique = [r for r in reasons if not (r in seen or seen.add(r))]
+    return "; ".join(unique)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -303,10 +396,11 @@ def check_task2(sandbox: Path) -> Report:
     changed = bool(baseline) and text.strip() != baseline.strip()
     report.add(
         changed, "README.md was modified",
-        hint="identical to the committed baseline — the docs flow wrote "
-             "nothing. Seen twice live: Gate 1 cannot evidence \"README "
-             "lacks a Usage section\" with a verbatim quote, so it "
-             "fail-closes and rejects the candidates the flow needs",
+        hint=_diagnose_no_candidates(sandbox) or (
+            "identical to the committed baseline — the docs flow wrote "
+            "nothing. Check the console log for 'Gate1[' rejections or "
+            "'giving up on this batch'"
+        ),
     )
 
     report.add(
@@ -345,6 +439,17 @@ def check_task2(sandbox: Path) -> Report:
 _ENTRY_RE = re.compile(r"^###\s+(.+)$", re.MULTILINE)
 
 
+def _entry_text(markdown: str, heading: str) -> str:
+    """The full text of one ``### <heading>`` entry — heading line through
+    the next ``### `` heading or end of file — or ``""`` if absent."""
+    pattern = re.compile(
+        rf"^###\s+{re.escape(heading)}\s*$.*?(?=\n###\s+|\Z)",
+        re.MULTILINE | re.DOTALL,
+    )
+    m = pattern.search(markdown)
+    return m.group(0).strip() if m else ""
+
+
 def check_task3(sandbox: Path) -> Report:
     report = Report(3, TASK_SKILL[3], sandbox)
     if not _add_run_context(report, sandbox):
@@ -357,7 +462,9 @@ def check_task3(sandbox: Path) -> Report:
     entries = _ENTRY_RE.findall(text)
     report.add(
         len(entries) >= 2, "a new entry was added", f"{len(entries)} entry/entries",
-        hint="only the seed entry is present — the flow added nothing",
+        hint=_diagnose_no_candidates(sandbox) or (
+            "only the seed entry is present — the flow added nothing"
+        ),
     )
 
     report.add(
@@ -366,6 +473,34 @@ def check_task3(sandbox: Path) -> Report:
              "`continuity` then has no predecessor to compare against and "
              "its approval means less than it appears to",
     )
+
+    # CHECK-1 bug (found via a live run): the check above only looks for the
+    # HEADING string. A run where the architect never saw the real
+    # CHANGELOG.md (its cluster review came back empty) reconstructed the
+    # seed entry from a guess and the coder overwrote its prose wholesale —
+    # same heading, different words — and "seed entry preserved" read as a
+    # bare PASS right next to "a new entry was added" correctly failing.
+    # This compares the actual committed seed entry (not just its heading)
+    # against what is on disk now. Skips (warn) rather than fails when there
+    # is no baseline to diff against, e.g. a repo without the usual
+    # examples/hello-world/CHANGELOG.md history.
+    baseline_changelog = _baseline("CHANGELOG.md")
+    seed_entry = _entry_text(baseline_changelog, "The first greeting")
+    if seed_entry:
+        report.add(
+            seed_entry in text, "seed entry text unchanged",
+            hint="the heading survived but the coder rewrote the seed "
+                 "entry's own prose instead of leaving it untouched and "
+                 "prepending a new entry above it — check whether the "
+                 "architect's cluster review that shows CHANGELOG.md's "
+                 "real content actually returned candidates, or came back "
+                 "empty/rate-limited and left the coder guessing",
+        )
+    else:
+        report.add(
+            True, "seed entry text unchanged",
+            "skipped: no baseline CHANGELOG.md to diff against", warn=True,
+        )
 
     report.add("Hello world" in text, "canon fact intact")
 
@@ -391,12 +526,234 @@ def check_task3(sandbox: Path) -> Report:
     return report
 
 
-CHECKS = {1: check_task1, 2: check_task2, 3: check_task3}
+# ─────────────────────────────────────────────────────────────────────────────
+# Task 4 — narrative changelog, canon/continuity on a second provider
+# ─────────────────────────────────────────────────────────────────────────────
+# GATE3-PROFILE-5: proves the GATE3-PROFILE-2 per-validator profile keys work
+# on a real run, not only in unit tests. hello-creative-split is the same
+# skill body as hello-creative (same base, same artefact contract), with
+# [validator_agent] canon_llm_profile / continuity_llm_profile pointed at
+# [task4_provider_b] via its [skill.overlay] — see skills/hello-creative-split
+# .skill.ini. So this reuses check_task3 wholesale for the artefact criteria,
+# then adds one more finding this task alone can make: did canon/continuity
+# actually go to a DIFFERENT provider than the coder and Gate 2 did.
+
+#: Matches GATE3-PROFILE-2's per-gate startup line, e.g.:
+#:   validator_agent.canon_llm_profile: provider = https://b.example/v1 (m) — via ...
+_GATE_PROVIDER_RE = re.compile(
+    r"validator_agent\.(canon|continuity)_llm_profile: provider = (\S+) \("
+)
+#: Matches the shared-provider step every enabled gate resolves through
+#: first (GATE3-PROFILE-2's `validator_llm_profile` link in the chain),
+#: which is what the coder and Gate 2 also use — the baseline "provider A".
+_SHARED_PROVIDER_RE = re.compile(
+    r"validator_agent\.validator_llm_profile: provider = (\S+) \("
+)
+
+
+def _add_provider_split_evidence(report: Report, sandbox: Path) -> None:
+    """Did canon/continuity resolve to a different provider than the coder.
+
+    A WARN (not a FAIL) whenever the evidence can't be found or shows only
+    one provider in play: this needs a second real, reachable LLM endpoint
+    ([task4_provider_b]) that the operator configures locally and that is
+    not always available. `Report.failed` excludes warned findings (see its
+    property above), so `check_runbook.py --task 4` still exits 0 on an
+    otherwise-healthy single-provider run rather than failing a check it
+    structurally cannot perform — "skip with an explicit reason" rather than
+    a silent, vacuous pass on a property that was never actually verified.
+    """
+    log = _read(sandbox.parent / "console-log.txt")
+    if not log:
+        report.add(
+            False, "canon/continuity used a second provider",
+            "no console-log.txt found next to the sandbox",
+            hint="run_flows.sh writes it automatically — run the flow "
+                 "through run_flows.sh rather than main.py directly, or "
+                 "copy your own log to examples/task4/console-log.txt",
+            warn=True,
+        )
+        return
+
+    resolved = dict(_GATE_PROVIDER_RE.findall(log))  # {"canon": url, ...}
+    if not resolved:
+        report.add(
+            False, "canon/continuity used a second provider",
+            "no canon_llm_profile/continuity_llm_profile startup line in "
+            "the console log",
+            hint="GATE3-PROFILE-2 logs one INFO line per gate naming its "
+                 "resolved provider — check the flow actually used "
+                 "skills/hello-creative-split.skill.ini",
+            warn=True,
+        )
+        return
+
+    shared_match = _SHARED_PROVIDER_RE.search(log)
+    shared_url = shared_match.group(1) if shared_match else None
+    split = {
+        gate: url for gate, url in resolved.items()
+        if shared_url is None or url != shared_url
+    }
+
+    if not split:
+        report.add(
+            False, "canon/continuity used a second provider",
+            f"canon/continuity resolved to {sorted(set(resolved.values()))}, "
+            f"same as the shared provider — [task4_provider_b] is not "
+            f"configured (or is identical to [api_{{active}}]) for this run",
+            hint="add a [task4_provider_b] section with a second real "
+                 "base_url/api_key/model to your config before running "
+                 "task 4 — see RUNBOOK.md 'Flow 4'",
+            warn=True,
+        )
+        return
+
+    report.add(
+        True, "canon/continuity used a second provider",
+        ", ".join(f"{gate}={url}" for gate, url in sorted(split.items())),
+    )
+
+
+def check_task4(sandbox: Path) -> Report:
+    report = check_task3(sandbox)
+    report.task = 4
+    report.skill = TASK_SKILL[4]
+    if _run_ran(sandbox):
+        _add_provider_split_evidence(report, sandbox)
+    return report
+
+
+CHECKS = {1: check_task1, 2: check_task2, 3: check_task3, 4: check_task4}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CLI
 # ─────────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Weighted scoring — a percentage on top of the pass/fail findings above
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# check_task1/2 report binary findings: a run either satisfies "test suite
+# passes" or it doesn't. That's the right tool for "should CI go green", but
+# it throws away information a human reviewing a run actually wants — a run
+# that hardened main.py but forgot one docstring is not the same outcome as
+# a run that left main.py untouched, and PASS/FAIL alone can't tell them
+# apart. WEIGHTS turns the SAME findings check_task1/2 already computed into
+# a 0-100 score instead of a second, independent judgement — this can never
+# disagree with the PASS/FAIL verdict about WHAT happened, only about how
+# much a given gap should cost.
+#
+# GATES are findings whose failure caps the score outright, no matter how
+# many other points were earned: points for "wrote docstrings" mean nothing
+# if the docs run edited main.py instead of README.md, or if the code run's
+# one required behaviour (prints "Hello world") broke. A capped run can
+# still land above 0% — a gate failure means "this run violated a hard
+# constraint", not "this run did nothing".
+#
+# Only tasks 1 and 2 are weighted below. Task 3/4 (creative) are deliberately
+# left out — RUNBOOK.md is explicit that judging prose quality is out of
+# scope for this deterministic checker; a creative rubric needs a different
+# kind of criterion (canon/continuity) that belongs to the Gate-3 validators
+# at runtime, not to a percentage computed after the fact.
+
+@dataclass(frozen=True)
+class ScoreBand:
+    floor: int
+    label: str
+    meaning: str
+
+
+BANDS: tuple[ScoreBand, ...] = (
+    ScoreBand(100, "Excellent", "every weighted check passed — nothing left to fix"),
+    ScoreBand(85, "Solid", "the deliverable is there and working; only cosmetic gaps remain"),
+    ScoreBand(65, "Partial", "the deliverable landed but is noticeably incomplete"),
+    ScoreBand(40, "Weak", "the deliverable is mostly missing or badly broken"),
+    ScoreBand(0, "Failed", "a hard constraint was violated or nothing usable landed"),
+)
+
+
+def band_for(pct: float) -> ScoreBand:
+    for b in BANDS:
+        if pct >= b.floor:
+            return b
+    return BANDS[-1]  # pragma: no cover — 0 is always in range
+
+
+#: label -> points earned when that finding is present and OK. Each task's
+#: points sum to 100 so the raw total doubles as the percentage.
+WEIGHTS: dict[int, dict[str, int]] = {
+    1: {  # hello-code
+        "main.py present": 5,
+        "main.py still prints Hello world": 20,
+        "main.py parses": 5,
+        "main() defined": 10,
+        "test file created": 15,
+        "test suite passes": 25,
+        "module docstring": 7,
+        "main() docstring": 7,
+        "main() return annotation": 6,
+    },
+    2: {  # hello-docs
+        "README.md present": 5,
+        "README.md was modified": 30,
+        "README has a Usage section": 25,
+        "no .py file was targeted": 20,
+        "no references to missing files": 20,
+    },
+}
+
+#: label -> cap. If that finding fails, the score cannot exceed cap even
+#: though other points were earned.
+GATES: dict[int, dict[str, int]] = {
+    1: {
+        "main.py parses": 10,                    # broken syntax — nothing else here is trustworthy
+        "main.py still prints Hello world": 15,   # regressed the one behaviour that must survive
+    },
+    2: {
+        "no .py file was targeted": 30,           # a docs run touching code violates the skill contract
+    },
+}
+
+
+@dataclass
+class Score:
+    applicable: bool  # False when the flow never ran — nothing to grade
+    pct: float = 0.0
+    band: ScoreBand = BANDS[-1]
+    capped_by: tuple[str, ...] = ()
+
+
+def compute_score(report: Report) -> Score | None:
+    """None when task has no rubric yet (3/4). Score.applicable is False
+    when the flow never ran (score of 0 would misleadingly read as 'tried
+    and failed everything' rather than 'nothing to grade')."""
+    weights = WEIGHTS.get(report.task)
+    if weights is None:
+        return None
+    by_label = {f.label: f for f in report.findings}
+    ran = by_label.get("flow was run")
+    if ran is not None and not ran.ok:
+        return Score(applicable=False)
+
+    total = sum(weights.values())
+    earned = sum(
+        points for label, points in weights.items()
+        if (f := by_label.get(label)) is not None and f.ok
+    )
+    pct = (earned / total * 100) if total else 0.0
+
+    cap = 100
+    capped_by: list[str] = []
+    for label, cap_value in GATES.get(report.task, {}).items():
+        f = by_label.get(label)
+        if f is not None and not f.ok:
+            cap = min(cap, cap_value)
+            capped_by.append(label)
+    pct = min(pct, cap)
+
+    return Score(applicable=True, pct=pct, band=band_for(pct), capped_by=tuple(capped_by))
+
 
 def render(report: Report, colour: bool = True) -> str:
     def paint(code: str, s: str) -> str:
@@ -419,6 +776,17 @@ def render(report: Report, colour: bool = True) -> str:
         lines.append(line)
     verdict = "OK" if report.passed else f"{len(report.failed)} failure(s)"
     lines.append(f"  => {paint(_GREEN if report.passed else _RED, verdict)}")
+
+    score = compute_score(report)
+    if score is not None:
+        if not score.applicable:
+            lines.append(paint(_DIM, "  => score: n/a — flow never ran"))
+        else:
+            band_code = _GREEN if score.pct >= 85 else _YELLOW if score.pct >= 40 else _RED
+            score_line = f"  => score: {score.pct:.0f}% ({score.band.label})"
+            if score.capped_by:
+                score_line += f" — capped by: {', '.join(score.capped_by)}"
+            lines.append(paint(band_code, score_line))
     return "\n".join(lines)
 
 
@@ -437,10 +805,21 @@ def main() -> int:
     reports = [CHECKS[t](sandbox_for(t)) for t in tasks]
 
     if args.json:
+        def score_json(r: Report) -> dict | None:
+            s = compute_score(r)
+            if s is None:
+                return None
+            if not s.applicable:
+                return {"applicable": False}
+            return {
+                "applicable": True, "pct": round(s.pct, 1), "band": s.band.label,
+                "capped_by": list(s.capped_by),
+            }
+
         print(json.dumps([
             {
                 "task": r.task, "skill": r.skill, "sandbox": str(r.sandbox),
-                "passed": r.passed,
+                "passed": r.passed, "score": score_json(r),
                 "findings": [
                     {
                         "ok": f.ok, "warn": f.warn, "label": f.label,

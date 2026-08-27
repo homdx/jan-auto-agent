@@ -62,8 +62,10 @@ from typing import Any
 
 from tools.agent_trace import tracer
 from tools.auto.architect import CandidateTask
+from tools.auto.llm_profile import LlmSettings, resolve_llm_profile
 from tools.auto.gate1_grounding import (
     callee_context, config_fallback_note, target_file_context,
+    instruction_file_context,
     collect_contract_note, existing_test_coverage_note, truncation_safety_note,
     intentional_design_note, test_helper_note,
 )
@@ -416,92 +418,75 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         independent verdict from whatever the shared provider's url+model
         has recorded — no extra wiring needed here for that part.
         """
-        profile_name = config.get(sec, "presence_llm_profile", fallback="").strip()
-        if not profile_name:
-            self._presence_base_url      = self._base_url
-            self._presence_api_key       = self._api_key
-            self._presence_model         = self._model
-            self._presence_api_format    = self._api_format
-            self._presence_ssl_context   = self._ssl_context
-            self._presence_think         = self._think
-            self._presence_temperature   = self._temperature
-            self._presence_max_tokens    = self._max_tokens
-            self._presence_num_ctx       = self._num_ctx
-            self._presence_response_format = self._response_format
-            self._presence_think_effort  = self._think_effort
-            # AUTO-PRESENCE-LOG-1: field report — a run's presence-check
-            # requests went to a URL that matched neither [api_*] section
-            # in the config the user was looking at, and there was no way
-            # to tell from the log alone whether presence_llm_profile was
-            # even in effect for that run without reverse-engineering it
-            # from request URLs buried in a much larger log. One clear
-            # line at startup removes the guesswork.
+        # GATE3-PROFILE-6: the field-by-field resolution (unset -> exact
+        # copy of the shared provider; named section -> required
+        # base_url/api_key/model + optional overrides falling back to
+        # THIS instance's own resolved values, never a hardcoded literal
+        # and never another profile's value) used to be duplicated here
+        # and in resolve_validator_llm_profile below. Both now delegate to
+        # the shared tools.auto.llm_profile.resolve_llm_profile, which
+        # this docstring's two modes describe (that module is the
+        # authoritative source of the field-resolution behaviour; this
+        # method's job is only to translate to/from this class's own
+        # self._presence_* attribute names and its ssl_context caching).
+        defaults = LlmSettings(
+            base_url=base_url, api_key=api_key, model=model,
+            api_format=api_format, verify_ssl=verify_ssl,
+            think=self._think, temperature=self._temperature,
+            max_tokens=self._max_tokens, num_ctx=self._num_ctx,
+            response_format=self._response_format,
+            think_effort_enabled=self._think_effort is not None,
+            think_effort=self._think_effort,
+        )
+        settings, profile_name = resolve_llm_profile(
+            config, sec, "presence_llm_profile", defaults=defaults)
+
+        self._presence_base_url        = settings.base_url
+        self._presence_api_key         = settings.api_key
+        self._presence_model           = settings.model
+        self._presence_api_format      = settings.api_format
+        # No profile: reuse this instance's own ssl_context object as-is
+        # (identity, not just an equivalent rebuild) rather than
+        # constructing a fresh one from settings.verify_ssl — some
+        # callers compare `is self._ssl_context` and a freshly built
+        # SSLContext, while behaviourally equivalent, is a different
+        # object. A profile that actually sets its own verify_ssl gets a
+        # context built for its own value, same as before this refactor.
+        self._presence_ssl_context = (
+            self._ssl_context if profile_name is None
+            else (_llm_stream.make_unverified_context()
+                  if not settings.verify_ssl else None)
+        )
+        self._presence_think           = settings.think
+        self._presence_temperature     = settings.temperature
+        self._presence_max_tokens      = settings.max_tokens
+        self._presence_num_ctx         = settings.num_ctx
+        self._presence_response_format = settings.response_format
+        self._presence_think_effort    = settings.think_effort
+
+        # AUTO-PRESENCE-LOG-1: field report — a run's presence-check
+        # requests went to a URL that matched neither [api_*] section in
+        # the config the user was looking at, and there was no way to
+        # tell from the log alone whether presence_llm_profile was even
+        # in effect for that run without reverse-engineering it from
+        # request URLs buried in a much larger log. One clear line at
+        # startup removes the guesswork. Logged here (rather than relying
+        # on resolve_llm_profile's own generic log line) so the message
+        # keeps its established "Gate1Filter: presence-check provider"
+        # wording and this logger's name, unchanged for anyone grepping
+        # existing logs or filtering on tools.auto.gate1_filter.
+        if profile_name is None:
             logger.info(
                 "Gate1Filter: presence-check provider = %s (%s) — shared "
                 "provider (no presence_llm_profile configured)",
                 self._presence_base_url, self._presence_model,
             )
-            return
-
-        if not config.has_section(profile_name):
-            raise ValueError(
-                f"[gate1] presence_llm_profile = {profile_name!r} but the "
-                f"config has no [{profile_name}] section. Add one with at "
-                f"least base_url/api_key/model, or remove "
-                f"presence_llm_profile to use the shared provider."
-            )
-        required = [k for k in ("base_url", "api_key", "model")
-                    if not config.has_option(profile_name, k)]
-        if required:
-            raise ValueError(
-                f"[{profile_name}] (gate1 presence_llm_profile) is missing "
-                f"required option(s): {', '.join(required)}. A presence "
-                f"profile must fully specify its own connection details — "
-                f"it never silently inherits base_url/api_key/model from "
-                f"the shared provider, since that could send a different "
-                f"provider's credential to the wrong host."
-            )
-        self._presence_base_url   = config.get(profile_name, "base_url").rstrip("/")
-        self._presence_api_key    = config.get(profile_name, "api_key")
-        self._presence_model      = config.get(profile_name, "model")
-        self._presence_api_format = config.get(profile_name, "api_format", fallback="openai")
-        _verify_ssl = config.getboolean(profile_name, "verify_ssl", fallback=verify_ssl)
-        self._presence_ssl_context = (
-            _llm_stream.make_unverified_context() if not _verify_ssl else None
-        )
-        # Each falls back to THIS instance's own resolved value when the
-        # profile doesn't set it — deliberately never a hardcoded
-        # True/False/0/None default, and never another profile's value:
-        # fallback is always "what this Gate1Filter instance itself
-        # resolved", scoped to this one instance.
-        self._presence_think = config.getboolean(
-            profile_name, "think", fallback=self._think)
-        self._presence_temperature = float(config.get(
-            profile_name, "temperature", fallback=str(self._temperature)))
-        self._presence_max_tokens = int(config.get(
-            profile_name, "max_tokens", fallback=str(self._max_tokens)))
-        self._presence_num_ctx = config.getint(
-            profile_name, "num_ctx", fallback=self._num_ctx)
-        self._presence_response_format = config.getboolean(
-            profile_name, "response_format", fallback=self._response_format)
-        if config.has_option(profile_name, "think_effort_enabled"):
-            _profile_effort_enabled = config.getboolean(
-                profile_name, "think_effort_enabled")
-            self._presence_think_effort = (
-                config.get(profile_name, "think_effort", fallback="").strip()
-                if _profile_effort_enabled else None
-            ) or None
         else:
-            self._presence_think_effort = self._think_effort
-
-        # AUTO-PRESENCE-LOG-1: see the no-profile branch's sibling log
-        # above — this is the other exit point, so both cases always log
-        # exactly which provider presence-check calls will actually hit.
-        logger.info(
-            "Gate1Filter: presence-check provider = %s (%s) — via "
-            "presence_llm_profile = [%s]",
-            self._presence_base_url, self._presence_model, profile_name,
-        )
+            logger.info(
+                "Gate1Filter: presence-check provider = %s (%s) — via "
+                "presence_llm_profile = [%s]",
+                self._presence_base_url, self._presence_model, profile_name,
+            )
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -630,15 +615,62 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         )
 
         # ── Stage C: deduplication ────────────────────────────────────────────
+        # AUTO-FIX (found via a live run, hello-creative-split/Flow 4):
+        # creative-mode target-fingerprint dedup used to keep whichever
+        # candidate a FIXED cluster review order happened to produce first,
+        # with no regard for which one actually saw the file it targets.
+        # entry_orchestration is always reviewed before support, so when
+        # entry_orchestration's REVIEW OF main.py ALONE proposed a task
+        # targeting CHANGELOG.md — a file it never saw, cited_location=
+        # main.py — and support's LATER review of CHANGELOG.md itself
+        # correctly proposed the real new entry, cited_location=
+        # CHANGELOG.md — the ungrounded one always won the collision purely
+        # by review order, every time this shape of goal comes up. Now: on
+        # a target-fingerprint collision, a later candidate that IS grounded
+        # in its own target file (cited_location.file appears in
+        # target_files) replaces an earlier one that ISN'T, instead of
+        # always losing to it. Does not change dedup on the full
+        # fingerprint (`fp`) — only the creative-only target-fingerprint
+        # path (`tfp`) that this bug lives in.
         accepted: list[CandidateTask] = []
         seen_fingerprints: set[str] = set()
         seen_target_fingerprints: set[str] = set()
+        target_fp_index: dict[str, int] = {}
+
+        def _grounded_in_own_target(c: CandidateTask) -> bool:
+            return c.cited_location.file in c.target_files
 
         for c, reason in presence_passed:
             fp = _fingerprint(c)
             tfp = _target_fingerprint(c) if self._task_mode == "creative" else None
-            if fp in seen_fingerprints or (tfp is not None and tfp in seen_target_fingerprints):
-                dup_key = fp if fp in seen_fingerprints else tfp
+            is_fp_dup = fp in seen_fingerprints
+            is_tfp_dup = tfp is not None and tfp in seen_target_fingerprints
+            if is_fp_dup or is_tfp_dup:
+                dup_key = fp if is_fp_dup else tfp
+                if (
+                    not is_fp_dup and tfp in target_fp_index
+                    and _grounded_in_own_target(c)
+                    and not _grounded_in_own_target(accepted[target_fp_index[tfp]])
+                ):
+                    superseded = accepted[target_fp_index[tfp]]
+                    accepted[target_fp_index[tfp]] = c
+                    all_results.append(FilterResult(
+                        candidate=superseded, accepted=False, stage="duplicate",
+                        reason=(
+                            f"superseded by a later candidate with fingerprint "
+                            f"{dup_key!r} that is grounded in its own target "
+                            f"file ({superseded.cited_location.file!r} is not "
+                            f"in {superseded.target_files!r})"
+                        ),
+                    ))
+                    all_results.append(FilterResult(
+                        candidate=c, accepted=True, stage="presence", reason=reason,
+                    ))
+                    logger.info(
+                        "Gate1[dedup] replaced ungrounded duplicate %r with "
+                        "grounded %r", superseded.title, c.title,
+                    )
+                    continue
                 all_results.append(FilterResult(
                     candidate=c, accepted=False, stage="duplicate",
                     reason=f"duplicate of an earlier candidate with fingerprint {dup_key!r}",
@@ -648,6 +680,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             seen_fingerprints.add(fp)
             if tfp is not None:
                 seen_target_fingerprints.add(tfp)
+                target_fp_index[tfp] = len(accepted)
             accepted.append(c)
             all_results.append(FilterResult(
                 candidate=c, accepted=True, stage="presence", reason=reason,
@@ -908,6 +941,20 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             if tf_note:
                 notes.append(tf_note)
 
+            # AUTO-H2-6b: covers the case tf_note above does not — cited_file
+            # already matches target_files (so tf_note found nothing) but
+            # neither matches what the instruction is actually about.
+            try:
+                if_note = instruction_file_context(
+                    candidate.instruction, loc.file, base_dir,
+                    already_noted=bool(tf_note),
+                )
+            except Exception as exc:  # pragma: no cover - defensive, see docstring
+                logger.warning("Gate1._build_grounding_notes: instruction_file_context failed (%s) — skipping", exc)
+                if_note = None
+            if if_note:
+                notes.append(if_note)
+
         if base_dir is not None:
             try:
                 cc_note = callee_context(
@@ -1023,7 +1070,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                 source="gate1",
                 target="llm",
                 kind="llm_request",
-                content=msg,
+                content=msg, model=self._presence_model,
                 params={"model": self._presence_model, "candidate": candidate.title},
             )
             text = _llm_stream.request_completion(
@@ -1040,7 +1087,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                 source="llm",
                 target="gate1",
                 kind="llm_response",
-                content=cleaned,
+                content=cleaned, model=self._presence_model,
                 params={"candidate": candidate.title},
             )
             return cleaned
@@ -1088,7 +1135,8 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             logger.warning("Gate1._check_presence: %s — failing closed", reason)
             tracer.event(
                 source="gate1", target="llm", kind="llm_response",
-                content=f"[ERROR] {last_exc}", params={"candidate": candidate.title},
+                content=f"[ERROR] {last_exc}", model=self._presence_model,
+                params={"candidate": candidate.title},
             )
             return False, reason
 

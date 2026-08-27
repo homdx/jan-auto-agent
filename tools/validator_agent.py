@@ -199,7 +199,7 @@ class ValidatorAgent:
             tracer.event("validator_agent", "orchestrator", "error", content=_err)
             return _err
 
-        tracer.event("llm", "validator_agent", "llm_response", content=content)
+        tracer.event("llm", "validator_agent", "llm_response", content=content, model=self.model)
         content = strip_think(content)
         content = strip_json_fence(content)
 

@@ -417,6 +417,7 @@ def make_canon_validator(
     task_mode: str = "creative",
     broker=None,
     synopsis_path: str = "synopsis.md",
+    settings=None,
 ) -> "CanonValidator | None":
     """Build a :class:`CanonValidator` from *config*, or ``None`` when disabled.
 
@@ -424,6 +425,13 @@ def make_canon_validator(
     (default 1); reads the creative token budget from ``[coder]`` via
     ``_cfg_mode``.  Returns ``None`` when ``canon_check_every <= 0`` so callers
     can treat the whole feature as off via one config key.
+
+    GATE3-PROFILE-2: *settings*, an optional
+    :class:`tools.auto.llm_profile.LlmSettings`, is passed straight through
+    to ``_make_llm_call``. ``None`` (the default) reproduces today's
+    behaviour exactly — only :func:`tools.auto.gate_registry.
+    build_validators` passes a resolved value, via ``[validator_agent]
+    canon_llm_profile``.
     """
     every = config.getint("auto", "canon_check_every", fallback=3)
     if every <= 0:
@@ -452,7 +460,16 @@ def make_canon_validator(
         except Exception:  # noqa: BLE001
             broker = None
 
-    llm_call = _make_llm_call(config, task_mode=task_mode)
+    # GATE3-PROFILE-2: only pass settings= when a profile was actually
+    # resolved, preserving the exact old call arity — not just the
+    # resulting values — when canon_llm_profile is unconfigured. This
+    # keeps a bare-signature stand-in for _make_llm_call (as tests may
+    # legitimately install) working unchanged in the default case.
+    llm_call = (
+        _make_llm_call(config, task_mode=task_mode, settings=settings)
+        if settings is not None
+        else _make_llm_call(config, task_mode=task_mode)
+    )
 
     return CanonValidator(
         llm_call,

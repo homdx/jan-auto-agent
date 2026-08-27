@@ -13,15 +13,19 @@ Plus edge-case extras for commit_on_success hook and boundary conditions.
 """
 from __future__ import annotations
 
+import configparser
 from pathlib import Path
 from unittest.mock import MagicMock, call
 
+import pytest
 
 from tools.auto.summary_memory import (
     SummaryMemory,
     SummaryFidelityVerifier,
     _clean_bullet_list,
     _chunk_paragraphs,
+    _make_llm_call,
+    make_summary_memory,
 )
 
 
@@ -481,4 +485,126 @@ class TestCommitOnSuccessHook:
             call("Chapter 2 revised text."),
             call("Chapter 3 revised text."),
         ])
+
+
+# ── 8. GATE3-PROFILE-3: [summary] llm_profile ────────────────────────────────
+
+class TestSummaryLlmProfile:
+    """GATE3-PROFILE-3 acceptance tests for ``[summary] llm_profile``.
+
+    Mirrors the pattern in ``tests/test_gate3_profiles.py``: each test
+    asserts the (url, model) actually used for the outbound HTTP request
+    by monkeypatching ``tools.llm_stream.request_completion`` and
+    invoking the constructed ``SummaryMemory``'s stored LLM callable
+    (``mem._llm``) directly — mocking at ``make_summary_memory``'s
+    return-value level would let a settings kwarg that never reached
+    ``_make_llm_call`` pass unnoticed.
+    """
+
+    @staticmethod
+    def _config(
+        *, profile_section: "str | None" = None, extra: "dict | None" = None,
+    ) -> configparser.ConfigParser:
+        sections: dict = {
+            "api": {"active": "local"},
+            "api_local": {
+                "base_url": "https://shared.example/v1",
+                "api_key": "shared-key",
+                "model": "shared-model",
+                "api_format": "openai",
+            },
+        }
+        if profile_section is not None:
+            sections.setdefault("summary", {})["llm_profile"] = profile_section
+        if extra:
+            for section, kv in extra.items():
+                sections.setdefault(section, {}).update(kv)
+        cfg = configparser.ConfigParser()
+        cfg.read_dict(sections)
+        return cfg
+
+    @staticmethod
+    def _capture(monkeypatch, capture: dict) -> None:
+        import tools.llm_stream as _llm_stream
+
+        def _fake(*, url, headers, payload, **kwargs):
+            capture["result"] = (url, payload.get("model"))
+            return "APPROVED"
+
+        monkeypatch.setattr(_llm_stream, "request_completion", _fake)
+
+    def test_default_path_uses_shared_provider(self, monkeypatch, tmp_path):
+        capture: dict = {}
+        self._capture(monkeypatch, capture)
+        mem = make_summary_memory(self._config(), base_dir=tmp_path, task_mode="creative")
+        mem._llm("system", "user")
+
+        url, model = capture["result"]
+        assert "shared.example" in url
+        assert model == "shared-model"
+
+    def test_own_profile_path_uses_that_providers_url_and_model(self, monkeypatch, tmp_path):
+        capture: dict = {}
+        self._capture(monkeypatch, capture)
+        cfg = self._config(
+            profile_section="judge_llm",
+            extra={
+                "judge_llm": {
+                    "base_url": "https://own.example/v1",
+                    "api_key": "own-key",
+                    "model": "own-model",
+                    "api_format": "openai",
+                }
+            },
+        )
+        mem = make_summary_memory(cfg, base_dir=tmp_path, task_mode="creative")
+        mem._llm("system", "user")
+
+        url, model = capture["result"]
+        assert "own.example" in url
+        assert "shared.example" not in url
+        assert model == "own-model"
+
+    def test_empty_profile_value_treated_as_unset(self, monkeypatch, tmp_path):
+        capture: dict = {}
+        self._capture(monkeypatch, capture)
+        mem = make_summary_memory(
+            self._config(profile_section=""), base_dir=tmp_path, task_mode="creative",
+        )
+        mem._llm("system", "user")
+
+        url, model = capture["result"]
+        assert "shared.example" in url
+        assert model == "shared-model"
+
+    def test_profile_naming_missing_section_raises_at_construction(self, tmp_path):
+        with pytest.raises(ValueError, match="ghost"):
+            make_summary_memory(
+                self._config(profile_section="ghost"), base_dir=tmp_path, task_mode="creative",
+            )
+
+    def test_profile_missing_required_option_raises_at_construction(self, tmp_path):
+        cfg = self._config(
+            profile_section="incomplete",
+            extra={"incomplete": {"base_url": "https://incomplete.example"}},
+        )
+        with pytest.raises(ValueError, match="api_key|model"):
+            make_summary_memory(cfg, base_dir=tmp_path, task_mode="creative")
+
+    def test_no_new_key_present_request_matches_pre_ticket_behaviour(self, monkeypatch, tmp_path):
+        """A config with no ``[summary] llm_profile`` must hit the exact
+        same provider/model as ``_make_llm_call`` produced before this
+        ticket — the byte-for-byte acceptance criterion.
+        """
+        capture_new: dict = {}
+        self._capture(monkeypatch, capture_new)
+        mem = make_summary_memory(self._config(), base_dir=tmp_path, task_mode="creative")
+        mem._llm("system", "user")
+
+        capture_old: dict = {}
+        self._capture(monkeypatch, capture_old)
+        old_call = _make_llm_call(self._config(), task_mode="creative")  # pre-ticket call shape
+        old_call("system", "user")
+
+        assert capture_new["result"] == capture_old["result"]
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import configparser
 
+import pytest
 
 from tools.auto.architect import ClusterReviewer, CandidateTask, CitedLocation
 
@@ -47,6 +48,60 @@ def _candidate(title: str, instruction: str) -> CandidateTask:
 
 def _dict_candidate(title: str, instruction: str) -> dict:
     return {"title": title, "instruction": instruction}
+
+
+# ── Regression: _build_llm_call fail-open contract ─────────────────────────
+#
+# Found via independent review, not by this file's existing tests: every
+# test above constructs a real ClusterReviewer and then immediately
+# overwrites reviewer._llm_call with a stub, so none of them exercise what
+# self._build_llm_call() actually returns during __init__ itself. A
+# refactor (GATE3-PROFILE-3) restructured _build_llm_call so only the
+# `from ... import` statements were guarded by try/except -- the
+# _default_llm_settings(...) and _make_llm_call(...) calls that follow ran
+# fully unguarded, so a config error with nothing to do with
+# plan_llm_profile (a malformed [coder] max_tokens, say) crashed
+# ClusterReviewer.__init__ outright, contradicting _build_llm_call's own
+# docstring ("so __init__ never raises for that reason"). These two tests
+# construct ClusterReviewer directly (no _llm_call override) to prove both
+# halves of the intended contract: general config errors fail open, a
+# genuinely malformed plan_llm_profile still raises loudly at construction.
+
+def test_build_llm_call_fails_open_on_unrelated_config_error() -> None:
+    """A bad [coder] max_tokens (nothing to do with plan_llm_profile) must
+    not crash construction -- it must fall back to the no-op fail-open
+    callable, per _build_llm_call's own docstring."""
+    cfg = configparser.ConfigParser()
+    cfg.read_dict({
+        "api":       {"active": "local"},
+        "api_local": {"base_url": "http://localhost:1234/v1",
+                      "api_key":  "x",
+                      "model":    "test-model"},
+        "coder":     {"max_tokens": "not-a-number"},
+    })
+
+    reviewer = ClusterReviewer(cfg, "http://localhost:1234/v1", "x", "test-model",
+                                task_mode="code")
+
+    assert reviewer._llm_call("system", "user") == ""
+
+
+def test_build_llm_call_still_raises_on_malformed_plan_llm_profile() -> None:
+    """A plan_llm_profile naming a section that doesn't exist is an
+    operator typo, not a transient error -- must still raise at
+    construction, not be swallowed by the fail-open fix above."""
+    cfg = configparser.ConfigParser()
+    cfg.read_dict({
+        "api":       {"active": "local"},
+        "api_local": {"base_url": "http://localhost:1234/v1",
+                      "api_key":  "x",
+                      "model":    "test-model"},
+        "architect": {"plan_llm_profile": "nonexistent_section"},
+    })
+
+    with pytest.raises(ValueError, match="plan_llm_profile"):
+        ClusterReviewer(cfg, "http://localhost:1234/v1", "x", "test-model",
+                         task_mode="code")
 
 
 # ── Tests ─────────────────────────────────────────────────────────────────────
@@ -188,3 +243,132 @@ def test_arch_plan_system_prompt_is_narrow():
     assert "REVISE" in upper
     # Must not prompt for style/ordering revisions
     assert "STYLE" not in upper or "NOT" in upper or "DO NOT" in upper
+
+
+# ── GATE3-PROFILE-3: [architect] plan_llm_profile ────────────────────────────
+
+class TestPlanLlmProfile:
+    """GATE3-PROFILE-3 acceptance tests for ``[architect] plan_llm_profile``.
+
+    Mirrors the pattern in ``tests/test_gate3_profiles.py``: each test
+    asserts the (url, model) actually used for the outbound HTTP request
+    by monkeypatching ``tools.llm_stream.request_completion`` and
+    invoking the constructed ``ClusterReviewer``'s own ``_llm_call``
+    (built by ``_build_llm_call``, never stubbed out here) directly — a
+    mis-wired ``settings`` kwarg that never reached ``_make_llm_call``
+    would still pass a higher-level mock.
+    """
+
+    @staticmethod
+    def _config(
+        *, profile_section: "str | None" = None, extra: "dict | None" = None,
+    ) -> configparser.ConfigParser:
+        sections: dict = {
+            "api": {"active": "local"},
+            "api_local": {
+                "base_url": "https://shared.example/v1",
+                "api_key": "shared-key",
+                "model": "shared-model",
+                "api_format": "openai",
+            },
+            "architect": {},
+            "loop": {"timeout_seconds": "30"},
+        }
+        if profile_section is not None:
+            sections["architect"]["plan_llm_profile"] = profile_section
+        if extra:
+            for section, kv in extra.items():
+                sections.setdefault(section, {}).update(kv)
+        cfg = configparser.ConfigParser()
+        cfg.read_dict(sections)
+        return cfg
+
+    @staticmethod
+    def _capture(monkeypatch, capture: dict) -> None:
+        import tools.llm_stream as _llm_stream
+
+        def _fake(*, url, headers, payload, **kwargs):
+            capture["result"] = (url, payload.get("model"))
+            return "APPROVED"
+
+        monkeypatch.setattr(_llm_stream, "request_completion", _fake)
+
+    @staticmethod
+    def _reviewer(cfg: configparser.ConfigParser) -> ClusterReviewer:
+        return ClusterReviewer(
+            cfg, "https://shared.example/v1", "shared-key", "shared-model",
+            task_mode="creative",
+        )
+
+    def test_default_path_uses_shared_provider(self, monkeypatch):
+        capture: dict = {}
+        self._capture(monkeypatch, capture)
+        reviewer = self._reviewer(self._config())
+        reviewer._llm_call("system", "user")
+
+        url, model = capture["result"]
+        assert "shared.example" in url
+        assert model == "shared-model"
+
+    def test_own_profile_path_uses_that_providers_url_and_model(self, monkeypatch):
+        capture: dict = {}
+        self._capture(monkeypatch, capture)
+        cfg = self._config(
+            profile_section="judge_llm",
+            extra={
+                "judge_llm": {
+                    "base_url": "https://own.example/v1",
+                    "api_key": "own-key",
+                    "model": "own-model",
+                    "api_format": "openai",
+                }
+            },
+        )
+        reviewer = self._reviewer(cfg)
+        reviewer._llm_call("system", "user")
+
+        url, model = capture["result"]
+        assert "own.example" in url
+        assert "shared.example" not in url
+        assert model == "own-model"
+
+    def test_empty_profile_value_treated_as_unset(self, monkeypatch):
+        capture: dict = {}
+        self._capture(monkeypatch, capture)
+        reviewer = self._reviewer(self._config(profile_section=""))
+        reviewer._llm_call("system", "user")
+
+        url, model = capture["result"]
+        assert "shared.example" in url
+        assert model == "shared-model"
+
+    def test_profile_naming_missing_section_raises_at_construction(self):
+        with pytest.raises(ValueError, match="ghost"):
+            self._reviewer(self._config(profile_section="ghost"))
+
+    def test_profile_missing_required_option_raises_at_construction(self):
+        cfg = self._config(
+            profile_section="incomplete",
+            extra={"incomplete": {"base_url": "https://incomplete.example"}},
+        )
+        with pytest.raises(ValueError, match="api_key|model"):
+            self._reviewer(cfg)
+
+    def test_no_new_key_present_request_matches_pre_ticket_behaviour(self, monkeypatch):
+        """A config with no ``plan_llm_profile`` must hit the exact same
+        provider/model as ``_make_llm_call`` produced before this ticket —
+        the byte-for-byte acceptance criterion.
+        """
+        from tools.auto.summary_memory import _make_llm_call
+
+        capture_new: dict = {}
+        self._capture(monkeypatch, capture_new)
+        reviewer = self._reviewer(self._config())
+        reviewer._llm_call("system", "user")
+
+        capture_old: dict = {}
+        self._capture(monkeypatch, capture_old)
+        old_call = _make_llm_call(self._config(), task_mode="creative")  # pre-ticket shape
+        old_call("system", "user")
+
+        assert capture_new["result"] == capture_old["result"]
