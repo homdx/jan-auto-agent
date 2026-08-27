@@ -75,7 +75,7 @@ while [ $# -gt 0 ]; do
     esac
     shift
 done
-[ ${#TASKS[@]} -eq 0 ] && TASKS=(1 2 3)
+[ ${#TASKS[@]} -eq 0 ] && TASKS=(1 2 3 4)
 
 say()  { printf '\n\033[1m== %s\033[0m\n' "$*"; }
 warn() { printf '\033[33m%s\033[0m\n' "$*"; }

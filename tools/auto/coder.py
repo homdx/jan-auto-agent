@@ -1220,7 +1220,7 @@ class Coder(_llm_stream.LLMClientBase):
                     task_id, i,
                 )
                 continue
-            path    = (item.get("path") or "").strip()
+            path    = str(item.get("path") or "").strip()
             content = item.get("content")
             if not path:
                 logger.warning(

@@ -739,37 +739,67 @@ def _parse_args():
 # ── AUTO-FIX (cfg-crash-prevention): startup config validation ─────────────
 # `configparser`'s `fallback=` only covers a MISSING key — a *present-but-
 # empty* value (e.g. "verify_ssl =" with nothing after the "=") still
-# reaches `.getboolean()`/`.getint()` and raises a bare ValueError, deep
-# inside whichever agent's `__init__` happens to read it first (architect,
-# coder, gate1_filter, auto_tuner, existence_validator, ... — ~100 call
-# sites across tools/auto/). The traceback that results points at
-# `configparser.py`, not at the ini line that's actually wrong, so the
-# fix took real digging to track down each time it happened.
+# reaches `.getboolean()`/`.getint()`/`.getfloat()` and raises a bare
+# ValueError, deep inside whichever agent's `__init__` happens to read it
+# first. The traceback that results points at `configparser.py`, not at
+# the ini line that's actually wrong, so the fix took real digging to
+# track down each time it happened.
 #
 # Rather than hardening every call site by hand (a moving target — the
-# list grows as new agents are added), scan tools/auto/*.py for every
-# literal `config.getboolean(section, key, ...)` / `config.getint(section,
-# key, ...)` call, then check the ini file that's about to be loaded for
-# any of those (section, key) pairs present with a blank value. Fail once,
-# loudly, up front, naming every offending line — instead of crashing N
-# different ways, N different times, once per agent construction.
-_TYPED_CONFIG_METHODS = ("getboolean", "getint")
+# list grows as new agents are added), scan every .py file under tools/
+# plus main.py itself for every literal `config.getboolean(section, key,
+# ...)` / `.getint(...)` / `.getfloat(...)` call, then check the ini file
+# that's about to be loaded for any of those (section, key) pairs present
+# with a blank value. Fail once, loudly, up front, naming every offending
+# line — instead of crashing N different ways, N different times.
+#
+# NOTE — this check only catches a *blank* value, not a malformed one
+# (e.g. `max_iterations = abc`). It intentionally does NOT replace the
+# handful of pre-existing per-call `try/except ValueError` guards already
+# in this codebase (main.py's own Orchestrator._getint/_getfloat/
+# _getboolean, tools/search_agent.py, tools/faq_agent.py, etc.) — those
+# catch *any* malformed value, not just blank, and degrade gracefully to
+# the coded default rather than aborting the run (see tests/test_t1_load_
+# config_malformed.py). That's a stricter, and arguably better, contract
+# than "fail fast at startup", so it's kept rather than removed. This
+# scan's job is narrower: catch the one failure mode (blank value) that
+# used to have NO guard at all across most of tools/auto/, and say
+# clearly which ini line and which call site is at fault, before any
+# agent constructs.
+#
+# The one thing this scan can never catch, guarded or not: a call whose
+# *key* isn't a literal at the call site (e.g. a loop over field names, or
+# a small `_get_bool(config, key, default)`-style wrapper parameterized on
+# `key`) — there's no way to know statically which keys it'll read.
+_TYPED_CONFIG_METHODS = ("getboolean", "getint", "getfloat")
 
 
-def _scan_typed_config_call_sites(auto_dir: Path) -> List[tuple]:
-    """AST-scan every tools/auto/*.py file for `<cfg>.getboolean(...)` /
-    `<cfg>.getint(...)` calls with a literal key argument.
+def _scan_typed_config_call_sites(repo_root: Path) -> List[tuple]:
+    """AST-scan every .py file under tools/, plus main.py itself, for
+    `<cfg>.getboolean(...)` / `<cfg>.getint(...)` / `<cfg>.getfloat(...)`
+    calls with a literal key argument.
 
     Returns a list of (file_path, lineno, method, section_or_None, key)
     tuples. `section_or_None` is None when the section argument isn't a
     plain string literal (e.g. `f"api_{active_profile}"`) — those calls
     are still worth checking, just against every section in the file
     rather than one we can resolve statically.
+
+    A call whose *key* argument is itself a variable (e.g. a loop over
+    field names, or a small wrapper function parameterized on `key`) is
+    skipped — there's no way to know which literal keys that resolves to
+    without executing the program, so those sites keep their own runtime
+    guard rather than relying on this scan.
     """
     import ast
 
+    py_files = sorted(repo_root.glob("tools/**/*.py"))
+    main_py = repo_root / "main.py"
+    if main_py.is_file():
+        py_files.append(main_py)
+
     sites: List[tuple] = []
-    for py_file in sorted(auto_dir.glob("*.py")):
+    for py_file in py_files:
         try:
             source = py_file.read_text(encoding="utf-8")
             tree = ast.parse(source, filename=str(py_file))
@@ -815,7 +845,7 @@ def _validate_typed_config_values(config_path: str, base_dir: str) -> None:
     if not auto_dir.is_dir():
         return
 
-    sites = _scan_typed_config_call_sites(auto_dir)
+    sites = _scan_typed_config_call_sites(current_dir)
     candidate_sections = probe.sections()
     resolve_root = base_dir if os.path.isdir(base_dir) else str(current_dir)
 
