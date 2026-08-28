@@ -333,14 +333,17 @@ def build_gates_map(
     scanned. True for this repo at any location, false for a genuinely
     different one.
     """
-    module_paths = {m.path for m in modules} if modules is not None else set()
+    # AUTO-FIX: `modules` is typed Iterable and consumed twice here, so a
+    # one-shot generator would be exhausted by the first pass and the second
+    # would silently see nothing. Snapshot once.
+    modules_list = list(modules) if modules is not None else []
+    module_paths = {m.path for m in modules_list}
 
     if root is not None and modules is not None and Path(root).resolve() != _SEED_REPO_ROOT:
         if not _looks_like_this_repo(module_paths):
             return []
 
     verify = modules is not None and root is not None
-    modules_list = list(modules) if modules is not None else []
 
     entries: List[GateEntry] = []
     for name, spec in seed.items():

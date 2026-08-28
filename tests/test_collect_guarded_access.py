@@ -156,7 +156,10 @@ def test_reassigned_name_end_to_end_survives_verification():
 # ── guard-shape coverage ────────────────────────────────────────────────────
 
 
-def test_if_x_is_none_guards_x():
+def test_if_x_is_none_does_not_guard_subscript_access():
+    # Bugfix (dataflow audit): `x is None` proves non-None-ness, not
+    # non-emptiness — `x = []` passes the guard and `x[0]` still raises.
+    # Was GUARDED; `not x` / `len(x) == 0` stay GUARDED and still do.
     source = (
         "def f(x):\n"
         "    if x is None:\n"
@@ -164,7 +167,7 @@ def test_if_x_is_none_guards_x():
         "    return x[0]\n"
     )
     accesses = _accesses(source, "m.py")
-    assert accesses[0].status == "GUARDED"
+    assert accesses[0].status == "UNGUARDED"
 
 
 def test_guard_scoped_to_its_own_function_only():

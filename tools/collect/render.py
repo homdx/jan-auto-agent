@@ -38,7 +38,7 @@ from tools.collect.config_map import ConfigMapEntry, SiblingGap
 from tools.collect.gates import GateEntry
 from tools.collect.graph import Graph
 from tools.collect.model import ContractRecord, ModuleRecord
-from tools.collect.registries import FailOpenEntry
+from tools.collect.registries import FailOpenEntry, _sort_key as _fail_open_sort_key
 from tools.collect.risk import RiskEntry
 
 #: The exact nine pages COLLECT-18's brief names, in the order `render_all`
@@ -191,7 +191,10 @@ def render_contracts(contracts: Iterable[ContractRecord]) -> str:
 def render_fail_open_registry(entries: Iterable[FailOpenEntry]) -> str:
     """One row per `FailOpenEntry` (COLLECT-9): location, exception type,
     and the literal source-comment rationale, if any."""
-    entries = sorted(entries, key=lambda e: e.location)
+    # AUTO-FIX: sorting "file.py:N" as a plain string put :100 before :20.
+    # registries.py already has the correct (path, int(line)) key used when
+    # building this registry (COLLECT-3); reuse it.
+    entries = sorted(entries, key=_fail_open_sort_key)
     lines = [_h(1, "FAIL_OPEN_REGISTRY"), ""]
     if not entries:
         lines.append("_No fail-open sites recorded._")

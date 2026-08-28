@@ -67,6 +67,14 @@ from typing import Callable
 
 from tools.auto.utils import atomic_write_text, chars_per_token
 
+# Bugfix: "LlmSettings" is used in annotations here but was only imported
+# inside _default_llm_settings's body. Under `from __future__ import
+# annotations` that stayed dormant until typing.get_type_hints() resolved
+# the string against module globals and raised NameError. A module-level
+# import is safe (llm_profile.py imports nothing from this package) and a
+# TYPE_CHECKING-gated one would not fix it — that block never executes.
+from tools.auto.llm_profile import LlmSettings
+
 logger = logging.getLogger(__name__)
 
 # ── constants ─────────────────────────────────────────────────────────────────

@@ -68,8 +68,12 @@ class OrchestratorActions:
         body = user_input.strip()[len(command):].strip()
         if not body:
             return None, None
-        if "::" in body:                       # /<command> <file> :: <payload>
-            file_path, payload = body.split("::", 1)
+        # Bugfix: the bare substring "::" also matches inside identifiers
+        # ("std::vector"), so "/search std::vector in utils.cpp" was split
+        # on the symbol instead of falling through to the " in " form.
+        # The documented syntax has spaces around the separator.
+        if " :: " in body:                     # /<command> <file> :: <payload>
+            file_path, payload = body.split(" :: ", 1)
             return payload.strip(), file_path.strip()
         if " in " in body:                     # /<command> <payload> in <file>
             payload, file_path = body.rsplit(" in ", 1)
@@ -220,13 +224,45 @@ class OrchestratorActions:
             for _attempt in range(_RETRY):
                 ans = self._ask_over_text(query, file_path, source)
                 if ans is not None:
-                    return
+                    break
                 if _attempt < _RETRY - 1:
                     _wait = backoff.backoff_seconds(_attempt)
                     print(f"[{_ts()}] ⚠️  Retrying after error "
                           f"(attempt {_attempt + 2}/{_RETRY})...")
                     time.sleep(_wait)
-            print(f"[{_ts()}] ⚠️  Search unreachable after {_RETRY} attempts.")
+            if ans is None:
+                print(f"[{_ts()}] ⚠️  Search unreachable after {_RETRY} attempts.")
+                return
+
+            # BUGFIX: returning on any non-None answer skipped both checks
+            # the chunked path below applies — the model's "NONE" sentinel
+            # was reported as a found answer, and _validate_text_answer
+            # never ran on single-chunk files. Whether an answer gets
+            # grounded must not depend on whether the file needed chunking.
+            if not ans or ans.strip().upper() == "NONE":
+                print(f"[{_ts()}] No answer found in {file_path} for: {query}")
+                return
+
+            print(f"[{_ts()}] 🤖 Validating candidate answer...")
+            with Spinner("Search validator"):
+                validation = self._validate_text_answer(query, source, ans,
+                                                         stream_mode=self.stream_agents)
+
+            if validation.get("_api_error") or validation.get("_unparseable"):
+                print(f"[{_ts()}] ⚠️  Validator unavailable — accepting answer as-is. "
+                      f"({validation.get('feedback', '')})")
+                print(f"[{_ts()}] ✅ Answer found in {file_path} (unvalidated).")
+                return
+
+            if validation.get("status") == "approved":
+                print(f"[{_ts()}] ✅ Answer found in {file_path} "
+                      f"(validated, grounded={validation.get('grounded')}).")
+                return
+
+            feedback = (validation.get("feedback") or "").strip()
+            if feedback:
+                print(f"[{_ts()}] ❗ Answer rejected: {feedback}")
+            print(f"[{_ts()}] No chunk contained a validated answer to: {query}")
             return
 
         # File too large for one context → allowed to split.
@@ -637,12 +673,20 @@ class OrchestratorActions:
 
     @staticmethod
     def _strip_code_fence(text: str) -> str:
-        """If the model wrapped the whole file in a ``` fence, return the inside."""
+        """If the model wrapped the whole file in a ``` fence, return the inside.
+
+        BUGFIX: stripping fired on a leading "```" with no matching closer,
+        deleting the real first line of e.g. a markdown file that opens with
+        a fenced snippet. Requires a genuine whole-body wrap now.
+        """
         t = text.strip()
         if t.startswith("```"):
-            t = t.split("\n", 1)[1] if "\n" in t else ""
-            if t.rstrip().endswith("```"):
-                t = t.rstrip()[:-3]
+            if "\n" not in t:
+                t = ""
+            else:
+                rest = t.split("\n", 1)[1]
+                if rest.rstrip().endswith("```"):
+                    t = rest.rstrip()[:-3]
         return t.rstrip("\n") + "\n"
 
     def _edit_file_content(self, instruction: str, file_label: str,

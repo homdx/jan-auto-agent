@@ -246,7 +246,17 @@ def make_collect_bridge(
     `test_collect_model_loaded_once_per_run`).
     """
     key = "use_in_doc" if task_mode == "docs" else "use_in_auto"
-    if not config.getboolean("collect", key, fallback=False):
+    # Bugfix (config-crash audit): unguarded. Wrapped per-call, not via a
+    # helper, so extract_config_reads still sees the literal call.
+    try:
+        use_collect = config.getboolean("collect", key, fallback=False)
+    except ValueError as exc:
+        logger.warning(
+            "config [collect] %s is malformed (%s) — using default False",
+            key, exc,
+        )
+        use_collect = False
+    if not use_collect:
         return None
     try:
         from tools.collect.loader import load as load_collect_model
@@ -272,7 +282,15 @@ def make_collect_bridge(
             getattr(model, "reason", ""),
         )
 
-    max_chars = config.getint("collect", "max_context_chars_auto", fallback=_DEFAULT_MAX_CONTEXT_CHARS)
+    try:
+        max_chars = config.getint(
+            "collect", "max_context_chars_auto", fallback=_DEFAULT_MAX_CONTEXT_CHARS)
+    except ValueError as exc:
+        logger.warning(
+            "config [collect] max_context_chars_auto is malformed (%s) — using default %r",
+            exc, _DEFAULT_MAX_CONTEXT_CHARS,
+        )
+        max_chars = _DEFAULT_MAX_CONTEXT_CHARS
 
     summarizer_call = None
     if config.getboolean("collect", "llm_summaries", fallback=True):

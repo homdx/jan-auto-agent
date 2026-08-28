@@ -26,6 +26,27 @@ REPO_ROOT = Path(__file__).parent.parent
 FIXTURE_ROOT = Path(__file__).parent / "fixtures" / "collect_mini_repo"
 
 
+def _line_of(rel_path: str, needle: str) -> int:
+    """1-based line number of the only line in *rel_path* containing *needle*.
+
+    These citations used to be hardcoded (`prompt_store.py:193`) and drifted
+    every time a fix added lines above them — 222 -> 284 -> 292 for the
+    os.replace anchor alone, three separate test updates. Locate them from
+    the source instead so the next fix above them doesn't break these tests.
+    """
+    lines = (REPO_ROOT / rel_path).read_text(encoding="utf-8").splitlines()
+    hits = [i for i, ln in enumerate(lines, start=1) if needle in ln]
+    assert len(hits) == 1, f"{needle!r} matched {len(hits)} lines in {rel_path}"
+    return hits[0]
+
+
+#: `data[agent_name]` is UNGUARDED here, `stack[-1]` is GUARDED (via the
+#: `entry.get("stack")` alias two lines up) — one line, two guard statuses.
+_MIXED_LINE = 'data[agent_name]["current_version"] = stack[-1]["version"] if stack'
+#: A line genuinely inside _save's try block.
+_SAVE_BODY_LINE = "os.replace(tmp_path, self.store_path)"
+
+
 def _real_repo_index():
     modules = scan_repo(REPO_ROOT)
     fail_open = build_fail_open_registry(modules, root=REPO_ROOT)
@@ -151,15 +172,15 @@ def test_unknown_location_is_not_safe_and_not_guessed():
 # two different subscript expressions, one guarded and one not, would
 # report the whole location "safe: guarded", which could wrongly suppress
 # a real finding about the *other*, unguarded expression on that same
-# line. Real in this repo: `tools/prompt_store.py:193` is
-# `data[agent_name]["current_version"] = stack[-1]["version"] if stack
-# else 0` — `data[agent_name]` is UNGUARDED, `stack[-1]` is GUARDED (via
-# the `entry.get("stack")` alias two lines up).
+# line. Real in this repo: the `data[agent_name]["current_version"] =
+# stack[-1]["version"] if stack else 0` line in `tools/prompt_store.py`
+# (located by _MIXED_LINE, not pinned by number — it drifts).
 
 
 def test_real_mixed_line_without_access_is_ambiguous_not_optimistically_guarded():
     index = _real_repo_index()
-    answer = index.query("tools/prompt_store.py:193")
+    line = _line_of("tools/prompt_store.py", _MIXED_LINE)
+    answer = index.query(f"tools/prompt_store.py:{line}")
     assert answer.safe is False
     assert answer.reason == "ambiguous_location"
     assert "data[agent_name]" in answer.detail
@@ -168,7 +189,8 @@ def test_real_mixed_line_without_access_is_ambiguous_not_optimistically_guarded(
 
 def test_real_mixed_line_disambiguated_via_access_resolves_the_guarded_one():
     index = _real_repo_index()
-    answer = index.query("tools/prompt_store.py:193", access="stack[-1]")
+    line = _line_of("tools/prompt_store.py", _MIXED_LINE)
+    answer = index.query(f"tools/prompt_store.py:{line}", access="stack[-1]")
     assert answer.safe is True
     assert answer.reason == "guarded"
 
@@ -180,7 +202,8 @@ def test_real_mixed_line_disambiguated_via_access_does_not_falsely_clear_the_ung
     # come back "guarded" (borrowing stack[-1]'s status), whatever else it
     # resolves to.
     index = _real_repo_index()
-    answer = index.query("tools/prompt_store.py:193", access="data[agent_name]")
+    line = _line_of("tools/prompt_store.py", _MIXED_LINE)
+    answer = index.query(f"tools/prompt_store.py:{line}", access="data[agent_name]")
     assert answer.reason != "guarded"
 
 
@@ -252,8 +275,8 @@ def test_real_prompt_store_unrelated_methods_no_longer_falsely_match_save_contra
 
 def test_real_prompt_store_save_body_still_matches_its_own_contract():
     index = _real_repo_index()
-    # A line actually inside _save's try block (the os.replace call).
-    answer = index.query("tools/prompt_store.py:284")  # os.replace line; shifted from 222 by the PromptStore._load quarantine fix — see tests/test_prompt_store_corrupt.py
+    line = _line_of("tools/prompt_store.py", _SAVE_BODY_LINE)
+    answer = index.query(f"tools/prompt_store.py:{line}")
     assert answer.safe is True
     assert answer.reason == "contract"
     assert "prompt_store_atomic_save" in answer.detail

@@ -111,16 +111,21 @@ class OutputFormatter:
         # 5. Evaluate Intent Matrices Filtering Threshold Rules
         intent = parsed.intent
 
-        # Section: EXPLANATION (Skipped for intent='show')
-        if intent != "show":
+        # Section: EXPLANATION (Skipped for intent='show'/'show_imports')
+        # Bugfix: "show_imports" is a distinct intent (prompt_parser.py)
+        # that should behave like "show", but this gate only matched the
+        # literal "show" and printed a spurious EXPLANATION under the list.
+        if intent not in ("show", "show_imports"):
             explanation_text = (improvement.get("explanation") or "").strip()
             if explanation_text:
                 print("# EXPLANATION")
                 print(explanation_text)
                 print()
 
-        # Sections: ISSUES, IMPROVED CODE, CHANGES (Skipped for intent='show' or intent='explain')
-        if intent not in ("show", "explain"):
+        # Sections: ISSUES, IMPROVED CODE, CHANGES
+        # (Skipped for intent='show'/'show_imports'/'explain' — same bug as
+        # the EXPLANATION gate above: show_imports was missing here too.)
+        if intent not in ("show", "show_imports", "explain"):
             # Sub-Section: ISSUES
             print("# ISSUES")
             issues = improvement.get("issues", [])

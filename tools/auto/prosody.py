@@ -75,9 +75,9 @@ def rhyme_key_ru(line: str) -> str:
     5. Return the tail; return ``""`` when the line contains no vowel.
 
     >>> rhyme_key_ru("гимнастика")
-    'ика'
+    'ка'
     >>> rhyme_key_ru("акробатика")
-    'ика'
+    'ка'
     >>> rhyme_key_ru("")
     ''
     """

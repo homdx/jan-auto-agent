@@ -527,10 +527,34 @@ def make_outer_loop(
     fact/prosody gates see the run goal even when the architect didn't echo
     it into a task's own ``instruction``.
     """
-    max_rounds             = config.getint("auto", "max_rounds_per_task",
-                                           fallback=_DEFAULT_MAX_ROUNDS)
-    rewrite_every_n_rounds = config.getint("auto", "rewrite_every_n_rounds", fallback=2)
-    max_rewrites           = config.getint("auto", "max_rewrites",           fallback=5)
+    # Bugfix (config-crash audit): all three were unguarded. Wrapped
+    # per-call, not via a helper, so extract_config_reads still sees the
+    # literal calls.
+    try:
+        max_rounds = config.getint("auto", "max_rounds_per_task",
+                                   fallback=_DEFAULT_MAX_ROUNDS)
+    except ValueError as exc:
+        logger.warning(
+            "config [auto] max_rounds_per_task is malformed (%s) — using default %r",
+            exc, _DEFAULT_MAX_ROUNDS,
+        )
+        max_rounds = _DEFAULT_MAX_ROUNDS
+    try:
+        rewrite_every_n_rounds = config.getint("auto", "rewrite_every_n_rounds", fallback=2)
+    except ValueError as exc:
+        logger.warning(
+            "config [auto] rewrite_every_n_rounds is malformed (%s) — using default 2",
+            exc,
+        )
+        rewrite_every_n_rounds = 2
+    try:
+        max_rewrites = config.getint("auto", "max_rewrites", fallback=5)
+    except ValueError as exc:
+        logger.warning(
+            "config [auto] max_rewrites is malformed (%s) — using default 5",
+            exc,
+        )
+        max_rewrites = 5
 
     # selfrun E2E finding: the rewrite condition requires rnd >= 3, so with
     # max_rounds_per_task <= 2 a configured rewriter can NEVER fire — and

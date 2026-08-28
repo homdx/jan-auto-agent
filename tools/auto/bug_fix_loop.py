@@ -703,13 +703,22 @@ class BugFixLoop:
             # by either route.
             settled = (self._state.get_task(fix_id) or {}).get("status") == STATUS_DONE
             if not sha and not settled:
+                # AUTO-FIX: this branch is reached in both modes but always
+                # blamed "the commit (git error)". In no-git mode no git ran
+                # at all — sha is None by construction and the failure is in
+                # the state store. Report what actually failed.
+                no_git_mode = self._cos is None
+                reason = (
+                    "could not mark the fix task DONE (no-git mode)"
+                    if no_git_mode else "the commit failed (git error)"
+                )
                 logger.error(
-                    "BugFixLoop: fix task %s passed its check but the commit "
-                    "failed (git error) — NOT marking %s fixed",
-                    fix_id, ticket_id,
+                    "BugFixLoop: fix task %s passed its check but %s — "
+                    "NOT marking %s fixed",
+                    fix_id, reason, ticket_id,
                 )
                 self._state.log(
-                    f"bug {ticket_id} fix passed but the commit failed "
+                    f"bug {ticket_id} fix passed but {reason} "
                     f"(attempt {attempts}/{self._max_fix_attempts}) — "
                     f"not marking fixed"
                 )

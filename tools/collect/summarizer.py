@@ -301,6 +301,10 @@ def summarize_repo(
             done = dict(state.get("modules", {}))
 
     # Modules that will actually need an LLM call (used for progress totals).
+    # AUTO-FIX: `modules` is only required to be an iterable but is
+    # consumed here and again in the loop below, so a one-shot generator
+    # would leave the main loop with zero modules. Snapshot once.
+    modules = list(modules)
     total = sum(
         1 for m in modules
         if m.parse_error is None and done.get(m.path) is None

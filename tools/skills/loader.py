@@ -421,8 +421,25 @@ def load_skill(
 
     # ── budget ───────────────────────────────────────────────────────────────
     num_ctx = _active_num_ctx(config)
-    min_num_ctx = adapter.getint("skill", "min_num_ctx", fallback=DEFAULT_MIN_NUM_CTX)
-    fraction = adapter.getfloat("skill", "budget_fraction", fallback=DEFAULT_BUDGET_FRACTION)
+    # Bugfix (config-crash audit): both reads were unguarded. Wrapped
+    # per-call, not via a helper, so extract_config_reads still sees the
+    # literal calls.
+    try:
+        min_num_ctx = adapter.getint("skill", "min_num_ctx", fallback=DEFAULT_MIN_NUM_CTX)
+    except ValueError as exc:
+        logger.warning(
+            "config [skill] min_num_ctx is malformed (%s) — using default %r",
+            exc, DEFAULT_MIN_NUM_CTX,
+        )
+        min_num_ctx = DEFAULT_MIN_NUM_CTX
+    try:
+        fraction = adapter.getfloat("skill", "budget_fraction", fallback=DEFAULT_BUDGET_FRACTION)
+    except ValueError as exc:
+        logger.warning(
+            "config [skill] budget_fraction is malformed (%s) — using default %r",
+            exc, DEFAULT_BUDGET_FRACTION,
+        )
+        fraction = DEFAULT_BUDGET_FRACTION
     policy = adapter.get("skill", "on_overflow", fallback="error").strip().lower()
 
     if num_ctx <= 0:

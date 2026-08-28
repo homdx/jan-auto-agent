@@ -389,6 +389,17 @@ class GitManager:
                 "  Possible causes: stale .git/index.lock, a hung git hook, "
                 "or an unresponsive remote."
             ) from exc
+        except OSError as exc:
+            # Only TimeoutExpired was caught, unlike the sibling call sites in
+            # this module: a missing git binary or a vanished repo_dir escaped
+            # as a bare OSError past callers that catch GitError.
+            raise GitError(
+                f"{error_msg} ({exc})\n"
+                f"  cmd : {' '.join(cmd)}\n"
+                "  Possible causes: git is not installed / not on PATH, or "
+                f"repo_dir ({self.repo_dir!r}) does not exist or is not "
+                "accessible."
+            ) from exc
         if result.returncode != 0:
             raise GitError(
                 f"{error_msg}\n"

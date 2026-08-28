@@ -201,12 +201,18 @@ class Orchestrator(OrchestratorActions):
         # path and re-raised as a clear, actionable error instead of a
         # bare traceback from deep inside configparser.
         if os.path.exists(config_path):
+            # Bugfix: ConfigParser.read() MERGES, so a key deleted from
+            # agents.ini between two /reloads kept its stale value forever.
+            # Parse into a fresh instance and swap only on success — a
+            # malformed file then still leaves the last-good config intact.
+            _new_config = configparser.ConfigParser(inline_comment_prefixes=(';', '#'))
             try:
-                self.config.read(config_path, encoding="utf-8")
+                _new_config.read(config_path, encoding="utf-8")
             except configparser.Error as exc:
                 raise configparser.Error(
                     f"{config_path} is not a valid .ini file: {exc}"
                 ) from exc
+            self.config = _new_config
         
         # AUTO-T1 FIX: fallback= only handles MISSING keys; a present-but-malformed
         # value (e.g. max_iterations = abc) raises ValueError with a raw traceback.
@@ -301,10 +307,13 @@ class Orchestrator(OrchestratorActions):
         Uses the [direct_chat] temperature from agents.ini (default 0.3).
         Streams the reply token-by-token to stdout, same as other agents.
         """
-        temperature = self.config.getfloat("direct_chat", "temperature", fallback=0.3)
+        # Bugfix (config-crash audit): these bypassed this file's own
+        # _getfloat/_getint helpers, so a malformed [direct_chat] value
+        # raised ValueError and crashed every direct-chat turn.
+        temperature = self._getfloat("direct_chat", "temperature", 0.3)
         # Clamp to >=0: a negative config value should not be interpreted as
         # "unlimited" (it isn't — see the _max_msgs note below).
-        history_max_turns = max(0, self.config.getint("direct_chat", "history_max_turns", fallback=10))
+        history_max_turns = max(0, self._getint("direct_chat", "history_max_turns", 10))
 
         base = self.base_url.rstrip("/")
         if self.api_format == "ollama":
@@ -385,7 +394,10 @@ class Orchestrator(OrchestratorActions):
             print(f"Error: Target path is not a valid file: '{parsed.file_path}'")
             return
 
-        ext = Path(parsed.file_path).suffix
+        # Bugfix: _CODE_EXTENSIONS is all-lowercase, so "app.PY" was
+        # treated as a non-code file and routed to question-answering
+        # instead of block extraction.
+        ext = Path(parsed.file_path).suffix.lower()
 
         try:
             source = file_reader.read_file(target_path)
@@ -594,8 +606,11 @@ class Orchestrator(OrchestratorActions):
             elapsed_time=total_elapsed,
             iteration=iteration,
             output_config={
-                "show_timing": self.config.getboolean("output", "show_timing", fallback=True),
-                "show_iteration_count": self.config.getboolean("output", "show_iteration_count", fallback=True),
+                # Bugfix (config-crash audit): same helper bypass as the
+                # direct_chat reads above — a malformed [output] value
+                # crashed the render pipeline.
+                "show_timing": self._getboolean("output", "show_timing", True),
+                "show_iteration_count": self._getboolean("output", "show_iteration_count", True),
                 "max_iterations": self.max_iterations
             },
             prompt_version=self.prompt_store.get_version_label("validator_agent")

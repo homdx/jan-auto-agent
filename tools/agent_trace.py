@@ -67,7 +67,17 @@ class AgentTracer:
         # every llm_request, even when console_echo is off / max_field_chars
         # would otherwise truncate it. LLM_DEBUG=1 (or unset) leaves the
         # normal head/tail preview behavior untouched.
-        self.llm_debug: int = int(os.environ.get("LLM_DEBUG", "0") or 0)
+        # AUTO-FIX: the tracer is a module-level singleton, so this runs at
+        # import time — a non-numeric LLM_DEBUG ("true", a typo) raised
+        # ValueError and broke the import for every module that imports it.
+        try:
+            self.llm_debug: int = int(os.environ.get("LLM_DEBUG", "0") or 0)
+        except (TypeError, ValueError):
+            logger.warning(
+                "AgentTracer: LLM_DEBUG=%r is not a valid integer — "
+                "defaulting to 0", os.environ.get("LLM_DEBUG"),
+            )
+            self.llm_debug = 0
         self.path: Optional[Path] = None
         self.max_field_chars: int = 4000
         self._seq: int = 0

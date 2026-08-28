@@ -274,10 +274,16 @@ def detect_language(text: str) -> "str | None":
     total = sum(counts.values())
     if total < 8:           # too little signal to be sure
         return None
-    lang, n = max(counts.items(), key=lambda kv: kv[1])
-    if n == 0 or (n / total) < 0.30:
+    max_n = max(counts.values())
+    if max_n == 0 or (max_n / total) < 0.30:
         return None
-    return lang
+    # AUTO-FIX (bug 44): max(counts.items(), ...) breaks ties by insertion
+    # order, so an exact Russian/English tie always returned "Russian". A
+    # tie is the ambiguous case this docstring says returns None.
+    tied = [name for name, n in counts.items() if n == max_n]
+    if len(tied) > 1:
+        return None
+    return tied[0]
 
 
 def resolve_creative_language(

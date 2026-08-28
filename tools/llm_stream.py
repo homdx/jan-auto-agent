@@ -440,9 +440,21 @@ def ollama_chat_url(base_url: str) -> str:
 def strip_json_fence(text: str) -> str:
     """Strip a ```json ... ``` or ``` ... ``` fence wrapping a JSON blob, if present."""
     if "```json" in text:
-        return text.split("```json")[1].split("```")[0].strip()
+        rest = text.split("```json", 1)[1]
+        # AUTO-FIX: a lone opening fence (output truncated mid-stream) fell
+        # through to split("```")[0], which returns `rest` unchanged and
+        # silently discards everything before the fence. Require a
+        # confirmed closer before treating it as a fenced block.
+        if "```" in rest:
+            return rest.split("```")[0].strip()
+        return text
     if "```" in text:
-        return text.split("```")[1].split("```")[0].strip()
+        before, _, rest = text.partition("```")
+        if "```" in rest:
+            return rest.split("```")[0].strip()
+        # Only a single, unmatched "```" — not a real fence pair. Don't
+        # discard whatever precedes it.
+        return text
     return text
 
 

@@ -1052,6 +1052,16 @@ class FaqAgent:
         for _attempt in range(_LEGACY_RETRY_ATTEMPTS):
             try:
                 if stream:
+                    # AUTO-FIX (bug 45): on_token writes straight to stdout
+                    # with no separator, so a stream dropped mid-answer was
+                    # followed by the retry's answer from word one — reading
+                    # as one garbled generation. Mark the restart.
+                    if _attempt > 0:
+                        sys.stdout.write(
+                            f"\n[…retrying — previous stream was interrupted; "
+                            f"attempt {_attempt + 1}/{_LEGACY_RETRY_ATTEMPTS}…]\n"
+                        )
+                        sys.stdout.flush()
                     reply = request_completion(
                         url, headers, payload, self.timeout,
                         stream=True,

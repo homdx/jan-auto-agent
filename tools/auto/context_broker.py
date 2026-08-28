@@ -153,7 +153,21 @@ class ContextBroker:
         # not a symbol or a phrase that appears in the prose — so the
         # section/entity extractors below would never match it. Resolve such a
         # request to the requested file's full (capped) content directly.
-        if remaining:
+        #
+        # AUTO-FIX: _resolve_whole_file()'s bare-stem fallback matches ANY
+        # symbol against ANY prose file's stem, so in a code task a "config"
+        # symbol resolved to docs/config.md's entire text and preempted the
+        # real code search — contradicting this pass's own claim that a code
+        # symbol never accidentally resolves to a file here.
+        #
+        # Gate off only for a non-empty, all-code target_files. Empty is
+        # deliberately NOT gated: resolve() is called with no target_files
+        # (chapter helpers, this module's tests) to exercise Pass 0 alone,
+        # and any() over an empty sequence is False.
+        is_code_only_task = bool(target_files) and not any(
+            Path(t).suffix.lower() in _PROSE_EXTS for t in target_files
+        )
+        if remaining and not is_code_only_task:
             for sym in list(remaining):
                 whole = self._resolve_whole_file(sym, base_dir, target_files)
                 if whole:

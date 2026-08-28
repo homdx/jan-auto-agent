@@ -404,7 +404,7 @@ class LLMGate2Validator:
             from tools.auto.utils import resolve_creative_language  # noqa: PLC0415
 
             sample = ""
-            for rel in (getattr(coder_result, "files", None) or []):
+            for rel in (getattr(coder_result, "files_written", None) or []):
                 try:
                     sample = (_Path(base_dir) / str(rel)).read_text(
                         encoding="utf-8", errors="replace")
@@ -887,6 +887,31 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
         ),
     ]
 
+    # ── English "NO, <it's all good>" discourse-filler guard ────────────────
+    # BUGFIX: the subject phrase was optional before every adjective, so a
+    # bare "NO GOOD: <reason>" — the English idiom for "this is bad", and
+    # shaped like a REJECT verdict — matched as affirmative and inverted a
+    # real rejection. Only GOOD now requires an explicit subject ("no, it's
+    # good"); "no fine" / "no great" have no such negative reading.
+    _EN_DISCOURSE_OK = _re.compile(
+        r"^NO[,.]?\s*(?:"
+        r"(?:IT'?S|IT IS|THAT'?S|THAT IS|EVERYTHING'?S|EVERYTHING IS|ALL)"
+        r"\s*GOOD"
+        r"|(?:IT'?S|IT IS|THAT'?S|THAT IS|EVERYTHING'?S|EVERYTHING IS|ALL)?"
+        r"\s*(?:FINE|PERFECT|GREAT|OK|OKAY|CORRECT|IN ORDER)"
+        r")\b"
+    )
+
+    # ── English "NO <revisions/changes/…> NEEDED" approval guard ────────────
+    # AUTO-BUG: "NO REVISIONS NEEDED" is a clean approval, but the bare
+    # startswith("NO") check below read it as a rejection with the reason
+    # "REVISIONS NEEDED". Match the "nothing left to do" shape first.
+    _EN_NOTHING_NEEDED = _re.compile(
+        r"^NO\s+(?:FURTHER\s+|ADDITIONAL\s+|MORE\s+)?"
+        r"(?:REVISIONS?|CHANGES?|EDITS?|FIXES?|CORRECTIONS?|ADJUSTMENTS?)\s+"
+        r"(?:NEEDED|REQUIRED|NECESSARY)\b"
+    )
+
     # ── Scan: first try the first non-empty line; fall back to whole text ──
     candidates: list[str] = []
     first_line: str | None = None
@@ -920,12 +945,11 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
         # of language. Genuine rejections opening with "No" but naming an
         # actual problem ("No, this doesn't work", "No, fix the ending")
         # are unaffected — only an explicit all-good phrase is excluded.
-        if _re.match(
-            r"^NO[,.]?\s*(?:IT'?S|IT IS|THAT'?S|THAT IS|EVERYTHING'?S|"
-            r"EVERYTHING IS|ALL)?\s*(?:GOOD|FINE|PERFECT|GREAT|OK|OKAY|"
-            r"CORRECT|IN ORDER)\b",
-            upper,
-        ):
+        if _EN_DISCOURSE_OK.match(upper):
+            return True, "", False
+
+        # ── English "NO <revisions/changes/…> NEEDED" approval guard ─────
+        if _EN_NOTHING_NEEDED.match(upper):
             return True, "", False
 
         # ── English REVISE / REJECT / NO ─────────────────────────────────
@@ -959,6 +983,8 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
             if not _lu:
                 continue
             if _lu.startswith("APPROVED") or _re.match(r"^OK\b", _lu):
+                return True, "", False
+            if _EN_DISCOURSE_OK.match(_lu) or _EN_NOTHING_NEEDED.match(_lu):
                 return True, "", False
             for token in ("REVISE", "REJECT", "NO"):
                 if _lu.startswith(token):
@@ -1515,10 +1541,20 @@ def make_inner_loop(
     # AUTO-CR-16: creative editing/review benefits from more coder→review→
     # revise cycles than code. Prefer a creative-specific cap when set.
     from tools.auto.utils import _cfg_mode
-    max_attempts = int(_cfg_mode(
-        config, "auto", "max_attempts_per_task", task_mode,
-        fallback=str(_DEFAULT_MAX_ATTEMPTS),
-    ))
+    # Bugfix (config-crash audit): _cfg_mode returns the raw string by
+    # contract (callers cast), so a malformed max_attempts_per_task value
+    # crashed this int() with no fallback.
+    try:
+        max_attempts = int(_cfg_mode(
+            config, "auto", "max_attempts_per_task", task_mode,
+            fallback=str(_DEFAULT_MAX_ATTEMPTS),
+        ))
+    except ValueError as exc:
+        logger.warning(
+            "config [auto] max_attempts_per_task is malformed (%s) — using default %r",
+            exc, _DEFAULT_MAX_ATTEMPTS,
+        )
+        max_attempts = _DEFAULT_MAX_ATTEMPTS
 
     # ── API settings ─────────────────────────────────────────────────────────
     active_profile = config.get("api", "active", fallback="local")
@@ -1660,9 +1696,26 @@ def make_inner_loop(
 
 
     # ── AUTO-CR-21-4: hard per-task wall-clock guard ───────────────────────────
-    max_task_seconds = config.getint("auto", "max_task_seconds", fallback=1800)
-    require_tests = config.getboolean("inner_loop", "require_tests_code",
-                                      fallback=False)
+    # Bugfix (config-crash audit): both reads were unguarded. Wrapped
+    # per-call, not via a helper, so extract_config_reads still sees the
+    # literal calls.
+    try:
+        max_task_seconds = config.getint("auto", "max_task_seconds", fallback=1800)
+    except ValueError as exc:
+        logger.warning(
+            "config [auto] max_task_seconds is malformed (%s) — using default 1800",
+            exc,
+        )
+        max_task_seconds = 1800
+    try:
+        require_tests = config.getboolean("inner_loop", "require_tests_code",
+                                          fallback=False)
+    except ValueError as exc:
+        logger.warning(
+            "config [inner_loop] require_tests_code is malformed (%s) — using default False",
+            exc,
+        )
+        require_tests = False
 
     loop = InnerLoop(coder, executor, validator, max_attempts=max_attempts,
                      context_broker=broker,

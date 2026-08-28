@@ -415,7 +415,14 @@ class CommitOnSuccess:
                         "pre-existing chapter %s (bible was empty).",
                         _seed.name,
                     )
-                    self._story_bible.update(_seed_text)
+                    try:
+                        self._story_bible.update(_seed_text)
+                    except Exception as exc:
+                        logger.error(
+                            "CommitOnSuccess: bible bootstrap failed for "
+                            "%s: %s — commit outcome is unaffected.",
+                            _seed.name, exc,
+                        )
 
         for chapter_file in target_files:
             chapter_path = base_dir / chapter_file

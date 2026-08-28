@@ -38,6 +38,7 @@ Fail-open, like every Gate-3 gate: any error approves.
 
 from __future__ import annotations
 
+import glob
 import logging
 import re
 from dataclasses import dataclass, field
@@ -151,7 +152,13 @@ class ExistenceValidator:
         return suffix[1].lower() in self._extensions
 
     def _normalise(self, token: str) -> str:
-        return token.strip().strip("\"'()[],;:").lstrip("./")
+        token = token.strip().strip("\"'()[],;:")
+        # AUTO-FIX: lstrip("./") strips a *charset*, not the "./" prefix —
+        # ".hidden_test.py" became "hidden_test.py". Strip only real leading
+        # "./" and "../" path segments.
+        while token.startswith("./") or token.startswith("../"):
+            token = token.split("/", 1)[1] if "/" in token else token
+        return token.lstrip("/")
 
     def references(self, text: str) -> list[str]:
         """Distinct file references in *text*, in order of appearance."""
@@ -200,9 +207,12 @@ class ExistenceValidator:
                 # referenced from a nested doc), so fall back to a name match
                 # before calling it missing.
                 name = Path(ref).name
+                # AUTO-FIX: rglob() takes a glob pattern, so a reference
+                # like "handler[old].py" searched for a pattern, not that
+                # name. Escape it for a literal match.
                 if any(
                     p.name == name and not any(q.startswith(".") for q in p.parts)
-                    for p in base.rglob(name)
+                    for p in base.rglob(glob.escape(name))
                 ):
                     continue
                 missing.append(ref)

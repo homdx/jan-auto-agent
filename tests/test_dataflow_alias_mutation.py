@@ -113,3 +113,32 @@ def f(stack):
     return stack[-1]
 """
         assert _last_status(src) == "UNGUARDED"
+
+    def test_alias_created_outside_mutated_inside_nested_try(self):
+        """Bugfix regression: the alias dict was re-initialized empty on
+        each recursive descent, so an alias bound in the OUTER scope
+        (`alt = stack`) was invisible to a mutation inside a nested block."""
+        src = """
+def f(stack):
+    if not stack: return None
+    alt = stack
+    try:
+        alt.pop()
+    except Exception:
+        pass
+    return stack[-1]
+"""
+        assert _last_status(src) == "UNGUARDED"
+
+    def test_alias_created_and_mutated_both_inside_nested_if(self):
+        """Alias and mutation in the SAME nested block must also invalidate
+        the outer guard — worked before the fix, must keep working."""
+        src = """
+def f(stack):
+    if not stack: return None
+    if True:
+        alt = stack
+        alt.pop()
+    return stack[-1]
+"""
+        assert _last_status(src) == "UNGUARDED"

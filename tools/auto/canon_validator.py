@@ -192,14 +192,21 @@ class CanonValidator:
         # a token count — the char budget depends on the synopsis text's
         # script (Cyrillic tokenizes ~2x denser than Latin — see
         # chars_per_token()), so it's computed per-call in _load_canon().
-        self._canon_budget_tokens = max(0, int(num_ctx) - int(max_tokens) - _GROUNDING_OVERHEAD_TOKENS)
+        #
+        # num_ctx=0 is the "server/API default" sentinel every api_* section
+        # and main.py's _getint pass. Taken literally it collapsed the canon
+        # budget to 0 tokens; ContextAssembler already guards this same case.
+        _effective_num_ctx = int(num_ctx) if num_ctx else 4096
+        self._canon_budget_tokens = max(0, _effective_num_ctx - int(max_tokens) - _GROUNDING_OVERHEAD_TOKENS)
 
     # ── Cadence ──────────────────────────────────────────────────────────────
 
     @staticmethod
     def chapter_index(chapter_file: str) -> "int | None":
         """Return the numeric chapter index from a filename, or ``None``."""
-        m = _CHAPTER_RE.search(str(chapter_file))
+        # AUTO-FIX: searching the full path let a directory segment win —
+        # "chapter_2_drafts/chapter_10.txt" matched chapter 2, not 10.
+        m = _CHAPTER_RE.search(Path(str(chapter_file)).name)
         return int(m.group(1)) if m else None
 
     def should_check(self, chapter_file: str) -> bool:

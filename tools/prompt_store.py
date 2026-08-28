@@ -146,7 +146,13 @@ class PromptStore:
         entry = data.get(agent_name)
         if not entry or not entry.get("stack"):
             return "hardcoded"
-        return f"v{entry['current_version']}"
+        # Bugfix: raised KeyError when the stack is non-empty but
+        # current_version is absent (older store format, hand-edited file).
+        # get_current() and get_store_summary() already fall back to the top
+        # of the stack; this site — on main.py's per-turn path — did not.
+        stack = entry["stack"]
+        current_version = entry.get("current_version", stack[-1]["version"])
+        return f"v{current_version}"
 
     def push(self, agent_name: str, new_prompt: str, score: float) -> None:
         """

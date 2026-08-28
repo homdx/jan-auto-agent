@@ -99,7 +99,9 @@ class MetricsCollector:
         in this file (_load_all's per-file quarantine).
         """
         records = self._load_all()
-        recent = records[-n:] if len(records) >= n else records
+        # AUTO-FIX: for n=0 the slice was `records[-0:]`, and -0 == 0, so
+        # it returned the FULL list instead of an empty one.
+        recent = records[-n:] if n > 0 else []
         _fields = {f.name for f in fields(RunRecord)}
         out: List[RunRecord] = []
         for r in recent:
@@ -124,7 +126,9 @@ class MetricsCollector:
           worst_intent        - intent with the highest avg iteration count
         """
         records = self._load_all()
-        window = records[-n:] if len(records) >= n else records
+        # AUTO-FIX: same `records[-0:]` issue as load_recent() above — n=0
+        # meant "the entire history" instead of an empty window.
+        window = records[-n:] if n > 0 else []
         total = len(window)
 
         if total == 0:

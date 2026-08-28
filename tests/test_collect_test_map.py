@@ -122,6 +122,27 @@ def test_from_package_import_submodule_style_is_matched(tmp_path):
     assert test_map["pkg/sub.py"] == ("tests/test_sub.py",)
 
 
+def test_relative_import_from_dot_module_is_matched(tmp_path):
+    # Bugfix regression: `from .helper import run` dropped node.level, so
+    # it was recorded as bare "helper" — either losing the edge or matching
+    # an unrelated top-level helper.py. Needs the dot AND importer_path.
+    _write(tmp_path, "tests/helper.py", "def run():\n    return 1\n")
+    _write(tmp_path, "tests/test_uses_helper.py", "from .helper import run\n")
+    modules = scan_repo(tmp_path)
+    test_map = build_test_map(tmp_path, modules)
+    assert test_map["tests/helper.py"] == ("tests/test_uses_helper.py",)
+
+
+def test_relative_import_bare_dot_form_is_matched(tmp_path):
+    # Bugfix regression: `from . import helper` has node.module is None, so
+    # the old `... and node.module` guard skipped it entirely.
+    _write(tmp_path, "tests/helper.py", "def run():\n    return 1\n")
+    _write(tmp_path, "tests/test_uses_helper2.py", "from . import helper\n")
+    modules = scan_repo(tmp_path)
+    test_map = build_test_map(tmp_path, modules)
+    assert test_map["tests/helper.py"] == ("tests/test_uses_helper2.py",)
+
+
 # ── thin-list / zero-list: disjoint worklists ────────────────────────────
 
 

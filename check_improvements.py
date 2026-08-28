@@ -676,14 +676,29 @@ def main() -> None:
         _run_grade(folders, args, file_texts, whole_repo)
 
 
+def _folder_display_keys(folders: list[Path]) -> dict:
+    """Map each folder to a comparison-table key unique across *folders*.
+
+    AUTO-FIX (bug 42): keying by folder.name alone let two folders with the
+    same basename collide, silently dropping one agent from the comparison
+    table. Falls back to the full path only when the basename repeats.
+    """
+    names = [f.name for f in folders]
+    keys = {}
+    for f, name in zip(folders, names):
+        keys[f] = name if names.count(name) == 1 else str(f)
+    return keys
+
+
 def _run_grade(folders: list[Path], args, file_texts, whole_repo) -> None:
     ground_truth_path = Path(args.ground_truth) if args.ground_truth else None
+    folder_keys = _folder_display_keys(folders)
     results = {}
     for f in folders:
         r = grade_folder(f"Folder ({f})", f, args.overlap_ratio, ground_truth_path,
                           file_texts, whole_repo)
         if r:
-            results[f.name] = r
+            results[folder_keys[f]] = r
 
     graded = {n: r for n, r in results.items() if r.get("has_verdict")}
     if len(graded) < 2:
@@ -750,9 +765,10 @@ def _run_legacy(folders: list[Path], args, file_texts, whole_repo) -> None:
                 "relying on source-grounding scan only.", YELLOW))
 
     results = {}
+    folder_keys = _folder_display_keys(folders)
     for f in folders:
-        results[f.name] = report_folder(f"Folder ({f})", f / "IMPROVEMENTS.md", known_fps,
-                                         args.overlap_ratio, file_texts, whole_repo)
+        results[folder_keys[f]] = report_folder(f"Folder ({f})", f / "IMPROVEMENTS.md", known_fps,
+                                                  args.overlap_ratio, file_texts, whole_repo)
 
     print(f"\n{'='*76}")
     print(c("  COMPARISON", BOLD))

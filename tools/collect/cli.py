@@ -551,7 +551,9 @@ def action_refresh(
         # write) raises TypeError, not OSError/ValueError/KeyError. Matches
         # loader.py::_load_from_dir's existing (correct) guard so a corrupt
         # artifact degrades to "no previous manifest" instead of crashing.
-        except (OSError, ValueError, KeyError, TypeError):
+        # AttributeError added: a valid-JSON-but-non-dict artifact (bare
+        # list/number/string/null) makes payload.get(...) raise it.
+        except (AttributeError, OSError, ValueError, KeyError, TypeError):
             previous_manifest = None
             previous_by_path = {}
 
@@ -760,7 +762,9 @@ def action_module(
     # forms of a broken artifact.
     try:
         modules = [ModuleRecord.from_dict(d) for d in payload.get("modules", [])]
-    except (KeyError, TypeError, ValueError) as exc:
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
+        # Bugfix: AttributeError added — a valid-JSON-but-non-dict payload
+        # makes payload.get(...) raise it, and that fell through uncaught.
         raise CollectCliError(f"existing artifact at {artifact_path} is malformed: {exc}") from exc
     by_path = {m.path: m for m in modules}
 
@@ -938,7 +942,17 @@ def main(argv: List[str], root: Optional[str] = None, config_path: str = "agents
     base = Path(root or ".").resolve()
     config = configparser.ConfigParser(inline_comment_prefixes=(";", "#"))
     if Path(config_path).exists():
-        config.read(config_path, encoding="utf-8")
+        # AUTO-FIX: this sat OUTSIDE the try/except below, so a non-UTF-8
+        # agents.ini crashed the whole CLI entry point with an uncaught
+        # UnicodeDecodeError before it could report errors cleanly.
+        try:
+            config.read(config_path, encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            print(f"collect: {config_path} is not valid UTF-8 — {exc}")
+            return 1
+        except configparser.Error as exc:
+            print(f"collect: {config_path} is not a valid .ini file — {exc}")
+            return 1
 
     try:
         kwargs = parse_collect_args(argv)

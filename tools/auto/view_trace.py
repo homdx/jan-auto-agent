@@ -192,9 +192,22 @@ def load_events(trace_file: Path) -> list[dict]:
             if not line:
                 continue
             try:
-                events.append(json.loads(line))
+                evt = json.loads(line)
             except json.JSONDecodeError as exc:
                 print(f"  [warn] line {lineno}: {exc}", file=sys.stderr)
+                continue
+            # AUTO-FIX: a line can be valid JSON but not an object (a bare
+            # string, number or array). apply_filters() calls .get() on
+            # every event, so it raised AttributeError deep inside filtering
+            # instead of being reported here, where the bad record is.
+            if not isinstance(evt, dict):
+                print(
+                    f"  [warn] line {lineno}: expected a JSON object, got "
+                    f"{type(evt).__name__} — skipping",
+                    file=sys.stderr,
+                )
+                continue
+            events.append(evt)
     return events
 
 
@@ -215,8 +228,11 @@ def apply_filters(
     if sources:
         src_set = set(sources)
         events = [e for e in events if e.get("source") in src_set]
-    if tail and tail > 0:
-        events = events[-tail:]
+    # AUTO-FIX: `if tail and tail > 0` treats 0 as falsy, so `--tail 0`
+    # fell through and returned every event. Test "was --tail given"
+    # separately from "is it positive".
+    if tail is not None:
+        events = events[-tail:] if tail > 0 else []
     return events
 
 

@@ -268,7 +268,16 @@ def make_auto_tuner(
     if prompt_store is None:
         default_store = str(agent_dir / "auto_prompts.json")
         store_path_str = config.get("auto", "prompt_store_path", fallback=default_store)
-        max_versions = config.getint("prompt_store", "max_versions", fallback=3)
+        # Bugfix (config-crash audit): unguarded. Wrapped per-call, not via
+        # a helper, so extract_config_reads still sees the literal call.
+        try:
+            max_versions = config.getint("prompt_store", "max_versions", fallback=3)
+        except ValueError as exc:
+            logger.warning(
+                "config [prompt_store] max_versions is malformed (%s) — using default 3",
+                exc,
+            )
+            max_versions = 3
         prompt_store = PromptStore(store_path=Path(store_path_str), max_versions=max_versions)
 
     # Auto-metrics — isolated from interactive metrics.json (AUTO-E2)

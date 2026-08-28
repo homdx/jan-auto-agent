@@ -103,21 +103,45 @@ class ImprovementAgent:
             "Authorization": f"Bearer {self.api_key}"
         }
 
-        # pull prompt dynamically at call time so any push()/rollback()
-        # takes effect on the very next pipeline run with zero code change.
-        template = (
-            self.prompt_store.get_current("improvement_agent")
-            if self.prompt_store is not None
-            else IMPROVEMENT_PROMPT_HARDCODED
-        )
+        # Bugfix: get_current() can raise (corrupt prompts.json, missing
+        # directory) and a prompt-store outage must not kill the whole
+        # improvement pass. Matches validator_agent.py's guard.
+        try:
+            template = (
+                self.prompt_store.get_current("improvement_agent")
+                if self.prompt_store is not None
+                else IMPROVEMENT_PROMPT_HARDCODED
+            )
+        except Exception as e:  # noqa: BLE001 — prompt store outage must not kill improvement
+            logger.warning(
+                "ImprovementAgent: prompt store unavailable (%s) — "
+                "using hardcoded fallback prompt", e
+            )
+            template = IMPROVEMENT_PROMPT_HARDCODED
 
-        prompt = template.format(
-            intent=intent,
-            target_block=context.get("target_block"),
-            imports=context.get("imports"),
-            related_code=json.dumps(context.get("related_code"), indent=2),
-            context_lines=context.get("context_lines"),
-        )
+        # Bugfix: unguarded — a pushed prompt with a typo'd placeholder
+        # raises KeyError/ValueError from str.format and crashed the whole
+        # improvement pass. validator_agent.py already recovers from this.
+        try:
+            prompt = template.format(
+                intent=intent,
+                target_block=context.get("target_block"),
+                imports=context.get("imports"),
+                related_code=json.dumps(context.get("related_code"), indent=2),
+                context_lines=context.get("context_lines"),
+            )
+        except (KeyError, ValueError) as fmt_err:
+            logger.error(
+                "ImprovementAgent: prompt template has invalid placeholders (%s) — "
+                "rolling back to hardcoded prompt for this call", fmt_err
+            )
+            prompt = IMPROVEMENT_PROMPT_HARDCODED.format(
+                intent=intent,
+                target_block=context.get("target_block"),
+                imports=context.get("imports"),
+                related_code=json.dumps(context.get("related_code"), indent=2),
+                context_lines=context.get("context_lines"),
+            )
 
         # Select the per-intent system prompt from agents.ini when available.
         if intent == "explain" and self._system_explain:
@@ -196,6 +220,16 @@ class ImprovementAgent:
             content = strip_think(content)
             content = strip_json_fence(content)
             parsed_result = json.loads(content)
+            # Bugfix: json.loads() parses a bare `[]`/`null` fine, and the
+            # result was returned as-is. Callers (main.py's
+            # improvement.get("improved_code")) assume a dict, so this
+            # raised AttributeError deep in the render pipeline instead of
+            # taking the JSONDecodeError fallback below.
+            if not isinstance(parsed_result, dict):
+                raise json.JSONDecodeError(
+                    f"expected a JSON object, got {type(parsed_result).__name__}",
+                    content, 0,
+                )
             tracer.event("improvement_agent", "orchestrator", "result", content=parsed_result)
             return parsed_result
         except json.JSONDecodeError as e:
