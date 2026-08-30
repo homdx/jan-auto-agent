@@ -44,6 +44,7 @@ from tools.auto.repo_ingest import RESERVED_META_FILES
 from typing import Any
 
 from tools.agent_trace import tracer
+from tools.auto import arch_probe as _arch_probe
 from tools.auto.repo_ingest import RepoCluster
 from tools.auto.utils import atomic_write_text, file_set_fingerprint
 import tools.llm_stream as _llm_stream
@@ -417,6 +418,13 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
         # Default to disabling thinking for this call; [architect] think =
         # true re-enables it for a model/setup that needs it.
         self._think                  = config.getboolean(arch, "think", fallback=False)
+
+        # ── AUTO-P2: architect context probe ─────────────────────────────────
+        # Absent key ⇒ False ⇒ extract_probe_request is never called and every
+        # prompt/response path is byte-identical to pre-AUTO-P. AUTO-P3 adds
+        # the documented key to agents.ini; the other six agents_*.ini window
+        # profiles need no edit precisely because of this fallback.
+        self._probe_enabled          = config.getboolean(arch, "probe_enabled", fallback=False)
 
         # ── DM-2: select system prompt based on task_mode + ini overrides ─────
         # Priority: mode-specific ini key > legacy "system" key > built-in constant.
@@ -878,16 +886,22 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
             max_tasks: int, *,
             max_tokens: "int | None" = None,
             temperature: "float | None" = None,
-        ) -> "tuple[list[CandidateTask] | None, bool, bool]":
+        ) -> "tuple[list[CandidateTask] | None, bool, bool, list]":
             """One LLM call + parse at a given max_tasks budget.
 
-            Returns ``(candidates_or_None, truncated, unsalvageable)``.
-            ``None`` candidates means the call itself failed after all
-            transient-error retries (unrelated to either AUTO-H4/H5 —
-            see the network-retry loop below); ``truncated`` and
-            ``unsalvageable`` are only meaningful when candidates is not
-            ``None``, and are mutually exclusive (see
+            Returns ``(candidates_or_None, truncated, unsalvageable,
+            probe_request)``.  ``None`` candidates means the call itself
+            failed after all transient-error retries (unrelated to either
+            AUTO-H4/H5 — see the network-retry loop below); ``truncated``
+            and ``unsalvageable`` are only meaningful when candidates is
+            not ``None``, and are mutually exclusive (see
             ``_parse_candidates_ex``'s docstring).
+
+            AUTO-P2: ``probe_request`` is the list of
+            ``arch_probe.ProbeOp`` the Architect asked for, or ``[]``.
+            **Invariant: when it is non-empty, both ``truncated`` and
+            ``unsalvageable`` are forced ``False``** — see the block above
+            the return statement for why.
 
             *max_tokens*/*temperature*, when given, override this
             instance's own ``self._max_tokens``/``self._temperature`` for
@@ -1021,7 +1035,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 # None (not []) so callers can distinguish "call failed" from
                 # "call succeeded but LLM produced no valid candidates".  The
                 # checkpoint must NOT record a failed batch; None signals that.
-                return None, False, False
+                return None, False, False, []
 
             # Strip reasoning tokens before JSON parsing.
             cleaned = strip_think(raw_text)
@@ -1034,10 +1048,53 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 params={"cluster": cluster.name, "max_tasks": max_tasks},
             )
 
-            return self._parse_candidates_ex(cleaned, cluster.name, cluster.files)
+            _cands, _truncated, _unsalvageable = self._parse_candidates_ex(
+                cleaned, cluster.name, cluster.files
+            )
+
+            # ── AUTO-P2: probe detection, ahead of the ladder verdict ────────
+            # An "ARCH_PROBE: ..." reply is non-JSON prose, so
+            # _parse_candidates_ex above classifies it *unsalvageable*. Left
+            # alone, that hands it to the AUTO-H5 ladder, which re-asks the
+            # identical question up to empty_response_retry_max times at
+            # rising max_tokens/temperature — burning the whole budget while
+            # ignoring the request the model actually made, and reading in the
+            # logs as a flaky model rather than as a feature that never fires.
+            # Detecting it *here*, before the verdict leaves this closure, is
+            # what makes the invariant unconditional: a probe can never
+            # consume an H4 shrink or an H5 escalation.
+            #
+            # Both flags are cleared, not just `unsalvageable`. A single-line
+            # probe should never trip the truncation heuristic (which needs a
+            # partial `{...}` object), but forcing both keeps the guarantee a
+            # property of this branch rather than of _parse_candidates_ex's
+            # internals.
+            _probe_request: list = []
+            if self._probe_enabled:
+                try:
+                    _probe_request = _arch_probe.extract_probe_request(cleaned) or []
+                except Exception as exc:  # noqa: BLE001 — never fail the batch on this
+                    logger.warning(
+                        "review_one_cluster [%s]: probe parse raised (%s) — "
+                        "treating response as a normal (non-probe) reply.",
+                        cluster.name, exc,
+                    )
+                    _probe_request = []
+
+            if _probe_request:
+                _truncated = False
+                _unsalvageable = False
+                tracer.event(
+                    source="architect", target="probe", kind="probe_request",
+                    model=self._model,
+                    content=", ".join(str(op) for op in _probe_request),
+                    params={"cluster": cluster.name, "ops": len(_probe_request)},
+                )
+
+            return _cands, _truncated, _unsalvageable, _probe_request
 
         max_tasks = _base_max_tasks
-        candidates, truncated, unsalvageable = _call_and_parse(max_tasks)
+        candidates, truncated, unsalvageable, probe_request = _call_and_parse(max_tasks)
 
         _shrink_attempts = 0
         _empty_attempts = 0
@@ -1113,7 +1170,9 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                     cluster.name, _empty_attempts, _empty_retry_max, max_tasks,
                     _attempt_tokens, _attempt_temp,
                 )
-            candidates, truncated, unsalvageable = _call_and_parse(max_tasks, **_call_kwargs)
+            candidates, truncated, unsalvageable, probe_request = _call_and_parse(
+                max_tasks, **_call_kwargs
+            )
 
         if candidates is not None and truncated:
             # Shrink-retries exhausted (or disabled via
@@ -1137,6 +1196,25 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 "review_one_cluster [%s]: still unsalvageable after %d plain "
                 "retry attempt(s) — giving up on this batch with 0 candidates.",
                 cluster.name, _empty_attempts,
+            )
+
+        # AUTO-P2: a recognised probe request clears both ladder flags above,
+        # so the while-loop exits (or never runs) and control lands here with
+        # whatever the probe reply itself parsed to — normally nothing. That
+        # is the intended AUTO-P2 outcome: the batch yields no candidates, but
+        # it does so after ONE call instead of seven, and without a misleading
+        # "unsalvageable" warning. AUTO-P1 replaces this log with the
+        # probe execute → digest → re-ask loop; until then the operator needs
+        # to be able to see that the Architect asked for something nobody
+        # answered, which is exactly the signal the decision gate measures.
+        if candidates is not None and probe_request:
+            logger.info(
+                "review_one_cluster [%s]: architect requested context "
+                "(%d op(s): %s) — no probe handler installed yet (AUTO-P1); "
+                "returning %d candidate(s) without retrying.",
+                cluster.name, len(probe_request),
+                ", ".join(str(op) for op in probe_request),
+                len(candidates),
             )
 
         return candidates
