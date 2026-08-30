@@ -238,7 +238,10 @@ def _load_from_dir(collect_dir: Path, *, status: str, reason: str = "") -> Colle
             )
             for c in payload.get("config_map", [])
         )
-    except (KeyError, TypeError, ValueError):
+    except (AttributeError, KeyError, TypeError, ValueError):
+        # Bugfix: a valid-JSON-but-non-dict artifact.json made
+        # payload.get(...) raise AttributeError, which this tuple missed —
+        # breaking the docstring's "must never raise out of the loader".
         return _absent(collect_dir, "artifact has an unexpected shape — treated as absent")
 
     return CollectModel(

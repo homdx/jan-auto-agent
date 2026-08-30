@@ -955,7 +955,17 @@ class AutoController:
         """
         from tools.auto.bug_fix_loop import _FIX_PREFIX
 
-        max_rounds_cfg = cfg.getint("auto", "max_rounds_per_task", fallback=10)
+        # Bugfix (config-crash audit): unguarded, unlike RunLimits.from_config
+        # above. Wrapped per-call, not via a helper, so extract_config_reads
+        # still recognizes the literal call site.
+        try:
+            max_rounds_cfg = cfg.getint("auto", "max_rounds_per_task", fallback=10)
+        except ValueError as exc:
+            logger.warning(
+                "config [auto] max_rounds_per_task is malformed (%s) — using default 10",
+                exc,
+            )
+            max_rounds_cfg = 10
         for task in self.state.all_tasks():
             if task["status"] != STATUS_BLOCKED:
                 continue

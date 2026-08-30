@@ -355,7 +355,11 @@ class Executor:
         try:
             shutil.copytree(
                 self._base_dir, workspace,
-                ignore=_MIRROR_IGNORE, dirs_exist_ok=True, symlinks=True,
+                ignore=_MIRROR_IGNORE, dirs_exist_ok=True,
+                # SECURITY: copy symlink *targets*, not the links — a repo
+                # symlink pointing outside base_dir stayed live and
+                # traversable from inside the sandbox workspace.
+                symlinks=False,
             )
         except (OSError, shutil.Error) as exc:
             logger.warning(
@@ -379,17 +383,46 @@ class Executor:
 
         copied: list[str] = []
         missing: list[str] = []
+        base_resolved = self._base_dir.resolve()
+        workspace_resolved = workspace.resolve()
         for rel in target_files:
+            # SECURITY: an absolute `rel` silently discards the left operand
+            # of the "/" join (pathlib), and a "../" one is only resolved by
+            # the OS — either lets a crafted target_files entry read from and
+            # write to arbitrary paths. Require the join to stay inside both
+            # base_dir and workspace.
             src = self._base_dir / rel
+            dst = workspace / rel
+            try:
+                src.resolve().relative_to(base_resolved)
+                dst.resolve().relative_to(workspace_resolved)
+            except ValueError:
+                logger.warning(
+                    "_prepare_workspace: %r escapes base_dir/workspace — "
+                    "skipping copy", rel,
+                )
+                missing.append(rel)
+                continue
             if not src.exists():
                 logger.debug(
                     "_prepare_workspace: %r not found in base_dir — skipping copy", rel
                 )
                 missing.append(rel)
                 continue
-            dst = workspace / rel
             dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src, dst)
+            # AUTO-FIX: a target_files entry naming a directory made
+            # copy2() raise IsADirectoryError uncaught, aborting the copy of
+            # every remaining file. Skip just the bad one, fail-open like
+            # the "not found" branch above.
+            try:
+                shutil.copy2(src, dst)
+            except (IsADirectoryError, OSError) as exc:
+                logger.warning(
+                    "_prepare_workspace: could not copy %r into workspace "
+                    "(%s) — skipping", rel, exc,
+                )
+                missing.append(rel)
+                continue
             logger.debug("_prepare_workspace: copied %s → %s", src, dst)
             copied.append(rel)
 
@@ -562,7 +595,21 @@ class Executor:
 
         py_files = [f for f in target_files if f.endswith(".py")]
         if len(py_files) == 1:
-            return f"{self._python_bin} {py_files[0]}"
+            # AUTO-FIX: this f-string goes straight into
+            # subprocess.run(shell=True); an unquoted space in _python_bin
+            # ("/Users/Jane Doe/.venv/bin/python") or in the file name was
+            # word-split into two bogus arguments.
+            #
+            # Quoting must be per-platform: shell=True runs cmd.exe on
+            # Windows (which this executor supports — see the AUTO-CR-12 fix
+            # above), and cmd.exe ignores shlex.quote()'s single quotes, so
+            # a POSIX-only quote would reintroduce the bug there.
+            def _quote(s: str) -> str:
+                if os.name == "nt":
+                    return subprocess.list2cmdline([s])
+                return shlex.quote(s)
+
+            return f"{_quote(self._python_bin)} {_quote(py_files[0])}"
 
         return "pytest"
 

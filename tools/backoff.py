@@ -175,7 +175,12 @@ def sleep_with_interrupt_save(
         # cleanly — the interrupt itself must always win.
         try:
             save_state(state, path)
-        except OSError as exc:
+        except (OSError, TypeError, ValueError) as exc:
+            # AUTO-FIX: save_state() json.dumps a caller-supplied dict, so
+            # a non-serializable value (a set, a datetime) raises TypeError
+            # and some edge cases ValueError — neither was caught, which is
+            # exactly the "new exception inside a KeyboardInterrupt handler"
+            # the comment above exists to prevent.
             print(f"  ⚠  Could not save checkpoint: {exc}")
             print("  ▶  Restart will NOT be able to resume from this point.")
             sys.exit(0)

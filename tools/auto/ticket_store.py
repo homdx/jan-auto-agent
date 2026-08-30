@@ -447,7 +447,13 @@ class TicketStore:
         if not path.exists():
             raise TicketNotFound(f"Ticket '{ticket_id}' not found")
 
-        ticket = self._read(path)
+        try:
+            ticket = self._read(path)
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
+            self._quarantine(path, str(exc))
+            raise TicketSchemaError(
+                f"Ticket '{ticket_id}' is corrupt ({exc}) — quarantined"
+            ) from exc
         # AUTO-FIX: a file that is valid JSON of the wrong shape (a list,
         # a string) used to reach ticket.update(fields) below and raise a
         # raw AttributeError. get() already quarantines this exact case;

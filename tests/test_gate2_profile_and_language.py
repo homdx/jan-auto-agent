@@ -85,8 +85,22 @@ def test_creative_prompt_still_has_three_format_examples():
 
 
 class _Result:
+    # `files_written`, not `files`: CoderResult has never had a `files`
+    # attribute, so the production read returned None and the directive was
+    # always empty on real runs. The stub matched the bug, hiding it.
     def __init__(self, files):
-        self.files = files
+        self.files_written = files
+
+
+def test_stub_matches_the_real_coder_result_field():
+    """Pins the attribute name so the stub cannot drift from production again."""
+    from dataclasses import fields
+
+    from tools.auto.coder import CoderResult
+
+    names = {f.name for f in fields(CoderResult)}
+    assert "files_written" in names
+    assert "files" not in names
 
 
 def _validator(task_mode="creative", cfg_text="[validator_agent]\n"):

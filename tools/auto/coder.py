@@ -1361,14 +1361,14 @@ class Coder(_llm_stream.LLMClientBase):
             for i, m_open in enumerate(open_matches):
                 relpath = m_open.group(1).strip()
                 content_start = m_open.end()
-                # Find the matching <<<END>>> after this <<<FILE:>>> marker.
-                close_match = _FILE_CLOSE.search(body, content_start)
-                if close_match:
-                    content_end = close_match.start()
-                else:
-                    # No closing marker: take everything up to the next <<<FILE:>>>.
-                    next_open = open_matches[i + 1] if i + 1 < len(open_matches) else None
-                    content_end = next_open.start() if next_open else len(body)
+                next_open = open_matches[i + 1] if i + 1 < len(open_matches) else None
+                boundary = next_open.start() if next_open else len(body)
+                # BUGFIX: the <<<END>>> search was unbounded, so a missing
+                # closer here matched a *later* file's marker, folding every
+                # file in between into this one's content. Only accept a
+                # closer before the next <<<FILE:>>>.
+                close_match = _FILE_CLOSE.search(body, content_start, boundary)
+                content_end = close_match.start() if close_match else boundary
                 chunk = body[content_start:content_end].strip()
                 chunk = re.sub(r"\s*<<<END>>>\s*$", "", chunk)
                 if chunk:
@@ -2272,12 +2272,19 @@ def _strip_code_fence(text: str) -> str:
     Mirrors ``OrchestratorActions._strip_code_fence`` from tools/actions.py:
     if the model wrapped the whole file in ``` fences, return the inside.
     Preserves the final newline expected of well-formed source files.
+
+    BUGFIX: stripping fired on a leading "```" with no matching closer,
+    deleting the real first line of e.g. a markdown file that opens with a
+    fenced snippet. Requires a genuine whole-body wrap now.
     """
     t = text.strip()
     if t.startswith("```"):
-        t = t.split("\n", 1)[1] if "\n" in t else ""
-        if t.rstrip().endswith("```"):
-            t = t.rstrip()[:-3]
+        if "\n" not in t:
+            t = ""
+        else:
+            rest = t.split("\n", 1)[1]
+            if rest.rstrip().endswith("```"):
+                t = rest.rstrip()[:-3]
     return t.rstrip("\n") + "\n"
 
 

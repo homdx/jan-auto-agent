@@ -99,10 +99,24 @@ def _rich_import_targets(source: str) -> Set[str]:
         if isinstance(node, ast.Import):
             for alias in node.names:
                 names.add(alias.name)
-        elif isinstance(node, ast.ImportFrom) and node.module:
-            names.add(node.module)
-            for alias in node.names:
-                names.add(f"{node.module}.{alias.name}")
+        elif isinstance(node, ast.ImportFrom):
+            # Bugfix: relative imports were rebuilt from node.module alone,
+            # dropping node.level, so a package-internal import looked
+            # absolute and either matched an unrelated top-level module or
+            # resolved to nothing. Same bug graph.py's extract_imports
+            # already fixed; this reimplementation never picked it up.
+            dots = "." * node.level
+            module = node.module or ""
+            if module:
+                base = f"{dots}{module}"
+                names.add(base)
+                for alias in node.names:
+                    names.add(f"{base}.{alias.name}")
+            elif dots:
+                # `from . import X` / `from .. import X` — no module part;
+                # only the imported name itself is a resolvable candidate.
+                for alias in node.names:
+                    names.add(f"{dots}{alias.name}")
     return names
 
 
@@ -146,7 +160,10 @@ def build_test_map(
             # describes for a test file that fails to re-read/re-parse.
             continue
         for dotted in _rich_import_targets(source):
-            resolved = resolve_import(dotted, index)
+            # Bugfix: importer_path was never passed, so every relative
+            # name hit resolve_import's `importer_path is None` early
+            # return and was dropped even when correctly formed.
+            resolved = resolve_import(dotted, index, importer_path=t.path)
             if resolved is not None:
                 covering[resolved].add(t.path)
 

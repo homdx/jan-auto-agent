@@ -183,7 +183,7 @@ class PromptEvaluator:
 
         reason = (
             f"Insufficient improvement: Δ={delta:+.2f} "
-            f"(need ≥ 0.05; {current_score:.2f} → {candidate_score:.2f})"
+            f"(need > 0.05; {current_score:.2f} → {candidate_score:.2f})"
         )
         return EvalResult(promoted=False, reason=reason, score=candidate_score)
 

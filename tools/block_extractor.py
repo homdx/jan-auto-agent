@@ -997,8 +997,8 @@ def _find_block_start_line_fallback(source: str, target_name: str, file_ext: str
         for i, line in enumerate(lines, start=1):
             if def_pat.match(line) or class_pat.match(line):
                 # include decorators directly above
-                j = i - 1
-                while j >= 1 and re.match(r"^\s*@\S+", lines[j - 1]):
+                j = i
+                while j >= 2 and re.match(r"^\s*@\S+", lines[j - 2]):
                     j -= 1
                 return j
         return None

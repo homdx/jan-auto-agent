@@ -81,9 +81,16 @@ def _block_terminates(body: List[ast.stmt]) -> bool:
 def _falsy_guard_targets(test: ast.expr) -> "Tuple[Set[str], Set[Tuple[str, object]]]":
     """Names and `(name, key)` pairs a boolean test guards-as-falsy.
 
-    Recognizes `not x`, `not x.get(k)` (-> pair), `len(x) == 0`, `x is None`
-    at the top level, and inside any nesting depth of `or`-combinations —
-    but *not* inside an `and`.
+    Recognizes `not x`, `not x.get(k)` (-> pair), `len(x) == 0` at the top
+    level, and inside any nesting depth of `or`-combinations — but *not*
+    inside an `and`.
+
+    BUGFIX: `x is None` was recognized here too, marking a later `x[0]`
+    GUARDED. It proves only non-None-ness — `x = []` refutes it exactly as
+    a non-empty value does, so `x[0]` still raises IndexError. The sole
+    consumer is subscript-access safety, so this trades recall for
+    correctness, the direction this module already commits to: "a missed
+    guard is acceptable, a wrongly-kept one is not."
 
     That `and` exclusion is load-bearing, not an oversight: what this
     function computes is "what do we know for sure once `test` has
@@ -145,13 +152,8 @@ def _falsy_guard_targets(test: ast.expr) -> "Tuple[Set[str], Set[Tuple[str, obje
                 and right.value == 0
             ):
                 names.add(left.args[0].id)
-            elif (
-                isinstance(op, ast.Is)
-                and isinstance(left, ast.Name)
-                and isinstance(right, ast.Constant)
-                and right.value is None
-            ):
-                names.add(left.id)
+            # BUGFIX: `x is None` removed — proves non-None-ness, not
+            # non-emptiness. See the docstring.
             return
 
     visit(test)
@@ -347,7 +349,9 @@ def _nested_stmt_lists(stmt: ast.stmt) -> List[List[ast.stmt]]:
     return lists
 
 
-def _rebound_names_in(stmts: List[ast.stmt]) -> Set[str]:
+def _rebound_names_in(
+    stmts: List[ast.stmt], _inherited_aliases: "Optional[Dict[str, str]]" = None,
+) -> Set[str]:
     """Names any statement in `stmts` — at any nesting depth, but never
     crossing into a nested function/class's own separate dataflow scope —
     rebinds via a bare `x = <expr>` (the same shape `_invalidate_reassigned`
@@ -395,7 +399,13 @@ def _rebound_names_in(stmts: List[ast.stmt]) -> Set[str]:
     # the conservative direction this module's own docstring already
     # commits to elsewhere in this function: "a missed guard (false
     # positive downstream) is acceptable, a wrongly-kept one is not."
-    aliases: Dict[str, str] = {}
+    #
+    # BUGFIX: this dict was re-initialized empty on every recursive descent,
+    # so `alt = stack` at the top level was invisible to an `alt.pop()`
+    # inside a nested try/if — the later `stack[-1]` still claimed GUARDED.
+    # Inherit a *copy*, matching _FunctionGuardWalker's copy-on-descent, so
+    # aliases found inside a block don't leak back out to its siblings.
+    aliases: Dict[str, str] = dict(_inherited_aliases) if _inherited_aliases else {}
     for s in stmts:
         if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
             continue  # separate dataflow scope — a rebind there is irrelevant here
@@ -415,7 +425,7 @@ def _rebound_names_in(stmts: List[ast.stmt]) -> Set[str]:
                 if source_name == mutated:
                     names.add(alias_name)
         for nested in _nested_stmt_lists(s):
-            names |= _rebound_names_in(nested)
+            names |= _rebound_names_in(nested, aliases)
     return names
 
 
@@ -558,9 +568,14 @@ class _FunctionGuardWalker:
         containing the rebind can never share a control-flow path with
         anything after it.
         """
+        # BUGFIX: passed no alias state, so threading aliases through
+        # _rebound_names_in's own recursion (see its docstring) had no
+        # starting point. This is the live walk's entry point, so it must
+        # seed from self._aliases — the map _walk already maintains — or an
+        # alias bound before this statement stays invisible.
         rebound: Set[str] = set()
         for nested in (nested_lists if nested_lists is not None else _nested_stmt_lists(stmt)):
-            rebound |= _rebound_names_in(nested)
+            rebound |= _rebound_names_in(nested, self._aliases)
         if not rebound:
             return
         for name in rebound:

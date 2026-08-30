@@ -67,9 +67,14 @@ def main() -> None:
     # raise a raw configparser.Error with no indication of which file, deep
     # into argument setup instead of at the point of failure.
     try:
-        cfg.read(args.config, encoding="utf-8")
+        read_files = cfg.read(args.config, encoding="utf-8")
     except configparser.Error as exc:
         print(f"error: --config {args.config} is not a valid .ini file: {exc}", file=sys.stderr)
+        sys.exit(1)
+    # AUTO-FIX: ConfigParser.read() skips missing files silently, so a
+    # typo'd --config ran with an entirely empty config instead of failing.
+    if not read_files:
+        print(f"error: --config file not found: {args.config}", file=sys.stderr)
         sys.exit(1)
 
     if args.fresh:

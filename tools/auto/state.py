@@ -106,6 +106,18 @@ def make_task(
     return task
 
 
+def _matches_schema_type(value: Any, expected_type: type) -> bool:
+    """isinstance() check that rejects a bool for a non-bool expected_type.
+
+    AUTO-FIX (bug 43): bool subclasses int, so `"round": true` in a
+    malformed plan.json passed schema validation for an int field. No
+    _REQUIRED_TASK_FIELDS entry expects bool.
+    """
+    if isinstance(value, bool) and expected_type is not bool:
+        return False
+    return isinstance(value, expected_type)
+
+
 def _validate_task_schema(task: dict) -> None:
     """Raise ValueError if *task* violates the plan.json task schema."""
     # LOOP-3: backfill impl_version for tasks created before this field existed
@@ -115,7 +127,7 @@ def _validate_task_schema(task: dict) -> None:
     for field, expected_type in _REQUIRED_TASK_FIELDS.items():
         if field not in task:
             raise ValueError(f"Task schema violation: missing field '{field}'")
-        if not isinstance(task[field], expected_type):
+        if not _matches_schema_type(task[field], expected_type):
             raise ValueError(
                 f"Task schema violation: field '{field}' must be {expected_type.__name__}, "
                 f"got {type(task[field]).__name__}"
@@ -238,7 +250,10 @@ class StateStore:
         return list(self._plan.get("tasks", []))
 
     def get_goal(self) -> str:
-        return self._plan.get("goal", "")
+        # Bugfix: .get("goal", "") only falls back on a MISSING key, so an
+        # explicit `"goal": null` returned None and initialise()'s
+        # `.strip()` on the resume path raised AttributeError.
+        return self._plan.get("goal") or ""
 
     def get_progress(self) -> dict:
         return dict(self._progress)
@@ -700,14 +715,17 @@ class StateStore:
         atomic (see ``_atomic_write``); this recovery path is the safety net
         for any file that is corrupted despite that (e.g. a manual edit).
         """
+        # Bugfix: only JSONDecodeError was caught. Invalid UTF-8 bytes
+        # raise UnicodeDecodeError and an unreadable file raises OSError, so
+        # resume crashed instead of falling through to .bak recovery.
         try:
             return json.loads(path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError) as exc:
             bak = path.with_suffix(path.suffix + ".bak")
             if bak.exists():
                 try:
                     recovered = json.loads(bak.read_text(encoding="utf-8"))
-                except (OSError, json.JSONDecodeError) as bak_exc:
+                except (OSError, UnicodeDecodeError, json.JSONDecodeError) as bak_exc:
                     raise RuntimeError(
                         f"{what} ({path}) is corrupted: {exc}. Its backup "
                         f"({bak}) is also unreadable: {bak_exc}. Manual "

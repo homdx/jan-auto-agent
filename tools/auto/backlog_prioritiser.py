@@ -511,18 +511,29 @@ def _chapter_dependencies(tasks: list[ReadyTask]) -> dict[str, list[str]]:
     # Sort by chapter number (ascending, numeric).
     chapter_tasks.sort(key=lambda x: x[0])
 
-    # For each chapter-N task, add a dependency on the nearest chapter-M task
-    # where M < N.  "Nearest" = the one with the largest M below N.
+    # For each chapter-N task, depend on the nearest chapter-M task, M < N.
+    # BUGFIX: chapter_tasks[idx - 1] is just the previous sorted entry,
+    # which for two tasks on the same chapter is a same-chapter task, not
+    # one with a strictly smaller M — so same-chapter tasks were chained
+    # and could not run in parallel. Group equal chapter numbers first.
+    groups: list[tuple[int, list[ReadyTask]]] = []
+    for n, task in chapter_tasks:
+        if groups and groups[-1][0] == n:
+            groups[-1][1].append(task)
+        else:
+            groups.append((n, [task]))
+
     edges: dict[str, list[str]] = {}
-    for idx, (n, task_n) in enumerate(chapter_tasks):
-        if idx == 0:
-            continue  # chapter_1 (or lowest) has no predecessor
-        # The nearest predecessor is the entry just before this one.
-        _m, task_m = chapter_tasks[idx - 1]
-        edges.setdefault(task_n.task_id, []).append(task_m.task_id)
+    for idx in range(1, len(groups)):
+        n, tasks_n = groups[idx]
+        m, tasks_m = groups[idx - 1]
+        for task_n in tasks_n:
+            edges.setdefault(task_n.task_id, []).extend(
+                task_m.task_id for task_m in tasks_m
+            )
         logger.debug(
             "_chapter_dependencies: chapter_%d (%s) depends on chapter_%d (%s)",
-            n, task_n.task_id, _m, task_m.task_id,
+            n, [t.task_id for t in tasks_n], m, [t.task_id for t in tasks_m],
         )
 
     return edges

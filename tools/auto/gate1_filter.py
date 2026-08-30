@@ -280,10 +280,30 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         self._collect_bridge = collect_bridge
 
         sec = "gate1"
-        self._temperature    = float(config.get(sec, "temperature", fallback="0.0"))
-        self._max_tokens     = int(config.get(sec, "max_tokens",   fallback="512"))
-        self._skip_llm       = config.getboolean(sec, "skip_llm", fallback=False)
-        self._timeout        = float(config.get("loop", "timeout_seconds", fallback="300"))
+        # Bugfix (config-crash audit): unguarded — one malformed
+        # [gate1]/[loop] value crashed Gate1 construction outright. Wrapped
+        # per-call, not via a helper, so extract_config_reads still sees
+        # each literal call.
+        try:
+            self._temperature = float(config.get(sec, "temperature", fallback="0.0"))
+        except ValueError as exc:
+            logger.warning("config [%s] temperature is malformed (%s) — using default 0.0", sec, exc)
+            self._temperature = 0.0
+        try:
+            self._max_tokens = int(config.get(sec, "max_tokens", fallback="512"))
+        except ValueError as exc:
+            logger.warning("config [%s] max_tokens is malformed (%s) — using default 512", sec, exc)
+            self._max_tokens = 512
+        try:
+            self._skip_llm = config.getboolean(sec, "skip_llm", fallback=False)
+        except ValueError as exc:
+            logger.warning("config [%s] skip_llm is malformed (%s) — using default False", sec, exc)
+            self._skip_llm = False
+        try:
+            self._timeout = float(config.get("loop", "timeout_seconds", fallback="300"))
+        except ValueError as exc:
+            logger.warning("config [loop] timeout_seconds is malformed (%s) — using default 300.0", exc)
+            self._timeout = 300.0
         # AUTO-RETRY-BACKOFF-1: how many extra attempts (after the first)
         # a plain LLM-call EXCEPTION (network error, HTTP 4xx/5xx that
         # bubbled up as an exception — NOT an unparseable-but-received
@@ -300,12 +320,36 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         # failures from ever removing a task from plan.json — this retry
         # budget exists to make hitting that safety net less common in
         # the first place, not instead of it).
-        self._llm_call_retry_max = max(0, config.getint(
-            sec, "llm_call_retry_max", fallback=3))
-        self._llm_call_retry_wait_sec = max(0.0, float(config.get(
-            sec, "llm_call_retry_wait_sec", fallback="60")))
-        self._max_context_lines = int(config.get(sec, "max_context_lines", fallback=str(_DEFAULT_MAX_CONTEXT_LINES)))
-        self._max_block_chars   = int(config.get(sec, "max_block_chars",   fallback=str(_DEFAULT_MAX_BLOCK_CHARS)))
+        try:
+            self._llm_call_retry_max = max(0, config.getint(
+                sec, "llm_call_retry_max", fallback=3))
+        except ValueError as exc:
+            logger.warning("config [%s] llm_call_retry_max is malformed (%s) — using default 3", sec, exc)
+            self._llm_call_retry_max = 3
+        try:
+            self._llm_call_retry_wait_sec = max(0.0, float(config.get(
+                sec, "llm_call_retry_wait_sec", fallback="60")))
+        except ValueError as exc:
+            logger.warning("config [%s] llm_call_retry_wait_sec is malformed (%s) — using default 60.0", sec, exc)
+            self._llm_call_retry_wait_sec = 60.0
+        try:
+            self._max_context_lines = int(config.get(
+                sec, "max_context_lines", fallback=str(_DEFAULT_MAX_CONTEXT_LINES)))
+        except ValueError as exc:
+            logger.warning(
+                "config [%s] max_context_lines is malformed (%s) — using default %r",
+                sec, exc, _DEFAULT_MAX_CONTEXT_LINES,
+            )
+            self._max_context_lines = _DEFAULT_MAX_CONTEXT_LINES
+        try:
+            self._max_block_chars = int(config.get(
+                sec, "max_block_chars", fallback=str(_DEFAULT_MAX_BLOCK_CHARS)))
+        except ValueError as exc:
+            logger.warning(
+                "config [%s] max_block_chars is malformed (%s) — using default %r",
+                sec, exc, _DEFAULT_MAX_BLOCK_CHARS,
+            )
+            self._max_block_chars = _DEFAULT_MAX_BLOCK_CHARS
         # AUTO-FIX: Gate 1's presence check wants a tiny, deterministic JSON
         # verdict — no reasoning needed in the reply. A thinking model (e.g.
         # qwen3) wraps its answer in <think>...</think> by default; with a

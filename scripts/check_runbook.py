@@ -311,16 +311,28 @@ def check_task1(sandbox: Path) -> Report:
 
     if test_files:
         rel = [str(p) for p in test_files]
-        result = subprocess.run(
-            [sys.executable, "-m", "pytest", "-q", *rel],
-            cwd=str(sandbox), capture_output=True, text=True, timeout=180,
-        )
-        report.add(
-            result.returncode == 0,
-            "test suite passes",
-            (result.stdout + result.stderr).strip().splitlines()[-1][:120]
-            if (result.stdout or result.stderr) else "",
-        )
+        # Bugfix: unguarded — a hung test raised TimeoutExpired and
+        # crashed the whole checker instead of reporting the failure, unlike
+        # _prints_hello_world's guard above. The static "uses pytest
+        # conventions" check below still runs after a timeout.
+        try:
+            result = subprocess.run(
+                [sys.executable, "-m", "pytest", "-q", *rel],
+                cwd=str(sandbox), capture_output=True, text=True, timeout=180,
+            )
+        except subprocess.TimeoutExpired as exc:
+            report.add(
+                False, "test suite passes",
+                f"timed out after {exc.timeout}s — "
+                "test suite may hang or be too slow",
+            )
+        else:
+            report.add(
+                result.returncode == 0,
+                "test suite passes",
+                (result.stdout + result.stderr).strip().splitlines()[-1][:120]
+                if (result.stdout or result.stderr) else "",
+            )
         uses_pytest = any(
             "def test_" in _read(sandbox / p) for p in test_files
         )
