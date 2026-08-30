@@ -163,7 +163,7 @@ def _user_messages(mock_llm) -> list[str]:
 def _fake_parser(ops):
     """Build a stand-in for arch_probe.extract_probe_request that returns
     *ops* only for a response actually carrying the protocol prefix."""
-    def _parse(text: str):
+    def _parse(text: str, **_kwargs):
         return list(ops) if arch_probe.PROBE_PREFIX in (text or "") else []
     return _parse
 
@@ -178,7 +178,9 @@ class TestProbeDoesNotConsumeLadderRetries:
         self, cfg, cluster_and_base, monkeypatch
     ) -> None:
         """AC-P2-1: without the guard this response is 'unsalvageable' and
-        AUTO-H5 re-asks it 6 more times (7 calls). With it: exactly one."""
+        AUTO-H5 re-asks it 6 more times (7 calls). With it: two — the probe
+        itself, then AUTO-P1's mandatory forced final call. The number that
+        matters is that it is nowhere near the H5 budget."""
         cluster, base_dir = cluster_and_base
         monkeypatch.setattr(
             arch_probe, "extract_probe_request", _fake_parser(_OPS)
@@ -190,7 +192,10 @@ class TestProbeDoesNotConsumeLadderRetries:
         ) as mock_llm:
             results = reviewer.review_clusters([cluster], base_dir, goal="improve code")
 
-        assert mock_llm.call_count == 1, (
+        assert mock_llm.call_count == 2, (
+            "expected probe + forced final call, not an AUTO-H5 ladder run"
+        )
+        assert mock_llm.call_count < 7, (
             "a probe reply must not enter the AUTO-H5 escalation ladder"
         )
         assert results == []
@@ -213,8 +218,8 @@ class TestProbeDoesNotConsumeLadderRetries:
             reviewer.review_clusters([cluster], base_dir, goal="improve code")
 
         msgs = _user_messages(mock_llm)
-        assert len(msgs) == 1
-        assert "up to 5 concrete tasks" in msgs[0], (
+        assert len(msgs) == 2  # probe + forced final call
+        assert all("up to 5 concrete tasks" in m for m in msgs), (
             "max_tasks must be untouched by a probe reply"
         )
 
@@ -251,7 +256,9 @@ class TestNonProbeRepliesAreUnaffected:
     ) -> None:
         """AC-P2-3: a malformed request (parser returns []) is not a probe."""
         cluster, base_dir = cluster_and_base
-        monkeypatch.setattr(arch_probe, "extract_probe_request", lambda text: [])
+        monkeypatch.setattr(
+            arch_probe, "extract_probe_request", lambda text, **_kw: []
+        )
         reviewer = _reviewer(cfg)
 
         with patch(
@@ -270,7 +277,7 @@ class TestNonProbeRepliesAreUnaffected:
         extract_probe_request is not consulted at all."""
         calls: list[str] = []
 
-        def _tripwire(text: str):
+        def _tripwire(text: str, **_kwargs):
             calls.append(text)
             return list(_OPS)
 
@@ -293,7 +300,7 @@ class TestNonProbeRepliesAreUnaffected:
     ) -> None:
         """AC-P2-8: a raising parser degrades to 'not a probe', never to a
         crashed batch."""
-        def _boom(text: str):
+        def _boom(text: str, **_kwargs):
             raise RuntimeError("parser blew up")
 
         cluster, base_dir = cluster_and_base
@@ -309,11 +316,14 @@ class TestNonProbeRepliesAreUnaffected:
         assert mock_llm.call_count == 2
         assert [r.title for r in results] == ["Recovered task"]
 
-    def test_shipped_stub_returns_nothing(self) -> None:
-        """AC-P2-3, at the source: the AUTO-P2 stub recognises no probe, so
-        merging this ticket alone changes no live behaviour. AUTO-P1 flips
-        this assertion when it implements the parser."""
-        assert arch_probe.extract_probe_request(_PROBE_PAYLOAD) == []
+    def test_real_parser_recognises_the_protocol(self) -> None:
+        """AC-P2-3, at the source. This assertion is the AUTO-P1 flip the
+        AUTO-P2 stub was written to anticipate: before AUTO-P1 both lines
+        returned []; now the first returns the ops it names. Full parser
+        coverage lives in test_auto_p1_probe_parser.py — this is only here to
+        pin the fact that everything else in THIS file exercises a live
+        parser, not a stub that made the guard look correct for free."""
+        assert arch_probe.extract_probe_request(_PROBE_PAYLOAD) == _OPS
         assert arch_probe.extract_probe_request("") == []
 
 

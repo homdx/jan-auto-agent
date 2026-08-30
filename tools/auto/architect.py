@@ -425,6 +425,27 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
         # the documented key to agents.ini; the other six agents_*.ini window
         # profiles need no edit precisely because of this fallback.
         self._probe_enabled          = config.getboolean(arch, "probe_enabled", fallback=False)
+        self._probe_max_rounds       = max(0, config.getint(arch, "probe_max_rounds", fallback=1))
+        self._probe_max_chars        = config.getint(arch, "probe_max_chars", fallback=2000)
+        self._probe_max_total_chars  = config.getint(arch, "probe_max_total_chars", fallback=6000)
+        _ops_raw                     = config.get(arch, "probe_allowed_ops", fallback="facts")
+        # NOT defaulted back to DEFAULT_ALLOWED_OPS when the key is present but
+        # empty: `probe_allowed_ops =` is an operator saying "allow nothing",
+        # and silently restoring "facts" would re-enable a probe they just
+        # switched off. An empty tuple makes extract_probe_request fail closed
+        # (see its allowed_ops guard) — probing becomes a no-op, which is
+        # exactly what was asked for.
+        self._probe_allowed_ops      = tuple(
+            o.strip().lower() for o in _ops_raw.split(",") if o.strip()
+        )
+        # Built lazily, once per reviewer instance, on first use — the collect
+        # model needs base_dir, which only arrives with review_clusters(). The
+        # sentinel distinguishes "not built yet" from a legitimately-cached
+        # None (collect off/unavailable), so a missing artifact is not
+        # re-probed once per cluster. See make_collect_bridge's contract:
+        # build once per run, never per task.
+        self._probe: "_arch_probe.ArchProbe | None" = None
+        self._probe_built            = False
 
         # ── DM-2: select system prompt based on task_mode + ini overrides ─────
         # Priority: mode-specific ini key > legacy "system" key > built-in constant.
@@ -699,6 +720,46 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
 
     # ── Private helpers ───────────────────────────────────────────────────────
 
+    def _get_probe(self, base_dir: Path) -> "_arch_probe.ArchProbe | None":
+        """Build the AUTO-P probe executor once, on first use.
+
+        Returns ``None`` — a valid, expected result the caller must treat as
+        "no probing this run" — when the feature is off, when the collect
+        artifact is absent or stale, or when constructing the bridge fails.
+        Never raises: an unavailable probe is a degraded plan phase, not a
+        failed one.
+        """
+        if not self._probe_enabled:
+            return None
+        if self._probe_built:
+            return self._probe
+        self._probe_built = True
+        try:
+            from tools.auto.collect_bridge import make_collect_bridge  # noqa: PLC0415
+
+            bridge = make_collect_bridge(
+                base_dir, self._config, task_mode=self._task_mode
+            )
+        except Exception as exc:  # noqa: BLE001 — opt-in feature, never fatal
+            logger.warning(
+                "architect: probe_enabled=true but the collect bridge could not "
+                "be built (%s) — planning without probes this run.", exc,
+            )
+            return None
+        if bridge is None or not getattr(bridge, "usable", False):
+            logger.warning(
+                "architect: probe_enabled=true but no fresh collect artifact is "
+                "available ([collect] use_in_auto) — planning without probes "
+                "this run.",
+            )
+            return None
+        self._probe = _arch_probe.ArchProbe(
+            bridge,
+            max_chars=self._probe_max_chars,
+            max_total_chars=self._probe_max_total_chars,
+        )
+        return self._probe
+
     def _build_llm_call(self):
         """Build a ``llm_call(system, user) -> str`` callable for validate_plan.
 
@@ -882,6 +943,14 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
         _empty_retry_max = self._config.getint("architect", "empty_response_retry_max", fallback=6)
         _empty_retry_max = max(0, _empty_retry_max)
 
+        # ── AUTO-P1: probe state, read by the _call_and_parse closure ───────
+        # Reassigned by the probe loop at the bottom of this method; the
+        # closure reads them at call time, so each attempt sees the current
+        # digest and the current forced/not-forced stance.
+        _probe = self._get_probe(base_dir)
+        _probe_digest = ""
+        _probe_forced = False
+
         def _call_and_parse(
             max_tasks: int, *,
             max_tokens: "int | None" = None,
@@ -917,6 +986,23 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 file_contents=file_contents,
                 max_tasks=max_tasks,
             )
+
+            # ── AUTO-P1: additive probe sections ────────────────────────────
+            # _USER_PROMPT_TMPL / _USER_PROMPT_CREATIVE are deliberately NOT
+            # edited: with probing off (or unavailable) nothing is appended and
+            # every byte sent is identical to pre-AUTO-P, which is what keeps
+            # the default path provably unchanged and the prompt-sensitive
+            # tests in test_architect_domain.py green.
+            if _probe_forced:
+                # Driven by the stance, not by _probe: a model that probed
+                # although probing was never offered still has to be told to
+                # stop, or the forced call is a byte-identical re-ask that
+                # reproduces the same probe.
+                user_msg += "\n" + _arch_probe.FORCED_SUFFIX
+            elif _probe is not None and _probe.usable:
+                user_msg += "\n" + _arch_probe.PROBE_INSTRUCTIONS
+            if _probe_digest:
+                user_msg += "\n\n" + _probe_digest
 
             url, headers, payload = _llm_stream.build_chat_request(
                 base_url=self._base_url, api_key=self._api_key, model=self._model,
@@ -1072,7 +1158,9 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
             _probe_request: list = []
             if self._probe_enabled:
                 try:
-                    _probe_request = _arch_probe.extract_probe_request(cleaned) or []
+                    _probe_request = _arch_probe.extract_probe_request(
+                        cleaned, allowed_ops=self._probe_allowed_ops
+                    ) or []
                 except Exception as exc:  # noqa: BLE001 — never fail the batch on this
                     logger.warning(
                         "review_one_cluster [%s]: probe parse raised (%s) — "
@@ -1093,129 +1181,221 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
 
             return _cands, _truncated, _unsalvageable, _probe_request
 
-        max_tasks = _base_max_tasks
-        candidates, truncated, unsalvageable, probe_request = _call_and_parse(max_tasks)
+        def _attempt_plan() -> "tuple[list[CandidateTask] | None, list]":
+            """One full planning attempt: initial call + the AUTO-H4/H5 ladders.
 
-        _shrink_attempts = 0
-        _empty_attempts = 0
-        # Single adaptive loop: on each iteration, react to whichever
-        # failure mode THIS attempt actually hit — a batch can legitimately
-        # flip between them (e.g. truncated on attempt 1, unsalvageable on
-        # a shrunk attempt 2) — rather than committing to one strategy for
-        # the whole retry budget upfront. Each failure mode has its own
-        # independent attempt budget so one doesn't steal retries from the
-        # other.
-        while candidates is not None and (truncated or unsalvageable):
-            _call_kwargs: dict = {}
-            if truncated:
-                if _shrink_attempts >= _retry_max or max_tasks <= 1:
-                    break
-                max_tasks = _shrink(max_tasks)
-                _shrink_attempts += 1
-                logger.warning(
-                    "review_one_cluster [%s]: response truncated "
-                    "(shrink-retry %d/%d) — re-asking with max_tasks=%d.",
-                    cluster.name, _shrink_attempts, _retry_max, max_tasks,
-                )
-            else:  # unsalvageable
-                if _empty_attempts >= _empty_retry_max:
-                    break
-                _empty_attempts += 1
-                # AUTO-H5-ESCALATE-1 / AUTO-RETRY-TEMP-1: mirrors
-                # gate1_filter.py's Gate1Filter unparseable-retry
-                # escalation exactly — an unsalvageable (empty/
-                # degenerate/non-JSON) response is very often the SAME
-                # thinking-budget-exhaustion failure Gate 1 already
-                # handles (see the class docstring above), not a one-off
-                # decoding hiccup a same-settings plain retry fixes.
-                # Every temperature in _UNSALVAGEABLE_TEMPERATURES is
-                # tried at the CURRENT token tier before the tier
-                # doubles — see that constant's docstring for why this
-                # is a fixed absolute schedule, not a step down from the
-                # configured base temperature.
-                _ctx_ceiling = (
-                    int(self._num_ctx * self._UNSALVAGEABLE_TOKENS_CTX_FRACTION)
-                    if self._num_ctx
-                    else self._UNSALVAGEABLE_TOKENS_DEFAULT_CEILING
-                )
-                _n_temps = len(self._UNSALVAGEABLE_TEMPERATURES)
-                _tier_index = (_empty_attempts - 1) // _n_temps
-                _temp_index = (_empty_attempts - 1) % _n_temps
-                _uncapped_tokens = (
-                    self._UNSALVAGEABLE_TOKENS_FLOOR
-                    * int(self._UNSALVAGEABLE_TOKENS_STEP_MULT ** _tier_index)
-                )
-                _attempt_tokens = min(_uncapped_tokens, _ctx_ceiling)
-                if _attempt_tokens < _uncapped_tokens:
-                    # AUTO-CTX-CAP-WARN-1: see gate1_filter.py's sibling
-                    # warning — a stale/small num_ctx silently capping
-                    # escalation has bitten in the field more than once.
+            AUTO-P1 extracted this from the body of ``_review_one_cluster`` so
+            the probe loop below can run it more than once. Nothing inside
+            changed: ``max_tasks`` still starts fresh at ``_base_max_tasks``
+            (each probe round is a new question, not a continuation of the
+            previous round's shrink state), and both retry budgets are still
+            per-attempt and independent of each other.
+
+            Returns ``(candidates_or_None, probe_request)``.
+            """
+            max_tasks = _base_max_tasks
+            candidates, truncated, unsalvageable, probe_request = _call_and_parse(max_tasks)
+
+            _shrink_attempts = 0
+            _empty_attempts = 0
+            # Single adaptive loop: on each iteration, react to whichever
+            # failure mode THIS attempt actually hit — a batch can legitimately
+            # flip between them (e.g. truncated on attempt 1, unsalvageable on
+            # a shrunk attempt 2) — rather than committing to one strategy for
+            # the whole retry budget upfront. Each failure mode has its own
+            # independent attempt budget so one doesn't steal retries from the
+            # other.
+            while candidates is not None and (truncated or unsalvageable):
+                _call_kwargs: dict = {}
+                if truncated:
+                    if _shrink_attempts >= _retry_max or max_tasks <= 1:
+                        break
+                    max_tasks = _shrink(max_tasks)
+                    _shrink_attempts += 1
                     logger.warning(
-                        "review_one_cluster [%s]: escalation wants "
-                        "max_tokens=%d but is capped at %d by "
-                        "num_ctx=%s (ceiling = num_ctx * %.1f). If this "
-                        "model's real context window is bigger, raise "
-                        "num_ctx in the active [api_*] section to let "
-                        "escalation actually use it.",
-                        cluster.name, _uncapped_tokens, _attempt_tokens,
-                        self._num_ctx or "unset",
-                        self._UNSALVAGEABLE_TOKENS_CTX_FRACTION,
+                        "review_one_cluster [%s]: response truncated "
+                        "(shrink-retry %d/%d) — re-asking with max_tasks=%d.",
+                        cluster.name, _shrink_attempts, _retry_max, max_tasks,
                     )
-                _attempt_temp = self._UNSALVAGEABLE_TEMPERATURES[_temp_index]
-                _call_kwargs = {"max_tokens": _attempt_tokens, "temperature": _attempt_temp}
-                logger.warning(
-                    "review_one_cluster [%s]: response unsalvageable (empty, "
-                    "degenerate, or non-JSON) — plain retry %d/%d at the "
-                    "same max_tasks=%d (max_tokens=%d, temperature=%.2f).",
-                    cluster.name, _empty_attempts, _empty_retry_max, max_tasks,
-                    _attempt_tokens, _attempt_temp,
+                else:  # unsalvageable
+                    if _empty_attempts >= _empty_retry_max:
+                        break
+                    _empty_attempts += 1
+                    # AUTO-H5-ESCALATE-1 / AUTO-RETRY-TEMP-1: mirrors
+                    # gate1_filter.py's Gate1Filter unparseable-retry
+                    # escalation exactly — an unsalvageable (empty/
+                    # degenerate/non-JSON) response is very often the SAME
+                    # thinking-budget-exhaustion failure Gate 1 already
+                    # handles (see the class docstring above), not a one-off
+                    # decoding hiccup a same-settings plain retry fixes.
+                    # Every temperature in _UNSALVAGEABLE_TEMPERATURES is
+                    # tried at the CURRENT token tier before the tier
+                    # doubles — see that constant's docstring for why this
+                    # is a fixed absolute schedule, not a step down from the
+                    # configured base temperature.
+                    _ctx_ceiling = (
+                        int(self._num_ctx * self._UNSALVAGEABLE_TOKENS_CTX_FRACTION)
+                        if self._num_ctx
+                        else self._UNSALVAGEABLE_TOKENS_DEFAULT_CEILING
+                    )
+                    _n_temps = len(self._UNSALVAGEABLE_TEMPERATURES)
+                    _tier_index = (_empty_attempts - 1) // _n_temps
+                    _temp_index = (_empty_attempts - 1) % _n_temps
+                    _uncapped_tokens = (
+                        self._UNSALVAGEABLE_TOKENS_FLOOR
+                        * int(self._UNSALVAGEABLE_TOKENS_STEP_MULT ** _tier_index)
+                    )
+                    _attempt_tokens = min(_uncapped_tokens, _ctx_ceiling)
+                    if _attempt_tokens < _uncapped_tokens:
+                        # AUTO-CTX-CAP-WARN-1: see gate1_filter.py's sibling
+                        # warning — a stale/small num_ctx silently capping
+                        # escalation has bitten in the field more than once.
+                        logger.warning(
+                            "review_one_cluster [%s]: escalation wants "
+                            "max_tokens=%d but is capped at %d by "
+                            "num_ctx=%s (ceiling = num_ctx * %.1f). If this "
+                            "model's real context window is bigger, raise "
+                            "num_ctx in the active [api_*] section to let "
+                            "escalation actually use it.",
+                            cluster.name, _uncapped_tokens, _attempt_tokens,
+                            self._num_ctx or "unset",
+                            self._UNSALVAGEABLE_TOKENS_CTX_FRACTION,
+                        )
+                    _attempt_temp = self._UNSALVAGEABLE_TEMPERATURES[_temp_index]
+                    _call_kwargs = {"max_tokens": _attempt_tokens, "temperature": _attempt_temp}
+                    logger.warning(
+                        "review_one_cluster [%s]: response unsalvageable (empty, "
+                        "degenerate, or non-JSON) — plain retry %d/%d at the "
+                        "same max_tasks=%d (max_tokens=%d, temperature=%.2f).",
+                        cluster.name, _empty_attempts, _empty_retry_max, max_tasks,
+                        _attempt_tokens, _attempt_temp,
+                    )
+                candidates, truncated, unsalvageable, probe_request = _call_and_parse(
+                    max_tasks, **_call_kwargs
                 )
-            candidates, truncated, unsalvageable, probe_request = _call_and_parse(
-                max_tasks, **_call_kwargs
-            )
 
-        if candidates is not None and truncated:
-            # Shrink-retries exhausted (or disabled via
-            # truncation_retry_max=0) and the LAST attempt was still
-            # truncated — keep whatever got salvaged rather than
-            # discarding it outright; this matches the pre-AUTO-H4
-            # fail-open behaviour for the final attempt.
-            logger.warning(
-                "review_one_cluster [%s]: still truncated after %d shrink-retry "
-                "attempt(s) (max_tasks=%d) — keeping %d salvaged candidate(s).",
-                cluster.name, _shrink_attempts, max_tasks, len(candidates),
-            )
-        if candidates is not None and unsalvageable:
-            # Plain retries exhausted (or disabled via
-            # empty_response_retry_max=0) and the response is still
-            # unsalvageable — nothing to keep this time; fail open with 0
-            # candidates for this batch, same as the pre-AUTO-H5 behaviour,
-            # but only after actually trying instead of giving up on the
-            # first empty/garbage reply.
-            logger.warning(
-                "review_one_cluster [%s]: still unsalvageable after %d plain "
-                "retry attempt(s) — giving up on this batch with 0 candidates.",
-                cluster.name, _empty_attempts,
-            )
+            if candidates is not None and truncated:
+                # Shrink-retries exhausted (or disabled via
+                # truncation_retry_max=0) and the LAST attempt was still
+                # truncated — keep whatever got salvaged rather than
+                # discarding it outright; this matches the pre-AUTO-H4
+                # fail-open behaviour for the final attempt.
+                logger.warning(
+                    "review_one_cluster [%s]: still truncated after %d shrink-retry "
+                    "attempt(s) (max_tasks=%d) — keeping %d salvaged candidate(s).",
+                    cluster.name, _shrink_attempts, max_tasks, len(candidates),
+                )
+            if candidates is not None and unsalvageable:
+                # Plain retries exhausted (or disabled via
+                # empty_response_retry_max=0) and the response is still
+                # unsalvageable — nothing to keep this time; fail open with 0
+                # candidates for this batch, same as the pre-AUTO-H5 behaviour,
+                # but only after actually trying instead of giving up on the
+                # first empty/garbage reply.
+                logger.warning(
+                    "review_one_cluster [%s]: still unsalvageable after %d plain "
+                    "retry attempt(s) — giving up on this batch with 0 candidates.",
+                    cluster.name, _empty_attempts,
+                )
 
-        # AUTO-P2: a recognised probe request clears both ladder flags above,
-        # so the while-loop exits (or never runs) and control lands here with
-        # whatever the probe reply itself parsed to — normally nothing. That
-        # is the intended AUTO-P2 outcome: the batch yields no candidates, but
-        # it does so after ONE call instead of seven, and without a misleading
-        # "unsalvageable" warning. AUTO-P1 replaces this log with the
-        # probe execute → digest → re-ask loop; until then the operator needs
-        # to be able to see that the Architect asked for something nobody
-        # answered, which is exactly the signal the decision gate measures.
-        if candidates is not None and probe_request:
+            # AUTO-P2: a recognised probe request cleared both ladder flags in
+            # _call_and_parse, so the while-loop above exits (or never runs) and
+            # control lands here with the probe intact. Handing it back to the
+            # probe loop below is what keeps a probe from ever consuming an H4
+            # shrink or an H5 escalation.
+            return candidates, probe_request
+
+        # ── AUTO-P1: probe → digest → re-ask loop ────────────────────────────
+        # Bounded three ways, any of which ends the loop:
+        #   * probe_max_rounds        — iteration cap
+        #   * probe_max_total_chars   — digest cap, enforced inside ArchProbe
+        #   * an empty digest         — nothing could be resolved, so re-asking
+        #                               would reproduce the identical response
+        #                               and the identical probe, forever
+        # Whichever fires, the model gets ONE forced final call telling it to
+        # plan with what it has. That call is not optional: without it, hitting
+        # a cap would mean zero candidates from the batch, which is a
+        # regression against the pre-AUTO-P behaviour.
+        candidates, probe_request = _attempt_plan()
+        _probe_rounds = 0
+
+        while probe_request and candidates is not None and not candidates:
+            if _probe is None or not _probe.usable:
+                # The model probed although probing was never offered to it
+                # (instructions are only appended when a usable probe exists).
+                # Nothing to resolve — go straight to the forced call.
+                logger.info(
+                    "review_one_cluster [%s]: architect probed but no collect "
+                    "artifact is available — forcing a final plan call.",
+                    cluster.name,
+                )
+                break
+            if _probe.budget_exhausted:
+                logger.info(
+                    "review_one_cluster [%s]: probe digest budget spent "
+                    "(%d/%d chars) — forcing a final plan call.",
+                    cluster.name, _probe.chars_used, self._probe_max_total_chars,
+                )
+                break
+            if _probe_rounds >= self._probe_max_rounds:
+                logger.info(
+                    "review_one_cluster [%s]: probe round cap reached (%d) — "
+                    "forcing a final plan call.",
+                    cluster.name, self._probe_max_rounds,
+                )
+                break
+
+            _digest_add = _probe.execute(probe_request)
+            if not _digest_add:
+                logger.info(
+                    "review_one_cluster [%s]: probe resolved nothing for %s — "
+                    "forcing a final plan call.",
+                    cluster.name, ", ".join(str(op) for op in probe_request),
+                )
+                break
+
+            _probe_rounds += 1
+            _probe_digest = (
+                f"{_probe_digest}\n\n{_digest_add}" if _probe_digest else _digest_add
+            )
+            tracer.event(
+                source="probe", target="architect", kind="probe_result",
+                model=self._model, content=_digest_add,
+                params={
+                    "cluster":    cluster.name,
+                    "round":      _probe_rounds,
+                    "ops":        len(probe_request),
+                    "chars_used": _probe.chars_used,
+                },
+            )
             logger.info(
-                "review_one_cluster [%s]: architect requested context "
-                "(%d op(s): %s) — no probe handler installed yet (AUTO-P1); "
-                "returning %d candidate(s) without retrying.",
-                cluster.name, len(probe_request),
-                ", ".join(str(op) for op in probe_request),
-                len(candidates),
+                "review_one_cluster [%s]: probe round %d/%d resolved %d op(s) "
+                "(%d chars total) — re-asking.",
+                cluster.name, _probe_rounds, self._probe_max_rounds,
+                len(probe_request), _probe.chars_used,
             )
+            candidates, probe_request = _attempt_plan()
+
+        # Forced final call — only when the model is still asking AND has not
+        # already produced a usable plan. A probe reply that also carried
+        # grounded tasks is a complete answer; spending another call on it
+        # would buy nothing.
+        if probe_request and candidates is not None and not candidates:
+            _probe_forced = True
+            candidates, probe_request = _attempt_plan()
+            if probe_request:
+                # Probe detection stays enabled on the forced call on purpose.
+                # A model that probes again after being told the budget is
+                # spent has ignored an instruction — that is not the decoding
+                # hiccup AUTO-H5 exists to retry, and six escalating re-asks
+                # will not change its mind. Recognising it keeps the flags
+                # cleared and ends the batch at 2 calls instead of 8.
+                logger.warning(
+                    "review_one_cluster [%s]: architect probed again after the "
+                    "forced final call (%s) — giving up on this batch with 0 "
+                    "candidate(s).",
+                    cluster.name, ", ".join(str(op) for op in probe_request),
+                )
 
         return candidates
 

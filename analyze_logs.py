@@ -411,6 +411,12 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
                 "events":         [],
                 "llm_calls":      0,
                 "context_requests": [],
+                # AUTO-P: architect context probes. `requests` counts
+                # ARCH_PROBE replies, `results` counts the ones the executor
+                # actually resolved. The gap between them IS the decision-gate
+                # signal: probes the collect model could not answer.
+                "probe_requests": [],
+                "probe_results":  [],
                 "total_events":   0,
                 "plan_total":     0,         # filled by plan_ready event — total tasks in plan
                 "files_preparing": [],       # [{ts, task, file_count, files_copied, files_missing, files}]
@@ -676,6 +682,28 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
             if src == "llm" and tgt == "prompt_optimizer":
                 run["_pending_new_prompt"] = str(content or "")
 
+        # ── AUTO-P architect context probes ────────────────────────────────
+        # Emitted by tools/auto/architect.py: kind="probe_request" when the
+        # Architect asks for facts, kind="probe_result" when ArchProbe resolves
+        # them. Counting both is what lets a run answer "is this feature used
+        # at all?" without re-reading the raw trace.
+        elif kind == "probe_request":
+            run["probe_requests"].append({
+                "ts":      ts,
+                "cluster": params.get("cluster", "?"),
+                "ops":     int(params.get("ops", 0) or 0),
+                "detail":  str(content or ""),
+            })
+
+        elif kind == "probe_result":
+            run["probe_results"].append({
+                "ts":         ts,
+                "cluster":    params.get("cluster", "?"),
+                "round":      int(params.get("round", 0) or 0),
+                "ops":        int(params.get("ops", 0) or 0),
+                "chars_used": int(params.get("chars_used", 0) or 0),
+            })
+
         # ── auto-tuner prompt rewrite outcomes (score, promoted or denied) ──
         elif kind in ("prompt_denied", "prompt_promoted"):
             promoted = (kind == "prompt_promoted")
@@ -933,6 +961,22 @@ def render_run_summary(run: dict) -> None:
         _total_syms = sum(len(r["symbols"]) for r in _ctx_reqs)
         print(f"  {bold('Context pulls')}:   {cyan(str(len(_ctx_reqs)))} "
               f"request(s), {_total_syms} symbol(s)")
+    _probe_reqs = run.get("probe_requests", [])
+    if _probe_reqs:
+        _probe_res = run.get("probe_results", [])
+        _asked = sum(r["ops"] for r in _probe_reqs)
+        _resolved = len(_probe_res)
+        _unanswered = len(_probe_reqs) - _resolved
+        _clusters = len({r["cluster"] for r in _probe_reqs})
+        _rounds = max((r["round"] for r in _probe_res), default=0)
+        _unans_str = (
+            f"  {yellow(f'{_unanswered} unresolved')}" if _unanswered > 0 else ""
+        )
+        print(
+            f"  {bold('Architect probes')}: {cyan(str(len(_probe_reqs)))} "
+            f"request(s) over {_clusters} cluster(s), {_asked} op(s), "
+            f"{_resolved} resolved (max round {_rounds}){_unans_str}"
+        )
     print(f"  {bold('Prompt changes')}: {magenta(str(prompt_changes))}")
     _rewrites = run.get("rewrite_attempts", [])
     if _rewrites:

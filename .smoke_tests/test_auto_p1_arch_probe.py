@@ -1,0 +1,1 @@
+../tests/test_auto_p1_arch_probe.py
