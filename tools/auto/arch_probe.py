@@ -202,6 +202,26 @@ class ArchProbe:
         self._bridge = collect_bridge
         self._max_chars = max(200, int(max_chars))
         self._max_total_chars = max(self._max_chars, int(max_total_chars))
+        # AUTO-P4a: per-BATCH, reset by reset() at the top of every batch.
+        # Before AUTO-P4a this counter was created once with the instance and
+        # never cleared, while the instance itself is memoized on the
+        # ClusterReviewer for the whole run — so `max_total_chars` silently
+        # behaved as a per-RUN cap. On a long run the probe stopped answering
+        # partway through and stayed off, which in the logs is indistinguishable
+        # from "the model stopped asking". The digest is appended to ONE batch's
+        # prompt, so the context-window budget it protects is per batch.
+        self._chars_used = 0
+        # Never reset — reported only, so a run can still be judged on total
+        # probe cost without that total being able to switch the feature off.
+        self._run_chars_used = 0
+
+    def reset(self) -> None:
+        """Clear the per-batch digest budget. Called once per batch.
+
+        Deliberately does NOT rebuild the underlying CollectBridge:
+        ``make_collect_bridge``'s contract is build-once-per-run, and the
+        artifact cannot change mid-run.
+        """
         self._chars_used = 0
 
     @property
@@ -215,7 +235,14 @@ class ArchProbe:
 
     @property
     def chars_used(self) -> int:
+        """Digest characters produced for the CURRENT batch."""
         return self._chars_used
+
+    @property
+    def run_chars_used(self) -> int:
+        """Digest characters produced across the whole run. Observability
+        only — never gates anything, unlike :attr:`chars_used`."""
+        return self._run_chars_used
 
     @property
     def budget_exhausted(self) -> bool:
@@ -254,6 +281,7 @@ class ArchProbe:
             block = f"### {op}\n{body}"
             blocks.append(block)
             self._chars_used += len(block)
+            self._run_chars_used += len(block)
         if not blocks:
             return ""
         return "## Probe results\n" + "\n\n".join(blocks)

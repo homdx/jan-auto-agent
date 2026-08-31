@@ -417,6 +417,16 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
                 # signal: probes the collect model could not answer.
                 "probe_requests": [],
                 "probe_results":  [],
+                # AUTO-P4a: `declined` records WHY a request went unanswered
+                # (round_cap / digest_budget / unresolved / no_executor /
+                # post_forced) instead of leaving requests-minus-results to be
+                # misread as "collect did not know these symbols". `config` is
+                # emitted once per run when probing is enabled, which is the
+                # only way to tell "enabled and never used" — the number the
+                # Phase 0 decision gate actually turns on — from "not
+                # installed", which otherwise render identically.
+                "probe_declined": [],
+                "probe_config":   None,
                 "total_events":   0,
                 "plan_total":     0,         # filled by plan_ready event — total tasks in plan
                 "files_preparing": [],       # [{ts, task, file_count, files_copied, files_missing, files}]
@@ -695,6 +705,26 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
                 "detail":  str(content or ""),
             })
 
+        elif kind == "probe_declined":
+            run["probe_declined"].append({
+                "ts":      ts,
+                "cluster": params.get("cluster", "?"),
+                "reason":  str(params.get("reason", "unknown")),
+                "ops":     int(params.get("ops", 0) or 0),
+                "round":   int(params.get("round", 0) or 0),
+            })
+
+        elif kind == "probe_config":
+            run["probe_config"] = {
+                "ts":              ts,
+                "usable":          str(params.get("usable", "False")) == "True",
+                "reason":          str(params.get("reason", "?")),
+                "max_rounds":      int(params.get("max_rounds", 0) or 0),
+                "max_total_chars": int(params.get("max_total_chars", 0) or 0),
+                "allowed_ops":     str(params.get("allowed_ops", "")),
+                "detail":          str(content or ""),
+            }
+
         elif kind == "probe_result":
             run["probe_results"].append({
                 "ts":         ts,
@@ -962,21 +992,68 @@ def render_run_summary(run: dict) -> None:
         print(f"  {bold('Context pulls')}:   {cyan(str(len(_ctx_reqs)))} "
               f"request(s), {_total_syms} symbol(s)")
     _probe_reqs = run.get("probe_requests", [])
-    if _probe_reqs:
+    _probe_cfg = run.get("probe_config")
+    if _probe_reqs or _probe_cfg:
         _probe_res = run.get("probe_results", [])
-        _asked = sum(r["ops"] for r in _probe_reqs)
-        _resolved = len(_probe_res)
-        _unanswered = len(_probe_reqs) - _resolved
-        _clusters = len({r["cluster"] for r in _probe_reqs})
-        _rounds = max((r["round"] for r in _probe_res), default=0)
-        _unans_str = (
-            f"  {yellow(f'{_unanswered} unresolved')}" if _unanswered > 0 else ""
-        )
-        print(
-            f"  {bold('Architect probes')}: {cyan(str(len(_probe_reqs)))} "
-            f"request(s) over {_clusters} cluster(s), {_asked} op(s), "
-            f"{_resolved} resolved (max round {_rounds}){_unans_str}"
-        )
+        _declined = run.get("probe_declined", [])
+        if _probe_cfg and not _probe_cfg["usable"]:
+            # Enabled, but nothing could ever have answered — worth saying out
+            # loud, because a run in this state produces zero probes for a
+            # reason that has nothing to do with whether the model wants them.
+            _why = {
+                "no_artifact":  "no fresh collect artifact ([collect] use_in_auto)",
+                "bridge_error": "collect bridge failed to build",
+            }.get(_probe_cfg["reason"], _probe_cfg["reason"])
+            print(f"  {bold('Architect probes')}: {yellow('enabled but unavailable')} — {_why}")
+        elif not _probe_reqs:
+            # THE decision-gate reading: offered on every batch, never taken.
+            print(
+                f"  {bold('Architect probes')}: {yellow('enabled, 0 requests')} "
+                f"(offered every batch, model never asked; "
+                f"max_rounds={_probe_cfg['max_rounds']}, "
+                f"ops={_probe_cfg['allowed_ops']})"
+            )
+        else:
+            _asked = sum(r["ops"] for r in _probe_reqs)
+            _clusters = len({r["cluster"] for r in _probe_reqs})
+            _rounds = max((r["round"] for r in _probe_res), default=0)
+            print(
+                f"  {bold('Architect probes')}: {cyan(str(len(_probe_reqs)))} "
+                f"request(s) over {_clusters} cluster(s), {_asked} op(s), "
+                f"{len(_probe_res)} resolved (max round {_rounds})"
+            )
+            if _declined:
+                _by_reason = {}
+                for d in _declined:
+                    _by_reason[d["reason"]] = _by_reason.get(d["reason"], 0) + 1
+                _label = {
+                    "round_cap":     "hit round cap",
+                    "digest_budget": "hit digest budget",
+                    "unresolved":    "collect had no answer",
+                    "no_executor":   "no collect artifact",
+                    "post_forced":   "probed after forced call",
+                }
+                _parts = ", ".join(
+                    f"{n} {_label.get(r, r)}"
+                    for r, n in sorted(_by_reason.items(), key=lambda kv: -kv[1])
+                )
+                print(f"  {' ' * len('Architect probes')}  {yellow(f'{len(_declined)} declined')}: {_parts}")
+            _probing = {r["cluster"] for r in _probe_reqs}
+            _batches = len({
+                e.get("params", {}).get("cluster")
+                for e in run.get("events", [])
+                if e.get("kind") == "llm_request"
+                and e.get("source") == "architect"
+                and e.get("params", {}).get("cluster")
+            })
+            if _batches:
+                # The decision-gate numerator/denominator, computed here so it
+                # does not have to be reconstructed by hand from the trace.
+                _rate = 100.0 * len(_probing) / _batches
+                print(
+                    f"  {' ' * len('Architect probes')}  request rate: "
+                    f"{cyan(f'{_rate:.1f}%')} ({len(_probing)}/{_batches} batches)"
+                )
     print(f"  {bold('Prompt changes')}: {magenta(str(prompt_changes))}")
     _rewrites = run.get("rewrite_attempts", [])
     if _rewrites:

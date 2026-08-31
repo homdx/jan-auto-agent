@@ -400,6 +400,13 @@ class TestObservability:
             {"run_id": "r1", "kind": "probe_request", "ts": "2026-01-01T00:00:03Z",
              "source": "architect", "target": "probe", "content": "facts zzz",
              "params": {"cluster": "io", "ops": 1}},
+            # AUTO-P4a: the reason the second request went unanswered is now
+            # recorded explicitly instead of being inferred from the
+            # requests-minus-results gap. See the assertion note below.
+            {"run_id": "r1", "kind": "probe_declined", "ts": "2026-01-01T00:00:04Z",
+             "source": "architect", "target": "probe", "content": "facts zzz",
+             "params": {"cluster": "io", "reason": "unresolved", "ops": 1,
+                        "round": 0}},
         ]
         data = analyze_logs.analyze(events)
         run = data["r1"]
@@ -412,10 +419,14 @@ class TestObservability:
         out = capsys.readouterr().out
         assert "Architect probes" in out
         assert "2 request(s)" in out
-        assert "unresolved" in out, (
-            "the asked-vs-resolved gap is the signal a run is probing for "
-            "facts collect cannot answer — it must be visible, not summed away"
-        )
+        # AUTO-P4a superseded the bare "N unresolved" label this originally
+        # asserted. The intent is unchanged and is now served better: the gap
+        # is still visible, but attributed to a cause. The old label was
+        # actively misleading — it claimed every unanswered request was a
+        # collect miss, when on the first real probing run all of them were
+        # the round cap and none were collect misses.
+        assert "1 declined" in out
+        assert "collect had no answer" in out
 
     def test_analyze_logs_silent_without_probes(self, capsys) -> None:
         """A pre-AUTO-P trace must render exactly as before."""

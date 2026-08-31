@@ -745,6 +745,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 "architect: probe_enabled=true but the collect bridge could not "
                 "be built (%s) — planning without probes this run.", exc,
             )
+            self._trace_probe_config(usable=False, reason="bridge_error", detail=str(exc))
             return None
         if bridge is None or not getattr(bridge, "usable", False):
             logger.warning(
@@ -752,6 +753,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 "available ([collect] use_in_auto) — planning without probes "
                 "this run.",
             )
+            self._trace_probe_config(usable=False, reason="no_artifact")
             return None
         self._probe = _arch_probe.ArchProbe(
             bridge,
@@ -768,7 +770,49 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
             "architect: probe available this run (collect artifact fresh) — "
             "offering ARCH_PROBE on every batch."
         )
+        self._trace_probe_config(usable=True, reason="ok")
         return self._probe
+
+    def _trace_probe_config(
+        self, *, usable: bool, reason: str, detail: str = "",
+    ) -> None:
+        """AUTO-P4a: emit exactly one ``probe_config`` event per run.
+
+        This is the trace-side counterpart to AUTO-DEBUG-1's console banner,
+        and it exists to make ONE state visible that nothing else could
+        express: *the probe was enabled and available, and the model never
+        used it*.
+
+        Before this event, ``analyze_logs.py`` rendered its probe line only
+        when at least one ``probe_request`` existed, so a run with zero probes
+        produced output byte-identical to a run on pre-AUTO-P code. For a
+        feature whose entire Phase 0 decision gate is "how often is this
+        actually used", the most important measurement rendered as silence,
+        and the only way to tell "never asked" from "not installed" was to
+        grep the raw prompt log.
+
+        No event is emitted when ``probe_enabled = false`` — an old trace and
+        a feature-off trace should stay indistinguishable, because for a
+        feature that is off they genuinely are the same thing.
+
+        Never raises: tracing is diagnostics, not control flow.
+        """
+        try:
+            tracer.event(
+                source="architect", target="probe", kind="probe_config",
+                model=self._model,
+                content=detail,
+                params={
+                    "usable":          str(bool(usable)),
+                    "reason":          reason,
+                    "max_rounds":      self._probe_max_rounds,
+                    "max_chars":       self._probe_max_chars,
+                    "max_total_chars": self._probe_max_total_chars,
+                    "allowed_ops":     ",".join(self._probe_allowed_ops),
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("architect: probe_config trace failed: %s", exc)
 
     def _build_llm_call(self):
         """Build a ``llm_call(system, user) -> str`` callable for validate_plan.
@@ -958,6 +1002,14 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
         # closure reads them at call time, so each attempt sees the current
         # digest and the current forced/not-forced stance.
         _probe = self._get_probe(base_dir)
+        if _probe is not None:
+            # AUTO-P4a: the ArchProbe instance is memoized for the whole run
+            # (one CollectBridge, per make_collect_bridge's contract), but its
+            # digest budget is per BATCH — the digest is appended to this
+            # batch's prompt and nobody else's. Without this reset,
+            # probe_max_total_chars accumulated across every batch and quietly
+            # switched the probe off partway through a long run.
+            _probe.reset()
         _probe_digest = ""
         _probe_forced = False
 
@@ -1194,12 +1246,20 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                     "architect [%s]: probe FIRED — %s",
                     cluster.name, ", ".join(str(op) for op in _probe_request),
                 )
-                tracer.event(
-                    source="architect", target="probe", kind="probe_request",
-                    model=self._model,
-                    content=", ".join(str(op) for op in _probe_request),
-                    params={"cluster": cluster.name, "ops": len(_probe_request)},
-                )
+                try:
+                    tracer.event(
+                        source="architect", target="probe", kind="probe_request",
+                        model=self._model,
+                        content=", ".join(str(op) for op in _probe_request),
+                        params={"cluster": cluster.name, "ops": len(_probe_request)},
+                    )
+                except Exception as exc:  # noqa: BLE001 — AUTO-P4a
+                    # AUTO-P1 shipped this call bare while every other step in
+                    # the probe path was fail-open. A tracer that cannot write
+                    # (full disk, bad path, a serialisation edge) would abort
+                    # the batch through the one line whose only job is to
+                    # observe it.
+                    logger.debug("probe_request trace failed: %s", exc)
 
             return _cands, _truncated, _unsalvageable, _probe_request
 
@@ -1341,6 +1401,36 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
         candidates, probe_request = _attempt_plan()
         _probe_rounds = 0
 
+        def _decline(reason: str, ops: list) -> None:
+            """AUTO-P4a: record WHY a probe request went unanswered.
+
+            Every ``break`` below leaves a ``probe_request`` in the trace with
+            no matching ``probe_result``. Before AUTO-P4a, analyze_logs.py
+            reported that gap as a single "N unresolved" figure, which read —
+            and was documented in the runbook — as "collect did not know these
+            symbols". Four different situations were collapsed into that one
+            number, and they call for opposite fixes: `round_cap` says raise
+            probe_max_rounds, `unresolved` says rebuild the collect artifact,
+            `no_executor` says the config is wrong, `post_forced` says the
+            model is ignoring instructions. The real run that exposed this had
+            4 "unresolved" of which 4 were round_cap and 0 were collect
+            misses — collect had in fact answered everything it was asked.
+            """
+            try:
+                tracer.event(
+                    source="architect", target="probe", kind="probe_declined",
+                    model=self._model,
+                    content=", ".join(str(op) for op in ops),
+                    params={
+                        "cluster": cluster.name,
+                        "reason":  reason,
+                        "ops":     len(ops),
+                        "round":   _probe_rounds,
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001 — diagnostics never break a batch
+                logger.debug("review_one_cluster: probe_declined trace failed: %s", exc)
+
         while probe_request and candidates is not None and not candidates:
             if _probe is None or not _probe.usable:
                 # The model probed although probing was never offered to it
@@ -1351,6 +1441,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                     "artifact is available — forcing a final plan call.",
                     cluster.name,
                 )
+                _decline("no_executor", probe_request)
                 break
             if _probe.budget_exhausted:
                 logger.info(
@@ -1358,6 +1449,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                     "(%d/%d chars) — forcing a final plan call.",
                     cluster.name, _probe.chars_used, self._probe_max_total_chars,
                 )
+                _decline("digest_budget", probe_request)
                 break
             if _probe_rounds >= self._probe_max_rounds:
                 logger.info(
@@ -1365,6 +1457,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                     "forcing a final plan call.",
                     cluster.name, self._probe_max_rounds,
                 )
+                _decline("round_cap", probe_request)
                 break
 
             _digest_add = _probe.execute(probe_request)
@@ -1374,22 +1467,29 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                     "forcing a final plan call.",
                     cluster.name, ", ".join(str(op) for op in probe_request),
                 )
+                _decline("unresolved", probe_request)
                 break
 
             _probe_rounds += 1
             _probe_digest = (
                 f"{_probe_digest}\n\n{_digest_add}" if _probe_digest else _digest_add
             )
-            tracer.event(
-                source="probe", target="architect", kind="probe_result",
-                model=self._model, content=_digest_add,
-                params={
-                    "cluster":    cluster.name,
-                    "round":      _probe_rounds,
-                    "ops":        len(probe_request),
-                    "chars_used": _probe.chars_used,
-                },
-            )
+            try:
+                tracer.event(
+                    source="probe", target="architect", kind="probe_result",
+                    model=self._model, content=_digest_add,
+                    params={
+                        "cluster":        cluster.name,
+                        "round":          _probe_rounds,
+                        "ops":            len(probe_request),
+                        # AUTO-P4a: per-batch (gates the loop) and per-run
+                        # (reported only) — see ArchProbe.reset.
+                        "chars_used":     _probe.chars_used,
+                        "run_chars_used": _probe.run_chars_used,
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001 — AUTO-P4a, see above
+                logger.debug("probe_result trace failed: %s", exc)
             logger.info(
                 "review_one_cluster [%s]: probe round %d/%d resolved %d op(s) "
                 "(%d chars total) — re-asking.",
@@ -1418,6 +1518,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                     "candidate(s).",
                     cluster.name, ", ".join(str(op) for op in probe_request),
                 )
+                _decline("post_forced", probe_request)
 
         return candidates
 
