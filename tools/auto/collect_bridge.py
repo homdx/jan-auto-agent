@@ -236,6 +236,99 @@ class CollectBridge:
             lines.append(f"contract {c.name}: {c.description}")
         return "\n".join(lines)
 
+    def module_symbols(self, module_ref: str) -> str:
+        """Inventory of one module's top-level symbols, or `""` if unknown.
+
+        AUTO-P5. `pull_symbol` answers "what is this symbol"; this answers
+        "what is in this file". The Architect needs the second question far
+        more often than the protocol let it ask: across two measured probe
+        runs, 7 of the 9 unresolved lookups were `facts backoff` or
+        `facts retry` — a *file* (`tools/backoff.py`) and a *concept*, neither
+        of which is a symbol, so `pull_symbol` correctly returned nothing and
+        the model had no way to get at the file it plainly meant.
+
+        `module_ref` may be a collect path (`tools/backoff.py`), the same
+        without its extension (`tools/backoff`), or a dotted import form
+        (`tools.backoff`); collect itself only ever stores the first, so the
+        other two are normalised before matching.
+
+        **Exact match only** — no suffix or bare-name fallback, deliberately
+        unlike `pull_symbol`. A module reference is either the file the caller
+        meant or a different file entirely, and answering with a "closest
+        match" would hand the Architect an inventory of the wrong module
+        while looking like a successful lookup. A miss here is honest.
+        """
+        if not self.usable or not module_ref:
+            return ""
+        ref = module_ref.strip().strip("`\"'")
+        if not ref:
+            return ""
+        candidates = {ref}
+        if not ref.endswith(".py"):
+            candidates.add(ref + ".py")
+            candidates.add(ref.replace(".", "/") + ".py")
+        try:
+            for module in self._model.modules:
+                if module.path in candidates:
+                    return self._format_module_block(module)
+        except Exception as exc:  # noqa: BLE001 — never block a pull on this
+            logger.warning(
+                "CollectBridge.module_symbols(%s): failed: %s", module_ref, exc
+            )
+        return ""
+
+    # Symbols listed before the inventory is cut short. A module with 65
+    # entries (the largest in this tree) would otherwise be truncated
+    # mid-line by ArchProbe._cap, leaving the Architect with a partial list
+    # it cannot tell is partial. Cutting on a symbol boundary and saying so
+    # is the difference between "here is some of the file" and a silent lie.
+    _MODULE_SYMBOL_LIMIT = 40
+
+    def _format_module_block(self, module) -> str:
+        """One line per symbol: `name(sig) :line — first docstring line`.
+
+        The line number and docstring are not decoration. `signature` from
+        collect is elided to `name(...)` with no parameter list, so a bare
+        name+signature listing tells the model almost nothing it did not
+        already know. `docstring_first_line` is populated for 37% of symbols
+        in this tree and is the only prose in the record; `lineno` lets the
+        Architect emit an accurate `cited_location.line_start` instead of
+        guessing one, which is a Gate-1 rejection reason in its own right.
+        """
+        lines = [f"module: {module.path}"]
+        syms = list(module.public_symbols)
+        if not syms:
+            # Distinct from a miss: the module resolved, it is simply empty.
+            # Callers and telemetry must not conflate the two.
+            lines.append("(no public top-level symbols)")
+            return "\n".join(lines)
+        for sym in syms[: self._MODULE_SYMBOL_LIMIT]:
+            qn = getattr(sym, "qualname", "") or ""
+            bare = qn.split(":", 1)[-1] if ":" in qn else qn
+            # collect stores `signature` as "name(...)", NOT "(...)" — a
+            # naive f"{bare}{signature}" renders "backoff_secondsbackoff_seconds(...)".
+            # Found on a live artifact, not in a fixture: the test double had
+            # the same shape and the doubled text still contained the expected
+            # substring, so only real data exposed it.
+            sig = (getattr(sym, "signature", "") or "").strip()
+            if sig.startswith(bare):
+                part = f"  {sig}"
+            elif sig:
+                part = f"  {bare}{sig}"
+            else:
+                part = f"  {bare}"
+            lineno = getattr(sym, "lineno", None)
+            if lineno:
+                part += f" :{lineno}"
+            doc = (getattr(sym, "docstring_first_line", "") or "").strip()
+            if doc:
+                part += f" — {doc}"
+            lines.append(part)
+        extra = len(syms) - self._MODULE_SYMBOL_LIMIT
+        if extra > 0:
+            lines.append(f"  … and {extra} more symbol(s) not listed")
+        return "\n".join(lines)
+
     # ── GATE1-CTX-1/-2: read-only queries for Gate1's grounding notes ──────
 
     def contracts_for_symbol(self, symbol_name: str):

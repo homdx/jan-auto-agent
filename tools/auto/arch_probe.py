@@ -87,31 +87,44 @@ DEFAULT_ALLOWED_OPS: tuple[str, ...] = ("facts",)
 # config keys (`max_attempts_per_task`), module paths (`tools.llm_stream`),
 # methods (`InnerLoop.run_task`), and plain guesses at what a helper "should"
 # be called (`backoff`, `retry`, `_retry`, `attempt`, `retry_loop`). Collect
-# indexes TOP-LEVEL functions and classes only — no methods, no config keys,
-# no modules — so every one of those was unanswerable by construction, and the
-# model had never been told what kind of name it could ask for.
+# indexes TOP-LEVEL functions and classes only — no methods, no config keys —
+# so every one of those was unanswerable by construction, and the model had
+# never been told what kind of name it could ask for.
+#
+# AUTO-P5 then found that telling it was not enough for one whole class of
+# request: 7 of the 9 unresolved lookups across two later runs were
+# `facts backoff` or `facts retry`, where the model wanted a FILE
+# (tools/backoff.py) or a concept. Naming the restriction does not help when
+# the thing you need cannot be expressed at all, so `module <path>` was added
+# to make that question askable rather than merely forbidden.
 PROBE_INSTRUCTIONS = (
     "\nIF — and only if — you cannot ground a task because you are missing a "
     "fact about a symbol that is NOT shown above, you may reply with a single "
     "line instead of the JSON array:\n"
     "\n"
-    "    ARCH_PROBE: facts <symbol>, facts <other_symbol>\n"
+    "    ARCH_PROBE: facts <symbol>, module <path>\n"
     "\n"
-    "<symbol> must be a top-level function or class name, spelled exactly as "
-    "it is defined in the source — for example `request_completion` or "
-    "`InnerLoop`. The following CANNOT be looked up and will come back empty:\n"
+    "`facts <symbol>` — <symbol> must be a top-level function or class name, "
+    "spelled exactly as it is defined in the source, for example "
+    "`request_completion` or `InnerLoop`. Returns its signature and "
+    "contracts.\n"
+    "`module <path>` — <path> is a file path as it appears in the repository, "
+    "for example `tools/backoff.py`. Returns every top-level name defined "
+    "there with its line number and first docstring line. Use this when you "
+    "know WHICH FILE you need but not what is in it.\n"
+    "\n"
+    "The following CANNOT be looked up and will come back empty:\n"
     "  - a method or attribute (`InnerLoop.run_task`) — ask for `InnerLoop`\n"
-    "  - a module or import path (`tools.llm_stream`) — ask for a name in it\n"
     "  - a config key or setting (`max_attempts_per_task`)\n"
-    "  - a name you are guessing at rather than one you have seen "
-    "(`backoff`, `retry_loop`)\n"
+    "  - a concept rather than a real name (`retry`, `retry_loop`) — if you "
+    "mean a file, use `module`; if you mean a symbol, you must know its "
+    "actual name\n"
     "\n"
-    "You will be re-asked with the signature and contracts of whatever "
-    "resolves. Ask only for symbols you genuinely need, cannot see above, and "
-    "know the real name of; a probe costs a full round and you get a limited "
-    "number of them. Re-asking for a name that already came back empty will "
-    "end your probing, not retry it. If you can plan from what is already "
-    "above, return the JSON array and do not probe."
+    "You will be re-asked with whatever resolves. Ask only for what you "
+    "genuinely need and cannot see above; a probe costs a full round and you "
+    "get a limited number of them. Re-asking for something that already came "
+    "back empty will end your probing, not retry it. If you can plan from "
+    "what is already above, return the JSON array and do not probe."
 )
 
 # Appended instead of PROBE_INSTRUCTIONS on the final call, once the probe
@@ -235,6 +248,12 @@ class ArchProbe:
         # distinction that hid a 60/60 miss rate behind "22 resolved".
         self._last_hits = 0
         self._last_misses = 0
+        # AUTO-P5: {op_name: [hits, misses]} for the last execute(). Aggregate
+        # hit/miss cannot answer "which op is pulling its weight" once there is
+        # more than one op, and that is precisely the question the next
+        # scope decision (refs? read?) turns on. Recording it per type costs
+        # one dict and makes the decision measurable instead of arguable.
+        self._last_by_op: dict = {}
         # Never reset — reported only, so a run can still be judged on total
         # probe cost without that total being able to switch the feature off.
         self._run_chars_used = 0
@@ -271,6 +290,19 @@ class ArchProbe:
     def last_misses(self) -> int:
         """Ops the last :meth:`execute` could not resolve."""
         return self._last_misses
+
+    @property
+    def last_by_op(self) -> dict:
+        """AUTO-P5: ``{op_name: [hits, misses]}`` for the last execute()."""
+        return dict(self._last_by_op)
+
+    def last_by_op_str(self) -> str:
+        """`last_by_op` as a trace-friendly string: ``facts=3/1 module=1/0``
+        (hits/misses). Flat text because agent_trace stringifies params
+        anyway, and a parseable one-liner beats a repr of a dict."""
+        return " ".join(
+            f"{op}={h}/{m}" for op, (h, m) in sorted(self._last_by_op.items())
+        )
 
     @property
     def run_chars_used(self) -> int:
@@ -313,6 +345,7 @@ class ArchProbe:
         _hits = 0
         self._last_hits = 0
         self._last_misses = 0
+        self._last_by_op = {}
         for op in ops or ():
             if self.budget_exhausted:
                 logger.info(
@@ -326,12 +359,15 @@ class ArchProbe:
             except Exception as exc:  # noqa: BLE001 — never abort a batch
                 logger.warning("ArchProbe: op %s raised: %s", op, exc)
                 continue
+            _tally = self._last_by_op.setdefault(op.op, [0, 0])
             if not body:
                 body = "(not found)"
                 self._last_misses += 1
+                _tally[1] += 1
             else:
                 _hits += 1
                 self._last_hits += 1
+                _tally[0] += 1
             body = self._cap(body)
             block = f"### {op}\n{body}"
             blocks.append(block)
@@ -357,6 +393,8 @@ class ArchProbe:
     def _run_one(self, op: ProbeOp) -> str:
         if op.op == "facts":
             return self._facts(op.arg)
+        if op.op == "module":
+            return self._module(op.arg)
         # Unreachable while extract_probe_request enforces the allow-list;
         # defensive so a future op added to the parser but not here degrades
         # to "(not found)" rather than to an AttributeError mid-batch.
@@ -366,6 +404,15 @@ class ArchProbe:
     def _facts(self, symbol: str) -> str:
         """Signature + contracts for *symbol*, from the collect model."""
         return self._bridge.pull_symbol(symbol) or ""
+
+    def _module(self, module_ref: str) -> str:
+        """AUTO-P5: top-level symbol inventory for *module_ref*.
+
+        Answers "what is in this file", which `facts` structurally cannot.
+        Same budget, same truncation, same miss accounting — the only new
+        thing is the question it can answer.
+        """
+        return self._bridge.module_symbols(module_ref) or ""
 
     def _cap(self, text: str) -> str:
         if len(text) <= self._max_chars:

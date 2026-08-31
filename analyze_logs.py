@@ -755,6 +755,8 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
                 # lie this ticket exists to remove.
                 "hits":       _int_or(params.get("hits"), -1),
                 "misses":     _int_or(params.get("misses"), -1),
+                # AUTO-P5: "facts=3/1 module=1/0". Empty on pre-P5 traces.
+                "by_op":      str(params.get("by_op", "") or ""),
                 "chars_used": int(params.get("chars_used", 0) or 0),
             })
 
@@ -1061,6 +1063,27 @@ def render_run_summary(run: dict) -> None:
                 f"request(s) over {_clusters} cluster(s), {_asked} op(s), "
                 f"{_found} (max round {_rounds})"
             )
+            # AUTO-P5: per-op breakdown. With one op it is redundant; with
+            # two or more it is the only way to see whether a newly added op
+            # is earning the round-trip it costs, which is the number the
+            # next scope decision turns on.
+            _by_op: dict = {}
+            for r in _probe_res:
+                for part in r.get("by_op", "").split():
+                    if "=" not in part or "/" not in part:
+                        continue
+                    op, _, tally = part.partition("=")
+                    h, _, m = tally.partition("/")
+                    slot = _by_op.setdefault(op, [0, 0])
+                    slot[0] += _int_or(h, 0)
+                    slot[1] += _int_or(m, 0)
+            if len(_by_op) > 1:
+                _parts = ", ".join(
+                    f"{op} {h}/{h + m}"
+                    for op, (h, m) in sorted(_by_op.items(), key=lambda kv: -kv[1][0])
+                )
+                print(f"  {' ' * len('Architect probes')}  by op: {_parts}")
+
             if _declined:
                 _by_reason = {}
                 for d in _declined:

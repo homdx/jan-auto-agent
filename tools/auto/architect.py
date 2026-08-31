@@ -1511,6 +1511,10 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                         # rate across two real runs as "22 resolved".
                         "hits":           _probe.last_hits,
                         "misses":         _probe.last_misses,
+                        # AUTO-P5: "facts=3/1 module=1/0" — which op resolved
+                        # what. Aggregate hits cannot tell you whether a newly
+                        # added op is earning its round-trip.
+                        "by_op":          _probe.last_by_op_str(),
                         "chars_used":     _probe.chars_used,
                         "run_chars_used": _probe.run_chars_used,
                     },

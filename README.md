@@ -218,19 +218,35 @@ do not mention them keep working):
 | `probe_max_rounds` | `1` | Probe rounds per batch before the forced final call. See the table above. No measured run has ever needed more than 3, or hit a cap of 5. |
 | `probe_max_chars` | `2000` | Cap on one op's result. Overflow is hard-truncated with a visible notice. |
 | `probe_max_total_chars` | `6000` | Cap on the accumulated digest **per batch** (reset between batches — AUTO-P4a). Must be ≥ `probe_max_chars` or it is clamped up. |
-| `probe_allowed_ops` | `facts` | Comma-separated allow-list. Only `facts` has an executor today. Present-but-empty means *allow nothing* and fails closed; it does not restore the default. |
+| `probe_allowed_ops` | `facts` | Comma-separated allow-list. `facts` and `module` have executors. The shipped profiles set `facts, module`; the code fallback stays `facts` alone, so a config that omits the key does not silently gain an op. Present-but-empty means *allow nothing* and fails closed. |
 
-`facts <symbol>` returns the signature and contracts the collect model holds
-for that symbol — denser per token than a source excerpt, and it works even
-for a symbol in a file the Architect was never shown.
+**Two ops** (AUTO-P5):
 
-**What can and cannot be looked up.** Collect indexes **top-level functions
-and classes only**. `facts request_completion` and `facts InnerLoop` resolve;
-methods (`InnerLoop.run_task`), module paths (`tools.llm_stream`) and config
-keys (`max_attempts_per_task`) never will, because they are not in the index.
-The probe instructions say this to the model explicitly (AUTO-P4b) — in the
-first runs without that guidance it asked for 19 names of which only 2 were
-of a shape the artifact could answer. `symbol` / `refs` /
+| Op | Question it answers | Returns |
+|---|---|---|
+| `facts <symbol>` | "what is this symbol" | signature + contracts |
+| `module <path>` | "what is in this file" | every top-level name, with line number and first docstring line |
+
+`module` exists because `facts` structurally could not answer the question the
+Architect kept asking. Across two measured runs, **7 of the 9 unresolved
+lookups were `facts backoff` or `facts retry`** — the first is a *file*
+(`tools/backoff.py`, which defines six functions but no symbol called
+`backoff`), the second a *concept* that is not an identifier anywhere in the
+tree. Both correctly returned nothing, and the model had no way to express
+what it actually meant. `module tools/backoff.py` is that way.
+
+`module` accepts three reference forms — `tools/backoff.py`,
+`tools/backoff`, `tools.backoff` — and matches **exactly**, with no
+bare-basename fallback: if two files share a basename, answering with
+whichever came first would plan against the wrong module while the telemetry
+recorded a success.
+
+**What still cannot be looked up.** Collect indexes **top-level functions and
+classes only**. `facts request_completion` and `facts InnerLoop` resolve;
+methods (`InnerLoop.run_task`) and config keys (`max_attempts_per_task`) never
+will. The probe instructions say this to the model explicitly (AUTO-P4b) — in
+the first runs without that guidance it asked for 19 names of which only 2
+were of a shape the artifact could answer. `symbol` / `refs` /
 `read` are planned but not implemented; an op outside the allow-list parses
 to nothing, which the harness reads as "not a probe" rather than as a probe
 it will silently no-op on.
@@ -544,6 +560,7 @@ Working and used. Read it as follows.
 | `over M cluster(s)` | whether probing is one pathological batch or spread out |
 | `K op(s)` | total symbols asked for |
 | `N/M symbol(s) found` | symbols collect actually returned, out of those asked. **`0/M — collect resolved nothing` means the probe is doing nothing useful**, whatever the request count says |
+| `by op:` | per-op hit rate, shown once more than one op is in play (AUTO-P5) — the number that says whether a newly added op is earning its round-trip |
 | `declined` | **why** the rest went unanswered — see below |
 | `request rate` | probing batches ÷ batches reviewed |
 
