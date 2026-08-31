@@ -30,6 +30,8 @@ is exactly the trap ``_lint_probe_config`` warns about.
             instead of raising NoSectionError.
   AC-P3M-8  probe_allowed_ops = <empty> fails closed (no ops), rather than
             silently restoring the "facts" default.
+  AC-P3M-9  Every profile's probe budget FITS its own num_ctx (AUTO-P4c).
+  AC-P3M-10 Budgets are internally coherent and scale with the window.
 """
 
 from __future__ import annotations
@@ -111,6 +113,99 @@ class TestEveryProfile:
 
         assert ("use_in_auto" in text) is (not has_collect)
         assert ("num_ctx=" in text) is bool(0 < num_ctx < 8192)
+
+
+# Chars-per-token used for the headroom arithmetic. Deliberately optimistic
+# (real English/code prose runs ~3.5–4); a budget that fails this check would
+# fail worse in practice.
+_CPT = 3.5
+
+# What a probe round adds on top of the architect prompt, beyond the digest.
+_INSTR_CHARS = len(arch_probe.PROBE_INSTRUCTIONS)
+
+
+@pytest.mark.parametrize("profile", PROFILES)
+def test_probe_budget_fits_the_window(profile: str) -> None:
+    """AC-P3M-9 (AUTO-P4c): a profile whose probe budget cannot fit its own
+    context window is a latent truncation bug, not a config preference.
+
+    The probe appends PROBE_INSTRUCTIONS to every architect prompt and, on a
+    firing batch, up to probe_max_total_chars of digest on top. That has to
+    coexist with the file contents the architect is actually reviewing
+    (max_files_per_review x max_file_chars), the prompt template, and the
+    max_tokens reserved for the reply.
+
+    This is the check that was missing when the AUTO-P defaults (6 000-char
+    digest) were copied unchanged into profiles with an 8 192- or 4 096-token
+    window. Anyone retuning a window — changing num_ctx, max_file_chars or
+    max_files_per_review — trips this before a run does.
+    """
+    cfg = _load(profile)
+    active = cfg.get("api", "active", fallback="local")
+    num_ctx = cfg.getint(f"api_{active}", "num_ctx", fallback=0)
+    if num_ctx <= 0:
+        pytest.skip(f"{profile}: num_ctx not set — server default, nothing to check")
+
+    files = cfg.getint("architect", "max_files_per_review", fallback=6)
+    file_chars = cfg.getint("architect", "max_file_chars", fallback=4000)
+    reply = cfg.getint("architect", "max_tokens", fallback=2048)
+    digest = cfg.getint("architect", "probe_max_total_chars", fallback=6000)
+
+    # +4000 chars for the prompt template, file listing and goal.
+    prompt_tok = (files * file_chars + 4000) / _CPT
+    probe_tok = (_INSTR_CHARS + digest) / _CPT
+    total = prompt_tok + probe_tok + reply
+
+    assert total <= num_ctx, (
+        f"{profile}: a probe round needs ~{total:.0f} tokens but num_ctx is "
+        f"{num_ctx}. Lower probe_max_total_chars (currently {digest}), "
+        f"max_file_chars ({file_chars}) or max_files_per_review ({files})."
+    )
+
+
+@pytest.mark.parametrize("profile", PROFILES)
+def test_probe_budgets_are_coherent(profile: str) -> None:
+    """AC-P3M-10: internal consistency of the three budget keys.
+
+    max_total_chars below max_chars is silently clamped up by ArchProbe
+    (`max(max_chars, max_total_chars)`), so a profile written that way does
+    not do what it says. Rounds must be at least 1 — 0 disables probing
+    through the back door while probe_enabled still reads true.
+    """
+    cfg = _load(profile)
+    if not cfg.has_option("architect", "probe_max_rounds"):
+        pytest.skip(f"{profile}: no explicit AUTO-P block — fallbacks apply")
+
+    rounds = cfg.getint("architect", "probe_max_rounds")
+    per_op = cfg.getint("architect", "probe_max_chars")
+    total = cfg.getint("architect", "probe_max_total_chars")
+
+    assert rounds >= 1, "0 rounds disables probing without saying so"
+    assert rounds <= 5, "no measured run ever needed more than 3 rounds"
+    assert per_op > 0
+    assert total >= per_op, (
+        f"{profile}: probe_max_total_chars ({total}) < probe_max_chars "
+        f"({per_op}) — ArchProbe clamps the total up, so this profile does "
+        f"not do what it says"
+    )
+
+
+def test_every_profile_declares_its_probe_budget() -> None:
+    """AUTO-P4c: fallbacks exist, but a profile that relies on them silently
+    inherits budgets tuned for a different window. Every shipped profile
+    states its own, so the numbers can be reviewed next to the num_ctx they
+    were chosen for.
+
+    agents_128k.ini is the documented exception — see the patch notes: it is
+    the operator's live, hand-tuned profile and is deliberately left alone.
+    """
+    missing = [
+        p for p in PROFILES
+        if not _load(p).has_option("architect", "probe_max_rounds")
+    ]
+    assert missing == ["agents_128k.ini"], (
+        f"profiles without an explicit AUTO-P budget block: {missing}"
+    )
 
 
 def test_128k_is_the_only_probe_ready_profile() -> None:

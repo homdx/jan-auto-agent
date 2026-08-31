@@ -179,21 +179,45 @@ python3 main.py --dry-run --goal "..."
 straight through to the forced call — the startup lint warns about exactly
 that. No profile ships with `probe_enabled` set; absent means `false`.
 
-The 4k-sized profiles (`agents_4k.ini`, `agents_stub.ini`) have no room for a
-probe round at all — the digest would overflow the window — and the lint
-warns about them separately. `agents.ini` at `num_ctx = 8192` fits but runs
-at about 82% of the window; halve `probe_max_total_chars` to `3000` if you
-want to probe there.
+**Every profile carries its own budget** (AUTO-P4c). The three numeric keys
+are scaled to the window they sit in, because a digest sized for a
+262 144-token context does not belong in a 4 096-token one:
+
+| Profile | `num_ctx` | rounds | per-op | digest/batch |
+|---|---:|---:|---:|---:|
+| `agents_4k.ini`, `agents_stub.ini` | 4 096 | 1 | 600 | 1 200 |
+| `agents.ini` | 8 192 | 2 | 1 200 | 2 500 |
+| `agents_32k.ini`, `..._fast_cpu` | 32 768 | 3 | 2 000 | 6 000 |
+| `agents_32k_slow_cpu.ini` | 32 768 | 2 | 1 500 | 4 000 |
+| `agents_64k.ini` | 65 536 | 3 | 2 000 | 8 000 |
+| `agents_256k.ini` | 262 144 | 3 | 4 000 | 12 000 |
+| `agents_128k.ini` | 1 000 000 | operator-tuned | | |
+
+These are ceilings, not targets. A measured working run used at most **457
+characters of digest per batch** at 3 rounds and 1 171 at 5, so every profile
+above has room to spare — including the 4k ones, which an earlier version of
+this document wrongly called unusable.
+
+`agents_32k_slow_cpu.ini` is stingier than its identically-sized sibling on
+purpose: a firing probe costs one extra architect round-trip, and on a
+CPU-bound profile wall-clock is the binding constraint, not tokens.
+
+Two tests keep this honest. `test_probe_budget_fits_the_window` fails if any
+profile's `prompt + instructions + digest + max_tokens` exceeds its own
+`num_ctx`, so retuning `max_file_chars` or `num_ctx` trips before a run does.
+`test_probe_budgets_are_coherent` fails if `probe_max_total_chars` is below
+`probe_max_chars` — `ArchProbe` silently clamps the total up in that case, so
+the profile would not do what it says.
 
 **All settings** (`[architect]`; every one has a fallback, so profiles that
 do not mention them keep working):
 
-| Key | Default | Meaning |
+| Key | Fallback | Meaning |
 |---|---|---|
 | `probe_enabled` | `false` | Master switch. Off ⇒ nothing is appended to any prompt and every byte sent is identical to pre-AUTO-P. |
-| `probe_max_rounds` | `1` | Probe rounds per batch before the forced final call. Keep it low — a high cap usually means `max_files_per_review` is too narrow. |
+| `probe_max_rounds` | `1` | Probe rounds per batch before the forced final call. See the table above. No measured run has ever needed more than 3, or hit a cap of 5. |
 | `probe_max_chars` | `2000` | Cap on one op's result. Overflow is hard-truncated with a visible notice. |
-| `probe_max_total_chars` | `6000` | Cap on the accumulated digest **per batch** (reset between batches — AUTO-P4a). Normally reached before the round cap. |
+| `probe_max_total_chars` | `6000` | Cap on the accumulated digest **per batch** (reset between batches — AUTO-P4a). Must be ≥ `probe_max_chars` or it is clamped up. |
 | `probe_allowed_ops` | `facts` | Comma-separated allow-list. Only `facts` has an executor today. Present-but-empty means *allow nothing* and fails closed; it does not restore the default. |
 
 `facts <symbol>` returns the signature and contracts the collect model holds
