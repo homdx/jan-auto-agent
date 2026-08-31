@@ -292,7 +292,7 @@ def summarize_repo(
     or parse-error modules don't count toward the total, since nothing is
     sent for them). Pass a no-op lambda to silence progress reporting.
     """
-    from tools.backoff import backoff_seconds, clear_state, load_state, save_state
+    from tools.backoff import retry_with_backoff, clear_state, load_state, save_state
 
     done: Dict[str, dict] = {}
     if checkpoint_path is not None:
@@ -326,30 +326,28 @@ def summarize_repo(
 
         source = sources.get(module.path, "")
         result = module
-        error_count = 0
-        while True:
-            try:
-                result = summarize_module(
-                    module, source, llm_call, num_ctx=num_ctx, max_tokens=max_tokens
-                )
-                break
-            except Exception as exc:  # noqa: BLE001 - one bad module must not abort the batch
-                error_count += 1
-                if on_error is not None:
-                    on_error(module.path, exc, error_count)
-                if error_count > max_retries:
-                    logger.warning(
-                        "collect summarizer: giving up on %s after %d error(s): %s",
-                        module.path, error_count, exc,
-                    )
-                    result = module
-                    break
-                wait = backoff_seconds(error_count - 1)
-                logger.warning(
+        try:
+            result = retry_with_backoff(
+                lambda: summarize_module(
+                    module, source, llm_call,
+                    num_ctx=num_ctx, max_tokens=max_tokens,
+                ),
+                attempts=max_retries + 1,
+                sleep_fn=sleep_fn,
+                on_retry=lambda exc, n, wait: logger.warning(
                     "collect summarizer: %s failed (%s); retrying in %ds",
                     module.path, exc, wait,
-                )
-                sleep_fn(wait)
+                ),
+                on_error=lambda exc, count: (
+                    on_error(module.path, exc, count) if on_error is not None else None
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 — one bad module must not abort the batch
+            logger.warning(
+                "collect summarizer: giving up on %s after %d error(s): %s",
+                module.path, max_retries + 1, exc,
+            )
+            result = module
 
         out.append(result)
         sent += 1

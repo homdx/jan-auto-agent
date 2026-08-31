@@ -1047,52 +1047,51 @@ class FaqAgent:
         # request_completion call so a genuine model NOT_FOUND (which
         # returns normally, no exception) still short-circuits immediately.
         _LEGACY_RETRY_ATTEMPTS = 3
-        reply = None
-        last_exc = None  # type: Exception | None
-        for _attempt in range(_LEGACY_RETRY_ATTEMPTS):
-            try:
-                if stream:
-                    # AUTO-FIX (bug 45): on_token writes straight to stdout
-                    # with no separator, so a stream dropped mid-answer was
-                    # followed by the retry's answer from word one — reading
-                    # as one garbled generation. Mark the restart.
-                    if _attempt > 0:
-                        sys.stdout.write(
-                            f"\n[…retrying — previous stream was interrupted; "
-                            f"attempt {_attempt + 1}/{_LEGACY_RETRY_ATTEMPTS}…]\n"
-                        )
-                        sys.stdout.flush()
-                    reply = request_completion(
-                        url, headers, payload, self.timeout,
-                        stream=True,
-                        api_format=self.api_format,
-                        on_token=lambda t: (sys.stdout.write(t), sys.stdout.flush()),
-                        ssl_context=self.ssl_context,
-                    )
-                    self.llm_call_count += 1  # legacy streaming call
-                    print()  # newline after streamed output
-                else:
-                    reply = request_completion(
-                        url, headers, payload, self.timeout,
-                        stream=False,
-                        api_format=self.api_format,
-                        ssl_context=self.ssl_context,
-                    )
-                    self.llm_call_count += 1  # legacy non-streaming call
-                last_exc = None
-                break
-            except Exception as exc:
-                last_exc = exc
-                if _attempt < _LEGACY_RETRY_ATTEMPTS - 1:
-                    _wait = backoff.backoff_seconds(_attempt)
-                    logger.warning(
-                        "FaqAgent: legacy API call failed (%s) — retrying "
-                        "(attempt %d/%d) in %ds",
-                        exc, _attempt + 2, _LEGACY_RETRY_ATTEMPTS, _wait,
-                    )
-                    time.sleep(_wait)
 
-        if last_exc is not None:
+        def _one_call() -> str:
+            if stream:
+                reply = request_completion(
+                    url, headers, payload, self.timeout,
+                    stream=True,
+                    api_format=self.api_format,
+                    on_token=lambda t: (sys.stdout.write(t), sys.stdout.flush()),
+                    ssl_context=self.ssl_context,
+                )
+                self.llm_call_count += 1  # legacy streaming call
+                print()  # newline after streamed output
+            else:
+                reply = request_completion(
+                    url, headers, payload, self.timeout,
+                    stream=False,
+                    api_format=self.api_format,
+                    ssl_context=self.ssl_context,
+                )
+                self.llm_call_count += 1  # legacy non-streaming call
+            return reply
+
+        def _on_retry(exc: Exception, attempt: int, wait: int) -> None:
+            # AUTO-FIX (bug 45): on_token writes straight to stdout with no
+            # separator, so a stream dropped mid-answer was followed by the
+            # retry's answer from word one — reading as one garbled
+            # generation. Mark the restart.
+            if stream:
+                sys.stdout.write(
+                    f"\n[…retrying — previous stream was interrupted; "
+                    f"attempt {attempt + 1}/{_LEGACY_RETRY_ATTEMPTS}…]\n"
+                )
+                sys.stdout.flush()
+            logger.warning(
+                "FaqAgent: legacy API call failed (%s) — retrying "
+                "(attempt %d/%d) in %ds",
+                exc, attempt + 1, _LEGACY_RETRY_ATTEMPTS, wait,
+            )
+
+        try:
+            reply = backoff.retry_with_backoff(
+                _one_call, attempts=_LEGACY_RETRY_ATTEMPTS,
+                sleep_fn=time.sleep, on_retry=_on_retry,
+            )
+        except Exception as last_exc:
             logger.error(
                 "FaqAgent: API call failed after %d attempt(s): %s",
                 _LEGACY_RETRY_ATTEMPTS, last_exc,

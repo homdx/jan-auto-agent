@@ -480,9 +480,6 @@ class Orchestrator(OrchestratorActions):
 
                 if validation.get("_api_error"):
                     _api_err_count += 1
-                    if _api_err_count == 1:
-                        print(backoff.MILESTONE_TABLE)
-                    _wait = backoff.backoff_seconds(_api_err_count - 1)
                     if iteration >= self.max_iterations:
                         print(f"[{_ts()}] ⚠️  Validator unavailable — "
                               f"max iterations reached, stopping. "
@@ -497,7 +494,7 @@ class Orchestrator(OrchestratorActions):
                         "already_searched": list(already_searched),
                         "search_result": search_result,
                     }
-                    backoff.sleep_with_interrupt_save(_wait, _chk)
+                    backoff.api_error_pause(_api_err_count, _chk)
                     continue  # retry same iteration (do not increment)
 
                 _api_err_count = 0
