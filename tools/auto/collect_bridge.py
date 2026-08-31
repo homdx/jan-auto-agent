@@ -56,6 +56,54 @@ _SHRINK_SYSTEM_PROMPT = (
 )
 
 
+def _qualname_matches(qualname: str, name: str) -> bool:
+    """Does collect's ``qualname`` refer to the symbol the caller named?
+
+    COLLECT-FIX-1. Collect writes qualnames as ``<module path>:<dotted
+    symbol>`` — ``tools/llm_stream.py:strip_think``,
+    ``tools/auto/inner_loop.py:InnerLoop.run_task``. The previous matcher
+    treated the whole string as dotted::
+
+        qn == name or qn.endswith("." + name) or qn.split(".")[-1] == name
+
+    which never sees the ``:`` separator, and so:
+
+    * a module-level function or class NEVER matched its bare name —
+      ``"tools/llm_stream.py:strip_think".split(".")[-1]`` is
+      ``"py:strip_think"``, not ``"strip_think"``;
+    * a *method* matched its bare name only by accident, because the dot in
+      ``.py`` happens to fall to the left of the class dot;
+    * the ``Class.method`` form never matched, because the qualname carries
+      ``:InnerLoop.run_task``, not ``.InnerLoop.run_task``.
+
+    Both public methods promised "bare name, dotted suffix, or full
+    qualname" in their docstrings and delivered roughly none of it. Because
+    every caller (ContextBroker Pass 3, Gate-1 grounding notes, and now
+    AUTO-P's ArchProbe) fails open on a miss, the failure was silent: it
+    looked like "collect does not know that symbol" rather than like a bug.
+    It surfaced only when AUTO-P started reporting per-lookup outcomes and
+    a real run came back 60/60 misses.
+
+    Matching is now done on the symbol part alone, most specific first:
+    exact qualname, then exact dotted symbol, then dotted suffix
+    (``run_task`` matches ``InnerLoop.run_task``), then bare last
+    component. A caller-supplied ``path:Symbol`` still matches exactly.
+    """
+    if not qualname or not name:
+        return False
+    if qualname == name:
+        return True
+    # Split off the module-path prefix; collect always uses ':' for it, and a
+    # symbol name can never contain one.
+    symbol = qualname.split(":", 1)[1] if ":" in qualname else qualname
+    if symbol == name:
+        return True
+    if symbol.endswith("." + name):
+        return True
+    return symbol.split(".")[-1] == name
+
+
+
 class CollectBridge:
     """Consumer-facing wrapper around a loaded `CollectModel` for `--auto`.
 
@@ -169,7 +217,7 @@ class CollectBridge:
             for module in self._model.modules:
                 for sym in module.public_symbols:
                     qn = sym.qualname
-                    if qn == name or qn.endswith("." + name) or qn.split(".")[-1] == name:
+                    if _qualname_matches(qn, name):
                         return self._format_symbol_block(module.path, sym)
         except Exception as exc:  # noqa: BLE001 — never block a pull on this
             logger.warning("CollectBridge.pull_symbol(%s): failed: %s", symbol_name, exc)
@@ -204,7 +252,7 @@ class CollectBridge:
             for module in self._model.modules:
                 for sym in module.public_symbols:
                     qn = sym.qualname
-                    if qn == name or qn.endswith("." + name) or qn.split(".")[-1] == name:
+                    if _qualname_matches(qn, name):
                         return list(self._model.contracts_for(qn))
         except Exception as exc:  # noqa: BLE001
             logger.warning("CollectBridge.contracts_for_symbol(%s): failed: %s", symbol_name, exc)

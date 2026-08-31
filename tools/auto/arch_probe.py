@@ -82,6 +82,14 @@ DEFAULT_ALLOWED_OPS: tuple[str, ...] = ("facts",)
 # Appended to the Architect's user message when probing is available. Kept
 # short on purpose: the surrounding prompt is already long, and every token
 # here competes with the file contents the model is meant to be reviewing.
+# AUTO-P4b: the shape rules below are not decoration. In the first two real
+# runs the model asked for 19 distinct names and only 2 existed: the rest were
+# config keys (`max_attempts_per_task`), module paths (`tools.llm_stream`),
+# methods (`InnerLoop.run_task`), and plain guesses at what a helper "should"
+# be called (`backoff`, `retry`, `_retry`, `attempt`, `retry_loop`). Collect
+# indexes TOP-LEVEL functions and classes only — no methods, no config keys,
+# no modules — so every one of those was unanswerable by construction, and the
+# model had never been told what kind of name it could ask for.
 PROBE_INSTRUCTIONS = (
     "\nIF — and only if — you cannot ground a task because you are missing a "
     "fact about a symbol that is NOT shown above, you may reply with a single "
@@ -89,10 +97,21 @@ PROBE_INSTRUCTIONS = (
     "\n"
     "    ARCH_PROBE: facts <symbol>, facts <other_symbol>\n"
     "\n"
-    "You will be re-asked with those facts (signature and contracts) added. "
-    "Ask only for symbols you genuinely need and cannot see; a probe costs a "
-    "full round, and you get a limited number of them. If you can plan from "
-    "what is already above, return the JSON array and do not probe."
+    "<symbol> must be a top-level function or class name, spelled exactly as "
+    "it is defined in the source — for example `request_completion` or "
+    "`InnerLoop`. The following CANNOT be looked up and will come back empty:\n"
+    "  - a method or attribute (`InnerLoop.run_task`) — ask for `InnerLoop`\n"
+    "  - a module or import path (`tools.llm_stream`) — ask for a name in it\n"
+    "  - a config key or setting (`max_attempts_per_task`)\n"
+    "  - a name you are guessing at rather than one you have seen "
+    "(`backoff`, `retry_loop`)\n"
+    "\n"
+    "You will be re-asked with the signature and contracts of whatever "
+    "resolves. Ask only for symbols you genuinely need, cannot see above, and "
+    "know the real name of; a probe costs a full round and you get a limited "
+    "number of them. Re-asking for a name that already came back empty will "
+    "end your probing, not retry it. If you can plan from what is already "
+    "above, return the JSON array and do not probe."
 )
 
 # Appended instead of PROBE_INSTRUCTIONS on the final call, once the probe
@@ -211,6 +230,11 @@ class ArchProbe:
         # from "the model stopped asking". The digest is appended to ONE batch's
         # prompt, so the context-window budget it protects is per batch.
         self._chars_used = 0
+        # AUTO-P4b: per-round outcome of the LAST execute() call, so callers
+        # can report "symbols found" instead of "digests produced" — the
+        # distinction that hid a 60/60 miss rate behind "22 resolved".
+        self._last_hits = 0
+        self._last_misses = 0
         # Never reset — reported only, so a run can still be judged on total
         # probe cost without that total being able to switch the feature off.
         self._run_chars_used = 0
@@ -239,6 +263,16 @@ class ArchProbe:
         return self._chars_used
 
     @property
+    def last_hits(self) -> int:
+        """Ops the last :meth:`execute` actually resolved."""
+        return self._last_hits
+
+    @property
+    def last_misses(self) -> int:
+        """Ops the last :meth:`execute` could not resolve."""
+        return self._last_misses
+
+    @property
     def run_chars_used(self) -> int:
         """Digest characters produced across the whole run. Observability
         only — never gates anything, unlike :attr:`chars_used`."""
@@ -255,13 +289,30 @@ class ArchProbe:
         as budget exhaustion — re-asking with an empty digest would produce
         the identical response and the identical probe, forever.
 
-        Fail-open throughout: an op that misses contributes a ``(not found)``
-        line so the model can see its guess was wrong and stop asking for it,
-        and an op that raises is logged and skipped.  Neither aborts a batch.
+        AUTO-P4b: a round in which EVERY op missed now returns ``""`` as
+        well.  It previously returned a digest made entirely of
+        ``(not found)`` lines, on the theory (AC-P1E-3) that the model would
+        read them, learn its guesses were wrong, and stop asking.  It does
+        not.  A real run showed one batch asking ``facts backoff`` five
+        rounds running, receiving ``(not found)`` each time, and only
+        stopping at the round cap — five LLM calls spent re-asking a question
+        whose answer had not changed.  An all-miss round carries no
+        information the next round can act on, so it is treated as the
+        nothing it is.
+
+        A round with even one hit still reports the misses alongside it: in
+        that case the digest does carry new information, and naming what was
+        not found stops the model re-requesting it.
+
+        Fail-open throughout: an op that raises is logged and skipped, and
+        nothing here aborts a batch.
         """
         if not self.usable:
             return ""
         blocks: list[str] = []
+        _hits = 0
+        self._last_hits = 0
+        self._last_misses = 0
         for op in ops or ():
             if self.budget_exhausted:
                 logger.info(
@@ -277,12 +328,27 @@ class ArchProbe:
                 continue
             if not body:
                 body = "(not found)"
+                self._last_misses += 1
+            else:
+                _hits += 1
+                self._last_hits += 1
             body = self._cap(body)
             block = f"### {op}\n{body}"
             blocks.append(block)
             self._chars_used += len(block)
             self._run_chars_used += len(block)
         if not blocks:
+            return ""
+        if _hits == 0:
+            # AUTO-P4b: all-miss round — see the docstring. The characters are
+            # still charged against the batch budget: the lookups happened, and
+            # a model that burns its digest allowance on names that do not
+            # exist should not get an unlimited supply of retries for free.
+            logger.info(
+                "ArchProbe: all %d op(s) missed (%s) — returning an empty "
+                "digest so the caller stops re-asking.",
+                len(blocks), ", ".join(str(op) for op in ops or ()),
+            )
             return ""
         return "## Probe results\n" + "\n\n".join(blocks)
 

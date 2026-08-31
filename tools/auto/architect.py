@@ -1400,6 +1400,16 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
         # regression against the pre-AUTO-P behaviour.
         candidates, probe_request = _attempt_plan()
         _probe_rounds = 0
+        # AUTO-P4b: every op-set already asked in THIS batch. The all-miss fix
+        # in ArchProbe.execute covers the common spin (ask → (not found) →
+        # ask the same thing again), but it cannot cover a model that re-asks
+        # after a round that DID resolve something — a real run showed one
+        # batch alternating between `facts _llm_stream, facts strip_think` and
+        # `facts tools.llm_stream, facts tools.llm_stream.strip_think` for
+        # four rounds. Whatever the digest said, repeating a request that was
+        # already answered cannot produce a different answer, so the second
+        # occurrence ends the loop instead of spending another call.
+        _asked_before: set = set()
 
         def _decline(reason: str, ops: list) -> None:
             """AUTO-P4a: record WHY a probe request went unanswered.
@@ -1460,6 +1470,17 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 _decline("round_cap", probe_request)
                 break
 
+            _fingerprint = frozenset(str(op) for op in probe_request)
+            if _fingerprint in _asked_before:
+                logger.info(
+                    "review_one_cluster [%s]: architect re-asked an already "
+                    "answered probe (%s) — forcing a final plan call.",
+                    cluster.name, ", ".join(str(op) for op in probe_request),
+                )
+                _decline("repeat", probe_request)
+                break
+            _asked_before.add(_fingerprint)
+
             _digest_add = _probe.execute(probe_request)
             if not _digest_add:
                 logger.info(
@@ -1484,6 +1505,12 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                         "ops":            len(probe_request),
                         # AUTO-P4a: per-batch (gates the loop) and per-run
                         # (reported only) — see ArchProbe.reset.
+                        # AUTO-P4b: hits/misses are the honest measure. Before
+                        # this, analyze_logs counted probe_result events and
+                        # called them "resolved", which reported a 60/60 miss
+                        # rate across two real runs as "22 resolved".
+                        "hits":           _probe.last_hits,
+                        "misses":         _probe.last_misses,
                         "chars_used":     _probe.chars_used,
                         "run_chars_used": _probe.run_chars_used,
                     },
@@ -1491,10 +1518,10 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
             except Exception as exc:  # noqa: BLE001 — AUTO-P4a, see above
                 logger.debug("probe_result trace failed: %s", exc)
             logger.info(
-                "review_one_cluster [%s]: probe round %d/%d resolved %d op(s) "
-                "(%d chars total) — re-asking.",
+                "review_one_cluster [%s]: probe round %d/%d — %d of %d op(s) "
+                "found (%d chars total) — re-asking.",
                 cluster.name, _probe_rounds, self._probe_max_rounds,
-                len(probe_request), _probe.chars_used,
+                _probe.last_hits, len(probe_request), _probe.chars_used,
             )
             candidates, probe_request = _attempt_plan()
 

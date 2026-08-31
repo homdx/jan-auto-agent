@@ -198,7 +198,15 @@ do not mention them keep working):
 
 `facts <symbol>` returns the signature and contracts the collect model holds
 for that symbol — denser per token than a source excerpt, and it works even
-for a symbol in a file the Architect was never shown. `symbol` / `refs` /
+for a symbol in a file the Architect was never shown.
+
+**What can and cannot be looked up.** Collect indexes **top-level functions
+and classes only**. `facts request_completion` and `facts InnerLoop` resolve;
+methods (`InnerLoop.run_task`), module paths (`tools.llm_stream`) and config
+keys (`max_attempts_per_task`) never will, because they are not in the index.
+The probe instructions say this to the model explicitly (AUTO-P4b) — in the
+first runs without that guidance it asked for 19 names of which only 2 were
+of a shape the artifact could answer. `symbol` / `refs` /
 `read` are planned but not implemented; an op outside the allow-list parses
 to nothing, which the harness reads as "not a probe" rather than as a probe
 it will silently no-op on.
@@ -500,7 +508,7 @@ Zero probes for a reason that has nothing to do with the model. Run
 `--collect` and set `use_in_auto = true`.
 
 ```
-Architect probes: 12 request(s) over 8 cluster(s), 24 op(s), 8 resolved (max round 1)
+Architect probes: 12 request(s) over 8 cluster(s), 24 op(s), 5/24 symbol(s) found (max round 1)
                   4 declined: 4 hit round cap
                   request rate: 4.0% (8/202 batches)
 ```
@@ -511,7 +519,7 @@ Working and used. Read it as follows.
 | `N request(s)` | how many `ARCH_PROBE` replies the Architect sent |
 | `over M cluster(s)` | whether probing is one pathological batch or spread out |
 | `K op(s)` | total symbols asked for |
-| `R resolved` | requests the executor answered |
+| `N/M symbol(s) found` | symbols collect actually returned, out of those asked. **`0/M — collect resolved nothing` means the probe is doing nothing useful**, whatever the request count says |
 | `declined` | **why** the rest went unanswered — see below |
 | `request rate` | probing batches ÷ batches reviewed |
 
@@ -521,15 +529,22 @@ rather than summed:
 | Reason | What it means | What to change |
 |---|---|---|
 | `hit round cap` | the model wanted another round | raise `probe_max_rounds`, or widen `max_files_per_review` |
+| `re-asked an answered probe` | the model repeated a request | usually harmless; a persistent pattern means the digest is not answering the real question |
 | `hit digest budget` | the digest filled up within the batch | raise `probe_max_total_chars` |
 | `collect had no answer` | the symbol is not in the artifact | rebuild with `--collect`; check staleness |
 | `no collect artifact` | probing was never actually available | fix the config; the startup lint warns about this |
 | `probed after forced call` | the model ignored an instruction | usually a weak model, not a config problem |
 
 Before AUTO-P4a these five were reported as one figure labelled
-`N unresolved`, which the runbook documented as "collect did not know these
-symbols". On the first real run that produced probes, all four were the round
-cap and none were collect misses — collect had answered 8 of 8.
+`N unresolved`, which was documented as "collect did not know these symbols".
+On the first real probing run all four were in fact the round cap.
+
+AUTO-P4b then found that "8 resolved" in that same line had been counting
+*rounds that produced a digest*, not symbols found. Across two measured runs
+the true figure was **0 of 60**: `CollectBridge` could not match a bare symbol
+name against collect's `path:Symbol` qualname format, so every lookup returned
+`(not found)` and the loop spun on it. If you are comparing against notes from
+before AUTO-P4b, treat every "resolved" number in them as meaningless.
 
 The line updates as the run proceeds: `analyze_logs.py` reads the JSONL
 trace, which is appended live, so you can run it against an in-flight run

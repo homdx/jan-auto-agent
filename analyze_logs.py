@@ -385,6 +385,21 @@ def _extract_current_prompt_from_meta(meta_prompt: str) -> str:
     return after.rstrip("\n")
 
 
+def _int_or(value, default: int) -> int:
+    """int(value), or *default* when value is missing or unparseable.
+
+    agent_trace stringifies params, so this normally sees "0"/"2"; synthetic
+    traces and tests may pass real ints. Both must survive, and a genuine 0
+    must never collapse to the default.
+    """
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
     """
     Walk events and build an analytics structure:
@@ -731,6 +746,15 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
                 "cluster":    params.get("cluster", "?"),
                 "round":      int(params.get("round", 0) or 0),
                 "ops":        int(params.get("ops", 0) or 0),
+                # AUTO-P4b: absent on pre-P4b traces, hence the -1 sentinel —
+                # "not recorded" must not be silently reported as "zero found".
+                # NOT written as `int(params.get("hits", -1) or -1)`: an
+                # integer 0 is falsy, so that idiom turns the single most
+                # important value here — zero symbols found — back into
+                # "not recorded", which is the exact class of comfortable
+                # lie this ticket exists to remove.
+                "hits":       _int_or(params.get("hits"), -1),
+                "misses":     _int_or(params.get("misses"), -1),
                 "chars_used": int(params.get("chars_used", 0) or 0),
             })
 
@@ -1017,10 +1041,25 @@ def render_run_summary(run: dict) -> None:
             _asked = sum(r["ops"] for r in _probe_reqs)
             _clusters = len({r["cluster"] for r in _probe_reqs})
             _rounds = max((r["round"] for r in _probe_res), default=0)
+            # AUTO-P4b: "resolved" now counts SYMBOLS the collect model
+            # actually returned, not probe_result events. Counting events
+            # reported two real runs — 60 lookups, 60 "(not found)" — as
+            # "22 resolved" and "8 resolved", which is how a completely
+            # non-functional lookup path survived three measured runs.
+            _hits = sum(r["hits"] for r in _probe_res if r["hits"] >= 0)
+            _has_hits = any(r["hits"] >= 0 for r in _probe_res)
+            if _has_hits:
+                _found = f"{_hits}/{_asked} symbol(s) found"
+                if _hits == 0:
+                    _found = yellow(f"{_found} — collect resolved nothing")
+            else:
+                # Pre-AUTO-P4b trace: the counters do not exist. Say so rather
+                # than inventing a number.
+                _found = f"{len(_probe_res)} round(s) answered (hit counts not recorded)"
             print(
                 f"  {bold('Architect probes')}: {cyan(str(len(_probe_reqs)))} "
                 f"request(s) over {_clusters} cluster(s), {_asked} op(s), "
-                f"{len(_probe_res)} resolved (max round {_rounds})"
+                f"{_found} (max round {_rounds})"
             )
             if _declined:
                 _by_reason = {}
@@ -1032,6 +1071,7 @@ def render_run_summary(run: dict) -> None:
                     "unresolved":    "collect had no answer",
                     "no_executor":   "no collect artifact",
                     "post_forced":   "probed after forced call",
+                    "repeat":        "re-asked an answered probe",
                 }
                 _parts = ", ".join(
                     f"{n} {_label.get(r, r)}"

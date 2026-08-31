@@ -171,12 +171,33 @@ class TestArchProbeExecutor:
         assert "signature: f()" in out
         assert probe.chars_used > 0
 
-    def test_miss_is_reported_not_dropped(self) -> None:
-        """AC-P1E-3: silence would leave the model guessing that its request
-        was simply ignored, and asking again next round."""
-        out = ArchProbe(_FakeBridge({})).execute(_ops("nope"))
-        assert "### facts nope" in out
-        assert "(not found)" in out
+    def test_miss_is_reported_alongside_a_hit(self) -> None:
+        """AC-P1E-3, as revised by AUTO-P4b.
+
+        The original assertion was that an all-miss round still returns a
+        digest of ``(not found)`` lines, so the model could see its guesses
+        were wrong and stop asking. A real run disproved the premise: one
+        batch asked ``facts backoff``, got ``(not found)``, and asked the
+        identical thing four more times before the round cap stopped it.
+
+        What survives is the half that does work — when a round resolves
+        SOMETHING, naming what it did not resolve is useful, because the
+        digest is going back to the model either way.
+        """
+        out = ArchProbe(_FakeBridge({"good": "module: ok"})).execute(
+            _ops("good", "nope")
+        )
+        assert "### facts good" in out and "module: ok" in out
+        assert "### facts nope" in out and "(not found)" in out
+
+    def test_all_miss_round_returns_empty(self) -> None:
+        """AC-P1E-3b (AUTO-P4b): an all-miss round carries nothing the next
+        round can act on, so it reads as exhaustion and the caller forces a
+        final plan call instead of spending another round."""
+        probe = ArchProbe(_FakeBridge({}))
+        assert probe.execute(_ops("nope", "also_nope")) == ""
+        assert probe.last_hits == 0
+        assert probe.last_misses == 2
 
     def test_oversized_result_is_truncated_visibly(self) -> None:
         """AC-P1E-4"""
@@ -206,12 +227,35 @@ class TestArchProbeExecutor:
         """AC-P1E-7: defensive — unreachable while the parser enforces the
         allow-list, but a future op added to the parser and not here must not
         raise mid-batch."""
-        out = ArchProbe(_FakeBridge({})).execute([ProbeOp("refs", "alpha")])
-        assert "(not found)" in out
+        probe = ArchProbe(_FakeBridge({}))
+        out = probe.execute([ProbeOp("refs", "alpha")])
+        # AUTO-P4b: an op with no executor is a miss like any other, so a
+        # request made only of them comes back empty rather than as a digest
+        # of "(not found)". What matters here is unchanged: no exception.
+        assert out == ""
+        assert probe.last_misses == 1
+        mixed = ArchProbe(_FakeBridge({"a": "module: ok"})).execute(
+            [ProbeOp("refs", "alpha"), ProbeOp("facts", "a")]
+        )
+        assert "(not found)" in mixed and "module: ok" in mixed
 
-    def test_empty_and_all_miss_are_distinguishable(self) -> None:
-        """AC-P1E-8: '' means 'stop, nothing to add'; an all-miss digest is
-        real information and must NOT collapse to ''."""
+    def test_empty_and_all_miss_both_stop_the_loop(self) -> None:
+        """AC-P1E-8, reversed by AUTO-P4b.
+
+        This originally asserted that an all-miss digest is 'real information'
+        and must not collapse to ``""``. It is not: the model demonstrably
+        re-asks the same names after reading it. Both cases now return ``""``
+        because both mean the same thing to the caller — there is nothing new
+        to re-ask with.
+
+        They stay distinguishable where it actually matters, in the counters
+        the trace and analyze_logs report, so a run can still tell 'the model
+        asked for things that do not exist' from 'the model asked for
+        nothing'.
+        """
         probe = ArchProbe(_FakeBridge({}))
         assert probe.execute([]) == ""
-        assert probe.execute(_ops("nope")) != ""
+        assert probe.last_misses == 0
+
+        assert probe.execute(_ops("nope")) == ""
+        assert probe.last_misses == 1

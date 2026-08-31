@@ -285,7 +285,7 @@ def test_real_analyze_logs_done_site_appears_exactly_once_and_is_guarded():
     # that function's line position shifts.
     source = (REPO_ROOT / "analyze_logs.py").read_text(encoding="utf-8")
     accesses = _accesses(source, "analyze_logs.py")
-    matches = [a for a in accesses if (a.location, a.access) == ("analyze_logs.py:1459", "done[-1]")]
+    matches = [a for a in accesses if (a.location, a.access) == ("analyze_logs.py:1499", "done[-1]")]
     assert len(matches) == 1, f"expected exactly one record, got {matches!r}"
     assert matches[0].status == "GUARDED"
 
