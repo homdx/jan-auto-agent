@@ -390,6 +390,21 @@ class AutoController:
         # Pure logging; never raises, never changes self.task_mode.
         _lint_mode_config(self.config, self.task_mode)
         _lint_probe_config(self.config)
+        # AUTO-DEBUG-1: always-on startup banner (not gated by LLM_DEBUG or
+        # [trace] console_echo) so "is probing even eligible this run" is
+        # answerable from the first few lines of stdout instead of being
+        # inferred after the fact from a trace file. `_lint_probe_config`
+        # only speaks up when something is *wrong*; this speaks up every
+        # time, so silence elsewhere (e.g. no "probe fired" line later,
+        # see architect.py AUTO-DEBUG-1) can be read as a real negative
+        # rather than "maybe it just wasn't logged".
+        _probe_enabled = self.config.getboolean("architect", "probe_enabled", fallback=False)
+        _use_in_auto = self.config.getboolean("collect", "use_in_auto", fallback=False)
+        logger.info(
+            "controller: run flags — task_mode=%s dry_run=%s "
+            "[architect] probe_enabled=%s  [collect] use_in_auto=%s",
+            self.task_mode, self.dry_run, _probe_enabled, _use_in_auto,
+        )
         # AUTO-A4: execution working dir (executor/AUTO-C1 runs code here)
         self.workspace_dir = self.agent_dir / "workspace"
 

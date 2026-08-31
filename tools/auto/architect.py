@@ -758,6 +758,16 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
             max_chars=self._probe_max_chars,
             max_total_chars=self._probe_max_total_chars,
         )
+        # AUTO-DEBUG-1: the two warning branches above are the only prior
+        # console signal for this method; a *successful* build was silent,
+        # so "did probing even become available this run" could only be
+        # inferred by grepping prompts for PROBE_INSTRUCTIONS (which the
+        # [trace] max_field_chars head-truncation can hide — see
+        # controller.py AUTO-DEBUG-1 banner for the rest of this fix).
+        logger.info(
+            "architect: probe available this run (collect artifact fresh) — "
+            "offering ARCH_PROBE on every batch."
+        )
         return self._probe
 
     def _build_llm_call(self):
@@ -1172,6 +1182,18 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
             if _probe_request:
                 _truncated = False
                 _unsalvageable = False
+                # AUTO-DEBUG-1: plain logger.info, unconditional — the
+                # tracer.event below is the source of truth for the trace
+                # file, but it only reaches stdout when [trace] console_echo
+                # is on, and even then competes with a lot of other console
+                # noise. This one line is the deliberately-boring,
+                # grep-for-it ("probe FIRED") signal: if it never appears in
+                # a run's log, the probe genuinely never fired — not just
+                # "wasn't printed".
+                logger.info(
+                    "architect [%s]: probe FIRED — %s",
+                    cluster.name, ", ".join(str(op) for op in _probe_request),
+                )
                 tracer.event(
                     source="architect", target="probe", kind="probe_request",
                     model=self._model,
