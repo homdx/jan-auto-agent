@@ -472,6 +472,12 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
         self._probe_max_rounds       = max(0, config.getint(arch, "probe_max_rounds", fallback=1))
         self._probe_max_chars        = config.getint(arch, "probe_max_chars", fallback=2000)
         self._probe_max_total_chars  = config.getint(arch, "probe_max_total_chars", fallback=6000)
+        # AUTO-P8: escalated re-asks allowed when the digest cap cuts a round
+        # short. 0 restores the pre-AUTO-P8 behaviour (force immediately).
+        self._probe_budget_escalations = max(0, min(
+            len(_arch_probe._BUDGET_ESCALATION_LADDER),
+            config.getint(arch, "probe_budget_escalations", fallback=2),
+        ))
         _ops_raw                     = config.get(arch, "probe_allowed_ops", fallback="facts")
         # NOT defaulted back to DEFAULT_ALLOWED_OPS when the key is present but
         # empty: `probe_allowed_ops =` is an operator saying "allow nothing",
@@ -1330,7 +1336,9 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
 
             return _cands, _truncated, _unsalvageable, _probe_request
 
-        def _attempt_plan() -> "tuple[list[CandidateTask] | None, list]":
+        def _attempt_plan(
+            *, temperature: "float | None" = None,
+        ) -> "tuple[list[CandidateTask] | None, list]":
             """One full planning attempt: initial call + the AUTO-H4/H5 ladders.
 
             AUTO-P1 extracted this from the body of ``_review_one_cluster`` so
@@ -1343,7 +1351,12 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
             Returns ``(candidates_or_None, probe_request)``.
             """
             max_tasks = _base_max_tasks
-            candidates, truncated, unsalvageable, probe_request = _call_and_parse(max_tasks)
+            # AUTO-P8: an escalated re-ask pins temperature so the model
+            # re-issues the SAME request and the widened budget serves the ops
+            # that were dropped, rather than re-rolling into a different one.
+            candidates, truncated, unsalvageable, probe_request = _call_and_parse(
+                max_tasks, temperature=temperature
+            )
 
             _shrink_attempts = 0
             _empty_attempts = 0
@@ -1477,6 +1490,8 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
         # already answered cannot produce a different answer, so the second
         # occurrence ends the loop instead of spending another call.
         _asked_before: set = set()
+        # AUTO-P8: escalated re-asks spent on this batch.
+        _budget_escalations = 0
 
         def _decline_by_op(reason: str, ops: list) -> str:
             """Per-op tallies for a declined request, as `facts=0/2`.
@@ -1551,10 +1566,58 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 _decline("no_executor", probe_request)
                 break
             if _probe.budget_exhausted:
+                # ── AUTO-P8: escalate before giving up ──────────────────────
+                # The digest cap became the dominant constraint once `module`
+                # and `read` landed: 15 of 23 declines in the last measured
+                # run were this branch, and the ops it dropped were dropped
+                # silently. Forcing a final plan call here throws away a
+                # request the model made in good faith and could have been
+                # answered with more room.
+                #
+                # Bounded by probe_budget_escalations, and each step is one
+                # extra architect call — the same cost shape as AUTO-H5's
+                # escalation ladder, which this mirrors.
+                if _budget_escalations < self._probe_budget_escalations:
+                    _factor, _temp = _arch_probe._BUDGET_ESCALATION_LADDER[
+                        min(_budget_escalations,
+                            len(_arch_probe._BUDGET_ESCALATION_LADDER) - 1)
+                    ]
+                    _new_cap = _probe.raise_budget(_factor)
+                    _budget_escalations += 1
+                    logger.info(
+                        "review_one_cluster [%s]: probe digest budget spent "
+                        "(%d/%d chars) — escalation %d/%d: cap raised to %d, "
+                        "temperature %.1f.",
+                        cluster.name, _probe.chars_used,
+                        self._probe_max_total_chars, _budget_escalations,
+                        self._probe_budget_escalations, _new_cap, _temp,
+                    )
+                    tracer.event(
+                        source="architect", target="probe",
+                        kind="probe_escalated", model=self._model,
+                        content=", ".join(str(op) for op in probe_request),
+                        params={
+                            "cluster":     cluster.name,
+                            "step":        _budget_escalations,
+                            "new_cap":     _new_cap,
+                            "temperature": _temp,
+                        },
+                    )
+                    # The escalation exists precisely to get this same request
+                    # re-issued with more room, so it must not then be killed
+                    # as a duplicate. Drop its fingerprint: the repeat detector
+                    # guards against a model looping on an ANSWERED request,
+                    # and this one was never fully answered — the budget ran
+                    # out mid-way through it.
+                    _asked_before.discard(frozenset(str(op) for op in probe_request))
+                    candidates, probe_request = _attempt_plan(temperature=_temp)
+                    continue
                 logger.info(
                     "review_one_cluster [%s]: probe digest budget spent "
-                    "(%d/%d chars) — forcing a final plan call.",
-                    cluster.name, _probe.chars_used, self._probe_max_total_chars,
+                    "(%d/%d chars) after %d escalation(s) — forcing a final "
+                    "plan call.",
+                    cluster.name, _probe.chars_used,
+                    self._probe_max_total_chars, _budget_escalations,
                 )
                 _decline("digest_budget", probe_request)
                 break

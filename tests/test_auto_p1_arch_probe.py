@@ -305,6 +305,11 @@ class TestBudgets:
                 probe_max_rounds="5",
                 probe_max_chars="500",
                 probe_max_total_chars="500",
+                # AUTO-P8 added a budget-escalation ladder that now sits
+                # between exhaustion and the forced call. This test is about
+                # the CAP ending the loop, not about the ladder, so the ladder
+                # is switched off here; AUTO-P8's own tests cover it.
+                probe_budget_escalations="0",
             ),
             bridge=bridge,
         )

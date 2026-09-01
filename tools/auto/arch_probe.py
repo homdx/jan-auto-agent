@@ -81,6 +81,27 @@ _MAX_OPS = 8
 # spend the batch's entire digest budget on one op.
 _READ_MAX_LINES = 120
 
+# AUTO-P8: what to do when a probe round is cut short by the digest cap.
+# Each entry is (digest-cap multiplier, temperature) for one escalated
+# re-ask, applied in order. Modelled on AUTO-H5-ESCALATE-1, which already
+# escalates max_tokens/temperature for an unsalvageable response — this is
+# the same idea for a response that was fine but could not be *answered* in
+# full.
+#
+# The order is deliberate. Step 1 gives more room at temperature 0, because
+# what we need is the SAME request re-issued so the larger budget serves the
+# ops that were dropped; a re-roll at higher temperature would ask something
+# else and waste the room. Step 2 keeps the room and raises temperature,
+# because if step 1 produced a byte-identical loop the determinism is the
+# problem, not the budget. Step 3 goes back to temperature 0 with more room
+# still, for the case where step 2 broke the loop into a genuinely bigger
+# request.
+_BUDGET_ESCALATION_LADDER = (
+    (2.0, 0.0),
+    (2.0, 0.7),
+    (4.0, 0.0),
+)
+
 # Ops the Phase 0 executor can actually answer. Anything else parses to
 # nothing, so an unrecognised op degrades to "not a probe" rather than to a
 # probe the executor will silently no-op on.
@@ -268,6 +289,10 @@ class ArchProbe:
         # from "the model stopped asking". The digest is appended to ONE batch's
         # prompt, so the context-window budget it protects is per batch.
         self._chars_used = 0
+        # AUTO-P8: the configured cap, preserved so raise_budget() can multiply
+        # it rather than the current (possibly already-raised) value, and so
+        # reset() can restore it between batches.
+        self._base_total_chars = self._max_total_chars
         # AUTO-P4b: per-round outcome of the LAST execute() call, so callers
         # can report "symbols found" instead of "digests produced" — the
         # distinction that hid a 60/60 miss rate behind "22 resolved".
@@ -279,6 +304,11 @@ class ArchProbe:
         # scope decision (refs? read?) turns on. Recording it per type costs
         # one dict and makes the decision measurable instead of arguable.
         self._last_by_op: dict = {}
+        # AUTO-P8: ops the last execute() never ran because the digest cap was
+        # already spent. Before this they were dropped with only a log line —
+        # the model was never told, so it planned as though it had been
+        # answered. A real run lost `read main.py:100-200` exactly this way.
+        self._last_dropped: list = []
         # Never reset — reported only, so a run can still be judged on total
         # probe cost without that total being able to switch the feature off.
         self._run_chars_used = 0
@@ -293,14 +323,36 @@ class ArchProbe:
         """
         self._batch_files = frozenset(str(f) for f in (files or ()))
 
+    def raise_budget(self, factor: float) -> int:
+        """AUTO-P8: widen the per-batch digest cap for an escalated re-ask.
+
+        Multiplies the CONFIGURED cap, not the current one, so the ladder's
+        multipliers compose predictably (2x then 4x, not 2x then 8x).
+        Returns the new cap.
+        """
+        self._max_total_chars = max(
+            self._max_chars, int(self._base_total_chars * float(factor))
+        )
+        return self._max_total_chars
+
+    @property
+    def last_dropped(self) -> list:
+        """Ops the last :meth:`execute` did not run — budget already spent."""
+        return list(self._last_dropped)
+
     def reset(self) -> None:
-        """Clear the per-batch digest budget. Called once per batch.
+        """Clear the per-batch digest budget and any escalation. Called once
+        per batch.
 
         Deliberately does NOT rebuild the underlying CollectBridge:
         ``make_collect_bridge``'s contract is build-once-per-run, and the
         artifact cannot change mid-run.
         """
         self._chars_used = 0
+        # AUTO-P8: an escalation is scoped to one batch. Carrying a raised cap
+        # into the next batch would silently re-tune the profile.
+        self._max_total_chars = self._base_total_chars
+        self._last_dropped = []
 
     @property
     def usable(self) -> bool:
@@ -386,18 +438,25 @@ class ArchProbe:
         if not self.usable:
             return ""
         blocks: list[str] = []
+        _done: list = []
         _hits = 0
+        self._last_dropped = []
         self._last_hits = 0
         self._last_misses = 0
         self._last_by_op = {}
         for op in ops or ():
             if self.budget_exhausted:
+                # AUTO-P8: remember which ops went unanswered so execute() can
+                # SAY SO in the digest. Logging alone left the model believing
+                # its whole request had been served.
+                self._last_dropped = [o for o in (ops or ()) if o not in _done]
                 logger.info(
                     "ArchProbe: total digest budget (%d chars) reached — "
-                    "dropping remaining op(s) starting at %s.",
-                    self._max_total_chars, op,
+                    "dropping %d remaining op(s) starting at %s.",
+                    self._max_total_chars, len(self._last_dropped), op,
                 )
                 break
+            _done.append(op)
             try:
                 body = self._run_one(op)
             except Exception as exc:  # noqa: BLE001 — never abort a batch
@@ -430,7 +489,19 @@ class ArchProbe:
                 len(blocks), ", ".join(str(op) for op in ops or ()),
             )
             return ""
-        return "## Probe results\n" + "\n\n".join(blocks)
+        out = "## Probe results\n" + "\n\n".join(blocks)
+        if self._last_dropped:
+            # The model must be able to see the gap. Otherwise it plans as if
+            # the dropped op had come back empty, which is a different and
+            # much more misleading fact than "not answered yet".
+            out += (
+                "\n\n[NOT ANSWERED — the digest budget for this batch ran out "
+                "before these: "
+                + ", ".join(str(o) for o in self._last_dropped)
+                + ". They were not looked up and are NOT known to be absent. "
+                "Ask again for the one you most need.]"
+            )
+        return out
 
     # ── op implementations ───────────────────────────────────────────────
 

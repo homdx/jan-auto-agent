@@ -203,12 +203,18 @@ def test_every_profile_declares_its_probe_budget() -> None:
         p for p in PROFILES
         if not _load(p).has_option("architect", "probe_max_rounds")
     ]
-    assert missing == ["agents_128k.ini"], (
+    # agents_128k.ini used to be the documented exception — the operator's
+    # live, hand-tuned profile, deliberately skipped by every AUTO-P patch.
+    # It has since been removed from the repository (it carried credentials
+    # and now lives only locally), so the exception list is allowed to be
+    # empty. Written as a subset check rather than equality so the test
+    # survives the profile coming back without needing another edit.
+    assert set(missing) <= {"agents_128k.ini"}, (
         f"profiles without an explicit AUTO-P budget block: {missing}"
     )
 
 
-def test_128k_is_the_only_probe_ready_profile() -> None:
+def test_no_profile_is_silently_probe_ready() -> None:
     """AC-P3M-6, stated as a fact rather than as a per-profile assertion,
     because it is the single most useful thing to know before enabling the
     feature: only agents_128k.ini has a collect artifact for the probe to
@@ -222,8 +228,15 @@ def test_128k_is_the_only_probe_ready_profile() -> None:
         p for p in PROFILES
         if _load(p).getboolean("collect", "use_in_auto", fallback=False)
     ]
-    assert ready == ["agents_128k.ini"], (
-        f"probe-ready profiles changed: {ready}. Update AUTO-P-RUNBOOK.md."
+    # agents_128k.ini was the only shipped profile with a collect artifact,
+    # and it is no longer in the repository (see the note above). What this
+    # test guards is unchanged and still worth guarding: NO OTHER profile may
+    # quietly become probe-ready, because enabling probing where collect is
+    # off produces lookups that resolve nothing and fall straight through to
+    # the forced call — a measurement of the plumbing, not of the feature.
+    assert set(ready) <= {"agents_128k.ini"}, (
+        f"probe-ready profiles changed: {ready}. Update AUTO-P-RUNBOOK.md "
+        f"and re-check the enabling instructions in README.md."
     )
 
 
