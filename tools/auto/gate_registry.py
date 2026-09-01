@@ -28,6 +28,17 @@ a new revision counter to remember to thread through.
 
 Gate order is the order of :data:`GATES`, which is data: it can be
 reordered, or filtered per task mode, without touching control flow.
+
+Every gate's verdict now reports through one interface —
+:class:`~tools.auto.gate_verdict.GateVerdict` (``approved`` +
+``feedback()``) — so :func:`run_gates` tests ``not verdict.approved`` for
+every gate via the single :func:`_gate_rejected` predicate. Before that
+unification, ``CanonResult`` exposed an inverted ``has_conflict`` field
+while every other verdict exposed ``approved``, and the registry carried
+two per-shape rejection predicates (``_rejected_by_conflict`` for canon,
+``_rejected_by_approved`` for the rest) to bridge the split. Those
+predicates now alias :func:`_gate_rejected` and are kept only for
+backward compatibility.
 """
 
 from __future__ import annotations
@@ -86,16 +97,49 @@ def _check_prosody(validator, *, text, rel_path, task, loop, base_dir_path):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Verdict predicates
+# Verdict predicate
 # ─────────────────────────────────────────────────────────────────────────────
+# Before the unified :class:`~tools.auto.gate_verdict.GateVerdict` interface,
+# each gate's verdict had its own shape — ``CanonResult`` exposed
+# ``has_conflict`` (inverted: ``True`` = rejected) while every other verdict
+# exposed ``approved``. Two per-gate predicates (``_rejected_by_conflict``
+# for canon, ``_rejected_by_approved`` for the rest) bridged that split so
+# the shared loop body did not need to know which shape a given gate had.
+#
+# Every verdict now honours the one interface: ``verdict.approved`` is True
+# when the gate accepts the attempt, False when it rejects it. A single
+# predicate — :func:`_gate_rejected` — reads ``not verdict.approved`` for
+# every gate. The old per-gate predicates are kept as thin aliases below
+# for any external caller that imported them directly.
+
+
+def _gate_rejected(verdict) -> bool:
+    """The one rejection predicate every gate verdict reports through.
+
+    ``True`` when *verdict* rejects the attempt (``verdict.approved`` is
+    False). Every shipped verdict — :class:`CanonResult`,
+    :class:`FactVerdict`, :class:`ContinuityVerdict`,
+    :class:`DeltaVerdict`, :class:`ExistenceVerdict`,
+    :class:`ThemeVerdict`, :class:`ProsodyVerdict` — implements
+    ``approved`` (and ``feedback()``) through
+    :class:`~tools.auto.gate_verdict.GateVerdict`, so this single
+    predicate replaces the two shape-specific ones that used to live here.
+    """
+    return not verdict.approved
+
+
+# Backward-compat aliases — external code that imported the old
+# per-shape predicates keeps working. Both now delegate to the single
+# unified predicate.
 
 def _rejected_by_conflict(verdict) -> bool:
-    """CanonResult exposes ``has_conflict`` rather than ``approved``."""
-    return bool(verdict.has_conflict)
+    """CanonResult exposed ``has_conflict``; now aliased to the unified check."""
+    return _gate_rejected(verdict)
 
 
 def _rejected_by_approved(verdict) -> bool:
-    return not verdict.approved
+    """Every other verdict exposed ``approved``; now the unified check."""
+    return _gate_rejected(verdict)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -121,7 +165,12 @@ class GateSpec:
     check:
         Adapter from the shared per-file context to ``validator.check``.
     is_rejection:
-        Predicate turning a verdict object into a bool.
+        Predicate turning a verdict object into a bool. Defaults to
+        :func:`_gate_rejected` (``not verdict.approved``), the one
+        unified rejection test every verdict now honours through
+        :class:`~tools.auto.gate_verdict.GateVerdict`. A gate whose
+        verdict uses a different field can still pass its own predicate
+        here, but none of the shipped gates need to anymore.
     reject_label:
         Prefix for the coder-visible feedback (``"canon rejected"``).
     reject_log / cap_log:
@@ -178,7 +227,7 @@ GATES: tuple[GateSpec, ...] = (
         cap_attr="max_delta_revisions",
         default_cap=1,
         check=_check_delta,
-        is_rejection=_rejected_by_approved,
+        is_rejection=_gate_rejected,
         reject_label="delta rejected",
         reject_log="InnerLoop: attempt %d delta rejected (%d/%d) — %s",
         cap_log=(
@@ -211,7 +260,7 @@ GATES: tuple[GateSpec, ...] = (
         cap_attr="max_canon_revisions",
         default_cap=1,
         check=_check_canon,
-        is_rejection=_rejected_by_conflict,
+        is_rejection=_gate_rejected,
         reject_label="canon rejected",
         reject_log="InnerLoop: attempt %d canon REJECT (%d/%d) — %s",
         cap_log=(
@@ -231,7 +280,7 @@ GATES: tuple[GateSpec, ...] = (
         cap_attr="max_fact_revisions",
         default_cap=1,
         check=_check_fact,
-        is_rejection=_rejected_by_approved,
+        is_rejection=_gate_rejected,
         reject_label="fact-check rejected",
         reject_log="InnerLoop: attempt %d fact-check rejected (%d/%d) — %s",
         cap_log=(
@@ -248,7 +297,7 @@ GATES: tuple[GateSpec, ...] = (
         cap_attr="max_continuity_revisions",
         default_cap=1,
         check=_check_continuity,
-        is_rejection=_rejected_by_approved,
+        is_rejection=_gate_rejected,
         reject_label="continuity rejected",
         reject_log="InnerLoop: attempt %d continuity rejected (%d/%d) — %s",
         cap_log=(
@@ -265,7 +314,7 @@ GATES: tuple[GateSpec, ...] = (
         cap_attr="max_existence_revisions",
         default_cap=2,
         check=_check_existence,
-        is_rejection=_rejected_by_approved,
+        is_rejection=_gate_rejected,
         reject_label="existence rejected",
         reject_log="InnerLoop: attempt %d existence rejected (%d/%d) — %s",
         cap_log=(
@@ -282,7 +331,7 @@ GATES: tuple[GateSpec, ...] = (
         cap_attr="max_theme_revisions",
         default_cap=2,
         check=_check_theme,
-        is_rejection=_rejected_by_approved,
+        is_rejection=_gate_rejected,
         reject_label="theme rejected",
         reject_log="InnerLoop: attempt %d theme rejected (%d/%d) — %s",
         cap_log=(
@@ -299,7 +348,7 @@ GATES: tuple[GateSpec, ...] = (
         cap_attr="max_prosody_revisions",
         default_cap=2,
         check=_check_prosody,
-        is_rejection=_rejected_by_approved,
+        is_rejection=_gate_rejected,
         reject_label="prosody rejected",
         reject_log="InnerLoop: attempt %d prosody rejected (%d/%d) — %s",
         cap_log=(

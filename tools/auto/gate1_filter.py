@@ -173,6 +173,16 @@ _DEFAULT_MAX_BLOCK_CHARS   = 4000
 class FilterResult:
     """Outcome record for one candidate after Gate 1.
 
+    Implements the unified :class:`~tools.auto.gate_verdict.GateVerdict`
+    interface: ``approved`` is the inverse of ``accepted`` (so a candidate
+    the Gate-3 runner would want to reject reads the same way it reads
+    every other gate), and :meth:`feedback` returns the human-readable
+    ``reason`` on a rejection or ``""`` on acceptance — matching the
+    ``feedback()`` contract of every Gate-3 verdict. The native
+    ``accepted`` field is kept unchanged for the many call sites
+    (:mod:`tools.auto.plan_validator`, the ``filter`` return tuple, the
+    ``all_results`` loop below) that read it directly.
+
     Attributes
     ----------
     candidate:
@@ -193,6 +203,22 @@ class FilterResult:
     accepted: bool
     stage: str
     reason: str
+
+    @property
+    def approved(self) -> bool:
+        """Unified GateVerdict field — the inverse of :attr:`accepted`.
+
+        Gate 1's native field is ``accepted`` (a candidate that *passed*
+        the filter is ``True``); the unified interface uses ``approved``
+        with the same sense (``True`` = the gate accepts the candidate).
+        The two are exact inverses only in name — here they mean the
+        same thing, so this property is a plain alias.
+        """
+        return self.accepted
+
+    def feedback(self) -> str:
+        """Coder-facing message. Empty on acceptance, the ``reason`` on rejection."""
+        return "" if self.accepted else self.reason
 
 
 # ─────────────────────────────────────────────────────────────────────────────

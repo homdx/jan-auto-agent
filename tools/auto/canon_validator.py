@@ -102,6 +102,15 @@ _SYSTEM_GROUND_CLAIM = (
 class CanonResult:
     """Outcome of one canon check.
 
+    Implements the unified :class:`~tools.auto.gate_verdict.GateVerdict`
+    interface alongside its native ``has_conflict`` field — ``approved``
+    is the inverse of ``has_conflict``, so the shared Gate-3 runner
+    (:func:`~tools.auto.gate_registry.run_gates`) reads
+    ``not verdict.approved`` for every gate without a canon-specific
+    predicate. ``has_conflict`` is kept for backward compatibility (and
+    because it reads more naturally in the canon domain: "does this
+    chapter conflict with established canon?").
+
     Attributes
     ----------
     checked:
@@ -124,6 +133,16 @@ class CanonResult:
     @property
     def has_conflict(self) -> bool:
         return bool(self.conflicts)
+
+    @property
+    def approved(self) -> bool:
+        """Unified GateVerdict field — True when the chapter has no canon conflict.
+
+        The inverse of :attr:`has_conflict`. Fail-open (``checked=False``)
+        produces an empty ``conflicts`` list, so ``approved`` is ``True``
+        there too — matching every other gate's fail-open contract.
+        """
+        return not self.has_conflict
 
     def feedback(self) -> str:
         """Render conflicts as Gate-2-style prescriptive feedback for the coder."""

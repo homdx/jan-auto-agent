@@ -218,6 +218,39 @@ def _resolve_validator_system(config, task_mode: str) -> str:
     return builtin
 
 
+@dataclass
+class Gate2Verdict:
+    """Unified GateVerdict for Gate 2 (the LLM validator).
+
+    Wraps the ``(approved, feedback)`` tuple :meth:`LLMGate2Validator.approve`
+    has always returned so Gate 2 reports its verdict through the same
+    :class:`~tools.auto.gate_verdict.GateVerdict` interface (``approved`` +
+    ``feedback()``) as every Gate-3 validator. The existing ``approve()``
+    tuple return is unchanged for the many call sites and tests that unpack
+    it; :meth:`LLMGate2Validator.approve_verdict` returns this object.
+
+    Attributes
+    ----------
+    approved:
+        ``True`` when the validator accepts the attempt; ``False`` when it
+        rejects (or fail-closed on an error — the validator never silently
+        approves, it returns ``False`` with a ``validator unavailable: …``
+        message).
+    reason:
+        The raw feedback string (``""`` on acceptance, a structured
+        ``Reason: …`` / ``Hints: …`` block on rejection). Kept under its
+        existing name for callers that read the tuple's second element
+        directly.
+    """
+
+    approved: bool
+    reason: str = ""
+
+    def feedback(self) -> str:
+        """Coder-facing message. Empty on acceptance, the reason on rejection."""
+        return self.reason
+
+
 class LLMGate2Validator:
     """Fail-closed LLM-based Gate-2 validator.
 
@@ -750,6 +783,30 @@ class LLMGate2Validator:
             logger.warning("LLMGate2Validator error: %s", exc)
             self.last_missing_context = []
             return False, f"validator unavailable: {exc}"
+
+    def approve_verdict(
+        self,
+        task:         dict,
+        exec_result,
+        coder_result,
+        *,
+        base_dir=None,
+        prior_critique: str = "",
+    ) -> "Gate2Verdict":
+        """Return a :class:`Gate2Verdict` (the unified GateVerdict interface).
+
+        Thin wrapper over :meth:`approve` that keeps the existing tuple
+        return contract intact for every existing caller/test while also
+        exposing the verdict through the shared ``approved`` / ``feedback()``
+        interface used by :mod:`tools.auto.gate_registry`'s runner. The
+        ``last_missing_context`` side channel is populated identically to
+        :meth:`approve` — this method calls it directly.
+        """
+        approved, reason = self.approve(
+            task, exec_result, coder_result,
+            base_dir=base_dir, prior_critique=prior_critique,
+        )
+        return Gate2Verdict(approved=approved, reason=reason)
 
 
 def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:

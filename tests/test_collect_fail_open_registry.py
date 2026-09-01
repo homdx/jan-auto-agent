@@ -151,4 +151,4 @@ def test_ac_real_repo_reference_sites_are_all_registered():
     locations = fail_open_locations(registry)
     assert "tools/auto/auto_metrics.py:271" in locations  # NOTE: line tracks record_gate2_result's get_version_label bare except; update if it shifts
     assert "tools/auto/coder.py:797" in locations
-    assert "tools/auto/inner_loop.py:387" in locations  # NOTE: line tracks _fetch_needed_flat's bare except; update if it shifts
+    assert "tools/auto/inner_loop.py:420" in locations  # NOTE: line tracks _fetch_needed_flat's bare except; update if it shifts
