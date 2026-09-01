@@ -1470,6 +1470,24 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
         # occurrence ends the loop instead of spending another call.
         _asked_before: set = set()
 
+        def _decline_by_op(reason: str, ops: list) -> str:
+            """Per-op tallies for a declined request, as `facts=0/2`.
+
+            For an `unresolved` decline the executor ran and already counted
+            what it found, so its own tally is authoritative. For every other
+            reason (round_cap, digest_budget, no_executor, repeat,
+            post_forced) nothing was looked up at all, so the ops are counted
+            as neither hits nor misses — recording them as misses would blame
+            the collect artifact for a budget the harness spent.
+            """
+            if reason == "unresolved" and _probe is not None:
+                return _probe.last_by_op_str()
+            counts: dict = {}
+            for op in ops or ():
+                counts.setdefault(op.op, 0)
+                counts[op.op] += 1
+            return " ".join(f"{k}=0/0" for k in sorted(counts))
+
         def _decline(reason: str, ops: list) -> None:
             """AUTO-P4a: record WHY a probe request went unanswered.
 
@@ -1495,6 +1513,18 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                         "reason":  reason,
                         "ops":     len(ops),
                         "round":   _probe_rounds,
+                        # AUTO-P6: per-op tallies on the DECLINE side too.
+                        # AUTO-P5 recorded by_op only on probe_result, but an
+                        # all-miss round returns an empty digest and emits no
+                        # probe_result at all (AUTO-P4b) — it lands here. So
+                        # every fully-missed lookup was invisible to the
+                        # breakdown, which reported "facts=23/0" on a run whose
+                        # true figure was 23 hits and 17 misses. With one op
+                        # that is merely wrong; with two it systematically
+                        # flatters whichever op tends to miss ENTIRELY, which
+                        # is exactly the comparison the next scope decision
+                        # (refs? read?) rests on.
+                        "by_op":   _decline_by_op(reason, ops),
                     },
                 )
             except Exception as exc:  # noqa: BLE001 — diagnostics never break a batch

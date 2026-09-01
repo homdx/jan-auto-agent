@@ -1,0 +1,1 @@
+../tests/test_auto_p6_decline_tallies.py

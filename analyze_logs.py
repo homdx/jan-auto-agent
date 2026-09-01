@@ -727,6 +727,8 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
                 "reason":  str(params.get("reason", "unknown")),
                 "ops":     int(params.get("ops", 0) or 0),
                 "round":   int(params.get("round", 0) or 0),
+                # AUTO-P6: empty on pre-P6 traces.
+                "by_op":   str(params.get("by_op", "") or ""),
             })
 
         elif kind == "probe_config":
@@ -1068,7 +1070,10 @@ def render_run_summary(run: dict) -> None:
             # is earning the round-trip it costs, which is the number the
             # next scope decision turns on.
             _by_op: dict = {}
-            for r in _probe_res:
+            # AUTO-P6: declines carry tallies too. An all-miss round emits no
+            # probe_result (its digest is empty), so summing results alone
+            # reported a run with 17 real misses as having none.
+            for r in list(_probe_res) + list(_declined):
                 for part in r.get("by_op", "").split():
                     if "=" not in part or "/" not in part:
                         continue
