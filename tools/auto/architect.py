@@ -818,6 +818,9 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
             bridge,
             max_chars=self._probe_max_chars,
             max_total_chars=self._probe_max_total_chars,
+            # AUTO-P7: `read` needs a root to contain paths against. Without
+            # it the op disables itself rather than reading anywhere.
+            base_dir=base_dir,
         )
         # AUTO-DEBUG-1: the two warning branches above are the only prior
         # console signal for this method; a *successful* build was silent,
@@ -1062,6 +1065,11 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
         # digest and the current forced/not-forced stance.
         _probe = self._get_probe(base_dir)
         if _probe is not None:
+            # AUTO-P7: tell the probe which files this batch actually saw, so
+            # results from anywhere else can be marked. Set here rather than
+            # in _get_probe because the probe instance is memoized per RUN
+            # while the batch changes every call.
+            _probe.set_batch_files(cluster.files)
             # AUTO-P4a: the ArchProbe instance is memoized for the whole run
             # (one CollectBridge, per make_collect_bridge's contract), but its
             # digest budget is per BATCH — the digest is appended to this

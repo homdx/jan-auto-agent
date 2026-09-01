@@ -57,7 +57,9 @@ is byte-identical to pre-AUTO-P).
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Iterable, Sequence
 
 logger = logging.getLogger(__name__)
@@ -73,6 +75,11 @@ PROBE_PREFIX = "ARCH_PROBE:"
 # the first 8 and letting it re-ask is both cheaper and more informative than
 # resolving all 40.
 _MAX_OPS = 8
+
+# AUTO-P7: lines returned by a `read` with no explicit range. Enough to see a
+# function and its neighbours, small enough that a whole-file read cannot
+# spend the batch's entire digest budget on one op.
+_READ_MAX_LINES = 120
 
 # Ops the Phase 0 executor can actually answer. Anything else parses to
 # nothing, so an unrecognised op degrades to "not a probe" rather than to a
@@ -102,7 +109,7 @@ PROBE_INSTRUCTIONS = (
     "fact about a symbol that is NOT shown above, you may reply with a single "
     "line instead of the JSON array:\n"
     "\n"
-    "    ARCH_PROBE: facts <symbol>, module <path>\n"
+    "    ARCH_PROBE: facts <symbol>, module <path>, read <path>:<a>-<b>\n"
     "\n"
     "`facts <symbol>` — <symbol> must be a top-level function or class name, "
     "spelled exactly as it is defined in the source, for example "
@@ -112,6 +119,11 @@ PROBE_INSTRUCTIONS = (
     "for example `tools/backoff.py`. Returns every top-level name defined "
     "there with its line number and first docstring line. Use this when you "
     "know WHICH FILE you need but not what is in it.\n"
+    "`read <path>:<start>-<end>` — the actual source lines. Use this ONLY to "
+    "verify a claim you are about to make about code you cannot see — for "
+    "example before writing \"this function has a retry loop\". ALWAYS give a "
+    "range; `module <path>` hands you the line numbers to ask for, and a "
+    "whole-file read spends most of your budget on one op.\n"
     "\n"
     "The following CANNOT be looked up and will come back empty:\n"
     "  - a method or attribute (`InnerLoop.run_task`) — ask for `InnerLoop`\n"
@@ -230,8 +242,21 @@ class ArchProbe:
         *,
         max_chars: int = 2000,
         max_total_chars: int = 6000,
+        base_dir=None,
+        batch_files=(),
     ) -> None:
         self._bridge = collect_bridge
+        # AUTO-P7: `read` is the first op that touches the filesystem rather
+        # than the collect artifact, so it needs a root to contain paths
+        # against. None disables the op entirely — an unconstrained read is
+        # not a degraded feature, it is a path-traversal hole.
+        self._base_dir = Path(base_dir).resolve() if base_dir else None
+        # AUTO-P7: the files this batch was actually shown. Results sourced
+        # from anywhere else get a marker, because Gate-1 rejects a
+        # cited_location outside the batch as a hallucinated path — two such
+        # rejections in the last measured run, and the count doubled when
+        # AUTO-P5 widened out-of-batch knowledge.
+        self._batch_files = frozenset(str(f) for f in (batch_files or ()))
         self._max_chars = max(200, int(max_chars))
         self._max_total_chars = max(self._max_chars, int(max_total_chars))
         # AUTO-P4a: per-BATCH, reset by reset() at the top of every batch.
@@ -258,6 +283,16 @@ class ArchProbe:
         # probe cost without that total being able to switch the feature off.
         self._run_chars_used = 0
 
+    def set_batch_files(self, files) -> None:
+        """AUTO-P7: the files the current batch was shown.
+
+        Separate from the constructor because the ArchProbe instance is
+        memoized for the whole run (one CollectBridge) while the batch
+        changes on every call — the same asymmetry that made AUTO-P4a's
+        per-batch `reset()` necessary.
+        """
+        self._batch_files = frozenset(str(f) for f in (files or ()))
+
     def reset(self) -> None:
         """Clear the per-batch digest budget. Called once per batch.
 
@@ -274,6 +309,15 @@ class ArchProbe:
         Mirrors ``CollectBridge.usable`` — a stale artifact counts as absent,
         exactly as it does everywhere else in the ``--auto`` path.
         """
+        # AUTO-P7: `read` answers from the working tree, not the artifact, so
+        # a base_dir alone makes this probe useful even with no collect model.
+        # Before this the whole probe went dark when the artifact was missing,
+        # which would have silently disabled the one op that never needed it.
+        # Each op still guards its own backing source independently.
+        return bool(self._bridge_usable or self._base_dir is not None)
+
+    @property
+    def _bridge_usable(self) -> bool:
         return bool(self._bridge is not None and getattr(self._bridge, "usable", False))
 
     @property
@@ -369,7 +413,7 @@ class ArchProbe:
                 self._last_hits += 1
                 _tally[0] += 1
             body = self._cap(body)
-            block = f"### {op}\n{body}"
+            block = f"### {op}\n{self._out_of_batch_note(body)}{body}"
             blocks.append(block)
             self._chars_used += len(block)
             self._run_chars_used += len(block)
@@ -395,6 +439,8 @@ class ArchProbe:
             return self._facts(op.arg)
         if op.op == "module":
             return self._module(op.arg)
+        if op.op == "read":
+            return self._read(op.arg)
         # Unreachable while extract_probe_request enforces the allow-list;
         # defensive so a future op added to the parser but not here degrades
         # to "(not found)" rather than to an AttributeError mid-batch.
@@ -403,6 +449,8 @@ class ArchProbe:
 
     def _facts(self, symbol: str) -> str:
         """Signature + contracts for *symbol*, from the collect model."""
+        if not self._bridge_usable:
+            return ""
         return self._bridge.pull_symbol(symbol) or ""
 
     def _module(self, module_ref: str) -> str:
@@ -412,7 +460,130 @@ class ArchProbe:
         Same budget, same truncation, same miss accounting — the only new
         thing is the question it can answer.
         """
+        if not self._bridge_usable:
+            return ""
         return self._bridge.module_symbols(module_ref) or ""
+
+    def _read(self, arg: str) -> str:
+        """AUTO-P7: actual source lines for ``<path>`` or ``<path>:<a>-<b>``.
+
+        The op the measurements asked for. Across six runs the largest
+        Gate-1 rejection bucket has been "hallucinated the premise" — the
+        Architect asserting a retry loop exists in a file that has none, 34
+        of 52 rejections in the last run. `facts` returns a signature,
+        `module` returns a name list; neither returns a single line of code,
+        so nothing in the protocol let the model check a claim before making
+        it.
+
+        Unlike the other two ops this reads the WORKING TREE, not the collect
+        artifact, which brings two obligations the others never had:
+
+        * **Containment.** Anything resolving outside ``base_dir`` is a miss,
+          never a read. Same shape ``gate1_filter`` uses for cited paths.
+        * **Freshness.** When this disagrees with `facts`/`module`, this is
+          right — the artifact can lag the tree.
+
+        Misses (absent, outside root, a directory, binary, undecodable)
+        return ``""`` and are counted as misses like any other. Never raises.
+        """
+        if self._base_dir is None:
+            logger.debug("ArchProbe: read requested but no base_dir — skipping.")
+            return ""
+        raw = (arg or "").strip().strip("`\"'")
+        if not raw:
+            return ""
+
+        rel, start, end = self._parse_read_arg(raw)
+        if not rel:
+            return ""
+
+        try:
+            target = (self._base_dir / rel).resolve()
+            # Containment BEFORE any I/O. `..` segments, absolute paths and
+            # symlinks out of the tree all collapse here.
+            target.relative_to(self._base_dir)
+        except (ValueError, OSError) as exc:
+            logger.warning(
+                "ArchProbe: read %r rejected — resolves outside the repo (%s).",
+                raw, exc,
+            )
+            return ""
+
+        try:
+            if not target.is_file():
+                return ""
+            text = target.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            logger.debug("ArchProbe: read %r unreadable: %s", raw, exc)
+            return ""
+
+        lines = text.splitlines()
+        if not lines:
+            return f"file: {rel}\n(empty file)"
+
+        if start is None:
+            lo, hi = 1, min(len(lines), _READ_MAX_LINES)
+        else:
+            lo = max(1, start)
+            hi = min(len(lines), end if end is not None else start)
+            if hi < lo:
+                return ""
+
+        body = [f"{n:>5}  {lines[n - 1]}" for n in range(lo, hi + 1)]
+        header = f"file: {rel}  lines {lo}-{hi} of {len(lines)}"
+        omitted = len(lines) - hi
+        if omitted > 0 and start is None:
+            # Say so. A silently head-truncated file reads as a complete one,
+            # which is precisely the kind of confident-but-wrong input this
+            # op exists to prevent.
+            body.append(
+                f"      … {omitted} more line(s) not shown — ask for a range, "
+                f"e.g. read {rel}:{hi + 1}-{min(len(lines), hi + _READ_MAX_LINES)}"
+            )
+        return header + "\n" + "\n".join(body)
+
+    @staticmethod
+    def _parse_read_arg(raw: str) -> tuple:
+        """Split ``path`` / ``path:12-40`` / ``path:12`` into parts.
+
+        Returns ``(rel, start, end)`` with ``rel=""`` when unparseable. A
+        Windows-style ``C:`` or any colon that is not followed by digits is
+        treated as part of the path, not as a range separator.
+        """
+        rel, start, end = raw, None, None
+        if ":" in raw:
+            head, _, tail = raw.rpartition(":")
+            m = re.fullmatch(r"(\d+)(?:\s*-\s*(\d+))?", tail.strip())
+            if head and m:
+                rel = head
+                start = int(m.group(1))
+                end = int(m.group(2)) if m.group(2) else start
+        return rel.strip(), start, end
+
+    def _out_of_batch_note(self, block: str) -> str:
+        """A one-line warning when a result names a file outside this batch.
+
+        AUTO-P7. The probe hands the Architect knowledge of files it was
+        never shown; Gate-1 rejects any `cited_location.file` or
+        `target_files` entry outside the batch as a hallucinated path. The
+        two rules contradict each other, and the rejection count doubled
+        between the last two runs as `module` widened out-of-batch
+        knowledge. Marking the result is the cheap half of the fix — it does
+        not teach Gate-1 anything, it stops the model citing what it cannot
+        cite.
+        """
+        if not self._batch_files:
+            return ""
+        m = re.search(r"^(?:file|module): (\S+)", block, re.M)
+        if not m:
+            return ""
+        path = m.group(1).split(":", 1)[0]
+        if path in self._batch_files:
+            return ""
+        return (
+            "[NOT IN YOUR BATCH — read-only context. Do NOT put this path in "
+            "target_files or cited_location; Gate-1 will reject it.]\n"
+        )
 
     def _cap(self, text: str) -> str:
         if len(text) <= self._max_chars:
