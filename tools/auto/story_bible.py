@@ -780,26 +780,61 @@ def make_story_bible(
     # that the shipped agents.ini never actually set left the whole
     # subsystem (and its story_bible_verify / story_bible_immutable_guard
     # sub-settings) silently inert out of the box.
-    enabled = config.getboolean("validator_agent", "story_bible_creative", fallback=True)
+    #
+    # BUGFIX (verified-bugs audit #3d, corrected): these were raw
+    # config.getboolean/getint calls with no try/except — unlike
+    # search_agent.py's make_search_agent, which guards every read.
+    # Wrapped per-call (not via a shared helper) so extract_config_reads
+    # (tools/collect/ast_facts.py) still sees each literal config.getX(...)
+    # call — a shared helper's `getattr(config, method)(...)` call shape
+    # is invisible to that AST scanner, confirmed directly: 0 reads
+    # recognized through a helper vs. 1 recognized for the identical
+    # literal call. Matches the established pattern already used for
+    # gate1_filter.py's config reads.
+    try:
+        enabled = config.getboolean("validator_agent", "story_bible_creative", fallback=True)
+    except ValueError as exc:
+        logger.warning("config [validator_agent] story_bible_creative is malformed (%s) — using True", exc)
+        enabled = True
     if not enabled:
         logger.warning("make_story_bible: story_bible_creative=false — bible disabled "
                         "(durable cross-chapter facts will NOT be tracked).")
         return None
 
-    max_chars = config.getint("validator_agent", "story_bible_max_chars", fallback=2000)
-    verify = config.getboolean("validator_agent", "story_bible_verify", fallback=False)
-    max_fidelity_rounds = config.getint(
-        "validator_agent", "story_bible_max_fidelity_rounds", fallback=1
-    )
-    immutable_guard = config.getboolean(
-        "validator_agent", "story_bible_immutable_guard", fallback=True
-    )
+    try:
+        max_chars = config.getint("validator_agent", "story_bible_max_chars", fallback=2000)
+    except ValueError as exc:
+        logger.warning("config [validator_agent] story_bible_max_chars is malformed (%s) — using 2000", exc)
+        max_chars = 2000
+    try:
+        verify = config.getboolean("validator_agent", "story_bible_verify", fallback=False)
+    except ValueError as exc:
+        logger.warning("config [validator_agent] story_bible_verify is malformed (%s) — using False", exc)
+        verify = False
+    try:
+        max_fidelity_rounds = config.getint(
+            "validator_agent", "story_bible_max_fidelity_rounds", fallback=1
+        )
+    except ValueError as exc:
+        logger.warning("config [validator_agent] story_bible_max_fidelity_rounds is malformed (%s) — using 1", exc)
+        max_fidelity_rounds = 1
+    try:
+        immutable_guard = config.getboolean(
+            "validator_agent", "story_bible_immutable_guard", fallback=True
+        )
+    except ValueError as exc:
+        logger.warning("config [validator_agent] story_bible_immutable_guard is malformed (%s) — using True", exc)
+        immutable_guard = True
     # Litera-sim fix: LLM semantic conflict gate on merge (see StoryBible).
     # Default ON — one extra LLM call per chapter is the accepted price for
     # a bible that cannot hold two mutually exclusive facts.
-    semantic_guard = config.getboolean(
-        "validator_agent", "story_bible_semantic_guard", fallback=True
-    )
+    try:
+        semantic_guard = config.getboolean(
+            "validator_agent", "story_bible_semantic_guard", fallback=True
+        )
+    except ValueError as exc:
+        logger.warning("config [validator_agent] story_bible_semantic_guard is malformed (%s) — using True", exc)
+        semantic_guard = True
 
     llm_call = _build_llm_call(
         base_url=base_url,
@@ -832,9 +867,21 @@ def _build_llm_call(
     import ssl
     import tools.llm_stream as _llm_stream
 
-    verify_ssl = config.getboolean("api", "verify_ssl", fallback=True)
-    temperature = config.getfloat("inner_loop", "temperature", fallback=0.1)
-    timeout = config.getint("loop", "timeout_seconds", fallback=300)
+    try:
+        verify_ssl = config.getboolean("api", "verify_ssl", fallback=True)
+    except ValueError as exc:
+        logger.warning("config [api] verify_ssl is malformed (%s) — using True", exc)
+        verify_ssl = True
+    try:
+        temperature = config.getfloat("inner_loop", "temperature", fallback=0.1)
+    except ValueError as exc:
+        logger.warning("config [inner_loop] temperature is malformed (%s) — using 0.1", exc)
+        temperature = 0.1
+    try:
+        timeout = config.getint("loop", "timeout_seconds", fallback=300)
+    except ValueError as exc:
+        logger.warning("config [loop] timeout_seconds is malformed (%s) — using 300", exc)
+        timeout = 300
     # AUTO-FIX (fable follow-up 3): the bible generator used to borrow
     # [validator_agent] max_tokens (a cap sized for a short JSON verdict /
     # numbered critique). Raising the validator budget silently inflated the
@@ -843,12 +890,27 @@ def _build_llm_call(
     # bible its own key with a creative-sized default; keep the old
     # validator_agent value as a secondary fallback so existing tuned
     # configs don't regress.
-    _legacy_mt = config.getint("validator_agent", "max_tokens", fallback=200)
-    max_tokens = config.getint("story_bible", "max_tokens",
-                               fallback=max(1000, _legacy_mt))
+    #
+    # BUGFIX (verified-bugs audit #3d, corrected): see the matching comment
+    # in make_story_bible() above — wrapped per-call (not via a shared
+    # helper) so extract_config_reads still sees each literal call.
+    try:
+        _legacy_mt = config.getint("validator_agent", "max_tokens", fallback=200)
+    except ValueError as exc:
+        logger.warning("config [validator_agent] max_tokens is malformed (%s) — using 200", exc)
+        _legacy_mt = 200
+    try:
+        max_tokens = config.getint("story_bible", "max_tokens", fallback=max(1000, _legacy_mt))
+    except ValueError as exc:
+        logger.warning("config [story_bible] max_tokens is malformed (%s) — using %d", exc, max(1000, _legacy_mt))
+        max_tokens = max(1000, _legacy_mt)
     # Same context-window forwarding as everywhere else: 0 = server default.
     active_profile = config.get("api", "active", fallback="local")
-    num_ctx = config.getint(f"api_{active_profile}", "num_ctx", fallback=0)
+    try:
+        num_ctx = config.getint(f"api_{active_profile}", "num_ctx", fallback=0)
+    except ValueError as exc:
+        logger.warning("config [api_%s] num_ctx is malformed (%s) — using 0", active_profile, exc)
+        num_ctx = 0
     # AUTO-FIX (fable follow-up 3): thinking models (qwen3) wrap output in
     # <think>…</think>; with a bounded num_predict the reply can truncate
     # mid-think and the bible comes back empty — or worse, reasoning lines
@@ -856,7 +918,11 @@ def _build_llm_call(
     # story_bible.md and re-injected into every later chapter prompt.
     # Mirror the gate1/architect/coder toggle: default off, re-enable via
     # [story_bible] think = true.
-    think = config.getboolean("story_bible", "think", fallback=False)
+    try:
+        think = config.getboolean("story_bible", "think", fallback=False)
+    except ValueError as exc:
+        logger.warning("config [story_bible] think is malformed (%s) — using False", exc)
+        think = False
 
     ssl_context: ssl.SSLContext | None = _llm_stream.make_unverified_context() if not verify_ssl else None
 

@@ -903,12 +903,23 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
     # shaped like a REJECT verdict — matched as affirmative and inverted a
     # real rejection. Only GOOD now requires an explicit subject ("no, it's
     # good"); "no fine" / "no great" have no such negative reading.
+    #
+    # BUGFIX (verified-bugs follow-up report): "NO problems, it's perfect."
+    # is a clean approval ("there are no problems") but didn't match either
+    # alternative above — "PROBLEMS" is a noun, not a subject phrase
+    # (IT'S/THAT'S/...) or one of the bare adjectives (FINE/PERFECT/...) —
+    # so it fell through to the bare startswith("NO") REJECT branch below,
+    # a false rejection. "NO PROBLEMS/ISSUES/CONCERNS/COMPLAINTS" is itself
+    # already an unambiguous all-clear regardless of what follows, so it's
+    # a third top-level alternative rather than requiring a GOOD/FINE-style
+    # continuation.
     _EN_DISCOURSE_OK = _re.compile(
         r"^NO[,.]?\s*(?:"
         r"(?:IT'?S|IT IS|THAT'?S|THAT IS|EVERYTHING'?S|EVERYTHING IS|ALL)"
         r"\s*GOOD"
         r"|(?:IT'?S|IT IS|THAT'?S|THAT IS|EVERYTHING'?S|EVERYTHING IS|ALL)?"
         r"\s*(?:FINE|PERFECT|GREAT|OK|OKAY|CORRECT|IN ORDER)"
+        r"|PROBLEMS?|ISSUES?|CONCERNS?|COMPLAINTS?"
         r")\b"
     )
 
@@ -921,6 +932,34 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
         r"(?:REVISIONS?|CHANGES?|EDITS?|FIXES?|CORRECTIONS?|ADJUSTMENTS?)\s+"
         r"(?:NEEDED|REQUIRED|NECESSARY)\b"
     )
+
+    # ── English "OK, but/however/so <problem>" caveat guard ─────────────────
+    # BUGFIX (verified-bugs follow-up report): the bare `^OK\b` approval
+    # match below fires on the very FIRST token and never looks at what
+    # follows on the rest of the line — so "OK, but the character's
+    # motivation is wrong and the ending contradicts chapter 3." and "OK so
+    # chapter needs a full rewrite before it can be accepted" both matched
+    # `^OK\b` and returned an immediate, unconditional approval despite
+    # explicitly stating real problems right after the "OK". Mirrors the
+    # existing _EN_DISCOURSE_OK / _EN_NOTHING_NEEDED guards in spirit (a
+    # narrow, high-confidence pattern checked before the bare prefix match,
+    # not general sentiment analysis): BUT/HOWEVER/SO immediately after
+    # "OK" are contrastive/consequence markers that — in a validator-verdict
+    # context — reliably introduce a caveat or problem, never a plain
+    # affirmation (unlike a bare "OK looks good to me" / "OK looks fine" /
+    # "OK the chapter is fine", none of which use a contrastive marker and
+    # all of which remain approved exactly as before). Reason extraction
+    # mirrors the REVISE/REJECT/NO branch below.
+    _EN_OK_CAVEAT = _re.compile(
+        r"^OK[,.]?\s+(BUT|HOWEVER|SO)\b[,:]?\s*(.*)$"
+    )
+
+    def _ok_caveat_reason(s: str) -> "str | None":
+        m = _EN_OK_CAVEAT.match(s.strip().upper())
+        if not m:
+            return None
+        rest = s.strip()[m.start(2):].strip() if m.group(2) else ""
+        return rest if rest else "validator rejected (no reason given)"
 
     # ── Scan: first try the first non-empty line; fall back to whole text ──
     candidates: list[str] = []
@@ -938,6 +977,14 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
     for raw in candidates:
         norm = _normalise(raw)
         upper = raw.strip().upper()
+
+        # ── English "OK, but/however/so <problem>" caveat guard ───────────
+        # Checked BEFORE the bare APPROVED/OK prefix match below, so a
+        # caveat right after "OK" is caught before the prefix match would
+        # otherwise return an unconditional approval.
+        _ok_caveat = _ok_caveat_reason(raw)
+        if _ok_caveat is not None:
+            return False, _ok_caveat, False
 
         # ── English APPROVED ──────────────────────────────────────────────
         if upper.startswith("APPROVED") or _re.match(r"^OK\b", upper):
@@ -992,6 +1039,12 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
             _lu = _line.strip().upper()
             if not _lu:
                 continue
+            # Same caveat guard as the top-level check above, applied
+            # per-line so a caveat on a later line (behind a preamble) is
+            # also caught before the bare OK-prefix match below.
+            _line_ok_caveat = _ok_caveat_reason(_line)
+            if _line_ok_caveat is not None:
+                return False, _line_ok_caveat, False
             if _lu.startswith("APPROVED") or _re.match(r"^OK\b", _lu):
                 return True, "", False
             if _EN_DISCOURSE_OK.match(_lu) or _EN_NOTHING_NEEDED.match(_lu):

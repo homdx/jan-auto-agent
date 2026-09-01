@@ -398,17 +398,57 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
         self._task_mode  = task_mode
 
         arch = "architect"
-        self._temperature            = float(config.get(arch, "temperature",         fallback="0.2"))
+        # BUGFIX (verified-bugs follow-up report): every read in this
+        # block was a raw config.get(...)+int()/float() or
+        # config.getboolean()/getint() call with no try/except — unlike
+        # Gate1Filter's equivalent reads (already guarded), this class had
+        # NO guards at all. A single malformed key (confirmed live:
+        # [architect] max_files_per_review = five) crashed ClusterReviewer
+        # construction outright. Wrapped per-call (not via a shared
+        # helper) so extract_config_reads (tools/collect/ast_facts.py)
+        # still sees each literal call — a shared helper's call shape is
+        # invisible to that AST scanner (confirmed directly: 0 reads
+        # recognized through a helper vs. 1 for an identical literal
+        # call). Matches gate1_filter.py's established style.
+        try:
+            self._temperature = float(config.get(arch, "temperature", fallback="0.2"))
+        except ValueError as exc:
+            logger.warning("config [%s] temperature is malformed (%s) — using 0.2", arch, exc)
+            self._temperature = 0.2
         # AUTO-CR-11: mode-aware token cap — creative tasks (Cyrillic, longer
         # instructions) need more room or the JSON array truncates mid-object.
         from tools.auto.utils import _cfg_mode
-        self._max_tokens             = int(_cfg_mode(config, arch, "max_tokens", task_mode, fallback="2048"))
-        self._timeout                = float(config.get("loop", "timeout_seconds",   fallback="300"))
-        self._max_file_chars         = int(config.get(arch,   "max_file_chars",      fallback=str(_DEFAULT_MAX_FILE_CHARS)))
-        self._max_files_per_review   = int(config.get(arch,   "max_files_per_review", fallback=str(_DEFAULT_MAX_FILES_PER_REVIEW)))
+        try:
+            self._max_tokens = int(_cfg_mode(config, arch, "max_tokens", task_mode, fallback="2048"))
+        except ValueError as exc:
+            logger.warning("config [%s] max_tokens is malformed (%s) — using 2048", arch, exc)
+            self._max_tokens = 2048
+        try:
+            self._timeout = float(config.get("loop", "timeout_seconds", fallback="300"))
+        except ValueError as exc:
+            logger.warning("config [loop] timeout_seconds is malformed (%s) — using 300", exc)
+            self._timeout = 300.0
+        try:
+            self._max_file_chars = int(config.get(arch, "max_file_chars", fallback=str(_DEFAULT_MAX_FILE_CHARS)))
+        except ValueError as exc:
+            logger.warning("config [%s] max_file_chars is malformed (%s) — using %d",
+                            arch, exc, _DEFAULT_MAX_FILE_CHARS)
+            self._max_file_chars = _DEFAULT_MAX_FILE_CHARS
+        try:
+            self._max_files_per_review = int(
+                config.get(arch, "max_files_per_review", fallback=str(_DEFAULT_MAX_FILES_PER_REVIEW))
+            )
+        except ValueError as exc:
+            logger.warning("config [%s] max_files_per_review is malformed (%s) — using %d",
+                            arch, exc, _DEFAULT_MAX_FILES_PER_REVIEW)
+            self._max_files_per_review = _DEFAULT_MAX_FILES_PER_REVIEW
         # num_ctx controls the total context window on Ollama; 0 means "use server default".
-        active_profile               = config.get("api", "active", fallback="local")
-        self._num_ctx                = config.getint(f"api_{active_profile}", "num_ctx", fallback=0)
+        active_profile = config.get("api", "active", fallback="local")
+        try:
+            self._num_ctx = config.getint(f"api_{active_profile}", "num_ctx", fallback=0)
+        except ValueError as exc:
+            logger.warning("config [api_%s] num_ctx is malformed (%s) — using 0", active_profile, exc)
+            self._num_ctx = 0
         # AUTO-FIX (fable follow-up): mirrors the gate1_filter.py fix — a
         # thinking model (e.g. qwen3) wraps its JSON task array in
         # a "think" reasoning block by default. If that reasoning consumes the
@@ -417,7 +457,11 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
         # returned a totally empty response after ~5 minutes on qwen3:8b).
         # Default to disabling thinking for this call; [architect] think =
         # true re-enables it for a model/setup that needs it.
-        self._think                  = config.getboolean(arch, "think", fallback=False)
+        try:
+            self._think = config.getboolean(arch, "think", fallback=False)
+        except ValueError as exc:
+            logger.warning("config [%s] think is malformed (%s) — using False", arch, exc)
+            self._think = False
 
         # ── AUTO-P2: architect context probe ─────────────────────────────────
         # Absent key ⇒ False ⇒ extract_probe_request is never called and every

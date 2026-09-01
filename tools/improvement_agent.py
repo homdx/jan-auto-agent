@@ -75,9 +75,27 @@ class ImprovementAgent:
 
         # Read temperature and max_tokens from [improvement_agent] in agents.ini.
         # Fall back to the values the original code hardcoded if the section is absent.
+        #
+        # BUGFIX (verified-bugs audit #3a): these were raw config.getfloat/
+        # getint/getboolean calls with no try/except — the only site in
+        # this file, and unlike its siblings (search_agent.py's
+        # make_search_agent, tools/auto/*'s config readers), which all
+        # wrap each read individually and fall back to the coded default
+        # with a warning. A present-but-malformed value here (e.g.
+        # `[improvement_agent] temperature = abc`) raised a raw
+        # ValueError straight out of the constructor instead of
+        # degrading gracefully like every sibling agent.
         if config is not None and config.has_section("improvement_agent"):
-            self.temperature = config.getfloat("improvement_agent", "temperature", fallback=0.4)
-            self.max_tokens  = config.getint  ("improvement_agent", "max_tokens",  fallback=2000)
+            try:
+                self.temperature = config.getfloat("improvement_agent", "temperature", fallback=0.4)
+            except ValueError as exc:
+                logger.warning("config [improvement_agent] temperature invalid (%s) — using 0.4", exc)
+                self.temperature = 0.4
+            try:
+                self.max_tokens = config.getint("improvement_agent", "max_tokens", fallback=2000)
+            except ValueError as exc:
+                logger.warning("config [improvement_agent] max_tokens invalid (%s) — using 2000", exc)
+                self.max_tokens = 2000
             self._system_improve = config.get("improvement_agent", "system_improve", fallback=None)
             self._system_explain = config.get("improvement_agent", "system_explain", fallback=None)
         else:
@@ -88,7 +106,11 @@ class ImprovementAgent:
 
         # Echo the model's answer live (like direct chat) when [output] stream_agents = true.
         if config is not None and config.has_section("output"):
-            self.stream = config.getboolean("output", "stream_agents", fallback=False)
+            try:
+                self.stream = config.getboolean("output", "stream_agents", fallback=False)
+            except ValueError as exc:
+                logger.warning("config [output] stream_agents invalid (%s) — using False", exc)
+                self.stream = False
         else:
             self.stream = False
 

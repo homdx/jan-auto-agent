@@ -600,6 +600,22 @@ class AutoController:
         """
         pending = self.state.resume_info()["pending"]
         tasks_done = 0
+        # BUGFIX (verified-bugs audit #1): tasks_done (below) is
+        # intentionally "tasks that passed" — AC4's own test suite
+        # (tests/test_auto_g4.py::TestG4RunContinues::
+        # test_exhausted_tasks_not_counted_as_done) pins that as the
+        # counter's contract for progress reporting / run.log, and this
+        # fix must not change it. But check_caps() below was ALSO being
+        # fed tasks_done, so an exhausted/blocked task (which never
+        # increments tasks_done) never counted against max_tasks_per_run
+        # either — a run hitting repeated failures could attempt far more
+        # than max_tasks_per_run tasks, bounded only by max_runtime_min,
+        # silently violating the documented "maximum tasks to execute
+        # this session" contract (see this module's [auto] docstring).
+        # tasks_processed tracks every task this loop actually ran (pass
+        # or exhaustion) and is used for the cap check only, leaving
+        # tasks_done and its AC4 semantics untouched.
+        tasks_processed = 0
 
         # AUTO-FIX (podrugi sim): a repeat --auto invocation against a
         # directory whose plan.json is already fully done used to exit with
@@ -715,11 +731,12 @@ class AutoController:
 
         for task in pending:
             # AUTO-A4: check caps BEFORE executing each task
-            reason = self.check_caps(tasks_done)
+            reason = self.check_caps(tasks_processed)
             if reason:
                 logger.info(
-                    "_run_task_loop: cap fired (%s) after %d task(s) — stopping",
-                    reason, tasks_done,
+                    "_run_task_loop: cap fired (%s) after %d task(s) "
+                    "processed (%d passed) — stopping",
+                    reason, tasks_processed, tasks_done,
                 )
                 return reason, tasks_done
 
@@ -798,6 +815,8 @@ class AutoController:
                 if self.run_trace:
                     feedback_snippet = result.knowledge()[:200] if result.feedback_files else ""
                     self.run_trace.log_task_blocked(task["id"], feedback_snippet)
+
+            tasks_processed += 1
 
             # AUTO-F1: Tick progress upon task completion / exhaustion
             if self.progress_display:

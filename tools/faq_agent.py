@@ -784,22 +784,43 @@ class FaqAgent:
         skipped: list[str] = []
         for i, (name, content) in enumerate(docs):
             block = f"=== {name} ===\n{content.strip()}"
-            if budget_chars and used + len(block) > budget_chars and parts:
-                # BUGFIX: this used to be `skipped.append(name); continue`,
-                # which only skips THIS doc and keeps probing later ones in
-                # the ranked list. Since docs are passed in relevance order,
-                # that let a lower-ranked-but-small doc later in the list
-                # get included while a higher-ranked-but-large one right
-                # here gets dropped — e.g. [small#2, LARGE#1, small#3] could
-                # end up keeping #2 and #3 while dropping #1, the single
-                # most relevant document, purely because of its size and
-                # position. That breaks this function's own promise above
-                # ("the tail we drop is the least relevant part"): the
-                # dropped set is only guaranteed to be a relevance-ordered
-                # tail if we stop here entirely, so every kept doc remains
-                # provably more relevant than every dropped one.
-                skipped.extend(n for n, _ in docs[i:])
-                break
+            if budget_chars and used + len(block) > budget_chars:
+                if not parts:
+                    # BUGFIX (verified-bugs audit #9): the `and parts`
+                    # guard below exists so we never skip/break on the
+                    # very first doc — but that meant when the single
+                    # most-relevant doc alone exceeds budget_chars, this
+                    # branch was never entered at all: the whole `if` was
+                    # False (parts is falsy), so the oversized doc fell
+                    # straight through to the normal append below with NO
+                    # warning and no entry in `skipped`, silently blowing
+                    # past num_ctx for the whole request. There's nothing
+                    # better to include instead of the top-ranked doc, so
+                    # still include it (some grounded context beats none)
+                    # — but warn, so this isn't silent.
+                    logger.warning(
+                        "FaqAgent._build_context: the single most relevant "
+                        "document (%r, %d chars) alone exceeds the ~%d char "
+                        "budget for num_ctx=%d — including it anyway; this "
+                        "request will likely exceed the model's context window.",
+                        name, len(block), budget_chars, self.num_ctx,
+                    )
+                else:
+                    # BUGFIX: this used to be `skipped.append(name); continue`,
+                    # which only skips THIS doc and keeps probing later ones in
+                    # the ranked list. Since docs are passed in relevance order,
+                    # that let a lower-ranked-but-small doc later in the list
+                    # get included while a higher-ranked-but-large one right
+                    # here gets dropped — e.g. [small#2, LARGE#1, small#3] could
+                    # end up keeping #2 and #3 while dropping #1, the single
+                    # most relevant document, purely because of its size and
+                    # position. That breaks this function's own promise above
+                    # ("the tail we drop is the least relevant part"): the
+                    # dropped set is only guaranteed to be a relevance-ordered
+                    # tail if we stop here entirely, so every kept doc remains
+                    # provably more relevant than every dropped one.
+                    skipped.extend(n for n, _ in docs[i:])
+                    break
             parts.append(block)
             used += len(block) + 2
         if skipped:
