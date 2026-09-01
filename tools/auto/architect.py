@@ -474,6 +474,11 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
         self._probe_max_total_chars  = config.getint(arch, "probe_max_total_chars", fallback=6000)
         # AUTO-P8: escalated re-asks allowed when the digest cap cuts a round
         # short. 0 restores the pre-AUTO-P8 behaviour (force immediately).
+        # AUTO-P9: learn the working digest cap instead of rediscovering it
+        # once per batch. See ArchProbe.seeded_cap.
+        self._probe_budget_warmup    = config.getint(arch, "probe_budget_warmup", fallback=3)
+        self._probe_budget_headroom  = config.getfloat(arch, "probe_budget_headroom", fallback=2.0)
+        self._probe_budget_max_chars = config.getint(arch, "probe_budget_max_chars", fallback=0)
         self._probe_budget_escalations = max(0, min(
             len(_arch_probe._BUDGET_ESCALATION_LADDER),
             config.getint(arch, "probe_budget_escalations", fallback=2),
@@ -827,6 +832,11 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
             # AUTO-P7: `read` needs a root to contain paths against. Without
             # it the op disables itself rather than reading anywhere.
             base_dir=base_dir,
+        )
+        self._probe.configure_learning(
+            warmup=self._probe_budget_warmup,
+            headroom=self._probe_budget_headroom,
+            ceiling=self._probe_budget_max_chars,
         )
         # AUTO-DEBUG-1: the two warning branches above are the only prior
         # console signal for this method; a *successful* build was silent,
@@ -1578,9 +1588,20 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 # extra architect call — the same cost shape as AUTO-H5's
                 # escalation ladder, which this mirrors.
                 if _budget_escalations < self._probe_budget_escalations:
-                    _factor, _temp = _arch_probe._BUDGET_ESCALATION_LADDER[
-                        min(_budget_escalations,
-                            len(_arch_probe._BUDGET_ESCALATION_LADDER) - 1)
+                    # AUTO-P9: once the run has learned a working cap, the
+                    # temperature rung is skipped. That rung exists to break a
+                    # deterministic loop when we have no idea how much room a
+                    # round needs; with a measured median we DO know, so the
+                    # honest remedy is more room, and re-rolling the request at
+                    # a higher temperature would only ask something different
+                    # from what the wider budget was bought for.
+                    _ladder = (
+                        _arch_probe._BUDGET_ONLY_LADDER
+                        if _probe.has_seeded_cap
+                        else _arch_probe._BUDGET_ESCALATION_LADDER
+                    )
+                    _factor, _temp = _ladder[
+                        min(_budget_escalations, len(_ladder) - 1)
                     ]
                     _new_cap = _probe.raise_budget(_factor)
                     _budget_escalations += 1
@@ -1601,6 +1622,9 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                             "step":        _budget_escalations,
                             "new_cap":     _new_cap,
                             "temperature": _temp,
+                            # AUTO-P9: which ladder was in force, so a run can
+                            # be read as "still learning" vs "learned".
+                            "seeded":      str(_probe.has_seeded_cap),
                         },
                     )
                     # The escalation exists precisely to get this same request

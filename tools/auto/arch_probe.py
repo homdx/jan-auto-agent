@@ -102,6 +102,16 @@ _BUDGET_ESCALATION_LADDER = (
     (4.0, 0.0),
 )
 
+# AUTO-P9: the ladder used once the run has measured a working cap
+# (ArchProbe.seeded_cap). Pure budget, no temperature rung — see the comment
+# at its use site in architect.py. Rungs are larger because a seeded batch
+# that still overflows is genuinely an outlier, not a mis-set floor.
+_BUDGET_ONLY_LADDER = (
+    (1.5, 0.0),
+    (2.5, 0.0),
+    (4.0, 0.0),
+)
+
 # Ops the Phase 0 executor can actually answer. Anything else parses to
 # nothing, so an unrecognised op degrades to "not a probe" rather than to a
 # probe the executor will silently no-op on.
@@ -309,6 +319,19 @@ class ArchProbe:
         # the model was never told, so it planned as though it had been
         # answered. A real run lost `read main.py:100-200` exactly this way.
         self._last_dropped: list = []
+        # AUTO-P9: what each COMPLETE round actually cost, across the whole
+        # run. Deliberately not cleared by reset() — one batch cannot learn
+        # anything, and the point is to stop every later batch re-discovering
+        # the same answer by climbing the ladder from scratch.
+        #
+        # Only rounds that finished without dropping an op are recorded. A
+        # truncated round tells you what the cap was, not what the round
+        # needed, and seeding from those would peg the estimate to the cap
+        # that was already too small.
+        self._round_costs: list = []
+        self._warmup = 3
+        self._headroom = 2.0
+        self._seed_ceiling = 0
         # Never reset — reported only, so a run can still be judged on total
         # probe cost without that total being able to switch the feature off.
         self._run_chars_used = 0
@@ -322,6 +345,56 @@ class ArchProbe:
         per-batch `reset()` necessary.
         """
         self._batch_files = frozenset(str(f) for f in (files or ()))
+
+    def configure_learning(
+        self, *, warmup: int, headroom: float, ceiling: int,
+    ) -> None:
+        """AUTO-P9 tuning, passed down from ``[architect]`` config."""
+        self._warmup = max(0, int(warmup))
+        self._headroom = max(1.0, float(headroom))
+        # 0 means "no explicit ceiling" — fall back to 4x the configured cap,
+        # so a pathological run cannot learn its way to an unbounded prompt.
+        self._seed_ceiling = int(ceiling) or (self._base_total_chars * 4)
+
+    @property
+    def seeded_cap(self) -> "int | None":
+        """The cap later batches should START at, or ``None`` during warm-up.
+
+        Median, not mean: a single 23k-char round should not drag the estimate
+        up for every batch after it, and the measured distribution is skewed
+        (median 9 582, p90 20 028 on the run that motivated this).
+
+        The headroom multiplier is what makes the number useful rather than
+        merely descriptive — seeding at exactly the median guarantees half of
+        all rounds still overflow on the first try, which is the situation
+        this is meant to end.
+
+        The 2.0 default was measured, not guessed. Replaying the 216 completed
+        rounds of the run that motivated this against each candidate::
+
+            headroom   cap     overflow   escalations avoided
+                 1.0   10000        48%     0   (the status quo)
+                 1.5   14373        25%    ~26
+                 2.0   19165        12%    ~42
+                 2.5   23956         0%    ~57
+
+        2.5 removes every escalation but buys a 24k-char digest for every
+        batch, most of which need a third of that; 2.0 keeps the prompt
+        smaller and leaves the ladder to handle the 12% tail, which is
+        exactly what a ladder is for.
+        """
+        if self._warmup <= 0 or len(self._round_costs) < self._warmup:
+            return None
+        costs = sorted(self._round_costs)
+        mid = len(costs) // 2
+        median = (costs[mid] if len(costs) % 2
+                  else (costs[mid - 1] + costs[mid]) / 2)
+        want = int(median * self._headroom)
+        return max(self._base_total_chars, min(want, self._seed_ceiling))
+
+    @property
+    def has_seeded_cap(self) -> bool:
+        return self.seeded_cap is not None
 
     def raise_budget(self, factor: float) -> int:
         """AUTO-P8: widen the per-batch digest cap for an escalated re-ask.
@@ -351,7 +424,12 @@ class ArchProbe:
         self._chars_used = 0
         # AUTO-P8: an escalation is scoped to one batch. Carrying a raised cap
         # into the next batch would silently re-tune the profile.
-        self._max_total_chars = self._base_total_chars
+        # AUTO-P9: start where experience says, not at the configured floor.
+        # On the run that motivated this, 57 of 63 probing batches climbed the
+        # escalation ladder from 10 000 — each rung costing one architect
+        # call — to rediscover a number the first few batches had already
+        # established.
+        self._max_total_chars = self.seeded_cap or self._base_total_chars
         self._last_dropped = []
 
     @property
@@ -490,6 +568,10 @@ class ArchProbe:
             )
             return ""
         out = "## Probe results\n" + "\n\n".join(blocks)
+        if not self._last_dropped:
+            # AUTO-P9: a round that served everything it was asked. This is
+            # the only honest sample of "how much room a round needs".
+            self._round_costs.append(self._chars_used)
         if self._last_dropped:
             # The model must be able to see the gap. Otherwise it plans as if
             # the dropped op had come back empty, which is a different and
