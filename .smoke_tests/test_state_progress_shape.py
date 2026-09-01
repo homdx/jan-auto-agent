@@ -1,1 +1,0 @@
-../tests/test_state_progress_shape.py

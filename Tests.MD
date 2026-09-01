@@ -2,15 +2,20 @@
 
 ## The three directories
 
-`tests/` holds every real test file and is the **single source of truth**.
-`.smoke_tests/` and `.regression_tests/` contain nothing but relative
-symlinks back into it, partitioned by how long each file takes:
+`tests/` holds every real *feature* test file and is the **single source of
+truth** for the tiered run below. `.smoke_tests/` and `.regression_tests/`
+contain nothing but relative symlinks back into it, partitioned by how long
+each file takes:
 
-| Directory | Contents | Wall time | When to run |
-|---|---|---|---|
-| `.smoke_tests/` | 190 fast files (< 2s each) | ~35s CPU, ~10s with `-n 4` | Before every commit |
-| `.regression_tests/` | 34 heavy files | ~611s CPU | Before push / merge |
-| `tests/` | all 224 real files | ~645s CPU | Final gate, and when in doubt |
+| Directory | Contents | When to run |
+|---|---|---|
+| `.smoke_tests/` | 122 fast files (< 2s each) | Before every commit |
+| `.regression_tests/` | 28 heavy files | Before push / merge |
+| `tests/` | all 150 real files | Final gate, and when in doubt |
+
+(Pre-BUGFIX-SPLIT, on 2026-08-24, these were 190/34/224 with ~35s/~611s/~645s
+CPU; re-measure with the command in "Re-measuring the tiers" below rather
+than trusting old wall-clock numbers next to a freshly changed file count.)
 
 The two tiers are **disjoint and complete**: every file in `tests/` appears
 in exactly one of them. So
@@ -32,6 +37,28 @@ The split is heavily skewed on purpose — measurement on 2026-08-24 showed
 (`test_auto_b3.py`) at 182s. Splitting by an even file count would have
 produced two slow tiers; splitting by measured cost produces one genuinely
 fast one.
+
+## The fourth directory: `tests_bugfix/`
+
+`tests_bugfix/` (BUGFIX-SPLIT, 2026-09-01) sits beside `tests/`, not inside
+it, and is **not** part of the tiering above — `sync_test_tiers.py` only
+ever looks inside `tests/`, so nothing here needs a manifest entry or a
+symlink. It holds the 107 files whose own docstring frames them as a
+regression guard for one already-fixed, historical bug (`Bug:`, `AUTO-FIX-N`,
+`Field report:`, `Before the fix, ...`, and equivalent framings) rather than
+an acceptance test for a feature as originally specified. See
+`tests_bugfix/README.md` for the exact criterion and what's guaranteed
+unchanged about the moved files.
+
+Run them explicitly when you want that coverage — a release gate, or after
+touching one of the fixes they pin — with:
+
+```bash
+python3 -m pytest tests_bugfix -q
+```
+
+They are ordinary test files sharing this project's root `conftest.py`, so
+nothing else about how you run or write them differs from `tests/`.
 
 ## Regenerating the symlinks
 
@@ -154,7 +181,10 @@ git commit --no-verify
 
 ## Adding a test
 
-1. Write the file in `tests/`.
+1. Write the file in `tests/` — unless it's a regression guard for a bug
+   that already shipped and was fixed (see `tests_bugfix/README.md`'s
+   criterion), in which case it goes straight into `tests_bugfix/` instead
+   and steps 2–3 don't apply.
 2. Run `python3 scripts/sync_test_tiers.py`. A new file defaults to the
    smoke tier.
 3. If it turns out to be slow, add its filename to `tests/SLOW_TESTS.txt`

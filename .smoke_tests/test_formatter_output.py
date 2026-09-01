@@ -1,1 +1,0 @@
-../tests/test_formatter_output.py

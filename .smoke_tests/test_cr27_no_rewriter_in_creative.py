@@ -1,1 +1,0 @@
-../tests/test_cr27_no_rewriter_in_creative.py

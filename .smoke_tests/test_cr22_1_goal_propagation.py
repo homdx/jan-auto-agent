@@ -1,1 +1,0 @@
-../tests/test_cr22_1_goal_propagation.py

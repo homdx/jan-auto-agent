@@ -1,1 +1,0 @@
-../tests/test_t37_ticket_store_oserror.py

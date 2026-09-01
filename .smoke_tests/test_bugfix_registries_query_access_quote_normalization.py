@@ -1,1 +1,0 @@
-../tests/test_bugfix_registries_query_access_quote_normalization.py

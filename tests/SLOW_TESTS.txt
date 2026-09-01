@@ -8,6 +8,15 @@
 #   python3 -m pytest tests/ -q -n 4 --durations=0
 # and re-tier anything that crosses the 2.0s-per-FILE threshold.
 # Measured 2026-08-24: these 34 files account for ~611s of ~645s total.
+#
+# BUGFIX-SPLIT (see tests_bugfix/README.md): six files that used to be
+# listed here — test_bug_fix_loop_fuzz.py, test_executor_workspace_prune_order.py,
+# test_llm_stream_empty_choices.py, test_llm_stream_reasoning_field_fallback.py,
+# test_llm_stream_retry.py, test_llm_stream_zai_thinking.py — moved out of
+# tests/ entirely into tests_bugfix/, so they no longer belong in this
+# manifest (sync_test_tiers.py would otherwise flag them as stale: it only
+# looks for files inside tests/). Their cost is gone from both tiers, not
+# just relabelled. Timings below are pre-split and due for a re-measure.
 
 test_architect_domain.py
 test_architect_resilience.py
@@ -21,7 +30,6 @@ test_auto_g11.py
 test_auto_g9.py
 test_auto_h1.py
 test_auto_h5_empty_response_retry.py
-test_bug_fix_loop_fuzz.py
 test_collect_already_safe_query.py
 test_collect_ast_symbols.py
 test_collect_config_languages.py
@@ -34,12 +42,7 @@ test_collect_guarded_access.py
 test_collect_risk.py
 test_collect_test_map.py
 test_collect_verifier_contradiction.py
-test_executor_workspace_prune_order.py
 test_faq_agent_validate.py
 test_gate1_presence_llm_profile.py
-test_llm_stream_empty_choices.py
-test_llm_stream_reasoning_field_fallback.py
 test_llm_stream_response_format.py
-test_llm_stream_retry.py
 test_llm_stream_think_effort.py
-test_llm_stream_zai_thinking.py
