@@ -364,24 +364,34 @@ class ModuleRecord:
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> "ModuleRecord":
+        # BUGFIX (audit): same class of bug as AUTO-MODEL-GUARD-1 above —
+        # FunctionRecord.from_dict was hardened against a schema-mismatched
+        # persisted artifact raising a raw TypeError past callers that only
+        # catch ValueError; this sibling method (constructing ConfigRead,
+        # ExceptSite, GuardedAccess, LLMSummary the same way) was not.
         d = dict(d)
-        symbols = tuple(FunctionRecord.from_dict(s) for s in d.get("public_symbols", ()))
-        config_reads = tuple(ConfigRead(**c) for c in d.get("config_reads", ()))
-        except_sites = tuple(ExceptSite(**e) for e in d.get("except_sites", ()))
-        guarded_accesses = tuple(GuardedAccess(**g) for g in d.get("guarded_accesses", ()))
-        summary_d = d.get("summary")
-        summary = LLMSummary(**summary_d) if summary_d else None
-        return cls(
-            path=d["path"],
-            public_symbols=symbols,
-            imports=tuple(d.get("imports", ())),
-            config_reads=config_reads,
-            except_sites=except_sites,
-            guarded_accesses=guarded_accesses,
-            parse_error=d.get("parse_error"),
-            summary=summary,
-            language=d.get("language", "python"),
-        )
+        try:
+            symbols = tuple(FunctionRecord.from_dict(s) for s in d.get("public_symbols", ()))
+            config_reads = tuple(ConfigRead(**c) for c in d.get("config_reads", ()))
+            except_sites = tuple(ExceptSite(**e) for e in d.get("except_sites", ()))
+            guarded_accesses = tuple(GuardedAccess(**g) for g in d.get("guarded_accesses", ()))
+            summary_d = d.get("summary")
+            summary = LLMSummary(**summary_d) if summary_d else None
+            return cls(
+                path=d["path"],
+                public_symbols=symbols,
+                imports=tuple(d.get("imports", ())),
+                config_reads=config_reads,
+                except_sites=except_sites,
+                guarded_accesses=guarded_accesses,
+                parse_error=d.get("parse_error"),
+                summary=summary,
+                language=d.get("language", "python"),
+            )
+        except TypeError as exc:
+            raise ValueError(
+                f"ModuleRecord.from_dict: schema mismatch ({exc})"
+            ) from exc
 
 
 def to_dict(record: Any) -> Dict[str, Any]:

@@ -437,10 +437,20 @@ def ollama_chat_url(base_url: str) -> str:
     return f"{base}/api/chat"
 
 
+_JSON_FENCE_OPEN_RE = re.compile(r"```json", re.IGNORECASE)
+
+
 def strip_json_fence(text: str) -> str:
     """Strip a ```json ... ``` or ``` ... ``` fence wrapping a JSON blob, if present."""
-    if "```json" in text:
-        rest = text.split("```json", 1)[1]
+    # BUGFIX (audit): only lowercase ```json was special-cased — a
+    # capitalized fence (```JSON, ```Json) fell through to the generic
+    # "```" branch below, which doesn't skip past the "JSON" label, so it
+    # leaked into the returned content and broke every caller's
+    # json.loads. Match case-insensitively but split the *original* text
+    # at the matched span so casing elsewhere in the content is untouched.
+    m = _JSON_FENCE_OPEN_RE.search(text)
+    if m:
+        rest = text[m.end():]
         # AUTO-FIX: a lone opening fence (output truncated mid-stream) fell
         # through to split("```")[0], which returns `rest` unchanged and
         # silently discards everything before the fence. Require a
@@ -1225,66 +1235,119 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
                 attempt += 1
 
     if not stream:
-        with _open() as response:
-            raw = json.loads(response.read().decode("utf-8"))
-            return _extract_content(raw, api_format)
+        # BUGFIX (audit): _open()'s retry loop only wraps urlopen() itself —
+        # response.read() below was outside it, so a transient network
+        # error while downloading the body (as opposed to connecting) was
+        # not retried. Safe to retry the whole open+read here since no
+        # partial result has been returned to the caller yet.
+        _read_attempt = 0
+        while True:
+            try:
+                with _open() as response:
+                    raw = json.loads(response.read().decode("utf-8"))
+                return _extract_content(raw, api_format)
+            except (TimeoutError, ssl.SSLError, ConnectionError, urllib.error.URLError) as e:
+                if _read_attempt >= error_retries:
+                    raise RuntimeError(
+                        f"{type(e).__name__} reading response body from {url}: {e} "
+                        f"(after {_read_attempt} retr{'y' if _read_attempt == 1 else 'ies'})"
+                    ) from e
+                msg = (
+                    f"{type(e).__name__} reading response body from {url}: {e}, "
+                    f"waiting {error_retry_wait_sec:.1f}s and retrying "
+                    f"(attempt {_read_attempt + 1}/{error_retries})"
+                )
+                logger.warning("request_completion: %s", msg)
+                if on_retry:
+                    on_retry(msg)
+                sleep(error_retry_wait_sec)
+                _read_attempt += 1
 
     # ── Streaming ────────────────────────────────────────────────────────
     parts = []
-    with _open() as response:
-        for raw_line in response:
-            line = raw_line.decode("utf-8").strip()
-            if not line:
-                continue
+    # BUGFIX (audit): same gap as the non-streaming path above — the
+    # `for raw_line in response:` iteration was outside _open()'s retry
+    # loop. Unlike the non-streaming path, tokens may already have been
+    # handed to on_token() by the time a transient error hits, and
+    # reopening the connection would re-fetch from the start — duplicating
+    # output the caller already received. Only retry while nothing has
+    # been emitted yet; once `parts` is non-empty, surface the failure
+    # like before rather than risk corrupting the stream.
+    _stream_attempt = 0
+    while True:
+        try:
+            with _open() as response:
+                for raw_line in response:
+                    line = raw_line.decode("utf-8").strip()
+                    if not line:
+                        continue
 
-            if api_format == "ollama":
-                # Ollama streams newline-delimited JSON objects
-                # {"message": {"role": "assistant", "content": "tok"}, "done": false}
-                try:
-                    chunk = json.loads(line)
-                    token = chunk.get("message", {}).get("content", "")
-                    done  = chunk.get("done", False)
-                except json.JSONDecodeError:
-                    continue
-            else:
-                # OpenAI SSE: "data: {...}" lines
-                if not line.startswith("data:"):
-                    continue
-                data = line[len("data:"):].strip()
-                if data == "[DONE]":
-                    break
-                try:
-                    chunk = json.loads(data)
-                    # BUGFIX: some OpenAI-COMPATIBLE backends (this branch
-                    # supports any base_url speaking the openai format, not
-                    # just literal OpenAI) send an SSE chunk with an EMPTY
-                    # choices array — a real usage-reporting chunk shape
-                    # OpenAI itself sends when stream_options.include_usage
-                    # is set, and also seen from various proxy/gateway
-                    # wrappers regardless of client request options.
-                    # `chunk["choices"][0]` on an empty list raises
-                    # IndexError, which the except clause below did NOT
-                    # catch (only JSONDecodeError/KeyError) — so this chunk
-                    # crashed the WHOLE streaming request with an unhandled
-                    # exception, losing every token already accumulated in
-                    # `parts`, rather than just being skipped like any other
-                    # unparseable chunk. Reproduced directly:
-                    #
-                    #   lines = [..normal tokens.., '{"choices": [],
-                    #            "usage": {...}}', "[DONE]"]
-                    #   -> IndexError: list index out of range
-                    #      (uncaught, propagates out of request_completion)
-                    choices = chunk.get("choices") or []
-                    token = choices[0]["delta"].get("content", "") if choices else ""
-                    done  = False
-                except (json.JSONDecodeError, KeyError):
-                    continue
+                    if api_format == "ollama":
+                        # Ollama streams newline-delimited JSON objects
+                        # {"message": {"role": "assistant", "content": "tok"}, "done": false}
+                        try:
+                            chunk = json.loads(line)
+                            token = chunk.get("message", {}).get("content", "")
+                            done  = chunk.get("done", False)
+                        except json.JSONDecodeError:
+                            continue
+                    else:
+                        # OpenAI SSE: "data: {...}" lines
+                        if not line.startswith("data:"):
+                            continue
+                        data = line[len("data:"):].strip()
+                        if data == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(data)
+                            # BUGFIX: some OpenAI-COMPATIBLE backends (this branch
+                            # supports any base_url speaking the openai format, not
+                            # just literal OpenAI) send an SSE chunk with an EMPTY
+                            # choices array — a real usage-reporting chunk shape
+                            # OpenAI itself sends when stream_options.include_usage
+                            # is set, and also seen from various proxy/gateway
+                            # wrappers regardless of client request options.
+                            # `chunk["choices"][0]` on an empty list raises
+                            # IndexError, which the except clause below did NOT
+                            # catch (only JSONDecodeError/KeyError) — so this chunk
+                            # crashed the WHOLE streaming request with an unhandled
+                            # exception, losing every token already accumulated in
+                            # `parts`, rather than just being skipped like any other
+                            # unparseable chunk. Reproduced directly:
+                            #
+                            #   lines = [..normal tokens.., '{"choices": [],
+                            #            "usage": {...}}', "[DONE]"]
+                            #   -> IndexError: list index out of range
+                            #      (uncaught, propagates out of request_completion)
+                            choices = chunk.get("choices") or []
+                            token = choices[0]["delta"].get("content", "") if choices else ""
+                            done  = False
+                        except (json.JSONDecodeError, KeyError):
+                            continue
 
-            if token:
-                parts.append(token)
-                if on_token is not None:
-                    on_token(token)
-            if done:
-                break
+                    if token:
+                        parts.append(token)
+                        if on_token is not None:
+                            on_token(token)
+                    if done:
+                        break
+            break
+        except (TimeoutError, ssl.SSLError, ConnectionError, urllib.error.URLError) as e:
+            if parts or _stream_attempt >= error_retries:
+                raise RuntimeError(
+                    f"{type(e).__name__} reading stream from {url}: {e} "
+                    f"(after {_stream_attempt} retr{'y' if _stream_attempt == 1 else 'ies'}"
+                    f"{', tokens already emitted' if parts else ''})"
+                ) from e
+            msg = (
+                f"{type(e).__name__} reading stream from {url}: {e}, waiting "
+                f"{error_retry_wait_sec:.1f}s and retrying "
+                f"(attempt {_stream_attempt + 1}/{error_retries})"
+            )
+            logger.warning("request_completion: %s", msg)
+            if on_retry:
+                on_retry(msg)
+            sleep(error_retry_wait_sec)
+            _stream_attempt += 1
 
     return "".join(parts).strip()

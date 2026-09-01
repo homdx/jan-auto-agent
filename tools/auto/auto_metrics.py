@@ -236,9 +236,13 @@ class AutoMetricsStream:
                     len(contaminated),
                     path,
                 )
-        except (json.JSONDecodeError, OSError):
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError):
             # Corrupt or unreadable — MetricsCollector already handles this
-            # gracefully (returns [] from _load_all).  Nothing to do.
+            # gracefully (returns [] from _load_all). Nothing to do.
+            # BUGFIX (audit): UnicodeDecodeError (raised by the implicit
+            # decode inside fh.read()/json.load() for a non-UTF-8 file)
+            # wasn't caught here, unlike the sibling metrics_collector.py's
+            # equivalent guard.
             pass
 
 

@@ -251,10 +251,22 @@ class PlanEmitter:
         if not self._hashes_path.exists():
             return {}
         try:
-            return json.loads(self._hashes_path.read_text(encoding="utf-8"))
+            data = json.loads(self._hashes_path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError) as exc:
             logger.warning("_load_cluster_hashes: could not read hash file: %s", exc)
             return {}
+        # BUGFIX (audit): no isinstance check — a valid-JSON but
+        # wrong-shape hash file (e.g. a list) was returned as-is, and the
+        # caller's `stored.get(cluster.name)` then crashed with
+        # AttributeError instead of degrading to "no stored hash" the way
+        # a missing/corrupt file already does above.
+        if not isinstance(data, dict):
+            logger.warning(
+                "_load_cluster_hashes: hash file is not a JSON object "
+                "(found %s) — treating as empty", type(data).__name__,
+            )
+            return {}
+        return data
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

@@ -379,6 +379,70 @@ class TestDuplicateMerging:
         assert len(dup) == 1
         assert dup[0].candidate.title == "Add changelog entry for greeting"
 
+    def test_bugfix_supersede_registers_winners_own_fingerprint(
+        self, tmp_path: Path, minimal_config: configparser.ConfigParser,
+    ) -> None:
+        """BUGFIX (audit): after a supersede (see the test above), the
+        winning candidate's own plain fingerprint (`fp`) was never added
+        to `seen_fingerprints` — only the normal, non-supersede accept
+        path at the bottom of the loop does that, and the supersede branch
+        `continue`s before reaching it. A LATER candidate sharing that
+        exact `fp` (same cited_location + same title) but a DIFFERENT
+        `tfp` (different target_files) then found `is_fp_dup=False` and
+        passed straight through as if the winner had never been seen,
+        instead of being caught as a duplicate of it.
+        """
+        (tmp_path / "main.py").write_text("print('Hello world')\n", encoding="utf-8")
+        (tmp_path / "CHANGELOG.md").write_text(
+            "# Changelog\n\n### The first greeting\n\nWe taught it to say hello.\n",
+            encoding="utf-8",
+        )
+
+        ungrounded_first = CandidateTask(
+            title="Add changelog entry for greeting",
+            instruction="Create CHANGELOG.md with '### The first greeting'...",
+            target_files=["CHANGELOG.md"],
+            acceptance_check="true",
+            cited_location=CitedLocation(file="main.py"),
+            cluster="entry_orchestration",
+        )
+        grounded_second = CandidateTask(
+            title="Prepend a new greeting changelog entry",
+            instruction="Append a new entry above the existing seed entry...",
+            target_files=["CHANGELOG.md"],
+            acceptance_check="true",
+            cited_location=CitedLocation(file="CHANGELOG.md"),
+            cluster="support",
+        )
+        # Same fp as grounded_second (same cited_location.file, same anchor
+        # — no symbol/line range on either — and same normalised title),
+        # but a different target file set, so a different tfp.
+        same_fp_different_target = CandidateTask(
+            title="Prepend a new greeting changelog entry",
+            instruction="A completely different instruction body...",
+            target_files=["OTHER.md"],
+            acceptance_check="true",
+            cited_location=CitedLocation(file="CHANGELOG.md"),
+            cluster="support",
+        )
+
+        creative_filt = Gate1Filter(
+            config=minimal_config,
+            base_url="http://localhost:1337/v1",
+            api_key="test",
+            model="test-model",
+            verify_ssl=False,
+            task_mode="creative",  # bypasses Stage B — no LLM call needed
+        )
+
+        accepted, rejected = creative_filt.filter(
+            [ungrounded_first, grounded_second, same_fp_different_target], tmp_path,
+        )
+
+        assert [c.title for c in accepted] == ["Prepend a new greeting changelog entry"]
+        dup_titles = [r.candidate.title for r in rejected if r.stage == "duplicate"]
+        assert dup_titles.count("Prepend a new greeting changelog entry") == 1
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Existence checks

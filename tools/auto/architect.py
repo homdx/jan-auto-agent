@@ -607,11 +607,26 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 # ── Checkpoint hit: skip LLM call, reuse saved candidates ────
                 if checkpoint_path is not None and batch_key in checkpoint:
                     saved = checkpoint[batch_key]
-                    restored = _deserialise_candidates(saved)
-                    print(f"   ♻️  Cluster/batch '{sub.name}' restored from checkpoint "
-                          f"({len(restored)} candidate(s)) — skipping LLM call")
-                    cluster_candidates.extend(restored)
-                    continue
+                    # BUGFIX (audit): _deserialise_candidates() ran outside
+                    # any try/except here — a structurally-wrong checkpoint
+                    # entry (schema drift, hand-edited file) raised
+                    # uncaught, defeating this whole mechanism's own
+                    # "start fresh on bad checkpoint" contract (already
+                    # honoured by the load-time try/except above, which
+                    # only guards json.loads/read_text, not this).
+                    try:
+                        restored = _deserialise_candidates(saved)
+                    except Exception as exc:  # noqa: BLE001 — fall back to a live call
+                        logger.warning(
+                            "review_clusters: could not restore checkpoint for "
+                            "'%s' (%s) — making a live LLM call instead",
+                            sub.name, exc,
+                        )
+                    else:
+                        print(f"   ♻️  Cluster/batch '{sub.name}' restored from checkpoint "
+                              f"({len(restored)} candidate(s)) — skipping LLM call")
+                        cluster_candidates.extend(restored)
+                        continue
 
                 # ── Live LLM call ─────────────────────────────────────────────
                 _all_files = files if (len(batches) > 1 and self._task_mode == "creative") else None
@@ -1663,9 +1678,9 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 continue
 
             # --- Validate required scalar fields ---
-            title       = (item.get("title") or "").strip()
-            instruction = (item.get("instruction") or "").strip()
-            acceptance  = (item.get("acceptance_check") or "").strip()
+            title       = _to_str_or_empty(item.get("title"))
+            instruction = _to_str_or_empty(item.get("instruction"))
+            acceptance  = _to_str_or_empty(item.get("acceptance_check"))
 
             # In creative mode, empty acceptance_check is allowed (handled below).
             if not title or not instruction or (not acceptance and self._task_mode != "creative"):
@@ -1742,11 +1757,11 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 continue
 
             cited = CitedLocation(
-                file       = (loc_raw.get("file") or "").strip(),
+                file       = _to_str_or_empty(loc_raw.get("file")),
                 symbol     = (loc_raw.get("symbol") or None),
                 line_start = _to_int_or_none(loc_raw.get("line_start")),
                 line_end   = _to_int_or_none(loc_raw.get("line_end")),
-                new_file   = bool(loc_raw.get("new_file", False)),
+                new_file   = _to_bool_or(loc_raw.get("new_file", False)),
             )
 
             if not cited.is_valid(self._task_mode):
@@ -2213,9 +2228,9 @@ class TaskRewriter(_llm_stream.LLMClientBase):
             )
             return original_task
 
-        new_title       = (data.get("title") or "").strip()
-        new_instruction = (data.get("instruction") or "").strip()
-        new_acceptance  = (data.get("acceptance_check") or "").strip()
+        new_title       = _to_str_or_empty(data.get("title"))
+        new_instruction = _to_str_or_empty(data.get("instruction"))
+        new_acceptance  = _to_str_or_empty(data.get("acceptance_check"))
 
         if not new_instruction:
             logger.warning(
@@ -2337,3 +2352,36 @@ def _to_int_or_none(val: Any) -> int | None:
         return int(val)
     except (TypeError, ValueError):
         return None
+
+
+def _to_str_or_empty(val: Any) -> str:
+    """Coerce *val* to a stripped str, or "" when it isn't string-like.
+
+    BUGFIX: callers previously did ``(val or "").strip()``, which assumes
+    *val* is already a string whenever it's truthy — a truthy non-string
+    LLM field (e.g. ``123``, ``["x"]``) crashed ``.strip()`` with
+    AttributeError. Treating a non-string value the same as an absent one
+    lets the existing "missing required field" validation just below each
+    call site reject the candidate with a proper warning instead of the
+    whole run crashing on one malformed field.
+    """
+    return val.strip() if isinstance(val, str) else ""
+
+
+def _to_bool_or(val: Any, default: bool = False) -> bool:
+    """Coerce *val* to bool, treating common string spellings sensibly.
+
+    BUGFIX (audit): ``bool(loc_raw.get("new_file", False))`` treated an
+    LLM-emitted JSON *string* like ``"new_file": "false"`` as True — any
+    non-empty string is truthy in Python — silently marking an
+    existing-file task as new-file and bypassing the symbol/line
+    grounding requirement. A string value is now matched against common
+    false/true spellings instead of just checked for truthiness.
+    """
+    if isinstance(val, bool):
+        return val
+    if val is None:
+        return default
+    if isinstance(val, str):
+        return val.strip().lower() not in ("false", "no", "0", "")
+    return bool(val)

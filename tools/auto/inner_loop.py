@@ -240,6 +240,7 @@ class LLMGate2Validator:
         max_tokens: int  = 512,
         task_mode:  str  = "code",
         config = None,
+        think: bool | None = None,
     ):
         self.base_url    = base_url
         self.model       = model
@@ -270,7 +271,16 @@ class LLMGate2Validator:
         # strict JSON with no soft-parse fallback (see AUTO-BUG-10) — a
         # thinking model truncated mid-<think> here fails closed exactly
         # like architect/coder did before the think=false fix.
-        self._think      = config.getboolean("validator_agent", "think", fallback=False) if config is not None else False
+        # BUGFIX (audit): resolve_validator_llm_profile's profile-resolved
+        # think override was computed by callers and then silently
+        # dropped — this always re-read the base [validator_agent] think
+        # key instead, ignoring any per-profile override. Accept an
+        # explicit think= and only fall back to the config read when the
+        # caller didn't resolve one (None), preserving old behaviour.
+        self._think = (
+            think if think is not None
+            else (config.getboolean("validator_agent", "think", fallback=False) if config is not None else False)
+        )
         # AUTO-DM-5 / AUTO-CR-19-1: select system prompt — mode-specific
         # override > (code-mode-only) legacy "system" key > built-in.
         # See _resolve_validator_system for the full priority rationale.
@@ -1223,12 +1233,26 @@ class InnerLoop:
             # × rounds. None disables the guard.
             if _eff_deadline is not None:
                 if time.monotonic() >= _eff_deadline:
-                    logger.warning(
-                        "InnerLoop: task wall-clock limit (%ds = %.1f min, "
-                        "from max_task_seconds) reached — stopping after %d attempts",
-                        self.max_task_seconds, self.max_task_seconds / 60.0,
-                        attempt - 1,
-                    )
+                    # BUGFIX (audit): this always attributed the deadline to
+                    # max_task_seconds, even when _eff_deadline actually came
+                    # from the `deadline` parameter (the outer-loop's
+                    # task-wide budget shared across rounds) — e.g. logging
+                    # "0s from max_task_seconds" when max_task_seconds is 0
+                    # but a real shared deadline was passed in and reached.
+                    if deadline is not None:
+                        logger.warning(
+                            "InnerLoop: task wall-clock limit reached (from the "
+                            "outer-loop's shared task-wide deadline; this call "
+                            "had run %.1f min) — stopping after %d attempts",
+                            (time.monotonic() - _start_time) / 60.0, attempt - 1,
+                        )
+                    else:
+                        logger.warning(
+                            "InnerLoop: task wall-clock limit (%ds = %.1f min, "
+                            "from max_task_seconds) reached — stopping after %d attempts",
+                            self.max_task_seconds, self.max_task_seconds / 60.0,
+                            attempt - 1,
+                        )
                     _trace_stage(task_id, attempt - 1, "overall", "EXHAUSTED", reason="wall_clock")
                     last = feedback[-1] if feedback else ""
                     return InnerLoopResult(
@@ -1665,6 +1689,7 @@ def make_inner_loop(
             base_dir=str(base_dir),
             task_mode=task_mode,
             config=config,  # AUTO-DM-5: for system prompt override lookup
+            think=_val_think,  # BUGFIX (audit): profile override was dropped
             **_val_kwargs,
         )
 

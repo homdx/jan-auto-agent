@@ -1,0 +1,1 @@
+../tests/test_bugfix_faq_legacy_stdout_no_retry.py

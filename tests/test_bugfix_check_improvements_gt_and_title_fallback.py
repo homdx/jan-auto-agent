@@ -48,6 +48,26 @@ def test_title_fallback_does_not_match_dissimilar_titles():
     assert kind == ""
 
 
+def test_weak_overlap_returns_highest_ratio_not_first():
+    """BUGFIX (audit): find_false_positive's weak_overlap fallback only
+    ever recorded the FIRST below-threshold match it saw, even though a
+    later candidate might share a much higher (still below-threshold)
+    fraction of files. `ratio` is computed for every candidate — the
+    highest one should win, not whichever came first in known_fps.
+    """
+    task = {"target_files": {"a.py", "b.py", "c.py", "d.py"}, "title": "t"}
+    # Shares 1/4 files with task -> ratio 0.25, seen first.
+    weak_fp = {"target_files": {"a.py", "x.py", "y.py", "z.py"}, "title": "weak"}
+    # Shares 3/4 files with task -> ratio 0.75, seen second, above
+    # weak_fp's ratio but still below the 0.9 overlap_ratio threshold
+    # used here (so still "weak_overlap", not "file_overlap").
+    stronger_fp = {"target_files": {"a.py", "b.py", "c.py", "q.py"}, "title": "stronger"}
+
+    matched, kind = find_false_positive(task, [weak_fp, stronger_fp], overlap_ratio=0.9)
+    assert kind == "weak_overlap"
+    assert matched is stronger_fp
+
+
 def test_ground_truth_table_parses_bucket_heading():
     text = (
         "## Bucket 1 \u2014 Confirmed FALSE POSITIVE\n\n"

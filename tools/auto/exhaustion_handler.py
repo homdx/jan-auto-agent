@@ -288,14 +288,19 @@ class ExhaustionHandler:
         transition over a ticket-write failure.
         """
         ts = make_ticket_store(self._state.agent_dir)
-        ticket = make_ticket(
-            id=ticket_id,
-            type=TICKET_TYPE_INVESTIGATION,
-            linked_task=linked_task,
-            title=f"Deferred: {title}",
-            body=body,
-        )
         try:
+            # BUGFIX (audit): make_ticket() itself used to run before this
+            # try/except — a malformed field (e.g. ticket_id is None)
+            # raises TicketSchemaError from make_ticket, not just from
+            # ts.create(), and that propagated straight out of this
+            # fallback-of-last-resort handler.
+            ticket = make_ticket(
+                id=ticket_id,
+                type=TICKET_TYPE_INVESTIGATION,
+                linked_task=linked_task,
+                title=f"Deferred: {title}",
+                body=body,
+            )
             # Idempotent: if a ticket already exists (e.g. resume), skip creation.
             if ts.exists(ticket_id):
                 logger.debug("_open_ticket: %s already exists — skipping create", ticket_id)

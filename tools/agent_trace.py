@@ -318,7 +318,7 @@ class AgentTracer:
             for k, v in params.items():
                 if k in SKIP:
                     continue
-                v_str = json.dumps(v, ensure_ascii=False) if not isinstance(v, str) else v
+                v_str = json.dumps(v, ensure_ascii=False, default=str) if not isinstance(v, str) else v
                 _show(k, v_str)
 
         elif kind in ("result", "decision", "error") and content is not None:

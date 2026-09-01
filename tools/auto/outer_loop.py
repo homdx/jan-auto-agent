@@ -130,7 +130,49 @@ class OuterLoop:
             _mts = int(getattr(self.inner_loop, "max_task_seconds", 0) or 0)
         except (TypeError, ValueError):
             _mts = 0   # non-numeric (e.g. a test mock) → guard disabled
-        _task_deadline = (time.monotonic() + _mts) if _mts > 0 else None
+        # BUGFIX (audit): _task_deadline was purely in-process
+        # (time.monotonic() + budget), so it reset to a fresh full budget
+        # on every process restart — the exact multi-round runaway this
+        # mechanism exists to prevent, just re-emerging across restarts
+        # instead of across rounds. monotonic() has no fixed epoch and
+        # can't be persisted meaningfully, so persist the task's
+        # wall-clock start time instead (once, the first time this task
+        # is worked) and derive the deadline from elapsed wall-clock time
+        # on every call — including resumes — so the budget is actually
+        # consumed across restarts too.
+        _task_deadline = None
+        if _mts > 0:
+            _started_at = None
+            try:
+                _started_raw = self.state.read_task_file(task_id, "deadline_started_at.txt")
+            except OSError:
+                _started_raw = None
+            if _started_raw is not None:
+                try:
+                    _started_at = float(_started_raw.strip())
+                except ValueError:
+                    _started_at = None
+            if _started_at is None:
+                # Fresh start (or a missing/corrupted timestamp) — full
+                # budget, no elapsed-time deduction. Deliberately not
+                # computed as time.time() - time.time() (which would
+                # introduce a tiny nonzero drift from two separate real
+                # clock reads for what should be an exact zero interval).
+                _remaining = float(_mts)
+                try:
+                    self.state.write_task_file(
+                        task_id, "deadline_started_at.txt", repr(time.time()),
+                    )
+                except OSError as exc:
+                    logger.warning(
+                        "outer_loop: could not persist deadline start time for "
+                        "%s — the wall-clock budget will not survive a resume "
+                        "this time: %s", task_id, exc,
+                    )
+            else:
+                _elapsed = max(time.time() - _started_at, 0.0)
+                _remaining = max(_mts - _elapsed, 0.0)
+            _task_deadline = time.monotonic() + _remaining
         # AUTO-CR-33: only hand the deadline to inner loops that accept it, so
         # fakes/older InnerLoop signatures are not broken.
         try:
@@ -196,8 +238,14 @@ class OuterLoop:
                     task_id, _mts, _mts / 60.0, rnd,
                 )
                 self.state.set_task_status(task_id, STATUS_BLOCKED)
+                # BUGFIX (audit): impl_versions_used was omitted here,
+                # unlike every other OuterLoopResult return path in this
+                # method — on round 2+ (impl_versions_used already holds
+                # entries from earlier rounds by this point), this reported
+                # an empty list despite impls having actually been used.
                 return OuterLoopResult(task_id, False, rnd - 1, True,
-                                       feedback_files, inner_results)
+                                       feedback_files, inner_results,
+                                       impl_versions_used)
 
             # Fresh context: seed ONLY with the compact prior-round summaries.
             prior = self._read_round_feedback(task_id)
@@ -317,7 +365,19 @@ class OuterLoop:
                     f"(impl v{impl_num})"
                 )
 
-                new_task = self.task_rewriter.rewrite(task, failure_history)
+                try:
+                    new_task = self.task_rewriter.rewrite(task, failure_history)
+                except Exception as exc:
+                    # BUGFIX (audit): task_rewriter.rewrite() was called with no
+                    # guard here — an exception it doesn't already swallow
+                    # internally (e.g. a bad template) propagated straight out
+                    # of run_task, violating its own "Never raises" contract.
+                    logger.warning(
+                        "outer_loop: task_rewriter.rewrite failed for %s — "
+                        "continuing with the original task unchanged: %s",
+                        task_id, exc,
+                    )
+                    new_task = task
                 if new_task is not task:
                     # A genuine rewrite was produced — record it on disk and
                     # persist it in state (LOOP-3). Bugfix: this used to call
@@ -337,36 +397,58 @@ class OuterLoop:
                             title=new_task.get("title"),
                         )
                     except Exception as exc:
+                        # BUGFIX (audit): this used to fall through to write
+                        # the rewrite_round_N.md artifact and apply new_task
+                        # in-memory anyway — but state never durably recorded
+                        # this rewrite, so a resume restarts from the
+                        # pre-rewrite task while this round's artifact file
+                        # (and impl_version bump) still exist on disk,
+                        # letting the rewrite gate fire again and produce a
+                        # duplicate. Treat a failed apply_rewrite the same as
+                        # "no rewrite happened" — skip persisting the
+                        # artifact and keep the original task for this round
+                        # — instead of applying half of it.
                         logger.warning(
-                            "outer_loop: apply_rewrite failed for %s — rewrite "
-                            "will NOT survive a resume this round (continuing "
-                            "in-memory only): %s", task_id, exc,
+                            "outer_loop: apply_rewrite failed for %s — discarding "
+                            "this round's rewrite, continuing with the original "
+                            "task (it was never durably recorded): %s", task_id, exc,
                         )
-                        impl_version = impl_num   # fallback: derive from rewrites_done
-
-                    rewrite_body = (
-                        f"# Rewrite after round {rnd} — impl v{impl_version} — "
-                        f"task {task_id}\n\n"
-                        f"## New instruction\n{new_task.get('instruction', '')}\n\n"
-                        f"## Acceptance check\n{new_task.get('acceptance_check', '')}\n"
-                    )
-                    self.state.write_task_file(
-                        task_id,
-                        f"rewrite_round_{rnd}.md",
-                        rewrite_body,
-                    )
-                    task = new_task
-                    rewrites_done += 1
-                    tracer.event(
-                        "outer_loop", "task_rewriter", "rewrite",
-                        content=new_task.get("instruction", ""),
-                        params={
-                            "task": task_id,
-                            "round": rnd,
-                            "impl_version": impl_version,
-                            "rewrites_done": rewrites_done,
-                        },
-                    )
+                    else:
+                        rewrite_body = (
+                            f"# Rewrite after round {rnd} — impl v{impl_version} — "
+                            f"task {task_id}\n\n"
+                            f"## New instruction\n{new_task.get('instruction', '')}\n\n"
+                            f"## Acceptance check\n{new_task.get('acceptance_check', '')}\n"
+                        )
+                        try:
+                            self.state.write_task_file(
+                                task_id,
+                                f"rewrite_round_{rnd}.md",
+                                rewrite_body,
+                            )
+                        except OSError as exc:
+                            # BUGFIX (audit): unguarded — a disk/permission
+                            # failure here must not crash the whole --auto run
+                            # over a bookkeeping write; the rewrite still applies
+                            # in-memory (and via apply_rewrite above, if that
+                            # succeeded) even if this human-readable copy fails.
+                            logger.warning(
+                                "outer_loop: could not write rewrite_round_%d.md "
+                                "for %s — continuing without it: %s",
+                                rnd, task_id, exc,
+                            )
+                        task = new_task
+                        rewrites_done += 1
+                        tracer.event(
+                            "outer_loop", "task_rewriter", "rewrite",
+                            content=new_task.get("instruction", ""),
+                            params={
+                                "task": task_id,
+                                "round": rnd,
+                                "impl_version": impl_version,
+                                "rewrites_done": rewrites_done,
+                            },
+                        )
                 else:
                     logger.warning(
                         "TaskRewriter returned original task unchanged for %r "

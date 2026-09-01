@@ -434,7 +434,18 @@ def make_collect_bridge(
         max_chars = _DEFAULT_MAX_CONTEXT_CHARS
 
     summarizer_call = None
-    if config.getboolean("collect", "llm_summaries", fallback=True):
+    # BUGFIX (audit): unguarded — the two reads above already catch
+    # ValueError; this one didn't, contradicting this function's own
+    # "opt-in, never fatal / fail-open" contract (a malformed value raised
+    # straight out instead of degrading to the documented default).
+    try:
+        _llm_summaries = config.getboolean("collect", "llm_summaries", fallback=True)
+    except ValueError as exc:
+        logger.warning(
+            "config [collect] llm_summaries is malformed (%s) — using default True", exc,
+        )
+        _llm_summaries = True
+    if _llm_summaries:
         try:
             from tools.collect.summarizer import make_summarizer_call
             summarizer_call = make_summarizer_call(config, task_mode=task_mode)

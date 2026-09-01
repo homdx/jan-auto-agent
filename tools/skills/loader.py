@@ -440,6 +440,17 @@ def load_skill(
             exc, DEFAULT_BUDGET_FRACTION,
         )
         fraction = DEFAULT_BUDGET_FRACTION
+    # BUGFIX (audit): a syntactically-valid-but-nonsensical
+    # budget_fraction <= 0 passed getfloat() fine (no ValueError), but
+    # later int(need / fraction) in _overflow_error() divides by it
+    # directly — a 0 value crashed with ZeroDivisionError instead of the
+    # SkillBudgetError this whole function exists to raise cleanly.
+    if fraction <= 0:
+        logger.warning(
+            "config [skill] budget_fraction must be > 0 (got %r) — using default %r",
+            fraction, DEFAULT_BUDGET_FRACTION,
+        )
+        fraction = DEFAULT_BUDGET_FRACTION
     policy = adapter.get("skill", "on_overflow", fallback="error").strip().lower()
 
     if num_ctx <= 0:

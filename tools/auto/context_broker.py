@@ -323,7 +323,23 @@ class ContextBroker:
         low = token.lower()
         if low.endswith((".md", ".txt", ".markdown")):
             p = base_dir / token
-            if p.is_file() and not _is_target(p):
+            # BUGFIX (audit): no containment check — a token like
+            # "../secret.md" escaped base_dir, and _is_target() (which only
+            # checks membership in target_files, not location) returned
+            # False for any out-of-base path, so the escaped file was read
+            # and injected straight into the model prompt. Mirrors the
+            # same relative_to() containment check gate1_filter.py's
+            # new_file branch already uses. Checked on a resolved copy so
+            # it isn't fooled by a "../" that stays textually inside
+            # base_dir; p itself is left unresolved so _is_target()'s own
+            # (already-working) relative_to(base_dir) comparison below is
+            # unaffected.
+            try:
+                p.resolve().relative_to(base_dir.resolve())
+                _escapes_base = False
+            except ValueError:
+                _escapes_base = True
+            if not _escapes_base and p.is_file() and not _is_target(p):
                 candidates.append(p)
         # Chapter-number reference (chapter_2, chapter 2, Chapter_02 …).
         m = _CHAPTER_RE.search(token)

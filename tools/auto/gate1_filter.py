@@ -698,6 +698,15 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                 ):
                     superseded = accepted[target_fp_index[tfp]]
                     accepted[target_fp_index[tfp]] = c
+                    # BUGFIX (audit): the normal accept path below
+                    # (seen_fingerprints.add(fp) at the end of this loop
+                    # body) never runs for this supersede branch, since it
+                    # continues before reaching it — so `c`'s own `fp` was
+                    # never registered. A later candidate with the SAME
+                    # `fp` (but a different `tfp`) then found is_fp_dup
+                    # False and passed through as if `c` had never been
+                    # seen, instead of being caught as a duplicate of it.
+                    seen_fingerprints.add(fp)
                     all_results.append(FilterResult(
                         candidate=superseded, accepted=False, stage="duplicate",
                         reason=(
@@ -803,6 +812,17 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                 )
 
         abs_path = base_dir / loc.file
+        # BUGFIX (audit): no containment check here — the new_file branch
+        # above already confirms candidate_path resolves inside base_dir
+        # (relative_to(base_dir.resolve())), but this normal (non-new_file)
+        # branch reads and returns file content straight from base_dir /
+        # loc.file with no such check. An LLM-generated loc.file like
+        # "../../etc/passwd" reads outside the repo and hands its content
+        # to Stage B as if it were a legitimate cited block.
+        try:
+            abs_path.resolve().relative_to(base_dir.resolve())
+        except ValueError:
+            return False, f"cited path escapes base_dir: {loc.file!r}", ""
 
         # 1. File must exist.
         if not abs_path.is_file():

@@ -472,11 +472,19 @@ def make_canon_validator(
     # resulting values — when canon_llm_profile is unconfigured. This
     # keeps a bare-signature stand-in for _make_llm_call (as tests may
     # legitimately install) working unchanged in the default case.
-    llm_call = (
-        _make_llm_call(config, task_mode=task_mode, settings=settings)
-        if settings is not None
-        else _make_llm_call(config, task_mode=task_mode)
-    )
+    # BUGFIX (audit): sibling factories (make_fact_validator,
+    # make_continuity_validator) wrap this call in try/except so invalid
+    # LLM config degrades to a disabled validator instead of crashing the
+    # caller; this one didn't.
+    try:
+        llm_call = (
+            _make_llm_call(config, task_mode=task_mode, settings=settings)
+            if settings is not None
+            else _make_llm_call(config, task_mode=task_mode)
+        )
+    except Exception as exc:  # noqa: BLE001 — never block the loop on setup
+        logger.warning("make_canon_validator: could not build LLM call — %s", exc)
+        return None
 
     return CanonValidator(
         llm_call,

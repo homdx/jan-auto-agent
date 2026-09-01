@@ -128,6 +128,21 @@ _GENDER_MALE_RE = re.compile(
 )
 
 _AGE_RE = re.compile(r"(\d+)\s*(?:лет|год)", re.IGNORECASE)
+# BUGFIX (audit): unanchored — a duration-of-something phrase ("в браке 5
+# лет" = married for 5 years, "живёт здесь уже 10 лет" = has lived here
+# for 10 years already) matches the same "N лет/год" shape as a genuine
+# age statement ("Рейес — 40 лет"), and used to be misread as the
+# entity's age, which then falsely "conflicted" with a real age bullet
+# in _find_conflict. There is no positive age-context marker common
+# enough to require (the terse "Name — N лет" phrasing used throughout
+# this file's own tests has none), so this excludes the specific
+# duration-context words that immediately precede the number in a
+# non-age reading instead of requiring an age-context one.
+_AGE_DURATION_CONTEXT_RE = re.compile(
+    r"(?:в\s+браке|женат\w*|замужем|прошло|знаком\w*|живёт|живет|работает|"
+    r"длилось|прожил\w*|проработал\w*|уже)\s*$",
+    re.IGNORECASE,
+)
 # AUTO-BUG: no human age is >= 120, but a calendar-year reference like
 # "в 1990 году" / "к 2020 году" / "с 1985 года" matches _AGE_RE too — "год"
 # is an unanchored prefix of "году"/"года", so "1990 году" was being read as
@@ -187,10 +202,28 @@ _NAME_STOPWORDS = {
 
 
 def _gender_of(bullet: str) -> "str | None":
-    """Return ``'f'``, ``'m'``, or ``None`` if *bullet* asserts a gender."""
-    if _GENDER_FEMALE_RE.search(bullet):
+    """Return ``'f'``, ``'m'``, or ``None`` if *bullet* asserts a gender.
+
+    BUGFIX (audit): a bullet mentioning more than one entity can contain
+    BOTH a female and a male marker at once (e.g. a male character's name
+    alongside a stray "она" referring to someone else in the same
+    sentence) — this used to just return whichever regex happened to be
+    checked first ("f", unconditionally, since the female check ran
+    first), asserting a gender for the *whole* bullet that may not
+    belong to the entity `_find_conflict` is actually comparing it
+    against, producing a false conflict with a correctly-gendered
+    bullet for a different character. Resolving which name a given
+    pronoun refers to is real coreference resolution and out of scope
+    here; when both markers are present the safer, honest answer is
+    "ambiguous — don't assert either" rather than an arbitrary pick.
+    """
+    is_female = bool(_GENDER_FEMALE_RE.search(bullet))
+    is_male = bool(_GENDER_MALE_RE.search(bullet))
+    if is_female and is_male:
+        return None
+    if is_female:
         return "f"
-    if _GENDER_MALE_RE.search(bullet):
+    if is_male:
         return "m"
     return None
 
@@ -208,8 +241,14 @@ def _age_of(bullet: str) -> "int | str | None":
     # age (or gets misread as one when it's the only \d+ (лет|год) hit).
     for m in _AGE_RE.finditer(bullet):
         value = int(m.group(1))
-        if value <= _MAX_PLAUSIBLE_AGE:
-            return value
+        if value > _MAX_PLAUSIBLE_AGE:
+            continue
+        # BUGFIX (audit): reject a match immediately preceded by a
+        # duration-context word ("в браке 5 лет") — see
+        # _AGE_DURATION_CONTEXT_RE above.
+        if _AGE_DURATION_CONTEXT_RE.search(bullet[:m.start()]):
+            continue
+        return value
     w = _AGE_WORD_RE.search(bullet)
     if w:
         return _AGE_WORDS[w.group(1).lower()]
@@ -445,7 +484,22 @@ class StoryBible:
                     if _sem is not None and _sem in merged:
                         conflict_bullet = _sem
                 if conflict_bullet is not None:
-                    if self._register_correction_attempt(fact, conflict_bullet):
+                    # BUGFIX (audit): a new fact that explicitly says the age
+                    # is unknown (_age_of() == "unknown") must never win an
+                    # age conflict against an established REAL numeric age,
+                    # no matter how many times it's proposed — "we don't
+                    # know" can't legitimately "correct" "we know it's 40".
+                    # Without this, _register_correction_attempt's normal
+                    # escalate-after-N-consistent-proposals logic (correct
+                    # for genuine corrections, e.g. a real age typo) would
+                    # eventually accept a vague re-observation and silently
+                    # overwrite the real age with "unknown" — the data
+                    # corruption this guards against.
+                    _unknown_cannot_correct_real_age = (
+                        _age_of(fact) == "unknown"
+                        and _age_of(conflict_bullet) not in (None, "unknown")
+                    )
+                    if not _unknown_cannot_correct_real_age and self._register_correction_attempt(fact, conflict_bullet):
                         # AUTO-BUG-2 fix: the SAME correction has now been
                         # proposed by _CORRECTION_THRESHOLD independent
                         # chapters in a row — treat it as a genuine fix to

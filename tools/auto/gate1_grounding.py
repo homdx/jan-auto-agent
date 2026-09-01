@@ -229,6 +229,15 @@ def instruction_file_context(
         seen.add(token)
 
         path = base_dir / token
+        # BUGFIX (audit): no containment check — _FILENAME_TOKEN_RE allows
+        # "/" and "." in a token, so an instruction containing something
+        # like "a/../../etc/passwd.txt" matches and reads outside
+        # base_dir, unlike every other base_dir-relative read in this
+        # codebase's Gate 1 stage (see gate1_filter.py's same fix).
+        try:
+            path.resolve().relative_to(base_dir.resolve())
+        except ValueError:
+            continue
         if not path.is_file():
             continue
         try:

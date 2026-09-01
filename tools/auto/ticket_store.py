@@ -247,7 +247,16 @@ class TicketStore:
             raise TicketError(
                 f"Could not create ticket directory '{self._dir}': {exc}"
             ) from exc
-        self._write(path, ticket)
+        # BUGFIX (audit): _write() itself was unguarded here — a disk-full
+        # or permission error raised a raw OSError past this method's own
+        # documented Raises: (TicketSchemaError, TicketAlreadyExists),
+        # inconsistent with the _ensure_dir() conversion right above it.
+        try:
+            self._write(path, ticket)
+        except OSError as exc:
+            raise TicketError(
+                f"Could not write ticket '{ticket['id']}' to {path}: {exc}"
+            ) from exc
         logger.debug("TicketStore.create: %s", ticket["id"])
 
     # ── Read ─────────────────────────────────────────────────────────────────

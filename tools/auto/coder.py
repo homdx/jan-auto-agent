@@ -379,7 +379,15 @@ class Coder(_llm_stream.LLMClientBase):
                     "task_id": task_id},
         )
 
-        print(f"\n💻 [LIVE CODER STREAMING — task: {task_id}]:")
+        # BUGFIX (audit): this print() ran before the try/except below,
+        # unlike the context-probe's equivalent print (which IS inside its
+        # own try) — an asymmetry that let a stdout failure (e.g.
+        # BrokenPipeError) here escape uncaught, violating generate()'s
+        # own "never raises" contract.
+        try:
+            print(f"\n💻 [LIVE CODER STREAMING — task: {task_id}]:")
+        except OSError as exc:
+            logger.warning("Coder: could not write streaming banner (%s) — continuing", exc)
         try:
             _coder_tokens: list[str] = []
 
@@ -460,7 +468,22 @@ class Coder(_llm_stream.LLMClientBase):
                     )
                     raw_text = raw_text or "".join(_probe_tokens)
                     print("\n" + "═" * 80 + "\n")
-                    cleaned = strip_think(raw_text)
+                    _probe_cleaned = strip_think(raw_text)
+                    # BUGFIX (audit): this used to overwrite `cleaned`
+                    # unconditionally — if the probe call SUCCEEDED but
+                    # returned empty (no exception, just nothing), the good
+                    # first response was silently discarded and replaced
+                    # with "". The except clause below only preserves the
+                    # first response on an actual exception, not on this
+                    # empty-but-successful case. Only adopt the probe's
+                    # result when it actually has content.
+                    if _probe_cleaned.strip():
+                        cleaned = _probe_cleaned
+                    else:
+                        logger.warning(
+                            "coder.generate [%s]: context-probe second call "
+                            "returned empty — using first response", task_id,
+                        )
                     # Re-extract context_request symbols from the new response
                     # so the CoderResult reflects any new symbols the second
                     # call asked for.  context_satisfied intentionally keeps
@@ -1297,16 +1320,19 @@ class Coder(_llm_stream.LLMClientBase):
             body = _salvaged
 
         # ── Extract trailing CONTEXT_REQUEST line ───────────────────────────
+        # BUGFIX (audit): this only scanned (and stripped) the LAST 3 lines,
+        # but _extract_context_request_prose — which the module docstring
+        # says reads "the same line" this strips — scans the ENTIRE text.
+        # A CONTEXT_REQUEST line emitted earlier than the last 3 lines was
+        # extracted into missing_ctx by that function but left verbatim in
+        # the body actually written to disk. Strip every matching line,
+        # not just one found within the tail.
         lines = body.splitlines()
-        cr_idx = None
-        for i in range(len(lines) - 1, max(len(lines) - 4, -1), -1):
-            if lines[i].strip().upper().startswith("CONTEXT_REQUEST:"):
-                cr_idx = i
-                break
-        if cr_idx is not None:
-            # Remove the line from the body so it is not written to disk.
-            lines = lines[:cr_idx] + lines[cr_idx + 1:]
-            body = "\n".join(lines)
+        kept_lines = [
+            ln for ln in lines if not ln.strip().upper().startswith("CONTEXT_REQUEST:")
+        ]
+        if len(kept_lines) != len(lines):
+            body = "\n".join(kept_lines)
 
         body = body.strip()
 

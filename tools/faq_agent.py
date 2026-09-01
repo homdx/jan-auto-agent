@@ -1058,7 +1058,6 @@ class FaqAgent:
                     ssl_context=self.ssl_context,
                 )
                 self.llm_call_count += 1  # legacy streaming call
-                print()  # newline after streamed output
             else:
                 reply = request_completion(
                     url, headers, payload, self.timeout,
@@ -1097,6 +1096,27 @@ class FaqAgent:
                 _LEGACY_RETRY_ATTEMPTS, last_exc,
             )
             return self.not_found_marker
+
+        if stream:
+            # BUGFIX (audit, bug 45 — reintroduced by the retry_with_backoff
+            # refactor): this print() used to sit inside _one_call(), which
+            # is the function retry_with_backoff() wraps in try/except and
+            # retries on ANY exception — so a stdout failure (e.g.
+            # BrokenPipeError) here, AFTER the LLM call had already
+            # succeeded, was indistinguishable from a failed API call. It
+            # triggered a wasted duplicate request_completion retry, and
+            # once attempts were exhausted, discarded an answer that had
+            # already streamed successfully in favour of not_found_marker.
+            # Moved outside the retried closure entirely: a failure here is
+            # now just a best-effort trailing newline, never a reason to
+            # retry the whole call or lose the answer.
+            try:
+                print()  # newline after streamed output
+            except OSError as exc:
+                logger.warning(
+                    "FaqAgent: could not write trailing newline after "
+                    "streamed output (%s) — continuing", exc,
+                )
 
         try:
             answer = strip_think(reply).strip()
