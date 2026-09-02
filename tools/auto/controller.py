@@ -675,6 +675,11 @@ class AutoController:
                 _summary_memory = make_summary_memory(
                     cfg, base_dir=self.base_dir, task_mode=task_mode,
                 )
+            except ValueError:
+                # resolve_llm_profile deliberately raises ValueError for a
+                # misconfigured [summary] llm_profile — surface it at
+                # construction time, not silently swallowed.
+                raise
             except Exception as exc:  # noqa: BLE001 — never block commits on setup
                 logger.warning(
                     "controller: could not build SummaryMemory — synopsis "
