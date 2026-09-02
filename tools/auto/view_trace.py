@@ -170,7 +170,19 @@ def find_trace_file(path_arg: str) -> Path:
     if p.is_file():
         return p
     if p.is_dir():
-        candidates = sorted(p.glob("trace_*.jsonl"), key=lambda f: f.stat().st_mtime)
+        # BUGFIX (audit): f.stat() inside sorted()'s key= was unguarded —
+        # a broken symlink (or a file deleted between glob() and this
+        # stat() call) raised FileNotFoundError mid-sort and crashed this
+        # tool, which exists specifically to diagnose crashed runs. The
+        # sibling analyze_logs.py::find_trace_files fixed this the same
+        # way: fall back to 0 (sorts first/oldest, harmless) instead of
+        # raising.
+        def _safe_mtime(f: Path) -> float:
+            try:
+                return f.stat().st_mtime
+            except OSError:
+                return 0.0
+        candidates = sorted(p.glob("trace_*.jsonl"), key=_safe_mtime)
         if not candidates:
             sys.exit(f"No trace_*.jsonl files found in {p}")
         return candidates[-1]

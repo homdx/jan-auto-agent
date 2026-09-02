@@ -1,1 +1,0 @@
-../tests/test_cr19_validator_prompt.py

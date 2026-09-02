@@ -92,15 +92,20 @@ def _build_plan_validator(
     if not cfg.getboolean("architect", "validate_plan_creative", fallback=False):
         return None
 
-    active     = cfg.get("api", "active", fallback="local")
-    section    = f"api_{active}"
-    base_url   = cfg.get(section, "base_url")
-    api_key    = cfg.get(section, "api_key",    fallback="")
-    model      = cfg.get(section, "model")
-    api_fmt    = cfg.get(section, "api_format", fallback="openai")
-    verify_ssl = cfg.getboolean("api", "verify_ssl", fallback=True)
+    active = cfg.get("api", "active", fallback="local")
+    section = f"api_{active}"
 
+    # BUGFIX (audit): base_url/model have no fallback= and used to run
+    # before this try/except — a missing [api_{active}] section or a
+    # missing base_url/model key raised NoSectionError/NoOptionError
+    # uncaught, defeating the "never block the run on setup" guard below
+    # that was meant to catch exactly this kind of setup failure.
     try:
+        base_url   = cfg.get(section, "base_url")
+        api_key    = cfg.get(section, "api_key",    fallback="")
+        model      = cfg.get(section, "model")
+        api_fmt    = cfg.get(section, "api_format", fallback="openai")
+        verify_ssl = cfg.getboolean("api", "verify_ssl", fallback=True)
         return ClusterReviewer(
             cfg, base_url, api_key, model,
             api_format=api_fmt,

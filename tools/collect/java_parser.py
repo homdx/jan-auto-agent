@@ -127,4 +127,12 @@ def parse_java(source: str, module_path: str) -> JavaParseResult:
         tree = parser.parse(source.encode("utf-8", errors="replace"))
     except Exception as exc:  # noqa: BLE001 - a parser crash degrades to `error`, never aborts the scan
         return JavaParseResult(tree=None, error=f"{module_path}: {exc}")
+    # BUGFIX (audit): Parser.parse() is typed Optional[Tree] and can
+    # return None (not raise) — tree.root_node was dereferenced
+    # unconditionally right after, so a None tree crashed with
+    # AttributeError instead of degrading to `error` like every other
+    # failure mode in this function, violating its own "never aborts the
+    # scan" contract.
+    if tree is None:
+        return JavaParseResult(tree=None, error=f"{module_path}: parser.parse() returned no tree")
     return JavaParseResult(tree=tree, error=None, has_error=bool(tree.root_node.has_error))

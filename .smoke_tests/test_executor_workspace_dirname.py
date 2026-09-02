@@ -1,1 +1,0 @@
-../tests/test_executor_workspace_dirname.py

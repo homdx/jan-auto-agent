@@ -385,6 +385,21 @@ def _extract_current_prompt_from_meta(meta_prompt: str) -> str:
     return after.rstrip("\n")
 
 
+def _int_or(value, default: int) -> int:
+    """int(value), or *default* when value is missing or unparseable.
+
+    agent_trace stringifies params, so this normally sees "0"/"2"; synthetic
+    traces and tests may pass real ints. Both must survive, and a genuine 0
+    must never collapse to the default.
+    """
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
     """
     Walk events and build an analytics structure:
@@ -411,6 +426,22 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
                 "events":         [],
                 "llm_calls":      0,
                 "context_requests": [],
+                # AUTO-P: architect context probes. `requests` counts
+                # ARCH_PROBE replies, `results` counts the ones the executor
+                # actually resolved. The gap between them IS the decision-gate
+                # signal: probes the collect model could not answer.
+                "probe_requests": [],
+                "probe_results":  [],
+                # AUTO-P4a: `declined` records WHY a request went unanswered
+                # (round_cap / digest_budget / unresolved / no_executor /
+                # post_forced) instead of leaving requests-minus-results to be
+                # misread as "collect did not know these symbols". `config` is
+                # emitted once per run when probing is enabled, which is the
+                # only way to tell "enabled and never used" — the number the
+                # Phase 0 decision gate actually turns on — from "not
+                # installed", which otherwise render identically.
+                "probe_declined": [],
+                "probe_config":   None,
                 "total_events":   0,
                 "plan_total":     0,         # filled by plan_ready event — total tasks in plan
                 "files_preparing": [],       # [{ts, task, file_count, files_copied, files_missing, files}]
@@ -676,6 +707,61 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
             if src == "llm" and tgt == "prompt_optimizer":
                 run["_pending_new_prompt"] = str(content or "")
 
+        # ── AUTO-P architect context probes ────────────────────────────────
+        # Emitted by tools/auto/architect.py: kind="probe_request" when the
+        # Architect asks for facts, kind="probe_result" when ArchProbe resolves
+        # them. Counting both is what lets a run answer "is this feature used
+        # at all?" without re-reading the raw trace.
+        elif kind == "probe_request":
+            run["probe_requests"].append({
+                "ts":      ts,
+                "cluster": params.get("cluster", "?"),
+                "ops":     int(params.get("ops", 0) or 0),
+                "detail":  str(content or ""),
+            })
+
+        elif kind == "probe_declined":
+            run["probe_declined"].append({
+                "ts":      ts,
+                "cluster": params.get("cluster", "?"),
+                "reason":  str(params.get("reason", "unknown")),
+                "ops":     int(params.get("ops", 0) or 0),
+                "round":   int(params.get("round", 0) or 0),
+                # AUTO-P6: empty on pre-P6 traces.
+                "by_op":   str(params.get("by_op", "") or ""),
+            })
+
+        elif kind == "probe_config":
+            run["probe_config"] = {
+                "ts":              ts,
+                "usable":          str(params.get("usable", "False")) == "True",
+                "reason":          str(params.get("reason", "?")),
+                "max_rounds":      int(params.get("max_rounds", 0) or 0),
+                "max_total_chars": int(params.get("max_total_chars", 0) or 0),
+                "allowed_ops":     str(params.get("allowed_ops", "")),
+                "detail":          str(content or ""),
+            }
+
+        elif kind == "probe_result":
+            run["probe_results"].append({
+                "ts":         ts,
+                "cluster":    params.get("cluster", "?"),
+                "round":      int(params.get("round", 0) or 0),
+                "ops":        int(params.get("ops", 0) or 0),
+                # AUTO-P4b: absent on pre-P4b traces, hence the -1 sentinel —
+                # "not recorded" must not be silently reported as "zero found".
+                # NOT written as `int(params.get("hits", -1) or -1)`: an
+                # integer 0 is falsy, so that idiom turns the single most
+                # important value here — zero symbols found — back into
+                # "not recorded", which is the exact class of comfortable
+                # lie this ticket exists to remove.
+                "hits":       _int_or(params.get("hits"), -1),
+                "misses":     _int_or(params.get("misses"), -1),
+                # AUTO-P5: "facts=3/1 module=1/0". Empty on pre-P5 traces.
+                "by_op":      str(params.get("by_op", "") or ""),
+                "chars_used": int(params.get("chars_used", 0) or 0),
+            })
+
         # ── auto-tuner prompt rewrite outcomes (score, promoted or denied) ──
         elif kind in ("prompt_denied", "prompt_promoted"):
             promoted = (kind == "prompt_promoted")
@@ -933,6 +1019,109 @@ def render_run_summary(run: dict) -> None:
         _total_syms = sum(len(r["symbols"]) for r in _ctx_reqs)
         print(f"  {bold('Context pulls')}:   {cyan(str(len(_ctx_reqs)))} "
               f"request(s), {_total_syms} symbol(s)")
+    _probe_reqs = run.get("probe_requests", [])
+    _probe_cfg = run.get("probe_config")
+    if _probe_reqs or _probe_cfg:
+        _probe_res = run.get("probe_results", [])
+        _declined = run.get("probe_declined", [])
+        if _probe_cfg and not _probe_cfg["usable"]:
+            # Enabled, but nothing could ever have answered — worth saying out
+            # loud, because a run in this state produces zero probes for a
+            # reason that has nothing to do with whether the model wants them.
+            _why = {
+                "no_artifact":  "no fresh collect artifact ([collect] use_in_auto)",
+                "bridge_error": "collect bridge failed to build",
+            }.get(_probe_cfg["reason"], _probe_cfg["reason"])
+            print(f"  {bold('Architect probes')}: {yellow('enabled but unavailable')} — {_why}")
+        elif not _probe_reqs:
+            # THE decision-gate reading: offered on every batch, never taken.
+            print(
+                f"  {bold('Architect probes')}: {yellow('enabled, 0 requests')} "
+                f"(offered every batch, model never asked; "
+                f"max_rounds={_probe_cfg['max_rounds']}, "
+                f"ops={_probe_cfg['allowed_ops']})"
+            )
+        else:
+            _asked = sum(r["ops"] for r in _probe_reqs)
+            _clusters = len({r["cluster"] for r in _probe_reqs})
+            _rounds = max((r["round"] for r in _probe_res), default=0)
+            # AUTO-P4b: "resolved" now counts SYMBOLS the collect model
+            # actually returned, not probe_result events. Counting events
+            # reported two real runs — 60 lookups, 60 "(not found)" — as
+            # "22 resolved" and "8 resolved", which is how a completely
+            # non-functional lookup path survived three measured runs.
+            _hits = sum(r["hits"] for r in _probe_res if r["hits"] >= 0)
+            _has_hits = any(r["hits"] >= 0 for r in _probe_res)
+            if _has_hits:
+                _found = f"{_hits}/{_asked} symbol(s) found"
+                if _hits == 0:
+                    _found = yellow(f"{_found} — collect resolved nothing")
+            else:
+                # Pre-AUTO-P4b trace: the counters do not exist. Say so rather
+                # than inventing a number.
+                _found = f"{len(_probe_res)} round(s) answered (hit counts not recorded)"
+            print(
+                f"  {bold('Architect probes')}: {cyan(str(len(_probe_reqs)))} "
+                f"request(s) over {_clusters} cluster(s), {_asked} op(s), "
+                f"{_found} (max round {_rounds})"
+            )
+            # AUTO-P5: per-op breakdown. With one op it is redundant; with
+            # two or more it is the only way to see whether a newly added op
+            # is earning the round-trip it costs, which is the number the
+            # next scope decision turns on.
+            _by_op: dict = {}
+            # AUTO-P6: declines carry tallies too. An all-miss round emits no
+            # probe_result (its digest is empty), so summing results alone
+            # reported a run with 17 real misses as having none.
+            for r in list(_probe_res) + list(_declined):
+                for part in r.get("by_op", "").split():
+                    if "=" not in part or "/" not in part:
+                        continue
+                    op, _, tally = part.partition("=")
+                    h, _, m = tally.partition("/")
+                    slot = _by_op.setdefault(op, [0, 0])
+                    slot[0] += _int_or(h, 0)
+                    slot[1] += _int_or(m, 0)
+            if len(_by_op) > 1:
+                _parts = ", ".join(
+                    f"{op} {h}/{h + m}"
+                    for op, (h, m) in sorted(_by_op.items(), key=lambda kv: -kv[1][0])
+                )
+                print(f"  {' ' * len('Architect probes')}  by op: {_parts}")
+
+            if _declined:
+                _by_reason = {}
+                for d in _declined:
+                    _by_reason[d["reason"]] = _by_reason.get(d["reason"], 0) + 1
+                _label = {
+                    "round_cap":     "hit round cap",
+                    "digest_budget": "hit digest budget",
+                    "unresolved":    "collect had no answer",
+                    "no_executor":   "no collect artifact",
+                    "post_forced":   "probed after forced call",
+                    "repeat":        "re-asked an answered probe",
+                }
+                _parts = ", ".join(
+                    f"{n} {_label.get(r, r)}"
+                    for r, n in sorted(_by_reason.items(), key=lambda kv: -kv[1])
+                )
+                print(f"  {' ' * len('Architect probes')}  {yellow(f'{len(_declined)} declined')}: {_parts}")
+            _probing = {r["cluster"] for r in _probe_reqs}
+            _batches = len({
+                e.get("params", {}).get("cluster")
+                for e in run.get("events", [])
+                if e.get("kind") == "llm_request"
+                and e.get("source") == "architect"
+                and e.get("params", {}).get("cluster")
+            })
+            if _batches:
+                # The decision-gate numerator/denominator, computed here so it
+                # does not have to be reconstructed by hand from the trace.
+                _rate = 100.0 * len(_probing) / _batches
+                print(
+                    f"  {' ' * len('Architect probes')}  request rate: "
+                    f"{cyan(f'{_rate:.1f}%')} ({len(_probing)}/{_batches} batches)"
+                )
     print(f"  {bold('Prompt changes')}: {magenta(str(prompt_changes))}")
     _rewrites = run.get("rewrite_attempts", [])
     if _rewrites:

@@ -87,7 +87,7 @@ def test_real_view_trace_find_trace_file_is_guarded_via_sys_exit():
     source = (REPO_ROOT / "tools" / "auto" / "view_trace.py").read_text(encoding="utf-8")
     accesses = _accesses(source, "tools/auto/view_trace.py")
     by_access = {(a.location, a.access): a for a in accesses}
-    site = by_access[("tools/auto/view_trace.py:176", "candidates[-1]")]
+    site = by_access[("tools/auto/view_trace.py:188", "candidates[-1]")]
     assert site.status == "GUARDED"
     assert site.guard
 
@@ -272,7 +272,7 @@ def test_no_duplicate_or_conflicting_records_anywhere_in_module():
 def test_real_view_trace_site_appears_exactly_once():
     source = (REPO_ROOT / "tools" / "auto" / "view_trace.py").read_text(encoding="utf-8")
     accesses = _accesses(source, "tools/auto/view_trace.py")
-    matches = [a for a in accesses if (a.location, a.access) == ("tools/auto/view_trace.py:176", "candidates[-1]")]
+    matches = [a for a in accesses if (a.location, a.access) == ("tools/auto/view_trace.py:188", "candidates[-1]")]
     assert len(matches) == 1, f"expected exactly one record, got {matches!r}"
     assert matches[0].status == "GUARDED"
 
@@ -285,7 +285,7 @@ def test_real_analyze_logs_done_site_appears_exactly_once_and_is_guarded():
     # that function's line position shifts.
     source = (REPO_ROOT / "analyze_logs.py").read_text(encoding="utf-8")
     accesses = _accesses(source, "analyze_logs.py")
-    matches = [a for a in accesses if (a.location, a.access) == ("analyze_logs.py:1338", "done[-1]")]
+    matches = [a for a in accesses if (a.location, a.access) == ("analyze_logs.py:1527", "done[-1]")]
     assert len(matches) == 1, f"expected exactly one record, got {matches!r}"
     assert matches[0].status == "GUARDED"
 

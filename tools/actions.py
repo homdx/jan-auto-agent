@@ -27,6 +27,11 @@ def _ts() -> str:
     return time.strftime("%H:%M:%S")
 
 
+class _SearchChunkFailed(Exception):
+    """Internal: _ask_over_text's None failure sentinel, as an exception —
+    the shape backoff.retry_with_backoff retries on."""
+
+
 class OrchestratorActions:
     """Mixin that adds run_search, run_text_qa, and run_edit
     to the Orchestrator without cluttering its core orchestration logic."""
@@ -162,6 +167,17 @@ class OrchestratorActions:
             print(f"[{_ts()}] search failed: {e}")
             return None
 
+    def _ask_over_text_retryable(self, query: str, file_path: str,
+                                 text: str, chunk_label=None):
+        """_ask_over_text with its None failure sentinel translated into a
+        private exception, so run_search can drive it through
+        backoff.retry_with_backoff (which retries on exceptions, not on
+        falsy returns — a falsy return is a SUCCESS there)."""
+        ans = self._ask_over_text(query, file_path, text, chunk_label=chunk_label)
+        if ans is None:
+            raise _SearchChunkFailed()
+        return ans
+
     @staticmethod
     def _split_text(text: str, budget: int, overlap: int = 200):
         """Split text into <=budget-char chunks on line boundaries, with overlap."""
@@ -220,16 +236,20 @@ class OrchestratorActions:
             # got zero retries: the search just printed nothing and
             # returned silently. Same asymmetric-resilience bug, same fix.
             _RETRY = 3
-            ans = None
-            for _attempt in range(_RETRY):
-                ans = self._ask_over_text(query, file_path, source)
-                if ans is not None:
-                    break
-                if _attempt < _RETRY - 1:
-                    _wait = backoff.backoff_seconds(_attempt)
-                    print(f"[{_ts()}] ⚠️  Retrying after error "
-                          f"(attempt {_attempt + 2}/{_RETRY})...")
-                    time.sleep(_wait)
+
+            def _ask_full_file():
+                return self._ask_over_text_retryable(query, file_path, source)
+
+            try:
+                ans = backoff.retry_with_backoff(
+                    _ask_full_file, attempts=_RETRY,
+                    sleep_fn=time.sleep,
+                    on_retry=lambda exc, n, wait: print(
+                        f"[{_ts()}] ⚠️  Retrying after error "
+                        f"(attempt {n + 1}/{_RETRY})..."),
+                )
+            except Exception:
+                ans = None
             if ans is None:
                 print(f"[{_ts()}] ⚠️  Search unreachable after {_RETRY} attempts.")
                 return
@@ -283,16 +303,21 @@ class OrchestratorActions:
             # but scoped to one chunk so a persistently broken connection
             # can't stall the whole multi-chunk search.
             _CHUNK_RETRY_ATTEMPTS = 3
-            ans = None
-            for _attempt in range(_CHUNK_RETRY_ATTEMPTS):
-                ans = self._ask_over_text(query, file_path, ch, chunk_label=f"{i}/{len(chunks)}")
-                if ans is not None:
-                    break
-                if _attempt < _CHUNK_RETRY_ATTEMPTS - 1:
-                    _wait = backoff.backoff_seconds(_attempt)
-                    print(f"[{_ts()}] ⚠️  Retrying chunk {i}/{len(chunks)} "
-                          f"after error (attempt {_attempt + 2}/{_CHUNK_RETRY_ATTEMPTS})...")
-                    time.sleep(_wait)
+
+            def _ask_this_chunk(_ch=ch, _i=i, _n=len(chunks)):
+                return self._ask_over_text_retryable(
+                    query, file_path, _ch, chunk_label=f"{_i}/{_n}")
+
+            try:
+                ans = backoff.retry_with_backoff(
+                    _ask_this_chunk, attempts=_CHUNK_RETRY_ATTEMPTS,
+                    sleep_fn=time.sleep,
+                    on_retry=lambda exc, n, wait, _i=i, _n=len(chunks): print(
+                        f"[{_ts()}] ⚠️  Retrying chunk {_i}/{_n} "
+                        f"after error (attempt {n + 1}/{_CHUNK_RETRY_ATTEMPTS})..."),
+                )
+            except Exception:
+                ans = None
             if ans is None:
                 print(f"[{_ts()}] ⚠️  Chunk {i}/{len(chunks)} unreachable after "
                       f"{_CHUNK_RETRY_ATTEMPTS} attempts — skipping.")
@@ -575,9 +600,6 @@ class OrchestratorActions:
                 # content-based feedback. Keep the previous best `answer`
                 # (if any) rather than clobbering it with the failure.
                 _api_err_count += 1
-                if _api_err_count == 1:
-                    print(backoff.MILESTONE_TABLE)
-                _wait = backoff.backoff_seconds(_api_err_count - 1)
                 if iteration >= self.max_iterations:
                     print(f"[{_ts()}] ⚠️  Answer generation unavailable — "
                           f"max iterations reached, keeping best answer so far.")
@@ -591,7 +613,7 @@ class OrchestratorActions:
                     "feedback": feedback,
                     "answer": answer,
                 }
-                backoff.sleep_with_interrupt_save(_wait, _chk)
+                backoff.api_error_pause(_api_err_count, _chk)
                 continue  # retry same iteration (do not increment)
 
             answer = _new_answer
@@ -615,9 +637,6 @@ class OrchestratorActions:
                 # Keep the current best answer; do NOT feed the error back as
                 # feedback (that derails the answerer on the next attempt).
                 _api_err_count += 1
-                if _api_err_count == 1:
-                    print(backoff.MILESTONE_TABLE)
-                _wait = backoff.backoff_seconds(_api_err_count - 1)
                 if iteration >= self.max_iterations:
                     print(f"[{_ts()}] ⚠️  Validator unavailable — "
                           f"max iterations reached, keeping best answer. "
@@ -632,7 +651,7 @@ class OrchestratorActions:
                     "feedback": feedback,
                     "answer": answer,
                 }
-                backoff.sleep_with_interrupt_save(_wait, _chk)
+                backoff.api_error_pause(_api_err_count, _chk)
                 continue  # retry same iteration (do not increment)
 
             _api_err_count = 0
@@ -1019,9 +1038,6 @@ class OrchestratorActions:
                 # here so one dropped connection doesn't permanently kill
                 # the whole /edit command.
                 _api_err_count += 1
-                if _api_err_count == 1:
-                    print(backoff.MILESTONE_TABLE)
-                _wait = backoff.backoff_seconds(_api_err_count - 1)
                 if iteration >= self.max_iterations:
                     print(f"[{_ts()}] ⚠️  Edit generation unavailable — "
                           f"max iterations reached, using best edit so far.")
@@ -1038,7 +1054,7 @@ class OrchestratorActions:
                     "_prev_shown_count": _prev_shown_count,
                     "_is_reset_iter": _is_reset_iter,
                 }
-                backoff.sleep_with_interrupt_save(_wait, _chk)
+                backoff.api_error_pause(_api_err_count, _chk)
                 continue  # retry same iteration (do not increment)
 
             revised = _new_revised
@@ -1061,9 +1077,6 @@ class OrchestratorActions:
             if validation.get("_api_error"):
                 # Issue 7: exponential backoff instead of immediate break.
                 _api_err_count += 1
-                if _api_err_count == 1:
-                    print(backoff.MILESTONE_TABLE)
-                _wait = backoff.backoff_seconds(_api_err_count - 1)
                 if iteration >= self.max_iterations:
                     print(f"[{_ts()}] ⚠️  Edit validator unavailable — "
                           f"max iterations reached, writing best effort. "
@@ -1081,7 +1094,7 @@ class OrchestratorActions:
                     "_prev_shown_count": _prev_shown_count,
                     "_is_reset_iter": _is_reset_iter,
                 }
-                backoff.sleep_with_interrupt_save(_wait, _chk)
+                backoff.api_error_pause(_api_err_count, _chk)
                 continue  # retry same iteration (do not increment)
 
             _api_err_count = 0

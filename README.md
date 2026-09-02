@@ -121,6 +121,162 @@ the files it was shown.
   changes between retries.
 - **Architect checkpoint** — see [Resumability](#resumability).
 
+#### AUTO-P — the context probe (opt-in, off by default)
+
+The Architect sees `max_files_per_review` files of `max_file_chars` each —
+on the default profile that is about **10 KB of source per call**, against a
+tree of ~80 modules. It cannot tell whether a test for the change already
+exists, whether the symbol it wants to touch has three other callers, or
+whether the `acceptance_check` it is about to write already passes. Before
+AUTO-P it had no way to ask, so it guessed, and Gate 1 caught the guesses a
+full plan→gate cycle later.
+
+With probing on, the Architect may answer with **one line instead of the JSON
+array**:
+
+```
+ARCH_PROBE: facts <symbol>, facts <other_symbol>
+```
+
+The harness resolves those read-only lookups against the
+[collect artifact](#collect-artifact-reference), appends a
+`## Probe results` digest to the same prompt, and re-asks. When the budget is
+spent it sends one **forced** final call telling the model to plan with what
+it has — so hitting a cap never costs the batch its candidates.
+
+The stop decision belongs to the harness, by counter, never to the model:
+models are unreliable about when to stop asking, and an unbounded ask→answer
+loop has no upper bound on cost.
+
+**How to turn it on.** Minimal change — three lines:
+
+```ini
+[collect]
+use_in_auto   = true     ; REQUIRED — the collect artifact is the probe's only data source
+
+[architect]
+probe_enabled = true     ; master switch
+```
+
+Then, before measuring anything:
+
+```bash
+python3 main.py --collect                      # build/refresh the artifact
+rm -f .agent/architect_checkpoint.json         # see the warning below
+python3 main.py --dry-run --goal "..."
+```
+
+> **Delete `.agent/architect_checkpoint.json` whenever you flip
+> `probe_enabled`.** A cached batch result is replayed with no LLM call at
+> all, so a run measured against a checkpoint written while probing was off
+> shows a probe that never fires — and the obvious conclusion ("nobody uses
+> this") is wrong.
+
+**Which profile to use.** `agents_128k.ini` is the only shipped profile with
+`[collect] use_in_auto = true`, so it is the only one where adding
+`probe_enabled = true` is a one-line change. Everywhere else you must turn
+`use_in_auto` on as well, or you get probes that resolve nothing and fall
+straight through to the forced call — the startup lint warns about exactly
+that. No profile ships with `probe_enabled` set; absent means `false`.
+
+**Every profile carries its own budget** (AUTO-P4c). The three numeric keys
+are scaled to the window they sit in, because a digest sized for a
+262 144-token context does not belong in a 4 096-token one:
+
+| Profile | `num_ctx` | rounds | per-op | digest/batch |
+|---|---:|---:|---:|---:|
+| `agents_4k.ini`, `agents_stub.ini` | 4 096 | 1 | 600 | 1 200 |
+| `agents.ini` | 8 192 | 2 | 1 200 | 2 500 |
+| `agents_32k.ini`, `..._fast_cpu` | 32 768 | 3 | 2 000 | 6 000 |
+| `agents_32k_slow_cpu.ini` | 32 768 | 2 | 1 500 | 4 000 |
+| `agents_64k.ini` | 65 536 | 3 | 2 000 | 8 000 |
+| `agents_256k.ini` | 262 144 | 3 | 4 000 | 12 000 |
+| `agents_128k.ini` | 1 000 000 | operator-tuned | | |
+
+These are ceilings, not targets. A measured working run used at most **457
+characters of digest per batch** at 3 rounds and 1 171 at 5, so every profile
+above has room to spare — including the 4k ones, which an earlier version of
+this document wrongly called unusable.
+
+`agents_32k_slow_cpu.ini` is stingier than its identically-sized sibling on
+purpose: a firing probe costs one extra architect round-trip, and on a
+CPU-bound profile wall-clock is the binding constraint, not tokens.
+
+Two tests keep this honest. `test_probe_budget_fits_the_window` fails if any
+profile's `prompt + instructions + digest + max_tokens` exceeds its own
+`num_ctx`, so retuning `max_file_chars` or `num_ctx` trips before a run does.
+`test_probe_budgets_are_coherent` fails if `probe_max_total_chars` is below
+`probe_max_chars` — `ArchProbe` silently clamps the total up in that case, so
+the profile would not do what it says.
+
+**All settings** (`[architect]`; every one has a fallback, so profiles that
+do not mention them keep working):
+
+| Key | Fallback | Meaning |
+|---|---|---|
+| `probe_enabled` | `false` | Master switch. Off ⇒ nothing is appended to any prompt and every byte sent is identical to pre-AUTO-P. |
+| `probe_max_rounds` | `1` | Probe rounds per batch before the forced final call. See the table above. No measured run has ever needed more than 3, or hit a cap of 5. |
+| `probe_max_chars` | `2000` | Cap on one op's result. Overflow is hard-truncated with a visible notice. |
+| `probe_max_total_chars` | `6000` | Cap on the accumulated digest **per batch** (reset between batches — AUTO-P4a). Must be ≥ `probe_max_chars` or it is clamped up. |
+| `probe_allowed_ops` | `facts` | Comma-separated allow-list. `facts` and `module` have executors. The shipped profiles set `facts, module`; the code fallback stays `facts` alone, so a config that omits the key does not silently gain an op. Present-but-empty means *allow nothing* and fails closed. |
+
+**Two ops** (AUTO-P5):
+
+| Op | Question it answers | Returns |
+|---|---|---|
+| `facts <symbol>` | "what is this symbol" | signature + contracts |
+| `module <path>` | "what is in this file" | every top-level name, with line number and first docstring line |
+
+`module` exists because `facts` structurally could not answer the question the
+Architect kept asking. Across two measured runs, **7 of the 9 unresolved
+lookups were `facts backoff` or `facts retry`** — the first is a *file*
+(`tools/backoff.py`, which defines six functions but no symbol called
+`backoff`), the second a *concept* that is not an identifier anywhere in the
+tree. Both correctly returned nothing, and the model had no way to express
+what it actually meant. `module tools/backoff.py` is that way.
+
+`module` accepts three reference forms — `tools/backoff.py`,
+`tools/backoff`, `tools.backoff` — and matches **exactly**, with no
+bare-basename fallback: if two files share a basename, answering with
+whichever came first would plan against the wrong module while the telemetry
+recorded a success.
+
+**What still cannot be looked up.** Collect indexes **top-level functions and
+classes only**. `facts request_completion` and `facts InnerLoop` resolve;
+methods (`InnerLoop.run_task`) and config keys (`max_attempts_per_task`) never
+will. The probe instructions say this to the model explicitly (AUTO-P4b) — in
+the first runs without that guidance it asked for 19 names of which only 2
+were of a shape the artifact could answer. `symbol` / `refs` /
+`read` are planned but not implemented; an op outside the allow-list parses
+to nothing, which the harness reads as "not a probe" rather than as a probe
+it will silently no-op on.
+
+**What you should see.** Two console lines, both unconditional:
+
+```
+controller: run flags — task_mode=code dry_run=False [architect] probe_enabled=True  [collect] use_in_auto=True
+architect: probe available this run (collect artifact fresh) — offering ARCH_PROBE on every batch.
+```
+
+and then, each time the Architect actually asks:
+
+```
+architect [agents (batch 34/79)]: probe FIRED — facts retry, facts _retry
+review_one_cluster [agents (batch 34/79)]: probe round 1/1 resolved 2 op(s) (209 chars total) — re-asking.
+```
+
+If the first two lines appear and `probe FIRED` never does, the probe was
+genuinely offered and genuinely never taken — which is a real measurement,
+not a missing log line. See [`analyze_logs.py`](#analyze_logspy) for the
+same signal in aggregate.
+
+**Interaction with AUTO-H4/H5.** An `ARCH_PROBE:` reply is not JSON, so the
+parser classifies it *unsalvageable* — the exact input AUTO-H5 exists to
+retry. Probe detection therefore runs **before** that verdict reaches either
+ladder, and a recognised probe force-clears both flags. A probe can never
+consume a shrink-retry or an escalation, and the two ladders keep their full
+budgets for the failures they are actually for.
+
 ### 4. Gate 1 — filtering candidate tasks (before any code is written)
 
 `tools/auto/gate1_filter.py`, class `Gate1Filter`. Runs on **every**
@@ -371,6 +527,69 @@ use_in_bughunt  = false
 staleness       = warn      # warn | refresh | ignore, on stale reads
 llm_summaries   = true      # false = purely structural, no Pass B LLM prose
 ```
+
+### Reading the architect-probe line (AUTO-P / AUTO-P4a)
+
+When [probing](#auto-p--the-context-probe-opt-in-off-by-default) is enabled,
+the run summary gains an `Architect probes` line. It has three shapes, and
+telling them apart is the whole point — a run with zero probes and a run on
+code that never had the feature used to render identically.
+
+```
+Architect probes: enabled, 0 requests (offered every batch, model never asked; max_rounds=1, ops=facts)
+```
+Working as designed, and the model did not need it. This is a real
+measurement, not a missing line.
+
+```
+Architect probes: enabled but unavailable — no fresh collect artifact ([collect] use_in_auto)
+```
+Zero probes for a reason that has nothing to do with the model. Run
+`--collect` and set `use_in_auto = true`.
+
+```
+Architect probes: 12 request(s) over 8 cluster(s), 24 op(s), 5/24 symbol(s) found (max round 1)
+                  4 declined: 4 hit round cap
+                  request rate: 4.0% (8/202 batches)
+```
+Working and used. Read it as follows.
+
+| Field | Read it as |
+|---|---|
+| `N request(s)` | how many `ARCH_PROBE` replies the Architect sent |
+| `over M cluster(s)` | whether probing is one pathological batch or spread out |
+| `K op(s)` | total symbols asked for |
+| `N/M symbol(s) found` | symbols collect actually returned, out of those asked. **`0/M — collect resolved nothing` means the probe is doing nothing useful**, whatever the request count says |
+| `by op:` | per-op hit rate, shown once more than one op is in play (AUTO-P5) — the number that says whether a newly added op is earning its round-trip |
+| `declined` | **why** the rest went unanswered — see below |
+| `request rate` | probing batches ÷ batches reviewed |
+
+The decline reasons call for opposite fixes, which is why they are broken out
+rather than summed:
+
+| Reason | What it means | What to change |
+|---|---|---|
+| `hit round cap` | the model wanted another round | raise `probe_max_rounds`, or widen `max_files_per_review` |
+| `re-asked an answered probe` | the model repeated a request | usually harmless; a persistent pattern means the digest is not answering the real question |
+| `hit digest budget` | the digest filled up within the batch | raise `probe_max_total_chars` |
+| `collect had no answer` | the symbol is not in the artifact | rebuild with `--collect`; check staleness |
+| `no collect artifact` | probing was never actually available | fix the config; the startup lint warns about this |
+| `probed after forced call` | the model ignored an instruction | usually a weak model, not a config problem |
+
+Before AUTO-P4a these five were reported as one figure labelled
+`N unresolved`, which was documented as "collect did not know these symbols".
+On the first real probing run all four were in fact the round cap.
+
+AUTO-P4b then found that "8 resolved" in that same line had been counting
+*rounds that produced a digest*, not symbols found. Across two measured runs
+the true figure was **0 of 60**: `CollectBridge` could not match a bare symbol
+name against collect's `path:Symbol` qualname format, so every lookup returned
+`(not found)` and the loop spun on it. If you are comparing against notes from
+before AUTO-P4b, treat every "resolved" number in them as meaningless.
+
+The line updates as the run proceeds: `analyze_logs.py` reads the JSONL
+trace, which is appended live, so you can run it against an in-flight run
+rather than waiting for the end.
 
 ### COLLECT-25 — Language dispatch + tree-sitter-java parser (Java 17+)
 

@@ -1,5 +1,5 @@
 """tests_slow/test_gate1_log_levels_slow.py — relocated out of
-tests/test_gate1_log_levels.py.
+tests_bugfix/test_gate1_log_levels.py.
 
 Contains exactly one test: test_technical_failure_still_logs_at_warning.
 It's real (unmocked) time.sleep() in Gate1Filter's retry backoff
@@ -13,7 +13,7 @@ Run just this file:
     pytest tests_slow -q
 
 Everything else is unchanged and still lives in
-tests/test_gate1_log_levels.py.
+tests_bugfix/test_gate1_log_levels.py.
 """
 
 from __future__ import annotations

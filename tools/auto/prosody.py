@@ -630,11 +630,28 @@ def make_prosody_validator(config) -> "ProsodyValidator | None":
     if not enabled:
         return None
 
-    max_rev = config.getint("validator_agent", "max_prosody_revisions", fallback=2)
+    # BUGFIX (audit): unguarded — the `enabled` read above (and every other
+    # config read in this codebase's config.getint/getboolean call sites,
+    # per the audit's "key patterns" note) tolerates malformed values; these
+    # two didn't, so a bad max_prosody_revisions/prosody_syllable_tolerance
+    # crashed the whole function instead of falling back to its default.
+    try:
+        max_rev = config.getint("validator_agent", "max_prosody_revisions", fallback=2)
+    except ValueError as exc:
+        logger.warning(
+            "config [validator_agent] max_prosody_revisions is malformed (%s) — using default 2", exc,
+        )
+        max_rev = 2
     min_scheme = config.get("validator_agent", "prosody_min_scheme", fallback="ABCB")
-    syllable_tolerance = config.getint(
-        "validator_agent", "prosody_syllable_tolerance", fallback=2
-    )
+    try:
+        syllable_tolerance = config.getint(
+            "validator_agent", "prosody_syllable_tolerance", fallback=2
+        )
+    except ValueError as exc:
+        logger.warning(
+            "config [validator_agent] prosody_syllable_tolerance is malformed (%s) — using default 2", exc,
+        )
+        syllable_tolerance = 2
 
     return ProsodyValidator(
         max_prosody_revisions=max_rev,

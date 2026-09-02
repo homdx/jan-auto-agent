@@ -45,6 +45,33 @@ class TestGenderFlipDropped:
         assert "мужчина" not in text
         assert any("dropped contradicting immutable fact" in r.message for r in caplog.records)
 
+    def test_bugfix_ambiguous_mixed_gender_bullet_does_not_false_conflict(self, tmp_path) -> None:
+        """BUGFIX (audit): a new bullet mentioning the same established
+        name plus BOTH a male and a female marker (e.g. two characters in
+        one sentence — "он" referring to one, "она" to another) used to
+        resolve to "f" unconditionally (the female regex was checked
+        first), asserting a gender for the whole bullet that may not
+        belong to the shared-name entity at all, and falsely conflicting
+        with — and dropping — a correctly-established gender fact for a
+        different reason entirely. When both markers are present the
+        bullet is genuinely ambiguous and must not assert either gender,
+        so it should just be added normally, not treated as a conflict.
+        """
+        bible_path = tmp_path / "story_bible.md"
+        bible_path.write_text("• Капитан Рейес — мужчина", encoding="utf-8")
+
+        def llm(system: str, user: str) -> str:
+            return "• Рейес и Мира поговорили; он был спокоен, а она — расстроена"
+
+        bible = _make_bible(tmp_path, llm)
+        bible.update("some chapter text")
+
+        text = bible.load()
+        # The established fact must survive untouched (no false conflict).
+        assert "Рейес — мужчина" in text
+        # The ambiguous mixed-gender bullet is added normally, not dropped.
+        assert "он был спокоен" in text
+
 
 # ── test_age_conflict_dropped ───────────────────────────────────────────────
 
@@ -72,6 +99,29 @@ class TestAgeConflictDropped:
 
         bible = _make_bible(tmp_path, llm)
         bible.update("chapter text")
+
+        text = bible.load()
+        assert "40 лет" in text
+        assert "не указан" not in text
+
+    def test_age_conflict_unknown_never_escalates_to_correction(self, tmp_path) -> None:
+        """BUGFIX (audit): an "unknown age" fact used to eventually WIN once
+        proposed _CORRECTION_THRESHOLD times in a row — the generic
+        correction-escalation logic (correct for a real numeric age typo)
+        doesn't know "unknown" can never legitimately correct a known
+        value, so it silently overwrote the real age with "unknown" on the
+        threshold-th repeat. This must never happen, no matter how many
+        chapters keep re-proposing the same vague fact.
+        """
+        bible_path = tmp_path / "story_bible.md"
+        bible_path.write_text("• Рейес — 40 лет", encoding="utf-8")
+
+        def llm(system: str, user: str) -> str:
+            return "• возраст Рейес не указан"
+
+        bible = _make_bible(tmp_path, llm)
+        for i in range(5):
+            bible.update(f"chapter {i} text")
 
         text = bible.load()
         assert "40 лет" in text

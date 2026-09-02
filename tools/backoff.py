@@ -62,6 +62,79 @@ def _now() -> str:
     return datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
+# ── retry helpers ─────────────────────────────────────────────────────────────
+#
+# Two shared helpers that used to be copy-pasted at every call site:
+#
+#   retry_with_backoff  — the bounded "call / on exception sleep
+#                         backoff_seconds(n) / retry" loop (run_search's
+#                         single-file and per-chunk paths, FaqAgent's
+#                         _answer_legacy, collect's summarize_repo).
+#   api_error_pause     — the Issue-7 "consecutive API error" block
+#                         (milestone table once, backoff_seconds(n-1),
+#                         sleep_with_interrupt_save with a checkpoint) used
+#                         by main.py's run_pipeline and actions.py's
+#                         run_text_qa / run_edit.
+
+
+def retry_with_backoff(call, attempts: int = 3, sleep_fn=None,
+                       on_retry=None, on_error=None):
+    """Call *call* up to ``attempts`` times, sleeping between failures.
+
+    ``call`` is invoked with no arguments; any exception it raises aborts
+    nothing — the loop sleeps ``backoff_seconds(failure_index)`` seconds
+    and tries again, up to ``attempts`` total calls. ``sleep_fn`` replaces
+    ``time.sleep`` (tests pass a no-op/recorder); ``on_retry(exc, attempt,
+    wait)`` is called before each sleep for a caller-specific log/print;
+    ``on_error(exc, attempt)`` (1-indexed, like the call sites' error_count)
+    is called on EVERY failure including the final one.
+
+    Returns whatever the first successful ``call()`` returns, or raises the
+    LAST exception if every attempt failed. A falsy ``attempts`` means one
+    try with no retry (still raises on failure, never sleeps).
+    """
+    sleep = sleep_fn or time.sleep
+    attempts = max(1, int(attempts))
+    last_exc: "BaseException | None" = None
+    for attempt in range(attempts):
+        try:
+            return call()
+        except Exception as exc:  # noqa: BLE001 — one bad call must not kill the loop
+            last_exc = exc
+            if on_error is not None:
+                on_error(exc, attempt + 1)
+            if attempt < attempts - 1:
+                wait = backoff_seconds(attempt)
+                if on_retry is not None:
+                    on_retry(exc, attempt + 1, wait)
+                sleep(wait)
+    assert last_exc is not None  # attempts >= 1 and no return ⇒ at least one raise
+    raise last_exc
+
+
+def api_error_pause(error_count: int, checkpoint: Dict[str, Any],
+                    sleep_fn=None, path: Path = STATE_FILE) -> None:
+    """Pause before retrying after *error_count* consecutive API errors.
+
+    This is the Issue-7 block that used to be repeated verbatim in every
+    validated loop (run_pipeline / run_text_qa / run_edit):
+
+      * print the MILESTONE_TABLE once (on the first error),
+      * compute ``backoff_seconds(error_count - 1)``,
+      * sleep via :func:`sleep_with_interrupt_save`, which saves *checkpoint*
+        to *path* and exits cleanly on KeyboardInterrupt.
+
+    ``error_count`` is the ALREADY-INCREMENTED count of consecutive errors
+    (1 = first error ⇒ 1 s wait). ``sleep_fn`` is accepted for symmetry with
+    the other helpers; the checkpoint-saving sleep has no injectable clock
+    by design — interrupt handling is the whole point of this path.
+    """
+    if error_count == 1:
+        print(MILESTONE_TABLE)
+    wait = backoff_seconds(error_count - 1)
+    sleep_with_interrupt_save(wait, checkpoint, path)
+
+
 # ── state persistence ─────────────────────────────────────────────────────────
 
 def save_state(state: Dict[str, Any], path: Path = STATE_FILE) -> None:

@@ -231,7 +231,25 @@ class MetricsCollector:
         if not isinstance(data, list):
             self._quarantine(f"expected a JSON array, got {type(data).__name__}")
             return []
-        return data
+        # BUGFIX (verified-bugs audit #10): this only validated that the
+        # top-level parsed value is a list — it did not validate that each
+        # ITEM in that list is a dict. A scalar/null entry in metrics.json
+        # (e.g. `[{"a": 1}, null, {"b": 2}]`, from a hand edit or a
+        # partial/corrupted write) sailed through here unchanged, then blew
+        # up downstream: load_recent()'s `r.items()` raised AttributeError
+        # (only TypeError was caught there), and summarize_failures()'s
+        # `r.get(...)` calls raised the same — either way, one bad item
+        # crashed the WHOLE call, contradicting this method's own "one bad
+        # item must not take down the batch" contract (see the class
+        # docstring above). Filtering here protects every caller at once
+        # instead of duplicating an isinstance check in each of them.
+        clean = [r for r in data if isinstance(r, dict)]
+        if len(clean) != len(data):
+            logger.warning(
+                "MetricsCollector._load_all: skipping %d non-dict record(s) "
+                "in %s", len(data) - len(clean), self.metrics_path,
+            )
+        return clean
 
     def _quarantine(self, reason: str) -> None:
         """Move an unusable metrics.json aside and log why.

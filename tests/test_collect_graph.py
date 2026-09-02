@@ -120,7 +120,18 @@ def test_entry_points_include_main_py_on_real_repo():
     # Restrict to production modules: a test importing `main` (e.g. to
     # drive its CLI) is not itself part of the call graph `main.py` is the
     # root of, so it shouldn't disqualify `main.py` as an entry point.
-    modules = [m for m in scan_repo(REPO_ROOT) if not m.path.startswith("tests/")]
+    #
+    # AUTO-P6: the prefix list, not a single literal. This filter was
+    # written when `tests/` was the only test directory; the tests_bugfix/
+    # reorganisation moved three files that `import main` into a directory
+    # this check did not know about, and `main.py` silently stopped being an
+    # entry point. The failure names neither the moved files nor the filter,
+    # so match on every directory that holds tests rather than on one.
+    _TEST_DIRS = ("tests/", "tests_bugfix/", "tests_slow/")
+    modules = [
+        m for m in scan_repo(REPO_ROOT)
+        if not m.path.startswith(_TEST_DIRS)
+    ]
     edges = import_edges(modules)
     eps = entry_points(edges)
     assert "main.py" in eps

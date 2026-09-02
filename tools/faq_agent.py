@@ -784,22 +784,43 @@ class FaqAgent:
         skipped: list[str] = []
         for i, (name, content) in enumerate(docs):
             block = f"=== {name} ===\n{content.strip()}"
-            if budget_chars and used + len(block) > budget_chars and parts:
-                # BUGFIX: this used to be `skipped.append(name); continue`,
-                # which only skips THIS doc and keeps probing later ones in
-                # the ranked list. Since docs are passed in relevance order,
-                # that let a lower-ranked-but-small doc later in the list
-                # get included while a higher-ranked-but-large one right
-                # here gets dropped — e.g. [small#2, LARGE#1, small#3] could
-                # end up keeping #2 and #3 while dropping #1, the single
-                # most relevant document, purely because of its size and
-                # position. That breaks this function's own promise above
-                # ("the tail we drop is the least relevant part"): the
-                # dropped set is only guaranteed to be a relevance-ordered
-                # tail if we stop here entirely, so every kept doc remains
-                # provably more relevant than every dropped one.
-                skipped.extend(n for n, _ in docs[i:])
-                break
+            if budget_chars and used + len(block) > budget_chars:
+                if not parts:
+                    # BUGFIX (verified-bugs audit #9): the `and parts`
+                    # guard below exists so we never skip/break on the
+                    # very first doc — but that meant when the single
+                    # most-relevant doc alone exceeds budget_chars, this
+                    # branch was never entered at all: the whole `if` was
+                    # False (parts is falsy), so the oversized doc fell
+                    # straight through to the normal append below with NO
+                    # warning and no entry in `skipped`, silently blowing
+                    # past num_ctx for the whole request. There's nothing
+                    # better to include instead of the top-ranked doc, so
+                    # still include it (some grounded context beats none)
+                    # — but warn, so this isn't silent.
+                    logger.warning(
+                        "FaqAgent._build_context: the single most relevant "
+                        "document (%r, %d chars) alone exceeds the ~%d char "
+                        "budget for num_ctx=%d — including it anyway; this "
+                        "request will likely exceed the model's context window.",
+                        name, len(block), budget_chars, self.num_ctx,
+                    )
+                else:
+                    # BUGFIX: this used to be `skipped.append(name); continue`,
+                    # which only skips THIS doc and keeps probing later ones in
+                    # the ranked list. Since docs are passed in relevance order,
+                    # that let a lower-ranked-but-small doc later in the list
+                    # get included while a higher-ranked-but-large one right
+                    # here gets dropped — e.g. [small#2, LARGE#1, small#3] could
+                    # end up keeping #2 and #3 while dropping #1, the single
+                    # most relevant document, purely because of its size and
+                    # position. That breaks this function's own promise above
+                    # ("the tail we drop is the least relevant part"): the
+                    # dropped set is only guaranteed to be a relevance-ordered
+                    # tail if we stop here entirely, so every kept doc remains
+                    # provably more relevant than every dropped one.
+                    skipped.extend(n for n, _ in docs[i:])
+                    break
             parts.append(block)
             used += len(block) + 2
         if skipped:
@@ -1047,57 +1068,76 @@ class FaqAgent:
         # request_completion call so a genuine model NOT_FOUND (which
         # returns normally, no exception) still short-circuits immediately.
         _LEGACY_RETRY_ATTEMPTS = 3
-        reply = None
-        last_exc = None  # type: Exception | None
-        for _attempt in range(_LEGACY_RETRY_ATTEMPTS):
-            try:
-                if stream:
-                    # AUTO-FIX (bug 45): on_token writes straight to stdout
-                    # with no separator, so a stream dropped mid-answer was
-                    # followed by the retry's answer from word one — reading
-                    # as one garbled generation. Mark the restart.
-                    if _attempt > 0:
-                        sys.stdout.write(
-                            f"\n[…retrying — previous stream was interrupted; "
-                            f"attempt {_attempt + 1}/{_LEGACY_RETRY_ATTEMPTS}…]\n"
-                        )
-                        sys.stdout.flush()
-                    reply = request_completion(
-                        url, headers, payload, self.timeout,
-                        stream=True,
-                        api_format=self.api_format,
-                        on_token=lambda t: (sys.stdout.write(t), sys.stdout.flush()),
-                        ssl_context=self.ssl_context,
-                    )
-                    self.llm_call_count += 1  # legacy streaming call
-                    print()  # newline after streamed output
-                else:
-                    reply = request_completion(
-                        url, headers, payload, self.timeout,
-                        stream=False,
-                        api_format=self.api_format,
-                        ssl_context=self.ssl_context,
-                    )
-                    self.llm_call_count += 1  # legacy non-streaming call
-                last_exc = None
-                break
-            except Exception as exc:
-                last_exc = exc
-                if _attempt < _LEGACY_RETRY_ATTEMPTS - 1:
-                    _wait = backoff.backoff_seconds(_attempt)
-                    logger.warning(
-                        "FaqAgent: legacy API call failed (%s) — retrying "
-                        "(attempt %d/%d) in %ds",
-                        exc, _attempt + 2, _LEGACY_RETRY_ATTEMPTS, _wait,
-                    )
-                    time.sleep(_wait)
 
-        if last_exc is not None:
+        def _one_call() -> str:
+            if stream:
+                reply = request_completion(
+                    url, headers, payload, self.timeout,
+                    stream=True,
+                    api_format=self.api_format,
+                    on_token=lambda t: (sys.stdout.write(t), sys.stdout.flush()),
+                    ssl_context=self.ssl_context,
+                )
+                self.llm_call_count += 1  # legacy streaming call
+            else:
+                reply = request_completion(
+                    url, headers, payload, self.timeout,
+                    stream=False,
+                    api_format=self.api_format,
+                    ssl_context=self.ssl_context,
+                )
+                self.llm_call_count += 1  # legacy non-streaming call
+            return reply
+
+        def _on_retry(exc: Exception, attempt: int, wait: int) -> None:
+            # AUTO-FIX (bug 45): on_token writes straight to stdout with no
+            # separator, so a stream dropped mid-answer was followed by the
+            # retry's answer from word one — reading as one garbled
+            # generation. Mark the restart.
+            if stream:
+                sys.stdout.write(
+                    f"\n[…retrying — previous stream was interrupted; "
+                    f"attempt {attempt + 1}/{_LEGACY_RETRY_ATTEMPTS}…]\n"
+                )
+                sys.stdout.flush()
+            logger.warning(
+                "FaqAgent: legacy API call failed (%s) — retrying "
+                "(attempt %d/%d) in %ds",
+                exc, attempt + 1, _LEGACY_RETRY_ATTEMPTS, wait,
+            )
+
+        try:
+            reply = backoff.retry_with_backoff(
+                _one_call, attempts=_LEGACY_RETRY_ATTEMPTS,
+                sleep_fn=time.sleep, on_retry=_on_retry,
+            )
+        except Exception as last_exc:
             logger.error(
                 "FaqAgent: API call failed after %d attempt(s): %s",
                 _LEGACY_RETRY_ATTEMPTS, last_exc,
             )
             return self.not_found_marker
+
+        if stream:
+            # BUGFIX (audit, bug 45 — reintroduced by the retry_with_backoff
+            # refactor): this print() used to sit inside _one_call(), which
+            # is the function retry_with_backoff() wraps in try/except and
+            # retries on ANY exception — so a stdout failure (e.g.
+            # BrokenPipeError) here, AFTER the LLM call had already
+            # succeeded, was indistinguishable from a failed API call. It
+            # triggered a wasted duplicate request_completion retry, and
+            # once attempts were exhausted, discarded an answer that had
+            # already streamed successfully in favour of not_found_marker.
+            # Moved outside the retried closure entirely: a failure here is
+            # now just a best-effort trailing newline, never a reason to
+            # retry the whole call or lose the answer.
+            try:
+                print()  # newline after streamed output
+            except OSError as exc:
+                logger.warning(
+                    "FaqAgent: could not write trailing newline after "
+                    "streamed output (%s) — continuing", exc,
+                )
 
         try:
             answer = strip_think(reply).strip()

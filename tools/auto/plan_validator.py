@@ -279,7 +279,12 @@ def validate_plan(
     # path-less JSONDecodeError instead of a clear, actionable message.
     try:
         stored_goal = json.loads(plan_path.read_text(encoding="utf-8")).get("goal", "")
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, json.JSONDecodeError, AttributeError) as exc:
+        # BUGFIX (audit): AttributeError added — a plan.json that is valid
+        # JSON but not a dict (e.g. a bare list) raises AttributeError on
+        # .get("goal", ...), which this guard didn't catch, producing the
+        # same unclear/unhandled crash this fix already exists to prevent
+        # for the "not valid JSON at all" case.
         raise RuntimeError(
             f"validate_plan: {plan_path} could not be read as JSON ({exc}). "
             f"The plan file may be corrupted or was interrupted mid-write. "

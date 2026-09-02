@@ -128,6 +128,21 @@ _GENDER_MALE_RE = re.compile(
 )
 
 _AGE_RE = re.compile(r"(\d+)\s*(?:лет|год)", re.IGNORECASE)
+# BUGFIX (audit): unanchored — a duration-of-something phrase ("в браке 5
+# лет" = married for 5 years, "живёт здесь уже 10 лет" = has lived here
+# for 10 years already) matches the same "N лет/год" shape as a genuine
+# age statement ("Рейес — 40 лет"), and used to be misread as the
+# entity's age, which then falsely "conflicted" with a real age bullet
+# in _find_conflict. There is no positive age-context marker common
+# enough to require (the terse "Name — N лет" phrasing used throughout
+# this file's own tests has none), so this excludes the specific
+# duration-context words that immediately precede the number in a
+# non-age reading instead of requiring an age-context one.
+_AGE_DURATION_CONTEXT_RE = re.compile(
+    r"(?:в\s+браке|женат\w*|замужем|прошло|знаком\w*|живёт|живет|работает|"
+    r"длилось|прожил\w*|проработал\w*|уже)\s*$",
+    re.IGNORECASE,
+)
 # AUTO-BUG: no human age is >= 120, but a calendar-year reference like
 # "в 1990 году" / "к 2020 году" / "с 1985 года" matches _AGE_RE too — "год"
 # is an unanchored prefix of "году"/"года", so "1990 году" was being read as
@@ -187,10 +202,28 @@ _NAME_STOPWORDS = {
 
 
 def _gender_of(bullet: str) -> "str | None":
-    """Return ``'f'``, ``'m'``, or ``None`` if *bullet* asserts a gender."""
-    if _GENDER_FEMALE_RE.search(bullet):
+    """Return ``'f'``, ``'m'``, or ``None`` if *bullet* asserts a gender.
+
+    BUGFIX (audit): a bullet mentioning more than one entity can contain
+    BOTH a female and a male marker at once (e.g. a male character's name
+    alongside a stray "она" referring to someone else in the same
+    sentence) — this used to just return whichever regex happened to be
+    checked first ("f", unconditionally, since the female check ran
+    first), asserting a gender for the *whole* bullet that may not
+    belong to the entity `_find_conflict` is actually comparing it
+    against, producing a false conflict with a correctly-gendered
+    bullet for a different character. Resolving which name a given
+    pronoun refers to is real coreference resolution and out of scope
+    here; when both markers are present the safer, honest answer is
+    "ambiguous — don't assert either" rather than an arbitrary pick.
+    """
+    is_female = bool(_GENDER_FEMALE_RE.search(bullet))
+    is_male = bool(_GENDER_MALE_RE.search(bullet))
+    if is_female and is_male:
+        return None
+    if is_female:
         return "f"
-    if _GENDER_MALE_RE.search(bullet):
+    if is_male:
         return "m"
     return None
 
@@ -208,8 +241,14 @@ def _age_of(bullet: str) -> "int | str | None":
     # age (or gets misread as one when it's the only \d+ (лет|год) hit).
     for m in _AGE_RE.finditer(bullet):
         value = int(m.group(1))
-        if value <= _MAX_PLAUSIBLE_AGE:
-            return value
+        if value > _MAX_PLAUSIBLE_AGE:
+            continue
+        # BUGFIX (audit): reject a match immediately preceded by a
+        # duration-context word ("в браке 5 лет") — see
+        # _AGE_DURATION_CONTEXT_RE above.
+        if _AGE_DURATION_CONTEXT_RE.search(bullet[:m.start()]):
+            continue
+        return value
     w = _AGE_WORD_RE.search(bullet)
     if w:
         return _AGE_WORDS[w.group(1).lower()]
@@ -445,7 +484,22 @@ class StoryBible:
                     if _sem is not None and _sem in merged:
                         conflict_bullet = _sem
                 if conflict_bullet is not None:
-                    if self._register_correction_attempt(fact, conflict_bullet):
+                    # BUGFIX (audit): a new fact that explicitly says the age
+                    # is unknown (_age_of() == "unknown") must never win an
+                    # age conflict against an established REAL numeric age,
+                    # no matter how many times it's proposed — "we don't
+                    # know" can't legitimately "correct" "we know it's 40".
+                    # Without this, _register_correction_attempt's normal
+                    # escalate-after-N-consistent-proposals logic (correct
+                    # for genuine corrections, e.g. a real age typo) would
+                    # eventually accept a vague re-observation and silently
+                    # overwrite the real age with "unknown" — the data
+                    # corruption this guards against.
+                    _unknown_cannot_correct_real_age = (
+                        _age_of(fact) == "unknown"
+                        and _age_of(conflict_bullet) not in (None, "unknown")
+                    )
+                    if not _unknown_cannot_correct_real_age and self._register_correction_attempt(fact, conflict_bullet):
                         # AUTO-BUG-2 fix: the SAME correction has now been
                         # proposed by _CORRECTION_THRESHOLD independent
                         # chapters in a row — treat it as a genuine fix to
@@ -726,26 +780,61 @@ def make_story_bible(
     # that the shipped agents.ini never actually set left the whole
     # subsystem (and its story_bible_verify / story_bible_immutable_guard
     # sub-settings) silently inert out of the box.
-    enabled = config.getboolean("validator_agent", "story_bible_creative", fallback=True)
+    #
+    # BUGFIX (verified-bugs audit #3d, corrected): these were raw
+    # config.getboolean/getint calls with no try/except — unlike
+    # search_agent.py's make_search_agent, which guards every read.
+    # Wrapped per-call (not via a shared helper) so extract_config_reads
+    # (tools/collect/ast_facts.py) still sees each literal config.getX(...)
+    # call — a shared helper's `getattr(config, method)(...)` call shape
+    # is invisible to that AST scanner, confirmed directly: 0 reads
+    # recognized through a helper vs. 1 recognized for the identical
+    # literal call. Matches the established pattern already used for
+    # gate1_filter.py's config reads.
+    try:
+        enabled = config.getboolean("validator_agent", "story_bible_creative", fallback=True)
+    except ValueError as exc:
+        logger.warning("config [validator_agent] story_bible_creative is malformed (%s) — using True", exc)
+        enabled = True
     if not enabled:
         logger.warning("make_story_bible: story_bible_creative=false — bible disabled "
                         "(durable cross-chapter facts will NOT be tracked).")
         return None
 
-    max_chars = config.getint("validator_agent", "story_bible_max_chars", fallback=2000)
-    verify = config.getboolean("validator_agent", "story_bible_verify", fallback=False)
-    max_fidelity_rounds = config.getint(
-        "validator_agent", "story_bible_max_fidelity_rounds", fallback=1
-    )
-    immutable_guard = config.getboolean(
-        "validator_agent", "story_bible_immutable_guard", fallback=True
-    )
+    try:
+        max_chars = config.getint("validator_agent", "story_bible_max_chars", fallback=2000)
+    except ValueError as exc:
+        logger.warning("config [validator_agent] story_bible_max_chars is malformed (%s) — using 2000", exc)
+        max_chars = 2000
+    try:
+        verify = config.getboolean("validator_agent", "story_bible_verify", fallback=False)
+    except ValueError as exc:
+        logger.warning("config [validator_agent] story_bible_verify is malformed (%s) — using False", exc)
+        verify = False
+    try:
+        max_fidelity_rounds = config.getint(
+            "validator_agent", "story_bible_max_fidelity_rounds", fallback=1
+        )
+    except ValueError as exc:
+        logger.warning("config [validator_agent] story_bible_max_fidelity_rounds is malformed (%s) — using 1", exc)
+        max_fidelity_rounds = 1
+    try:
+        immutable_guard = config.getboolean(
+            "validator_agent", "story_bible_immutable_guard", fallback=True
+        )
+    except ValueError as exc:
+        logger.warning("config [validator_agent] story_bible_immutable_guard is malformed (%s) — using True", exc)
+        immutable_guard = True
     # Litera-sim fix: LLM semantic conflict gate on merge (see StoryBible).
     # Default ON — one extra LLM call per chapter is the accepted price for
     # a bible that cannot hold two mutually exclusive facts.
-    semantic_guard = config.getboolean(
-        "validator_agent", "story_bible_semantic_guard", fallback=True
-    )
+    try:
+        semantic_guard = config.getboolean(
+            "validator_agent", "story_bible_semantic_guard", fallback=True
+        )
+    except ValueError as exc:
+        logger.warning("config [validator_agent] story_bible_semantic_guard is malformed (%s) — using True", exc)
+        semantic_guard = True
 
     llm_call = _build_llm_call(
         base_url=base_url,
@@ -778,9 +867,21 @@ def _build_llm_call(
     import ssl
     import tools.llm_stream as _llm_stream
 
-    verify_ssl = config.getboolean("api", "verify_ssl", fallback=True)
-    temperature = config.getfloat("inner_loop", "temperature", fallback=0.1)
-    timeout = config.getint("loop", "timeout_seconds", fallback=300)
+    try:
+        verify_ssl = config.getboolean("api", "verify_ssl", fallback=True)
+    except ValueError as exc:
+        logger.warning("config [api] verify_ssl is malformed (%s) — using True", exc)
+        verify_ssl = True
+    try:
+        temperature = config.getfloat("inner_loop", "temperature", fallback=0.1)
+    except ValueError as exc:
+        logger.warning("config [inner_loop] temperature is malformed (%s) — using 0.1", exc)
+        temperature = 0.1
+    try:
+        timeout = config.getint("loop", "timeout_seconds", fallback=300)
+    except ValueError as exc:
+        logger.warning("config [loop] timeout_seconds is malformed (%s) — using 300", exc)
+        timeout = 300
     # AUTO-FIX (fable follow-up 3): the bible generator used to borrow
     # [validator_agent] max_tokens (a cap sized for a short JSON verdict /
     # numbered critique). Raising the validator budget silently inflated the
@@ -789,12 +890,27 @@ def _build_llm_call(
     # bible its own key with a creative-sized default; keep the old
     # validator_agent value as a secondary fallback so existing tuned
     # configs don't regress.
-    _legacy_mt = config.getint("validator_agent", "max_tokens", fallback=200)
-    max_tokens = config.getint("story_bible", "max_tokens",
-                               fallback=max(1000, _legacy_mt))
+    #
+    # BUGFIX (verified-bugs audit #3d, corrected): see the matching comment
+    # in make_story_bible() above — wrapped per-call (not via a shared
+    # helper) so extract_config_reads still sees each literal call.
+    try:
+        _legacy_mt = config.getint("validator_agent", "max_tokens", fallback=200)
+    except ValueError as exc:
+        logger.warning("config [validator_agent] max_tokens is malformed (%s) — using 200", exc)
+        _legacy_mt = 200
+    try:
+        max_tokens = config.getint("story_bible", "max_tokens", fallback=max(1000, _legacy_mt))
+    except ValueError as exc:
+        logger.warning("config [story_bible] max_tokens is malformed (%s) — using %d", exc, max(1000, _legacy_mt))
+        max_tokens = max(1000, _legacy_mt)
     # Same context-window forwarding as everywhere else: 0 = server default.
     active_profile = config.get("api", "active", fallback="local")
-    num_ctx = config.getint(f"api_{active_profile}", "num_ctx", fallback=0)
+    try:
+        num_ctx = config.getint(f"api_{active_profile}", "num_ctx", fallback=0)
+    except ValueError as exc:
+        logger.warning("config [api_%s] num_ctx is malformed (%s) — using 0", active_profile, exc)
+        num_ctx = 0
     # AUTO-FIX (fable follow-up 3): thinking models (qwen3) wrap output in
     # <think>…</think>; with a bounded num_predict the reply can truncate
     # mid-think and the bible comes back empty — or worse, reasoning lines
@@ -802,7 +918,11 @@ def _build_llm_call(
     # story_bible.md and re-injected into every later chapter prompt.
     # Mirror the gate1/architect/coder toggle: default off, re-enable via
     # [story_bible] think = true.
-    think = config.getboolean("story_bible", "think", fallback=False)
+    try:
+        think = config.getboolean("story_bible", "think", fallback=False)
+    except ValueError as exc:
+        logger.warning("config [story_bible] think is malformed (%s) — using False", exc)
+        think = False
 
     ssl_context: ssl.SSLContext | None = _llm_stream.make_unverified_context() if not verify_ssl else None
 

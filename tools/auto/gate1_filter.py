@@ -173,6 +173,16 @@ _DEFAULT_MAX_BLOCK_CHARS   = 4000
 class FilterResult:
     """Outcome record for one candidate after Gate 1.
 
+    Implements the unified :class:`~tools.auto.gate_verdict.GateVerdict`
+    interface: ``approved`` is the inverse of ``accepted`` (so a candidate
+    the Gate-3 runner would want to reject reads the same way it reads
+    every other gate), and :meth:`feedback` returns the human-readable
+    ``reason`` on a rejection or ``""`` on acceptance — matching the
+    ``feedback()`` contract of every Gate-3 verdict. The native
+    ``accepted`` field is kept unchanged for the many call sites
+    (:mod:`tools.auto.plan_validator`, the ``filter`` return tuple, the
+    ``all_results`` loop below) that read it directly.
+
     Attributes
     ----------
     candidate:
@@ -193,6 +203,22 @@ class FilterResult:
     accepted: bool
     stage: str
     reason: str
+
+    @property
+    def approved(self) -> bool:
+        """Unified GateVerdict field — the inverse of :attr:`accepted`.
+
+        Gate 1's native field is ``accepted`` (a candidate that *passed*
+        the filter is ``True``); the unified interface uses ``approved``
+        with the same sense (``True`` = the gate accepts the candidate).
+        The two are exact inverses only in name — here they mean the
+        same thing, so this property is a plain alias.
+        """
+        return self.accepted
+
+    def feedback(self) -> str:
+        """Coder-facing message. Empty on acceptance, the ``reason`` on rejection."""
+        return "" if self.accepted else self.reason
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -698,6 +724,15 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                 ):
                     superseded = accepted[target_fp_index[tfp]]
                     accepted[target_fp_index[tfp]] = c
+                    # BUGFIX (audit): the normal accept path below
+                    # (seen_fingerprints.add(fp) at the end of this loop
+                    # body) never runs for this supersede branch, since it
+                    # continues before reaching it — so `c`'s own `fp` was
+                    # never registered. A later candidate with the SAME
+                    # `fp` (but a different `tfp`) then found is_fp_dup
+                    # False and passed through as if `c` had never been
+                    # seen, instead of being caught as a duplicate of it.
+                    seen_fingerprints.add(fp)
                     all_results.append(FilterResult(
                         candidate=superseded, accepted=False, stage="duplicate",
                         reason=(
@@ -803,6 +838,17 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                 )
 
         abs_path = base_dir / loc.file
+        # BUGFIX (audit): no containment check here — the new_file branch
+        # above already confirms candidate_path resolves inside base_dir
+        # (relative_to(base_dir.resolve())), but this normal (non-new_file)
+        # branch reads and returns file content straight from base_dir /
+        # loc.file with no such check. An LLM-generated loc.file like
+        # "../../etc/passwd" reads outside the repo and hands its content
+        # to Stage B as if it were a legitimate cited block.
+        try:
+            abs_path.resolve().relative_to(base_dir.resolve())
+        except ValueError:
+            return False, f"cited path escapes base_dir: {loc.file!r}", ""
 
         # 1. File must exist.
         if not abs_path.is_file():

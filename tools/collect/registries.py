@@ -195,7 +195,11 @@ def build_fail_open_registry(
                 source = (Path(root) / m.path).read_text(encoding="utf-8")
                 tree = ast.parse(source, filename=m.path)
                 comments = _line_comments(source)
-            except (OSError, SyntaxError, UnicodeDecodeError):
+            except (OSError, SyntaxError, UnicodeDecodeError, ValueError):
+                # BUGFIX (audit): ast.parse raises ValueError (not
+                # SyntaxError) on null-byte input; a null-byte module used
+                # to crash build_fail_open_registry instead of degrading
+                # to rationale=None like every other parse failure here.
                 tree = None
                 comments = {}
 
@@ -257,7 +261,12 @@ def _load_seed_entries(seed_path: Path) -> List[Dict[str, object]]:
     # the offending file.
     try:
         raw = yaml.safe_load(seed_path.read_text(encoding="utf-8"))
-    except yaml.YAMLError as exc:
+    except (yaml.YAMLError, UnicodeDecodeError) as exc:
+        # BUGFIX (audit): UnicodeDecodeError added — a non-UTF-8 seed file
+        # raised uncaught here, inconsistent with the sibling
+        # UnicodeDecodeError handling in risk.py/graph.py/test_map.py and
+        # with this function's own "allowed to raise, but with a message
+        # that names the offending file" contract just above.
         raise ContractCitationError(
             f"{seed_path}: not valid YAML ({exc})"
         ) from exc
@@ -475,7 +484,11 @@ def _method_line_range(source: str, class_name: str, method_name: str) -> Option
     """
     try:
         tree = ast.parse(source)
-    except SyntaxError:
+    except (SyntaxError, ValueError):
+        # BUGFIX (audit): ast.parse raises ValueError (not SyntaxError) on
+        # null-byte input — a null-byte source used to crash
+        # AlreadySafeIndex.__init__ instead of returning None like every
+        # other parse failure here.
         return None
     for node in ast.walk(tree):
         if isinstance(node, ast.ClassDef) and node.name == class_name:

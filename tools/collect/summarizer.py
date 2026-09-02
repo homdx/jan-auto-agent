@@ -152,7 +152,16 @@ def _budget_chars(num_ctx: int, max_tokens: int,
 
 
 def _truncate_source(source: str, budget_chars: int) -> str:
-    if budget_chars <= 0 or len(source) <= budget_chars:
+    # BUGFIX (audit): budget_chars <= 0 means _budget_chars() determined
+    # there is NO room left for a source excerpt at all (num_ctx too
+    # small for max_tokens + the fixed prompt overhead) — returning the
+    # full, untruncated source in that case is the exact opposite of
+    # this function's purpose and can blow the context window it exists
+    # to protect. Only skip truncation when there's a real (non-empty)
+    # budget and the source already fits inside it.
+    if budget_chars <= 0:
+        return ""
+    if len(source) <= budget_chars:
         return source
     return source[:budget_chars] + "\n# ... (truncated to fit summarization budget)"
 
@@ -292,7 +301,7 @@ def summarize_repo(
     or parse-error modules don't count toward the total, since nothing is
     sent for them). Pass a no-op lambda to silence progress reporting.
     """
-    from tools.backoff import backoff_seconds, clear_state, load_state, save_state
+    from tools.backoff import retry_with_backoff, clear_state, load_state, save_state
 
     done: Dict[str, dict] = {}
     if checkpoint_path is not None:
@@ -326,30 +335,28 @@ def summarize_repo(
 
         source = sources.get(module.path, "")
         result = module
-        error_count = 0
-        while True:
-            try:
-                result = summarize_module(
-                    module, source, llm_call, num_ctx=num_ctx, max_tokens=max_tokens
-                )
-                break
-            except Exception as exc:  # noqa: BLE001 - one bad module must not abort the batch
-                error_count += 1
-                if on_error is not None:
-                    on_error(module.path, exc, error_count)
-                if error_count > max_retries:
-                    logger.warning(
-                        "collect summarizer: giving up on %s after %d error(s): %s",
-                        module.path, error_count, exc,
-                    )
-                    result = module
-                    break
-                wait = backoff_seconds(error_count - 1)
-                logger.warning(
+        try:
+            result = retry_with_backoff(
+                lambda: summarize_module(
+                    module, source, llm_call,
+                    num_ctx=num_ctx, max_tokens=max_tokens,
+                ),
+                attempts=max_retries + 1,
+                sleep_fn=sleep_fn,
+                on_retry=lambda exc, n, wait: logger.warning(
                     "collect summarizer: %s failed (%s); retrying in %ds",
                     module.path, exc, wait,
-                )
-                sleep_fn(wait)
+                ),
+                on_error=lambda exc, count: (
+                    on_error(module.path, exc, count) if on_error is not None else None
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 — one bad module must not abort the batch
+            logger.warning(
+                "collect summarizer: giving up on %s after %d error(s): %s",
+                module.path, max_retries + 1, exc,
+            )
+            result = module
 
         out.append(result)
         sent += 1
@@ -413,7 +420,16 @@ def should_run_pass_b(config) -> bool:
     """`[collect] llm_summaries` (default true) — the config-level twin of
     the CLI's `--no-llm` flag (COLLECT-19 wires the flag; this reads the
     config default it falls back to)."""
-    return config.getboolean("collect", "llm_summaries", fallback=True)
+    # BUGFIX (audit): unguarded — a malformed value (e.g.
+    # `llm_summaries = maybe`) raised ValueError straight out of this
+    # function instead of falling back to the documented default.
+    try:
+        return config.getboolean("collect", "llm_summaries", fallback=True)
+    except ValueError as exc:
+        logger.warning(
+            "config [collect] llm_summaries is malformed (%s) — using default True", exc,
+        )
+        return True
 
 
 def _make_llm_call(config, task_mode: str = "code") -> LlmCall:
@@ -433,17 +449,39 @@ def _make_llm_call(config, task_mode: str = "code") -> LlmCall:
     api_key = config.get(api_sec, "api_key", fallback="ollama")
     model = config.get(api_sec, "model", fallback="llama3.1:8b")
     api_format = config.get(api_sec, "api_format", fallback="ollama")
-    verify_ssl = config.getboolean("api", "verify_ssl", fallback=True)
+    # BUGFIX (audit): every getboolean/getfloat/getint read below was
+    # unguarded — any one malformed value (e.g. `verify_ssl = maybe`)
+    # raised ValueError straight out of this function, matching the same
+    # "Unguarded config.getint/getboolean/getfloat" pattern already fixed
+    # elsewhere in this codebase. Each now degrades to its documented
+    # default with a logged warning instead.
+    try:
+        verify_ssl = config.getboolean("api", "verify_ssl", fallback=True)
+    except ValueError as exc:
+        logger.warning("config [api] verify_ssl is malformed (%s) — using default True", exc)
+        verify_ssl = True
 
     num_ctx, max_tokens = collect_llm_budget(config, task_mode=task_mode)
-    temperature = config.getfloat("collect", "temperature", fallback=0.1)
-    timeout = config.getint("loop", "timeout_seconds", fallback=300)
+    try:
+        temperature = config.getfloat("collect", "temperature", fallback=0.1)
+    except ValueError as exc:
+        logger.warning("config [collect] temperature is malformed (%s) — using default 0.1", exc)
+        temperature = 0.1
+    try:
+        timeout = config.getint("loop", "timeout_seconds", fallback=300)
+    except ValueError as exc:
+        logger.warning("config [loop] timeout_seconds is malformed (%s) — using default 300", exc)
+        timeout = 300
     # Thinking models (qwen3) prepend a <think> block; Pass B is a short,
     # structured-JSON reply, so default this off the same way gate1/coder do
     # — otherwise a small max_tokens cap can truncate mid-<think> and the
     # reply never reaches a usable JSON object at all. [collect] think=true
     # re-enables it (strip_think below still cleans up either way).
-    think = config.getboolean("collect", "think", fallback=False)
+    try:
+        think = config.getboolean("collect", "think", fallback=False)
+    except ValueError as exc:
+        logger.warning("config [collect] think is malformed (%s) — using default False", exc)
+        think = False
 
     # Per-request HTTP retry (429/5xx) — was previously hardcoded to
     # request_completion()'s own defaults (error_retries=2,
@@ -451,9 +489,25 @@ def _make_llm_call(config, task_mode: str = "code") -> LlmCall:
     # what a profile's .ini said. Now config-driven via [collect], falling
     # back to those same defaults when unset so existing profiles behave
     # exactly as before.
-    error_retries = config.getint("collect", "error_retries", fallback=2)
-    error_retry_wait_sec = config.getfloat("collect", "error_retry_wait_sec", fallback=60.0)
-    max_retry_after_sec = config.getfloat("collect", "max_retry_after_sec", fallback=180.0)
+    try:
+        error_retries = config.getint("collect", "error_retries", fallback=2)
+    except ValueError as exc:
+        logger.warning("config [collect] error_retries is malformed (%s) — using default 2", exc)
+        error_retries = 2
+    try:
+        error_retry_wait_sec = config.getfloat("collect", "error_retry_wait_sec", fallback=60.0)
+    except ValueError as exc:
+        logger.warning(
+            "config [collect] error_retry_wait_sec is malformed (%s) — using default 60.0", exc,
+        )
+        error_retry_wait_sec = 60.0
+    try:
+        max_retry_after_sec = config.getfloat("collect", "max_retry_after_sec", fallback=180.0)
+    except ValueError as exc:
+        logger.warning(
+            "config [collect] max_retry_after_sec is malformed (%s) — using default 180.0", exc,
+        )
+        max_retry_after_sec = 180.0
 
     ssl_context = _llm_stream.make_unverified_context() if not verify_ssl else None
 
@@ -485,7 +539,17 @@ def collect_max_retries(config) -> int:
     was never read from any .ini — always the hardcoded default."""
     if config is None:
         return DEFAULT_MAX_RETRIES
-    return config.getint("collect", "max_retries", fallback=DEFAULT_MAX_RETRIES)
+    # BUGFIX (audit): unguarded — same pattern as should_run_pass_b/
+    # _make_llm_call above; a malformed value raised ValueError instead
+    # of falling back to DEFAULT_MAX_RETRIES.
+    try:
+        return config.getint("collect", "max_retries", fallback=DEFAULT_MAX_RETRIES)
+    except ValueError as exc:
+        logger.warning(
+            "config [collect] max_retries is malformed (%s) — using default %r",
+            exc, DEFAULT_MAX_RETRIES,
+        )
+        return DEFAULT_MAX_RETRIES
 
 
 def make_summarizer_call(config, task_mode: str = "code") -> LlmCall:

@@ -1,0 +1,1 @@
+../tests/test_auto_p7_read_probe.py

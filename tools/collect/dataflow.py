@@ -263,9 +263,9 @@ _HEAD_ONLY_FIELDS: Dict[type, Tuple[str, ...]] = {
 _INVALIDATING_MUTATOR_METHODS = frozenset({"pop", "clear", "popitem", "remove"})
 
 
-def _mutated_name_in_stmt(stmt: ast.stmt) -> Optional[str]:
-    """The bare name `stmt` mutates in place well enough to invalidate a
-    prior truthy guard about it, or `None` if `stmt` isn't one of the
+def _mutated_name_in_stmt(stmt: ast.stmt) -> set:
+    """The bare name(s) `stmt` mutates in place well enough to invalidate a
+    prior truthy guard about them. Empty set if `stmt` isn't one of the
     recognized shapes.
 
     BUGFIX: `_invalidate_reassigned` only clears a guard on a bare
@@ -285,6 +285,11 @@ def _mutated_name_in_stmt(stmt: ast.stmt) -> Optional[str]:
     rebind, which the rebind branch below already invalidates via its own
     path but is included here for `x = stack.pop()` where `stack` itself,
     not `x`, needs invalidating), and `del name[...]`.
+
+    BUGFIX (audit): `del a[0], b[0]` used to only invalidate `a` — this
+    returned on the first subscript target found in a multi-target
+    `Delete`, silently leaving a guard on `b` uninvalidated. Now returns
+    every recognized name at once instead of stopping at the first.
     """
     call: Optional[ast.Call] = None
     if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
@@ -300,12 +305,14 @@ def _mutated_name_in_stmt(stmt: ast.stmt) -> Optional[str]:
         and call.func.attr in _INVALIDATING_MUTATOR_METHODS
         and isinstance(call.func.value, ast.Name)
     ):
-        return call.func.value.id
+        return {call.func.value.id}
     if isinstance(stmt, ast.Delete):
-        for target in stmt.targets:
-            if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name):
-                return target.value.id
-    return None
+        return {
+            target.value.id
+            for target in stmt.targets
+            if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name)
+        }
+    return set()
 
 
 def _own_scan_sources(stmt: ast.stmt) -> List[ast.AST]:
@@ -416,8 +423,20 @@ def _rebound_names_in(
                 aliases[target] = s.value.id
             else:
                 aliases.pop(target, None)  # rebound to something else — alias broken
-        mutated = _mutated_name_in_stmt(s)
-        if mutated is not None:
+        # BUGFIX (audit): a name reused as a `for` loop variable rebinds it
+        # exactly like a bare `x = <expr>` assignment does — a guard on
+        # `x` from before the loop cannot be trusted for code after it if
+        # the loop reassigns `x` on every iteration. Neither this function
+        # nor `_invalidate_reassigned` (the top-level, non-recursive
+        # sibling, fixed alongside this) recognized this — only
+        # `ast.Assign` invalidated a guard. Same bare-Name-only scope as
+        # an ordinary assignment target (see `_invalidate_reassigned`'s
+        # docstring on why tuple-unpacking targets are deliberately left
+        # alone throughout this module).
+        elif isinstance(s, (ast.For, ast.AsyncFor)) and isinstance(s.target, ast.Name):
+            names.add(s.target.id)
+            aliases.pop(s.target.id, None)  # rebound by the loop — alias broken
+        for mutated in _mutated_name_in_stmt(s):
             names.add(mutated)
             if mutated in aliases:
                 names.add(aliases[mutated])
@@ -523,7 +542,20 @@ class _FunctionGuardWalker:
         `x[i] = ...`/`x.attr = ...`/tuple-unpacking targets don't replace
         what `x` itself refers to, so they're left alone here (and were
         never something `_propagate_alias` recognized as a target either).
+
+        BUGFIX (audit): a name reused as a `for` loop's (bare-Name) target
+        rebinds it exactly like a bare `x = <expr>` assignment does — this
+        only ever checked `ast.Assign`, so a guard on a name later reused
+        as a loop variable survived the loop as stale, unlike its
+        recursive sibling `_rebound_names_in` (fixed alongside this).
         """
+        if isinstance(stmt, (ast.For, ast.AsyncFor)) and isinstance(stmt.target, ast.Name):
+            target = stmt.target.id
+            guarded_names.discard(target)
+            guard_desc.pop(target, None)
+            for pair in {p for p in guarded_pairs if p[0] == target}:
+                guarded_pairs.discard(pair)
+            return
         if not (isinstance(stmt, ast.Assign) and len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name)):
             return
         target = stmt.targets[0].id
@@ -673,8 +705,7 @@ class _FunctionGuardWalker:
                 else:
                     self._aliases.pop(alias_target, None)
 
-            mutated = _mutated_name_in_stmt(stmt)
-            if mutated is not None:
+            for mutated in _mutated_name_in_stmt(stmt):
                 to_invalidate = {mutated}
                 if mutated in self._aliases:
                     to_invalidate.add(self._aliases[mutated])

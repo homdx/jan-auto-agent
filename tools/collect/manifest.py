@@ -285,6 +285,13 @@ class Manifest:
             generated_at = d["generated_at"]
         except KeyError as exc:
             raise ValueError(f"manifest is missing required field {exc}") from exc
+        except TypeError as exc:
+            # BUGFIX (audit): a valid-JSON-but-non-dict payload (a list,
+            # null, a bare number) raises TypeError on d["..."], not
+            # KeyError — every call site's (OSError, ValueError) guard
+            # missed this the same way it missed KeyError before the fix
+            # above. Re-raise as ValueError so those guards work here too.
+            raise ValueError(f"manifest is not a JSON object: {exc}") from exc
         return cls(
             collector_version=collector_version,
             generated_at=generated_at,
@@ -450,4 +457,12 @@ def refresh_manifest(root: Path, previous: Manifest) -> Manifest:
     discovered = set(discover_files(root))
     tracked = set(previous.file_hashes.keys())
     file_list = sorted(discovered | tracked)
-    return build_manifest(root, file_list, collector_version=previous.collector_version)
+    # BUGFIX (audit): this stamped previous.collector_version instead of
+    # the current COLLECTOR_VERSION — since is_fresh() rejects any
+    # manifest whose collector_version != COLLECTOR_VERSION, a manifest
+    # refreshed after a collector-version bump was immediately stale
+    # again despite refresh_manifest's own purpose being to bring it
+    # up to date. build_manifest's own default already covers the normal
+    # case; passed explicitly here so this fix's intent isn't lost as
+    # implicit.
+    return build_manifest(root, file_list, collector_version=COLLECTOR_VERSION)

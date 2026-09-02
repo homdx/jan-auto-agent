@@ -196,6 +196,7 @@ def find_false_positive(task: dict, known_fps: list[dict], overlap_ratio: float)
       ""              — no match
     """
     best_weak = None
+    best_weak_ratio = -1.0
     for fp in known_fps:
         if task["target_files"] and fp["target_files"]:
             shared = task["target_files"] & fp["target_files"]
@@ -203,8 +204,14 @@ def find_false_positive(task: dict, known_fps: list[dict], overlap_ratio: float)
                 ratio = len(shared) / max(len(task["target_files"]), len(fp["target_files"]))
                 if ratio >= overlap_ratio:
                     return fp, "file_overlap"
-                if best_weak is None:
+                # BUGFIX (audit): this only ever recorded the FIRST weak
+                # overlap encountered (`if best_weak is None`), so a later,
+                # stronger-but-still-below-threshold match was ignored even
+                # though `ratio` is computed for every candidate — report
+                # the highest-ratio weak overlap, not just the first one.
+                if ratio > best_weak_ratio:
                     best_weak = fp
+                    best_weak_ratio = ratio
         elif not task["target_files"] or not fp["target_files"]:
             # AUTO-FIX: this used to require BOTH sides to have zero
             # target_files (`and`), contradicting the docstring's own

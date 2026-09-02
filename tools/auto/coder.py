@@ -285,9 +285,28 @@ class Coder(_llm_stream.LLMClientBase):
         # for "the story's language" the way the user's own goal text is.
         self._run_goal = str(run_goal or "")
         sec = "coder"
-        self._temperature = float(config.get(sec, "temperature", fallback="0.2"))
+        # BUGFIX (verified-bugs follow-up report): every read in this block
+        # was a raw config.get(...)+float()/int() or config.getboolean()/
+        # getint() call with no try/except — the file this class is named
+        # after (coder.py:300) was one of the explicitly-named affected
+        # locations, and this class had NO guards at all, the same as
+        # ClusterReviewer (architect.py). Wrapped per-call (not via a
+        # shared helper) so extract_config_reads (tools/collect/
+        # ast_facts.py) still sees each literal call — a shared helper's
+        # call shape is invisible to that AST scanner (confirmed directly:
+        # 0 reads recognized through a helper vs. 1 for an identical
+        # literal call). Matches gate1_filter.py's established style.
+        try:
+            self._temperature = float(config.get(sec, "temperature", fallback="0.2"))
+        except ValueError as exc:
+            logger.warning("config [%s] temperature is malformed (%s) — using 0.2", sec, exc)
+            self._temperature = 0.2
         # AUTO-CR-3: prefer max_tokens_{task_mode} (e.g. max_tokens_creative) over max_tokens.
-        self._max_tokens  = int(_cfg_mode(config, sec, "max_tokens", task_mode, fallback="16384"))
+        try:
+            self._max_tokens = int(_cfg_mode(config, sec, "max_tokens", task_mode, fallback="16384"))
+        except ValueError as exc:
+            logger.warning("config [%s] max_tokens is malformed (%s) — using 16384", sec, exc)
+            self._max_tokens = 16384
         # Select system prompt by task_mode (mirrors architect / validator).
         # Priority: mode-specific ini key > legacy "system" key > built-in constant.
         _mode_key = f"system_{self._task_mode}" if self._task_mode != "code" else None
@@ -296,33 +315,70 @@ class Coder(_llm_stream.LLMClientBase):
         else:
             _builtin      = _CODER_SYSTEM_PROMPTS.get(self._task_mode, _SYSTEM_PROMPT_CODE)
             self._system  = config.get(sec, "system", fallback=_builtin).strip()
-        self._timeout     = float(config.get("loop", "timeout_seconds", fallback="300"))
-        self._max_file_chars = int(config.get(sec, "max_file_chars", fallback=str(_DEFAULT_MAX_FILE_CHARS)))
+        try:
+            self._timeout = float(config.get("loop", "timeout_seconds", fallback="300"))
+        except ValueError as exc:
+            logger.warning("config [loop] timeout_seconds is malformed (%s) — using 300", exc)
+            self._timeout = 300.0
+        try:
+            self._max_file_chars = int(config.get(sec, "max_file_chars", fallback=str(_DEFAULT_MAX_FILE_CHARS)))
+        except ValueError as exc:
+            logger.warning("config [%s] max_file_chars is malformed (%s) — using %d",
+                            sec, exc, _DEFAULT_MAX_FILE_CHARS)
+            self._max_file_chars = _DEFAULT_MAX_FILE_CHARS
         # pullrun-sim: optional deterministic gate rejecting non-ASCII
         # identifiers in generated .py files (code mode only).
-        self._ascii_identifiers_only = config.getboolean(
-            sec, "ascii_identifiers_only", fallback=False)
+        try:
+            self._ascii_identifiers_only = config.getboolean(
+                sec, "ascii_identifiers_only", fallback=False)
+        except ValueError as exc:
+            logger.warning("config [%s] ascii_identifiers_only is malformed (%s) — using False", sec, exc)
+            self._ascii_identifiers_only = False
         # selfhost pilot: allow editing files that already contain a flagged
         # pattern (see _check_content_safety grandfathering). Default on —
         # it strictly reduces false positives; introducing a pattern into a
         # clean file is still blocked either way.
-        self._allow_preexisting_patterns = config.getboolean(
-            sec, "allow_preexisting_patterns", fallback=True)
+        try:
+            self._allow_preexisting_patterns = config.getboolean(
+                sec, "allow_preexisting_patterns", fallback=True)
+        except ValueError as exc:
+            logger.warning("config [%s] allow_preexisting_patterns is malformed (%s) — using True", sec, exc)
+            self._allow_preexisting_patterns = True
         active_profile = config.get("api", "active", fallback="local")
         # num_ctx controls the total context window on Ollama; 0 means "use server default".
         # AUTO-CR-3: prefer [coder] num_ctx_{task_mode} then [api_{active}] num_ctx.
         _num_ctx_str = _cfg_mode(config, sec, "num_ctx", task_mode, fallback=None)
         if _num_ctx_str is None:
             _num_ctx_str = config.get(f"api_{active_profile}", "num_ctx", fallback="0")
-        self._num_ctx = int(_num_ctx_str)
+        try:
+            self._num_ctx = int(_num_ctx_str)
+        except ValueError as exc:
+            logger.warning("config num_ctx is malformed (%r: %s) — using 0", _num_ctx_str, exc)
+            self._num_ctx = 0
         # AUTO-FIX (fable follow-up): same thinking-model truncation risk as
         # gate1/architect — a big coder JSON response (files array) plus a
         # <think> block is even more likely to blow the budget mid-reasoning.
-        self._think = config.getboolean(sec, "think", fallback=False)
+        try:
+            self._think = config.getboolean(sec, "think", fallback=False)
+        except ValueError as exc:
+            logger.warning("config [%s] think is malformed (%s) — using False", sec, exc)
+            self._think = False
         # Context-probe: fetch missing symbols on first LLM response, then retry once.
-        self._context_probe_enabled = config.getboolean(sec, "context_probe", fallback=True)
-        self._max_chars_per_dep     = config.getint(sec, "max_chars_per_dep", fallback=2000)
-        self._max_dep_chars         = config.getint(sec, "max_dep_chars",     fallback=6000)
+        try:
+            self._context_probe_enabled = config.getboolean(sec, "context_probe", fallback=True)
+        except ValueError as exc:
+            logger.warning("config [%s] context_probe is malformed (%s) — using True", sec, exc)
+            self._context_probe_enabled = True
+        try:
+            self._max_chars_per_dep = config.getint(sec, "max_chars_per_dep", fallback=2000)
+        except ValueError as exc:
+            logger.warning("config [%s] max_chars_per_dep is malformed (%s) — using 2000", sec, exc)
+            self._max_chars_per_dep = 2000
+        try:
+            self._max_dep_chars = config.getint(sec, "max_dep_chars", fallback=6000)
+        except ValueError as exc:
+            logger.warning("config [%s] max_dep_chars is malformed (%s) — using 6000", sec, exc)
+            self._max_dep_chars = 6000
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -379,7 +435,15 @@ class Coder(_llm_stream.LLMClientBase):
                     "task_id": task_id},
         )
 
-        print(f"\n💻 [LIVE CODER STREAMING — task: {task_id}]:")
+        # BUGFIX (audit): this print() ran before the try/except below,
+        # unlike the context-probe's equivalent print (which IS inside its
+        # own try) — an asymmetry that let a stdout failure (e.g.
+        # BrokenPipeError) here escape uncaught, violating generate()'s
+        # own "never raises" contract.
+        try:
+            print(f"\n💻 [LIVE CODER STREAMING — task: {task_id}]:")
+        except OSError as exc:
+            logger.warning("Coder: could not write streaming banner (%s) — continuing", exc)
         try:
             _coder_tokens: list[str] = []
 
@@ -460,7 +524,22 @@ class Coder(_llm_stream.LLMClientBase):
                     )
                     raw_text = raw_text or "".join(_probe_tokens)
                     print("\n" + "═" * 80 + "\n")
-                    cleaned = strip_think(raw_text)
+                    _probe_cleaned = strip_think(raw_text)
+                    # BUGFIX (audit): this used to overwrite `cleaned`
+                    # unconditionally — if the probe call SUCCEEDED but
+                    # returned empty (no exception, just nothing), the good
+                    # first response was silently discarded and replaced
+                    # with "". The except clause below only preserves the
+                    # first response on an actual exception, not on this
+                    # empty-but-successful case. Only adopt the probe's
+                    # result when it actually has content.
+                    if _probe_cleaned.strip():
+                        cleaned = _probe_cleaned
+                    else:
+                        logger.warning(
+                            "coder.generate [%s]: context-probe second call "
+                            "returned empty — using first response", task_id,
+                        )
                     # Re-extract context_request symbols from the new response
                     # so the CoderResult reflects any new symbols the second
                     # call asked for.  context_satisfied intentionally keeps
@@ -1297,16 +1376,19 @@ class Coder(_llm_stream.LLMClientBase):
             body = _salvaged
 
         # ── Extract trailing CONTEXT_REQUEST line ───────────────────────────
+        # BUGFIX (audit): this only scanned (and stripped) the LAST 3 lines,
+        # but _extract_context_request_prose — which the module docstring
+        # says reads "the same line" this strips — scans the ENTIRE text.
+        # A CONTEXT_REQUEST line emitted earlier than the last 3 lines was
+        # extracted into missing_ctx by that function but left verbatim in
+        # the body actually written to disk. Strip every matching line,
+        # not just one found within the tail.
         lines = body.splitlines()
-        cr_idx = None
-        for i in range(len(lines) - 1, max(len(lines) - 4, -1), -1):
-            if lines[i].strip().upper().startswith("CONTEXT_REQUEST:"):
-                cr_idx = i
-                break
-        if cr_idx is not None:
-            # Remove the line from the body so it is not written to disk.
-            lines = lines[:cr_idx] + lines[cr_idx + 1:]
-            body = "\n".join(lines)
+        kept_lines = [
+            ln for ln in lines if not ln.strip().upper().startswith("CONTEXT_REQUEST:")
+        ]
+        if len(kept_lines) != len(lines):
+            body = "\n".join(kept_lines)
 
         body = body.strip()
 

@@ -1,1 +1,0 @@
-../tests/test_collect_line_comments_token_error.py

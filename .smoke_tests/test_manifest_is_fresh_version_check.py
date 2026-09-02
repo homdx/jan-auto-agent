@@ -1,1 +1,0 @@
-../tests/test_manifest_is_fresh_version_check.py

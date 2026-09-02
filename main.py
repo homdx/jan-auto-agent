@@ -102,8 +102,6 @@ class Orchestrator(OrchestratorActions):
         so a promoted prompt / edited config takes effect with no restart.
         PromptStore + MetricsCollector are preserved."""
         self.load_config(self._config_path)
-        self.prompt_store.store_path   = Path(self.config.get("prompt_store", "store_path", fallback="prompts.json"))
-        self.prompt_store.max_versions = self._getint("prompt_store", "max_versions", 3)
 
         self.prompt_optimizer = PromptOptimizer(
             model=self.model,
@@ -169,6 +167,27 @@ class Orchestrator(OrchestratorActions):
             config=self.config,
         )
 
+        # BUGFIX (verified-bugs audit #2, follow-up): these two used to run
+        # right after load_config(), mutating self.prompt_store IN PLACE
+        # (not by reassignment) before any of the agent constructors above
+        # had run. reload_agents()'s atomicity fix snapshots/restores
+        # self.__dict__, which is a SHALLOW copy — it captures the same
+        # prompt_store object reference, not a copy of its fields. So if
+        # SearchAgent/ValidatorAgent/.../FaqAgent construction above raised
+        # partway through, these two fields were already mutated and
+        # survived the "atomic" rollback even though every self.* attribute
+        # correctly rolled back to the old object. Confirmed live: reload
+        # failing after this point used to leave prompt_store.store_path /
+        # max_versions on the new (bad) values while self.model correctly
+        # reverted. Running this last — after every constructor that can
+        # raise has already succeeded — means it only ever executes once
+        # _build_agents() is guaranteed to complete, so there's nothing left
+        # to roll back. (Nothing above reads store_path/max_versions back
+        # off self.prompt_store during construction, so this reordering
+        # doesn't change behaviour on the success path.)
+        self.prompt_store.store_path   = Path(self.config.get("prompt_store", "store_path", fallback="prompts.json"))
+        self.prompt_store.max_versions = self._getint("prompt_store", "max_versions", 3)
+
     def reload_agents(self) -> None:
         """Re-read agents.ini and rebuild all agents mid-session (no restart)."""
         logger.info("reload_agents: re-reading %s …", self._config_path)
@@ -182,9 +201,29 @@ class Orchestrator(OrchestratorActions):
         # entire chat session instead of just failing the reload. The
         # previously-built agents are left exactly as they were on
         # failure, so the session keeps working with the last-good config.
+        #
+        # BUGFIX (verified-bugs audit #2): the try/except above only
+        # covered the crash — it did NOT make the rebuild atomic.
+        # _build_agents() assigns self.config, self.model, self.base_url,
+        # self.search_agent, self.validator_agent, self.improvement_agent,
+        # self.faq_agent, etc. one attribute at a time via load_config()
+        # and its own body; if any assignment past the first raises (e.g.
+        # ImprovementAgent's constructor hitting a malformed
+        # [improvement_agent] max_tokens), self was left with a mix of
+        # already-rebuilt (new config, new search_agent/validator_agent)
+        # and not-yet-rebuilt (old improvement_agent/faq_agent) state —
+        # contradicting this method's own "previously-built agents are
+        # left exactly as they were on failure" claim. Snapshot every
+        # instance attribute before rebuilding and restore the snapshot
+        # wholesale on failure, so a partial rebuild can never be
+        # observed: either every attribute reflects the new config, or
+        # every attribute is back to exactly what it was before this call.
+        snapshot = dict(self.__dict__)
         try:
             self._build_agents()
         except Exception as exc:
+            self.__dict__.clear()
+            self.__dict__.update(snapshot)
             logger.warning("reload_agents: failed to rebuild agents — %s", exc)
             print(f"[{_ts()}] ⚠️  Reload failed: {exc}\n"
                   f"    Still using the previously loaded agents/config.")
@@ -480,9 +519,6 @@ class Orchestrator(OrchestratorActions):
 
                 if validation.get("_api_error"):
                     _api_err_count += 1
-                    if _api_err_count == 1:
-                        print(backoff.MILESTONE_TABLE)
-                    _wait = backoff.backoff_seconds(_api_err_count - 1)
                     if iteration >= self.max_iterations:
                         print(f"[{_ts()}] ⚠️  Validator unavailable — "
                               f"max iterations reached, stopping. "
@@ -497,7 +533,7 @@ class Orchestrator(OrchestratorActions):
                         "already_searched": list(already_searched),
                         "search_result": search_result,
                     }
-                    backoff.sleep_with_interrupt_save(_wait, _chk)
+                    backoff.api_error_pause(_api_err_count, _chk)
                     continue  # retry same iteration (do not increment)
 
                 _api_err_count = 0
@@ -994,7 +1030,27 @@ def main():
         # code from this entry point.
         llm_call = None
         if action != "check" and not args.no_llm and should_run_pass_b(config):
-            llm_call = make_summarizer_call(config)
+            # BUGFIX (verified-bugs audit #3c): make_summarizer_call() reads
+            # several [collect]/[api] keys (verify_ssl, temperature,
+            # timeout, think, error_retries, ...) with raw config.getX()
+            # calls and no try/except of its own. Called here, outside any
+            # try/except, a single malformed value (e.g. `[collect]
+            # temperature = abc`) crashed the entire --collect invocation
+            # with a raw ValueError — including `--refresh` and `--module`
+            # runs that don't even need Pass B's structural-only fallback
+            # is available for. tools/auto/collect_bridge.py's
+            # make_collect_bridge() already guards this same call the same
+            # way; mirror that here so a bad LLM-profile key degrades to
+            # "Pass B skipped" instead of aborting the whole command.
+            try:
+                llm_call = make_summarizer_call(config)
+            except Exception as exc:  # noqa: BLE001 — Pass B is optional
+                logger.warning(
+                    "--collect: could not build the summarizer LLM call (%s) "
+                    "— continuing with structural-only output (Pass B/C skipped).",
+                    exc,
+                )
+                llm_call = None
 
         try:
             result = collect_run(

@@ -218,6 +218,39 @@ def _resolve_validator_system(config, task_mode: str) -> str:
     return builtin
 
 
+@dataclass
+class Gate2Verdict:
+    """Unified GateVerdict for Gate 2 (the LLM validator).
+
+    Wraps the ``(approved, feedback)`` tuple :meth:`LLMGate2Validator.approve`
+    has always returned so Gate 2 reports its verdict through the same
+    :class:`~tools.auto.gate_verdict.GateVerdict` interface (``approved`` +
+    ``feedback()``) as every Gate-3 validator. The existing ``approve()``
+    tuple return is unchanged for the many call sites and tests that unpack
+    it; :meth:`LLMGate2Validator.approve_verdict` returns this object.
+
+    Attributes
+    ----------
+    approved:
+        ``True`` when the validator accepts the attempt; ``False`` when it
+        rejects (or fail-closed on an error — the validator never silently
+        approves, it returns ``False`` with a ``validator unavailable: …``
+        message).
+    reason:
+        The raw feedback string (``""`` on acceptance, a structured
+        ``Reason: …`` / ``Hints: …`` block on rejection). Kept under its
+        existing name for callers that read the tuple's second element
+        directly.
+    """
+
+    approved: bool
+    reason: str = ""
+
+    def feedback(self) -> str:
+        """Coder-facing message. Empty on acceptance, the reason on rejection."""
+        return self.reason
+
+
 class LLMGate2Validator:
     """Fail-closed LLM-based Gate-2 validator.
 
@@ -240,6 +273,7 @@ class LLMGate2Validator:
         max_tokens: int  = 512,
         task_mode:  str  = "code",
         config = None,
+        think: bool | None = None,
     ):
         self.base_url    = base_url
         self.model       = model
@@ -270,7 +304,16 @@ class LLMGate2Validator:
         # strict JSON with no soft-parse fallback (see AUTO-BUG-10) — a
         # thinking model truncated mid-<think> here fails closed exactly
         # like architect/coder did before the think=false fix.
-        self._think      = config.getboolean("validator_agent", "think", fallback=False) if config is not None else False
+        # BUGFIX (audit): resolve_validator_llm_profile's profile-resolved
+        # think override was computed by callers and then silently
+        # dropped — this always re-read the base [validator_agent] think
+        # key instead, ignoring any per-profile override. Accept an
+        # explicit think= and only fall back to the config read when the
+        # caller didn't resolve one (None), preserving old behaviour.
+        self._think = (
+            think if think is not None
+            else (config.getboolean("validator_agent", "think", fallback=False) if config is not None else False)
+        )
         # AUTO-DM-5 / AUTO-CR-19-1: select system prompt — mode-specific
         # override > (code-mode-only) legacy "system" key > built-in.
         # See _resolve_validator_system for the full priority rationale.
@@ -741,6 +784,30 @@ class LLMGate2Validator:
             self.last_missing_context = []
             return False, f"validator unavailable: {exc}"
 
+    def approve_verdict(
+        self,
+        task:         dict,
+        exec_result,
+        coder_result,
+        *,
+        base_dir=None,
+        prior_critique: str = "",
+    ) -> "Gate2Verdict":
+        """Return a :class:`Gate2Verdict` (the unified GateVerdict interface).
+
+        Thin wrapper over :meth:`approve` that keeps the existing tuple
+        return contract intact for every existing caller/test while also
+        exposing the verdict through the shared ``approved`` / ``feedback()``
+        interface used by :mod:`tools.auto.gate_registry`'s runner. The
+        ``last_missing_context`` side channel is populated identically to
+        :meth:`approve` — this method calls it directly.
+        """
+        approved, reason = self.approve(
+            task, exec_result, coder_result,
+            base_dir=base_dir, prior_critique=prior_critique,
+        )
+        return Gate2Verdict(approved=approved, reason=reason)
+
 
 def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
     """Parse a line-oriented Gate-2 verdict for creative mode (AUTO-CR-2 / CR-26-1).
@@ -893,12 +960,23 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
     # shaped like a REJECT verdict — matched as affirmative and inverted a
     # real rejection. Only GOOD now requires an explicit subject ("no, it's
     # good"); "no fine" / "no great" have no such negative reading.
+    #
+    # BUGFIX (verified-bugs follow-up report): "NO problems, it's perfect."
+    # is a clean approval ("there are no problems") but didn't match either
+    # alternative above — "PROBLEMS" is a noun, not a subject phrase
+    # (IT'S/THAT'S/...) or one of the bare adjectives (FINE/PERFECT/...) —
+    # so it fell through to the bare startswith("NO") REJECT branch below,
+    # a false rejection. "NO PROBLEMS/ISSUES/CONCERNS/COMPLAINTS" is itself
+    # already an unambiguous all-clear regardless of what follows, so it's
+    # a third top-level alternative rather than requiring a GOOD/FINE-style
+    # continuation.
     _EN_DISCOURSE_OK = _re.compile(
         r"^NO[,.]?\s*(?:"
         r"(?:IT'?S|IT IS|THAT'?S|THAT IS|EVERYTHING'?S|EVERYTHING IS|ALL)"
         r"\s*GOOD"
         r"|(?:IT'?S|IT IS|THAT'?S|THAT IS|EVERYTHING'?S|EVERYTHING IS|ALL)?"
         r"\s*(?:FINE|PERFECT|GREAT|OK|OKAY|CORRECT|IN ORDER)"
+        r"|PROBLEMS?|ISSUES?|CONCERNS?|COMPLAINTS?"
         r")\b"
     )
 
@@ -911,6 +989,34 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
         r"(?:REVISIONS?|CHANGES?|EDITS?|FIXES?|CORRECTIONS?|ADJUSTMENTS?)\s+"
         r"(?:NEEDED|REQUIRED|NECESSARY)\b"
     )
+
+    # ── English "OK, but/however/so <problem>" caveat guard ─────────────────
+    # BUGFIX (verified-bugs follow-up report): the bare `^OK\b` approval
+    # match below fires on the very FIRST token and never looks at what
+    # follows on the rest of the line — so "OK, but the character's
+    # motivation is wrong and the ending contradicts chapter 3." and "OK so
+    # chapter needs a full rewrite before it can be accepted" both matched
+    # `^OK\b` and returned an immediate, unconditional approval despite
+    # explicitly stating real problems right after the "OK". Mirrors the
+    # existing _EN_DISCOURSE_OK / _EN_NOTHING_NEEDED guards in spirit (a
+    # narrow, high-confidence pattern checked before the bare prefix match,
+    # not general sentiment analysis): BUT/HOWEVER/SO immediately after
+    # "OK" are contrastive/consequence markers that — in a validator-verdict
+    # context — reliably introduce a caveat or problem, never a plain
+    # affirmation (unlike a bare "OK looks good to me" / "OK looks fine" /
+    # "OK the chapter is fine", none of which use a contrastive marker and
+    # all of which remain approved exactly as before). Reason extraction
+    # mirrors the REVISE/REJECT/NO branch below.
+    _EN_OK_CAVEAT = _re.compile(
+        r"^OK[,.]?\s+(BUT|HOWEVER|SO)\b[,:]?\s*(.*)$"
+    )
+
+    def _ok_caveat_reason(s: str) -> "str | None":
+        m = _EN_OK_CAVEAT.match(s.strip().upper())
+        if not m:
+            return None
+        rest = s.strip()[m.start(2):].strip() if m.group(2) else ""
+        return rest if rest else "validator rejected (no reason given)"
 
     # ── Scan: first try the first non-empty line; fall back to whole text ──
     candidates: list[str] = []
@@ -928,6 +1034,14 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
     for raw in candidates:
         norm = _normalise(raw)
         upper = raw.strip().upper()
+
+        # ── English "OK, but/however/so <problem>" caveat guard ───────────
+        # Checked BEFORE the bare APPROVED/OK prefix match below, so a
+        # caveat right after "OK" is caught before the prefix match would
+        # otherwise return an unconditional approval.
+        _ok_caveat = _ok_caveat_reason(raw)
+        if _ok_caveat is not None:
+            return False, _ok_caveat, False
 
         # ── English APPROVED ──────────────────────────────────────────────
         if upper.startswith("APPROVED") or _re.match(r"^OK\b", upper):
@@ -982,6 +1096,12 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
             _lu = _line.strip().upper()
             if not _lu:
                 continue
+            # Same caveat guard as the top-level check above, applied
+            # per-line so a caveat on a later line (behind a preamble) is
+            # also caught before the bare OK-prefix match below.
+            _line_ok_caveat = _ok_caveat_reason(_line)
+            if _line_ok_caveat is not None:
+                return False, _line_ok_caveat, False
             if _lu.startswith("APPROVED") or _re.match(r"^OK\b", _lu):
                 return True, "", False
             if _EN_DISCOURSE_OK.match(_lu) or _EN_NOTHING_NEEDED.match(_lu):
@@ -1223,12 +1343,26 @@ class InnerLoop:
             # × rounds. None disables the guard.
             if _eff_deadline is not None:
                 if time.monotonic() >= _eff_deadline:
-                    logger.warning(
-                        "InnerLoop: task wall-clock limit (%ds = %.1f min, "
-                        "from max_task_seconds) reached — stopping after %d attempts",
-                        self.max_task_seconds, self.max_task_seconds / 60.0,
-                        attempt - 1,
-                    )
+                    # BUGFIX (audit): this always attributed the deadline to
+                    # max_task_seconds, even when _eff_deadline actually came
+                    # from the `deadline` parameter (the outer-loop's
+                    # task-wide budget shared across rounds) — e.g. logging
+                    # "0s from max_task_seconds" when max_task_seconds is 0
+                    # but a real shared deadline was passed in and reached.
+                    if deadline is not None:
+                        logger.warning(
+                            "InnerLoop: task wall-clock limit reached (from the "
+                            "outer-loop's shared task-wide deadline; this call "
+                            "had run %.1f min) — stopping after %d attempts",
+                            (time.monotonic() - _start_time) / 60.0, attempt - 1,
+                        )
+                    else:
+                        logger.warning(
+                            "InnerLoop: task wall-clock limit (%ds = %.1f min, "
+                            "from max_task_seconds) reached — stopping after %d attempts",
+                            self.max_task_seconds, self.max_task_seconds / 60.0,
+                            attempt - 1,
+                        )
                     _trace_stage(task_id, attempt - 1, "overall", "EXHAUSTED", reason="wall_clock")
                     last = feedback[-1] if feedback else ""
                     return InnerLoopResult(
@@ -1665,6 +1799,7 @@ def make_inner_loop(
             base_dir=str(base_dir),
             task_mode=task_mode,
             config=config,  # AUTO-DM-5: for system prompt override lookup
+            think=_val_think,  # BUGFIX (audit): profile override was dropped
             **_val_kwargs,
         )
 

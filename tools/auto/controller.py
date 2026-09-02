@@ -230,6 +230,52 @@ def _lint_mode_config(config: "configparser.ConfigParser | None", task_mode: str
     return warnings
 
 
+def _lint_probe_config(config: "configparser.ConfigParser | None") -> list[str]:
+    """AUTO-P3: warn at startup when [architect] probe_enabled is on but the
+    run cannot actually use it.
+
+    Deliberately separate from ``_lint_mode_config`` rather than folded into
+    it: that function returns early for ``task_mode == "code"`` (its own
+    checks are about non-code modes only), and the probe traps apply to code
+    mode most of all, since that is where the Architect does the bulk of its
+    planning.
+
+    Pure logging — returns the list of warning strings it logged (for
+    testability) and never raises or changes behaviour.
+    """
+    warnings: list[str] = []
+    if config is None:
+        return warnings
+    if not config.getboolean("architect", "probe_enabled", fallback=False):
+        return warnings
+
+    if not config.getboolean("collect", "use_in_auto", fallback=False):
+        warnings.append(
+            "[architect] probe_enabled = true but [collect] use_in_auto is "
+            "false — the probe resolves facts from the collect model, so with "
+            "no artifact to read it can never answer and every probe will "
+            "fall straight through to the forced final call. Enable "
+            "[collect] use_in_auto or turn probe_enabled back off."
+        )
+
+    active_profile = config.get("api", "active", fallback="local")
+    try:
+        base_num_ctx = config.getint(f"api_{active_profile}", "num_ctx", fallback=0)
+    except ValueError:
+        base_num_ctx = 0
+    if 0 < base_num_ctx < _CR19_SMALL_NUM_CTX_THRESHOLD:
+        warnings.append(
+            f"[architect] probe_enabled = true with api_{active_profile} "
+            f"num_ctx={base_num_ctx} — a probe round appends a digest to an "
+            "already-full architect prompt, and an agents_4k.ini-sized window "
+            "has no room for it. Use a larger profile or leave probing off."
+        )
+
+    for w in warnings:
+        logger.warning("controller: %s", w)
+    return warnings
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # AutoController
 # ─────────────────────────────────────────────────────────────────────────────
@@ -343,6 +389,22 @@ class AutoController:
         # non-code task_mode with no matching system_{mode} override.
         # Pure logging; never raises, never changes self.task_mode.
         _lint_mode_config(self.config, self.task_mode)
+        _lint_probe_config(self.config)
+        # AUTO-DEBUG-1: always-on startup banner (not gated by LLM_DEBUG or
+        # [trace] console_echo) so "is probing even eligible this run" is
+        # answerable from the first few lines of stdout instead of being
+        # inferred after the fact from a trace file. `_lint_probe_config`
+        # only speaks up when something is *wrong*; this speaks up every
+        # time, so silence elsewhere (e.g. no "probe fired" line later,
+        # see architect.py AUTO-DEBUG-1) can be read as a real negative
+        # rather than "maybe it just wasn't logged".
+        _probe_enabled = self.config.getboolean("architect", "probe_enabled", fallback=False)
+        _use_in_auto = self.config.getboolean("collect", "use_in_auto", fallback=False)
+        logger.info(
+            "controller: run flags — task_mode=%s dry_run=%s "
+            "[architect] probe_enabled=%s  [collect] use_in_auto=%s",
+            self.task_mode, self.dry_run, _probe_enabled, _use_in_auto,
+        )
         # AUTO-A4: execution working dir (executor/AUTO-C1 runs code here)
         self.workspace_dir = self.agent_dir / "workspace"
 
@@ -538,6 +600,22 @@ class AutoController:
         """
         pending = self.state.resume_info()["pending"]
         tasks_done = 0
+        # BUGFIX (verified-bugs audit #1): tasks_done (below) is
+        # intentionally "tasks that passed" — AC4's own test suite
+        # (tests/test_auto_g4.py::TestG4RunContinues::
+        # test_exhausted_tasks_not_counted_as_done) pins that as the
+        # counter's contract for progress reporting / run.log, and this
+        # fix must not change it. But check_caps() below was ALSO being
+        # fed tasks_done, so an exhausted/blocked task (which never
+        # increments tasks_done) never counted against max_tasks_per_run
+        # either — a run hitting repeated failures could attempt far more
+        # than max_tasks_per_run tasks, bounded only by max_runtime_min,
+        # silently violating the documented "maximum tasks to execute
+        # this session" contract (see this module's [auto] docstring).
+        # tasks_processed tracks every task this loop actually ran (pass
+        # or exhaustion) and is used for the cap check only, leaving
+        # tasks_done and its AC4 semantics untouched.
+        tasks_processed = 0
 
         # AUTO-FIX (podrugi sim): a repeat --auto invocation against a
         # directory whose plan.json is already fully done used to exit with
@@ -653,11 +731,12 @@ class AutoController:
 
         for task in pending:
             # AUTO-A4: check caps BEFORE executing each task
-            reason = self.check_caps(tasks_done)
+            reason = self.check_caps(tasks_processed)
             if reason:
                 logger.info(
-                    "_run_task_loop: cap fired (%s) after %d task(s) — stopping",
-                    reason, tasks_done,
+                    "_run_task_loop: cap fired (%s) after %d task(s) "
+                    "processed (%d passed) — stopping",
+                    reason, tasks_processed, tasks_done,
                 )
                 return reason, tasks_done
 
@@ -736,6 +815,8 @@ class AutoController:
                 if self.run_trace:
                     feedback_snippet = result.knowledge()[:200] if result.feedback_files else ""
                     self.run_trace.log_task_blocked(task["id"], feedback_snippet)
+
+            tasks_processed += 1
 
             # AUTO-F1: Tick progress upon task completion / exhaustion
             if self.progress_display:

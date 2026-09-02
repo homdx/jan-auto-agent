@@ -1,1 +1,0 @@
-../tests/test_bugfix_prompt_parser_dotted_symbol.py

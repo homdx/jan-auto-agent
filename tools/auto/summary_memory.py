@@ -443,6 +443,20 @@ class SummaryMemory:
         """
         _base = Path(base_dir) if base_dir is not None else self._base_dir
         chapter_path = _base / chapter_file
+        # BUGFIX (audit): no validation — an absolute chapter_file discards
+        # _base entirely (pathlib's `/` operator returns the right side
+        # unchanged when it's absolute), and a relative one containing
+        # ".." can escape _base the same way the other base_dir-relative
+        # reads in this codebase's Gate 1 stage did before their own fix
+        # (see gate1_filter.py / context_broker.py / gate1_grounding.py).
+        try:
+            chapter_path.resolve().relative_to(_base.resolve())
+        except ValueError:
+            logger.error(
+                "SummaryMemory.update: chapter_file %r escapes base_dir — "
+                "skipping synopsis update.", chapter_file,
+            )
+            return
         try:
             chapter_text = chapter_path.read_text(encoding="utf-8", errors="replace")
         except OSError as exc:
@@ -475,22 +489,20 @@ class SummaryMemory:
         # leave the previous section (if any) untouched instead.
         _stripped = body.strip()
         _is_bare_verdict = _stripped.upper().rstrip(".:!") in {"APPROVED", "OK", "REVISE"}
-        # BUGFIX (generalizes AUTO-BUG-6): the check above only ever caught
-        # those 3 literal words — but _clean_bullet_list's own no-marker
-        # fallback already refuses to treat a reply as a fact list unless it
-        # has at least 2 non-empty lines (a single line can never plausibly
-        # be "one fact per line"; see its docstring). When `cleaned` is ""
-        # for exactly that reason, `body` silently falls back to the raw
-        # single-line text, so ANY short single-line reply — not just
-        # "APPROVED"/"OK"/"REVISE" — slipped past this guard and got
-        # persisted to synopsis.md as if it were a real multi-fact summary.
-        # Observed in practice: verifier/summarizer error strings like
-        # "Unable to summarize this chapter." or "N/A" writing straight into
-        # continuity memory that later chapters rely on. A single line that
-        # bullet-cleaning couldn't parse can only be a verdict, refusal, or
-        # error string — never a genuine summary — so reject it the same way.
-        _single_line_and_unclean = (not cleaned) and len(_stripped.splitlines()) <= 1
-        if not _stripped or _is_bare_verdict or _single_line_and_unclean:
+        # BUGFIX (audit, generalizes the fix above): the previous version of
+        # this guard only rejected UNCLEAN content when it was a single
+        # line — but _clean_bullet_list() itself already fails open
+        # ("") for ANY reply that doesn't look like a fact list, single-
+        # line or not (e.g. >20 lines, or a line >220 chars — its own
+        # "looks like narrative prose" checks; see its docstring). When
+        # the summarizer/verifier failed and `verified` was raw or
+        # truncated multi-line chapter text, `cleaned` was correctly ""
+        # but this guard let it through anyway because it had more than
+        # one line, polluting synopsis.md with un-summarized chapter
+        # text. `cleaned` being "" is _clean_bullet_list's own considered
+        # verdict that the content isn't usable, regardless of line count.
+        _unclean = not cleaned
+        if not _stripped or _is_bare_verdict or _unclean:
             logger.warning(
                 "SummaryMemory.update: summary for %s looks invalid (%r) — "
                 "not writing it to synopsis.md (keeping previous content, if any).",

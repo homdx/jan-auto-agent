@@ -102,7 +102,12 @@ class OutputFormatter:
             for ref_name, ref_data in found_refs.items():
                 if isinstance(ref_data, dict):
                     source_file = ref_data.get("file", "unknown_source")
-                    ref_code = ref_data.get("code", "").strip()
+                    # BUGFIX (audit): .get("code", "") only applies the ""
+                    # default when the key is ABSENT, not when it's present
+                    # with an explicit None value — (None).strip() crashed.
+                    # Other fields in this codebase use the `or ""` idiom
+                    # for exactly this reason; this one didn't.
+                    ref_code = (ref_data.get("code") or "").strip()
                     if ref_code:
                         print(f"# REFERENCED FROM {source_file}")
                         print(ref_code)

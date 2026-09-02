@@ -482,7 +482,16 @@ class Executor:
         except (OSError, FileNotFoundError):
             return
         # Oldest first among the *other* task workspaces.
-        siblings.sort(key=lambda p: p.stat().st_mtime if p.exists() else 0)
+        # BUGFIX (audit): p.stat() ran outside the try/except that wraps
+        # iterdir() above — if a sibling is removed by a concurrent
+        # process between the .exists() check and this .stat() call
+        # (TOCTOU), the resulting OSError/FileNotFoundError was uncaught.
+        def _safe_mtime(p: Path) -> float:
+            try:
+                return p.stat().st_mtime
+            except OSError:
+                return 0.0
+        siblings.sort(key=_safe_mtime)
         # "keep" always survives, so the other siblings we may retain is
         # (limit - 1); anything beyond that, starting with the oldest, goes.
         excess = len(siblings) - max(self._max_retained_workspaces - 1, 0)

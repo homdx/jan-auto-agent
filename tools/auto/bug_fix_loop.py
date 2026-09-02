@@ -225,10 +225,24 @@ class BugFixLoop:
             # disambiguating-suffix guard here rather than leaving this one
             # call site as the odd one out.
             suffix_n = 0
-            while archive.exists():
-                suffix_n += 1
-                archive = tdir / f"previous_attempt_{stamp}-{suffix_n:03d}"
-            archive.mkdir(parents=True)
+            # BUGFIX (audit): `while archive.exists(): ...` then a separate
+            # `archive.mkdir(parents=True)` is a check-then-act TOCTOU race
+            # — a concurrent process can create the exact same directory
+            # between this loop's last .exists()=False and the mkdir()
+            # call below, raising FileExistsError. That was caught by the
+            # broad `except OSError` at the bottom of this block, which
+            # just logs a warning and gives up — silently skipping
+            # archiving instead of retrying with the next suffix the way
+            # the loop above already intends to. Retry mkdir() itself on
+            # collision instead of pre-checking existence, closing the
+            # race window entirely.
+            while True:
+                try:
+                    archive.mkdir(parents=True)
+                    break
+                except FileExistsError:
+                    suffix_n += 1
+                    archive = tdir / f"previous_attempt_{stamp}-{suffix_n:03d}"
             for f in rounds:
                 f.rename(archive / f.name)
             logger.info(
@@ -373,6 +387,18 @@ class BugFixLoop:
             logger.warning(
                 "BugFixLoop: ticket %s disappeared before update %s — "
                 "continuing", ticket_id, sorted(fields),
+            )
+            return False
+        except (TicketError, OSError) as exc:
+            # BUGFIX (audit): only TicketNotFound was caught here — a
+            # corrupt-on-disk ticket (TicketSchemaError, quarantined by
+            # TicketStore.update() itself) or a disk-write failure (raw
+            # OSError from the same call) still propagated out, crashing
+            # the run over exactly the kind of bookkeeping write this
+            # method's docstring says must never do that.
+            logger.warning(
+                "BugFixLoop: could not update ticket %s (%s) — "
+                "continuing", ticket_id, exc,
             )
             return False
 

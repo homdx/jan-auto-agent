@@ -1,1 +1,0 @@
-../tests/test_cr19_config_lint.py

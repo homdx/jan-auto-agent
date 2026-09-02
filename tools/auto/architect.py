@@ -44,6 +44,7 @@ from tools.auto.repo_ingest import RESERVED_META_FILES
 from typing import Any
 
 from tools.agent_trace import tracer
+from tools.auto import arch_probe as _arch_probe
 from tools.auto.repo_ingest import RepoCluster
 from tools.auto.utils import atomic_write_text, file_set_fingerprint
 import tools.llm_stream as _llm_stream
@@ -397,17 +398,57 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
         self._task_mode  = task_mode
 
         arch = "architect"
-        self._temperature            = float(config.get(arch, "temperature",         fallback="0.2"))
+        # BUGFIX (verified-bugs follow-up report): every read in this
+        # block was a raw config.get(...)+int()/float() or
+        # config.getboolean()/getint() call with no try/except — unlike
+        # Gate1Filter's equivalent reads (already guarded), this class had
+        # NO guards at all. A single malformed key (confirmed live:
+        # [architect] max_files_per_review = five) crashed ClusterReviewer
+        # construction outright. Wrapped per-call (not via a shared
+        # helper) so extract_config_reads (tools/collect/ast_facts.py)
+        # still sees each literal call — a shared helper's call shape is
+        # invisible to that AST scanner (confirmed directly: 0 reads
+        # recognized through a helper vs. 1 for an identical literal
+        # call). Matches gate1_filter.py's established style.
+        try:
+            self._temperature = float(config.get(arch, "temperature", fallback="0.2"))
+        except ValueError as exc:
+            logger.warning("config [%s] temperature is malformed (%s) — using 0.2", arch, exc)
+            self._temperature = 0.2
         # AUTO-CR-11: mode-aware token cap — creative tasks (Cyrillic, longer
         # instructions) need more room or the JSON array truncates mid-object.
         from tools.auto.utils import _cfg_mode
-        self._max_tokens             = int(_cfg_mode(config, arch, "max_tokens", task_mode, fallback="2048"))
-        self._timeout                = float(config.get("loop", "timeout_seconds",   fallback="300"))
-        self._max_file_chars         = int(config.get(arch,   "max_file_chars",      fallback=str(_DEFAULT_MAX_FILE_CHARS)))
-        self._max_files_per_review   = int(config.get(arch,   "max_files_per_review", fallback=str(_DEFAULT_MAX_FILES_PER_REVIEW)))
+        try:
+            self._max_tokens = int(_cfg_mode(config, arch, "max_tokens", task_mode, fallback="2048"))
+        except ValueError as exc:
+            logger.warning("config [%s] max_tokens is malformed (%s) — using 2048", arch, exc)
+            self._max_tokens = 2048
+        try:
+            self._timeout = float(config.get("loop", "timeout_seconds", fallback="300"))
+        except ValueError as exc:
+            logger.warning("config [loop] timeout_seconds is malformed (%s) — using 300", exc)
+            self._timeout = 300.0
+        try:
+            self._max_file_chars = int(config.get(arch, "max_file_chars", fallback=str(_DEFAULT_MAX_FILE_CHARS)))
+        except ValueError as exc:
+            logger.warning("config [%s] max_file_chars is malformed (%s) — using %d",
+                            arch, exc, _DEFAULT_MAX_FILE_CHARS)
+            self._max_file_chars = _DEFAULT_MAX_FILE_CHARS
+        try:
+            self._max_files_per_review = int(
+                config.get(arch, "max_files_per_review", fallback=str(_DEFAULT_MAX_FILES_PER_REVIEW))
+            )
+        except ValueError as exc:
+            logger.warning("config [%s] max_files_per_review is malformed (%s) — using %d",
+                            arch, exc, _DEFAULT_MAX_FILES_PER_REVIEW)
+            self._max_files_per_review = _DEFAULT_MAX_FILES_PER_REVIEW
         # num_ctx controls the total context window on Ollama; 0 means "use server default".
-        active_profile               = config.get("api", "active", fallback="local")
-        self._num_ctx                = config.getint(f"api_{active_profile}", "num_ctx", fallback=0)
+        active_profile = config.get("api", "active", fallback="local")
+        try:
+            self._num_ctx = config.getint(f"api_{active_profile}", "num_ctx", fallback=0)
+        except ValueError as exc:
+            logger.warning("config [api_%s] num_ctx is malformed (%s) — using 0", active_profile, exc)
+            self._num_ctx = 0
         # AUTO-FIX (fable follow-up): mirrors the gate1_filter.py fix — a
         # thinking model (e.g. qwen3) wraps its JSON task array in
         # a "think" reasoning block by default. If that reasoning consumes the
@@ -416,7 +457,50 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
         # returned a totally empty response after ~5 minutes on qwen3:8b).
         # Default to disabling thinking for this call; [architect] think =
         # true re-enables it for a model/setup that needs it.
-        self._think                  = config.getboolean(arch, "think", fallback=False)
+        try:
+            self._think = config.getboolean(arch, "think", fallback=False)
+        except ValueError as exc:
+            logger.warning("config [%s] think is malformed (%s) — using False", arch, exc)
+            self._think = False
+
+        # ── AUTO-P2: architect context probe ─────────────────────────────────
+        # Absent key ⇒ False ⇒ extract_probe_request is never called and every
+        # prompt/response path is byte-identical to pre-AUTO-P. AUTO-P3 adds
+        # the documented key to agents.ini; the other six agents_*.ini window
+        # profiles need no edit precisely because of this fallback.
+        self._probe_enabled          = config.getboolean(arch, "probe_enabled", fallback=False)
+        self._probe_max_rounds       = max(0, config.getint(arch, "probe_max_rounds", fallback=1))
+        self._probe_max_chars        = config.getint(arch, "probe_max_chars", fallback=2000)
+        self._probe_max_total_chars  = config.getint(arch, "probe_max_total_chars", fallback=6000)
+        # AUTO-P8: escalated re-asks allowed when the digest cap cuts a round
+        # short. 0 restores the pre-AUTO-P8 behaviour (force immediately).
+        # AUTO-P9: learn the working digest cap instead of rediscovering it
+        # once per batch. See ArchProbe.seeded_cap.
+        self._probe_budget_warmup    = config.getint(arch, "probe_budget_warmup", fallback=3)
+        self._probe_budget_headroom  = config.getfloat(arch, "probe_budget_headroom", fallback=2.0)
+        self._probe_budget_max_chars = config.getint(arch, "probe_budget_max_chars", fallback=0)
+        self._probe_budget_escalations = max(0, min(
+            len(_arch_probe._BUDGET_ESCALATION_LADDER),
+            config.getint(arch, "probe_budget_escalations", fallback=2),
+        ))
+        _ops_raw                     = config.get(arch, "probe_allowed_ops", fallback="facts")
+        # NOT defaulted back to DEFAULT_ALLOWED_OPS when the key is present but
+        # empty: `probe_allowed_ops =` is an operator saying "allow nothing",
+        # and silently restoring "facts" would re-enable a probe they just
+        # switched off. An empty tuple makes extract_probe_request fail closed
+        # (see its allowed_ops guard) — probing becomes a no-op, which is
+        # exactly what was asked for.
+        self._probe_allowed_ops      = tuple(
+            o.strip().lower() for o in _ops_raw.split(",") if o.strip()
+        )
+        # Built lazily, once per reviewer instance, on first use — the collect
+        # model needs base_dir, which only arrives with review_clusters(). The
+        # sentinel distinguishes "not built yet" from a legitimately-cached
+        # None (collect off/unavailable), so a missing artifact is not
+        # re-probed once per cluster. See make_collect_bridge's contract:
+        # build once per run, never per task.
+        self._probe: "_arch_probe.ArchProbe | None" = None
+        self._probe_built            = False
 
         # ── DM-2: select system prompt based on task_mode + ini overrides ─────
         # Priority: mode-specific ini key > legacy "system" key > built-in constant.
@@ -578,11 +662,26 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 # ── Checkpoint hit: skip LLM call, reuse saved candidates ────
                 if checkpoint_path is not None and batch_key in checkpoint:
                     saved = checkpoint[batch_key]
-                    restored = _deserialise_candidates(saved)
-                    print(f"   ♻️  Cluster/batch '{sub.name}' restored from checkpoint "
-                          f"({len(restored)} candidate(s)) — skipping LLM call")
-                    cluster_candidates.extend(restored)
-                    continue
+                    # BUGFIX (audit): _deserialise_candidates() ran outside
+                    # any try/except here — a structurally-wrong checkpoint
+                    # entry (schema drift, hand-edited file) raised
+                    # uncaught, defeating this whole mechanism's own
+                    # "start fresh on bad checkpoint" contract (already
+                    # honoured by the load-time try/except above, which
+                    # only guards json.loads/read_text, not this).
+                    try:
+                        restored = _deserialise_candidates(saved)
+                    except Exception as exc:  # noqa: BLE001 — fall back to a live call
+                        logger.warning(
+                            "review_clusters: could not restore checkpoint for "
+                            "'%s' (%s) — making a live LLM call instead",
+                            sub.name, exc,
+                        )
+                    else:
+                        print(f"   ♻️  Cluster/batch '{sub.name}' restored from checkpoint "
+                              f"({len(restored)} candidate(s)) — skipping LLM call")
+                        cluster_candidates.extend(restored)
+                        continue
 
                 # ── Live LLM call ─────────────────────────────────────────────
                 _all_files = files if (len(batches) > 1 and self._task_mode == "creative") else None
@@ -690,6 +789,119 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
         return all_candidates
 
     # ── Private helpers ───────────────────────────────────────────────────────
+
+    def _get_probe(self, base_dir: Path) -> "_arch_probe.ArchProbe | None":
+        """Build the AUTO-P probe executor once, on first use.
+
+        Returns ``None`` — a valid, expected result the caller must treat as
+        "no probing this run" — when the feature is off, when the collect
+        artifact is absent or stale, or when constructing the bridge fails.
+        Never raises: an unavailable probe is a degraded plan phase, not a
+        failed one.
+        """
+        if not self._probe_enabled:
+            return None
+        if self._probe_built:
+            return self._probe
+        self._probe_built = True
+        try:
+            from tools.auto.collect_bridge import make_collect_bridge  # noqa: PLC0415
+
+            bridge = make_collect_bridge(
+                base_dir, self._config, task_mode=self._task_mode
+            )
+        except Exception as exc:  # noqa: BLE001 — opt-in feature, never fatal
+            logger.warning(
+                "architect: probe_enabled=true but the collect bridge could not "
+                "be built (%s) — planning without probes this run.", exc,
+            )
+            self._trace_probe_config(usable=False, reason="bridge_error", detail=str(exc))
+            return None
+        if bridge is None or not getattr(bridge, "usable", False):
+            logger.warning(
+                "architect: probe_enabled=true but no fresh collect artifact is "
+                "available ([collect] use_in_auto) — planning without probes "
+                "this run.",
+            )
+            self._trace_probe_config(usable=False, reason="no_artifact")
+            return None
+        self._probe = _arch_probe.ArchProbe(
+            bridge,
+            max_chars=self._probe_max_chars,
+            max_total_chars=self._probe_max_total_chars,
+            # AUTO-P7: `read` needs a root to contain paths against. Without
+            # it the op disables itself rather than reading anywhere.
+            base_dir=base_dir,
+        )
+        # AUTO-P11: an absolute ceiling the learned and escalated caps must
+        # respect. Estimated the same way test_probe_budget_fits_the_window
+        # estimates it, so the runtime guard and the config-time guard agree:
+        # window minus the file contents, the prompt template and the reply.
+        if self._num_ctx > 0:
+            _prompt_tok = (
+                self._max_files_per_review * self._max_file_chars + 4000
+            ) / 3.5
+            _free_tok = self._num_ctx - _prompt_tok - self._max_tokens
+            # 3.5 chars/token, then 80% so a digest never fills the last of it.
+            self._probe.set_window_budget(max(0, int(_free_tok * 3.5 * 0.8)))
+        self._probe.configure_learning(
+            warmup=self._probe_budget_warmup,
+            headroom=self._probe_budget_headroom,
+            ceiling=self._probe_budget_max_chars,
+        )
+        # AUTO-DEBUG-1: the two warning branches above are the only prior
+        # console signal for this method; a *successful* build was silent,
+        # so "did probing even become available this run" could only be
+        # inferred by grepping prompts for PROBE_INSTRUCTIONS (which the
+        # [trace] max_field_chars head-truncation can hide — see
+        # controller.py AUTO-DEBUG-1 banner for the rest of this fix).
+        logger.info(
+            "architect: probe available this run (collect artifact fresh) — "
+            "offering ARCH_PROBE on every batch."
+        )
+        self._trace_probe_config(usable=True, reason="ok")
+        return self._probe
+
+    def _trace_probe_config(
+        self, *, usable: bool, reason: str, detail: str = "",
+    ) -> None:
+        """AUTO-P4a: emit exactly one ``probe_config`` event per run.
+
+        This is the trace-side counterpart to AUTO-DEBUG-1's console banner,
+        and it exists to make ONE state visible that nothing else could
+        express: *the probe was enabled and available, and the model never
+        used it*.
+
+        Before this event, ``analyze_logs.py`` rendered its probe line only
+        when at least one ``probe_request`` existed, so a run with zero probes
+        produced output byte-identical to a run on pre-AUTO-P code. For a
+        feature whose entire Phase 0 decision gate is "how often is this
+        actually used", the most important measurement rendered as silence,
+        and the only way to tell "never asked" from "not installed" was to
+        grep the raw prompt log.
+
+        No event is emitted when ``probe_enabled = false`` — an old trace and
+        a feature-off trace should stay indistinguishable, because for a
+        feature that is off they genuinely are the same thing.
+
+        Never raises: tracing is diagnostics, not control flow.
+        """
+        try:
+            tracer.event(
+                source="architect", target="probe", kind="probe_config",
+                model=self._model,
+                content=detail,
+                params={
+                    "usable":          str(bool(usable)),
+                    "reason":          reason,
+                    "max_rounds":      self._probe_max_rounds,
+                    "max_chars":       self._probe_max_chars,
+                    "max_total_chars": self._probe_max_total_chars,
+                    "allowed_ops":     ",".join(self._probe_allowed_ops),
+                },
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("architect: probe_config trace failed: %s", exc)
 
     def _build_llm_call(self):
         """Build a ``llm_call(system, user) -> str`` callable for validate_plan.
@@ -874,20 +1086,47 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
         _empty_retry_max = self._config.getint("architect", "empty_response_retry_max", fallback=6)
         _empty_retry_max = max(0, _empty_retry_max)
 
+        # ── AUTO-P1: probe state, read by the _call_and_parse closure ───────
+        # Reassigned by the probe loop at the bottom of this method; the
+        # closure reads them at call time, so each attempt sees the current
+        # digest and the current forced/not-forced stance.
+        _probe = self._get_probe(base_dir)
+        if _probe is not None:
+            # AUTO-P7: tell the probe which files this batch actually saw, so
+            # results from anywhere else can be marked. Set here rather than
+            # in _get_probe because the probe instance is memoized per RUN
+            # while the batch changes every call.
+            _probe.set_batch_files(cluster.files)
+            # AUTO-P4a: the ArchProbe instance is memoized for the whole run
+            # (one CollectBridge, per make_collect_bridge's contract), but its
+            # digest budget is per BATCH — the digest is appended to this
+            # batch's prompt and nobody else's. Without this reset,
+            # probe_max_total_chars accumulated across every batch and quietly
+            # switched the probe off partway through a long run.
+            _probe.reset()
+        _probe_digest = ""
+        _probe_forced = False
+
         def _call_and_parse(
             max_tasks: int, *,
             max_tokens: "int | None" = None,
             temperature: "float | None" = None,
-        ) -> "tuple[list[CandidateTask] | None, bool, bool]":
+        ) -> "tuple[list[CandidateTask] | None, bool, bool, list]":
             """One LLM call + parse at a given max_tasks budget.
 
-            Returns ``(candidates_or_None, truncated, unsalvageable)``.
-            ``None`` candidates means the call itself failed after all
-            transient-error retries (unrelated to either AUTO-H4/H5 —
-            see the network-retry loop below); ``truncated`` and
-            ``unsalvageable`` are only meaningful when candidates is not
-            ``None``, and are mutually exclusive (see
+            Returns ``(candidates_or_None, truncated, unsalvageable,
+            probe_request)``.  ``None`` candidates means the call itself
+            failed after all transient-error retries (unrelated to either
+            AUTO-H4/H5 — see the network-retry loop below); ``truncated``
+            and ``unsalvageable`` are only meaningful when candidates is
+            not ``None``, and are mutually exclusive (see
             ``_parse_candidates_ex``'s docstring).
+
+            AUTO-P2: ``probe_request`` is the list of
+            ``arch_probe.ProbeOp`` the Architect asked for, or ``[]``.
+            **Invariant: when it is non-empty, both ``truncated`` and
+            ``unsalvageable`` are forced ``False``** — see the block above
+            the return statement for why.
 
             *max_tokens*/*temperature*, when given, override this
             instance's own ``self._max_tokens``/``self._temperature`` for
@@ -903,6 +1142,23 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 file_contents=file_contents,
                 max_tasks=max_tasks,
             )
+
+            # ── AUTO-P1: additive probe sections ────────────────────────────
+            # _USER_PROMPT_TMPL / _USER_PROMPT_CREATIVE are deliberately NOT
+            # edited: with probing off (or unavailable) nothing is appended and
+            # every byte sent is identical to pre-AUTO-P, which is what keeps
+            # the default path provably unchanged and the prompt-sensitive
+            # tests in test_architect_domain.py green.
+            if _probe_forced:
+                # Driven by the stance, not by _probe: a model that probed
+                # although probing was never offered still has to be told to
+                # stop, or the forced call is a byte-identical re-ask that
+                # reproduces the same probe.
+                user_msg += "\n" + _arch_probe.FORCED_SUFFIX
+            elif _probe is not None and _probe.usable:
+                user_msg += "\n" + _arch_probe.PROBE_INSTRUCTIONS
+            if _probe_digest:
+                user_msg += "\n\n" + _probe_digest
 
             url, headers, payload = _llm_stream.build_chat_request(
                 base_url=self._base_url, api_key=self._api_key, model=self._model,
@@ -1021,7 +1277,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 # None (not []) so callers can distinguish "call failed" from
                 # "call succeeded but LLM produced no valid candidates".  The
                 # checkpoint must NOT record a failed batch; None signals that.
-                return None, False, False
+                return None, False, False, []
 
             # Strip reasoning tokens before JSON parsing.
             cleaned = strip_think(raw_text)
@@ -1034,110 +1290,465 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 params={"cluster": cluster.name, "max_tasks": max_tasks},
             )
 
-            return self._parse_candidates_ex(cleaned, cluster.name, cluster.files)
+            _cands, _truncated, _unsalvageable = self._parse_candidates_ex(
+                cleaned, cluster.name, cluster.files
+            )
 
-        max_tasks = _base_max_tasks
-        candidates, truncated, unsalvageable = _call_and_parse(max_tasks)
-
-        _shrink_attempts = 0
-        _empty_attempts = 0
-        # Single adaptive loop: on each iteration, react to whichever
-        # failure mode THIS attempt actually hit — a batch can legitimately
-        # flip between them (e.g. truncated on attempt 1, unsalvageable on
-        # a shrunk attempt 2) — rather than committing to one strategy for
-        # the whole retry budget upfront. Each failure mode has its own
-        # independent attempt budget so one doesn't steal retries from the
-        # other.
-        while candidates is not None and (truncated or unsalvageable):
-            _call_kwargs: dict = {}
-            if truncated:
-                if _shrink_attempts >= _retry_max or max_tasks <= 1:
-                    break
-                max_tasks = _shrink(max_tasks)
-                _shrink_attempts += 1
-                logger.warning(
-                    "review_one_cluster [%s]: response truncated "
-                    "(shrink-retry %d/%d) — re-asking with max_tasks=%d.",
-                    cluster.name, _shrink_attempts, _retry_max, max_tasks,
-                )
-            else:  # unsalvageable
-                if _empty_attempts >= _empty_retry_max:
-                    break
-                _empty_attempts += 1
-                # AUTO-H5-ESCALATE-1 / AUTO-RETRY-TEMP-1: mirrors
-                # gate1_filter.py's Gate1Filter unparseable-retry
-                # escalation exactly — an unsalvageable (empty/
-                # degenerate/non-JSON) response is very often the SAME
-                # thinking-budget-exhaustion failure Gate 1 already
-                # handles (see the class docstring above), not a one-off
-                # decoding hiccup a same-settings plain retry fixes.
-                # Every temperature in _UNSALVAGEABLE_TEMPERATURES is
-                # tried at the CURRENT token tier before the tier
-                # doubles — see that constant's docstring for why this
-                # is a fixed absolute schedule, not a step down from the
-                # configured base temperature.
-                _ctx_ceiling = (
-                    int(self._num_ctx * self._UNSALVAGEABLE_TOKENS_CTX_FRACTION)
-                    if self._num_ctx
-                    else self._UNSALVAGEABLE_TOKENS_DEFAULT_CEILING
-                )
-                _n_temps = len(self._UNSALVAGEABLE_TEMPERATURES)
-                _tier_index = (_empty_attempts - 1) // _n_temps
-                _temp_index = (_empty_attempts - 1) % _n_temps
-                _uncapped_tokens = (
-                    self._UNSALVAGEABLE_TOKENS_FLOOR
-                    * int(self._UNSALVAGEABLE_TOKENS_STEP_MULT ** _tier_index)
-                )
-                _attempt_tokens = min(_uncapped_tokens, _ctx_ceiling)
-                if _attempt_tokens < _uncapped_tokens:
-                    # AUTO-CTX-CAP-WARN-1: see gate1_filter.py's sibling
-                    # warning — a stale/small num_ctx silently capping
-                    # escalation has bitten in the field more than once.
+            # ── AUTO-P2: probe detection, ahead of the ladder verdict ────────
+            # An "ARCH_PROBE: ..." reply is non-JSON prose, so
+            # _parse_candidates_ex above classifies it *unsalvageable*. Left
+            # alone, that hands it to the AUTO-H5 ladder, which re-asks the
+            # identical question up to empty_response_retry_max times at
+            # rising max_tokens/temperature — burning the whole budget while
+            # ignoring the request the model actually made, and reading in the
+            # logs as a flaky model rather than as a feature that never fires.
+            # Detecting it *here*, before the verdict leaves this closure, is
+            # what makes the invariant unconditional: a probe can never
+            # consume an H4 shrink or an H5 escalation.
+            #
+            # Both flags are cleared, not just `unsalvageable`. A single-line
+            # probe should never trip the truncation heuristic (which needs a
+            # partial `{...}` object), but forcing both keeps the guarantee a
+            # property of this branch rather than of _parse_candidates_ex's
+            # internals.
+            _probe_request: list = []
+            if self._probe_enabled:
+                try:
+                    _probe_request = _arch_probe.extract_probe_request(
+                        cleaned, allowed_ops=self._probe_allowed_ops
+                    ) or []
+                except Exception as exc:  # noqa: BLE001 — never fail the batch on this
                     logger.warning(
-                        "review_one_cluster [%s]: escalation wants "
-                        "max_tokens=%d but is capped at %d by "
-                        "num_ctx=%s (ceiling = num_ctx * %.1f). If this "
-                        "model's real context window is bigger, raise "
-                        "num_ctx in the active [api_*] section to let "
-                        "escalation actually use it.",
-                        cluster.name, _uncapped_tokens, _attempt_tokens,
-                        self._num_ctx or "unset",
-                        self._UNSALVAGEABLE_TOKENS_CTX_FRACTION,
+                        "review_one_cluster [%s]: probe parse raised (%s) — "
+                        "treating response as a normal (non-probe) reply.",
+                        cluster.name, exc,
                     )
-                _attempt_temp = self._UNSALVAGEABLE_TEMPERATURES[_temp_index]
-                _call_kwargs = {"max_tokens": _attempt_tokens, "temperature": _attempt_temp}
-                logger.warning(
-                    "review_one_cluster [%s]: response unsalvageable (empty, "
-                    "degenerate, or non-JSON) — plain retry %d/%d at the "
-                    "same max_tasks=%d (max_tokens=%d, temperature=%.2f).",
-                    cluster.name, _empty_attempts, _empty_retry_max, max_tasks,
-                    _attempt_tokens, _attempt_temp,
-                )
-            candidates, truncated, unsalvageable = _call_and_parse(max_tasks, **_call_kwargs)
+                    _probe_request = []
 
-        if candidates is not None and truncated:
-            # Shrink-retries exhausted (or disabled via
-            # truncation_retry_max=0) and the LAST attempt was still
-            # truncated — keep whatever got salvaged rather than
-            # discarding it outright; this matches the pre-AUTO-H4
-            # fail-open behaviour for the final attempt.
-            logger.warning(
-                "review_one_cluster [%s]: still truncated after %d shrink-retry "
-                "attempt(s) (max_tasks=%d) — keeping %d salvaged candidate(s).",
-                cluster.name, _shrink_attempts, max_tasks, len(candidates),
+            if _probe_request:
+                _truncated = False
+                _unsalvageable = False
+                # AUTO-DEBUG-1: plain logger.info, unconditional — the
+                # tracer.event below is the source of truth for the trace
+                # file, but it only reaches stdout when [trace] console_echo
+                # is on, and even then competes with a lot of other console
+                # noise. This one line is the deliberately-boring,
+                # grep-for-it ("probe FIRED") signal: if it never appears in
+                # a run's log, the probe genuinely never fired — not just
+                # "wasn't printed".
+                logger.info(
+                    "architect [%s]: probe FIRED — %s",
+                    cluster.name, ", ".join(str(op) for op in _probe_request),
+                )
+                try:
+                    tracer.event(
+                        source="architect", target="probe", kind="probe_request",
+                        model=self._model,
+                        content=", ".join(str(op) for op in _probe_request),
+                        params={"cluster": cluster.name, "ops": len(_probe_request)},
+                    )
+                except Exception as exc:  # noqa: BLE001 — AUTO-P4a
+                    # AUTO-P1 shipped this call bare while every other step in
+                    # the probe path was fail-open. A tracer that cannot write
+                    # (full disk, bad path, a serialisation edge) would abort
+                    # the batch through the one line whose only job is to
+                    # observe it.
+                    logger.debug("probe_request trace failed: %s", exc)
+
+            return _cands, _truncated, _unsalvageable, _probe_request
+
+        def _attempt_plan(
+            *, temperature: "float | None" = None,
+        ) -> "tuple[list[CandidateTask] | None, list]":
+            """One full planning attempt: initial call + the AUTO-H4/H5 ladders.
+
+            AUTO-P1 extracted this from the body of ``_review_one_cluster`` so
+            the probe loop below can run it more than once. Nothing inside
+            changed: ``max_tasks`` still starts fresh at ``_base_max_tasks``
+            (each probe round is a new question, not a continuation of the
+            previous round's shrink state), and both retry budgets are still
+            per-attempt and independent of each other.
+
+            Returns ``(candidates_or_None, probe_request)``.
+            """
+            max_tasks = _base_max_tasks
+            # AUTO-P8: an escalated re-ask pins temperature so the model
+            # re-issues the SAME request and the widened budget serves the ops
+            # that were dropped, rather than re-rolling into a different one.
+            candidates, truncated, unsalvageable, probe_request = _call_and_parse(
+                max_tasks, temperature=temperature
             )
-        if candidates is not None and unsalvageable:
-            # Plain retries exhausted (or disabled via
-            # empty_response_retry_max=0) and the response is still
-            # unsalvageable — nothing to keep this time; fail open with 0
-            # candidates for this batch, same as the pre-AUTO-H5 behaviour,
-            # but only after actually trying instead of giving up on the
-            # first empty/garbage reply.
-            logger.warning(
-                "review_one_cluster [%s]: still unsalvageable after %d plain "
-                "retry attempt(s) — giving up on this batch with 0 candidates.",
-                cluster.name, _empty_attempts,
+
+            _shrink_attempts = 0
+            _empty_attempts = 0
+            # Single adaptive loop: on each iteration, react to whichever
+            # failure mode THIS attempt actually hit — a batch can legitimately
+            # flip between them (e.g. truncated on attempt 1, unsalvageable on
+            # a shrunk attempt 2) — rather than committing to one strategy for
+            # the whole retry budget upfront. Each failure mode has its own
+            # independent attempt budget so one doesn't steal retries from the
+            # other.
+            while candidates is not None and (truncated or unsalvageable):
+                _call_kwargs: dict = {}
+                if truncated:
+                    if _shrink_attempts >= _retry_max or max_tasks <= 1:
+                        break
+                    max_tasks = _shrink(max_tasks)
+                    _shrink_attempts += 1
+                    logger.warning(
+                        "review_one_cluster [%s]: response truncated "
+                        "(shrink-retry %d/%d) — re-asking with max_tasks=%d.",
+                        cluster.name, _shrink_attempts, _retry_max, max_tasks,
+                    )
+                else:  # unsalvageable
+                    if _empty_attempts >= _empty_retry_max:
+                        break
+                    _empty_attempts += 1
+                    # AUTO-H5-ESCALATE-1 / AUTO-RETRY-TEMP-1: mirrors
+                    # gate1_filter.py's Gate1Filter unparseable-retry
+                    # escalation exactly — an unsalvageable (empty/
+                    # degenerate/non-JSON) response is very often the SAME
+                    # thinking-budget-exhaustion failure Gate 1 already
+                    # handles (see the class docstring above), not a one-off
+                    # decoding hiccup a same-settings plain retry fixes.
+                    # Every temperature in _UNSALVAGEABLE_TEMPERATURES is
+                    # tried at the CURRENT token tier before the tier
+                    # doubles — see that constant's docstring for why this
+                    # is a fixed absolute schedule, not a step down from the
+                    # configured base temperature.
+                    _ctx_ceiling = (
+                        int(self._num_ctx * self._UNSALVAGEABLE_TOKENS_CTX_FRACTION)
+                        if self._num_ctx
+                        else self._UNSALVAGEABLE_TOKENS_DEFAULT_CEILING
+                    )
+                    _n_temps = len(self._UNSALVAGEABLE_TEMPERATURES)
+                    _tier_index = (_empty_attempts - 1) // _n_temps
+                    _temp_index = (_empty_attempts - 1) % _n_temps
+                    _uncapped_tokens = (
+                        self._UNSALVAGEABLE_TOKENS_FLOOR
+                        * int(self._UNSALVAGEABLE_TOKENS_STEP_MULT ** _tier_index)
+                    )
+                    _attempt_tokens = min(_uncapped_tokens, _ctx_ceiling)
+                    if _attempt_tokens < _uncapped_tokens:
+                        # AUTO-CTX-CAP-WARN-1: see gate1_filter.py's sibling
+                        # warning — a stale/small num_ctx silently capping
+                        # escalation has bitten in the field more than once.
+                        logger.warning(
+                            "review_one_cluster [%s]: escalation wants "
+                            "max_tokens=%d but is capped at %d by "
+                            "num_ctx=%s (ceiling = num_ctx * %.1f). If this "
+                            "model's real context window is bigger, raise "
+                            "num_ctx in the active [api_*] section to let "
+                            "escalation actually use it.",
+                            cluster.name, _uncapped_tokens, _attempt_tokens,
+                            self._num_ctx or "unset",
+                            self._UNSALVAGEABLE_TOKENS_CTX_FRACTION,
+                        )
+                    _attempt_temp = self._UNSALVAGEABLE_TEMPERATURES[_temp_index]
+                    _call_kwargs = {"max_tokens": _attempt_tokens, "temperature": _attempt_temp}
+                    logger.warning(
+                        "review_one_cluster [%s]: response unsalvageable (empty, "
+                        "degenerate, or non-JSON) — plain retry %d/%d at the "
+                        "same max_tasks=%d (max_tokens=%d, temperature=%.2f).",
+                        cluster.name, _empty_attempts, _empty_retry_max, max_tasks,
+                        _attempt_tokens, _attempt_temp,
+                    )
+                candidates, truncated, unsalvageable, probe_request = _call_and_parse(
+                    max_tasks, **_call_kwargs
+                )
+
+            if candidates is not None and truncated:
+                # Shrink-retries exhausted (or disabled via
+                # truncation_retry_max=0) and the LAST attempt was still
+                # truncated — keep whatever got salvaged rather than
+                # discarding it outright; this matches the pre-AUTO-H4
+                # fail-open behaviour for the final attempt.
+                logger.warning(
+                    "review_one_cluster [%s]: still truncated after %d shrink-retry "
+                    "attempt(s) (max_tasks=%d) — keeping %d salvaged candidate(s).",
+                    cluster.name, _shrink_attempts, max_tasks, len(candidates),
+                )
+            if candidates is not None and unsalvageable:
+                # Plain retries exhausted (or disabled via
+                # empty_response_retry_max=0) and the response is still
+                # unsalvageable — nothing to keep this time; fail open with 0
+                # candidates for this batch, same as the pre-AUTO-H5 behaviour,
+                # but only after actually trying instead of giving up on the
+                # first empty/garbage reply.
+                logger.warning(
+                    "review_one_cluster [%s]: still unsalvageable after %d plain "
+                    "retry attempt(s) — giving up on this batch with 0 candidates.",
+                    cluster.name, _empty_attempts,
+                )
+
+            # AUTO-P2: a recognised probe request cleared both ladder flags in
+            # _call_and_parse, so the while-loop above exits (or never runs) and
+            # control lands here with the probe intact. Handing it back to the
+            # probe loop below is what keeps a probe from ever consuming an H4
+            # shrink or an H5 escalation.
+            return candidates, probe_request
+
+        # ── AUTO-P1: probe → digest → re-ask loop ────────────────────────────
+        # Bounded three ways, any of which ends the loop:
+        #   * probe_max_rounds        — iteration cap
+        #   * probe_max_total_chars   — digest cap, enforced inside ArchProbe
+        #   * an empty digest         — nothing could be resolved, so re-asking
+        #                               would reproduce the identical response
+        #                               and the identical probe, forever
+        # Whichever fires, the model gets ONE forced final call telling it to
+        # plan with what it has. That call is not optional: without it, hitting
+        # a cap would mean zero candidates from the batch, which is a
+        # regression against the pre-AUTO-P behaviour.
+        candidates, probe_request = _attempt_plan()
+        _probe_rounds = 0
+        # AUTO-P4b: every op-set already asked in THIS batch. The all-miss fix
+        # in ArchProbe.execute covers the common spin (ask → (not found) →
+        # ask the same thing again), but it cannot cover a model that re-asks
+        # after a round that DID resolve something — a real run showed one
+        # batch alternating between `facts _llm_stream, facts strip_think` and
+        # `facts tools.llm_stream, facts tools.llm_stream.strip_think` for
+        # four rounds. Whatever the digest said, repeating a request that was
+        # already answered cannot produce a different answer, so the second
+        # occurrence ends the loop instead of spending another call.
+        _asked_before: set = set()
+        # AUTO-P8: escalated re-asks spent on this batch.
+        _budget_escalations = 0
+
+        def _decline_by_op(reason: str, ops: list) -> str:
+            """Per-op tallies for a declined request, as `facts=0/2`.
+
+            For an `unresolved` decline the executor ran and already counted
+            what it found, so its own tally is authoritative. For every other
+            reason (round_cap, digest_budget, no_executor, repeat,
+            post_forced) nothing was looked up at all, so the ops are counted
+            as neither hits nor misses — recording them as misses would blame
+            the collect artifact for a budget the harness spent.
+            """
+            if reason == "unresolved" and _probe is not None:
+                return _probe.last_by_op_str()
+            counts: dict = {}
+            for op in ops or ():
+                counts.setdefault(op.op, 0)
+                counts[op.op] += 1
+            return " ".join(f"{k}=0/0" for k in sorted(counts))
+
+        def _decline(reason: str, ops: list) -> None:
+            """AUTO-P4a: record WHY a probe request went unanswered.
+
+            Every ``break`` below leaves a ``probe_request`` in the trace with
+            no matching ``probe_result``. Before AUTO-P4a, analyze_logs.py
+            reported that gap as a single "N unresolved" figure, which read —
+            and was documented in the runbook — as "collect did not know these
+            symbols". Four different situations were collapsed into that one
+            number, and they call for opposite fixes: `round_cap` says raise
+            probe_max_rounds, `unresolved` says rebuild the collect artifact,
+            `no_executor` says the config is wrong, `post_forced` says the
+            model is ignoring instructions. The real run that exposed this had
+            4 "unresolved" of which 4 were round_cap and 0 were collect
+            misses — collect had in fact answered everything it was asked.
+            """
+            try:
+                tracer.event(
+                    source="architect", target="probe", kind="probe_declined",
+                    model=self._model,
+                    content=", ".join(str(op) for op in ops),
+                    params={
+                        "cluster": cluster.name,
+                        "reason":  reason,
+                        "ops":     len(ops),
+                        "round":   _probe_rounds,
+                        # AUTO-P6: per-op tallies on the DECLINE side too.
+                        # AUTO-P5 recorded by_op only on probe_result, but an
+                        # all-miss round returns an empty digest and emits no
+                        # probe_result at all (AUTO-P4b) — it lands here. So
+                        # every fully-missed lookup was invisible to the
+                        # breakdown, which reported "facts=23/0" on a run whose
+                        # true figure was 23 hits and 17 misses. With one op
+                        # that is merely wrong; with two it systematically
+                        # flatters whichever op tends to miss ENTIRELY, which
+                        # is exactly the comparison the next scope decision
+                        # (refs? read?) rests on.
+                        "by_op":   _decline_by_op(reason, ops),
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001 — diagnostics never break a batch
+                logger.debug("review_one_cluster: probe_declined trace failed: %s", exc)
+
+        while probe_request and candidates is not None and not candidates:
+            if _probe is None or not _probe.usable:
+                # The model probed although probing was never offered to it
+                # (instructions are only appended when a usable probe exists).
+                # Nothing to resolve — go straight to the forced call.
+                logger.info(
+                    "review_one_cluster [%s]: architect probed but no collect "
+                    "artifact is available — forcing a final plan call.",
+                    cluster.name,
+                )
+                _decline("no_executor", probe_request)
+                break
+            if _probe.budget_exhausted:
+                # ── AUTO-P8: escalate before giving up ──────────────────────
+                # The digest cap became the dominant constraint once `module`
+                # and `read` landed: 15 of 23 declines in the last measured
+                # run were this branch, and the ops it dropped were dropped
+                # silently. Forcing a final plan call here throws away a
+                # request the model made in good faith and could have been
+                # answered with more room.
+                #
+                # Bounded by probe_budget_escalations, and each step is one
+                # extra architect call — the same cost shape as AUTO-H5's
+                # escalation ladder, which this mirrors.
+                if _budget_escalations < self._probe_budget_escalations:
+                    # AUTO-P9: once the run has learned a working cap, the
+                    # temperature rung is skipped. That rung exists to break a
+                    # deterministic loop when we have no idea how much room a
+                    # round needs; with a measured median we DO know, so the
+                    # honest remedy is more room, and re-rolling the request at
+                    # a higher temperature would only ask something different
+                    # from what the wider budget was bought for.
+                    _ladder = (
+                        _arch_probe._BUDGET_ONLY_LADDER
+                        if _probe.has_seeded_cap
+                        else _arch_probe._BUDGET_ESCALATION_LADDER
+                    )
+                    _factor, _temp = _ladder[
+                        min(_budget_escalations, len(_ladder) - 1)
+                    ]
+                    _new_cap = _probe.raise_budget(_factor)
+                    _budget_escalations += 1
+                    logger.info(
+                        # AUTO-P11: the denominator is the cap ACTUALLY in
+                        # force, not the configured one. It used to print
+                        # "17237/10000" on a batch whose cap was 15 000, which
+                        # made a working escalation look like a broken one.
+                        "review_one_cluster [%s]: probe digest budget spent "
+                        "(%d/%d chars) — escalation %d/%d: cap raised to %d, "
+                        "temperature %.1f.",
+                        cluster.name, _probe.chars_used,
+                        _probe.current_cap, _budget_escalations,
+                        self._probe_budget_escalations, _new_cap, _temp,
+                    )
+                    tracer.event(
+                        source="architect", target="probe",
+                        kind="probe_escalated", model=self._model,
+                        content=", ".join(str(op) for op in probe_request),
+                        params={
+                            "cluster":     cluster.name,
+                            "step":        _budget_escalations,
+                            "new_cap":     _new_cap,
+                            "temperature": _temp,
+                            # AUTO-P9: which ladder was in force, so a run can
+                            # be read as "still learning" vs "learned".
+                            "seeded":      str(_probe.has_seeded_cap),
+                        },
+                    )
+                    # The escalation exists precisely to get this same request
+                    # re-issued with more room, so it must not then be killed
+                    # as a duplicate. Drop its fingerprint: the repeat detector
+                    # guards against a model looping on an ANSWERED request,
+                    # and this one was never fully answered — the budget ran
+                    # out mid-way through it.
+                    _asked_before.discard(frozenset(str(op) for op in probe_request))
+                    candidates, probe_request = _attempt_plan(temperature=_temp)
+                    continue
+                logger.info(
+                    "review_one_cluster [%s]: probe digest budget spent "
+                    "(%d/%d chars) after %d escalation(s) — forcing a final "
+                    "plan call.",
+                    cluster.name, _probe.chars_used,
+                    _probe.current_cap, _budget_escalations,
+                )
+                _decline("digest_budget", probe_request)
+                break
+            if _probe_rounds >= self._probe_max_rounds:
+                logger.info(
+                    "review_one_cluster [%s]: probe round cap reached (%d) — "
+                    "forcing a final plan call.",
+                    cluster.name, self._probe_max_rounds,
+                )
+                _decline("round_cap", probe_request)
+                break
+
+            _fingerprint = frozenset(str(op) for op in probe_request)
+            if _fingerprint in _asked_before:
+                logger.info(
+                    "review_one_cluster [%s]: architect re-asked an already "
+                    "answered probe (%s) — forcing a final plan call.",
+                    cluster.name, ", ".join(str(op) for op in probe_request),
+                )
+                _decline("repeat", probe_request)
+                break
+            _asked_before.add(_fingerprint)
+
+            _digest_add = _probe.execute(probe_request)
+            if not _digest_add:
+                logger.info(
+                    "review_one_cluster [%s]: probe resolved nothing for %s — "
+                    "forcing a final plan call.",
+                    cluster.name, ", ".join(str(op) for op in probe_request),
+                )
+                _decline("unresolved", probe_request)
+                break
+
+            _probe_rounds += 1
+            _probe_digest = (
+                f"{_probe_digest}\n\n{_digest_add}" if _probe_digest else _digest_add
             )
+            try:
+                tracer.event(
+                    source="probe", target="architect", kind="probe_result",
+                    model=self._model, content=_digest_add,
+                    params={
+                        "cluster":        cluster.name,
+                        "round":          _probe_rounds,
+                        "ops":            len(probe_request),
+                        # AUTO-P4a: per-batch (gates the loop) and per-run
+                        # (reported only) — see ArchProbe.reset.
+                        # AUTO-P4b: hits/misses are the honest measure. Before
+                        # this, analyze_logs counted probe_result events and
+                        # called them "resolved", which reported a 60/60 miss
+                        # rate across two real runs as "22 resolved".
+                        "hits":           _probe.last_hits,
+                        "misses":         _probe.last_misses,
+                        # AUTO-P5: "facts=3/1 module=1/0" — which op resolved
+                        # what. Aggregate hits cannot tell you whether a newly
+                        # added op is earning its round-trip.
+                        "by_op":          _probe.last_by_op_str(),
+                        "chars_used":     _probe.chars_used,
+                        "run_chars_used": _probe.run_chars_used,
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001 — AUTO-P4a, see above
+                logger.debug("probe_result trace failed: %s", exc)
+            logger.info(
+                "review_one_cluster [%s]: probe round %d/%d — %d of %d op(s) "
+                "found (%d chars total) — re-asking.",
+                cluster.name, _probe_rounds, self._probe_max_rounds,
+                _probe.last_hits, len(probe_request), _probe.chars_used,
+            )
+            candidates, probe_request = _attempt_plan()
+
+        # Forced final call — only when the model is still asking AND has not
+        # already produced a usable plan. A probe reply that also carried
+        # grounded tasks is a complete answer; spending another call on it
+        # would buy nothing.
+        if probe_request and candidates is not None and not candidates:
+            _probe_forced = True
+            candidates, probe_request = _attempt_plan()
+            if probe_request:
+                # Probe detection stays enabled on the forced call on purpose.
+                # A model that probes again after being told the budget is
+                # spent has ignored an instruction — that is not the decoding
+                # hiccup AUTO-H5 exists to retry, and six escalating re-asks
+                # will not change its mind. Recognising it keeps the flags
+                # cleared and ends the batch at 2 calls instead of 8.
+                logger.warning(
+                    "review_one_cluster [%s]: architect probed again after the "
+                    "forced final call (%s) — giving up on this batch with 0 "
+                    "candidate(s).",
+                    cluster.name, ", ".join(str(op) for op in probe_request),
+                )
+                _decline("post_forced", probe_request)
 
         return candidates
 
@@ -1251,9 +1862,9 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 continue
 
             # --- Validate required scalar fields ---
-            title       = (item.get("title") or "").strip()
-            instruction = (item.get("instruction") or "").strip()
-            acceptance  = (item.get("acceptance_check") or "").strip()
+            title       = _to_str_or_empty(item.get("title"))
+            instruction = _to_str_or_empty(item.get("instruction"))
+            acceptance  = _to_str_or_empty(item.get("acceptance_check"))
 
             # In creative mode, empty acceptance_check is allowed (handled below).
             if not title or not instruction or (not acceptance and self._task_mode != "creative"):
@@ -1330,11 +1941,11 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 continue
 
             cited = CitedLocation(
-                file       = (loc_raw.get("file") or "").strip(),
+                file       = _to_str_or_empty(loc_raw.get("file")),
                 symbol     = (loc_raw.get("symbol") or None),
                 line_start = _to_int_or_none(loc_raw.get("line_start")),
                 line_end   = _to_int_or_none(loc_raw.get("line_end")),
-                new_file   = bool(loc_raw.get("new_file", False)),
+                new_file   = _to_bool_or(loc_raw.get("new_file", False)),
             )
 
             if not cited.is_valid(self._task_mode):
@@ -1801,9 +2412,9 @@ class TaskRewriter(_llm_stream.LLMClientBase):
             )
             return original_task
 
-        new_title       = (data.get("title") or "").strip()
-        new_instruction = (data.get("instruction") or "").strip()
-        new_acceptance  = (data.get("acceptance_check") or "").strip()
+        new_title       = _to_str_or_empty(data.get("title"))
+        new_instruction = _to_str_or_empty(data.get("instruction"))
+        new_acceptance  = _to_str_or_empty(data.get("acceptance_check"))
 
         if not new_instruction:
             logger.warning(
@@ -1925,3 +2536,36 @@ def _to_int_or_none(val: Any) -> int | None:
         return int(val)
     except (TypeError, ValueError):
         return None
+
+
+def _to_str_or_empty(val: Any) -> str:
+    """Coerce *val* to a stripped str, or "" when it isn't string-like.
+
+    BUGFIX: callers previously did ``(val or "").strip()``, which assumes
+    *val* is already a string whenever it's truthy — a truthy non-string
+    LLM field (e.g. ``123``, ``["x"]``) crashed ``.strip()`` with
+    AttributeError. Treating a non-string value the same as an absent one
+    lets the existing "missing required field" validation just below each
+    call site reject the candidate with a proper warning instead of the
+    whole run crashing on one malformed field.
+    """
+    return val.strip() if isinstance(val, str) else ""
+
+
+def _to_bool_or(val: Any, default: bool = False) -> bool:
+    """Coerce *val* to bool, treating common string spellings sensibly.
+
+    BUGFIX (audit): ``bool(loc_raw.get("new_file", False))`` treated an
+    LLM-emitted JSON *string* like ``"new_file": "false"`` as True — any
+    non-empty string is truthy in Python — silently marking an
+    existing-file task as new-file and bypassing the symbol/line
+    grounding requirement. A string value is now matched against common
+    false/true spellings instead of just checked for truthiness.
+    """
+    if isinstance(val, bool):
+        return val
+    if val is None:
+        return default
+    if isinstance(val, str):
+        return val.strip().lower() not in ("false", "no", "0", "")
+    return bool(val)

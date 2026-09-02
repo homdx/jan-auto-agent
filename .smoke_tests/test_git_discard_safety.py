@@ -1,1 +1,0 @@
-../tests/test_git_discard_safety.py
