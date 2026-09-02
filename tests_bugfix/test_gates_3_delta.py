@@ -364,3 +364,40 @@ def test_delta_accepts_at_cap_after_repeated_no_op(repo):
         revisions=revisions, trace_stage=lambda *a, **k: None,
     )
     assert second is None  # accepted at cap, still unchanged on disk
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UnicodeDecodeError — file at HEAD with non-UTF-8 bytes
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_non_utf8_file_at_head_does_not_crash(validator, tmp_path):
+    """A file committed with non-UTF-8 bytes (e.g. latin-1 encoded) must
+    not crash DeltaValidator.check. _read_at_head uses subprocess.run with
+    text=True, which decodes stdout as UTF-8 — a UnicodeDecodeError from
+    non-UTF-8 content must be caught and treated as 'no baseline', not
+    propagate up."""
+    _git("init", cwd=tmp_path)
+    _git("config", "user.email", "test@example.com", cwd=tmp_path)
+    _git("config", "user.name", "Test", cwd=tmp_path)
+    # Write a file with non-UTF-8 bytes (latin-1: 0xe9 = 'é' in latin-1,
+    # but an invalid standalone byte in UTF-8).
+    (tmp_path / "data.txt").write_bytes(b"caf\xe9: non-utf-8 content\n")
+    _git("add", ".", cwd=tmp_path)
+    _git("commit", "-m", "init", cwd=tmp_path)
+
+    # check() must not raise — it should fail-open (approved)
+    verdict = validator.check("anything different", tmp_path, rel_path="data.txt")
+    assert verdict.approved is True
+
+
+def test_non_utf8_file_at_head_read_at_head_returns_none(tmp_path):
+    """_read_at_head must return None (not raise) for non-UTF-8 content at HEAD."""
+    _git("init", cwd=tmp_path)
+    _git("config", "user.email", "test@example.com", cwd=tmp_path)
+    _git("config", "user.name", "Test", cwd=tmp_path)
+    (tmp_path / "data.txt").write_bytes(b"binary: \xff\xfe\xfd\n")
+    _git("add", ".", cwd=tmp_path)
+    _git("commit", "-m", "init", cwd=tmp_path)
+
+    result = DeltaValidator._read_at_head(tmp_path, "data.txt")
+    assert result is None
