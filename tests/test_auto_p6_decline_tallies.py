@@ -135,13 +135,17 @@ class TestDeclineTallies:
     def test_round_cap_decline_records_no_lookup(
         self, cluster_and_base, tmp_path
     ) -> None:
-        """AC-P6-2: nothing was looked up here — the harness spent the
-        budget. Counting these as misses would blame the collect artifact
-        for a decision the harness made."""
+        """AC-P6-2: when the pending request at the round cap cannot be
+        resolved even unbounded (AUTO-P12), a probe_declined(round_cap) is
+        still emitted with by_op=0/0 — the harness made the budget decision,
+        not collect, so recording the ops as misses would unfairly blame the
+        collect artifact."""
         cluster, base_dir = cluster_and_base
+        # "fn" resolves (round 1 succeeds); "unknown_fn" does not, so the
+        # AUTO-P12 unbounded attempt at the cap also returns "" → decline.
         r = _reviewer(_cfg(probe_max_rounds="1"), _FakeBridge({"fn": "module: x"}))
         ev = _run(r, cluster, base_dir, tmp_path,
-                  ["ARCH_PROBE: facts fn", "ARCH_PROBE: facts fn",
+                  ["ARCH_PROBE: facts fn", "ARCH_PROBE: facts unknown_fn",
                    _good("Forced")], "cap.jsonl")
         d = _declines(ev)
         assert len(d) == 1 and d[0]["params"]["reason"] == "round_cap"
