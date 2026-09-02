@@ -960,6 +960,42 @@ def _validate_typed_config_values(config_path: str, base_dir: str) -> None:
         sys.exit(1)
 
 
+def _resume_from_checkpoint(saved: dict, orchestrator, base_dir: str) -> None:
+    """Dispatch a saved checkpoint to the appropriate orchestrator method.
+
+    Uses ``.get(key, default)`` for every key so a partial/corrupt
+    checkpoint (missing ``user_input``, ``base_dir``, ``question``, etc.)
+    degrades gracefully instead of raising ``KeyError`` mid-resume.
+    """
+    _loop = saved.get("loop", "unknown")
+    if _loop == "run_pipeline":
+        orchestrator.run_pipeline(
+            saved.get("user_input", ""), saved.get("base_dir", base_dir),
+            resume_state=saved)
+    elif _loop == "run_text_qa":
+        import os as _os
+        _src = ""
+        _fp = saved.get("file_path", "")
+        _fp_abs = _fp if _os.path.isabs(_fp) else _os.path.join(
+            saved.get("base_dir", base_dir), _fp)
+        try:
+            from tools.file_reader import read_file as _rf
+            _src = _rf(_fp_abs)
+        except Exception as _exc:
+            print(f"[{_ts()}] ⚠  Could not re-read '{_fp_abs}' for "
+                  f"resumed run_text_qa: {_exc}")
+        orchestrator.run_text_qa(
+            saved.get("question", ""), _fp, _src,
+            saved.get("base_dir", base_dir),
+            resume_state=saved)
+    elif _loop == "run_edit":
+        orchestrator.run_edit(
+            saved.get("user_input", ""), saved.get("base_dir", base_dir),
+            resume_state=saved)
+    else:
+        print(f"  Unknown loop '{_loop}' in checkpoint — discarded.")
+
+
 def main():
     args = _parse_args()
     base_dir = os.path.abspath(args.base or args.base_dir_positional or os.getcwd())
@@ -1165,35 +1201,7 @@ def main():
             _ans = "n"
         if _ans == "y":
             backoff.clear_state()
-            if _loop == "run_pipeline":
-                orchestrator.run_pipeline(
-                    _saved["user_input"], _saved["base_dir"], resume_state=_saved)
-            elif _loop == "run_text_qa":
-                import os as _os
-                _src = ""
-                _fp  = _saved.get("file_path", "")
-                _fp_abs = _fp if _os.path.isabs(_fp) else _os.path.join(
-                    _saved.get("base_dir", base_dir), _fp)
-                try:
-                    from tools.file_reader import read_file as _rf
-                    _src = _rf(_fp_abs)
-                except Exception as _exc:
-                    # Best-effort resume-time re-read: file may have moved
-                    # or been deleted since the checkpoint was written.
-                    # Fall back to an empty source rather than aborting the
-                    # resume, but don't swallow the error silently.
-                    print(f"[{_ts()}] ⚠  Could not re-read '{_fp_abs}' for "
-                          f"resumed run_text_qa: {_exc}")
-                orchestrator.run_text_qa(
-                    _saved["question"], _fp, _src,
-                    _saved.get("base_dir", base_dir),
-                    resume_state=_saved)
-            elif _loop == "run_edit":
-                orchestrator.run_edit(
-                    _saved["user_input"], _saved.get("base_dir", base_dir),
-                    resume_state=_saved)
-            else:
-                print(f"  Unknown loop '{_loop}' in checkpoint — discarded.")
+            _resume_from_checkpoint(_saved, orchestrator, base_dir)
         else:
             backoff.clear_state()
             print("Checkpoint discarded. Starting fresh.")
