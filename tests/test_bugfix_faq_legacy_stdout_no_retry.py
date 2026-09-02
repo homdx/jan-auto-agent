@@ -71,3 +71,46 @@ class TestLegacyStreamingStdoutFailureDoesNotRetry:
         assert reply == "hi"
         # Trailing newline still happens in the ordinary (no stdout error) case.
         assert capsys.readouterr().out.endswith("\n")
+
+
+class TestLegacyStreamingOnTokenBrokenPipe:
+    """on_token writes to stdout via sys.stdout.write — if the pipe is
+    closed (e.g. output piped to ``head``), BrokenPipeError must be
+    swallowed inside on_token, NOT propagate into retry_with_backoff
+    which would waste a duplicate LLM call and then discard the answer.
+    """
+
+    def test_on_token_broken_pipe_does_not_retry(self):
+        agent = _agent()
+        call_count = 0
+
+        def _fake_request_completion(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            on_token = kwargs.get("on_token")
+            if on_token is not None:
+                on_token("the answer")
+            return "the answer"
+
+        # Replace sys.stdout with a pipe that raises BrokenPipeError on write.
+        import io
+        class _BrokenStdout(io.StringIO):
+            def write(self, s):
+                raise BrokenPipeError("pipe closed")
+            def flush(self):
+                pass
+
+        _real_stdout = sys.stdout
+        sys.stdout = _BrokenStdout()
+        try:
+            with patch("tools.faq_agent.request_completion", side_effect=_fake_request_completion):
+                reply = agent._answer_legacy("question?", [("doc.md", "content")], stream=True)
+        finally:
+            sys.stdout = _real_stdout
+
+        # The LLM call must have run exactly once — the on_token
+        # BrokenPipeError must not have triggered a retry.
+        assert call_count == 1
+        # The already-obtained reply must still be returned, not discarded.
+        assert reply == "the answer"
+        assert agent.llm_call_count == 1

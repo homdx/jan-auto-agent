@@ -12,6 +12,20 @@ from tools.llm_stream import request_completion, strip_think, ollama_chat_url, s
 
 logger = logging.getLogger(__name__)
 
+
+def _safe_stdout_write(t: str) -> None:
+    """Write a streaming token to stdout, swallowing BrokenPipeError.
+
+    When stdout is piped to a command that closes early (e.g. ``head``),
+    ``sys.stdout.write`` raises BrokenPipeError — swallow it so the LLM
+    call result is not lost.
+    """
+    try:
+        sys.stdout.write(t)
+        sys.stdout.flush()
+    except (BrokenPipeError, OSError):
+        pass
+
 # Hardcoded prompt extracted to a named module-level constant — the canonical
 # fallback PromptStore can always return to. Runtime values are injected via
 # .format() in process(); do not use f-string here.
@@ -195,7 +209,7 @@ class ImprovementAgent:
                 content = request_completion(
                     url, headers, req_payload, self.timeout,
                     stream=True,
-                    on_token=lambda t: (sys.stdout.write(t), sys.stdout.flush()),
+                    on_token=lambda t: _safe_stdout_write(t),
                     api_format=self.api_format,
                     ssl_context=self.ssl_context,
                 )
