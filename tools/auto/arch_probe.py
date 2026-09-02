@@ -329,6 +329,7 @@ class ArchProbe:
         # needed, and seeding from those would peg the estimate to the cap
         # that was already too small.
         self._round_costs: list = []
+        self._batch_floor = self._max_total_chars
         self._warmup = 3
         self._headroom = 2.0
         self._seed_ceiling = 0
@@ -399,12 +400,25 @@ class ArchProbe:
     def raise_budget(self, factor: float) -> int:
         """AUTO-P8: widen the per-batch digest cap for an escalated re-ask.
 
-        Multiplies the CONFIGURED cap, not the current one, so the ladder's
-        multipliers compose predictably (2x then 4x, not 2x then 8x).
-        Returns the new cap.
+        Multiplies the cap this BATCH started at, not the current one, so the
+        ladder's multipliers compose predictably (1.5x then 2.5x, not 1.5x
+        then 3.75x).
+
+        AUTO-P10 — this used to multiply the *configured* cap. That was
+        correct while every batch started there, and became a bug the moment
+        AUTO-P9 made batches start at a learned cap instead: with a
+        configured 10 000, a seeded 16 624 and a 1.5x first rung, escalation
+        produced 15 000 — **less room than the batch already had**. The
+        measured run shows the consequence exactly: 18 step-1 escalations,
+        and all 18 went on to need step 2, because step 1 could not possibly
+        have helped.
+
+        The escalation must always widen. The floor below is not defensive
+        padding; it is the invariant.
         """
+        widened = int(self._batch_floor * float(factor))
         self._max_total_chars = max(
-            self._max_chars, int(self._base_total_chars * float(factor))
+            self._max_chars, self._max_total_chars, widened
         )
         return self._max_total_chars
 
@@ -430,6 +444,10 @@ class ArchProbe:
         # call — to rediscover a number the first few batches had already
         # established.
         self._max_total_chars = self.seeded_cap or self._base_total_chars
+        # AUTO-P10: what this batch started with. raise_budget multiplies THIS,
+        # so an escalation is always relative to where the batch actually
+        # began — configured floor while learning, seeded cap afterwards.
+        self._batch_floor = self._max_total_chars
         self._last_dropped = []
 
     @property
