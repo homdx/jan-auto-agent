@@ -1622,6 +1622,19 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                     _factor, _temp = _ladder[
                         min(_budget_escalations, len(_ladder) - 1)
                     ]
+                    # AUTO-P9-followup: capture the cap BEFORE raise_budget()
+                    # mutates it. raise_budget() and current_cap share the
+                    # same underlying state, so reading current_cap AFTER the
+                    # call — as the line below used to — silently prints the
+                    # NEW cap in the slot meant to show what was just
+                    # exceeded. That is the exact failure this log line's own
+                    # AUTO-P11 comment warns about, just reintroduced from the
+                    # other direction: a live run showed "(12775/17716)" for
+                    # a batch that actually started at 11811 and had only
+                    # just been raised TO 17716 — reading as "had room to
+                    # spare and still ran out" when the batch never had that
+                    # room in the first place.
+                    _old_cap = _probe.current_cap
                     _new_cap = _probe.raise_budget(_factor)
                     _budget_escalations += 1
                     logger.info(
@@ -1633,7 +1646,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                         "(%d/%d chars) — escalation %d/%d: cap raised to %d, "
                         "temperature %.1f.",
                         cluster.name, _probe.chars_used,
-                        _probe.current_cap, _budget_escalations,
+                        _old_cap, _budget_escalations,
                         self._probe_budget_escalations, _new_cap, _temp,
                     )
                     tracer.event(

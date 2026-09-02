@@ -316,11 +316,24 @@ class TestProbeDeclined:
         return [e for e in ev if e.get("kind") == "probe_declined"]
 
     def test_round_cap(self, cluster_and_base, tmp_path) -> None:
-        """AC-P4a-8: this is what all 4 'unresolved' in the real run were."""
+        """AC-P4a-8: this is what all 4 'unresolved' in the real run were.
+
+        AUTO-P12 follow-up: round 1 resolves `fn` normally (so it does not
+        end early on the OWN "unresolved" all-miss path), and the round
+        cap fires on a second, DIFFERENT symbol the bridge has no answer
+        for — genuinely unresolvable even unbounded. AUTO-P12 added a
+        fold-in-unbounded path for a round-cap hit whose pending request
+        CAN still be answered (see AC-P12-6/9 in
+        tests/test_auto_p12_round_cap_unbounded.py); this test is about
+        the other case, which AUTO-P12 itself documents as falling back
+        to this exact decline (AC-P12-8)."""
         cluster, base_dir = cluster_and_base
         r = _reviewer(_cfg(probe_max_rounds="1"), bridge=_FakeBridge(_FACTS))
-        ev = _run_traced(r, [cluster], base_dir, tmp_path,
-                         [_PROBE, _PROBE, _good("Forced")], "d_cap.jsonl")
+        ev = _run_traced(
+            r, [cluster], base_dir, tmp_path,
+            [_PROBE, "ARCH_PROBE: facts nonexistent", _good("Forced")],
+            "d_cap.jsonl",
+        )
         d = self._declines(ev)
         assert len(d) == 1 and d[0]["params"]["reason"] == "round_cap"
         assert int(d[0]["params"]["round"]) == 1

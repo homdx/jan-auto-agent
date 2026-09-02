@@ -337,6 +337,46 @@ class TestEscalationLadder:
         assert int(e["params"]["new_cap"]) == 1200  # 600 configured x 2.0
         assert e["params"]["cluster"] == "agents"
 
+    def test_escalation_log_shows_the_cap_that_was_exceeded(
+        self, cluster_and_base, caplog
+    ) -> None:
+        """AUTO-P9 follow-up: the "(chars/cap)" pairing on the escalation
+        log line must show the cap that was actually in force when the
+        round overflowed — not the cap it was just raised to.
+
+        `raise_budget()` and `current_cap` share the same underlying
+        state, so reading `current_cap` AFTER calling `raise_budget()`
+        always prints the just-raised cap in both places. A live run
+        showed "(12775/17716)" for a batch that started at 11811 and had
+        only just been raised TO 17716 — reading as "had room to spare
+        and still ran out" when the batch never had that room. This is
+        exactly the failure mode the comment right above this line warns
+        about (from the OTHER direction — AUTO-P11 fixed a stale-OLD-value
+        bug; this one is a stale-NEW-value bug)."""
+        import logging
+        cluster, base_dir = cluster_and_base
+        r = _reviewer(_cfg(probe_budget_escalations="1"))
+        with caplog.at_level(logging.INFO):
+            with patch(
+                "tools.llm_stream.request_completion",
+                side_effect=[_BIG, _BIG, _good("F")],
+            ):
+                r.review_clusters([cluster], base_dir, goal="g")
+
+        msg = next(
+            rec.getMessage() for rec in caplog.records
+            if "escalation 1/" in rec.getMessage()
+        )
+        # configured cap is 600 (see _cfg); the first ladder rung is 2.0x,
+        # so the escalation raises it to 1200 — and 600, the cap that was
+        # ACTUALLY exceeded, must be what's printed as the denominator.
+        assert "cap raised to 1200" in msg
+        assert "/600 chars)" in msg, (
+            f"the exceeded-cap slot must show 600 (the cap in force before "
+            f"this escalation), not 1200 (the cap it was just raised to): {msg!r}"
+        )
+        assert "/1200 chars)" not in msg
+
     def test_round_cap_does_not_escalate(self, cluster_and_base) -> None:
         """AC-P8-11: escalation buys room. A round cap is not a room problem,
         and spending calls on it would be spending them on nothing."""
