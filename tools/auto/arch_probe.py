@@ -330,6 +330,9 @@ class ArchProbe:
         # that was already too small.
         self._round_costs: list = []
         self._batch_floor = self._max_total_chars
+        # AUTO-P11: hard ceiling from num_ctx; 0 = unset.
+        self._window_budget = 0
+        self._window_warned = False
         self._warmup = 3
         self._headroom = 2.0
         self._seed_ceiling = 0
@@ -356,6 +359,39 @@ class ArchProbe:
         # 0 means "no explicit ceiling" — fall back to 4x the configured cap,
         # so a pathological run cannot learn its way to an unbounded prompt.
         self._seed_ceiling = int(ceiling) or (self._base_total_chars * 4)
+
+    def set_window_budget(self, max_chars: int) -> None:
+        """AUTO-P11: absolute ceiling in digest chars, derived from num_ctx.
+
+        Everything before this validated the CONFIGURED cap and nothing else.
+        `test_probe_budget_fits_the_window` checks that
+        `probe_max_total_chars` fits the window — but AUTO-P9 can reseed it to
+        4x that, and AUTO-P8/P10 then multiply the batch floor by up to 4.0.
+        Nothing checked the product. A measured run escalated to **56 737
+        chars**, roughly 16 000 tokens of digest, against a cap that had been
+        validated at 10 000.
+
+        On a 128k or 1M window that is merely wasteful. On a 32k profile it
+        would consume most of the room the file contents need, and on 8k it
+        would not fit at all — and the failure mode is a silently truncated
+        prompt, not an error.
+
+        0 disables the ceiling (no num_ctx configured — the server decides).
+        """
+        self._window_budget = max(0, int(max_chars))
+
+    def _clamp_to_window(self, value: int, what: str) -> int:
+        if self._window_budget and value > self._window_budget:
+            if not self._window_warned:
+                self._window_warned = True
+                logger.warning(
+                    "ArchProbe: %s of %d chars exceeds what this context "
+                    "window can hold (%d) — clamped. Lower "
+                    "probe_budget_headroom, or raise num_ctx.",
+                    what, value, self._window_budget,
+                )
+            return self._window_budget
+        return value
 
     @property
     def seeded_cap(self) -> "int | None":
@@ -391,7 +427,8 @@ class ArchProbe:
         median = (costs[mid] if len(costs) % 2
                   else (costs[mid - 1] + costs[mid]) / 2)
         want = int(median * self._headroom)
-        return max(self._base_total_chars, min(want, self._seed_ceiling))
+        capped = max(self._base_total_chars, min(want, self._seed_ceiling))
+        return self._clamp_to_window(capped, "learned digest cap")
 
     @property
     def has_seeded_cap(self) -> bool:
@@ -416,7 +453,9 @@ class ArchProbe:
         The escalation must always widen. The floor below is not defensive
         padding; it is the invariant.
         """
-        widened = int(self._batch_floor * float(factor))
+        widened = self._clamp_to_window(
+            int(self._batch_floor * float(factor)), "escalated digest cap"
+        )
         self._max_total_chars = max(
             self._max_chars, self._max_total_chars, widened
         )
@@ -501,6 +540,13 @@ class ArchProbe:
         """Digest characters produced across the whole run. Observability
         only — never gates anything, unlike :attr:`chars_used`."""
         return self._run_chars_used
+
+    @property
+    def current_cap(self) -> int:
+        """The digest cap actually in force for this batch, after seeding and
+        any escalation. AUTO-P11 — the logs used to report the configured
+        value here, which made a working escalation read as a broken one."""
+        return self._max_total_chars
 
     @property
     def budget_exhausted(self) -> bool:

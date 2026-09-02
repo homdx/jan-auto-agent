@@ -833,6 +833,17 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
             # it the op disables itself rather than reading anywhere.
             base_dir=base_dir,
         )
+        # AUTO-P11: an absolute ceiling the learned and escalated caps must
+        # respect. Estimated the same way test_probe_budget_fits_the_window
+        # estimates it, so the runtime guard and the config-time guard agree:
+        # window minus the file contents, the prompt template and the reply.
+        if self._num_ctx > 0:
+            _prompt_tok = (
+                self._max_files_per_review * self._max_file_chars + 4000
+            ) / 3.5
+            _free_tok = self._num_ctx - _prompt_tok - self._max_tokens
+            # 3.5 chars/token, then 80% so a digest never fills the last of it.
+            self._probe.set_window_budget(max(0, int(_free_tok * 3.5 * 0.8)))
         self._probe.configure_learning(
             warmup=self._probe_budget_warmup,
             headroom=self._probe_budget_headroom,
@@ -1606,11 +1617,15 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                     _new_cap = _probe.raise_budget(_factor)
                     _budget_escalations += 1
                     logger.info(
+                        # AUTO-P11: the denominator is the cap ACTUALLY in
+                        # force, not the configured one. It used to print
+                        # "17237/10000" on a batch whose cap was 15 000, which
+                        # made a working escalation look like a broken one.
                         "review_one_cluster [%s]: probe digest budget spent "
                         "(%d/%d chars) — escalation %d/%d: cap raised to %d, "
                         "temperature %.1f.",
                         cluster.name, _probe.chars_used,
-                        self._probe_max_total_chars, _budget_escalations,
+                        _probe.current_cap, _budget_escalations,
                         self._probe_budget_escalations, _new_cap, _temp,
                     )
                     tracer.event(
@@ -1641,7 +1656,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                     "(%d/%d chars) after %d escalation(s) — forcing a final "
                     "plan call.",
                     cluster.name, _probe.chars_used,
-                    self._probe_max_total_chars, _budget_escalations,
+                    _probe.current_cap, _budget_escalations,
                 )
                 _decline("digest_budget", probe_request)
                 break
