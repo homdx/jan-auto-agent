@@ -483,6 +483,32 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
             len(_arch_probe._BUDGET_ESCALATION_LADDER),
             config.getint(arch, "probe_budget_escalations", fallback=2),
         ))
+        # AUTO-P13: the AUTO-P8/AUTO-P9 ladders (2x/2x/4x, or 1.5x/2.5x/4x
+        # once a cap is learned) are fixed module-level constants — the same
+        # rungs fire whether the active profile's real window is 4K or 1M
+        # tokens. AUTO-H5-ESCALATE-1's own comment already flags this class
+        # of bug for max_tokens escalation ("a stale, too-small num_ctx
+        # silently caps escalation far below what the CURRENT model can
+        # actually take, even though nothing errors or warns about it") —
+        # this is the same problem for the probe's digest-cap ladder. A
+        # profile whose active [api_{active}] num_ctx is huge relative to
+        # probe_max_total_chars (e.g. a 1M-token remote model behind a
+        # "128k" profile) still climbs one small rung at a time, spending
+        # one architect round-trip per rung to reach room the window had
+        # from the start. Default 1.0 leaves every existing profile's ladder
+        # byte-identical; a profile can opt into faster growth by setting
+        # this above 1.0. _clamp_to_window (AUTO-P11) still bounds the
+        # result, so a large scale cannot exceed what the window can hold.
+        try:
+            self._probe_budget_ladder_scale = max(
+                0.1, config.getfloat(arch, "probe_budget_ladder_scale", fallback=1.0)
+            )
+        except ValueError as exc:
+            logger.warning(
+                "config [%s] probe_budget_ladder_scale is malformed (%s) — using 1.0",
+                arch, exc,
+            )
+            self._probe_budget_ladder_scale = 1.0
         # AUTO-F1: bound on the run-level miss memo — see ArchProbe's own
         # docstring for why reset() must not clear it.
         self._probe_memo_max_entries = max(
@@ -1622,6 +1648,13 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                     _factor, _temp = _ladder[
                         min(_budget_escalations, len(_ladder) - 1)
                     ]
+                    # AUTO-P13: widen the rung itself for a profile that
+                    # opted into faster growth (see the attribute's own
+                    # comment in __init__). 1.0 is a no-op multiply, so a
+                    # profile that never sets probe_budget_ladder_scale gets
+                    # the exact 2x/2x/4x (or 1.5x/2.5x/4x) rungs AUTO-P8/
+                    # AUTO-P9 shipped — this only stretches them when asked.
+                    _factor *= self._probe_budget_ladder_scale
                     # AUTO-P9-followup: capture the cap BEFORE raise_budget()
                     # mutates it. raise_budget() and current_cap share the
                     # same underlying state, so reading current_cap AFTER the

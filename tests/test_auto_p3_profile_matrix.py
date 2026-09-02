@@ -181,7 +181,15 @@ def test_probe_budgets_are_coherent(profile: str) -> None:
     total = cfg.getint("architect", "probe_max_total_chars")
 
     assert rounds >= 1, "0 rounds disables probing without saying so"
-    assert rounds <= 5, "no measured run ever needed more than 3 rounds"
+    # AUTO-P13 revision: this used to read "<= 5, no measured run ever
+    # needed more than 3 rounds". A live run against agents_128k.ini's
+    # actual (remote, 1M-token) endpoint needed all 5 of its then-configured
+    # rounds and still hit the cap mid-batch with escalation budget unused
+    # — the opposite of what that comment claimed. 10 is a sanity ceiling
+    # against a runaway typo (e.g. an extra zero), not a measured maximum;
+    # see agents_128k.ini's own probe_max_rounds comment for the specific
+    # figure this repo has actually observed needing more than 3.
+    assert rounds <= 10, "probe_max_rounds looks like a runaway value (>10)"
     assert per_op > 0
     assert total >= per_op, (
         f"{profile}: probe_max_total_chars ({total}) < probe_max_chars "
