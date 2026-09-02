@@ -585,7 +585,7 @@ class ArchProbe:
     def budget_exhausted(self) -> bool:
         return self._chars_used >= self._max_total_chars
 
-    def execute(self, ops: Iterable[ProbeOp]) -> str:
+    def execute(self, ops: Iterable[ProbeOp], *, unbounded: bool = False) -> str:
         """Run *ops* and return a prompt-ready digest, or ``""``.
 
         ``""`` means "nothing usable came back" and the caller must treat it
@@ -609,6 +609,18 @@ class ArchProbe:
 
         Fail-open throughout: an op that raises is logged and skipped, and
         nothing here aborts a batch.
+
+        unbounded:
+            AUTO-P12 — skip both the per-op (``max_chars``) and total-digest
+            (``max_total_chars``) caps. Meant for exactly one call per batch:
+            the single request still pending when ``probe_max_rounds`` is
+            reached, which the round-cap branch would otherwise discard
+            outright rather than throttle like every other round. Chars are
+            still tallied in ``chars_used``/``run_chars_used`` for
+            observability, but never gate which ops run or how much of a
+            result is kept, and a call made this way is never recorded into
+            ``_round_costs`` — an uncapped round is not an honest sample of
+            what a normal budget needs.
         """
         if not self.usable:
             return ""
@@ -621,7 +633,7 @@ class ArchProbe:
         self._last_by_op = {}
         self._last_memo_hits = 0
         for op in ops or ():
-            if self.budget_exhausted:
+            if not unbounded and self.budget_exhausted:
                 # AUTO-P8: remember which ops went unanswered so execute() can
                 # SAY SO in the digest. Logging alone left the model believing
                 # its whole request had been served.
@@ -634,7 +646,7 @@ class ArchProbe:
                 break
             _done.append(op)
             try:
-                block, is_hit = self._resolve_op(op)
+                block, is_hit = self._resolve_op(op, unbounded=unbounded)
             except Exception as exc:  # noqa: BLE001 — never abort a batch
                 logger.warning("ArchProbe: op %s raised: %s", op, exc)
                 continue
@@ -667,7 +679,7 @@ class ArchProbe:
             )
             return ""
         out = "## Probe results\n" + "\n\n".join(blocks)
-        if not self._last_dropped:
+        if not unbounded and not self._last_dropped:
             # AUTO-P9: a round that served everything it was asked. This is
             # the only honest sample of "how much room a round needs".
             self._round_costs.append(self._chars_used)
@@ -686,7 +698,7 @@ class ArchProbe:
 
     # ── AUTO-F1: run-level miss memo ─────────────────────────────────────
 
-    def _resolve_op(self, op: ProbeOp) -> tuple:
+    def _resolve_op(self, op: ProbeOp, *, unbounded: bool = False) -> tuple:
         """Resolve one op to a ready-to-append digest block.
 
         Returns ``(block, is_hit)``. For a ``facts`` op, checks the
@@ -719,7 +731,7 @@ class ArchProbe:
             self._last_memo_hits += 1
             self._run_memo_hits += 1
             _tally[1] += 1
-            return self._format_block(op, body), False
+            return self._format_block(op, body, unbounded=unbounded), False
 
         body = self._run_one(op)
         if not body:
@@ -733,7 +745,7 @@ class ArchProbe:
             self._last_hits += 1
             _tally[0] += 1
             is_hit = True
-        return self._format_block(op, body), is_hit
+        return self._format_block(op, body, unbounded=unbounded), is_hit
 
     def _remember_miss(self, memo_key: tuple) -> None:
         """AC-F1-8: record a first-time miss, evicting the oldest entry first
@@ -757,8 +769,8 @@ class ArchProbe:
             "concept, name a real function.)"
         )
 
-    def _format_block(self, op: ProbeOp, body: str) -> str:
-        capped = self._cap(body)
+    def _format_block(self, op: ProbeOp, body: str, *, unbounded: bool = False) -> str:
+        capped = body if unbounded else self._cap(body)
         return f"### {op}\n{self._out_of_batch_note(capped)}{capped}"
 
     # ── op implementations ───────────────────────────────────────────────

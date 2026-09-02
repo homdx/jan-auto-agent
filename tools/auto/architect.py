@@ -1669,12 +1669,58 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 _decline("digest_budget", probe_request)
                 break
             if _probe_rounds >= self._probe_max_rounds:
-                logger.info(
-                    "review_one_cluster [%s]: probe round cap reached (%d) — "
-                    "forcing a final plan call.",
-                    cluster.name, self._probe_max_rounds,
-                )
-                _decline("round_cap", probe_request)
+                # AUTO-P12: the round cap ends the back-and-forth, but the
+                # request that triggered it is still a legitimate,
+                # never-answered ask — the model was cut off mid-question,
+                # not told its question was wrong. Every other branch above
+                # discards the pending request outright once its budget is
+                # spent; this is the one case where that is avoidable at no
+                # extra cost, because the forced final call below is already
+                # about to happen regardless. So: answer this last request
+                # once, with the digest cap lifted (there is no further round
+                # left for an oversized answer to blow), and fold it into
+                # that same forced call rather than spending another
+                # architect round-trip asking again.
+                _last_digest = _probe.execute(probe_request, unbounded=True)
+                if _last_digest:
+                    logger.info(
+                        "review_one_cluster [%s]: probe round cap reached "
+                        "(%d) — answering the pending request without a "
+                        "digest cap before the forced final call.",
+                        cluster.name, self._probe_max_rounds,
+                    )
+                    _probe_digest = (
+                        f"{_probe_digest}\n\n{_last_digest}"
+                        if _probe_digest else _last_digest
+                    )
+                    try:
+                        tracer.event(
+                            source="probe", target="architect",
+                            kind="probe_result", model=self._model,
+                            content=_last_digest,
+                            params={
+                                "cluster":        cluster.name,
+                                "round":          _probe_rounds + 1,
+                                "ops":            len(probe_request),
+                                "hits":           _probe.last_hits,
+                                "misses":         _probe.last_misses,
+                                "by_op":          _probe.last_by_op_str(),
+                                "chars_used":     _probe.chars_used,
+                                "run_chars_used": _probe.run_chars_used,
+                                "unbounded":      "True",
+                            },
+                        )
+                    except Exception as exc:  # noqa: BLE001 — AUTO-P4a
+                        logger.debug(
+                            "probe_result (unbounded) trace failed: %s", exc
+                        )
+                else:
+                    logger.info(
+                        "review_one_cluster [%s]: probe round cap reached "
+                        "(%d) — forcing a final plan call.",
+                        cluster.name, self._probe_max_rounds,
+                    )
+                    _decline("round_cap", probe_request)
                 break
 
             _fingerprint = frozenset(str(op) for op in probe_request)
