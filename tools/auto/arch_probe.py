@@ -136,6 +136,14 @@ DEFAULT_ALLOWED_OPS: tuple[str, ...] = ("facts",)
 # (tools/backoff.py) or a concept. Naming the restriction does not help when
 # the thing you need cannot be expressed at all, so `module <path>` was added
 # to make that question askable rather than merely forbidden.
+# AUTO-F1-followup: a measured run (trace_8c83140453d5) found EVERY single
+# "repeat" decline was a re-ask of something that had already come back
+# WITH an answer — specifically, an out-of-batch `module` hit the model
+# could not cite, re-asked verbatim next round. The line below used to warn
+# only about repeating an EMPTY result ("already came back empty"), which
+# is silent on the far more common real case: repeating something that DID
+# resolve. See _out_of_batch_note()'s own updated wording for the other
+# half of this fix.
 PROBE_INSTRUCTIONS = (
     "\nIF — and only if — you cannot ground a task because you are missing a "
     "fact about a symbol that is NOT shown above, you may reply with a single "
@@ -166,9 +174,11 @@ PROBE_INSTRUCTIONS = (
     "\n"
     "You will be re-asked with whatever resolves. Ask only for what you "
     "genuinely need and cannot see above; a probe costs a full round and you "
-    "get a limited number of them. Re-asking for something that already came "
-    "back empty will end your probing, not retry it. If you can plan from "
-    "what is already above, return the JSON array and do not probe."
+    "get a limited number of them. Re-asking for anything already shown "
+    "above — empty OR answered — will end your probing, not repeat it; an "
+    "answer outside your batch cannot become citable no matter how many "
+    "times you ask for it. If you can plan from what is already above, "
+    "return the JSON array and do not probe."
 )
 
 # Appended instead of PROBE_INSTRUCTIONS on the final call, once the probe
@@ -923,7 +933,9 @@ class ArchProbe:
             return ""
         return (
             "[NOT IN YOUR BATCH — read-only context. Do NOT put this path in "
-            "target_files or cited_location; Gate-1 will reject it.]\n"
+            "target_files or cited_location; Gate-1 will reject it. You "
+            "already have everything this returns above — asking again will "
+            "not make it citable, it will end your probing instead.]\n"
         )
 
     def _cap(self, text: str) -> str:

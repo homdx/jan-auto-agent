@@ -231,6 +231,17 @@ class TestOutOfBatchMarker:
         out = p.execute([ProbeOp("module", "tools/other.py")])
         assert "NOT IN YOUR BATCH" in out
 
+    def test_marker_warns_against_re_asking(self, repo) -> None:
+        """AUTO-F1-followup: a measured run (trace_8c83140453d5) found EVERY
+        'repeat' decline in it was a re-ask of an out-of-batch HIT — the
+        model already had the answer and asked again anyway. The marker used
+        to warn only about citation, never about asking twice; a re-ask
+        costs a full architect round-trip before the repeat-detector
+        declines it, for zero new information."""
+        p = _probe(repo, batch=["tools/small.py"])
+        out = p.execute([ProbeOp("read", "tools/backoff.py:1-2")])
+        assert "will end your probing" in out
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Integration with the existing machinery

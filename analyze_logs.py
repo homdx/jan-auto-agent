@@ -442,6 +442,13 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
                 # installed", which otherwise render identically.
                 "probe_declined": [],
                 "probe_config":   None,
+                # AUTO-F1-followup / AUTO-P13: escalation events — the ladder
+                # widening a batch's digest cap mid-round (AUTO-P8), and
+                # whether the seeded/learned cap (AUTO-P9) was already in
+                # play when it fired. Without this the ladder is invisible
+                # to a human reading the report; it only ever showed up in
+                # the raw JSONL.
+                "probe_escalated": [],
                 "total_events":   0,
                 "plan_total":     0,         # filled by plan_ready event — total tasks in plan
                 "files_preparing": [],       # [{ts, task, file_count, files_copied, files_missing, files}]
@@ -449,6 +456,11 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
                 "_current_task":  None,      # task_id of the task currently in the loop
                 "_pending_old_prompt": None, # most recent prompt_optimizer llm_request "CURRENT PROMPT" text
                 "_pending_new_prompt": None, # most recent prompt_optimizer llm_response candidate text
+                # AUTO-F1-followup: last probe_result's out-of-batch state per
+                # cluster, so a "repeat" decline can be classified as "re-asked
+                # something it already had" vs. a genuine re-ask of nothing.
+                # See its use at kind == "probe_declined" below.
+                "_probe_last_out_of_batch": {},
             }
         return runs[rid]
 
@@ -721,14 +733,29 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
             })
 
         elif kind == "probe_declined":
+            _cluster = params.get("cluster", "?")
+            _reason = str(params.get("reason", "unknown"))
             run["probe_declined"].append({
                 "ts":      ts,
-                "cluster": params.get("cluster", "?"),
-                "reason":  str(params.get("reason", "unknown")),
+                "cluster": _cluster,
+                "reason":  _reason,
                 "ops":     int(params.get("ops", 0) or 0),
                 "round":   int(params.get("round", 0) or 0),
                 # AUTO-P6: empty on pre-P6 traces.
                 "by_op":   str(params.get("by_op", "") or ""),
+                # AUTO-F1-followup: for a "repeat" decline, was the request
+                # being repeated one that already resolved out-of-batch last
+                # round in this same cluster? A measured run
+                # (trace_8c83140453d5) found this was true of EVERY "repeat"
+                # decline it produced — the model re-asking for something it
+                # already had and could not cite, rather than a genuine
+                # repeated miss. False (not just absent) on any other
+                # decline reason, and on a "repeat" this cluster has no
+                # prior out-of-batch result recorded for.
+                "out_of_batch_repeat": (
+                    _reason == "repeat"
+                    and run["_probe_last_out_of_batch"].get(_cluster, False)
+                ),
             })
 
         elif kind == "probe_config":
@@ -743,9 +770,19 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
             }
 
         elif kind == "probe_result":
+            _cluster = params.get("cluster", "?")
+            # AUTO-F1-followup: remembered per cluster so a LATER "repeat"
+            # decline in the same cluster can tell whether it is re-asking
+            # something that already resolved out-of-batch. Overwritten on
+            # every result, not just non-empty ones — an in-batch or
+            # ordinary result correctly clears a stale out-of-batch flag
+            # from an earlier round of the same batch.
+            run["_probe_last_out_of_batch"][_cluster] = bool(
+                content and "NOT IN YOUR BATCH" in str(content)
+            )
             run["probe_results"].append({
                 "ts":         ts,
-                "cluster":    params.get("cluster", "?"),
+                "cluster":    _cluster,
                 "round":      int(params.get("round", 0) or 0),
                 "ops":        int(params.get("ops", 0) or 0),
                 # AUTO-P4b: absent on pre-P4b traces, hence the -1 sentinel —
@@ -760,6 +797,23 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
                 # AUTO-P5: "facts=3/1 module=1/0". Empty on pre-P5 traces.
                 "by_op":      str(params.get("by_op", "") or ""),
                 "chars_used": int(params.get("chars_used", 0) or 0),
+                # AUTO-F1: requests answered from the run-level miss memo —
+                # zero bridge lookups, but still tallied as misses above
+                # (never as hits). Absent on pre-AUTO-F1 traces, hence -1.
+                "memo_hits":  _int_or(params.get("memo_hits"), -1),
+            })
+
+        # AUTO-F1-followup / AUTO-P13: the ladder widening a batch's digest
+        # cap mid-round. `seeded` distinguishes a learned-cap batch that
+        # STILL needed more room (a genuine outlier) from an unlearned batch
+        # climbing from the configured floor (the common, expected case).
+        elif kind == "probe_escalated":
+            run["probe_escalated"].append({
+                "ts":      ts,
+                "cluster": params.get("cluster", "?"),
+                "step":    _int_or(params.get("step"), 0),
+                "new_cap": _int_or(params.get("new_cap"), 0),
+                "seeded":  str(params.get("seeded", "False")) == "True",
             })
 
         # ── auto-tuner prompt rewrite outcomes (score, promoted or denied) ──
@@ -1089,6 +1143,43 @@ def render_run_summary(run: dict) -> None:
                 )
                 print(f"  {' ' * len('Architect probes')}  by op: {_parts}")
 
+            # AUTO-F1: memo hits — `facts` requests served from the
+            # run-level miss memo instead of a fresh bridge lookup. Zero
+            # bridge cost, but still tallied as misses above (never
+            # inflates the hit rate above) — this line is where the
+            # SAVING becomes visible, since the hit-rate line by itself
+            # cannot show it (AC-F1-5's own point: a memo hit must not
+            # read as a success).
+            _memo_hits = sum(
+                r["memo_hits"] for r in _probe_res if r["memo_hits"] >= 0
+            )
+            if _memo_hits > 0:
+                _total_misses = sum(
+                    r["misses"] for r in _probe_res if r["misses"] >= 0
+                )
+                _memo_pct = (
+                    100.0 * _memo_hits / _total_misses if _total_misses else 0.0
+                )
+                print(
+                    f"  {' ' * len('Architect probes')}  memo: "
+                    f"{cyan(str(_memo_hits))} hit(s) served free (0 bridge "
+                    f"call(s)) — {_memo_pct:.0f}% of {_total_misses} miss(es)"
+                )
+
+            # AUTO-F1-followup / AUTO-P13: the escalation ladder widening a
+            # batch's digest cap mid-round. Previously invisible here —
+            # only in the raw JSONL — so "did the budget/median tuning do
+            # anything" had no answer short of hand-parsing the trace.
+            _esc = run.get("probe_escalated", [])
+            if _esc:
+                _seeded_esc = sum(1 for e in _esc if e["seeded"])
+                _esc_batches = len({e["cluster"] for e in _esc})
+                print(
+                    f"  {' ' * len('Architect probes')}  budget escalations: "
+                    f"{cyan(str(len(_esc)))} across {_esc_batches} batch(es) "
+                    f"({_seeded_esc} on an already-learned cap — see AUTO-P9)"
+                )
+
             if _declined:
                 _by_reason = {}
                 for d in _declined:
@@ -1101,10 +1192,27 @@ def render_run_summary(run: dict) -> None:
                     "post_forced":   "probed after forced call",
                     "repeat":        "re-asked an answered probe",
                 }
-                _parts = ", ".join(
-                    f"{n} {_label.get(r, r)}"
-                    for r, n in sorted(_by_reason.items(), key=lambda kv: -kv[1])
-                )
+                _parts = []
+                for r, n in sorted(_by_reason.items(), key=lambda kv: -kv[1]):
+                    _lbl = _label.get(r, r)
+                    if r == "repeat":
+                        # AUTO-F1-followup: a measured run
+                        # (trace_8c83140453d5) found every single "repeat"
+                        # decline was the model re-asking for something it
+                        # ALREADY HAD, out of batch — a different failure
+                        # from re-asking a genuine miss, with a different
+                        # fix (see _out_of_batch_note's wording). Surfacing
+                        # the split here is what makes that fixable without
+                        # re-deriving it by hand from the raw trace.
+                        _oob = sum(
+                            1 for d in _declined
+                            if d["reason"] == "repeat"
+                            and d.get("out_of_batch_repeat")
+                        )
+                        if _oob:
+                            _lbl = f"{_lbl} ({_oob} already had it, out of batch)"
+                    _parts.append(f"{n} {_lbl}")
+                _parts = ", ".join(_parts)
                 print(f"  {' ' * len('Architect probes')}  {yellow(f'{len(_declined)} declined')}: {_parts}")
             _probing = {r["cluster"] for r in _probe_reqs}
             _batches = len({
