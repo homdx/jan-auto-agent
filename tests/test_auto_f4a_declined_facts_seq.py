@@ -1,5 +1,5 @@
 """tests/test_auto_f4a_declined_facts_seq.py — AUTO-F4a: the informed/blind
-split misses declined rounds.
+split misses declined rounds (and a self-inflicted regression, fixed here).
 
 AUTO-F4 taught `ArchProbe` to tally `informed_facts` / `blind_facts` and put
 them on every `probe_result` event. It missed the exact hole AUTO-P6
@@ -10,21 +10,33 @@ tally: an all-miss round returns an empty digest and emits **no**
 blind, hit vs. miss) but that update never reached a `probe_result` event,
 so `analyze_logs.py`'s "facts sequencing" line silently under-counted.
 
-Found reviewing AUTO-F4 against a live run (`trace_e8d5b9fcd4b2`): a
-declined "support (batch 11/50)" round asked `facts RetryLoop` and
-`facts make_retry_loop` after two `module` misses taught it nothing — both
-blind, both misses, both invisible to the reported split. The run's `by_op`
-correctly showed `facts 15/22`; the "facts sequencing" line's own
-denominator only summed to 20.
+The first version of this fix copied `_decline_by_op`'s shape too closely:
+"0/0 for every reason except `unresolved`". That is correct for `by_op`,
+which is a PER-ROUND delta — a decline round genuinely contributes nothing
+new to a sum. `informed_facts`/`blind_facts` are a cumulative-for-the-batch
+snapshot instead (analyze_logs keeps only the LAST value per cluster, not a
+sum), so hardcoding "0/0" for a `repeat` or other non-`unresolved` decline
+didn't just fail to add anything — it overwrote and erased whatever real
+data earlier rounds in the SAME batch had already established, whenever
+that decline happened to be the last event recorded for its cluster.
+
+A live run (`trace_47f94038c230`) hit this exactly: two batches' facts data
+— one of them 1 informed hit plus 3 blind misses — vanished behind a
+trailing `repeat` decline, undercounting the run's `facts` denominator by 5
+and its hit count by 2. Fixed by always reading the live cumulative
+counters regardless of decline reason, falling back to "0/0" only when
+`_probe` itself is `None` (`no_executor`).
 
   AC-F4a-1  An `unresolved` decline with a blind `facts` miss carries a real
             `blind_facts` count on the `probe_declined` event.
   AC-F4a-2  An `unresolved` decline with an informed-but-still-missed
             `facts` ask carries a real `informed_facts` count (0 hits, the
             ask still counts).
-  AC-F4a-3  Every other decline reason (`round_cap`, `no_executor`, ...)
-            records "0/0" for both — nothing was looked up, mirroring
-            `_decline_by_op`'s existing "0/0" for `by_op`.
+  AC-F4a-3  Every decline reason with a live `_probe` reports its TRUE
+            cumulative split, whatever the reason — including `round_cap`
+            and `repeat`, which must not erase real prior data. Only
+            `no_executor` (`_probe is None`) genuinely has nothing to
+            report.
   AC-F4a-4  `analyze_logs` includes a declined round's contribution in the
             rendered "facts sequencing" split.
   AC-F4a-5  A pre-AUTO-F4a trace (no informed_facts/blind_facts on
@@ -175,13 +187,17 @@ class TestDeclineFactsSeq:
         )
         assert d[0]["params"]["blind_facts"] == "0/0"
 
-    def test_round_cap_and_no_executor_record_zero_for_facts_seq(
+    def test_round_cap_decline_carries_the_true_cumulative_split(
         self, cluster_and_base, tmp_path
     ) -> None:
-        """AC-F4a-3: mirrors AC-P6-2/3 exactly — nothing was looked up for
-        these reasons, so both fields are '0/0', same as by_op."""
+        """AC-F4a-3, corrected: `round_cap` is NOT `by_op`'s "0/0" case in
+        disguise. Round 1's `facts fn` genuinely resolves (a blind hit);
+        round 2's `facts unknown_fn` hits the round cap and declines. The
+        cumulative counters must reflect BOTH asks — 1 hit of 2 — not "0/0".
+        An earlier, broken version of this fix hardcoded "0/0" for every
+        reason but `unresolved`, which happened to be right for `by_op`
+        (a per-round delta) and wrong here (a running total)."""
         cluster, base_dir = cluster_and_base
-
         r = _reviewer(_cfg(probe_max_rounds="1"),
                       _FakeBridge({"fn": "module: x"}))
         ev = _run(r, cluster, base_dir, tmp_path,
@@ -190,8 +206,20 @@ class TestDeclineFactsSeq:
         d = _declines(ev)
         assert d[0]["params"]["reason"] == "round_cap"
         assert d[0]["params"]["informed_facts"] == "0/0"
-        assert d[0]["params"]["blind_facts"] == "0/0"
+        assert d[0]["params"]["blind_facts"] == "1/2", (
+            "'fn' resolved for real in round 1 — that must survive into "
+            "the round_cap decline's reported total, not be zeroed"
+        )
 
+    def test_no_executor_decline_records_zero_because_probe_never_existed(
+        self, cluster_and_base, tmp_path
+    ) -> None:
+        """AC-F4a-3: `no_executor` is the one genuine "0/0" case — `_probe`
+        itself is `None`, so there is no cumulative state to read at all.
+        This is different in kind from `round_cap`/`repeat`: those decline
+        with a live `_probe` that already has real counters; this declines
+        because no `_probe` was ever built."""
+        cluster, base_dir = cluster_and_base
         r2 = _reviewer(_cfg(), None)
         ev2 = _run(r2, cluster, base_dir, tmp_path,
                    ["ARCH_PROBE: facts fn, module tools/x.py", _good("F")],
@@ -200,6 +228,36 @@ class TestDeclineFactsSeq:
         assert d2[0]["params"]["reason"] == "no_executor"
         assert d2[0]["params"]["informed_facts"] == "0/0"
         assert d2[0]["params"]["blind_facts"] == "0/0"
+
+    def test_repeat_decline_does_not_erase_earlier_real_facts_data(
+        self, cluster_and_base, tmp_path
+    ) -> None:
+        """AC-F4a-3, the regression this fix exists for: a live run
+        (`trace_47f94038c230`) showed a `repeat` decline as the LAST event
+        for a batch that had already resolved real `facts` data in an
+        earlier round — the broken version's hardcoded "0/0" overwrote and
+        permanently erased that batch's entire contribution (1 informed hit
+        plus 3 blind misses, in the worst of the two affected batches).
+
+        Round 1 resolves `facts helper` for real (a blind hit). Round 2
+        asks the exact same thing again — a `repeat` decline, since the
+        harness already answered it. The decline's own informed/blind must
+        still show round 1's real hit, not zero it out."""
+        cluster, base_dir = cluster_and_base
+        r = _reviewer(_cfg(probe_max_rounds="2"),
+                      _FakeBridge({"helper": "module: tools/x.py\nsignature: helper()"}))
+        ev = _run(r, cluster, base_dir, tmp_path,
+                  ["ARCH_PROBE: facts helper",
+                   "ARCH_PROBE: facts helper",  # exact repeat -> declines
+                   _good("Forced")],
+                  "repeat.jsonl")
+        d = _declines(ev)
+        assert len(d) == 1 and d[0]["params"]["reason"] == "repeat"
+        assert d[0]["params"]["blind_facts"] == "1/1", (
+            "round 1's real hit must survive the repeat decline, not be "
+            "wiped to 0/0 the way the broken version did"
+        )
+        assert d[0]["params"]["informed_facts"] == "0/0"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

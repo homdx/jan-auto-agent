@@ -1567,28 +1567,49 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
             return " ".join(f"{k}=0/0" for k in sorted(counts))
 
         def _decline_facts_seq(reason: str, ops: list) -> tuple:
-            """AUTO-F4a: informed_facts / blind_facts strings for a declined
-            request — same reasoning as :func:`_decline_by_op`, applied to
-            the AUTO-F4 split instead of the general per-op tally.
+            """AUTO-F4a, corrected: informed_facts / blind_facts for a
+            declined request.
 
-            An `unresolved` decline ran the executor, and ArchProbe already
-            tallied every `facts` ask in the round — including into
-            `_probe.informed_facts` / `_probe.blind_facts` — before
-            returning an empty digest. Those counters are cumulative for the
-            whole batch (see ArchProbe.informed_facts), so they are read the
-            same way a probe_result event reads them, not recomputed here.
+            This is deliberately NOT a copy of :func:`_decline_by_op`'s
+            "0/0 unless unresolved" rule, even though it looks like the same
+            shape of problem. `by_op` is a PER-ROUND delta — analyze_logs
+            sums every round's contribution, so a decline round that looked
+            nothing up correctly contributes "0/0" to that sum without
+            erasing anything: earlier rounds already emitted their own
+            events.
 
-            Every other reason (round_cap, digest_budget, no_executor,
-            repeat, post_forced) declined before any lookup ran at all, so
-            there is nothing to attribute as informed or blind — "0/0" for
-            both, exactly mirroring `_decline_by_op`'s "0/0" for by_op.
+            `informed_facts` / `blind_facts` are the opposite: a
+            cumulative-for-the-whole-batch snapshot (see
+            ArchProbe.informed_facts), and analyze_logs deliberately keeps
+            only the LAST recorded value per cluster, not a sum — summing
+            would double-count a batch's own running total (see
+            analyze_logs.py's `_probe_last_facts_seq` comment). An earlier,
+            broken version of this function returned a hardcoded "0/0" for
+            any reason other than `unresolved` — which is correct for
+            `by_op`'s per-round semantics but wrong here: whenever a
+            `repeat` (or other non-`unresolved`) decline happened to be the
+            LAST event recorded for a cluster, that hardcoded "0/0"
+            overwrote and permanently erased whatever real informed/blind
+            counts earlier rounds in the SAME batch had already
+            established. Measured impact on a live run (trace
+            `47f94038c230`): two batches' entire facts-sequencing
+            contribution — one of them 1 informed hit plus 3 blind misses —
+            vanished this way, undercounting the run's `facts` denominator
+            by 5 and its hit count by 2, both silently.
+
+            The fix: always read the CURRENT cumulative counters, whatever
+            the decline reason — they already reflect every `facts` ask
+            made so far in this batch and do not need `reason` to interpret
+            them. Only genuinely unavailable when `_probe` itself is `None`
+            (`no_executor`: the probe was never built at all, so there is
+            no cumulative state to read).
             """
-            if reason == "unresolved" and _probe is not None:
-                return (
-                    "%d/%d" % _probe.informed_facts,
-                    "%d/%d" % _probe.blind_facts,
-                )
-            return ("0/0", "0/0")
+            if _probe is None:
+                return ("0/0", "0/0")
+            return (
+                "%d/%d" % _probe.informed_facts,
+                "%d/%d" % _probe.blind_facts,
+            )
 
         def _decline(reason: str, ops: list) -> None:
             """AUTO-P4a: record WHY a probe request went unanswered.
