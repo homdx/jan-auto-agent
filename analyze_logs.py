@@ -761,6 +761,21 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
         elif kind == "probe_declined":
             _cluster = params.get("cluster", "?")
             _reason = str(params.get("reason", "unknown"))
+            # AUTO-F4a: a decline can be the LAST event recorded for a
+            # cluster's batch — an all-miss round emits no probe_result at
+            # all (AUTO-P4b), which is exactly why AUTO-P6 had to teach the
+            # by_op tally below to read _declined too. Without this, any
+            # `facts` asks inside such a round reach the general by_op
+            # total (via _decline_by_op) but never reach the "facts
+            # sequencing" split, undercounting it — found reviewing a live
+            # run where a declined "unresolved" round's 2 blind misses were
+            # missing from the reported blind total. Same cumulative-per-
+            # batch caveat and (-1, -1) sentinel as the probe_result
+            # handling below — see _probe_last_facts_seq's own comment.
+            _informed = _frac_or(params.get("informed_facts"), (-1, -1))
+            _blind = _frac_or(params.get("blind_facts"), (-1, -1))
+            if _informed != (-1, -1) or _blind != (-1, -1):
+                run["_probe_last_facts_seq"][_cluster] = (_informed, _blind)
             run["probe_declined"].append({
                 "ts":      ts,
                 "cluster": _cluster,

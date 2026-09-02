@@ -1566,6 +1566,30 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 counts[op.op] += 1
             return " ".join(f"{k}=0/0" for k in sorted(counts))
 
+        def _decline_facts_seq(reason: str, ops: list) -> tuple:
+            """AUTO-F4a: informed_facts / blind_facts strings for a declined
+            request — same reasoning as :func:`_decline_by_op`, applied to
+            the AUTO-F4 split instead of the general per-op tally.
+
+            An `unresolved` decline ran the executor, and ArchProbe already
+            tallied every `facts` ask in the round — including into
+            `_probe.informed_facts` / `_probe.blind_facts` — before
+            returning an empty digest. Those counters are cumulative for the
+            whole batch (see ArchProbe.informed_facts), so they are read the
+            same way a probe_result event reads them, not recomputed here.
+
+            Every other reason (round_cap, digest_budget, no_executor,
+            repeat, post_forced) declined before any lookup ran at all, so
+            there is nothing to attribute as informed or blind — "0/0" for
+            both, exactly mirroring `_decline_by_op`'s "0/0" for by_op.
+            """
+            if reason == "unresolved" and _probe is not None:
+                return (
+                    "%d/%d" % _probe.informed_facts,
+                    "%d/%d" % _probe.blind_facts,
+                )
+            return ("0/0", "0/0")
+
         def _decline(reason: str, ops: list) -> None:
             """AUTO-P4a: record WHY a probe request went unanswered.
 
@@ -1582,6 +1606,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
             misses — collect had in fact answered everything it was asked.
             """
             try:
+                _informed_seq, _blind_seq = _decline_facts_seq(reason, ops)
                 tracer.event(
                     source="architect", target="probe", kind="probe_declined",
                     model=self._model,
@@ -1603,6 +1628,18 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                         # is exactly the comparison the next scope decision
                         # (refs? read?) rests on.
                         "by_op":   _decline_by_op(reason, ops),
+                        # AUTO-F4a: closes the exact same gap for the
+                        # informed/blind split that AUTO-P6 (above) closed
+                        # for by_op. Without this, a `facts` ask that misses
+                        # inside an all-miss round is counted in `by_op`
+                        # (via _decline_by_op) but silently invisible to
+                        # analyze_logs's "facts sequencing" line — a real
+                        # gap found reviewing AUTO-F4 against a live run
+                        # (trace_e8d5b9fcd4b2: 2 blind misses in a declined
+                        # "support (batch 11/50)" round were missing from
+                        # the reported blind total).
+                        "informed_facts": _informed_seq,
+                        "blind_facts":    _blind_seq,
                     },
                 )
             except Exception as exc:  # noqa: BLE001 — diagnostics never break a batch

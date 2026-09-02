@@ -1,0 +1,1 @@
+../tests/test_auto_f4a_declined_facts_seq.py
