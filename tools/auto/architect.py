@@ -483,6 +483,11 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
             len(_arch_probe._BUDGET_ESCALATION_LADDER),
             config.getint(arch, "probe_budget_escalations", fallback=2),
         ))
+        # AUTO-F1: bound on the run-level miss memo — see ArchProbe's own
+        # docstring for why reset() must not clear it.
+        self._probe_memo_max_entries = max(
+            1, config.getint(arch, "probe_memo_max_entries", fallback=200)
+        )
         _ops_raw                     = config.get(arch, "probe_allowed_ops", fallback="facts")
         # NOT defaulted back to DEFAULT_ALLOWED_OPS when the key is present but
         # empty: `probe_allowed_ops =` is an operator saying "allow nothing",
@@ -832,6 +837,8 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
             # AUTO-P7: `read` needs a root to contain paths against. Without
             # it the op disables itself rather than reading anywhere.
             base_dir=base_dir,
+            # AUTO-F1: run-level miss memo cap.
+            memo_max_entries=self._probe_memo_max_entries,
         )
         # AUTO-P11: an absolute ceiling the learned and escalated caps must
         # respect. Estimated the same way test_probe_budget_fits_the_window
@@ -898,6 +905,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                     "max_chars":       self._probe_max_chars,
                     "max_total_chars": self._probe_max_total_chars,
                     "allowed_ops":     ",".join(self._probe_allowed_ops),
+                    "memo_max_entries": self._probe_memo_max_entries,
                 },
             )
         except Exception as exc:  # noqa: BLE001
@@ -1710,6 +1718,12 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                         # rate across two real runs as "22 resolved".
                         "hits":           _probe.last_hits,
                         "misses":         _probe.last_misses,
+                        # AUTO-F1: of those misses, how many cost nothing —
+                        # answered from the run-level memo with no bridge
+                        # lookup. Folded into "misses" already (AC-F1-5); this
+                        # is the breakout that makes the saving visible rather
+                        # than merely asserted.
+                        "memo_hits":      _probe.last_memo_hits,
                         # AUTO-P5: "facts=3/1 module=1/0" — which op resolved
                         # what. Aggregate hits cannot tell you whether a newly
                         # added op is earning its round-trip.

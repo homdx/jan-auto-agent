@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import logging
 import re
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -265,6 +266,10 @@ class ArchProbe:
         Cap on everything this instance has produced across all rounds of one
         batch.  Reached before ``probe_max_rounds`` in practice, and the
         reason a request for eight hot symbols cannot blow the context window.
+    memo_max_entries:
+        AUTO-F1: bound on the run-level miss memo (below).  Oldest entry is
+        evicted first once the cap is reached, so a pathological run cannot
+        grow it without limit.
     """
 
     def __init__(
@@ -275,6 +280,7 @@ class ArchProbe:
         max_total_chars: int = 6000,
         base_dir=None,
         batch_files=(),
+        memo_max_entries: int = 200,
     ) -> None:
         self._bridge = collect_bridge
         # AUTO-P7: `read` is the first op that touches the filesystem rather
@@ -339,6 +345,20 @@ class ArchProbe:
         # Never reset — reported only, so a run can still be judged on total
         # probe cost without that total being able to switch the feature off.
         self._run_chars_used = 0
+        # AUTO-F1: run-level miss memo — {(op, arg): times asked}. Deliberately
+        # NOT touched by reset(): a batch boundary teaches the memo nothing,
+        # and the collect artifact `make_collect_bridge` builds is immutable
+        # for the whole run (the same invariant reset() already relies on for
+        # not rebuilding the bridge), so a name that missed at batch 3 cannot
+        # resolve at batch 40. Only a fresh ArchProbe starts empty.
+        # OrderedDict so eviction can drop the oldest entry first (AC-F1-8).
+        self._miss_memo: "OrderedDict[tuple[str, str], int]" = OrderedDict()
+        self._memo_max_entries = max(1, int(memo_max_entries))
+        # Memo hits for the last execute() call and across the whole run —
+        # reported the same way last_hits/last_misses and run_chars_used are,
+        # so the saving AUTO-F1 claims is visible in the trace, not asserted.
+        self._last_memo_hits = 0
+        self._run_memo_hits = 0
 
     def set_batch_files(self, files) -> None:
         """AUTO-P7: the files the current batch was shown.
@@ -542,6 +562,19 @@ class ArchProbe:
         return self._run_chars_used
 
     @property
+    def last_memo_hits(self) -> int:
+        """AUTO-F1: repeated misses the last :meth:`execute` answered from the
+        memo — no bridge lookup performed. Counted in :attr:`last_misses`
+        too (AC-F1-5); this is the breakout that makes the saving visible."""
+        return self._last_memo_hits
+
+    @property
+    def run_memo_hits(self) -> int:
+        """AUTO-F1: memo hits across the whole run. Observability only, like
+        :attr:`run_chars_used` — never gates anything."""
+        return self._run_memo_hits
+
+    @property
     def current_cap(self) -> int:
         """The digest cap actually in force for this batch, after seeding and
         any escalation. AUTO-P11 — the logs used to report the configured
@@ -586,6 +619,7 @@ class ArchProbe:
         self._last_hits = 0
         self._last_misses = 0
         self._last_by_op = {}
+        self._last_memo_hits = 0
         for op in ops or ():
             if self.budget_exhausted:
                 # AUTO-P8: remember which ops went unanswered so execute() can
@@ -600,21 +634,12 @@ class ArchProbe:
                 break
             _done.append(op)
             try:
-                body = self._run_one(op)
+                block, is_hit = self._resolve_op(op)
             except Exception as exc:  # noqa: BLE001 — never abort a batch
                 logger.warning("ArchProbe: op %s raised: %s", op, exc)
                 continue
-            _tally = self._last_by_op.setdefault(op.op, [0, 0])
-            if not body:
-                body = "(not found)"
-                self._last_misses += 1
-                _tally[1] += 1
-            else:
+            if is_hit:
                 _hits += 1
-                self._last_hits += 1
-                _tally[0] += 1
-            body = self._cap(body)
-            block = f"### {op}\n{self._out_of_batch_note(body)}{body}"
             blocks.append(block)
             self._chars_used += len(block)
             self._run_chars_used += len(block)
@@ -648,6 +673,72 @@ class ArchProbe:
                 "Ask again for the one you most need.]"
             )
         return out
+
+    # ── AUTO-F1: run-level miss memo ─────────────────────────────────────
+
+    def _resolve_op(self, op: ProbeOp) -> tuple:
+        """Resolve one op to a ready-to-append digest block.
+
+        Returns ``(block, is_hit)``. Checks the run-level miss memo BEFORE
+        touching the bridge: a repeated miss for the same ``(op, arg)`` is
+        answered instantly from the memo, at zero cost, with a digest line
+        that escalates with the repetition count (AC-F1-1, AC-F1-2). A miss
+        seen for the first time falls through to a real lookup and, if it
+        misses, is memoised for next time; a hit is never memoised (AC-F1-7)
+        — only a name that is genuinely absent can be told apart from one
+        that merely has not been asked yet.
+        """
+        _tally = self._last_by_op.setdefault(op.op, [0, 0])
+        memo_key = (op.op, op.arg)
+        if memo_key in self._miss_memo:
+            self._miss_memo[memo_key] += 1
+            body = self._memo_miss_body(op, self._miss_memo[memo_key])
+            # AC-F1-5: a memo hit counts as a miss, exactly like a real one —
+            # it must not flatter the hit rate the memo exists to protect.
+            self._last_misses += 1
+            self._last_memo_hits += 1
+            self._run_memo_hits += 1
+            _tally[1] += 1
+            return self._format_block(op, body), False
+
+        body = self._run_one(op)
+        if not body:
+            body = "(not found)"
+            self._last_misses += 1
+            _tally[1] += 1
+            self._remember_miss(memo_key)
+            is_hit = False
+        else:
+            self._last_hits += 1
+            _tally[0] += 1
+            is_hit = True
+        return self._format_block(op, body), is_hit
+
+    def _remember_miss(self, memo_key: tuple) -> None:
+        """AC-F1-8: record a first-time miss, evicting the oldest entry first
+        once the memo is at capacity so a pathological run cannot grow it
+        without limit. ``OrderedDict`` preserves insertion order, so the
+        first item is always the oldest miss still on record."""
+        if len(self._miss_memo) >= self._memo_max_entries:
+            self._miss_memo.popitem(last=False)
+        self._miss_memo[memo_key] = 1
+
+    @staticmethod
+    def _memo_miss_body(op: ProbeOp, count: int) -> str:
+        """AC-F1-2: the escalating message for a repeated miss — the model is
+        told THIS SPECIFIC name is dead, rather than getting the identical
+        ``(not found)`` it has already ignored ``count`` times."""
+        plural = "" if count == 1 else "s"
+        return (
+            f"(not found — already looked up {count} time{plural} this run, "
+            f"still absent. `{op.arg}` is not a symbol in this repository. "
+            "If you mean a file, use `module <path>`; if you mean a "
+            "concept, name a real function.)"
+        )
+
+    def _format_block(self, op: ProbeOp, body: str) -> str:
+        capped = self._cap(body)
+        return f"### {op}\n{self._out_of_batch_note(capped)}{capped}"
 
     # ── op implementations ───────────────────────────────────────────────
 
