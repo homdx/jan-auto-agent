@@ -645,11 +645,21 @@ class ArchProbe:
             self._run_chars_used += len(block)
         if not blocks:
             return ""
-        if _hits == 0:
+        if _hits == 0 and self._last_memo_hits == 0:
             # AUTO-P4b: all-miss round — see the docstring. The characters are
             # still charged against the batch budget: the lookups happened, and
             # a model that burns its digest allowance on names that do not
             # exist should not get an unlimited supply of retries for free.
+            #
+            # AUTO-F1 follow-up: a round that is ALL memo hits is exempt.
+            # Unlike a bare repeated "(not found)", a memo hit's message is
+            # NOT identical to what the model saw last time — the count in
+            # it just changed — so it is exactly the "new information" this
+            # check exists to require. Swallowing it here means AC-F1-2's
+            # escalating message never reaches the model in the common case
+            # of a batch re-asking a known-dead name on its own, which was
+            # measured live: every solo repeat of `facts retry` came back as
+            # an empty digest, count included.
             logger.info(
                 "ArchProbe: all %d op(s) missed (%s) — returning an empty "
                 "digest so the caller stops re-asking.",
@@ -679,18 +689,28 @@ class ArchProbe:
     def _resolve_op(self, op: ProbeOp) -> tuple:
         """Resolve one op to a ready-to-append digest block.
 
-        Returns ``(block, is_hit)``. Checks the run-level miss memo BEFORE
-        touching the bridge: a repeated miss for the same ``(op, arg)`` is
-        answered instantly from the memo, at zero cost, with a digest line
-        that escalates with the repetition count (AC-F1-1, AC-F1-2). A miss
-        seen for the first time falls through to a real lookup and, if it
-        misses, is memoised for next time; a hit is never memoised (AC-F1-7)
-        — only a name that is genuinely absent can be told apart from one
-        that merely has not been asked yet.
+        Returns ``(block, is_hit)``. For a ``facts`` op, checks the
+        run-level miss memo BEFORE touching the bridge: a repeated miss
+        for the same symbol is answered instantly from the memo, at zero
+        cost, with a digest line that escalates with the repetition count
+        (AC-F1-1, AC-F1-2). A miss seen for the first time falls through
+        to a real lookup and, if it misses, is memoised for next time; a
+        hit is never memoised (AC-F1-7).
+
+        AUTO-F1 follow-up: scoped to ``facts`` only. The epic's own
+        non-goals rule out `module`/`read` ("No change to `module` or
+        `read`. They work.") — both already resolve at ~95%+, and the
+        escalating message below is written for a symbol name. Applied
+        indiscriminately to every op, a live run produced exactly the
+        wrong claim for a `read` miss: `` `tools/auto/inner_loop.py:254-
+        350` is not a symbol in this repository `` for what was actually
+        just a bad line range — a path is not a symbol, and telling the
+        model to use `module <path>` when it was already using `read` on
+        a path is not useful, it is confusing.
         """
         _tally = self._last_by_op.setdefault(op.op, [0, 0])
-        memo_key = (op.op, op.arg)
-        if memo_key in self._miss_memo:
+        memo_key = (op.op, op.arg) if op.op == "facts" else None
+        if memo_key is not None and memo_key in self._miss_memo:
             self._miss_memo[memo_key] += 1
             body = self._memo_miss_body(op, self._miss_memo[memo_key])
             # AC-F1-5: a memo hit counts as a miss, exactly like a real one —
@@ -706,7 +726,8 @@ class ArchProbe:
             body = "(not found)"
             self._last_misses += 1
             _tally[1] += 1
-            self._remember_miss(memo_key)
+            if memo_key is not None:
+                self._remember_miss(memo_key)
             is_hit = False
         else:
             self._last_hits += 1

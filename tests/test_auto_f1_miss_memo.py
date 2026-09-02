@@ -174,3 +174,55 @@ class TestMissMemo:
         assert bridge.module_calls == ["retry"], (
             "a facts miss must not memo-block a module lookup of the same name"
         )
+
+    # ── AUTO-F1 follow-up: scope and the solo-repeat gap ───────────────────
+    #
+    # A run trace showed the memo firing on a `read` miss and rendering
+    # "`tools/auto/inner_loop.py:254-350` is not a symbol in this
+    # repository" — the epic's non-goals rule out `module`/`read`
+    # ("No change to `module` or `read`. They work."), and a path is not
+    # a symbol regardless. The two tests below pin that down: `module`
+    # and `read` misses are never memoised, so a message written for
+    # `facts` can never be attached to either.
+
+    def test_module_misses_are_never_memoised(self) -> None:
+        bridge = _FakeBridge({})
+        probe = ArchProbe(bridge)
+
+        probe.execute([ProbeOp("module", "nope.py")])
+        probe.execute([ProbeOp("module", "nope.py")])
+
+        assert bridge.module_calls == ["nope.py", "nope.py"], (
+            "a module miss must reach the bridge every time — module is "
+            "out of scope for this story"
+        )
+
+    def test_read_misses_are_never_memoised_or_mislabelled(self) -> None:
+        bridge = _FakeBridge({"good": "module: x\nsignature: good()"})
+        probe = ArchProbe(bridge, base_dir="/tmp")
+
+        probe.execute([ProbeOp("read", "nope.py:1-10"), ProbeOp("facts", "good")])
+        out = probe.execute(
+            [ProbeOp("read", "nope.py:1-10"), ProbeOp("facts", "good")]
+        )
+
+        assert "is not a symbol in this repository" not in out, (
+            "a `read` miss must never get the facts-shaped memo message — "
+            "a path is not a symbol"
+        )
+
+    def test_solo_repeat_reaches_the_digest(self) -> None:
+        """AC-F1-2, end to end: a repeat asked ALONE — the common real-run
+        shape for `facts retry` — must not be swallowed by the all-miss-
+        round rule, or the escalating message it exists to deliver never
+        reaches the model. Before this follow-up, every solo repeat came
+        back as an empty digest."""
+        bridge = _FakeBridge({})
+        probe = ArchProbe(bridge)
+
+        probe.execute(_ops("retry"))
+        out = probe.execute(_ops("retry"))
+
+        assert "already looked up 2 times this run" in out, (
+            "a solo repeat must still surface the escalating memo message"
+        )
