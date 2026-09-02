@@ -1754,6 +1754,9 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                                 "chars_used":     _probe.chars_used,
                                 "run_chars_used": _probe.run_chars_used,
                                 "unbounded":      "True",
+                                # AUTO-F4 — see the other probe_result event.
+                                "informed_facts": "%d/%d" % _probe.informed_facts,
+                                "blind_facts":    "%d/%d" % _probe.blind_facts,
                             },
                         )
                     except Exception as exc:  # noqa: BLE001 — AUTO-P4a
@@ -1822,6 +1825,16 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                         "by_op":          _probe.last_by_op_str(),
                         "chars_used":     _probe.chars_used,
                         "run_chars_used": _probe.run_chars_used,
+                        # AUTO-F4: is the model asking `facts` for names it
+                        # already saw via `module`, or guessing blind?
+                        # `PROBE_INSTRUCTIONS` now says to check `module`
+                        # first — this measures whether that instruction is
+                        # actually followed instead of assuming it is.
+                        # Cumulative for the batch so far, not just this
+                        # round, hence read fresh each time rather than
+                        # cached — see ArchProbe.informed_facts/blind_facts.
+                        "informed_facts": "%d/%d" % _probe.informed_facts,
+                        "blind_facts":    "%d/%d" % _probe.blind_facts,
                     },
                 )
             except Exception as exc:  # noqa: BLE001 — AUTO-P4a, see above

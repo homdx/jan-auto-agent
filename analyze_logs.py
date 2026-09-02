@@ -385,6 +385,23 @@ def _extract_current_prompt_from_meta(meta_prompt: str) -> str:
     return after.rstrip("\n")
 
 
+def _frac_or(value, default: tuple) -> tuple:
+    """AUTO-F4: parse a ``"hits/asks"`` param (see ArchProbe.informed_facts /
+    blind_facts) into ``(hits, asks)``, or *default* when missing or not in
+    that shape. Absent on pre-AUTO-F4 traces, hence a ``(-1, -1)`` default at
+    the call site rather than ``(0, 0)`` — a run that genuinely asked no
+    `facts` at all must not read the same as a run whose trace predates this
+    metric entirely.
+    """
+    if not value or "/" not in str(value):
+        return default
+    h, _, a = str(value).partition("/")
+    try:
+        return (int(h), int(a))
+    except (TypeError, ValueError):
+        return default
+
+
 def _int_or(value, default: int) -> int:
     """int(value), or *default* when value is missing or unparseable.
 
@@ -461,6 +478,15 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
                 # something it already had" vs. a genuine re-ask of nothing.
                 # See its use at kind == "probe_declined" below.
                 "_probe_last_out_of_batch": {},
+                # AUTO-F4: informed_facts/blind_facts are CUMULATIVE per
+                # batch (see ArchProbe.informed_facts) — every probe_result
+                # event for a cluster restates the running total for that
+                # whole batch, not just that round. Keeping only the latest
+                # value per cluster (like _probe_last_out_of_batch above) and
+                # summing those at report time avoids double-counting a
+                # batch's early rounds every time a later round re-reports
+                # the same growing total.
+                "_probe_last_facts_seq": {},
             }
         return runs[rid]
 
@@ -780,6 +806,16 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
             run["_probe_last_out_of_batch"][_cluster] = bool(
                 content and "NOT IN YOUR BATCH" in str(content)
             )
+            # AUTO-F4: overwritten every event, same as the out-of-batch flag
+            # above — the latest event for a cluster carries that batch's
+            # full-so-far total, which is exactly what should survive to
+            # report time. Skipped when the trace predates AUTO-F4
+            # (sentinel (-1, -1)) so an old trace's absence of the field
+            # cannot overwrite a real value with "not recorded".
+            _informed = _frac_or(params.get("informed_facts"), (-1, -1))
+            _blind = _frac_or(params.get("blind_facts"), (-1, -1))
+            if _informed != (-1, -1) or _blind != (-1, -1):
+                run["_probe_last_facts_seq"][_cluster] = (_informed, _blind)
             run["probe_results"].append({
                 "ts":         ts,
                 "cluster":    _cluster,
@@ -801,6 +837,13 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
                 # zero bridge lookups, but still tallied as misses above
                 # (never as hits). Absent on pre-AUTO-F1 traces, hence -1.
                 "memo_hits":  _int_or(params.get("memo_hits"), -1),
+                # AUTO-F4: was a `facts` ask informed by an earlier `module`
+                # hit this batch, or blind? Absent on pre-AUTO-F4 traces,
+                # hence the (-1, -1) sentinel — distinct from "(0, 0) facts
+                # asks this round", which is the common and honest case for
+                # a round that only asked `module`.
+                "informed_facts": _frac_or(params.get("informed_facts"), (-1, -1)),
+                "blind_facts":    _frac_or(params.get("blind_facts"), (-1, -1)),
             })
 
         # AUTO-F1-followup / AUTO-P13: the ladder widening a batch's digest
@@ -1165,6 +1208,38 @@ def render_run_summary(run: dict) -> None:
                     f"{cyan(str(_memo_hits))} hit(s) served free (0 bridge "
                     f"call(s)) — {_memo_pct:.0f}% of {_total_misses} miss(es)"
                 )
+
+            # AUTO-F4: is the model checking `module` before guessing at
+            # `facts`, the way PROBE_INSTRUCTIONS now says to? Summed from
+            # the LAST recorded (informed, blind) pair per cluster — see the
+            # comment at "_probe_last_facts_seq" — so a batch's growing
+            # per-round total is counted once, not once per round.
+            _seq = run.get("_probe_last_facts_seq", {})
+            if _seq:
+                _tot_i_h = sum(v[0][0] for v in _seq.values())
+                _tot_i_a = sum(v[0][1] for v in _seq.values())
+                _tot_b_h = sum(v[1][0] for v in _seq.values())
+                _tot_b_a = sum(v[1][1] for v in _seq.values())
+                # AC-F4-3/4: omit entirely when no `facts` op was ever asked
+                # this run — a run that only used `module`/`read` has
+                # nothing to report here, and a 0/0 rate would misread as
+                # "facts never resolves" rather than "facts was never asked".
+                if _tot_i_a or _tot_b_a:
+                    _i_pct = (100.0 * _tot_i_h / _tot_i_a) if _tot_i_a else None
+                    _b_pct = (100.0 * _tot_b_h / _tot_b_a) if _tot_b_a else None
+                    _i_str = (
+                        f"{_i_pct:.0f}% ({_tot_i_h}/{_tot_i_a})"
+                        if _i_pct is not None else "no asks"
+                    )
+                    _b_str = (
+                        f"{_b_pct:.0f}% ({_tot_b_h}/{_tot_b_a})"
+                        if _b_pct is not None else "no asks"
+                    )
+                    print(
+                        f"  {' ' * len('Architect probes')}  facts "
+                        f"sequencing: informed {cyan(_i_str)}, "
+                        f"blind {yellow(_b_str)}"
+                    )
 
             # AUTO-F1-followup / AUTO-P13: the escalation ladder widening a
             # batch's digest cap mid-round. Previously invisible here —
