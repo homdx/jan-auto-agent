@@ -284,22 +284,19 @@ class TestRetryExhaustionAndConfig:
     def test_invalid_retry_max_falls_back_to_config_default_parsing(
         self, cfg, cluster_and_base
     ) -> None:
-        """getint() raising on a non-integer falls through this method's
-        own try/except path the same way truncation_retry_max does —
-        verify a garbage value doesn't crash the run."""
+        """A non-integer empty_response_retry_max must not crash the run —
+        it falls back to the default (6), matching the try/except pattern
+        used by every other config read in this __init__."""
         cluster, base_dir = cluster_and_base
         cfg["architect"]["empty_response_retry_max"] = "not-a-number"
         reviewer = _reviewer(cfg)
         with patch(
             "tools.llm_stream.request_completion", return_value=_EMPTY_PAYLOAD
-        ):
-            # configparser.getint raises ValueError for a non-integer with
-            # no fallback triggered (fallback only applies to a MISSING
-            # key, not an invalid one) — this documents that behaviour
-            # rather than asserting a specific recovery, since the ini
-            # value itself is simply invalid input.
-            with pytest.raises(ValueError):
-                reviewer.review_clusters([cluster], base_dir, goal="improve code")
+        ) as mock_llm:
+            results = reviewer.review_clusters([cluster], base_dir, goal="improve code")
+        # default empty_response_retry_max=6 → 1 initial + 6 retries = 7 calls
+        assert mock_llm.call_count == 7
+        assert results == []
 
 
 # ─────────────────────────────────────────────────────────────────────────────

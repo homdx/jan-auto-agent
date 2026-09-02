@@ -305,6 +305,29 @@ class TestRetryExhaustionAndDisable:
         assert mock_llm.call_count == 2  # 1 initial + 1 retry (capped)
         assert [r.title for r in results] == ["Task B1"]
 
+    def test_invalid_truncation_retry_max_falls_back_to_default(
+        self, cfg, cluster_and_base
+    ) -> None:
+        """A non-integer truncation_retry_max must not crash — it falls back
+        to the default (2), matching the try/except pattern used by every
+        other config read in this __init__."""
+        cluster, base_dir = cluster_and_base
+        cfg["architect"]["truncation_retry_max"] = "not-a-number"
+        reviewer = _reviewer(cfg)
+        side_effects = [
+            _truncated_payload("Task A1", "Task A2 cut off"),
+            _truncated_payload("Task B1", "Task B2 cut off"),
+            _truncated_payload("Task C1", "Task C2 cut off"),
+        ]
+        with patch(
+            "tools.llm_stream.request_completion", side_effect=side_effects
+        ) as mock_llm:
+            results = reviewer.review_clusters([cluster], base_dir, goal="improve code")
+
+        # default truncation_retry_max=2 → 1 initial + 2 retries = 3 calls
+        assert mock_llm.call_count == 3
+        assert [r.title for r in results] == ["Task C1"]
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # AC-H4-5 / AC-H4-6 — shrink-retry does NOT fire for other failure modes

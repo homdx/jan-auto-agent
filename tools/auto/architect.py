@@ -1066,7 +1066,11 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
         #   truncation_shrink_factor — multiplier applied to max_tasks on each
         #                              shrink (default 0.5; clamped to (0, 1)
         #                              and to never fail to shrink at all).
-        _retry_max = self._config.getint("architect", "truncation_retry_max", fallback=2)
+        try:
+            _retry_max = self._config.getint("architect", "truncation_retry_max", fallback=2)
+        except ValueError as exc:
+            logger.warning("config [architect] truncation_retry_max is malformed (%s) — using default 2", exc)
+            _retry_max = 2
         _retry_max = max(0, _retry_max)
         try:
             _shrink_factor = float(
@@ -1117,7 +1121,11 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
         #                              before escalating further; an odd
         #                              max leaves the final tier's
         #                              second temperature untried.
-        _empty_retry_max = self._config.getint("architect", "empty_response_retry_max", fallback=6)
+        try:
+            _empty_retry_max = self._config.getint("architect", "empty_response_retry_max", fallback=6)
+        except ValueError as exc:
+            logger.warning("config [architect] empty_response_retry_max is malformed (%s) — using default 6", exc)
+            _empty_retry_max = 6
         _empty_retry_max = max(0, _empty_retry_max)
 
         # ── AUTO-P1: probe state, read by the _call_and_parse closure ───────
