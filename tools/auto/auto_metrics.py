@@ -129,7 +129,7 @@ class AutoMetricsStream:
         *,
         approved: bool,
         feedback: str,
-        attempts_used: int = 0,
+        attempts_used: int | None = None,
         attempts: int = 0,   # backward-compatible alias — prefer attempts_used
         prompt_store=None,  # Optional[PromptStore]
     ) -> None:
@@ -151,7 +151,10 @@ class AutoMetricsStream:
             for backward compatibility but will be removed in a future release.
         """
         # Support legacy callers that pass attempts= instead of attempts_used=.
-        effective_attempts = attempts_used if attempts_used else attempts
+        # Use ``is not None`` so ``attempts_used=0`` (a valid value meaning
+        # "zero attempts were used") is kept rather than falling through to
+        # the legacy ``attempts`` parameter.
+        effective_attempts = attempts_used if attempts_used is not None else attempts
         try:
             with self._lock:
                 _record_gate2_locked(

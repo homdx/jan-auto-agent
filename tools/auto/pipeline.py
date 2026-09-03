@@ -89,18 +89,22 @@ def _build_plan_validator(
     """
     if task_mode != "creative":
         return None
-    if not cfg.getboolean("architect", "validate_plan_creative", fallback=False):
-        return None
 
-    active = cfg.get("api", "active", fallback="local")
-    section = f"api_{active}"
-
-    # BUGFIX (audit): base_url/model have no fallback= and used to run
-    # before this try/except — a missing [api_{active}] section or a
-    # missing base_url/model key raised NoSectionError/NoOptionError
-    # uncaught, defeating the "never block the run on setup" guard below
-    # that was meant to catch exactly this kind of setup failure.
+    # BUGFIX: getboolean and cfg.get for the [api] section used to be
+    # outside the try/except below. A malformed validate_plan_creative
+    # (e.g. "maybe") raised ValueError, a missing [architect] section
+    # raised NoSectionError — both uncaught, crashing the entire --auto
+    # run instead of degrading to "no plan validator" as the docstring
+    # promises. Moving them inside the guard makes the "never block the
+    # run on setup" contract cover ALL config reads, not just the
+    # ClusterReviewer constructor.
     try:
+        if not cfg.getboolean("architect", "validate_plan_creative", fallback=False):
+            return None
+
+        active = cfg.get("api", "active", fallback="local")
+        section = f"api_{active}"
+
         base_url   = cfg.get(section, "base_url")
         api_key    = cfg.get(section, "api_key",    fallback="")
         model      = cfg.get(section, "model")
@@ -281,9 +285,20 @@ def _run_plan_phase(controller: "AutoController", cfg: configparser.ConfigParser
     task_mode = getattr(controller, "task_mode", "code")
     _plan_validator = _build_plan_validator(cfg, task_mode)
     if _plan_validator is not None:
+        # BUGFIX: the nested cfg.getint("architect", "max_rewrites",
+        # fallback=1) used to be evaluated eagerly as the fallback=
+        # argument to the outer getint. If max_rewrites was present but
+        # non-numeric, the inner getint raised ValueError before the
+        # outer call could use its fallback=1. Read max_rewrites
+        # separately with its own try/except so a malformed value
+        # degrades to 1 instead of crashing the pipeline.
+        try:
+            _max_rewrites = cfg.getint("architect", "max_rewrites", fallback=1)
+        except ValueError:
+            _max_rewrites = 1
         _plan_max_rev = cfg.getint(
             "architect", "plan_max_revisions",
-            fallback=cfg.getint("architect", "max_rewrites", fallback=1),
+            fallback=_max_rewrites,
         )
         _plan_max_rev = max(1, _plan_max_rev)
         _plan_revisions = 0

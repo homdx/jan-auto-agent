@@ -1299,9 +1299,16 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
                     if api_format == "ollama":
                         # Ollama streams newline-delimited JSON objects
                         # {"message": {"role": "assistant", "content": "tok"}, "done": false}
+                        # BUGFIX: chunk.get("message", {}) returns the default {}
+                        # only when the key is ABSENT — a present-but-null
+                        # "message" (e.g. a keep-alive or role-only chunk from
+                        # a non-standard Ollama-compatible server) returns None,
+                        # and None.get("content", "") raises AttributeError,
+                        # which is NOT caught by the except json.JSONDecodeError
+                        # below. Use `or {}` to handle both absent and null.
                         try:
                             chunk = json.loads(line)
-                            token = chunk.get("message", {}).get("content", "")
+                            token = (chunk.get("message") or {}).get("content", "")
                             done  = chunk.get("done", False)
                         except json.JSONDecodeError:
                             continue
@@ -1334,7 +1341,14 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
                             #   -> IndexError: list index out of range
                             #      (uncaught, propagates out of request_completion)
                             choices = chunk.get("choices") or []
-                            token = choices[0]["delta"].get("content", "") if choices else ""
+                            # BUGFIX: choices[0]["delta"] can be None (a
+                            # role-only or usage-reporting chunk from some
+                            # OpenAI-compatible servers), and
+                            # None.get("content", "") raises AttributeError
+                            # which is NOT caught by the except clause below
+                            # (only JSONDecodeError/KeyError). Use `or {}` to
+                            # handle both a missing and a null delta.
+                            token = (choices[0].get("delta") or {}).get("content", "") if choices else ""
                             done  = False
                         except (json.JSONDecodeError, KeyError):
                             continue

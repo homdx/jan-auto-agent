@@ -483,7 +483,18 @@ class TicketStore:
         ticket.update(fields)
         ticket["updated_at"] = _ts()
         _validate(ticket)
-        self._write(path, ticket)
+        # BUGFIX: create() wraps _write() in try/except OSError and re-raises
+        # as TicketError (AUTO-T37). update() did not — a disk-full,
+        # permission-denied, or read-only-filesystem failure from
+        # atomic_write_text() propagated as a raw OSError past this method's
+        # own docstring (which only lists TicketNotFound and
+        # TicketSchemaError), inconsistent with create()'s established contract.
+        try:
+            self._write(path, ticket)
+        except OSError as exc:
+            raise TicketError(
+                f"Could not write ticket '{ticket_id}' to {path}: {exc}"
+            ) from exc
         logger.debug("TicketStore.update: %s  fields=%s", ticket_id, list(fields))
 
     # ── Delete ───────────────────────────────────────────────────────────────

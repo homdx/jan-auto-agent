@@ -366,6 +366,12 @@ class Orchestrator(OrchestratorActions):
             "Authorization": f"Bearer {self.api_key}",
         }
 
+        # Snapshot the history before appending so a failed API call can
+        # restore the exact pre-call state. Previously, pop() only removed
+        # the last element — the older messages that were trimmed by the
+        # cap during the append were permanently lost.
+        _saved_history = list(self._direct_chat_history)
+
         # Append the new turn, then trim history to the rolling cap (1 user +
         # 1 assistant = 2 entries/turn). _max_msgs uses max(1, ...) because
         # list[-0:] returns the whole list, not empty — so history_max_turns=0
@@ -403,9 +409,11 @@ class Orchestrator(OrchestratorActions):
         except Exception as exc:
             logger.error("execute_direct_chat failed: %s", exc)
             print(f"[{_ts()}] ❌ Chat request failed: {exc}")
-            # Remove the user turn we just added — the exchange never completed,
-            # so history should not reflect a half-finished turn.
-            self._direct_chat_history.pop()
+            # Restore the pre-call history — the exchange never completed,
+            # so history should not reflect a half-finished turn. This
+            # also restores any messages that were trimmed by the cap
+            # during the append, which pop() alone could not recover.
+            self._direct_chat_history = _saved_history
 
     def run_pipeline(self, user_input: str, base_dir: str,
                      resume_state: dict = None) -> None:
