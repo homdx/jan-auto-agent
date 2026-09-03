@@ -1,0 +1,1 @@
+../tests/test_bugfix_plan_validator_malformed_config.py
