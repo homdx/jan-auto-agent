@@ -610,6 +610,85 @@ class ArchProbe:
         :attr:`run_chars_used` — never gates anything."""
         return self._run_memo_hits
 
+    # ─────────────────────────────────────────────────────────────────────
+    # AUTO-F4 / F4a / F4b — the informed/blind flow, pullv2 vs pullv3
+    #
+    # The module docstring above still describes Phase 0 (facts-only,
+    # no sequencing concept). This is what changed once `module` and
+    # `read` landed and AUTO-F4 taught the model to use them together:
+    #
+    #   pullv2 — no facts-sequencing concept at all
+    #   ──────────────────────────────────────────────
+    #   op = facts <name>  →  memo / bridge lookup
+    #           ↓
+    #     hit/miss folds into the generic per-op tally
+    #     only ("facts=23/40"). A `module` hit teaches
+    #     nothing to a `facts` ask — the two ops are
+    #     unrelated to every counter that exists.
+    #
+    #
+    #   pullv3 — AUTO-F4 (Part 1) + AUTO-F4a/F4b
+    #   ──────────────────────────────────────────────
+    #   Architect: "need X's exact name, not sure of it"
+    #           ↓
+    #   PROBE_INSTRUCTIONS (AUTO-F4, new sentence):
+    #     "ask `module <path>` first, then `facts`
+    #      for one of the names it returned"
+    #           ↓
+    #   ArchProbe.execute(ops) — this round, per op
+    #   ────────────────────────────────────────────
+    #   op = module <path>  →  bridge.module_symbols()
+    #           ↓ (on a hit)
+    #     AUTO-F4: _learn_module_names(capped_text)
+    #       → names actually shown → _informed_symbols
+    #         (this batch only — wiped on reset())
+    #
+    #   op = facts <name>
+    #           ↓
+    #     AUTO-F4 (checked BEFORE the lookup runs):
+    #     is <name> in _informed_symbols?
+    #           ↓                        ↓
+    #         yes                       no
+    #     informed ask +1           blind ask +1
+    #           ↓                        ↓
+    #     lookup runs exactly as before — memo hit,
+    #     bridge hit, or miss. Behavior UNCHANGED;
+    #     a blind guess still gets answered.
+    #   ────────────────────────────────────────────
+    #           ↓
+    #     did this round resolve anything at all?
+    #           ↓ yes                     ↓ no — every op missed
+    #     probe_result event          probe_declined event
+    #     informed_facts="41/45"      informed_facts / blind_facts
+    #     blind_facts="13/59"         (AUTO-F4a, then AUTO-F4b ★)
+    #     (AUTO-F4, original)
+    #           │                            │
+    #           └─────────────┬──────────────┘
+    #                          ↓
+    #     analyze_logs.py: keep the LATEST cumulative
+    #     pair per cluster — from whichever event kind
+    #     (result or declined) came last — sum across run
+    #                          ↓
+    #     printed once per run, only if facts was asked:
+    #       facts sequencing: informed 91% (41/45),
+    #                          blind   22% (13/59)
+    #
+    #   (91%/22% above are illustrative, not a specific real run — see
+    #   the ground file / commit history for actual measured figures.)
+    #
+    #   ★ AUTO-F4a first added informed_facts/blind_facts to
+    #   probe_declined, but computed them as a fresh "0/0 unless
+    #   unresolved" per-round value — correct for the neighboring by_op
+    #   tally (a per-round delta) and wrong here (a cumulative-for-the-
+    #   batch snapshot), so a `repeat` decline landing last in a batch
+    #   could overwrite and erase real data an earlier round in the same
+    #   batch had already established. AUTO-F4b fixed it by always
+    #   reading the live cumulative counters regardless of decline
+    #   reason, falling back to 0/0 only when no probe was ever built
+    #   at all. See tests/test_auto_f4a_declined_facts_seq.py's module
+    #   docstring for the full story with the real trace that found it.
+    # ─────────────────────────────────────────────────────────────────────
+
     @property
     def informed_facts(self) -> tuple:
         """AUTO-F4: ``(hits, asks)`` for `facts` ops this BATCH whose symbol

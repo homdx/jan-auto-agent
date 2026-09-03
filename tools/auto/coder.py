@@ -137,7 +137,17 @@ _SYSTEM_PROMPT = (
     '{"path": "relative/path.py", "delete": true} in "files" — with NO '
     '"content" key. Deletion is only allowed for paths listed in target_files; '
     "the original is backed up automatically. Never emit shell commands or "
-    "os.remove calls to delete files — use the delete flag."
+    "os.remove calls to delete files — use the delete flag.\n"
+    "10. Do NOT introduce a new third-party dependency. Use only the standard "
+    "library and packages the repository already imports or declares in its "
+    "dependency manifest (requirements.txt, package.json, pom.xml, go.mod, "
+    "Cargo.toml). If the task looks like it needs a new one, implement it with "
+    "what is already available — an unavailable import makes the acceptance "
+    "check fail.\n"
+    "11. You are rewriting the WHOLE file, so preserve everything unrelated to "
+    "the task — existing imports, helpers, comments and docstrings — and match "
+    "the file's existing conventions (naming, error handling, logging, comment "
+    "style). Never reformat or strip comments you were not asked to change."
 )
 
 # Backward-compat alias — "code" is the default persona.
