@@ -55,6 +55,12 @@ directories are direct children of the repo root.
 * `tests_slow/test_gate1_log_levels_slow.py` split one slow test out of
   `test_gate1_log_levels.py` before this move; its cross-reference comment
   now points at `tests_bugfix/test_gate1_log_levels.py`.
+  (2026-09-03: that split existed because `filter()`'s default retry
+  backoff cost the test a real ~180s. Once that got a test-only fix —
+  same idiom as `tests_bugfix/test_gate1_llm_call_retry_backoff.py`,
+  overriding `filt._llm_call_retry_wait_sec` before calling `.filter()` —
+  the test no longer needed isolating, so it moved back into
+  `test_gate1_log_levels.py` and the now-empty `tests_slow/` was removed.)
 
 ## Adding a new file here
 
