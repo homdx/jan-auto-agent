@@ -575,7 +575,8 @@ class Orchestrator(OrchestratorActions):
         # both a show-type and an improve-type verb) must run the improvement
         # agent too, exactly like plain "improve" does.
         improvement: Dict[str, Any] = {}
-        if parsed.intent in ("improve", "explain", "show_and_improve"):
+        _improvement_ran = parsed.intent in ("improve", "explain", "show_and_improve")
+        if _improvement_ran:
             print("⚡ Processing improvements...")
             improvement_context = {
                 "target_block": block,
@@ -595,7 +596,16 @@ class Orchestrator(OrchestratorActions):
 
         # Record run metrics
         last_validation = validation if parsed.intent not in ("show", "show_imports") else {}
-        improvement_json_ok = bool(improvement.get("improved_code") or improvement.get("explanation"))
+        # RunRecord types improvement_json_ok as Optional[bool] and documents
+        # None as "not applicable (show/show_imports)"; summarize_failures
+        # honours that with an `is not None` filter. Passing False for a run
+        # that never invoked the improvement agent counted a stage that did not
+        # execute as a JSON parse failure, inflating json_parse_failure_rate —
+        # one of the two signals that trigger the PromptOptimizer.
+        improvement_json_ok = (
+            bool(improvement.get("improved_code") or improvement.get("explanation"))
+            if _improvement_ran else None
+        )
         self.metrics_collector.record(RunRecord(
             timestamp=timestamp,
             intent=parsed.intent,

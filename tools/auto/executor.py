@@ -525,6 +525,21 @@ class Executor:
     )
 
     @staticmethod
+    def _dequote(command: str) -> str:
+        r"""Strip shell quoting/escaping characters from *command*.
+
+        A word-boundary scan is trivially evaded by quoting a token's own
+        characters — ``r"m"``, ``cu''rl``, ``su\do`` — which breaks the
+        ``\b…\b`` match without changing what the shell ultimately executes.
+        The architect's acceptance_check is derived from repo file contents it
+        was shown, so an obfuscated command is reachable by injection, not only
+        by hallucination. Removing the quoting/escaping characters the shell
+        itself would strip defeats the cheap obfuscations; it is still
+        best-effort, not a shell parser (``$(echo rm)`` is not covered).
+        """
+        return command.translate(str.maketrans("", "", "\"'`\\"))
+
+    @staticmethod
     def _check_command_safety(command: str) -> tuple[bool, str]:
         """Return *(safe, reason)* — ``safe=False`` blocks execution.
 
@@ -535,6 +550,8 @@ class Executor:
         """
         import re as _re
         lower = command.lower()
+        # Scan the de-quoted form too so quoted-obfuscated tokens still match.
+        dequoted = Executor._dequote(lower)
         for pattern in Executor._BLOCKED_COMMAND_PATTERNS:
             token = pattern.strip().lower()
             if token.isalpha():
@@ -543,9 +560,12 @@ class Executor:
                 # — 'rm ' matched 'terrafo[rm ]', 'nc ' matched 'rsy[nc ]',
                 # 'rm ' matched 'confi[rm ]'.  Python \b treats '_' as a word
                 # char, so identifier-style checks stay safe too.
-                if _re.search(r"\b" + _re.escape(token) + r"\b", lower):
+                if (
+                    _re.search(r"\b" + _re.escape(token) + r"\b", lower)
+                    or _re.search(r"\b" + _re.escape(token) + r"\b", dequoted)
+                ):
                     return False, f"blocked pattern {pattern!r} in acceptance_check"
-            elif pattern in lower:
+            elif pattern in lower or pattern in dequoted:
                 # Non-word tokens (shell metachars: '> /', '>/', fork bomb) have
                 # no word boundary to anchor on — keep the substring check.
                 return False, f"blocked pattern {pattern!r} in acceptance_check"
@@ -604,6 +624,24 @@ class Executor:
 
         py_files = [f for f in target_files if f.endswith(".py")]
         if len(py_files) == 1:
+            # SECURITY: unlike the acceptance_check branch above, this fallback
+            # builds a command straight from an unvalidated target_files entry.
+            # _prepare_workspace refuses to *copy* an escaping path (see its
+            # resolve()/relative_to() guard), but the command still runs with
+            # cwd=workspace, so an absolute or "../.." entry would execute a
+            # file outside the workspace — the unmodified base_dir original at
+            # best (defeating "run the Coder's version"), an arbitrary host
+            # file at worst. Fail closed, exactly like a blocked
+            # acceptance_check does above.
+            try:
+                (workspace / py_files[0]).resolve().relative_to(workspace.resolve())
+            except ValueError:
+                logger.error(
+                    "_resolve_command: [SAFETY] %r escapes the workspace — "
+                    "failing the check rather than running a file outside it",
+                    py_files[0],
+                )
+                return "false"
             # AUTO-FIX: this f-string goes straight into
             # subprocess.run(shell=True); an unquoted space in _python_bin
             # ("/Users/Jane Doe/.venv/bin/python") or in the file name was

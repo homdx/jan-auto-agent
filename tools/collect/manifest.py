@@ -137,7 +137,7 @@ def _run_git(root: Path, *args: str) -> Optional[str]:
     ``is_dirty`` reports True for output that is entirely the collector's
     own, exactly the "dirty on every refresh" bug this module's docstrings
     already describe fixing once, reopened here for one case they missed.
-    Reproduced directly:
+    Fixed by this flag; before adding it the failure reproduced directly:
 
         exclude_dir = root / "выход"    (a Cyrillic collect-output dir)
         is_dirty(root, exclude_dir) == True   (WRONG — nothing outside
