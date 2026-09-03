@@ -562,6 +562,11 @@ class TestPresenceChecks:
         self, filt: Gate1Filter, repo: Path
     ) -> None:
         c = _make_candidate(symbol="parse_config")
+        # Default retry config is 3 retries * 60s real time.sleep() between
+        # them (see Gate1Filter._check_presence) -- this test only checks
+        # the fail-closed outcome, not retry timing, so skip the wait.
+        # Same idiom as tests_bugfix/test_gate1_llm_call_retry_backoff.py.
+        filt._llm_call_retry_wait_sec = 0
         with patch(
             "tools.llm_stream.request_completion",
             side_effect=ConnectionError("refused"),
