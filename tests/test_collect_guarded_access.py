@@ -283,9 +283,15 @@ def test_real_analyze_logs_done_site_appears_exactly_once_and_is_guarded():
     # a couple of lines above it, nested inside an unrelated outer block.
     # NOTE: line number tracks the real analyze_logs.py source — update if
     # that function's line position shifts.
+    # BUGFIX: pinned at 1635 when this test was written; two later commits
+    # (AUTO-F4 Part 1 / Part 2) added ~90 lines earlier in analyze_logs.py,
+    # shifting this site down to 1725 with no code-shape change at all —
+    # confirmed via `git blame`, the guard/access pair is byte-identical.
+    # Re-pin to the current real line so this test tracks the site instead
+    # of a stale snapshot of it.
     source = (REPO_ROOT / "analyze_logs.py").read_text(encoding="utf-8")
     accesses = _accesses(source, "analyze_logs.py")
-    matches = [a for a in accesses if (a.location, a.access) == ("analyze_logs.py:1635", "done[-1]")]
+    matches = [a for a in accesses if (a.location, a.access) == ("analyze_logs.py:1725", "done[-1]")]
     assert len(matches) == 1, f"expected exactly one record, got {matches!r}"
     assert matches[0].status == "GUARDED"
 
