@@ -305,7 +305,16 @@ class PromptStore:
             # 2. Write the JSON data to the temp file
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
-                
+                # BUGFIX: flush + fsync before the rename — os.replace alone
+                # only guarantees the RENAME is atomic, not that the bytes
+                # written above are durable. A power loss / kernel panic /
+                # OOM-kill between json.dump and os.replace can otherwise
+                # produce a 0-byte or partially-flushed prompts.json, which
+                # the next run reads back as corrupt and quarantines,
+                # losing all prior A/B tuning history.
+                f.flush()
+                os.fsync(f.fileno())
+
             # 3. Atomically replace the target file with the complete temp file
             os.replace(tmp_path, self.store_path)
             

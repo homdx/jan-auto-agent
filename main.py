@@ -437,6 +437,15 @@ class Orchestrator(OrchestratorActions):
             return
 
         target_path = os.path.normpath(os.path.join(base_dir, parsed.file_path))
+        # SECURITY: reject any target that resolves outside base_dir — without
+        # this, a file_path like "../../.ssh/id_rsa" or an absolute path
+        # normalizes to a location outside base_dir and gets read and fed
+        # back through the LLM reply, exfiltrating arbitrary host files.
+        _base_abs = os.path.abspath(base_dir)
+        _target_abs = os.path.abspath(target_path)
+        if _target_abs != _base_abs and not _target_abs.startswith(_base_abs + os.sep):
+            print(f"Error: Target path is not a valid file: '{parsed.file_path}'")
+            return
         if not os.path.exists(target_path) or not os.path.isfile(target_path):
             print(f"Error: Target path is not a valid file: '{parsed.file_path}'")
             return
@@ -1142,7 +1151,18 @@ def main():
         _loop = _saved.get("loop", "unknown")
         _it   = _saved.get("iteration", "?")
         print(f"\n⚡ Checkpoint found: loop='{_loop}', iteration={_it}")
-        _ans = input("Resume interrupted session? [y/N] ").strip().lower()
+        # BUGFIX: unlike the interactive REPL prompt below (which is inside
+        # a try/except (KeyboardInterrupt, EOFError) loop), this one runs
+        # unconditionally whenever a checkpoint exists — including under a
+        # piped/redirected/non-interactive stdin (CI, `cmd < /dev/null`,
+        # a TTY-less container). input() there raised a raw EOFError
+        # traceback instead of a clean fallback. Treat EOF as "no", the
+        # same as an explicit non-'y' answer.
+        try:
+            _ans = input("Resume interrupted session? [y/N] ").strip().lower()
+        except EOFError:
+            print("(no input available — treating as 'N')")
+            _ans = "n"
         if _ans == "y":
             backoff.clear_state()
             if _loop == "run_pipeline":

@@ -597,6 +597,12 @@ class BugFixLoop:
                 "bug_fix_loop", "controller", "attempts_exhausted",
                 params={"ticket_id": ticket_id, "attempts": attempts},
             )
+            # BUGFIX: every other "defer this ticket" branch in this file
+            # calls _discard_fix_residue before _park_fix_task; this one
+            # skipped it, leaving the last (never-committed) fix attempt's
+            # working-tree edits in place to be swept into whatever the
+            # NEXT successful commit happens to be.
+            self._discard_fix_residue(fix_id)
             self._park_fix_task(fix_id)
             return BugFixResult(
                 ticket_id, fix_id, fixed=False, exhausted=True, skipped=True,

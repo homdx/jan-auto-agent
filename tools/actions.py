@@ -27,6 +27,25 @@ def _ts() -> str:
     return time.strftime("%H:%M:%S")
 
 
+def _resolve_within_base(base_dir: str, file_path: str) -> "str | None":
+    """Resolve *file_path* against *base_dir* and refuse anything that
+    escapes it.
+
+    SECURITY: /search and /edit used to accept an absolute file_path
+    verbatim, or a relative one containing "..", and read (or, for /edit,
+    read-and-write-back) whatever that path resolved to — a
+    prompt/instruction like "/search :: query in ../../.ssh/id_rsa" (or
+    any absolute path) could exfiltrate, and for /edit even overwrite,
+    arbitrary files on the host. Returns the resolved absolute path if it
+    stays within base_dir, else None.
+    """
+    base_abs = os.path.abspath(base_dir)
+    target_abs = os.path.abspath(os.path.join(base_dir, file_path))
+    if target_abs == base_abs or target_abs.startswith(base_abs + os.sep):
+        return target_abs
+    return None
+
+
 class _SearchChunkFailed(Exception):
     """Internal: _ask_over_text's None failure sentinel, as an exception —
     the shape backoff.retry_with_backoff retries on."""
@@ -217,7 +236,10 @@ class OrchestratorActions:
             print("Usage: /search <query> in <file>   (or: /search <file> :: <query>)")
             return
 
-        target = file_path if os.path.isabs(file_path) else os.path.join(base_dir, file_path)
+        target = _resolve_within_base(base_dir, file_path)
+        if target is None:
+            print(f"[{_ts()}] Error: '{file_path}' is outside the project directory.")
+            return
         tracer.start_run(f"/search {query} in {file_path}")
         try:
             source = read_file(target)
@@ -959,7 +981,10 @@ class OrchestratorActions:
         if not instruction or not file_path:
             print("Usage: /edit <instruction> in <file>   (or: /edit <file> :: <instruction>)")
             return
-        target = file_path if os.path.isabs(file_path) else os.path.join(base_dir, file_path)
+        target = _resolve_within_base(base_dir, file_path)
+        if target is None:
+            print(f"[{_ts()}] Error: '{file_path}' is outside the project directory.")
+            return
         if not os.path.isfile(target):
             print(f"[{_ts()}] Not a file: {target}")
             return

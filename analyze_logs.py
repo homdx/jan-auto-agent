@@ -2029,7 +2029,15 @@ def main() -> int:
     if len(runs) > 1 and not args.run_id and not args.rewrites_only:
         render_multi_run_overview(runs)
         print()
-        ans = input(bold("Show details for each run? [Y/n] ")).strip().lower()
+        # BUGFIX: input() with no try/except EOFError crashed with a raw
+        # traceback under any non-interactive invocation (piped stdout,
+        # `analyze_logs.py < /dev/null`, CI, a TTY-less container) — exactly
+        # the environments where a log-analysis tool is most likely to be
+        # run. Treat EOF as the default answer ("Y", i.e. show details).
+        try:
+            ans = input(bold("Show details for each run? [Y/n] ")).strip().lower()
+        except EOFError:
+            ans = ""
         if ans in ("n", "no"):
             return 0
 

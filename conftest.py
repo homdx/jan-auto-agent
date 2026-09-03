@@ -132,8 +132,18 @@ class ScriptTestItem(pytest.Item):
                 timeout=300,
             )
         except subprocess.TimeoutExpired as exc:
-            self._stdout = exc.stdout or ""
-            self._stderr = (exc.stderr or "") + "\n[TIMEOUT] script exceeded 300s"
+            # BUGFIX: with text=True, TimeoutExpired.stdout/stderr are
+            # documented as str — but can still be None (no output captured
+            # before the kill) or, on Python builds older than 3.7.10, bytes
+            # on a partial-read boundary. Decode defensively so a slow
+            # script is reported as a clean timeout instead of crashing the
+            # whole pytest run with an uncaught TypeError (str + bytes).
+            def _as_text(b):
+                if isinstance(b, (bytes, bytearray)):
+                    return b.decode("utf-8", "replace")
+                return b or ""
+            self._stdout = _as_text(exc.stdout)
+            self._stderr = _as_text(exc.stderr) + "\n[TIMEOUT] script exceeded 300s"
             self._returncode = -1
             raise ScriptTestFailed(-1, self._stdout, self._stderr) from exc
 

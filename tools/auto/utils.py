@@ -3,12 +3,15 @@ from __future__ import annotations
 
 import configparser
 import hashlib
+import logging
 import os
 import re
 import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 # Longest sanitised name component we will hand to the filesystem. NAME_MAX is
@@ -126,6 +129,31 @@ def atomic_write_text(path: "str | Path", content: str) -> None:
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_name, path)
+        # BUGFIX: os.replace is only guaranteed durable on Linux after the
+        # containing directory itself is fsynced — fsyncing just the file
+        # (above) is not enough. Without this, a crash right after the
+        # rename can make the "atomically written" file disappear entirely,
+        # so a resumed run finds plan.json/progress.json/tickets missing
+        # and restarts from blank state (or double-commits prior work).
+        # Best-effort and POSIX-only: os.O_DIRECTORY doesn't exist as an
+        # attribute on Windows at all (not just unsupported at the OS
+        # level) — referencing it directly would raise AttributeError,
+        # not OSError, crashing this already-successful write. getattr
+        # here turns "unsupported" into a clean skip instead.
+        _o_directory = getattr(os, "O_DIRECTORY", None)
+        if _o_directory is not None:
+            try:
+                dir_fd = os.open(str(path.parent), _o_directory)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except OSError as exc:
+                logger.debug(
+                    "atomic_write_text: directory fsync on %s failed "
+                    "(best-effort durability step, write itself already "
+                    "succeeded): %s", path.parent, exc,
+                )
     except BaseException:
         try:
             os.unlink(tmp_name)

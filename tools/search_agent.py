@@ -45,8 +45,25 @@ def extract_block(filepath: str, target_name: str) -> Optional[str]:
         with open(filepath, "r", encoding="utf-8", errors="replace") as fh:
             source = fh.read()
         result = _extract_block_from_source(source, target_name, ext)
-        return result if result else None
-    except Exception:
+        if not result:
+            # BUGFIX: this branch used to be indistinguishable from a read
+            # failure below (both returned bare None). It also fires for a
+            # file with no extension — ext="" degrades extract_block to a
+            # brace-based scan instead of an AST parse, which is a real,
+            # silent quality drop, not just "not found". Logged at debug so
+            # the cause is visible without changing the return contract.
+            logger.debug(
+                "search_agent.extract_block: %r not found in %s (ext=%r%s)",
+                target_name, filepath, ext,
+                " — no extension, used brace-based fallback" if not ext else "",
+            )
+            return None
+        return result
+    except Exception as exc:
+        logger.debug(
+            "search_agent.extract_block: could not read/parse %s: %s",
+            filepath, exc,
+        )
         return None
 
 

@@ -1007,8 +1007,17 @@ class Coder(_llm_stream.LLMClientBase):
                         chapters[p.name] = p.read_text(encoding="utf-8", errors="replace")
                     except OSError:
                         continue
-        except Exception:  # noqa: BLE001
-            pass
+        except OSError as exc:
+            # BUGFIX: was a bare `except Exception: pass` — narrowed to
+            # OSError (the only kind this glob/path-construction code can
+            # raise) and logged. Silently swallowing it meant a permission
+            # error or a vanishing candidate directory quietly reduced the
+            # set of sibling chapters checked for near-duplication, with no
+            # signal that detection quality had degraded.
+            logger.debug(
+                "_creative_duplication_error: could not list candidate "
+                "chapters under %s: %s", base_dir, exc,
+            )
 
         produced: dict[str, str] = {}
         for f in parsed_files:
@@ -1144,8 +1153,19 @@ class Coder(_llm_stream.LLMClientBase):
                     txt = p.read_text(encoding="utf-8", errors="replace")
                     if txt.strip():
                         return txt
-        except Exception:  # noqa: BLE001
-            pass
+        except OSError as exc:
+            # BUGFIX: was a bare `except Exception: pass`, which swallowed a
+            # real I/O error (permission-denied, disk failure, a candidate
+            # path disappearing mid-scan) exactly the same as "no preceding
+            # chapter found" — the caller then generates prose with no
+            # language-sample grounding and no hint anything went wrong.
+            # Narrowed to OSError (the only exception this glob/read-text
+            # code can actually raise) and logged so the real cause is
+            # visible instead of silently downgrading to "no content".
+            logger.warning(
+                "_creative_language_sample: could not read a candidate "
+                "chapter under %s: %s", cdir, exc,
+            )
         return ""
 
     def _build_creative_file_contents(
