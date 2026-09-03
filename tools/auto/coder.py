@@ -252,6 +252,33 @@ class CoderResult:
 # Coder
 # ─────────────────────────────────────────────────────────────────────────────
 
+
+def _is_truthy_delete(value) -> bool:
+    """True iff `value` should be interpreted as 'delete this file'.
+
+    Models regularly emit the ``delete`` key in non-canonical forms:
+    ``"true"`` (string), ``1`` (int), ``"yes"`` (string), etc. A strict
+    ``value is True`` check rejects every one of those and the file
+    silently stays in place. Accept the small canonical set:
+        - JSON ``True``
+        - ``"true"/"True"/"TRUE"``  (case-insensitive)
+        - ``"yes"/"Yes"/"YES"``     (case-insensitive)
+        - integer ``1``
+    Anything else (``False``, ``0``, ``"false"``, ``None``, prose) is
+    NOT a delete — preserving the prior fail-loud behaviour for
+    ambiguous or missing values.
+    """
+    if value is True:
+        return True
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value == 1
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "yes", "1"}
+    return False
+
+
 class Coder(_llm_stream.LLMClientBase):
     """Generates full revised file content for a single autonomous task.
 
@@ -1247,6 +1274,24 @@ class Coder(_llm_stream.LLMClientBase):
             return "\n\n".join(parts)
         return "(new chapter — no prior content to continue from)"
 
+    @staticmethod
+    def _is_truthy_delete(value) -> bool:
+        """Accept truthy variants of a ``delete`` flag from the model.
+
+        JSON ``true`` is the canonical form, but models also emit ``"true"``,
+        ``"True"``, ``"TRUE"``, ``"yes"``, ``"Yes"``, and the integer ``1``.
+        Every one of those should trigger the delete branch; anything else
+        (``false``, ``"false"``, ``0``, ``None``, arbitrary strings) must
+        fall through to the content branch.
+        """
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value == 1
+        if isinstance(value, str):
+            return value.strip().lower() in ("true", "yes")
+        return False
+
     def _parse_response(
         self, text: str, task_id: str,
         target_files: "list[str] | None" = None,
@@ -1339,7 +1384,11 @@ class Coder(_llm_stream.LLMClientBase):
                 continue
             # pullrun-sim fix: {"path": ..., "delete": true} marks a file for
             # deletion (refactors that merge a module away). No content needed.
-            if item.get("delete") is True:
+            # BUGFIX A5: models emit the flag in non-canonical forms
+            # ("true" string, 1, "yes") — use _is_truthy_delete to accept
+            # the canonical truthy variants without falsely triggering
+            # on "false"/None/prose.
+            if _is_truthy_delete(item.get("delete")):
                 parsed.append({"path": path, "delete": True})
                 continue
             if content is None:
@@ -1874,7 +1923,9 @@ class Coder(_llm_stream.LLMClientBase):
             # Same path/target guards as writes; original backed up to
             # .coder.bak so the deletion is reversible without git. Deleting
             # an already-absent file is a no-op success (idempotent retries).
-            if item.get("delete") is True:
+            # BUGFIX A5: accept truthy string/int variants ("true", 1,
+            # "yes") the same way _parse_response does.
+            if _is_truthy_delete(item.get("delete")):
                 try:
                     if dest.exists():
                         backup = dest.with_suffix(dest.suffix + ".coder.bak")
