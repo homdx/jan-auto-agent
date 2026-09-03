@@ -48,6 +48,40 @@ _CODE_EXTENSIONS = {
     ".rs", ".rb", ".php", ".cs", ".swift", ".kt", ".scala",
 }
 
+
+def resolve_target_path(base_dir: str, parsed_file_path: str):
+    """Resolve a user-supplied file path against ``base_dir`` and refuse
+    any path that escapes the project root.
+
+    ``parsed_file_path`` is raw text from the LLM-side prompt parser and
+    is therefore untrusted: a prompt like 'explain foo in
+    ../../etc/passwd' used to slip past the old ``os.path.normpath +
+    os.path.join`` check because normpath happily produces a path
+    outside base_dir. Downstream code (file_reader.read_file,
+    run_edit, _save_history) then read/wrote outside the project.
+
+    Returns the absolute, realpath-resolved target string when the
+    path stays inside base_dir (after symlink resolution). Returns
+    None on any traversal attempt, an empty input, or a path on a
+    different drive than base_dir (Windows: commonpath raises
+    ValueError on cross-drive paths — also None).
+    """
+    if not parsed_file_path:
+        return None
+    try:
+        base_real = os.path.realpath(base_dir)
+        target_real = os.path.realpath(
+            os.path.join(base_dir, parsed_file_path)
+        )
+        # commonpath raises ValueError on different drives (Windows).
+        common = os.path.commonpath([base_real, target_real])
+    except (ValueError, OSError):
+        return None
+    if common != base_real:
+        return None
+    return target_real
+
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -436,15 +470,9 @@ class Orchestrator(OrchestratorActions):
             self.execute_direct_chat(user_input)
             return
 
-        target_path = os.path.normpath(os.path.join(base_dir, parsed.file_path))
-        # SECURITY: reject any target that resolves outside base_dir — without
-        # this, a file_path like "../../.ssh/id_rsa" or an absolute path
-        # normalizes to a location outside base_dir and gets read and fed
-        # back through the LLM reply, exfiltrating arbitrary host files.
-        _base_abs = os.path.abspath(base_dir)
-        _target_abs = os.path.abspath(target_path)
-        if _target_abs != _base_abs and not _target_abs.startswith(_base_abs + os.sep):
-            print(f"Error: Target path is not a valid file: '{parsed.file_path}'")
+        target_path = resolve_target_path(base_dir, parsed.file_path)
+        if target_path is None:
+            print(f"Error: Target path is outside the project: '{parsed.file_path}'")
             return
         if not os.path.exists(target_path) or not os.path.isfile(target_path):
             print(f"Error: Target path is not a valid file: '{parsed.file_path}'")
