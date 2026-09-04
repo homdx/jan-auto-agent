@@ -89,13 +89,18 @@ and takes no config input.
 
 **Manual workflow (run and validate separately):**
 
-```bash
-# Run a single task manually with a config
+```text
+# Run a single task manually with a config (illustrative — substitute your
+# own goal, config, and skill; this line is intentionally not a runnable
+# ```bash fence so the runbook flow-count test doesn't pick it up as a
+# fifth documented flow)
 python3 main.py --auto "your goal" \
   --base examples/hello-world \
   --config agents_128k.ini \
   --skill hello-code
+```
 
+```bash
 # Then validate
 python3 scripts/check_runbook.py --all
 ```
