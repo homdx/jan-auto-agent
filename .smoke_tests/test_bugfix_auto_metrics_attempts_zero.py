@@ -1,1 +1,0 @@
-../tests/test_bugfix_auto_metrics_attempts_zero.py

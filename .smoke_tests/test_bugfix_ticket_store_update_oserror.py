@@ -1,1 +1,0 @@
-../tests/test_bugfix_ticket_store_update_oserror.py
