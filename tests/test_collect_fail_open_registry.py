@@ -150,5 +150,5 @@ def test_ac_real_repo_reference_sites_are_all_registered():
     registry = build_fail_open_registry(modules, root=REPO_ROOT)
     locations = fail_open_locations(registry)
     assert "tools/auto/auto_metrics.py:250" in locations  # NOTE: line tracks _warn_if_contaminated's corrupt-file swallow (documented rationale); update if it shifts
-    assert "tools/auto/coder.py:834" in locations  # NOTE: line tracks a bare `except Exception: pass`; update if it shifts
+    assert "tools/auto/coder.py:1027" in locations  # NOTE: line tracks the dup_reject_ratio config-fallback bare except (was :834's _extract_missing_context, fixed — now logs, correctly dropped out); update if it shifts
     assert "tools/auto/inner_loop.py:420" in locations  # NOTE: line tracks _fetch_needed_flat's bare except; update if it shifts

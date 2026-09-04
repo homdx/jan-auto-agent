@@ -831,8 +831,18 @@ class Coder(_llm_stream.LLMClientBase):
             missing = data.get("missing_context")
             if isinstance(missing, list):
                 return [str(s).strip() for s in missing if s][:8]
-        except Exception:
-            pass
+        except (json.JSONDecodeError, AttributeError, TypeError) as exc:
+            # BUGFIX: was a bare `except Exception: pass`, which swallowed
+            # malformed-JSON, non-dict, and non-list payloads identically —
+            # the caller then silently treats context as "satisfied" (no
+            # missing_context) with no signal that the LLM's response
+            # couldn't be parsed at all versus genuinely having nothing
+            # missing. Narrowed to the exceptions this parse can actually
+            # raise and logged at debug so the real cause is visible.
+            logger.debug(
+                "_extract_missing_context: could not parse missing_context "
+                "from LLM response: %s", exc,
+            )
         return []
 
     def _fetch_needed(

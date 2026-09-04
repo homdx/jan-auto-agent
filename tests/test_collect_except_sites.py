@@ -78,7 +78,12 @@ def test_all_four_mini_repo_sites_found():
 def test_coder_718_pass_is_classified_fail_open():
     source = CODER_PATH.read_text(encoding="utf-8")
     sites = _sites_by_location(source, "tools/auto/coder.py")
-    site = sites["tools/auto/coder.py:834"]  # NOTE: line tracks a bare `except Exception: pass`; update if it shifts
+    # NOTE: was tools/auto/coder.py:834 (_extract_missing_context's bare
+    # `except Exception: pass`), fixed to narrow-and-log — it now correctly
+    # classifies as "log"/not-fail-open, so this AC re-points to another
+    # still-genuine bare `except: <fallback assignment>` site (dup_reject_ratio
+    # config fallback). Update if it shifts.
+    site = sites["tools/auto/coder.py:1027"]
     assert site.body_kind == "pass"
     assert site.is_fail_open is True
 
@@ -86,7 +91,7 @@ def test_coder_718_pass_is_classified_fail_open():
 def test_coder_866_continue_is_not_silent():
     source = CODER_PATH.read_text(encoding="utf-8")
     sites = _sites_by_location(source, "tools/auto/coder.py")
-    site = sites["tools/auto/coder.py:982"]  # NOTE: line tracks a bare `except OSError: continue`; update if it shifts
+    site = sites["tools/auto/coder.py:992"]  # NOTE: line tracks a bare `except OSError: continue`; update if it shifts
     assert site.body_kind == "continue"
     assert site.is_fail_open is False
 
