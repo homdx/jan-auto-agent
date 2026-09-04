@@ -15,13 +15,31 @@ adapters. If you edit a command here, run that test.
 ## Running everything at once
 
 ```bash
+# Using the wrapper script (recommended)
 scripts/run_flows.sh                      # tasks 1-3, then validate
 scripts/run_flows.sh 2                    # just task 2
 scripts/run_flows.sh 4                    # task 4 (needs [task4_provider_b] first)
 scripts/run_flows.sh --config agents_128k.ini
 scripts/run_flows.sh --runner proxychains4
+scripts/run_flows.sh --config agents_128k.ini --runner proxychains4
 scripts/run_flows.sh --check-only         # validate previous runs, run nothing
 ```
+
+**The wrapper script does two things:** (1) runs the flows in auto mode against
+`main.py` using the specified config, and (2) validates the output deterministically.
+You pass `--config` to `run_flows.sh` and it forwards it to `main.py --auto`.
+
+**Available configs:**
+
+| Config | Context | Use case |
+|--------|---------|----------|
+| `agents_32k.ini` | 32K tokens | Default, minimum for skills |
+| `agents_64k.ini` | 64K tokens | Larger context |
+| `agents_128k.ini` | 128K tokens | Large files/complex tasks |
+| `agents_256k.ini` | 256K tokens | Extra large |
+| `agents_32k_fast_cpu.ini` | 32K + optimized | CPU inference |
+| `agents_32k_slow_cpu.ini` | 32K + slower CPU | Very slow hardware |
+| `agents_4k.ini` | 4K tokens | Testing only (too small) |
 
 Each flow gets its **own** sandbox, rebuilt from the committed baseline
 before it starts:
@@ -50,15 +68,39 @@ which costs a second instead of a whole run.
 
 ## Validating a run
 
-`pytest` proves the machinery is wired. It cannot prove a *run* produced the
-right artefact, because the artefact is written by a model at runtime.
+There are three ways to validate. `pytest` proves the machinery is wired; it
+cannot prove a *run* produced the right artefact, because the artefact is
+written by a model at runtime.
+
+**After running flows with `run_flows.sh`:**
 
 ```bash
+# Already done by the script, but can be re-run:
 python3 scripts/check_runbook.py --task 2
 python3 scripts/check_runbook.py --task 4
 python3 scripts/check_runbook.py --all
 python3 scripts/check_runbook.py --all --json
 ```
+
+**Note: `check_runbook.py` accepts NO `--config` argument.** Config is only
+used during the *run* phase (in `main.py --auto`), not during validation.
+Validation is deterministic — it inspects what's on disk, makes no LLM calls,
+and takes no config input.
+
+**Manual workflow (run and validate separately):**
+
+```bash
+# Run a single task manually with a config
+python3 main.py --auto "your goal" \
+  --base examples/hello-world \
+  --config agents_128k.ini \
+  --skill hello-code
+
+# Then validate
+python3 scripts/check_runbook.py --all
+```
+
+The `--config` flag goes to `main.py`, not to `check_runbook.py`.
 
 Every check is **deterministic — no LLM, no network.** "Does `test_main.py`
 exist", "did `README.md` change", "is the seed changelog entry still there"
