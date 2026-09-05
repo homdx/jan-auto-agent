@@ -567,9 +567,11 @@ def _classify_except_body(body: List[ast.stmt]) -> "tuple[str, bool]":
     logged/raised/continued/returned statement nested one level inside an
     `if` inside the handler still counts):
 
-    1. A bare `raise` (no exception expression, i.e. re-raise-the-caught-one)
-       anywhere -> ``"re-raise"``. Never fail-open: the exception keeps
-       propagating.
+    1. A `raise` anywhere (bare or with an exception expression) ->
+       ``"re-raise"``. Never fail-open: the exception keeps propagating
+       whether it is a re-raise of the caught one (bare ``raise``) or a
+       new exception (``raise SomeException(...)``). Both exit the handler
+       visibly — the opposite of a silent swallow.
     2. A logging call anywhere -> ``"log"``. Not silent: someone will see it.
     3. A `continue` anywhere -> ``"continue"``. Control flow, not a silent
        swallow — the loop keeps going, but visibly (COLLECT-6 AC:
@@ -581,21 +583,21 @@ def _classify_except_body(body: List[ast.stmt]) -> "tuple[str, bool]":
        category responsible for the majority of false positives in bug
        hunts (COLLECT-6's whole reason for existing).
     """
-    has_bare_raise = False
+    has_raise = False
     has_log = False
     has_continue = False
     has_return = False
     for stmt in body:
         for sub in _walk_own_scope(stmt):
-            if isinstance(sub, ast.Raise) and sub.exc is None:
-                has_bare_raise = True
+            if isinstance(sub, ast.Raise):
+                has_raise = True
             elif _is_log_call(sub):
                 has_log = True
             elif isinstance(sub, ast.Continue):
                 has_continue = True
             elif isinstance(sub, ast.Return):
                 has_return = True
-    if has_bare_raise:
+    if has_raise:
         return "re-raise", False
     if has_log:
         return "log", False

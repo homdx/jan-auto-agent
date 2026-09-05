@@ -55,6 +55,45 @@ def test_except_bare_raise_is_re_raise_not_fail_open():
     assert site.is_fail_open is False
 
 
+def test_except_raise_with_exc_is_not_fail_open():
+    # A `raise SomeException(...)` (with an exception expression, not a bare
+    # re-raise) propagates the exception — it is NOT a silent swallow.
+    # _classify_except_body used to only recognise bare `raise` (exc is None)
+    # as not-fail-open; a `raise ValueError(...)` fell through to "pass" /
+    # is_fail_open=True, which poisoned the FAIL_OPEN_REGISTRY and
+    # AlreadySafeIndex into suppressing real crash-site bug claims at
+    # re-raising except blocks.
+    tree = ast.parse(
+        "def f():\n"
+        "    try:\n"
+        "        risky()\n"
+        "    except Exception:\n"
+        "        raise ValueError('bad')\n",
+        filename="m.py",
+    )
+    sites = extract_except_sites(tree, "m.py")
+    assert sites[0].body_kind == "re-raise"
+    assert sites[0].is_fail_open is False
+
+
+def test_except_raise_with_exc_inside_if_still_not_fail_open():
+    # Same as above but the raise is inside an `if` — control-flow statements
+    # (if/for/while/try) are not a separate scope, so a raise nested in one
+    # must still count.
+    tree = ast.parse(
+        "def f(cond):\n"
+        "    try:\n"
+        "        risky()\n"
+        "    except Exception:\n"
+        "        if cond:\n"
+        "            raise RuntimeError('nope')\n",
+        filename="m.py",
+    )
+    sites = extract_except_sites(tree, "m.py")
+    assert sites[0].body_kind == "re-raise"
+    assert sites[0].is_fail_open is False
+
+
 def test_except_continue_is_not_silent():
     # `except OSError: continue` is control flow, NOT a silent fail-open —
     # this is the exact distinction COLLECT-6's AC calls out for
