@@ -220,7 +220,15 @@ class Orchestrator(OrchestratorActions):
         # off self.prompt_store during construction, so this reordering
         # doesn't change behaviour on the success path.)
         self.prompt_store.store_path   = Path(self.config.get("prompt_store", "store_path", fallback="prompts.json"))
-        self.prompt_store.max_versions = self._getint("prompt_store", "max_versions", 3)
+        # BUGFIX: _getint returns the raw value — a present-but-zero
+        # max_versions (e.g. "max_versions = 0") is a valid int, not
+        # malformed, so it bypasses _getint's ValueError guard and reaches
+        # push() unclamped. PromptStore.__init__ clamps with max(1, …)
+        # but that branch only runs when config is passed to __init__;
+        # here the store was created with config=None (line 125) and this
+        # line overwrites max_versions after the fact. With 0, push()
+        # appends then evicts down to 0 and crashes on stack[-1].
+        self.prompt_store.max_versions = max(1, self._getint("prompt_store", "max_versions", 3))
 
     def reload_agents(self) -> None:
         """Re-read agents.ini and rebuild all agents mid-session (no restart)."""
