@@ -768,10 +768,16 @@ class LLMGate2Validator:
                 raise ValueError(
                     f"validator returned {type(parsed).__name__}, expected JSON object"
                 )
-            self.last_missing_context = [
-                str(x).strip() for x in (parsed.get("missing_context") or [])
-                if str(x).strip()
-            ]
+            # BUGFIX: same string-vs-list class of bug as _format_gate2_feedback —
+            # an LLM may return "missing_context" as a string. Without a type
+            # guard, iterating a string yields single characters.
+            raw_missing = parsed.get("missing_context")
+            if isinstance(raw_missing, list):
+                self.last_missing_context = [
+                    str(x).strip() for x in raw_missing if str(x).strip()
+                ]
+            else:
+                self.last_missing_context = []
             approved = bool(parsed.get("approved", False))
             if approved:
                 return True, ""
@@ -1144,7 +1150,19 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
 def _format_gate2_feedback(parsed: dict, max_hints: int) -> str:
     """Build a structured rejection string from a Gate-2 dict (LOOP-1)."""
     feedback = parsed.get("feedback", "no reason given")
-    hints    = (parsed.get("hints") or [])[:max_hints]
+    # BUGFIX: an LLM may return "hints" as a string instead of a list
+    # ("fix the ending" rather than ["fix the ending"]). Without a type
+    # guard, [:max_hints] slices the string and enumerate() iterates over
+    # individual characters ("1. f", "2. i", "3. x"). Wrap a string in a
+    # list so it is treated as a single hint; drop any other non-list type.
+    raw_hints = parsed.get("hints")
+    if isinstance(raw_hints, list):
+        hints = raw_hints
+    elif isinstance(raw_hints, str) and raw_hints.strip():
+        hints = [raw_hints]
+    else:
+        hints = []
+    hints = hints[:max_hints]
     approach = parsed.get("suggested_approach", "")
 
     lines = [f"Reason: {feedback}"]
