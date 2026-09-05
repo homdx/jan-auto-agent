@@ -77,6 +77,33 @@ def test_enabled_languages_malformed_value_falls_back_to_python_only():
     assert enabled_languages(cfg) == frozenset({Language.PYTHON})
 
 
+def test_enabled_languages_typo_falls_back_to_python_only():
+    # A typo like "pythn" (for "python") used to return frozenset({"pythn"}),
+    # which scan_repo's language filter never matches — silently disabling
+    # all scanning with no warning. The docstring promises this can't happen.
+    cfg = _config(languages="pythn")
+    assert enabled_languages(cfg) == frozenset({Language.PYTHON})
+
+
+def test_enabled_languages_typo_alongside_valid_keeps_valid():
+    # A typo alongside a valid language drops the typo, keeps the valid one.
+    cfg = _config(languages="python,tyop")
+    assert enabled_languages(cfg) == frozenset({Language.PYTHON})
+
+
+def test_enabled_languages_typo_alongside_java_keeps_java():
+    # "pythn" (typo) is dropped, "java" is kept — not a full fallback.
+    cfg = _config(languages="pythn,java")
+    assert enabled_languages(cfg) == frozenset({Language.JAVA})
+
+
+def test_enabled_languages_all_typos_falls_back_to_python_only():
+    # Every configured value unrecognized → fallback to default (Python only),
+    # not an empty set that would scan zero modules.
+    cfg = _config(languages="pythn,jvaa")
+    assert enabled_languages(cfg) == frozenset({Language.PYTHON})
+
+
 # ── java_extensions_from_config ─────────────────────────────────────────
 
 

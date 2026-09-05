@@ -105,7 +105,16 @@ def enabled_languages(config: Optional["configparser.ConfigParser"]) -> FrozenSe
         return _DEFAULT_ENABLED_LANGUAGES
     raw = config.get("collect", "languages", fallback=Language.PYTHON)
     langs = {part.strip().lower() for part in raw.split(",") if part.strip()}
-    return frozenset(langs) if langs else _DEFAULT_ENABLED_LANGUAGES
+    # Filter out unrecognized language names (typos like "pythn" that
+    # would silently disable all scanning — scan_repo's language filter
+    # never matches "pythn", so zero modules would be scanned). If at
+    # least one configured value is recognized, keep only the recognized
+    # ones (a typo alongside "python" drops the typo, keeps Python). If
+    # none are recognized, fall back to the default rather than scanning
+    # zero languages — the docstring's "a config typo should never
+    # silently turn off Python scanning" guarantee.
+    valid = {lang for lang in langs if lang in Language.ALL}
+    return frozenset(valid) if valid else _DEFAULT_ENABLED_LANGUAGES
 
 
 #: `[collect] java_extensions`' own fallback — see `java_extensions_from_config`.
