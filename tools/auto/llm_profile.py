@@ -26,7 +26,7 @@ this module directly now.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, replace
 from typing import Optional
 
 logger = logging.getLogger(__name__)

@@ -41,7 +41,7 @@ import logging
 import time
 from tools.auto.context_broker import ContextBroker
 from tools.auto.gate_registry import (  # GATES-1 / GATES-2
-    GATES, build_validators, resolve_gate_order, run_gates,
+    build_validators, resolve_gate_order, run_gates,
 )
 from tools.agent_trace import tracer   # AUTO-CR-27: per-stage decision tracing
 

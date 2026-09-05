@@ -230,7 +230,7 @@ class SearchAgent:
         already_searched_set = set(already_searched or [])
         visited_names = visited_names or set()
         
-        result = {
+        result: Dict[str, Any] = {
             "found": {},
             "not_found": [],
             "searched_files": []
