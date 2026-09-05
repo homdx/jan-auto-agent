@@ -898,15 +898,19 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
         # «не против» / «непротив»
         _re.compile(r"\bне\s+против\b"),
         _re.compile(r"\bнепротив\b"),
-        # «одобрен* / одобряю» — NOT preceded by «не »
-        _re.compile(r"(?<!не )одобр"),
-        # «принято / принимаю / можно принять» — NOT preceded by «не »
-        _re.compile(r"(?<!не )принят"),
+        # «одобрен* / одобряю» — NOT preceded by «не » or «не» (one-word
+        # negation «неодобренный» must not match; the (?<!не) lookbehind
+        # catches the no-space form, (?<!не ) catches the spaced form).
+        _re.compile(r"(?<!не)(?<!не )одобр"),
+        # «принято / принимаю / можно принять» — NOT preceded by «не » or «не»
+        _re.compile(r"(?<!не)(?<!не )принят"),
         _re.compile(r"\bможно\s+принять\b"),
-        # «всё верно» / «все верно»
-        _re.compile(r"\b(всё|все)\s+верно\b"),
-        # «соответствует» — NOT preceded by «не »
-        _re.compile(r"(?<!не )соответствует\b"),
+        # «всё верно» / «все верно» — NOT preceded by «не » (the one-word
+        # form «невсё» has no \b before «всё» so \b already blocks it).
+        _re.compile(r"(?<!не )\b(всё|все)\s+верно\b"),
+        # «соответствует» — NOT preceded by «не » or «не» (one-word
+        # negation «несоответствует» must not match).
+        _re.compile(r"(?<!не)(?<!не )соответствует\b"),
         # «соглас*» (согласен/согласна/…) — NOT preceded by «не»/«нет»
         _re.compile(r"(?<!не)(?<!нет)(?<!не )(?<!нет )соглас"),
     ]

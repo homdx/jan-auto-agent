@@ -223,6 +223,94 @@ class TestNegationTraps:
 
 
 # ===========================================================================
+# 5b. One-word negation traps — Russian
+# ===========================================================================
+#
+# The «соглас» pattern already had four lookbehinds: (?<!не)(?<!нет)(?<!не )
+# (?<!нет ).  But «одобр», «принят», «соответствует», and «всё верно» only
+# had (?<!не ) (with-space) — a one-word negation like «неодобренный» (no
+# space) had only 2 chars before the keyword, so the 3-char (?<!не ) could
+# not match and the keyword was classified APPROVED, letting a rejected
+# chapter through Gate 2.  The fix adds (?<!не) (no-space) to each.
+#
+# «не всё верно» (spaced) had NO negation lookbehind at all on «всё верно»,
+# so the spaced negation matched the APPROVED pattern too.
+
+class TestOneWordNegationTraps:
+    """One-word (no-space) and spaced negations of APPROVED keywords must
+    NOT be classified as a definite APPROVED (ok=True, unparseable=False).
+
+    Before the fix, the (?<!не ) lookbehind only caught the spaced form
+    «не X»; a one-word negation like «неодобренный» had only 2 chars
+    before the keyword, so the 3-char (?<!не ) could not match and the
+    keyword was classified APPROVED, letting a rejected chapter through
+    Gate 2. The fix adds (?<!не) (no-space) to «одобр», «принят»,
+    «соответствует» and (?<!не ) to «всё верно».
+
+    Forms that also match a _RU_REVISE pattern («не соответствует»,
+    «не согласен») return REVISE; the rest return UNPARSEABLE (fail-open)
+    — the key invariant is that none return a definite APPROVED."""
+
+    # ── one-word negations (no space): «неX» → not definite APPROVED ──
+
+    def test_neodobrennyy_not_APPROVED(self):
+        ok, _, unparseable = _parse_verdict_soft("Неодобренный")
+        assert not (ok and not unparseable), "'неодобренный' must not be APPROVED"
+
+    def test_neprinyat_not_APPROVED(self):
+        ok, _, unparseable = _parse_verdict_soft("Непринят")
+        assert not (ok and not unparseable), "'непринят' must not be APPROVED"
+
+    def test_nesootvetstvuet_not_APPROVED(self):
+        ok, _, unparseable = _parse_verdict_soft("Несоответствует")
+        assert not (ok and not unparseable), "'несоответствует' must not be APPROVED"
+
+    # ── spaced negations: «не X» → not definite APPROVED ──
+
+    def test_ne_odobrennyy_not_APPROVED(self):
+        ok, _, unparseable = _parse_verdict_soft("Не одобренный")
+        assert not (ok and not unparseable), "'не одобренный' must not be APPROVED"
+
+    def test_ne_prinyat_not_APPROVED(self):
+        ok, _, unparseable = _parse_verdict_soft("Не принят")
+        assert not (ok and not unparseable), "'не принят' must not be APPROVED"
+
+    # ── «не всё верно» (not all correct) → not definite APPROVED ──
+
+    def test_ne_vsyo_verno_not_APPROVED(self):
+        ok, _, unparseable = _parse_verdict_soft("Не всё верно")
+        assert not (ok and not unparseable), "'не всё верно' must not be APPROVED"
+
+    # ── spaced negations that DO match a _RU_REVISE pattern → REVISE ──
+
+    def test_ne_sootvetstvuet_is_REVISE(self):
+        _, _, unparseable = _parse_verdict_soft("Не соответствует")
+        assert unparseable is False, "'не соответствует' must be REVISE (has pattern)"
+
+    # ── positive forms still definite APPROVED (regression guard) ──
+
+    def test_odobrennyy_still_APPROVED(self):
+        ok, _, unparseable = _parse_verdict_soft("Одобренный")
+        assert ok is True and unparseable is False
+
+    def test_prinyato_still_APPROVED(self):
+        ok, _, unparseable = _parse_verdict_soft("Принято")
+        assert ok is True and unparseable is False
+
+    def test_sootvetstvuet_still_APPROVED(self):
+        ok, _, unparseable = _parse_verdict_soft("Соответствует тексту")
+        assert ok is True and unparseable is False
+
+    def test_vsyo_verno_still_APPROVED(self):
+        ok, _, unparseable = _parse_verdict_soft("Всё верно")
+        assert ok is True and unparseable is False
+
+    def test_vse_verno_still_APPROVED(self):
+        ok, _, unparseable = _parse_verdict_soft("Все верно")
+        assert ok is True and unparseable is False
+
+
+# ===========================================================================
 # 6. Case / whitespace robustness
 # ===========================================================================
 
