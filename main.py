@@ -644,7 +644,7 @@ class Orchestrator(OrchestratorActions):
         # --- FINAL RENDER ---
         total_elapsed = time.time() - start_time
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-        
+
         print(f"\n[PIPELINE COMPLETED - {timestamp}]")
 
         # Record run metrics
@@ -659,11 +659,23 @@ class Orchestrator(OrchestratorActions):
             bool(improvement.get("improved_code") or improvement.get("explanation"))
             if _improvement_ran else None
         )
+        # BUGFIX: an exhausted validation loop (all max_iterations rejected)
+        # increments iteration one past max (iteration = max + 1) because the
+        # increment at the bottom of the loop runs before the while condition
+        # re-checks. Clamp to max_iterations so iterations_used and the
+        # formatter display don't show 4/3. Also, show/show_imports skip the
+        # validation loop entirely (iteration stays at 1 from the init at the
+        # top of run_pipeline) — record 0, not 1, so avg_iterations in the
+        # optimizer trigger is not diluted by non-validation runs.
+        if parsed.intent in ("show", "show_imports"):
+            iterations_used = 0
+        else:
+            iterations_used = min(iteration, self.max_iterations)
         self.metrics_collector.record(RunRecord(
             timestamp=timestamp,
             intent=parsed.intent,
             prompt_version=self.prompt_store.get_version_label("validator_agent"),
-            iterations_used=iteration,
+            iterations_used=iterations_used,
             validator_status=last_validation.get("status", "skipped"),
             validator_feedback=last_validation.get("feedback", ""),
             improvement_json_ok=improvement_json_ok,
@@ -703,7 +715,7 @@ class Orchestrator(OrchestratorActions):
             search_result=search_result,
             improvement=improvement,
             elapsed_time=total_elapsed,
-            iteration=iteration,
+            iteration=iterations_used,
             output_config={
                 # Bugfix (config-crash audit): same helper bypass as the
                 # direct_chat reads above — a malformed [output] value
