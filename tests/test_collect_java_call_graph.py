@@ -159,6 +159,56 @@ def test_build_call_edges_skips_broken_java_file_without_crashing(tmp_path):
     assert set(edges) == {"pkg/Broken.java", "pkg/Good.java"}
 
 
+def test_build_call_edges_skips_java_file_with_has_error(tmp_path):
+    """A .java file that tree-sitter partially recovers (has_error=True,
+    error=None, tree not None) must be skipped — walking the recovered
+    tree extracts garbage call names and creates false edges.
+
+    This simulates a file that was valid during scan_repo (no parse_error)
+    but became syntactically broken before build_call_edges re-parses it.
+    scan_java_module sets parse_error for has_error=True, but the re-parse
+    in build_call_edges is independent and must check has_error itself.
+    """
+    _write(
+        tmp_path / "pkg" / "Helper.java",
+        "package pkg;\n"
+        "public class Helper {\n"
+        "    public static int doThing() { return 1; }\n"
+        "}\n",
+    )
+    # Scan a VALID file first — no parse_error
+    _write(
+        tmp_path / "pkg" / "Caller.java",
+        "package pkg;\n"
+        "public class Caller {\n"
+        "    public int run() {\n"
+        "        return doThing();\n"
+        "    }\n"
+        "}\n",
+    )
+    modules = scan_repo(tmp_path, config=_java_enabled_config())
+    caller = [m for m in modules if "Caller" in m.path][0]
+    assert caller.parse_error is None  # sanity: clean during scan
+
+    # Now corrupt the file (missing semicolon — has_error=True, error=None)
+    _write(
+        tmp_path / "pkg" / "Caller.java",
+        "package pkg;\n"
+        "public class Caller {\n"
+        "    public int run() {\n"
+        "        return doThing()\n"  # missing semicolon
+        "    }\n"
+        "}\n",
+    )
+    # Re-parse in build_call_edges must skip the has_error tree, not
+    # extract doThing from the recovered tree and create a false edge.
+    edges = build_call_edges(tmp_path, modules)
+    assert edges.get("pkg/Caller.java", frozenset()) == frozenset(), (
+        "has_error Java file must not produce call edges — "
+        f"got {edges.get('pkg/Caller.java')}"
+    )
+
+
 # ── mixed Python + Java repo: each language resolves independently ──────
 
 

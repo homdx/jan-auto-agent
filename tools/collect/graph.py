@@ -374,7 +374,18 @@ def build_call_edges(root: Path, modules: Iterable[ModuleRecord]) -> Graph:
                 # fix, same reasoning.
                 continue
             result = parse_java(source, m.path)
-            if result.error is not None or result.tree is None:
+            # BUGFIX: check has_error too — tree-sitter recovers a tree with
+            # ERROR/MISSING nodes for a syntactically broken .java file,
+            # returning error=None, tree=<recovered>, has_error=True.
+            # scan_java_module (scanner.py:100) treats has_error=True as a
+            # parse error and sets ModuleRecord.parse_error, which the
+            # m.parse_error check above (line 352) skips. But this re-parse
+            # is independent of scan_repo — a file that was valid during
+            # scan but corrupted before build_call_edges (or any non-deterministic
+            # tree-sitter recovery) would walk the broken tree and extract
+            # garbage call names. Checking has_error here mirrors the Python
+            # branch's SyntaxError guard and scan_java_module's contract.
+            if result.error is not None or result.tree is None or result.has_error:
                 continue
             for name in _java_call_names(result.tree):
                 target = owners.get(name)
