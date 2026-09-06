@@ -26,7 +26,7 @@ class _R:
     exit_code = 0; stdout = ""; stderr = ""
 
 
-def test_recovers_on_second_try():
+def test_recovers_on_second_try(monkeypatch):
     calls = {"n": 0, "msgs": []}
 
     def rc(**k):
@@ -36,7 +36,9 @@ def test_recovers_on_second_try():
         if calls["n"] == 1:
             return "Let's go through each point:\n1. The bridge scene repeats chapter 1..."
         return "REVISE:\n1. Сцена на мостике повторяет главу 1 — убрать."
-    ls.request_completion = rc; ls.strip_think = lambda x: x; ls.ollama_chat_url = lambda u: u
+    monkeypatch.setattr(ls, "request_completion", rc)
+    monkeypatch.setattr(ls, "strip_think", lambda x: x)
+    monkeypatch.setattr(ls, "ollama_chat_url", lambda u: u)
 
     v = _validator()
     approved, fb = v.approve({"instruction": "x"}, _R(), None)
@@ -46,13 +48,15 @@ def test_recovers_on_second_try():
     assert "повторяет главу 1" in fb              # clear critique reaches coder
 
 
-def test_capped_then_fail_open():
+def test_capped_then_fail_open(monkeypatch):
     calls = {"n": 0}
 
     def rc(**k):
         calls["n"] += 1
         return "Hmm, let me think about this..."   # never parseable
-    ls.request_completion = rc; ls.strip_think = lambda x: x; ls.ollama_chat_url = lambda u: u
+    monkeypatch.setattr(ls, "request_completion", rc)
+    monkeypatch.setattr(ls, "strip_think", lambda x: x)
+    monkeypatch.setattr(ls, "ollama_chat_url", lambda u: u)
 
     v = _validator()
     approved, _fb = v.approve({"instruction": "x"}, _R(), None)
@@ -60,13 +64,15 @@ def test_capped_then_fail_open():
     assert approved is True         # still fail-open after the one retry
 
 
-def test_clear_first_reply_no_retry():
+def test_clear_first_reply_no_retry(monkeypatch):
     calls = {"n": 0}
 
     def rc(**k):
         calls["n"] += 1
         return "APPROVED"
-    ls.request_completion = rc; ls.strip_think = lambda x: x; ls.ollama_chat_url = lambda u: u
+    monkeypatch.setattr(ls, "request_completion", rc)
+    monkeypatch.setattr(ls, "strip_think", lambda x: x)
+    monkeypatch.setattr(ls, "ollama_chat_url", lambda u: u)
 
     v = _validator()
     approved, _fb = v.approve({"instruction": "x"}, _R(), None)

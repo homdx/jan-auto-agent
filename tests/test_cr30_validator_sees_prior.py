@@ -8,13 +8,13 @@ import tools.llm_stream as ls
 from tools.auto.inner_loop import LLMGate2Validator, InnerLoop
 
 
-def _make_validator(capture):
+def _make_validator(monkeypatch, capture):
     def rc(**k):
         capture["payload"] = k.get("payload")
         return "REVISE:\n1. Диалог всё ещё не по заданию.\n2. Повтор не убран."
-    ls.request_completion = rc
-    ls.strip_think = lambda x: x
-    ls.ollama_chat_url = lambda u: u
+    monkeypatch.setattr(ls, "request_completion", rc)
+    monkeypatch.setattr(ls, "strip_think", lambda x: x)
+    monkeypatch.setattr(ls, "ollama_chat_url", lambda u: u)
     v = object.__new__(LLMGate2Validator)
     for k, val in dict(task_mode="creative", api_format="ollama", base_url="http://x",
                        api_key="k", model="m", ssl_context=None, temperature=0.1,
@@ -34,9 +34,9 @@ class _R:
     exit_code = 0; stdout = ""; stderr = ""
 
 
-def test_prior_critique_injected_on_revalidation():
+def test_prior_critique_injected_on_revalidation(monkeypatch):
     cap = {}
-    v = _make_validator(cap)
+    v = _make_validator(monkeypatch, cap)
     prior = "1. Диалог Миры не по заданию — заменить.\n2. Повтор сцены — убрать."
     approved, fb = v.approve({"instruction": "паника у проливов"}, _R(), None,
                              prior_critique=prior)
@@ -48,9 +48,9 @@ def test_prior_critique_injected_on_revalidation():
     assert "Повтор не убран" in fb                       # full new critique reaches coder
 
 
-def test_first_pass_has_no_previous_review_block():
+def test_first_pass_has_no_previous_review_block(monkeypatch):
     cap = {}
-    v = _make_validator(cap)
+    v = _make_validator(monkeypatch, cap)
     v.approve({"instruction": "паника"}, _R(), None, prior_critique="")
     assert "YOUR PREVIOUS REVIEW" not in _user_text(cap["payload"])
 
