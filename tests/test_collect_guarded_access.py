@@ -481,6 +481,102 @@ def test_and_nested_inside_or_does_not_leak_names_out():
     }
 
 
+# ── BUGFIX regression: x.get(k, truthy_default) does not guard k ─────────────
+# ── a truthy default means the guard `not x.get(k, default)` is False when ──
+# ── k is missing (the default is returned), so the guard body does NOT run  ──
+# ── and the code after the if executes with k absent — x[k] raises KeyError. ──
+# ── Before the fix, (x, k) was added to guarded_pairs unconditionally, so an ──
+# ── alias `y = x[k]; y[-1]` was wrongly marked GUARDED.                         ──
+
+
+def test_get_with_truthy_default_not_guarded():
+    """`if not x.get(k, 'default'): return` does not prove k is present
+    when the default is truthy — the guard is False when k is missing, so
+    the body doesn't run and k is still absent. The aliased access must be
+    UNGUARDED, not GUARDED."""
+    source = (
+        'def f(x):\n'
+        '    if not x.get("key", "default"):\n'
+        '        return None\n'
+        '    y = x["key"]\n'
+        '    return y[-1]\n'
+    )
+    accesses = _accesses(source, "m.py")
+    y_access = [a for a in accesses if a.access == "y[-1]"]
+    assert y_access, "y[-1] access not found"
+    assert y_access[0].status == "UNGUARDED", (
+        "truthy default does not guard k — y[-1] must be UNGUARDED"
+    )
+
+
+def test_get_with_truthy_default_one_not_guarded():
+    """Same as above but with integer 1 as the truthy default."""
+    source = (
+        'def f(x):\n'
+        '    if not x.get("key", 1):\n'
+        '        return None\n'
+        '    y = x["key"]\n'
+        '    return y[-1]\n'
+    )
+    accesses = _accesses(source, "m.py")
+    y_access = [a for a in accesses if a.access == "y[-1]"]
+    assert y_access, "y[-1] access not found"
+    assert y_access[0].status == "UNGUARDED"
+
+
+def test_get_with_falsy_default_still_guarded():
+    """Regression guard: a falsy default (None, 0, False, '') still
+    produces a GUARDED access — the guard fires when k is missing."""
+    for default_expr in ("None", "0", "False", '""'):
+        source = (
+            f'def f(x):\n'
+            f'    if not x.get("key", {default_expr}):\n'
+            f'        return None\n'
+            f'    y = x["key"]\n'
+            f'    return y[-1]\n'
+        )
+        accesses = _accesses(source, "m.py")
+        y_access = [a for a in accesses if a.access == "y[-1]"]
+        assert y_access, f"y[-1] not found for default={default_expr!r}"
+        assert y_access[0].status == "GUARDED", (
+            f"falsy default {default_expr!r} should still guard k — "
+            f"y[-1] must be GUARDED, got {y_access[0].status}"
+        )
+
+
+def test_get_no_default_still_guarded():
+    """Regression guard: no default at all (x.get(k)) — the guard fires
+    when k is missing (get returns None, which is falsy)."""
+    source = (
+        'def f(x):\n'
+        '    if not x.get("key"):\n'
+        '        return None\n'
+        '    y = x["key"]\n'
+        '    return y[-1]\n'
+    )
+    accesses = _accesses(source, "m.py")
+    y_access = [a for a in accesses if a.access == "y[-1]"]
+    assert y_access, "y[-1] access not found"
+    assert y_access[0].status == "GUARDED"
+
+
+def test_get_with_non_constant_default_not_guarded():
+    """A non-constant default (x.get(k, func())) can't be evaluated
+    statically — conservatively not guarded (a missed guard is acceptable,
+    a wrongly-kept one is not)."""
+    source = (
+        'def f(x):\n'
+        '    if not x.get("key", make_default()):\n'
+        '        return None\n'
+        '    y = x["key"]\n'
+        '    return y[-1]\n'
+    )
+    accesses = _accesses(source, "m.py")
+    y_access = [a for a in accesses if a.access == "y[-1]"]
+    assert y_access, "y[-1] access not found"
+    assert y_access[0].status == "UNGUARDED"
+
+
 def test_mutating_pop_after_guard_invalidates_it():
     # Bug reproduction: `if not stack: return None` proves `stack` truthy,
     # but `stack.pop()` right after can empty it again with no reassignment
