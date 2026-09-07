@@ -657,7 +657,17 @@ class BugFixLoop:
         fix_task = self._build_fix_task(
             fix_id, ticket_id, triggering_task, exec_result
         )
-        self._state.upsert_task(fix_task)
+        # A1 follow-up: fix_id is deterministic (f"{_FIX_PREFIX}{root_id}"), so a
+        # NEW regression on the same root re-upserts the SAME id. Once the first
+        # fix succeeded that task is STATUS_DONE (bug_fix_loop.py:712 /
+        # commit_on_success.py:165), and the A1 downgrade guard would refuse the
+        # done -> todo re-open — the new regression would sit in plan.json with a
+        # fresh instruction and a done status, so the queue would never pick it
+        # up and the regression would go silently unfixed. A new regression IS
+        # the explicit "give this task a fresh start" signal the opt-in exists
+        # for. Plain re-plans (plan_emitter / pipeline) still do not pass it, so
+        # completed work stays protected there.
+        self._state.upsert_task(fix_task, allow_downgrade=True)
 
         # ── 3. Run the fix through the C-loop ─────────────────────────────────
         logger.info(
