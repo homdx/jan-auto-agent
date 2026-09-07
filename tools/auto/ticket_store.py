@@ -553,7 +553,14 @@ class TicketStore:
         self._dir.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
-    def _read(path: Path) -> dict:
+    def _read(path: Path) -> Any:
+        # B10: this is json.loads, so it returns whatever the file holds. The
+        # class only ever WRITES an object, but a hand-edited file, a restored
+        # backup or an older format can leave a list, a scalar or null behind.
+        # Any, not "dict | list": narrowing to two container types would still
+        # be a lie about the other three. Every caller (get(), list_all(),
+        # update()) already isinstance-checks the result; the annotation was
+        # the only thing claiming they did not have to.
         return json.loads(path.read_text(encoding="utf-8"))
 
     @staticmethod

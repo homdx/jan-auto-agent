@@ -215,7 +215,7 @@ _API_KEY_LINE_RE = re.compile(
 )
 
 
-def mask_api_key(text: str) -> str:
+def mask_api_key(text: "str | None") -> "str | None":
     """Replace every ``api_key = <value>`` line in *text* with
     ``api_key = here_your_key``, regardless of what the value actually is
     (a placeholder like "test", a real key, anything non-blank).
@@ -231,7 +231,7 @@ def mask_api_key(text: str) -> str:
     return _API_KEY_LINE_RE.sub(r"\1here_your_key\3", text)
 
 
-def strip_think(text: str) -> str:
+def strip_think(text: "str | None") -> "str | None":
     """
     Remove reasoning-model <think>…</think> blocks from model output.
 

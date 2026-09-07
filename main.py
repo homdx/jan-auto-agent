@@ -374,7 +374,7 @@ class Orchestrator(OrchestratorActions):
             )
             return fallback
 
-    def execute_direct_chat(self, user_input: str) -> None:
+    def execute_direct_chat(self, user_input: str) -> "str | None":
         """
         Send a free-form message directly to the model with no file context —
         used when run_pipeline detects no file path in the user's request.
@@ -456,6 +456,11 @@ class Orchestrator(OrchestratorActions):
             # also restores any messages that were trimmed by the cap
             # during the append, which pop() alone could not recover.
             self._direct_chat_history = _saved_history
+            # B10: explicit, not implicit. The success path returns the reply
+            # string, so this branch returning None by falling off the end is
+            # the difference the annotation now documents -- callers have to
+            # handle it.
+            return None
 
     def run_pipeline(self, user_input: str, base_dir: str,
                      resume_state: dict = None) -> None:
