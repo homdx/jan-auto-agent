@@ -533,7 +533,21 @@ def ollama_chat_url(base_url: str) -> str:
     return f"{base}/api/chat"
 
 
-_JSON_FENCE_OPEN_RE = re.compile(r"```json", re.IGNORECASE)
+_JSON_FENCE_OPEN_RE = re.compile(
+    r"`{3,}json[A-Za-z0-9_+\-#.,]*(?=\s|$|[{\[\"])", re.IGNORECASE
+)
+# The label on a NON-``json`` opening fence: anything up to the next
+# whitespace/backtick, so ```python, ```text, ```json5, ```c++, ```c# and a
+# bare ``` all behave the same way. Deliberately not "rest of the line" —
+# a model that puts its body on the same line as the marker
+# (```json {"a": 1}) must keep that body.
+# A label is markdown's info string, which ends the opening line — so it is
+# only a label when whitespace, a newline or the end of the text follows it.
+# Without that lookahead "```123```" parsed as label "123" + empty body, and
+# the body of a fence holding a bare JSON number was silently swallowed.
+_FENCE_LABEL_RE = re.compile(
+    r"`{3,}(?:[ \t]*[A-Za-z0-9_+\-#.,]*(?=\s|$|[{\[\"]))?"
+)
 
 
 def strip_json_fence(text: str) -> str:
@@ -567,7 +581,14 @@ def strip_json_fence(text: str) -> str:
         # while giving complete-but-unclosed JSON a real chance to parse.
         return rest.strip()
     if "```" in text:
-        before, _, rest = text.partition("```")
+        # BUGFIX (audit): only the ```json branch above knew its fence had a
+        # label. A block labelled anything else (```python, ```text, ```js)
+        # fell through here and the label was left glued to the body —
+        # "python\n{\"a\": 1}" — so every caller's json.loads failed on
+        # content that was perfectly valid JSON, burning a retry on a format
+        # slip the parser could have recovered from. Consume whatever label
+        # the opening fence carries, not just the literal "json".
+        rest = text[_FENCE_LABEL_RE.search(text).end():]
         if "```" in rest:
             return rest.split("```")[0].strip()
         # Only a single, unmatched "```" — not a real fence pair. Same
