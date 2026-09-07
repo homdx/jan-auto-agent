@@ -548,7 +548,37 @@ class StateStore:
         rewrites overwrite ``instruction``.
 
         Returns the new impl_version.
+
+        Raises
+        ------
+        ValueError
+            If *instruction* is not a non-empty, non-whitespace string, or if
+            *task_id* is not in the plan. On rejection nothing is written:
+            the previous ``instruction``, ``impl_version`` and
+            ``original_instruction`` state all survive intact.
         """
+        # B2: the task schema requires a non-empty id and title but says
+        # nothing about instruction, and outer_loop hands over
+        # new_task.get("instruction", "") -- the default is literally "".
+        # A truncated or partial rewriter reply therefore overwrote the live
+        # instruction with an empty string, recorded original_instruction and
+        # bumped impl_version. The empty body became the Coder's active task,
+        # and because impl_version had advanced, the real already-failing
+        # instruction dropped out of the "previously tried" history the
+        # rewrite cap depends on.
+        #
+        # The guard runs BEFORE the lookup loop, so no task is touched on
+        # rejection -- not even original_instruction, which must keep holding
+        # the true v1 baseline. isinstance is part of the check: a non-string
+        # (None from a missing JSON key) must raise ValueError here, not
+        # AttributeError from .strip() a line later.
+        if not isinstance(instruction, str) or not instruction.strip():
+            raise ValueError(
+                f"apply_rewrite: refusing a blank or non-string instruction "
+                f"for task '{task_id}' -- keeping the previous instruction "
+                f"and impl_version"
+            )
+
         tasks = self._plan.get("tasks", [])
         for t in tasks:
             if t["id"] == task_id:
