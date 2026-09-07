@@ -206,6 +206,31 @@ def _validate_task_schema(task: dict) -> None:
         raise ValueError("Task schema violation: 'title' must be a non-empty string")
 
 
+def _validate_extra_task_fields(extra_fields: dict) -> None:
+    """Type-check *extra_fields* against the required-task-field schema.
+
+    Unlike :func:`_validate_task_schema` this does NOT require every required
+    field to be present -- it only checks the entries that are actually being
+    written. That distinction matters: ``set_task_status`` is called with a
+    bare status on legacy and hand-edited ``plan.json`` files whose tasks may
+    legitimately lack a required field, and re-validating the whole merged
+    task would turn those writes into a mid-run abort.
+
+    Keys outside ``_REQUIRED_TASK_FIELDS`` (``commit``,
+    ``original_instruction``, ``blocked_reason``, ...) are free-form
+    bookkeeping and are deliberately left unchecked.
+    """
+    for field, expected_type in _REQUIRED_TASK_FIELDS.items():
+        if field in extra_fields and not _matches_schema_type(
+            extra_fields[field], expected_type
+        ):
+            raise ValueError(
+                f"Task schema violation: field '{field}' must be "
+                f"{expected_type.__name__}, "
+                f"got {type(extra_fields[field]).__name__}"
+            )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # StateStore
 # ─────────────────────────────────────────────────────────────────────────────
@@ -385,6 +410,13 @@ class StateStore:
         """
         if status not in _VALID_STATUSES:
             raise ValueError(f"Invalid status '{status}'; must be one of {_VALID_STATUSES}")
+
+        # B1: extra_fields used to be merged with a bare t.update() and no
+        # validation at all, so a typo such as round="2" landed in plan.json
+        # as a string where the schema demands an int, and a later
+        # t["attempt"] + delta raised TypeError somewhere else entirely.
+        # Validate the incoming fields only -- never the merged task.
+        _validate_extra_task_fields(extra_fields)
 
         tasks = self._plan.get("tasks", [])
         for t in tasks:
