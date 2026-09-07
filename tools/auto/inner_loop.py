@@ -352,6 +352,31 @@ class LLMGate2Validator:
         budget = max(800, 6000 // max(len(files), 1))
         blocks = []
         for rel in files:
+            # B8: files_written is coder output, not code. A non-string entry
+            # (None, an int, a dict from a lenient JSON parse) makes
+            # `_base / rel` raise TypeError, which the `except OSError` below
+            # does not catch -- so one junk entry aborted the whole Gate-2
+            # prompt build instead of degrading to a note, which is this
+            # helper's entire job. An empty string is unusable too:
+            # `_base / ""` is just `_base`, and reading a directory raises.
+            #
+            # The check sits BEFORE the try on purpose. Detecting the bad
+            # entry from inside the exception handler would depend on which
+            # exception the path join happens to raise, and a pathlib.Path
+            # entry (which joins fine) would slip past unnoticed.
+            #
+            # Each bad entry gets its own visible block rather than being
+            # filtered out. A silently shorter list reads to the validator as
+            # "nothing suspicious here" at exactly the moment the coder
+            # invented a path -- the opposite of what this pipeline is for.
+            if not isinstance(rel, str) or not rel.strip():
+                blocks.append(
+                    f"--- (not a usable path: {rel!r}) ---\n"
+                    f"(the coder reported this entry in files_written, but it "
+                    f"is not a path — expected a non-empty string, got "
+                    f"{type(rel).__name__})"
+                )
+                continue
             try:
                 content = (_base / rel).read_text(
                     encoding="utf-8", errors="replace")
