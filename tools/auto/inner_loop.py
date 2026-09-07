@@ -1355,10 +1355,31 @@ class InnerLoop:
         # (not per attempt) and seeded into prefetched_context before the
         # first coder call. Purely additive: "" when no bridge was wired in,
         # the model is absent/stale, or target_files have no collect record.
+        # OPT-1: computed once and kept in a local for the whole round. The
+        # pull-model reassignments below (`prefetched_context =
+        # format_for_prompt(...)`) replace the WHOLE string, so this seeded
+        # block was silently dropped the first time the coder asked for extra
+        # context -- the collect record vanished from the prompt at exactly
+        # the point the coder had admitted it was missing something. Both
+        # reassignment sites re-prepend it via _with_collect_block().
+        _collect_block = ""
         if self._collect_bridge is not None:
-            _collect_block = self._collect_bridge.context_for_many(target_files)
+            _collect_block = self._collect_bridge.context_for_many(target_files) or ""
             if _collect_block:
                 prefetched_context = _collect_block + "\n\n"
+
+        def _with_collect_block(formatted: str) -> str:
+            """Re-attach the per-task collect block to a rebuilt context string.
+
+            Purely additive: returns *formatted* unchanged when no bridge was
+            wired in, the model is absent or stale, or target_files have no
+            collect record.
+            """
+            if not _collect_block:
+                return formatted
+            if not formatted:
+                return _collect_block + "\n\n"
+            return _collect_block + "\n\n" + formatted
         _start_time = time.monotonic()  # AUTO-CR-21-4: wall-clock guard reference point
         # AUTO-CR-33: prefer a task-wide deadline shared across rounds; fall back
         # to a per-call budget when called standalone (no deadline passed).
@@ -1446,7 +1467,8 @@ class InnerLoop:
                 # next rejection carried no missing_context of its own).
                 newly = self._broker.resolve(coder_missing, target_files, base_dir_path)
                 resolved_context.update(newly)
-                prefetched_context = self._broker.format_for_prompt(resolved_context)
+                prefetched_context = _with_collect_block(
+                    self._broker.format_for_prompt(resolved_context))
                 logger.info("InnerLoop: attempt %d coder requested context %s — accumulated (%d total)",
                             attempt, coder_missing, len(resolved_context))
 
@@ -1561,7 +1583,8 @@ class InnerLoop:
                 if val_missing:
                     newly = self._broker.resolve(val_missing, target_files, base_dir_path)
                     resolved_context.update(newly)
-                    prefetched_context = self._broker.format_for_prompt(resolved_context)
+                    prefetched_context = _with_collect_block(
+                        self._broker.format_for_prompt(resolved_context))
                     logger.info(
                         "InnerLoop: attempt %d validator requested context %s — accumulated (%d total)",
                         attempt, val_missing, len(resolved_context),
