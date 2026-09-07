@@ -228,7 +228,20 @@ class ImprovementAgent:
             # normalizes HTTPError into RuntimeError before it reaches us
             # (tools/llm_stream.py _open()), so in practice the branch below
             # is what fires for HTTP failures today.
-            body = e.read().decode("utf-8", errors="replace")
+            # Same defect as validator_agent.py (A5): e.read() is a second
+            # unguarded read on the same socket, and a sibling except clause
+            # does not nest — an exception raised here was never offered to the
+            # except Exception below, so it escaped process() and crashed the
+            # improve flow on the very path that exists to turn a failed call
+            # into a result dict.
+            try:
+                body = e.read().decode("utf-8", errors="replace")
+            except Exception as read_exc:
+                logger.warning(
+                    f"ImprovementAgent HTTP {e.code}: could not read the error "
+                    f"body ({read_exc}) — reporting the status alone"
+                )
+                body = f"<error body unreadable: {type(read_exc).__name__}: {read_exc}>"
             logger.error(f"ImprovementAgent HTTP {e.code}: {body}")
             _err = {
                 "explanation": f"HTTP {e.code} from API: {body}",
