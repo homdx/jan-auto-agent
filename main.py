@@ -1008,6 +1008,38 @@ def _validate_typed_config_values(config_path: str, base_dir: str) -> None:
         sys.exit(1)
 
 
+def _confirm_resume_checkpoint() -> "bool | None":
+    """Ask whether to resume a saved backoff checkpoint.
+
+    Returns
+    -------
+    bool
+        ``True`` to resume, ``False`` to discard and start fresh. An
+        ``EOFError`` -- no input available at all (CI, piped or redirected
+        stdin, a TTY-less container) -- counts as an explicit "no", because
+        this prompt fires unconditionally whenever a checkpoint exists.
+    None
+        The user pressed Ctrl-C. B6: this prompt was guarded only against
+        EOFError, so the single most obvious way to answer "no" produced a
+        raw KeyboardInterrupt traceback while the REPL loop further down has
+        always caught it.
+
+        None is deliberately distinct from False. Treating the interrupt as
+        "no" would clear the checkpoint, so Ctrl-C at this prompt would
+        destroy the very session the prompt is offering to resume. The caller
+        exits with 130 and leaves the checkpoint on disk for a later run.
+    """
+    try:
+        answer = input("Resume interrupted session? [y/N] ").strip().lower()
+    except EOFError:
+        print("(no input available — treating as 'N')")
+        return False
+    except KeyboardInterrupt:
+        print("\n(interrupted — checkpoint kept for the next run)")
+        return None
+    return answer == "y"
+
+
 def _resume_from_checkpoint(saved: dict, orchestrator, base_dir: str) -> None:
     """Dispatch a saved checkpoint to the appropriate orchestrator method.
 
@@ -1242,12 +1274,16 @@ def main():
         # a TTY-less container). input() there raised a raw EOFError
         # traceback instead of a clean fallback. Treat EOF as "no", the
         # same as an explicit non-'y' answer.
-        try:
-            _ans = input("Resume interrupted session? [y/N] ").strip().lower()
-        except EOFError:
-            print("(no input available — treating as 'N')")
-            _ans = "n"
-        if _ans == "y":
+        # B6: KeyboardInterrupt was still uncaught here -- see
+        # _confirm_resume_checkpoint() for the full rationale.
+        _resume = _confirm_resume_checkpoint()
+        if _resume is None:
+            # Ctrl-C at the prompt. Exit cleanly (no traceback) and leave the
+            # checkpoint on disk: an interrupt means "stop", not "discard my
+            # interrupted session and start over".
+            print()
+            sys.exit(130)
+        if _resume:
             backoff.clear_state()
             _resume_from_checkpoint(_saved, orchestrator, base_dir)
         else:
