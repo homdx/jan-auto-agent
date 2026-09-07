@@ -53,6 +53,69 @@ STATUS_BLOCKED     = "blocked"
 
 _VALID_STATUSES = {STATUS_TODO, STATUS_IN_PROGRESS, STATUS_DONE, STATUS_BLOCKED}
 
+# Counters that only ever move forward.  A re-plan or a second regression on
+# the same root task rebuilds these from zero; letting that through would reset
+# the round/attempt budget and drop impl_version to 1, defeating the LOOP-2 /
+# LOOP-3 cross-resume rewrite cap.
+_MONOTONIC_TASK_FIELDS: tuple[str, ...] = ("round", "attempt", "impl_version")
+
+# Free-form fields a fresh plan payload never carries.  A wholesale replace
+# deletes them outright: the commit key severs the git linkage between
+# plan.json and the real commit, and original_instruction is only ever
+# recorded once (first rewrite).
+_PRESERVED_TASK_FIELDS: tuple[str, ...] = ("commit", "original_instruction")
+
+
+def merge_task_update(
+    existing: dict,
+    incoming: dict,
+    *,
+    allow_downgrade: bool = False,
+) -> dict:
+    """Merge *incoming* over *existing* for the same task id.
+
+    Unlike a plain ``dict.update`` this never moves a task backwards: status
+    stays at its higher rank, round/attempt/impl_version only increase, and
+    fields the incoming dict lacks (commit, original_instruction) survive.
+    Everything the incoming dict does carry still lands, so a genuine re-plan
+    is applied rather than frozen out.
+    """
+    merged = dict(existing)
+    merged.update(incoming)
+
+    # Only DONE is protected. A rank ordering over all four statuses would
+    # also freeze blocked -> in_progress / blocked -> todo, which are ordinary
+    # forward moves, not downgrades: BLOCKED is not "more progress" than
+    # IN_PROGRESS. The bug being closed is a re-plan silently reopening
+    # FINISHED work, so guard exactly that.
+    existing_status = existing.get("status", STATUS_TODO)
+    incoming_status = incoming.get("status", existing_status)
+    if (
+        not allow_downgrade
+        and existing_status == STATUS_DONE
+        and incoming_status != STATUS_DONE
+    ):
+        merged["status"] = existing_status
+
+    # Counters only move forward; a lower value in the incoming dict is the
+    # reset artefact of a re-plan, not real progress.
+    for field in _MONOTONIC_TASK_FIELDS:
+        old_val, new_val = existing.get(field), incoming.get(field)
+        if old_val is None or new_val is None:
+            continue
+        try:
+            if new_val < old_val:
+                merged[field] = old_val
+        except TypeError:
+            merged[field] = old_val
+
+    # A fresh plan payload never carries these; keep what was already stored.
+    for field in _PRESERVED_TASK_FIELDS:
+        if not merged.get(field) and existing.get(field):
+            merged[field] = existing[field]
+
+    return merged
+
 # ── Required top-level fields in a task dict ────────────────────────────────
 _REQUIRED_TASK_FIELDS: dict[str, type] = {
     "id":               str,
@@ -260,17 +323,36 @@ class StateStore:
 
     # ── Mutating API ─────────────────────────────────────────────────────────
 
-    def upsert_task(self, task: dict) -> None:
+    def upsert_task(self, task: dict, *, allow_downgrade: bool = False) -> None:
         """Insert or update a task in plan.json.
 
         The task is validated against the schema before writing.  If a task
-        with the same ``id`` already exists it is replaced; otherwise appended.
+        with the same ``id`` already exists it is MERGED, not replaced: the
+        existing status, round, attempt, impl_version, ``commit`` and
+        ``original_instruction`` are preserved unless the incoming dict
+        explicitly carries a newer value.  Otherwise appended.
+
+        This matters because ``plan_emitter.py`` / ``pipeline.py`` upsert the
+        whole backlog on every re-plan and ``bug_fix_loop.py`` re-upserts a
+        deterministic ``BUG-FIX-<root>`` id on each regression — both paths
+        hand over minimal dicts (status="todo", round=0, impl_version=1, no
+        commit), so a wholesale replace would silently reopen completed tasks
+        and delete their git linkage.
+
+        Parameters
+        ----------
+        allow_downgrade:
+            Pass ``True`` to let the incoming status move the task backwards
+            (e.g. done -> todo).  Default ``False`` keeps the downgrade guard
+            on, so a re-plan cannot reopen finished work.
         """
         _validate_task_schema(task)
         tasks = self._plan.setdefault("tasks", [])
         for i, t in enumerate(tasks):
             if t["id"] == task["id"]:
-                tasks[i] = task
+                tasks[i] = merge_task_update(
+                    t, task, allow_downgrade=allow_downgrade
+                )
                 self._save_plan()
                 return
         tasks.append(task)
