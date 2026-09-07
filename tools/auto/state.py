@@ -39,7 +39,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from tools.auto.utils import _ts, safe_filename_component
+from tools.auto.utils import _ts, safe_filename_component, fsync_directory
 from pathlib import Path
 from typing import Any
 
@@ -981,7 +981,8 @@ class StateStore:
             if the write or the atomic rename fails. This is intentionally
             NOT swallowed — a silently failed state write is worse than a
             loud one; callers that need this to be non-fatal must catch it
-            themselves.
+            themselves. A failed *directory* fsync is not in this list: it
+            happens after a successful rename and is logged at DEBUG instead.
         """
         if path.exists():
             try:
@@ -993,8 +994,27 @@ class StateStore:
                 )
         tmp_path = path.with_suffix(path.suffix + ".tmp")
         try:
-            tmp_path.write_text(content, encoding="utf-8")
+            # B4: atomicity is not durability. This used to be a bare
+            # Path.write_text() plus os.replace(), which guarantees *path*
+            # always holds one complete version -- but Path.write_text
+            # exposes no file descriptor, so nothing was ever flushed to
+            # disk. A power loss or kernel panic right after the rename could
+            # leave plan.json/progress.json missing entirely, and a resumed
+            # run would start from blank state. Write through an explicit fd
+            # so the contents can be fsynced before the rename, then fsync
+            # the parent directory after it (see utils.fsync_directory for
+            # why the directory step is separate and best-effort).
+            #
+            # The .bak refresh above and the OSError re-wrap below are NOT
+            # delegated to utils.atomic_write_text: that helper has neither,
+            # and .bak is the documented recovery path for a corrupt
+            # plan.json. Only the fsync discipline is shared.
+            with open(tmp_path, "w", encoding="utf-8") as fh:
+                fh.write(content)
+                fh.flush()
+                os.fsync(fh.fileno())
             os.replace(tmp_path, path)
+            fsync_directory(path.parent)
         except OSError as exc:
             try:
                 tmp_path.unlink(missing_ok=True)
