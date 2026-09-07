@@ -1375,9 +1375,17 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
         while True:
             try:
                 with _open() as response:
-                    raw = json.loads(response.read().decode("utf-8"))
-                return _extract_content(raw, api_format)
-            except (TimeoutError, ssl.SSLError, ConnectionError, urllib.error.URLError) as e:
+                    # utf-8-sig: a UTF-8 BOM at the head of the body makes
+                    # json.loads fail on "not a valid JSON text" even though
+                    # the payload itself is fine. utf-8-sig is identical for
+                    # BOM-free bodies.
+                    raw = json.loads(response.read().decode("utf-8-sig"))
+            except (TimeoutError, ssl.SSLError, ConnectionError, urllib.error.URLError,
+                    ValueError) as e:
+                # ValueError covers json.JSONDecodeError (a subclass): a
+                # truncated or garbled body from a flaky proxy is as retryable
+                # as a dropped connection, and it used to escape this loop as
+                # an uncaught exception instead of taking the ladder below.
                 if _read_attempt >= error_retries:
                     raise RuntimeError(
                         f"{type(e).__name__} reading response body from {url}: {e} "
@@ -1393,6 +1401,13 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
                     on_retry(msg)
                 sleep(error_retry_wait_sec)
                 _read_attempt += 1
+            else:
+                # Only the read+parse is retried. A ValueError from
+                # _extract_content means the response DID arrive and is a
+                # distinct outcome the caller must see right away — feeding
+                # it back into this loop would retry a deterministic shape
+                # mismatch error_retries times instead of surfacing it.
+                return _extract_content(raw, api_format)
 
     # ── Streaming ────────────────────────────────────────────────────────
     parts = []
@@ -1409,7 +1424,10 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
         try:
             with _open() as response:
                 for raw_line in response:
-                    line = raw_line.decode("utf-8").strip()
+                    # utf-8-sig: a BOM on the first line of the stream would
+                    # otherwise drop that chunk via the JSONDecodeError
+                    # `continue` below.
+                    line = raw_line.decode("utf-8-sig").strip()
                     if not line:
                         continue
 
