@@ -256,6 +256,56 @@ def strip_think(text: str) -> str:
     return out.strip()
 
 
+def _not_an_object_error(where: str, value, keys_desc: str) -> ValueError:
+    """Build the malformed-reply ValueError for a `message` (or choice) field
+    that is present but is not a JSON object.
+
+    A missing key raises KeyError, which the guards below already convert to
+    this same descriptive ValueError — so callers' retry ladders see one
+    exception class either way. Indexing a non-object raises TypeError
+    instead, which is NOT a KeyError and escaped the guard: that is what
+    ``{"message": null}`` did before this helper existed.
+    """
+    return ValueError(
+        f"LLM response's {where} is not a JSON object (got "
+        f"{type(value).__name__}) — malformed reply from the backend "
+        f"({keys_desc})"
+    )
+
+
+def _content_to_text(content, subject: str) -> str:
+    """Return a message's ``content`` as text, or raise ValueError.
+
+    ``content`` may legitimately be JSON ``null`` (an empty reply). It may
+    also arrive as a LIST — the OpenAI multimodal shape, which some gateways
+    relay verbatim — or as any other non-string. ``(content or "").strip()``
+    raised ``AttributeError`` on those: neither a KeyError nor a ValueError,
+    so it escaped this module's error convention with no diagnostic.
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        # OpenAI's multimodal shape, which some gateways relay verbatim:
+        # [{"type": "text", "text": "..."}, {"type": "image_url", ...}].
+        # It is a VALID reply, so join the text parts rather than rejecting
+        # it; only a list with no text part at all is unusable.
+        parts = [
+            block["text"]
+            for block in content
+            if isinstance(block, dict) and isinstance(block.get("text"), str)
+        ]
+        if parts:
+            return "".join(parts).strip()
+        if not content:
+            return ""
+    raise ValueError(
+        f"{subject}'s 'content' is not a string (got "
+        f"{type(content).__name__}) — malformed reply from the backend"
+    )
+
+
 def _extract_content(raw: dict, api_format: str) -> str:
     """Extract assistant message text from a non-streaming response dict.
 
@@ -268,6 +318,14 @@ def _extract_content(raw: dict, api_format: str) -> str:
     has no attribute 'strip'` — a response that arrived successfully was
     crashing the whole call instead of degrading to an empty reply the
     same way a filtered/empty `choices` list already does below.
+
+    BUGFIX: the same two accesses also had to handle `message: null`
+    (present, not an object). `raw["message"]["content"]` then raised
+    `TypeError: 'NoneType' object is not subscriptable` — not a KeyError, so
+    it escaped the guard below and aborted the call instead of taking the
+    descriptive-ValueError path every caller's retry ladder already handles.
+    Both dict accesses now isinstance-check the `message` field first and
+    raise the same ValueError.
     """
     # AUTO-FIX (medium-priority audit, DeepSeek-plan finding): both
     # dict-key accesses below (`raw["message"]`, `choices[0]["message"]`)
@@ -278,9 +336,32 @@ def _extract_content(raw: dict, api_format: str) -> str:
     # still raised a bare KeyError with no diagnostic content. Surface the
     # same kind of descriptive ValueError the empty-choices case already
     # uses, rather than letting a raw KeyError propagate.
+    # A body that json.loads() accepted but that is a JSON *array* (or any
+    # other non-object) made both branches below raise AttributeError while
+    # calling .get()/.keys() — including while BUILDING their own error
+    # message. Guard once, up front, with the same error class.
+    if not isinstance(raw, dict):
+        preview = repr(raw)
+        if len(preview) > 120:
+            preview = preview[:117] + "..."
+        raise ValueError(
+            f"LLM response is not a JSON object (got {type(raw).__name__}: "
+            f"{preview}) — malformed reply from the backend"
+        )
     if api_format == "ollama":
+        message = raw.get("message")
+        if not isinstance(message, dict):
+            if "message" in raw:
+                # Present but null (or a string/list): `None["content"]` raises
+                # TypeError, which is NOT a KeyError and escaped the guard below.
+                raise _not_an_object_error("message", message,
+                                           f"raw keys: {list(raw.keys())}")
+            raise ValueError(
+                "LLM response missing expected key 'message' — raw response "
+                f"shape was unexpected (raw keys: {list(raw.keys())})"
+            )
         try:
-            return (raw["message"]["content"] or "").strip()
+            return _content_to_text(message["content"], "LLM response")
         except KeyError as exc:
             raise ValueError(
                 f"LLM response missing expected key {exc} — raw response "
@@ -303,13 +384,28 @@ def _extract_content(raw: dict, api_format: str) -> str:
             f"LLM response had no choices — likely blocked/filtered by the "
             f"backend (raw keys: {list(raw.keys())})"
         )
+    choice = choices[0]
+    if not isinstance(choice, dict):
+        raise _not_an_object_error(
+            "first choice", choice, f"raw keys: {list(raw.keys())}"
+        )
+    message = choice.get("message")
+    if not isinstance(message, dict):
+        if "message" in choice:
+            raise _not_an_object_error(
+                "first choice's message", message, f"choice keys: {list(choice.keys())}"
+            )
+        raise ValueError(
+            "LLM response's first choice is missing expected key 'message' — "
+            f"raw response shape was unexpected (choice keys: {list(choice.keys())})"
+        )
     try:
-        return (choices[0]["message"]["content"] or "").strip()
+        return _content_to_text(message["content"], "LLM response's first choice")
     except KeyError as exc:
         raise ValueError(
             f"LLM response's first choice is missing expected key {exc} — "
             f"raw response shape was unexpected (choice keys: "
-            f"{list(choices[0].keys()) if isinstance(choices[0], dict) else type(choices[0]).__name__})"
+            f"{list(choice.keys())})"
         ) from exc
 
 
