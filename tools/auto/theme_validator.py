@@ -55,7 +55,7 @@ class ThemeVerdict:
     unparseable: bool = False
 
     def feedback(self) -> str:
-        return self.reason or ("approved" if self.approved else "revise")
+        return self.reason if not self.approved else ""
 
 
 class ThemeValidator:

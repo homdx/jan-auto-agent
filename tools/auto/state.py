@@ -1023,6 +1023,8 @@ class StateStore:
             raise OSError(f"StateStore: failed to write {path} ({exc})") from exc
 
     def _save_plan(self) -> None:
+        for task in self._plan.get("tasks", []):
+            _validate_task_schema(task)
         self._atomic_write(
             self._plan_path,
             json.dumps(self._plan, indent=2, ensure_ascii=False),

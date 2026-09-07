@@ -403,7 +403,7 @@ class BacklogPrioritiser:
         if loc_a.file != loc_b.file:
             return False
 
-        a_end   = loc_a.line_end   if loc_a.line_end   is not None else loc_a.line_start
+        a_end   = loc_a.line_end
         b_start = loc_b.line_start
 
         if a_end is None or b_start is None:
@@ -601,9 +601,11 @@ def _topological_sort(tasks: list[ReadyTask]) -> list[ReadyTask]:
             if in_degree[dep_task_id] == 0:
                 newly_free.append(id_to_task[dep_task_id])
 
-        # Sort newly-freed tasks by original_index before enqueuing.
+        # Sort newly-freed tasks by original_index and merge with existing queue.
         newly_free.sort(key=lambda t: t.original_index)
         queue.extend(newly_free)
+        # Re-sort the entire queue to ensure global ordering
+        queue = deque(sorted(queue, key=lambda t: t.original_index))
 
     # Handle cycles: any tasks not yet in ordered have unresolved deps.
     if len(ordered) < len(tasks):

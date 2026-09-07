@@ -1161,9 +1161,16 @@ def main():
         else:
             action = "collect"
 
+        if not os.path.exists(args.config):
+            print(
+                f"Error: --config file not found: {args.config!r}. "
+                f"Check the path and extension (a common mistake is a typo "
+                f"like 'agents_128k.in' instead of 'agents_128k.ini').",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         config = configparser.ConfigParser(inline_comment_prefixes=(';', '#'))
-        if os.path.exists(args.config):
-            config.read(args.config, encoding="utf-8")
+        config.read(args.config, encoding="utf-8")
 
         # BUGFIX: `make_summarizer_call`/`should_run_pass_b` are the
         # documented COLLECT-19 entry points `summarizer.py` describes

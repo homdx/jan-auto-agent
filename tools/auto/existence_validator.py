@@ -180,7 +180,7 @@ class ExistenceValidator:
         return suffix[1].lower() in self._extensions
 
     def _normalise(self, token: str) -> str:
-        token = token.strip().strip("\"'()[],;:")
+        token = token.strip().strip("\"'(),;:")
         # AUTO-FIX: lstrip("./") strips a *charset*, not the "./" prefix —
         # ".hidden_test.py" became "hidden_test.py". Strip only real leading
         # "./" and "../" path segments.

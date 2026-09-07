@@ -54,7 +54,7 @@ from typing import TYPE_CHECKING, Optional
 
 from tools.auto.backlog_prioritiser import PrioritisedBacklog, to_improvements_md
 from tools.auto.git_manager import GitError
-from tools.auto.utils import file_set_fingerprint
+from tools.auto.utils import atomic_write_text, file_set_fingerprint
 
 if TYPE_CHECKING:  # avoid circular imports at runtime
     from tools.auto.git_manager import GitManager
@@ -128,7 +128,7 @@ class PlanEmitter:
         # 1. Write IMPROVEMENTS.md to repo root.
         md_content  = to_improvements_md(backlog)
         md_path     = self._base_dir / IMPROVEMENTS_FILENAME
-        md_path.write_text(md_content, encoding="utf-8")
+        atomic_write_text(md_path, md_content)
         logger.info("emit: wrote %s (%d bytes)", md_path, len(md_content))
 
         # 2. Upsert all auto tasks into plan.json via StateStore.

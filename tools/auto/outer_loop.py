@@ -213,7 +213,10 @@ class OuterLoop:
         # true per-task, cross-resume limit.
         # LOOP-3: impl_version tracking — starts at 1, bumped on each rewrite
         impl_version = task.get("impl_version", 1)
-        rewrites_done = max(0, int(impl_version or 1) - 1)
+        try:
+            rewrites_done = max(0, int(impl_version or 1) - 1)
+        except (ValueError, TypeError):
+            rewrites_done = 0
         impl_versions_used: list[int] = []
 
         if start_round > self.max_rounds:

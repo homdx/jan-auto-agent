@@ -297,7 +297,7 @@ def _wrapper_fallback_note(instruction: str, code_block: str, full_source: str) 
     for m in _WRAPPER_CALL_RE.finditer(code_block):
         name = m.group(1)
         body_match = re.search(
-            rf"def\s+{re.escape(name)}\s*\(([^)]*)\)(?:\s*->\s*[^:]+)?:(.*?)(?=\n    def |\nclass |\Z)",
+            rf"def\s+{re.escape(name)}\s*\(self[^)]*\)(?::\s*[^:]+)?:(.*?)(?=\n    def |\nclass |\Z)",
             full_source, re.S,
         )
         if not body_match:
@@ -404,11 +404,11 @@ def _find_def_in_repo(name: str, base_dir: Path, max_files: int = 4000) -> Optio
     count = 0
     try:
         for p in base_dir.rglob("*.py"):
+            if "/.agent/" in str(p) or "/node_modules/" in str(p):
+                continue
             count += 1
             if count > max_files:
                 break
-            if "/.agent/" in str(p) or "/node_modules/" in str(p):
-                continue
             try:
                 text = p.read_text(encoding="utf-8", errors="ignore")
             except OSError:

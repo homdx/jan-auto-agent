@@ -876,7 +876,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         except OSError as exc:
             return False, f"cannot read {loc.file!r}: {exc}", ""
 
-        file_ext = Path(loc.file).suffix or ".py"
+        file_ext = Path(loc.file).suffix
 
         # AUTO-CR-8: in docs/creative mode a FILE alone is sufficient grounding,
         # since small models often hallucinate line_start and the target
