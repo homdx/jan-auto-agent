@@ -1038,6 +1038,16 @@ class AutoController:
         the configured cap — and leaves those tasks BLOCKED so the status
         honestly reflects reality. Only genuinely-resettable tasks (case 1,
         or anything that hasn't used up its rounds) are reset.
+
+        The same reset also unlinks the task's ``deadline_started_at.txt``.
+        Bugfix: it used to clear only the STATUS half of "give this task a
+        fresh start", so on resume OuterLoop re-read the persisted start time,
+        the elapsed wall-clock time already exceeded the budget, the remaining
+        budget was 0, and the task was re-blocked immediately — the reset was
+        structurally incapable of granting the attempt it exists to grant, and
+        every resume burned a cycle and re-parked the task. The unlink is
+        scoped to the task that was actually reset: tasks left BLOCKED keep
+        their deadline files untouched.
         """
         from tools.auto.bug_fix_loop import _FIX_PREFIX
 
@@ -1077,6 +1087,20 @@ class AutoController:
             if highest_completed_round(self.state.task_dir(task["id"])) >= max_rounds_cfg:
                 continue  # round-exhausted — resetting would not help
             self.state.set_task_status(task["id"], STATUS_TODO)
+            # Give the retry a full fresh wall-clock budget, not the leftover
+            # one from the blocked attempt. Without this the reset is a no-op
+            # in disguise: OuterLoop.run_task reads this file back on resume
+            # and computes _remaining = max(_mts - elapsed, 0), which is 0 for
+            # a task that was already parked, so it stops before round 1 and
+            # sets the status straight back to BLOCKED.
+            try:
+                self.state.clear_task_deadline(task["id"])
+            except OSError as exc:
+                logger.warning(
+                    "controller: could not clear the deadline start time for "
+                    "%s — the reset attempt may inherit a stale wall-clock "
+                    "budget: %s", task["id"], exc,
+                )
 
     def _setup_git(self) -> None:
         """AUTO-A3: ensure the base dir is a git repo and apply agent identity.

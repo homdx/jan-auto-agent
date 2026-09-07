@@ -639,6 +639,26 @@ class StateStore:
         path = self.task_dir(task_id) / filename
         return path.read_text(encoding="utf-8") if path.exists() else None
 
+    def clear_task_deadline(self, task_id: str) -> None:
+        """Remove this task's ``deadline_started_at.txt`` (no-op if absent).
+
+        OuterLoop.run_task writes this file the first time a task is worked and
+        reads it back on every resume to compute the remaining wall-clock
+        budget. Clearing it is what makes a retry start with a full budget;
+        leaving it means the retry inherits the elapsed time of the attempt it
+        replaced and can be re-blocked before round 1.
+
+        No directories are created: the point of this call is usually to
+        finish a task that was never worked, so ``task_dir()`` (which creates)
+        must not be used here.
+        """
+        path = (self._tasks_dir / self._safe_task_id(task_id)
+                / "deadline_started_at.txt")
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            return
+
     # ── Private ──────────────────────────────────────────────────────────────
 
     def _ensure_dirs(self) -> None:
