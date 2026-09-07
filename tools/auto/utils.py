@@ -73,6 +73,15 @@ def highest_completed_round(task_dir: "str | Path") -> int:
     """
     best = 0
     for p in Path(task_dir).glob("feedback_round_*.md"):
+        # B3: glob() yields DIRECTORIES as well as files, and the check
+        # below is only a name match -- a directory literally named
+        # feedback_round_5.md counted as a completed round. This value is
+        # load-bearing: controller._reset_resettable_blocked_tasks compares it
+        # against max_rounds to decide whether a BLOCKED task may be reset to
+        # TODO, so a phantom round parked the task in BLOCKED forever with
+        # nothing in any log explaining why.
+        if not p.is_file():
+            continue
         m = _FEEDBACK_ROUND_RE.search(p.name)
         if m:
             best = max(best, int(m.group(1)))

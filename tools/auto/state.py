@@ -697,9 +697,41 @@ class StateStore:
         return path
 
     def read_task_file(self, task_id: str, filename: str) -> str | None:
-        """Read a per-task file; return None if it doesn't exist."""
-        path = self.task_dir(task_id) / filename
-        return path.read_text(encoding="utf-8") if path.exists() else None
+        """Read a per-task file; return None if it isn't readable.
+
+        B3, two separate problems in the old
+        ``read_text(...) if exists() else None`` body:
+
+        * It raised where the contract promises None. ``exists()`` is True for
+          directories too (``IsADirectoryError``), invalid UTF-8 raised
+          ``UnicodeDecodeError``, and the gap between ``exists()`` and
+          ``read_text()`` is a TOCTOU window (``FileNotFoundError``).
+          ``OuterLoop.run_task`` reads ``deadline_started_at.txt`` on every
+          resume, so an unhandled raise here killed the run at exactly the
+          resume point. Every caller already treats None as "nothing there",
+          which for a deadline file degrades to a full fresh budget.
+
+        * It *wrote* on a read path. ``task_dir()`` mkdir()s the per-task
+          directory as a side effect, so merely asking whether a file exists
+          created a directory -- which fails outright on a read-only
+          ``.agent/`` and confuses any caller that distinguishes "the file was
+          there" from "the directory was made". The path is built directly
+          instead.
+
+        FileNotFoundError is the routine "not written yet" case and stays
+        silent; anything stranger is logged so it is not invisible.
+        """
+        path = self._tasks_dir / self._safe_task_id(task_id) / filename
+        try:
+            return path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+        except (OSError, UnicodeDecodeError) as exc:
+            logger.warning(
+                "StateStore: could not read task file %s: %s -- "
+                "treating it as absent", path, exc,
+            )
+            return None
 
     def clear_task_deadline(self, task_id: str) -> None:
         """Remove this task's ``deadline_started_at.txt`` (no-op if absent).
