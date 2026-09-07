@@ -1025,8 +1025,12 @@ class ArchProbe:
         * **Freshness.** When this disagrees with `facts`/`module`, this is
           right — the artifact can lag the tree.
 
-        Misses (absent, outside root, a directory, binary, undecodable)
-        return ``""`` and are counted as misses like any other. Never raises.
+        Misses (absent, outside root, a directory) return ``""`` and are
+        counted as misses like any other. Never raises.
+
+        A file that exists but is not valid UTF-8 is NOT a miss: it is read
+        with ``errors="replace"``, so undecodable bytes come back as U+FFFD
+        and the file is still readable (B7).
         """
         if self._base_dir is None:
             logger.debug("ArchProbe: read requested but no base_dir — skipping.")
@@ -1054,8 +1058,23 @@ class ArchProbe:
         try:
             if not target.is_file():
                 return ""
-            text = target.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as exc:
+            # B7: a strict utf-8 decode turned one stray byte (a cp1251 or
+            # latin-1 source file) into UnicodeDecodeError, which the except
+            # clause below folded into "" -- the exact same value this method
+            # returns for "no such file". The Architect could not tell the
+            # two apart, so it was handed an empty context and left to assert
+            # whatever it had already guessed about the file: the
+            # hallucinated-premise failure this op exists to prevent.
+            #
+            # errors="replace" is what the rest of the codebase already uses
+            # to read repo source (LLMGate2Validator._read_changed_content,
+            # the context broker, the canon validator). Degraded context
+            # beats none: the model can see the file and say it is not valid
+            # UTF-8. UnicodeDecodeError is unreachable from here now, so it
+            # drops out of the except clause rather than lingering as a dead
+            # branch.
+            text = target.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
             logger.debug("ArchProbe: read %r unreadable: %s", raw, exc)
             return ""
 

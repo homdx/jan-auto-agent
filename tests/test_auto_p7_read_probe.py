@@ -162,10 +162,21 @@ class TestReadEdgeCases:
     """AC-P7-4"""
 
     @pytest.mark.parametrize("arg", [
-        "tools/nope.py", "tools", "", "   ", "tools/blob.bin",
+        "tools/nope.py", "tools", "", "   ",
     ])
     def test_misses(self, repo, arg) -> None:
         assert _probe(repo)._read(arg) == ""
+
+    def test_non_utf8_file_is_not_a_miss(self, repo) -> None:
+        """B7: undecodable bytes degrade to U+FFFD, they do not erase the file.
+
+        This used to be listed as a miss above. Returning "" for a file that
+        exists is indistinguishable from "no such file", which is precisely
+        the empty context this op is meant to prevent.
+        """
+        out = _probe(repo)._read("tools/blob.bin")
+        assert out != ""
+        assert "blob.bin" in out
 
     def test_empty_file_is_not_a_miss(self, repo) -> None:
         """The file exists and is empty — a different fact from "no such
