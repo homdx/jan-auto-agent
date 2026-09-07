@@ -806,12 +806,7 @@ class AutoController:
                 # commit() stages everything (git add -u/.), which would sweep
                 # it into the next successful task's commit. Discard the
                 # uncommitted residue now (no-op when git is disabled).
-                if self.git is not None:
-                    self.git.discard_working_changes()
-                    self.state.log(
-                        f"task {task['id']} uncommitted edits discarded "
-                        f"(exhausted, not committed)"
-                    )
+                self._discard_exhausted_residue(task["id"])
                 self.state.log(
                     f"task {task['id']} exhausted — "
                     f"rounds={result.rounds_used} "
@@ -866,6 +861,53 @@ class AutoController:
                     )
 
         return None, tasks_done  # all tasks done / no tasks
+
+    def _discard_exhausted_residue(self, task_id: str) -> None:
+        """Discard the uncommitted edits left behind by an exhausted task.
+
+        The coder writes its candidate into base_dir before validation, so an
+        exhausted task leaves that edit dirty -- and commit() stages
+        everything (git add -u/.), which would sweep it into the next
+        successful task's commit. No-op when git is disabled.
+
+        B9: this call used to be unguarded.
+        ``discard_working_changes()`` goes through ``GitManager._run()``,
+        which raises ``GitError`` on a timeout (a stale index.lock, a hung
+        hook), a missing git binary, or a non-zero ``git reset --hard``. That
+        one cleanup failure aborted the entire multi-task run at the worst
+        possible moment: the task had already been fully accounted for
+        (exhaustion note, ticket, BLOCKED status), so every task still
+        pending in plan.json was dropped with it.
+
+        Worst case if the discard fails is that the residue is swept into the
+        next commit -- bad, but recoverable, and strictly better than losing
+        the run. ``GitError`` is caught specifically rather than ``Exception``
+        so a real bug on this path still surfaces.
+
+        The failure is written to ``state.log`` as well as ``logger``: the
+        run log is what gets read during a postmortem, and ``logger`` may be
+        configured to a level that drops the warning entirely.
+        """
+        if self.git is None:
+            return
+        try:
+            self.git.discard_working_changes()
+        except GitError as exc:
+            logger.warning(
+                "task %s: could not discard uncommitted edits after "
+                "exhaustion — continuing (residue may be swept into the next "
+                "commit): %s", task_id, exc,
+            )
+            self.state.log(
+                f"task {task_id} uncommitted edits NOT discarded "
+                f"(git discard failed: {exc}) — residue may be swept into "
+                f"the next commit"
+            )
+            return
+        self.state.log(
+            f"task {task_id} uncommitted edits discarded "
+            f"(exhausted, not committed)"
+        )
 
     def _check_regressions(
         self,
