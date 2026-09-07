@@ -509,10 +509,23 @@ class TicketStore:
             already absent (no-op — never raises).
         """
         path = self._path(ticket_id)
-        if not path.exists():
+        # B5: do NOT precede the unlink with an exists() check. The two are
+        # separate syscalls, and a concurrent cleanup (a second run sharing
+        # this .agent/, a ticket sweep, a manual rm) can remove the file in
+        # between. A bare unlink() then raised FileNotFoundError out of a
+        # method documented as "no-op if already absent (never raises)".
+        #
+        # unlink(missing_ok=True) after an exists() check would absorb the
+        # exception but still return True for a file this call did not
+        # remove. Letting the unlink itself be the single source of truth
+        # keeps both halves of the contract honest: the file was either there
+        # and is now gone (True), or it was already absent (False). Other
+        # errors (PermissionError, IsADirectoryError) still propagate.
+        try:
+            path.unlink()
+        except FileNotFoundError:
             logger.debug("TicketStore.delete: %s not found — no-op", ticket_id)
             return False
-        path.unlink()
         logger.debug("TicketStore.delete: removed %s", ticket_id)
         return True
 
