@@ -68,7 +68,7 @@ def _rt(controller: "AutoController"):
 # Imported at module level so test suites can patch via
 # ``patch("tools.auto.pipeline.<name>")``.
 from tools.auto.repo_ingest import ingest_repo
-from tools.auto.architect import review_clusters, ClusterReviewer
+from tools.auto.architect import review_clusters, ClusterReviewer, ConfigValueError
 from tools.auto.gate1_filter import filter_candidates
 from tools.auto.backlog_prioritiser import build_backlog, to_improvements_md
 from tools.auto.plan_emitter import PlanEmitter, IMPROVEMENTS_FILENAME
@@ -116,6 +116,13 @@ def _build_plan_validator(
             verify_ssl=verify_ssl,
             task_mode=task_mode,
         )
+    except ConfigValueError:
+        # A value the operator explicitly set and ClusterReviewer refuses
+        # (today: max_files_per_review <= 0). Returning None here would run
+        # the whole creative plan phase WITHOUT plan validation behind a
+        # single warning line. The architect review path aborts on the same
+        # value, so both paths now agree.
+        raise
     except Exception as exc:  # noqa: BLE001 — never block the run on setup
         logger.warning("_build_plan_validator: could not build reviewer — %s", exc)
         return None

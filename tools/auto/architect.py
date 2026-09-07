@@ -335,6 +335,19 @@ class CandidateTask:
 # ClusterReviewer
 # ─────────────────────────────────────────────────────────────────────────────
 
+class ConfigValueError(ValueError):
+    """A config value the operator explicitly set that this code refuses.
+
+    Distinct from a plain ValueError on purpose: ClusterReviewer raises
+    ValueError both for values it cannot READ (a malformed int) and for
+    values it actively REFUSES (max_files_per_review <= 0). A caller that
+    degrades setup failures into "feature off" — pipeline._build_plan_validator
+    — must not swallow the second kind, or the creative plan phase runs
+    unvalidated and the operator never learns their config was rejected.
+    Kept a ValueError subclass so existing ``except ValueError`` still catches it.
+    """
+
+
 class ClusterReviewer(_llm_stream.LLMClientBase):
     """Sends one Architect LLM call per cluster and returns grounded candidates.
 
@@ -442,6 +455,22 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
             logger.warning("config [%s] max_files_per_review is malformed (%s) — using %d",
                             arch, exc, _DEFAULT_MAX_FILES_PER_REVIEW)
             self._max_files_per_review = _DEFAULT_MAX_FILES_PER_REVIEW
+        # A numeric but non-positive step slips past the guard above (int()
+        # accepts it) and reaches the batch split in review_clusters:
+        # range(0, len(files), 0) raises ValueError: range() arg 3 must not
+        # be zero for every non-empty cluster. That failure is deferred all
+        # the way into the review phase, so the operator sees a traceback
+        # deep in the architect instead of a config error. Validate at read
+        # time and name the key; deliberately not wrapped in try/except —
+        # this is a config error, and swallowing it would run the review with
+        # an arbitrary batch size nobody configured.
+        if self._max_files_per_review <= 0:
+            raise ConfigValueError(
+                "config [architect] max_files_per_review must be >= 1, "
+                f"got {self._max_files_per_review} — it is used as the step of "
+                "range(0, len(files), step), so 0 raises "
+                "'range() arg 3 must not be zero' for every cluster"
+            )
         # num_ctx controls the total context window on Ollama; 0 means "use server default".
         active_profile = config.get("api", "active", fallback="local")
         try:
