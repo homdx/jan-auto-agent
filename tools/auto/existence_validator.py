@@ -122,6 +122,34 @@ def _candidate_tokens(text: str) -> list[str]:
     return tokens
 
 
+def _parts_inside_base(path: Path, base: Path) -> tuple[str, ...]:
+    """Components of *path* relative to *base*, i.e. what is inside the repo.
+
+    `Path.parts` is rooted at the filesystem root, so it contains the BASE
+    DIRECTORY'S OWN COMPONENTS too. Judging hidden-ness against it meant any
+    base path with a dot component — `/home/u/.cache/repo`, `/srv/.deploy/src`,
+    `/tmp/.venv/proj` — made EVERY file in the repository look hidden:
+    `_repo_has_tests` then reported a real test suite as phantom, and
+    `check()`'s name-match fallback reported present files as missing. Both
+    were silent and total rather than intermittent. Hidden detection must judge
+    only what is inside the repository.
+
+    `rglob` always yields paths under *base*, so `relative_to` normally cannot
+    fail; the fallback keeps a differently-normalised base (a relative base,
+    a symlinked prefix) from turning into an unhandled error and silently
+    disabling the filter in the opposite direction.
+    """
+    try:
+        return path.relative_to(base).parts
+    except ValueError:
+        return path.parts
+
+
+def _is_hidden(path: Path, base: Path) -> bool:
+    """True if *path* sits inside a dot-directory relative to *base*."""
+    return any(part.startswith(".") for part in _parts_inside_base(path, base))
+
+
 class ExistenceValidator:
     """Check that every file a document references is really there."""
 
@@ -176,7 +204,7 @@ class ExistenceValidator:
     @staticmethod
     def _repo_has_tests(base_dir: Path) -> bool:
         for path in base_dir.rglob("*.py"):
-            if any(part.startswith(".") for part in path.parts):
+            if _is_hidden(path, base_dir):
                 continue
             if _TEST_FILE_RE.match(path.name):
                 return True
@@ -211,7 +239,7 @@ class ExistenceValidator:
                 # like "handler[old].py" searched for a pattern, not that
                 # name. Escape it for a literal match.
                 if any(
-                    p.name == name and not any(q.startswith(".") for q in p.parts)
+                    p.name == name and not _is_hidden(p, base)
                     for p in base.rglob(glob.escape(name))
                 ):
                     continue
