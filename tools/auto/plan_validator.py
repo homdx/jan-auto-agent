@@ -427,20 +427,56 @@ def validate_plan(
 # IMPROVEMENTS.md — strip the false positive's section
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Matches from a task's "### <id>: ..." heading up to (but not including)
-# either the next task heading, the start of the Manual Suggestions section,
-# or end of file. DOTALL so it spans the whole multi-line entry (including
-# fenced code blocks).
+# Matches an entire task entry — from its "### <id>: ..." heading through
+# its own trailing "---" separator — so it can be deleted as one clean block.
+# DOTALL so it spans the whole multi-line entry (including fenced code
+# blocks).
 #
-# The closing lookahead is deliberately the exact literal
-# "\n## Manual Suggestions" rather than a generic "\n## " — a task's own
-# acceptance_check or instruction text can legitimately contain a line
-# starting with "## " (a shell comment, a markdown snippet quoted in the
-# instruction, ...), and a generic boundary would truncate that entry's
-# removal early, leaving its tail behind as orphaned text.
+# FIX-2 #8: the interior boundary used to be the bare "\n### ", which matches
+# ANY line starting with "### " — including one *inside* the task's own
+# instruction or acceptance_check (a markdown heading quoted in an example,
+# a "### Notes:" sub-section the author wrote, a "###"-style shell comment).
+# That truncated the removal at the interior heading and left the rest of
+# the entry behind as orphaned text. A colon-terminated variant ("### <x>:")
+# is not a fix: an interior sub-heading almost always carries a colon too
+# ("### Notes:", "### Example Usage:"), so it still gets treated as a task
+# boundary; hardcoding the id's alphabetic prefix ("### AUTO-T\d+:") isn't
+# either, since it stops matching the moment a differently-prefixed id
+# (a custom [auto] task_id_prefix, a "BUG-FIX-*" entry) is the very next
+# section.
+#
+# The fix instead keys off something a task's own body cannot forge by
+# accident: to_improvements_md() (backlog_prioritiser.py) always closes
+# every rendered task -- auto or last-in-file -- with a literal "\n---\n"
+# separator before the next heading or "## Manual Suggestions" begins. That
+# separator is matched and CONSUMED here (not just looked ahead to), so the
+# whole entry -- body and its own trailing "---" -- comes out as one unit
+# and nothing is left orphaned between the previous entry and the next
+# heading.
+#
+# The separator is only accepted as a terminator when the next thing after
+# it is the next task heading, the Manual Suggestions section, or end of
+# file. Without that trailing lookahead the separator alternative has the
+# very defect it replaces, only with a different trigger: an instruction
+# containing a markdown horizontal rule ("...\n\n---\n\nmore prose") ends the
+# lazy match at its own interior "---", leaving "more prose" behind as
+# orphaned text. A real entry terminator is always followed by a heading,
+# an interior rule never is, so the lookahead separates the two exactly.
+# Note "### " / "## Manual Suggestions" must NOT be added to the *fallback*
+# lookahead below for the same reason the bare "\n### " boundary was removed
+# in the first place.
+#
+# The lookahead alternatives ("\n## Manual Suggestions" / end-of-string) are
+# kept as a fallback for a plan.json that was hand-edited or produced
+# outside to_improvements_md's own renderer and so may be missing that
+# trailing separator; the exact literal (not a generic "\n## ") is
+# deliberate for the same reason as above -- a task's own text can
+# legitimately contain a line starting with "## ".
 def _task_section_pattern(task_id: str) -> re.Pattern:
     return re.compile(
-        r"### " + re.escape(task_id) + r":.*?(?=\n### |\n## Manual Suggestions|\Z)",
+        r"### " + re.escape(task_id) + r":.*?"
+        r"(?:\n-{3,}\n+(?=### |## Manual Suggestions|\Z)"
+        r"|(?=\n## Manual Suggestions|\Z))",
         re.DOTALL,
     )
 
