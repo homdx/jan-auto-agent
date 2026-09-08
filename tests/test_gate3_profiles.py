@@ -228,44 +228,59 @@ def test_empty_profile_value_treated_as_unset(monkeypatch, tmp_path, gate_name):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Error paths — malformed profile raises at construction, never mid-run
+# Error paths — malformed profile disables only the affected gate (fail-open)
 # ─────────────────────────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("gate_name", GATE_NAMES)
-def test_profile_naming_missing_section_raises_at_construction(tmp_path, gate_name):
+def test_profile_naming_missing_section_disables_only_that_gate(tmp_path, gate_name):
+    """C1 — a gate whose named profile section is missing yields ``None``,
+    not an abort of the whole builder.
+
+    The old fail-fast contract (raising here, at construction) was the
+    defect: one bad profile killed every gate. The resolution now sits
+    inside the per-gate ``except``, so only the broken gate is disabled —
+    the fail-open architecture the registry exists to provide.
+    """
     sections = _merge(
         _GATE_ENABLE[gate_name],
         {"validator_agent": {_PROFILE_KEY[gate_name]: "ghost"}},
     )
-    with pytest.raises(ValueError, match="ghost"):
-        build_validators(_config(_SHARED_SECTIONS, sections), tmp_path, task_mode="creative")
+    out = build_validators(_config(_SHARED_SECTIONS, sections), tmp_path, task_mode="creative")
+    assert out[GATES_BY_NAME[gate_name].attr] is None
 
 
 @pytest.mark.parametrize("gate_name", GATE_NAMES)
-def test_profile_missing_required_option_raises_at_construction(tmp_path, gate_name):
+def test_profile_missing_required_option_disables_only_that_gate(tmp_path, gate_name):
+    """An existing-but-incomplete profile also raises from
+    ``resolve_llm_profile``; the guard must cover that path too."""
     sections = _merge(
         _GATE_ENABLE[gate_name],
         {"validator_agent": {_PROFILE_KEY[gate_name]: "incomplete"}},
         {"incomplete": {"base_url": "https://incomplete.example"}},  # api_key/model absent
     )
-    with pytest.raises(ValueError, match="api_key|model"):
-        build_validators(_config(_SHARED_SECTIONS, sections), tmp_path, task_mode="creative")
+    out = build_validators(_config(_SHARED_SECTIONS, sections), tmp_path, task_mode="creative")
+    assert out[GATES_BY_NAME[gate_name].attr] is None
 
 
 @pytest.mark.parametrize("gate_name", GATE_NAMES)
-def test_broken_validator_llm_profile_raises_even_for_gate_using_own_key(tmp_path, gate_name):
-    """A broken validator_llm_profile must raise even when THIS gate has
-    its own, valid, gate-specific key — the shared step still has to
-    resolve first to serve as the *other* gates' fallback, and a
-    misconfigured shared profile must be caught at startup, not silently
-    skipped for the one gate that happens not to need it.
+def test_broken_shared_validator_llm_profile_disables_gates_not_builder(tmp_path, gate_name):
+    """A broken shared ``validator_llm_profile`` disables the gates that
+    depend on it — and never aborts the builder.
+
+    The shared step is the ``defaults`` source for every gate's own-key
+    resolution, so a broken shared profile disables every gate that has a
+    profile_key — including the one with its own valid key, whose
+    resolution still needs the shared step as its fallback. What is
+    asserted here is that ``build_validators`` itself does not raise: it
+    returns a dict with those gates at ``None``.
     """
     sections = _merge(
         _own_provider_sections(gate_name),
         {"validator_agent": {"validator_llm_profile": "ghost"}},
     )
-    with pytest.raises(ValueError, match="ghost"):
-        build_validators(_config(_SHARED_SECTIONS, sections), tmp_path, task_mode="creative")
+    out = build_validators(_config(_SHARED_SECTIONS, sections), tmp_path, task_mode="creative")
+    for other in GATE_NAMES:
+        assert out[GATES_BY_NAME[other].attr] is None
 
 
 # ─────────────────────────────────────────────────────────────────────────────

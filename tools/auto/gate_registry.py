@@ -461,10 +461,12 @@ def build_validators(config, base_dir, *, task_mode: str, broker=None) -> dict:
     ``task_mode``/``broker`` introspection below. A config with no
     ``*_llm_profile`` keys resolves every gate straight back to
     ``[api_{active}]``, so behaviour is unchanged from before this
-    ticket. Deliberately NOT wrapped in the per-gate ``except Exception``
-    below: a malformed profile must raise here, at construction, before
-    any task runs — never be swallowed into "gate unavailable" and
-    discovered mid-run instead.
+    ticket. C1: the resolution is wrapped in the per-gate
+    ``except Exception`` below — a malformed or missing profile section
+    disables only that gate (logged, then ``None``), preserving the
+    fail-open architecture of the registry. Letting the ``ValueError``
+    escape aborted the whole ``make_inner_loop`` builder and took every
+    other gate down with the misconfigured one.
 
     Returns a dict keyed by :attr:`GateSpec.attr`, ready to splat into
     ``InnerLoop(...)`` as keyword arguments.
@@ -501,15 +503,15 @@ def build_validators(config, base_dir, *, task_mode: str, broker=None) -> dict:
             out[spec.attr] = None
             continue
 
-        gate_settings = None
-        if spec.profile_key is not None:
-            from tools.auto.llm_profile import resolve_llm_profile
-            gate_settings, _ = resolve_llm_profile(
-                config, "validator_agent", spec.profile_key,
-                defaults=_validator_llm_settings(),
-            )
-
         try:
+            gate_settings = None
+            if spec.profile_key is not None:
+                from tools.auto.llm_profile import resolve_llm_profile
+                gate_settings, _ = resolve_llm_profile(
+                    config, "validator_agent", spec.profile_key,
+                    defaults=_validator_llm_settings(),
+                )
+
             module = __import__(spec.factory_module, fromlist=[spec.factory_name])
             factory = getattr(module, spec.factory_name)
             # The factories don't share a signature either; pass only what
