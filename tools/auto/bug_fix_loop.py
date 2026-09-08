@@ -50,7 +50,7 @@ from __future__ import annotations
 
 import logging
 import shutil
-from datetime import datetime
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -206,7 +206,14 @@ class BugFixLoop:
             rounds = sorted(tdir.glob("feedback_round_*.md"))
             if not rounds:
                 return
-            stamp   = datetime.now().strftime("%Y%m%dT%H%M%S")
+            # FIX-1 #8 (second half): local clock -> UTC. These archive
+            # directories are read next to run.log lines and ticket
+            # timestamps, both of which _ts() now stamps in UTC; leaving
+            # this one local makes the order of events in a failed run
+            # unreconstructable by eye. Patched in place (not via utils) so
+            # tests_bugfix/test_bug_fix_loop_archive_collision.py can keep
+            # freezing bug_fix_loop.datetime.
+            stamp   = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
             archive = tdir / f"previous_attempt_{stamp}"
             # BUGFIX: two archive calls for the same fix_id within the same
             # wall-clock second land on an identical `archive` path. With

@@ -63,9 +63,17 @@ def test_same_second_archive_calls_do_not_overwrite_each_other(monkeypatch):
 
     class _FrozenDatetime:
         @classmethod
-        def now(cls):
+        def now(cls, tz=None):
+            # FIX-1 #8: _clear_stale_fix_rounds now calls now(timezone.utc)
+            # instead of the local-clock now(). This stub only accepted the
+            # zero-arg form, so it raised TypeError after that change. The
+            # `tz` parameter is accepted and the same fixed instant is
+            # returned in it — what this test pins is the *collision*
+            # behaviour of two archives in one second, which is unchanged;
+            # only the clock the stamp is read from moved.
             import datetime as _dt
-            return _dt.datetime(2026, 1, 1, 12, 0, 0)
+            frozen = _dt.datetime(2026, 1, 1, 12, 0, 0)
+            return frozen if tz is None else frozen.replace(tzinfo=tz)
 
     monkeypatch.setattr(bfl_mod, "datetime", _FrozenDatetime)
 

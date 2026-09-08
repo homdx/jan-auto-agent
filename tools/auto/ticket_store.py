@@ -57,7 +57,7 @@ AC (from Jira story AUTO-D1):
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 import logging
 from tools.auto.utils import _ts, atomic_write_text, safe_filename_component
 from pathlib import Path
@@ -336,7 +336,21 @@ class TicketStore:
         two ordinary back-to-back calls, no mocking required.  A numeric
         suffix disambiguates so neither call's evidence is destroyed.
         """
-        stamp = datetime.now().strftime("%Y%m%dT%H%M%S")
+        # FIX-1 #8 (second half): this stamp was on the LOCAL clock while
+        # this module's own schema (lines 16-17) records created_at /
+        # updated_at as ISO-8601 UTC via _ts(). Fixing only _ts() would
+        # leave a quarantine copy named in local time sitting beside the
+        # very ticket fields it belongs to, with nothing on either name to
+        # say which clock it came from -- the exact confusion _ts() was
+        # fixed to remove, just moved into the filename. Same instant, same
+        # "Z" marker, filename-safe formatting.
+        #
+        # Guarded via the module-level `datetime` symbol rather than a
+        # shared helper in utils: tests_bugfix/test_ticket_store_corrupt.py
+        # freezes the clock with monkeypatch.setattr(ticket_store,
+        # "datetime", ...), and routing this through utils would silently
+        # make those four collision tests unfreezable.
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         dest  = path.with_suffix(f".json.corrupt-{stamp}")
         suffix_n = 0
         while dest.exists():

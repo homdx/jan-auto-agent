@@ -7,7 +7,7 @@ import logging
 import os
 import re
 import tempfile
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -21,8 +21,20 @@ _MAX_FILENAME_COMPONENT = 200
 
 
 def _ts() -> str:
-    """Return the current local time as an ISO-8601 string (YYYY-MM-DDTHH:MM:SS)."""
-    return datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    """Return the current UTC time as an ISO-8601 string (YYYY-MM-DDTHH:MM:SSZ).
+
+    FIX-1 #8: this used to call ``datetime.now()`` — the *local* system
+    clock — while ``ticket_store.py``'s schema (lines 16-17) documents
+    every ``created_at`` / ``updated_at`` as "ISO-8601 UTC", and every
+    caller that supplies its own literal timestamp already uses the
+    trailing "Z" (see ``tests/test_auto_d1.py``), matching
+    ``tools/collect/manifest.py::_utc_iso_now()``. Recording local time
+    under a UTC label is invisible on one machine, but the moment a
+    ticket written on a UTC+5 box is read on a UTC box the chronology is
+    wrong, and the old string gave no hint it ever was local. UTC plus
+    an explicit "Z" suffix matches the rest of the codebase's contract.
+    """
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def safe_filename_component(value: str) -> str:
