@@ -264,6 +264,25 @@ def _coerce_counter(task: dict, field: str, default: int) -> int:
     return default
 
 
+def _coerce_delta(value: Any, label: str) -> int:
+    """Return *value* as an int delta, treating a malformed one as a no-op.
+
+    FIX-2 #7: the sibling of :func:`_coerce_counter` for the *increment*
+    side of ``increment_task_counters`` -- an invalid ``attempt_delta`` /
+    ``round_delta`` argument gets the same repair-rather-than-raise
+    treatment as a corrupted stored counter, since it is exactly the same
+    class of bookkeeping fault and must not abort a run over it. ``bool``
+    is rejected alongside non-ints, matching ``_matches_schema_type``.
+    """
+    if _matches_schema_type(value, int):
+        return value
+    logger.warning(
+        "increment_task_counters: %s is malformed (%r) — treating as 0 (no-op)",
+        label, value,
+    )
+    return 0
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # StateStore
 # ─────────────────────────────────────────────────────────────────────────────
@@ -525,7 +544,22 @@ class StateStore:
         attempt_delta: int = 0,
         round_delta: int = 0,
     ) -> None:
-        """Increment attempt/round counters for a task and persist."""
+        """Increment attempt/round counters for a task and persist.
+
+        FIX-2 #7: ``_coerce_counter`` already repairs a malformed *stored*
+        counter (a ``"2"`` or ``null`` left in plan.json), but the
+        *incoming* deltas were never checked at all. A caller bug passing
+        a non-int delta (a float from a bad average, a stray string) still
+        reached the ``+`` unguarded: sometimes a silent float write (e.g.
+        ``attempt_delta=0.5``), sometimes a raw ``TypeError`` that aborted
+        the run despite the base value being perfectly valid. Coerce the
+        deltas the same way ``_coerce_counter`` coerces the stored values --
+        repair-and-warn, not raise -- since a bookkeeping counter must never
+        be what kills an otherwise-successful task loop.
+        """
+        attempt_delta = _coerce_delta(attempt_delta, "attempt_delta")
+        round_delta = _coerce_delta(round_delta, "round_delta")
+
         tasks = self._plan.get("tasks", [])
         for t in tasks:
             if t["id"] == task_id:
