@@ -537,21 +537,65 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
         # prompt/response path is byte-identical to pre-AUTO-P. AUTO-P3 adds
         # the documented key to agents.ini; the other six agents_*.ini window
         # profiles need no edit precisely because of this fallback.
-        self._probe_enabled          = config.getboolean(arch, "probe_enabled", fallback=False)
-        self._probe_max_rounds       = max(0, config.getint(arch, "probe_max_rounds", fallback=1))
-        self._probe_max_chars        = config.getint(arch, "probe_max_chars", fallback=2000)
-        self._probe_max_total_chars  = config.getint(arch, "probe_max_total_chars", fallback=6000)
+        # FIX-2 C2: every probe read below was a bare
+        # getboolean/getint/getfloat with no try/except. fallback= only
+        # covers a *missing* key — a key that is present but unparseable
+        # ([architect] probe_max_rounds = five) raises ValueError straight
+        # out of the call. Nothing on the path catches it: review_clusters
+        # builds this reviewer directly and pipeline._run_plan_phase calls
+        # it with no guard (unlike _build_plan_validator, which is the
+        # plan-*validation* path), so one malformed probe key aborted the
+        # whole --auto run at the plan phase. Each read now degrades to its
+        # documented default, matching the guarded block above. Wrapped
+        # per-call rather than via a shared helper for the same reason as
+        # that block — extract_config_reads must still see each literal call.
+        try:
+            self._probe_enabled          = config.getboolean(arch, "probe_enabled", fallback=False)
+        except ValueError as exc:
+            logger.warning("config [%s] probe_enabled is malformed (%s) — using False", arch, exc)
+            self._probe_enabled = False
+        try:
+            self._probe_max_rounds       = max(0, config.getint(arch, "probe_max_rounds", fallback=1))
+        except ValueError as exc:
+            logger.warning("config [%s] probe_max_rounds is malformed (%s) — using 1", arch, exc)
+            self._probe_max_rounds = 1
+        try:
+            self._probe_max_chars        = config.getint(arch, "probe_max_chars", fallback=2000)
+        except ValueError as exc:
+            logger.warning("config [%s] probe_max_chars is malformed (%s) — using 2000", arch, exc)
+            self._probe_max_chars = 2000
+        try:
+            self._probe_max_total_chars  = config.getint(arch, "probe_max_total_chars", fallback=6000)
+        except ValueError as exc:
+            logger.warning("config [%s] probe_max_total_chars is malformed (%s) — using 6000", arch, exc)
+            self._probe_max_total_chars = 6000
         # AUTO-P8: escalated re-asks allowed when the digest cap cuts a round
         # short. 0 restores the pre-AUTO-P8 behaviour (force immediately).
         # AUTO-P9: learn the working digest cap instead of rediscovering it
         # once per batch. See ArchProbe.seeded_cap.
-        self._probe_budget_warmup    = config.getint(arch, "probe_budget_warmup", fallback=3)
-        self._probe_budget_headroom  = config.getfloat(arch, "probe_budget_headroom", fallback=2.0)
-        self._probe_budget_max_chars = config.getint(arch, "probe_budget_max_chars", fallback=0)
-        self._probe_budget_escalations = max(0, min(
-            len(_arch_probe._BUDGET_ESCALATION_LADDER),
-            config.getint(arch, "probe_budget_escalations", fallback=2),
-        ))
+        try:
+            self._probe_budget_warmup    = config.getint(arch, "probe_budget_warmup", fallback=3)
+        except ValueError as exc:
+            logger.warning("config [%s] probe_budget_warmup is malformed (%s) — using 3", arch, exc)
+            self._probe_budget_warmup = 3
+        try:
+            self._probe_budget_headroom  = config.getfloat(arch, "probe_budget_headroom", fallback=2.0)
+        except ValueError as exc:
+            logger.warning("config [%s] probe_budget_headroom is malformed (%s) — using 2.0", arch, exc)
+            self._probe_budget_headroom = 2.0
+        try:
+            self._probe_budget_max_chars = config.getint(arch, "probe_budget_max_chars", fallback=0)
+        except ValueError as exc:
+            logger.warning("config [%s] probe_budget_max_chars is malformed (%s) — using 0", arch, exc)
+            self._probe_budget_max_chars = 0
+        try:
+            self._probe_budget_escalations = max(0, min(
+                len(_arch_probe._BUDGET_ESCALATION_LADDER),
+                config.getint(arch, "probe_budget_escalations", fallback=2),
+            ))
+        except ValueError as exc:
+            logger.warning("config [%s] probe_budget_escalations is malformed (%s) — using 2", arch, exc)
+            self._probe_budget_escalations = 2
         # AUTO-P13: the AUTO-P8/AUTO-P9 ladders (2x/2x/4x, or 1.5x/2.5x/4x
         # once a cap is learned) are fixed module-level constants — the same
         # rungs fire whether the active profile's real window is 4K or 1M
@@ -580,9 +624,13 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
             self._probe_budget_ladder_scale = 1.0
         # AUTO-F1: bound on the run-level miss memo — see ArchProbe's own
         # docstring for why reset() must not clear it.
-        self._probe_memo_max_entries = max(
-            1, config.getint(arch, "probe_memo_max_entries", fallback=200)
-        )
+        try:
+            self._probe_memo_max_entries = max(
+                1, config.getint(arch, "probe_memo_max_entries", fallback=200)
+            )
+        except ValueError as exc:
+            logger.warning("config [%s] probe_memo_max_entries is malformed (%s) — using 200", arch, exc)
+            self._probe_memo_max_entries = 200
         _ops_raw                     = config.get(arch, "probe_allowed_ops", fallback="facts")
         # NOT defaulted back to DEFAULT_ALLOWED_OPS when the key is present but
         # empty: `probe_allowed_ops =` is an operator saying "allow nothing",
