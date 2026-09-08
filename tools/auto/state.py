@@ -231,6 +231,39 @@ def _validate_extra_task_fields(extra_fields: dict) -> None:
             )
 
 
+def _coerce_counter(task: dict, field: str, default: int) -> int:
+    """Return *task[field]* as an int, repairing a malformed value in place.
+
+    BUGFIX (counter schema): ``increment_task_counters`` and
+    ``increment_impl_version`` read a counter straight out of the task dict
+    and added a delta to it. Both are write paths that ``set_task_status``'s
+    sibling guard (``_validate_extra_task_fields``, added by B1) does not
+    cover, because they never go through ``**extra_fields`` — and both run
+    against tasks that came off disk. A legacy or hand-edited ``plan.json``
+    whose task carries ``"attempt": "2"`` (or ``null``, or ``true``) turned
+    the addition into an unhandled ``TypeError`` in the middle of a run,
+    after work had already been committed.
+
+    Repair rather than raise: a counter is bookkeeping, not instruction
+    content, so a malformed one must not cost the run. The bad value is
+    replaced by *default* — the same value ``make_task`` would have given a
+    fresh task — and reported, since a silently reset attempt counter looks
+    exactly like a task that simply has not been retried yet. Booleans are
+    rejected alongside non-ints for the reason ``_matches_schema_type``
+    documents: ``bool`` is an ``int`` subclass and no counter field means
+    ``True``.
+    """
+    value = task.get(field, default)
+    if _matches_schema_type(value, int):
+        return value
+    logger.warning(
+        "task %s: counter '%s' is malformed (%r) — resetting to %d",
+        task.get("id", "<unknown>"), field, value, default,
+    )
+    task[field] = default
+    return default
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # StateStore
 # ─────────────────────────────────────────────────────────────────────────────
@@ -496,8 +529,8 @@ class StateStore:
         tasks = self._plan.get("tasks", [])
         for t in tasks:
             if t["id"] == task_id:
-                t["attempt"] = t.get("attempt", 0) + attempt_delta
-                t["round"]   = t.get("round", 0)   + round_delta
+                t["attempt"] = _coerce_counter(t, "attempt", 0) + attempt_delta
+                t["round"]   = _coerce_counter(t, "round",   0) + round_delta
                 self._save_plan()
                 return
         raise ValueError(f"Task '{task_id}' not found in plan")
@@ -511,7 +544,7 @@ class StateStore:
         tasks = self._plan.get("tasks", [])
         for t in tasks:
             if t["id"] == task_id:
-                new_ver = t.get("impl_version", 1) + 1
+                new_ver = _coerce_counter(t, "impl_version", 1) + 1
                 t["impl_version"] = new_ver
                 self._save_plan()
                 return new_ver
@@ -589,7 +622,7 @@ class StateStore:
                     t["acceptance_check"] = acceptance_check
                 if title:
                     t["title"] = title
-                new_ver = t.get("impl_version", 1) + 1
+                new_ver = _coerce_counter(t, "impl_version", 1) + 1
                 t["impl_version"] = new_ver
                 self._save_plan()
                 return new_ver
