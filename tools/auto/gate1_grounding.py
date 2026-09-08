@@ -117,7 +117,14 @@ def target_file_context(
             source = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        file_ext = Path(tf).suffix or ".py"
+        # FIX-2 #13: an extensionless file is not a Python file. The old
+        # `or ".py"` default asserted a language the path never claimed, so
+        # Makefile / Dockerfile / Jenkinsfile / .gitignore content was handed
+        # to the AST-based Python strategy. An empty extension is the honest
+        # answer: block_extractor then assumes no language and uses its
+        # language-neutral brace search, and extract_module_docstring returns
+        # "" rather than parsing a non-Python file as Python.
+        file_ext = Path(tf).suffix
 
         block = ""
         for symbol in ([cited_symbol] if cited_symbol else []) + _instruction_symbol_candidates(instruction):

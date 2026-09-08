@@ -876,7 +876,14 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         except OSError as exc:
             return False, f"cannot read {loc.file!r}: {exc}", ""
 
-        file_ext = Path(loc.file).suffix or ".py"
+        # FIX-2 #13: an extensionless file is not a Python file. The old
+        # `or ".py"` default asserted a language the path never claimed, so
+        # Makefile / Dockerfile / Jenkinsfile / .gitignore content was handed
+        # to the AST-based Python strategy. An empty extension is the honest
+        # answer: block_extractor then assumes no language and uses its
+        # language-neutral brace search, and extract_module_docstring returns
+        # "" rather than parsing a non-Python file as Python.
+        file_ext = Path(loc.file).suffix
 
         # AUTO-CR-8: in docs/creative mode a FILE alone is sufficient grounding,
         # since small models often hallucinate line_start and the target
@@ -979,7 +986,14 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             source = (base_dir / loc.file).read_text(encoding="utf-8", errors="replace")
         except OSError:
             return ""
-        file_ext = Path(loc.file).suffix or ".py"
+        # FIX-2 #13: an extensionless file is not a Python file. The old
+        # `or ".py"` default asserted a language the path never claimed, so
+        # Makefile / Dockerfile / Jenkinsfile / .gitignore content was handed
+        # to the AST-based Python strategy. An empty extension is the honest
+        # answer: block_extractor then assumes no language and uses its
+        # language-neutral brace search, and extract_module_docstring returns
+        # "" rather than parsing a non-Python file as Python.
+        file_ext = Path(loc.file).suffix
         try:
             return extract_module_docstring(source, file_ext)
         except Exception:  # pragma: no cover - defensive, see docstring
