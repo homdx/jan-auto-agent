@@ -403,10 +403,21 @@ class BacklogPrioritiser:
         if loc_a.file != loc_b.file:
             return False
 
+        # FIX-2 H11b: an ordering claim needs A's range to be *known*, not
+        # guessed. a_end used to fall back to line_start when line_end was
+        # null, collapsing A to a single line so that every later task in the
+        # file looked cleanly downstream of it — an edge asserted from data
+        # the citation never carried, and dependencies are hard blockers in
+        # the controller. line_start is required for the same reason the
+        # docstring already states ("numeric line anchors"): a citation with
+        # an end but no start does not describe a range either. B only needs
+        # its start — where B's edit *ends* has no bearing on whether A
+        # finishes before it begins, and demanding it would drop real edges.
+        a_start = loc_a.line_start
         a_end   = loc_a.line_end
         b_start = loc_b.line_start
 
-        if a_end is None or b_start is None:
+        if a_start is None or a_end is None or b_start is None:
             return False
 
         return a_end < b_start
