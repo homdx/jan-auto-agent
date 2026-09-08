@@ -1,24 +1,32 @@
 """tests_bugfix/test_bugfix_emit_upsert_guarded.py
 
-BUG 14 (second half) — the ``upsert_task`` loop in
-``PlanEmitter.emit`` was unguarded.
+BUG 14 — Non-Atomic File Writes and Unguarded Persistence in
+``PlanEmitter.emit`` (``plan_emitter.py:131, 136-137``).
 
-The write of ``IMPROVEMENTS.md`` was made atomic by an earlier fix, but the
-loop right after it was not touched: ``upsert_task`` validates against the
-plan.json schema and raises ``ValueError`` on a violation, and the tasks
-being upserted are derived from LLM-authored candidates, so a violation is
-a normal-frequency event.
+Two independent hazards in the same method:
 
-Unguarded, the first bad task aborted ``emit()`` *after* IMPROVEMENTS.md
-had been written and after every earlier task had already been persisted
-by its own ``upsert_task`` — leaving plan.json half-populated, uncommitted,
-and disagreeing with the IMPROVEMENTS.md sitting beside it. The next run
-resumed from that partial plan.
+1. ``IMPROVEMENTS.md`` was written with a plain ``Path.write_text()``. A
+   kill mid-write (or a crash before the OS flushes the write) truncates
+   the file in place, leaving a corrupt/partial IMPROVEMENTS.md on disk
+   instead of either the old or the new content.
+2. The ``upsert_task`` loop right after it was unguarded: ``upsert_task``
+   validates against the plan.json schema and raises ``ValueError`` on a
+   violation, and the tasks being upserted are derived from LLM-authored
+   candidates, so a violation is a normal-frequency event.
 
-The fix skips the offending task and keeps going. What these tests pin
-beyond "does not raise" is that the tasks *after* the bad one are still
-persisted (a try/except around the whole loop would drop them, and would
-look identical from the caller's side) and that the shortfall is recorded,
+   Unguarded, the first bad task aborted ``emit()`` *after* IMPROVEMENTS.md
+   had been written and after every earlier task had already been persisted
+   by its own ``upsert_task`` — leaving plan.json half-populated,
+   uncommitted, and disagreeing with the IMPROVEMENTS.md sitting beside it.
+   The next run resumed from that partial plan.
+
+The fix: (1) route the IMPROVEMENTS.md write through the existing
+``atomic_write_text`` utility (temp file + ``os.replace``), same as
+plan.json/progress.json and synopsis.md/story_bible.md already do; (2)
+skip the offending task and keep going. What the loop tests pin beyond
+"does not raise" is that the tasks *after* the bad one are still persisted
+(a try/except around the whole loop would drop them, and would look
+identical from the caller's side) and that the shortfall is recorded,
 since plan.json and IMPROVEMENTS.md now legitimately disagree.
 """
 
@@ -26,7 +34,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -84,6 +92,46 @@ def emitter(tmp_path: Path, monkeypatch) -> tuple[PlanEmitter, StateStore]:
         "tools.auto.plan_emitter.to_improvements_md", lambda backlog: "# plan\n"
     )
     return em, state
+
+
+class TestImprovementsMdWriteIsAtomic:
+    def test_write_goes_through_atomic_write_text(self, emitter) -> None:
+        """IMPROVEMENTS.md must be written via atomic_write_text, not a bare
+        write_text() — a kill mid-write must not be able to leave a
+        truncated/corrupt file behind."""
+        em, _ = emitter
+        with patch(
+            "tools.auto.plan_emitter.atomic_write_text",
+            wraps=__import__("tools.auto.utils", fromlist=["atomic_write_text"]).atomic_write_text,
+        ) as mock_atomic:
+            em.emit(_FakeBacklog([_valid("T-1")]))
+
+        assert mock_atomic.called
+        md_path = em._base_dir / "IMPROVEMENTS.md"
+        assert md_path.exists()
+        assert md_path.read_text(encoding="utf-8") == "# plan\n"
+
+    def test_no_direct_write_text_on_improvements_md(self, emitter) -> None:
+        """Confirm production code never falls back to a direct write_text()
+        on IMPROVEMENTS.md that would bypass the atomic-write fix."""
+        em, _ = emitter
+        md_path = em._base_dir / "IMPROVEMENTS.md"
+
+        direct_writes = []
+        original = Path.write_text
+
+        def spy(self, data, *a, **kw):
+            if self == md_path:
+                direct_writes.append(data)
+            return original(self, data, *a, **kw)
+
+        with patch.object(Path, "write_text", spy):
+            em.emit(_FakeBacklog([_valid("T-1")]))
+
+        assert not direct_writes, (
+            "IMPROVEMENTS.md was written with a direct write_text() call — "
+            "it must go through atomic_write_text() instead."
+        )
 
 
 class TestUpsertLoopIsGuarded:
