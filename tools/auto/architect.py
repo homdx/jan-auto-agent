@@ -2584,14 +2584,67 @@ class TaskRewriter(_llm_stream.LLMClientBase):
         super().__init__(config, base_url, api_key, model, api_format, verify_ssl)
 
         arch = "architect"
-        self._max_tokens  = int(config.get(arch, "rewrite_max_tokens",  fallback="512"))
-        self._temperature = float(config.get(arch, "rewrite_temperature", fallback="0.4"))
-        self._think       = config.getboolean(arch, "think", fallback=False)
-        raw_system        = config.get(arch, "rewrite_system", fallback="").strip()
-        self._system      = raw_system or _REWRITER_SYSTEM_DEFAULT
-        self._timeout     = float(config.get("loop", "timeout_seconds", fallback="300"))
+        # BUGFIX (FIX-1 #7): every conversion below used to be bare.
+        # configparser's fallback= only covers a *missing* key — a key that is
+        # present but malformed (rewrite_max_tokens = many, think = maybe,
+        # num_ctx = 8k) raises ValueError out of the constructor, and
+        # make_outer_loop builds the rewriter unconditionally, so one bad
+        # value killed the rewrite phase before it could rewrite anything.
+        # Each read is guarded independently so a bad key degrades to its
+        # documented default and the other four still apply. Wrapped
+        # per-call (not via a shared helper) so extract_config_reads
+        # (tools/collect/ast_facts.py) still sees each literal call — a
+        # shared helper's call shape is invisible to that AST scanner.
+        # Matches ClusterReviewer.__init__'s established style (above).
+        try:
+            self._max_tokens = int(
+                config.get(arch, "rewrite_max_tokens", fallback="512")
+            )
+        except ValueError as exc:
+            logger.warning(
+                "config [%s] rewrite_max_tokens is malformed (%s) — using 512",
+                arch, exc,
+            )
+            self._max_tokens = 512
+        try:
+            self._temperature = float(
+                config.get(arch, "rewrite_temperature", fallback="0.4")
+            )
+        except ValueError as exc:
+            logger.warning(
+                "config [%s] rewrite_temperature is malformed (%s) — using 0.4",
+                arch, exc,
+            )
+            self._temperature = 0.4
+        try:
+            self._think = config.getboolean(arch, "think", fallback=False)
+        except ValueError as exc:
+            logger.warning(
+                "config [%s] think is malformed (%s) — using False", arch, exc,
+            )
+            self._think = False
+        raw_system = config.get(arch, "rewrite_system", fallback="").strip()
+        self._system = raw_system or _REWRITER_SYSTEM_DEFAULT
+        try:
+            self._timeout = float(
+                config.get("loop", "timeout_seconds", fallback="300")
+            )
+        except ValueError as exc:
+            logger.warning(
+                "config [loop] timeout_seconds is malformed (%s) — using 300", exc,
+            )
+            self._timeout = 300.0
         active_profile    = config.get("api", "active", fallback="local")
-        self._num_ctx     = config.getint(f"api_{active_profile}", "num_ctx", fallback=0)
+        try:
+            self._num_ctx = config.getint(
+                f"api_{active_profile}", "num_ctx", fallback=0
+            )
+        except ValueError as exc:
+            logger.warning(
+                "config [api_%s] num_ctx is malformed (%s) — using 0",
+                active_profile, exc,
+            )
+            self._num_ctx = 0
 
     # ── Public API ────────────────────────────────────────────────────────────
 
