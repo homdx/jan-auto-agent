@@ -796,7 +796,27 @@ class AutoController:
                     self.run_trace.log_task_done(task["id"], commit_hash)
 
                 # ── AUTO-G5: post-commit regression check ──────────────────
-                self._check_regressions(task["id"], executor, bug_fix_loop)
+                # BUGFIX (check-regressions-guard): this call used to be
+                # bare. _check_regressions() is fail-open internally (see
+                # the guards inside the method), but anything that can run
+                # before its own try/except -- e.g. self.state.all_tasks()
+                # -- was still able to raise and escape here uncaught. The
+                # task that was just committed is already fully accounted
+                # for, so losing the rest of this post-commit step must
+                # never cost the tasks still pending in plan.json.
+                try:
+                    self._check_regressions(task["id"], executor, bug_fix_loop)
+                except Exception as exc:  # noqa: BLE001 — never abort the run
+                    logger.warning(
+                        "_check_regressions raised after commit of %s — %s; "
+                        "continuing with remaining tasks.",
+                        task["id"], exc,
+                    )
+                    self.state.log(
+                        f"regression checks failed after commit of "
+                        f"{task['id']} ({type(exc).__name__}: {exc}) — "
+                        f"continuing with remaining tasks"
+                    )
 
             else:
                 # ── AUTO-G4: exhaustion → knowledge note + ticket ──────────
@@ -989,7 +1009,28 @@ class AutoController:
                     f"(after commit of {just_committed_id})"
                 )
                 break
-            exec_result = executor.run(done_task)
+
+            # BUGFIX (check-regressions-guard): executor.run() shells out to
+            # re-run a previously-recorded acceptance check, and can raise
+            # OSError (a vanished workspace), a timeout, or GitError. Guard
+            # per done_task rather than around the whole loop, so one flaky
+            # check does not skip the regression check for every other
+            # already-DONE task in this same batch.
+            try:
+                exec_result = executor.run(done_task)
+            except Exception as exc:  # noqa: BLE001 — fail-open, keep checking siblings
+                logger.warning(
+                    "_check_regressions: check for %s raised — %s; "
+                    "continuing with remaining done task(s).",
+                    done_task["id"], exc,
+                )
+                self.state.log(
+                    f"regression check for {done_task['id']} after commit "
+                    f"of {just_committed_id} failed "
+                    f"({type(exc).__name__}: {exc}) — continuing"
+                )
+                continue
+
             if not exec_result.passed:
                 logger.warning(
                     "_check_regressions: task %s regressed (rc=%s) — "
@@ -1001,9 +1042,28 @@ class AutoController:
                     f"after commit of {just_committed_id} "
                     f"(rc={exec_result.exit_code})"
                 )
-                bfl_result = bug_fix_loop.handle_regression(
-                    done_task, exec_result, self.base_dir
-                )
+                # BUGFIX (check-regressions-guard): handle_regression() drives
+                # a full BugFixLoop (git + executor + LLM subprocesses) and
+                # can raise for the same reasons as executor.run() above.
+                # Guarded separately so the failure is attributed to the
+                # right stage and the loop still moves on to the next
+                # done_task instead of aborting the whole regression pass.
+                try:
+                    bfl_result = bug_fix_loop.handle_regression(
+                        done_task, exec_result, self.base_dir
+                    )
+                except Exception as exc:  # noqa: BLE001 — fail-open, keep checking siblings
+                    logger.warning(
+                        "_check_regressions: bug fix loop for %s raised — "
+                        "%s; continuing with remaining done task(s).",
+                        done_task["id"], exc,
+                    )
+                    self.state.log(
+                        f"bug fix loop for {done_task['id']} after commit "
+                        f"of {just_committed_id} failed "
+                        f"({type(exc).__name__}: {exc}) — continuing"
+                    )
+                    continue
                 self.state.log(
                     f"bug fix loop: {bfl_result.summary()}"
                 )
