@@ -404,6 +404,15 @@ def _find_def_in_repo(name: str, base_dir: Path, max_files: int = 4000) -> Optio
     count = 0
     try:
         for p in base_dir.rglob("*.py"):
+            # FIX-2 #11: this exclusion must stay AHEAD of the increment.
+            # With it below, every file the walk was about to throw away
+            # still consumed max_files budget — and .agent/ holds the run's
+            # own state while node_modules/ holds thousands of vendored
+            # files, so whenever either sorted ahead of the file defining
+            # the symbol, the walk hit the cap having read nothing but
+            # files it was discarding anyway and reported "not found" for a
+            # definition that was sitting right there. The counter bounds
+            # the work actually done: never read, never counted.
             if "/.agent/" in str(p) or "/node_modules/" in str(p):
                 continue
             count += 1
