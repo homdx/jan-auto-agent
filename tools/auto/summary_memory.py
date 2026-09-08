@@ -172,6 +172,27 @@ def _strip_meta_parentheticals(fact: str) -> str:
     return cleaned.strip()
 
 
+def _is_ok_sentinel(reply: str) -> bool:
+    """True only if *reply* IS the one-word ``OK`` sentinel.
+
+    FIX-2 #9: this used to be ``first_line.startswith("OK") and len(reply) <= 4``,
+    which accepted ``"OKAY"`` — it starts with ``OK`` and is 4 characters long.
+    ``OKAY`` is a real English word a model can easily emit instead of the bare
+    ``OK`` the prompt asks for, and it is an interjection, not an assertion
+    that the summary is faithful. Treating it as a pass stopped the loop
+    before the correction the model was about to send was ever read.
+
+    A shorter length bound alone is not enough either: ``len(reply) <= 4``
+    with a first-line check still lets a two-line reply like ``"OK\\nX"``
+    (4 characters total) through, silently discarding whatever the model put
+    on the second line. The sentinel is one word, so match the *entire*
+    reply against it exactly (case- and whitespace-insensitively, which is
+    all the tolerance the old length bound ever provided for) rather than
+    bounding the length of a multi-line reply.
+    """
+    return reply.strip().upper() == "OK"
+
+
 def _clean_bullet_list(reply: str) -> str:
     """Normalise a verifier reply into a clean bullet list, or "" if unusable.
 
@@ -303,8 +324,7 @@ class SummaryFidelityVerifier:
                 )
                 break
 
-            first_line = reply.splitlines()[0].strip().upper()
-            if first_line.startswith("OK") and len(reply) <= 4:
+            if _is_ok_sentinel(reply):
                 logger.debug("SummaryFidelityVerifier: OK on round %d.", rnd)
                 break
 
