@@ -281,6 +281,46 @@ class CitedLocation:
     line_end: int | None = None
     new_file: bool = False
 
+    def __post_init__(self) -> None:
+        """Normalise ``symbol`` to ``str | None`` regardless of how this
+        dataclass was built (FIX-1 bug #5).
+
+        Two call sites build a ``CitedLocation`` from untrusted data:
+        ``ClusterReviewer._parse_candidates`` (raw LLM JSON) and the
+        module-level ``_deserialise_candidates`` (a JSON checkpoint file,
+        which could have been written by an older/buggy build or edited
+        by hand). Either can hand this a truthy non-string ``symbol`` —
+        an LLM-emitted ``123``, ``["Foo"]``, ``True``. ``is_valid()``
+        only checks truthiness, so such a value used to pass the
+        grounding gate and then crash downstream where a string is
+        assumed: ``re.escape()`` in ``backlog_prioritiser.py`` and
+        ``extract_block()`` in ``gate1_filter.py`` both raise
+        ``TypeError`` on a non-string.
+
+        Enforcing the invariant here, once, protects every construction
+        site — present and future, including direct construction in
+        tests — instead of only whichever one happened to be reported.
+        A non-string value carries no real grounding information (an
+        LLM's ``symbol: 123`` doesn't name any real symbol in the file),
+        so it is treated the same as "no symbol was given": discarded to
+        ``None`` rather than stringified into a fake anchor that would
+        just fail to be found later, silently, by ``extract_block``.
+        This also matches the sibling fields' existing pattern
+        (``_to_str_or_empty``, ``_to_int_or_none``, ``_to_bool_or``),
+        which is the pattern ``symbol`` alone was missing.
+        """
+        if self.symbol is None:
+            return
+        if isinstance(self.symbol, str):
+            self.symbol = self.symbol.strip() or None
+            return
+        logger.debug(
+            "CitedLocation: discarding non-string symbol %r (%s) for "
+            "file=%r — treated as no symbol given.",
+            self.symbol, type(self.symbol).__name__, self.file,
+        )
+        self.symbol = None
+
     def is_valid(self, task_mode: str = "code") -> bool:
         """A location is valid when it has a file AND at least one anchor.
 
