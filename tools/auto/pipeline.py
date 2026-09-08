@@ -303,10 +303,33 @@ def _run_plan_phase(controller: "AutoController", cfg: configparser.ConfigParser
             _max_rewrites = cfg.getint("architect", "max_rewrites", fallback=1)
         except ValueError:
             _max_rewrites = 1
-        _plan_max_rev = cfg.getint(
-            "architect", "plan_max_revisions",
-            fallback=_max_rewrites,
-        )
+        # BUG-1 FIX: this outer read had the same problem as the nested one
+        # above. configparser's fallback= only applies when the key is
+        # *missing*; a key that is present but non-numeric ("abc", "3x")
+        # makes getint raise ValueError straight out of the call, which
+        # nothing on the path up to --auto caught. One malformed
+        # plan_max_revisions value crashed the entire plan phase before any
+        # task ran. Guard it the same way as max_rewrites: degrade to the
+        # already-sanitised _max_rewrites instead of propagating.
+        try:
+            _plan_max_rev = cfg.getint(
+                "architect", "plan_max_revisions",
+                fallback=_max_rewrites,
+            )
+        except ValueError as exc:
+            # Logged, not silent: the run continues on the fallback, but a
+            # malformed agents.ini key is an operator mistake they can only
+            # correct if something says so -- the visible symptom (fewer
+            # plan revisions than configured) is indistinguishable from
+            # normal operation. This matches the reporting the sibling
+            # config guards in this batch already do (max_tasks_creative,
+            # and each of TaskRewriter's five reads); plan_max_revisions
+            # was the one guard that degraded without a word.
+            logger.warning(
+                "config [architect] plan_max_revisions is malformed (%s) — "
+                "using max_rewrites (%d)", exc, _max_rewrites,
+            )
+            _plan_max_rev = _max_rewrites
         _plan_max_rev = max(1, _plan_max_rev)
         _plan_revisions = 0
         while _plan_revisions < _plan_max_rev:
