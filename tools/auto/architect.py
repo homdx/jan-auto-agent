@@ -2263,7 +2263,27 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
         # which collapse every chapter into a copy of one when run
         # sequentially over shared files. Keep only the first N.
         if self._task_mode == "creative":
-            cap = self._config.getint("architect", "max_tasks_creative", fallback=1)
+            # BUGFIX (FIX-1 #6): fallback= only covers a *missing* key — a
+            # present but non-numeric max_tasks_creative (e.g. "three", or a
+            # leftover empty value) raised ValueError straight out of
+            # getint, and nothing on the path from _review_one_cluster up to
+            # --auto caught it, so one bad value in agents.ini crashed the
+            # whole plan phase *after* the architect's LLM call had already
+            # produced the candidates this cap exists to trim. Degrade to
+            # the documented default (1) — the strictest setting, and the
+            # safe direction for a cap whose purpose is to stop overlapping
+            # creative tasks. Guarded inline (not via a shared helper) so
+            # extract_config_reads (tools/collect/ast_facts.py) still sees
+            # this as a literal getint call — matches this class's own
+            # __init__ guards and gate1_filter.py's established style.
+            try:
+                cap = self._config.getint("architect", "max_tasks_creative", fallback=1)
+            except ValueError as exc:
+                logger.warning(
+                    "config [architect] max_tasks_creative is malformed (%s) — using 1",
+                    exc,
+                )
+                cap = 1
             cap = max(1, cap)
             if len(candidates) > cap:
                 logger.info(
