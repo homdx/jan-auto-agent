@@ -403,7 +403,7 @@ class BacklogPrioritiser:
         if loc_a.file != loc_b.file:
             return False
 
-        a_end   = loc_a.line_end   if loc_a.line_end   is not None else loc_a.line_start
+        a_end   = loc_a.line_end
         b_start = loc_b.line_start
 
         if a_end is None or b_start is None:

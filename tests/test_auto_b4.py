@@ -305,6 +305,36 @@ class TestSameFileLinearDependency:
         for t in backlog.auto_tasks:
             assert not t.dependencies
 
+    def test_unknown_line_end_creates_no_dependency(self) -> None:
+        """A citation with no line_end must NOT be treated as a single line.
+
+        Regression: ``a_end`` used to fall back to ``line_start`` when
+        ``line_end`` was null, so a symbol-anchored task at line 1 was judged
+        to end at line 1 and every later task in the same file became its
+        dependent. Because ``dependencies`` are hard blockers in the
+        controller (a task whose dep is not DONE is marked BLOCKED and never
+        run), that invented an ordering the citation never claimed. With the
+        real extent unknown, infer nothing.
+        """
+        a = _cand(title="Task A", file="tools/m.py", symbol="fn_a",
+                  line_start=1, line_end=None, acceptance_check="pytest")
+        b = _cand(title="Task B", file="tools/m.py", symbol="fn_b",
+                  line_start=200, line_end=220, acceptance_check="pytest")
+        backlog = build_backlog([a, b])
+        for t in backlog.auto_tasks:
+            assert not t.dependencies
+
+    def test_known_line_end_still_creates_dependency(self) -> None:
+        """The heuristic still fires when A's extent is actually known."""
+        a = _cand(title="Task A", file="tools/m.py", symbol="fn_a",
+                  line_start=1, line_end=5, acceptance_check="pytest")
+        b = _cand(title="Task B", file="tools/m.py", symbol="fn_b",
+                  line_start=200, line_end=220, acceptance_check="pytest")
+        backlog = build_backlog([a, b])
+        task_a = next(t for t in backlog.auto_tasks if t.title == "Task A")
+        task_b = next(t for t in backlog.auto_tasks if t.title == "Task B")
+        assert task_a.task_id in task_b.dependencies
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Dependency inference — cross-file symbol reference
