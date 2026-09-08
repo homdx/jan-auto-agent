@@ -472,9 +472,46 @@ def validate_plan(
 # trailing separator; the exact literal (not a generic "\n## ") is
 # deliberate for the same reason as above -- a task's own text can
 # legitimately contain a line starting with "## ".
+#
+# FIX-2 H4: the body is ".*?" no longer, but "(?:_FENCE_BLOCK|.)*?" — an
+# alternation that consumes a whole fenced code block as ONE atomic unit
+# whenever one opens, and a single character otherwise. Without it the
+# separator rule above has the same defect it was written to remove, only
+# reached through a different door: an instruction that quotes markdown
+# inside a fence
+#
+#     ```markdown
+#     ---
+#     ### Example heading
+#     ```
+#
+# contains a "\n---\n" whose next line really does start with "### ", so the
+# terminator (and its lookahead) both fire on text that is a code sample, not
+# structure. The entry was cut off mid-fence and its tail left behind in
+# IMPROVEMENTS.md as orphaned text — the exact failure the separator rule
+# exists to prevent. Because the loop is lazy, the engine tries to END the
+# section before it tries either alternative, so a fence is only entered when
+# no terminator matches at its opening line; consuming it whole then skips
+# every position inside it, and no interior "---" or "### " is ever offered
+# as a boundary. An UNCLOSED fence matches no block and degrades to the
+# per-character path, i.e. to the pre-H4 behaviour, rather than swallowing
+# the rest of the file.
+#
+# The closer must repeat the opener's own character (CommonMark: ``` closes
+# ```, ~~~ closes ~~~), which is why the run is captured and back-referenced
+# instead of being written as a literal — a "~~~" line inside a ``` block is
+# body text, not a terminator.
+_FENCE_BLOCK = (
+    r"(?m:^ {0,3})(?P<fence>`{3,}|~{3,})[^\n]*\n"   # opening fence line
+    r"[\s\S]*?"                                     # block body, verbatim
+    r"(?m:^ {0,3})(?P=fence)[^\n]*"                  # closing fence line
+)
+
+
 def _task_section_pattern(task_id: str) -> re.Pattern:
     return re.compile(
-        r"### " + re.escape(task_id) + r":.*?"
+        r"### " + re.escape(task_id) + r":"
+        r"(?:" + _FENCE_BLOCK + r"|.)*?"
         r"(?:\n-{3,}\n+(?=### |## Manual Suggestions|\Z)"
         r"|(?=\n## Manual Suggestions|\Z))",
         re.DOTALL,
