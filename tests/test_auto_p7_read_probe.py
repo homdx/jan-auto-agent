@@ -67,6 +67,11 @@ def repo(tmp_path: Path) -> Path:
     (tmp_path / "tools" / "small.py").write_text("a\nb\nc\n", encoding="utf-8")
     (tmp_path / "tools" / "empty.py").write_text("", encoding="utf-8")
     (tmp_path / "tools" / "blob.bin").write_bytes(b"\xff\xfe\x00\x01binary")
+    # A source file with an embedded invalid UTF-8 byte (lone continuation byte
+    # \x80 is illegal as a leading byte in UTF-8). Used by Bug-16 regression.
+    (tmp_path / "tools" / "latin1.py").write_bytes(
+        b"def hello():\n    # caf\x80\n    pass\n"
+    )
     (tmp_path / "outside.txt").write_text("secret\n", encoding="utf-8")
     return tmp_path
 
@@ -177,6 +182,22 @@ class TestReadEdgeCases:
         out = _probe(repo)._read("tools/blob.bin")
         assert out != ""
         assert "blob.bin" in out
+
+    def test_invalid_utf8_byte_replaced_not_crash(self, repo) -> None:
+        """Bug 16: read_text must use errors="replace", not strict UTF-8.
+
+        A lone 0x80 continuation byte embedded in an otherwise-ASCII Python
+        source is invalid UTF-8. With strict decoding this raises
+        UnicodeDecodeError, which the except clause folded into "" — making an
+        existing file indistinguishable from a missing one. With
+        errors="replace" the byte becomes U+FFFD and the read succeeds.
+        """
+        out = _probe(repo)._read("tools/latin1.py")
+        # Must return content, not an empty miss.
+        assert out != "", "invalid UTF-8 byte must not silence the file"
+        assert "latin1.py" in out
+        # The replacement character proves errors="replace" was used.
+        assert "�" in out
 
     def test_empty_file_is_not_a_miss(self, repo) -> None:
         """The file exists and is empty — a different fact from "no such
