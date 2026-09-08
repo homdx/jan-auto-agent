@@ -138,3 +138,26 @@ class TestNonNumericImplVersion:
         outer, _inner = outer_pair
         outer.run_task(task, tmp_path)
         assert store.get_task("T-1")["impl_version"] == "abc"
+
+    def test_corrupt_version_is_labelled_v1_not_v0(
+        self, store: StateStore, tmp_path: Path, outer_pair
+    ) -> None:
+        """A corrupt impl_version must recover to the SAME starting point as
+        a normal, uncorrupted task (``make_task`` seeds ``impl_version=1``;
+        ``StateStore._coerce_counter``'s bump path also falls back to 1) --
+        not to 0.
+
+        ``rewrites_done = max(0, impl_version - 1)`` comes out to 0 either
+        way, so this cannot be caught by asserting ``result.passed`` alone.
+        But ``impl_version`` itself is also recorded verbatim into
+        ``impl_versions_used`` (and into feedback-file headers as
+        "impl v{impl_version}", fed back to the coder on the next round) at
+        the top of every round -- a fallback of 0 there means a "version 0"
+        that should never exist in this system surfaces to the LLM prompt,
+        inconsistent with how every other corrupt-counter recovery in this
+        codebase behaves.
+        """
+        task = _seed_task(store, impl_version="abc")
+        outer, _inner = outer_pair
+        result = outer.run_task(task, tmp_path)
+        assert result.impl_versions_used == [1]

@@ -71,17 +71,23 @@ def _coerce_impl_version(value: object) -> int:
     task still pending in plan.json.
 
     A value that cannot be read as an integer means "we don't know how many
-    rewrites this task had", so return 0: the caller then seeds its rewrite
-    counter from zero and ``max_rewrites`` caps only the rewrites this
-    process actually observes. The persisted value is left untouched --
-    nothing about it can be safely repaired in place.
+    rewrites this task had", so fall back to 1 -- the same starting value
+    ``make_task`` gives every task and ``_coerce_counter`` (state.py) falls
+    back to on the bump path -- rather than 0. Both fall back to a value
+    that makes ``rewrites_done`` (``max(0, impl_version - 1)``) come out to
+    0 either way, but only 1 keeps ``impl_version`` itself consistent with
+    "no rewrites yet" everywhere else it is used in this function --
+    feedback file headers ("impl v{impl_version}"), ``impl_versions_used``,
+    and the trace events -- instead of surfacing a "v0" that should never
+    exist. The persisted value is left untouched -- nothing about it can be
+    safely repaired in place.
     """
     if isinstance(value, bool):
-        return 0
+        return 1
     try:
-        return max(0, int(value))
+        return max(1, int(value))
     except (TypeError, ValueError):
-        return 0
+        return 1
 
 # LOOP-4: regex to extract impl version from file headers
 _IMPL_HEADER_RE = re.compile(r"impl v(\d+)")
