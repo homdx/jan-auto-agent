@@ -74,6 +74,7 @@ from tools.auto.utils import atomic_write_text, chars_per_token
 # import is safe (llm_profile.py imports nothing from this package) and a
 # TYPE_CHECKING-gated one would not fix it — that block never executes.
 from tools.auto.llm_profile import LlmSettings
+from tools.config_safe import safe_getboolean, safe_getfloat, safe_getint
 
 logger = logging.getLogger(__name__)
 
@@ -699,7 +700,7 @@ def _default_llm_settings(
     api_key    = config.get(api_sec, "api_key",    fallback="ollama")
     model      = config.get(api_sec, "model",      fallback="llama3.1:8b")
     api_format = config.get(api_sec, "api_format", fallback="ollama")
-    verify_ssl = config.getboolean("api", "verify_ssl", fallback=True)
+    verify_ssl = safe_getboolean(config, "api", "verify_ssl", fallback=True)
 
     num_ctx_str = _cfg_mode(config, "coder", "num_ctx", task_mode, fallback=None)
     if num_ctx_str is None:
@@ -709,7 +710,7 @@ def _default_llm_settings(
     max_tokens_str = _cfg_mode(config, "coder", "max_tokens", task_mode, fallback="800")
     max_tokens = int(max_tokens_str)
 
-    temperature = config.getfloat("inner_loop", "temperature", fallback=0.2)
+    temperature = safe_getfloat(config, "inner_loop", "temperature", fallback=0.2)
     # AUTO-FIX (fable follow-up 3): thinking models (qwen3) prepend a
     # <think> block; if it truncates against num_predict the synopsis update
     # comes back empty, and if it doesn't, the reasoning text is WRITTEN
@@ -717,7 +718,7 @@ def _default_llm_settings(
     # prompt, so one polluted call poisons the whole run. Same toggle as
     # gate1/architect/coder: default off, [summary_memory] think = true
     # re-enables it.
-    think = config.getboolean("summary_memory", "think", fallback=False)
+    think = safe_getboolean(config, "summary_memory", "think", fallback=False)
 
     # AUTO-FIX (GATE3-PROFILE audit): think_effort was absent here, so every
     # LlmSettings this function produced carried the dataclass default (None)
@@ -737,8 +738,8 @@ def _default_llm_settings(
     # have gone straight into a live profile. A caller that genuinely wants
     # JSON mode can still set response_format in its own *_llm_profile, which
     # is an explicit, per-caller opt-in rather than a global one.
-    think_effort_enabled = config.getboolean(
-        "api", "think_effort_enabled", fallback=False)
+    think_effort_enabled = safe_getboolean(
+        config, "api", "think_effort_enabled", fallback=False)
     think_effort = (
         (config.get("api", "think_effort", fallback="").strip() or None)
         if think_effort_enabled else None
@@ -798,7 +799,7 @@ def _make_llm_call(
     response_format = settings.response_format
     think_effort    = settings.think_effort
 
-    timeout = config.getint("loop", "timeout_seconds", fallback=300)
+    timeout = safe_getint(config, "loop", "timeout_seconds", fallback=300)
 
     ssl_context: ssl.SSLContext | None = _llm_stream.make_unverified_context() if not verify_ssl else None
 
@@ -891,8 +892,8 @@ def make_summary_memory(
     from tools.auto.utils import _cfg_mode
     from tools.auto.llm_profile import resolve_llm_profile
 
-    max_passes  = config.getint("auto", "max_compression_passes", fallback=2)
-    max_fidelity = config.getint("auto", "max_fidelity_rounds",   fallback=2)
+    max_passes  = safe_getint(config, "auto", "max_compression_passes", fallback=2)
+    max_fidelity = safe_getint(config, "auto", "max_fidelity_rounds",   fallback=2)
 
     num_ctx_str = _cfg_mode(config, "coder", "num_ctx", task_mode, fallback=None)
     if num_ctx_str is None:

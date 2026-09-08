@@ -74,6 +74,7 @@ from tools.auto.git_manager import GitError, make_git_manager
 from tools.auto.plan_emitter import IMPROVEMENTS_FILENAME
 from tools.auto.state import STATUS_IN_PROGRESS, STATUS_TODO, StateStore
 from tools.auto.utils import _ts, atomic_write_text, normalize_task_mode
+from tools.config_safe import safe_getboolean
 
 logger = logging.getLogger(__name__)
 
@@ -203,7 +204,7 @@ def _presence_check_skip_reason(
     default to task_mode = creative, unlike agents.ini / agents_4k.ini's
     task_mode = code).
     """
-    if cfg.getboolean("gate1", "skip_llm", fallback=False):
+    if safe_getboolean(cfg, "gate1", "skip_llm", fallback=False):
         return "[gate1] skip_llm=true"
     if task_mode != "code":
         return f"[auto] task_mode={task_mode!r} (non-code modes skip Stage B by design)"

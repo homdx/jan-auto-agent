@@ -72,6 +72,7 @@ from tools.auto.gate1_grounding import (
 from tools.block_extractor import extract_block, extract_module_docstring
 import tools.llm_stream as _llm_stream
 from tools.llm_stream import strip_think
+from tools.config_safe import safe_getboolean
 
 logger = logging.getLogger(__name__)
 
@@ -1532,7 +1533,7 @@ def filter_candidates(
     api_key   = config.get(section, "api_key",    fallback="")
     model     = model_override or config.get(section, "model")
     api_fmt   = config.get(section, "api_format", fallback="openai")
-    verify_ssl = config.getboolean("api", "verify_ssl", fallback=True)
+    verify_ssl = safe_getboolean(config, "api", "verify_ssl", fallback=True)
 
     filt = Gate1Filter(
         config=config,

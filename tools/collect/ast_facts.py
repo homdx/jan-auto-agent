@@ -314,11 +314,23 @@ def _simple_literal_assignments(tree: ast.Module) -> dict:
 #: METHODS` recognizes `ConfigParser` methods by name.
 _CFG_MODE_HELPER_NAME = "_cfg_mode"
 
+#: This codebase's shared fail-open config readers (`tools.config_safe`,
+#: FIX-2 M3). Their argument order deliberately mirrors `_cfg_mode`'s —
+#: `safe_get*(config, section, key, fallback=...)` — so the same positional
+#: layout applies: section is args[1], key is args[2]. Recognized by name for
+#: the same reason `_cfg_mode` is: the real `config.get*` call lives inside
+#: the helper's body, one module away from every caller, so an extractor that
+#: only saw literal `config.get*()` shapes would record ZERO reads for every
+#: site that routes through them — silently emptying the config map of 31
+#: call sites the moment they were converted.
+_SAFE_CONFIG_HELPERS = frozenset({"safe_getint", "safe_getfloat", "safe_getboolean"})
+
 
 def extract_config_reads(tree: ast.Module, module_path: str) -> List[ConfigRead]:
     """Every `config.get*(section, key, fallback=...)` call site in `tree`,
     plus every `_cfg_mode(config, section, key, task_mode, fallback=...)`
-    call site (COLLECT-5).
+    call site (COLLECT-5) and every `safe_get*(config, section, key,
+    fallback=...)` call site (FIX-2 M3).
 
     Recognizes the four `ConfigParser` reader methods (`get`, `getint`,
     `getboolean`, `getfloat`) — but only when a `fallback=` keyword (or a
@@ -378,6 +390,51 @@ def extract_config_reads(tree: ast.Module, module_path: str) -> List[ConfigRead]
                 continue  # can't determine section/key positionally; skip
             section_node, key_node = node.args[0], node.args[1]
 
+            if isinstance(section_node, ast.Constant) and isinstance(section_node.value, str):
+                section = section_node.value
+            elif isinstance(section_node, ast.Name) and section_node.id in aliases:
+                section = aliases[section_node.id]
+            else:
+                continue  # dynamic section: can't attribute statically
+
+            has_mode_override = False
+            if isinstance(key_node, ast.Constant) and isinstance(key_node.value, str):
+                key = key_node.value
+            elif isinstance(key_node, ast.JoinedStr):
+                key, has_mode_override = _fstring_key_and_override(key_node)
+            elif isinstance(key_node, ast.Name) and key_node.id in aliases:
+                key = aliases[key_node.id]
+            else:
+                continue  # dynamic, non-f-string/non-alias key: can't attribute statically
+
+            reads.append(
+                ConfigRead(
+                    section=section,
+                    key=key,
+                    fallback=_literal_or_none(fallback_node),
+                    reader_module=module_path,
+                    has_mode_override=has_mode_override,
+                )
+            )
+
+        elif isinstance(func, ast.Name) and func.id in _SAFE_CONFIG_HELPERS:
+            # safe_getint(config, section, key, fallback=...) — the leading
+            # `config` positional shifts section/key one slot later than the
+            # direct-call shape above, exactly like _cfg_mode. Unlike
+            # _cfg_mode, these never imply the mode-override convention: they
+            # read the key they are given, verbatim.
+            if len(node.args) < 3:
+                continue  # can't determine section/key positionally; skip
+
+            fallback_node = None
+            for kw in node.keywords:
+                if kw.arg == "fallback":
+                    fallback_node = kw.value
+                    break
+            if fallback_node is None and len(node.args) >= 4:
+                fallback_node = node.args[3]
+
+            section_node, key_node = node.args[1], node.args[2]
             if isinstance(section_node, ast.Constant) and isinstance(section_node.value, str):
                 section = section_node.value
             elif isinstance(section_node, ast.Name) and section_node.id in aliases:

@@ -78,6 +78,7 @@ from tools.auto.context_assembler import ContextAssembler
 from tools.agent_trace import tracer
 import tools.llm_stream as _llm_stream
 from tools.llm_stream import strip_think
+from tools.config_safe import safe_getboolean
 
 logger = logging.getLogger(__name__)
 
@@ -2492,7 +2493,7 @@ def make_coder(config: configparser.ConfigParser, task_mode: str = "code",
     api_key   = config.get(section, "api_key",    fallback="")
     model     = config.get(section, "model")
     api_fmt   = config.get(section, "api_format", fallback="openai")
-    verify_ssl = config.getboolean("api", "verify_ssl", fallback=True)
+    verify_ssl = safe_getboolean(config, "api", "verify_ssl", fallback=True)
 
     return Coder(
         config     = config,

@@ -6,6 +6,7 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+from tools.config_safe import safe_getint
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +68,7 @@ class PromptStore:
         if max_versions is not None:
             self.max_versions = max(1, int(max_versions))
         elif config is not None:
-            self.max_versions = max(1, config.getint("prompt_store", "max_versions", fallback=3))
+            self.max_versions = max(1, safe_getint(config, "prompt_store", "max_versions", fallback=3))
         else:
             self.max_versions = 3
 

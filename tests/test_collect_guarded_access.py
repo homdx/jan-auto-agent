@@ -76,7 +76,7 @@ def test_real_prompt_store_get_current_is_guarded_via_alias():
     by_access = {(a.location, a.access): a for a in accesses}
     # NOTE: line number tracks the real tools/prompt_store.py::get_current
     # source — update if that method's line position shifts.
-    site = by_access[("tools/prompt_store.py:90", "stack[-1]")]
+    site = by_access[("tools/prompt_store.py:91", "stack[-1]")]
     assert site.status == "GUARDED"
     assert site.guard
 

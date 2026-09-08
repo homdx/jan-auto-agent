@@ -5,7 +5,7 @@
 * A rationale comment sitting on the `except` line or the first line of
   its body is picked up verbatim; a fail-open site with no such comment
   gets `rationale=None` rather than a guess.
-* AC: `tools/auto/auto_metrics.py:255`, `tools/auto/coder.py:718`, and
+* AC: `tools/auto/auto_metrics.py:255`, `tools/auto/coder.py:719`, and
   `tools/auto/inner_loop.py:364` are all in the registry when built from
   this real repo.
 """
@@ -150,5 +150,5 @@ def test_ac_real_repo_reference_sites_are_all_registered():
     registry = build_fail_open_registry(modules, root=REPO_ROOT)
     locations = fail_open_locations(registry)
     assert "tools/auto/auto_metrics.py:250" in locations  # NOTE: line tracks _warn_if_contaminated's corrupt-file swallow (documented rationale); update if it shifts
-    assert "tools/auto/coder.py:1027" in locations  # NOTE: line tracks the dup_reject_ratio config-fallback bare except (was :834's _extract_missing_context, fixed — now logs, correctly dropped out); update if it shifts
-    assert "tools/auto/inner_loop.py:445" in locations  # NOTE: line tracks _fetch_needed_flat's bare except; update if it shifts
+    assert "tools/auto/coder.py:1028" in locations  # NOTE: line tracks the dup_reject_ratio config-fallback bare except (was :834's _extract_missing_context, fixed — now logs, correctly dropped out); update if it shifts
+    assert "tools/auto/inner_loop.py:446" in locations  # NOTE: line tracks _fetch_needed_flat's bare except; update if it shifts

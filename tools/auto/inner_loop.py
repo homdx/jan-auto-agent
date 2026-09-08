@@ -47,6 +47,7 @@ from tools.agent_trace import tracer   # AUTO-CR-27: per-stage decision tracing
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from tools.config_safe import safe_getboolean, safe_getint
 
 logger = logging.getLogger(__name__)
 
@@ -312,7 +313,7 @@ class LLMGate2Validator:
         # caller didn't resolve one (None), preserving old behaviour.
         self._think = (
             think if think is not None
-            else (config.getboolean("validator_agent", "think", fallback=False) if config is not None else False)
+            else (safe_getboolean(config, "validator_agent", "think", fallback=False) if config is not None else False)
         )
         # AUTO-DM-5 / AUTO-CR-19-1: select system prompt — mode-specific
         # override > (code-mode-only) legacy "system" key > built-in.
@@ -323,10 +324,10 @@ class LLMGate2Validator:
         from tools.search_agent import make_search_agent
         self._search_agent = make_search_agent(config, base_dir) if config else None
         self._context_probe_enabled = (
-            config.getboolean("coder", "context_probe", fallback=True) if config else True
+            safe_getboolean(config, "coder", "context_probe", fallback=True) if config else True
         )
         self._max_chars_per_dep = (
-            config.getint("coder", "max_chars_per_dep", fallback=2000) if config else 2000
+            safe_getint(config, "coder", "max_chars_per_dep", fallback=2000) if config else 2000
         )
 
     # ------------------------------------------------------------------

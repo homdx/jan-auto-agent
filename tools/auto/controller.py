@@ -42,6 +42,7 @@ from tools.auto.run_trace import setup_run_trace
 from tools.auto.progress_display import ProgressDisplay, make_progress_display
 from tools.auto.auto_metrics import AutoMetricsStream
 from tools.auto.auto_tuner import AutoTuner, make_auto_tuner
+from tools.config_safe import safe_getboolean
 
 logger = logging.getLogger(__name__)
 
@@ -246,10 +247,10 @@ def _lint_probe_config(config: "configparser.ConfigParser | None") -> list[str]:
     warnings: list[str] = []
     if config is None:
         return warnings
-    if not config.getboolean("architect", "probe_enabled", fallback=False):
+    if not safe_getboolean(config, "architect", "probe_enabled", fallback=False):
         return warnings
 
-    if not config.getboolean("collect", "use_in_auto", fallback=False):
+    if not safe_getboolean(config, "collect", "use_in_auto", fallback=False):
         warnings.append(
             "[architect] probe_enabled = true but [collect] use_in_auto is "
             "false — the probe resolves facts from the collect model, so with "
@@ -398,8 +399,8 @@ class AutoController:
         # time, so silence elsewhere (e.g. no "probe fired" line later,
         # see architect.py AUTO-DEBUG-1) can be read as a real negative
         # rather than "maybe it just wasn't logged".
-        _probe_enabled = self.config.getboolean("architect", "probe_enabled", fallback=False)
-        _use_in_auto = self.config.getboolean("collect", "use_in_auto", fallback=False)
+        _probe_enabled = safe_getboolean(self.config, "architect", "probe_enabled", fallback=False)
+        _use_in_auto = safe_getboolean(self.config, "collect", "use_in_auto", fallback=False)
         logger.info(
             "controller: run flags — task_mode=%s dry_run=%s "
             "[architect] probe_enabled=%s  [collect] use_in_auto=%s",
@@ -1277,7 +1278,7 @@ class AutoController:
         `agents.ini`'s own documented default (turning collect on never
         changes behaviour until this flag is also explicitly set)."""
         key = "use_in_doc" if self.task_mode == "docs" else "use_in_auto"
-        return self.config.getboolean("collect", key, fallback=False)
+        return safe_getboolean(self.config, "collect", key, fallback=False)
 
     def _get_collect_bridge(self, task_mode: str):
         """COLLECT-24: lazily build (and cache for the lifetime of this

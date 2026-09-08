@@ -43,6 +43,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from tools.config_safe import safe_getboolean
 
 logger = logging.getLogger(__name__)
 
@@ -346,8 +347,8 @@ def make_existence_validator(config, *, task_mode: str = "docs"):
     validator = ExistenceValidator(
         extensions=_list("existence_extensions", DEFAULT_EXTENSIONS),
         ignore=_list("existence_ignore", DEFAULT_IGNORE),
-        check_test_suite=config.getboolean(
-            "validator_agent", "existence_check_test_suite", fallback=True
+        check_test_suite=safe_getboolean(
+            config, "validator_agent", "existence_check_test_suite", fallback=True
         ),
         max_existence_revisions=max_rev,
     )

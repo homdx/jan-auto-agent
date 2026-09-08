@@ -5,7 +5,7 @@
 fail-open (silent swallow). This is the killer for the except-classification
 category that accounted for 58% of false positives in the "78 bugs" report
 (per COLLECT-6's description) — so the AC below pins the two real-repo
-reference sites (`coder.py:718`, `coder.py:866`) as well as the four
+reference sites (`coder.py:719`, `coder.py:867`) as well as the four
 synthetic mini-repo cases the spec calls out by name.
 """
 
@@ -97,7 +97,7 @@ def test_except_raise_with_exc_inside_if_still_not_fail_open():
 def test_except_continue_is_not_silent():
     # `except OSError: continue` is control flow, NOT a silent fail-open —
     # this is the exact distinction COLLECT-6's AC calls out for
-    # `coder.py:866`.
+    # `coder.py:867`.
     source = FIXTURE.read_text(encoding="utf-8")
     sites = _sites_by_location(source, "pkg/error_handling.py")
     site = sites["pkg/error_handling.py:41"]
@@ -122,7 +122,7 @@ def test_coder_718_pass_is_classified_fail_open():
     # classifies as "log"/not-fail-open, so this AC re-points to another
     # still-genuine bare `except: <fallback assignment>` site (dup_reject_ratio
     # config fallback). Update if it shifts.
-    site = sites["tools/auto/coder.py:1027"]
+    site = sites["tools/auto/coder.py:1028"]
     assert site.body_kind == "pass"
     assert site.is_fail_open is True
 
@@ -130,7 +130,7 @@ def test_coder_718_pass_is_classified_fail_open():
 def test_coder_866_continue_is_not_silent():
     source = CODER_PATH.read_text(encoding="utf-8")
     sites = _sites_by_location(source, "tools/auto/coder.py")
-    site = sites["tools/auto/coder.py:992"]  # NOTE: line tracks a bare `except OSError: continue`; update if it shifts
+    site = sites["tools/auto/coder.py:993"]  # NOTE: line tracks a bare `except OSError: continue`; update if it shifts
     assert site.body_kind == "continue"
     assert site.is_fail_open is False
 

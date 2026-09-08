@@ -49,6 +49,7 @@ from tools.auto.repo_ingest import RepoCluster
 from tools.auto.utils import atomic_write_text, file_set_fingerprint
 import tools.llm_stream as _llm_stream
 from tools.llm_stream import strip_think
+from tools.config_safe import safe_getboolean
 
 logger = logging.getLogger(__name__)
 
@@ -2263,7 +2264,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
             # Replaces the previous hard-coded task_mode == "creative" check (DM-2).
             if not acceptance:
                 _acc_default = (
-                    self._config.getboolean("auto", "creative_acceptance_default", fallback=True)
+                    safe_getboolean(self._config, "auto", "creative_acceptance_default", fallback=True)
                     if self._task_mode == "creative"
                     else False
                 )
@@ -2538,7 +2539,7 @@ def review_clusters(
     api_key   = config.get(section, "api_key",    fallback="")
     model     = config.get(section, "model")
     api_fmt   = config.get(section, "api_format", fallback="openai")
-    verify_ssl = config.getboolean("api", "verify_ssl", fallback=True)
+    verify_ssl = safe_getboolean(config, "api", "verify_ssl", fallback=True)
 
     reviewer = ClusterReviewer(
         config=config,

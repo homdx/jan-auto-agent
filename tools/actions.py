@@ -18,6 +18,7 @@ from tools.agent_trace import tracer
 from tools.file_reader import read_file
 from tools.ui import Spinner, stream_tracker
 from tools import backoff
+from tools.config_safe import safe_getint
 
 logger = logging.getLogger(__name__)
 
@@ -1001,8 +1002,8 @@ class OrchestratorActions:
         _prev_ctx_max     = 0   # max chars for previous_revised; 0 = no limit
         _cfg = getattr(self, "config", None)
         if _cfg:
-            _prev_ctx_every = _cfg.getint("file_editor", "prev_context_every",   fallback=0)
-            _prev_ctx_max   = _cfg.getint("file_editor", "prev_context_max_chars", fallback=0)
+            _prev_ctx_every = safe_getint(_cfg, "file_editor", "prev_context_every",   fallback=0)
+            _prev_ctx_max   = safe_getint(_cfg, "file_editor", "prev_context_max_chars", fallback=0)
 
         revised, validation, feedback = "", {}, None
         _prev_shown_count = 0     # consecutive iters where previous_revised was shown
