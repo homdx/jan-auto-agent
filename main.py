@@ -48,8 +48,45 @@ _CODE_EXTENSIONS = {
     ".rs", ".rb", ".php", ".cs", ".swift", ".kt", ".scala",
 }
 
+
+def resolve_target_path(base_dir: str, parsed_file_path: str):
+    """Resolve a user-supplied file path against ``base_dir`` and refuse
+    any path that escapes the project root.
+
+    ``parsed_file_path`` is raw text from the LLM-side prompt parser and
+    is therefore untrusted: a prompt like 'explain foo in
+    ../../etc/passwd' used to slip past the old ``os.path.normpath +
+    os.path.join`` check because normpath happily produces a path
+    outside base_dir. Downstream code (file_reader.read_file,
+    run_edit, _save_history) then read/wrote outside the project.
+
+    Returns the absolute, realpath-resolved target string when the
+    path stays inside base_dir (after symlink resolution). Returns
+    None on any traversal attempt, an empty input, or a path on a
+    different drive than base_dir (Windows: commonpath raises
+    ValueError on cross-drive paths — also None).
+    """
+    if not parsed_file_path:
+        return None
+    try:
+        base_real = os.path.realpath(base_dir)
+        target_real = os.path.realpath(
+            os.path.join(base_dir, parsed_file_path)
+        )
+        # commonpath raises ValueError on different drives (Windows).
+        common = os.path.commonpath([base_real, target_real])
+    except (ValueError, OSError):
+        return None
+    if common != base_real:
+        return None
+    return target_real
+
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
+
+# Must stay in sync with the --config argparse default.
+_DEFAULT_CONFIG_PATH = "agents.ini"
 
 
 class MockFileUtilities:
@@ -186,7 +223,15 @@ class Orchestrator(OrchestratorActions):
         # off self.prompt_store during construction, so this reordering
         # doesn't change behaviour on the success path.)
         self.prompt_store.store_path   = Path(self.config.get("prompt_store", "store_path", fallback="prompts.json"))
-        self.prompt_store.max_versions = self._getint("prompt_store", "max_versions", 3)
+        # BUGFIX: _getint returns the raw value — a present-but-zero
+        # max_versions (e.g. "max_versions = 0") is a valid int, not
+        # malformed, so it bypasses _getint's ValueError guard and reaches
+        # push() unclamped. PromptStore.__init__ clamps with max(1, …)
+        # but that branch only runs when config is passed to __init__;
+        # here the store was created with config=None (line 125) and this
+        # line overwrites max_versions after the fact. With 0, push()
+        # appends then evicts down to 0 and crashes on stack[-1].
+        self.prompt_store.max_versions = max(1, self._getint("prompt_store", "max_versions", 3))
 
     def reload_agents(self) -> None:
         """Re-read agents.ini and rebuild all agents mid-session (no restart)."""
@@ -332,7 +377,7 @@ class Orchestrator(OrchestratorActions):
             )
             return fallback
 
-    def execute_direct_chat(self, user_input: str) -> None:
+    def execute_direct_chat(self, user_input: str) -> "str | None":
         """
         Send a free-form message directly to the model with no file context —
         used when run_pipeline detects no file path in the user's request.
@@ -365,6 +410,12 @@ class Orchestrator(OrchestratorActions):
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}",
         }
+
+        # Snapshot the history before appending so a failed API call can
+        # restore the exact pre-call state. Previously, pop() only removed
+        # the last element — the older messages that were trimmed by the
+        # cap during the append were permanently lost.
+        _saved_history = list(self._direct_chat_history)
 
         # Append the new turn, then trim history to the rolling cap (1 user +
         # 1 assistant = 2 entries/turn). _max_msgs uses max(1, ...) because
@@ -403,9 +454,16 @@ class Orchestrator(OrchestratorActions):
         except Exception as exc:
             logger.error("execute_direct_chat failed: %s", exc)
             print(f"[{_ts()}] ❌ Chat request failed: {exc}")
-            # Remove the user turn we just added — the exchange never completed,
-            # so history should not reflect a half-finished turn.
-            self._direct_chat_history.pop()
+            # Restore the pre-call history — the exchange never completed,
+            # so history should not reflect a half-finished turn. This
+            # also restores any messages that were trimmed by the cap
+            # during the append, which pop() alone could not recover.
+            self._direct_chat_history = _saved_history
+            # B10: explicit, not implicit. The success path returns the reply
+            # string, so this branch returning None by falling off the end is
+            # the difference the annotation now documents -- callers have to
+            # handle it.
+            return None
 
     def run_pipeline(self, user_input: str, base_dir: str,
                      resume_state: dict = None) -> None:
@@ -428,7 +486,10 @@ class Orchestrator(OrchestratorActions):
             self.execute_direct_chat(user_input)
             return
 
-        target_path = os.path.normpath(os.path.join(base_dir, parsed.file_path))
+        target_path = resolve_target_path(base_dir, parsed.file_path)
+        if target_path is None:
+            print(f"Error: Target path is outside the project: '{parsed.file_path}'")
+            return
         if not os.path.exists(target_path) or not os.path.isfile(target_path):
             print(f"Error: Target path is not a valid file: '{parsed.file_path}'")
             return
@@ -575,7 +636,8 @@ class Orchestrator(OrchestratorActions):
         # both a show-type and an improve-type verb) must run the improvement
         # agent too, exactly like plain "improve" does.
         improvement: Dict[str, Any] = {}
-        if parsed.intent in ("improve", "explain", "show_and_improve"):
+        _improvement_ran = parsed.intent in ("improve", "explain", "show_and_improve")
+        if _improvement_ran:
             print("⚡ Processing improvements...")
             improvement_context = {
                 "target_block": block,
@@ -590,17 +652,38 @@ class Orchestrator(OrchestratorActions):
         # --- FINAL RENDER ---
         total_elapsed = time.time() - start_time
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-        
+
         print(f"\n[PIPELINE COMPLETED - {timestamp}]")
 
         # Record run metrics
         last_validation = validation if parsed.intent not in ("show", "show_imports") else {}
-        improvement_json_ok = bool(improvement.get("improved_code") or improvement.get("explanation"))
+        # RunRecord types improvement_json_ok as Optional[bool] and documents
+        # None as "not applicable (show/show_imports)"; summarize_failures
+        # honours that with an `is not None` filter. Passing False for a run
+        # that never invoked the improvement agent counted a stage that did not
+        # execute as a JSON parse failure, inflating json_parse_failure_rate —
+        # one of the two signals that trigger the PromptOptimizer.
+        improvement_json_ok = (
+            bool(improvement.get("improved_code") or improvement.get("explanation"))
+            if _improvement_ran else None
+        )
+        # BUGFIX: an exhausted validation loop (all max_iterations rejected)
+        # increments iteration one past max (iteration = max + 1) because the
+        # increment at the bottom of the loop runs before the while condition
+        # re-checks. Clamp to max_iterations so iterations_used and the
+        # formatter display don't show 4/3. Also, show/show_imports skip the
+        # validation loop entirely (iteration stays at 1 from the init at the
+        # top of run_pipeline) — record 0, not 1, so avg_iterations in the
+        # optimizer trigger is not diluted by non-validation runs.
+        if parsed.intent in ("show", "show_imports"):
+            iterations_used = 0
+        else:
+            iterations_used = min(iteration, self.max_iterations)
         self.metrics_collector.record(RunRecord(
             timestamp=timestamp,
             intent=parsed.intent,
             prompt_version=self.prompt_store.get_version_label("validator_agent"),
-            iterations_used=iteration,
+            iterations_used=iterations_used,
             validator_status=last_validation.get("status", "skipped"),
             validator_feedback=last_validation.get("feedback", ""),
             improvement_json_ok=improvement_json_ok,
@@ -640,7 +723,7 @@ class Orchestrator(OrchestratorActions):
             search_result=search_result,
             improvement=improvement,
             elapsed_time=total_elapsed,
-            iteration=iteration,
+            iteration=iterations_used,
             output_config={
                 # Bugfix (config-crash audit): same helper bypass as the
                 # direct_chat reads above — a malformed [output] value
@@ -727,7 +810,7 @@ def _parse_args():
                         help="Run a single query, print the result, and exit (0 ok / 1 error).")
     parser.add_argument("--base", metavar="DIR", default=None,
                         help="Project root directory (overrides positional base_dir).")
-    parser.add_argument("--config", metavar="FILE", default="agents.ini",
+    parser.add_argument("--config", metavar="FILE", default=_DEFAULT_CONFIG_PATH,
                         help="Path to agents.ini (default: agents.ini).")
     # AUTO-A1: autonomous mode flag
     parser.add_argument("--auto", metavar="GOAL", default=None,
@@ -933,6 +1016,74 @@ def _validate_typed_config_values(config_path: str, base_dir: str) -> None:
         sys.exit(1)
 
 
+def _confirm_resume_checkpoint() -> "bool | None":
+    """Ask whether to resume a saved backoff checkpoint.
+
+    Returns
+    -------
+    bool
+        ``True`` to resume, ``False`` to discard and start fresh. An
+        ``EOFError`` -- no input available at all (CI, piped or redirected
+        stdin, a TTY-less container) -- counts as an explicit "no", because
+        this prompt fires unconditionally whenever a checkpoint exists.
+    None
+        The user pressed Ctrl-C. B6: this prompt was guarded only against
+        EOFError, so the single most obvious way to answer "no" produced a
+        raw KeyboardInterrupt traceback while the REPL loop further down has
+        always caught it.
+
+        None is deliberately distinct from False. Treating the interrupt as
+        "no" would clear the checkpoint, so Ctrl-C at this prompt would
+        destroy the very session the prompt is offering to resume. The caller
+        exits with 130 and leaves the checkpoint on disk for a later run.
+    """
+    try:
+        answer = input("Resume interrupted session? [y/N] ").strip().lower()
+    except EOFError:
+        print("(no input available — treating as 'N')")
+        return False
+    except KeyboardInterrupt:
+        print("\n(interrupted — checkpoint kept for the next run)")
+        return None
+    return answer == "y"
+
+
+def _resume_from_checkpoint(saved: dict, orchestrator, base_dir: str) -> None:
+    """Dispatch a saved checkpoint to the appropriate orchestrator method.
+
+    Uses ``.get(key, default)`` for every key so a partial/corrupt
+    checkpoint (missing ``user_input``, ``base_dir``, ``question``, etc.)
+    degrades gracefully instead of raising ``KeyError`` mid-resume.
+    """
+    _loop = saved.get("loop", "unknown")
+    if _loop == "run_pipeline":
+        orchestrator.run_pipeline(
+            saved.get("user_input", ""), saved.get("base_dir", base_dir),
+            resume_state=saved)
+    elif _loop == "run_text_qa":
+        import os as _os
+        _src = ""
+        _fp = saved.get("file_path", "")
+        _fp_abs = _fp if _os.path.isabs(_fp) else _os.path.join(
+            saved.get("base_dir", base_dir), _fp)
+        try:
+            from tools.file_reader import read_file as _rf
+            _src = _rf(_fp_abs)
+        except Exception as _exc:
+            print(f"[{_ts()}] ⚠  Could not re-read '{_fp_abs}' for "
+                  f"resumed run_text_qa: {_exc}")
+        orchestrator.run_text_qa(
+            saved.get("question", ""), _fp, _src,
+            saved.get("base_dir", base_dir),
+            resume_state=saved)
+    elif _loop == "run_edit":
+        orchestrator.run_edit(
+            saved.get("user_input", ""), saved.get("base_dir", base_dir),
+            resume_state=saved)
+    else:
+        print(f"  Unknown loop '{_loop}' in checkpoint — discarded.")
+
+
 def main():
     args = _parse_args()
     base_dir = os.path.abspath(args.base or args.base_dir_positional or os.getcwd())
@@ -1013,9 +1164,24 @@ def main():
         else:
             action = "collect"
 
+        # A missing config is only fatal when the user explicitly asked for a
+        # specific file: erroring out on the *default* path breaks every run
+        # that relied on built-in defaults (e.g. from outside the repo root).
+        if not os.path.exists(args.config):
+            if args.config != _DEFAULT_CONFIG_PATH:
+                print(
+                    f"Error: --config file not found: {args.config!r}. "
+                    f"Check the path and extension (a common mistake is a typo "
+                    f"like 'agents_128k.in' instead of 'agents_128k.ini').",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            logger.warning(
+                "config %r not found — continuing with built-in defaults",
+                args.config,
+            )
         config = configparser.ConfigParser(inline_comment_prefixes=(';', '#'))
-        if os.path.exists(args.config):
-            config.read(args.config, encoding="utf-8")
+        config.read(args.config, encoding="utf-8")
 
         # BUGFIX: `make_summarizer_call`/`should_run_pass_b` are the
         # documented COLLECT-19 entry points `summarizer.py` describes
@@ -1124,38 +1290,25 @@ def main():
         _loop = _saved.get("loop", "unknown")
         _it   = _saved.get("iteration", "?")
         print(f"\n⚡ Checkpoint found: loop='{_loop}', iteration={_it}")
-        _ans = input("Resume interrupted session? [y/N] ").strip().lower()
-        if _ans == "y":
+        # BUGFIX: unlike the interactive REPL prompt below (which is inside
+        # a try/except (KeyboardInterrupt, EOFError) loop), this one runs
+        # unconditionally whenever a checkpoint exists — including under a
+        # piped/redirected/non-interactive stdin (CI, `cmd < /dev/null`,
+        # a TTY-less container). input() there raised a raw EOFError
+        # traceback instead of a clean fallback. Treat EOF as "no", the
+        # same as an explicit non-'y' answer.
+        # B6: KeyboardInterrupt was still uncaught here -- see
+        # _confirm_resume_checkpoint() for the full rationale.
+        _resume = _confirm_resume_checkpoint()
+        if _resume is None:
+            # Ctrl-C at the prompt. Exit cleanly (no traceback) and leave the
+            # checkpoint on disk: an interrupt means "stop", not "discard my
+            # interrupted session and start over".
+            print()
+            sys.exit(130)
+        if _resume:
             backoff.clear_state()
-            if _loop == "run_pipeline":
-                orchestrator.run_pipeline(
-                    _saved["user_input"], _saved["base_dir"], resume_state=_saved)
-            elif _loop == "run_text_qa":
-                import os as _os
-                _src = ""
-                _fp  = _saved.get("file_path", "")
-                _fp_abs = _fp if _os.path.isabs(_fp) else _os.path.join(
-                    _saved.get("base_dir", base_dir), _fp)
-                try:
-                    from tools.file_reader import read_file as _rf
-                    _src = _rf(_fp_abs)
-                except Exception as _exc:
-                    # Best-effort resume-time re-read: file may have moved
-                    # or been deleted since the checkpoint was written.
-                    # Fall back to an empty source rather than aborting the
-                    # resume, but don't swallow the error silently.
-                    print(f"[{_ts()}] ⚠  Could not re-read '{_fp_abs}' for "
-                          f"resumed run_text_qa: {_exc}")
-                orchestrator.run_text_qa(
-                    _saved["question"], _fp, _src,
-                    _saved.get("base_dir", base_dir),
-                    resume_state=_saved)
-            elif _loop == "run_edit":
-                orchestrator.run_edit(
-                    _saved["user_input"], _saved.get("base_dir", base_dir),
-                    resume_state=_saved)
-            else:
-                print(f"  Unknown loop '{_loop}' in checkpoint — discarded.")
+            _resume_from_checkpoint(_saved, orchestrator, base_dir)
         else:
             backoff.clear_state()
             print("Checkpoint discarded. Starting fresh.")

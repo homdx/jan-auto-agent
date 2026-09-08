@@ -44,7 +44,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 
 from tools.auto.architect import CandidateTask, CitedLocation
@@ -511,3 +511,105 @@ class TestIntegration:
         stale = emitter.changed_clusters(clusters_v2)
         assert len(stale) == 1
         assert stale[0].name == "io"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Bug 14 — atomic IMPROVEMENTS.md write and guarded upsert loop
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestAtomicWrite:
+    """emit() must use atomic_write_text, not a plain write_text, for IMPROVEMENTS.md."""
+
+    def test_improvements_md_written_via_atomic_write_text(self, tmp_path: Path) -> None:
+        import tools.auto.plan_emitter as emitter_mod
+
+        written: list[tuple] = []
+        original = emitter_mod.atomic_write_text
+
+        def spy(path, content):
+            written.append((path, content))
+            return original(path, content)
+
+        with patch.object(emitter_mod, "atomic_write_text", spy):
+            emitter = _make_emitter(tmp_path)
+            emitter.emit(build_backlog([_cand()]))
+
+        md_path = tmp_path / IMPROVEMENTS_FILENAME
+        assert any(p == md_path for p, _ in written), (
+            "atomic_write_text was not called with the IMPROVEMENTS.md path"
+        )
+
+    def test_improvements_md_content_intact_after_atomic_write(self, tmp_path: Path) -> None:
+        backlog = build_backlog([_cand(title="Atomic task")])
+        emitter = _make_emitter(tmp_path)
+        emitter.emit(backlog)
+        content = (tmp_path / IMPROVEMENTS_FILENAME).read_text(encoding="utf-8")
+        assert "Atomic task" in content
+
+
+class TestGuardedUpsertLoop:
+    """A ValueError from upsert_task on one task must not abort the rest."""
+
+    def test_one_bad_task_does_not_abort_remaining(self, tmp_path: Path) -> None:
+        state = _mock_state(tmp_path / ".agent")
+        (tmp_path / ".agent").mkdir(parents=True, exist_ok=True)
+
+        call_count = 0
+        upserted: list[object] = []
+
+        def side_effect(task):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise ValueError("schema violation on first task")
+            upserted.append(task)
+
+        state.upsert_task.side_effect = side_effect
+
+        candidates = [
+            _cand(title="Bad task",   file="a.py", acceptance_check="pytest"),
+            _cand(title="Good task1", file="b.py", acceptance_check="pytest"),
+            _cand(title="Good task2", file="c.py", acceptance_check="pytest"),
+        ]
+        emitter = PlanEmitter(base_dir=tmp_path, state=state, git=_mock_git())
+        emitter.emit(build_backlog(candidates))
+
+        assert len(upserted) == 2, (
+            "the two valid tasks should have been upserted despite the first raising ValueError"
+        )
+
+    def test_all_bad_tasks_emit_does_not_raise(self, tmp_path: Path) -> None:
+        state = _mock_state(tmp_path / ".agent")
+        (tmp_path / ".agent").mkdir(parents=True, exist_ok=True)
+        state.upsert_task.side_effect = ValueError("always bad")
+
+        candidates = [
+            _cand(title=f"Bad {i}", file=f"{i}.py", acceptance_check="pytest")
+            for i in range(3)
+        ]
+        emitter = PlanEmitter(base_dir=tmp_path, state=state, git=_mock_git())
+        # Must not raise even when every task is rejected.
+        emitter.emit(build_backlog(candidates))
+
+    def test_rejection_logged_to_state(self, tmp_path: Path) -> None:
+        state = _mock_state(tmp_path / ".agent")
+        (tmp_path / ".agent").mkdir(parents=True, exist_ok=True)
+        state.upsert_task.side_effect = ValueError("bad schema")
+
+        emitter = PlanEmitter(base_dir=tmp_path, state=state, git=_mock_git())
+        emitter.emit(build_backlog([_cand(title="Rejected", file="x.py", acceptance_check="pytest")]))
+
+        log_calls = " ".join(str(c) for c in state.log.call_args_list)
+        assert "rejected" in log_calls.lower(), "state.log should mention the rejected task"
+
+    def test_improvements_md_written_even_when_all_tasks_rejected(self, tmp_path: Path) -> None:
+        state = _mock_state(tmp_path / ".agent")
+        (tmp_path / ".agent").mkdir(parents=True, exist_ok=True)
+        state.upsert_task.side_effect = ValueError("bad")
+
+        emitter = PlanEmitter(base_dir=tmp_path, state=state, git=_mock_git())
+        emitter.emit(build_backlog([_cand(title="Fail", file="x.py", acceptance_check="pytest")]))
+
+        assert (tmp_path / IMPROVEMENTS_FILENAME).exists(), (
+            "IMPROVEMENTS.md must be written before the upsert loop, so it exists even when all tasks are rejected"
+        )

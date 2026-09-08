@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import logging
 import re
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Sequence
@@ -135,6 +136,14 @@ DEFAULT_ALLOWED_OPS: tuple[str, ...] = ("facts",)
 # (tools/backoff.py) or a concept. Naming the restriction does not help when
 # the thing you need cannot be expressed at all, so `module <path>` was added
 # to make that question askable rather than merely forbidden.
+# AUTO-F1-followup: a measured run (trace_8c83140453d5) found EVERY single
+# "repeat" decline was a re-ask of something that had already come back
+# WITH an answer — specifically, an out-of-batch `module` hit the model
+# could not cite, re-asked verbatim next round. The line below used to warn
+# only about repeating an EMPTY result ("already came back empty"), which
+# is silent on the far more common real case: repeating something that DID
+# resolve. See _out_of_batch_note()'s own updated wording for the other
+# half of this fix.
 PROBE_INSTRUCTIONS = (
     "\nIF — and only if — you cannot ground a task because you are missing a "
     "fact about a symbol that is NOT shown above, you may reply with a single "
@@ -165,9 +174,16 @@ PROBE_INSTRUCTIONS = (
     "\n"
     "You will be re-asked with whatever resolves. Ask only for what you "
     "genuinely need and cannot see above; a probe costs a full round and you "
-    "get a limited number of them. Re-asking for something that already came "
-    "back empty will end your probing, not retry it. If you can plan from "
-    "what is already above, return the JSON array and do not probe."
+    "get a limited number of them. Re-asking for anything already shown "
+    "above — empty OR answered — will end your probing, not repeat it; an "
+    "answer outside your batch cannot become citable no matter how many "
+    "times you ask for it. If you can plan from what is already above, "
+    "return the JSON array and do not probe.\n"
+    "\n"
+    "If you do not KNOW a symbol's exact name, do not guess it. Ask "
+    "`module <path>` first — it lists every top-level name in that file "
+    "with its line number — then ask `facts` for one of the names it "
+    "returned."
 )
 
 # Appended instead of PROBE_INSTRUCTIONS on the final call, once the probe
@@ -265,6 +281,10 @@ class ArchProbe:
         Cap on everything this instance has produced across all rounds of one
         batch.  Reached before ``probe_max_rounds`` in practice, and the
         reason a request for eight hot symbols cannot blow the context window.
+    memo_max_entries:
+        AUTO-F1: bound on the run-level miss memo (below).  Oldest entry is
+        evicted first once the cap is reached, so a pathological run cannot
+        grow it without limit.
     """
 
     def __init__(
@@ -275,6 +295,7 @@ class ArchProbe:
         max_total_chars: int = 6000,
         base_dir=None,
         batch_files=(),
+        memo_max_entries: int = 200,
     ) -> None:
         self._bridge = collect_bridge
         # AUTO-P7: `read` is the first op that touches the filesystem rather
@@ -339,6 +360,34 @@ class ArchProbe:
         # Never reset — reported only, so a run can still be judged on total
         # probe cost without that total being able to switch the feature off.
         self._run_chars_used = 0
+        # AUTO-F1: run-level miss memo — {(op, arg): times asked}. Deliberately
+        # NOT touched by reset(): a batch boundary teaches the memo nothing,
+        # and the collect artifact `make_collect_bridge` builds is immutable
+        # for the whole run (the same invariant reset() already relies on for
+        # not rebuilding the bridge), so a name that missed at batch 3 cannot
+        # resolve at batch 40. Only a fresh ArchProbe starts empty.
+        # OrderedDict so eviction can drop the oldest entry first (AC-F1-8).
+        self._miss_memo: "OrderedDict[tuple[str, str], int]" = OrderedDict()
+        self._memo_max_entries = max(1, int(memo_max_entries))
+        # Memo hits for the last execute() call and across the whole run —
+        # reported the same way last_hits/last_misses and run_chars_used are,
+        # so the saving AUTO-F1 claims is visible in the trace, not asserted.
+        self._last_memo_hits = 0
+        self._run_memo_hits = 0
+        # AUTO-F4: is a `facts` ask "informed" (the name was returned by a
+        # `module` hit earlier in THIS batch) or "blind" (the model is
+        # guessing)? `PROBE_INSTRUCTIONS` now tells the model to check
+        # `module` first; this is what measures whether that instruction is
+        # actually followed, rather than assuming it. Per-BATCH — cleared by
+        # reset() — because "earlier in this batch" is the whole definition;
+        # a name shown in a `module` result three batches ago tells you
+        # nothing about whether THIS batch's ask was informed.
+        self._informed_symbols: set = set()
+        # [hits, asks] — asks counted the moment a `facts` op is seen, hits
+        # counted only on a genuine bridge hit (never on a memo hit, which is
+        # by definition never a hit at all).
+        self._informed_facts = [0, 0]
+        self._blind_facts = [0, 0]
 
     def set_batch_files(self, files) -> None:
         """AUTO-P7: the files the current batch was shown.
@@ -488,6 +537,13 @@ class ArchProbe:
         # began — configured floor while learning, seeded cap afterwards.
         self._batch_floor = self._max_total_chars
         self._last_dropped = []
+        # AUTO-F4: "informed by a `module` result" is a per-batch fact, not a
+        # per-run one — see the constructor comment. This is the "resets
+        # between batches" half of AC-F4 test plan; the miss memo just above
+        # is the deliberate opposite (AUTO-F1: never cleared here).
+        self._informed_symbols = set()
+        self._informed_facts = [0, 0]
+        self._blind_facts = [0, 0]
 
     @property
     def usable(self) -> bool:
@@ -542,6 +598,125 @@ class ArchProbe:
         return self._run_chars_used
 
     @property
+    def last_memo_hits(self) -> int:
+        """AUTO-F1: repeated misses the last :meth:`execute` answered from the
+        memo — no bridge lookup performed. Counted in :attr:`last_misses`
+        too (AC-F1-5); this is the breakout that makes the saving visible."""
+        return self._last_memo_hits
+
+    @property
+    def run_memo_hits(self) -> int:
+        """AUTO-F1: memo hits across the whole run. Observability only, like
+        :attr:`run_chars_used` — never gates anything."""
+        return self._run_memo_hits
+
+    # ─────────────────────────────────────────────────────────────────────
+    # AUTO-F4 / F4a / F4b — the informed/blind flow, pullv2 vs pullv3
+    #
+    # The module docstring above still describes Phase 0 (facts-only,
+    # no sequencing concept). This is what changed once `module` and
+    # `read` landed and AUTO-F4 taught the model to use them together:
+    #
+    #   pullv2 — no facts-sequencing concept at all
+    #   ──────────────────────────────────────────────
+    #   op = facts <name>  →  memo / bridge lookup
+    #           ↓
+    #     hit/miss folds into the generic per-op tally
+    #     only ("facts=23/40"). A `module` hit teaches
+    #     nothing to a `facts` ask — the two ops are
+    #     unrelated to every counter that exists.
+    #
+    #
+    #   pullv3 — AUTO-F4 (Part 1) + AUTO-F4a/F4b
+    #   ──────────────────────────────────────────────
+    #   Architect: "need X's exact name, not sure of it"
+    #           ↓
+    #   PROBE_INSTRUCTIONS (AUTO-F4, new sentence):
+    #     "ask `module <path>` first, then `facts`
+    #      for one of the names it returned"
+    #           ↓
+    #   ArchProbe.execute(ops) — this round, per op
+    #   ────────────────────────────────────────────
+    #   op = module <path>  →  bridge.module_symbols()
+    #           ↓ (on a hit)
+    #     AUTO-F4: _learn_module_names(capped_text)
+    #       → names actually shown → _informed_symbols
+    #         (this batch only — wiped on reset())
+    #
+    #   op = facts <name>
+    #           ↓
+    #     AUTO-F4 (checked BEFORE the lookup runs):
+    #     is <name> in _informed_symbols?
+    #           ↓                        ↓
+    #         yes                       no
+    #     informed ask +1           blind ask +1
+    #           ↓                        ↓
+    #     lookup runs exactly as before — memo hit,
+    #     bridge hit, or miss. Behavior UNCHANGED;
+    #     a blind guess still gets answered.
+    #   ────────────────────────────────────────────
+    #           ↓
+    #     did this round resolve anything at all?
+    #           ↓ yes                     ↓ no — every op missed
+    #     probe_result event          probe_declined event
+    #     informed_facts="41/45"      informed_facts / blind_facts
+    #     blind_facts="13/59"         (AUTO-F4a, then AUTO-F4b ★)
+    #     (AUTO-F4, original)
+    #           │                            │
+    #           └─────────────┬──────────────┘
+    #                          ↓
+    #     analyze_logs.py: keep the LATEST cumulative
+    #     pair per cluster — from whichever event kind
+    #     (result or declined) came last — sum across run
+    #                          ↓
+    #     printed once per run, only if facts was asked:
+    #       facts sequencing: informed 91% (41/45),
+    #                          blind   22% (13/59)
+    #
+    #   (91%/22% above are illustrative, not a specific real run — see
+    #   the ground file / commit history for actual measured figures.)
+    #
+    #   ★ AUTO-F4a first added informed_facts/blind_facts to
+    #   probe_declined, but computed them as a fresh "0/0 unless
+    #   unresolved" per-round value — correct for the neighboring by_op
+    #   tally (a per-round delta) and wrong here (a cumulative-for-the-
+    #   batch snapshot), so a `repeat` decline landing last in a batch
+    #   could overwrite and erase real data an earlier round in the same
+    #   batch had already established. AUTO-F4b fixed it by always
+    #   reading the live cumulative counters regardless of decline
+    #   reason, falling back to 0/0 only when no probe was ever built
+    #   at all. See tests/test_auto_f4a_declined_facts_seq.py's module
+    #   docstring for the full story with the real trace that found it.
+    # ─────────────────────────────────────────────────────────────────────
+
+    @property
+    def informed_facts(self) -> tuple:
+        """AUTO-F4: ``(hits, asks)`` for `facts` ops this BATCH whose symbol
+        was named in a `module` hit earlier in the same batch. Accumulates
+        across every :meth:`execute` call since the last :meth:`reset` —
+        unlike :attr:`last_hits`, this is not overwritten each round, because
+        "informed" is a property of the whole batch's sequencing, not of one
+        round in isolation."""
+        return (self._informed_facts[0], self._informed_facts[1])
+
+    @property
+    def blind_facts(self) -> tuple:
+        """AUTO-F4: ``(hits, asks)`` for `facts` ops this batch whose symbol
+        was NOT named in any `module` hit earlier in the same batch — a
+        guess. Same accumulation rule as :attr:`informed_facts`."""
+        return (self._blind_facts[0], self._blind_facts[1])
+
+    def facts_informed_str(self) -> str:
+        """`informed_facts` / `blind_facts` as a trace-friendly string:
+        ``informed=3/4 blind=1/9`` (hits/asks) — empty when no `facts` op has
+        been asked this batch, mirroring :meth:`last_by_op_str`."""
+        _i_h, _i_a = self.informed_facts
+        _b_h, _b_a = self.blind_facts
+        if not _i_a and not _b_a:
+            return ""
+        return f"informed={_i_h}/{_i_a} blind={_b_h}/{_b_a}"
+
+    @property
     def current_cap(self) -> int:
         """The digest cap actually in force for this batch, after seeding and
         any escalation. AUTO-P11 — the logs used to report the configured
@@ -552,7 +727,7 @@ class ArchProbe:
     def budget_exhausted(self) -> bool:
         return self._chars_used >= self._max_total_chars
 
-    def execute(self, ops: Iterable[ProbeOp]) -> str:
+    def execute(self, ops: Iterable[ProbeOp], *, unbounded: bool = False) -> str:
         """Run *ops* and return a prompt-ready digest, or ``""``.
 
         ``""`` means "nothing usable came back" and the caller must treat it
@@ -576,6 +751,18 @@ class ArchProbe:
 
         Fail-open throughout: an op that raises is logged and skipped, and
         nothing here aborts a batch.
+
+        unbounded:
+            AUTO-P12 — skip both the per-op (``max_chars``) and total-digest
+            (``max_total_chars``) caps. Meant for exactly one call per batch:
+            the single request still pending when ``probe_max_rounds`` is
+            reached, which the round-cap branch would otherwise discard
+            outright rather than throttle like every other round. Chars are
+            still tallied in ``chars_used``/``run_chars_used`` for
+            observability, but never gate which ops run or how much of a
+            result is kept, and a call made this way is never recorded into
+            ``_round_costs`` — an uncapped round is not an honest sample of
+            what a normal budget needs.
         """
         if not self.usable:
             return ""
@@ -586,8 +773,9 @@ class ArchProbe:
         self._last_hits = 0
         self._last_misses = 0
         self._last_by_op = {}
+        self._last_memo_hits = 0
         for op in ops or ():
-            if self.budget_exhausted:
+            if not unbounded and self.budget_exhausted:
                 # AUTO-P8: remember which ops went unanswered so execute() can
                 # SAY SO in the digest. Logging alone left the model believing
                 # its whole request had been served.
@@ -600,31 +788,32 @@ class ArchProbe:
                 break
             _done.append(op)
             try:
-                body = self._run_one(op)
+                block, is_hit = self._resolve_op(op, unbounded=unbounded)
             except Exception as exc:  # noqa: BLE001 — never abort a batch
                 logger.warning("ArchProbe: op %s raised: %s", op, exc)
                 continue
-            _tally = self._last_by_op.setdefault(op.op, [0, 0])
-            if not body:
-                body = "(not found)"
-                self._last_misses += 1
-                _tally[1] += 1
-            else:
+            if is_hit:
                 _hits += 1
-                self._last_hits += 1
-                _tally[0] += 1
-            body = self._cap(body)
-            block = f"### {op}\n{self._out_of_batch_note(body)}{body}"
             blocks.append(block)
             self._chars_used += len(block)
             self._run_chars_used += len(block)
         if not blocks:
             return ""
-        if _hits == 0:
+        if _hits == 0 and self._last_memo_hits == 0:
             # AUTO-P4b: all-miss round — see the docstring. The characters are
             # still charged against the batch budget: the lookups happened, and
             # a model that burns its digest allowance on names that do not
             # exist should not get an unlimited supply of retries for free.
+            #
+            # AUTO-F1 follow-up: a round that is ALL memo hits is exempt.
+            # Unlike a bare repeated "(not found)", a memo hit's message is
+            # NOT identical to what the model saw last time — the count in
+            # it just changed — so it is exactly the "new information" this
+            # check exists to require. Swallowing it here means AC-F1-2's
+            # escalating message never reaches the model in the common case
+            # of a batch re-asking a known-dead name on its own, which was
+            # measured live: every solo repeat of `facts retry` came back as
+            # an empty digest, count included.
             logger.info(
                 "ArchProbe: all %d op(s) missed (%s) — returning an empty "
                 "digest so the caller stops re-asking.",
@@ -632,7 +821,7 @@ class ArchProbe:
             )
             return ""
         out = "## Probe results\n" + "\n\n".join(blocks)
-        if not self._last_dropped:
+        if not unbounded and not self._last_dropped:
             # AUTO-P9: a round that served everything it was asked. This is
             # the only honest sample of "how much room a round needs".
             self._round_costs.append(self._chars_used)
@@ -648,6 +837,142 @@ class ArchProbe:
                 "Ask again for the one you most need.]"
             )
         return out
+
+    # ── AUTO-F1: run-level miss memo ─────────────────────────────────────
+
+    def _resolve_op(self, op: ProbeOp, *, unbounded: bool = False) -> tuple:
+        """Resolve one op to a ready-to-append digest block.
+
+        Returns ``(block, is_hit)``. For a ``facts`` op, checks the
+        run-level miss memo BEFORE touching the bridge: a repeated miss
+        for the same symbol is answered instantly from the memo, at zero
+        cost, with a digest line that escalates with the repetition count
+        (AC-F1-1, AC-F1-2). A miss seen for the first time falls through
+        to a real lookup and, if it misses, is memoised for next time; a
+        hit is never memoised (AC-F1-7).
+
+        AUTO-F1 follow-up: scoped to ``facts`` only. The epic's own
+        non-goals rule out `module`/`read` ("No change to `module` or
+        `read`. They work.") — both already resolve at ~95%+, and the
+        escalating message below is written for a symbol name. Applied
+        indiscriminately to every op, a live run produced exactly the
+        wrong claim for a `read` miss: `` `tools/auto/inner_loop.py:254-
+        350` is not a symbol in this repository `` for what was actually
+        just a bad line range — a path is not a symbol, and telling the
+        model to use `module <path>` when it was already using `read` on
+        a path is not useful, it is confusing.
+        """
+        _tally = self._last_by_op.setdefault(op.op, [0, 0])
+        memo_key = (op.op, op.arg) if op.op == "facts" else None
+
+        # AUTO-F4: bookkeeping only — never changes what gets looked up or
+        # what counts as a hit/miss above. A `facts` ask is tallied as
+        # "informed" or "blind" the moment it is seen, whether it goes on to
+        # hit the memo, the bridge, or nothing at all; only a genuine bridge
+        # hit below increments the hit side.
+        _facts_tally = None
+        if op.op == "facts":
+            _facts_tally = (
+                self._informed_facts
+                if self._arg_seen_via_module(op.arg)
+                else self._blind_facts
+            )
+            _facts_tally[1] += 1
+
+        if memo_key is not None and memo_key in self._miss_memo:
+            self._miss_memo[memo_key] += 1
+            body = self._memo_miss_body(op, self._miss_memo[memo_key])
+            # AC-F1-5: a memo hit counts as a miss, exactly like a real one —
+            # it must not flatter the hit rate the memo exists to protect.
+            self._last_misses += 1
+            self._last_memo_hits += 1
+            self._run_memo_hits += 1
+            _tally[1] += 1
+            return self._format_block(op, body, unbounded=unbounded), False
+
+        body = self._run_one(op)
+        if not body:
+            body = "(not found)"
+            self._last_misses += 1
+            _tally[1] += 1
+            if memo_key is not None:
+                self._remember_miss(memo_key)
+            is_hit = False
+        else:
+            self._last_hits += 1
+            _tally[0] += 1
+            is_hit = True
+            if _facts_tally is not None:
+                _facts_tally[0] += 1
+            elif op.op == "module":
+                # AUTO-F4: teach the informed set from a real `module` hit —
+                # only names collect actually returned, never guessed or
+                # taken from a truncated/out-of-batch note.
+                #
+                # Learn from the CAPPED text, not the raw `body` above: this
+                # mirrors exactly what _format_block below is about to send
+                # to the model (`capped = body if unbounded else
+                # self._cap(body)`). `body` can be longer than `_max_chars`
+                # for a module with many symbols; a name that only appears
+                # past that cutoff was truncated out of the digest and never
+                # actually shown, so it must not be learned — otherwise a
+                # later `facts` ask for it would be counted "informed" for a
+                # name the model could not have seen.
+                self._learn_module_names(body if unbounded else self._cap(body))
+        return self._format_block(op, body, unbounded=unbounded), is_hit
+
+    def _arg_seen_via_module(self, arg: str) -> bool:
+        """AUTO-F4: was *arg* (a `facts` symbol) named in a `module` hit
+        earlier in this batch? Exact match only — `module`'s inventory lists
+        bare top-level names, and a `facts` ask that does not match one of
+        them exactly is exactly the guess this measurement exists to catch,
+        not a near-miss to be generous about (that is AUTO-F2's job, not
+        this story's)."""
+        name = (arg or "").strip().strip("`\"'")
+        return bool(name) and name in self._informed_symbols
+
+    # A line collect's `_format_module_block` emits for one symbol:
+    # "  name(...)  :12 — first docstring line" or a bare "  name". Anchored
+    # on the two-space indent `_format_module_block` uses for every symbol
+    # line so it never matches the leading "module: <path>" line or the
+    # "(no public top-level symbols)" / "… and N more" placeholder lines,
+    # both of which start with something other than a name character.
+    _MODULE_NAME_RE = re.compile(r"^  (\w+)", re.M)
+
+    def _learn_module_names(self, body: str) -> None:
+        """AUTO-F4: record every top-level name a `module` hit listed, so a
+        later `facts` ask for one of them in this same batch counts as
+        informed. Additive only — never removes a name, and a name learned
+        this batch is forgotten at the next :meth:`reset` along with
+        everything else `module` could not have told a fresh batch."""
+        for m in self._MODULE_NAME_RE.finditer(body or ""):
+            self._informed_symbols.add(m.group(1))
+
+    def _remember_miss(self, memo_key: tuple) -> None:
+        """AC-F1-8: record a first-time miss, evicting the oldest entry first
+        once the memo is at capacity so a pathological run cannot grow it
+        without limit. ``OrderedDict`` preserves insertion order, so the
+        first item is always the oldest miss still on record."""
+        if len(self._miss_memo) >= self._memo_max_entries:
+            self._miss_memo.popitem(last=False)
+        self._miss_memo[memo_key] = 1
+
+    @staticmethod
+    def _memo_miss_body(op: ProbeOp, count: int) -> str:
+        """AC-F1-2: the escalating message for a repeated miss — the model is
+        told THIS SPECIFIC name is dead, rather than getting the identical
+        ``(not found)`` it has already ignored ``count`` times."""
+        plural = "" if count == 1 else "s"
+        return (
+            f"(not found — already looked up {count} time{plural} this run, "
+            f"still absent. `{op.arg}` is not a symbol in this repository. "
+            "If you mean a file, use `module <path>`; if you mean a "
+            "concept, name a real function.)"
+        )
+
+    def _format_block(self, op: ProbeOp, body: str, *, unbounded: bool = False) -> str:
+        capped = body if unbounded else self._cap(body)
+        return f"### {op}\n{self._out_of_batch_note(capped)}{capped}"
 
     # ── op implementations ───────────────────────────────────────────────
 
@@ -700,8 +1025,12 @@ class ArchProbe:
         * **Freshness.** When this disagrees with `facts`/`module`, this is
           right — the artifact can lag the tree.
 
-        Misses (absent, outside root, a directory, binary, undecodable)
-        return ``""`` and are counted as misses like any other. Never raises.
+        Misses (absent, outside root, a directory) return ``""`` and are
+        counted as misses like any other. Never raises.
+
+        A file that exists but is not valid UTF-8 is NOT a miss: it is read
+        with ``errors="replace"``, so undecodable bytes come back as U+FFFD
+        and the file is still readable (B7).
         """
         if self._base_dir is None:
             logger.debug("ArchProbe: read requested but no base_dir — skipping.")
@@ -729,8 +1058,23 @@ class ArchProbe:
         try:
             if not target.is_file():
                 return ""
-            text = target.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError) as exc:
+            # B7: a strict utf-8 decode turned one stray byte (a cp1251 or
+            # latin-1 source file) into UnicodeDecodeError, which the except
+            # clause below folded into "" -- the exact same value this method
+            # returns for "no such file". The Architect could not tell the
+            # two apart, so it was handed an empty context and left to assert
+            # whatever it had already guessed about the file: the
+            # hallucinated-premise failure this op exists to prevent.
+            #
+            # errors="replace" is what the rest of the codebase already uses
+            # to read repo source (LLMGate2Validator._read_changed_content,
+            # the context broker, the canon validator). Degraded context
+            # beats none: the model can see the file and say it is not valid
+            # UTF-8. UnicodeDecodeError is unreachable from here now, so it
+            # drops out of the except clause rather than lingering as a dead
+            # branch.
+            text = target.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
             logger.debug("ArchProbe: read %r unreadable: %s", raw, exc)
             return ""
 
@@ -799,7 +1143,9 @@ class ArchProbe:
             return ""
         return (
             "[NOT IN YOUR BATCH — read-only context. Do NOT put this path in "
-            "target_files or cited_location; Gate-1 will reject it.]\n"
+            "target_files or cited_location; Gate-1 will reject it. You "
+            "already have everything this returns above — asking again will "
+            "not make it citable, it will end your probing instead.]\n"
         )
 
     def _cap(self, text: str) -> str:

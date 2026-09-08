@@ -72,6 +72,7 @@ from tools.auto.gate1_grounding import (
 from tools.block_extractor import extract_block, extract_module_docstring
 import tools.llm_stream as _llm_stream
 from tools.llm_stream import strip_think
+from tools.config_safe import safe_getboolean
 
 logger = logging.getLogger(__name__)
 
@@ -378,16 +379,24 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             self._max_block_chars = _DEFAULT_MAX_BLOCK_CHARS
         # AUTO-FIX: Gate 1's presence check wants a tiny, deterministic JSON
         # verdict — no reasoning needed in the reply. A thinking model (e.g.
-        # qwen3) wraps its answer in <think>...</think> by default; with a
+        # qwen3) wraps its answer in <think>... by default; with a
         # small max_tokens that reasoning can consume the whole budget and
         # truncate before any JSON is emitted, so strip_think() discards
         # everything and every candidate fails closed. Default to disabling
         # thinking for Gate 1's call (Ollama "think" field); an explicit
         # [gate1] think = true in agents.ini re-enables it.
-        self._think = config.getboolean(sec, "think", fallback=False)
+        try:
+            self._think = config.getboolean(sec, "think", fallback=False)
+        except ValueError as exc:
+            logger.warning("config [%s] think is malformed (%s) — using default False", sec, exc)
+            self._think = False
         # num_ctx controls the total context window on Ollama; 0 means "use server default".
         _active = config.get("api", "active", fallback="local")
-        self._num_ctx = config.getint(f"api_{_active}", "num_ctx", fallback=0)
+        try:
+            self._num_ctx = config.getint(f"api_{_active}", "num_ctx", fallback=0)
+        except ValueError as exc:
+            logger.warning("config [api_%s] num_ctx is malformed (%s) — using default 0", _active, exc)
+            self._num_ctx = 0
         # AUTO-JSONMODE-1: single GLOBAL switch (not per-[gate1]) — read
         # from [api], same section that already governs `active` above, so
         # one ini flag covers every LLM call this project makes. Default
@@ -398,7 +407,11 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         # endpoint doesn't support it, request_completion() detects the
         # HTTP 400, logs a loud warning, and falls back to today's
         # behaviour for the rest of the run — no action needed here.
-        self._response_format = config.getboolean("api", "response_format", fallback=False)
+        try:
+            self._response_format = config.getboolean("api", "response_format", fallback=False)
+        except ValueError as exc:
+            logger.warning("config [api] response_format is malformed (%s) — using default False", exc)
+            self._response_format = False
         # AUTO-THINKDEPTH-1: single GLOBAL switch + depth value, same
         # pattern as [api] response_format above — off by default, so
         # existing [gate1] think = true/false on/off behaviour (self._think
@@ -409,9 +422,14 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         # doesn't support the depth value, build_chat_request/
         # request_completion detect it, log a loud warning, and fall back
         # to plain think on/off for the rest of the run.
+        try:
+            _think_effort_enabled = config.getboolean("api", "think_effort_enabled", fallback=False)
+        except ValueError as exc:
+            logger.warning("config [api] think_effort_enabled is malformed (%s) — using default False", exc)
+            _think_effort_enabled = False
         self._think_effort = (
             config.get("api", "think_effort", fallback="").strip()
-            if config.getboolean("api", "think_effort_enabled", fallback=False)
+            if _think_effort_enabled
             else None
         ) or None
 
@@ -859,7 +877,14 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         except OSError as exc:
             return False, f"cannot read {loc.file!r}: {exc}", ""
 
-        file_ext = Path(loc.file).suffix or ".py"
+        # FIX-2 #13: an extensionless file is not a Python file. The old
+        # `or ".py"` default asserted a language the path never claimed, so
+        # Makefile / Dockerfile / Jenkinsfile / .gitignore content was handed
+        # to the AST-based Python strategy. An empty extension is the honest
+        # answer: block_extractor then assumes no language and uses its
+        # language-neutral brace search, and extract_module_docstring returns
+        # "" rather than parsing a non-Python file as Python.
+        file_ext = Path(loc.file).suffix
 
         # AUTO-CR-8: in docs/creative mode a FILE alone is sufficient grounding,
         # since small models often hallucinate line_start and the target
@@ -962,7 +987,14 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             source = (base_dir / loc.file).read_text(encoding="utf-8", errors="replace")
         except OSError:
             return ""
-        file_ext = Path(loc.file).suffix or ".py"
+        # FIX-2 #13: an extensionless file is not a Python file. The old
+        # `or ".py"` default asserted a language the path never claimed, so
+        # Makefile / Dockerfile / Jenkinsfile / .gitignore content was handed
+        # to the AST-based Python strategy. An empty extension is the honest
+        # answer: block_extractor then assumes no language and uses its
+        # language-neutral brace search, and extract_module_docstring returns
+        # "" rather than parsing a non-Python file as Python.
+        file_ext = Path(loc.file).suffix
         try:
             return extract_module_docstring(source, file_ext)
         except Exception:  # pragma: no cover - defensive, see docstring
@@ -1501,7 +1533,7 @@ def filter_candidates(
     api_key   = config.get(section, "api_key",    fallback="")
     model     = model_override or config.get(section, "model")
     api_fmt   = config.get(section, "api_format", fallback="openai")
-    verify_ssl = config.getboolean("api", "verify_ssl", fallback=True)
+    verify_ssl = safe_getboolean(config, "api", "verify_ssl", fallback=True)
 
     filt = Gate1Filter(
         config=config,

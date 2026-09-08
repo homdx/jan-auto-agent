@@ -68,7 +68,7 @@ def _rt(controller: "AutoController"):
 # Imported at module level so test suites can patch via
 # ``patch("tools.auto.pipeline.<name>")``.
 from tools.auto.repo_ingest import ingest_repo
-from tools.auto.architect import review_clusters, ClusterReviewer
+from tools.auto.architect import review_clusters, ClusterReviewer, ConfigValueError
 from tools.auto.gate1_filter import filter_candidates
 from tools.auto.backlog_prioritiser import build_backlog, to_improvements_md
 from tools.auto.plan_emitter import PlanEmitter, IMPROVEMENTS_FILENAME
@@ -89,18 +89,22 @@ def _build_plan_validator(
     """
     if task_mode != "creative":
         return None
-    if not cfg.getboolean("architect", "validate_plan_creative", fallback=False):
-        return None
 
-    active = cfg.get("api", "active", fallback="local")
-    section = f"api_{active}"
-
-    # BUGFIX (audit): base_url/model have no fallback= and used to run
-    # before this try/except — a missing [api_{active}] section or a
-    # missing base_url/model key raised NoSectionError/NoOptionError
-    # uncaught, defeating the "never block the run on setup" guard below
-    # that was meant to catch exactly this kind of setup failure.
+    # BUGFIX: getboolean and cfg.get for the [api] section used to be
+    # outside the try/except below. A malformed validate_plan_creative
+    # (e.g. "maybe") raised ValueError, a missing [architect] section
+    # raised NoSectionError — both uncaught, crashing the entire --auto
+    # run instead of degrading to "no plan validator" as the docstring
+    # promises. Moving them inside the guard makes the "never block the
+    # run on setup" contract cover ALL config reads, not just the
+    # ClusterReviewer constructor.
     try:
+        if not cfg.getboolean("architect", "validate_plan_creative", fallback=False):
+            return None
+
+        active = cfg.get("api", "active", fallback="local")
+        section = f"api_{active}"
+
         base_url   = cfg.get(section, "base_url")
         api_key    = cfg.get(section, "api_key",    fallback="")
         model      = cfg.get(section, "model")
@@ -112,6 +116,13 @@ def _build_plan_validator(
             verify_ssl=verify_ssl,
             task_mode=task_mode,
         )
+    except ConfigValueError:
+        # A value the operator explicitly set and ClusterReviewer refuses
+        # (today: max_files_per_review <= 0). Returning None here would run
+        # the whole creative plan phase WITHOUT plan validation behind a
+        # single warning line. The architect review path aborts on the same
+        # value, so both paths now agree.
+        raise
     except Exception as exc:  # noqa: BLE001 — never block the run on setup
         logger.warning("_build_plan_validator: could not build reviewer — %s", exc)
         return None
@@ -281,10 +292,44 @@ def _run_plan_phase(controller: "AutoController", cfg: configparser.ConfigParser
     task_mode = getattr(controller, "task_mode", "code")
     _plan_validator = _build_plan_validator(cfg, task_mode)
     if _plan_validator is not None:
-        _plan_max_rev = cfg.getint(
-            "architect", "plan_max_revisions",
-            fallback=cfg.getint("architect", "max_rewrites", fallback=1),
-        )
+        # BUGFIX: the nested cfg.getint("architect", "max_rewrites",
+        # fallback=1) used to be evaluated eagerly as the fallback=
+        # argument to the outer getint. If max_rewrites was present but
+        # non-numeric, the inner getint raised ValueError before the
+        # outer call could use its fallback=1. Read max_rewrites
+        # separately with its own try/except so a malformed value
+        # degrades to 1 instead of crashing the pipeline.
+        try:
+            _max_rewrites = cfg.getint("architect", "max_rewrites", fallback=1)
+        except ValueError:
+            _max_rewrites = 1
+        # BUG-1 FIX: this outer read had the same problem as the nested one
+        # above. configparser's fallback= only applies when the key is
+        # *missing*; a key that is present but non-numeric ("abc", "3x")
+        # makes getint raise ValueError straight out of the call, which
+        # nothing on the path up to --auto caught. One malformed
+        # plan_max_revisions value crashed the entire plan phase before any
+        # task ran. Guard it the same way as max_rewrites: degrade to the
+        # already-sanitised _max_rewrites instead of propagating.
+        try:
+            _plan_max_rev = cfg.getint(
+                "architect", "plan_max_revisions",
+                fallback=_max_rewrites,
+            )
+        except ValueError as exc:
+            # Logged, not silent: the run continues on the fallback, but a
+            # malformed agents.ini key is an operator mistake they can only
+            # correct if something says so -- the visible symptom (fewer
+            # plan revisions than configured) is indistinguishable from
+            # normal operation. This matches the reporting the sibling
+            # config guards in this batch already do (max_tasks_creative,
+            # and each of TaskRewriter's five reads); plan_max_revisions
+            # was the one guard that degraded without a word.
+            logger.warning(
+                "config [architect] plan_max_revisions is malformed (%s) — "
+                "using max_rewrites (%d)", exc, _max_rewrites,
+            )
+            _plan_max_rev = _max_rewrites
         _plan_max_rev = max(1, _plan_max_rev)
         _plan_revisions = 0
         while _plan_revisions < _plan_max_rev:

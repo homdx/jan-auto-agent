@@ -238,6 +238,93 @@ class TestCodeModeJsonVerdictUnchanged:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Regression: missing_context guarded against non-list JSON shapes
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestMissingContextTypeGuard:
+    """BUGFIX (same class of bug as the ``hints`` field — see
+    tests/test_gate2_feedback_hints.py): the Gate-2 JSON contract asks for
+    ``"missing_context": ["Foo", "Bar"]`` (a list), but an LLM may instead
+    return a bare string, e.g. ``"missing_context": "Foo"``. Before the
+    fix, ``[str(x).strip() for x in (parsed.get("missing_context") or [])]``
+    iterated the string character by character, so ``last_missing_context``
+    (the pull-model side channel InnerLoop reads to retry search) filled
+    with single letters instead of the intended symbol name. The fix only
+    accepts a list; any other shape (string, int, None, missing key) now
+    yields an empty ``last_missing_context`` — no leaked characters, and
+    no crash on an unexpected type.
+    """
+
+    def _approve_code(self, raw_llm_reply: str):
+        validator = _make_validator("code")
+        with (
+            patch("tools.llm_stream.request_completion", return_value=raw_llm_reply),
+            patch.object(validator, "_read_changed_content", return_value="(code content)"),
+        ):
+            ok, fb = validator.approve(
+                _DUMMY_TASK, _DUMMY_EXEC_RESULT, _DUMMY_CODER_RESULT,
+                base_dir="/tmp",
+            )
+        return validator, ok, fb
+
+    def test_missing_context_as_list_normal(self):
+        payload = json.dumps({
+            "approved": False,
+            "feedback": "needs more context",
+            "missing_context": ["SomeHelper", "OtherThing"],
+        })
+        validator, _, _ = self._approve_code(payload)
+        assert validator.last_missing_context == ["SomeHelper", "OtherThing"]
+
+    def test_missing_context_as_string_not_split_into_characters(self):
+        """A string missing_context must not be iterated character by
+        character — the old bug turned "SomeHelper" into
+        ['S', 'o', 'm', 'e', ...]."""
+        payload = json.dumps({
+            "approved": False,
+            "feedback": "needs more context",
+            "missing_context": "SomeHelper",
+        })
+        validator, _, _ = self._approve_code(payload)
+        assert validator.last_missing_context == [], (
+            "a string missing_context must not leak individual characters "
+            f"— got {validator.last_missing_context!r}"
+        )
+
+    def test_missing_context_key_absent_is_empty(self):
+        payload = json.dumps({"approved": False, "feedback": "no context field"})
+        validator, _, _ = self._approve_code(payload)
+        assert validator.last_missing_context == []
+
+    def test_missing_context_none_is_empty(self):
+        payload = json.dumps({
+            "approved": False, "feedback": "x", "missing_context": None,
+        })
+        validator, _, _ = self._approve_code(payload)
+        assert validator.last_missing_context == []
+
+    def test_missing_context_non_list_type_is_empty_not_a_crash(self):
+        """A non-list, non-string JSON value (a stray int here) must not
+        crash iteration — dropped, same treatment as an unrecognized
+        `hints` type."""
+        payload = json.dumps({
+            "approved": False, "feedback": "x", "missing_context": 42,
+        })
+        validator, ok, _ = self._approve_code(payload)
+        assert ok is False  # still parses and rejects — no crash surfaced
+        assert validator.last_missing_context == []
+
+    def test_missing_context_blank_entries_filtered_from_list(self):
+        payload = json.dumps({
+            "approved": False,
+            "feedback": "x",
+            "missing_context": ["  ", "RealSymbol", ""],
+        })
+        validator, _, _ = self._approve_code(payload)
+        assert validator.last_missing_context == ["RealSymbol"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # System prompt tests
 # ─────────────────────────────────────────────────────────────────────────────
 

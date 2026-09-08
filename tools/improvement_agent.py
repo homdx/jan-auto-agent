@@ -12,6 +12,20 @@ from tools.llm_stream import request_completion, strip_think, ollama_chat_url, s
 
 logger = logging.getLogger(__name__)
 
+
+def _safe_stdout_write(t: str) -> None:
+    """Write a streaming token to stdout, swallowing BrokenPipeError.
+
+    When stdout is piped to a command that closes early (e.g. ``head``),
+    ``sys.stdout.write`` raises BrokenPipeError — swallow it so the LLM
+    call result is not lost.
+    """
+    try:
+        sys.stdout.write(t)
+        sys.stdout.flush()
+    except (BrokenPipeError, OSError):
+        pass
+
 # Hardcoded prompt extracted to a named module-level constant — the canonical
 # fallback PromptStore can always return to. Runtime values are injected via
 # .format() in process(); do not use f-string here.
@@ -195,7 +209,7 @@ class ImprovementAgent:
                 content = request_completion(
                     url, headers, req_payload, self.timeout,
                     stream=True,
-                    on_token=lambda t: (sys.stdout.write(t), sys.stdout.flush()),
+                    on_token=lambda t: _safe_stdout_write(t),
                     api_format=self.api_format,
                     ssl_context=self.ssl_context,
                 )
@@ -214,7 +228,20 @@ class ImprovementAgent:
             # normalizes HTTPError into RuntimeError before it reaches us
             # (tools/llm_stream.py _open()), so in practice the branch below
             # is what fires for HTTP failures today.
-            body = e.read().decode("utf-8", errors="replace")
+            # Same defect as validator_agent.py (A5): e.read() is a second
+            # unguarded read on the same socket, and a sibling except clause
+            # does not nest — an exception raised here was never offered to the
+            # except Exception below, so it escaped process() and crashed the
+            # improve flow on the very path that exists to turn a failed call
+            # into a result dict.
+            try:
+                body = e.read().decode("utf-8", errors="replace")
+            except Exception as read_exc:
+                logger.warning(
+                    f"ImprovementAgent HTTP {e.code}: could not read the error "
+                    f"body ({read_exc}) — reporting the status alone"
+                )
+                body = f"<error body unreadable: {type(read_exc).__name__}: {read_exc}>"
             logger.error(f"ImprovementAgent HTTP {e.code}: {body}")
             _err = {
                 "explanation": f"HTTP {e.code} from API: {body}",

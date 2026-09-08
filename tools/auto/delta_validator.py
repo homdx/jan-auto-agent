@@ -105,7 +105,7 @@ class DeltaValidator:
                 ["git", "-C", str(base_dir), "show", f"HEAD:./{rel_path}"],
                 capture_output=True, text=True, timeout=10,
             )
-        except (OSError, subprocess.TimeoutExpired) as exc:
+        except (OSError, subprocess.TimeoutExpired, UnicodeDecodeError) as exc:
             logger.warning(
                 "DeltaValidator: git show HEAD:%s failed — %s; treating as no baseline.",
                 rel_path, exc,

@@ -54,7 +54,7 @@ from typing import TYPE_CHECKING, Optional
 
 from tools.auto.backlog_prioritiser import PrioritisedBacklog, to_improvements_md
 from tools.auto.git_manager import GitError
-from tools.auto.utils import file_set_fingerprint
+from tools.auto.utils import atomic_write_text, file_set_fingerprint
 
 if TYPE_CHECKING:  # avoid circular imports at runtime
     from tools.auto.git_manager import GitManager
@@ -128,16 +128,50 @@ class PlanEmitter:
         # 1. Write IMPROVEMENTS.md to repo root.
         md_content  = to_improvements_md(backlog)
         md_path     = self._base_dir / IMPROVEMENTS_FILENAME
-        md_path.write_text(md_content, encoding="utf-8")
+        atomic_write_text(md_path, md_content)
         logger.info("emit: wrote %s (%d bytes)", md_path, len(md_content))
 
         # 2. Upsert all auto tasks into plan.json via StateStore.
+        # BUGFIX (unguarded upsert loop): upsert_task() validates against the
+        # plan.json schema and raises ValueError on a violation. The tasks
+        # here are derived from LLM-authored candidates, so a violation is a
+        # normal-frequency event, not a can't-happen. Unguarded, the first
+        # bad task aborted emit() *after* IMPROVEMENTS.md had been written
+        # and after every earlier task had already been persisted by its own
+        # upsert — leaving plan.json half-populated, uncommitted, and out of
+        # sync with the IMPROVEMENTS.md sitting next to it. Skip the offender
+        # instead: the remaining tasks are independently valid and a plan
+        # missing one task is recoverable, where a half-written one needs
+        # manual repair before the next run can resume.
         state_tasks = backlog.to_state_tasks()
+        upserted = 0
+        rejected: list[str] = []
         for task in state_tasks:
-            self._state.upsert_task(task)
+            try:
+                self._state.upsert_task(task)
+            except ValueError as exc:
+                task_id = task.get("id", "<no id>") if isinstance(task, dict) else "<not a dict>"
+                logger.error(
+                    "emit: task %s rejected by the plan schema — %s; "
+                    "skipping it and continuing with the rest",
+                    task_id, exc,
+                )
+                self._state.log(f"emit: task {task_id} rejected — {exc}")
+                rejected.append(str(task_id))
+            else:
+                upserted += 1
         logger.info(
-            "emit: upserted %d auto task(s) into plan.json", len(state_tasks)
+            "emit: upserted %d of %d auto task(s) into plan.json",
+            upserted, len(state_tasks),
         )
+        if rejected:
+            # IMPROVEMENTS.md still lists these — say so, or the mismatch
+            # between the file and plan.json reads as a lost write.
+            self._state.log(
+                f"emit: {len(rejected)} task(s) listed in "
+                f"{IMPROVEMENTS_FILENAME} were not added to plan.json "
+                f"({', '.join(rejected)})"
+            )
 
         # 3. Update cluster hashes (re-run cheapness).
         if clusters is not None:

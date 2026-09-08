@@ -12,3 +12,6 @@ __pycache__/
 # CHECK-1: per-task sandboxes created by scripts/run_flows.sh. They are run
 # output, rebuilt from the committed baseline on every run.
 examples/task*/
+
+# auto-agent safety entries
+*.coder.bak

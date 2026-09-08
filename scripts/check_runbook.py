@@ -150,7 +150,8 @@ def _prints_hello_world(sandbox: Path) -> tuple[bool, str]:
     try:
         result = subprocess.run(
             [sys.executable, "main.py"],
-            cwd=str(sandbox), capture_output=True, text=True, timeout=60,
+            cwd=str(sandbox), capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=60,
         )
     except (OSError, subprocess.SubprocessError) as exc:
         return False, str(exc)

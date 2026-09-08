@@ -117,7 +117,14 @@ def target_file_context(
             source = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        file_ext = Path(tf).suffix or ".py"
+        # FIX-2 #13: an extensionless file is not a Python file. The old
+        # `or ".py"` default asserted a language the path never claimed, so
+        # Makefile / Dockerfile / Jenkinsfile / .gitignore content was handed
+        # to the AST-based Python strategy. An empty extension is the honest
+        # answer: block_extractor then assumes no language and uses its
+        # language-neutral brace search, and extract_module_docstring returns
+        # "" rather than parsing a non-Python file as Python.
+        file_ext = Path(tf).suffix
 
         block = ""
         for symbol in ([cited_symbol] if cited_symbol else []) + _instruction_symbol_candidates(instruction):
@@ -291,18 +298,133 @@ _CONFIG_GET_RE = re.compile(
 _WRAPPER_CALL_RE = re.compile(r"\bself\.([a-z_][a-z0-9_]*)\(")
 
 
+# FIX-2 #12: the wrapper's ``def`` used to be located with a bare
+# ``re.search`` over the entire file, which has no notion of which class the
+# call site is in. Two classes defining a same-named private helper --
+# routine for ``_read_int`` / ``_config`` / ``_open`` -- made the match a
+# file-position lottery: the note could be built from a body the call site
+# can never reach, and this note's whole purpose is to tell Stage B "your
+# claimed crash is impossible", so a wrong body means a *correct* finding is
+# argued away with a fabricated fact. Resolution is AST-based and scoped to
+# the class the call site actually lives in.
+#
+# The AST also retires the old body boundary ``(?=\n    def |\nclass |\Z)``,
+# which assumed exactly four-space indentation and a column-0 ``class``: in a
+# file indented any other way it never fired, so the "body" ran to end of
+# file and swallowed later methods -- another route to reading a
+# ``fallback=`` that belongs to something else entirely.
+
+# The first ``def`` in an extracted block is the method the call site is in
+# (``extract_block`` returns the cited symbol including its def line).
+_BLOCK_DEF_RE = re.compile(r"^\s*def\s+([A-Za-z_]\w*)\s*\(", re.MULTILINE)
+
+
+def _direct_method(cls: ast.ClassDef, name: str):
+    """``cls``'s own ``name`` method, ignoring anything it inherits."""
+    for stmt in cls.body:
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)) and stmt.name == name:
+            return stmt
+    return None
+
+
+def _resolve_method(cls: ast.ClassDef, name: str, by_name: dict, _seen=None):
+    """``cls.name``, following base classes that are defined in this file.
+
+    A wrapper inherited from a base class in the same module is genuinely
+    reachable from the call site, so it stays resolvable -- the whole-file
+    search used to find it by accident, and narrowing to the exact class
+    without this would lose a case that used to work. Bases from other
+    modules are unknown here and simply end the walk; ``_seen`` guards
+    against a cyclic or self-referential base list in malformed source.
+    """
+    if _seen is None:
+        _seen = set()
+    if id(cls) in _seen:
+        return None
+    _seen.add(id(cls))
+
+    found = _direct_method(cls, name)
+    if found is not None:
+        return found
+
+    for base in cls.bases:
+        base_name = None
+        if isinstance(base, ast.Name):
+            base_name = base.id
+        elif isinstance(base, ast.Attribute):
+            base_name = base.attr
+        parent = by_name.get(base_name)
+        if parent is not None:
+            found = _resolve_method(parent, name, by_name, _seen)
+            if found is not None:
+                return found
+    return None
+
+
+def _calling_class(full_source: str, code_block: str):
+    """(class owning *code_block*'s method, {class name: node}), or (None, None).
+
+    Returns ``None`` -- meaning "emit no note" -- whenever the scope cannot
+    be pinned down: unparseable source, a block with no ``def`` line, a
+    method name no class defines, or several classes defining it that
+    position cannot separate. Failing closed is the right direction for this
+    check: a missing counter-fact costs one extra LLM judgement, while a
+    counter-fact quoted from the wrong class actively argues a real finding
+    away.
+    """
+    try:
+        tree = ast.parse(full_source)
+    except (SyntaxError, ValueError):
+        return None, None
+
+    block_def = _BLOCK_DEF_RE.search(code_block)
+    if block_def is None:
+        return None, None
+    caller = block_def.group(1)
+
+    classes = [n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)]
+    if not classes:
+        return None, None
+    by_name = {c.name: c for c in classes}
+
+    owners = [c for c in classes if _direct_method(c, caller) is not None]
+    if len(owners) > 1:
+        # Same method name in several classes — fall back to where the block
+        # physically sits in the file to separate them.
+        idx = full_source.find(code_block)
+        if idx >= 0:
+            line = full_source.count("\n", 0, idx) + 1
+            owners = [
+                c for c in owners
+                if c.lineno <= line <= (getattr(c, "end_lineno", None) or c.lineno)
+            ]
+    if len(owners) != 1:
+        return None, None
+    return owners[0], by_name
+
+
+def _method_body_source(full_source: str, fn) -> str:
+    """Source of *fn*'s body, excluding its signature line(s)."""
+    if not fn.body:
+        return ""
+    lines = full_source.splitlines(keepends=True)
+    start = fn.body[0].lineno - 1
+    end = getattr(fn, "end_lineno", None) or fn.body[-1].lineno
+    return "".join(lines[start:end])
+
+
 def _wrapper_fallback_note(instruction: str, code_block: str, full_source: str) -> Optional[str]:
     if not full_source:
         return None
+    scope, by_name = _calling_class(full_source, code_block)
+    if scope is None:
+        return None
     for m in _WRAPPER_CALL_RE.finditer(code_block):
         name = m.group(1)
-        body_match = re.search(
-            rf"def\s+{re.escape(name)}\s*\(([^)]*)\)(?:\s*->\s*[^:]+)?:(.*?)(?=\n    def |\nclass |\Z)",
-            full_source, re.S,
-        )
-        if not body_match:
+        wrapper = _resolve_method(scope, name, by_name)
+        if wrapper is None:
             continue
-        body = body_match.group(2)
+        body = _method_body_source(full_source, wrapper)
         get_match = _CONFIG_GET_RE.search(body)
         if get_match and "fallback" in get_match.group("rest"):
             return (
@@ -404,11 +526,20 @@ def _find_def_in_repo(name: str, base_dir: Path, max_files: int = 4000) -> Optio
     count = 0
     try:
         for p in base_dir.rglob("*.py"):
+            # FIX-2 #11: this exclusion must stay AHEAD of the increment.
+            # With it below, every file the walk was about to throw away
+            # still consumed max_files budget — and .agent/ holds the run's
+            # own state while node_modules/ holds thousands of vendored
+            # files, so whenever either sorted ahead of the file defining
+            # the symbol, the walk hit the cap having read nothing but
+            # files it was discarding anyway and reported "not found" for a
+            # definition that was sitting right there. The counter bounds
+            # the work actually done: never read, never counted.
+            if "/.agent/" in str(p) or "/node_modules/" in str(p):
+                continue
             count += 1
             if count > max_files:
                 break
-            if "/.agent/" in str(p) or "/node_modules/" in str(p):
-                continue
             try:
                 text = p.read_text(encoding="utf-8", errors="ignore")
             except OSError:

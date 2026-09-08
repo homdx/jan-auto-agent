@@ -58,6 +58,37 @@ _FEEDBACK_GLOB = "feedback_round_*.md"
 _FEEDBACK_RE = re.compile(r"feedback_round_(\d+)\.md$")
 _MAX_FEEDBACK_CHARS = 800        # keep each round file compact
 
+
+def _coerce_impl_version(value: object) -> int:
+    """Best-effort int read of a persisted ``impl_version``.
+
+    FIX-2 #2: plan.json is a hand-writable file that has already been shown
+    to carry corrupt values, so a bare ``int(impl_version or 1)`` raised
+    ``ValueError`` on a non-numeric entry (and ``TypeError`` on the JSON
+    null that Architect's ``_to_int_or_none`` writes for an unparseable
+    line anchor) before the first round started. That escaped ``run_task``
+    -- the per-task body of the whole ``--auto`` loop -- and dropped every
+    task still pending in plan.json.
+
+    A value that cannot be read as an integer means "we don't know how many
+    rewrites this task had", so fall back to 1 -- the same starting value
+    ``make_task`` gives every task and ``_coerce_counter`` (state.py) falls
+    back to on the bump path -- rather than 0. Both fall back to a value
+    that makes ``rewrites_done`` (``max(0, impl_version - 1)``) come out to
+    0 either way, but only 1 keeps ``impl_version`` itself consistent with
+    "no rewrites yet" everywhere else it is used in this function --
+    feedback file headers ("impl v{impl_version}"), ``impl_versions_used``,
+    and the trace events -- instead of surfacing a "v0" that should never
+    exist. The persisted value is left untouched -- nothing about it can be
+    safely repaired in place.
+    """
+    if isinstance(value, bool):
+        return 1
+    try:
+        return max(1, int(value))
+    except (TypeError, ValueError):
+        return 1
+
 # LOOP-4: regex to extract impl version from file headers
 _IMPL_HEADER_RE = re.compile(r"impl v(\d+)")
 
@@ -212,8 +243,11 @@ class OuterLoop:
         # apply_rewrite), so seed the local counter from it to make the cap a
         # true per-task, cross-resume limit.
         # LOOP-3: impl_version tracking — starts at 1, bumped on each rewrite
-        impl_version = task.get("impl_version", 1)
-        rewrites_done = max(0, int(impl_version or 1) - 1)
+        # FIX-2 #2: the bare int(impl_version or 1) raised ValueError/TypeError
+        # on a corrupt plan.json value before round 1 and escaped run_task,
+        # dropping every pending task. See _coerce_impl_version().
+        impl_version = _coerce_impl_version(task.get("impl_version", 1))
+        rewrites_done = max(0, impl_version - 1)
         impl_versions_used: list[int] = []
 
         if start_round > self.max_rounds:

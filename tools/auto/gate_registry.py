@@ -44,7 +44,7 @@ backward compatibility.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -461,10 +461,12 @@ def build_validators(config, base_dir, *, task_mode: str, broker=None) -> dict:
     ``task_mode``/``broker`` introspection below. A config with no
     ``*_llm_profile`` keys resolves every gate straight back to
     ``[api_{active}]``, so behaviour is unchanged from before this
-    ticket. Deliberately NOT wrapped in the per-gate ``except Exception``
-    below: a malformed profile must raise here, at construction, before
-    any task runs — never be swallowed into "gate unavailable" and
-    discovered mid-run instead.
+    ticket. C1: the resolution is wrapped in the per-gate
+    ``except Exception`` below — a malformed or missing profile section
+    disables only that gate (logged, then ``None``), preserving the
+    fail-open architecture of the registry. Letting the ``ValueError``
+    escape aborted the whole ``make_inner_loop`` builder and took every
+    other gate down with the misconfigured one.
 
     Returns a dict keyed by :attr:`GateSpec.attr`, ready to splat into
     ``InnerLoop(...)`` as keyword arguments.
@@ -501,15 +503,15 @@ def build_validators(config, base_dir, *, task_mode: str, broker=None) -> dict:
             out[spec.attr] = None
             continue
 
-        gate_settings = None
-        if spec.profile_key is not None:
-            from tools.auto.llm_profile import resolve_llm_profile
-            gate_settings, _ = resolve_llm_profile(
-                config, "validator_agent", spec.profile_key,
-                defaults=_validator_llm_settings(),
-            )
-
         try:
+            gate_settings = None
+            if spec.profile_key is not None:
+                from tools.auto.llm_profile import resolve_llm_profile
+                gate_settings, _ = resolve_llm_profile(
+                    config, "validator_agent", spec.profile_key,
+                    defaults=_validator_llm_settings(),
+                )
+
             module = __import__(spec.factory_module, fromlist=[spec.factory_name])
             factory = getattr(module, spec.factory_name)
             # The factories don't share a signature either; pass only what
@@ -553,9 +555,10 @@ def run_gates(
     is mutated in place — it holds the per-gate spent-revision counters
     that used to be five separate locals in ``run_task``.
 
-    Every gate is fail-OPEN: an exception from ``check`` (or from reading
-    the file) approves that file rather than failing the attempt, matching
-    the pre-existing per-block behaviour exactly.
+    Every gate is fail-OPEN: an exception from reading the file, from
+    ``check``, or from turning a rejecting verdict into feedback approves
+    that file rather than failing the attempt, matching the pre-existing
+    per-block behaviour exactly.
     """
     if not target_files:
         return None
@@ -593,6 +596,15 @@ def run_gates(
 
         problem_blocks: list[str] = []
         for rel_path in files:
+            # BUGFIX (FIX-1 #4): is_rejection()/verdict.feedback() used to
+            # run *after* this try/except, so a rejecting verdict whose
+            # feedback() raised (verdicts assemble coder-visible prose from
+            # LLM-authored fields — conflict lists, missing-fact lists —
+            # that can hold None or non-string entries) escaped run_gates
+            # and broke the fail-open contract documented above. The whole
+            # per-file gate pass is guarded now: a raise from check() OR
+            # from feedback() approves that one file; sibling files in the
+            # same gate are still judged on their own iteration.
             try:
                 text = (base_dir_path / rel_path).read_text(
                     encoding="utf-8", errors="replace"
@@ -605,15 +617,22 @@ def run_gates(
                     loop=loop,
                     base_dir_path=base_dir_path,
                 )
+                if verdict is not None and spec.is_rejection(verdict):
+                    try:
+                        feedback = verdict.feedback()
+                    except Exception as exc:  # noqa: BLE001 — fail-open
+                        logger.warning(
+                            "InnerLoop: %s feedback() raised for %s — %s; "
+                            "approving.",
+                            spec.name, rel_path, exc,
+                        )
+                    else:
+                        problem_blocks.append(f"{rel_path}:\n{feedback}")
             except Exception as exc:  # noqa: BLE001 — fail-open
                 logger.warning(
                     "InnerLoop: %s check raised for %s — %s; approving.",
                     spec.name, rel_path, exc,
                 )
-                verdict = None
-
-            if verdict is not None and spec.is_rejection(verdict):
-                problem_blocks.append(f"{rel_path}:\n{verdict.feedback()}")
 
         if not problem_blocks:
             continue

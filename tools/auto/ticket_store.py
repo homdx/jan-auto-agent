@@ -57,7 +57,7 @@ AC (from Jira story AUTO-D1):
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 import logging
 from tools.auto.utils import _ts, atomic_write_text, safe_filename_component
 from pathlib import Path
@@ -336,7 +336,21 @@ class TicketStore:
         two ordinary back-to-back calls, no mocking required.  A numeric
         suffix disambiguates so neither call's evidence is destroyed.
         """
-        stamp = datetime.now().strftime("%Y%m%dT%H%M%S")
+        # FIX-1 #8 (second half): this stamp was on the LOCAL clock while
+        # this module's own schema (lines 16-17) records created_at /
+        # updated_at as ISO-8601 UTC via _ts(). Fixing only _ts() would
+        # leave a quarantine copy named in local time sitting beside the
+        # very ticket fields it belongs to, with nothing on either name to
+        # say which clock it came from -- the exact confusion _ts() was
+        # fixed to remove, just moved into the filename. Same instant, same
+        # "Z" marker, filename-safe formatting.
+        #
+        # Guarded via the module-level `datetime` symbol rather than a
+        # shared helper in utils: tests_bugfix/test_ticket_store_corrupt.py
+        # freezes the clock with monkeypatch.setattr(ticket_store,
+        # "datetime", ...), and routing this through utils would silently
+        # make those four collision tests unfreezable.
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         dest  = path.with_suffix(f".json.corrupt-{stamp}")
         suffix_n = 0
         while dest.exists():
@@ -483,7 +497,18 @@ class TicketStore:
         ticket.update(fields)
         ticket["updated_at"] = _ts()
         _validate(ticket)
-        self._write(path, ticket)
+        # BUGFIX: create() wraps _write() in try/except OSError and re-raises
+        # as TicketError (AUTO-T37). update() did not — a disk-full,
+        # permission-denied, or read-only-filesystem failure from
+        # atomic_write_text() propagated as a raw OSError past this method's
+        # own docstring (which only lists TicketNotFound and
+        # TicketSchemaError), inconsistent with create()'s established contract.
+        try:
+            self._write(path, ticket)
+        except OSError as exc:
+            raise TicketError(
+                f"Could not write ticket '{ticket_id}' to {path}: {exc}"
+            ) from exc
         logger.debug("TicketStore.update: %s  fields=%s", ticket_id, list(fields))
 
     # ── Delete ───────────────────────────────────────────────────────────────
@@ -498,10 +523,23 @@ class TicketStore:
             already absent (no-op — never raises).
         """
         path = self._path(ticket_id)
-        if not path.exists():
+        # B5: do NOT precede the unlink with an exists() check. The two are
+        # separate syscalls, and a concurrent cleanup (a second run sharing
+        # this .agent/, a ticket sweep, a manual rm) can remove the file in
+        # between. A bare unlink() then raised FileNotFoundError out of a
+        # method documented as "no-op if already absent (never raises)".
+        #
+        # unlink(missing_ok=True) after an exists() check would absorb the
+        # exception but still return True for a file this call did not
+        # remove. Letting the unlink itself be the single source of truth
+        # keeps both halves of the contract honest: the file was either there
+        # and is now gone (True), or it was already absent (False). Other
+        # errors (PermissionError, IsADirectoryError) still propagate.
+        try:
+            path.unlink()
+        except FileNotFoundError:
             logger.debug("TicketStore.delete: %s not found — no-op", ticket_id)
             return False
-        path.unlink()
         logger.debug("TicketStore.delete: removed %s", ticket_id)
         return True
 
@@ -529,7 +567,14 @@ class TicketStore:
         self._dir.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
-    def _read(path: Path) -> dict:
+    def _read(path: Path) -> Any:
+        # B10: this is json.loads, so it returns whatever the file holds. The
+        # class only ever WRITES an object, but a hand-edited file, a restored
+        # backup or an older format can leave a list, a scalar or null behind.
+        # Any, not "dict | list": narrowing to two container types would still
+        # be a lie about the other three. Every caller (get(), list_all(),
+        # update()) already isinstance-checks the result; the annotation was
+        # the only thing claiming they did not have to.
         return json.loads(path.read_text(encoding="utf-8"))
 
     @staticmethod

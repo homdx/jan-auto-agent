@@ -52,6 +52,7 @@ from pathlib import Path
 from typing import Callable
 
 from tools.auto.utils import chars_per_token
+from tools.config_safe import safe_getint
 
 logger = logging.getLogger(__name__)
 
@@ -459,13 +460,13 @@ def make_canon_validator(
     build_validators` passes a resolved value, via ``[validator_agent]
     canon_llm_profile``.
     """
-    every = config.getint("auto", "canon_check_every", fallback=3)
+    every = safe_getint(config, "auto", "canon_check_every", fallback=3)
     if every <= 0:
         logger.info("CanonValidator: disabled (canon_check_every <= 0).")
         return None
 
-    max_rev = config.getint("auto", "max_canon_revisions", fallback=1)
-    max_claims = config.getint("auto", "canon_max_claims", fallback=12)
+    max_rev = safe_getint(config, "auto", "max_canon_revisions", fallback=1)
+    max_claims = safe_getint(config, "auto", "canon_max_claims", fallback=12)
 
     from tools.auto.utils import _cfg_mode
     from tools.auto.summary_memory import _make_llm_call

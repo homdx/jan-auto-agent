@@ -29,6 +29,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from typing import Callable
+from tools.config_safe import safe_getboolean, safe_getint
 
 logger = logging.getLogger(__name__)
 
@@ -203,12 +204,12 @@ def make_fact_validator(
     :func:`tools.auto.inner_loop.make_inner_loop` can remain a no-op with a
     simple ``if fact_validator is not None`` guard.
     """
-    enabled = config.getboolean("validator_agent", "fact_check_creative", fallback=False)
+    enabled = safe_getboolean(config, "validator_agent", "fact_check_creative", fallback=False)
     if not enabled:
         logger.debug("FactValidator: disabled (fact_check_creative not set).")
         return None
 
-    max_rev = config.getint("validator_agent", "max_fact_revisions", fallback=1)
+    max_rev = safe_getint(config, "validator_agent", "max_fact_revisions", fallback=1)
 
     try:
         from tools.auto.summary_memory import _make_llm_call  # noqa: PLC0415

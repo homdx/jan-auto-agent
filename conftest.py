@@ -31,6 +31,47 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 
+# ── 1b. Cache scan_repo(REPO_ROOT) across the test session ─────────────────────
+#
+# ~30 tests across tests/test_collect_*.py call scan_repo(REPO_ROOT) (this
+# repo's own source tree) with no config= override, each re-walking and
+# re-parsing every file from scratch -- 2-8s per call, ~100s+ of the
+# suite's wall time in aggregate. That specific call is safe to cache:
+# this checked-out repo doesn't change mid-run, and scan_repo has no side
+# effects (ModuleRecord is a frozen dataclass of tuples; verified no test
+# or library call in this suite mutates the returned list in place).
+#
+# The cache is scoped tightly on purpose -- a blanket
+# functools.lru_cache(scan_repo) was tried and reverted, because it broke
+# two other things: (1) ConfigParser isn't hashable, so any call passing
+# config=<a real ConfigParser> (e.g. tools/collect/loader.py's staleness
+# path) raised TypeError; (2) several tests scan a tmp_path repo, mutate
+# a file, and scan the *same* tmp_path again expecting the change to show
+# up -- caching that call would silently return stale results and defeat
+# the test. So this only ever caches root == this repo's own ROOT with
+# config is None; every other call (tmp_path roots, explicit configs)
+# goes straight to the real, uncached scan_repo, unchanged.
+#
+# Only this test session's imported reference is wrapped -- the on-disk
+# tools/collect/scanner.py is untouched, so `collect` CLI runs are unaffected.
+from tools.collect import scanner as _scanner
+
+_real_scan_repo = _scanner.scan_repo
+_repo_scan_cache: dict = {}
+
+
+def _cached_scan_repo(root, *, config=None):
+    resolved = Path(root).resolve()
+    if config is not None or resolved != ROOT:
+        return _real_scan_repo(root, config=config)
+    if resolved not in _repo_scan_cache:
+        _repo_scan_cache[resolved] = _real_scan_repo(root, config=config)
+    return _repo_scan_cache[resolved]
+
+
+_scanner.scan_repo = _cached_scan_repo
+
+
 # ── 2a. Custom collector ───────────────────────────────────────────────────────
 
 def _is_script_test(p: Path) -> bool:
@@ -91,8 +132,18 @@ class ScriptTestItem(pytest.Item):
                 timeout=300,
             )
         except subprocess.TimeoutExpired as exc:
-            self._stdout = exc.stdout or ""
-            self._stderr = (exc.stderr or "") + "\n[TIMEOUT] script exceeded 300s"
+            # BUGFIX: with text=True, TimeoutExpired.stdout/stderr are
+            # documented as str — but can still be None (no output captured
+            # before the kill) or, on Python builds older than 3.7.10, bytes
+            # on a partial-read boundary. Decode defensively so a slow
+            # script is reported as a clean timeout instead of crashing the
+            # whole pytest run with an uncaught TypeError (str + bytes).
+            def _as_text(b):
+                if isinstance(b, (bytes, bytearray)):
+                    return b.decode("utf-8", "replace")
+                return b or ""
+            self._stdout = _as_text(exc.stdout)
+            self._stderr = _as_text(exc.stderr) + "\n[TIMEOUT] script exceeded 300s"
             self._returncode = -1
             raise ScriptTestFailed(-1, self._stdout, self._stderr) from exc
 

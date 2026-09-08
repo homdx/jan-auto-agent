@@ -126,3 +126,72 @@ class TestGate1ForwardsFlagToBuildChatRequest:
             response_format=filt._response_format,
         )
         assert "response_format" not in payload
+
+
+# ── Regression: unguarded config reads crash on malformed values ──────────────
+#
+# Gate1Filter.__init__ wraps most config reads in try/except ValueError, but
+# three were left unguarded:
+#   * [api_{active}] num_ctx (getint)          — ValueError on non-numeric
+#   * [api] response_format (getboolean)      — ValueError on non-boolean
+#   * [api] think_effort_enabled (getboolean)  — ValueError on non-boolean
+# Each must fall back to its default instead of crashing Gate1Filter.__init__.
+
+
+class TestGate1MalformedConfigDefaults:
+    """Malformed config values must fall back to defaults, not crash."""
+
+    @staticmethod
+    def _base_cfg(**api_overrides) -> configparser.ConfigParser:
+        api_section = {"active": "local", "verify_ssl": "false"}
+        api_section.update(api_overrides)
+        cfg = configparser.ConfigParser()
+        cfg.read_dict({
+            "api":       api_section,
+            "api_local": {
+                "base_url":   "http://localhost:1337/v1",
+                "api_key":    "test",
+                "model":      "test-model",
+                "api_format": "openai",
+            },
+            "gate1": {"temperature": "0.0", "max_tokens": "64", "skip_llm": "false"},
+            "loop":  {"timeout_seconds": "10"},
+        })
+        return cfg
+
+    def test_malformed_num_ctx_falls_back_to_zero(self):
+        cfg = self._base_cfg()
+        cfg.set("api_local", "num_ctx", "not-a-number")
+        filt = Gate1Filter(
+            config=cfg, base_url="http://localhost:1337/v1",
+            api_key="test", model="test-model", api_format="openai", verify_ssl=False,
+        )
+        assert filt._num_ctx == 0
+
+    def test_malformed_response_format_falls_back_to_false(self):
+        cfg = self._base_cfg(response_format="not-a-bool")
+        filt = Gate1Filter(
+            config=cfg, base_url="http://localhost:1337/v1",
+            api_key="test", model="test-model", api_format="openai", verify_ssl=False,
+        )
+        assert filt._response_format is False
+
+    def test_malformed_think_effort_enabled_falls_back_to_none(self):
+        cfg = self._base_cfg(
+            think_effort_enabled="maybe",
+            think_effort="medium",
+        )
+        filt = Gate1Filter(
+            config=cfg, base_url="http://localhost:1337/v1",
+            api_key="test", model="test-model", api_format="openai", verify_ssl=False,
+        )
+        assert filt._think_effort is None
+
+    def test_malformed_gate1_think_falls_back_to_false(self):
+        cfg = self._base_cfg()
+        cfg.set("gate1", "think", "not-a-bool")
+        filt = Gate1Filter(
+            config=cfg, base_url="http://localhost:1337/v1",
+            api_key="test", model="test-model", api_format="openai", verify_ssl=False,
+        )
+        assert filt._think is False

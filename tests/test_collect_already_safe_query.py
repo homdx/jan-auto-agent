@@ -1,6 +1,6 @@
 """tests/test_collect_already_safe_query.py — COLLECT-11.
 
-* A query for `prompt_store.py:90` (a real, GUARDED `stack[-1]` access,
+* A query for `prompt_store.py:91` (a real, GUARDED `stack[-1]` access,
   per COLLECT-7's own reference case) answers "safe: guarded".
 * A query for a fabricated UNGUARDED location answers "not safe".
 * A registered fail-open except site answers "safe: fail_open".
@@ -59,7 +59,7 @@ def _real_repo_index():
 
 def test_guarded_prompt_store_access_is_safe():
     index = _real_repo_index()
-    answer = index.query("tools/prompt_store.py:90")
+    answer = index.query("tools/prompt_store.py:91")
 
     assert isinstance(answer, SafetyAnswer)
     assert answer.safe is True

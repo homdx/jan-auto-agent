@@ -27,6 +27,10 @@ batch costs, and whether the caps hold.
   AC-P1-11  analyze_logs.analyze() counts them and render_summary prints them.
   AC-P1-12  AUTO-P3 lint fires on probe_enabled without collect, and on a
             4k-sized num_ctx, and stays silent on a healthy config.
+  AC-F1F-1  analyze_logs renders memo hits, budget escalations, and splits
+            "repeat" declines into out-of-batch vs. genuine re-asks — added
+            after a measured run (trace_8c83140453d5) showed 13/13 "repeat"
+            declines were the model re-asking something it already had.
 
 All LLM calls are patched; no network and no real sleep I/O occurs.
 """
@@ -443,6 +447,79 @@ class TestObservability:
         ]
         analyze_logs.render_run_summary(analyze_logs.analyze(events)["r1"])
         assert "Architect probes" not in capsys.readouterr().out
+
+    def test_memo_and_escalation_rendered(self, capsys) -> None:
+        """AC-F1F-1: memo savings and the AUTO-P8/P9/P13 escalation ladder
+        must be readable from render_run_summary — previously invisible
+        here, only recoverable by hand-parsing the raw JSONL."""
+        import analyze_logs
+
+        events = [
+            {"run_id": "r1", "kind": "run_start", "ts": "2026-01-01T00:00:00Z",
+             "source": "controller", "target": "auto", "params": {"goal": "g"}},
+            {"run_id": "r1", "kind": "probe_request", "ts": "2026-01-01T00:00:01Z",
+             "source": "architect", "target": "probe", "content": "facts fn",
+             "params": {"cluster": "agents", "ops": 1}},
+            {"run_id": "r1", "kind": "probe_result", "ts": "2026-01-01T00:00:02Z",
+             "source": "probe", "target": "architect", "content": "facts: fn",
+             "params": {"cluster": "agents", "round": 1, "ops": 1,
+                        "hits": 0, "misses": 1, "by_op": "facts=0/1",
+                        "chars_used": 40, "memo_hits": 1}},
+            {"run_id": "r1", "kind": "probe_escalated", "ts": "2026-01-01T00:00:03Z",
+             "source": "architect", "target": "probe",
+             "params": {"cluster": "agents", "step": 1, "new_cap": 1200,
+                        "seeded": True}},
+        ]
+        analyze_logs.render_run_summary(analyze_logs.analyze(events)["r1"])
+        out = capsys.readouterr().out
+        assert "memo: 1 hit(s) served free" in out
+        assert "100% of 1 miss(es)" in out
+        assert "budget escalations: 1 across 1 batch(es)" in out
+        assert "1 on an already-learned cap" in out
+
+    def test_repeat_split_out_of_batch_vs_other(self, capsys) -> None:
+        """AC-F1F-1: a "repeat" decline that follows a successful
+        out-of-batch result is labelled as such — this was 13/13 of the
+        "repeat" declines in a measured run (trace_8c83140453d5), a
+        different failure from re-asking a genuine miss, with a different
+        fix (see arch_probe.py's _out_of_batch_note)."""
+        import analyze_logs
+
+        events = [
+            {"run_id": "r1", "kind": "run_start", "ts": "2026-01-01T00:00:00Z",
+             "source": "controller", "target": "auto", "params": {"goal": "g"}},
+            # Cluster "a": an out-of-batch HIT, then a repeat of it.
+            {"run_id": "r1", "kind": "probe_request", "ts": "2026-01-01T00:00:00.5Z",
+             "source": "architect", "target": "probe", "content": "module x.py",
+             "params": {"cluster": "a", "ops": 1}},
+            {"run_id": "r1", "kind": "probe_result", "ts": "2026-01-01T00:00:01Z",
+             "source": "probe", "target": "architect",
+             "content": "### module x.py\n[NOT IN YOUR BATCH — ...]\nmodule: x.py",
+             "params": {"cluster": "a", "round": 1, "ops": 1,
+                        "hits": 1, "misses": 0, "by_op": "module=1/0",
+                        "chars_used": 30}},
+            {"run_id": "r1", "kind": "probe_declined", "ts": "2026-01-01T00:00:02Z",
+             "source": "architect", "target": "probe", "content": "module x.py",
+             "params": {"cluster": "a", "reason": "repeat", "ops": 1,
+                        "round": 1}},
+            # Cluster "b": a genuine miss, then a repeat of it — NOT
+            # out-of-batch, must not be mislabelled as such.
+            {"run_id": "r1", "kind": "probe_request", "ts": "2026-01-01T00:00:02.5Z",
+             "source": "architect", "target": "probe", "content": "facts zzz",
+             "params": {"cluster": "b", "ops": 1}},
+            {"run_id": "r1", "kind": "probe_result", "ts": "2026-01-01T00:00:03Z",
+             "source": "probe", "target": "architect", "content": "facts: zzz",
+             "params": {"cluster": "b", "round": 1, "ops": 1,
+                        "hits": 0, "misses": 1, "by_op": "facts=0/1",
+                        "chars_used": 20}},
+            {"run_id": "r1", "kind": "probe_declined", "ts": "2026-01-01T00:00:04Z",
+             "source": "architect", "target": "probe", "content": "facts zzz",
+             "params": {"cluster": "b", "reason": "repeat", "ops": 1,
+                        "round": 1}},
+        ]
+        analyze_logs.render_run_summary(analyze_logs.analyze(events)["r1"])
+        out = capsys.readouterr().out
+        assert "2 re-asked an answered probe (1 already had it, out of batch)" in out
 
 
 # ─────────────────────────────────────────────────────────────────────────────

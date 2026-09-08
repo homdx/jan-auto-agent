@@ -5,7 +5,7 @@
 fail-open (silent swallow). This is the killer for the except-classification
 category that accounted for 58% of false positives in the "78 bugs" report
 (per COLLECT-6's description) — so the AC below pins the two real-repo
-reference sites (`coder.py:718`, `coder.py:866`) as well as the four
+reference sites (`coder.py:719`, `coder.py:867`) as well as the four
 synthetic mini-repo cases the spec calls out by name.
 """
 
@@ -55,10 +55,49 @@ def test_except_bare_raise_is_re_raise_not_fail_open():
     assert site.is_fail_open is False
 
 
+def test_except_raise_with_exc_is_not_fail_open():
+    # A `raise SomeException(...)` (with an exception expression, not a bare
+    # re-raise) propagates the exception — it is NOT a silent swallow.
+    # _classify_except_body used to only recognise bare `raise` (exc is None)
+    # as not-fail-open; a `raise ValueError(...)` fell through to "pass" /
+    # is_fail_open=True, which poisoned the FAIL_OPEN_REGISTRY and
+    # AlreadySafeIndex into suppressing real crash-site bug claims at
+    # re-raising except blocks.
+    tree = ast.parse(
+        "def f():\n"
+        "    try:\n"
+        "        risky()\n"
+        "    except Exception:\n"
+        "        raise ValueError('bad')\n",
+        filename="m.py",
+    )
+    sites = extract_except_sites(tree, "m.py")
+    assert sites[0].body_kind == "re-raise"
+    assert sites[0].is_fail_open is False
+
+
+def test_except_raise_with_exc_inside_if_still_not_fail_open():
+    # Same as above but the raise is inside an `if` — control-flow statements
+    # (if/for/while/try) are not a separate scope, so a raise nested in one
+    # must still count.
+    tree = ast.parse(
+        "def f(cond):\n"
+        "    try:\n"
+        "        risky()\n"
+        "    except Exception:\n"
+        "        if cond:\n"
+        "            raise RuntimeError('nope')\n",
+        filename="m.py",
+    )
+    sites = extract_except_sites(tree, "m.py")
+    assert sites[0].body_kind == "re-raise"
+    assert sites[0].is_fail_open is False
+
+
 def test_except_continue_is_not_silent():
     # `except OSError: continue` is control flow, NOT a silent fail-open —
     # this is the exact distinction COLLECT-6's AC calls out for
-    # `coder.py:866`.
+    # `coder.py:867`.
     source = FIXTURE.read_text(encoding="utf-8")
     sites = _sites_by_location(source, "pkg/error_handling.py")
     site = sites["pkg/error_handling.py:41"]
@@ -78,7 +117,12 @@ def test_all_four_mini_repo_sites_found():
 def test_coder_718_pass_is_classified_fail_open():
     source = CODER_PATH.read_text(encoding="utf-8")
     sites = _sites_by_location(source, "tools/auto/coder.py")
-    site = sites["tools/auto/coder.py:797"]  # NOTE: line tracks a bare `except Exception: pass`; update if it shifts
+    # NOTE: was tools/auto/coder.py:834 (_extract_missing_context's bare
+    # `except Exception: pass`), fixed to narrow-and-log — it now correctly
+    # classifies as "log"/not-fail-open, so this AC re-points to another
+    # still-genuine bare `except: <fallback assignment>` site (dup_reject_ratio
+    # config fallback). Update if it shifts.
+    site = sites["tools/auto/coder.py:1028"]
     assert site.body_kind == "pass"
     assert site.is_fail_open is True
 
@@ -86,7 +130,7 @@ def test_coder_718_pass_is_classified_fail_open():
 def test_coder_866_continue_is_not_silent():
     source = CODER_PATH.read_text(encoding="utf-8")
     sites = _sites_by_location(source, "tools/auto/coder.py")
-    site = sites["tools/auto/coder.py:945"]  # NOTE: line tracks a bare `except OSError: continue`; update if it shifts
+    site = sites["tools/auto/coder.py:993"]  # NOTE: line tracks a bare `except OSError: continue`; update if it shifts
     assert site.body_kind == "continue"
     assert site.is_fail_open is False
 

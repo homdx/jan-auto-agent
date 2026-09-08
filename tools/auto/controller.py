@@ -42,6 +42,7 @@ from tools.auto.run_trace import setup_run_trace
 from tools.auto.progress_display import ProgressDisplay, make_progress_display
 from tools.auto.auto_metrics import AutoMetricsStream
 from tools.auto.auto_tuner import AutoTuner, make_auto_tuner
+from tools.config_safe import safe_getboolean
 
 logger = logging.getLogger(__name__)
 
@@ -246,10 +247,10 @@ def _lint_probe_config(config: "configparser.ConfigParser | None") -> list[str]:
     warnings: list[str] = []
     if config is None:
         return warnings
-    if not config.getboolean("architect", "probe_enabled", fallback=False):
+    if not safe_getboolean(config, "architect", "probe_enabled", fallback=False):
         return warnings
 
-    if not config.getboolean("collect", "use_in_auto", fallback=False):
+    if not safe_getboolean(config, "collect", "use_in_auto", fallback=False):
         warnings.append(
             "[architect] probe_enabled = true but [collect] use_in_auto is "
             "false — the probe resolves facts from the collect model, so with "
@@ -398,8 +399,8 @@ class AutoController:
         # time, so silence elsewhere (e.g. no "probe fired" line later,
         # see architect.py AUTO-DEBUG-1) can be read as a real negative
         # rather than "maybe it just wasn't logged".
-        _probe_enabled = self.config.getboolean("architect", "probe_enabled", fallback=False)
-        _use_in_auto = self.config.getboolean("collect", "use_in_auto", fallback=False)
+        _probe_enabled = safe_getboolean(self.config, "architect", "probe_enabled", fallback=False)
+        _use_in_auto = safe_getboolean(self.config, "collect", "use_in_auto", fallback=False)
         logger.info(
             "controller: run flags — task_mode=%s dry_run=%s "
             "[architect] probe_enabled=%s  [collect] use_in_auto=%s",
@@ -675,6 +676,11 @@ class AutoController:
                 _summary_memory = make_summary_memory(
                     cfg, base_dir=self.base_dir, task_mode=task_mode,
                 )
+            except ValueError:
+                # resolve_llm_profile deliberately raises ValueError for a
+                # misconfigured [summary] llm_profile — surface it at
+                # construction time, not silently swallowed.
+                raise
             except Exception as exc:  # noqa: BLE001 — never block commits on setup
                 logger.warning(
                     "controller: could not build SummaryMemory — synopsis "
@@ -791,7 +797,27 @@ class AutoController:
                     self.run_trace.log_task_done(task["id"], commit_hash)
 
                 # ── AUTO-G5: post-commit regression check ──────────────────
-                self._check_regressions(task["id"], executor, bug_fix_loop)
+                # BUGFIX (check-regressions-guard): this call used to be
+                # bare. _check_regressions() is fail-open internally (see
+                # the guards inside the method), but anything that can run
+                # before its own try/except -- e.g. self.state.all_tasks()
+                # -- was still able to raise and escape here uncaught. The
+                # task that was just committed is already fully accounted
+                # for, so losing the rest of this post-commit step must
+                # never cost the tasks still pending in plan.json.
+                try:
+                    self._check_regressions(task["id"], executor, bug_fix_loop)
+                except Exception as exc:  # noqa: BLE001 — never abort the run
+                    logger.warning(
+                        "_check_regressions raised after commit of %s — %s; "
+                        "continuing with remaining tasks.",
+                        task["id"], exc,
+                    )
+                    self.state.log(
+                        f"regression checks failed after commit of "
+                        f"{task['id']} ({type(exc).__name__}: {exc}) — "
+                        f"continuing with remaining tasks"
+                    )
 
             else:
                 # ── AUTO-G4: exhaustion → knowledge note + ticket ──────────
@@ -801,12 +827,7 @@ class AutoController:
                 # commit() stages everything (git add -u/.), which would sweep
                 # it into the next successful task's commit. Discard the
                 # uncommitted residue now (no-op when git is disabled).
-                if self.git is not None:
-                    self.git.discard_working_changes()
-                    self.state.log(
-                        f"task {task['id']} uncommitted edits discarded "
-                        f"(exhausted, not committed)"
-                    )
+                self._discard_exhausted_residue(task["id"])
                 self.state.log(
                     f"task {task['id']} exhausted — "
                     f"rounds={result.rounds_used} "
@@ -861,6 +882,53 @@ class AutoController:
                     )
 
         return None, tasks_done  # all tasks done / no tasks
+
+    def _discard_exhausted_residue(self, task_id: str) -> None:
+        """Discard the uncommitted edits left behind by an exhausted task.
+
+        The coder writes its candidate into base_dir before validation, so an
+        exhausted task leaves that edit dirty -- and commit() stages
+        everything (git add -u/.), which would sweep it into the next
+        successful task's commit. No-op when git is disabled.
+
+        B9: this call used to be unguarded.
+        ``discard_working_changes()`` goes through ``GitManager._run()``,
+        which raises ``GitError`` on a timeout (a stale index.lock, a hung
+        hook), a missing git binary, or a non-zero ``git reset --hard``. That
+        one cleanup failure aborted the entire multi-task run at the worst
+        possible moment: the task had already been fully accounted for
+        (exhaustion note, ticket, BLOCKED status), so every task still
+        pending in plan.json was dropped with it.
+
+        Worst case if the discard fails is that the residue is swept into the
+        next commit -- bad, but recoverable, and strictly better than losing
+        the run. ``GitError`` is caught specifically rather than ``Exception``
+        so a real bug on this path still surfaces.
+
+        The failure is written to ``state.log`` as well as ``logger``: the
+        run log is what gets read during a postmortem, and ``logger`` may be
+        configured to a level that drops the warning entirely.
+        """
+        if self.git is None:
+            return
+        try:
+            self.git.discard_working_changes()
+        except GitError as exc:
+            logger.warning(
+                "task %s: could not discard uncommitted edits after "
+                "exhaustion — continuing (residue may be swept into the next "
+                "commit): %s", task_id, exc,
+            )
+            self.state.log(
+                f"task {task_id} uncommitted edits NOT discarded "
+                f"(git discard failed: {exc}) — residue may be swept into "
+                f"the next commit"
+            )
+            return
+        self.state.log(
+            f"task {task_id} uncommitted edits discarded "
+            f"(exhausted, not committed)"
+        )
 
     def _check_regressions(
         self,
@@ -942,7 +1010,28 @@ class AutoController:
                     f"(after commit of {just_committed_id})"
                 )
                 break
-            exec_result = executor.run(done_task)
+
+            # BUGFIX (check-regressions-guard): executor.run() shells out to
+            # re-run a previously-recorded acceptance check, and can raise
+            # OSError (a vanished workspace), a timeout, or GitError. Guard
+            # per done_task rather than around the whole loop, so one flaky
+            # check does not skip the regression check for every other
+            # already-DONE task in this same batch.
+            try:
+                exec_result = executor.run(done_task)
+            except Exception as exc:  # noqa: BLE001 — fail-open, keep checking siblings
+                logger.warning(
+                    "_check_regressions: check for %s raised — %s; "
+                    "continuing with remaining done task(s).",
+                    done_task["id"], exc,
+                )
+                self.state.log(
+                    f"regression check for {done_task['id']} after commit "
+                    f"of {just_committed_id} failed "
+                    f"({type(exc).__name__}: {exc}) — continuing"
+                )
+                continue
+
             if not exec_result.passed:
                 logger.warning(
                     "_check_regressions: task %s regressed (rc=%s) — "
@@ -954,9 +1043,28 @@ class AutoController:
                     f"after commit of {just_committed_id} "
                     f"(rc={exec_result.exit_code})"
                 )
-                bfl_result = bug_fix_loop.handle_regression(
-                    done_task, exec_result, self.base_dir
-                )
+                # BUGFIX (check-regressions-guard): handle_regression() drives
+                # a full BugFixLoop (git + executor + LLM subprocesses) and
+                # can raise for the same reasons as executor.run() above.
+                # Guarded separately so the failure is attributed to the
+                # right stage and the loop still moves on to the next
+                # done_task instead of aborting the whole regression pass.
+                try:
+                    bfl_result = bug_fix_loop.handle_regression(
+                        done_task, exec_result, self.base_dir
+                    )
+                except Exception as exc:  # noqa: BLE001 — fail-open, keep checking siblings
+                    logger.warning(
+                        "_check_regressions: bug fix loop for %s raised — "
+                        "%s; continuing with remaining done task(s).",
+                        done_task["id"], exc,
+                    )
+                    self.state.log(
+                        f"bug fix loop for {done_task['id']} after commit "
+                        f"of {just_committed_id} failed "
+                        f"({type(exc).__name__}: {exc}) — continuing"
+                    )
+                    continue
                 self.state.log(
                     f"bug fix loop: {bfl_result.summary()}"
                 )
@@ -1033,6 +1141,16 @@ class AutoController:
         the configured cap — and leaves those tasks BLOCKED so the status
         honestly reflects reality. Only genuinely-resettable tasks (case 1,
         or anything that hasn't used up its rounds) are reset.
+
+        The same reset also unlinks the task's ``deadline_started_at.txt``.
+        Bugfix: it used to clear only the STATUS half of "give this task a
+        fresh start", so on resume OuterLoop re-read the persisted start time,
+        the elapsed wall-clock time already exceeded the budget, the remaining
+        budget was 0, and the task was re-blocked immediately — the reset was
+        structurally incapable of granting the attempt it exists to grant, and
+        every resume burned a cycle and re-parked the task. The unlink is
+        scoped to the task that was actually reset: tasks left BLOCKED keep
+        their deadline files untouched.
         """
         from tools.auto.bug_fix_loop import _FIX_PREFIX
 
@@ -1072,6 +1190,20 @@ class AutoController:
             if highest_completed_round(self.state.task_dir(task["id"])) >= max_rounds_cfg:
                 continue  # round-exhausted — resetting would not help
             self.state.set_task_status(task["id"], STATUS_TODO)
+            # Give the retry a full fresh wall-clock budget, not the leftover
+            # one from the blocked attempt. Without this the reset is a no-op
+            # in disguise: OuterLoop.run_task reads this file back on resume
+            # and computes _remaining = max(_mts - elapsed, 0), which is 0 for
+            # a task that was already parked, so it stops before round 1 and
+            # sets the status straight back to BLOCKED.
+            try:
+                self.state.clear_task_deadline(task["id"])
+            except OSError as exc:
+                logger.warning(
+                    "controller: could not clear the deadline start time for "
+                    "%s — the reset attempt may inherit a stale wall-clock "
+                    "budget: %s", task["id"], exc,
+                )
 
     def _setup_git(self) -> None:
         """AUTO-A3: ensure the base dir is a git repo and apply agent identity.
@@ -1146,7 +1278,7 @@ class AutoController:
         `agents.ini`'s own documented default (turning collect on never
         changes behaviour until this flag is also explicitly set)."""
         key = "use_in_doc" if self.task_mode == "docs" else "use_in_auto"
-        return self.config.getboolean("collect", key, fallback=False)
+        return safe_getboolean(self.config, "collect", key, fallback=False)
 
     def _get_collect_bridge(self, task_mode: str):
         """COLLECT-24: lazily build (and cache for the lifetime of this

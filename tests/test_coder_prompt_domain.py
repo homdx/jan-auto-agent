@@ -48,6 +48,16 @@ def test_creative_mode_uses_editor_persona():
     assert "Return ONLY the chapter prose" in _coder("creative")._system
 
 
+def test_dependency_and_convention_rules_present():
+    # Rules 10/11 ride on the shared contract, so they must reach code and docs
+    # modes; creative is prose-native and deliberately carries neither.
+    for mode in ("code", "docs"):
+        s = _coder(mode)._system
+        assert "third-party dependency" in s, f"rule 10 missing for mode={mode!r}"
+        assert "existing conventions" in s, f"rule 11 missing for mode={mode!r}"
+    assert "third-party dependency" not in _coder("creative")._system
+
+
 def test_json_contract_preserved_across_modes():
     # The JSON contract must survive for code and docs modes.
     # Creative mode deliberately uses a prose-native protocol (AUTO-CR-1) and

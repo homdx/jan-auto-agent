@@ -491,6 +491,12 @@ def make_commit_on_success(
         try:
             from tools.auto.summary_memory import make_summary_memory
             summary_memory = make_summary_memory(config, base_dir=repo_dir, task_mode=task_mode)
+        except ValueError:
+            # resolve_llm_profile deliberately raises ValueError for a
+            # misconfigured [summary] llm_profile — a missing section or
+            # missing base_url/api_key/model. This is an operator error that
+            # must surface at construction time, not be silently swallowed.
+            raise
         except Exception as exc:
             logger.warning(
                 "make_commit_on_success: could not build SummaryMemory: %s — "                "synopsis updates will be skipped.", exc,

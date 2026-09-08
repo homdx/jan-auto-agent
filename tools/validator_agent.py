@@ -12,6 +12,20 @@ from tools.llm_stream import request_completion, strip_think, ollama_chat_url, s
 
 logger = logging.getLogger(__name__)
 
+
+def _safe_stdout_write(t: str) -> None:
+    """Write a streaming token to stdout, swallowing BrokenPipeError.
+
+    When stdout is piped to a command that closes early (e.g. ``head``),
+    ``sys.stdout.write`` raises BrokenPipeError — swallow it so the LLM
+    call result is not lost.
+    """
+    try:
+        sys.stdout.write(t)
+        sys.stdout.flush()
+    except (BrokenPipeError, OSError):
+        pass
+
 # Hardcoded prompt extracted to a named module-level constant — the canonical
 # fallback PromptStore can always return to. Runtime values are injected via
 # .format() in validate(); do not use f-string here.
@@ -174,7 +188,7 @@ class ValidatorAgent:
                 content = request_completion(
                     url, headers, req_payload, self.timeout,
                     stream=True,
-                    on_token=lambda t: (sys.stdout.write(t), sys.stdout.flush()),
+                    on_token=lambda t: _safe_stdout_write(t),
                     api_format=self.api_format,
                     ssl_context=self.ssl_context,
                 )
@@ -187,7 +201,21 @@ class ValidatorAgent:
                                              api_format=self.api_format,
                                              ssl_context=self.ssl_context)
         except urllib.error.HTTPError as e:
-            body = e.read().decode("utf-8", errors="replace")
+            # The error body is a SECOND unguarded read on the same socket, so
+            # the transport problem that produced the HTTPError can raise again
+            # while draining it. Sibling handlers do not nest: an exception
+            # raised inside this block is NOT offered to the `except Exception`
+            # below, so an unguarded e.read() escaped validate() entirely and
+            # the ERROR path was less robust than the success path. Fall back
+            # to a placeholder body and let the HTTPError verdict stand.
+            try:
+                body = e.read().decode("utf-8", errors="replace")
+            except Exception as body_err:
+                logger.warning(
+                    f"ValidatorAgent: could not read the body of HTTP {e.code} "
+                    f"({body_err}) — reporting the status without a body"
+                )
+                body = f"<body unreadable: {type(body_err).__name__}: {body_err}>"
             logger.error(f"ValidatorAgent HTTP {e.code}: {body}")
             # _api_error sentinel lets prompt_evaluator exclude this from scoring.
             _err = {"status": "needs_fix", "feedback": f"HTTP {e.code} from API: {body}", "_api_error": True}

@@ -74,6 +74,13 @@ class MetricsCollector:
             try:
                 with os.fdopen(fd, "w", encoding="utf-8") as f:
                     json.dump(records, f, indent=2)
+                    # BUGFIX: same missing-fsync bug as PromptStore._save —
+                    # without flush+fsync here, a crash between the write and
+                    # os.replace can lose metrics history on an unclean
+                    # shutdown, which the operator sees as metrics silently
+                    # "resetting to zero" with no explanation.
+                    f.flush()
+                    os.fsync(f.fileno())
             except Exception:
                 os.unlink(tmp_path)
                 raise

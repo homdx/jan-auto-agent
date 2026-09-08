@@ -96,10 +96,18 @@ class AutoMetricsStream:
                     f"metrics file at {_INTERACTIVE_DEFAULT.resolve()}. "
                     f"Pass a proper .agent/ directory, not the project root."
                 )
-        except OSError:
+        except OSError as exc:
             # resolve() can fail on non-existent paths on some OSes — safe to
-            # skip; the path-collision check is best-effort anyway.
-            pass
+            # skip; the path-collision check is best-effort anyway. BUGFIX:
+            # this used to swallow the exception entirely, which also hid
+            # the case of a real permission error making the metrics path
+            # unreadable — the operator would end up with a metrics file
+            # that silently collides with the interactive one and no clue
+            # why the collision check didn't catch it.
+            logger.debug(
+                "AutoMetricsStream: could not resolve %s for the "
+                "interactive-path collision check: %s", metrics_path, exc,
+            )
 
         self._lock = threading.Lock()
         self._collector = MetricsCollector(metrics_path=metrics_path)
@@ -129,7 +137,7 @@ class AutoMetricsStream:
         *,
         approved: bool,
         feedback: str,
-        attempts_used: int = 0,
+        attempts_used: int | None = None,
         attempts: int = 0,   # backward-compatible alias — prefer attempts_used
         prompt_store=None,  # Optional[PromptStore]
     ) -> None:
@@ -151,7 +159,10 @@ class AutoMetricsStream:
             for backward compatibility but will be removed in a future release.
         """
         # Support legacy callers that pass attempts= instead of attempts_used=.
-        effective_attempts = attempts_used if attempts_used else attempts
+        # Use ``is not None`` so ``attempts_used=0`` (a valid value meaning
+        # "zero attempts were used") is kept rather than falling through to
+        # the legacy ``attempts`` parameter.
+        effective_attempts = attempts_used if attempts_used is not None else attempts
         try:
             with self._lock:
                 _record_gate2_locked(
@@ -268,8 +279,16 @@ def _record_gate2_locked(
             # Coerce to str so MagicMocks/non-string values don't break JSON
             # serialisation when tests pass a mock prompt_store.
             prompt_version = str(v) if v is not None else "auto"
-        except Exception:
-            pass
+        except Exception as exc:
+            # BUGFIX: was a bare `except Exception: pass` — the metric
+            # record then silently carries "auto" as its prompt_version
+            # whether the run genuinely is on auto mode or the version-label
+            # lookup crashed. Logging here lets an operator debugging a
+            # regression tell those two cases apart (with --verbose).
+            logger.warning(
+                "auto_metrics: get_version_label('validator') failed — "
+                "recording prompt_version='auto': %s", exc,
+            )
 
     record = RunRecord(
         timestamp=datetime.now(timezone.utc).isoformat(),

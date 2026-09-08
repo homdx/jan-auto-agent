@@ -135,7 +135,19 @@ def _falsy_guard_targets(test: ast.expr) -> "Tuple[Set[str], Set[Tuple[str, obje
                 and inner.args
                 and isinstance(inner.args[0], ast.Constant)
             ):
-                pairs.add((inner.func.value.id, inner.args[0].value))
+                # BUGFIX: a truthy default (x.get(k, "non-empty")) means
+                # the guard `not x.get(k, default)` is False when k is
+                # missing (the default is returned), so the guard body
+                # does NOT execute and the code after the if runs with k
+                # absent — x[k] still raises KeyError. Only add the pair
+                # when the default is absent or a falsy constant (None, 0,
+                # False, ""), which makes the guard fire when k is missing.
+                # A non-constant default (x.get(k, func())) can't be
+                # evaluated statically, so we conservatively skip it.
+                if len(inner.args) < 2:
+                    pairs.add((inner.func.value.id, inner.args[0].value))
+                elif isinstance(inner.args[1], ast.Constant) and not inner.args[1].value:
+                    pairs.add((inner.func.value.id, inner.args[0].value))
             return
         if isinstance(node, ast.Compare) and len(node.ops) == 1:
             op = node.ops[0]

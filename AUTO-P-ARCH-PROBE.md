@@ -415,6 +415,170 @@ the shared ceiling is not in Phase 0.
 
 ---
 
+## 5a. The facts epic (AUTO-F) — built on `pullv3`
+
+Separate epic doc (`AUTO-F: raise the facts hit rate from 43%`), depends on
+AUTO-P11 (`0d8e188`, merged). Where §5 above got the probe loop running at
+all, this epic is about one op inside it: a measured run (run 13) put the
+`facts` hit rate at 43% (60/140) against 95%+ for `module` and `read`, and
+falling as the epic progressed. Full background, the run-13 trace, and the
+class A/B/C miss breakdown live in the epic doc, not repeated here — this
+section documents what actually shipped: **AUTO-F1 and AUTO-F4/F4a/F4b.**
+AUTO-F2 ("did you mean") and AUTO-F3 (resolver call) are still proposed
+only; see the note at the end of this section.
+
+---
+
+#### AUTO-F1 — run-level miss memo
+
+| | |
+|---|---|
+| **Modified** | `tools/auto/arch_probe.py`, `tools/auto/architect.py`, `agents.ini` |
+| **Size** | 300 insertions across 5 files |
+
+`ArchProbe` remembers every `(op, arg)` that missed during the run. A
+repeated miss is answered from the memo — **no bridge lookup** — with an
+escalating message:
+
+```
+(not found — already looked up 12 times this run, still absent.
+`retry` is not a symbol in this repository. If you mean a file, use
+`module <path>`; if you mean a concept, name a real function.)
+```
+
+Scoped to the run; `reset()` deliberately does **not** clear it — that is
+the entire point (the collect artifact is immutable for the run, so a name
+dead at batch 3 cannot resolve at batch 40). A memo hit still counts as a
+miss in `by_op`, never a hit, so it cannot flatter the metric it is meant
+to fix.
+
+**Tests — `tests/test_auto_f1_miss_memo.py` (176 LOC):**
+
+| AC | Assertion |
+|---|---|
+| AC-F1-1 | Repeated miss on the same `(op, arg)` performs no bridge lookup |
+| AC-F1-2 | The message names the repetition count |
+| AC-F1-3 | Memo is per-run: a fresh `ArchProbe` starts empty |
+| AC-F1-4 | `reset()` does **not** clear the memo |
+| AC-F1-5 | Memo hits count as misses in `by_op`, never as hits |
+| AC-F1-6 | A `probe_memo_hit` counter reaches the trace |
+| AC-F1-7 | A hit is never memoised — only misses |
+| AC-F1-8 | Bounded at `probe_memo_max_entries` (default 200), oldest-first eviction |
+
+**Measured/expected effect:** ~45 fewer wasted lookups on run 13's numbers;
+43% → ~63% hit rate from this ticket alone, no extra LLM call.
+
+---
+
+#### AUTO-F4 — teach the `module → facts` sequence, and measure it
+
+| | |
+|---|---|
+| **Modified** | `tools/auto/arch_probe.py`, `tools/auto/architect.py`, `analyze_logs.py` |
+| **Size** | 582 insertions across 5 files |
+
+`PROBE_INSTRUCTIONS` forbade guessing but never said what to do instead.
+Added:
+
+```
+If you do not KNOW a symbol's exact name, do not guess it. Ask
+`module <path>` first — it lists every top-level name in that file
+with its line number — then ask `facts` for one of the names it
+returned.
+```
+
+Because instructions in this codebase have already been shown to get
+ignored — that is the reason AUTO-F1 exists — this ships with its own
+adherence metric instead of assuming the sentence works: a `facts` ask is
+**informed** when its name appeared in a `module` result earlier in the
+same batch, **blind** otherwise. No behaviour change — a blind ask still
+runs exactly as before; this ticket measures, it does not restrict.
+
+Mechanically: `ArchProbe._learn_module_names()` scans a `module` hit's
+result for `  name(...)` lines and adds each to `_informed_symbols` for
+the batch (wiped on `reset()`). A `facts` ask is classified against that
+set **before** its own lookup runs — memo hit, bridge hit, or miss all
+still happen exactly as before. `probe_result` carries `informed_facts` /
+`blind_facts` as `"hits/asks"` strings; `analyze_logs.py` keeps the latest
+(cumulative) pair per cluster and sums across the run, printed once per
+run only when `facts` was ever asked.
+
+**Tests — `tests/test_auto_f4_informed_facts.py` (380 LOC):**
+
+| AC | Assertion |
+|---|---|
+| AC-F4-1 | Instructions state the sequence, not only the prohibition |
+| AC-F4-2 | `probe_result` carries `informed_facts` / `blind_facts` |
+| AC-F4-3 | `analyze_logs` reports the split whenever `facts` was asked |
+| AC-F4-4 | Hit rate reported separately for informed vs. blind |
+| AC-F4-5 | No behaviour change — a blind `facts` still runs |
+
+Plus one regression case not in the original epic doc, added during
+implementation: a name that exists in a `module` result but is truncated
+out of the digest by the per-op char cap (`ArchProbe._cap`) must **not**
+be learned — `_learn_module_names` reads the capped text `_format_block`
+actually sends onward, not the raw bridge response.
+
+---
+
+#### AUTO-F4a / AUTO-F4b — the split misses declined rounds
+
+| | |
+|---|---|
+| **Modified** | `tools/auto/architect.py`, `analyze_logs.py` |
+| **Size** | F4a: 379 insertions / 4 files. F4b: 115 insertions, 36 deletions / 2 files |
+
+AUTO-F4 put `informed_facts`/`blind_facts` on `probe_result`. It missed the
+hole AUTO-P6 (`4520393`) already had to close once for the general `by_op`
+tally: an all-miss round emits **no** `probe_result` — it emits
+`probe_declined` instead (AUTO-P4b). Any `facts` asks inside such a round
+were tallied in memory but never reached an event, so the reported split
+silently under-counted.
+
+F4a's first cut copied `_decline_by_op`'s shape — `"0/0"` for every decline
+reason except `unresolved`. That is correct for `by_op` (a **per-round**
+delta that analyze_logs sums), but wrong here: `informed_facts`/
+`blind_facts` is a **cumulative-per-batch snapshot**, and analyze_logs
+keeps only the *last* value per cluster, not a sum. A hardcoded `"0/0"` on
+a trailing `repeat` or other non-`unresolved` decline didn't just fail to
+add anything — it **overwrote and erased** whatever real counts earlier
+rounds in the same batch had already established, whenever that decline
+happened to be the last event recorded for its cluster.
+
+A live run (`trace_47f94038c230`) hit this: two batches' facts data — one
+of them 1 informed hit plus 3 blind misses — vanished behind a trailing
+`repeat` decline, undercounting that run's `facts` denominator by 5 and its
+hit count by 2. **F4b** fixed it: always read the live cumulative counters
+regardless of decline reason; `"0/0"` only when `_probe` itself is `None`
+(`no_executor` — nothing was ever built to have state).
+
+**Tests — `tests/test_auto_f4a_declined_facts_seq.py`:**
+
+| AC | Assertion |
+|---|---|
+| AC-F4a-1 | An `unresolved` decline with a blind miss carries a real `blind_facts` count |
+| AC-F4a-2 | An `unresolved` decline with an informed-but-missed ask carries a real `informed_facts` count |
+| AC-F4a-3 | **Every** decline reason with a live `_probe` reports its true cumulative split — including `round_cap` and `repeat`, which must not erase real prior data. Only `no_executor` genuinely has nothing |
+| AC-F4a-4 | `analyze_logs` includes a declined round's contribution in the rendered split |
+| AC-F4a-5 | A pre-AUTO-F4a trace (no `informed_facts`/`blind_facts` on `probe_declined`) still renders without crashing |
+| AC-F4a-6 | Totals sum correctly across clusters when one ends in a decline and another in an ordinary result |
+
+---
+
+#### Not built: AUTO-F2, AUTO-F3
+
+The epic doc also proposes a `difflib` "did you mean" suggestion on a
+near-miss (**AUTO-F2**, config `probe_suggest_threshold` / `probe_suggest_max`)
+and a small, bounded resolver LLM call as a last resort (**AUTO-F3**, config
+`probe_resolver_enabled` / `probe_resolver_max_per_batch` /
+`probe_resolver_candidates`). Neither has landed on any branch as of this
+writing — `grep -r "probe_suggest\|probe_resolver"` across the tree returns
+nothing. The epic's own rollout order has F4 landing *before* F3
+deliberately ("its numbers decide whether F3 is worth turning on"); F2 has
+no such dependency and simply appears not yet started.
+
+---
+
 ## 6. Config reference
 
 ```ini
@@ -436,6 +600,11 @@ probe_max_chars       = 2000
 probe_max_total_chars = 6000
 # Comma-separated. Phase 0 supports "facts" only.
 probe_allowed_ops     = facts
+# AUTO-F1: run-level memo of every (op, arg) that missed. A repeated miss is
+# answered from the memo — no bridge lookup — with a digest line naming how
+# many times it has already been asked. Bounded, oldest-first eviction;
+# never cleared between batches within a run (only a fresh run starts empty).
+probe_memo_max_entries = 200
 ```
 
 ---

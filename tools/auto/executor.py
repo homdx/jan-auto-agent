@@ -68,12 +68,21 @@ logger = logging.getLogger(__name__)
 
 # Environment variables that could give a subprocess network access that we
 # want to suppress.  We clear these rather than block at the OS level.
-_PROXY_VARS = (
+#
+# BUGFIX: no_proxy/NO_PROXY are NOT proxy servers — they are bypass lists
+# (e.g. "localhost,.internal") telling an HTTP client which hosts to reach
+# DIRECTLY, without a proxy. Clearing them alongside the actual proxy vars
+# had the opposite of the intended effect: on a host that relies on
+# no_proxy to keep intranet/local traffic off the proxy, removing it made
+# every subprocess spawned by the executor (pytest, linters, scripts) route
+# local-domain requests through a real proxy (or fail/slow down) instead of
+# going direct. Only the actual proxy-server vars are cleared; no_proxy is
+# left untouched.
+_PROXY_SERVER_VARS = (
     "http_proxy", "HTTP_PROXY",
     "https_proxy", "HTTPS_PROXY",
     "ftp_proxy",  "FTP_PROXY",
     "all_proxy",  "ALL_PROXY",
-    "no_proxy",   "NO_PROXY",
 )
 
 # Maximum number of characters captured from stdout / stderr before truncation.
@@ -278,7 +287,10 @@ class Executor:
             logger.info("executor run: task=%s no-op acceptance (%r) → fail", task_id, command)
             return ExecutionResult(exit_code=1, command=command, task_id=task_id)
 
-        logger.info("executor run: task=%s cmd=%r cwd=%s", task_id, command, workspace)
+        logger.info(
+            "executor run: task=%s cmd=%r cwd=%s",
+            task_id, _redact_command(command), workspace,
+        )
 
         # Execute.
         result = self._execute(command, cwd=workspace, task_id=task_id)
@@ -525,6 +537,21 @@ class Executor:
     )
 
     @staticmethod
+    def _dequote(command: str) -> str:
+        r"""Strip shell quoting/escaping characters from *command*.
+
+        A word-boundary scan is trivially evaded by quoting a token's own
+        characters — ``r"m"``, ``cu''rl``, ``su\do`` — which breaks the
+        ``\b…\b`` match without changing what the shell ultimately executes.
+        The architect's acceptance_check is derived from repo file contents it
+        was shown, so an obfuscated command is reachable by injection, not only
+        by hallucination. Removing the quoting/escaping characters the shell
+        itself would strip defeats the cheap obfuscations; it is still
+        best-effort, not a shell parser (``$(echo rm)`` is not covered).
+        """
+        return command.translate(str.maketrans("", "", "\"'`\\"))
+
+    @staticmethod
     def _check_command_safety(command: str) -> tuple[bool, str]:
         """Return *(safe, reason)* — ``safe=False`` blocks execution.
 
@@ -535,6 +562,8 @@ class Executor:
         """
         import re as _re
         lower = command.lower()
+        # Scan the de-quoted form too so quoted-obfuscated tokens still match.
+        dequoted = Executor._dequote(lower)
         for pattern in Executor._BLOCKED_COMMAND_PATTERNS:
             token = pattern.strip().lower()
             if token.isalpha():
@@ -543,9 +572,12 @@ class Executor:
                 # — 'rm ' matched 'terrafo[rm ]', 'nc ' matched 'rsy[nc ]',
                 # 'rm ' matched 'confi[rm ]'.  Python \b treats '_' as a word
                 # char, so identifier-style checks stay safe too.
-                if _re.search(r"\b" + _re.escape(token) + r"\b", lower):
+                if (
+                    _re.search(r"\b" + _re.escape(token) + r"\b", lower)
+                    or _re.search(r"\b" + _re.escape(token) + r"\b", dequoted)
+                ):
                     return False, f"blocked pattern {pattern!r} in acceptance_check"
-            elif pattern in lower:
+            elif pattern in lower or pattern in dequoted:
                 # Non-word tokens (shell metachars: '> /', '>/', fork bomb) have
                 # no word boundary to anchor on — keep the substring check.
                 return False, f"blocked pattern {pattern!r} in acceptance_check"
@@ -604,6 +636,24 @@ class Executor:
 
         py_files = [f for f in target_files if f.endswith(".py")]
         if len(py_files) == 1:
+            # SECURITY: unlike the acceptance_check branch above, this fallback
+            # builds a command straight from an unvalidated target_files entry.
+            # _prepare_workspace refuses to *copy* an escaping path (see its
+            # resolve()/relative_to() guard), but the command still runs with
+            # cwd=workspace, so an absolute or "../.." entry would execute a
+            # file outside the workspace — the unmodified base_dir original at
+            # best (defeating "run the Coder's version"), an arbitrary host
+            # file at worst. Fail closed, exactly like a blocked
+            # acceptance_check does above.
+            try:
+                (workspace / py_files[0]).resolve().relative_to(workspace.resolve())
+            except ValueError:
+                logger.error(
+                    "_resolve_command: [SAFETY] %r escapes the workspace — "
+                    "failing the check rather than running a file outside it",
+                    py_files[0],
+                )
+                return "false"
             # AUTO-FIX: this f-string goes straight into
             # subprocess.run(shell=True); an unquoted space in _python_bin
             # ("/Users/Jane Doe/.venv/bin/python") or in the file name was
@@ -758,6 +808,11 @@ class Executor:
         # expecting one behavior into getting the other with no warning. The
         # explicit form below makes the intent unmistakable.
         timeout = self._timeout_sec if self._timeout_sec > 0 else None
+        # BUGFIX: computed once and reused for every branch below — see
+        # _redact_command's docstring. The real, un-redacted `command` is
+        # still what's actually executed just below; only what gets stored
+        # on ExecutionResult and logged is redacted.
+        _logged_command = _redact_command(command)
 
         try:
             proc = subprocess.run(
@@ -779,7 +834,7 @@ class Executor:
                 stderr    = stderr,
                 timed_out = False,
                 traceback = _extract_traceback(stderr),
-                command   = command,
+                command   = _logged_command,
                 task_id   = task_id,
             )
 
@@ -797,7 +852,7 @@ class Executor:
             )
             logger.warning(
                 "_execute: TIMEOUT task=%s cmd=%r timeout=%.1fs",
-                task_id, command, self._timeout_sec,
+                task_id, _logged_command, self._timeout_sec,
             )
             return ExecutionResult(
                 exit_code = -1,
@@ -805,14 +860,14 @@ class Executor:
                 stderr    = stderr,
                 timed_out = True,
                 traceback = _extract_traceback(stderr),
-                command   = command,
+                command   = _logged_command,
                 task_id   = task_id,
             )
 
         except OSError as exc:
             # Shell not found, permission error, etc.
             logger.error(
-                "_execute: OSError task=%s cmd=%r: %s", task_id, command, exc
+                "_execute: OSError task=%s cmd=%r: %s", task_id, _logged_command, exc
             )
             return ExecutionResult(
                 exit_code = -1,
@@ -820,14 +875,14 @@ class Executor:
                 stderr    = str(exc),
                 timed_out = False,
                 traceback = "",
-                command   = command,
+                command   = _logged_command,
                 task_id   = task_id,
             )
 
     def _build_env(self) -> dict[str, str]:
         """Return a child-process environment with proxy vars cleared."""
         env = os.environ.copy()
-        for var in _PROXY_VARS:
+        for var in _PROXY_SERVER_VARS:
             env.pop(var, None)
         env["PYTHONDONTWRITEBYTECODE"] = "1"
         env["PYTHONUNBUFFERED"] = "1"
@@ -885,6 +940,47 @@ def _truncate(text: str, max_chars: int) -> str:
         return text
     notice = f"\n... [truncated — {len(text) - max_chars} chars omitted]"
     return text[:max_chars] + notice
+
+
+# Matches a likely-secret CLI option (--api-key, --token, etc.) followed by
+# a single-token value, so the value can be redacted while the option name
+# — useful for debugging what the command was doing — stays visible.
+_SECRET_OPT_RE = re.compile(
+    r"(--(?:api[-_]?key|token|secret|password|passwd|pwd|auth|"
+    r"access[-_]?key|client[-_]?secret|private[-_]?key))"
+    r"([=:]\s*|\s+)"
+    r"(\S+)"
+)
+
+# Authorization header values are commonly two words ("Bearer <token>",
+# "Basic <base64>") — matched separately and greedily up to the next quote
+# or shell-flag boundary, since the single-token pattern above would redact
+# only the scheme word ("Bearer") and leave the actual token exposed.
+_SECRET_AUTH_RE = re.compile(
+    r"(Authorization)([=:]\s*|\s+)([^\"'\n]+?)(?=\s+--|[\"'\n]|$)"
+)
+
+
+def _redact_command(command: str) -> str:
+    """Redact likely inline secrets from a shell command before it is
+    logged or attached to an ExecutionResult.
+
+    BUGFIX: the raw command string used to be stored un-redacted on every
+    ExecutionResult (all three outcomes below) and logged verbatim on
+    timeout/OSError. Any secret the caller typed inline on the command line
+    (e.g. ``pytest --api-key=sk-...`` or ``-H "Authorization: Bearer
+    sk-..."``) then persisted in agent trace JSONL files (via
+    ExecutionResult.to_dict()), progress logs (via .summary()), and plain
+    log lines — all of which tend to be archived or shared by an operator
+    debugging a run. Only the option/header's value is replaced; the
+    option name and the rest of the command are left intact.
+    """
+    try:
+        redacted = _SECRET_OPT_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}[REDACTED]", command)
+        redacted = _SECRET_AUTH_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}[REDACTED]", redacted)
+        return redacted
+    except Exception:  # pragma: no cover — never let redaction crash the executor
+        return command
 
 
 # Match a Python traceback block: "Traceback (most recent call last):" through

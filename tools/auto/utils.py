@@ -3,12 +3,15 @@ from __future__ import annotations
 
 import configparser
 import hashlib
+import logging
 import os
 import re
 import tempfile
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 # Longest sanitised name component we will hand to the filesystem. NAME_MAX is
@@ -18,8 +21,20 @@ _MAX_FILENAME_COMPONENT = 200
 
 
 def _ts() -> str:
-    """Return the current local time as an ISO-8601 string (YYYY-MM-DDTHH:MM:SS)."""
-    return datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    """Return the current UTC time as an ISO-8601 string (YYYY-MM-DDTHH:MM:SSZ).
+
+    FIX-1 #8: this used to call ``datetime.now()`` — the *local* system
+    clock — while ``ticket_store.py``'s schema (lines 16-17) documents
+    every ``created_at`` / ``updated_at`` as "ISO-8601 UTC", and every
+    caller that supplies its own literal timestamp already uses the
+    trailing "Z" (see ``tests/test_auto_d1.py``), matching
+    ``tools/collect/manifest.py::_utc_iso_now()``. Recording local time
+    under a UTC label is invisible on one machine, but the moment a
+    ticket written on a UTC+5 box is read on a UTC box the chronology is
+    wrong, and the old string gave no hint it ever was local. UTC plus
+    an explicit "Z" suffix matches the rest of the codebase's contract.
+    """
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def safe_filename_component(value: str) -> str:
@@ -70,6 +85,15 @@ def highest_completed_round(task_dir: "str | Path") -> int:
     """
     best = 0
     for p in Path(task_dir).glob("feedback_round_*.md"):
+        # B3: glob() yields DIRECTORIES as well as files, and the check
+        # below is only a name match -- a directory literally named
+        # feedback_round_5.md counted as a completed round. This value is
+        # load-bearing: controller._reset_resettable_blocked_tasks compares it
+        # against max_rounds to decide whether a BLOCKED task may be reset to
+        # TODO, so a phantom round parked the task in BLOCKED forever with
+        # nothing in any log explaining why.
+        if not p.is_file():
+            continue
         m = _FEEDBACK_ROUND_RE.search(p.name)
         if m:
             best = max(best, int(m.group(1)))
@@ -102,6 +126,40 @@ def file_set_fingerprint(base_dir: "str | Path", files: "list[str]") -> str:
     return h.hexdigest()[:12]
 
 
+def fsync_directory(directory: "str | Path") -> None:
+    """Best-effort ``fsync`` of *directory* itself.
+
+    ``os.replace`` is atomic, but on Linux the rename is only guaranteed
+    DURABLE once the containing directory has been fsynced -- fsyncing the
+    file alone is not enough, and a crash right after the rename can make the
+    "atomically written" file disappear entirely.
+
+    This is a hint, not a guarantee, and it is called only after the write and
+    the rename have already succeeded, so a failure here must never turn a
+    successful write into a raised error:
+
+    * ``os.O_DIRECTORY`` does not exist as an attribute on Windows at all (not
+      merely unsupported at the OS level), so referencing it directly would
+      raise ``AttributeError``. ``getattr`` turns that into a clean skip.
+    * some filesystems reject fsync on a directory; that ``OSError`` is
+      logged at DEBUG and swallowed.
+    """
+    o_directory = getattr(os, "O_DIRECTORY", None)
+    if o_directory is None:
+        return
+    try:
+        dir_fd = os.open(str(directory), o_directory)
+        try:
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+    except OSError as exc:
+        logger.debug(
+            "fsync_directory: fsync on %s failed (best-effort durability "
+            "step, the write itself already succeeded): %s", directory, exc,
+        )
+
+
 def atomic_write_text(path: "str | Path", content: str) -> None:
     """Write *content* to *path* atomically (temp file + ``os.replace``).
 
@@ -126,6 +184,7 @@ def atomic_write_text(path: "str | Path", content: str) -> None:
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_name, path)
+        fsync_directory(path.parent)
     except BaseException:
         try:
             os.unlink(tmp_name)

@@ -36,10 +36,11 @@ plan.json task schema (enforced by _validate_task_schema):
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
-from tools.auto.utils import _ts, safe_filename_component
+from tools.auto.utils import _ts, safe_filename_component, fsync_directory
 from pathlib import Path
 from typing import Any
 
@@ -52,6 +53,69 @@ STATUS_DONE        = "done"
 STATUS_BLOCKED     = "blocked"
 
 _VALID_STATUSES = {STATUS_TODO, STATUS_IN_PROGRESS, STATUS_DONE, STATUS_BLOCKED}
+
+# Counters that only ever move forward.  A re-plan or a second regression on
+# the same root task rebuilds these from zero; letting that through would reset
+# the round/attempt budget and drop impl_version to 1, defeating the LOOP-2 /
+# LOOP-3 cross-resume rewrite cap.
+_MONOTONIC_TASK_FIELDS: tuple[str, ...] = ("round", "attempt", "impl_version")
+
+# Free-form fields a fresh plan payload never carries.  A wholesale replace
+# deletes them outright: the commit key severs the git linkage between
+# plan.json and the real commit, and original_instruction is only ever
+# recorded once (first rewrite).
+_PRESERVED_TASK_FIELDS: tuple[str, ...] = ("commit", "original_instruction")
+
+
+def merge_task_update(
+    existing: dict,
+    incoming: dict,
+    *,
+    allow_downgrade: bool = False,
+) -> dict:
+    """Merge *incoming* over *existing* for the same task id.
+
+    Unlike a plain ``dict.update`` this never moves a task backwards: status
+    stays at its higher rank, round/attempt/impl_version only increase, and
+    fields the incoming dict lacks (commit, original_instruction) survive.
+    Everything the incoming dict does carry still lands, so a genuine re-plan
+    is applied rather than frozen out.
+    """
+    merged = dict(existing)
+    merged.update(incoming)
+
+    # Only DONE is protected. A rank ordering over all four statuses would
+    # also freeze blocked -> in_progress / blocked -> todo, which are ordinary
+    # forward moves, not downgrades: BLOCKED is not "more progress" than
+    # IN_PROGRESS. The bug being closed is a re-plan silently reopening
+    # FINISHED work, so guard exactly that.
+    existing_status = existing.get("status", STATUS_TODO)
+    incoming_status = incoming.get("status", existing_status)
+    if (
+        not allow_downgrade
+        and existing_status == STATUS_DONE
+        and incoming_status != STATUS_DONE
+    ):
+        merged["status"] = existing_status
+
+    # Counters only move forward; a lower value in the incoming dict is the
+    # reset artefact of a re-plan, not real progress.
+    for field in _MONOTONIC_TASK_FIELDS:
+        old_val, new_val = existing.get(field), incoming.get(field)
+        if old_val is None or new_val is None:
+            continue
+        try:
+            if new_val < old_val:
+                merged[field] = old_val
+        except TypeError:
+            merged[field] = old_val
+
+    # A fresh plan payload never carries these; keep what was already stored.
+    for field in _PRESERVED_TASK_FIELDS:
+        if not merged.get(field) and existing.get(field):
+            merged[field] = existing[field]
+
+    return merged
 
 # ── Required top-level fields in a task dict ────────────────────────────────
 _REQUIRED_TASK_FIELDS: dict[str, type] = {
@@ -143,6 +207,83 @@ def _validate_task_schema(task: dict) -> None:
         raise ValueError("Task schema violation: 'title' must be a non-empty string")
 
 
+def _validate_extra_task_fields(extra_fields: dict) -> None:
+    """Type-check *extra_fields* against the required-task-field schema.
+
+    Unlike :func:`_validate_task_schema` this does NOT require every required
+    field to be present -- it only checks the entries that are actually being
+    written. That distinction matters: ``set_task_status`` is called with a
+    bare status on legacy and hand-edited ``plan.json`` files whose tasks may
+    legitimately lack a required field, and re-validating the whole merged
+    task would turn those writes into a mid-run abort.
+
+    Keys outside ``_REQUIRED_TASK_FIELDS`` (``commit``,
+    ``original_instruction``, ``blocked_reason``, ...) are free-form
+    bookkeeping and are deliberately left unchecked.
+    """
+    for field, expected_type in _REQUIRED_TASK_FIELDS.items():
+        if field in extra_fields and not _matches_schema_type(
+            extra_fields[field], expected_type
+        ):
+            raise ValueError(
+                f"Task schema violation: field '{field}' must be "
+                f"{expected_type.__name__}, "
+                f"got {type(extra_fields[field]).__name__}"
+            )
+
+
+def _coerce_counter(task: dict, field: str, default: int) -> int:
+    """Return *task[field]* as an int, repairing a malformed value in place.
+
+    BUGFIX (counter schema): ``increment_task_counters`` and
+    ``increment_impl_version`` read a counter straight out of the task dict
+    and added a delta to it. Both are write paths that ``set_task_status``'s
+    sibling guard (``_validate_extra_task_fields``, added by B1) does not
+    cover, because they never go through ``**extra_fields`` — and both run
+    against tasks that came off disk. A legacy or hand-edited ``plan.json``
+    whose task carries ``"attempt": "2"`` (or ``null``, or ``true``) turned
+    the addition into an unhandled ``TypeError`` in the middle of a run,
+    after work had already been committed.
+
+    Repair rather than raise: a counter is bookkeeping, not instruction
+    content, so a malformed one must not cost the run. The bad value is
+    replaced by *default* — the same value ``make_task`` would have given a
+    fresh task — and reported, since a silently reset attempt counter looks
+    exactly like a task that simply has not been retried yet. Booleans are
+    rejected alongside non-ints for the reason ``_matches_schema_type``
+    documents: ``bool`` is an ``int`` subclass and no counter field means
+    ``True``.
+    """
+    value = task.get(field, default)
+    if _matches_schema_type(value, int):
+        return value
+    logger.warning(
+        "task %s: counter '%s' is malformed (%r) — resetting to %d",
+        task.get("id", "<unknown>"), field, value, default,
+    )
+    task[field] = default
+    return default
+
+
+def _coerce_delta(value: Any, label: str) -> int:
+    """Return *value* as an int delta, treating a malformed one as a no-op.
+
+    FIX-2 #7: the sibling of :func:`_coerce_counter` for the *increment*
+    side of ``increment_task_counters`` -- an invalid ``attempt_delta`` /
+    ``round_delta`` argument gets the same repair-rather-than-raise
+    treatment as a corrupted stored counter, since it is exactly the same
+    class of bookkeeping fault and must not abort a run over it. ``bool``
+    is rejected alongside non-ints, matching ``_matches_schema_type``.
+    """
+    if _matches_schema_type(value, int):
+        return value
+    logger.warning(
+        "increment_task_counters: %s is malformed (%r) — treating as 0 (no-op)",
+        label, value,
+    )
+    return 0
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # StateStore
 # ─────────────────────────────────────────────────────────────────────────────
@@ -218,6 +359,25 @@ class StateStore:
 
     # ── Query API ────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _detached(task: dict) -> dict:
+        """A caller-owned copy of *task*.
+
+        FIX-3 M1: every read accessor here used to hand back the live dict out
+        of ``self._plan``. Nothing stopped a caller mutating it, and the next
+        validated setter then persisted whatever they had written — the setters
+        validate their own arguments, not the plan they are about to serialise.
+        Confirmed live before this fix: ``get_task(id)["status"] = 12345``
+        followed by any counter bump put a non-enum status into plan.json.
+
+        A copy is the cheap end of the fix. Validating on every write would pay
+        a schema check on each status change for a path that copying closes
+        outright, and it would still leave the plan mutable from the outside
+        between validation and serialisation. Tasks are small flat dicts, and
+        these accessors run once per task per phase, not in any hot loop.
+        """
+        return copy.deepcopy(task)
+
     def resume_info(self) -> dict:
         """Return a summary of tasks by status for the resume banner.
 
@@ -230,8 +390,9 @@ class StateStore:
         """
         tasks = self._plan.get("tasks", [])
         done_ids    = {t["id"] for t in tasks if t["status"] == STATUS_DONE}
-        in_progress = [t for t in tasks if t["status"] == STATUS_IN_PROGRESS]
-        pending     = [t for t in tasks if t["status"] not in (STATUS_DONE, STATUS_BLOCKED)]
+        in_progress = [self._detached(t) for t in tasks if t["status"] == STATUS_IN_PROGRESS]
+        pending     = [self._detached(t) for t in tasks
+                       if t["status"] not in (STATUS_DONE, STATUS_BLOCKED)]
         return {
             "done_ids":    done_ids,
             "in_progress": in_progress,
@@ -239,15 +400,22 @@ class StateStore:
         }
 
     def get_task(self, task_id: str) -> dict | None:
-        """Return the task dict for *task_id*, or None if not found."""
+        """Return a caller-owned copy of the task dict, or None if not found.
+
+        FIX-3 M1: returns a copy, not the live object — see :meth:`_detached`.
+        Mutating the result changes nothing on disk; route changes through
+        ``set_task_status``/``upsert_task``, which validate what they are given.
+        """
         for t in self._plan.get("tasks", []):
             if t["id"] == task_id:
-                return t
+                return self._detached(t)
         return None
 
     def all_tasks(self) -> list[dict]:
         """Return all tasks in plan order."""
-        return list(self._plan.get("tasks", []))
+        # FIX-3 M1: list() alone was a *shallow* copy — a new list holding the
+        # same live dicts, so the plan was still mutable through any element.
+        return [self._detached(t) for t in self._plan.get("tasks", [])]
 
     def get_goal(self) -> str:
         # Bugfix: .get("goal", "") only falls back on a MISSING key, so an
@@ -260,17 +428,36 @@ class StateStore:
 
     # ── Mutating API ─────────────────────────────────────────────────────────
 
-    def upsert_task(self, task: dict) -> None:
+    def upsert_task(self, task: dict, *, allow_downgrade: bool = False) -> None:
         """Insert or update a task in plan.json.
 
         The task is validated against the schema before writing.  If a task
-        with the same ``id`` already exists it is replaced; otherwise appended.
+        with the same ``id`` already exists it is MERGED, not replaced: the
+        existing status, round, attempt, impl_version, ``commit`` and
+        ``original_instruction`` are preserved unless the incoming dict
+        explicitly carries a newer value.  Otherwise appended.
+
+        This matters because ``plan_emitter.py`` / ``pipeline.py`` upsert the
+        whole backlog on every re-plan and ``bug_fix_loop.py`` re-upserts a
+        deterministic ``BUG-FIX-<root>`` id on each regression — both paths
+        hand over minimal dicts (status="todo", round=0, impl_version=1, no
+        commit), so a wholesale replace would silently reopen completed tasks
+        and delete their git linkage.
+
+        Parameters
+        ----------
+        allow_downgrade:
+            Pass ``True`` to let the incoming status move the task backwards
+            (e.g. done -> todo).  Default ``False`` keeps the downgrade guard
+            on, so a re-plan cannot reopen finished work.
         """
         _validate_task_schema(task)
         tasks = self._plan.setdefault("tasks", [])
         for i, t in enumerate(tasks):
             if t["id"] == task["id"]:
-                tasks[i] = task
+                tasks[i] = merge_task_update(
+                    t, task, allow_downgrade=allow_downgrade
+                )
                 self._save_plan()
                 return
         tasks.append(task)
@@ -303,6 +490,13 @@ class StateStore:
         """
         if status not in _VALID_STATUSES:
             raise ValueError(f"Invalid status '{status}'; must be one of {_VALID_STATUSES}")
+
+        # B1: extra_fields used to be merged with a bare t.update() and no
+        # validation at all, so a typo such as round="2" landed in plan.json
+        # as a string where the schema demands an int, and a later
+        # t["attempt"] + delta raised TypeError somewhere else entirely.
+        # Validate the incoming fields only -- never the merged task.
+        _validate_extra_task_fields(extra_fields)
 
         tasks = self._plan.get("tasks", [])
         for t in tasks:
@@ -378,12 +572,27 @@ class StateStore:
         attempt_delta: int = 0,
         round_delta: int = 0,
     ) -> None:
-        """Increment attempt/round counters for a task and persist."""
+        """Increment attempt/round counters for a task and persist.
+
+        FIX-2 #7: ``_coerce_counter`` already repairs a malformed *stored*
+        counter (a ``"2"`` or ``null`` left in plan.json), but the
+        *incoming* deltas were never checked at all. A caller bug passing
+        a non-int delta (a float from a bad average, a stray string) still
+        reached the ``+`` unguarded: sometimes a silent float write (e.g.
+        ``attempt_delta=0.5``), sometimes a raw ``TypeError`` that aborted
+        the run despite the base value being perfectly valid. Coerce the
+        deltas the same way ``_coerce_counter`` coerces the stored values --
+        repair-and-warn, not raise -- since a bookkeeping counter must never
+        be what kills an otherwise-successful task loop.
+        """
+        attempt_delta = _coerce_delta(attempt_delta, "attempt_delta")
+        round_delta = _coerce_delta(round_delta, "round_delta")
+
         tasks = self._plan.get("tasks", [])
         for t in tasks:
             if t["id"] == task_id:
-                t["attempt"] = t.get("attempt", 0) + attempt_delta
-                t["round"]   = t.get("round", 0)   + round_delta
+                t["attempt"] = _coerce_counter(t, "attempt", 0) + attempt_delta
+                t["round"]   = _coerce_counter(t, "round",   0) + round_delta
                 self._save_plan()
                 return
         raise ValueError(f"Task '{task_id}' not found in plan")
@@ -397,7 +606,7 @@ class StateStore:
         tasks = self._plan.get("tasks", [])
         for t in tasks:
             if t["id"] == task_id:
-                new_ver = t.get("impl_version", 1) + 1
+                new_ver = _coerce_counter(t, "impl_version", 1) + 1
                 t["impl_version"] = new_ver
                 self._save_plan()
                 return new_ver
@@ -434,7 +643,37 @@ class StateStore:
         rewrites overwrite ``instruction``.
 
         Returns the new impl_version.
+
+        Raises
+        ------
+        ValueError
+            If *instruction* is not a non-empty, non-whitespace string, or if
+            *task_id* is not in the plan. On rejection nothing is written:
+            the previous ``instruction``, ``impl_version`` and
+            ``original_instruction`` state all survive intact.
         """
+        # B2: the task schema requires a non-empty id and title but says
+        # nothing about instruction, and outer_loop hands over
+        # new_task.get("instruction", "") -- the default is literally "".
+        # A truncated or partial rewriter reply therefore overwrote the live
+        # instruction with an empty string, recorded original_instruction and
+        # bumped impl_version. The empty body became the Coder's active task,
+        # and because impl_version had advanced, the real already-failing
+        # instruction dropped out of the "previously tried" history the
+        # rewrite cap depends on.
+        #
+        # The guard runs BEFORE the lookup loop, so no task is touched on
+        # rejection -- not even original_instruction, which must keep holding
+        # the true v1 baseline. isinstance is part of the check: a non-string
+        # (None from a missing JSON key) must raise ValueError here, not
+        # AttributeError from .strip() a line later.
+        if not isinstance(instruction, str) or not instruction.strip():
+            raise ValueError(
+                f"apply_rewrite: refusing a blank or non-string instruction "
+                f"for task '{task_id}' -- keeping the previous instruction "
+                f"and impl_version"
+            )
+
         tasks = self._plan.get("tasks", [])
         for t in tasks:
             if t["id"] == task_id:
@@ -445,7 +684,7 @@ class StateStore:
                     t["acceptance_check"] = acceptance_check
                 if title:
                     t["title"] = title
-                new_ver = t.get("impl_version", 1) + 1
+                new_ver = _coerce_counter(t, "impl_version", 1) + 1
                 t["impl_version"] = new_ver
                 self._save_plan()
                 return new_ver
@@ -553,9 +792,61 @@ class StateStore:
         return path
 
     def read_task_file(self, task_id: str, filename: str) -> str | None:
-        """Read a per-task file; return None if it doesn't exist."""
-        path = self.task_dir(task_id) / filename
-        return path.read_text(encoding="utf-8") if path.exists() else None
+        """Read a per-task file; return None if it isn't readable.
+
+        B3, two separate problems in the old
+        ``read_text(...) if exists() else None`` body:
+
+        * It raised where the contract promises None. ``exists()`` is True for
+          directories too (``IsADirectoryError``), invalid UTF-8 raised
+          ``UnicodeDecodeError``, and the gap between ``exists()`` and
+          ``read_text()`` is a TOCTOU window (``FileNotFoundError``).
+          ``OuterLoop.run_task`` reads ``deadline_started_at.txt`` on every
+          resume, so an unhandled raise here killed the run at exactly the
+          resume point. Every caller already treats None as "nothing there",
+          which for a deadline file degrades to a full fresh budget.
+
+        * It *wrote* on a read path. ``task_dir()`` mkdir()s the per-task
+          directory as a side effect, so merely asking whether a file exists
+          created a directory -- which fails outright on a read-only
+          ``.agent/`` and confuses any caller that distinguishes "the file was
+          there" from "the directory was made". The path is built directly
+          instead.
+
+        FileNotFoundError is the routine "not written yet" case and stays
+        silent; anything stranger is logged so it is not invisible.
+        """
+        path = self._tasks_dir / self._safe_task_id(task_id) / filename
+        try:
+            return path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+        except (OSError, UnicodeDecodeError) as exc:
+            logger.warning(
+                "StateStore: could not read task file %s: %s -- "
+                "treating it as absent", path, exc,
+            )
+            return None
+
+    def clear_task_deadline(self, task_id: str) -> None:
+        """Remove this task's ``deadline_started_at.txt`` (no-op if absent).
+
+        OuterLoop.run_task writes this file the first time a task is worked and
+        reads it back on every resume to compute the remaining wall-clock
+        budget. Clearing it is what makes a retry start with a full budget;
+        leaving it means the retry inherits the elapsed time of the attempt it
+        replaced and can be re-blocked before round 1.
+
+        No directories are created: the point of this call is usually to
+        finish a task that was never worked, so ``task_dir()`` (which creates)
+        must not be used here.
+        """
+        path = (self._tasks_dir / self._safe_task_id(task_id)
+                / "deadline_started_at.txt")
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            return
 
     # ── Private ──────────────────────────────────────────────────────────────
 
@@ -785,7 +1076,8 @@ class StateStore:
             if the write or the atomic rename fails. This is intentionally
             NOT swallowed — a silently failed state write is worse than a
             loud one; callers that need this to be non-fatal must catch it
-            themselves.
+            themselves. A failed *directory* fsync is not in this list: it
+            happens after a successful rename and is logged at DEBUG instead.
         """
         if path.exists():
             try:
@@ -797,8 +1089,27 @@ class StateStore:
                 )
         tmp_path = path.with_suffix(path.suffix + ".tmp")
         try:
-            tmp_path.write_text(content, encoding="utf-8")
+            # B4: atomicity is not durability. This used to be a bare
+            # Path.write_text() plus os.replace(), which guarantees *path*
+            # always holds one complete version -- but Path.write_text
+            # exposes no file descriptor, so nothing was ever flushed to
+            # disk. A power loss or kernel panic right after the rename could
+            # leave plan.json/progress.json missing entirely, and a resumed
+            # run would start from blank state. Write through an explicit fd
+            # so the contents can be fsynced before the rename, then fsync
+            # the parent directory after it (see utils.fsync_directory for
+            # why the directory step is separate and best-effort).
+            #
+            # The .bak refresh above and the OSError re-wrap below are NOT
+            # delegated to utils.atomic_write_text: that helper has neither,
+            # and .bak is the documented recovery path for a corrupt
+            # plan.json. Only the fsync discipline is shared.
+            with open(tmp_path, "w", encoding="utf-8") as fh:
+                fh.write(content)
+                fh.flush()
+                os.fsync(fh.fileno())
             os.replace(tmp_path, path)
+            fsync_directory(path.parent)
         except OSError as exc:
             try:
                 tmp_path.unlink(missing_ok=True)
@@ -807,6 +1118,24 @@ class StateStore:
             raise OSError(f"StateStore: failed to write {path} ({exc})") from exc
 
     def _save_plan(self) -> None:
+        """Serialise ``self._plan`` to plan.json atomically, without revalidating.
+
+        FIX-3 M1 asked whether this should re-validate every task before
+        writing, on the theory that a caller might mutate ``self._plan``
+        directly and reach here outside a validated setter. That path was real
+        — not through this method, but through the read accessors, which handed
+        out live task dicts (see :meth:`_detached`). Closing it there makes the
+        invariant true rather than merely documented: all eight call sites are
+        validated setters, and no accessor exposes anything the caller can use
+        to reach into the plan.
+
+        So no per-write validation here. It would cost a schema pass on every
+        status change to guard a path that copy-on-read already closes, and it
+        would not have caught the leak anyway — the mutated task was schema-
+        shaped, just wrong. A new call site must go through a setter or
+        validate first; ``tests_bugfix/test_bugfix_m1_get_task_reference_leak``
+        fails if an accessor starts leaking again.
+        """
         self._atomic_write(
             self._plan_path,
             json.dumps(self._plan, indent=2, ensure_ascii=False),

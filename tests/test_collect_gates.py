@@ -26,6 +26,22 @@ from tools.collect.scanner import scan_repo
 REPO_ROOT = Path(__file__).parent.parent
 
 
+@pytest.fixture(scope="session")
+def gates_entries():
+    """Session-scoped cache of `build_gates_map` against the real repo.
+
+    `scan_repo(REPO_ROOT)` is already cached across the whole test
+    session by the root conftest.py's monkeypatch, so it's cheap here.
+    The remaining cost is `build_gates_map` itself: `_repo_defines_function`
+    re-reads and re-`ast.walk`s every module in the repo, once per gate
+    entry, on every call (~6-9s per call on this tree). Three tests below
+    previously called `build_gates_map(scan_repo(REPO_ROOT), REPO_ROOT)`
+    independently with the default seed; this fixture builds it once.
+    """
+    modules = scan_repo(REPO_ROOT)
+    return build_gates_map(modules, REPO_ROOT)
+
+
 def _by_name(entries):
     return {e.name: e for e in entries}
 
@@ -152,9 +168,8 @@ def test_canon_gate_switch_is_a_cadence_not_a_boolean():
 # ── Citation check against the real repo ────────────────────────────────────
 
 
-def test_all_seed_entries_citation_check_clean_against_real_repo():
-    modules = scan_repo(REPO_ROOT)
-    entries = build_gates_map(modules, REPO_ROOT)
+def test_all_seed_entries_citation_check_clean_against_real_repo(gates_entries):
+    entries = gates_entries
     assert len(entries) == 7
 
 
@@ -207,22 +222,20 @@ def test_foreign_repo_skips_seed_instead_of_raising(tmp_path):
     assert entries == []
 
 
-def test_method_qualified_parser_resolves_via_bare_name():
+def test_method_qualified_parser_resolves_via_bare_name(gates_entries):
     # "CanonValidator._ground_claim" must resolve by searching for a
     # method named `_ground_claim`, not by literally finding that
     # dotted string in source.
-    modules = scan_repo(REPO_ROOT)
-    entries = _by_name(build_gates_map(modules, REPO_ROOT))
+    entries = _by_name(gates_entries)
     assert entries["canon"].parser == "CanonValidator._ground_claim"
 
 
-def test_reused_parser_across_modules_resolves_repo_wide():
+def test_reused_parser_across_modules_resolves_repo_wide(gates_entries):
     # `_parse_verdict_soft` is defined once in inner_loop.py but cited as
     # the parser for continuity/theme/fact, whose own modules only
     # *import* it — the citation check must search the whole repo, not
     # just each gate's own module.
-    modules = scan_repo(REPO_ROOT)
-    entries = _by_name(build_gates_map(modules, REPO_ROOT))
+    entries = _by_name(gates_entries)
     for name in ("continuity", "theme", "fact"):
         assert entries[name].parser == "_parse_verdict_soft"
         assert entries[name].module != "tools/auto/inner_loop.py"

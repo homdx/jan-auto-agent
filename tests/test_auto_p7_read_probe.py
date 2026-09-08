@@ -67,6 +67,11 @@ def repo(tmp_path: Path) -> Path:
     (tmp_path / "tools" / "small.py").write_text("a\nb\nc\n", encoding="utf-8")
     (tmp_path / "tools" / "empty.py").write_text("", encoding="utf-8")
     (tmp_path / "tools" / "blob.bin").write_bytes(b"\xff\xfe\x00\x01binary")
+    # A source file with an embedded invalid UTF-8 byte (lone continuation byte
+    # \x80 is illegal as a leading byte in UTF-8). Used by Bug-16 regression.
+    (tmp_path / "tools" / "latin1.py").write_bytes(
+        b"def hello():\n    # caf\x80\n    pass\n"
+    )
     (tmp_path / "outside.txt").write_text("secret\n", encoding="utf-8")
     return tmp_path
 
@@ -162,10 +167,37 @@ class TestReadEdgeCases:
     """AC-P7-4"""
 
     @pytest.mark.parametrize("arg", [
-        "tools/nope.py", "tools", "", "   ", "tools/blob.bin",
+        "tools/nope.py", "tools", "", "   ",
     ])
     def test_misses(self, repo, arg) -> None:
         assert _probe(repo)._read(arg) == ""
+
+    def test_non_utf8_file_is_not_a_miss(self, repo) -> None:
+        """B7: undecodable bytes degrade to U+FFFD, they do not erase the file.
+
+        This used to be listed as a miss above. Returning "" for a file that
+        exists is indistinguishable from "no such file", which is precisely
+        the empty context this op is meant to prevent.
+        """
+        out = _probe(repo)._read("tools/blob.bin")
+        assert out != ""
+        assert "blob.bin" in out
+
+    def test_invalid_utf8_byte_replaced_not_crash(self, repo) -> None:
+        """Bug 16: read_text must use errors="replace", not strict UTF-8.
+
+        A lone 0x80 continuation byte embedded in an otherwise-ASCII Python
+        source is invalid UTF-8. With strict decoding this raises
+        UnicodeDecodeError, which the except clause folded into "" — making an
+        existing file indistinguishable from a missing one. With
+        errors="replace" the byte becomes U+FFFD and the read succeeds.
+        """
+        out = _probe(repo)._read("tools/latin1.py")
+        # Must return content, not an empty miss.
+        assert out != "", "invalid UTF-8 byte must not silence the file"
+        assert "latin1.py" in out
+        # The replacement character proves errors="replace" was used.
+        assert "�" in out
 
     def test_empty_file_is_not_a_miss(self, repo) -> None:
         """The file exists and is empty — a different fact from "no such
@@ -230,6 +262,17 @@ class TestOutOfBatchMarker:
                       max_chars=4000, max_total_chars=9000)
         out = p.execute([ProbeOp("module", "tools/other.py")])
         assert "NOT IN YOUR BATCH" in out
+
+    def test_marker_warns_against_re_asking(self, repo) -> None:
+        """AUTO-F1-followup: a measured run (trace_8c83140453d5) found EVERY
+        'repeat' decline in it was a re-ask of an out-of-batch HIT — the
+        model already had the answer and asked again anyway. The marker used
+        to warn only about citation, never about asking twice; a re-ask
+        costs a full architect round-trip before the repeat-detector
+        declines it, for zero new information."""
+        p = _probe(repo, batch=["tools/small.py"])
+        out = p.execute([ProbeOp("read", "tools/backoff.py:1-2")])
+        assert "will end your probing" in out
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -76,7 +76,7 @@ def test_real_prompt_store_get_current_is_guarded_via_alias():
     by_access = {(a.location, a.access): a for a in accesses}
     # NOTE: line number tracks the real tools/prompt_store.py::get_current
     # source — update if that method's line position shifts.
-    site = by_access[("tools/prompt_store.py:90", "stack[-1]")]
+    site = by_access[("tools/prompt_store.py:91", "stack[-1]")]
     assert site.status == "GUARDED"
     assert site.guard
 
@@ -283,9 +283,15 @@ def test_real_analyze_logs_done_site_appears_exactly_once_and_is_guarded():
     # a couple of lines above it, nested inside an unrelated outer block.
     # NOTE: line number tracks the real analyze_logs.py source — update if
     # that function's line position shifts.
+    # BUGFIX: pinned at 1635 when this test was written; two later commits
+    # (AUTO-F4 Part 1 / Part 2) added ~90 lines earlier in analyze_logs.py,
+    # shifting this site down to 1725 with no code-shape change at all —
+    # confirmed via `git blame`, the guard/access pair is byte-identical.
+    # Re-pin to the current real line so this test tracks the site instead
+    # of a stale snapshot of it.
     source = (REPO_ROOT / "analyze_logs.py").read_text(encoding="utf-8")
     accesses = _accesses(source, "analyze_logs.py")
-    matches = [a for a in accesses if (a.location, a.access) == ("analyze_logs.py:1527", "done[-1]")]
+    matches = [a for a in accesses if (a.location, a.access) == ("analyze_logs.py:1725", "done[-1]")]
     assert len(matches) == 1, f"expected exactly one record, got {matches!r}"
     assert matches[0].status == "GUARDED"
 
@@ -473,6 +479,102 @@ def test_and_nested_inside_or_does_not_leak_names_out():
         "b[0]": "UNGUARDED",
         "c[0]": "UNGUARDED",
     }
+
+
+# ── BUGFIX regression: x.get(k, truthy_default) does not guard k ─────────────
+# ── a truthy default means the guard `not x.get(k, default)` is False when ──
+# ── k is missing (the default is returned), so the guard body does NOT run  ──
+# ── and the code after the if executes with k absent — x[k] raises KeyError. ──
+# ── Before the fix, (x, k) was added to guarded_pairs unconditionally, so an ──
+# ── alias `y = x[k]; y[-1]` was wrongly marked GUARDED.                         ──
+
+
+def test_get_with_truthy_default_not_guarded():
+    """`if not x.get(k, 'default'): return` does not prove k is present
+    when the default is truthy — the guard is False when k is missing, so
+    the body doesn't run and k is still absent. The aliased access must be
+    UNGUARDED, not GUARDED."""
+    source = (
+        'def f(x):\n'
+        '    if not x.get("key", "default"):\n'
+        '        return None\n'
+        '    y = x["key"]\n'
+        '    return y[-1]\n'
+    )
+    accesses = _accesses(source, "m.py")
+    y_access = [a for a in accesses if a.access == "y[-1]"]
+    assert y_access, "y[-1] access not found"
+    assert y_access[0].status == "UNGUARDED", (
+        "truthy default does not guard k — y[-1] must be UNGUARDED"
+    )
+
+
+def test_get_with_truthy_default_one_not_guarded():
+    """Same as above but with integer 1 as the truthy default."""
+    source = (
+        'def f(x):\n'
+        '    if not x.get("key", 1):\n'
+        '        return None\n'
+        '    y = x["key"]\n'
+        '    return y[-1]\n'
+    )
+    accesses = _accesses(source, "m.py")
+    y_access = [a for a in accesses if a.access == "y[-1]"]
+    assert y_access, "y[-1] access not found"
+    assert y_access[0].status == "UNGUARDED"
+
+
+def test_get_with_falsy_default_still_guarded():
+    """Regression guard: a falsy default (None, 0, False, '') still
+    produces a GUARDED access — the guard fires when k is missing."""
+    for default_expr in ("None", "0", "False", '""'):
+        source = (
+            f'def f(x):\n'
+            f'    if not x.get("key", {default_expr}):\n'
+            f'        return None\n'
+            f'    y = x["key"]\n'
+            f'    return y[-1]\n'
+        )
+        accesses = _accesses(source, "m.py")
+        y_access = [a for a in accesses if a.access == "y[-1]"]
+        assert y_access, f"y[-1] not found for default={default_expr!r}"
+        assert y_access[0].status == "GUARDED", (
+            f"falsy default {default_expr!r} should still guard k — "
+            f"y[-1] must be GUARDED, got {y_access[0].status}"
+        )
+
+
+def test_get_no_default_still_guarded():
+    """Regression guard: no default at all (x.get(k)) — the guard fires
+    when k is missing (get returns None, which is falsy)."""
+    source = (
+        'def f(x):\n'
+        '    if not x.get("key"):\n'
+        '        return None\n'
+        '    y = x["key"]\n'
+        '    return y[-1]\n'
+    )
+    accesses = _accesses(source, "m.py")
+    y_access = [a for a in accesses if a.access == "y[-1]"]
+    assert y_access, "y[-1] access not found"
+    assert y_access[0].status == "GUARDED"
+
+
+def test_get_with_non_constant_default_not_guarded():
+    """A non-constant default (x.get(k, func())) can't be evaluated
+    statically — conservatively not guarded (a missed guard is acceptable,
+    a wrongly-kept one is not)."""
+    source = (
+        'def f(x):\n'
+        '    if not x.get("key", make_default()):\n'
+        '        return None\n'
+        '    y = x["key"]\n'
+        '    return y[-1]\n'
+    )
+    accesses = _accesses(source, "m.py")
+    y_access = [a for a in accesses if a.access == "y[-1]"]
+    assert y_access, "y[-1] access not found"
+    assert y_access[0].status == "UNGUARDED"
 
 
 def test_mutating_pop_after_guard_invalidates_it():

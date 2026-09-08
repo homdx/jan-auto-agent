@@ -1069,13 +1069,28 @@ class FaqAgent:
         # returns normally, no exception) still short-circuits immediately.
         _LEGACY_RETRY_ATTEMPTS = 3
 
+        def _safe_write(t: str) -> None:
+            """Write a streaming token to stdout, swallowing BrokenPipeError.
+
+            When stdout is piped to a command that closes early (e.g. ``head``),
+            ``sys.stdout.write`` raises BrokenPipeError. If this propagates into
+            ``retry_with_backoff`` it triggers a wasted duplicate LLM call and
+            discards the answer that already streamed — so swallow it here,
+            matching the pattern in ``tools/ui.py:stream_tracker``.
+            """
+            try:
+                sys.stdout.write(t)
+                sys.stdout.flush()
+            except (BrokenPipeError, OSError):
+                pass
+
         def _one_call() -> str:
             if stream:
                 reply = request_completion(
                     url, headers, payload, self.timeout,
                     stream=True,
                     api_format=self.api_format,
-                    on_token=lambda t: (sys.stdout.write(t), sys.stdout.flush()),
+                    on_token=lambda t: _safe_write(t),
                     ssl_context=self.ssl_context,
                 )
                 self.llm_call_count += 1  # legacy streaming call

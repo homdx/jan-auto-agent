@@ -328,6 +328,131 @@ class TestFactory:
         assert sha == "deadf00d" + "0" * 32
         assert st.get_task("AUTO-T1")["commit"] == sha
 
+    def test_factory_creative_malformed_llm_profile_raises(self, tmp_path, monkeypatch):
+        """A malformed [summary] llm_profile must raise ValueError, not be
+        silently swallowed by the broad except in the factory.
+
+        make_summary_memory deliberately lets resolve_llm_profile raise
+        ValueError for a non-existent profile section; the factory's
+        except Exception must re-raise it so the misconfiguration is
+        discovered at construction time, not silently degraded.
+        """
+        import configparser
+        import tools.auto.commit_on_success as c5_mod
+
+        class _FakeGM(FakeGitManager):
+            def __init__(self):
+                super().__init__([])
+            def ensure_repo(self): return False
+            def configure_identity(self): pass
+
+        monkeypatch.setattr(c5_mod, "make_git_manager", lambda *a, **kw: _FakeGM())
+
+        st = _state(tmp_path)
+        repo = tmp_path / "repo"
+        repo.mkdir()
+
+        cfg = configparser.ConfigParser()
+        cfg.read_dict({
+            "auto":   {"task_mode": "creative", "git_user": "bot", "git_email": "bot@test.local"},
+            "api":    {"active": "local"},
+            "api_local": {
+                "base_url": "http://localhost:11434/v1",
+                "api_key":  "x",
+                "model":    "test-model",
+                "api_format": "openai",
+            },
+            "summary": {"llm_profile": "ghost"},
+        })
+
+        with pytest.raises(ValueError, match="ghost"):
+            make_commit_on_success(cfg, repo, st)
+
+    def test_factory_creative_missing_profile_option_raises(self, tmp_path, monkeypatch):
+        """A [summary] llm_profile pointing to a section missing api_key/model
+        must raise ValueError, not be silently swallowed.
+        """
+        import configparser
+        import tools.auto.commit_on_success as c5_mod
+
+        class _FakeGM(FakeGitManager):
+            def __init__(self):
+                super().__init__([])
+            def ensure_repo(self): return False
+            def configure_identity(self): pass
+
+        monkeypatch.setattr(c5_mod, "make_git_manager", lambda *a, **kw: _FakeGM())
+
+        st = _state(tmp_path)
+        repo = tmp_path / "repo"
+        repo.mkdir()
+
+        cfg = configparser.ConfigParser()
+        cfg.read_dict({
+            "auto":   {"task_mode": "creative", "git_user": "bot", "git_email": "bot@test.local"},
+            "api":    {"active": "local"},
+            "api_local": {
+                "base_url": "http://localhost:11434/v1",
+                "api_key":  "x",
+                "model":    "test-model",
+                "api_format": "openai",
+            },
+            "summary":    {"llm_profile": "incomplete"},
+            "incomplete": {"base_url": "https://incomplete.example"},
+        })
+
+        with pytest.raises(ValueError, match="api_key|model"):
+            make_commit_on_success(cfg, repo, st)
+
+    def test_factory_creative_non_valueerror_still_caught(self, tmp_path, monkeypatch):
+        """Non-ValueError exceptions (e.g. missing api section) must still be
+        caught and logged, not re-raised — only ValueError from
+        resolve_llm_profile should propagate.
+        """
+        import configparser
+        import tools.auto.commit_on_success as c5_mod
+
+        class _FakeGM(FakeGitManager):
+            def __init__(self):
+                super().__init__([])
+            def ensure_repo(self): return False
+            def configure_identity(self): pass
+
+        monkeypatch.setattr(c5_mod, "make_git_manager", lambda *a, **kw: _FakeGM())
+
+        st = _state(tmp_path)
+        repo = tmp_path / "repo"
+        repo.mkdir()
+
+        # Creative mode but with a config that will cause a non-ValueError
+        # in make_summary_memory — e.g. a non-numeric num_ctx triggers
+        # ValueError which SHOULD propagate; we use a missing api section
+        # to get a non-ValueError path. Actually, let's force an
+        # ImportError-like situation by monkeypatching make_summary_memory.
+        original_make = None
+        import tools.auto.summary_memory as sm_mod
+
+        def _boom(*a, **kw):
+            raise ConnectionError("network down")
+
+        monkeypatch.setattr(sm_mod, "make_summary_memory", _boom)
+
+        cfg = configparser.ConfigParser()
+        cfg.read_dict({
+            "auto":   {"task_mode": "creative", "git_user": "bot", "git_email": "bot@test.local"},
+            "api":    {"active": "local"},
+            "api_local": {
+                "base_url": "http://localhost:11434/v1",
+                "api_key":  "x",
+                "model":    "test-model",
+                "api_format": "openai",
+            },
+        })
+
+        # Should NOT raise — ConnectionError is caught, not ValueError
+        cos = make_commit_on_success(cfg, repo, st)
+        assert isinstance(cos, CommitOnSuccess)
+
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-q"]))

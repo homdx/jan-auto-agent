@@ -49,6 +49,7 @@ from tools.auto.repo_ingest import RepoCluster
 from tools.auto.utils import atomic_write_text, file_set_fingerprint
 import tools.llm_stream as _llm_stream
 from tools.llm_stream import strip_think
+from tools.config_safe import safe_getboolean
 
 logger = logging.getLogger(__name__)
 
@@ -281,6 +282,46 @@ class CitedLocation:
     line_end: int | None = None
     new_file: bool = False
 
+    def __post_init__(self) -> None:
+        """Normalise ``symbol`` to ``str | None`` regardless of how this
+        dataclass was built (FIX-1 bug #5).
+
+        Two call sites build a ``CitedLocation`` from untrusted data:
+        ``ClusterReviewer._parse_candidates`` (raw LLM JSON) and the
+        module-level ``_deserialise_candidates`` (a JSON checkpoint file,
+        which could have been written by an older/buggy build or edited
+        by hand). Either can hand this a truthy non-string ``symbol`` —
+        an LLM-emitted ``123``, ``["Foo"]``, ``True``. ``is_valid()``
+        only checks truthiness, so such a value used to pass the
+        grounding gate and then crash downstream where a string is
+        assumed: ``re.escape()`` in ``backlog_prioritiser.py`` and
+        ``extract_block()`` in ``gate1_filter.py`` both raise
+        ``TypeError`` on a non-string.
+
+        Enforcing the invariant here, once, protects every construction
+        site — present and future, including direct construction in
+        tests — instead of only whichever one happened to be reported.
+        A non-string value carries no real grounding information (an
+        LLM's ``symbol: 123`` doesn't name any real symbol in the file),
+        so it is treated the same as "no symbol was given": discarded to
+        ``None`` rather than stringified into a fake anchor that would
+        just fail to be found later, silently, by ``extract_block``.
+        This also matches the sibling fields' existing pattern
+        (``_to_str_or_empty``, ``_to_int_or_none``, ``_to_bool_or``),
+        which is the pattern ``symbol`` alone was missing.
+        """
+        if self.symbol is None:
+            return
+        if isinstance(self.symbol, str):
+            self.symbol = self.symbol.strip() or None
+            return
+        logger.debug(
+            "CitedLocation: discarding non-string symbol %r (%s) for "
+            "file=%r — treated as no symbol given.",
+            self.symbol, type(self.symbol).__name__, self.file,
+        )
+        self.symbol = None
+
     def is_valid(self, task_mode: str = "code") -> bool:
         """A location is valid when it has a file AND at least one anchor.
 
@@ -334,6 +375,19 @@ class CandidateTask:
 # ─────────────────────────────────────────────────────────────────────────────
 # ClusterReviewer
 # ─────────────────────────────────────────────────────────────────────────────
+
+class ConfigValueError(ValueError):
+    """A config value the operator explicitly set that this code refuses.
+
+    Distinct from a plain ValueError on purpose: ClusterReviewer raises
+    ValueError both for values it cannot READ (a malformed int) and for
+    values it actively REFUSES (max_files_per_review <= 0). A caller that
+    degrades setup failures into "feature off" — pipeline._build_plan_validator
+    — must not swallow the second kind, or the creative plan phase runs
+    unvalidated and the operator never learns their config was rejected.
+    Kept a ValueError subclass so existing ``except ValueError`` still catches it.
+    """
+
 
 class ClusterReviewer(_llm_stream.LLMClientBase):
     """Sends one Architect LLM call per cluster and returns grounded candidates.
@@ -442,6 +496,22 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
             logger.warning("config [%s] max_files_per_review is malformed (%s) — using %d",
                             arch, exc, _DEFAULT_MAX_FILES_PER_REVIEW)
             self._max_files_per_review = _DEFAULT_MAX_FILES_PER_REVIEW
+        # A numeric but non-positive step slips past the guard above (int()
+        # accepts it) and reaches the batch split in review_clusters:
+        # range(0, len(files), 0) raises ValueError: range() arg 3 must not
+        # be zero for every non-empty cluster. That failure is deferred all
+        # the way into the review phase, so the operator sees a traceback
+        # deep in the architect instead of a config error. Validate at read
+        # time and name the key; deliberately not wrapped in try/except —
+        # this is a config error, and swallowing it would run the review with
+        # an arbitrary batch size nobody configured.
+        if self._max_files_per_review <= 0:
+            raise ConfigValueError(
+                "config [architect] max_files_per_review must be >= 1, "
+                f"got {self._max_files_per_review} — it is used as the step of "
+                "range(0, len(files), step), so 0 raises "
+                "'range() arg 3 must not be zero' for every cluster"
+            )
         # num_ctx controls the total context window on Ollama; 0 means "use server default".
         active_profile = config.get("api", "active", fallback="local")
         try:
@@ -468,21 +538,100 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
         # prompt/response path is byte-identical to pre-AUTO-P. AUTO-P3 adds
         # the documented key to agents.ini; the other six agents_*.ini window
         # profiles need no edit precisely because of this fallback.
-        self._probe_enabled          = config.getboolean(arch, "probe_enabled", fallback=False)
-        self._probe_max_rounds       = max(0, config.getint(arch, "probe_max_rounds", fallback=1))
-        self._probe_max_chars        = config.getint(arch, "probe_max_chars", fallback=2000)
-        self._probe_max_total_chars  = config.getint(arch, "probe_max_total_chars", fallback=6000)
+        # FIX-2 C2: every probe read below was a bare
+        # getboolean/getint/getfloat with no try/except. fallback= only
+        # covers a *missing* key — a key that is present but unparseable
+        # ([architect] probe_max_rounds = five) raises ValueError straight
+        # out of the call. Nothing on the path catches it: review_clusters
+        # builds this reviewer directly and pipeline._run_plan_phase calls
+        # it with no guard (unlike _build_plan_validator, which is the
+        # plan-*validation* path), so one malformed probe key aborted the
+        # whole --auto run at the plan phase. Each read now degrades to its
+        # documented default, matching the guarded block above. Wrapped
+        # per-call rather than via a shared helper for the same reason as
+        # that block — extract_config_reads must still see each literal call.
+        try:
+            self._probe_enabled          = config.getboolean(arch, "probe_enabled", fallback=False)
+        except ValueError as exc:
+            logger.warning("config [%s] probe_enabled is malformed (%s) — using False", arch, exc)
+            self._probe_enabled = False
+        try:
+            self._probe_max_rounds       = max(0, config.getint(arch, "probe_max_rounds", fallback=1))
+        except ValueError as exc:
+            logger.warning("config [%s] probe_max_rounds is malformed (%s) — using 1", arch, exc)
+            self._probe_max_rounds = 1
+        try:
+            self._probe_max_chars        = config.getint(arch, "probe_max_chars", fallback=2000)
+        except ValueError as exc:
+            logger.warning("config [%s] probe_max_chars is malformed (%s) — using 2000", arch, exc)
+            self._probe_max_chars = 2000
+        try:
+            self._probe_max_total_chars  = config.getint(arch, "probe_max_total_chars", fallback=6000)
+        except ValueError as exc:
+            logger.warning("config [%s] probe_max_total_chars is malformed (%s) — using 6000", arch, exc)
+            self._probe_max_total_chars = 6000
         # AUTO-P8: escalated re-asks allowed when the digest cap cuts a round
         # short. 0 restores the pre-AUTO-P8 behaviour (force immediately).
         # AUTO-P9: learn the working digest cap instead of rediscovering it
         # once per batch. See ArchProbe.seeded_cap.
-        self._probe_budget_warmup    = config.getint(arch, "probe_budget_warmup", fallback=3)
-        self._probe_budget_headroom  = config.getfloat(arch, "probe_budget_headroom", fallback=2.0)
-        self._probe_budget_max_chars = config.getint(arch, "probe_budget_max_chars", fallback=0)
-        self._probe_budget_escalations = max(0, min(
-            len(_arch_probe._BUDGET_ESCALATION_LADDER),
-            config.getint(arch, "probe_budget_escalations", fallback=2),
-        ))
+        try:
+            self._probe_budget_warmup    = config.getint(arch, "probe_budget_warmup", fallback=3)
+        except ValueError as exc:
+            logger.warning("config [%s] probe_budget_warmup is malformed (%s) — using 3", arch, exc)
+            self._probe_budget_warmup = 3
+        try:
+            self._probe_budget_headroom  = config.getfloat(arch, "probe_budget_headroom", fallback=2.0)
+        except ValueError as exc:
+            logger.warning("config [%s] probe_budget_headroom is malformed (%s) — using 2.0", arch, exc)
+            self._probe_budget_headroom = 2.0
+        try:
+            self._probe_budget_max_chars = config.getint(arch, "probe_budget_max_chars", fallback=0)
+        except ValueError as exc:
+            logger.warning("config [%s] probe_budget_max_chars is malformed (%s) — using 0", arch, exc)
+            self._probe_budget_max_chars = 0
+        try:
+            self._probe_budget_escalations = max(0, min(
+                len(_arch_probe._BUDGET_ESCALATION_LADDER),
+                config.getint(arch, "probe_budget_escalations", fallback=2),
+            ))
+        except ValueError as exc:
+            logger.warning("config [%s] probe_budget_escalations is malformed (%s) — using 2", arch, exc)
+            self._probe_budget_escalations = 2
+        # AUTO-P13: the AUTO-P8/AUTO-P9 ladders (2x/2x/4x, or 1.5x/2.5x/4x
+        # once a cap is learned) are fixed module-level constants — the same
+        # rungs fire whether the active profile's real window is 4K or 1M
+        # tokens. AUTO-H5-ESCALATE-1's own comment already flags this class
+        # of bug for max_tokens escalation ("a stale, too-small num_ctx
+        # silently caps escalation far below what the CURRENT model can
+        # actually take, even though nothing errors or warns about it") —
+        # this is the same problem for the probe's digest-cap ladder. A
+        # profile whose active [api_{active}] num_ctx is huge relative to
+        # probe_max_total_chars (e.g. a 1M-token remote model behind a
+        # "128k" profile) still climbs one small rung at a time, spending
+        # one architect round-trip per rung to reach room the window had
+        # from the start. Default 1.0 leaves every existing profile's ladder
+        # byte-identical; a profile can opt into faster growth by setting
+        # this above 1.0. _clamp_to_window (AUTO-P11) still bounds the
+        # result, so a large scale cannot exceed what the window can hold.
+        try:
+            self._probe_budget_ladder_scale = max(
+                0.1, config.getfloat(arch, "probe_budget_ladder_scale", fallback=1.0)
+            )
+        except ValueError as exc:
+            logger.warning(
+                "config [%s] probe_budget_ladder_scale is malformed (%s) — using 1.0",
+                arch, exc,
+            )
+            self._probe_budget_ladder_scale = 1.0
+        # AUTO-F1: bound on the run-level miss memo — see ArchProbe's own
+        # docstring for why reset() must not clear it.
+        try:
+            self._probe_memo_max_entries = max(
+                1, config.getint(arch, "probe_memo_max_entries", fallback=200)
+            )
+        except ValueError as exc:
+            logger.warning("config [%s] probe_memo_max_entries is malformed (%s) — using 200", arch, exc)
+            self._probe_memo_max_entries = 200
         _ops_raw                     = config.get(arch, "probe_allowed_ops", fallback="facts")
         # NOT defaulted back to DEFAULT_ALLOWED_OPS when the key is present but
         # empty: `probe_allowed_ops =` is an operator saying "allow nothing",
@@ -832,6 +981,8 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
             # AUTO-P7: `read` needs a root to contain paths against. Without
             # it the op disables itself rather than reading anywhere.
             base_dir=base_dir,
+            # AUTO-F1: run-level miss memo cap.
+            memo_max_entries=self._probe_memo_max_entries,
         )
         # AUTO-P11: an absolute ceiling the learned and escalated caps must
         # respect. Estimated the same way test_probe_budget_fits_the_window
@@ -898,6 +1049,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                     "max_chars":       self._probe_max_chars,
                     "max_total_chars": self._probe_max_total_chars,
                     "allowed_ops":     ",".join(self._probe_allowed_ops),
+                    "memo_max_entries": self._probe_memo_max_entries,
                 },
             )
         except Exception as exc:  # noqa: BLE001
@@ -1032,7 +1184,11 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
         #   truncation_shrink_factor — multiplier applied to max_tasks on each
         #                              shrink (default 0.5; clamped to (0, 1)
         #                              and to never fail to shrink at all).
-        _retry_max = self._config.getint("architect", "truncation_retry_max", fallback=2)
+        try:
+            _retry_max = self._config.getint("architect", "truncation_retry_max", fallback=2)
+        except ValueError as exc:
+            logger.warning("config [architect] truncation_retry_max is malformed (%s) — using default 2", exc)
+            _retry_max = 2
         _retry_max = max(0, _retry_max)
         try:
             _shrink_factor = float(
@@ -1083,7 +1239,11 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
         #                              before escalating further; an odd
         #                              max leaves the final tier's
         #                              second temperature untried.
-        _empty_retry_max = self._config.getint("architect", "empty_response_retry_max", fallback=6)
+        try:
+            _empty_retry_max = self._config.getint("architect", "empty_response_retry_max", fallback=6)
+        except ValueError as exc:
+            logger.warning("config [architect] empty_response_retry_max is malformed (%s) — using default 6", exc)
+            _empty_retry_max = 6
         _empty_retry_max = max(0, _empty_retry_max)
 
         # ── AUTO-P1: probe state, read by the _call_and_parse closure ───────
@@ -1532,6 +1692,51 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 counts[op.op] += 1
             return " ".join(f"{k}=0/0" for k in sorted(counts))
 
+        def _decline_facts_seq(reason: str, ops: list) -> tuple:
+            """AUTO-F4a, corrected: informed_facts / blind_facts for a
+            declined request.
+
+            This is deliberately NOT a copy of :func:`_decline_by_op`'s
+            "0/0 unless unresolved" rule, even though it looks like the same
+            shape of problem. `by_op` is a PER-ROUND delta — analyze_logs
+            sums every round's contribution, so a decline round that looked
+            nothing up correctly contributes "0/0" to that sum without
+            erasing anything: earlier rounds already emitted their own
+            events.
+
+            `informed_facts` / `blind_facts` are the opposite: a
+            cumulative-for-the-whole-batch snapshot (see
+            ArchProbe.informed_facts), and analyze_logs deliberately keeps
+            only the LAST recorded value per cluster, not a sum — summing
+            would double-count a batch's own running total (see
+            analyze_logs.py's `_probe_last_facts_seq` comment). An earlier,
+            broken version of this function returned a hardcoded "0/0" for
+            any reason other than `unresolved` — which is correct for
+            `by_op`'s per-round semantics but wrong here: whenever a
+            `repeat` (or other non-`unresolved`) decline happened to be the
+            LAST event recorded for a cluster, that hardcoded "0/0"
+            overwrote and permanently erased whatever real informed/blind
+            counts earlier rounds in the SAME batch had already
+            established. Measured impact on a live run (trace
+            `47f94038c230`): two batches' entire facts-sequencing
+            contribution — one of them 1 informed hit plus 3 blind misses —
+            vanished this way, undercounting the run's `facts` denominator
+            by 5 and its hit count by 2, both silently.
+
+            The fix: always read the CURRENT cumulative counters, whatever
+            the decline reason — they already reflect every `facts` ask
+            made so far in this batch and do not need `reason` to interpret
+            them. Only genuinely unavailable when `_probe` itself is `None`
+            (`no_executor`: the probe was never built at all, so there is
+            no cumulative state to read).
+            """
+            if _probe is None:
+                return ("0/0", "0/0")
+            return (
+                "%d/%d" % _probe.informed_facts,
+                "%d/%d" % _probe.blind_facts,
+            )
+
         def _decline(reason: str, ops: list) -> None:
             """AUTO-P4a: record WHY a probe request went unanswered.
 
@@ -1548,6 +1753,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
             misses — collect had in fact answered everything it was asked.
             """
             try:
+                _informed_seq, _blind_seq = _decline_facts_seq(reason, ops)
                 tracer.event(
                     source="architect", target="probe", kind="probe_declined",
                     model=self._model,
@@ -1569,6 +1775,18 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                         # is exactly the comparison the next scope decision
                         # (refs? read?) rests on.
                         "by_op":   _decline_by_op(reason, ops),
+                        # AUTO-F4a: closes the exact same gap for the
+                        # informed/blind split that AUTO-P6 (above) closed
+                        # for by_op. Without this, a `facts` ask that misses
+                        # inside an all-miss round is counted in `by_op`
+                        # (via _decline_by_op) but silently invisible to
+                        # analyze_logs's "facts sequencing" line — a real
+                        # gap found reviewing AUTO-F4 against a live run
+                        # (trace_e8d5b9fcd4b2: 2 blind misses in a declined
+                        # "support (batch 11/50)" round were missing from
+                        # the reported blind total).
+                        "informed_facts": _informed_seq,
+                        "blind_facts":    _blind_seq,
                     },
                 )
             except Exception as exc:  # noqa: BLE001 — diagnostics never break a batch
@@ -1614,6 +1832,26 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                     _factor, _temp = _ladder[
                         min(_budget_escalations, len(_ladder) - 1)
                     ]
+                    # AUTO-P13: widen the rung itself for a profile that
+                    # opted into faster growth (see the attribute's own
+                    # comment in __init__). 1.0 is a no-op multiply, so a
+                    # profile that never sets probe_budget_ladder_scale gets
+                    # the exact 2x/2x/4x (or 1.5x/2.5x/4x) rungs AUTO-P8/
+                    # AUTO-P9 shipped — this only stretches them when asked.
+                    _factor *= self._probe_budget_ladder_scale
+                    # AUTO-P9-followup: capture the cap BEFORE raise_budget()
+                    # mutates it. raise_budget() and current_cap share the
+                    # same underlying state, so reading current_cap AFTER the
+                    # call — as the line below used to — silently prints the
+                    # NEW cap in the slot meant to show what was just
+                    # exceeded. That is the exact failure this log line's own
+                    # AUTO-P11 comment warns about, just reintroduced from the
+                    # other direction: a live run showed "(12775/17716)" for
+                    # a batch that actually started at 11811 and had only
+                    # just been raised TO 17716 — reading as "had room to
+                    # spare and still ran out" when the batch never had that
+                    # room in the first place.
+                    _old_cap = _probe.current_cap
                     _new_cap = _probe.raise_budget(_factor)
                     _budget_escalations += 1
                     logger.info(
@@ -1625,7 +1863,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                         "(%d/%d chars) — escalation %d/%d: cap raised to %d, "
                         "temperature %.1f.",
                         cluster.name, _probe.chars_used,
-                        _probe.current_cap, _budget_escalations,
+                        _old_cap, _budget_escalations,
                         self._probe_budget_escalations, _new_cap, _temp,
                     )
                     tracer.event(
@@ -1661,12 +1899,61 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                 _decline("digest_budget", probe_request)
                 break
             if _probe_rounds >= self._probe_max_rounds:
-                logger.info(
-                    "review_one_cluster [%s]: probe round cap reached (%d) — "
-                    "forcing a final plan call.",
-                    cluster.name, self._probe_max_rounds,
-                )
-                _decline("round_cap", probe_request)
+                # AUTO-P12: the round cap ends the back-and-forth, but the
+                # request that triggered it is still a legitimate,
+                # never-answered ask — the model was cut off mid-question,
+                # not told its question was wrong. Every other branch above
+                # discards the pending request outright once its budget is
+                # spent; this is the one case where that is avoidable at no
+                # extra cost, because the forced final call below is already
+                # about to happen regardless. So: answer this last request
+                # once, with the digest cap lifted (there is no further round
+                # left for an oversized answer to blow), and fold it into
+                # that same forced call rather than spending another
+                # architect round-trip asking again.
+                _last_digest = _probe.execute(probe_request, unbounded=True)
+                if _last_digest:
+                    logger.info(
+                        "review_one_cluster [%s]: probe round cap reached "
+                        "(%d) — answering the pending request without a "
+                        "digest cap before the forced final call.",
+                        cluster.name, self._probe_max_rounds,
+                    )
+                    _probe_digest = (
+                        f"{_probe_digest}\n\n{_last_digest}"
+                        if _probe_digest else _last_digest
+                    )
+                    try:
+                        tracer.event(
+                            source="probe", target="architect",
+                            kind="probe_result", model=self._model,
+                            content=_last_digest,
+                            params={
+                                "cluster":        cluster.name,
+                                "round":          _probe_rounds + 1,
+                                "ops":            len(probe_request),
+                                "hits":           _probe.last_hits,
+                                "misses":         _probe.last_misses,
+                                "by_op":          _probe.last_by_op_str(),
+                                "chars_used":     _probe.chars_used,
+                                "run_chars_used": _probe.run_chars_used,
+                                "unbounded":      "True",
+                                # AUTO-F4 — see the other probe_result event.
+                                "informed_facts": "%d/%d" % _probe.informed_facts,
+                                "blind_facts":    "%d/%d" % _probe.blind_facts,
+                            },
+                        )
+                    except Exception as exc:  # noqa: BLE001 — AUTO-P4a
+                        logger.debug(
+                            "probe_result (unbounded) trace failed: %s", exc
+                        )
+                else:
+                    logger.info(
+                        "review_one_cluster [%s]: probe round cap reached "
+                        "(%d) — forcing a final plan call.",
+                        cluster.name, self._probe_max_rounds,
+                    )
+                    _decline("round_cap", probe_request)
                 break
 
             _fingerprint = frozenset(str(op) for op in probe_request)
@@ -1710,12 +1997,28 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                         # rate across two real runs as "22 resolved".
                         "hits":           _probe.last_hits,
                         "misses":         _probe.last_misses,
+                        # AUTO-F1: of those misses, how many cost nothing —
+                        # answered from the run-level memo with no bridge
+                        # lookup. Folded into "misses" already (AC-F1-5); this
+                        # is the breakout that makes the saving visible rather
+                        # than merely asserted.
+                        "memo_hits":      _probe.last_memo_hits,
                         # AUTO-P5: "facts=3/1 module=1/0" — which op resolved
                         # what. Aggregate hits cannot tell you whether a newly
                         # added op is earning its round-trip.
                         "by_op":          _probe.last_by_op_str(),
                         "chars_used":     _probe.chars_used,
                         "run_chars_used": _probe.run_chars_used,
+                        # AUTO-F4: is the model asking `facts` for names it
+                        # already saw via `module`, or guessing blind?
+                        # `PROBE_INSTRUCTIONS` now says to check `module`
+                        # first — this measures whether that instruction is
+                        # actually followed instead of assuming it is.
+                        # Cumulative for the batch so far, not just this
+                        # round, hence read fresh each time rather than
+                        # cached — see ArchProbe.informed_facts/blind_facts.
+                        "informed_facts": "%d/%d" % _probe.informed_facts,
+                        "blind_facts":    "%d/%d" % _probe.blind_facts,
                     },
                 )
             except Exception as exc:  # noqa: BLE001 — AUTO-P4a, see above
@@ -1961,7 +2264,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
             # Replaces the previous hard-coded task_mode == "creative" check (DM-2).
             if not acceptance:
                 _acc_default = (
-                    self._config.getboolean("auto", "creative_acceptance_default", fallback=True)
+                    safe_getboolean(self._config, "auto", "creative_acceptance_default", fallback=True)
                     if self._task_mode == "creative"
                     else False
                 )
@@ -2009,7 +2312,27 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
         # which collapse every chapter into a copy of one when run
         # sequentially over shared files. Keep only the first N.
         if self._task_mode == "creative":
-            cap = self._config.getint("architect", "max_tasks_creative", fallback=1)
+            # BUGFIX (FIX-1 #6): fallback= only covers a *missing* key — a
+            # present but non-numeric max_tasks_creative (e.g. "three", or a
+            # leftover empty value) raised ValueError straight out of
+            # getint, and nothing on the path from _review_one_cluster up to
+            # --auto caught it, so one bad value in agents.ini crashed the
+            # whole plan phase *after* the architect's LLM call had already
+            # produced the candidates this cap exists to trim. Degrade to
+            # the documented default (1) — the strictest setting, and the
+            # safe direction for a cap whose purpose is to stop overlapping
+            # creative tasks. Guarded inline (not via a shared helper) so
+            # extract_config_reads (tools/collect/ast_facts.py) still sees
+            # this as a literal getint call — matches this class's own
+            # __init__ guards and gate1_filter.py's established style.
+            try:
+                cap = self._config.getint("architect", "max_tasks_creative", fallback=1)
+            except ValueError as exc:
+                logger.warning(
+                    "config [architect] max_tasks_creative is malformed (%s) — using 1",
+                    exc,
+                )
+                cap = 1
             cap = max(1, cap)
             if len(candidates) > cap:
                 logger.info(
@@ -2216,7 +2539,7 @@ def review_clusters(
     api_key   = config.get(section, "api_key",    fallback="")
     model     = config.get(section, "model")
     api_fmt   = config.get(section, "api_format", fallback="openai")
-    verify_ssl = config.getboolean("api", "verify_ssl", fallback=True)
+    verify_ssl = safe_getboolean(config, "api", "verify_ssl", fallback=True)
 
     reviewer = ClusterReviewer(
         config=config,
@@ -2310,14 +2633,67 @@ class TaskRewriter(_llm_stream.LLMClientBase):
         super().__init__(config, base_url, api_key, model, api_format, verify_ssl)
 
         arch = "architect"
-        self._max_tokens  = int(config.get(arch, "rewrite_max_tokens",  fallback="512"))
-        self._temperature = float(config.get(arch, "rewrite_temperature", fallback="0.4"))
-        self._think       = config.getboolean(arch, "think", fallback=False)
-        raw_system        = config.get(arch, "rewrite_system", fallback="").strip()
-        self._system      = raw_system or _REWRITER_SYSTEM_DEFAULT
-        self._timeout     = float(config.get("loop", "timeout_seconds", fallback="300"))
+        # BUGFIX (FIX-1 #7): every conversion below used to be bare.
+        # configparser's fallback= only covers a *missing* key — a key that is
+        # present but malformed (rewrite_max_tokens = many, think = maybe,
+        # num_ctx = 8k) raises ValueError out of the constructor, and
+        # make_outer_loop builds the rewriter unconditionally, so one bad
+        # value killed the rewrite phase before it could rewrite anything.
+        # Each read is guarded independently so a bad key degrades to its
+        # documented default and the other four still apply. Wrapped
+        # per-call (not via a shared helper) so extract_config_reads
+        # (tools/collect/ast_facts.py) still sees each literal call — a
+        # shared helper's call shape is invisible to that AST scanner.
+        # Matches ClusterReviewer.__init__'s established style (above).
+        try:
+            self._max_tokens = int(
+                config.get(arch, "rewrite_max_tokens", fallback="512")
+            )
+        except ValueError as exc:
+            logger.warning(
+                "config [%s] rewrite_max_tokens is malformed (%s) — using 512",
+                arch, exc,
+            )
+            self._max_tokens = 512
+        try:
+            self._temperature = float(
+                config.get(arch, "rewrite_temperature", fallback="0.4")
+            )
+        except ValueError as exc:
+            logger.warning(
+                "config [%s] rewrite_temperature is malformed (%s) — using 0.4",
+                arch, exc,
+            )
+            self._temperature = 0.4
+        try:
+            self._think = config.getboolean(arch, "think", fallback=False)
+        except ValueError as exc:
+            logger.warning(
+                "config [%s] think is malformed (%s) — using False", arch, exc,
+            )
+            self._think = False
+        raw_system = config.get(arch, "rewrite_system", fallback="").strip()
+        self._system = raw_system or _REWRITER_SYSTEM_DEFAULT
+        try:
+            self._timeout = float(
+                config.get("loop", "timeout_seconds", fallback="300")
+            )
+        except ValueError as exc:
+            logger.warning(
+                "config [loop] timeout_seconds is malformed (%s) — using 300", exc,
+            )
+            self._timeout = 300.0
         active_profile    = config.get("api", "active", fallback="local")
-        self._num_ctx     = config.getint(f"api_{active_profile}", "num_ctx", fallback=0)
+        try:
+            self._num_ctx = config.getint(
+                f"api_{active_profile}", "num_ctx", fallback=0
+            )
+        except ValueError as exc:
+            logger.warning(
+                "config [api_%s] num_ctx is malformed (%s) — using 0",
+                active_profile, exc,
+            )
+            self._num_ctx = 0
 
     # ── Public API ────────────────────────────────────────────────────────────
 

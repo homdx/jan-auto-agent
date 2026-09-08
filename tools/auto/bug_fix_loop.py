@@ -50,7 +50,7 @@ from __future__ import annotations
 
 import logging
 import shutil
-from datetime import datetime
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -206,7 +206,14 @@ class BugFixLoop:
             rounds = sorted(tdir.glob("feedback_round_*.md"))
             if not rounds:
                 return
-            stamp   = datetime.now().strftime("%Y%m%dT%H%M%S")
+            # FIX-1 #8 (second half): local clock -> UTC. These archive
+            # directories are read next to run.log lines and ticket
+            # timestamps, both of which _ts() now stamps in UTC; leaving
+            # this one local makes the order of events in a failed run
+            # unreconstructable by eye. Patched in place (not via utils) so
+            # tests_bugfix/test_bug_fix_loop_archive_collision.py can keep
+            # freezing bug_fix_loop.datetime.
+            stamp   = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
             archive = tdir / f"previous_attempt_{stamp}"
             # BUGFIX: two archive calls for the same fix_id within the same
             # wall-clock second land on an identical `archive` path. With
@@ -250,6 +257,26 @@ class BugFixLoop:
                 "so the retry starts from round 1",
                 len(rounds), fix_id, archive.name,
             )
+            # BUGFIX: also clear deadline_started_at.txt so the retry gets a
+            # fresh wall-clock budget. OuterLoop.run_task writes this file on
+            # the first run and reads it on every resume to compute the
+            # remaining budget (outer_loop.py:147-174). Archiving the feedback
+            # rounds resets the *round* counter but not the *time* counter, so
+            # a fix that exhausted most of its max_task_seconds on the first
+            # attempt started the retry with ~0 seconds left and was
+            # immediately re-blocked by the deadline gate — the operator reset
+            # (ticket status -> "open") restored the attempt budget but the
+            # stale deadline silently defeated the retry.
+            deadline_path = tdir / "deadline_started_at.txt"
+            if deadline_path.exists():
+                try:
+                    deadline_path.unlink()
+                except OSError as exc:
+                    logger.warning(
+                        "BugFixLoop: could not remove %s for %s — the "
+                        "retry may inherit a stale wall-clock budget: %s",
+                        deadline_path.name, fix_id, exc,
+                    )
             self._prune_old_archives(tdir)
         except OSError as exc:
             logger.warning(
@@ -577,6 +604,12 @@ class BugFixLoop:
                 "bug_fix_loop", "controller", "attempts_exhausted",
                 params={"ticket_id": ticket_id, "attempts": attempts},
             )
+            # BUGFIX: every other "defer this ticket" branch in this file
+            # calls _discard_fix_residue before _park_fix_task; this one
+            # skipped it, leaving the last (never-committed) fix attempt's
+            # working-tree edits in place to be swept into whatever the
+            # NEXT successful commit happens to be.
+            self._discard_fix_residue(fix_id)
             self._park_fix_task(fix_id)
             return BugFixResult(
                 ticket_id, fix_id, fixed=False, exhausted=True, skipped=True,
@@ -631,7 +664,17 @@ class BugFixLoop:
         fix_task = self._build_fix_task(
             fix_id, ticket_id, triggering_task, exec_result
         )
-        self._state.upsert_task(fix_task)
+        # A1 follow-up: fix_id is deterministic (f"{_FIX_PREFIX}{root_id}"), so a
+        # NEW regression on the same root re-upserts the SAME id. Once the first
+        # fix succeeded that task is STATUS_DONE (bug_fix_loop.py:712 /
+        # commit_on_success.py:165), and the A1 downgrade guard would refuse the
+        # done -> todo re-open — the new regression would sit in plan.json with a
+        # fresh instruction and a done status, so the queue would never pick it
+        # up and the regression would go silently unfixed. A new regression IS
+        # the explicit "give this task a fresh start" signal the opt-in exists
+        # for. Plain re-plans (plan_emitter / pipeline) still do not pass it, so
+        # completed work stays protected there.
+        self._state.upsert_task(fix_task, allow_downgrade=True)
 
         # ── 3. Run the fix through the C-loop ─────────────────────────────────
         logger.info(

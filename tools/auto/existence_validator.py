@@ -43,6 +43,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from tools.config_safe import safe_getboolean
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +79,56 @@ _INLINE_CODE_RE = re.compile(r"`([^`\n]+)`")
 _FENCE_RE = re.compile(r"```[a-zA-Z0-9_-]*\n(.*?)```", re.DOTALL)
 
 _URLISH_RE = re.compile(r"https?://|www\.")
+
+# Prose punctuation that can legitimately wrap a path token: quotes and
+# trailing sentence punctuation are never part of a filename and are always
+# safe to strip. Brackets/parens are different — they are also valid
+# *filename* characters (see the glob.escape() call in check(), added for
+# exactly this reason, for "handler[old].py") — so they are only stripped
+# when they form a genuine wrapping pair or an unambiguous stray delimiter.
+# "." is deliberately NOT in this set: it is the leading character of a
+# dotfile reference (".hidden_test.py"), which the AUTO-FIX in _normalise()
+# below exists specifically to preserve.
+_QUOTE_AND_PUNCT = "\"',;:"
+_OPEN_TO_CLOSE = {"(": ")", "[": "]", "{": "}"}
+_CLOSE_TO_OPEN = {close: open_ for open_, close in _OPEN_TO_CLOSE.items()}
+
+
+def _strip_wrapping_delimiters(token: str) -> str:
+    """Strip prose delimiters around *token* without corrupting it.
+
+    FIX-2 #3: this used to be a single ``token.strip("\"'()[],;:")`` call.
+    ``str.strip(chars)`` removes a *charset* independently from each end, not
+    a matched delimiter pair, so ``"[file].py"`` — whose closing ``]`` is not
+    the last character — lost only its leading ``[`` and became
+    ``"file].py"``: a name that isn't on disk, so a document that correctly
+    referenced an existing file was rejected as broken.
+
+    A bracket/paren is removed only when it wraps the whole token
+    (``"(file.py)"`` -> ``"file.py"``) or is unambiguously stray, i.e. it has
+    no partner anywhere else in the token (``"file.py)"`` -> ``"file.py"``).
+    ``"handler[old].py"`` and ``"[file].py"`` keep every bracket, because a
+    partner exists elsewhere in the token — exactly the case this module
+    already treats as a real filename character.
+    """
+    while True:
+        token = token.strip(_QUOTE_AND_PUNCT)
+        if not token:
+            return token
+        first, last = token[0], token[-1]
+        if first in _OPEN_TO_CLOSE:
+            if len(token) >= 2 and last == _OPEN_TO_CLOSE[first]:
+                token = token[1:-1]
+                continue
+            if _OPEN_TO_CLOSE[first] not in token[1:]:
+                token = token[1:]
+                continue
+        elif last in _CLOSE_TO_OPEN:
+            if _CLOSE_TO_OPEN[last] not in token[:-1]:
+                token = token[:-1]
+                continue
+        break
+    return token
 
 
 @dataclass
@@ -122,6 +173,34 @@ def _candidate_tokens(text: str) -> list[str]:
     return tokens
 
 
+def _parts_inside_base(path: Path, base: Path) -> tuple[str, ...]:
+    """Components of *path* relative to *base*, i.e. what is inside the repo.
+
+    `Path.parts` is rooted at the filesystem root, so it contains the BASE
+    DIRECTORY'S OWN COMPONENTS too. Judging hidden-ness against it meant any
+    base path with a dot component — `/home/u/.cache/repo`, `/srv/.deploy/src`,
+    `/tmp/.venv/proj` — made EVERY file in the repository look hidden:
+    `_repo_has_tests` then reported a real test suite as phantom, and
+    `check()`'s name-match fallback reported present files as missing. Both
+    were silent and total rather than intermittent. Hidden detection must judge
+    only what is inside the repository.
+
+    `rglob` always yields paths under *base*, so `relative_to` normally cannot
+    fail; the fallback keeps a differently-normalised base (a relative base,
+    a symlinked prefix) from turning into an unhandled error and silently
+    disabling the filter in the opposite direction.
+    """
+    try:
+        return path.relative_to(base).parts
+    except ValueError:
+        return path.parts
+
+
+def _is_hidden(path: Path, base: Path) -> bool:
+    """True if *path* sits inside a dot-directory relative to *base*."""
+    return any(part.startswith(".") for part in _parts_inside_base(path, base))
+
+
 class ExistenceValidator:
     """Check that every file a document references is really there."""
 
@@ -141,7 +220,7 @@ class ExistenceValidator:
     # ── helpers ──────────────────────────────────────────────────────────────
 
     def _looks_like_path(self, token: str) -> bool:
-        token = token.strip().strip("\"'()[],;:")
+        token = _strip_wrapping_delimiters(token.strip())
         if not token or _URLISH_RE.search(token):
             return False
         if token.startswith("-"):          # a CLI flag, not a path
@@ -152,7 +231,7 @@ class ExistenceValidator:
         return suffix[1].lower() in self._extensions
 
     def _normalise(self, token: str) -> str:
-        token = token.strip().strip("\"'()[],;:")
+        token = _strip_wrapping_delimiters(token.strip())
         # AUTO-FIX: lstrip("./") strips a *charset*, not the "./" prefix —
         # ".hidden_test.py" became "hidden_test.py". Strip only real leading
         # "./" and "../" path segments.
@@ -176,7 +255,7 @@ class ExistenceValidator:
     @staticmethod
     def _repo_has_tests(base_dir: Path) -> bool:
         for path in base_dir.rglob("*.py"):
-            if any(part.startswith(".") for part in path.parts):
+            if _is_hidden(path, base_dir):
                 continue
             if _TEST_FILE_RE.match(path.name):
                 return True
@@ -211,7 +290,7 @@ class ExistenceValidator:
                 # like "handler[old].py" searched for a pattern, not that
                 # name. Escape it for a literal match.
                 if any(
-                    p.name == name and not any(q.startswith(".") for q in p.parts)
+                    p.name == name and not _is_hidden(p, base)
                     for p in base.rglob(glob.escape(name))
                 ):
                     continue
@@ -268,8 +347,8 @@ def make_existence_validator(config, *, task_mode: str = "docs"):
     validator = ExistenceValidator(
         extensions=_list("existence_extensions", DEFAULT_EXTENSIONS),
         ignore=_list("existence_ignore", DEFAULT_IGNORE),
-        check_test_suite=config.getboolean(
-            "validator_agent", "existence_check_test_suite", fallback=True
+        check_test_suite=safe_getboolean(
+            config, "validator_agent", "existence_check_test_suite", fallback=True
         ),
         max_existence_revisions=max_rev,
     )

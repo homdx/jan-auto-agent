@@ -78,6 +78,7 @@ from tools.auto.context_assembler import ContextAssembler
 from tools.agent_trace import tracer
 import tools.llm_stream as _llm_stream
 from tools.llm_stream import strip_think
+from tools.config_safe import safe_getboolean
 
 logger = logging.getLogger(__name__)
 
@@ -137,7 +138,17 @@ _SYSTEM_PROMPT = (
     '{"path": "relative/path.py", "delete": true} in "files" — with NO '
     '"content" key. Deletion is only allowed for paths listed in target_files; '
     "the original is backed up automatically. Never emit shell commands or "
-    "os.remove calls to delete files — use the delete flag."
+    "os.remove calls to delete files — use the delete flag.\n"
+    "10. Do NOT introduce a new third-party dependency. Use only the standard "
+    "library and packages the repository already imports or declares in its "
+    "dependency manifest (requirements.txt, package.json, pom.xml, go.mod, "
+    "Cargo.toml). If the task looks like it needs a new one, implement it with "
+    "what is already available — an unavailable import makes the acceptance "
+    "check fail.\n"
+    "11. You are rewriting the WHOLE file, so preserve everything unrelated to "
+    "the task — existing imports, helpers, comments and docstrings — and match "
+    "the file's existing conventions (naming, error handling, logging, comment "
+    "style). Never reformat or strip comments you were not asked to change."
 )
 
 # Backward-compat alias — "code" is the default persona.
@@ -241,6 +252,33 @@ class CoderResult:
 # ─────────────────────────────────────────────────────────────────────────────
 # Coder
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+def _is_truthy_delete(value) -> bool:
+    """True iff `value` should be interpreted as 'delete this file'.
+
+    Models regularly emit the ``delete`` key in non-canonical forms:
+    ``"true"`` (string), ``1`` (int), ``"yes"`` (string), etc. A strict
+    ``value is True`` check rejects every one of those and the file
+    silently stays in place. Accept the small canonical set:
+        - JSON ``True``
+        - ``"true"/"True"/"TRUE"``  (case-insensitive)
+        - ``"yes"/"Yes"/"YES"``     (case-insensitive)
+        - integer ``1``
+    Anything else (``False``, ``0``, ``"false"``, ``None``, prose) is
+    NOT a delete — preserving the prior fail-loud behaviour for
+    ambiguous or missing values.
+    """
+    if value is True:
+        return True
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value == 1
+    if isinstance(value, str):
+        return value.strip().lower() in {"true", "yes", "1"}
+    return False
+
 
 class Coder(_llm_stream.LLMClientBase):
     """Generates full revised file content for a single autonomous task.
@@ -794,8 +832,18 @@ class Coder(_llm_stream.LLMClientBase):
             missing = data.get("missing_context")
             if isinstance(missing, list):
                 return [str(s).strip() for s in missing if s][:8]
-        except Exception:
-            pass
+        except (json.JSONDecodeError, AttributeError, TypeError) as exc:
+            # BUGFIX: was a bare `except Exception: pass`, which swallowed
+            # malformed-JSON, non-dict, and non-list payloads identically —
+            # the caller then silently treats context as "satisfied" (no
+            # missing_context) with no signal that the LLM's response
+            # couldn't be parsed at all versus genuinely having nothing
+            # missing. Narrowed to the exceptions this parse can actually
+            # raise and logged at debug so the real cause is visible.
+            logger.debug(
+                "_extract_missing_context: could not parse missing_context "
+                "from LLM response: %s", exc,
+            )
         return []
 
     def _fetch_needed(
@@ -997,8 +1045,17 @@ class Coder(_llm_stream.LLMClientBase):
                         chapters[p.name] = p.read_text(encoding="utf-8", errors="replace")
                     except OSError:
                         continue
-        except Exception:  # noqa: BLE001
-            pass
+        except OSError as exc:
+            # BUGFIX: was a bare `except Exception: pass` — narrowed to
+            # OSError (the only kind this glob/path-construction code can
+            # raise) and logged. Silently swallowing it meant a permission
+            # error or a vanishing candidate directory quietly reduced the
+            # set of sibling chapters checked for near-duplication, with no
+            # signal that detection quality had degraded.
+            logger.debug(
+                "_creative_duplication_error: could not list candidate "
+                "chapters under %s: %s", base_dir, exc,
+            )
 
         produced: dict[str, str] = {}
         for f in parsed_files:
@@ -1134,8 +1191,19 @@ class Coder(_llm_stream.LLMClientBase):
                     txt = p.read_text(encoding="utf-8", errors="replace")
                     if txt.strip():
                         return txt
-        except Exception:  # noqa: BLE001
-            pass
+        except OSError as exc:
+            # BUGFIX: was a bare `except Exception: pass`, which swallowed a
+            # real I/O error (permission-denied, disk failure, a candidate
+            # path disappearing mid-scan) exactly the same as "no preceding
+            # chapter found" — the caller then generates prose with no
+            # language-sample grounding and no hint anything went wrong.
+            # Narrowed to OSError (the only exception this glob/read-text
+            # code can actually raise) and logged so the real cause is
+            # visible instead of silently downgrading to "no content".
+            logger.warning(
+                "_creative_language_sample: could not read a candidate "
+                "chapter under %s: %s", cdir, exc,
+            )
         return ""
 
     def _build_creative_file_contents(
@@ -1216,6 +1284,24 @@ class Coder(_llm_stream.LLMClientBase):
         if parts:
             return "\n\n".join(parts)
         return "(new chapter — no prior content to continue from)"
+
+    @staticmethod
+    def _is_truthy_delete(value) -> bool:
+        """Accept truthy variants of a ``delete`` flag from the model.
+
+        JSON ``true`` is the canonical form, but models also emit ``"true"``,
+        ``"True"``, ``"TRUE"``, ``"yes"``, ``"Yes"``, and the integer ``1``.
+        Every one of those should trigger the delete branch; anything else
+        (``false``, ``"false"``, ``0``, ``None``, arbitrary strings) must
+        fall through to the content branch.
+        """
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, int) and not isinstance(value, bool):
+            return value == 1
+        if isinstance(value, str):
+            return value.strip().lower() in ("true", "yes")
+        return False
 
     def _parse_response(
         self, text: str, task_id: str,
@@ -1309,7 +1395,11 @@ class Coder(_llm_stream.LLMClientBase):
                 continue
             # pullrun-sim fix: {"path": ..., "delete": true} marks a file for
             # deletion (refactors that merge a module away). No content needed.
-            if item.get("delete") is True:
+            # BUGFIX A5: models emit the flag in non-canonical forms
+            # ("true" string, 1, "yes") — use _is_truthy_delete to accept
+            # the canonical truthy variants without falsely triggering
+            # on "false"/None/prose.
+            if _is_truthy_delete(item.get("delete")):
                 parsed.append({"path": path, "delete": True})
                 continue
             if content is None:
@@ -1844,7 +1934,9 @@ class Coder(_llm_stream.LLMClientBase):
             # Same path/target guards as writes; original backed up to
             # .coder.bak so the deletion is reversible without git. Deleting
             # an already-absent file is a no-op success (idempotent retries).
-            if item.get("delete") is True:
+            # BUGFIX A5: accept truthy string/int variants ("true", 1,
+            # "yes") the same way _parse_response does.
+            if _is_truthy_delete(item.get("delete")):
                 try:
                     if dest.exists():
                         backup = dest.with_suffix(dest.suffix + ".coder.bak")
@@ -2401,7 +2493,7 @@ def make_coder(config: configparser.ConfigParser, task_mode: str = "code",
     api_key   = config.get(section, "api_key",    fallback="")
     model     = config.get(section, "model")
     api_fmt   = config.get(section, "api_format", fallback="openai")
-    verify_ssl = config.getboolean("api", "verify_ssl", fallback=True)
+    verify_ssl = safe_getboolean(config, "api", "verify_ssl", fallback=True)
 
     return Coder(
         config     = config,

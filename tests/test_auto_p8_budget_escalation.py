@@ -337,6 +337,46 @@ class TestEscalationLadder:
         assert int(e["params"]["new_cap"]) == 1200  # 600 configured x 2.0
         assert e["params"]["cluster"] == "agents"
 
+    def test_escalation_log_shows_the_cap_that_was_exceeded(
+        self, cluster_and_base, caplog
+    ) -> None:
+        """AUTO-P9 follow-up: the "(chars/cap)" pairing on the escalation
+        log line must show the cap that was actually in force when the
+        round overflowed — not the cap it was just raised to.
+
+        `raise_budget()` and `current_cap` share the same underlying
+        state, so reading `current_cap` AFTER calling `raise_budget()`
+        always prints the just-raised cap in both places. A live run
+        showed "(12775/17716)" for a batch that started at 11811 and had
+        only just been raised TO 17716 — reading as "had room to spare
+        and still ran out" when the batch never had that room. This is
+        exactly the failure mode the comment right above this line warns
+        about (from the OTHER direction — AUTO-P11 fixed a stale-OLD-value
+        bug; this one is a stale-NEW-value bug)."""
+        import logging
+        cluster, base_dir = cluster_and_base
+        r = _reviewer(_cfg(probe_budget_escalations="1"))
+        with caplog.at_level(logging.INFO):
+            with patch(
+                "tools.llm_stream.request_completion",
+                side_effect=[_BIG, _BIG, _good("F")],
+            ):
+                r.review_clusters([cluster], base_dir, goal="g")
+
+        msg = next(
+            rec.getMessage() for rec in caplog.records
+            if "escalation 1/" in rec.getMessage()
+        )
+        # configured cap is 600 (see _cfg); the first ladder rung is 2.0x,
+        # so the escalation raises it to 1200 — and 600, the cap that was
+        # ACTUALLY exceeded, must be what's printed as the denominator.
+        assert "cap raised to 1200" in msg
+        assert "/600 chars)" in msg, (
+            f"the exceeded-cap slot must show 600 (the cap in force before "
+            f"this escalation), not 1200 (the cap it was just raised to): {msg!r}"
+        )
+        assert "/1200 chars)" not in msg
+
     def test_round_cap_does_not_escalate(self, cluster_and_base) -> None:
         """AC-P8-11: escalation buys room. A round cap is not a room problem,
         and spending calls on it would be spending them on nothing."""
@@ -354,3 +394,75 @@ class TestEscalationLadder:
             r.review_clusters([cluster], base_dir, goal="g")
 
         assert mock_llm.call_count == 3  # probe, re-ask, forced — no extra
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AUTO-P13: per-profile ladder scale
+# ─────────────────────────────────────────────────────────────────────────────
+#
+#   AC-P13-1  Unset probe_budget_ladder_scale ⇒ the ladder's rungs are
+#             byte-identical to AUTO-P8 (new_cap == configured x 2.0).
+#   AC-P13-2  probe_budget_ladder_scale > 1.0 widens the rung by that extra
+#             factor, on top of the ladder's own multiplier.
+#   AC-P13-3  A malformed value logs a warning and falls back to 1.0 (noop)
+#             instead of crashing construction.
+
+class TestLadderScale:
+
+    def test_unset_scale_is_a_noop(self, cluster_and_base, tmp_path) -> None:
+        """AC-P13-1: no profile that never sets this key sees any change."""
+        cluster, base_dir = cluster_and_base
+        r = _reviewer(_cfg(probe_budget_escalations="1"))
+        tp = tmp_path / "t.jsonl"
+        tracer.configure(enabled=True, path=str(tp), console_echo=False)
+        try:
+            with patch(
+                "tools.llm_stream.request_completion",
+                side_effect=[_BIG, _BIG, _good("F")],
+            ):
+                r.review_clusters([cluster], base_dir, goal="g")
+        finally:
+            tracer.configure(enabled=False)
+
+        ev = [json.loads(l) for l in tp.read_text().splitlines() if l.strip()]
+        e = next(x for x in ev if x.get("kind") == "probe_escalated")
+        assert int(e["params"]["new_cap"]) == 1200  # 600 configured x 2.0, unchanged
+
+    def test_scale_widens_the_rung(self, cluster_and_base, tmp_path) -> None:
+        """AC-P13-2: a profile with far more real headroom than the fixed
+        ladder assumes (e.g. a 1M-token remote model behind a "128k"
+        profile) can ask for bigger jumps instead of climbing one small
+        rung — and one architect round-trip — at a time."""
+        cluster, base_dir = cluster_and_base
+        r = _reviewer(_cfg(probe_budget_escalations="1",
+                            probe_budget_ladder_scale="3.0"))
+        tp = tmp_path / "t.jsonl"
+        tracer.configure(enabled=True, path=str(tp), console_echo=False)
+        try:
+            with patch(
+                "tools.llm_stream.request_completion",
+                side_effect=[_BIG, _BIG, _good("F")],
+            ):
+                r.review_clusters([cluster], base_dir, goal="g")
+        finally:
+            tracer.configure(enabled=False)
+
+        ev = [json.loads(l) for l in tp.read_text().splitlines() if l.strip()]
+        e = next(x for x in ev if x.get("kind") == "probe_escalated")
+        assert int(e["params"]["new_cap"]) == 3600  # 600 x 2.0 x 3.0
+
+    def test_malformed_scale_falls_back_to_noop(
+        self, cluster_and_base, caplog
+    ) -> None:
+        """AC-P13-3: a config typo degrades to the documented default
+        rather than crashing the whole batch."""
+        import logging
+        cluster, base_dir = cluster_and_base
+        with caplog.at_level(logging.WARNING):
+            r = _reviewer(_cfg(probe_budget_escalations="1",
+                                probe_budget_ladder_scale="not-a-number"))
+        assert r._probe_budget_ladder_scale == 1.0
+        assert any(
+            "probe_budget_ladder_scale is malformed" in rec.getMessage()
+            for rec in caplog.records
+        )

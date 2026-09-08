@@ -221,10 +221,26 @@ class TestPresenceRejectionLevelDependsOnCause:
                 filt.filter([c], repo)
         assert not any("Gate1[presence] REJECTED" in r.message for r in caplog.records)
 
-    # test_technical_failure_still_logs_at_warning moved to
-    # tests_slow/test_gate1_log_levels_slow.py — it exercises the real
-    # (unmocked) ~180s retry backoff and was dominating `pytest tests`
-    # runtime by itself. Run it via `pytest tests_slow`.
+    def test_technical_failure_still_logs_at_warning(self, filt, repo, caplog):
+        """A real call failure must NOT be downgraded to INFO — this is
+        the actual anomaly WARNING exists for."""
+        c = _candidate(symbol="stable_func")
+        # Default retry config is 3 retries * 60s real time.sleep() between
+        # them (see Gate1Filter._check_presence) -- this test only checks
+        # the WARNING-level logging outcome, not retry timing, so skip the
+        # wait. Was split into tests_slow/test_gate1_log_levels_slow.py
+        # while this ~180s cost was unavoidable; merged back now that it
+        # isn't (2026-09-03, same fix as tests/test_auto_b3.py).
+        filt._llm_call_retry_wait_sec = 0
+        with caplog.at_level(logging.WARNING, logger="tools.auto.gate1_filter"):
+            with patch(
+                "tools.llm_stream.request_completion",
+                side_effect=RuntimeError("HTTP 500 from server"),
+            ):
+                accepted, rejected = filt.filter([c], repo)
+        assert accepted == []
+        warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert any("REJECTED" in r.message for r in warning_records)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -215,7 +215,7 @@ _API_KEY_LINE_RE = re.compile(
 )
 
 
-def mask_api_key(text: str) -> str:
+def mask_api_key(text: "str | None") -> "str | None":
     """Replace every ``api_key = <value>`` line in *text* with
     ``api_key = here_your_key``, regardless of what the value actually is
     (a placeholder like "test", a real key, anything non-blank).
@@ -231,7 +231,7 @@ def mask_api_key(text: str) -> str:
     return _API_KEY_LINE_RE.sub(r"\1here_your_key\3", text)
 
 
-def strip_think(text: str) -> str:
+def strip_think(text: "str | None") -> "str | None":
     """
     Remove reasoning-model <think>…</think> blocks from model output.
 
@@ -256,6 +256,56 @@ def strip_think(text: str) -> str:
     return out.strip()
 
 
+def _not_an_object_error(where: str, value, keys_desc: str) -> ValueError:
+    """Build the malformed-reply ValueError for a `message` (or choice) field
+    that is present but is not a JSON object.
+
+    A missing key raises KeyError, which the guards below already convert to
+    this same descriptive ValueError — so callers' retry ladders see one
+    exception class either way. Indexing a non-object raises TypeError
+    instead, which is NOT a KeyError and escaped the guard: that is what
+    ``{"message": null}`` did before this helper existed.
+    """
+    return ValueError(
+        f"LLM response's {where} is not a JSON object (got "
+        f"{type(value).__name__}) — malformed reply from the backend "
+        f"({keys_desc})"
+    )
+
+
+def _content_to_text(content, subject: str) -> str:
+    """Return a message's ``content`` as text, or raise ValueError.
+
+    ``content`` may legitimately be JSON ``null`` (an empty reply). It may
+    also arrive as a LIST — the OpenAI multimodal shape, which some gateways
+    relay verbatim — or as any other non-string. ``(content or "").strip()``
+    raised ``AttributeError`` on those: neither a KeyError nor a ValueError,
+    so it escaped this module's error convention with no diagnostic.
+    """
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content.strip()
+    if isinstance(content, list):
+        # OpenAI's multimodal shape, which some gateways relay verbatim:
+        # [{"type": "text", "text": "..."}, {"type": "image_url", ...}].
+        # It is a VALID reply, so join the text parts rather than rejecting
+        # it; only a list with no text part at all is unusable.
+        parts = [
+            block["text"]
+            for block in content
+            if isinstance(block, dict) and isinstance(block.get("text"), str)
+        ]
+        if parts:
+            return "".join(parts).strip()
+        if not content:
+            return ""
+    raise ValueError(
+        f"{subject}'s 'content' is not a string (got "
+        f"{type(content).__name__}) — malformed reply from the backend"
+    )
+
+
 def _extract_content(raw: dict, api_format: str) -> str:
     """Extract assistant message text from a non-streaming response dict.
 
@@ -268,6 +318,14 @@ def _extract_content(raw: dict, api_format: str) -> str:
     has no attribute 'strip'` — a response that arrived successfully was
     crashing the whole call instead of degrading to an empty reply the
     same way a filtered/empty `choices` list already does below.
+
+    BUGFIX: the same two accesses also had to handle `message: null`
+    (present, not an object). `raw["message"]["content"]` then raised
+    `TypeError: 'NoneType' object is not subscriptable` — not a KeyError, so
+    it escaped the guard below and aborted the call instead of taking the
+    descriptive-ValueError path every caller's retry ladder already handles.
+    Both dict accesses now isinstance-check the `message` field first and
+    raise the same ValueError.
     """
     # AUTO-FIX (medium-priority audit, DeepSeek-plan finding): both
     # dict-key accesses below (`raw["message"]`, `choices[0]["message"]`)
@@ -278,9 +336,32 @@ def _extract_content(raw: dict, api_format: str) -> str:
     # still raised a bare KeyError with no diagnostic content. Surface the
     # same kind of descriptive ValueError the empty-choices case already
     # uses, rather than letting a raw KeyError propagate.
+    # A body that json.loads() accepted but that is a JSON *array* (or any
+    # other non-object) made both branches below raise AttributeError while
+    # calling .get()/.keys() — including while BUILDING their own error
+    # message. Guard once, up front, with the same error class.
+    if not isinstance(raw, dict):
+        preview = repr(raw)
+        if len(preview) > 120:
+            preview = preview[:117] + "..."
+        raise ValueError(
+            f"LLM response is not a JSON object (got {type(raw).__name__}: "
+            f"{preview}) — malformed reply from the backend"
+        )
     if api_format == "ollama":
+        message = raw.get("message")
+        if not isinstance(message, dict):
+            if "message" in raw:
+                # Present but null (or a string/list): `None["content"]` raises
+                # TypeError, which is NOT a KeyError and escaped the guard below.
+                raise _not_an_object_error("message", message,
+                                           f"raw keys: {list(raw.keys())}")
+            raise ValueError(
+                "LLM response missing expected key 'message' — raw response "
+                f"shape was unexpected (raw keys: {list(raw.keys())})"
+            )
         try:
-            return (raw["message"]["content"] or "").strip()
+            return _content_to_text(message["content"], "LLM response")
         except KeyError as exc:
             raise ValueError(
                 f"LLM response missing expected key {exc} — raw response "
@@ -303,13 +384,28 @@ def _extract_content(raw: dict, api_format: str) -> str:
             f"LLM response had no choices — likely blocked/filtered by the "
             f"backend (raw keys: {list(raw.keys())})"
         )
+    choice = choices[0]
+    if not isinstance(choice, dict):
+        raise _not_an_object_error(
+            "first choice", choice, f"raw keys: {list(raw.keys())}"
+        )
+    message = choice.get("message")
+    if not isinstance(message, dict):
+        if "message" in choice:
+            raise _not_an_object_error(
+                "first choice's message", message, f"choice keys: {list(choice.keys())}"
+            )
+        raise ValueError(
+            "LLM response's first choice is missing expected key 'message' — "
+            f"raw response shape was unexpected (choice keys: {list(choice.keys())})"
+        )
     try:
-        return (choices[0]["message"]["content"] or "").strip()
+        return _content_to_text(message["content"], "LLM response's first choice")
     except KeyError as exc:
         raise ValueError(
             f"LLM response's first choice is missing expected key {exc} — "
             f"raw response shape was unexpected (choice keys: "
-            f"{list(choices[0].keys()) if isinstance(choices[0], dict) else type(choices[0]).__name__})"
+            f"{list(choice.keys())})"
         ) from exc
 
 
@@ -437,7 +533,21 @@ def ollama_chat_url(base_url: str) -> str:
     return f"{base}/api/chat"
 
 
-_JSON_FENCE_OPEN_RE = re.compile(r"```json", re.IGNORECASE)
+_JSON_FENCE_OPEN_RE = re.compile(
+    r"`{3,}json[A-Za-z0-9_+\-#.,]*(?=\s|$|[{\[\"])", re.IGNORECASE
+)
+# The label on a NON-``json`` opening fence: anything up to the next
+# whitespace/backtick, so ```python, ```text, ```json5, ```c++, ```c# and a
+# bare ``` all behave the same way. Deliberately not "rest of the line" —
+# a model that puts its body on the same line as the marker
+# (```json {"a": 1}) must keep that body.
+# A label is markdown's info string, which ends the opening line — so it is
+# only a label when whitespace, a newline or the end of the text follows it.
+# Without that lookahead "```123```" parsed as label "123" + empty body, and
+# the body of a fence holding a bare JSON number was silently swallowed.
+_FENCE_LABEL_RE = re.compile(
+    r"`{3,}(?:[ \t]*[A-Za-z0-9_+\-#.,]*(?=\s|$|[{\[\"]))?"
+)
 
 
 def strip_json_fence(text: str) -> str:
@@ -457,14 +567,35 @@ def strip_json_fence(text: str) -> str:
         # confirmed closer before treating it as a fenced block.
         if "```" in rest:
             return rest.split("```")[0].strip()
-        return text
+        # BUGFIX (audit): an unclosed fence used to fall back to returning
+        # the ORIGINAL `text` — opening marker and all — instead of `rest`
+        # (the content actually inside the fence). That's harmless when the
+        # JSON body is itself incomplete (json.loads fails either way), but
+        # when the model's JSON is complete and only the closing ``` was
+        # never emitted (truncation, or the model just omitted it), leaving
+        # the leading "```json" attached broke every caller's json.loads on
+        # otherwise-valid content. `rest` already excludes everything
+        # BEFORE the opening marker — the exact thing the AUTO-FIX above
+        # guards against discarding — so returning `rest.strip()` here
+        # loses nothing that returning `text` didn't equally risk losing,
+        # while giving complete-but-unclosed JSON a real chance to parse.
+        return rest.strip()
     if "```" in text:
-        before, _, rest = text.partition("```")
+        # BUGFIX (audit): only the ```json branch above knew its fence had a
+        # label. A block labelled anything else (```python, ```text, ```js)
+        # fell through here and the label was left glued to the body —
+        # "python\n{\"a\": 1}" — so every caller's json.loads failed on
+        # content that was perfectly valid JSON, burning a retry on a format
+        # slip the parser could have recovered from. Consume whatever label
+        # the opening fence carries, not just the literal "json".
+        rest = text[_FENCE_LABEL_RE.search(text).end():]
         if "```" in rest:
             return rest.split("```")[0].strip()
-        # Only a single, unmatched "```" — not a real fence pair. Don't
-        # discard whatever precedes it.
-        return text
+        # Only a single, unmatched "```" — not a real fence pair. Same
+        # reasoning as the ```json branch above: return what follows the
+        # marker (not the untouched original) so a complete JSON body with
+        # just a missing closing fence still parses.
+        return rest.strip()
     return text
 
 
@@ -1244,9 +1375,17 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
         while True:
             try:
                 with _open() as response:
-                    raw = json.loads(response.read().decode("utf-8"))
-                return _extract_content(raw, api_format)
-            except (TimeoutError, ssl.SSLError, ConnectionError, urllib.error.URLError) as e:
+                    # utf-8-sig: a UTF-8 BOM at the head of the body makes
+                    # json.loads fail on "not a valid JSON text" even though
+                    # the payload itself is fine. utf-8-sig is identical for
+                    # BOM-free bodies.
+                    raw = json.loads(response.read().decode("utf-8-sig"))
+            except (TimeoutError, ssl.SSLError, ConnectionError, urllib.error.URLError,
+                    ValueError) as e:
+                # ValueError covers json.JSONDecodeError (a subclass): a
+                # truncated or garbled body from a flaky proxy is as retryable
+                # as a dropped connection, and it used to escape this loop as
+                # an uncaught exception instead of taking the ladder below.
                 if _read_attempt >= error_retries:
                     raise RuntimeError(
                         f"{type(e).__name__} reading response body from {url}: {e} "
@@ -1262,6 +1401,13 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
                     on_retry(msg)
                 sleep(error_retry_wait_sec)
                 _read_attempt += 1
+            else:
+                # Only the read+parse is retried. A ValueError from
+                # _extract_content means the response DID arrive and is a
+                # distinct outcome the caller must see right away — feeding
+                # it back into this loop would retry a deterministic shape
+                # mismatch error_retries times instead of surfacing it.
+                return _extract_content(raw, api_format)
 
     # ── Streaming ────────────────────────────────────────────────────────
     parts = []
@@ -1278,16 +1424,26 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
         try:
             with _open() as response:
                 for raw_line in response:
-                    line = raw_line.decode("utf-8").strip()
+                    # utf-8-sig: a BOM on the first line of the stream would
+                    # otherwise drop that chunk via the JSONDecodeError
+                    # `continue` below.
+                    line = raw_line.decode("utf-8-sig").strip()
                     if not line:
                         continue
 
                     if api_format == "ollama":
                         # Ollama streams newline-delimited JSON objects
                         # {"message": {"role": "assistant", "content": "tok"}, "done": false}
+                        # BUGFIX: chunk.get("message", {}) returns the default {}
+                        # only when the key is ABSENT — a present-but-null
+                        # "message" (e.g. a keep-alive or role-only chunk from
+                        # a non-standard Ollama-compatible server) returns None,
+                        # and None.get("content", "") raises AttributeError,
+                        # which is NOT caught by the except json.JSONDecodeError
+                        # below. Use `or {}` to handle both absent and null.
                         try:
                             chunk = json.loads(line)
-                            token = chunk.get("message", {}).get("content", "")
+                            token = (chunk.get("message") or {}).get("content", "")
                             done  = chunk.get("done", False)
                         except json.JSONDecodeError:
                             continue
@@ -1320,7 +1476,14 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
                             #   -> IndexError: list index out of range
                             #      (uncaught, propagates out of request_completion)
                             choices = chunk.get("choices") or []
-                            token = choices[0]["delta"].get("content", "") if choices else ""
+                            # BUGFIX: choices[0]["delta"] can be None (a
+                            # role-only or usage-reporting chunk from some
+                            # OpenAI-compatible servers), and
+                            # None.get("content", "") raises AttributeError
+                            # which is NOT caught by the except clause below
+                            # (only JSONDecodeError/KeyError). Use `or {}` to
+                            # handle both a missing and a null delta.
+                            token = (choices[0].get("delta") or {}).get("content", "") if choices else ""
                             done  = False
                         except (json.JSONDecodeError, KeyError):
                             continue

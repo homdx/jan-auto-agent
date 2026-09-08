@@ -55,7 +55,24 @@ class ThemeVerdict:
     unparseable: bool = False
 
     def feedback(self) -> str:
-        return self.reason or ("approved" if self.approved else "revise")
+        """Coder-facing message: the instruction verbatim, or "" if approved.
+
+        FIX-2 #10: this used to be ``self.reason or ("approved" if approved
+        else "revise")``, so an APPROVED verdict reported the literal string
+        "approved" and a rejection without a reason reported "revise". That
+        broke the mirrored-design promise stated in this class's own
+        docstring ("same shape as ContinuityVerdict") — a caller cannot
+        treat non-empty feedback as "there is a problem" when a passing
+        check says "approved".
+
+        An approved verdict carries no coder-facing message, whatever else
+        it records — the fail-open note in ``reason`` (e.g. "no guidelines
+        configured", "llm error — passed on fail-open") stays on the
+        verdict for logging, but is not surfaced here.
+        """
+        if self.approved:
+            return ""
+        return self.reason
 
 
 class ThemeValidator:

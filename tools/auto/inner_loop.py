@@ -41,12 +41,13 @@ import logging
 import time
 from tools.auto.context_broker import ContextBroker
 from tools.auto.gate_registry import (  # GATES-1 / GATES-2
-    GATES, build_validators, resolve_gate_order, run_gates,
+    build_validators, resolve_gate_order, run_gates,
 )
 from tools.agent_trace import tracer   # AUTO-CR-27: per-stage decision tracing
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from tools.config_safe import safe_getboolean, safe_getint
 
 logger = logging.getLogger(__name__)
 
@@ -312,7 +313,7 @@ class LLMGate2Validator:
         # caller didn't resolve one (None), preserving old behaviour.
         self._think = (
             think if think is not None
-            else (config.getboolean("validator_agent", "think", fallback=False) if config is not None else False)
+            else (safe_getboolean(config, "validator_agent", "think", fallback=False) if config is not None else False)
         )
         # AUTO-DM-5 / AUTO-CR-19-1: select system prompt — mode-specific
         # override > (code-mode-only) legacy "system" key > built-in.
@@ -323,10 +324,10 @@ class LLMGate2Validator:
         from tools.search_agent import make_search_agent
         self._search_agent = make_search_agent(config, base_dir) if config else None
         self._context_probe_enabled = (
-            config.getboolean("coder", "context_probe", fallback=True) if config else True
+            safe_getboolean(config, "coder", "context_probe", fallback=True) if config else True
         )
         self._max_chars_per_dep = (
-            config.getint("coder", "max_chars_per_dep", fallback=2000) if config else 2000
+            safe_getint(config, "coder", "max_chars_per_dep", fallback=2000) if config else 2000
         )
 
     # ------------------------------------------------------------------
@@ -352,6 +353,31 @@ class LLMGate2Validator:
         budget = max(800, 6000 // max(len(files), 1))
         blocks = []
         for rel in files:
+            # B8: files_written is coder output, not code. A non-string entry
+            # (None, an int, a dict from a lenient JSON parse) makes
+            # `_base / rel` raise TypeError, which the `except OSError` below
+            # does not catch -- so one junk entry aborted the whole Gate-2
+            # prompt build instead of degrading to a note, which is this
+            # helper's entire job. An empty string is unusable too:
+            # `_base / ""` is just `_base`, and reading a directory raises.
+            #
+            # The check sits BEFORE the try on purpose. Detecting the bad
+            # entry from inside the exception handler would depend on which
+            # exception the path join happens to raise, and a pathlib.Path
+            # entry (which joins fine) would slip past unnoticed.
+            #
+            # Each bad entry gets its own visible block rather than being
+            # filtered out. A silently shorter list reads to the validator as
+            # "nothing suspicious here" at exactly the moment the coder
+            # invented a path -- the opposite of what this pipeline is for.
+            if not isinstance(rel, str) or not rel.strip():
+                blocks.append(
+                    f"--- (not a usable path: {rel!r}) ---\n"
+                    f"(the coder reported this entry in files_written, but it "
+                    f"is not a path — expected a non-empty string, got "
+                    f"{type(rel).__name__})"
+                )
+                continue
             try:
                 content = (_base / rel).read_text(
                     encoding="utf-8", errors="replace")
@@ -768,10 +794,16 @@ class LLMGate2Validator:
                 raise ValueError(
                     f"validator returned {type(parsed).__name__}, expected JSON object"
                 )
-            self.last_missing_context = [
-                str(x).strip() for x in (parsed.get("missing_context") or [])
-                if str(x).strip()
-            ]
+            # BUGFIX: same string-vs-list class of bug as _format_gate2_feedback —
+            # an LLM may return "missing_context" as a string. Without a type
+            # guard, iterating a string yields single characters.
+            raw_missing = parsed.get("missing_context")
+            if isinstance(raw_missing, list):
+                self.last_missing_context = [
+                    str(x).strip() for x in raw_missing if str(x).strip()
+                ]
+            else:
+                self.last_missing_context = []
             approved = bool(parsed.get("approved", False))
             if approved:
                 return True, ""
@@ -898,15 +930,19 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
         # «не против» / «непротив»
         _re.compile(r"\bне\s+против\b"),
         _re.compile(r"\bнепротив\b"),
-        # «одобрен* / одобряю» — NOT preceded by «не »
-        _re.compile(r"(?<!не )одобр"),
-        # «принято / принимаю / можно принять» — NOT preceded by «не »
-        _re.compile(r"(?<!не )принят"),
+        # «одобрен* / одобряю» — NOT preceded by «не » or «не» (one-word
+        # negation «неодобренный» must not match; the (?<!не) lookbehind
+        # catches the no-space form, (?<!не ) catches the spaced form).
+        _re.compile(r"(?<!не)(?<!не )одобр"),
+        # «принято / принимаю / можно принять» — NOT preceded by «не » or «не»
+        _re.compile(r"(?<!не)(?<!не )принят"),
         _re.compile(r"\bможно\s+принять\b"),
-        # «всё верно» / «все верно»
-        _re.compile(r"\b(всё|все)\s+верно\b"),
-        # «соответствует» — NOT preceded by «не »
-        _re.compile(r"(?<!не )соответствует\b"),
+        # «всё верно» / «все верно» — NOT preceded by «не » (the one-word
+        # form «невсё» has no \b before «всё» so \b already blocks it).
+        _re.compile(r"(?<!не )\b(всё|все)\s+верно\b"),
+        # «соответствует» — NOT preceded by «не » or «не» (one-word
+        # negation «несоответствует» must not match).
+        _re.compile(r"(?<!не)(?<!не )соответствует\b"),
         # «соглас*» (согласен/согласна/…) — NOT preceded by «не»/«нет»
         _re.compile(r"(?<!не)(?<!нет)(?<!не )(?<!нет )соглас"),
     ]
@@ -1140,7 +1176,19 @@ def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
 def _format_gate2_feedback(parsed: dict, max_hints: int) -> str:
     """Build a structured rejection string from a Gate-2 dict (LOOP-1)."""
     feedback = parsed.get("feedback", "no reason given")
-    hints    = (parsed.get("hints") or [])[:max_hints]
+    # BUGFIX: an LLM may return "hints" as a string instead of a list
+    # ("fix the ending" rather than ["fix the ending"]). Without a type
+    # guard, [:max_hints] slices the string and enumerate() iterates over
+    # individual characters ("1. f", "2. i", "3. x"). Wrap a string in a
+    # list so it is treated as a single hint; drop any other non-list type.
+    raw_hints = parsed.get("hints")
+    if isinstance(raw_hints, list):
+        hints = raw_hints
+    elif isinstance(raw_hints, str) and raw_hints.strip():
+        hints = [raw_hints]
+    else:
+        hints = []
+    hints = hints[:max_hints]
     approach = parsed.get("suggested_approach", "")
 
     lines = [f"Reason: {feedback}"]
@@ -1308,10 +1356,31 @@ class InnerLoop:
         # (not per attempt) and seeded into prefetched_context before the
         # first coder call. Purely additive: "" when no bridge was wired in,
         # the model is absent/stale, or target_files have no collect record.
+        # OPT-1: computed once and kept in a local for the whole round. The
+        # pull-model reassignments below (`prefetched_context =
+        # format_for_prompt(...)`) replace the WHOLE string, so this seeded
+        # block was silently dropped the first time the coder asked for extra
+        # context -- the collect record vanished from the prompt at exactly
+        # the point the coder had admitted it was missing something. Both
+        # reassignment sites re-prepend it via _with_collect_block().
+        _collect_block = ""
         if self._collect_bridge is not None:
-            _collect_block = self._collect_bridge.context_for_many(target_files)
+            _collect_block = self._collect_bridge.context_for_many(target_files) or ""
             if _collect_block:
                 prefetched_context = _collect_block + "\n\n"
+
+        def _with_collect_block(formatted: str) -> str:
+            """Re-attach the per-task collect block to a rebuilt context string.
+
+            Purely additive: returns *formatted* unchanged when no bridge was
+            wired in, the model is absent or stale, or target_files have no
+            collect record.
+            """
+            if not _collect_block:
+                return formatted
+            if not formatted:
+                return _collect_block + "\n\n"
+            return _collect_block + "\n\n" + formatted
         _start_time = time.monotonic()  # AUTO-CR-21-4: wall-clock guard reference point
         # AUTO-CR-33: prefer a task-wide deadline shared across rounds; fall back
         # to a per-call budget when called standalone (no deadline passed).
@@ -1399,7 +1468,8 @@ class InnerLoop:
                 # next rejection carried no missing_context of its own).
                 newly = self._broker.resolve(coder_missing, target_files, base_dir_path)
                 resolved_context.update(newly)
-                prefetched_context = self._broker.format_for_prompt(resolved_context)
+                prefetched_context = _with_collect_block(
+                    self._broker.format_for_prompt(resolved_context))
                 logger.info("InnerLoop: attempt %d coder requested context %s — accumulated (%d total)",
                             attempt, coder_missing, len(resolved_context))
 
@@ -1514,7 +1584,8 @@ class InnerLoop:
                 if val_missing:
                     newly = self._broker.resolve(val_missing, target_files, base_dir_path)
                     resolved_context.update(newly)
-                    prefetched_context = self._broker.format_for_prompt(resolved_context)
+                    prefetched_context = _with_collect_block(
+                        self._broker.format_for_prompt(resolved_context))
                     logger.info(
                         "InnerLoop: attempt %d validator requested context %s — accumulated (%d total)",
                         attempt, val_missing, len(resolved_context),
