@@ -440,7 +440,7 @@ def validate_plan(
 # removal early, leaving its tail behind as orphaned text.
 def _task_section_pattern(task_id: str) -> re.Pattern:
     return re.compile(
-        r"### " + re.escape(task_id) + r":.*?(?=\n### [A-Za-z0-9_-]+:|\n## Manual Suggestions|\Z)",
+        r"### " + re.escape(task_id) + r":.*?(?=\n### |\n## Manual Suggestions|\Z)",
         re.DOTALL,
     )
 

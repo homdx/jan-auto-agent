@@ -297,7 +297,7 @@ def _wrapper_fallback_note(instruction: str, code_block: str, full_source: str) 
     for m in _WRAPPER_CALL_RE.finditer(code_block):
         name = m.group(1)
         body_match = re.search(
-            rf"def\s+{re.escape(name)}\s*\(self[^)]*\)(?::\s*[^:]+)?:(.*?)(?=\n    def |\nclass |\Z)",
+            rf"def\s+{re.escape(name)}\s*\(([^)]*)\)(?:\s*->\s*[^:]+)?:(.*?)(?=\n    def |\nclass |\Z)",
             full_source, re.S,
         )
         if not body_match:

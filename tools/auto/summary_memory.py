@@ -304,7 +304,7 @@ class SummaryFidelityVerifier:
                 break
 
             first_line = reply.splitlines()[0].strip().upper()
-            if first_line == "OK" and len(reply) <= 4:
+            if first_line.startswith("OK") and len(reply) <= 4:
                 logger.debug("SummaryFidelityVerifier: OK on round %d.", rnd)
                 break
 

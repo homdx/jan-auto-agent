@@ -85,6 +85,9 @@ def resolve_target_path(base_dir: str, parsed_file_path: str):
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
+# Must stay in sync with the --config argparse default.
+_DEFAULT_CONFIG_PATH = "agents.ini"
+
 
 class MockFileUtilities:
     """Last-resort fallback only. The real implementations live in tools/ and are
@@ -807,7 +810,7 @@ def _parse_args():
                         help="Run a single query, print the result, and exit (0 ok / 1 error).")
     parser.add_argument("--base", metavar="DIR", default=None,
                         help="Project root directory (overrides positional base_dir).")
-    parser.add_argument("--config", metavar="FILE", default="agents.ini",
+    parser.add_argument("--config", metavar="FILE", default=_DEFAULT_CONFIG_PATH,
                         help="Path to agents.ini (default: agents.ini).")
     # AUTO-A1: autonomous mode flag
     parser.add_argument("--auto", metavar="GOAL", default=None,
@@ -1161,14 +1164,22 @@ def main():
         else:
             action = "collect"
 
+        # A missing config is only fatal when the user explicitly asked for a
+        # specific file: erroring out on the *default* path breaks every run
+        # that relied on built-in defaults (e.g. from outside the repo root).
         if not os.path.exists(args.config):
-            print(
-                f"Error: --config file not found: {args.config!r}. "
-                f"Check the path and extension (a common mistake is a typo "
-                f"like 'agents_128k.in' instead of 'agents_128k.ini').",
-                file=sys.stderr,
+            if args.config != _DEFAULT_CONFIG_PATH:
+                print(
+                    f"Error: --config file not found: {args.config!r}. "
+                    f"Check the path and extension (a common mistake is a typo "
+                    f"like 'agents_128k.in' instead of 'agents_128k.ini').",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            logger.warning(
+                "config %r not found — continuing with built-in defaults",
+                args.config,
             )
-            sys.exit(1)
         config = configparser.ConfigParser(inline_comment_prefixes=(';', '#'))
         config.read(args.config, encoding="utf-8")
 
