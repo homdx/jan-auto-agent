@@ -79,6 +79,56 @@ _FENCE_RE = re.compile(r"```[a-zA-Z0-9_-]*\n(.*?)```", re.DOTALL)
 
 _URLISH_RE = re.compile(r"https?://|www\.")
 
+# Prose punctuation that can legitimately wrap a path token: quotes and
+# trailing sentence punctuation are never part of a filename and are always
+# safe to strip. Brackets/parens are different — they are also valid
+# *filename* characters (see the glob.escape() call in check(), added for
+# exactly this reason, for "handler[old].py") — so they are only stripped
+# when they form a genuine wrapping pair or an unambiguous stray delimiter.
+# "." is deliberately NOT in this set: it is the leading character of a
+# dotfile reference (".hidden_test.py"), which the AUTO-FIX in _normalise()
+# below exists specifically to preserve.
+_QUOTE_AND_PUNCT = "\"',;:"
+_OPEN_TO_CLOSE = {"(": ")", "[": "]", "{": "}"}
+_CLOSE_TO_OPEN = {close: open_ for open_, close in _OPEN_TO_CLOSE.items()}
+
+
+def _strip_wrapping_delimiters(token: str) -> str:
+    """Strip prose delimiters around *token* without corrupting it.
+
+    FIX-2 #3: this used to be a single ``token.strip("\"'()[],;:")`` call.
+    ``str.strip(chars)`` removes a *charset* independently from each end, not
+    a matched delimiter pair, so ``"[file].py"`` — whose closing ``]`` is not
+    the last character — lost only its leading ``[`` and became
+    ``"file].py"``: a name that isn't on disk, so a document that correctly
+    referenced an existing file was rejected as broken.
+
+    A bracket/paren is removed only when it wraps the whole token
+    (``"(file.py)"`` -> ``"file.py"``) or is unambiguously stray, i.e. it has
+    no partner anywhere else in the token (``"file.py)"`` -> ``"file.py"``).
+    ``"handler[old].py"`` and ``"[file].py"`` keep every bracket, because a
+    partner exists elsewhere in the token — exactly the case this module
+    already treats as a real filename character.
+    """
+    while True:
+        token = token.strip(_QUOTE_AND_PUNCT)
+        if not token:
+            return token
+        first, last = token[0], token[-1]
+        if first in _OPEN_TO_CLOSE:
+            if len(token) >= 2 and last == _OPEN_TO_CLOSE[first]:
+                token = token[1:-1]
+                continue
+            if _OPEN_TO_CLOSE[first] not in token[1:]:
+                token = token[1:]
+                continue
+        elif last in _CLOSE_TO_OPEN:
+            if _CLOSE_TO_OPEN[last] not in token[:-1]:
+                token = token[:-1]
+                continue
+        break
+    return token
+
 
 @dataclass
 class ExistenceVerdict:
@@ -169,7 +219,7 @@ class ExistenceValidator:
     # ── helpers ──────────────────────────────────────────────────────────────
 
     def _looks_like_path(self, token: str) -> bool:
-        token = token.strip().strip("\"'()[],;:")
+        token = _strip_wrapping_delimiters(token.strip())
         if not token or _URLISH_RE.search(token):
             return False
         if token.startswith("-"):          # a CLI flag, not a path
@@ -180,7 +230,7 @@ class ExistenceValidator:
         return suffix[1].lower() in self._extensions
 
     def _normalise(self, token: str) -> str:
-        token = token.strip().strip("\"'()[],;:")
+        token = _strip_wrapping_delimiters(token.strip())
         # AUTO-FIX: lstrip("./") strips a *charset*, not the "./" prefix —
         # ".hidden_test.py" became "hidden_test.py". Strip only real leading
         # "./" and "../" path segments.
