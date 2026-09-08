@@ -36,6 +36,7 @@ plan.json task schema (enforced by _validate_task_schema):
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -358,6 +359,25 @@ class StateStore:
 
     # ── Query API ────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _detached(task: dict) -> dict:
+        """A caller-owned copy of *task*.
+
+        FIX-3 M1: every read accessor here used to hand back the live dict out
+        of ``self._plan``. Nothing stopped a caller mutating it, and the next
+        validated setter then persisted whatever they had written — the setters
+        validate their own arguments, not the plan they are about to serialise.
+        Confirmed live before this fix: ``get_task(id)["status"] = 12345``
+        followed by any counter bump put a non-enum status into plan.json.
+
+        A copy is the cheap end of the fix. Validating on every write would pay
+        a schema check on each status change for a path that copying closes
+        outright, and it would still leave the plan mutable from the outside
+        between validation and serialisation. Tasks are small flat dicts, and
+        these accessors run once per task per phase, not in any hot loop.
+        """
+        return copy.deepcopy(task)
+
     def resume_info(self) -> dict:
         """Return a summary of tasks by status for the resume banner.
 
@@ -370,8 +390,9 @@ class StateStore:
         """
         tasks = self._plan.get("tasks", [])
         done_ids    = {t["id"] for t in tasks if t["status"] == STATUS_DONE}
-        in_progress = [t for t in tasks if t["status"] == STATUS_IN_PROGRESS]
-        pending     = [t for t in tasks if t["status"] not in (STATUS_DONE, STATUS_BLOCKED)]
+        in_progress = [self._detached(t) for t in tasks if t["status"] == STATUS_IN_PROGRESS]
+        pending     = [self._detached(t) for t in tasks
+                       if t["status"] not in (STATUS_DONE, STATUS_BLOCKED)]
         return {
             "done_ids":    done_ids,
             "in_progress": in_progress,
@@ -379,15 +400,22 @@ class StateStore:
         }
 
     def get_task(self, task_id: str) -> dict | None:
-        """Return the task dict for *task_id*, or None if not found."""
+        """Return a caller-owned copy of the task dict, or None if not found.
+
+        FIX-3 M1: returns a copy, not the live object — see :meth:`_detached`.
+        Mutating the result changes nothing on disk; route changes through
+        ``set_task_status``/``upsert_task``, which validate what they are given.
+        """
         for t in self._plan.get("tasks", []):
             if t["id"] == task_id:
-                return t
+                return self._detached(t)
         return None
 
     def all_tasks(self) -> list[dict]:
         """Return all tasks in plan order."""
-        return list(self._plan.get("tasks", []))
+        # FIX-3 M1: list() alone was a *shallow* copy — a new list holding the
+        # same live dicts, so the plan was still mutable through any element.
+        return [self._detached(t) for t in self._plan.get("tasks", [])]
 
     def get_goal(self) -> str:
         # Bugfix: .get("goal", "") only falls back on a MISSING key, so an
@@ -1090,6 +1118,24 @@ class StateStore:
             raise OSError(f"StateStore: failed to write {path} ({exc})") from exc
 
     def _save_plan(self) -> None:
+        """Serialise ``self._plan`` to plan.json atomically, without revalidating.
+
+        FIX-3 M1 asked whether this should re-validate every task before
+        writing, on the theory that a caller might mutate ``self._plan``
+        directly and reach here outside a validated setter. That path was real
+        — not through this method, but through the read accessors, which handed
+        out live task dicts (see :meth:`_detached`). Closing it there makes the
+        invariant true rather than merely documented: all eight call sites are
+        validated setters, and no accessor exposes anything the caller can use
+        to reach into the plan.
+
+        So no per-write validation here. It would cost a schema pass on every
+        status change to guard a path that copy-on-read already closes, and it
+        would not have caught the leak anyway — the mutated task was schema-
+        shaped, just wrong. A new call site must go through a setter or
+        validate first; ``tests_bugfix/test_bugfix_m1_get_task_reference_leak``
+        fails if an accessor starts leaking again.
+        """
         self._atomic_write(
             self._plan_path,
             json.dumps(self._plan, indent=2, ensure_ascii=False),
