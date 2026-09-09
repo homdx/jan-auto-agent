@@ -7,6 +7,51 @@ Each reviewer gets: the **core prompt**, one **variant block**, that variant's
 `IMPROVEMENTS.md`, and read access to the repo. It writes findings one at a time
 into its own CSV.
 
+## Where the prompt is — what to paste into a reviewer model
+
+The prompt lives in **this file**. There is no separate prompt file. Assemble it
+by copying two blocks of text from below, in order:
+
+1. **`## Core prompt — prepend to every variant`** — the whole block-quoted body
+   under that heading. Same for every reviewer, every run.
+2. **One `### Variant N` block** — pick the variant that produced the list you
+   are handing over. The current round is **Variant 1 — mutable state escaping
+   accessors** (every entry is an aliasing / defensive-copy task).
+
+Then attach, in the same message:
+
+3. **The findings list**: `validate1/IMPROVEMENTS.md` (for this round). The
+   reviewer does **not** open it directly — it is fed one entry at a time by
+   `scripts/next_finding.py` — but the file must be present in the working tree.
+4. **Read access to the repo.** The reviewer runs no code beyond a throwaway
+   `python3 -c` / grep to check its own claim, and it touches nothing under
+   `jan` / `main.py` — that was stage 1 and is already done.
+
+The reviewer runs inside whatever agent shell you like (Kilo plugin, etc.); it
+only needs a terminal in the repo root and the two loop scripts
+(`scripts/next_finding.py`, `scripts/append_finding.py`).
+
+### If `next_finding.py` says the list is "thin"
+
+> `error: every entry in validate1/IMPROVEMENTS.md has no Location and no Instruction`
+
+That means the `IMPROVEMENTS.md` copy was truncated to headings only (stage 1
+sometimes renders just the `### ID: title` line and the `**Cluster:**` line).
+A reviewer cannot judge a title alone, so the tool refuses it. Recover it one of
+two ways:
+
+- **Regenerate from stage 1** — the real, full list:
+  ```bash
+  python3 main.py --auto "<goal from docs/TASK-jan-selfaudit.md>" --dry-run \
+      --config agents_128k.ini --base .
+  cp IMPROVEMENTS.md validate1/IMPROVEMENTS.md
+  ```
+- **Or** pass `--allow-thin` to review titles only (weaker — records that the
+  input was thin).
+
+The `validate1/IMPROVEMENTS.md` in the tree now carries `**Location:**` /
+`**Target files:**` / `**Instruction:**` for all 53 entries, so it passes as-is.
+
 > **Revision 2**, after the first three-model run on Variant 1. What changed and
 > why is in "What the first run showed" at the end — read it if you are tuning
 > these prompts further.
