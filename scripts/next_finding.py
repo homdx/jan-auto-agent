@@ -80,26 +80,37 @@ def main():
         print(f"error: no '### <id>: <title>' sections in {a.improvements}", file=sys.stderr)
         return 1
 
+    # A thin entry — heading only, no Location and no Instruction — cannot be
+    # judged, and handing one over silently buys a confident verdict formed from
+    # a title. Skip those and say so, rather than failing the whole round: one
+    # broken entry should not cost the other fifty-two. A file that is entirely
+    # thin is a different thing — there is nothing to review at all, so stop.
     thin = [e["task_id"] for e in entries if e["thin"]]
-    if thin and not a.allow_thin:
-        share = len(thin) / len(entries)
-        print(f"error: {len(thin)}/{len(entries)} entries in {a.improvements} have no "
-              f"Location and no Instruction — only a heading.", file=sys.stderr)
-        print(f"  A reviewer cannot judge a task from its title, and a run over this "
-              f"file will produce confident verdicts with nothing behind them.",
-              file=sys.stderr)
-        print(f"  first few: {', '.join(thin[:8])}", file=sys.stderr)
-        if share > 0.5:
-            print(f"  {share:.0%} of the file is affected — regenerate it with "
-                  f"--auto ... --dry-run before reviewing.", file=sys.stderr)
-        print(f"  To proceed anyway (and record that the input was thin): --allow-thin",
-              file=sys.stderr)
-        return 1
+    # --status only reports; it hands nothing over, so it must keep working on a
+    # broken file — that is exactly when you want to look at the state.
+    if thin and not a.allow_thin and not a.status:
+        if len(thin) == len(entries):
+            print(f"error: every entry in {a.improvements} ({len(entries)}) is a heading "
+                  f"with no Location and no Instruction — there is nothing to review.",
+                  file=sys.stderr)
+            print(f"  Regenerate it with --auto ... --dry-run, or pass --allow-thin to "
+                  f"review titles only and record that the input was thin.", file=sys.stderr)
+            return 1
+        print(f"warning: skipping {len(thin)} entry/entries with no Location and no "
+              f"Instruction — they cannot be judged: {', '.join(thin[:8])}"
+              + (" ..." if len(thin) > 8 else ""), file=sys.stderr)
+        print(f"  reviewing the remaining {len(entries) - len(thin)}. "
+              f"--allow-thin includes them anyway.", file=sys.stderr)
+        entries = [e for e in entries if not e["thin"]]
 
     done = recorded_ids(a.out)
     todo = [e for e in entries if e["task_id"] not in done]
     n_done, n_all = len(entries) - len(todo), len(entries)
     extra = sorted(i for i in done if i.startswith("NEW-"))
+
+    if a.status and thin:
+        print(f"note: {len(thin)}/{len(entries)} entries carry no Location and no "
+              f"Instruction and would be skipped in a real run", file=sys.stderr)
 
     if a.status or not todo:
         print(f"progress: {n_done}/{n_all} recorded, {len(todo)} remaining"
