@@ -21,3 +21,4 @@ examples/task*/
 validate*/*.csv
 validate*/harvest.md
 validate*/pending-validation.md
+tasks/PROGRESS.csv

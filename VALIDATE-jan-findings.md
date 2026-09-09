@@ -1,6 +1,6 @@
 # Validating jan's findings — prompts for reviewer models
 
-`TASK-jan-selfaudit.md` produces `IMPROVEMENTS.md`: a list of *proposed* defects.
+`docs/TASK-jan-selfaudit.md` produces `IMPROVEMENTS.md`: a list of *proposed* defects.
 This file turns that into a graded result you can compare across reviewer models.
 
 Each reviewer gets: the **core prompt**, one **variant block**, that variant's

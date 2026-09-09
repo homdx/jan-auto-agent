@@ -7,8 +7,8 @@ points at.
 ## What this is
 
 A benchmark harness that measures **whether a model verifies a claim before
-acting on it**, using this repo (jan-auto-agent) as the subject. It runs in two
-stages:
+acting on it**, using this repo (jan-auto-agent) as the subject. It runs in
+these stages:
 
 1. **Find** — jan's own `--auto` mode proposes defects into `IMPROVEMENTS.md`.
 2. **Validate** — several reviewer models independently judge every proposal
@@ -18,8 +18,11 @@ stages:
    Their consensus becomes `truth.csv`, which scores every reviewer and every
    future run.
 4. **File** — confirmed defects become tickets in `tasks/`.
+5. **Fix** — a coder model works the tickets, one local commit per bug. Either
+   driven by hand from `tasks/INDEX.md`, or with `scripts/next_task.py` handing
+   out the next unrecorded ticket (resumable — see `docs/FIX-round.md`).
 
-Stages 2 and 3 use the same mechanic: the model never gets the list, only the
+Stages 2, 3 and 5 use the same mechanic: the model never gets the list, only the
 next unrecorded item, computed from its own output file. Batching is not
 discouraged, it is impossible.
 
@@ -85,25 +88,28 @@ awk -F'|' 'NR>2 && NF>3 {gsub(/[` *]/,"",$2); gsub(/[* ]/,"",$3);
 
 | File | What it is |
 |---|---|
-| `TASK-jan-selfaudit.md` | 6 `--auto` goal variants for hunting bugs in jan; variant 1 is a known-answer calibration |
+| `docs/TASK-jan-selfaudit.md` | 6 `--auto` goal variants for hunting bugs in jan; variant 1 is a known-answer calibration |
 | `VALIDATE-jan-findings.md` | The reviewer prompt — core + 6 variant blocks, CSV schema, how to rank models |
-| `JIRA-FIX3-pullv3.md` | The FIX-3 ticket the 11-model round used |
+| `docs/JIRA-FIX3-pullv3.md` | The FIX-3 ticket the 11-model round used |
 | `scripts/next_finding.py` | Hands out one unrecorded entry at a time |
 | `scripts/append_finding.py` | Writes one validated row, immediately |
 | `scripts/harvest_report.py` | Stage-2 report: Act/Disputed/Fixed/Dismissed + solo table + scorecard + `--pending` queue |
-| `ADJUDICATE-findings.md` | The stage-3 prompt — settling the open questions |
+| `docs/ADJUDICATE-findings.md` | The stage-3 prompt — settling the open questions |
 | `scripts/next_pending.py` | Hands out one unsettled question at a time |
 | `scripts/append_verdict.py` | Records one REAL/FALSE/FIXED verdict |
 | `scripts/truth_consensus.py` | Merges adjudicators into `truth.csv`; escalates splits |
 | `scripts/make_jira_tasks.py` | Confirmed defects → `tasks/*.md` + INDEX |
 | `scripts/merge_validations.py` | Lower-level "who said what" view |
+| `docs/FIX-round.md` | The stage-5 coder prompt — the loop + ground rules |
+| `scripts/next_task.py` | Hands out one unfinished `tasks/` ticket at a time |
+| `scripts/append_task.py` | Records one ticket outcome (FIXED / ALREADY-OK / SKIPPED) |
 | `validate1/` | The 5 reviewer CSVs, `truth.csv`, and the generated report |
 
 ## How to run it
 
 ```bash
 # 1. jan proposes (plan only — no code changes, no commits)
-python3 main.py --auto "<goal from TASK-jan-selfaudit.md>" --dry-run \
+python3 main.py --auto "<goal from docs/TASK-jan-selfaudit.md>" --dry-run \
     --config agents_128k.ini --base .
 python3 main.py --validate-plan --config agents_128k.ini --base .
 
@@ -150,7 +156,7 @@ real defects found so far were solo `NEW-*` rows nobody else raised.
 ### Stage 3 — settling the queue
 
 ```bash
-# each adjudicator, given ADJUDICATE-findings.md:
+# each adjudicator, given docs/ADJUDICATE-findings.md:
 python3 scripts/next_pending.py --pending validate<N>/pending-validation.md \
                                 --out validate<N>/truth-<model>.csv
 python3 scripts/append_verdict.py --out validate<N>/truth-<model>.csv ...
