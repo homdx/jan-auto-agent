@@ -54,10 +54,26 @@ into its own CSV.
 > number is your only measure of progress; if it is not moving, you are not
 > working. **These lists are long — 50+ entries is normal.** Keep cycling.
 >
+> ### Your job ends at the CSV
+>
+> You are reviewing, not fixing. **Do not edit any source file, do not write or
+> run tests, do not commit anything.** Read the code, decide, record the row.
+> Fixing the confirmed defects — with a regression test per fix, run against all
+> four test roots, one commit each — is a separate round with its own
+> instruction (`docs/FIX-round.md`), and it is scored on ground truth that does
+> not exist yet while you are working. A reviewer that patches the tree
+> invalidates the comparison every other reviewer is being measured against.
+>
+> The one thing you may run is a throwaway check of your own claim — a
+> `python3 -c "..."` identity test, a grep. Keep it out of the repo and put what
+> it showed into `--evidence` or `--disproof`.
+>
 > ### Name your file after yourself, once
 >
 > Use `--reviewer <your model name, lowercase>` and let the helper build the
-> filename, or pass the same `--out` every single time. Two spellings that
+> filename, or pass the same `--out` every single time. Write it into the round's
+> folder (`--out validate<N>/validation-v<N>-<yourname>.csv`), not the repo root
+> — that folder is what the analysis scripts glob. Two spellings that
 > differ only in case (`Kilo.csv`, `kilo.csv`) become two files, splitting your
 > work and defeating the duplicate check, which is per-file. The tools now
 > refuse the second spelling rather than start a rival file.
