@@ -44,6 +44,33 @@ Fixed during this work: `StateStore.get_task` / `all_tasks` / `resume_info` all
 returned live task dicts, so a caller could mutate one and the next validated
 setter persisted it (`status: 12345` reached plan.json). Commit `4796e0a`.
 
+## Verified ground truth
+
+The CSVs are run data and are gitignored; this table is the durable part. It is
+the scoring key for every run — recreate `validate<N>/truth.csv` from it, and add
+a row each time a finding is settled by hand.
+
+| finding | truth | how it was checked |
+|---|---|---|
+| `tools/search_agent.py::_DEFAULT_SKIP_DIRS` | **REAL** | identity check: `SearchAgent().skip_dirs is _DEFAULT_SKIP_DIRS` → True; one `append` poisons every later instance |
+| `tools/search_agent.py::SearchAgent.__init__` | **REAL** | same defect, reported at the constructor |
+| `tools/search_agent.py::SearchAgent.skip_dirs` | **REAL** | same defect, reported at the attribute |
+| `tools/auto/arch_probe.py::ArchProbe.last_by_op` | **REAL** | `dict()` is shallow and values are `[hits,misses]` lists from `setdefault(op,[0,0])` — nested mutables shared |
+| `tools/metrics_collector.py::MetricsCollector._load_all_cached` | **FALSE** | sole caller `record()` does `records = list(records)  # don't mutate the cached list in place` |
+| `tools/auto/state.py::StateStore.get_progress` | **FALSE** | `_progress` only ever holds str/int — `dict()` is a complete copy |
+| `tools/auto/state.py::StateStore.get_task` | FIXED | `4796e0a` — returns `self._detached(t)` |
+| `tools/auto/state.py::StateStore.all_tasks` | FIXED | `4796e0a` — comprehension over `_detached` |
+| `tools/auto/state.py::StateStore.resume_info` | FIXED | `4796e0a` — both task lists detached |
+
+To rebuild the CSV:
+
+```bash
+awk -F'|' 'NR>2 && NF>3 {gsub(/[` *]/,"",$2); gsub(/[* ]/,"",$3);
+  print $2","$3",ground-file,\"see GROUND-competition.md\""}' \
+  GROUND-competition.md > validate<N>/truth.csv
+# then prepend the header:  finding,truth,checked_by,how
+```
+
 ## The files
 
 | File | What it is |
@@ -70,10 +97,40 @@ python3 scripts/next_finding.py --improvements IMPROVEMENTS.md \
                                 --out validation-v1-<model>.csv
 python3 scripts/append_finding.py --out validation-v1-<model>.csv ...
 
-# 3. report
-python3 scripts/harvest_report.py validate1/*.csv --truth validate1/truth.csv \
-    --report harvest.md --actions actions.csv --solo solo.csv
+# 3. report (glob only the reviewer files — truth.csv is not a reviewer)
+python3 scripts/harvest_report.py validate<N>/validation-*.csv \
+    --truth validate<N>/truth.csv \
+    --report validate<N>/harvest.md \
+    --pending validate<N>/pending-validation.md \
+    --actions validate<N>/actions.csv --solo validate<N>/solo.csv
 ```
+
+### Running the same scenario more than once
+
+Use a fresh `validate2/`, `validate3/` … per round. Findings are grouped by
+`file::symbol`, not by task id, so `AUTO-T1` meaning different things in
+different rounds is harmless — and a finding that recurs across rounds with the
+same verdict is far stronger evidence than one that appeared once.
+
+`truth.csv` is the one thing that carries forward. Copy it into each new round's
+directory; anything already decided is excluded from that round's verification
+queue, so you never re-answer the same question.
+
+### The verification queue — the point of `--pending`
+
+`pending-validation.md` lists every finding that **at least one reviewer
+confirmed and no human has checked**. At the moment a run finishes, these are not
+results — they are open questions. A reviewer may have found a real defect or
+pattern-matched a shape that is harmless here, and nothing inside the run can
+tell the difference.
+
+The file is written to stand alone: claim, quoted code, reproduction, what the
+reviewer checked, and who disagreed — no CSVs needed. Carry it into a separate
+session, settle each one against the code, and append the answers to the ground
+truth. That is the only step that converts a benchmark result into knowledge.
+
+**Do not treat a solo confirmation as a bug, and do not discard it either.** Both
+real defects found so far were solo `NEW-*` rows nobody else raised.
 
 ## What was learned the hard way
 

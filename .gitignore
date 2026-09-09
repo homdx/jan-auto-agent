@@ -15,3 +15,9 @@ examples/task*/
 
 # auto-agent safety entries
 *.coder.bak
+
+# Benchmark run data — regenerated per run, not source.
+# The curated ground truth lives in GROUND-competition.md instead.
+validate*/*.csv
+validate*/harvest.md
+validate*/pending-validation.md

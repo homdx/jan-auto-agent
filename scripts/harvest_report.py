@@ -172,6 +172,9 @@ def main():
     ap.add_argument("--truth", metavar="FILE.csv",
                     help="ground truth (finding,truth) to score reviewers against")
     ap.add_argument("--solo", metavar="FILE.csv", help="write the solo-findings table")
+    ap.add_argument("--pending", metavar="FILE.md",
+                    help="write the self-contained verification queue: findings that "
+                         "are not dismissed and not yet in --truth")
     a = ap.parse_args()
 
     paths = [p for pat in a.csvs for p in sorted(glob.glob(pat))] or a.csvs
@@ -320,6 +323,62 @@ def main():
                     "repro": best_line(rs, "repro"),
                 })
         print(f"action list -> {a.actions}")
+
+    # ── the verification queue ───────────────────────────────────────────────
+    # A finding one reviewer confirmed and nobody contradicted is not a result.
+    # It is a question: real bug, or plausible-sounding false positive? Nothing
+    # in the run can answer that — only reading the code can. This file is that
+    # question list, written to stand alone so it can be carried into a separate
+    # session with no CSVs, no reviewer names to weigh, and no report to re-read.
+    if a.pending:
+        pend = []
+        for k, rs in groups.items():
+            if truth.get(k):
+                continue                       # already decided by a human
+            live = [r for r in rs if r["verdict"] in CONFIRMING]
+            if not live:
+                continue                       # nobody thinks it is real
+            pend.append((k, rs, live))
+        pend.sort(key=lambda x: (SEV.get(worst(x[1], CONFIRMING), 5), -len(x[2])))
+
+        Q = ["# Verification queue\n",
+             f"{len(pend)} finding(s) that at least one reviewer confirmed and no human "
+             "has checked yet.\n",
+             "Each entry is a **question, not a result**: the reviewer may have found a "
+             "real defect or may have pattern-matched a shape that is harmless here. "
+             "Only reading the code settles it. Everything needed is quoted below — no "
+             "CSVs required.\n",
+             "For each: open the file, find the symbol, and decide `REAL`, `FALSE` or "
+             "`FIXED`. Then append the answer to the ground-truth table so every future "
+             "run is scored against it.\n",
+             "---\n"]
+        for i, (k, rs, live) in enumerate(pend, 1):
+            confirmers = sorted(r["_rv"] for r in live)
+            against = sorted(r["_rv"] for r in rs if r["verdict"] in DISMISSING)
+            Q.append(f"## {i}. `{k}`\n")
+            Q.append(f"**{best_line(rs, 'title')}** — severity {worst(rs, CONFIRMING)}, "
+                     f"class `{best_line(rs, 'defect_class')}`\n")
+            Q.append(f"- confirmed by: {', '.join(confirmers)}"
+                     + (f" · disputed by: {', '.join(against)}" if against else
+                        " · **nobody else looked here**"))
+            Q.append(f"- caller actually mutates it: "
+                     f"{best_line(rs, 'caller_mutates') or 'unstated'}")
+            for f_, label in (("impact", "claimed impact"), ("evidence", "quoted code"),
+                              ("repro", "reproduction"), ("disproof", "what they checked")):
+                v = best_line(rs, f_)
+                if v and v.lower() != "none":
+                    Q.append(f"- **{label}:** {v[:600]}")
+            Q.append(f"\n**Verdict:** `REAL` / `FALSE` / `FIXED` — _________\n")
+            Q.append("---\n")
+        Q.append("\n## Recording the answers\n")
+        Q.append("Append each decided line to `validate<N>/truth.csv` "
+                 "(create it if absent):\n")
+        Q.append("```csv\nfinding,truth,checked_by,how\n"
+                 + "\n".join(f"{k},<REAL|FALSE|FIXED>,<you>,\"<how you checked>\""
+                              for k, _, _ in pend[:3])
+                 + "\n```\n")
+        open(a.pending, "w", encoding="utf-8").write("\n".join(Q))
+        print(f"verification queue -> {a.pending}  ({len(pend)} to check)")
 
     if a.solo:
         with open(a.solo, "w", newline="", encoding="utf-8") as fh:
