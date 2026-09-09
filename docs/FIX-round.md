@@ -216,22 +216,29 @@ worktree**, and you compare branches directly afterwards
 (`git log runs/<model>..`, `git range-diff`). Nothing to export.
 
 If you deliver the fixes as **patch files** instead — portable, no shared
-checkout needed — generate them one per commit into a **per-model folder**:
+checkout needed — generate them one per commit into a per-model folder, then
+prefix every file with the model name:
 
 ```bash
 git format-patch -o runs/<model>/patches/ <base>..HEAD
+cd runs/<model>/patches && for f in [0-9]*.patch; do mv "$f" "<model>-$f"; done
 ```
 
-Put the model name in the **folder**, not the filename. `git format-patch`
-numbers the files `0001-…`, `0002-…` and every model produces the same names, so
-a flat folder collides the moment you line two models up to compare — the same
-reason reviewers each owned `validation-v1-<model>.csv` and each coder owns
-`runs/<model>/PROGRESS.csv`. Do **not** rename the files: `git am` needs the
-`NNNN-` prefix to apply them in order.
+The model name goes in **both** the folder and the filename — the same way each
+reviewer owned `validation-v1-<model>.csv` in stage 2. `git format-patch` numbers
+the files `0001-…`, `0002-…` and every model produces the same names, so without
+the prefix the files collide the moment two models land in one folder to be
+compared, and a bare `0004-fix-….patch` on your disk no longer says who wrote it.
+
+Prefix only — `<model>-0001-…`, `<model>-0002-…`. The `NNNN-` stays in sort
+position, so a glob still lists the set in order and `git am` still applies it in
+order:
 
 ```bash
-git am runs/<model>/patches/*.patch      # applies the whole set, in order
+git am runs/<model>/patches/<model>-*.patch      # applies the whole set, in order
 ```
+
+Do not renumber or drop the `NNNN-` block; that is the part `git am` orders on.
 
 `runs/` is gitignored, so the patches and progress files stay out of the commits
 you are comparing.
