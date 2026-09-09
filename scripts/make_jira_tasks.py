@@ -108,13 +108,17 @@ def main():
               if alias_note else "\n"),
              "## The defect\n",
              (longest(both, "consequence") or longest(both, "impact")
+              or (row.get("how") or "").strip()
               or "_not stated — read the evidence below_") + "\n",
              "## Evidence\n", "```python", longest(both, "evidence") or "—", "```\n"]
 
         if longest(both, "repro"):
             T += ["## Reproduction\n", "```", longest(both, "repro"), "```\n"]
-        if longest(v, "how"):
-            T += ["## How it was verified\n", longest(v, "how") + "\n"]
+        # Prefer a stage-3 adjudicator's write-up; fall back to the one-line
+        # `how` recorded straight in truth.csv when no truth-*.csv was supplied.
+        how = longest(v, "how") or (row.get("how") or "").strip()
+        if how:
+            T += ["## How it was verified\n", how + "\n"]
         if longest(both, "disproof"):
             T += ["## What was checked to try to disprove it\n",
                   longest(both, "disproof") + "\n"]
@@ -134,7 +138,7 @@ def main():
               "- [ ] One local commit for this bug alone.\n",
               "## Provenance\n",
               f"- reported by: {', '.join(sorted({r['_src'] for r in d})) or '—'}",
-              f"- adjudicated by: {', '.join(sorted({r['_src'] for r in v})) or '—'}",
+              f"- adjudicated by: {', '.join(sorted({r['_src'] for r in v})) or row.get('checked_by', '') or '—'}",
               f"- ground truth: `{a.truth}`\n"]
 
         open(os.path.join(a.out, name), "w", encoding="utf-8").write("\n".join(T))
