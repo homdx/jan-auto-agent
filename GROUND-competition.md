@@ -12,7 +12,16 @@ stages:
 
 1. **Find** — jan's own `--auto` mode proposes defects into `IMPROVEMENTS.md`.
 2. **Validate** — several reviewer models independently judge every proposal
-   against the live code, one entry at a time, writing CSV as they go.
+   against the live code, one entry at a time, writing CSV as they go. Output:
+   a report plus `pending-validation.md`, the open questions.
+3. **Adjudicate** — several models settle those questions by reading the code.
+   Their consensus becomes `truth.csv`, which scores every reviewer and every
+   future run.
+4. **File** — confirmed defects become tickets in `tasks/`.
+
+Stages 2 and 3 use the same mechanic: the model never gets the list, only the
+next unrecorded item, computed from its own output file. Batching is not
+discouraged, it is impossible.
 
 The interesting number is not how many bugs get found. It is the **noise floor**
 (what share of proposals are wrong) and **who notices**.
@@ -80,7 +89,12 @@ awk -F'|' 'NR>2 && NF>3 {gsub(/[` *]/,"",$2); gsub(/[* ]/,"",$3);
 | `JIRA-FIX3-pullv3.md` | The FIX-3 ticket the 11-model round used |
 | `scripts/next_finding.py` | Hands out one unrecorded entry at a time |
 | `scripts/append_finding.py` | Writes one validated row, immediately |
-| `scripts/harvest_report.py` | The final report: Act/Disputed/Fixed/Dismissed + solo table + scorecard |
+| `scripts/harvest_report.py` | Stage-2 report: Act/Disputed/Fixed/Dismissed + solo table + scorecard + `--pending` queue |
+| `ADJUDICATE-findings.md` | The stage-3 prompt — settling the open questions |
+| `scripts/next_pending.py` | Hands out one unsettled question at a time |
+| `scripts/append_verdict.py` | Records one REAL/FALSE/FIXED verdict |
+| `scripts/truth_consensus.py` | Merges adjudicators into `truth.csv`; escalates splits |
+| `scripts/make_jira_tasks.py` | Confirmed defects → `tasks/*.md` + INDEX |
 | `scripts/merge_validations.py` | Lower-level "who said what" view |
 | `validate1/` | The 5 reviewer CSVs, `truth.csv`, and the generated report |
 
@@ -132,6 +146,35 @@ truth. That is the only step that converts a benchmark result into knowledge.
 **Do not treat a solo confirmation as a bug, and do not discard it either.** Both
 real defects found so far were solo `NEW-*` rows nobody else raised.
 
+### Stage 3 — settling the queue
+
+```bash
+# each adjudicator, given ADJUDICATE-findings.md:
+python3 scripts/next_pending.py --pending validate<N>/pending-validation.md \
+                                --out validate<N>/truth-<model>.csv
+python3 scripts/append_verdict.py --out validate<N>/truth-<model>.csv ...
+
+# then merge (exit 4 if anything is still disputed)
+python3 scripts/truth_consensus.py validate<N>/truth-*.csv \
+    --truth validate<N>/truth.csv --report validate<N>/adjudication.md
+```
+
+Disputes are not settled by majority — the code either does the thing or it does
+not, so a split means one side did not run the check it claims. Read those
+yourself.
+
+### Stage 4 — tickets
+
+```bash
+python3 scripts/make_jira_tasks.py --truth validate<N>/truth.csv \
+    --findings 'validate<N>/validation-*.csv' \
+    --verdicts 'validate<N>/truth-*.csv' --out tasks/
+```
+
+Add a `duplicate_of` column to `truth.csv` for aliases — the same defect often
+arrives at the constant, the constructor and the attribute, and that is one
+ticket, not three.
+
 ## What was learned the hard way
 
 These cost real iterations. Do not re-derive them.
@@ -175,6 +218,8 @@ with the same command resumes at entry 18 for free.
 
 ## Open items
 
+- **`tasks/` holds 2 generated tickets** for the verified defects; neither is
+  fixed yet.
 - **Two verified bugs are unfixed**: `SearchAgent._DEFAULT_SKIP_DIRS` aliasing
   and `ArchProbe.last_by_op` sharing nested lists. Both `LOW`, both real.
 - **Variants 2–6 have never been run.** Only variant 1 (mutable state) has data.
