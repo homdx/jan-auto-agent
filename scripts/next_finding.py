@@ -36,7 +36,13 @@ def parse_improvements(path):
         body = "\n".join(lines[i:end]).rstrip()
         # a trailing '---' separator belongs to the entry, not the next one
         body = re.sub(r"\n-{3,}\s*$", "", body)
-        entries.append({"task_id": tid, "title": title, "body": body})
+        # A rendered entry carries Location, Target files, Acceptance check and
+        # Instruction. One that has only a heading is not a task a reviewer can
+        # judge — it is a truncated file, and handing it over silently produces
+        # 53 confident verdicts formed from a title alone. Flag it here rather
+        # than letting the run look successful.
+        thin = "**Instruction:**" not in body and "**Location:**" not in body
+        entries.append({"task_id": tid, "title": title, "body": body, "thin": thin})
     return entries
 
 
@@ -52,6 +58,8 @@ def main():
     ap.add_argument("--improvements", required=True)
     ap.add_argument("--out", required=True, help="the CSV append_finding.py writes to")
     ap.add_argument("--status", action="store_true", help="progress only, hand out nothing")
+    ap.add_argument("--allow-thin", action="store_true",
+                    help="hand out entries that carry no Location/Instruction anyway")
     a = ap.parse_args()
 
     if not os.path.exists(a.improvements):
@@ -70,6 +78,22 @@ def main():
     entries = parse_improvements(a.improvements)
     if not entries:
         print(f"error: no '### <id>: <title>' sections in {a.improvements}", file=sys.stderr)
+        return 1
+
+    thin = [e["task_id"] for e in entries if e["thin"]]
+    if thin and not a.allow_thin:
+        share = len(thin) / len(entries)
+        print(f"error: {len(thin)}/{len(entries)} entries in {a.improvements} have no "
+              f"Location and no Instruction — only a heading.", file=sys.stderr)
+        print(f"  A reviewer cannot judge a task from its title, and a run over this "
+              f"file will produce confident verdicts with nothing behind them.",
+              file=sys.stderr)
+        print(f"  first few: {', '.join(thin[:8])}", file=sys.stderr)
+        if share > 0.5:
+            print(f"  {share:.0%} of the file is affected — regenerate it with "
+                  f"--auto ... --dry-run before reviewing.", file=sys.stderr)
+        print(f"  To proceed anyway (and record that the input was thin): --allow-thin",
+              file=sys.stderr)
         return 1
 
     done = recorded_ids(a.out)

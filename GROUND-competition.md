@@ -227,6 +227,34 @@ a case-variant sibling.
 session was 17/53. Because the queue is CSV-derived, re-running the same model
 with the same command resumes at entry 18 for free.
 
+## Known trap: a thin IMPROVEMENTS.md
+
+Round 1 of stage 2 was run against `jan-to-fix/IMPROVEMENTS.md`, in which **all 53
+entries carried only a heading** — no Location, no Target files, no Acceptance
+check, no Instruction. 5,934 bytes where a full render of the same 53 tasks is
+74,332 (`testtext3/IMPROVEMENTS.md`). The renderer in that checkout is byte-identical
+to this one and `--validate-plan` had not been run, so the file was truncated
+somewhere between generation and use rather than produced that way.
+
+Five reviewers judged 53 proposals from titles alone and produced 261 confident
+verdicts. They still found the two real defects — because they read the code
+rather than the description — but every number from that round was measured on a
+crippled input, and the 88% noise floor in particular is not comparable with a
+round run on a full file.
+
+`next_finding.py` now refuses such a file and says so, with `--allow-thin` to
+override deliberately. Before trusting a round, check:
+
+```bash
+grep -c "^### AUTO-T" IMPROVEMENTS.md      # tasks
+grep -c "^\*\*Instruction:" IMPROVEMENTS.md   # should match
+```
+
+**A worthwhile experiment:** re-run stage 2 over the full file with the same five
+models and compare. Same list, same reviewers, one variable — how much of the
+noise floor was jan proposing badly, and how much was the reviewers working
+blind?
+
 ## Open items
 
 - **`tasks/` holds 2 generated tickets** for the verified defects; neither is
