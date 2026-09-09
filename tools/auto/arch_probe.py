@@ -581,7 +581,7 @@ class ArchProbe:
     @property
     def last_by_op(self) -> dict:
         """AUTO-P5: ``{op_name: [hits, misses]}`` for the last execute()."""
-        return dict(self._last_by_op)
+        return {k: list(v) for k, v in self._last_by_op.items()}
 
     def last_by_op_str(self) -> str:
         """`last_by_op` as a trace-friendly string: ``facts=3/1 module=1/0``
