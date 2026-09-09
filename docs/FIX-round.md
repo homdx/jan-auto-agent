@@ -51,7 +51,7 @@ worktree each — see [Running several models over the same tickets](#running-se
 
 ---
 
-## Variant 1 — you drive the loop, by hand
+## Variant 1 — by hand (you feed the tickets)
 
 You hand the model `tasks/INDEX.md` (the table of all tickets, always in sync
 with `tasks/`) plus the ground rules, and it walks the list top to bottom, one
@@ -63,6 +63,8 @@ loses whatever was not committed, and you cannot tell from disk how far it got.
 Prefer variant 2 unless you have a reason not to.
 
 ### Prompt — paste this verbatim
+
+**▼▼▼ PROMPT STARTS — paste everything block-quoted below, up to "PROMPT ENDS" ▼▼▼**
 
 > You are fixing confirmed defects in this repository. The list is in
 > `tasks/INDEX.md`; each row links to a ticket file under `tasks/` with the
@@ -79,9 +81,11 @@ Prefer variant 2 unless you have a reason not to.
 > Follow the ground rules in `docs/FIX-round.md` §"Ground rules for the run"
 > exactly — they are how the work is scored.
 
+**▲▲▲ PROMPT ENDS — plus the "Ground rules for the run" section further down ▲▲▲**
+
 ---
 
-## Variant 2 — a script hands out the next ticket (resumable, preferred)
+## Variant 2 — automated hand-out, a script feeds the tickets (resumable, preferred)
 
 Same mechanic as `next_finding.py` in the validation round. The model never gets
 the whole folder, only the next ticket whose outcome is not yet recorded. If the
@@ -120,6 +124,8 @@ Exit code 3 from either command means the folder is finished.
 
 ### Prompt — paste this verbatim
 
+**▼▼▼ PROMPT STARTS — paste everything block-quoted below, up to "PROMPT ENDS" ▼▼▼**
+
 > You are fixing confirmed defects in this repository, one ticket at a time. Do
 > **not** open `tasks/` yourself — a script hands you the next ticket:
 >
@@ -146,6 +152,8 @@ Exit code 3 from either command means the folder is finished.
 >
 > Follow the ground rules in `docs/FIX-round.md` §"Ground rules for the run"
 > exactly — they are how the work is scored.
+
+**▲▲▲ PROMPT ENDS — plus the "Ground rules for the run" section further down ▲▲▲**
 
 ### Running several models over the same tickets at once
 

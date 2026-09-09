@@ -17,6 +17,12 @@ withholding them so the adjudicator forms its own view first.
 
 ## Adjudicator prompt
 
+This stage is **script-driven only** — there is no by-hand variant. The
+adjudicator loops on `next_pending.py` / `append_verdict.py`, one finding at a
+time, exactly like stage 2.
+
+**▼▼▼ PROMPT STARTS — paste everything block-quoted below, up to "PROMPT ENDS" ▼▼▼**
+
 > You are settling open questions about whether reported defects are real. Each
 > was confirmed by at least one automated reviewer and contradicted by none, or
 > by some — either way nobody has read the code to decide. Your answer becomes
@@ -82,6 +88,8 @@ withholding them so the adjudicator forms its own view first.
 > non-issue, then go and check that fact specifically. It is faster than
 > confirming, and it is what separates the adjudicators that were right from the
 > ones that agreed.
+
+**▲▲▲ PROMPT ENDS — paste everything above, back to "PROMPT STARTS" ▲▲▲**
 
 ---
 

@@ -60,6 +60,14 @@ The `validate1/IMPROVEMENTS.md` in the tree now carries `**Location:**` /
 
 ## Core prompt — prepend to every variant
 
+This stage is **script-driven only** — there is no by-hand variant. The reviewer
+loops on `next_finding.py` / `append_finding.py`, one entry at a time.
+
+**▼▼▼ PROMPT STARTS (part 1 of 2) — paste from the next line down to the
+"CSV columns" table inclusive, i.e. everything under this heading and the
+`### CSV columns` / Verdicts / Severity that follow it. Then append part 2:
+exactly one `### Variant N` block from "Variant blocks" below. ▼▼▼**
+
 > You are auditing a list of proposed code defects against the live source. The
 > list was produced by an automated agent and **its claims are unverified** —
 > treat every entry as a hypothesis, not a finding.
@@ -230,9 +238,16 @@ case · `MEDIUM` degrades a documented guarantee, or is real but unreachable
 today · `LOW` bounded — a missing log line, a bad message, wasted work · `NONE`
 no describable consequence.
 
+**▲▲▲ PROMPT part 1 ENDS here. Now append part 2: one variant block below. ▲▲▲**
+
 ---
 
 ## Variant blocks — append one to the core prompt
+
+**Part 2 of the prompt.** Paste **exactly one** of the block-quotes below —
+the variant that produced the list you are handing over — immediately after
+part 1. Stop at the next `###`. That completes the reviewer prompt; nothing
+after the variant block is part of it.
 
 ### Variant 1 — mutable state escaping accessors
 

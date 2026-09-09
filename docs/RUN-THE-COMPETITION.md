@@ -286,3 +286,100 @@ Everything else — reviewer CSVs, `merged.csv`, `harvest.md`, `actions.csv`,
 `solo.csv`, `pending-validation.md`, `PROGRESS.csv` — is **run data**. It is
 gitignored on purpose: it is regenerable from the CSVs, and committing it makes
 every re-run a diff.
+
+---
+
+## Quick start — the whole round as a command list
+
+`<N>` is the round number (`validate1`, `validate2`, …). Run every command from
+the repo root. `python` is not on PATH — use `python3`.
+
+### Stage 1 — propose (operator runs this)
+
+```bash
+python3 main.py --auto "<GOAL from docs/TASK-jan-selfaudit.md>" --dry-run --config agents_128k.ini --base .
+python3 main.py --validate-plan --config agents_128k.ini --base .
+mkdir -p validate<N> && cp IMPROVEMENTS.md validate<N>/IMPROVEMENTS.md
+grep -c '^### ' validate<N>/IMPROVEMENTS.md ; grep -c '\*\*Instruction:\*\*' validate<N>/IMPROVEMENTS.md   # must match
+```
+
+### Stage 2 — review (one agent per model; script-driven only, no by-hand variant)
+
+- **Prompt:** `VALIDATE-jan-findings.md`. Paste **part 1** (`## Core prompt` +
+  `### CSV columns` + Verdicts + Severity — the span marked `PROMPT STARTS` /
+  `PROMPT part 1 ENDS`) **+ part 2** (exactly one `### Variant N` block). Add one
+  line: `Use --reviewer <your model name, lowercase> on every append_finding.py call.`
+- **Attach:** read access to the repo + `validate<N>/IMPROVEMENTS.md` present in the tree.
+- The agent loops on its own:
+
+```bash
+python3 scripts/next_finding.py  --improvements validate<N>/IMPROVEMENTS.md --out validate<N>/validation-v1-<model>.csv
+python3 scripts/append_finding.py --out validate<N>/validation-v1-<model>.csv --variant 1 --task-id <id> --title "..." \
+    --file <real path> --symbol <Class.method> --verdict CONFIRMED --severity MEDIUM --evidence "..." --disproof "..."
+# repeat until next_finding.py exits 3
+```
+
+### Analyse stage 2 (operator runs this)
+
+```bash
+python3 scripts/merge_validations.py validate<N>/validation-v*.csv --csv validate<N>/merged.csv
+python3 scripts/harvest_report.py 'validate<N>/validation-v*.csv' \
+    --report validate<N>/harvest.md --actions validate<N>/actions.csv \
+    --solo validate<N>/solo.csv --pending validate<N>/pending-validation.md
+python3 scripts/gui_report_merged_csv.py validate<N>/merged.csv        # colour matrix; add --truth after stage 3
+```
+
+Before scoring, move unscorable CSVs (all-`CONFIRMED`, wrong-tree paths, a model's
+second re-run) into `validate<N>/_excluded/`.
+
+### Stage 3 — adjudicate (one agent per adjudicator; script-driven only)
+
+- **Prompt:** `docs/ADJUDICATE-findings.md` — the span marked `PROMPT STARTS` / `PROMPT ENDS`.
+- **Attach:** read access to the repo + `validate<N>/pending-validation.md`.
+
+```bash
+python3 scripts/next_pending.py   --pending validate<N>/pending-validation.md --out validate<N>/truth-<name>.csv
+python3 scripts/append_verdict.py --out validate<N>/truth-<name>.csv --finding "<file>::<symbol>" \
+    --truth REAL --checked-by <name> --confidence HIGH --how "..." --evidence "..." --consequence "..." --severity LOW
+# repeat until next_pending.py exits 3
+```
+
+### Stage 4 — tickets (operator runs this)
+
+```bash
+python3 scripts/truth_consensus.py 'validate<N>/truth-*.csv' \
+    --truth validate<N>/truth.csv --report validate<N>/adjudication.md --arbiter <who breaks ties>
+python3 scripts/make_jira_tasks.py --truth validate<N>/truth.csv \
+    --findings validate<N>/validation-v*.csv --verdicts validate<N>/truth-*.csv --out tasks/
+```
+
+Output: `tasks/NN-*.md` (one self-contained ticket per confirmed defect) + `tasks/INDEX.md`.
+Read `tasks/INDEX.md` and drop any `Severity: NONE` / "latent only" ticket before stage 5.
+
+### Stage 5 — fix (one agent per coder). Two variants:
+
+- **Prompt:** `docs/FIX-round.md`. Pick a variant, paste its `### Prompt — paste
+  this verbatim` box (the `PROMPT STARTS` / `PROMPT ENDS` span) **plus** the
+  `## Ground rules for the run` section.
+  - **Variant 1 — by hand:** hand the model `tasks/INDEX.md`; it walks the list top to bottom.
+  - **Variant 2 — automated hand-out (preferred, resumable):** the script feeds one ticket at a time.
+
+```bash
+# Variant 2 loop, run by the coder:
+python3 scripts/next_task.py   --tasks tasks/                       # add --progress runs/<model>/PROGRESS.csv for parallel coders
+python3 scripts/append_task.py --progress tasks/PROGRESS.csv --ticket <NN-*.md> \
+    --outcome FIXED --commit <sha> --note "what changed + the regression test"
+# repeat until next_task.py exits 3
+```
+
+### Rate the models (operator runs this)
+
+```bash
+python3 scripts/harvest_report.py 'validate<N>/validation-v*.csv' --truth validate<N>/truth.csv \
+    --report validate<N>/harvest.md --actions validate<N>/actions.csv --solo validate<N>/solo.csv
+python3 scripts/gui_report_merged_csv.py validate<N>/merged.csv --truth validate<N>/truth.csv
+```
+
+Read the scorecard in the order **NEW → accuracy → skepticism → rows** (see
+[Rating the models](#rating-the-models)). Then record every `FIXED` in
+`validate<N>/truth.csv` and add the settled rows to `GROUND-competition.md`.
