@@ -50,6 +50,10 @@ def main():
     ap.add_argument("csvs", nargs="+")
     ap.add_argument("--truth", metavar="FILE.csv", help="write the settled ground truth")
     ap.add_argument("--report", metavar="FILE.md")
+    ap.add_argument("--arbiter", metavar="NAME",
+                    help="whose verdict settles a split (e.g. the human who read the "
+                         "code). Without one, splits stay open — which is correct, "
+                         "because a majority of models can be confidently wrong together")
     a = ap.parse_args()
 
     paths = [p for pat in a.csvs for p in sorted(glob.glob(pat))] or a.csvs
@@ -63,14 +67,21 @@ def main():
     for r in rows:
         g[(r.get("finding") or "").strip()].append(r)
 
-    settled, disputed = {}, {}
+    settled, disputed, arbitrated = {}, {}, {}
     for k, rs in g.items():
         votes = {r["_adj"]: r["truth"] for r in rs}
         distinct = {v for v in votes.values() if v != "UNDECIDED"}
         if len(distinct) == 1:
             settled[k] = (distinct.pop(), rs)
         elif distinct:
-            disputed[k] = (votes, rs)
+            # An arbiter breaks the tie rather than the count doing it. Two
+            # models agreeing is not evidence when both applied the same wrong
+            # rule — which is exactly how a split usually arises.
+            if a.arbiter and a.arbiter in votes and votes[a.arbiter] != "UNDECIDED":
+                settled[k] = (votes[a.arbiter], rs)
+                arbitrated[k] = (votes[a.arbiter], votes)
+            else:
+                disputed[k] = (votes, rs)
 
     L = [f"# Adjudication\n",
          f"{len(adjudicators)} adjudicators · {len(g)} findings · "
@@ -100,6 +111,17 @@ def main():
         if items:
             L.append("")
 
+    if arbitrated:
+        L.append(f"\n## Settled by the arbiter ({len(arbitrated)})\n")
+        L.append(f"`{a.arbiter}` read the code and broke these ties. The other votes are "
+                 "kept because a reviewer that is reliably wrong on split questions is "
+                 "worth knowing about.\n")
+        L.append("| finding | arbiter | the other votes |\n|---|---|---|")
+        for k, (chosen, votes) in arbitrated.items():
+            others = ", ".join(f"{n}={v}" for n, v in sorted(votes.items()) if n != a.arbiter)
+            L.append(f"| `{k}` | **{chosen}** | {others} |")
+        L.append("")
+
     L.append(f"\n## Disputed ({len(disputed)}) — a human decides\n")
     if not disputed:
         L.append("_none_\n")
@@ -124,6 +146,20 @@ def main():
         L.append(f"| {adj} | {len(mine)} | {c.get('REAL',0)} | {c.get('FALSE',0)} | "
                  f"{c.get('FIXED',0)} | {c.get('UNDECIDED',0)} | "
                  f"{agree}/{scored}" + (f" ({agree/scored:.0%})" if scored else "") + " |")
+    if arbitrated:
+        L.append("\n### On the arbitrated questions\n")
+        L.append("| adjudicator | agreed with arbiter |\n|---|---|")
+        for adj in adjudicators:
+            if adj == a.arbiter:
+                continue
+            hit = sum(1 for k, (chosen, votes) in arbitrated.items()
+                      if votes.get(adj) == chosen)
+            seen = sum(1 for k, (_, votes) in arbitrated.items() if adj in votes)
+            if seen:
+                L.append(f"| {adj} | {hit}/{seen} |")
+        L.append("\nThese are the questions the models split on, so this column "
+                 "separates them far better than overall agreement does.\n")
+
     L.append("\nAgreement with consensus is not accuracy — consensus can be wrong "
              "together. It only flags an adjudicator that is reliably out of step, "
              "which is worth reading before trusting it.\n")

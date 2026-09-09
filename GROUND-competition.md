@@ -67,6 +67,7 @@ a row each time a finding is settled by hand.
 | `tools/auto/arch_probe.py::ArchProbe.last_by_op` | **REAL** | `dict()` is shallow and values are `[hits,misses]` lists from `setdefault(op,[0,0])` — nested mutables shared |
 | `tools/metrics_collector.py::MetricsCollector._load_all_cached` | **FALSE** | sole caller `record()` does `records = list(records)  # don't mutate the cached list in place` |
 | `tools/auto/state.py::StateStore.get_progress` | **FALSE** | `_progress` only ever holds str/int — `dict()` is a complete copy |
+| `tools/auto/controller.py::AutoController.config` | **REAL** (LOW) | форма подтверждена (обычный атрибут, не `@property`); заявленный импакт опровергнут — `task_mode`/`RunLimits` снимаются один раз в `__init__`; но `[gates]` order и `[collect] use_in_auto` читаются живьём, latent |
 | `tools/auto/state.py::StateStore.get_task` | FIXED | `4796e0a` — returns `self._detached(t)` |
 | `tools/auto/state.py::StateStore.all_tasks` | FIXED | `4796e0a` — comprehension over `_detached` |
 | `tools/auto/state.py::StateStore.resume_info` | FIXED | `4796e0a` — both task lists detached |
@@ -159,9 +160,19 @@ python3 scripts/truth_consensus.py validate<N>/truth-*.csv \
     --truth validate<N>/truth.csv --report validate<N>/adjudication.md
 ```
 
-Disputes are not settled by majority — the code either does the thing or it does
-not, so a split means one side did not run the check it claims. Read those
-yourself.
+Splits are not settled by majority — the code either does the thing or it does
+not, and two models agreeing is not evidence when both applied the same wrong
+rule, which is how splits usually arise. Read the split yourself, record your
+verdict with `append_verdict.py --out truth-<you>.csv`, and re-run with
+`--arbiter <you>`: your vote breaks the tie and the others are kept, because a
+model that is reliably wrong on split questions is worth knowing about.
+
+The first split was instructive. Three models judged `AutoController.config`:
+two said FALSE because no caller mutates it, one said REAL/LOW. The rule says an
+unreachable defect is still REAL at LOW severity, so the two were applying the
+wrong criterion — and the one that was right had also *disproved the reported
+impact* and found a different, genuine one. Agreement with the arbiter on split
+questions separates adjudicators far better than overall agreement does.
 
 ### Stage 4 — tickets
 

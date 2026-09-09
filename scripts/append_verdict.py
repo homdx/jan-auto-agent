@@ -33,6 +33,23 @@ def main():
     row = {c: str(a.get(c) or "").replace("\n", "; ").strip() for c in COLUMNS}
     out, t = a["out"], row["truth"].upper()
 
+    # Who wrote this row has to be trustworthy — it is how a disputed verdict
+    # gets traced back to whoever claimed a check they may not have run. Models
+    # leave it blank, or paste a neighbour's name from an example. The filename
+    # is the one reliable signal (truth-<name>.csv), so derive from it and warn
+    # loudly rather than silently accept a wrong attribution.
+    stem = os.path.basename(out).rsplit(".", 1)[0]
+    from_name = stem[6:] if stem.lower().startswith("truth-") else ""
+    if from_name:
+        given = row["checked_by"].lower()
+        if not given:
+            row["checked_by"] = from_name
+        elif given != from_name.lower():
+            print(f"warning: --checked-by {row['checked_by']!r} does not match the file "
+                  f"({from_name!r}). Using {from_name!r} — one adjudicator, one file.",
+                  file=sys.stderr)
+            row["checked_by"] = from_name
+
     problems = []
     if not row["finding"]:
         problems.append("--finding is required (copy the `file::symbol` from the queue)")
