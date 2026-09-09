@@ -18,6 +18,7 @@ This only reads what is already emitted, so a "before" number survives runs that
 have since finished.
 """
 import argparse
+import subprocess
 import collections
 import datetime
 import glob
@@ -29,6 +30,34 @@ import sys
 LOC = re.compile(r"^Location:\s*(.+)$", re.M)
 
 
+def base_sha(base):
+    """The commit the tree sat on when the run started.
+
+    `--auto` commits its own plan on top (``auto(AUTO-...)``), so walk back
+    past those: what makes an "after" run comparable is the *pre-run* tree.
+    Returns ``("", "")`` for anything that is not a git checkout.
+    """
+    def git(*args):
+        try:
+            return subprocess.run(("git", "-C", base) + args, capture_output=True,
+                                  text=True, timeout=15).stdout.strip()
+        except Exception:
+            return ""
+    head = git("rev-parse", "--short=7", "HEAD")
+    if not head:
+        return "", ""
+    pre, rev = head, head
+    for _ in range(20):
+        subject = git("log", "-1", "--format=%s", rev)
+        if not subject.startswith("auto("):
+            pre = rev
+            break
+        rev = git("rev-parse", "--short=7", rev + "^")
+        if not rev:
+            break
+    return head, pre
+
+
 def read_run(base):
     traces = sorted(glob.glob(os.path.join(base, ".agent", "trace_*.jsonl")))
     if not traces:
@@ -36,6 +65,7 @@ def read_run(base):
     out = {
         "run": os.path.basename(os.path.abspath(base)),
         "trace": os.path.basename(traces[0]),
+        "head_sha": "", "pre_run_sha": "",
         "goal": "", "probe_usable": None, "probe_reason": None,
         "llm_by_source": collections.Counter(),
         "gate1": {"requests": 0, "confirmed": 0, "rejected": 0, "unparsed": 0},
@@ -110,6 +140,7 @@ def read_run(base):
             (t1 - t0).total_seconds() / (out["gate1"]["requests"] - 1), 1)
     for k in ("llm_by_source", "gate1_location_ext", "probe_by_op"):
         out[k] = dict(out[k])
+    out["head_sha"], out["pre_run_sha"] = base_sha(base)
     return out
 
 

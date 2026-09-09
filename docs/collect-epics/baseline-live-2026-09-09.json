@@ -1,28 +1,30 @@
 {
- "taken_at": "2026-09-09T22:17:37+00:00",
+ "taken_at": "2026-09-09T22:28:09+00:00",
  "runs": [
   {
    "run": "testtext",
    "trace": "trace_bdef311afe41.jsonl",
+   "head_sha": "12df523",
+   "pre_run_sha": "12df523",
    "goal": "Find tests that would still pass if the code they guard were deleted — assertions over empty collections, checks whose subject is always absent, or a comparison to a set that could silently become empty. For each, add a companion test proving the guard fails when the invariant is actually violated.",
    "probe_usable": "True",
    "probe_reason": "ok",
    "llm_by_source": {
     "architect": 98,
-    "gate1": 255
+    "gate1": 282
    },
    "gate1": {
-    "requests": 255,
-    "confirmed": 119,
-    "rejected": 134,
+    "requests": 282,
+    "confirmed": 130,
+    "rejected": 150,
     "unparsed": 1,
-    "seconds_per_candidate": 14.5
+    "seconds_per_candidate": 15.3
    },
    "gate1_location_ext": {
     ".ini:rejected": 3,
     ".ini:confirmed": 2,
-    ".py:confirmed": 114,
-    ".py:rejected": 122,
+    ".py:confirmed": 125,
+    ".py:rejected": 138,
     ".yaml:confirmed": 2,
     ".yaml:rejected": 1,
     ".md:rejected": 5,
@@ -46,30 +48,32 @@
    },
    "collect_block_occurrences": 0,
    "first_ts": "2026-09-09T20:05:24.649158+00:00",
-   "last_ts": "2026-09-09T22:17:14.707441+00:00",
+   "last_ts": "2026-09-09T22:27:28.626184+00:00",
    "gate1_first_ts": "2026-09-09T21:15:54.890281+00:00",
-   "gate1_last_ts": "2026-09-09T22:17:14.707441+00:00"
+   "gate1_last_ts": "2026-09-09T22:27:28.626184+00:00"
   },
   {
    "run": "testtext3",
    "trace": "trace_bf6e9cd8f005.jsonl",
+   "head_sha": "a3a0cc4",
+   "pre_run_sha": "bb9b2ea",
    "goal": "Find except blocks that swallow an exception without logging what was swallowed, and add a warning that names the operation and the exception. Do not change control flow: a handler that intentionally continues must keep continuing, it must only become visible.",
    "probe_usable": "True",
    "probe_reason": "ok",
    "llm_by_source": {
     "architect": 215,
-    "gate1": 277
+    "gate1": 303
    },
    "gate1": {
-    "requests": 277,
-    "confirmed": 78,
-    "rejected": 197,
+    "requests": 303,
+    "confirmed": 100,
+    "rejected": 202,
     "unparsed": 1,
-    "seconds_per_candidate": 13.6
+    "seconds_per_candidate": 14.2
    },
    "gate1_location_ext": {
-    ".py:rejected": 197,
-    ".py:confirmed": 78,
+    ".py:rejected": 202,
+    ".py:confirmed": 100,
     ".py:unparsed": 1
    },
    "probe": {
@@ -88,34 +92,36 @@
    },
    "collect_block_occurrences": 0,
    "first_ts": "2026-09-09T20:07:04.950124+00:00",
-   "last_ts": "2026-09-09T22:17:14.976112+00:00",
+   "last_ts": "2026-09-09T22:26:09.690253+00:00",
    "gate1_first_ts": "2026-09-09T21:14:46.480923+00:00",
-   "gate1_last_ts": "2026-09-09T22:17:14.976112+00:00"
+   "gate1_last_ts": "2026-09-09T22:26:04.896007+00:00"
   },
   {
    "run": "testtext5",
    "trace": "trace_34cad6899ecf.jsonl",
+   "head_sha": "12df523",
+   "pre_run_sha": "12df523",
    "goal": "Find regular expressions that parse structured documents by matching a boundary marker that the document body could itself contain — markdown headings, code fences, horizontal rules, delimiters. Make each one aware of the enclosing structure so content inside a fenced block is never treated as a boundary.",
    "probe_usable": "True",
    "probe_reason": "ok",
    "llm_by_source": {
     "architect": 181,
-    "gate1": 83
+    "gate1": 116
    },
    "gate1": {
-    "requests": 83,
-    "confirmed": 18,
-    "rejected": 64,
+    "requests": 116,
+    "confirmed": 30,
+    "rejected": 85,
     "unparsed": 0,
-    "seconds_per_candidate": 18.0
+    "seconds_per_candidate": 17.9
    },
    "gate1_location_ext": {
-    ".py:rejected": 59,
+    ".py:rejected": 78,
     ".ini:confirmed": 1,
     ".yaml:rejected": 3,
-    ".py:confirmed": 15,
-    ".md:confirmed": 2,
-    ".md:rejected": 2
+    ".py:confirmed": 25,
+    ".md:confirmed": 4,
+    ".md:rejected": 4
    },
    "probe": {
     "ops": 124,
@@ -133,32 +139,34 @@
    },
    "collect_block_occurrences": 0,
    "first_ts": "2026-09-09T20:10:45.373790+00:00",
-   "last_ts": "2026-09-09T22:17:13.538813+00:00",
+   "last_ts": "2026-09-09T22:27:05.381021+00:00",
    "gate1_first_ts": "2026-09-09T21:52:41.455570+00:00",
-   "gate1_last_ts": "2026-09-09T22:17:13.538813+00:00"
+   "gate1_last_ts": "2026-09-09T22:27:05.381021+00:00"
   },
   {
    "run": "testtext6",
    "trace": "trace_32574e154e93.jsonl",
+   "head_sha": "12df523",
+   "pre_run_sha": "12df523",
    "goal": "Trace every write to a JSON state file and identify paths where data reaches the file without passing the schema validation that the module's own setters apply. Add validation at the boundary or document why the write is already safe.",
    "probe_usable": "True",
    "probe_reason": "ok",
    "llm_by_source": {
     "architect": 208,
-    "gate1": 134
+    "gate1": 168
    },
    "gate1": {
-    "requests": 134,
-    "confirmed": 60,
-    "rejected": 73,
+    "requests": 168,
+    "confirmed": 68,
+    "rejected": 99,
     "unparsed": 0,
-    "seconds_per_candidate": 17.1
+    "seconds_per_candidate": 17.5
    },
    "gate1_location_ext": {
     ".ini:confirmed": 3,
     ".ini:rejected": 2,
-    ".py:confirmed": 53,
-    ".py:rejected": 61,
+    ".py:confirmed": 61,
+    ".py:rejected": 87,
     ".yaml:confirmed": 2,
     ".yaml:rejected": 2,
     ".md:rejected": 6,
@@ -183,32 +191,34 @@
    },
    "collect_block_occurrences": 0,
    "first_ts": "2026-09-09T20:12:52.851065+00:00",
-   "last_ts": "2026-09-09T22:17:16.964408+00:00",
+   "last_ts": "2026-09-09T22:28:05.474565+00:00",
    "gate1_first_ts": "2026-09-09T21:39:27.020827+00:00",
-   "gate1_last_ts": "2026-09-09T22:17:16.964408+00:00"
+   "gate1_last_ts": "2026-09-09T22:28:05.474565+00:00"
   },
   {
    "run": "testtext7",
    "trace": "trace_1a19384bed52.jsonl",
+   "head_sha": "12df523",
+   "pre_run_sha": "12df523",
    "goal": "Find places where one module documents a guarantee about another module's behaviour in a comment or docstring, and verify the other module still provides it. Report each mismatch as a task to correct whichever side is now wrong.",
    "probe_usable": "False",
    "probe_reason": "no_artifact",
    "llm_by_source": {
     "architect": 93,
-    "gate1": 193
+    "gate1": 223
    },
    "gate1": {
-    "requests": 193,
-    "confirmed": 78,
-    "rejected": 114,
+    "requests": 223,
+    "confirmed": 97,
+    "rejected": 125,
     "unparsed": 0,
-    "seconds_per_candidate": 16.4
+    "seconds_per_candidate": 17.1
    },
    "gate1_location_ext": {
     ".ini:rejected": 12,
     ".ini:confirmed": 4,
-    ".py:confirmed": 64,
-    ".py:rejected": 78,
+    ".py:confirmed": 83,
+    ".py:rejected": 89,
     ".yaml:rejected": 4,
     ".yaml:confirmed": 1,
     ".md:confirmed": 7,
@@ -229,16 +239,16 @@
    "probe_by_op": {},
    "collect_block_occurrences": 0,
    "first_ts": "2026-09-09T20:14:43.272256+00:00",
-   "last_ts": "2026-09-09T22:17:19.352675+00:00",
+   "last_ts": "2026-09-09T22:28:06.099901+00:00",
    "gate1_first_ts": "2026-09-09T21:24:52.851242+00:00",
-   "gate1_last_ts": "2026-09-09T22:17:19.352675+00:00"
+   "gate1_last_ts": "2026-09-09T22:28:06.099901+00:00"
   }
  ],
  "totals": {
   "arch": 795,
-  "g1": 942,
-  "conf": 353,
-  "rej": 582,
+  "g1": 1092,
+  "conf": 425,
+  "rej": 661,
   "ops": 773,
   "miss": 24,
   "blocks": 0

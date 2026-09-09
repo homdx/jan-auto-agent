@@ -89,6 +89,10 @@ comparing.
 | `epic-tasks/` | the tickets — `next_task.py` hands them out one at a time |
 | `docs/collect-epics/PLAN-v2.md`, `EPIC-M-metrics.md`, `EPIC-L-live-findings.md` | context for *why*, when the ticket alone is not enough |
 
+`MEASURE-BEFORE-AFTER.md` is for **you**, not the agent — it is the protocol
+for the numbers a round is judged against, and an agent that reads it tends to
+start optimising the metric instead of implementing the ticket.
+
 Do **not** give it `docs/collect-epics/EPIC-A/B/C` unless you are deliberately
 running v1 — they are the superseded plan and several of their numbers are
 wrong (see `INDEX.md` §"Numbers in this file … are hand-measured").

@@ -30,9 +30,10 @@ plan had, and one run is producing competition data while blind.
 ## The short answer
 
 > **Yes, but not where the epics said the first win was.** The collect block
-> reaches only the coder. In these five runs the coder has not executed once in
-> two hours. 1629 LLM calls have been made and **not one of them carried a
-> collect block.**
+> reaches only the coder, and all five runs pass `--dry-run`, which skips the
+> execute phase outright (`dry-run: plan phase complete; execution skipped`).
+> The coder is unreachable **by construction**, not by timing. 1629 LLM calls
+> have been made and **not one of them carried a collect block.**
 
 ---
 
@@ -84,9 +85,21 @@ So the two phases that consume 100% of the round's wall clock:
 
 This is exactly the premise of both plans, but stronger than either stated it.
 `INDEX.md` says *"the per-task block describes the file the coder can already
-read"*. The live runs say something sharper: **for 2 h 05 m of a round, the
-block does not exist at all.** EPIC A's rows only start paying at the moment
-the coder runs, and the coder is the last thing to run.
+read"*. The live runs say something sharper: **in a `--dry-run` round the block
+does not exist at all.**
+
+That is worth being precise about, because it is not a timing accident. The
+execute phase is skipped by the flag:
+
+```
+[2026-09-09T22:26:09Z] dry-run: plan phase complete; execution skipped
+[2026-09-09T22:26:09Z] [AUTO-F2] phase execute skipped (dry-run)
+```
+
+Competition prep is planning-only, so for the way these runs are actually used,
+the coder-side pack delivers exactly nothing — gate 1 and the architect are the
+only surfaces that exist. EPIC A's rows start paying at the moment the coder
+runs, and in this mode the coder never does.
 
 ### The one exception, and it is the proof the mechanism works
 
@@ -299,9 +312,10 @@ made 326 for 326 — the architect uses the probe when it thinks to, and gets
 nothing when it does not. A pack row is a fact it does not have to think to ask
 for.
 
-**For the coder: unknown, and it will stay unknown this round**, because the
-coder has not run. Any claim about the coder's improvement is a claim about a
-phase that has produced zero LLM calls in two hours.
+**For the coder: unknown, and it will stay unknown for as long as the rounds
+are `--dry-run`**, because the flag skips the execute phase and the coder never
+runs. Proving anything about it needs one execution run or the `M5` A/B —
+see `MEASURE-BEFORE-AFTER.md`.
 
 **What is *not* enough:** 15% of rejections are a gate-contract mismatch that no
 fact fixes, and 10% are candidates against files collect does not index, which
