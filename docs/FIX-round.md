@@ -4,20 +4,60 @@ Stage 4 (`scripts/make_jira_tasks.py`) turned the adjudicated ground truth into
 one ticket per confirmed defect under `tasks/`. This is how a coder model works
 through them.
 
+> This file lives in `docs/`, but **every path below is written from the repo
+> root** — that is where the coder runs, and where all the commands assume it is.
+
 There are **two ways to run it**. Both use the same `tasks/*.md` tickets and the
 same ground rules; they differ only in how the coder is handed the next one.
 
 ---
 
-## Variant 1 — you drive the loop (the old way)
+## What to hand the coder
 
-Feed the model your fix-round instruction plus `tasks/INDEX.md`, and tell it to
-take the tickets in order, one commit each, then move to the next line. This is
-unchanged — nothing here replaces it.
+Everything a coder needs is in the repo. There is no separate fix-round briefing
+document to find — [the ground rules](#ground-rules-for-the-run--give-these-to-every-model-verbatim)
+below are it, and each ticket restates them in its own `## Acceptance` section.
+
+**One agent, working alone:**
+
+| give it | why |
+|---|---|
+| the repo, checked out on a branch of its own | it commits |
+| `docs/FIX-round.md` (this file) | the loop + the ground rules — paste it, or point at the path |
+| `tasks/` | the tickets. Variant 2 hands them over one at a time; you do not need to paste them |
+| `scripts/next_task.py`, `scripts/append_task.py` | already in the repo — the coder just runs them |
+
+Nothing from `validate1/` is needed **during** the round. Each ticket already
+carries the defect, the evidence, the reproduction and the disproof inline —
+that is what stage 4 built them for, and a coder that goes reading the reviewer
+CSVs is reading opinions instead of code. `validate1/truth.csv` matters only
+[after the round](#after-the-round), when you record what was fixed.
+
+The prompt itself is two sentences on top of this file:
+
+> Work the tickets in `tasks/` using the loop in `docs/FIX-round.md` (variant 2:
+> `next_task.py` → fix → commit → `append_task.py`, repeat until exit code 3).
+> Follow the ground rules in that file exactly; they are how the work is scored.
+
+**Several agents at once:** same list, plus one `--progress` file and one
+worktree each — see [Running several models over the same tickets](#running-several-models-over-the-same-tickets-at-once).
 
 ---
 
-## Variant 2 — a script hands out the next ticket (resumable)
+## Variant 1 — you drive the loop, by hand
+
+Hand the model `tasks/INDEX.md` (the table of all tickets, newest regeneration
+always in sync with `tasks/`) together with the ground rules below, and tell it
+to take the tickets in order, one commit each, then move to the next line.
+
+This is the older, unscripted way and it still works. What it does not give you
+is the resume: the model holds the whole list in context, so an interrupted run
+loses whatever was not committed, and you cannot tell from disk how far it got.
+Prefer variant 2 unless you have a reason not to.
+
+---
+
+## Variant 2 — a script hands out the next ticket (resumable, preferred)
 
 Same mechanic as `next_finding.py` in the validation round. The model never gets
 the whole folder, only the next ticket whose outcome is not yet recorded. If the
@@ -67,6 +107,17 @@ python3 scripts/append_task.py --progress runs/<model>/PROGRESS.csv --ticket ...
 Every model then works the full ticket list independently and you can compare
 their fixes ticket by ticket — the same shape as the validation round, where
 each reviewer owned one CSV.
+
+Each model gets the same handout as a solo coder (see [What to hand the
+coder](#what-to-hand-the-coder)) with two lines changed:
+
+> Use `--progress runs/<your model name>/PROGRESS.csv` on **every**
+> `next_task.py` and `append_task.py` call. Commit into your own worktree only.
+
+Name the run folder after the model, lowercase, the same way reviewers named
+their CSVs — that is what makes the comparison readable afterwards.
+`runs/*/PROGRESS.csv` is gitignored, so the progress files stay out of the
+commits you are comparing.
 
 Two things this does **not** do, and neither is a tool problem:
 
