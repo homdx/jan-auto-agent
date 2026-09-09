@@ -3,6 +3,10 @@
 How to turn the reviewer CSVs in this folder into a scored report. All commands
 run from the repo root. `python` is not on PATH — use `python3`.
 
+This is the deep reference for the analysis step. For the round as a whole —
+which prompt each stage hands the model, and which files you take away — see
+`docs/RUN-THE-COMPETITION.md`.
+
 The three scripts, in the order you use them:
 
 | script | question it answers | needs |

@@ -47,6 +47,32 @@ GROUND = {
     "tools/auto/state.py::StateStore.resume_info":                   "FIXED",
 }
 
+GROUND_SOURCE = "GROUND-competition.md (baked in)"
+
+
+def load_truth(path):
+    """Replace the baked-in GROUND table with a truth.csv.
+
+    The table above is a frozen snapshot of GROUND-competition.md. It was
+    written by hand and does not grow when validate<N>/truth.csv does, so a
+    later round silently scores against a stale subset. Point --truth at the
+    adjudicated file and the report scores against everything that was actually
+    settled.  Columns: finding,truth[,checked_by,duplicate_of,how].
+    """
+    out = {}
+    with open(path, newline="", encoding="utf-8-sig") as fh:
+        for row in csv.DictReader(fh):
+            finding = (row.get("finding") or "").strip()
+            truth = (row.get("truth") or "").strip().upper()
+            if not finding or not truth:
+                continue
+            # a row folded into another finding is the same defect counted twice
+            if (row.get("duplicate_of") or "").strip():
+                continue
+            out[finding] = truth
+    return out
+
+
 CONFIRMED_P = ["CONFIRMED","ACT","REAL","NEW"]
 DISMISSED_P = ["FALSE_POSITIVE","DISMISSED","FALSE","OUT_OF_SCOPE","UNVERIFIABLE","ALREADY_FIXED"]
 
@@ -148,8 +174,19 @@ def main():
     ap.add_argument("--no-color",      action="store_true")
     ap.add_argument("--only-ground",   action="store_true")
     ap.add_argument("--min-reviewers", type=int, default=0)
+    ap.add_argument("--truth", metavar="TRUTH_CSV",
+                    help="score against this adjudicated truth.csv instead of the "
+                         "baked-in table (e.g. validate1/truth.csv)")
     args = ap.parse_args()
     if args.no_color: COLOR = False
+
+    global GROUND, GROUND_SOURCE
+    if args.truth:
+        GROUND = load_truth(args.truth)
+        GROUND_SOURCE = args.truth
+        if not GROUND:
+            print(f"error: {args.truth} has no usable finding/truth rows", file=sys.stderr)
+            return 1
 
     with open(args.csv, newline="", encoding="utf-8-sig") as f:
         rows = list(csv.DictReader(f))
@@ -215,7 +252,7 @@ def main():
         print(f"  {c(GRY)}{label:<11}{r()}" + line[2:])
 
     # ── GROUND TRUTH ACCURACY ─────────────────────────────────────────────────
-    section("GROUND TRUTH ACCURACY   (GROUND-competition.md)")
+    section(f"GROUND TRUTH ACCURACY   ({GROUND_SOURCE})")
 
     csv_set     = {row["finding"].strip() for row in rows}
     missing_gt  = [f for f in GROUND if f not in csv_set]
@@ -358,4 +395,4 @@ def main():
     print()
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main() or 0)

@@ -6,6 +6,9 @@ through them.
 
 > This file lives in `docs/`, but **every path below is written from the repo
 > root** — that is where the coder runs, and where all the commands assume it is.
+>
+> This is stage 5 of five. For the whole round — what each stage hands the model
+> and what you take away from it — see [`docs/RUN-THE-COMPETITION.md`](RUN-THE-COMPETITION.md).
 
 There are **two ways to run it**. Both use the same `tasks/*.md` tickets and the
 same ground rules; they differ only in how the coder is handed the next one.
