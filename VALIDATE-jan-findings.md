@@ -278,7 +278,56 @@ no describable consequence.
    same command and the same CSV; the queue picks up where it stopped. Two or
    three sessions to finish a 53-entry list is normal and costs nothing extra —
    the first run's work is already on disk.
-4. Grade the reviewers, not only the findings:
+4. **Build the report and score the reviewers:**
+   ```bash
+   python3 scripts/harvest_report.py validate1/*.csv \
+       --truth validate1/truth.csv \
+       --report harvest.md --actions actions.csv --solo solo.csv
+   ```
+   `harvest.md` sorts findings into **Act / Disputed / Already fixed /
+   Dismissed**, adds a **Solo findings** table, and scores each reviewer.
+
+### Judging which model is better
+
+Skepticism alone does not rank reviewers. On a noisy list everybody scores 90%+
+by rejecting nearly everything, which is the correct behaviour and therefore not
+a discriminator. Rank on two things instead, in this order:
+
+**1. Accuracy against ground truth.** Keep a `truth.csv` of findings you have
+personally checked:
+
+```csv
+finding,truth,checked_by,how
+tools/search_agent.py::_DEFAULT_SKIP_DIRS,REAL,you,"identity check: instance list is the module list"
+tools/metrics_collector.py::MetricsCollector._load_all_cached,FALSE,you,"sole caller copies before mutating"
+tools/auto/state.py::StateStore.get_task,FIXED,you,"returns self._detached(t) since 4796e0a"
+```
+
+`REAL` / `FALSE` / `FIXED`. Only score what you actually verified — an unchecked
+finding is left out of the maths rather than counted as a pass, so a reviewer
+cannot gain by guessing. Nine checked findings were enough to separate the field
+in practice.
+
+**2. Solo discoveries that survive checking.** A `NEW-*` row only one reviewer
+produced is the highest-value output of the whole exercise, *and* the highest-
+risk: it is either the best result of the run or a hallucination, with nothing in
+between. The report puts these in their own table so you check them by hand.
+
+**A single vote is weak evidence about the finding and strong evidence about the
+reviewer.** Do not dismiss a solo find for being solo — nobody else was looking
+there. Check it, then add the answer to `truth.csv`, which raises the resolution
+of every future run.
+
+### Reading the solo table
+
+It separates two things that must not be averaged:
+
+- **Discoveries** — `NEW-*` rows nobody else raised. Judgement signal.
+- **Unshared judgements** — list entries nobody else reached. Coverage gap, and
+  says nothing about anyone's ability. Re-run a second reviewer over those ids
+  before trusting a lone verdict.
+
+### Grade the reviewers, not only the findings:
    - **Unanimous `CONFIRMED` with matching evidence** → trust the finding.
    - **Split verdicts** → the interesting rows; one reviewer read the code and
      the other read the proposal.
