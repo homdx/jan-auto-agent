@@ -36,11 +36,15 @@ that is what stage 4 built them for, and a coder that goes reading the reviewer
 CSVs is reading opinions instead of code. `validate1/truth.csv` matters only
 [after the round](#after-the-round), when you record what was fixed.
 
-The prompt itself is two sentences on top of this file:
+**The prompt to paste is not the same for the two variants.** Pick a variant
+first, then copy the exact text from its own **"Prompt — paste this verbatim"**
+box below:
 
-> Work the tickets in `tasks/` using the loop in `docs/FIX-round.md` (variant 2:
-> `next_task.py` → fix → commit → `append_task.py`, repeat until exit code 3).
-> Follow the ground rules in that file exactly; they are how the work is scored.
+- Variant 1 (you feed the tickets by hand) → [its prompt box](#prompt--paste-this-verbatim)
+- Variant 2 (a script feeds them, resumable — preferred) → [its prompt box](#prompt--paste-this-verbatim-1)
+
+In both cases the ground rules further down are part of the prompt — paste this
+whole file, or paste the box plus the ground-rules section.
 
 **Several agents at once:** same list, plus one `--progress` file and one
 worktree each — see [Running several models over the same tickets](#running-several-models-over-the-same-tickets-at-once).
@@ -49,14 +53,31 @@ worktree each — see [Running several models over the same tickets](#running-se
 
 ## Variant 1 — you drive the loop, by hand
 
-Hand the model `tasks/INDEX.md` (the table of all tickets, newest regeneration
-always in sync with `tasks/`) together with the ground rules below, and tell it
-to take the tickets in order, one commit each, then move to the next line.
+You hand the model `tasks/INDEX.md` (the table of all tickets, always in sync
+with `tasks/`) plus the ground rules, and it walks the list top to bottom, one
+commit per ticket.
 
 This is the older, unscripted way and it still works. What it does not give you
 is the resume: the model holds the whole list in context, so an interrupted run
 loses whatever was not committed, and you cannot tell from disk how far it got.
 Prefer variant 2 unless you have a reason not to.
+
+### Prompt — paste this verbatim
+
+> You are fixing confirmed defects in this repository. The list is in
+> `tasks/INDEX.md`; each row links to a ticket file under `tasks/` with the
+> defect, its evidence, a reproduction and the disproof to check first.
+>
+> Work the tickets **in the order they appear in `tasks/INDEX.md`**. For each
+> one: read the linked `tasks/NN-*.md`, verify the defect against the live
+> source, then either fix it with **one local commit** (never `git push`) or, if
+> it is not real, note that and move on. A regression test in `tests_bugfix/`
+> ships with every fix. Do the next ticket only after the current one is
+> committed. When every row is done, stop and report, per ticket, what you did
+> (fixed + commit sha / already-ok / skipped + reason).
+>
+> Follow the ground rules in `docs/FIX-round.md` §"Ground rules for the run"
+> exactly — they are how the work is scored.
 
 ---
 
@@ -96,6 +117,35 @@ ticket again — you cannot skip ahead, and nothing you did counts until it is i
 
 `python3 scripts/next_task.py --status` prints progress without handing anything out.
 Exit code 3 from either command means the folder is finished.
+
+### Prompt — paste this verbatim
+
+> You are fixing confirmed defects in this repository, one ticket at a time. Do
+> **not** open `tasks/` yourself — a script hands you the next ticket:
+>
+> ```bash
+> python3 scripts/next_task.py --tasks tasks/
+> ```
+>
+> It prints one ticket (defect, evidence, reproduction, disproof) and the exact
+> command to record it. Verify the defect against the live source, then either
+> fix it with **one local commit** (never `git push`) or decide it is not real.
+> Record the outcome:
+>
+> ```bash
+> python3 scripts/append_task.py --progress tasks/PROGRESS.csv \
+>     --ticket <the NN-*.md you were given> --outcome FIXED|ALREADY-OK|SKIPPED \
+>     --commit <sha> --note "one line: what changed + the regression test"
+> ```
+>
+> Then run `next_task.py` again. It re-hands the same ticket until you record it,
+> so you cannot skip ahead, and if this session is cut off just re-run the same
+> command — it resumes at the first unrecorded ticket. A regression test in
+> `tests_bugfix/` ships with every fix. Stop when `next_task.py` exits with code
+> 3 ("every ticket is recorded") and report your outcome counts.
+>
+> Follow the ground rules in `docs/FIX-round.md` §"Ground rules for the run"
+> exactly — they are how the work is scored.
 
 ### Running several models over the same tickets at once
 
