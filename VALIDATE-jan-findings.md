@@ -32,7 +32,7 @@ into its own CSV.
 > # 2. judge that one entry, then record it
 > python3 scripts/append_finding.py --out validation-v<N>-<yourname>.csv \
 >     --variant <N> --task-id <the id you were just given> --title "..." \
->     --file tools/auto/x.py --symbol ClassName.method \
+>     --file <the path the entry cites> --symbol <ClassName.method> \
 >     --verdict CONFIRMED --severity MEDIUM --defect-class mutable-state-leak \
 >     --caller-mutates YES \
 >     --impact "..." --repro "..." --evidence "..." --disproof "..." \
@@ -79,6 +79,11 @@ into its own CSV.
 > If `append_finding.py` rejects a row, it names the one thing missing. Fix that
 > and call it again; do not re-judge the entry from scratch. If it says a
 > finding is already recorded, that entry is done — go to step 1.
+>
+> `--file` must be a path that exists in the repo. It is the key every reviewer's
+> verdict on the same symbol is grouped under, so a placeholder path does not
+> just weaken your row — it hides it from the comparison, and your judgement is
+> read as something only you saw. Pass the path you actually opened.
 >
 > Anything you find that is *not* on the list gets recorded the same way, with
 > `--task-id NEW-1`, `NEW-2`, …

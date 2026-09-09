@@ -1,0 +1,1 @@
+../tests/test_competition_append_finding_file.py

@@ -54,6 +54,31 @@ ticket again — you cannot skip ahead, and nothing you did counts until it is i
 `python3 scripts/next_task.py --status` prints progress without handing anything out.
 Exit code 3 from either command means the folder is finished.
 
+### Running several models over the same tickets at once
+
+The queue is derived from the progress file, so **the progress file is what
+separates one agent from another**. Point each model at its own:
+
+```bash
+python3 scripts/next_task.py   --tasks tasks/ --progress runs/<model>/PROGRESS.csv
+python3 scripts/append_task.py --progress runs/<model>/PROGRESS.csv --ticket ... --outcome ...
+```
+
+Every model then works the full ticket list independently and you can compare
+their fixes ticket by ticket — the same shape as the validation round, where
+each reviewer owned one CSV.
+
+Two things this does **not** do, and neither is a tool problem:
+
+- **It does not split the work.** Sharing one `tasks/PROGRESS.csv` between
+  concurrent agents does not either: three agents that ask before any of them
+  records all receive ticket 01, because nothing is claimed until an outcome is
+  written. The loop is serial on purpose — that is what makes a context blow-up
+  a resume instead of a data loss.
+- **It does not isolate the working tree.** Several models committing into one
+  checkout will collide. Give each its own clone or `git worktree`, and compare
+  the branches afterwards.
+
 ---
 
 ## Ground rules for the run — give these to every model verbatim

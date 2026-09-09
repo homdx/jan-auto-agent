@@ -22,3 +22,4 @@ validate*/*.csv
 validate*/harvest.md
 validate*/pending-validation.md
 tasks/PROGRESS.csv
+runs/*/PROGRESS.csv
