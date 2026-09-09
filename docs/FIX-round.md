@@ -119,7 +119,7 @@ coder](#what-to-hand-the-coder)) with two lines changed:
 
 Name the run folder after the model, lowercase, the same way reviewers named
 their CSVs — that is what makes the comparison readable afterwards.
-`runs/*/PROGRESS.csv` is gitignored, so the progress files stay out of the
+`runs/` is gitignored, so the progress files stay out of the
 commits you are comparing.
 
 Two things this does **not** do, and neither is a tool problem:
@@ -156,6 +156,35 @@ They are the scoring criteria, and they are also printed inside every ticket's
 5. **Do not adjust a test to make a change pass** unless the test pins a contract
    the change deliberately replaces — and say so explicitly in the commit if it does.
 6. **Stay in scope.** No opportunistic refactors bundled into an unrelated fix.
+
+---
+
+## Handing the work back
+
+The default is that each fix is a commit on the model's **own branch or
+worktree**, and you compare branches directly afterwards
+(`git log runs/<model>..`, `git range-diff`). Nothing to export.
+
+If you deliver the fixes as **patch files** instead — portable, no shared
+checkout needed — generate them one per commit into a **per-model folder**:
+
+```bash
+git format-patch -o runs/<model>/patches/ <base>..HEAD
+```
+
+Put the model name in the **folder**, not the filename. `git format-patch`
+numbers the files `0001-…`, `0002-…` and every model produces the same names, so
+a flat folder collides the moment you line two models up to compare — the same
+reason reviewers each owned `validation-v1-<model>.csv` and each coder owns
+`runs/<model>/PROGRESS.csv`. Do **not** rename the files: `git am` needs the
+`NNNN-` prefix to apply them in order.
+
+```bash
+git am runs/<model>/patches/*.patch      # applies the whole set, in order
+```
+
+`runs/` is gitignored, so the patches and progress files stay out of the commits
+you are comparing.
 
 ---
 
