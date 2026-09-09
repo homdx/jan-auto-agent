@@ -42,19 +42,24 @@ run data — regenerable from the CSVs, not committed.
 
 ## JIRA tickets
 
-`tasks/` (the stage-4 output — 5 tickets + `INDEX.md`) has been **moved out of
-the git tree** to `~/qwen25-jira-tickets/`. That folder also carries
-`VALIDATION.md`, a re-check of all 5 against the live code:
+The stage-4 output (`tasks/` — 5 tickets + `INDEX.md`) is **no longer carried in
+the repo**. The `tasks/` folder and its `.gitignore` entries were removed once
+the two real defects were fixed directly. The working copy — plus `VALIDATION.md`,
+a re-check of all 5 against live code — lives at `~/qwen25-jira-tickets/`.
 
-- **real, worth fixing:** `03` (`_DEFAULT_SKIP_DIRS` aliasing) and `05`
-  (`ArchProbe.last_by_op` shallow copy) — both one-line, both ground-truth REAL.
-- **real, small fix:** `02` (`list_py_files` silently ignores path-qualified
-  `skip_dirs`).
-- **drop:** `01` (`AutoController.config` — latent, impact disproved in
+Outcome of that validation:
+
+- **fixed directly on `competition`:** `03` `_DEFAULT_SKIP_DIRS` aliasing
+  (`search_agent.py`, commit `8fcfe71`) and `05` `ArchProbe.last_by_op` shallow
+  copy (`arch_probe.py`, commit `6c06170`) — one line each, both ground-truth REAL.
+- **left for the operator:** `02` (`list_py_files` / `list_source_files` silently
+  ignore a path-qualified `skip_dirs` entry) — real but needs a warn-vs-normalise
+  decision, not a mechanical fix.
+- **dropped:** `01` (`AutoController.config` — latent, impact disproved in
   adjudication) and `04` (`_serialise_candidates` — `Severity: NONE`).
 
-The tickets are regenerable at any time with
-`scripts/make_jira_tasks.py --truth validate1/truth.csv --out tasks/`.
+If a future round needs tickets again, regenerate them outside the tree:
+`scripts/make_jira_tasks.py --truth validate1/truth.csv --out ~/qwen25-jira-tickets/`.
 
 ## Background (not part of the loop)
 

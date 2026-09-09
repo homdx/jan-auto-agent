@@ -22,9 +22,4 @@ validate*/*.csv
 validate*/harvest.md
 validate*/pending-validation.md
 validate*/IMPROVEMENTS.md
-tasks/PROGRESS.csv
-# Stage-4 JIRA tickets — regenerable from validate*/truth.csv via
-# scripts/make_jira_tasks.py; the working copy lives outside the repo
-# (~/qwen25-jira-tickets/). See docs/PIPELINE-DOCS-INDEX.md.
-tasks/*.md
 runs/
