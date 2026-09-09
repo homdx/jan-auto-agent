@@ -105,7 +105,13 @@ def classify(rs):
     if conf >= 2 or (conf and is_new):
         return "ACT"
     if conf == 1:
-        return "DISPUTED" if len(rs) > 1 else "ACT"
+        # A lone CONFIRMED that is not a NEW-* find is not actionable: nobody
+        # else reached the entry, so one vote is all there is. That is a
+        # question for a human (and the verification queue), not the action
+        # list — routing it to ACT lets a single rubber-stamp reviewer put an
+        # unreviewed finding in front of the fixer. NEW-* solo confirms are
+        # handled above, where a discovery with evidence is the point.
+        return "DISPUTED"
     if fixed:
         return "FIXED"
     return "DISMISSED"

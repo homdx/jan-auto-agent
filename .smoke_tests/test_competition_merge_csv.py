@@ -1,0 +1,1 @@
+../tests/test_competition_merge_csv.py

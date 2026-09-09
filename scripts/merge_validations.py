@@ -12,6 +12,12 @@ proposal, and you learn something either way.
 Usage:
     merge_validations.py validation-v1-*.csv
     merge_validations.py --csv merged.csv validation-v1-*.csv
+
+Pass the CSV paths unquoted so the shell expands the glob — this script does not
+expand globs itself. --csv OUT writes a spreadsheet-style pivot: one row per
+finding, one column per reviewer holding that reviewer's verdict, with
+severity / agreement / vote-tally columns in front. See write_merged_csv below
+for the full column list.
 """
 import argparse
 import csv
@@ -60,7 +66,10 @@ def key_of(r):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("csvs", nargs="+")
-    ap.add_argument("--csv", metavar="OUT", help="also write the merged table")
+    ap.add_argument("--csv", metavar="OUT",
+                    help="write a pivot: one row per finding, one column per "
+                         "reviewer holding its verdict, plus severity / agreement / "
+                         "confirmed / dismissed / fixed / task_ids / title")
     args = ap.parse_args()
 
     rows, problems = load(args.csvs)
@@ -143,14 +152,81 @@ def main():
               "  run or a hallucination. There is no third option — check it.\n")
 
     if args.csv:
-        with open(args.csv, "w", newline="", encoding="utf-8") as fh:
-            w = csv.DictWriter(fh, fieldnames=["reviewer"] + COLUMNS, extrasaction="ignore")
-            w.writeheader()
-            for k in sorted(groups):
-                for r in groups[k]:
-                    w.writerow({"reviewer": r["_reviewer"], **r})
+        write_merged_csv(args.csv, groups, reviewers, worst_sev)
         print(f"merged table -> {args.csv}")
     return 0
+
+
+# ── the --csv output ─────────────────────────────────────────────────────────
+# The on-screen report is grouped and scannable but you cannot sort or pivot it.
+# --csv writes the same thing as a spreadsheet: ONE ROW PER FINDING, with every
+# reviewer as its own column holding that reviewer's verdict. Read a row left to
+# right to see who said what; sort by `severity`, filter `agreement == SPLIT`.
+#
+#   finding     the grouping key — "path::symbol", or the task_id when the row
+#               named no file. One finding = one row here.
+#   severity    worst severity anyone gave it (CRITICAL > HIGH > MEDIUM > LOW > NONE).
+#   agreement   SPLIT     — reviewers gave 2+ distinct verdicts. Read these.
+#               UNANIMOUS — everyone who looked gave the same verdict.
+#               SOLO      — only one reviewer judged it (a NEW-* discovery, or a
+#                           list entry nobody else reached).
+#   reviewers   how many distinct reviewers judged this finding.
+#   confirmed / dismissed / fixed
+#               vote tally. dismissed = FALSE_POSITIVE + OUT_OF_SCOPE +
+#               UNVERIFIABLE; fixed = ALREADY_FIXED. confirmed+dismissed+fixed
+#               can exceed `reviewers` when the source list carried the same
+#               symbol under two task-ids and a reviewer judged both.
+#   task_ids    the IMPROVEMENTS.md id(s) that map onto this finding.
+#   title       the longest title any reviewer gave it.
+#   <one column per reviewer>
+#               that reviewer's verdict, or blank if they never judged it.
+#               "A|B" means they judged it twice (two task-ids) and disagreed
+#               with themselves — that is also what makes the tallies exceed
+#               `reviewers`.
+#
+# Rows are ordered: severity, then SPLIT before SOLO before UNANIMOUS, then
+# finding — so the contested, high-severity findings are at the top.
+MERGED_META = ["finding", "severity", "agreement", "reviewers",
+               "confirmed", "dismissed", "fixed", "task_ids", "title"]
+_DISMISS_VERDICTS = {"FALSE_POSITIVE", "OUT_OF_SCOPE", "UNVERIFIABLE"}
+_AGREEMENT_ORDER = {"SPLIT": 0, "SOLO": 1, "UNANIMOUS": 2}
+
+
+def write_merged_csv(path, groups, reviewers, worst_sev):
+    def row_for(k, rs):
+        by_rv = defaultdict(list)
+        for r in rs:
+            by_rv[r["_reviewer"]].append((r.get("verdict") or "").strip().upper())
+        tally = Counter(v for vs in by_rv.values() for v in vs)
+        if len(by_rv) == 1 and len(reviewers) > 1:
+            agreement = "SOLO"
+        else:
+            agreement = "SPLIT" if len(set(tally) - {""}) > 1 else "UNANIMOUS"
+        out = {
+            "finding": k,
+            "severity": worst_sev(rs) or "",
+            "agreement": agreement,
+            "reviewers": len(by_rv),
+            "confirmed": tally.get("CONFIRMED", 0),
+            "dismissed": sum(tally[v] for v in _DISMISS_VERDICTS),
+            "fixed": tally.get("ALREADY_FIXED", 0),
+            "task_ids": " ".join(sorted({(r.get("task_id") or "").strip()
+                                         for r in rs if (r.get("task_id") or "").strip()})),
+            "title": max(((r.get("title") or "").strip() for r in rs),
+                         key=len, default=""),
+        }
+        for rv in reviewers:
+            out[rv] = "|".join(sorted(set(by_rv.get(rv, [])))) if rv in by_rv else ""
+        return out
+
+    rows = [row_for(k, rs) for k, rs in groups.items()]
+    rows.sort(key=lambda r: (SEVERITY_ORDER.get(r["severity"], 5),
+                             _AGREEMENT_ORDER.get(r["agreement"], 3), r["finding"]))
+    with open(path, "w", newline="", encoding="utf-8") as fh:
+        w = csv.DictWriter(fh, fieldnames=MERGED_META + list(reviewers),
+                           extrasaction="ignore")
+        w.writeheader()
+        w.writerows(rows)
 
 
 if __name__ == "__main__":
