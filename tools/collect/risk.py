@@ -37,7 +37,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 from tools.collect.model import ModuleRecord
 from tools.collect.registries import FailOpenEntry
-from tools.collect.test_map import is_test_module
+from tools.collect.test_paths import is_test_module
 
 # ── Fixed weight table (COLLECT-3: deterministic, not tuned/adaptive) ──────
 

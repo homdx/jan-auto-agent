@@ -67,6 +67,7 @@ from tools.collect.gates import GateEntry
 from tools.collect.risk import RiskEntry
 from tools.collect.config_map import ConfigMapEntry
 from tools.collect.scanner import scan_repo
+from tools.collect.test_paths import is_test_path
 
 VALID_STALENESS = frozenset({"warn", "refresh", "ignore"})
 DEFAULT_STALENESS = "warn"
@@ -75,19 +76,16 @@ STATUS_ABSENT = "absent"
 STATUS_STALE = "stale"
 STATUS_FRESH = "fresh"
 
-#: Directory prefixes and file names that mark a module as test code rather
-#: than shipped code. `callers_of` uses these alongside the test paths the
-#: artifact itself recorded in `test_map`'s values: the artifact's own list is
-#: authoritative but indexes coverage rather than the test tree, and a stale
-#: artifact can omit whole test directories (this repo's `tests_bugfix/` has no
-#: entry at all), so a path fallback is needed for anything it did not record.
-#: `tools/collect/test_map.py` deliberately matches neither signal: it is
-#: shipped code whose name merely contains "test".
-_TEST_PATH_PREFIXES = (
-    "tests/", "tests_bugfix/", "tests_slow/", "stub-test/",
-    ".smoke_tests/", ".regression_tests/",
-)
-_TEST_FILE_NAMES = ("conftest.py",)
+#: Which paths are test code is `tools.collect.test_paths`'s call (L5) — the
+#: same list `test_map.build_test_map` splits the scan by, so the producer
+#: and this reader cannot disagree about a directory again (this reader used
+#: to keep its own six roots while `test_map` knew one, `tests/`). `callers_of`
+#: still pairs that rule with the test paths the artifact itself recorded in
+#: `test_map`'s values: the artifact's own list is authoritative but indexes
+#: coverage rather than the test tree, and a stale artifact can omit whole
+#: test directories, so the path rule is the fallback for anything it did not
+#: record. `tools/collect/test_map.py` matches neither signal: it is shipped
+#: code whose name merely contains "test".
 
 
 def _staleness_policy(config: Optional[configparser.ConfigParser]) -> str:
@@ -237,9 +235,10 @@ class CollectModel:
 
         Two signals, in order: a path the artifact itself recorded as a test
         file (`test_map`'s values — authoritative for whatever directory they
-        name), and the well-known test locations. The second is needed because
-        `test_map` indexes coverage, not the test tree, and a stale artifact can
-        omit whole test directories (this repo's `tests_bugfix/` has no entry
+        name), and the well-known test locations (`test_paths.is_test_path`,
+        shared with the producer since L5). The second is needed because
+        `test_map` indexes coverage, not the test tree, and an artifact built
+        before L5 omits whole test directories (`tests_bugfix/` had no entry
         at all).
 
         A bare `test_*.py` filename is deliberately **not** a signal: shipped
@@ -249,9 +248,7 @@ class CollectModel:
         """
         if not path:
             return False
-        if path.startswith(_TEST_PATH_PREFIXES):
-            return True
-        if path.rsplit("/", 1)[-1] in _TEST_FILE_NAMES:
+        if is_test_path(path):
             return True
         return path in test_paths
 

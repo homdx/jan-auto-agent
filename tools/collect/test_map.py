@@ -23,6 +23,19 @@ naming, so a naming-based heuristic alone would badly undercount. Import-based
 matching is also strictly a *static* fact — no guessing about what a test
 "really" exercises, just what it imports.
 
+Which files are tests (L5)
+--------------------------
+Not decided here. `is_test_module` is `tools.collect.test_paths`'s, the
+same root list `loader.CollectModel.callers_of` excludes test importers by,
+so the map and the graph cannot disagree about a directory again. Before L5
+this module knew only `tests/`: a `tests_bugfix/` test was a *source module*
+here (keyed, uncovered, on the zero-list) and a test importer to the graph,
+and the V3 pack for `main.py` said "13 test files do" three lines above
+"tests: 5 files". A covering test is credited once, under the path it
+really lives at: `.smoke_tests/` and `.regression_tests/` are symlink views
+onto `tests/`, and a mirror is collapsed onto its target
+(`test_paths.canonical_test_path`) before it is credited.
+
 Two derived worklists fall out of the same map:
 
 * **zero-list** — source modules with *no* test file importing them at
@@ -48,25 +61,13 @@ from typing import Dict, Iterable, List, Set, Tuple
 
 from tools.collect.graph import build_module_index, resolve_import
 from tools.collect.model import ModuleRecord
+# `is_test_module` is defined in `test_paths` (L5) and re-exported here:
+# `risk.py` and callers outside the package import it from this module.
+from tools.collect.test_paths import canonical_test_path, is_test_module  # noqa: F401
 
-#: Every path under this prefix is treated as test-suite code, not
-#: production source, when splitting the module list in two.
-TEST_DIR_PREFIX = "tests/"
-
-
-def is_test_module(path: str) -> bool:
-    """A module counts as "a test" for TEST_MAP purposes when it lives
-    under `tests/` *and* its filename starts with `test_` — the same
-    naming convention pytest itself discovers by. This deliberately
-    excludes non-test helpers that happen to live in `tests/`
-    (`tests/_pass_a_stub.py`, anything under `tests/fixtures/`): those
-    are fixtures/scaffolding, not coverage, and counting them as "a test"
-    would let a module look covered when nothing actually asserts on it.
-    """
-    if not path.startswith(TEST_DIR_PREFIX):
-        return False
-    name = path.rsplit("/", 1)[-1]
-    return name.startswith("test_") and name.endswith(".py")
+__all__ = [
+    "build_test_map", "is_test_module", "thin_coverage", "zero_coverage",
+]
 
 
 def _rich_import_targets(source: str) -> Set[str]:
@@ -131,6 +132,14 @@ def build_test_map(
     entry (empty tuple), so callers never need a defensive `.get(path, ())`
     (same totality convention `graph.import_edges`/`imported_by` follow).
 
+    Test modules are the ones `test_paths.is_test_module` names — every
+    root the loader's `callers_of` knows, not one — and each is credited
+    under its canonical path (L5): a symlinked mirror of `tests/test_a.py`
+    is read, resolved and recorded as `tests/test_a.py`, so the same file
+    reaching the scan under two names is one covering test, not two. A
+    mirror's relative imports are anchored at the real path for the same
+    reason — nothing lives beside the link.
+
     `root` is used only to re-read each test file's source for the richer
     import-target extraction above (mirroring `graph.build_call_edges`,
     which re-reads for the same reason: `ModuleRecord` doesn't retain the
@@ -148,9 +157,17 @@ def build_test_map(
     index = build_module_index(source_modules)
     covering: Dict[str, set] = {m.path: set() for m in source_modules}
 
+    seen: Set[str] = set()
     for t in test_modules:
+        # L5: a symlinked tier mirror collapses onto the file it points at
+        # and is credited once. The set makes the second name a no-op even
+        # when the mirror and its target both reached the scan.
+        real_path = canonical_test_path(root, t.path)
+        if real_path in seen:
+            continue
+        seen.add(real_path)
         try:
-            source = (root / t.path).read_text(encoding="utf-8")
+            source = (root / real_path).read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             # BUGFIX: same class of bug as scanner.scan_repo/graph.
             # build_call_edges/risk._loc/cli._sources_for — only OSError
@@ -164,9 +181,9 @@ def build_test_map(
             # Bugfix: importer_path was never passed, so every relative
             # name hit resolve_import's `importer_path is None` early
             # return and was dropped even when correctly formed.
-            resolved = resolve_import(dotted, index, importer_path=t.path)
+            resolved = resolve_import(dotted, index, importer_path=real_path)
             if resolved is not None:
-                covering[resolved].add(t.path)
+                covering[resolved].add(real_path)
 
     return {path: tuple(sorted(tests)) for path, tests in covering.items()}
 

@@ -42,6 +42,7 @@ test_collect_graph.py
 test_collect_guarded_access.py
 test_collect_risk.py
 test_collect_test_map.py
+test_collect_test_map_all_roots.py
 test_collect_verifier_contradiction.py
 test_faq_agent_validate.py
 test_gate1_presence_llm_profile.py
