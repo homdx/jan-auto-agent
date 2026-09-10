@@ -95,7 +95,7 @@ tables and their reach
       all-GUARDED locations        23            mixed 3   all-UNGUARDED 2620
       modules with >=1 GUARDED     15 / 469
   except_sites                     682
-  Pass B summaries present         241 / 469     empty 228 (219 of them tests)
+  Pass B summaries present         241 / 469     empty 228 (221 of them tests)
 
 per-task block, as rendered today
   non-empty blocks                 477 of 477 modules asked
@@ -105,6 +105,22 @@ per-task block, as rendered today
   duplicate config_read lines      24
   symbols silently cut by [:20]    296 across 28 modules
 ```
+
+**Where these actually live** — verified against the artifact on disk
+(2 284 645 bytes, 469 modules), so nobody re-derives it four times and gets four
+different denominators:
+
+* `import_edges`, `imported_by`, `entry_points`, `sibling_gaps`, `test_map`,
+  `zero_coverage`, `thin_coverage`, `risk_index`, `config_map`, `contracts`,
+  `fail_open_registry`, `gates` are **top-level** keys of `artifact.json`.
+* `guarded_accesses`, `except_sites`, `public_symbols`, `imports`,
+  `config_reads`, `language`, `parse_error`, `summary` are **per-module**, on
+  each entry of `modules`. There is no top-level `guarded_accesses`.
+* `summary` is a **dict**, not a string: `{"purpose", "notes", "provenance"}`.
+  "summaries present" counts modules whose `summary["purpose"]` is non-empty —
+  241 of 469; `notes` is non-empty on 362, and `provenance` on all 469.
+* A "location" for the guard tally is `guarded_accesses[].location`; the
+  2814 records collapse to 2646 distinct locations.
 
 ### Do
 

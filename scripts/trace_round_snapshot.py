@@ -30,32 +30,59 @@ import sys
 LOC = re.compile(r"^Location:\s*(.+)$", re.M)
 
 
-def base_sha(base):
+def base_sha(base, started_at=None):
     """The commit the tree sat on when the run started.
 
-    `--auto` commits its own plan on top (``auto(AUTO-...)``), so walk back
-    past those: what makes an "after" run comparable is the *pre-run* tree.
-    Returns ``("", "")`` for anything that is not a git checkout.
+    Walking back from HEAD is not enough. Four of the five baseline trees were
+    checked out to a *different branch* while their `--auto` run was still in
+    the plan phase, so the run's own plan commit landed on a history the run
+    never ingested. The reflog is the only record of what was actually on disk
+    at ingest time, so resolve `started_at` (the trace's first timestamp)
+    against it and fall back to HEAD only when there is no reflog.
+
+    Returns ``(head_sha, pre_run_sha, switched_mid_run)``.
     """
     def git(*args):
         try:
             return subprocess.run(("git", "-C", base) + args, capture_output=True,
-                                  text=True, timeout=15).stdout.strip()
+                                  text=True, timeout=15).stdout
         except Exception:
             return ""
-    head = git("rev-parse", "--short=7", "HEAD")
+
+    head = git("rev-parse", "--short=7", "HEAD").strip()
     if not head:
-        return "", ""
-    pre, rev = head, head
-    for _ in range(20):
-        subject = git("log", "-1", "--format=%s", rev)
-        if not subject.startswith("auto("):
-            pre = rev
-            break
-        rev = git("rev-parse", "--short=7", rev + "^")
-        if not rev:
-            break
-    return head, pre
+        return "", "", False
+
+    entries = []          # (datetime, sha) — newest first, as git prints them
+    for line in git("reflog", "--date=iso", "--format=%h%x09%gd%x09%gs").splitlines():
+        m = re.search(r"HEAD@\{([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:]{8} [+-][0-9]{4})\}", line)
+        if not m:
+            continue
+        try:
+            when = datetime.datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S %z")
+        except ValueError:
+            continue
+        entries.append((when, line.split("\t")[0].strip(), line))
+
+    if not entries or started_at is None:
+        return head, head, False
+
+    try:
+        t0 = datetime.datetime.fromisoformat(started_at)
+    except (TypeError, ValueError):
+        return head, head, False
+
+    # The entry in effect at t0 is the newest one at or before it. Its sha is
+    # where HEAD moved *to*, which is exactly the tree the run ingested.
+    at_start = next((e for e in entries if e[0] <= t0), None)
+    if at_start is None:
+        return head, head, False
+
+    # Anything logged between the run's start and now that moved HEAD is a
+    # mid-run switch: the trace and the current history describe different trees.
+    switched = any(e[0] > t0 and not e[2].endswith("emit plan")
+                   and "commit: auto(" not in e[2] for e in entries)
+    return head, at_start[1], switched
 
 
 def read_run(base):
@@ -65,7 +92,7 @@ def read_run(base):
     out = {
         "run": os.path.basename(os.path.abspath(base)),
         "trace": os.path.basename(traces[0]),
-        "head_sha": "", "pre_run_sha": "",
+        "head_sha": "", "pre_run_sha": "", "switched_mid_run": False,
         "goal": "", "probe_usable": None, "probe_reason": None,
         "llm_by_source": collections.Counter(),
         "gate1": {"requests": 0, "confirmed": 0, "rejected": 0, "unparsed": 0},
@@ -140,7 +167,8 @@ def read_run(base):
             (t1 - t0).total_seconds() / (out["gate1"]["requests"] - 1), 1)
     for k in ("llm_by_source", "gate1_location_ext", "probe_by_op"):
         out[k] = dict(out[k])
-    out["head_sha"], out["pre_run_sha"] = base_sha(base)
+    out["head_sha"], out["pre_run_sha"], out["switched_mid_run"] = base_sha(
+        base, out.get("first_ts"))
     return out
 
 
