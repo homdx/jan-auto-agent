@@ -83,6 +83,37 @@ _COLLECT_HEADER = "COLLECT MODEL (static facts, do not contradict):"
 # not listed"), and this matches that honesty.
 _SYMBOLS_CUT_NOTE = " … (+{extra} more, cut for budget)"
 
+# PLAN-v2 V3: the announcement the three neighbourhood rows share. `+N` counts
+# entries of the list the row itself is showing, so the announced remainder
+# always reconciles with the count the row leads with.
+_CUT_NOTE = ", +{extra}"
+
+# PLAN-v2 V3: per-row name caps. The count is the fact, the names are the
+# courtesy — each row leads with the total and then shows a bounded number of
+# names, so a list of 25 costs the same one line as a list of 2. Constants
+# rather than config keys: there is no plausible second value for them.
+_CALLERS_MAX_NAMES = 5
+_CALLS_INTO_MAX_NAMES = 5
+_TESTS_MAX_NAMES = 3
+
+_CALLERS_PREFIX = "callers: "
+_CALLS_INTO_PREFIX = "calls_into: "
+_TESTS_PREFIX = "tests: "
+
+# PLAN-v2 V3: the forms that replace an empty row. Each asserts an absence
+# rather than printing "0" — the absence is the useful fact and costs nothing.
+# The entry-point note has two shapes: a module nobody imports at all, and one
+# whose only importers are test files (`main.py`: 13 importers, every one a
+# test). The second keeps its count — "13 test files import this" is still a
+# fact — but says plainly that shipped code is not among them, because
+# "nothing imports this" would be false and a coder reading the pack would
+# rightly stop trusting it.
+_ENTRY_POINT_NOTE = "entry point — nothing imports this"
+_ENTRY_POINT_TESTS_ONLY_NOTE = (
+    "entry point — nothing in shipped code imports this; {count} test {noun} {verb}"
+)
+_NO_TESTS_NOTE = "no test covers this file"
+
 
 def _coerce_budget(budget) -> "int | None":
     """`budget` as a positive int, or `None` for "no limit".
@@ -186,14 +217,120 @@ def _row_public_symbols(model, target_file: str, remaining: "int | None") -> str
     return ""
 
 
-# PLAN-v2 V2: the ordered row list that IS the per-task fact pack. Highest
+def _plural(count: int, noun: str) -> str:
+    """`noun` pluralised for `count` — the V3 rows lead with a count, and
+    "1 modules import this" reads as a bug in a block that asks to be trusted."""
+    return noun if count == 1 else f"{noun}s"
+
+
+def _capped_names(paths: "list[str] | tuple[str, ...]", limit: int) -> str:
+    """`paths` comma-joined, capped at `limit`, the remainder announced.
+
+    Shared by the three V3 rows. `+N` is the remainder of *this* list, never of
+    some other count, so "25 modules import this (2 non-test): A, B" can never
+    read as if ten more names were hidden.
+    """
+    shown = paths[:limit]
+    extra = len(paths) - len(shown)
+    if extra <= 0:
+        return ", ".join(shown)
+    return f"{', '.join(shown)}{_CUT_NOTE.format(extra=extra)}"
+
+
+def _row_callers(model, target_file: str, remaining: "int | None") -> str:
+    """Who breaks if this file changes: the importer count first, then the
+    non-test importers, up to five, remainder announced.
+
+    The count spans every importer, test or not — that is the blast radius, and
+    it is what a rename decision turns on. The names are the non-test ones only:
+    test importers are already the `tests` row, and they are 23 of coder.py's
+    25 importers, so naming them here would repeat a row and hide the two
+    production callers the ticket exists to surface. The `(N non-test)`
+    parenthetical is dropped when it would restate the same number.
+
+    `remaining` is unused: the row is one line and either fits or the loop
+    skips it, never truncates it.
+
+    The entry-point form is claimed only from the artifact's own recorded
+    importer set: a module absent from `imported_by` (a pre-V1 artifact, which
+    is where V1's whole point was) has an *unknown* set, not an empty one, so
+    no row is emitted rather than an unverified "nothing imports this". A
+    module whose importers are all test files gets the entry-point form too —
+    the shipped-code blast radius is what the row is for — but with its test
+    importer count kept, so the fact is stated, not rounded down to nothing.
+    """
+    if model.module(target_file) is None or target_file not in model.imported_by:
+        return ""
+    total = len(model.imported_by.get(target_file, ()))
+    callers = model.callers_of(target_file)
+    if not callers:
+        if total == 0:
+            return f"{_CALLERS_PREFIX}{_ENTRY_POINT_NOTE}"
+        note = _ENTRY_POINT_TESTS_ONLY_NOTE.format(
+            count=total, noun=_plural(total, "file"), verb="does" if total == 1 else "do",
+        )
+        return f"{_CALLERS_PREFIX}{note}"
+    non_test = len(callers)
+    paren = f" ({non_test} non-test)" if non_test != total else ""
+    verb = "imports" if total == 1 else "import"
+    return f"{_CALLERS_PREFIX}{total} {_plural(total, 'module')} {verb} this{paren}: " \
+        f"{_capped_names(callers, _CALLERS_MAX_NAMES)}"
+
+
+def _row_calls_into(model, target_file: str, remaining: "int | None") -> str:
+    """First-party imports, up to five, remainder announced.
+
+    `calls_into` resolves against this model's module table, so a partial or
+    hand-edited artifact cannot surface a phantom dependency. `remaining` is
+    unused for the same reason as in `_row_callers`.
+    """
+    if model.module(target_file) is None:
+        return ""
+    targets = model.calls_into(target_file)
+    if not targets:
+        return ""
+    return f"{_CALLS_INTO_PREFIX}{_capped_names(targets, _CALLS_INTO_MAX_NAMES)}"
+
+
+def _row_tests(model, target_file: str, remaining: "int | None") -> str:
+    """The covering test files — or the absence of them, which is the more
+    useful fact and costs nothing.
+
+    Up to three names plus the count. A module the artifact put in
+    `zero_coverage` renders the no-tests form; so does a module that has a
+    `test_map` entry with no covering file even when `zero_coverage` itself is
+    missing from the artifact (an older producer), since the empty entry is the
+    same fact read two ways. A module that is in neither renders no row at all:
+    the artifact has no opinion about it, and that is 168 of the 469 modules.
+
+    `remaining` is unused: one line, fits or is skipped by the loop.
+    """
+    if model.module(target_file) is None:
+        return ""
+    tests = [t for t in model.test_map.get(target_file, ()) if isinstance(t, str)]
+    if not tests:
+        covered_by_nothing = target_file in model.test_map or target_file in model.zero_coverage()
+        if not covered_by_nothing:
+            return ""
+        return f"{_TESTS_PREFIX}{_NO_TESTS_NOTE}"
+    return f"{_TESTS_PREFIX}{len(tests)} {_plural(len(tests), 'file')}: " \
+        f"{_capped_names(tests, _TESTS_MAX_NAMES)}"
+
+
+# PLAN-v2: the ordered row list that IS the per-task fact pack. Highest
 # value first — "value" = how hard this fact is to get from the target file's
 # own source, which the coder already has in full in the same prompt. The
 # tuple order IS the priority, and cutting a row under budget pressure IS the
-# `continue` in `build_collect_context_block` below. V3–V5 append
-# callers/calls_into/tests/fails_open/risk/neighbours above the three rows
-# this ticket ports verbatim out of the old single pass.
+# `continue` in `build_collect_context_block` below. V3 ships the first three
+# rows (the neighbourhood: who imports this, what this imports, what tests it);
+# V4–V5 append fails_open/risk/neighbours above `contract` the same way. The
+# last three rows are the ones V2 ported verbatim out of the old single pass,
+# `public_symbols` still last because it is the row the target file's own
+# source makes redundant.
 _PACK_ROWS = (
+    ("callers", _row_callers),
+    ("calls_into", _row_calls_into),
+    ("tests", _row_tests),
     ("contract", _row_contract),
     ("config_read", _row_config_read),
     ("public_symbols", _row_public_symbols),
