@@ -35,6 +35,19 @@ Query-API antihallucination guarantee
 an `LLMSummary`. So "safe ли X?" answering only by static facts
 (COLLECT-21's own AC) holds by construction, the same way COLLECT-1's
 provenance isolation holds by construction rather than by convention.
+
+V1 — the import graph
+----------------------
+`import_edges` / `imported_by` / `entry_points` (COLLECT-8) are written by
+the producer on every run but, before this ticket, thrown away on read —
+9 of the artifact's 13 keys made it onto `CollectModel`, and "who calls
+X?" / "what does X call?" meant re-running the scan even though the
+answer sat in `.collect/artifact.json` already. They are now kept
+alongside everything else above: same guarded-try normalisation, same
+"missing/null key -> empty container, wrong-shaped key -> absent model"
+contract. `callers_of()` and `calls_into()` are the read-only query pair
+built on top; see their docstrings below for the ordering and
+test-exclusion rules.
 """
 
 from __future__ import annotations
@@ -61,6 +74,20 @@ DEFAULT_STALENESS = "warn"
 STATUS_ABSENT = "absent"
 STATUS_STALE = "stale"
 STATUS_FRESH = "fresh"
+
+#: Directory prefixes and file names that mark a module as test code rather
+#: than shipped code. `callers_of` uses these alongside the test paths the
+#: artifact itself recorded in `test_map`'s values: the artifact's own list is
+#: authoritative but indexes coverage rather than the test tree, and a stale
+#: artifact can omit whole test directories (this repo's `tests_bugfix/` has no
+#: entry at all), so a path fallback is needed for anything it did not record.
+#: `tools/collect/test_map.py` deliberately matches neither signal: it is
+#: shipped code whose name merely contains "test".
+_TEST_PATH_PREFIXES = (
+    "tests/", "tests_bugfix/", "tests_slow/", "stub-test/",
+    ".smoke_tests/", ".regression_tests/",
+)
+_TEST_FILE_NAMES = ("conftest.py",)
 
 
 def _staleness_policy(config: Optional[configparser.ConfigParser]) -> str:
@@ -93,6 +120,17 @@ class CollectModel:
     thin_coverage_list: Tuple[str, ...] = ()
     risk_index: Tuple[RiskEntry, ...] = ()
     config_map: Tuple[ConfigMapEntry, ...] = ()
+    # V1: the import graph the producer has always written (13 artifact keys,
+    # this was the first batch dropped on read). Both tables are keyed by
+    # relative module path: `import_edges` is first-party only — `graph.
+    # import_edges` resolves names against the scanned module set and drops
+    # anything outside the repo — and `imported_by` is its reverse index.
+    # `entry_points` is a denormalised copy of "keys of `imported_by` with an
+    # empty value"; kept because the artifact carries it, so a caller does not
+    # have to rebuild it. Empty containers, never `None`.
+    import_edges: Dict[str, Tuple[str, ...]] = field(default_factory=dict)
+    imported_by: Dict[str, Tuple[str, ...]] = field(default_factory=dict)
+    entry_points: Tuple[str, ...] = ()
     reason: str = ""
 
     # ── availability ────────────────────────────────────────────────────
@@ -178,6 +216,131 @@ class CollectModel:
             return list(self.config_map)
         return [c for c in self.config_map if c.section == section]
 
+    # ── V1: the import graph, read-only ─────────────────────────────────
+
+    def _test_paths(self) -> frozenset:
+        """Test-file paths the artifact itself recorded: `test_map`'s values,
+        keyed by the module they cover. Built per call — it is small (hundreds
+        of paths) and that keeps this frozen dataclass free of a mutable cache.
+        Only strings survive, so a partially written `test_map` cannot turn a
+        query into an exception."""
+        return frozenset(
+            test
+            for entries in self.test_map.values()
+            for test in entries
+            if isinstance(test, str)
+        )
+
+    @staticmethod
+    def _is_test_path(path: str, test_paths: frozenset) -> bool:
+        """Is `path` test code rather than shipped code?
+
+        Two signals, in order: a path the artifact itself recorded as a test
+        file (`test_map`'s values — authoritative for whatever directory they
+        name), and the well-known test locations. The second is needed because
+        `test_map` indexes coverage, not the test tree, and a stale artifact can
+        omit whole test directories (this repo's `tests_bugfix/` has no entry
+        at all).
+
+        A bare `test_*.py` filename is deliberately **not** a signal: shipped
+        code can be named that (`tools/collect/test_map.py` is a shipped module
+        in this repo), and filtering it out of a caller list would hide a real
+        importer under a plausible-looking name.
+        """
+        if not path:
+            return False
+        if path.startswith(_TEST_PATH_PREFIXES):
+            return True
+        if path.rsplit("/", 1)[-1] in _TEST_FILE_NAMES:
+            return True
+        return path in test_paths
+
+    def callers_of(self, path: str, *, exclude_tests: bool = True, limit: int = 0) -> List[str]:
+        """Every module that imports `path`, heaviest blast radius first.
+
+        `exclude_tests=True` is the default and is not decoration: an importer
+        list is usually dominated by a module's own test files, and those are
+        already the `tests` row a caller is looking at. Ordering is by the
+        caller's own `risk_index.blast_radius` descending, then path, so a
+        truncated list keeps the callers that matter and two `load()` calls
+        agree (COLLECT-3 determinism). `limit <= 0` means no limit.
+
+        Read-only: the tables are never mutated. `[]` when the model is absent,
+        `path` is not in the graph, or `exclude_tests` filters every importer
+        out — never an exception.
+        """
+        if not self.available or not path:
+            return []
+        test_paths = self._test_paths() if exclude_tests else frozenset()
+        blast_radius = {r.path: r.blast_radius for r in self.risk_index}
+        out = [
+            caller
+            for caller in self.imported_by.get(path, ())
+            if not (exclude_tests and self._is_test_path(caller, test_paths))
+        ]
+        out.sort(key=lambda caller: (-blast_radius.get(caller, 0), caller))
+        return out if limit <= 0 else out[:limit]
+
+    def calls_into(self, path: str, *, limit: int = 0) -> List[str]:
+        """Every first-party module `path` imports, sorted by path.
+
+        `graph.import_edges` already resolves names against the scanned module
+        set and drops stdlib/third-party, so the result is first-party by
+        construction; the extra filter only drops a target the artifact's
+        `modules` table does not know about, which a partial artifact can carry
+        and which must not surface as a phantom dependency. `limit <= 0` means
+        no limit. `[]` on an absent model or an unknown `path`.
+        """
+        if not self.available or not path:
+            return []
+        known = {m.path for m in self.modules} if self.modules else None
+        out = sorted(
+            target
+            for target in self.import_edges.get(path, ())
+            if known is None or target in known
+        )
+        return out if limit <= 0 else out[:limit]
+
+
+def _graph_table(value: object) -> Dict[str, Tuple[str, ...]]:
+    """Normalise one of the two graph tables to `{path: (path, ...)}`.
+
+    `None` means the producer never wrote the key and yields an empty dict, so
+    an older artifact still loads with the data it does have. Anything else with
+    the wrong shape raises `TypeError`, which `_load_from_dir`'s guarded block
+    already turns into an absent model — a table that is present *and* garbled
+    means the whole artifact is untrustworthy, the same stance as the malformed
+    `modules` entry `test_partial_artifact_missing_keys_treated_as_absent` pins.
+    """
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise TypeError(f"graph table must be an object, got {type(value).__name__}")
+    out: Dict[str, Tuple[str, ...]] = {}
+    for path, neighbours in value.items():
+        if not isinstance(path, str) or not isinstance(neighbours, (list, tuple)):
+            raise TypeError(f"graph table entry {path!r} is not path -> [path]")
+        if not all(isinstance(neighbour, str) for neighbour in neighbours):
+            raise TypeError(f"graph table entry {path!r} has a non-string neighbour")
+        out[path] = tuple(neighbours)
+    return out
+
+
+def _string_tuple(value: object, name: str) -> Tuple[str, ...]:
+    """Normalise a `[path]` artifact key to a tuple of paths.
+
+    Same split as `_graph_table`: `None` is "the producer did not write this",
+    so an empty tuple keeps the rest of the artifact alive; a wrong type raises
+    into `_load_from_dir`'s guarded block and the model becomes absent.
+    """
+    if value is None:
+        return ()
+    if not isinstance(value, (list, tuple)):
+        raise TypeError(f"{name} must be a list, got {type(value).__name__}")
+    if not all(isinstance(path, str) for path in value):
+        raise TypeError(f"{name} has a non-string entry")
+    return tuple(value)
+
 
 def _absent(collect_dir: Optional[Path], reason: str) -> CollectModel:
     return CollectModel(status=STATUS_ABSENT, collect_dir=collect_dir, reason=reason)
@@ -221,6 +384,14 @@ def _load_from_dir(collect_dir: Path, *, status: str, reason: str = "") -> Colle
             for g in payload.get("gates", [])
         )
         test_map = {k: tuple(v) for k, v in payload.get("test_map", {}).items()}
+        # V1: the three graph tables the producer has always written but this
+        # reader dropped. Each is normalised through a helper that raises
+        # TypeError on a wrong shape — the guard below already turns that into
+        # an absent model — while a missing or null key yields an empty
+        # container, so an older artifact still loads with the rest of its data.
+        import_edges = _graph_table(payload.get("import_edges"))
+        imported_by = _graph_table(payload.get("imported_by"))
+        entry_points = _string_tuple(payload.get("entry_points"), "entry_points")
         risk_index = tuple(
             RiskEntry(
                 path=r["path"], loc=r["loc"], blast_radius=r["blast_radius"],
@@ -256,6 +427,9 @@ def _load_from_dir(collect_dir: Path, *, status: str, reason: str = "") -> Colle
         thin_coverage_list=tuple(payload.get("thin_coverage", [])),
         risk_index=risk_index,
         config_map=config_map,
+        import_edges=import_edges,
+        imported_by=imported_by,
+        entry_points=entry_points,
         reason=reason,
     )
 
