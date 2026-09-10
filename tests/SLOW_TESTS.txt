@@ -37,6 +37,7 @@ test_collect_config_reads.py
 test_collect_contracts.py
 test_collect_fail_open_registry.py
 test_collect_gates.py
+test_collect_graph_from_import_module_alias.py
 test_collect_graph.py
 test_collect_guarded_access.py
 test_collect_risk.py

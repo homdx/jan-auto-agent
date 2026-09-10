@@ -15,6 +15,9 @@ Two extractors live here today:
 * `extract_imports` — the set of module names touched by `import` /
   `from ... import ...` statements anywhere in the tree, deduplicated and
   sorted (COLLECT-4).
+* `extract_from_import_names` — the submodule-qualified spelling of every
+  `from pkg import name` (L4): `"pkg.name"`, so the import graph can reach
+  `pkg/name.py` where `extract_imports` alone only reaches `pkg/__init__.py`.
 """
 
 from __future__ import annotations
@@ -228,6 +231,49 @@ def extract_imports(tree: ast.Module) -> List[str]:
                 # list itself.
                 for alias in node.names:
                     names.add(prefix + alias.name)
+    return sorted(names)
+
+
+def extract_from_import_names(tree: ast.Module) -> List[str]:
+    """Sorted, deduplicated `"pkg.name"` for every `from pkg import name`.
+
+    L4: `extract_imports` records `from tools.collect import test_map as
+    test_map_mod` as just `"tools.collect"` — the right *coarse* fact for
+    the Pass A prompt and the rendered pages (the package really is what
+    the statement imports first), but `graph.resolve_import` can only land
+    that on `tools/collect/__init__.py`, so the edge to the module actually
+    named — `tools/collect/test_map.py` — was never emitted. All nine
+    sibling imports in `tools/collect/cli.py` use exactly this house style,
+    so the V3 `callers:` row for every one of those siblings was missing its
+    main shipped consumer, under a header that says *do not contradict*.
+
+    This is the finer spelling that fixes it, kept as a **separate** list
+    (`ModuleRecord.from_imports`) on purpose: joining it into `imports`
+    would triple the `imports:` line of every Pass A facts block (measured:
+    +11% facts characters across this repo, all of it `typing.Any`-style
+    noise) for a benefit only `graph.import_edges` consumes.
+
+    Each entry is a *candidate*, not a claim — the same reconstruction
+    `test_map._rich_import_targets` already does on the test side. When
+    `name` is a real module (`pkg/name.py`, `pkg/name/__init__.py`)
+    `resolve_import`'s exact match lands it there; when it is a symbol
+    defined in `pkg/__init__.py` the prefix fallback lands it on that
+    `__init__.py`, the edge `imports` already produced, so nothing new
+    appears. `alias.name`, never `alias.asname`: the alias is a local
+    binding and means nothing to resolution. `from pkg import *` yields no
+    candidate (`"pkg.*"` names nothing); `from . import x` yields none
+    either — `extract_imports` already records that form at full precision
+    (`".x"`), see its BUGFIX note. Relative forms keep their dots
+    (`from .sub import mod` -> `".sub.mod"`) so the importer-anchored branch
+    of `resolve_import` handles them exactly as it does `imports`.
+    """
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            base = "." * node.level + node.module
+            for alias in node.names:
+                if alias.name != "*":
+                    names.add(f"{base}.{alias.name}")
     return sorted(names)
 
 

@@ -7,9 +7,11 @@ reverse import index (``imported_by``, a.k.a. blast-radius).
 Two edge kinds:
 
 * **Import edges** (`import_edges`) — a straight consequence of
-  `ModuleRecord.imports` (COLLECT-4): for each dotted import name, resolve
-  it to a module path *inside this repo* (`resolve_import`) and drop it if
-  it isn't one (stdlib/third-party imports don't add to blast-radius here).
+  `ModuleRecord.imports` (COLLECT-4) plus `ModuleRecord.from_imports` (L4,
+  the `"pkg.name"` spelling of `from pkg import name`): for each dotted
+  name, resolve it to a module path *inside this repo* (`resolve_import`)
+  and drop it if it isn't one (stdlib/third-party imports don't add to
+  blast-radius here).
   This is pure static-fact composition — no new AST walk, no LLM — so it
   stays `provenance="static"` in spirit even though the graph itself isn't
   a `model.py` record type (it's a plain dict of frozensets, the shape the
@@ -72,7 +74,9 @@ def _module_dotted_name(path: str) -> str:
     (`"tools/collect/__init__.py"` -> `"tools.collect"`), since that's what
     both `import tools.collect` and the coarser `from tools.collect import
     model` (recorded by `ast_facts.extract_imports` as just `"tools.collect"`
-    — see that module's docstring) actually refer to.
+    — see that module's docstring) actually refer to. The finer
+    `"tools.collect.model"` that `from_imports` records for the same
+    statement (L4) is keyed here too, by `tools/collect/model.py` itself.
 
     No separate Java branch exists here on purpose, not by oversight: Java
     has no `__init__.py`-equivalent "this file stands for the whole
@@ -117,6 +121,16 @@ def resolve_import(
     for `from tools.collect import model` (just `"tools.collect"`) still
     resolves to the package's `__init__.py` instead of being dropped as
     external.
+
+    L4: the same two rules are what make `ModuleRecord.from_imports` work
+    without a rule of their own. `from tools.collect import test_map as
+    test_map_mod` records `"tools.collect.test_map"` there; it *is* a module,
+    so the exact match lands it on `tools/collect/test_map.py` — the edge the
+    coarse form could never produce. `from tools.collect import SOME_NAME`
+    records `"tools.collect.SOME_NAME"`, which is nobody's module, so the
+    prefix fallback lands it on `tools/collect/__init__.py` — the edge the
+    coarse form already produced. Nothing new for a symbol, one new edge
+    for a submodule; the `as alias` never reaches this function.
 
     BUGFIX (relative imports): a `dotted` name starting with `.` is the
     relative-import spelling `extract_imports` now preserves (see its
@@ -177,12 +191,19 @@ def import_edges(modules: Iterable[ModuleRecord]) -> Graph:
     Every module in `modules` gets an entry, even one with no local
     imports (empty frozenset) — the graph is total over the input set, so
     `imported_by` below never has to guess at membership.
+
+    L4: `m.from_imports` (`"pkg.name"` per `from pkg import name`) is
+    resolved alongside `m.imports` so a submodule imported in the
+    `from pkg import module as alias` house style of `tools/collect/` gets
+    its own edge, not only the package's `__init__.py` — see
+    `resolve_import`. A record from an artifact written before L4 has an
+    empty `from_imports` and yields exactly the graph it always did.
     """
     modules = list(modules)
     index = build_module_index(modules)
     edges: Dict[str, Set[str]] = {m.path: set() for m in modules}
     for m in modules:
-        for dotted in m.imports:
+        for dotted in (*m.imports, *m.from_imports):
             resolved = resolve_import(dotted, index, importer_path=m.path)
             if resolved is not None and resolved != m.path:
                 edges[m.path].add(resolved)

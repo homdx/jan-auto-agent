@@ -43,6 +43,7 @@ from tools.auto.repo_ingest import RepoIngestor
 from tools.collect.ast_facts import (
     extract_config_reads,
     extract_except_sites,
+    extract_from_import_names,
     extract_imports,
     extract_symbols,
 )
@@ -74,6 +75,7 @@ def scan_module(source: str, module_path: str) -> ModuleRecord:
         path=module_path,
         public_symbols=tuple(extract_symbols(tree, module_path)),
         imports=tuple(extract_imports(tree)),
+        from_imports=tuple(extract_from_import_names(tree)),
         config_reads=tuple(extract_config_reads(tree, module_path)),
         except_sites=tuple(extract_except_sites(tree, module_path)),
         guarded_accesses=tuple(extract_guarded_accesses(tree, module_path)),

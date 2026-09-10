@@ -320,6 +320,12 @@ class ModuleRecord:
     path: str
     public_symbols: Tuple[FunctionRecord, ...] = ()
     imports: Tuple[str, ...] = ()
+    # L4: `"pkg.name"` for every `from pkg import name` — the submodule-
+    # qualified candidates `graph.import_edges` resolves *in addition to*
+    # `imports`. Kept apart from `imports` so the Pass A facts block and
+    # the rendered `Imports:` line stay the coarse list they always were.
+    # Absent from an older artifact -> `()` -> the pre-L4 graph, fail open.
+    from_imports: Tuple[str, ...] = ()
     config_reads: Tuple[ConfigRead, ...] = ()
     except_sites: Tuple[ExceptSite, ...] = ()
     guarded_accesses: Tuple[GuardedAccess, ...] = ()
@@ -337,6 +343,7 @@ class ModuleRecord:
             "path",
             "public_symbols",
             "imports",
+            "from_imports",
             "config_reads",
             "except_sites",
             "guarded_accesses",
@@ -354,6 +361,7 @@ class ModuleRecord:
             "path": self.path,
             "public_symbols": [s.to_dict() for s in self.public_symbols],
             "imports": list(self.imports),
+            "from_imports": list(self.from_imports),
             "config_reads": [dataclasses.asdict(c) for c in self.config_reads],
             "except_sites": [dataclasses.asdict(e) for e in self.except_sites],
             "guarded_accesses": [dataclasses.asdict(g) for g in self.guarded_accesses],
@@ -381,6 +389,7 @@ class ModuleRecord:
                 path=d["path"],
                 public_symbols=symbols,
                 imports=tuple(d.get("imports", ())),
+                from_imports=tuple(d.get("from_imports", ())),
                 config_reads=config_reads,
                 except_sites=except_sites,
                 guarded_accesses=guarded_accesses,

@@ -75,9 +75,10 @@ def _rich_import_targets(source: str) -> Set[str]:
     (COLLECT-4's `extract_imports`) deliberately collapses away.
 
     `extract_imports` records only the *source* module of a `from` import
-    (`from tools import backoff` -> `"tools"`) because that's the right
-    convention for the import graph (COLLECT-8): the thing actually being
-    referenced structurally is the package. For TEST_MAP that collapse is
+    (`from tools import backoff` -> `"tools"`): the thing actually being
+    referenced structurally is the package. (Since L4 the import graph
+    resolves the same finer candidates from `ModuleRecord.from_imports`, so
+    graph and TEST_MAP now agree on `from pkg import module`.) For TEST_MAP that collapse is
     exactly the gap that would silently zero-list a module like
     `tools/backoff.py`, which real callers in this repo reach via
     `from tools import backoff`, not `import tools.backoff`. This function
