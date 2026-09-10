@@ -8,6 +8,16 @@
 
 ---
 
+> **Numbers re-measured — M1** (`scripts/collect_metrics.py`, 2026-09-10).
+> The block table below measures the pre-V3 pack on a rebuilt 483-module
+> artifact. Against the artifact on disk the same script reports: 469 modules,
+> 469 non-empty blocks, 678-char median, 68 blocks over budget (14.5%),
+> 2.559 rows per block NOT derivable from the target file, 0 symbols cut
+> silently, 24 duplicate `config_read` lines in 11 modules. A1's premise — "the
+> block describes the file the coder already has" — is no longer true as
+> written: V3's `callers`/`calls_into`/`tests` rows are new facts, 2.559 of
+> them per block. Full table: [`baseline.json`](baseline.json).
+
 ## Problem
 
 `build_collect_context_block(model, target_file)` renders five kinds of line

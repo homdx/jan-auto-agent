@@ -73,6 +73,14 @@ python3 scripts/collect_metrics.py --collect-dir ../jan-to-fix-pull-v2/.collect 
 
 ### Metric set — Tier 0 and Tier 1, static
 
+Regenerated 2026-09-10 by `scripts/collect_metrics.py --collect-dir .collect`;
+the same numbers, flat and diffable, are committed as
+[`baseline.json`](baseline.json). The ticket as written carried hand-measured
+values in the block section — taken from a rebuilt 483-module artifact and a
+pack that still had the silent `[:20]` symbol cap. The artifact on disk says
+469, and PLAN-v2 V2.3/V3 has since changed both those lines, so those four
+numbers moved:
+
 ```
 artifact
   modules                          469
@@ -98,12 +106,12 @@ tables and their reach
   Pass B summaries present         241 / 469     empty 228 (221 of them tests)
 
 per-task block, as rendered today
-  non-empty blocks                 477 of 477 modules asked
-  median block                     544 chars
-  blocks over max_context_chars    50  (10%)
-  rows per block that are NOT derivable from the target file's own source   0
-  duplicate config_read lines      24
-  symbols silently cut by [:20]    296 across 28 modules
+  non-empty blocks                 469 of 469 modules asked
+  median block                     678 chars
+  blocks over max_context_chars    68  (14.5%)
+  rows per block that are NOT derivable from the target file's own source  2.559
+  duplicate config_read lines      24   (11 modules)
+  symbols cut without an announcement  0   (the silent [:20] is gone)
 ```
 
 **Where these actually live** — verified against the artifact on disk
@@ -119,6 +127,8 @@ different denominators:
 * `summary` is a **dict**, not a string: `{"purpose", "notes", "provenance"}`.
   "summaries present" counts modules whose `summary["purpose"]` is non-empty —
   241 of 469; `notes` is non-empty on 362, and `provenance` on all 469.
+* `collector_version` is in **`collect_manifest.json`**, not in `artifact.json` —
+  the one header fact the artifact itself does not carry.
 * A "location" for the guard tally is `guarded_accesses[].location`; the
   2814 records collapse to 2646 distinct locations.
 
@@ -130,18 +140,22 @@ different denominators:
    import from `tools/` the script is allowed.
 3. `--json` writes a flat dict; every key is stable across runs so a later diff
    is a plain key-by-key comparison.
-4. Print the collect-dir path, the artifact's `collector_version` and its mtime
+4. Print the collect-dir path, the `collector_version` and the artifact's mtime
    in the header. The 469-vs-483 confusion above is exactly what that prevents.
+   Found while implementing: that version is **not** a key of `artifact.json`,
+   it is in `collect_manifest.json` beside it — so the script reads it from the
+   manifest and prints which file it came from rather than claiming the
+   artifact carries a key it does not.
 
 ### Acceptance
 
-- [ ] Runs against any repo with a `.collect/`, changes nothing on disk.
-- [ ] Two consecutive runs produce byte-identical JSON.
-- [ ] Runs against an absent/corrupt `.collect/` with a clear message, exit 1.
-- [ ] `docs/collect-epics/baseline.json` committed, produced by this script.
-- [ ] The table above is regenerated from the script and replaces the
+- [x] Runs against any repo with a `.collect/`, changes nothing on disk.
+- [x] Two consecutive runs produce byte-identical JSON.
+- [x] Runs against an absent/corrupt `.collect/` with a clear message, exit 1.
+- [x] `docs/collect-epics/baseline.json` committed, produced by this script.
+- [x] The table above is regenerated from the script and replaces the
       hand-measured numbers in `INDEX.md` and in EPIC A/B/C.
-- [ ] New: `tests/test_collect_metrics_script.py` against the mini fixture repo.
+- [x] New: `tests/test_collect_metrics_script.py` against the mini fixture repo.
 
 ---
 
@@ -391,18 +405,22 @@ findings produced               ___          ___
 
 ## Measured
 
-Fill in as tickets land. `baseline` is produced by M1 and committed; every
-later column is the same script after the named epic.
+Fill in as tickets land. The `baseline` column is `scripts/collect_metrics.py`
+output, committed as [`baseline.json`](baseline.json) on 2026-09-10 against the
+artifact on disk (469 modules, `collector_version` 1); every later column is the
+same script after the named epic, so a column is a diff, not a re-measurement.
 
 | # | metric | baseline | after A | after B | after C |
 |---|---|---|---|---|---|
-| 0 | LLM calls, `--collect`, 1 file changed | 483 | | | |
+| 0 | LLM calls, `--collect`, 1 file changed | 469 (M1: the artifact's module count; the 483 came from a rebuild) | | | |
 | 0 | LLM calls, `--collect --refresh`, 1 file changed | 1 | | | |
 | 0 | summaries surviving `--collect --no-llm` | 0 / 469 | | | |
 | 1 | redundant share of block chars | ~100% | | | |
-| 1 | mean non-derivable rows per block | 0.008 | | | |
-| 1 | blocks over budget | 50 / 477 | | | |
-| 1 | modules with a Pass B purpose | 241 / 469 | | | |
+| 1 | mean non-derivable rows per block | 2.559 (M1; V3 shipped callers/calls_into/tests) | | | |
+| 1 | blocks over budget | 68 / 469 (M1) | | | |
+| 1 | median block chars | 678 (M1) | | | |
+| 1 | modules with a Pass B purpose | 241 / 469 (M1) | | | |
+| 1 | symbols cut without an announcement | 0 (M1; the silent `[:20]` is gone) | | | |
 | 1 | Pass C claims dropped | 1368 / 2238 (61%) | | | |
 | 2 | probe misses per run | | | | |
 | 2 | Gate-2 attempts per task | | | | |

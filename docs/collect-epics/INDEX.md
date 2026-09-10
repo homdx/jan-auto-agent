@@ -30,16 +30,29 @@ into `epic-tasks/NN-*.md` (24 tickets, in dependency order) in the exact shape
 `scripts/judge_epic_round.py` scores a round's worktrees on the mechanical
 facts — `_shrink` untouched, one commit, nothing pushed, a test shipped.
 
-### Numbers in this file and in EPIC A/B/C are hand-measured
+### The numbers in this file and in EPIC A/B/C are script-produced
 
-They came from throwaway scripts and one of them counted a rebuilt artifact:
-**this file says 483 modules; the artifact on disk has 469.** Re-measured
-against the restored artifact, four of v1's design decisions do not survive —
-`sibling_gaps` is empty, only 23 access locations in the whole repo are
-`GUARDED`, `config_map.readers` encodes sharing rather than ownership, and the
-adjudicated finding corpus is method-level while the symbol index has no
-methods. See `PLAN-v2.md` §2. `M1` replaces every number below with script
-output.
+`M1` landed the yardstick: `scripts/collect_metrics.py` is one read-only pass
+over `.collect/artifact.json` — no repo scan, no LLM, no network — and it
+prints a table and writes a flat JSON whose keys are stable across runs, so a
+later epic's baseline is a plain key-by-key diff. The baseline for the artifact
+on disk is committed as [`baseline.json`](baseline.json):
+
+```bash
+python3 scripts/collect_metrics.py --collect-dir .collect \
+    --json docs/collect-epics/baseline.json
+```
+
+Its header prints the collect dir, the artifact's `collector_version` and its
+mtime, which is what keeps a 469-vs-483 ambiguity from recurring silently.
+
+Re-measured against the artifact on disk, four of v1's design decisions do not
+survive — `sibling_gaps` is empty (0 entries), only 23 of 2646 access locations
+are `GUARDED`, `config_map.readers` encodes sharing rather than ownership, and
+the adjudicated finding corpus is method-level while the symbol index has no
+methods (`methods_indexed: 0`). See `PLAN-v2.md` §2. What `M1` cannot measure
+yet is left hand-measured and named as such: everything in the M2–M4 columns of
+EPIC M's **Measured** table.
 
 ## Why these epics exist
 
@@ -149,21 +162,28 @@ House rules, same as every previous round:
 
 ### Measuring it
 
-Two numbers decide whether these epics worked. Capture both before A1:
+Two numbers decide whether these epics worked. Both are script-produced now:
+`scripts/collect_metrics.py` wrote [`baseline.json`](baseline.json) before A1,
+and the same command re-written after each epic is the before/after:
 
 ```bash
-# 1. facts-per-block: how much of the pack is unreachable from the target source
-python3 - <<'PY'
-import json, statistics
-raw = json.load(open("../jan-to-fix-pull-v2/.collect/artifact.json"))
-print("modules", len(raw["modules"]), "symbols", sum(len(m["public_symbols"]) for m in raw["modules"]))
-PY
+python3 scripts/collect_metrics.py --collect-dir .collect \
+    --json docs/collect-epics/baseline-after-A.json
+diff docs/collect-epics/baseline.json docs/collect-epics/baseline-after-A.json
+```
 
-# 2. Gate-1 rejection mix on a real run — the "already handled" bucket is the target
+The second instrument is the Gate-1 rejection mix on a real run — the "already
+handled" bucket is the target, and it is still a log grep (M4 makes it a
+counter):
+
+```bash
 grep -c "gate1 accepted=" logs/*.log
 ```
 
-Baseline at time of writing: **10%** of blocks over budget (50/477), **0**
-non-redundant rows per block, **0** Gate-1 candidates suppressed by static
-facts (the suppressor has no callers), **61%** of Pass B claims dropped by
-Pass C (1368 of 2238).
+Baseline at time of writing, script-produced against the artifact on disk
+(469 modules, `collector_version` 1): **14.5%** of blocks over budget
+(68/469), **2.559** non-derivable rows per block, **678**-char median block,
+**0** symbols cut without an announcement, **24** duplicate `config_read` lines
+in 11 modules. **0** Gate-1 candidates are suppressed by static facts (the
+suppressor has no callers) and **61%** of Pass B claims are dropped by Pass C
+(1368 of 2238) — both unchanged, and both still hand-measured until M3/M4.

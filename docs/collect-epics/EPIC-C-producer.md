@@ -8,6 +8,15 @@
 
 ---
 
+> **Numbers re-measured — M1** (`scripts/collect_metrics.py`, 2026-09-10).
+> The producer-cost table below was written against `../jan-to-fix-pull-v2` at
+> 483 modules. The artifact on disk has 469 modules and 4030 symbols, every one
+> elided to `name(…)` (`signatures_elided 4030 / 4030`) and 0 methods indexed.
+> So C1's stale-tree full rebuild is 469 LLM calls, not 483, and C4's
+> signature work covers 4030 symbols, not 4093. Both conclusions are
+> unchanged — C1's diff-driven path and C4's real signatures are still the
+> whole point. Full table: [`baseline.json`](baseline.json).
+
 ## Problem
 
 Three separate classes of defect on the producer side, all measured against

@@ -8,6 +8,16 @@
 
 ---
 
+> **Numbers re-measured — M1** (`scripts/collect_metrics.py`, 2026-09-10).
+> The suppressor-ceiling arithmetic was written against a rebuilt 483-module
+> artifact. The artifact on disk says: 469 modules, 2814 `guarded_accesses`
+> collapsing to 2646 distinct locations, of which 23 are `GUARDED` and 3 are
+> ambiguous (2620 all-UNGUARDED), 117 `fail_open_registry` entries with 22
+> carrying a rationale, 4 contracts, 0 methods indexed. The ceiling is
+> unchanged in shape — about 144 of 2646 locations (5.4%) can answer
+> `safe=True` — because none of its three inputs moved. Full table:
+> [`baseline.json`](baseline.json).
+
 ## Problem
 
 `tools/collect/bughunt_filter.py` is 173 lines of finished, documented,
