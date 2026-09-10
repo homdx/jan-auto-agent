@@ -136,10 +136,28 @@ class CollectBridge:
     # ── availability ─────────────────────────────────────────────────────
 
     @property
+    def status(self) -> str:
+        """`"fresh"` / `"stale"` / `"absent"` — the model's own status, so a
+        caller can distinguish "there is an artifact, it is just old" from
+        "there is nothing at all".
+
+        Fail-open like the rest of this class: no model, no attribute, a
+        non-string value or an object whose `__getattr__` raises all read as
+        `"absent"`, never as an exception into a run.
+        """
+        if self._model is None:
+            return "absent"
+        try:
+            value = getattr(self._model, "status", "absent")
+        except Exception:  # noqa: BLE001 — diagnostics, never a run blocker
+            return "absent"
+        return value if isinstance(value, str) else "absent"
+
+    @property
     def usable(self) -> bool:
         """`True` only when the model is FRESH. A stale artifact is treated
         exactly like no artifact at all — see module docstring, item 3."""
-        return bool(self._model is not None and getattr(self._model, "status", "absent") == "fresh")
+        return bool(self._model is not None and self.status == "fresh")
 
     # ── 1. static per-task context ──────────────────────────────────────
 

@@ -967,12 +967,29 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
             self._trace_probe_config(usable=False, reason="bridge_error", detail=str(exc))
             return None
         if bridge is None or not getattr(bridge, "usable", False):
-            logger.warning(
-                "architect: probe_enabled=true but no fresh collect artifact is "
-                "available ([collect] use_in_auto) — planning without probes "
-                "this run.",
+            # Both are degraded-to-no-data for the run (see
+            # collect_bridge's module docstring), but the operator remedy
+            # differs: stale is one `--collect --refresh` away, absent is
+            # not. `getattr(..., "absent")` so a bridge that reports no
+            # status at all falls back to the original wording.
+            _stale = (
+                bridge is not None
+                and getattr(bridge, "status", "absent") == "stale"
             )
-            self._trace_probe_config(usable=False, reason="no_artifact")
+            if _stale:
+                logger.warning(
+                    "architect: probe_enabled=true but the collect artifact "
+                    "is stale (run --collect --refresh to update it) — "
+                    "planning without probes this run.",
+                )
+                self._trace_probe_config(usable=False, reason="stale_artifact")
+            else:
+                logger.warning(
+                    "architect: probe_enabled=true but no fresh collect artifact is "
+                    "available ([collect] use_in_auto) — planning without probes "
+                    "this run.",
+                )
+                self._trace_probe_config(usable=False, reason="no_artifact")
             return None
         self._probe = _arch_probe.ArchProbe(
             bridge,

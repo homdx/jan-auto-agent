@@ -1142,6 +1142,7 @@ def render_run_summary(run: dict) -> None:
             # reason that has nothing to do with whether the model wants them.
             _why = {
                 "no_artifact":  "no fresh collect artifact ([collect] use_in_auto)",
+                "stale_artifact": "collect artifact is stale (run --collect --refresh)",
                 "bridge_error": "collect bridge failed to build",
             }.get(_probe_cfg["reason"], _probe_cfg["reason"])
             print(f"  {bold('Architect probes')}: {yellow('enabled but unavailable')} — {_why}")
