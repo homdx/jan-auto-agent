@@ -3,7 +3,7 @@
 **Severity:** CRITICAL  
 **File:** `scripts/collect_metrics.py`  
 **Symbol:** `—`  
-**Round:** 15 of 24  
+**Round:** 15 of 27  
 **Size:** M  
 **Source:** `docs/collect-epics/EPIC-M-metrics.md` § M3  
 **Depends on:** M1. **Blocks:** every ticket in EPIC B except the Pass C fix.  

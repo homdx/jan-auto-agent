@@ -3,7 +3,7 @@
 **Severity:** MEDIUM  
 **File:** `scripts/`  
 **Symbol:** `—`  
-**Round:** 23 of 24  
+**Round:** 23 of 27  
 **Size:** M  
 **Source:** `docs/collect-epics/EPIC-M-metrics.md` § M6  
 **Depends on:** M3, and whatever EPIC B ends up shipping  

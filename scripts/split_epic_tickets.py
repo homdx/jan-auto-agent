@@ -55,9 +55,10 @@ ROUND_ORDER = [
     "V14", "V15",                            # stage 4 — docs mode
     "M6",                                    # outcome against the adjudicated corpus
     "L3",                                    # measurement-only, can run any time
+    "L4", "L5", "L6",                        # found by rendering V3 against the artifact
 ]
 
-SHORT_PATH = ["L2", "M1", "L1", "V1", "V2", "V3", "V5", "V7", "V9", "V11", "M2"]
+SHORT_PATH = ["L2", "M1", "L1", "V1", "V2", "V3", "V5", "L4", "L5", "L6", "V7", "V9", "V11", "M2"]
 
 SEVERITY = {"highest": "CRITICAL", "critical": "CRITICAL", "high": "HIGH",
             "medium": "MEDIUM", "low": "LOW", "lowest": "LOW"}

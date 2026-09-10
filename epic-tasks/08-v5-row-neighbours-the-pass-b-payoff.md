@@ -3,7 +3,7 @@
 **Severity:** HIGH  
 **File:** `tools/auto/context_assembler.py`  
 **Symbol:** `—`  
-**Round:** 8 of 24  
+**Round:** 8 of 27  
 **Size:** M  
 **Source:** `docs/collect-epics/PLAN-v2.md` § V5  
 **Depends on:** V1, V3  
@@ -36,6 +36,12 @@ callees' purposes are not in the prompt and cannot be derived from it.
 5. It sits below `risk` in `_PACK_ROWS`: under budget pressure the static facts
    survive and the prose is what goes.
 
+> **Short-path note (2026-09-10).** V4 is not on the short path, so `risk` and
+> `fails_open` do not exist when this ticket runs. Read "below `risk`" as
+> **directly after `tests`** — last of the fact rows, before the V2 trio — and
+> the budget acceptance as "`neighbours` is dropped before `tests`". Do not
+> implement V4 rows to satisfy the wording; that is a second ticket's work.
+
 **Acceptance**
 
 - [ ] The row renders `(llm)`; nothing else in the pack does.
@@ -43,7 +49,7 @@ callees' purposes are not in the prompt and cannot be derived from it.
 - [ ] With no summaries in the artifact the row is absent and the rest of the
       pack is unaffected.
 - [ ] Under a budget fitting half the pack, `neighbours` is dropped before
-      `fails_open`.
+      `tests` (before `fails_open` once V4 lands).
 - [ ] New: `tests/test_collect_pack_neighbour_purpose.py`.
 
 ---

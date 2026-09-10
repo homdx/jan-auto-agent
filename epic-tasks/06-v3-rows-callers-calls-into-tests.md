@@ -3,7 +3,7 @@
 **Severity:** HIGH  
 **File:** `tools/auto/context_assembler.py`  
 **Symbol:** `—`  
-**Round:** 6 of 24  
+**Round:** 6 of 27  
 **Size:** S  
 **Source:** `docs/collect-epics/PLAN-v2.md` § V3  
 **Depends on:** V1, V2  

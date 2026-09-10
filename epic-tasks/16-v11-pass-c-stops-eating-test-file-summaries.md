@@ -3,7 +3,7 @@
 **Severity:** HIGH  
 **File:** `tools/collect/verifier.py`  
 **Symbol:** `—`  
-**Round:** 16 of 24  
+**Round:** 16 of 27  
 **Size:** M  
 **Source:** `docs/collect-epics/PLAN-v2.md` § V11  
 **Depends on:** nothing  

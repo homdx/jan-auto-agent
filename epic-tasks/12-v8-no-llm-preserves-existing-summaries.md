@@ -3,7 +3,7 @@
 **Severity:** HIGH  
 **File:** `tools/collect/cli.py`  
 **Symbol:** `—`  
-**Round:** 12 of 24  
+**Round:** 12 of 27  
 **Size:** M  
 **Source:** `docs/collect-epics/PLAN-v2.md` § V8  
 **Also touches:** `main.py`  

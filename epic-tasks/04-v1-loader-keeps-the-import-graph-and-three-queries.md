@@ -3,7 +3,7 @@
 **Severity:** HIGH  
 **File:** `tools/collect/loader.py`  
 **Symbol:** `—`  
-**Round:** 4 of 24  
+**Round:** 4 of 27  
 **Size:** S  
 **Source:** `docs/collect-epics/PLAN-v2.md` § V1  
 

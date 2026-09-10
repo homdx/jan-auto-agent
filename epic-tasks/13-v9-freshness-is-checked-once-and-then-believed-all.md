@@ -3,7 +3,7 @@
 **Severity:** HIGH  
 **File:** `tools/auto/collect_bridge.py`  
 **Symbol:** `—`  
-**Round:** 13 of 24  
+**Round:** 13 of 27  
 **Size:** M  
 **Source:** `docs/collect-epics/PLAN-v2.md` § V9  
 **Also touches:** `tools/auto/controller.py`  

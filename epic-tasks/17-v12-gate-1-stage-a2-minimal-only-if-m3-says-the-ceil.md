@@ -3,7 +3,7 @@
 **Severity:** MEDIUM  
 **File:** `tools/auto/gate1_filter.py`  
 **Symbol:** `—`  
-**Round:** 17 of 24  
+**Round:** 17 of 27  
 **Size:** S  
 **Source:** `docs/collect-epics/PLAN-v2.md` § V12  
 **Depends on:** M3  

@@ -3,7 +3,7 @@
 **Severity:** MEDIUM  
 **File:** `tools/collect/ast_facts.py`  
 **Symbol:** `—`  
-**Round:** 14 of 24  
+**Round:** 14 of 27  
 **Size:** M  
 **Source:** `docs/collect-epics/PLAN-v2.md` § V10  
 **Also touches:** `tools/collect/model.py`  

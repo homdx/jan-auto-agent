@@ -3,7 +3,7 @@
 **Severity:** LOW  
 **File:** `README.md`  
 **Symbol:** `—`  
-**Round:** 22 of 24  
+**Round:** 22 of 27  
 **Size:** S  
 **Source:** `docs/collect-epics/PLAN-v2.md` § V15  
 **Depends on:** everything  
@@ -93,13 +93,18 @@ V1  loader keeps the import graph
 V2  block becomes an ordered list
 V3  callers / calls_into / tests   ← the biggest single jump in supply
 V5  neighbours (llm)               ← makes 483 LLM calls a run useful
+L4  graph sees `from pkg import mod as alias`   ← V3 rows lie without it
+L5  test_map covers all four test roots         ← callers/tests rows disagree without it
+L6  budget: fact rows shrink, public_symbols never displaces them
 V7  --collect stops costing 483 calls
 V9  facts stop being stale-but-labelled-fresh
 V11 Pass C stops eating test summaries   ← also feeds V5
 M2  measure the same numbers again
 ```
 
-Eight tickets. Everything else — V4, V6's memo, V10, V12–V15 — is refinement on
+Eleven tickets — L4–L6 were added after V3 was measured against the artifact
+(see `EPIC-L-live-findings.md`); they are collect-side defects V3 exposed, not
+changes to V1–V3. Everything else — V4, V6's memo, V10, V12–V15 — is refinement on
 top of a working pack, and each can be dropped without breaking the ones above.
 
 | | v1 | v2 |

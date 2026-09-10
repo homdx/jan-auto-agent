@@ -3,7 +3,7 @@
 **Severity:** HIGH  
 **File:** `scripts/collect_ab.sh`  
 **Symbol:** `—`  
-**Round:** 20 of 24  
+**Round:** 20 of 27  
 **Size:** M  
 **Source:** `docs/collect-epics/EPIC-M-metrics.md` § M5  
 **Depends on:** M4  

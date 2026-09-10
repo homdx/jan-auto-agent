@@ -3,7 +3,7 @@
 **Severity:** CRITICAL  
 **File:** `scripts/collect_metrics.py`  
 **Symbol:** `—`  
-**Round:** 2 of 24  
+**Round:** 2 of 27  
 **Size:** M  
 **Source:** `docs/collect-epics/EPIC-M-metrics.md` § M1  
 **Depends on:** nothing. **Must land before any other ticket in any epic.**  

@@ -3,7 +3,7 @@
 **Severity:** MEDIUM  
 **File:** `—`  
 **Symbol:** `—`  
-**Round:** 24 of 24  
+**Round:** 24 of 27  
 **Size:** S (measurement only)  
 **Source:** `docs/collect-epics/EPIC-L-live-findings.md` § L3  
 

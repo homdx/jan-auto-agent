@@ -3,7 +3,7 @@
 **Severity:** HIGH  
 **File:** `tools/auto/run_trace.py`  
 **Symbol:** `—`  
-**Round:** 19 of 24  
+**Round:** 19 of 27  
 **Size:** M  
 **Source:** `docs/collect-epics/EPIC-M-metrics.md` § M4  
 **Also touches:** `tools/auto/collect_bridge.py`, `tools/auto/gate1_filter.py`, `analyze_logs.py`  

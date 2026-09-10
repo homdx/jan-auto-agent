@@ -3,7 +3,7 @@
 **Severity:** HIGH  
 **File:** `tools/auto/architect.py`  
 **Symbol:** `—`  
-**Round:** 1 of 24  
+**Round:** 1 of 27  
 **Size:** XS  
 **Source:** `docs/collect-epics/EPIC-L-live-findings.md` § L2  
 **Also touches:** `tools/auto/collect_bridge.py`  

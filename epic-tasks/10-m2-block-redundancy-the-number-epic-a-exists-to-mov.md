@@ -3,7 +3,7 @@
 **Severity:** CRITICAL  
 **File:** `scripts/collect_metrics.py`  
 **Symbol:** `—`  
-**Round:** 10 of 24  
+**Round:** 10 of 27  
 **Size:** S  
 **Source:** `docs/collect-epics/EPIC-M-metrics.md` § M2  
 **Depends on:** M1  

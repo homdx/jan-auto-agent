@@ -3,7 +3,7 @@
 **Severity:** HIGH  
 **File:** `tools/auto/gate1_filter.py`  
 **Symbol:** `—`  
-**Round:** 3 of 24  
+**Round:** 3 of 27  
 **Size:** S  
 **Source:** `docs/collect-epics/EPIC-L-live-findings.md` § L1  
 **Depends on:** nothing. Not gated on `M3` — this is about file type, not about  

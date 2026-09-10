@@ -3,7 +3,7 @@
 **Severity:** LOW  
 **File:** `tools/auto/gate1_grounding.py`  
 **Symbol:** `—`  
-**Round:** 18 of 24  
+**Round:** 18 of 27  
 **Size:** S  
 **Source:** `docs/collect-epics/PLAN-v2.md` § V13  
 **Depends on:** V12  
