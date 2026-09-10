@@ -179,8 +179,8 @@ After V1–V5, from the same artifact, no new collection:
 ```
 COLLECT MODEL (static facts, do not contradict):
 module: tools/auto/coder.py
-callers      25 modules import this (7 non-test): controller.py, inner_loop.py,
-             outer_loop.py, pipeline.py, +3
+callers      25 modules import this (2 non-test): inner_loop.py,
+             tools/skills/loader.py
 calls_into   llm_stream.py, context_assembler.py, search_agent.py,
              block_extractor.py, config_safe.py, +2
 tests        11 files: tests/test_auto_c2.py, tests/test_coder_prompt_domain.py,
@@ -254,8 +254,12 @@ read. `sibling_gaps` is **not** recovered — it has 0 entries.
 
 **Acceptance**
 
-- [ ] `callers_of("tools/auto/coder.py")` returns 7 non-test modules, stable
-      across two loads; with `exclude_tests=False`, 25.
+- [ ] `callers_of("tools/auto/coder.py")` returns only non-test modules, stable
+      across two loads; with `exclude_tests=False`, every importer the artifact
+      records. Against the artifact on disk that is **2 and 25** — re-measure
+      rather than trusting the figure: an earlier draft of this plan said 7
+      non-test, which was measured on a different tree state and does not
+      reproduce.
 - [ ] An artifact missing these keys loads with empty containers — not an
       absent model. Both schema directions.
 - [ ] Absent model → `[]` / `None`, no exception.

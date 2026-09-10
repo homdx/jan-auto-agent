@@ -36,8 +36,12 @@ read. `sibling_gaps` is **not** recovered — it has 0 entries.
 
 **Acceptance**
 
-- [ ] `callers_of("tools/auto/coder.py")` returns 7 non-test modules, stable
-      across two loads; with `exclude_tests=False`, 25.
+- [ ] `callers_of("tools/auto/coder.py")` returns only non-test modules, stable
+      across two loads; with `exclude_tests=False`, every importer the artifact
+      records. Against the artifact on disk that is **2 and 25** — re-measure
+      rather than trusting the figure: an earlier draft of this plan said 7
+      non-test, which was measured on a different tree state and does not
+      reproduce.
 - [ ] An artifact missing these keys loads with empty containers — not an
       absent model. Both schema directions.
 - [ ] Absent model → `[]` / `None`, no exception.
