@@ -100,6 +100,21 @@ _CALLERS_PREFIX = "callers: "
 _CALLS_INTO_PREFIX = "calls_into: "
 _TESTS_PREFIX = "tests: "
 
+# PLAN-v2 V5: the one row whose material comes from Pass B (the LLM
+# summaries) rather than the AST. Up to three neighbours, and the `(llm)`
+# label on every line — it is the only non-static row in the pack, so the
+# label is what tells the model this prose is weaker evidence than the rows
+# above it. COLLECT-1's provenance isolation is preserved by labelling, not
+# by exclusion: `is_safe()` still reads only static facts and never touches
+# `summary`.
+_NEIGHBOURS_MAX_ENTRIES = 3
+_NEIGHBOURS_PURPOSE_MAX_CHARS = 110
+_NEIGHBOURS_PREFIX = "neighbours: "
+_NEIGHBOURS_LLM_LABEL = " (llm)"
+
+_SENTENCE_ENDINGS = ".!?"
+_WHITESPACE_RE = re.compile(r"\s+")
+
 # PLAN-v2 V3: the forms that replace an empty row. Each asserts an absence
 # rather than printing "0" — the absence is the useful fact and costs nothing.
 # The entry-point note has two shapes: a module nobody imports at all, and one
@@ -317,20 +332,122 @@ def _row_tests(model, target_file: str, remaining: "int | None") -> str:
         f"{_capped_names(tests, _TESTS_MAX_NAMES)}"
 
 
+def _first_sentence(text: str, limit: int = _NEIGHBOURS_PURPOSE_MAX_CHARS) -> str:
+    """`text` flattened to one line and cut at the first sentence, or at
+    `limit` chars, whichever comes first.
+
+    Whitespace is collapsed first: a summary is LLM prose and can carry a
+    newline or a run of spaces, and the `neighbours` row is one line per
+    neighbour. The sentence cut wins while it is shorter, because a whole
+    sentence is the smallest unit of meaning that can stand alone in a
+    prompt; the char cut is the ceiling, so a purpose that never reaches a
+    sentence end cannot grow the row past its budget.
+
+    A sentence boundary is a terminator followed by whitespace *and* by a word
+    that starts uppercase — not a bare terminator. Measured against the
+    artifact on disk (2026-09-10): 241 of 469 modules carry a purpose, 16 of
+    those have a terminator inside 110 chars, and 2 of the 16 are `(e.g. diff)`
+    abbreviations that a bare-terminator rule would cut into a dangling
+    fragment. The other 225 never reach a sentence end before the ceiling, so
+    the word-boundary cut below is the shape most rendered lines take.
+
+    When the ceiling does the cutting it backs up to the last word boundary,
+    so the cut never renders a broken fragment (`"in-memor"`) that would read
+    as a bug in a line already labelled weak evidence. `""` for nothing left to
+    say — an empty purpose is skipped by the caller rather than rendered blank.
+    """
+    flat = _WHITESPACE_RE.sub(" ", text if isinstance(text, str) else "").strip()
+    if not flat:
+        return ""
+
+    end = limit
+    for i, ch in enumerate(flat):
+        if i + 1 > end:  # the ceiling has already won; a further boundary is past it
+            break
+        if ch in _SENTENCE_ENDINGS and i + 1 < len(flat) and flat[i + 1] == " ":
+            nxt = flat[i + 2] if i + 2 < len(flat) else ""
+            if nxt and not nxt.isupper():  # an abbreviation, not a sentence end
+                continue
+            return flat[: i + 1].strip()
+
+    if len(flat) <= end:  # no sentence end inside the ceiling, and it fits as is
+        return flat
+
+    space = flat.rfind(" ", 0, end)
+    return flat[: space if space > 0 else end].strip()
+
+
+def _row_neighbours(model, target_file: str, remaining: "int | None") -> str:
+    """The purpose of this module's *neighbours*, never of the module itself.
+
+    The target's source is already in the prompt, so a paraphrase of it is
+    noise; its callers' and callees' purposes are not in the prompt and
+    cannot be derived from it. That is the design decision this row
+    implements, and it is why Pass B's 483 LLM calls have an agent consumer
+    at all: this is the first one.
+
+    Candidates are `callers_of` then `calls_into`, in that order — the
+    callers are the heaviest blast radius the model can actually break —
+    capped at `_NEIGHBOURS_MAX_ENTRIES` *after* skipping neighbours with an
+    empty purpose. Skipping rather than padding matters: 228 of this repo's
+    469 modules have no purpose today, and a blank line would spend budget
+    on the one thing a pack exists to avoid. Each surviving purpose is cut
+    by `_first_sentence` and each line carries `(llm)`.
+
+    `remaining` is unused: the row is up to three whole lines, so the loop
+    below either takes it all or drops it. Splitting it would leave the
+    pack stating a partial neighbourhood without saying it is partial.
+
+    Fails open like every other row: an unknown module, a neighbour the
+    module table does not know, or a stand-in model with no summary table
+    all yield `""`, and a neighbour whose summary is not an `LLMSummary` is
+    skipped rather than raising into a run.
+    """
+    if model.module(target_file) is None:
+        return ""
+
+    candidates: "list[str]" = []
+    for path in tuple(model.callers_of(target_file)) + tuple(model.calls_into(target_file)):
+        # A neighbour is not the target: this row exists because the target's
+        # own source is already in the prompt. `callers_of`/`calls_into`
+        # cannot return the target from a produced artifact (the graph drops
+        # self-edges), but a hand-edited one can.
+        if path and path != target_file and path not in candidates:
+            candidates.append(path)
+
+    lines: "list[str]" = []
+    for path in candidates:
+        if len(lines) >= _NEIGHBOURS_MAX_ENTRIES:
+            break
+        neighbour = model.module(path)
+        if neighbour is None or neighbour.summary is None:
+            continue
+        # `getattr`, not attribute access: a hand-edited artifact can carry a
+        # summary that is not an `LLMSummary`, and a malformed row degrades to
+        # a skipped neighbour rather than a raise into a run.
+        purpose = _first_sentence(getattr(neighbour.summary, "purpose", ""))
+        if not purpose:
+            continue
+        lines.append(f"{_NEIGHBOURS_PREFIX}{path} — {purpose}{_NEIGHBOURS_LLM_LABEL}")
+    return "\n".join(lines)
+
+
 # PLAN-v2: the ordered row list that IS the per-task fact pack. Highest
 # value first — "value" = how hard this fact is to get from the target file's
 # own source, which the coder already has in full in the same prompt. The
 # tuple order IS the priority, and cutting a row under budget pressure IS the
 # `continue` in `build_collect_context_block` below. V3 ships the first three
 # rows (the neighbourhood: who imports this, what this imports, what tests it);
-# V4–V5 append fails_open/risk/neighbours above `contract` the same way. The
-# last three rows are the ones V2 ported verbatim out of the old single pass,
-# `public_symbols` still last because it is the row the target file's own
-# source makes redundant.
+# V5 puts `neighbours` next — the only row carrying LLM prose, and therefore
+# the last one a budget cut should keep, so V4's fails_open/risk land above it
+# when they do. The last three rows are the ones V2 ported verbatim out of the
+# old single pass, `public_symbols` still last because it is the row the target
+# file's own source makes redundant.
 _PACK_ROWS = (
     ("callers", _row_callers),
     ("calls_into", _row_calls_into),
     ("tests", _row_tests),
+    ("neighbours", _row_neighbours),
     ("contract", _row_contract),
     ("config_read", _row_config_read),
     ("public_symbols", _row_public_symbols),

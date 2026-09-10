@@ -176,14 +176,16 @@ def _hub_model() -> CollectModel:
 
 
 def test_pack_rows_lead_with_the_three_neighbourhood_rows():
-    """V3 prepends callers/calls_into/tests above the three rows V2 ported,
-    and `public_symbols` stays last — it is the one row the target file's own
-    source makes redundant."""
+    """V3 prepends callers/calls_into/tests above the three rows V2 ported and
+    V5 puts `neighbours` next — still above the V2 rows; `public_symbols`
+    stays last, it is the one row the target file's own source makes
+    redundant."""
     names = [name for name, _ in _PACK_ROWS]
     assert names == [
         "callers",
         "calls_into",
         "tests",
+        "neighbours",
         "contract",
         "config_read",
         "public_symbols",
@@ -193,7 +195,7 @@ def test_pack_rows_lead_with_the_three_neighbourhood_rows():
 
 
 def test_every_pack_row_has_a_name_and_a_callable_renderer():
-    assert len(_PACK_ROWS) == 6
+    assert len(_PACK_ROWS) == 7
     for name, render in _PACK_ROWS:
         assert isinstance(name, str) and name
         assert callable(render)

@@ -91,15 +91,17 @@ def _symbol_line(block: str) -> str:
 
 
 def test_pack_rows_are_ordered_contract_then_config_then_public_symbols():
-    """V2.1/V2.3/V3: the tuple order IS the priority, and public_symbols is
+    """V2.1/V2.3/V3/V5: the tuple order IS the priority, and public_symbols is
     last because it is the one row the target file's own source makes
-    redundant. V3 prepended the neighbourhood rows; the three rows V2 ported
-    keep their relative order and their positions at the tail."""
+    redundant. V3 prepended the neighbourhood rows and V5 put `neighbours`
+    above the V2 rows; the three rows V2 ported keep their relative order and
+    their positions at the tail."""
     names = [name for name, _ in _PACK_ROWS]
     assert names == [
         "callers",
         "calls_into",
         "tests",
+        "neighbours",
         "contract",
         "config_read",
         "public_symbols",
@@ -109,7 +111,7 @@ def test_pack_rows_are_ordered_contract_then_config_then_public_symbols():
 
 
 def test_pack_rows_are_all_callable_renderers():
-    assert len(_PACK_ROWS) == 6
+    assert len(_PACK_ROWS) == 7
     for name, render in _PACK_ROWS:
         assert isinstance(name, str) and name
         assert callable(render)
