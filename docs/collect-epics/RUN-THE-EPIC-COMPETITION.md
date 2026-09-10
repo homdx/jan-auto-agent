@@ -220,7 +220,7 @@ agent is actually better, accumulated over 24 rounds instead of guessed.
 ```bash
 git checkout competition
 git cherry-pick <winning sha>
-for d in tests tests_bugfix .smoke_tests .regression_tests; do python3 -m pytest "$d" -q --timeout=180; done
+python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180
 git worktree remove ../round-opus   # …and the rest
 ```
 

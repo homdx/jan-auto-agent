@@ -204,10 +204,11 @@ the file it was given. That is the entire thesis, and M2 is the number for it.
 
 House rules are unchanged from `INDEX.md`: verify against live source before
 implementing, one local commit per ticket, never push, new behaviour → `tests/`
-and fixes → `tests_bugfix/`, and run the suite as four separate invocations:
+and fixes → `tests_bugfix/`, and run the two real roots one after the other
+(`.smoke_tests/` and `.regression_tests/` are symlink views onto `tests/`):
 
 ```bash
-for d in tests tests_bugfix .smoke_tests .regression_tests; do python3 -m pytest "$d" -q --timeout=180; done
+python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180
 ```
 
 Every new consumer is fail-open: an absent, malformed or stale artifact degrades

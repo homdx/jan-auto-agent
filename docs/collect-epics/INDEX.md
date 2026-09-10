@@ -132,10 +132,12 @@ House rules, same as every previous round:
 2. **One local commit per ticket.** Never push.
 3. **Every ticket ships a test.** New behaviour → `tests/`; a fix to something
    that used to be wrong → `tests_bugfix/` (repo convention).
-4. **Run the suite as four separate invocations** — combining the roots in one
-   `pytest` call produces ~362 false errors from a conftest collision:
+4. **Run the two real roots, one after the other, never combined** —
+   `.smoke_tests/` and `.regression_tests/` are symlink views onto `tests/`;
+   combining roots in one `pytest` call produces ~362 false errors from a
+   conftest collision:
    ```bash
-   for d in tests tests_bugfix .smoke_tests .regression_tests; do python3 -m pytest "$d" -q --timeout=180; done
+   python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180
    ```
    `python` is not on PATH — use `python3`.
 5. **Every new consumer is fail-open.** The existing contract — a broken

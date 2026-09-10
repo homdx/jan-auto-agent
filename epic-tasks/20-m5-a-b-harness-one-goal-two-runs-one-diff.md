@@ -66,12 +66,15 @@ LLM calls, whole run            ___       ___
    be wrong → `tests_bugfix/`. If you add a `tests/test_*.py`, run
    `python3 scripts/sync_test_tiers.py` so the `.smoke_tests/` mirror exists
    (a pre-commit hook enforces it).
-5. **Run the suite as four separate invocations** — combining the roots in one
-   `pytest` call produces ~362 false errors from a conftest collision:
+5. **Run the two real roots, one after the other, never combined** —
+   `.smoke_tests/` and `.regression_tests/` are symlink views onto `tests/`
+   and run nothing extra; combining roots in one `pytest` call produces ~362
+   false errors from a conftest collision:
    ```bash
-   for d in tests tests_bugfix .smoke_tests .regression_tests; do python3 -m pytest "$d" -q --timeout=180; done
+   python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180
    ```
-   `python` is not on PATH — use `python3`.
+   `python` is not on PATH — use `python3`. One suite at a time — the machine
+   is shared with the other round entrants.
 6. **Fail open.** A broken artifact, a malformed config key or an absent model
    degrades to "no collect data" and never raises into a run. Everything added
    here inherits that.
