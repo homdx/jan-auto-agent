@@ -77,11 +77,138 @@ _BIBLE_HEADER = "STORY FACTS (must not contradict):"
 # header above so a prompt log can tell the two apart at a glance.
 _COLLECT_HEADER = "COLLECT MODEL (static facts, do not contradict):"
 
+# PLAN-v2 V2.3: the announced remainder for a budget-cut symbol list. The old
+# silent `[:20]` claimed to be a complete list; `CollectBridge.
+# _format_module_block` already announces its own cut ("… and N more symbol(s)
+# not listed"), and this matches that honesty.
+_SYMBOLS_CUT_NOTE = " … (+{extra} more, cut for budget)"
 
-def build_collect_context_block(model, target_file: str, task_mode: str = "code") -> str:
-    """AUTO-CR-23/COLLECT-23: the opt-in `collect`-derived context block for
-    `target_file` — its structural module record, any contracts that cite
-    it, and config reads whose mode-override applies to `task_mode`.
+
+def _coerce_budget(budget) -> "int | None":
+    """`budget` as a positive int, or `None` for "no limit".
+
+    A value that is not an int or a numeric string (a bool, a float, a list)
+    means "no budget was configured", not a zero budget: a malformed config key
+    degrades to the full pack rather than raising into a run or silently
+    truncating it. `int()` handles the numeric-string case, because
+    `configparser` hands back strings.
+    """
+    if budget is None or isinstance(budget, bool):
+        return None
+    if not isinstance(budget, (int, str)):
+        return None
+    try:
+        value = int(budget)
+    except (ValueError, TypeError):
+        return None
+    return value if value > 0 else None
+
+
+def _row_contract(model, target_file: str, remaining: "int | None") -> str:
+    """Today's contract lines, verbatim: one per contract citing the module or
+    one of its public symbols, sorted by contract name. Empty string = the row
+    is absent from this block."""
+    record = model.module(target_file)
+    if record is None:
+        return ""
+    contracts = list(model.contracts_for(target_file))
+    # also surface contracts cited against a symbol defined in this file
+    for sym in record.public_symbols:
+        contracts.extend(c for c in model.contracts_for(sym.qualname) if c not in contracts)
+    if not contracts:
+        return ""
+    return "\n".join(
+        f"contract {c.name}: {c.description}" for c in sorted(contracts, key=lambda c: c.name)
+    )
+
+
+def _row_config_read(model, target_file: str, remaining: "int | None") -> str:
+    """Today's `config_read` lines, verbatim: one per call site. `remaining` is
+    unused here — the row is per-call-site fact, never summary prose."""
+    record = model.module(target_file)
+    if record is None or not record.config_reads:
+        return ""
+    lines = []
+    for cr in record.config_reads:
+        mode_note = " (mode-override)" if cr.has_mode_override else ""
+        lines.append(f"config_read [{cr.section}] {cr.key}{mode_note} (fallback={cr.fallback!r})")
+    return "\n".join(lines)
+
+
+def _row_public_symbols(model, target_file: str, remaining: "int | None") -> str:
+    """The module's public symbols — LAST in the pack, because it is the one
+    row the target file's own source already makes redundant.
+
+    `remaining is None` (no budget) renders the whole list: the old silent
+    `[:20]` is gone, so the 28 modules above 20 symbols no longer drop 296
+    symbols without saying so. With a budget the list is cut at a symbol
+    boundary and the remainder is announced (`_SYMBOLS_CUT_NOTE`); if nothing
+    at all fits, the row is absent rather than a bare announcement, so a tight
+    budget is not spent on "nothing listed".
+    """
+    record = model.module(target_file)
+    if record is None:
+        return ""
+    symbols = [s.qualname for s in record.public_symbols]
+    if not symbols:
+        return ""
+    prefix = "public_symbols: "
+    if remaining is None:
+        return f"{prefix}{', '.join(symbols)}"
+    if remaining <= 0:
+        return ""
+
+    listed: "list[str]" = []
+    used = 0
+    limit = remaining - len(prefix)
+    for qualname in symbols:
+        cost = len(qualname) + (2 if listed else 0)  # 2 = the ", " joiner
+        if used + cost > limit:
+            break
+        listed.append(qualname)
+        used += cost
+    if not listed:
+        return ""
+    if len(listed) == len(symbols):
+        return f"{prefix}{', '.join(listed)}"
+
+    # The greedy pass above reserved no room for the announcement, and the note
+    # gets longer as more symbols are cut, so trim again until the announced
+    # line itself fits — otherwise a LARGER budget could render FEWER symbols
+    # than a smaller one. If even a single symbol plus the note does not fit,
+    # the row is absent rather than a bare "nothing listed" announcement.
+    while listed:
+        extra = len(symbols) - len(listed)
+        line = f"{prefix}{', '.join(listed)}{_SYMBOLS_CUT_NOTE.format(extra=extra)}"
+        if len(line) <= remaining:
+            return line
+        listed.pop()
+    return ""
+
+
+# PLAN-v2 V2: the ordered row list that IS the per-task fact pack. Highest
+# value first — "value" = how hard this fact is to get from the target file's
+# own source, which the coder already has in full in the same prompt. The
+# tuple order IS the priority, and cutting a row under budget pressure IS the
+# `continue` in `build_collect_context_block` below. V3–V5 append
+# callers/calls_into/tests/fails_open/risk/neighbours above the three rows
+# this ticket ports verbatim out of the old single pass.
+_PACK_ROWS = (
+    ("contract", _row_contract),
+    ("config_read", _row_config_read),
+    ("public_symbols", _row_public_symbols),
+)
+
+
+def build_collect_context_block(
+    model,
+    target_file: str,
+    *,
+    task_mode: str = "code",
+    budget: "int | None" = None,
+) -> str:
+    """AUTO-CR-23/COLLECT-23, PLAN-v2 V2: the opt-in `collect`-derived context
+    block for `target_file` — an ordered row list built by `_PACK_ROWS`.
 
     Purely additive and read-only: this never touches a file on disk, and
     returns `""` (no block at all) whenever there is nothing to say, so a
@@ -89,6 +216,20 @@ def build_collect_context_block(model, target_file: str, task_mode: str = "code"
     when the model is absent/stale-ignored or the target file is unknown to
     `collect` — the exact "context as today" regression COLLECT-23's AC
     requires when the feature is off or has nothing to contribute.
+
+    `_COLLECT_HEADER`, the `module:` line and a `parse_error:` line stay
+    outside the row loop: they are not ranked content, so they cannot be cut
+    or reordered, and a block whose only content is a parse error is still a
+    block worth showing.
+
+    `budget=None` renders every row in full, so every existing caller keeps
+    working until V6 wires `max_context_chars_auto` in. With a budget, a row
+    that does not fit is skipped in favour of the next, shorter one, and
+    `public_symbols` (the lowest-value row, and the only one that can shrink
+    on a symbol boundary) announces the remainder instead of dropping it.
+
+    `task_mode` is threaded for V14's docs-mode tuple; it does not change the
+    code-mode pack this ticket ships.
 
     `model` is a `tools.collect.loader.CollectModel` (or any absent stand-in
     with the same `.available`/`.module`/`.contracts_for` surface) — not
@@ -103,34 +244,52 @@ def build_collect_context_block(model, target_file: str, task_mode: str = "code"
     if record is None:
         return ""
 
-    lines = [_COLLECT_HEADER, f"module: {record.path}"]
+    budget = _coerce_budget(budget)
 
+    head = [_COLLECT_HEADER, f"module: {record.path}"]
     if record.parse_error:
-        lines.append(f"parse_error: {record.parse_error}")
+        head.append(f"parse_error: {record.parse_error}")
 
-    if record.public_symbols:
-        symbols = ", ".join(s.qualname for s in record.public_symbols[:20])
-        lines.append(f"public_symbols: {symbols}")
+    body: "list[str]" = []
+    seen: "set[str]" = set(head)
+    used = len("\n".join(head))
 
-    contracts = list(model.contracts_for(target_file))
-    # also surface contracts cited against a symbol defined in this file
-    for sym in record.public_symbols:
-        contracts.extend(c for c in model.contracts_for(sym.qualname) if c not in contracts)
-    if contracts:
-        for c in sorted(contracts, key=lambda c: c.name):
-            lines.append(f"contract {c.name}: {c.description}")
+    for name, render in _PACK_ROWS:
+        try:
+            row = render(
+                model, target_file, (budget - used - 1) if budget is not None else None
+            )
+        except Exception as exc:  # noqa: BLE001 — a broken row is no row, never no block
+            logger.warning("collect block row %r failed for %s: %s", name, target_file, exc)
+            continue
+        if not row:
+            continue
 
-    config_reads = list(record.config_reads)
-    if config_reads:
-        for cr in config_reads:
-            mode_note = " (mode-override)" if cr.has_mode_override else ""
-            lines.append(f"config_read [{cr.section}] {cr.key}{mode_note} (fallback={cr.fallback!r})")
+        # V2.4: drop lines an earlier row already rendered. 24 of today's
+        # config_read lines are byte-identical duplicates of one already shown
+        # (the same (section, key) read through two code paths), and a block
+        # that repeats a fact spends budget on nothing.
+        fresh: "list[str]" = []
+        for line in row.split("\n"):
+            if line in seen:
+                continue
+            seen.add(line)
+            fresh.append(line)
+        if not fresh:
+            continue
 
-    if len(lines) == 2 and not record.public_symbols:
+        if budget is not None and used + len("\n".join(fresh)) + 1 > budget:
+            # V2.5: not enough budget left for this row — try the next, shorter one.
+            continue
+
+        body.extend(fresh)
+        used += len("\n".join(fresh)) + 1
+
+    if not body and len(head) == 2:
         # Only the header + bare module line — nothing substantive to add.
         return ""
 
-    return "\n".join(lines)
+    return "\n".join(head + body)
 
 
 def _chapter_number(filename: str) -> "int | None":
