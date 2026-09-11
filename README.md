@@ -62,10 +62,14 @@ This is **not** required to run `--auto`, but when `[collect] use_in_auto
 = true`, both the Architect and Gate 1 get a `CollectBridge` that injects
 grounding context per task — e.g. *"this file already has 90% test
 coverage"* or *"this config key already has a documented fallback"* — which
-measurably reduces false-positive task proposals. Re-run `--collect
---check` to see if the artifact is stale (source changed since last
-build); `--refresh` forces a full rebuild; `--module <path>` patches one
-file incrementally.
+measurably reduces false-positive task proposals. Re-run `--collect` after
+editing the source: it is a no-op (zero writes) while the artifact is fresh,
+and otherwise refreshes incrementally — one LLM call per *changed* module,
+with every unchanged module reusing its existing record. `--check` reports
+staleness without writing anything; `--module <path>` patches one file;
+`--refresh` is the same incremental path without the freshness gate;
+`--rebuild` is the only unconditional full rebuild — one LLM call per module
+in the tree.
 
 ### 2. Ingest — clustering the repo
 
@@ -473,18 +477,24 @@ that would need its own content-aware checkpoint (same pattern as
 $ python main.py --collect --check
 collect check: no manifest at .../.collect/collect_manifest.json — collect has never run
 
-$ python main.py --collect
-collect collect: built 11 file(s) in .../.collect
+$ python main.py --collect            # nothing to diff against -> full build
+collect collect: no prior artifact to diff against — full build: 493 module(s) re-summarized; wrote 11 file(s) in .../.collect
 
-$ python main.py --collect          # run again, nothing changed
+$ python main.py --collect            # run again, nothing changed
 collect collect: already up to date — nothing to do
 
 $ echo "# comment" >> tools/collect/model.py   # simulate an edit
 $ python main.py --collect --check
 collect check: stale — a tracked file changed since the last collect run
 
-$ python main.py --collect --refresh
-collect refresh: tree unchanged — recomputed derived artifacts only, wrote 11 file(s)
+$ python main.py --collect            # stale tree -> incremental, just the changed module
+collect collect: incrementally refreshed 1 changed module(s); wrote 11 file(s) in .../.collect
+
+$ python main.py --collect            # still fresh -> pure no-op, zero writes
+collect collect: already up to date — nothing to do
+
+$ python main.py --collect --rebuild  # opt into the expensive path: every module
+collect rebuild: 493 module(s) re-summarized; wrote 11 file(s) in .../.collect
 
 $ python main.py --collect --module tools/collect/model.py
 collect module: patched tools/collect/model.py and refreshed 11 file(s)

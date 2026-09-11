@@ -206,7 +206,7 @@ def test_module_patch_reports_clean_on_clean_tree(mini_repo):
     assert _manifest_dirty(result.collect_dir) is False
 
 
-# ── --refresh: unconditional rebuild ────────────────────────────────────────
+# ── --refresh: diff-driven incremental, regardless of freshness ─────────────
 
 
 def test_refresh_rebuilds_even_when_fresh(mini_repo):

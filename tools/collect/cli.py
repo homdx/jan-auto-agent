@@ -15,7 +15,7 @@ adds exactly one write surface: `_write_artifact`/`_write_manifest` below,
 and every path either writes is built from `resolve_collect_dir`, which
 always returns a path under `root / [collect] dir` (default
 `root/.collect`). There is no other `open(..., "w")` / `Path.write_text` /
-`Path.mkdir` anywhere in this module's four actions — that is what makes
+`Path.mkdir` anywhere in this module's five actions — that is what makes
 "collect physically cannot modify a file outside `[collect] dir`" true by
 construction rather than by convention, and what `tests/test_collect_cli.py`
 checks by hashing the whole source tree before/after every action.
@@ -24,9 +24,13 @@ Actions
 -------
 ``check``   — freshness check only (`manifest.is_fresh`). Never writes
               anything, anywhere — matches `--check`'s brief exactly.
-``collect`` — one-shot (`--collect` / `/collect`): build if `.collect/` is
-              missing or stale, otherwise a no-op. This is what running
-              `collect` "just in case" should cost: nothing, once fresh.
+``collect`` — one-shot (`--collect` / `/collect`): freshness-gated. A
+              fresh tree is a no-op (no write of any kind). A stale tree
+              delegates to `action_refresh`, so only the modules whose
+              content hash changed since the last manifest are re-summarized
+              — never the whole tree. This is what running `collect` "just
+              in case" should cost: nothing once fresh, and one Pass B call
+              per *changed* module when something moved.
 ``refresh`` — diff-driven incremental rebuild (`--refresh`), regardless of
               current freshness: Pass A always re-runs (cheap, no LLM),
               but Pass B (`llm_call`) only runs for modules whose content
@@ -34,6 +38,14 @@ Actions
               module's record, summary included, is reused verbatim
               (COLLECT-24). Falls back to a full build when there is no
               prior artifact to diff against.
+``rebuild`` — unconditional full rebuild (`--collect --rebuild` /
+              `/collect --rebuild`): `action_rebuild` → `_full_build`,
+              every module re-scanned and re-summarized regardless of
+              freshness, of which files changed, and of any prior
+              artifact. The deliberate escape hatch (after a
+              `collector_version` bump, or to discard a suspect artifact),
+              not the default — `collect` and `refresh` are both
+              incremental.
 ``module``  — incremental (`--module <path>`): re-scan *only* that file,
               patch its record into the existing artifact (every other
               module's `ModuleRecord` is reused, not re-parsed), and patch
@@ -87,7 +99,7 @@ ARTIFACT_FILENAME = "artifact.json"
 MANIFEST_FILENAME = "collect_manifest.json"
 VERIFICATION_REPORT_FILENAME = "verification_report.json"
 
-VALID_ACTIONS = frozenset({"check", "collect", "refresh", "module"})
+VALID_ACTIONS = frozenset({"check", "collect", "refresh", "rebuild", "module"})
 
 
 class CollectCliError(RuntimeError):
@@ -101,8 +113,8 @@ class CollectCliError(RuntimeError):
 @dataclass
 class CollectResult:
     """What every action returns: whether anything was written, why (or
-    why not), and — for `check`/`collect`/`refresh` — the freshness verdict
-    that drove the decision."""
+    why not), and — for `check`/`collect`/`refresh`/`rebuild` — the
+    freshness verdict that drove the decision."""
 
     action: str
     wrote: bool
@@ -446,7 +458,7 @@ def _write_manifest(
     manifest_mod.write_manifest(manifest, collect_dir / MANIFEST_FILENAME)
 
 
-# ── the four actions ─────────────────────────────────────────────────────────
+# ── the five actions ─────────────────────────────────────────────────────────
 
 
 def action_check(root: Path, *, config: Optional[configparser.ConfigParser] = None) -> CollectResult:
@@ -502,6 +514,53 @@ def _full_build(
     return collect_dir, written, ctx
 
 
+def _full_build_message(why: str, ctx: CollectContext, written: List[str], collect_dir: Path) -> str:
+    """The one line every full build reports, whichever path reached it
+    (`--rebuild`, a first-ever run, a `collector_version` mismatch). It
+    leads with `why` so the reader sees which path ran, and it counts what
+    Pass B actually did: `--no-llm` / `[collect] llm_summaries = false`
+    / a summarizer that could not be built all leave `summary` empty, and
+    then the honest verb is "re-scanned", not "re-summarized"."""
+    total = len(ctx.modules)
+    summarized = sum(1 for m in ctx.modules if m.summary is not None)
+    if summarized:
+        what = f"{total} module(s) re-summarized"
+    else:
+        what = f"{total} module(s) re-scanned (Pass B skipped)"
+    return f"{why}{what}; wrote {len(written)} file(s) in {collect_dir}"
+
+
+def action_rebuild(
+    root: Path,
+    *,
+    config: Optional[configparser.ConfigParser] = None,
+    config_path: Optional[str] = None,
+    llm_call: Optional[LlmCall] = None,
+) -> CollectResult:
+    """`--collect --rebuild` / `/collect --rebuild`: unconditional full
+    rebuild.
+
+    This is `_full_build`'s path as a first-class action rather than a
+    fallback only: every module in the tree is re-scanned and re-summarized
+    regardless of freshness, regardless of which files changed, and
+    regardless of whether a prior artifact exists. That is what you want
+    after a `collector_version` bump, when the artifact is suspect, or
+    when a summarizer prompt changed and every module's `purpose` should be
+    re-derived — previously the only way to get that was to delete
+    `[collect] dir` (or point `--base` at an empty artifact dir) first.
+
+    One Pass B call per module, which is exactly why this is a flag you
+    opt into rather than what `--collect` does by default.
+    """
+    root = Path(root)
+    collect_dir, written, ctx = _full_build(root, config=config, config_path=config_path, llm_call=llm_call)
+    return CollectResult(
+        action="rebuild", wrote=True, fresh=True,
+        message=_full_build_message("", ctx, written, collect_dir),
+        collect_dir=collect_dir, written_files=tuple(written),
+    )
+
+
 def action_refresh(
     root: Path,
     *,
@@ -510,6 +569,11 @@ def action_refresh(
     llm_call: Optional[LlmCall] = None,
 ) -> CollectResult:
     """`--refresh`: diff-driven incremental rebuild (COLLECT-24).
+
+    This is the function `action_collect` delegates a stale tree to, so
+    `--collect` and `--refresh` share one implementation for the
+    "something changed" case and differ only in that `collect` is
+    freshness-gated (a fresh tree is a no-op) and never reaches here.
 
     Pass A (AST scan) is always cheap and re-runs over the whole tree —
     it does no network I/O and is byte-deterministic (COLLECT-3), so
@@ -529,9 +593,11 @@ def action_refresh(
     `--refresh`-costs-zero-LLM-calls-on-an-unchanged-tree measure
     (COLLECT-24 AC).
 
-    Falls back to an unconditional full build — today's previous
-    behaviour — when there is no existing manifest+artifact pair to diff
-    against; there is nothing to be "incremental" relative to.
+    Falls back to an unconditional full build (`_full_build`) when there is
+    no existing manifest+artifact pair to diff against — nothing to be
+    "incremental" relative to — and also when the existing manifest was
+    written by a different `collector_version`. `action_rebuild` reaches
+    the same path directly, without either condition.
     """
     root = Path(root)
     collect_dir = resolve_collect_dir(root, config)
@@ -573,7 +639,12 @@ def action_refresh(
     # existing "no previous manifest" case — fall back to a full build —
     # closes it the same way that case is already closed, and is the
     # literal mechanism the docstring already promised existed.
+    why = "no prior artifact to diff against — full build: "
     if previous_manifest is not None and previous_manifest.collector_version != manifest_mod.COLLECTOR_VERSION:
+        why = (
+            f"manifest was built by collector_version={previous_manifest.collector_version!r}, "
+            f"current is {manifest_mod.COLLECTOR_VERSION!r} — full build: "
+        )
         logger.info(
             "collect --refresh: manifest was built by collector_version=%r, "
             "current is %r — falling back to a full build instead of "
@@ -584,10 +655,10 @@ def action_refresh(
         previous_by_path = {}
 
     if previous_manifest is None:
-        collect_dir, written, _ctx = _full_build(root, config=config, config_path=config_path, llm_call=llm_call)
+        collect_dir, written, ctx = _full_build(root, config=config, config_path=config_path, llm_call=llm_call)
         return CollectResult(
             action="refresh", wrote=True, fresh=True,
-            message=f"no prior artifact to diff against — full build: rebuilt {len(written)} file(s) in {collect_dir}",
+            message=_full_build_message(why, ctx, written, collect_dir),
             collect_dir=collect_dir, written_files=tuple(written),
         )
 
@@ -656,10 +727,12 @@ def action_refresh(
     if changes.is_empty():
         message = f"tree unchanged — recomputed derived artifacts only, wrote {len(written)} file(s) in {collect_dir}"
     else:
-        message = (
-            f"incrementally refreshed {len(changes.changed)} changed and "
-            f"{len(changes.removed)} removed module(s); wrote {len(written)} file(s) in {collect_dir}"
-        )
+        # "and 0 removed" is noise on the common path (one edited file); the
+        # removed count appears only when something was actually removed.
+        scope = f"{len(changes.changed)} changed"
+        if changes.removed:
+            scope += f" and {len(changes.removed)} removed"
+        message = f"incrementally refreshed {scope} module(s); wrote {len(written)} file(s) in {collect_dir}"
 
     return CollectResult(
         action="refresh", wrote=True, fresh=True,
@@ -674,9 +747,25 @@ def action_collect(
     config_path: Optional[str] = None,
     llm_call: Optional[LlmCall] = None,
 ) -> CollectResult:
-    """`--collect` / `/collect`: one-shot. Builds only if there is no
-    manifest yet, or the existing one is stale; a fresh tree is a no-op —
-    no write of any kind, same as `check` would report."""
+    """`--collect` / `/collect`: one-shot, freshness-gated.
+
+    A fresh tree is a no-op — no write of any kind, same as `check` would
+    report. A stale tree delegates to `action_refresh`, so only the modules
+    whose content hash changed since the last manifest are re-summarized and
+    every unchanged module keeps its previous record (summary included)
+    verbatim. The previous behaviour was to call `_full_build` here, which
+    re-ran Pass B over *every* module in the tree for every single changed
+    file — one changed file cost the same as a from-scratch build.
+
+    The delegated result's own message is passed through unchanged, so the
+    printed line always says which path actually ran ("incrementally
+    refreshed N changed module(s)" vs "no prior artifact ... full build")
+    while `action` stays "collect" — the flag the user typed. The
+    unconditional full rebuild lives in `action_rebuild` (`--rebuild`); a
+    `collector_version` mismatch still forces one, because `action_refresh`
+    drops a version-mismatched previous manifest and falls back to
+    `_full_build`.
+    """
     check_result = action_check(root, config=config)
     if check_result.fresh:
         return CollectResult(
@@ -684,11 +773,11 @@ def action_collect(
             message="already up to date — nothing to do",
             collect_dir=check_result.collect_dir,
         )
-    collect_dir, written, _ctx = _full_build(root, config=config, config_path=config_path, llm_call=llm_call)
+    result = action_refresh(root, config=config, config_path=config_path, llm_call=llm_call)
     return CollectResult(
-        action="collect", wrote=True, fresh=True,
-        message=f"built {len(written)} file(s) in {collect_dir}",
-        collect_dir=collect_dir, written_files=tuple(written),
+        action="collect", wrote=result.wrote, fresh=result.fresh,
+        message=result.message,
+        collect_dir=result.collect_dir, written_files=result.written_files,
     )
 
 
@@ -886,9 +975,9 @@ def run(
     module_path: Optional[str] = None,
     llm_call: Optional[LlmCall] = None,
 ) -> CollectResult:
-    """Single dispatch point for all four actions — what `main.py`'s
-    `/collect` command / `--collect`/`--check`/`--refresh`/`--module`
-    flags call."""
+    """Single dispatch point for all five actions — what `main.py`'s
+    `/collect` command / `--collect`/`--check`/`--refresh`/`--rebuild`/
+    `--module` flags call."""
     if action not in VALID_ACTIONS:
         raise CollectCliError(f"unknown collect action {action!r}; must be one of {sorted(VALID_ACTIONS)}")
     root = Path(root)
@@ -904,6 +993,8 @@ def run(
         )
     if action == "refresh":
         return action_refresh(root, config=config, config_path=config_path, llm_call=llm_call)
+    if action == "rebuild":
+        return action_rebuild(root, config=config, config_path=config_path, llm_call=llm_call)
     if action == "module":
         if not module_path:
             raise CollectCliError("action='module' requires module_path")
@@ -917,13 +1008,18 @@ def run(
 def parse_collect_args(argv: List[str]) -> Dict[str, Any]:
     """Parse the collect-specific slice of argv into `run()` kwargs. Kept
     separate from stdlib `argparse` so `main.py` can add `--collect`,
-    `--check`, `--refresh`, and `--module` to its existing parser and just
-    forward here — see that module's own `_parse_args` for the actual flag
-    definitions."""
+    `--check`, `--refresh`, `--rebuild`, and `--module` to its existing
+    parser and just forward here — see that module's own `_parse_args` for
+    the actual flag definitions."""
     action = "collect"
     module_path = None
     if "--check" in argv:
         action = "check"
+    elif "--rebuild" in argv:
+        # Before `--refresh`, and the same order `main.py`'s one-shot branch
+        # uses, so `/collect --refresh --rebuild` and `--collect --refresh
+        # --rebuild` run the same action: the unconditional one.
+        action = "rebuild"
     elif "--refresh" in argv:
         action = "refresh"
     elif "--module" in argv:

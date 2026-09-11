@@ -160,7 +160,7 @@ guarantee itself.
 
 | Task | What |
 |---|---|
-| COLLECT-19 | `/collect`, `--collect`, `--check` (freshness only), `--refresh` (diff-driven incremental rebuild), `--module <path>` (incremental) — same grain as existing `/auto`/`/edit` |
+| COLLECT-19 | `/collect`, `--collect` (freshness-gated: no-op when fresh, incremental refresh when stale), `--check` (freshness only), `--refresh` (diff-driven incremental rebuild), `--rebuild` (unconditional full rebuild), `--module <path>` (incremental) — same grain as existing `/auto`/`/edit` |
 | COLLECT-20 | `[collect]` section in `agents.ini`: `dir`, `enabled`, `use_in_auto/doc/bughunt`, `staleness`, `llm_summaries`, `think` — all safe-fallback |
 
 ### EPIC G — Consumer: loader + bughunt + auto/doc (where the payoff lands)
@@ -202,8 +202,13 @@ it).
 Same grain as the existing `/`-prefixed commands (`/auto`, `/faq`, `/search`, `/edit`)
 and the `--auto` flag — `collect` doesn't invent a parallel system:
 
-- **`/collect`** (interactive) / **`--collect`** (one-shot) — build or refresh the
-  artifact set for the current `--base` directory, then exit.
+- **`/collect`** (interactive) / **`--collect`** (one-shot) — bring the
+  artifact set for the current `--base` directory up to date, then exit.
+  Freshness-gated: a fresh tree is a no-op (no writes of any kind), and a
+  stale tree refreshes incrementally — the same code path as `--refresh`, so
+  only the modules whose manifest hash changed get re-summarized. A first run
+  against an empty artifact dir is a full build, since there is nothing to
+  diff against.
 - **`/collect --check`** — freshness report only, writes nothing.
 - **`/collect --module <path>`** — incremental re-collect of a single file.
 - **`/collect --refresh`** — diff-driven incremental rebuild: modules whose manifest
@@ -212,9 +217,16 @@ and the `--auto` flag — `collect` doesn't invent a parallel system:
   whose hash *did* change get re-scanned/re-summarized (COLLECT-24). **Not** a full
   rebuild — pointing `--base` at a fresh checkout of the same tree with an existing
   `.collect/` artifact from an older commit will carry most modules' summaries
-  forward unchanged. To force every module through Pass B again regardless of what
-  changed, delete `[collect] dir` (or point `--base`/the artifact dir somewhere
-  empty) before running `--collect`.
+  forward unchanged.
+- **`/collect --rebuild`** — unconditional full rebuild: every module in the tree
+  is re-scanned and re-summarized regardless of freshness, of which files changed,
+  and of any prior artifact. One Pass B call per module, which is why it is an opt-in
+  flag rather than what `--collect` does by default — use it after a
+  `collector_version` bump, to discard a suspect artifact, or after changing the
+  summarizer prompt, instead of deleting `[collect] dir` by hand. A
+  `collector_version` mismatch still forces a full rebuild even through plain
+  `--collect`/`--refresh`, since there is no safe record to reuse from the old
+  schema.
 
 `collect` is **read-only against the source tree** — it never edits code, only writes
 under its own artifact directory (`COLLECT-19`'s AC is literally that it's physically

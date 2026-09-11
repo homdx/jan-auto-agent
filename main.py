@@ -741,9 +741,19 @@ Available commands
   /help, /?            Show this help
   /auto <goal>         Run autonomous improvement mode (AUTO-A1).
                        e.g. /auto improve current code
-  /collect             Build/refresh the structural project model into
-                       [collect] dir (default .collect/). Read-only to the
-                       source tree; freshness-gated (no-op if up to date).
+  /collect             Bring the structural project model in [collect] dir
+                       (default .collect/) up to date. Read-only to the
+                       source tree. Freshness-gated: a no-op (no writes) if
+                       up to date, and an incremental refresh if stale —
+                       only the modules whose content changed are re-summarized,
+                       every unchanged module keeps its existing record.
+                       /collect --check        freshness report only, writes nothing
+                       /collect --module <p>   incremental re-scan of one module
+                       /collect --refresh      same incremental path, not freshness-gated
+                       /collect --rebuild      unconditional full rebuild: every
+                                               module re-summarized. Use after a
+                                               collector_version bump or to discard a
+                                               suspect artifact
   /faq <question>      Search the knowledge folder and answer the question.
                        Replies NOT FOUND if no matching entry exists.
                        e.g. /faq how do I reset my password?
@@ -847,12 +857,28 @@ def _parse_args():
     # Producer is read-only to the source tree; writes land only under
     # [collect] dir (default .collect/).
     parser.add_argument("--collect", action="store_true", default=False,
-                        help="One-shot: build the structural project model into [collect] dir "
-                             "if missing/stale (no-op if already fresh), then exit.")
+                        help="One-shot: bring the structural project model in [collect] dir "
+                             "up to date, then exit. Freshness-gated — a fresh tree is a "
+                             "no-op (no writes), a stale tree refreshes incrementally: only "
+                             "the modules whose content changed are re-summarized, every "
+                             "unchanged module keeps its existing record. Use --collect "
+                             "--rebuild for an unconditional full rebuild.")
     parser.add_argument("--check", action="store_true", default=False,
                         help="With --collect: only check freshness — writes nothing, anywhere.")
     parser.add_argument("--refresh", action="store_true", default=False,
-                        help="With --collect: unconditional full rebuild, ignoring freshness.")
+                        help="With --collect: diff-driven incremental rebuild — re-summarize "
+                             "only the modules whose content hash changed since the last "
+                             "run; unchanged modules keep their existing record (summary "
+                             "included) and cost zero LLM calls. Same path --collect takes "
+                             "on a stale tree, just not freshness-gated. Falls back to a "
+                             "full build only when there is no prior artifact to diff "
+                             "against (or the manifest is from a different collector_version).")
+    parser.add_argument("--rebuild", action="store_true", default=False,
+                        help="With --collect: unconditional full rebuild — every module in "
+                             "the tree is re-scanned and re-summarized regardless of "
+                             "freshness, of which files changed, and of any prior artifact. "
+                             "Use after a collector_version bump or to discard a suspect "
+                             "artifact; --collect on its own stays incremental.")
     parser.add_argument("--module", metavar="PATH", default=None,
                         help="With --collect: incrementally re-scan only this one module path "
                              "and patch it into the existing artifact + manifest.")
@@ -1157,6 +1183,8 @@ def main():
 
         if args.module is not None:
             action = "module"
+        elif args.rebuild:
+            action = "rebuild"
         elif args.refresh:
             action = "refresh"
         elif args.check:
@@ -1383,10 +1411,12 @@ def main():
                               f"(see logs / .agent trace for details).")
                 continue
 
-            # COLLECT-19: /collect [--check|--refresh|--module <path>] —
-            # build/refresh the structural project model. Producer is
-            # read-only to the source tree; writes land only under
-            # [collect] dir (default .collect/).
+            # COLLECT-19: /collect [--check|--refresh|--rebuild|--module <path>] —
+            # bring the structural project model up to date. Bare /collect is
+            # freshness-gated (no-op when fresh, incremental refresh when
+            # stale); /collect --rebuild is the unconditional full rebuild.
+            # Producer is read-only to the source tree; writes land only
+            # under [collect] dir (default .collect/).
             if user_input.startswith("/collect"):
                 from tools.collect.cli import CollectCliError, parse_collect_args, run as collect_run
                 from tools.collect.summarizer import make_summarizer_call, should_run_pass_b
