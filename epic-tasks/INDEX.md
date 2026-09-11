@@ -1,4 +1,4 @@
-# Epic round — 27 tickets, in order
+# Epic round — 28 tickets, in order
 
 One ticket per round. Every agent does the same ticket against the same
 tree; you merge the winner; the next round starts from the merged tree.
@@ -33,6 +33,7 @@ The loop and the scorecard: `docs/collect-epics/RUN-THE-EPIC-COMPETITION.md`.
 | 25 | `L4` | HIGH | S | [25-l4-graph-py-drops-from-pkg-import-module-as-alias-e.md](25-l4-graph-py-drops-from-pkg-import-module-as-alias-e.md) | `tools/collect/graph.py` |
 | 26 | `L5` | HIGH | S | [26-l5-test-map-scans-only-tests-the-import-graph-scans.md](26-l5-test-map-scans-only-tests-the-import-graph-scans.md) | `tools/collect/test_map.py` |
 | 27 | `L6` | HIGH | S | [27-l6-the-budget-loop-lets-public-symbols-displace-the.md](27-l6-the-budget-loop-lets-public-symbols-displace-the.md) | `tools/auto/context_assembler.py` |
+| 28 | `V16` | HIGH | S | [28-v16-pass-c-a-bare-name-in-a-source-summary-means-the-symbol-defined-here.md](28-v16-pass-c-a-bare-name-in-a-source-summary-means-the-symbol-defined-here.md) | `tools/collect/verifier.py` |
 
 ## Working these
 
