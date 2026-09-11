@@ -1,5 +1,6 @@
 # V11 — Pass C stops eating test-file summaries
 
+**Status:** landed — `9406601`  
 **Severity:** HIGH  
 **File:** `tools/collect/verifier.py`  
 **Symbol:** `—`  

@@ -1,5 +1,6 @@
 # L6 — the budget loop lets `public_symbols` displace the fact rows
 
+**Status:** landed — `ced5940`  
 **Severity:** HIGH  
 **File:** `tools/auto/context_assembler.py`  
 **Symbol:** `—`  

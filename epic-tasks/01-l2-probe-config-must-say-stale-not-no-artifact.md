@@ -1,5 +1,6 @@
 # L2 — `probe_config` must say `stale`, not `no_artifact`
 
+**Status:** landed — `8212df1`  
 **Severity:** HIGH  
 **File:** `tools/auto/architect.py`  
 **Symbol:** `—`  

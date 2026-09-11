@@ -1,5 +1,6 @@
 # V9 — Freshness is checked once and then believed all run
 
+**Status:** landed — `2f9005d`  
 **Severity:** HIGH  
 **File:** `tools/auto/collect_bridge.py`  
 **Symbol:** `—`  

@@ -1,5 +1,6 @@
 # L5 — `test_map` scans only `tests/`; the import graph scans four roots
 
+**Status:** landed — `9664530`  
 **Severity:** HIGH  
 **File:** `tools/collect/test_map.py`  
 **Symbol:** `—`  

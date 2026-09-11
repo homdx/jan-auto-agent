@@ -1,5 +1,6 @@
 # V4 — Rows: `fails_open`, `risk`
 
+**Status:** open (verified against `2f9005d`, 2026-09-12)  
 **Severity:** HIGH  
 **File:** `tools/auto/context_assembler.py`  
 **Symbol:** `—`  

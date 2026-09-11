@@ -1,5 +1,6 @@
 # M6 — Outcome metric: precision against the adjudicated corpus
 
+**Status:** open (verified against `2f9005d`, 2026-09-12)  
 **Severity:** MEDIUM  
 **File:** `scripts/`  
 **Symbol:** `—`  
@@ -41,7 +42,7 @@ findings produced               ___          ___
 
 - [ ] Noise floor recorded before and after, produced by the existing scorers.
 - [ ] Zero REAL findings lost.
-- [ ] Numbers land in `docs/collect-epics/METRICS.md` under **Measured**.
+- [ ] Numbers land in `docs/collect-epics/EPIC-M-metrics.md` (**Measured** table — there is no `METRICS.md`) under **Measured**.
 
 ---
 

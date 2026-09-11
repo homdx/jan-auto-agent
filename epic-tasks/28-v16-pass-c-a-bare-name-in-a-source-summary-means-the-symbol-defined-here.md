@@ -1,5 +1,6 @@
 # V16 — Pass C: a bare name in a source-file summary means the symbol defined *here*
 
+**Status:** landed — `ac28672`  
 **Severity:** HIGH  
 **File:** `tools/collect/verifier.py`  
 **Symbol:** `extract_claims`, `_prefer_citable_homonyms`  

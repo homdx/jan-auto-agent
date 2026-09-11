@@ -1,5 +1,6 @@
 # M1 — `scripts/collect_metrics.py` — the static baseline
 
+**Status:** landed — `5fe7737`  
 **Severity:** CRITICAL  
 **File:** `scripts/collect_metrics.py`  
 **Symbol:** `—`  

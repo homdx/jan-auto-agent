@@ -898,6 +898,13 @@ Eleven tickets — L4–L6 were added after V3 was measured against the artifact
 changes to V1–V3. Everything else — V4, V6's memo, V10, V12–V15 — is refinement on
 top of a working pack, and each can be dropped without breaking the ones above.
 
+**Correction (2026-09-12, all eleven landed):** V6's *budget wire* is not
+droppable. `CollectBridge.context_for` still calls
+`build_collect_context_block` without `budget=`, so L6's row-shrinking loop
+never runs in a live `--auto`; every overshoot goes to `_shrink`. V6 step 1 is
+the twelfth ticket of the short path. Status of every ticket:
+`STATUS.md`.
+
 | | v1 | v2 |
 |---|---|---|
 | tickets | 29 | 15 + 6 measurement |

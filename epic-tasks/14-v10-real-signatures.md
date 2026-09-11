@@ -1,5 +1,6 @@
 # V10 — Real signatures
 
+**Status:** open (verified against `2f9005d`, 2026-09-12)  
 **Severity:** MEDIUM  
 **File:** `tools/collect/ast_facts.py`  
 **Symbol:** `—`  

@@ -1,5 +1,6 @@
 # V7 — `--collect` on a stale tree goes incremental; fix the docs
 
+**Status:** landed — `25d5de8`  
 **Severity:** HIGH  
 **File:** `tools/collect/cli.py`  
 **Symbol:** `—`  

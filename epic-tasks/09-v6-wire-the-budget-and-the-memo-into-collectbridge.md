@@ -1,5 +1,6 @@
 # V6 — Wire the budget and the memo into `CollectBridge`
 
+**Status:** open (verified against `2f9005d`, 2026-09-12)  
 **Severity:** HIGH  
 **File:** `tools/auto/collect_bridge.py`  
 **Symbol:** `—`  
@@ -11,6 +12,27 @@
 
 **Priority:** High · **Size:** S · **Files:** `tools/auto/collect_bridge.py`,
 `agents*.ini` *(v1: A9 + A11, one boolean instead of seven keys)*
+
+### Verified against `2f9005d` (2026-09-12) — read this first
+
+- **This is now the ticket that makes L6 real.** `build_collect_context_block`
+  takes `budget=` and L6's row-shrinking loop is in place, but
+  `CollectBridge.context_for` (`tools/auto/collect_bridge.py`) still calls it
+  **without** `budget` — so in a live run every block is assembled unbudgeted
+  and any overshoot goes straight to `_shrink` (an LLM call that may cut fact
+  rows). PLAN-v2 §6 says V6 "can be dropped"; that is wrong for step 1 and
+  right only for the memo.
+- V9 landed first: `context_for` now checks `_is_dirty(target_file)` before
+  the budget. Keep that order, and the memo from step 2 must be **dropped for a
+  path when `invalidate()` marks it dirty** — a memoised pre-edit block is
+  exactly the bug V9 fixed. A test for that belongs in the ticket.
+- "`pack_enabled = false` restores the V2 block (today's three rows)" is
+  stale: the three-row block no longer exists. Redefine: `false` renders only
+  the rows that carry no neighbourhood facts — `contract`, `config_read`,
+  `public_symbols` — i.e. the pre-V3 shape. `use_in_auto` stays the master
+  switch; `pack_enabled` is the finer one and M5 may use either.
+- Row caps named below already live as module constants in
+  `context_assembler.py`; do not re-introduce them.
 
 **Do**
 

@@ -1,5 +1,6 @@
 # V8 — `--no-llm` preserves existing summaries
 
+**Status:** open (verified against `2f9005d`, 2026-09-12)  
 **Severity:** HIGH  
 **File:** `tools/collect/cli.py`  
 **Symbol:** `—`  
@@ -15,6 +16,17 @@
 
 Documented as "a purely structural build". It is a full rebuild that writes
 `summary: null` for every module — 469 summaries destroyed, silently.
+
+### Verified against `2f9005d` (2026-09-12)
+
+V7 changed the shape of this bug without closing it. `--collect` on a stale
+tree is now incremental (`action_refresh` carries unchanged records forward,
+summaries included), so `--collect --no-llm` after a normal build destroys
+summaries **only for the modules whose hash changed** — those are rebuilt with
+`llm_call=None` and get `summary: null`. `--rebuild --no-llm` still nulls all
+of them. Step 1 therefore reduces to the changed-module path plus `--rebuild`;
+step 3's `llm-stale` provenance is what the changed-module path should write
+instead of `null`. Test both paths, not the full-build one alone.
 
 **Do**
 

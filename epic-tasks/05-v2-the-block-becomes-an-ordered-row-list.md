@@ -1,5 +1,6 @@
 # V2 — The block becomes an ordered row list
 
+**Status:** landed — `72bbc86`  
 **Severity:** HIGH  
 **File:** `tools/auto/context_assembler.py`  
 **Symbol:** `—`  

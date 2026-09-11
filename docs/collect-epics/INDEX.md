@@ -18,6 +18,7 @@
 | [`LIVE-RUN-VALIDATION.md`](LIVE-RUN-VALIDATION.md) | the plans checked against **five live `--auto` runs** (2026-09-09 22:10 UTC), not against a harness. One premise turned out understated, one live defect surfaced, one run was producing competition data blind. |
 | [`EPIC-L-live-findings.md`](EPIC-L-live-findings.md) | `L1`–`L3` — the three tickets that measurement produced. Additive; neither plan is rewritten. |
 | [`RUN-THE-EPIC-COMPETITION.md`](RUN-THE-EPIC-COMPETITION.md) | **how to actually run these**: N agents, one ticket per round, merge the winner, next round from the merged tree. Reuses the fix-round machinery unchanged. |
+| [`STATUS.md`](STATUS.md) | **where it stands** (2026-09-12): 14 of 28 landed, the open 14 re-verified and re-ordered, what live run is pending, how to read it, how rounds were validated. |
 | [`MEASURE-BEFORE-AFTER.md`](MEASURE-BEFORE-AFTER.md) | **the before/after protocol**: which of the three instruments decides what, the exact re-run commands, and which columns are a verdict versus which are weather. Read with `EPIC-M-metrics.md`. |
 
 Both plans keep `CollectBridge._shrink` byte-identical. v2 is the recommended

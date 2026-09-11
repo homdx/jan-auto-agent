@@ -1,5 +1,6 @@
 # L4 — `graph.py` drops `from <pkg> import <module> as <alias>` edges
 
+**Status:** landed — `6f2550f`  
 **Severity:** HIGH  
 **File:** `tools/collect/graph.py`  
 **Symbol:** `—`  

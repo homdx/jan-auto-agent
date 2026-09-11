@@ -1,5 +1,6 @@
 # M4 — Runtime counters: collect events + Gate-1 stage split
 
+**Status:** open (verified against `2f9005d`, 2026-09-12)  
 **Severity:** HIGH  
 **File:** `tools/auto/run_trace.py`  
 **Symbol:** `—`  
@@ -16,6 +17,22 @@
 Tier 0 and Tier 1 are static. Tier 2 needs the run to say what happened.
 (This ticket absorbs v1's C5 and B4, which were measurement work filed as
 feature work at the end of two different epics.)
+
+### Verified against `2f9005d` (2026-09-12)
+
+- `collect_miss` already exists: V9 emits it through `tracer.event(...,
+  kind="collect_miss", params={reason, target, task_id?})` from
+  `CollectBridge._miss`, with per-run counts on `bridge.collect_misses`.
+  Reuse that channel for `absent` / `stale` / `unknown_module`; do not add a
+  second one. `run_trace.py` is not where it lives — it is `tools/agent_trace.py`.
+- `scripts/trace_round_snapshot.py` today counts a block by grepping the trace
+  for the literal header `COLLECT MODEL (static facts` in the coder prompt.
+  Once `collect_block` events exist, the snapshot must count those instead
+  (and keep the grep as a fallback for pre-M4 traces), or the before/after
+  columns are not comparable.
+- `collect_shrink` observes `_shrink` from `context_for`: `before=len(raw)`,
+  `after=len(result)`, `path="llm"` if `shrink_calls` incremented else
+  `"truncate"`. Still no edit inside `_shrink`.
 
 ### Do
 

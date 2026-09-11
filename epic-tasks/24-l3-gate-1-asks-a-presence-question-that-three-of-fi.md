@@ -1,5 +1,6 @@
 # L3 — Gate 1 asks a presence question that three of five goals cannot answer
 
+**Status:** open (verified against `2f9005d`, 2026-09-12)  
 **Severity:** MEDIUM  
 **File:** `—`  
 **Symbol:** `—`  

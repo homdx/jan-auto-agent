@@ -1,5 +1,6 @@
 # V14 — Turn on docs mode
 
+**Status:** open (verified against `2f9005d`, 2026-09-12)  
 **Severity:** MEDIUM  
 **File:** `tools/auto/context_assembler.py`  
 **Symbol:** `—`  

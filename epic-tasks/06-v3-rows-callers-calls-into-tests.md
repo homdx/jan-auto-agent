@@ -1,5 +1,6 @@
 # V3 — Rows: `callers`, `calls_into`, `tests`
 
+**Status:** landed — `b609492`  
 **Severity:** HIGH  
 **File:** `tools/auto/context_assembler.py`  
 **Symbol:** `—`  

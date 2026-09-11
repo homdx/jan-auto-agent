@@ -1,5 +1,6 @@
 # V1 — Loader keeps the import graph, and three queries on top
 
+**Status:** landed — `81658b6`  
 **Severity:** HIGH  
 **File:** `tools/collect/loader.py`  
 **Symbol:** `—`  

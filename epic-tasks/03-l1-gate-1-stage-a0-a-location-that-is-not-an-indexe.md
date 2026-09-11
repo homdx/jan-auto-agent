@@ -1,5 +1,6 @@
 # L1 — Gate-1 Stage A0: a location that is not an indexed source file costs no LLM call
 
+**Status:** open (verified against `2f9005d`, 2026-09-12)  
 **Severity:** HIGH  
 **File:** `tools/auto/gate1_filter.py`  
 **Symbol:** `—`  
@@ -53,6 +54,16 @@ does not index, and route it by task mode instead:
   behaviour exactly, LLM call included.
 - otherwise → reject at Stage A0 with
   `stage="existence"`, `reason="location is not an indexed source file (<ext>)"`.
+
+### Verified against `2f9005d` (2026-09-12)
+
+Still open and still true. What moved in your favour: `Gate1Filter` already
+takes `collect_bridge=` (GATE1-CTX-1/2, `self._collect_bridge`) and the
+controller passes the one bridge it built — so "does the model know this path"
+is `bridge.usable and bridge.module_symbols(path)`-shaped, no new plumbing.
+V9 adds a wrinkle: a path the run has already edited is *dirty* and the bridge
+withholds it; treat dirty as "known" (it is indexed, just stale), not as
+"unindexed", or Stage A0 would start rejecting `.py` files mid-run.
 
 ### Do
 

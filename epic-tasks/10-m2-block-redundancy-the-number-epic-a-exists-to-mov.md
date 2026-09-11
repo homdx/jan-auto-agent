@@ -1,5 +1,6 @@
 # M2 — Block redundancy: the number EPIC A exists to move
 
+**Status:** landed — `5ace54f`  
 **Severity:** CRITICAL  
 **File:** `scripts/collect_metrics.py`  
 **Symbol:** `—`  

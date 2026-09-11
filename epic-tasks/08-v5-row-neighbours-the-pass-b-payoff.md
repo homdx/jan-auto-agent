@@ -1,5 +1,6 @@
 # V5 — Row: `neighbours` — the Pass B payoff
 
+**Status:** landed — `da78fa3`  
 **Severity:** HIGH  
 **File:** `tools/auto/context_assembler.py`  
 **Symbol:** `—`  

@@ -1,5 +1,6 @@
 # M5 — A/B harness: one goal, two runs, one diff
 
+**Status:** open (verified against `2f9005d`, 2026-09-12)  
 **Severity:** HIGH  
 **File:** `scripts/collect_ab.sh`  
 **Symbol:** `—`  
@@ -16,6 +17,20 @@
 **Depends on:** M4
 
 The only way to claim "the agent works better" is to run the same thing twice.
+
+### Verified against `2f9005d` (2026-09-12) — two corrections
+
+1. **Not `--dry-run`.** `MEASURE-BEFORE-AFTER.md` §"`--dry-run` skips the
+   coder" is right: the collect block is built only in `Coder._build_prompt`,
+   so a dry-run A/B measures nothing the pack does. Both runs must execute
+   tasks. Do it against a local stub that answers every role (copy `proxy2/`
+   to `proxy-stub/` and log requests to JSON, or the harness's own stub) —
+   never a live provider. The switch is `[collect] use_in_auto` (exists today);
+   `pack_enabled` is a finer switch that only exists once V6 lands, so this
+   ticket depends on **M4** and optionally V6, not on V6 unconditionally.
+2. "fixed seed": the run has no seed flag. Determinism comes from the stub —
+   a stub that replays recorded answers keyed by prompt hash gives
+   "two runs of A produce the same counters" for free; a live model never will.
 
 ### Do
 

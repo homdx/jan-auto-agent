@@ -1,5 +1,6 @@
 # V15 — Docs sync and the consumer column
 
+**Status:** open (verified against `2f9005d`, 2026-09-12)  
 **Severity:** LOW  
 **File:** `README.md`  
 **Symbol:** `—`  
@@ -27,7 +28,7 @@
 3. `README.md` `[collect]`: `pack_enabled`, `--rebuild`, `--drop-summaries`, the
    corrected `--refresh` description, and what `use_in_bughunt` / `use_in_doc`
    now do.
-4. `docs/collect-epics/METRICS.md` gets the filled before/after table.
+4. `docs/collect-epics/EPIC-M-metrics.md` (**Measured** table — there is no `METRICS.md`) gets the filled before/after table.
 
 **Acceptance**
 
