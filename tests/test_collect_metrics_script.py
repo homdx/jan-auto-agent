@@ -1,4 +1,4 @@
-"""tests/test_collect_metrics_script.py — EPIC M1: `scripts/collect_metrics.py`.
+"""tests/test_collect_metrics_script.py — EPIC M1/M2: `scripts/collect_metrics.py`.
 
 M1's acceptance list, as tests, against `tests/fixtures/collect_mini_repo`:
 
@@ -12,6 +12,14 @@ M1's acceptance list, as tests, against `tests/fixtures/collect_mini_repo`:
 * the block section is rendered over the real `CollectModel`, so what is
   measured is the block that ships, and a later change to the loader's read
   side (V5, L4–L6) is measured rather than shadowed by a copy.
+
+M2 — block redundancy, the number EPIC A exists to move — at the end:
+
+* every row the renderer packs has a class in `ROW_KIND`, and V5's `neighbours`
+  row is `new` (M1's dict did not name it, so it counted as unknown);
+* redundant + new = total, per block, with the header in neither;
+* "blocks with a new row" counts blocks, not rows;
+* the three numbers reconcile with the rendered blocks.
 
 The mini artifact is produced by `tools.collect.cli.action_collect` with the
 seed data neutralized exactly as `tests/test_collect_cli.py` does it: the seeds
@@ -309,3 +317,74 @@ def test_the_script_read_only_contract_holds_in_source():
         assert forbidden not in code, forbidden
     # and it never opens a path for writing except the one `--json` names
     assert source.count('write_text(') == 1
+
+
+# ── M2: block redundancy ─────────────────────────────────────────────────────
+
+
+def test_every_packed_row_has_a_class_and_neighbours_is_new():
+    """`ROW_KIND` names every row `_PACK_ROWS` renders — a row without a class
+    falls into `blocks_rows_unknown` and out of EPIC A's number, which is how
+    V5's `neighbours` row went uncounted under M1 — and the renderer's own
+    prefix is what `_kind_of` matches, not a copy of it."""
+    from tools.auto import context_assembler as ca
+
+    packed = {name for name, _render in ca._PACK_ROWS}
+    assert packed <= set(cm.ROW_KIND), packed - set(cm.ROW_KIND)
+    assert cm.ROW_KIND_CLASS["neighbours"] == "new"
+    assert cm._kind_of(f"{ca._NEIGHBOURS_PREFIX}pkg/other.py — reads the config{ca._NEIGHBOURS_LLM_LABEL}") == "neighbours"
+    assert set(cm.ROW_KIND_CLASS.values()) == {"redundant", "new"}
+    # the two lookup tables are views of the one dict
+    assert dict(cm.ROW_KIND_BY_PREFIX) == {prefix: kind for kind, (_cls, prefix) in cm.ROW_KIND.items()}
+    assert {k for k, v in cm.ROW_KIND_CLASS.items() if v == "redundant"} == {
+        "module", "parse_error", "public_symbols", "config_read",
+    }
+
+
+def test_classify_block_partitions_the_rows_and_skips_the_header():
+    block = "\n".join([
+        "COLLECT MODEL (static facts, do not contradict):",
+        "module: pkg/a.py",
+        "callers: 2 modules import this: pkg/b.py, pkg/c.py",
+        "neighbours: pkg/b.py — owns the config (llm)",
+        "public_symbols: f(), g()",
+        "risk: HIGH — 3 findings",
+        "something: the renderer grew a row nobody classified",
+    ])
+    tally = cm._classify_block(block)
+    assert tally["redundant"] == len("module: pkg/a.py") + len("public_symbols: f(), g()")
+    assert tally["new"] == sum(len(l) for l in block.split("\n") if l.startswith(("callers", "neighbours", "risk")))
+    assert tally["total"] == tally["redundant"] + tally["new"]
+    assert tally["new_rows"] == 3
+    assert tally["unknown_rows"] == 1  # the canary, counted but not classed
+
+    empty = cm._classify_block("COLLECT MODEL (static facts, do not contradict):\nmodule: pkg/a.py")
+    assert empty["new"] == 0 and empty["new_rows"] == 0
+    assert empty["total"] == empty["redundant"] == len("module: pkg/a.py")
+
+
+def test_m2_numbers_reconcile_with_the_rendered_blocks(mini_collect):
+    payload, _ = cm.read_collect_dir(mini_collect)
+    metrics = cm.compute_metrics(
+        payload, {"collect_dir": str(mini_collect), "artifact_bytes": 0, "collector_version": "1"}
+    )
+    model = cm.load_model(mini_collect)
+    blocks = [b for b in (cm._rendered(model, m.path, None) for m in model.modules) if b]
+    tallies = [cm._classify_block(b) for b in blocks]
+
+    assert metrics["schema"] == "collect-metrics-m2"
+    assert metrics["blocks_chars_redundant"] == sum(t["redundant"] for t in tallies)
+    assert metrics["blocks_chars_new"] == sum(t["new"] for t in tallies)
+    assert metrics["blocks_chars_total"] == metrics["blocks_chars_redundant"] + metrics["blocks_chars_new"]
+    assert metrics["blocks_chars_redundant_pct"] == round(
+        100.0 * metrics["blocks_chars_redundant"] / metrics["blocks_chars_total"], 1
+    )
+    assert metrics["blocks_with_new_row"] == sum(1 for t in tallies if t["new_rows"])
+    assert 0 < metrics["blocks_with_new_row"] <= metrics["blocks_non_empty"]
+    assert metrics["blocks_rows_new"] == sum(t["new_rows"] for t in tallies)
+    assert metrics["blocks_rows_unknown"] == 0
+    # a block-of-facts denominator: the header is in no bucket
+    assert metrics["blocks_chars_total"] < sum(len(b) for b in blocks)
+
+    # an empty artifact divides nothing
+    assert cm._block_metrics(cm.CollectModel(status="absent"), 1200)["blocks_chars_redundant_pct"] == 0.0

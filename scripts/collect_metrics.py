@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""scripts/collect_metrics.py — EPIC M1: the static baseline.
+"""scripts/collect_metrics.py — EPIC M1/M2: the static baseline.
 
 One read-only pass over one `.collect/` directory. No repo scan, no LLM, no
 network, no git: the artifact is the only input. Two outputs — a human table
@@ -9,7 +9,10 @@ on stdout, and `--json` for diffing.
         --json docs/collect-epics/baseline.json
 
 Tier 0 and Tier 1 of `docs/collect-epics/EPIC-M-metrics.md`, measured from
-`artifact.json` alone. The per-task block section is measured, not estimated:
+`artifact.json` alone — M1's table, plus M2's three numbers (redundant share
+of block chars, blocks with a new row, mean new rows per block), which are
+EPIC A's claim *"the block describes the file the coder already has"* made
+measurable. They all come from `ROW_KIND`, one fixed kind→class dict. The per-task block section is measured, not estimated:
 `build_collect_context_block` is imported and run for every module, over the
 same `CollectModel` the coder gets (`loader._load_from_dir`, artifact only —
 never `loader.load()`, which scans the repo to judge freshness), so a change to
@@ -42,6 +45,12 @@ checking the live source before implementing (ground rule 1):
    The last is EPIC A's whole point — V3's `callers`/`calls_into`/`tests` rows
    are the pack's first facts the target file cannot show — so it is reported
    as measured, not restated as zero.
+
+4. M1's classifier did not name V5's `neighbours` row, so every one of those
+   lines fell through to `blocks_rows_unknown` and the "new rows" line
+   under-counted the pack it rendered. M2 names the kind; the same renderer
+   therefore reports more new rows than M1 did, and `blocks_rows_unknown` is
+   printed in the table from now on as the canary for the next unnamed row.
 
 Contract
 --------
@@ -99,34 +108,40 @@ DEFAULT_MAX_CONTEXT_CHARS = 1200
 _ELIDED_SUFFIX = "(...)"
 
 
-# M2's classification, shipped with M1 because M1's own table carries the "rows
-# per block that are NOT derivable from the target file's own source" line. One
-# fixed dict on purpose: it has to be stable, not clever, so a before/after pair
-# is comparable. `redundant` = visible by reading the target file, which the
-# coder already has in full in the same prompt.
-ROW_KIND_CLASS: "Dict[str, str]" = {
-    "module": "redundant",        # the file path itself
-    "parse_error": "redundant",   # a statement about this file's own source
-    "public_symbols": "redundant",
-    "config_read": "redundant",   # every read site is in the file
-    "callers": "new",             # who breaks lives outside this file
-    "calls_into": "new",          # first-party imports, resolved via the artifact
-    "tests": "new",               # the covering test tree
-    "contract": "new",            # lives in a registry, not in the file
+# M2's classification — the one dict EPIC A's number comes from. `redundant`
+# = visible by reading the target file, which the coder already has in full in
+# the same prompt; `new` = the fact lives outside that file (the artifact's
+# graph, the test tree, a registry, another module's summary). One fixed dict on
+# purpose: it has to be stable, not clever, so a before/after pair is
+# comparable. The value is ``(class, line prefix)`` — the class and the prefix
+# that names the row in the rendered block — so a kind is labelled in exactly
+# one place; `ROW_KIND_CLASS` and `ROW_KIND_BY_PREFIX` below are views of it.
+# V4's three rows are pinned before they render (their prefix is the row name
+# the ticket gives them): landing V4 must not move the line between the classes.
+ROW_KIND: "Dict[str, tuple]" = {
+    # ── redundant: the target file says this itself ──────────────────────────
+    "module": ("redundant", "module: "),                  # the file path itself
+    "parse_error": ("redundant", "parse_error: "),        # a statement about this file's own source
+    "public_symbols": ("redundant", "public_symbols: "),  # the file's own top-level names
+    "config_read": ("redundant", "config_read ["),        # every read site is in the file
+    # ── new: the fact is outside the target file ─────────────────────────────
+    "callers": ("new", "callers: "),                      # who breaks lives outside this file
+    "calls_into": ("new", "calls_into: "),                # first-party imports, resolved via the artifact
+    "tests": ("new", "tests: "),                          # the covering test tree
+    "neighbours": ("new", "neighbours: "),                # a *neighbour's* purpose (V5, LLM prose) — never this file's
+    "contract": ("new", "contract "),                     # lives in a registry, not in the file
+    "risk": ("new", "risk: "),                            # V4: the risk index, computed over the repo
+    "owns_config": ("new", "owns_config: "),              # V4: config ownership — the other readers are elsewhere
+    "fails_open": ("new", "fails_open: "),                # V4: the fail-open registry
 }
 
-ROW_KIND_BY_PREFIX = (
-    ("module: ", "module"),
-    ("parse_error: ", "parse_error"),
-    ("public_symbols: ", "public_symbols"),
-    ("config_read [", "config_read"),
-    ("callers: ", "callers"),
-    ("calls_into: ", "calls_into"),
-    ("tests: ", "tests"),
-    ("contract ", "contract"),
-)
+ROW_KIND_CLASS: "Dict[str, str]" = {kind: cls for kind, (cls, _prefix) in ROW_KIND.items()}
+ROW_KIND_BY_PREFIX = tuple((prefix, kind) for kind, (_cls, prefix) in ROW_KIND.items())
 
 _SYMBOLS_CUT_NOTE_RE = re.compile(r"… \(\+(\d+) more, cut for budget\)$")
+
+# The block's first line, which frames the rows and is itself no row.
+_BLOCK_HEADER_PREFIX = "COLLECT MODEL"
 
 
 class CollectMetricsError(RuntimeError):
@@ -334,6 +349,33 @@ def _kind_of(line: str) -> Optional[str]:
     return None
 
 
+def _classify_block(block: str) -> "Dict[str, int]":
+    """M2's tally for one rendered block: chars and rows by class.
+
+    `redundant` and `new` are the chars of the rows `ROW_KIND` names, without
+    the newline that joins them; their sum is `total` — the header line
+    (`COLLECT MODEL …`) frames the block and states no fact about the target,
+    so it is in neither class and not in the denominator, and an `unknown` row
+    (a kind `ROW_KIND` does not name — the canary for a row that landed without
+    a classification) is counted, not classed. So "redundant chars / total
+    chars" is the share of what the block *says* that the coder could have
+    read off the file in the same prompt.
+    """
+    tally = {"redundant": 0, "new": 0, "total": 0, "new_rows": 0, "unknown_rows": 0}
+    for line in block.split("\n"):
+        kind = _kind_of(line)
+        if kind is None:
+            if line.strip() and not line.startswith(_BLOCK_HEADER_PREFIX):
+                tally["unknown_rows"] += 1
+            continue
+        cls = ROW_KIND_CLASS[kind]
+        tally[cls] += len(line)
+        tally["total"] += len(line)
+        if cls == "new":
+            tally["new_rows"] += 1
+    return tally
+
+
 def _symbols_listed(block: str) -> int:
     for line in block.split("\n"):
         if line.startswith("public_symbols: "):
@@ -389,6 +431,9 @@ def _block_metrics(model: CollectModel, max_context_chars: int) -> "Dict[str, An
     duplicate_config_read_modules = 0
     new_rows = 0
     unknown_rows = 0
+    blocks_with_new_row = 0
+    chars_redundant = 0
+    chars_new = 0
     silently_cut = 0
     silently_cut_modules = 0
     announced_cut = 0
@@ -406,24 +451,28 @@ def _block_metrics(model: CollectModel, max_context_chars: int) -> "Dict[str, An
         if dup > 0:
             duplicate_config_read += dup
             duplicate_config_read_modules += 1
-        for line in block.split("\n"):
-            kind = _kind_of(line)
-            if kind is None:
-                if line.strip() and not line.startswith("COLLECT MODEL"):
-                    unknown_rows += 1
-                continue
-            if ROW_KIND_CLASS[kind] == "new":
-                new_rows += 1
-            if kind == "public_symbols":
-                total = len(module.public_symbols)
-                listed, remainder = _symbols_listed(block), _symbols_announced(block)
-                cut = total - listed - remainder
-                if cut > 0:
-                    silently_cut += cut
-                    silently_cut_modules += 1
-                if remainder > 0:
-                    announced_cut += remainder
-                    announced_cut_modules += 1
+        tally = _classify_block(block)
+        new_rows += tally["new_rows"]
+        unknown_rows += tally["unknown_rows"]
+        chars_redundant += tally["redundant"]
+        chars_new += tally["new"]
+        # A block, not a row: three new rows in one block are one block. V3's
+        # `callers` row is unconditional (an importless module still says
+        # `entry point — nothing imports this`, which the file cannot say), so
+        # this saturates at every block today; the ticket's "4 of 477" is the
+        # pre-V3 pack, and the number that still moves is the mean.
+        if tally["new_rows"] > 0:
+            blocks_with_new_row += 1
+        if any(_kind_of(line) == "public_symbols" for line in block.split("\n")):
+            total = len(module.public_symbols)
+            listed, remainder = _symbols_listed(block), _symbols_announced(block)
+            cut = total - listed - remainder
+            if cut > 0:
+                silently_cut += cut
+                silently_cut_modules += 1
+            if remainder > 0:
+                announced_cut += remainder
+                announced_cut_modules += 1
 
     return {
         "blocks_asked": len(paths),
@@ -434,6 +483,14 @@ def _block_metrics(model: CollectModel, max_context_chars: int) -> "Dict[str, An
         "blocks_rows_new": new_rows,
         "blocks_rows_new_mean": round(new_rows / len(non_empty), 3) if non_empty else 0.0,
         "blocks_rows_unknown": unknown_rows,
+        "blocks_with_new_row": blocks_with_new_row,
+        "blocks_chars_redundant": chars_redundant,
+        "blocks_chars_new": chars_new,
+        "blocks_chars_total": chars_redundant + chars_new,
+        "blocks_chars_redundant_pct": (
+            round(100.0 * chars_redundant / (chars_redundant + chars_new), 1)
+            if chars_redundant + chars_new else 0.0
+        ),
         "config_read_duplicate_lines": duplicate_config_read,
         "config_read_duplicate_modules": duplicate_config_read_modules,
         "symbols_silently_cut": silently_cut,
@@ -459,7 +516,7 @@ def compute_metrics(
     `meta["collect_dir"]` names the directory the loader re-reads for the block
     section; the table sections read `payload` directly."""
     metrics: Dict[str, Any] = {
-        "schema": "collect-metrics-m1",
+        "schema": "collect-metrics-m2",
         "collector_version": meta["collector_version"],
     }
     metrics.update(_artifact_metrics(payload, meta))
@@ -489,8 +546,10 @@ _ROWS = (
     ]),
     ("per-task block, as rendered today", [
         "blocks_non_empty", "blocks_asked", "blocks_chars_median", "blocks_over_budget",
-        "blocks_budgeted_non_empty", "blocks_budgeted_chars_median", "blocks_rows_new_mean",
-        "blocks_rows_new", "config_read_duplicate_lines", "config_read_duplicate_modules",
+        "blocks_budgeted_non_empty", "blocks_budgeted_chars_median",
+        "blocks_chars_redundant_pct", "blocks_with_new_row", "blocks_rows_new_mean",
+        "blocks_rows_new", "blocks_rows_unknown",
+        "config_read_duplicate_lines", "config_read_duplicate_modules",
         "symbols_silently_cut", "symbols_silently_cut_modules", "symbols_cut_announced",
         "symbols_cut_announced_modules",
     ]),
@@ -508,6 +567,11 @@ def _display_values(metrics: dict) -> "Dict[str, str]":
         "modules_with_guarded_access": f"{metrics.get('modules_with_guarded_access', 0)} / {metrics.get('modules', 0)}",
         "summaries_purpose_present": f"{metrics.get('summaries_purpose_present', 0)} / {metrics.get('modules', 0)}",
         "blocks_over_budget": f"{metrics.get('blocks_over_budget', 0)}  ({metrics.get('blocks_over_budget_pct', 0):g}%)",
+        "blocks_chars_redundant_pct": (
+            f"{metrics.get('blocks_chars_redundant_pct', 0):g}%  "
+            f"({metrics.get('blocks_chars_redundant', 0)} / {metrics.get('blocks_chars_total', 0)})"
+        ),
+        "blocks_with_new_row": f"{metrics.get('blocks_with_new_row', 0)} / {metrics.get('blocks_non_empty', 0)}",
     }
 
 

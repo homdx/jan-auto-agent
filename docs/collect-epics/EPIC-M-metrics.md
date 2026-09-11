@@ -178,23 +178,49 @@ For every module, split the rendered block into lines and classify each:
   `fails_open`, `neighbours`, `contract` — a contract lives in a registry, not
   in the file).
 
-Report:
+Report — measured 2026-09-11 by `scripts/collect_metrics.py` against the
+artifact on disk (497 modules, `collector_version` 1, 2 498 832 bytes; the
+`--json` keys are `blocks_chars_redundant_pct`, `blocks_with_new_row`,
+`blocks_rows_new_mean`):
 
 ```
-redundant chars / total chars     ___ %      (baseline: ~100%)
-blocks with >=1 new row           ___ / 477  (baseline: 4 — the contract rows)
-mean new rows per block           ___        (baseline: 0.008)
+redundant chars / total chars     65.1 %     328 910 / 505 246   (ticket's baseline: ~100%)
+blocks with >=1 new row           497 / 497                      (ticket's baseline: 4 — the contract rows)
+mean new rows per block           3.608      1 793 rows          (ticket's baseline: 0.008)
 ```
 
-The classification is a static dict of `kind -> redundant|new` in the script.
-It does not have to be clever; it has to be fixed, so before and after are
-comparable.
+The ticket's three baselines describe the pre-V3 pack (`module` +
+`public_symbols` + `config_read`, contract rows on four modules) and cannot be
+re-derived from the artifact on disk; they stay as the claim, these are the
+measurement. Three things the measurement fixed rather than assumed:
+
+* **Denominator.** `total` is the chars of the fact rows — `redundant` + `new`
+  — not of the block: the `COLLECT MODEL …` header frames the rows and states
+  nothing about the target, so it is in neither class. With the header's
+  chars in the denominator the share would read 62.2%; the number reported is
+  the share of what the block *says*.
+* **`neighbours` was unclassified.** M1's dict did not name V5's row, so every
+  `neighbours:` line fell into `blocks_rows_unknown` (733 of them on this
+  artifact) and out of the "new rows" count. M2 names it `new` — a neighbour's
+  purpose is never the target's — and prints `blocks_rows_unknown` in the table
+  as the canary for the next unnamed row. That, not a bigger pack, is why the
+  mean is 3.608 where M1 read 2.559.
+* **"Blocks with a new row" saturates.** V3's `callers` row is unconditional —
+  a module nothing imports still says `entry point — nothing imports this`,
+  which the file cannot say — so every block has one. 497 / 497 is the truth
+  of the pack, not a ceiling to aim at; the number that still moves is the
+  mean.
+
+The classification is one dict in the script, `ROW_KIND: kind -> (class,
+prefix)`, with the reason on every entry; the class table and the prefix table
+are views of it. V4's `risk` / `owns_config` / `fails_open` are pinned in it
+as `new` before they render, so V4 landing cannot move the line.
 
 ### Acceptance
 
-- [ ] Baseline recorded: redundant share, blocks with a new row, mean new rows.
+- [x] Baseline recorded: redundant share, blocks with a new row, mean new rows.
 - [ ] After EPIC A the same three numbers are recorded in the same table.
-- [ ] The kind→class mapping lives in one dict with a comment saying why each
+- [x] The kind→class mapping lives in one dict with a comment saying why each
       kind is classified the way it is.
 
 ---
@@ -406,17 +432,23 @@ findings produced               ___          ___
 ## Measured
 
 Fill in as tickets land. The `baseline` column is `scripts/collect_metrics.py`
-output, committed as [`baseline.json`](baseline.json) on 2026-09-10 against the
-artifact on disk (469 modules, `collector_version` 1); every later column is the
-same script after the named epic, so a column is a diff, not a re-measurement.
+output, committed as [`baseline.json`](baseline.json); every later column is
+the same script after the named epic, so a column is a diff, not a
+re-measurement. M1 wrote it on 2026-09-10 against a 469-module artifact; M2
+re-wrote it on 2026-09-11 against the artifact then on disk (497 modules,
+`collector_version` 1, 2 498 832 bytes) so that the file carries M2's keys and
+the after-A diff has a before column with the same key set. Every M1 cell
+below stays as M1 measured it; the artifact moved between the two, so an M1
+cell and an M2 cell do not share a denominator.
 
 | # | metric | baseline | after A | after B | after C |
 |---|---|---|---|---|---|
 | 0 | LLM calls, `--collect`, 1 file changed | 469 (M1: the artifact's module count; the 483 came from a rebuild) | | | |
 | 0 | LLM calls, `--collect --refresh`, 1 file changed | 1 | | | |
 | 0 | summaries surviving `--collect --no-llm` | 0 / 469 | | | |
-| 1 | redundant share of block chars | ~100% | | | |
-| 1 | mean non-derivable rows per block | 2.559 (M1; V3 shipped callers/calls_into/tests) | | | |
+| 1 | redundant share of block chars | 65.1% (M2; 328 910 / 505 246 fact-row chars, header excluded) | | | |
+| 1 | blocks with ≥1 new row | 497 / 497 (M2; saturated — V3's `callers` row is unconditional) | | | |
+| 1 | mean non-derivable rows per block | 3.608 (M2; M1 read 2.559 with the `neighbours` row unclassified) | | | |
 | 1 | blocks over budget | 68 / 469 (M1) | | | |
 | 1 | median block chars | 678 (M1) | | | |
 | 1 | modules with a Pass B purpose | 241 / 469 (M1) | | | |

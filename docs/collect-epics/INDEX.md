@@ -182,7 +182,9 @@ grep -c "gate1 accepted=" logs/*.log
 
 Baseline at time of writing, script-produced against the artifact on disk
 (469 modules, `collector_version` 1): **14.5%** of blocks over budget
-(68/469), **2.559** non-derivable rows per block, **678**-char median block,
+(68/469), **2.559** non-derivable rows per block (M2 re-reads it as **3.608**
+— M1 could not see the `neighbours` row — and adds **65.1%** redundant chars,
+**497/497** blocks with a new row), **678**-char median block,
 **0** symbols cut without an announcement, **24** duplicate `config_read` lines
 in 11 modules. **0** Gate-1 candidates are suppressed by static facts (the
 suppressor has no callers) and **61%** of Pass B claims are dropped by Pass C

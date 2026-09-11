@@ -44,9 +44,9 @@ The numbers that must move, and the ticket that owns each:
 | number | before | after | owner |
 |---|---|---|---|
 | tables dropped by the loader (`import_edges` / `imported_by` / `entry_points`) | 3 dropped | 0 dropped | `V1` |
-| mean **new** (non-redundant) rows per block | 0.008 | ≥ 3 | `V2`–`V5`, measured by `M2` |
-| blocks with ≥1 new row | 4 of 477 | ≥ 400 of 477 | `M2` |
-| redundant chars / total chars | ~100% | < 50% | `M2` |
+| mean **new** (non-redundant) rows per block | 0.008 → 3.608 (M2, script) | ≥ 3 — met | `V2`–`V5`, measured by `M2` |
+| blocks with ≥1 new row | 4 of 477 → 497 of 497 (M2, script) | ≥ 400 — met | `M2` |
+| redundant chars / total chars | ~100% → 65.1% (M2, script) | < 50% — not yet | `M2` |
 | blocks over budget (`_shrink` fires) | 50 of 477 (10%) | lower, and `_shrink` still byte-identical | `V6` |
 | signatures still elided `name(…)` | 4030 / 4030 | 0 | `V10` |
 | Pass B claims dropped by Pass C | 1368 of 2238 (61%) | lower | `V11` |
@@ -55,6 +55,11 @@ The numbers that must move, and the ticket that owns each:
 `M1` writes the "before" column with script output; every number in the left
 column above is hand-measured and is expected to move a little when M1 lands.
 That is fine — what matters is that both columns come from the same script.
+
+`M2` wrote its three rows with the script on 2026-09-11: the hand-measured
+value stays on the left of the arrow as the claim, the script's value on the
+right. Two of the three targets are already met by V3/V5; the redundant share
+is not, and it is the one EPIC A still has to move.
 
 ---
 
