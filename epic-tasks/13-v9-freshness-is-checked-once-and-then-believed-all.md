@@ -1,6 +1,6 @@
 # V9 — Freshness is checked once and then believed all run
 
-**Status:** landed — `2f9005d`  
+**Status:** landed — `2f9005d`; follow-up round V9-2 (no-op commit, empty git answer, re-arm, run-end summary, added-symbol repair) — see `V9-2/REPORT-V9-2.md`  
 **Severity:** HIGH  
 **File:** `tools/auto/collect_bridge.py`  
 **Symbol:** `—`  

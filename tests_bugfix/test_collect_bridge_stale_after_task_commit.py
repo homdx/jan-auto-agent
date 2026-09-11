@@ -32,8 +32,12 @@ This file pins the fix — invalidate on write, not on a timer:
      and folds the fresh `ModuleRecord` back into the in-memory model, so a
      5-task run where tasks 1 and 3 touch the same file gives task 3 the
      post-task-1 facts.
-  6. `collect_miss(reason="dirty")` is counted, and `invalidate()` fails
-     open on malformed input.
+   6. `collect_miss(reason="dirty")` is counted, and `invalidate()` fails
+      open on malformed input.
+   7. Follow-up: a task that staged nothing does not blind its declared
+      `target_files` (git is available and said the tree is unchanged), a
+      repair that failed once is re-attempted when a later commit dirties
+      the same path again, and the run reports how many blocks it withheld.
 """
 
 from __future__ import annotations
@@ -358,6 +362,65 @@ def test_invalidate_normalises_task_and_git_path_spelling():
     assert bridge.context_for("pkg/a.py") == ""
 
 
+def test_invalidate_is_idempotent_and_dedupes():
+    """`invalidate` is called once per task commit, and the controller can
+    feed it the same path from both a commit's `diff-tree` and a later
+    `target_files` fallback. A path dirtied twice is still just one dirty
+    path — and marking it twice must not, by itself, change anything."""
+    module = _module("pkg/a.py", [_symbol("pkg/a.py:a")])
+    bridge = CollectBridge(_fresh_model([module]))
+    bridge.invalidate(["pkg/a.py", "./pkg/a.py", Path("pkg/a.py")])
+    assert bridge.dirty_paths == frozenset({"pkg/a.py"})
+    bridge.invalidate(["pkg/a.py"])
+    bridge.invalidate(["pkg/a.py"])
+    assert bridge.dirty_paths == frozenset({"pkg/a.py"})
+    assert bridge.context_for("pkg/a.py") == ""
+
+
+def test_bridge_built_without_init_reads_dirty_as_empty():
+    """Some callers build a bridge via `__new__()` and never run `__init__`.
+    A missing dirt-set must read as "nothing was written" — the pre-V9
+    behaviour — and a later `invalidate` must still be able to create it."""
+    module = _module("pkg/a.py", [_symbol("pkg/a.py:a")])
+    bridge = CollectBridge.__new__(CollectBridge)
+    bridge._model = _fresh_model([module])
+    bridge._summarizer_call = None
+    bridge._max_context_chars = 1200
+    bridge._task_mode = "code"
+
+    assert bridge.dirty_paths == frozenset()
+    assert bridge.has_dirty is False
+    assert bridge.pull_symbol("a") != ""
+
+    bridge.invalidate(["pkg/a.py"])
+    assert bridge.dirty_paths == frozenset({"pkg/a.py"})
+    assert bridge.pull_symbol("a") == ""
+
+
+def test_context_for_many_blinds_the_dirty_file_and_keeps_the_clean_ones(mini_repo):
+    """`context_for_many` is the multi-target entry point: a dirty file in the
+    list must not drag the clean ones down with it, and the withheld block
+    must be counted once, not once per file in the batch."""
+    cli_mod.action_collect(mini_repo)
+    config_path = _write_ini(mini_repo)
+    bridge = make_collect_bridge(mini_repo, _cfg(config_path.read_text(encoding="utf-8")),
+                                 str(config_path), task_mode="code")
+
+    clean_b = bridge.context_for("pkg/b.py")
+    clean_c = bridge.context_for("pkg/c.py")
+    assert clean_b and clean_c
+    assert bridge.collect_misses == {}
+
+    bridge.invalidate(["pkg/a.py"])
+    block = bridge.context_for_many(["pkg/a.py", "pkg/b.py", "pkg/c.py"])
+
+    assert block.count("COLLECT MODEL") == 2
+    assert clean_b in block
+    assert clean_c in block
+    assert "pkg/a.py" in bridge.dirty_paths
+    assert bridge.collect_misses == {"dirty": 1}
+
+
 # ── 5. [collect] auto_refresh_between_tasks ────────────────────────────────
 
 
@@ -488,6 +551,39 @@ def test_auto_refresh_failure_is_attempted_once_per_path():
         assert bridge.context_for("pkg/a.py") == ""
         assert bridge.pull_symbol("a") == ""
     assert attempts == ["pkg/a.py"]
+
+
+def test_auto_refresh_retries_after_a_later_commit_redirties_the_path():
+    """The "once per path" cap is per *edit*, not per run: a repair that
+    failed is not retried on every later lookup, but a later commit that
+    dirties the same path again is a new attempt. Without it a transient
+    provider outage at task 1 keeps blinding a file that task 3 edited
+    again for the whole rest of the run — one LLM call per edit is the
+    cost the flag promises, and it stays bounded by the commits."""
+    stale = _module("pkg/a.py", [_symbol("pkg/a.py:a", "a() -> STALE")])
+    fresh = _module("pkg/a.py", [_symbol("pkg/a.py:a", "a(x) -> FRESH")])
+    bridge = CollectBridge(_fresh_model([stale]), auto_refresh=True)
+    attempts = []
+
+    def _flaky(path: str):
+        attempts.append(path)
+        if len(attempts) == 1:
+            raise RuntimeError("provider down")
+        return fresh
+
+    bridge._module_refresh_fn = _flaky
+    bridge.invalidate(["pkg/a.py"])
+
+    assert bridge.context_for("pkg/a.py") == ""      # first attempt fails
+    for _ in range(3):
+        assert bridge.context_for("pkg/a.py") == ""  # not retried
+    assert attempts == ["pkg/a.py"]
+
+    # Task 3 commits an edit to the same file: a new attempt is warranted.
+    bridge.invalidate(["pkg/a.py"])
+    assert "a(x) -> FRESH" in bridge.pull_symbol("a")
+    assert "pkg/a.py" not in bridge.dirty_paths
+    assert attempts == ["pkg/a.py", "pkg/a.py"]
 
 
 def test_auto_refresh_repairs_for_pull_symbol_and_contracts_too():
@@ -640,6 +736,122 @@ def test_controller_git_failure_falls_back_to_target_files(mini_repo, monkeypatc
     assert bridge.dirty_paths == frozenset({"pkg/a.py"})
 
 
+def test_controller_nothing_staged_blinds_nothing(mini_repo, monkeypatch):
+    """Git is configured but the task staged nothing: the tree is unchanged,
+    so every fact in the artifact is still exactly right. `target_files` is
+    a fallback for a tree we cannot ask, not for one that says it did not
+    change — falling back here would suppress a block that predates no edit
+    at all, and would break "an unedited path keeps its block the whole
+    run" on the run's own no-op tasks."""
+    cli_mod.action_collect(mini_repo)
+    config_path = _write_ini(mini_repo)
+    gm = GitManager(mini_repo)
+    gm.configure_identity()
+    ctrl = _make_controller(mini_repo, config_path, git=gm)
+    ctrl.state.resume_info.return_value = {"pending": [_task("T1", "pkg/a.py")]}
+    ctrl.state.get_task.side_effect = lambda task_id: _task(task_id, "pkg/a.py")
+
+    fake_outer = MagicMock()
+    fake_outer.run_task.return_value = SimpleNamespace(passed=True, rounds_used=1, inner_results=[])
+    _run_loop(ctrl, fake_outer)
+
+    bridge = ctrl._get_collect_bridge("code")
+    assert bridge.dirty_paths == frozenset()
+    assert bridge.context_for("pkg/a.py") != ""
+
+
+def test_controller_git_unusable_blinds_the_declared_files(mini_repo, monkeypatch):
+    """The mirror of the test above: git refused the commit AND cannot be
+    asked whether the tree changed (index.lock, a hung hook). The edit may
+    really be sitting in the tree, so the declared `target_files` are still
+    the safer guess — assume a write happened rather than serving stale
+    facts."""
+    cli_mod.action_collect(mini_repo)
+    config_path = _write_ini(mini_repo)
+    gm = GitManager(mini_repo)
+    gm.configure_identity()
+    ctrl = _make_controller(mini_repo, config_path, git=gm)
+    ctrl.state.resume_info.return_value = {"pending": [_task("T1", "pkg/a.py")]}
+    ctrl.state.get_task.side_effect = lambda task_id: _task(task_id, "pkg/a.py")
+
+    from tools.auto.git_manager import GitError
+
+    gm.paths_changed_in = MagicMock(side_effect=GitError("index.lock held"))
+    gm.has_staged_changes = MagicMock(side_effect=GitError("index.lock held"))
+
+    fake_outer = MagicMock()
+
+    def _edit(task, base_dir):
+        (base_dir / "pkg" / "a.py").write_text("def a():\n    return 9\n")
+        return SimpleNamespace(passed=True, rounds_used=1, inner_results=[])
+
+    fake_outer.run_task.side_effect = _edit
+    _run_loop(ctrl, fake_outer)
+
+    bridge = ctrl._get_collect_bridge("code")
+    assert bridge.dirty_paths == frozenset({"pkg/a.py"})
+    assert bridge.context_for("pkg/b.py") != ""
+
+
+def test_controller_reports_how_many_blocks_it_withheld(mini_repo, monkeypatch):
+    """Item 4 is only half done when the tally is counted and never shown:
+    a run must report how many collect blocks V9 suppressed, so an operator
+    can tell "the pack was thin" from "the pack was withheld"."""
+    cli_mod.action_collect(mini_repo)
+    config_path = _write_ini(mini_repo)
+    gm = GitManager(mini_repo)
+    gm.configure_identity()
+    ctrl = _make_controller(mini_repo, config_path, git=gm)
+    ctrl.limits = RunLimits(max_tasks_per_run=2)
+    logs: list[str] = []
+    ctrl.state.log = logs.append
+    # Two tasks on the same file: T1 commits an edit, T2 reads the block
+    # for it (and so meets the dirty path), then the task cap stops the run.
+    ctrl.state.resume_info.return_value = {"pending": [
+        _task("T1", "pkg/a.py"),
+        _task("T2", "pkg/a.py"),
+        _task("T3", "pkg/b.py"),
+    ]}
+
+    fake_outer = MagicMock()
+
+    def _read_then_edit(task, base_dir):
+        ctrl._get_collect_bridge("code").context_for(task["target_files"][0])
+        (base_dir / task["target_files"][0]).write_text(
+            f"def changed_by_{task['id']}():\n    return 0\n"
+        )
+        return SimpleNamespace(passed=True, rounds_used=1, inner_results=[])
+
+    fake_outer.run_task.side_effect = _read_then_edit
+
+    reason, done = _run_loop(ctrl, fake_outer)
+
+    assert reason == "task_cap" and done == 2
+    assert any("withheld 1 block(s)" in line and "dirty=1" in line for line in logs), logs
+
+
+def test_controller_reports_nothing_when_nothing_was_withheld(mini_repo, monkeypatch):
+    """The summary line is only for a run that actually suppressed a block —
+    a clean run stays silent, like every other per-run log line here."""
+    cli_mod.action_collect(mini_repo)
+    config_path = _write_ini(mini_repo)
+    ctrl = _make_controller(mini_repo, config_path, git=None)
+    ctrl.limits = RunLimits(max_tasks_per_run=1)
+    logs: list[str] = []
+    ctrl.state.log = logs.append
+    ctrl.state.resume_info.return_value = {"pending": [_task("T1", "pkg/a.py")]}
+    ctrl.state.get_task.side_effect = lambda task_id: _task(task_id, "pkg/a.py")
+
+    fake_outer = MagicMock()
+    fake_outer.run_task.return_value = SimpleNamespace(passed=True, rounds_used=1, inner_results=[])
+    _run_loop(ctrl, fake_outer)
+
+    # The path T1 wrote is still dirty, so the run says so — but it never
+    # withheld a block, and the summary must not claim it did.
+    assert not any("withheld" in line for line in logs), logs
+    assert any("still unrefreshed" in line and "pkg/a.py" in line for line in logs), logs
+
+
 def test_controller_auto_refresh_gives_task3_the_post_task1_facts(mini_repo, monkeypatch):
     """The ticket's headline acceptance criterion: with
     `auto_refresh_between_tasks = true`, a 5-task run where tasks 1 and 3
@@ -738,3 +950,609 @@ def test_paths_changed_between_covers_regressions_after_a_task_commit(mini_repo)
         paths = sorted(set(paths) | set(gm.paths_changed_between(base, tip)))
     bridge.invalidate(paths)
     assert bridge.dirty_paths == frozenset({"pkg/a.py", "pkg/c.py"})
+
+
+# ── 8. follow-up: what the first landing did not cover ──────────────────────
+
+
+def test_invalidate_ignores_a_parent_relative_path():
+    """`../pkg/a.py` is above the tree the model was built from; git never
+    reports such a path and the model holds nothing there. Before the fix it
+    survived normalisation verbatim (it ends in `.py`), sat in `dirty_paths`
+    as noise, and matched nothing. Now it is dropped like an absolute path
+    outside `base_dir` is."""
+    module = _module("pkg/a.py", [_symbol("pkg/a.py:a")])
+    bridge = CollectBridge(_fresh_model([module]))
+    bridge.invalidate(["../pkg/a.py", "../../x.py", ".."])
+    assert bridge.dirty_paths == frozenset()
+    assert bridge.context_for("pkg/a.py") != ""
+    assert bridge.collect_misses == {}
+
+
+def test_invalidate_keeps_a_non_py_parent_relative_path_out():
+    """A parent-relative doc or config path is dropped like any other."""
+    module = _module("pkg/a.py", [_symbol("pkg/a.py:a")])
+    bridge = CollectBridge(_fresh_model([module]))
+
+    bridge.invalidate(["../README.md", "../", "", "./../"])
+    assert bridge.dirty_paths == frozenset()
+    assert bridge.context_for("pkg/a.py") != ""
+
+
+def test_context_for_many_blinds_only_the_dirty_files():
+    """`context_for_many` joins one block per file, so a single dirty entry
+    must drop only its own block rather than empty the whole join — the
+    "one edited file must not blind the pack" contract, at the joiner."""
+    bridge = CollectBridge(_fresh_model([
+        _module("pkg/a.py", [_symbol("pkg/a.py:a")]),
+        _module("pkg/b.py", [_symbol("pkg/b.py:b")]),
+    ]))
+    bridge.invalidate(["pkg/a.py"])
+
+    block = bridge.context_for_many(["pkg/a.py", "pkg/b.py"])
+    assert "public_symbols: pkg/a.py:a" not in block
+    assert "public_symbols: pkg/b.py:b" in block
+    assert bridge.collect_misses == {"dirty": 1}
+
+
+def test_pull_symbol_counts_no_miss_when_a_clean_duplicate_answers():
+    """A dirty module that loses to a clean duplicate is not a miss: the caller
+    got real facts. Pinning this so the dirty-hit flag can never be promoted
+    from "any dirty module matched" to "a miss was counted"."""
+    module_a = _module("pkg/a.py", [_symbol("pkg/a.py:shared", "shared(x) -> STALE")])
+    module_b = _module("pkg/b.py", [_symbol("pkg/b.py:shared", "shared(x) -> FRESH")])
+    bridge = CollectBridge(_fresh_model([module_a, module_b]))
+    bridge.invalidate(["pkg/a.py"])
+
+    assert "FRESH" in bridge.pull_symbol("shared")
+    assert bridge.collect_misses == {}
+
+
+def test_summary_reports_the_withheld_blocks_and_the_still_dirty_paths():
+    """V9 item 4 asked for `collect_miss(reason="dirty")` so a run can report
+    how many blocks the rule suppressed. The tally was already counted but
+    nothing read it, so an operator could not tell "withheld for two files"
+    from "collect was never used". This is the reader."""
+    bridge = CollectBridge(_fresh_model([
+        _module("pkg/a.py", [_symbol("pkg/a.py:a")]),
+        _module("pkg/b.py", [_symbol("pkg/b.py:b")]),
+    ]))
+    assert bridge.summary() == ""       # nothing withheld, nothing dirty
+
+    bridge.invalidate(["pkg/a.py", "pkg/b.py"])
+    bridge.context_for("pkg/a.py")
+    bridge.pull_symbol("a")
+    bridge.module_symbols("pkg/b.py")
+
+    line = bridge.summary()
+    assert "withheld 3 block(s)" in line
+    assert "dirty=3" in line
+    assert "2 path(s) still unrefreshed" in line
+    assert "pkg/a.py" in line and "pkg/b.py" in line
+
+
+def test_summary_is_empty_when_a_repair_removed_all_the_dirt():
+    """A run that withheld nothing and repaired everything reports nothing, so
+    run.log stays silent about a run collect had no say in."""
+    bridge = CollectBridge(_fresh_model([
+        _module("pkg/a.py", [_symbol("pkg/a.py:a")]),
+    ]))
+    assert bridge.summary() == ""
+
+
+def test_summary_survives_a_broken_tally():
+    """The tally is counted on a plain dict, but a bridge built without
+    `__init__` has no attribute at all — the summary reads as empty rather
+    than raising into a run."""
+    bridge = CollectBridge.__new__(CollectBridge)
+    bridge._model = None
+    assert bridge.summary() == ""
+
+
+def test_repair_is_rearmed_by_a_new_invalidate():
+    """Before the fix, a path whose repair failed was remembered in
+    `_repair_failed` for the whole run: a later task that rewrote the same
+    file and committed could never get post-edit facts, even if the provider
+    was back. A new `invalidate()` is a new attempt — while repeated lookups
+    of the SAME dirty state still pay at most one call each."""
+    stale = _module("pkg/a.py", [_symbol("pkg/a.py:a", "a() -> STALE")])
+    fresh = _module("pkg/a.py", [_symbol("pkg/a.py:a", "a(x) -> FRESH")])
+    bridge = CollectBridge(_fresh_model([stale]), auto_refresh=True)
+
+    attempts = []
+
+    def _refresh(path: str):
+        attempts.append(path)
+        if len(attempts) == 1:
+            raise RuntimeError("provider down")
+        return fresh
+
+    bridge._module_refresh_fn = _refresh
+
+    bridge.invalidate(["pkg/a.py"])          # commit 1
+    for _ in range(3):                       # repeated lookups: one attempt
+        assert bridge.context_for("pkg/a.py") == ""
+    assert attempts == ["pkg/a.py"]
+    assert bridge.collect_misses == {"dirty": 3}
+
+    bridge.invalidate(["pkg/a.py"])          # commit 2 re-arms it
+    assert bridge.context_for("pkg/a.py") != ""   # the blind is gone
+    assert "a(x) -> FRESH" in bridge.pull_symbol("a")
+    assert "STALE" not in bridge.pull_symbol("a")
+    assert attempts == ["pkg/a.py", "pkg/a.py"]
+    assert "pkg/a.py" not in bridge.dirty_paths
+
+
+def test_controller_git_empty_answer_invalidates_nothing(mini_repo, monkeypatch):
+    """git answering `[]` is not "no git". Before the fix the `if not paths`
+    fallback also fired on an empty answer, so a merge commit or an
+    `--allow-empty` commit blinded the task's declared `target_files` — files
+    the task never touched."""
+    cli_mod.action_collect(mini_repo)
+    config_path = _write_ini(mini_repo)
+    gm = GitManager(mini_repo)
+    gm.configure_identity()
+    ctrl = _make_controller(mini_repo, config_path, git=gm)
+    ctrl.state.resume_info.return_value = {"pending": [_task("T1", "pkg/a.py")]}
+    ctrl.state.get_task.side_effect = lambda task_id: _task(task_id, "pkg/a.py")
+
+    gm.paths_changed_in = MagicMock(return_value=[])
+
+    fake_outer = MagicMock()
+
+    def _write_doc(task, base_dir):
+        (base_dir / "README.md").write_text("# docs only\n")
+        return SimpleNamespace(passed=True, rounds_used=1, inner_results=[])
+
+    fake_outer.run_task.side_effect = _write_doc
+    _run_loop(ctrl, fake_outer)
+
+    bridge = ctrl._get_collect_bridge("code")
+    assert bridge.dirty_paths == frozenset()
+    assert bridge.context_for("pkg/a.py") != ""
+
+
+def test_controller_falls_back_to_target_files_only_when_git_fails(mini_repo, monkeypatch):
+    """The contrast of the test above: git raising (index.lock, a hung hook)
+    still falls back to the declared `target_files` — over-blinding a path
+    that turned out clean costs a block, serving stale facts costs a wrong
+    one."""
+    cli_mod.action_collect(mini_repo)
+    config_path = _write_ini(mini_repo)
+    gm = GitManager(mini_repo)
+    gm.configure_identity()
+    ctrl = _make_controller(mini_repo, config_path, git=gm)
+    ctrl.state.resume_info.return_value = {"pending": [_task("T1", "pkg/a.py")]}
+    ctrl.state.get_task.side_effect = lambda task_id: _task(task_id, "pkg/a.py")
+
+    from tools.auto.git_manager import GitError
+
+    gm.paths_changed_in = MagicMock(side_effect=GitError("index.lock"))
+
+    fake_outer = MagicMock()
+
+    def _edit(task, base_dir):
+        (base_dir / "pkg" / "a.py").write_text("def a():\n    return 9\n")
+        return SimpleNamespace(passed=True, rounds_used=1, inner_results=[])
+
+    fake_outer.run_task.side_effect = _edit
+    _run_loop(ctrl, fake_outer)
+
+    bridge = ctrl._get_collect_bridge("code")
+    assert bridge.dirty_paths == frozenset({"pkg/a.py"})
+
+
+def test_controller_logs_the_collect_summary_at_run_end(mini_repo, monkeypatch):
+    """V9 item 4, wired: one run.log line for the whole run, on the normal
+    exit path."""
+    cli_mod.action_collect(mini_repo)
+    config_path = _write_ini(mini_repo)
+    gm = GitManager(mini_repo)
+    gm.configure_identity()
+    ctrl = _make_controller(mini_repo, config_path, git=gm)
+    ctrl.state.resume_info.return_value = {"pending": [
+        _task("T1", "pkg/a.py"), _task("T2", "pkg/a.py"),
+    ]}
+    ctrl.state.get_task.side_effect = lambda task_id: _task(task_id, "pkg/a.py")
+
+    fake_outer = MagicMock()
+
+    def _read_then_edit(task, base_dir):
+        withheld = ctrl._get_collect_bridge("code").context_for(task["target_files"][0])
+        if withheld:   # T1 still gets a block; T2 gets "" and so counts a miss
+            (base_dir / "pkg" / "a.py").write_text("def a():\n    return 7\n")
+        return SimpleNamespace(passed=True, rounds_used=1, inner_results=[])
+
+    fake_outer.run_task.side_effect = _read_then_edit
+    _run_loop(ctrl, fake_outer)
+
+    bridge = ctrl._get_collect_bridge("code")
+    assert bridge.collect_misses == {"dirty": 1}
+
+    lines = [str(c) for c in ctrl.state.log.call_args_list]
+    summary = [l for l in lines if "collect summary (code):" in l]
+    assert len(summary) == 1
+    assert "withheld 1 block(s)" in summary[0]
+    assert "dirty=1" in summary[0]
+    assert "pkg/a.py" in summary[0]
+
+
+def test_controller_logs_no_collect_summary_when_collect_had_no_say(mini_repo, monkeypatch):
+    """Nothing withheld and nothing dirty means no line — a run with no source
+    edits must not add collect chatter to run.log."""
+    cli_mod.action_collect(mini_repo)
+    config_path = _write_ini(mini_repo)
+    gm = GitManager(mini_repo)
+    gm.configure_identity()
+    ctrl = _make_controller(mini_repo, config_path, git=gm)
+    ctrl.state.resume_info.return_value = {"pending": [_task("T1", "README.md")]}
+
+    fake_outer = MagicMock()
+
+    def _write_doc(task, base_dir):
+        (base_dir / "README.md").write_text("# docs only\n")
+        return SimpleNamespace(passed=True, rounds_used=1, inner_results=[])
+
+    fake_outer.run_task.side_effect = _write_doc
+    _run_loop(ctrl, fake_outer)
+
+    bridge = ctrl._get_collect_bridge("code")
+    assert bridge.dirty_paths == frozenset()
+    assert bridge.summary() == ""
+    assert not [str(c) for c in ctrl.state.log.call_args_list
+                if "collect summary" in str(c)]
+
+
+def test_controller_rearm_gives_a_later_task_post_edit_facts(mini_repo, monkeypatch):
+    """End to end: task 1's edit cannot be repaired (provider down), task 3
+    rewrites the same file and commits, and task 4 — not task 3 — is the one
+    that reads post-edit facts. Without the re-arm, task 4 would have read
+    nothing for the rest of the run."""
+    cli_mod.action_collect(mini_repo)
+    config_path = _write_ini(mini_repo, auto_refresh_between_tasks="true")
+
+    gm = GitManager(mini_repo)
+    gm.configure_identity()
+    ctrl = _make_controller(mini_repo, config_path, git=gm)
+    ctrl.state.resume_info.return_value = {"pending": [
+        _task(f"T{i}", "pkg/a.py") for i in (1, 2, 3, 4)
+    ]}
+
+    # Build the bridge before the loop so the loop reuses this same instance.
+    bridge = ctrl._get_collect_bridge("code")
+
+    attempts = []
+
+    def _flaky_refresh(path):
+        attempts.append(path)
+        if len(attempts) == 1:
+            raise RuntimeError("provider down")
+        return ModuleRecord(
+            path=path,
+            public_symbols=(FunctionRecord(
+                qualname=f"{path}:helper_from_T3", module=path, lineno=1,
+                signature="helper_from_T3()",
+            ),),
+        )
+
+    bridge._module_refresh_fn = _flaky_refresh
+
+    fake_outer = MagicMock()
+
+    def _read_then_edit(task, base_dir):
+        seen[task["id"]] = (
+            bridge.context_for(task["target_files"][0]),
+            bridge.pull_symbol("helper_from_T3"),
+        )
+        if task["id"] in ("T1", "T3"):
+            (base_dir / "pkg" / "a.py").write_text(
+                f"def a():\n    return 1\n\n\ndef helper_from_{task['id']}():\n    return 2\n"
+            )
+        return SimpleNamespace(passed=True, rounds_used=1, inner_results=[])
+
+    seen: dict = {}
+    fake_outer.run_task.side_effect = _read_then_edit
+    _run_loop(ctrl, fake_outer)
+
+    assert seen["T2"][0] == ""                      # repair failed, so a blind
+    assert "helper_from_T3" in seen["T4"][0]        # the re-arm made it fresh
+    assert seen["T4"][1] != ""
+    assert len(attempts) == 2
+    assert "pkg/a.py" not in bridge.dirty_paths
+
+
+# ── 8. V9 bugfix: pull_symbol / contracts_for_symbol with auto_refresh ───
+
+
+def test_pull_symbol_finds_newly_added_symbol_with_auto_refresh():
+    """V9 bugfix: the OLD module has no match for the newly added symbol, so
+    the pre-edit `any(...)` check fails and `_is_dirty` is never called —
+    the repair is never attempted. The fix defers the dirty path and repairs
+    it once nothing clean answered, so the post-edit record is reachable."""
+    stale = _module("pkg/a.py", [_symbol("pkg/a.py:old_func", "old_func() -> int")])
+    fresh = _module("pkg/a.py", [
+        _symbol("pkg/a.py:old_func", "old_func() -> int"),
+        _symbol("pkg/a.py:new_func", "new_func(x: str) -> str"),
+    ])
+    bridge = CollectBridge(_fresh_model([stale]), auto_refresh=True)
+    bridge._module_refresh_fn = lambda path: fresh
+    bridge.invalidate(["pkg/a.py"])
+
+    assert bridge.pull_symbol("new_func") != ""
+    assert "new_func(x: str) -> str" in bridge.pull_symbol("new_func")
+    assert "pkg/a.py" not in bridge.dirty_paths
+    assert bridge.collect_misses == {}
+
+
+def test_contracts_for_symbol_finds_newly_added_contract_with_auto_refresh():
+    """Same bugfix as above, for contracts_for_symbol: a contract attached to
+    a symbol the OLD record does not know about must be reachable after repair."""
+    stale = _module("pkg/a.py", [_symbol("pkg/a.py:old_func")])
+    fresh = _module("pkg/a.py", [
+        _symbol("pkg/a.py:old_func"),
+        _symbol("pkg/a.py:new_func"),
+    ])
+    contract_new = ContractRecord(name="never_raises_new", known_edge="pkg/a.py:new_func",
+                                  description="never raises")
+    bridge = CollectBridge(_fresh_model([stale], contracts=[contract_new]), auto_refresh=True)
+    bridge._module_refresh_fn = lambda path: fresh
+    bridge.invalidate(["pkg/a.py"])
+
+    contracts = bridge.contracts_for_symbol("new_func")
+    assert len(contracts) == 1
+    assert contracts[0].name == "never_raises_new"
+    assert "pkg/a.py" not in bridge.dirty_paths
+
+
+def test_pull_symbol_miss_only_when_symbol_was_in_dirty_module():
+    """`collect_miss(reason='dirty')` must count only when the symbol was
+    actually in the OLD record (and therefore withheld). A dirty module that
+    never had the symbol is not a miss — it is simply not the right module.
+    Before the fix, the `any(...)` gate also prevented `_miss` from being
+    called for the newly-added-symbol case, which was correct but for the
+    wrong reason."""
+    module_a = _module("pkg/a.py", [_symbol("pkg/a.py:a")])
+    module_b = _module("pkg/b.py", [_symbol("pkg/b.py:b")])
+    bridge = CollectBridge(_fresh_model([module_a, module_b]))
+    bridge.invalidate(["pkg/a.py"])
+
+    # Symbol IS in the dirty module — this is a miss.
+    bridge.pull_symbol("a")
+    # Symbol is NOT in the dirty module — not a miss.
+    bridge.pull_symbol("b")
+    # Symbol is in no module at all — not a miss.
+    bridge.pull_symbol("zzz")
+    assert bridge.collect_misses == {"dirty": 1}
+
+
+def test_pull_symbol_auto_refresh_failure_no_miss_when_not_in_old():
+    """With auto_refresh on, a repair that fails for a module that never had
+    the symbol must not count as a collect_miss — the symbol was not withheld,
+    it simply was not there."""
+    module_a = _module("pkg/a.py", [_symbol("pkg/a.py:a")])
+    bridge = CollectBridge(_fresh_model([module_a]), auto_refresh=True)
+
+    def _broken(path: str):
+        raise RuntimeError("provider down")
+
+    bridge._module_refresh_fn = _broken
+    bridge.invalidate(["pkg/a.py"])
+
+    # 'a' was in the old record — miss.
+    bridge.pull_symbol("a")
+    # 'zzz' was never in any record — not a miss.
+    bridge.pull_symbol("zzz")
+    assert bridge.collect_misses == {"dirty": 1}
+
+
+# ── 9. tests_covering is NOT blinded by invalidate ─────────────────────────
+
+
+def test_tests_covering_is_not_blinded_by_invalidate():
+    """`tests_covering` records which test files import which modules — an edit
+    to a source module does not change that mapping. The docstring says it is
+    'Deliberately NOT blinded by invalidate()'. Pin that decision: invalidating
+    a source module must not suppress its test-coverage entry."""
+    module_a = _module("pkg/a.py", [_symbol("pkg/a.py:a")])
+    model = CollectModel(
+        status=STATUS_FRESH,
+        modules=(module_a,),
+        test_map={"pkg/a.py": ("tests/test_a.py", "tests/test_a_extra.py")},
+    )
+    bridge = CollectBridge(model)
+    assert bridge.tests_covering("pkg/a.py") == ("tests/test_a.py", "tests/test_a_extra.py")
+
+    bridge.invalidate(["pkg/a.py"])
+    assert bridge.tests_covering("pkg/a.py") == ("tests/test_a.py", "tests/test_a_extra.py")
+
+
+# ── 10. context_for_many skips dirty paths ─────────────────────────────────
+
+
+def test_context_for_many_skips_dirty_paths():
+    """`context_for_many` joins blocks for several files. A dirty path must
+    contribute nothing (not even a partial or truncated block), while clean
+    paths keep their full block."""
+    module_a = _module("pkg/a.py", [_symbol("pkg/a.py:a")])
+    module_b = _module("pkg/b.py", [_symbol("pkg/b.py:b")])
+    bridge = CollectBridge(_fresh_model([module_a, module_b]), max_context_chars=5000)
+    bridge.invalidate(["pkg/a.py"])
+
+    joined = bridge.context_for_many(["pkg/a.py", "pkg/b.py"])
+    assert "pkg/a.py" not in joined
+    assert "pkg/b.py" in joined
+    assert joined.count("COLLECT MODEL") == 1
+
+
+def test_context_for_many_all_dirty_returns_empty():
+    module_a = _module("pkg/a.py", [_symbol("pkg/a.py:a")])
+    module_b = _module("pkg/b.py", [_symbol("pkg/b.py:b")])
+    bridge = CollectBridge(_fresh_model([module_a, module_b]))
+    bridge.invalidate(["pkg/a.py", "pkg/b.py"])
+    assert bridge.context_for_many(["pkg/a.py", "pkg/b.py"]) == ""
+
+
+# ── 11. invalidate accumulates across calls ────────────────────────────────
+
+
+def test_invalidate_accumulates_across_calls():
+    """Multiple `invalidate` calls must accumulate dirty paths, not replace
+    them. Each task commit adds its own paths."""
+    module_a = _module("pkg/a.py", [_symbol("pkg/a.py:a")])
+    module_b = _module("pkg/b.py", [_symbol("pkg/b.py:b")])
+    module_c = _module("pkg/c.py", [_symbol("pkg/c.py:c")])
+    bridge = CollectBridge(_fresh_model([module_a, module_b, module_c]))
+
+    bridge.invalidate(["pkg/a.py"])
+    assert bridge.dirty_paths == frozenset({"pkg/a.py"})
+    assert bridge.context_for("pkg/b.py") != ""
+
+    bridge.invalidate(["pkg/b.py"])
+    assert bridge.dirty_paths == frozenset({"pkg/a.py", "pkg/b.py"})
+    assert bridge.context_for("pkg/c.py") != ""
+
+    bridge.invalidate(["pkg/c.py"])
+    assert bridge.dirty_paths == frozenset({"pkg/a.py", "pkg/b.py", "pkg/c.py"})
+
+
+def test_invalidate_idempotent():
+    """Calling `invalidate` twice with the same path must not change the dirty
+    set — `frozenset` semantics."""
+    module_a = _module("pkg/a.py", [_symbol("pkg/a.py:a")])
+    bridge = CollectBridge(_fresh_model([module_a]))
+    bridge.invalidate(["pkg/a.py"])
+    bridge.invalidate(["pkg/a.py"])
+    assert bridge.dirty_paths == frozenset({"pkg/a.py"})
+
+
+# ── 12. _normalize_path edge cases ─────────────────────────────────────────
+
+
+def test_normalize_path_handles_backslashes():
+    """Windows-style paths (backslash separators) must normalise to the
+    forward-slash key the model uses."""
+    module_a = _module("pkg/a.py", [_symbol("pkg/a.py:a")])
+    module_b = _module("sub/pkg/b.py", [_symbol("sub/pkg/b.py:b")])
+    bridge = CollectBridge(_fresh_model([module_a, module_b]))
+    bridge.invalidate(["pkg\\a.py", "sub\\pkg\\b.py"])
+    assert bridge.dirty_paths == frozenset({"pkg/a.py", "sub/pkg/b.py"})
+    assert bridge.context_for("pkg/a.py") == ""
+
+
+def test_normalize_path_handles_path_objects():
+    """`invalidate` accepts `pathlib.Path` objects (a `GitManager` might
+    return them). They must normalise to the same key as strings."""
+    module_a = _module("pkg/a.py", [_symbol("pkg/a.py:a")])
+    bridge = CollectBridge(_fresh_model([module_a]))
+    bridge.invalidate([Path("pkg/a.py")])
+    assert bridge.dirty_paths == frozenset({"pkg/a.py"})
+    assert bridge.context_for("pkg/a.py") == ""
+
+
+def test_normalize_path_strips_quotes_and_backticks():
+    module_a = _module("pkg/a.py", [_symbol("pkg/a.py:a")])
+    bridge = CollectBridge(_fresh_model([module_a]))
+    for spelling in ('"pkg/a.py"', "'pkg/a.py'", "`pkg/a.py`"):
+        bridge.invalidate([spelling])
+    assert bridge.dirty_paths == frozenset({"pkg/a.py"})
+
+
+# ── 13. pull_symbol: repair removes the symbol — not a dirty miss ────────
+
+
+def test_pull_symbol_repair_removes_symbol_no_miss():
+    """If the repair succeeds but the NEW module no longer has the symbol
+    (the task removed it), no collect_miss is counted — the symbol genuinely
+    doesn't exist anymore, it wasn't withheld due to dirtiness."""
+    stale = _module("pkg/a.py", [_symbol("pkg/a.py:removed")])
+    fresh = _module("pkg/a.py", [_symbol("pkg/a.py:kept")])
+    bridge = CollectBridge(_fresh_model([stale]), auto_refresh=True)
+    bridge._module_refresh_fn = lambda path: fresh
+    bridge.invalidate(["pkg/a.py"])
+
+    assert bridge.pull_symbol("removed") == ""
+    assert bridge.collect_misses == {}
+
+
+# ── 14. contracts_for_symbol: auto_refresh failure, not-in-old ───────────
+
+
+def test_contracts_for_symbol_auto_refresh_failure_no_miss_when_not_in_old():
+    """With auto_refresh on, a repair that fails for a module that never had
+    the symbol must not count as a collect_miss."""
+    module_a = _module("pkg/a.py", [_symbol("pkg/a.py:a")])
+    bridge = CollectBridge(_fresh_model([module_a]), auto_refresh=True)
+
+    def _broken(path: str):
+        raise RuntimeError("provider down")
+
+    bridge._module_refresh_fn = _broken
+    bridge.invalidate(["pkg/a.py"])
+
+    bridge.contracts_for_symbol("a")
+    bridge.contracts_for_symbol("zzz")
+    assert bridge.collect_misses == {"dirty": 1}
+
+
+# ── 15. module_symbols with auto_refresh ─────────────────────────────────
+
+
+def test_module_symbols_with_auto_refresh_returns_post_edit_facts():
+    """With auto_refresh on, `module_symbols` returns the post-edit
+    inventory after repairing the dirty module."""
+    stale = _module("pkg/a.py", [_symbol("pkg/a.py:old_func")])
+    fresh = _module("pkg/a.py", [
+        _symbol("pkg/a.py:old_func"),
+        _symbol("pkg/a.py:new_func"),
+    ])
+    bridge = CollectBridge(_fresh_model([stale]), auto_refresh=True)
+    bridge._module_refresh_fn = lambda path: fresh
+    bridge.invalidate(["pkg/a.py"])
+
+    block = bridge.module_symbols("pkg/a.py")
+    assert "new_func" in block
+    assert "old_func" in block
+    assert "pkg/a.py" not in bridge.dirty_paths
+
+
+def test_module_symbols_with_auto_refresh_failure_returns_empty():
+    """With auto_refresh on, a failed repair returns `""` for the dirty
+    module and counts a collect_miss."""
+    module_a = _module("pkg/a.py", [_symbol("pkg/a.py:a")])
+    bridge = CollectBridge(_fresh_model([module_a]), auto_refresh=True)
+
+    def _broken(path: str):
+        raise RuntimeError("provider down")
+
+    bridge._module_refresh_fn = _broken
+    bridge.invalidate(["pkg/a.py"])
+
+    assert bridge.module_symbols("pkg/a.py") == ""
+    assert "pkg/a.py" in bridge.dirty_paths
+    assert "dirty" in bridge.collect_misses
+
+
+def test_pull_symbol_does_not_repair_a_dirty_path_a_clean_module_answers_for():
+    """The added-symbol repair is paid only on a miss. A pull for a name a
+    clean module knows must not spend an `action_module` call on every
+    dirty path first — that would be one LLM call per dirty path per pull,
+    for a fact the clean record already has."""
+    stale = _module("pkg/a.py", [_symbol("pkg/a.py:old_func")])
+    clean = _module("pkg/b.py", [_symbol("pkg/b.py:helper", "helper() -> None")])
+    calls: list[str] = []
+
+    def _refresh(path: str):
+        calls.append(path)
+        return stale
+
+    bridge = CollectBridge(_fresh_model([stale, clean]), auto_refresh=True)
+    bridge._module_refresh_fn = _refresh
+    bridge.invalidate(["pkg/a.py"])
+
+    assert "helper() -> None" in bridge.pull_symbol("helper")
+    assert calls == []                       # clean record answered, no repair
+    assert bridge.contracts_for_symbol("helper") == []   # known, no contracts
+    assert calls == []
+    assert bridge.pull_symbol("nowhere") == ""
+    assert calls == ["pkg/a.py"]             # a miss pays exactly once
+    assert bridge.collect_misses == {}       # the old record never claimed it

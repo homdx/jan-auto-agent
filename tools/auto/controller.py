@@ -744,6 +744,7 @@ class AutoController:
                     "processed (%d passed) — stopping",
                     reason, tasks_processed, tasks_done,
                 )
+                self._log_collect_summary(collect_bridge)
                 return reason, tasks_done
 
             failed_deps = []
@@ -887,6 +888,7 @@ class AutoController:
                         f"{getattr(tune_outcome, 'reason', '')}"
                     )
 
+        self._log_collect_summary(collect_bridge)
         return None, tasks_done  # all tasks done / no tasks
 
     def _discard_exhausted_residue(self, task_id: str) -> None:
@@ -1341,6 +1343,22 @@ class AutoController:
         """
         if bridge is None:
             return
+        # A commit was attempted (git is configured) but produced no hash.
+        # Two different reasons land here, and only one of them is stale:
+        #   * git said there was nothing to commit — the coder wrote nothing,
+        #     the tree is unchanged, and every block in the artifact is still
+        #     exactly right. Blind nothing. Falling back to `target_files`
+        #     here would suppress a fact that predates no edit at all.
+        #   * git could not commit (index.lock, a hung hook) after staging —
+        #     the tree really does hold a change. `has_staged_changes()`
+        #     says so, so `target_files` is still the safer guess.
+        if not commit_hash and self.git is not None and not self._tree_has_uncommitted_changes():
+            logger.info(
+                "_invalidate_collect: task %s committed nothing and the tree "
+                "is clean — nothing was written, collect blocks stay valid",
+                task_id,
+            )
+            return
         paths: Optional[list] = None
         if commit_hash and self.git is not None:
             try:
@@ -1355,7 +1373,12 @@ class AutoController:
                     task_id, exc,
                 )
                 paths = None
-        if not paths:
+        if paths is None:
+            # No git, or git could not be asked. An *empty* answer is not
+            # this case: `diff-tree` lists nothing for a merge or an
+            # `--allow-empty` commit, and then nothing was written, so
+            # nothing is stale — falling back would blind files the task
+            # never touched.
             paths = list(self._task_target_files(task_id))
         try:
             bridge.invalidate(paths)
@@ -1380,6 +1403,52 @@ class AutoController:
             return [str(f) for f in files]
         except Exception:  # noqa: BLE001 — never abort the run
             return []
+
+    def _tree_has_uncommitted_changes(self) -> bool:
+        """V9: does the tree still hold a change git could not commit?
+
+        `GitManager.commit()` stages everything before it decides whether
+        there is anything to commit, so a `None` commit hash is ambiguous:
+        the coder may have written nothing, or git may have failed after
+        staging a real edit. Staged changes are the answer — `True` means
+        the edit exists and the collect facts for it are stale, `False`
+        means nothing was written and the facts are still correct.
+
+        Fail-open to `True`: if git cannot be asked, assuming a write
+        happened is the safer guess — blinding a path that turned out
+        clean costs one block, serving stale facts costs a wrong one.
+        Never raises.
+        """
+        git = getattr(self, "git", None)
+        if git is None:
+            return True
+        try:
+            return bool(git.has_staged_changes())
+        except Exception:  # noqa: BLE001 — never abort the run
+            return True
+
+    def _log_collect_summary(self, bridge) -> None:
+        """V9 item 4: one run.log line for how much invalidate-on-write
+        withheld this run.
+
+        `collect_miss(reason="dirty")` is counted on the bridge; this is the
+        reader. Called once, at the end of the task loop (both exit paths),
+        so the line is the whole run's picture rather than a per-task echo.
+        A bridge that withheld nothing and has nothing still dirty reports
+        nothing — a run with no edits adds no noise. Never raises.
+        """
+        if bridge is None:
+            return
+        try:
+            line = bridge.summary()
+        except Exception:  # noqa: BLE001 — never abort the run
+            return
+        if not line:
+            return
+        try:
+            self.state.log(f"collect summary ({self.task_mode}): {line}")
+        except Exception:  # noqa: BLE001 — a broken log sink is not a blocker
+            pass
 
     def collect_context_for(self, target_file: str) -> str:
         """The opt-in COLLECT-23 context block for `target_file` — kept for

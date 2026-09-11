@@ -163,7 +163,9 @@ class CollectBridge:
         # `load()` saw the tree before any of them; `status` cannot have
         # changed to say so, so this set is what carries it.
         self._dirty_paths: set = set()
-        # Paths whose in-run repair already failed once — never retried.
+        # Paths whose in-run repair already failed once — not retried again
+        # until the next commit dirties the path, at which point
+        # `invalidate()` drops them from here so the repair is re-attempted.
         self._repair_failed: set = set()
         # V9: `[collect] auto_refresh_between_tasks` (default false).
         self._auto_refresh = bool(auto_refresh)
@@ -227,6 +229,38 @@ class CollectBridge:
     def has_dirty(self) -> bool:
         return bool(self._dirty_set())
 
+    def summary(self) -> str:
+        """One line saying how much invalidate-on-write withheld this run.
+
+        V9 item 4 says `collect_miss(reason="dirty")` is emitted so a run can
+        report how many blocks the rule suppressed; the tally lives on
+        `collect_misses`, and this is its reader — the controller logs it
+        once, at the end of the task loop. `""` when nothing was withheld
+        and nothing is still dirty, so a run with no edits adds no noise to
+        run.log. Never raises.
+        """
+        withheld = {}
+        try:
+            for reason, count in (self.collect_misses or {}).items():
+                withheld[str(reason)] = int(count)
+        except Exception:  # noqa: BLE001 — a summary must never sink a run
+            return ""
+        parts = []
+        if withheld:
+            total = sum(withheld.values())
+            detail = ", ".join(f"{reason}={count}"
+                               for reason, count in sorted(withheld.items()))
+            parts.append(
+                f"collect withheld {total} block(s) for path(s) this run wrote "
+                f"({detail})"
+            )
+        if self.has_dirty:
+            parts.append(
+                f"{len(self.dirty_paths)} path(s) still unrefreshed at run end: "
+                f"{', '.join(sorted(self.dirty_paths))}"
+            )
+        return "; ".join(parts)
+
     def _normalize_path(self, path) -> Optional[str]:
         """`pkg/a.py` from a task or git path, or `None` when it is not a
         collect-modelled module.
@@ -250,6 +284,10 @@ class CollectBridge:
         ref = ref.replace("\\", "/")
         while ref.startswith("./"):
             ref = ref[2:]
+        if ref == ".." or ref.startswith("../"):
+            # Above the tree root: git never reports such a path and the
+            # model holds nothing there, so there is nothing to blind.
+            return None
         if ref.startswith("/"):
             # An absolute path only means something relative to the tree the
             # model was built from; outside it there is nothing to blind.
@@ -339,6 +377,13 @@ class CollectBridge:
         if not new_dirty:
             return
         self._dirty_paths = set(self._dirty_set() | new_dirty)
+        # A new commit means new facts, so a repair that already failed for
+        # these paths is worth one more attempt: an outage that started at
+        # task N must not keep blinding a path that task N+2 edited again.
+        # The attempt stays once per *edit* — never once per lookup.
+        failed = getattr(self, "_repair_failed", None)
+        if failed is not None and new_dirty & failed:
+            failed -= new_dirty
         logger.info(
             "CollectBridge.invalidate: %d path(s) now dirty — collect "
             "blocks withheld for them: %s",
@@ -552,12 +597,21 @@ class CollectBridge:
             return ""
         dirty_hit = False
         dirty_paths = self._dirty_set()
+        deferred: list = []
         try:
             for module in list(self._model.modules):
                 path = module.path
-                if path in dirty_paths and any(
-                    _qualname_matches(s.qualname, name) for s in module.public_symbols
-                ):
+                if path in dirty_paths:
+                    if not any(
+                        _qualname_matches(s.qualname, name) for s in module.public_symbols
+                    ):
+                        # The pre-edit record does not know the name — but
+                        # the edit may have ADDED it. Repairing now would
+                        # pay an LLM call for every dirty path on every
+                        # pull; a clean record elsewhere may still answer,
+                        # so the repair waits until nothing else did.
+                        deferred.append(path)
+                        continue
                     # V9: this record predates the edit, so it cannot be
                     # trusted as is. `_is_dirty` repairs it when
                     # auto_refresh is on; otherwise a clean duplicate
@@ -569,11 +623,32 @@ class CollectBridge:
                 for sym in module.public_symbols:
                     if _qualname_matches(sym.qualname, name):
                         return self._format_symbol_block(path, sym)
+            for path, module in self._repaired_deferred(deferred):
+                for sym in module.public_symbols:
+                    if _qualname_matches(sym.qualname, name):
+                        return self._format_symbol_block(path, sym)
         except Exception as exc:  # noqa: BLE001 — never block a pull on this
             logger.warning("CollectBridge.pull_symbol(%s): failed: %s", symbol_name, exc)
         if dirty_hit:
             self._miss("dirty", name)
         return ""
+
+    def _repaired_deferred(self, paths):
+        """Yield `(path, ModuleRecord)` for each dirty `paths` entry that
+        `_is_dirty` could repair in place — the second look a symbol lookup
+        takes when no pre-edit record answered.
+
+        With `auto_refresh` off this yields nothing: an added symbol is
+        withheld like every other post-edit fact, and no miss is counted
+        for it, since the pre-edit model never claimed to know it.
+        """
+        if not paths or not getattr(self, "_auto_refresh", False):
+            return
+        for path in paths:
+            if not self._is_dirty(path):
+                module = self._module_record(path)
+                if module is not None:
+                    yield path, module
 
     def _format_symbol_block(self, module_path: str, sym) -> str:
         lines = [f"module: {module_path}", f"symbol: {sym.qualname}"]
@@ -708,16 +783,25 @@ class CollectBridge:
             return []
         dirty_hit = False
         dirty_paths = self._dirty_set()
+        deferred: list = []
         try:
             for module in list(self._model.modules):
                 path = module.path
-                if path in dirty_paths and any(
-                    _qualname_matches(s.qualname, name) for s in module.public_symbols
-                ):
+                if path in dirty_paths:
+                    if not any(
+                        _qualname_matches(s.qualname, name) for s in module.public_symbols
+                    ):
+                        deferred.append(path)   # maybe added by the edit
+                        continue
                     if self._is_dirty(path):
                         dirty_hit = True
                         continue
                     module = self._module_record(path) or module
+                for sym in module.public_symbols:
+                    qn = sym.qualname
+                    if _qualname_matches(qn, name):
+                        return list(self._model.contracts_for(qn))
+            for path, module in self._repaired_deferred(deferred):
                 for sym in module.public_symbols:
                     qn = sym.qualname
                     if _qualname_matches(qn, name):
