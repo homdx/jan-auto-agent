@@ -819,6 +819,12 @@ class AutoController:
                         f"continuing with remaining tasks"
                     )
 
+                # ── V9: the collect artifact predates this commit ───────────
+                # Placed after the regression loop on purpose: those fixes
+                # commit on top of `commit_hash`, so the tree the NEXT task
+                # sees is HEAD, and paths from both commits must be dirty.
+                self._invalidate_collect(task["id"], collect_bridge, commit_hash)
+
             else:
                 # ── AUTO-G4: exhaustion → knowledge note + ticket ──────────
                 ex_outcome = exhaustion_handler.handle(task, result)
@@ -1312,6 +1318,68 @@ class AutoController:
         )
         cache[task_mode] = bridge
         return bridge
+
+    def _invalidate_collect(self, task_id: str, bridge, commit_hash: Optional[str]) -> None:
+        """V9: mark the paths this task wrote as dirty on the collect bridge.
+
+        The model was built once, at `load()`, before this commit happened,
+        so `status` still reads `"fresh"` while its facts describe a tree
+        that no longer exists. The paths the commit actually touched are the
+        authoritative answer to "what did this task write" — more accurate
+        than the task's declared `target_files`, which can both
+        under-report (the coder fixed a helper too) and over-report (a task
+        that staged nothing). Without git, or when git cannot be asked, the
+        task's declared `target_files` are the fallback — the safer guess:
+        blinding a path that turned out clean costs a block, serving stale
+        facts costs a wrong one. With no bridge this is a no-op.
+
+        Called after the post-commit regression loop, so the bug-fix
+        commits it produces are dirty as well: `paths_changed_between`
+        covers `commit_hash..HEAD` rather than just the one commit. Never
+        raises — a collect bookkeeping hiccup must not cost the remaining
+        tasks in plan.json.
+        """
+        if bridge is None:
+            return
+        paths: Optional[list] = None
+        if commit_hash and self.git is not None:
+            try:
+                paths = list(self.git.paths_changed_in(commit_hash))
+                tip = self.git.get_current_hash()
+                if tip and tip != commit_hash:
+                    paths = sorted(set(paths) | set(self.git.paths_changed_between(commit_hash, tip)))
+            except Exception as exc:  # noqa: BLE001 — never abort the run
+                logger.warning(
+                    "_invalidate_collect: could not list the paths committed "
+                    "for task %s (%s) — falling back to target_files",
+                    task_id, exc,
+                )
+                paths = None
+        if not paths:
+            paths = list(self._task_target_files(task_id))
+        try:
+            bridge.invalidate(paths)
+        except Exception as exc:  # noqa: BLE001 — never abort the run
+            logger.warning(
+                "_invalidate_collect: bridge.invalidate failed for task %s "
+                "(%s) — collect blocks may stay stale for the paths this "
+                "task wrote", task_id, exc,
+            )
+
+    def _task_target_files(self, task_id: str) -> list:
+        """A task's declared `target_files`, for the no-git invalidation
+        fallback. Returns `[]` when the task record is gone or malformed
+        rather than raising."""
+        try:
+            task = self.state.get_task(task_id)
+            if not isinstance(task, dict):
+                return []
+            files = task.get("target_files")
+            if not isinstance(files, (list, tuple)):
+                return []
+            return [str(f) for f in files]
+        except Exception:  # noqa: BLE001 — never abort the run
+            return []
 
     def collect_context_for(self, target_file: str) -> str:
         """The opt-in COLLECT-23 context block for `target_file` — kept for
