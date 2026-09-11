@@ -48,3 +48,4 @@ test_faq_agent_validate.py
 test_gate1_presence_llm_profile.py
 test_llm_stream_response_format.py
 test_llm_stream_think_effort.py
+test_collect_block_budget_keeps_fact_rows.py

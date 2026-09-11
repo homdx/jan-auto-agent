@@ -595,18 +595,22 @@ def test_without_summaries_the_existing_rows_are_all_still_present_in_order(monk
 # ── V5-5: the row goes before the static facts under a budget cut ──────────
 
 
-def test_at_half_the_pack_the_row_is_dropped_while_the_rows_above_it_survive():
+def test_at_half_the_pack_the_row_shrinks_while_the_rows_above_it_survive():
     """AC, adapted (see the module docstring): the ticket says `neighbours`
-    drops before `fails_open` — a V4 row above it — so at half the pack's size
-    the prose is gone while every row ranked above it survives. The assertion
-    is against callers/calls_into/tests, which are the rows above it here."""
+    gives way before the rows ranked above it. V5 pinned that as "the row is
+    gone at half the pack"; L6 shrinks rows instead of dropping them whole, so
+    at half the pack the fact rows above keep their count and the prose row
+    keeps at most the leading entries it can still afford — fewer than the
+    full three — and never outranks them."""
     model = _rich_model()
     full = build_collect_context_block(model, TARGET)
-    assert _NEIGHBOURS_PREFIX in full
+    full_lines = _neighbour_lines(full)
+    assert len(full_lines) == 3
     half = len(full) // 2
     block = build_collect_context_block(model, TARGET, budget=half)
-    assert _NEIGHBOURS_PREFIX not in block, (
-        f"budget {half} (half of {len(full)}): the row must be gone\n{block}"
+    lines = _neighbour_lines(block)
+    assert len(lines) < len(full_lines) and lines == full_lines[: len(lines)], (
+        f"budget {half} (half of {len(full)}): the row must be shrunk from the end\n{block}"
     )
     for prefix in (_CALLERS_PREFIX, _CALLS_INTO_PREFIX, _TESTS_PREFIX):
         assert any(line.startswith(prefix) for line in block.split("\n")), (
@@ -627,15 +631,17 @@ def test_no_budget_ever_renders_the_row_before_the_rows_above_it():
             assert any(line.startswith(prefix) for line in lines), f"budget {budget}: {lines!r}"
 
 
-def test_the_row_is_never_rendered_partially_under_a_budget_cut():
-    """A cut row is a whole row: three neighbours or none. Splitting it would
-    state a partial neighbourhood without saying it is partial."""
+def test_a_cut_row_is_always_a_leading_run_of_whole_entries():
+    """L6: a cut row is a prefix of the full row — whole entries dropped from
+    the end, callers kept first — never a fragment of a line and never an entry
+    out of order. Every surviving line still carries its `(llm)` label."""
     model = _rich_model()
-    full_lines = _neighbour_lines(build_collect_context_block(model, TARGET))
     full = build_collect_context_block(model, TARGET)
+    full_lines = _neighbour_lines(full)
     for budget in range(40, len(full) + 1):
         lines = _neighbour_lines(build_collect_context_block(model, TARGET, budget=budget))
-        assert not lines or lines == full_lines, f"budget {budget}: {lines!r}"
+        assert lines == full_lines[: len(lines)], f"budget {budget}: {lines!r}"
+        assert all(line.endswith(_NEIGHBOURS_LLM_LABEL) for line in lines)
 
 
 def test_a_block_with_the_row_never_exceeds_its_budget():

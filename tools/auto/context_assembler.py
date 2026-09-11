@@ -252,6 +252,42 @@ def _capped_names(paths: "list[str] | tuple[str, ...]", limit: int) -> str:
     return f"{', '.join(shown)}{_CUT_NOTE.format(extra=extra)}"
 
 
+def _fitted_names(head: str, bare: str, names, cap: int, remaining: "int | None") -> str:
+    """`head` + up to `cap` of `names` — the largest form that fits `remaining`.
+
+    `remaining is None` (no budget) is byte-identical to the old call: `head`
+    followed by `_capped_names(names, cap)`. With a budget the names are dropped
+    from the END, one at a time, until the line fits; when the last one goes,
+    `bare` is returned — the count alone. The count is the fact and the names
+    are the courtesy, so under budget pressure a row keeps its count instead of
+    vanishing whole and handing its budget to the row that comes after it.
+    `""` only when the row has no names at all: a row that has a count always
+    has a smallest form, which is `bare`, and it is returned even when `bare`
+    does not fit `remaining` — the caller asks for a form to *measure*, and it
+    is the budget check in `build_collect_context_block` that decides whether
+    the row renders at all.
+
+    `+N` is recomputed as the names go, so the announced remainder always
+    reconciles with the list the row leads with at every level of the cut.
+    Monotone in `remaining`: a larger allowance never yields fewer names, so a
+    bigger budget cannot make a row look more cut than a smaller one.
+    """
+    if not names:
+        return ""
+    if remaining is None:
+        return f"{head}{_capped_names(names, cap)}"
+    keep = min(cap, len(names))
+    while keep > 0:
+        line = f"{head}{', '.join(names[:keep])}"
+        extra = len(names) - keep
+        if extra > 0:
+            line += _CUT_NOTE.format(extra=extra)
+        if len(line) <= remaining:
+            return line
+        keep -= 1
+    return bare
+
+
 def _row_callers(model, target_file: str, remaining: "int | None") -> str:
     """Who breaks if this file changes: the importer count first, then the
     non-test importers, up to five, remainder announced.
@@ -263,8 +299,11 @@ def _row_callers(model, target_file: str, remaining: "int | None") -> str:
     production callers the ticket exists to surface. The `(N non-test)`
     parenthetical is dropped when it would restate the same number.
 
-    `remaining` is unused: the row is one line and either fits or the loop
-    skips it, never truncates it.
+    With a budget the row shrinks by dropping caller names from the end, down to
+    the count alone — `_fitted_names` — because the count is the blast radius
+    the row exists to state, and losing it to a shorter row would leave the
+    pack saying who this module is without saying how many files break it.
+    `remaining is None` renders the whole capped row, as before.
 
     The entry-point form is claimed only from the artifact's own recorded
     importer set: a module absent from `imported_by` (a pre-V1 artifact, which
@@ -288,23 +327,30 @@ def _row_callers(model, target_file: str, remaining: "int | None") -> str:
     non_test = len(callers)
     paren = f" ({non_test} non-test)" if non_test != total else ""
     verb = "imports" if total == 1 else "import"
-    return f"{_CALLERS_PREFIX}{total} {_plural(total, 'module')} {verb} this{paren}: " \
-        f"{_capped_names(callers, _CALLERS_MAX_NAMES)}"
+    fact = f"{_CALLERS_PREFIX}{total} {_plural(total, 'module')} {verb} this{paren}"
+    return _fitted_names(f"{fact}: ", fact, callers, _CALLERS_MAX_NAMES, remaining)
 
 
 def _row_calls_into(model, target_file: str, remaining: "int | None") -> str:
     """First-party imports, up to five, remainder announced.
 
     `calls_into` resolves against this model's module table, so a partial or
-    hand-edited artifact cannot surface a phantom dependency. `remaining` is
-    unused for the same reason as in `_row_callers`.
+    hand-edited artifact cannot surface a phantom dependency.
+
+    The names carry no count of their own, so the count is the one thing this
+    row can still say when they do not fit: under budget the row shrinks down to
+    `calls_into: N targets` (`_fitted_names` with `_CALLS_INTO_PREFIX` as its
+    head, so the unbudgeted form is byte-identical to the old one). The full
+    name list is never the whole point — the point is that this module has a
+    first-party dependency surface at all.
     """
     if model.module(target_file) is None:
         return ""
     targets = model.calls_into(target_file)
     if not targets:
         return ""
-    return f"{_CALLS_INTO_PREFIX}{_capped_names(targets, _CALLS_INTO_MAX_NAMES)}"
+    count = f"{_CALLS_INTO_PREFIX}{len(targets)} {_plural(len(targets), 'target')}"
+    return _fitted_names(_CALLS_INTO_PREFIX, count, targets, _CALLS_INTO_MAX_NAMES, remaining)
 
 
 def _row_tests(model, target_file: str, remaining: "int | None") -> str:
@@ -318,7 +364,10 @@ def _row_tests(model, target_file: str, remaining: "int | None") -> str:
     same fact read two ways. A module that is in neither renders no row at all:
     the artifact has no opinion about it, and that is 168 of the 469 modules.
 
-    `remaining` is unused: one line, fits or is skipped by the loop.
+    With a budget the row shrinks to the count alone — `tests: 8 files` — before
+    the loop gives up on it: the number of covering files is the fact the
+    reviewer checks, the names are a convenience, and a count row costs about
+    half a symbol row. `remaining is None` renders the whole capped row.
     """
     if model.module(target_file) is None:
         return ""
@@ -328,8 +377,8 @@ def _row_tests(model, target_file: str, remaining: "int | None") -> str:
         if not covered_by_nothing:
             return ""
         return f"{_TESTS_PREFIX}{_NO_TESTS_NOTE}"
-    return f"{_TESTS_PREFIX}{len(tests)} {_plural(len(tests), 'file')}: " \
-        f"{_capped_names(tests, _TESTS_MAX_NAMES)}"
+    count = f"{_TESTS_PREFIX}{len(tests)} {_plural(len(tests), 'file')}"
+    return _fitted_names(f"{count}: ", count, tests, _TESTS_MAX_NAMES, remaining)
 
 
 def _first_sentence(text: str, limit: int = _NEIGHBOURS_PURPOSE_MAX_CHARS) -> str:
@@ -394,9 +443,14 @@ def _row_neighbours(model, target_file: str, remaining: "int | None") -> str:
     on the one thing a pack exists to avoid. Each surviving purpose is cut
     by `_first_sentence` and each line carries `(llm)`.
 
-    `remaining` is unused: the row is up to three whole lines, so the loop
-    below either takes it all or drops it. Splitting it would leave the
-    pack stating a partial neighbourhood without saying it is partial.
+    L6: with a budget the row shrinks by dropping whole entries from the END
+    until what is left fits `remaining` — three neighbours, then two, then one,
+    then no row. Each line is a complete fact about one neighbour (its path,
+    its purpose, its `(llm)` label), so a shorter row states fewer facts, never
+    a fragment of one; and the entries the cut keeps are the ones the order
+    ranks highest (callers first). There is no count form here: a neighbour
+    count is not a fact the coder acts on, so when even one entry does not fit
+    the row is absent. `remaining is None` renders every entry, as before.
 
     Fails open like every other row: an unknown module, a neighbour the
     module table does not know, or a stand-in model with no summary table
@@ -429,6 +483,9 @@ def _row_neighbours(model, target_file: str, remaining: "int | None") -> str:
         if not purpose:
             continue
         lines.append(f"{_NEIGHBOURS_PREFIX}{path} — {purpose}{_NEIGHBOURS_LLM_LABEL}")
+    if remaining is not None:
+        while lines and len("\n".join(lines)) > remaining:
+            lines.pop()
     return "\n".join(lines)
 
 
@@ -438,11 +495,19 @@ def _row_neighbours(model, target_file: str, remaining: "int | None") -> str:
 # tuple order IS the priority, and cutting a row under budget pressure IS the
 # `continue` in `build_collect_context_block` below. V3 ships the first three
 # rows (the neighbourhood: who imports this, what this imports, what tests it);
-# V5 puts `neighbours` next — the only row carrying LLM prose, and therefore
-# the last one a budget cut should keep, so V4's fails_open/risk land above it
-# when they do. The last three rows are the ones V2 ported verbatim out of the
-# old single pass, `public_symbols` still last because it is the row the target
-# file's own source makes redundant.
+# V5 puts `neighbours` next — the only row carrying LLM prose, so it is the
+# first thing a budget cut drops. The last three rows are the ones V2 ported
+# verbatim out of the old single pass, `public_symbols` still last because it is
+# the row the target file's own source makes redundant.
+#
+# L6: the order is unchanged, but a row is no longer dropped whole. The three
+# rows that carry a `+N` tail (`callers`, `calls_into`, `tests`) shrink by
+# dropping names from the end down to their count alone before the loop gives
+# up on them — the count is the fact, the names are the courtesy — and
+# `public_symbols` is only ever rendered into whatever that leaves. `neighbours`
+# shrinks too, by whole entries from the end — it has no count to fall back to,
+# so it is not in `_SHRINKABLE_ROWS` (no floor is reserved for it) and simply
+# takes as many of its lines as fit what the rows above left.
 _PACK_ROWS = (
     ("callers", _row_callers),
     ("calls_into", _row_calls_into),
@@ -452,6 +517,14 @@ _PACK_ROWS = (
     ("config_read", _row_config_read),
     ("public_symbols", _row_public_symbols),
 )
+
+# L6: the rows whose material is a count plus a courtesy list of names, so a
+# budget cut can drop names from the end and keep the count. The set is by name
+# rather than a third `_PACK_ROWS` field: the tuple order is pinned byte for
+# byte by the V2/V3 tests, and it stays so. `public_symbols` is not here — it
+# already cuts at a symbol boundary on its own and stays last, so it only ever
+# takes the budget no row above it could use.
+_SHRINKABLE_ROWS = frozenset({"callers", "calls_into", "tests"})
 
 
 def build_collect_context_block(
@@ -477,10 +550,14 @@ def build_collect_context_block(
     block worth showing.
 
     `budget=None` renders every row in full, so every existing caller keeps
-    working until V6 wires `max_context_chars_auto` in. With a budget, a row
-    that does not fit is skipped in favour of the next, shorter one, and
-    `public_symbols` (the lowest-value row, and the only one that can shrink
-    on a symbol boundary) announces the remainder instead of dropping it.
+    working until V6 wires `max_context_chars_auto` in. With a budget each row
+    is asked for the largest form that fits what is left — the `+N` rows shrink
+    by dropping names from the end down to their count, `public_symbols` by
+    cutting the symbol list at a symbol boundary and announcing the remainder —
+    and only a row whose smallest form still does not fit is skipped in favour
+    of the next, shorter one. That is the L6 fix: a `tests` row no longer
+    disappears whole and hands its budget to `public_symbols`, because the count
+    it leads with is the fact the pack exists to carry.
 
     `task_mode` is threaded for V14's docs-mode tuple; it does not change the
     code-mode pack this ticket ships.
@@ -508,34 +585,73 @@ def build_collect_context_block(
     seen: "set[str]" = set(head)
     used = len("\n".join(head))
 
-    for name, render in _PACK_ROWS:
+    def _render(name: str, render, allowance: "int | None") -> str:
+        """One renderer call, fail-open: a broken row is no row, never no block."""
         try:
-            row = render(
-                model, target_file, (budget - used - 1) if budget is not None else None
-            )
-        except Exception as exc:  # noqa: BLE001 — a broken row is no row, never no block
+            return render(model, target_file, allowance)
+        except Exception as exc:  # noqa: BLE001
             logger.warning("collect block row %r failed for %s: %s", name, target_file, exc)
-            continue
+            return ""
+
+    # L6 pass one: the smallest form of every shrinkable row — its count alone,
+    # the one thing the row still says when its names do not fit.
+    floors: "dict[str, int]" = {}
+    if budget is not None:
+        for name, render in _PACK_ROWS:
+            if name not in _SHRINKABLE_ROWS:
+                continue
+            floor = _render(name, render, 0)
+            if floor:
+                floors[name] = len(floor)
+
+    # L6 pass two. The room left after every shrinkable row has taken its
+    # count, newlines included, split equally: each row gets its count plus an
+    # equal share of that room. The allowance is then a function of the budget
+    # alone — never of what the rows above happened to claim — so a larger
+    # budget only adds names and never takes them away, and no row can grow at
+    # the expense of a row below it. The share is floored, so the block never
+    # spends more than the budget.
+    share = 0
+    if budget is not None and floors:
+        room = budget - used - len(floors) - sum(floors.values())
+        if room > 0:
+            share = room // len(floors)
+
+    for name, render in _PACK_ROWS:
+        if budget is None:
+            allowance: "int | None" = None
+        elif name in floors:
+            allowance = floors[name] + share
+        else:
+            allowance = budget - used - 1
+        row = _render(name, render, allowance)
         if not row:
             continue
 
-        # V2.4: drop lines an earlier row already rendered. 24 of today's
-        # config_read lines are byte-identical duplicates of one already shown
-        # (the same (section, key) read through two code paths), and a block
-        # that repeats a fact spends budget on nothing.
+        # V2.4: drop lines an earlier row already rendered, and duplicates
+        # inside this row — 24 of today's config_read lines are byte-identical
+        # duplicates of one already shown (the same (section, key) read through
+        # two code paths), and a block that repeats a fact spends budget on
+        # nothing. L6: nothing goes into `seen` here; a row that the budget
+        # check below then skips must not suppress an identical line in a later
+        # row, so this row's own lines are tracked in `fresh_seen` instead.
         fresh: "list[str]" = []
+        fresh_seen: "set[str]" = set()
         for line in row.split("\n"):
-            if line in seen:
+            if line in seen or line in fresh_seen:
                 continue
-            seen.add(line)
+            fresh_seen.add(line)
             fresh.append(line)
         if not fresh:
             continue
 
         if budget is not None and used + len("\n".join(fresh)) + 1 > budget:
-            # V2.5: not enough budget left for this row — try the next, shorter one.
+            # V2.5: not enough budget left for this row — try the next, shorter
+            # one. L6: `seen` is left untouched, so a skipped row leaves no
+            # trace in the block.
             continue
 
+        seen.update(fresh)
         body.extend(fresh)
         used += len("\n".join(fresh)) + 1
 

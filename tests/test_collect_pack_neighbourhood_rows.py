@@ -131,6 +131,12 @@ def _row(block: str, prefix: str) -> str:
     return ""
 
 
+def _named_paths(line: str) -> int:
+    """The path names a row line shows. The `, +N` announcement is not one, and
+    neither is the count the row leads with."""
+    return len([part for part in line.split(", ") if part.endswith(".py")])
+
+
 # A graph used by most of the row tests below. `pkg/hub.py` is imported by 7
 # shipped modules and 3 test modules, imports 7 shipped modules, and is
 # covered by 7 test files — so every cap in this file has a remainder to cut.
@@ -493,13 +499,25 @@ def test_the_three_new_rows_return_empty_string_not_none():
     assert _row_tests(model, "pkg/lone.py", None) == ""
 
 
-def test_renderers_accept_the_remaining_argument_the_loop_passes():
+def test_renderers_honour_the_remaining_argument_the_loop_passes():
     """Every renderer has the `(model, target, remaining)` signature the loop
-    calls with; the new rows ignore it because each is one line."""
+    calls with. L6 made the three `+N` rows shrink to fit it: names are dropped
+    from the end down to the count alone, monotonically — a larger allowance
+    never yields fewer names, and `remaining=None` still gives the whole capped
+    row, so every pre-L6 caller keeps working."""
     model = _hub_model()
     for render in (_row_callers, _row_calls_into, _row_tests):
-        assert render(model, "pkg/hub.py", None) == render(model, "pkg/hub.py", 42)
-        assert render(model, "pkg/hub.py", 1) == render(model, "pkg/hub.py", None)
+        full = render(model, "pkg/hub.py", None)
+        assert render(model, "pkg/hub.py", len(full)) == full
+        previous = None
+        for remaining in range(0, len(full) + 60, 3):
+            names = _named_paths(render(model, "pkg/hub.py", remaining))
+            assert previous is None or names >= previous, (
+                f"{render.__name__} at remaining={remaining}: {names} names after {previous}"
+            )
+            previous = names
+        # the floor: the count alone, with no name in it at all
+        assert _named_paths(render(model, "pkg/hub.py", 0)) == 0
 
 
 def test_block_never_exceeds_its_budget_with_the_new_rows():
@@ -509,20 +527,24 @@ def test_block_never_exceeds_its_budget_with_the_new_rows():
         assert len(block) <= budget, f"block of {len(block)} chars exceeded budget {budget}"
 
 
-def test_no_neighbourhood_row_is_split_mid_line_by_the_budget():
-    """A cut row is a whole row — the budget never truncates one."""
+def test_no_neighbourhood_row_is_truncated_mid_line_by_the_budget():
+    """A cut row is still a whole row: the budget drops names, never characters.
+    A rendered line re-rendered at its own length reproduces itself, so every
+    line in the block is one of the row's legitimate forms — the full row or a
+    shrunk one — never a mid-line truncation of it."""
     model = _hub_model()
-    full = build_collect_context_block(model, "pkg/hub.py")
-    forms = {
-        _CALLERS_PREFIX: _row(full, _CALLERS_PREFIX),
-        _CALLS_INTO_PREFIX: _row(full, _CALLS_INTO_PREFIX),
-        _TESTS_PREFIX: _row(full, _TESTS_PREFIX),
+    renderers = {
+        _CALLERS_PREFIX: _row_callers,
+        _CALLS_INTO_PREFIX: _row_calls_into,
+        _TESTS_PREFIX: _row_tests,
     }
     for budget in range(60, 1500, 23):
         for line in build_collect_context_block(model, "pkg/hub.py", budget=budget).split("\n"):
-            for prefix, whole in forms.items():
+            for prefix, render in renderers.items():
                 if line.startswith(prefix):
-                    assert line == whole, f"{line!r} is not the whole row {whole!r}"
+                    assert render(model, "pkg/hub.py", len(line)) == line, (
+                        f"{line!r} is not a whole form of this row at budget {budget}"
+                    )
 
 
 def test_budget_none_still_renders_every_neighbourhood_row_in_full():
