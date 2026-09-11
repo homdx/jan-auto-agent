@@ -311,6 +311,10 @@ def build_context(
     patched module list without re-scanning the whole tree."""
     sources = _sources_for(root, modules)
 
+    # Built before Pass B/C on purpose: Pass C (V11) needs the import graph
+    # to know what a test file may cite, and a summary changes no import.
+    edges = graph_mod.import_edges(modules)
+
     verification_report: Optional[Dict[str, Any]] = None
     if llm_call is not None:
         summarized = summarize_repo(
@@ -319,9 +323,10 @@ def build_context(
             progress_fn=_print_summarize_progress,
             on_error=_print_summarize_error,
         )
-        modules, verification_report = verifier_mod.verify_repo(summarized, sources, root=root)
+        modules, verification_report = verifier_mod.verify_repo(
+            summarized, sources, root=root, import_edges=edges,
+        )
 
-    edges = graph_mod.import_edges(modules)
     reverse = graph_mod.imported_by(edges)
     entries = graph_mod.entry_points(edges, reverse)
 
@@ -717,7 +722,9 @@ def action_refresh(
     ctx = build_context(root, merged, config=config, config_path=config_path, llm_call=None)
     if any(m.summary is not None for m in merged):
         sources = _sources_for(root, merged)
-        verified_modules, report = verifier_mod.verify_repo(merged, sources, root=root)
+        verified_modules, report = verifier_mod.verify_repo(
+            merged, sources, root=root, import_edges=ctx.import_edges,
+        )
         ctx = replace(ctx, modules=verified_modules, verification_report=report)
 
     written = _write_artifact(collect_dir, ctx)
@@ -930,7 +937,9 @@ def action_module(
     # `--module` gets the same guarantee.
     if any(m.summary is not None for m in modules):
         sources = _sources_for(root, modules)
-        verified_modules, report = verifier_mod.verify_repo(modules, sources, root=root)
+        verified_modules, report = verifier_mod.verify_repo(
+            modules, sources, root=root, import_edges=ctx.import_edges,
+        )
         modules = verified_modules
         ctx = replace(ctx, modules=verified_modules, verification_report=report)
 
