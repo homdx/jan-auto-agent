@@ -298,9 +298,14 @@ def _prefer_citable_homonyms(
     When `citable_modules` is given and at least one candidate for a short
     name belongs to it, only those candidates stay; a short name with no
     citable candidate keeps all of them, and they fail exactly as before.
-    `None` (every non-test module) is a no-op, so source-file extraction
-    is unchanged. Explicit `path.py:name` citations never pass through
-    here — the caller appends those after this step, unfiltered.
+    `None` — the public default, for callers that never build a set — is a
+    no-op and keeps every homonym. `verify_repo` builds a set for *every*
+    module since V16: a test file's is its own path plus its imports (V11),
+    a source module's is just `{own path}`, so a bare name in a source-file
+    summary resolves to the symbol defined *here* instead of to every
+    module that defines one by that name. Explicit `path.py:name` citations
+    never pass through here — the caller appends those after this step,
+    unfiltered.
     """
     if citable_modules is None or not symbols:
         return symbols
@@ -593,7 +598,12 @@ def citation_check(
             return (
                 f"cited symbol {claim.symbol!r} belongs to module "
                 f"{symbol_module!r}, not {claim.module!r}"
-                + (" or any module it imports" if citable_modules is not None else "")
+                # V16: the suffix describes a set actually widened past the
+                # module itself. A source module's set is `{claim.module}`
+                # alone (what `None` folds into above), so its detail string
+                # stays byte-identical to the pre-V11 wording — `.collect/`
+                # diffs and the M-tickets' reason counters read it.
+                + (" or any module it imports" if len(citable) > 1 else "")
             )
 
     if claim.location is not None:
@@ -883,7 +893,9 @@ def verify_repo(
     `conftest.py`; the L5 rule — a bare `test_*.py` name is not a signal,
     `tools/collect/test_map.py` ships) gets `citable_modules` = its own
     path plus every module `import_edges` says it imports. Every other
-    module gets `None`, the own-module-only rule, unchanged. `import_edges`
+    module gets `{own path}` (V16; it was `None` before, which let a bare
+    name in a source summary expand to every homonym repo-wide and sink the
+    sentence) — the own-module-only rule, unchanged in effect. `import_edges`
     is the same `graph.import_edges(modules)` the artifact is built from —
     `cli.py` passes the one it already has; a caller without one gets it
     computed here, so the rule is never silently off. A test citing a
@@ -907,9 +919,9 @@ def verify_repo(
 
     if import_edges is None:
         import_edges = _import_edges(modules)
-    citable_by_module: Dict[str, Optional[FrozenSet[str]]] = {
+    citable_by_module: Dict[str, FrozenSet[str]] = {
         m.path: frozenset({m.path}) | import_edges.get(m.path, frozenset())
-        if is_test_path(m.path) else None
+        if is_test_path(m.path) else frozenset({m.path})
         for m in modules
     }
 
