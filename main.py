@@ -742,11 +742,14 @@ Available commands
   /auto <goal>         Run autonomous improvement mode (AUTO-A1).
                        e.g. /auto improve current code
   /collect             Bring the structural project model in [collect] dir
-                       (default .collect/) up to date. Read-only to the
-                       source tree. Freshness-gated: a no-op (no writes) if
-                       up to date, and an incremental refresh if stale —
-                       only the modules whose content changed are re-summarized,
-                       every unchanged module keeps its existing record.
+                        (default .collect/) up to date. Read-only to the
+                        source tree. Freshness-gated: a no-op (no writes) if
+                        up to date, and an incremental refresh if stale —
+                        only the modules whose content changed are re-summarized,
+                        every unchanged module keeps its existing record. A tree
+                        that matches its manifest but is missing artifact.json is
+                        rebuilt rather than reported as up to date.
+
                        /collect --check        freshness report only, writes nothing
                        /collect --module <p>   incremental re-scan of one module
                        /collect --refresh      same incremental path, not freshness-gated
@@ -754,6 +757,8 @@ Available commands
                                                module re-summarized. Use after a
                                                collector_version bump or to discard a
                                                suspect artifact
+                       Conflicting flags: --check wins (writes nothing), then
+                       --module, then --rebuild, then --refresh.
   /faq <question>      Search the knowledge folder and answer the question.
                        Replies NOT FOUND if no matching entry exists.
                        e.g. /faq how do I reset my password?
@@ -861,8 +866,10 @@ def _parse_args():
                              "up to date, then exit. Freshness-gated — a fresh tree is a "
                              "no-op (no writes), a stale tree refreshes incrementally: only "
                              "the modules whose content changed are re-summarized, every "
-                             "unchanged module keeps its existing record. Use --collect "
-                             "--rebuild for an unconditional full rebuild.")
+                             "unchanged module keeps its existing record. A tree that matches "
+                             "its manifest but is missing artifact.json is rebuilt, not "
+                             "reported as up to date. Use --collect --rebuild for an "
+                             "unconditional full rebuild.")
     parser.add_argument("--check", action="store_true", default=False,
                         help="With --collect: only check freshness — writes nothing, anywhere.")
     parser.add_argument("--refresh", action="store_true", default=False,
@@ -870,9 +877,12 @@ def _parse_args():
                              "only the modules whose content hash changed since the last "
                              "run; unchanged modules keep their existing record (summary "
                              "included) and cost zero LLM calls. Same path --collect takes "
-                             "on a stale tree, just not freshness-gated. Falls back to a "
-                             "full build only when there is no prior artifact to diff "
-                             "against (or the manifest is from a different collector_version).")
+                              "on a stale tree, just not freshness-gated. Falls back to a "
+                              "full build when there is nothing usable to diff against — an "
+                              "absent, unreadable or record-less artifact, an unreadable "
+                              "manifest, or a manifest from a different collector_version — "
+                              "and the message says which of those it hit.")
+
     parser.add_argument("--rebuild", action="store_true", default=False,
                         help="With --collect: unconditional full rebuild — every module in "
                              "the tree is re-scanned and re-summarized regardless of "
@@ -1178,19 +1188,22 @@ def main():
 
     # ── COLLECT ONE-SHOT MODE (COLLECT-19) ──────────────────────────────
     if args.collect:
-        from tools.collect.cli import CollectCliError, run as collect_run
-        from tools.collect.summarizer import make_summarizer_call, should_run_pass_b
+        from tools.collect.cli import (
+            CollectCliError,
+            action_from_flags,
+            run as collect_run,
+        )
+        from tools.collect.summarizer import make_summarizer_call_or_none, should_run_pass_b
 
-        if args.module is not None:
-            action = "module"
-        elif args.rebuild:
-            action = "rebuild"
-        elif args.refresh:
-            action = "refresh"
-        elif args.check:
-            action = "check"
-        else:
-            action = "collect"
+        # Same precedence table as `/collect`'s parse_collect_args — kept in
+        # one place so `--collect` and `/collect` never dispatch the same
+        # flag combination to different actions.
+        action, _ = action_from_flags(
+            check=args.check,
+            module_path=args.module,
+            rebuild=args.rebuild,
+            refresh=args.refresh,
+        )
 
         # A missing config is only fatal when the user explicitly asked for a
         # specific file: erroring out on the *default* path breaks every run
@@ -1231,20 +1244,12 @@ def main():
             # try/except, a single malformed value (e.g. `[collect]
             # temperature = abc`) crashed the entire --collect invocation
             # with a raw ValueError — including `--refresh` and `--module`
-            # runs that don't even need Pass B's structural-only fallback
-            # is available for. tools/auto/collect_bridge.py's
-            # make_collect_bridge() already guards this same call the same
-            # way; mirror that here so a bad LLM-profile key degrades to
-            # "Pass B skipped" instead of aborting the whole command.
-            try:
-                llm_call = make_summarizer_call(config)
-            except Exception as exc:  # noqa: BLE001 — Pass B is optional
-                logger.warning(
-                    "--collect: could not build the summarizer LLM call (%s) "
-                    "— continuing with structural-only output (Pass B/C skipped).",
-                    exc,
-                )
-                llm_call = None
+            # runs that don't even need Pass B. make_summarizer_call_or_none
+            # is the guarded form, and both entry points (this one and the
+            # interactive /collect) use it so a bad key degrades to "Pass B
+            # skipped" instead of aborting the command — the inline copy
+            # that used to live here was never mirrored to /collect.
+            llm_call = make_summarizer_call_or_none(config)
 
         try:
             result = collect_run(
@@ -1419,7 +1424,7 @@ def main():
             # under [collect] dir (default .collect/).
             if user_input.startswith("/collect"):
                 from tools.collect.cli import CollectCliError, parse_collect_args, run as collect_run
-                from tools.collect.summarizer import make_summarizer_call, should_run_pass_b
+                from tools.collect.summarizer import make_summarizer_call_or_none, should_run_pass_b
 
                 body = user_input[len("/collect"):].strip()
                 argv = body.split() if body else []
@@ -1431,7 +1436,15 @@ def main():
                     llm_call = None
                     no_llm = "--no-llm" in argv
                     if kwargs.get("action") != "check" and not no_llm and should_run_pass_b(orchestrator.config):
-                        llm_call = make_summarizer_call(orchestrator.config)
+                        # BUGFIX: this call site never had the guard the
+                        # --collect branch has. A malformed [collect]/[api]
+                        # key made make_summarizer_call raise straight out
+                        # of /collect — the only enclosing handler below is
+                        # CollectCliError and the one outside that is
+                        # KeyboardInterrupt/EOFError — so one bad config
+                        # value killed the whole interactive shell instead
+                        # of degrading to structural-only output.
+                        llm_call = make_summarizer_call_or_none(orchestrator.config)
                     result = collect_run(
                         base_dir, config=orchestrator.config, config_path=args.config,
                         llm_call=llm_call, **kwargs

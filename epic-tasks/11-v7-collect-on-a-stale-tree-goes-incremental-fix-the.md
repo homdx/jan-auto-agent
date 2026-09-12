@@ -1,6 +1,6 @@
 # V7 — `--collect` on a stale tree goes incremental; fix the docs
 
-**Status:** landed — `25d5de8`  
+**Status:** landed — `25d5de8`; follow-up V7-2 landed — one shared freshness gate (`_freshness`) for `--check` and `--collect` (a manifest without its artifact is stale, not "up to date"), a stale `--collect` costs one Pass A scan and one hash pass, `--module` normalises its path and keeps the manifest whole, both entry points dispatch flags through one table (`action_from_flags`, `--module=<path>` included), `/collect` degrades like `--collect` on a bad summarizer key, and every full-build / refresh / check line counts what Pass B actually did  
 **Severity:** HIGH  
 **File:** `tools/collect/cli.py`  
 **Symbol:** `—`  

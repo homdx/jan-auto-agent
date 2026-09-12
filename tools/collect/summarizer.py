@@ -558,3 +558,36 @@ def make_summarizer_call(config, task_mode: str = "code") -> LlmCall:
     `tools.collect.summarizer._make_llm_call` the same way existing tests
     monkeypatch `tools.auto.summary_memory._make_llm_call`."""
     return _make_llm_call(config, task_mode=task_mode)
+
+
+def make_summarizer_call_or_none(config, task_mode: str = "code") -> Optional[LlmCall]:
+    """`make_summarizer_call` with Pass B's actual failure contract: never
+    raise, degrade to structural-only.
+
+    `main.py` has two call sites for this factory — the `--collect` one-shot
+    branch and the interactive `/collect` REPL command. Each was wrapping it
+    in its own inline `try/except Exception`; the wrapper was added to the
+    one-shot branch (a malformed `[collect] temperature` must not kill the
+    command) and never mirrored to the REPL one, where the only enclosing
+    `except` is `CollectCliError` and the one outside that is
+    `KeyboardInterrupt`/`EOFError`. So one bad key in `[collect]` inside a
+    running session raised straight out of `/collect` and killed the whole
+    shell instead of degrading the one optional stage. Collapsing the guard
+    into this one function makes the two entry points say the same thing and
+    removes the inline copies that had already drifted apart once.
+
+    Pass B is optional by design (`--no-llm`, `[collect] llm_summaries =
+    false`, and a summarizer that cannot be built are all documented ways to
+    reach a structural-only artifact), so "could not build the call" belongs
+    in the same bucket as "was told not to build one": log once, return
+    `None`, and let the caller build the artifact without prose.
+    """
+    try:
+        return make_summarizer_call(config, task_mode=task_mode)
+    except Exception as exc:  # noqa: BLE001 — Pass B is optional, see above
+        logger.warning(
+            "collect: could not build the summarizer LLM call (%s) — "
+            "continuing with structural-only output (Pass B/C skipped).",
+            exc,
+        )
+        return None

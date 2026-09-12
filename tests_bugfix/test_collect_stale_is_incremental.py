@@ -29,9 +29,35 @@ After the fix:
      full build" vs "manifest was built by collector_version=... — full
      build". A full build without Pass B says "re-scanned (Pass B
      skipped)", never "re-summarized".
-  6. `--rebuild` beats `--refresh` in both entry points (`parse_collect_args`
-     for `/collect`, `main.py`'s if-chain for `--collect`), so asking for
-     both never silently downgrades to the cheap path.
+  6. Flag precedence lives in one shared table (`cli.action_from_flags`),
+     used by both entry points (`parse_collect_args` for `/collect`,
+     `main.py`'s one-shot branch for `--collect`), so asking for both
+     `--rebuild` and `--refresh` never silently downgrades to the cheap
+     path — and `--check` + `--module` no longer writes on one entry
+     point and stays read-only on the other.
+
+Follow-up to the same ticket (V7-2) — the stale-tree path still cost a
+second Pass A scan and a third tree hash, and four things about it were
+wrong:
+
+  7. `action_collect` decided staleness via `action_check`, which scanned
+     the whole tree (Pass A) just to hash it, and the `action_refresh` it
+     then delegated to scanned it a second time and hashed it a third
+     (again inside `manifest.build_manifest`). One `--collect` on a stale
+     tree: 2 `scan_repo` calls, 3 full hash passes. Now: 1 and 1.
+  8. A refresh whose only change was a deletion reported
+     "incrementally refreshed 0 changed and 1 removed module(s)".
+  9. A changed module that could not be re-read for the summarizer prompt
+     was still summarized — from an empty source. `summarize_repo` falls
+     back to `sources.get(path, "")`, so the reply parsed into a
+     plausible-looking `purpose` for a file the summarizer never read.
+ 10. `verification_report.json` is the one derived file whose write is
+     conditional, so a build where Pass B/C skipped left the previous
+     build's report next to an `artifact.json` that no longer had any
+     summary for it to describe.
+ 11. `--check` said "stale — a tracked file changed" for every non-fresh
+     verdict, including a `collector_version` mismatch and an unreadable
+     manifest, where no file changed at all.
 """
 
 from __future__ import annotations
@@ -46,11 +72,13 @@ from unittest.mock import patch
 import pytest
 
 from tools.collect import cli as cli_mod
+from tools.collect.manifest import hash_tree as _hash_tree_unpatched
 from tools.collect.cli import (
     ARTIFACT_FILENAME,
     MANIFEST_FILENAME,
     action_check,
     action_collect,
+    action_module,
     action_rebuild,
     action_refresh,
     parse_collect_args,
@@ -470,10 +498,16 @@ class TestRebuildWiring:
     def test_parse_collect_args_rebuild(self):
         assert parse_collect_args(["--rebuild"]) == {"action": "rebuild", "module_path": None}
 
-    def test_parse_collect_args_rebuild_ignores_late_module(self):
+    def test_parse_collect_args_module_beats_rebuild(self):
+        """`--module` names one specific file, so it wins over the
+        whole-tree `--rebuild` — the order `main.py`'s one-shot dispatch
+        already used. `/collect` used to disagree here (`--rebuild` won),
+        so the same flag combination ran a full rebuild interactively and
+        a single-file patch one-shot; both now use `action_from_flags`.
+        See `test_collect_v7_followups.py` for the full agreement matrix."""
         assert parse_collect_args(["--rebuild", "--module", "pkg/a.py"]) == {
-            "action": "rebuild",
-            "module_path": None,
+            "action": "module",
+            "module_path": "pkg/a.py",
         }
 
     def test_parse_collect_args_check_still_wins(self):
@@ -524,3 +558,735 @@ class TestRebuildWiring:
 
         assert result.action == "collect"
         assert len(llm.calls) == 1
+
+
+# ── 6. the stale-tree path costs one Pass A scan and one hash pass ───────────
+
+
+@pytest.fixture
+def op_counts(monkeypatch):
+    """Count the two tree-wide operations `--collect` performs.
+
+    `scan_repo` is imported into `tools.collect.cli`'s own namespace, so it
+    has to be patched there; `hash_tree` is always reached through the
+    manifest module (`build_manifest`, `is_fresh` and the actions all call
+    it that way), so patching that one attribute covers every caller.
+    """
+    from tools.collect import scanner as scanner_mod
+
+    counts = {"scan_repo": 0, "hash_tree": 0}
+    real_scan = scanner_mod.scan_repo
+    real_hash = cli_mod.manifest_mod.hash_tree
+
+    def _scan(*args, **kwargs):
+        counts["scan_repo"] += 1
+        return real_scan(*args, **kwargs)
+
+    def _hash(*args, **kwargs):
+        counts["hash_tree"] += 1
+        return real_hash(*args, **kwargs)
+
+    monkeypatch.setattr(cli_mod, "scan_repo", _scan)
+    monkeypatch.setattr(cli_mod.manifest_mod, "hash_tree", _hash)
+    return counts
+
+
+class TestStaleTreeCostsOneScanAndOneHashPass:
+    def test_one_llm_call_one_scan_one_hash_pass(self, mini_repo, op_counts):
+        """The whole point of the ticket, measured on all three axes.
+
+        Before the follow-up: 1 changed file cost 1 LLM call (the fix), but
+        `action_check`'s freshness gate and the delegated `action_refresh`
+        each ran their own Pass A over the same tree, and the tree was
+        hashed a third time inside `manifest.build_manifest`.
+        """
+        action_collect(mini_repo, llm_call=_counting_llm_call())
+        _change_a(mini_repo)
+        # the bootstrap build above is not the call under test
+        op_counts.update(scan_repo=0, hash_tree=0)
+
+        llm = _counting_llm_call()
+        result = action_collect(mini_repo, llm_call=llm)
+
+        assert result.wrote is True
+        assert len(llm.calls) == 1
+        assert op_counts["scan_repo"] == 1, "Pass A ran more than once over the same tree"
+        assert op_counts["hash_tree"] == 1, "the tree was hashed more than once"
+
+    def test_a_fresh_tree_still_scans_once_and_hashes_once(self, mini_repo, op_counts):
+        """The no-op path must not get worse while the slow path gets
+        better — `--check`-equivalent work is still one scan and one hash."""
+        action_collect(mini_repo)
+        # the bootstrap build above is not the call under test
+        op_counts.update(scan_repo=0, hash_tree=0)
+
+        result = action_collect(mini_repo)
+
+        assert result.wrote is False
+        assert op_counts["scan_repo"] == 1
+        assert op_counts["hash_tree"] == 1
+
+    def test_a_full_rebuild_scans_and_hashes_once_too(self, mini_repo, op_counts):
+        """The `--rebuild` path got the same treatment: the manifest is
+        built from the hashes `_full_build` already computed for the scan,
+        not from a second pass after `_write_artifact` wrote to disk."""
+        action_collect(mini_repo)
+        # the bootstrap build above is not the call under test
+        op_counts.update(scan_repo=0, hash_tree=0)
+
+        llm = _counting_llm_call()
+        result = action_rebuild(mini_repo, llm_call=llm)
+
+        assert op_counts["scan_repo"] == 1
+        assert op_counts["hash_tree"] == 1
+        assert len(llm.calls) == _module_count(mini_repo)
+
+    def test_caller_supplied_scan_and_hashes_are_not_recomputed(self, mini_repo, op_counts):
+        """`action_refresh(modules=..., hashes=...)` is the seam
+        `action_collect` uses: a caller that already has both must not pay
+        for either again."""
+        from tools.collect import scanner as scanner_mod
+
+        action_collect(mini_repo)
+        _change_a(mini_repo)
+        op_counts.update(scan_repo=0, hash_tree=0)
+
+        modules = scanner_mod.scan_repo(mini_repo)
+        # `_hash_tree_unpatched` is bound at import time, before the
+        # fixture's monkeypatch, so this is the real function — calling
+        # `cli_mod.manifest_mod.hash_tree` here would hit the counter and
+        # spoil the assertion below.
+        hashes = _hash_tree_unpatched(mini_repo, [m.path for m in modules])
+
+        result = action_refresh(mini_repo, llm_call=_counting_llm_call(),
+                                modules=modules, hashes=hashes)
+
+        assert op_counts["scan_repo"] == 0
+        assert op_counts["hash_tree"] == 0
+        assert "incrementally refreshed 1 changed" in result.message
+
+    def test_reused_hashes_do_not_change_what_the_manifest_records(
+        self, mini_repo, op_counts,
+    ):
+        """The optimization must be byte-neutral for the manifest: the same
+        file set as a plain `--collect` run, and still fresh afterwards."""
+        import json
+
+        action_collect(mini_repo)
+        _change_a(mini_repo)
+        op_counts.update(scan_repo=0, hash_tree=0)
+
+        result = action_collect(mini_repo)
+
+        manifest = json.loads((result.collect_dir / MANIFEST_FILENAME).read_text(encoding="utf-8"))
+        assert set(manifest["file_hashes"]) == {"pkg/__init__.py", "pkg/a.py", "pkg/b.py"}
+        assert action_check(mini_repo).fresh is True
+
+
+# ── 7. a change that is only a deletion does not report "0 changed" ───────────
+
+
+class TestDeletionOnlyMessage:
+    def test_deletion_only_does_not_report_zero_changed(self, mini_repo):
+        """Before: 'incrementally refreshed 0 changed and 1 removed
+        module(s)'. The zero says nothing; the one does."""
+        action_collect(mini_repo)
+        (mini_repo / "pkg" / "b.py").unlink()
+
+        result = action_collect(mini_repo)
+
+        assert "0 changed" not in result.message
+        assert "1 removed module(s)" in result.message
+
+    def test_deletion_only_does_not_claim_pass_b_was_skipped(self, mini_repo):
+        """"(Pass B skipped)" is for a changed module that went unsummarized.
+        A deletion leaves nothing to summarize, so Pass B had no work — not
+        a reason the line should read like `--no-llm` ran."""
+        action_collect(mini_repo, llm_call=_counting_llm_call())
+        (mini_repo / "pkg" / "b.py").unlink()
+
+        with_llm = action_collect(mini_repo, llm_call=_counting_llm_call())
+        assert "1 removed module(s)" in with_llm.message
+        assert "Pass B skipped" not in with_llm.message
+
+        (mini_repo / "pkg" / "__init__.py").unlink()
+        without_llm = action_collect(mini_repo, llm_call=None)
+        assert "1 removed module(s)" in without_llm.message
+        assert "Pass B skipped" not in without_llm.message
+
+        _change_a(mini_repo)
+        changed_without_llm = action_collect(mini_repo, llm_call=None)
+        assert "1 changed module(s) (Pass B skipped)" in changed_without_llm.message
+
+    def test_change_and_deletion_together_name_both_counts(self, mini_repo):
+        action_collect(mini_repo)
+        _change_a(mini_repo)
+        (mini_repo / "pkg" / "b.py").unlink()
+        (mini_repo / "pkg" / "c.py").write_text("def c():\n    return 3\n")
+
+        result = action_collect(mini_repo)
+
+        assert "2 changed and 1 removed module(s)" in result.message
+
+    def test_a_single_edit_still_reports_only_the_changed_count(self, mini_repo):
+        """The original V7 wording on the common path is unchanged."""
+        action_collect(mini_repo)
+        _change_a(mini_repo)
+
+        result = action_collect(mini_repo)
+
+        assert "incrementally refreshed 1 changed module(s)" in result.message
+
+
+# ── 8. an unreadable changed file is not summarized from an empty source ─────
+
+
+class TestNoSummaryWithoutASource:
+    def test_changed_file_that_becomes_unreadable_is_not_summarized(self, mini_repo, monkeypatch):
+        """The race the existing guard names: the file is fine when Pass A
+        reads it (a few lines up), unreadable when the summarizer re-reads
+        it for its prompt. `summarize_repo` falls back to
+        `sources.get(path, "")`, so that module was sent to the LLM with no
+        code at all — and the reply still parsed into a `purpose` that
+        landed in artifact.json as prose about a file nobody read.
+
+        The guard already kept such a module out of `sources_for_summary`;
+        it just never kept it out of the batch.
+        """
+        action_collect(mini_repo)
+        _change_a(mini_repo)
+
+        target = mini_repo / "pkg" / "a.py"
+        reads = {"n": 0}
+        real_read_text = Path.read_text
+
+        def _second_read_fails(self, *args, **kwargs):
+            if self == target:
+                reads["n"] += 1
+                if reads["n"] > 1:
+                    raise OSError("simulated: unreadable on the summarizer's re-read")
+            return real_read_text(self, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", _second_read_fails)
+
+        llm = _counting_llm_call()
+        result = action_collect(mini_repo, llm_call=llm)
+
+        assert result.wrote is True
+        modules = _artifact_modules(result.collect_dir)
+        # the file was still re-scanned structurally, so the change is picked
+        # up — just without invented prose for it
+        assert "pkg/a.py:extra" in {
+            s["qualname"] for s in modules["pkg/a.py"]["public_symbols"]
+        }
+        assert all("pkg/a.py" not in user for _system, user in llm.calls)
+        assert modules["pkg/a.py"]["summary"] is None
+        assert reads["n"] >= 2, "sanity: the second read was actually attempted"
+
+    def test_every_summarized_module_has_a_source_in_the_batch(self, mini_repo, monkeypatch):
+        """The invariant, checked at the seam: whatever reaches
+        `summarize_repo` is accompanied by a source for it."""
+        action_collect(mini_repo)
+        _change_a(mini_repo)
+
+        seen: list = []
+        real_summarize_repo = cli_mod.summarize_repo
+
+        def _recording(modules, sources, *args, **kwargs):
+            seen.extend((m.path, m.path in sources) for m in modules)
+            return real_summarize_repo(modules, sources, *args, **kwargs)
+
+        monkeypatch.setattr(cli_mod, "summarize_repo", _recording)
+
+        action_collect(mini_repo, llm_call=_counting_llm_call())
+
+        assert seen, "sanity: Pass B ran"
+        assert all(had_source for _path, had_source in seen), seen
+
+
+# ── 9. a build without Pass B/C does not leave the last report behind ────────
+
+
+class TestNoStaleVerificationReport:
+    def test_a_build_without_pass_b_removes_the_previous_report(self, mini_repo):
+        """`verification_report.json` is the one derived file whose write is
+        conditional on `ctx.verification_report is not None`, while every
+        rendered page is rewritten unconditionally. A build where Pass B/C
+        skipped therefore left the *previous* build's report next to an
+        `artifact.json` with no summary left in it — a file whose presence
+        looked like a claim about the current build."""
+        llm = _counting_llm_call()
+        first = action_collect(mini_repo, llm_call=llm)
+        report = first.collect_dir / cli_mod.VERIFICATION_REPORT_FILENAME
+        assert report.exists()
+        assert any(m["summary"] is not None for m in _artifact_modules(first.collect_dir).values())
+
+        result = action_rebuild(mini_repo)  # llm_call=None -> Pass B/C skipped
+
+        assert not report.exists()
+        assert cli_mod.VERIFICATION_REPORT_FILENAME not in result.written_files
+        assert all(m["summary"] is None for m in _artifact_modules(result.collect_dir).values())
+        # the rest of the artifact set is untouched by the removal
+        for page in ("MODULE_MAP.md", "TEST_MAP.md", "RISK_INDEX.md"):
+            assert (result.collect_dir / page).exists()
+
+    def test_a_build_with_pass_b_writes_the_report_again(self, mini_repo):
+        llm = _counting_llm_call()
+        action_collect(mini_repo)
+        action_rebuild(mini_repo)  # drops the report
+
+        result = action_rebuild(mini_repo, llm_call=llm)
+
+        report = result.collect_dir / cli_mod.VERIFICATION_REPORT_FILENAME
+        assert report.exists()
+        assert cli_mod.VERIFICATION_REPORT_FILENAME in result.written_files
+
+    def test_an_incremental_run_that_keeps_summaries_keeps_its_report(self, mini_repo):
+        """The removal must be scoped to 'no summary anywhere in this build':
+        an incremental refresh that reuses unchanged summaries still runs
+        Pass C and still owes a report."""
+        llm = _counting_llm_call()
+        first = action_collect(mini_repo, llm_call=llm)
+        report = first.collect_dir / cli_mod.VERIFICATION_REPORT_FILENAME
+        assert report.exists()
+        _change_a(mini_repo)
+
+        result = action_collect(mini_repo, llm_call=_counting_llm_call())
+
+        assert result.collect_dir == first.collect_dir
+        assert report.exists()
+
+
+# ── 10. --check names the reason a tree is not fresh ────────────────────────
+
+
+class TestCheckNamesTheReason:
+    def _bump_manifest_version(self, mini_repo: Path) -> None:
+        manifest_path = mini_repo / ".collect" / MANIFEST_FILENAME
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        data["collector_version"] = "999.0.0-future-schema"
+        manifest_path.write_text(json.dumps(data), encoding="utf-8")
+
+    def test_a_real_change_says_a_file_changed(self, mini_repo):
+        action_collect(mini_repo)
+        _change_a(mini_repo)
+
+        result = action_check(mini_repo)
+
+        assert result.fresh is False
+        assert "a tracked file changed" in result.message
+
+    def test_a_version_mismatch_does_not_claim_a_file_changed(self, mini_repo):
+        """No file changed at all — the reason is the schema. The old
+        blanket message said the opposite of what was true, which matters
+        because `--collect` used to route on this verdict."""
+        action_collect(mini_repo)
+        self._bump_manifest_version(mini_repo)
+
+        result = action_check(mini_repo)
+
+        assert result.fresh is False
+        assert "a tracked file changed" not in result.message
+        assert "collector_version='999.0.0-future-schema'" in result.message
+        assert f"current is {cli_mod.manifest_mod.COLLECTOR_VERSION!r}" in result.message
+
+    def test_an_unreadable_manifest_says_unreadable(self, mini_repo):
+        action_collect(mini_repo)
+        manifest_path = mini_repo / ".collect" / MANIFEST_FILENAME
+        manifest_path.write_text("{ this is not json", encoding="utf-8")
+
+        result = action_check(mini_repo)
+
+        assert result.fresh is False
+        assert "unreadable" in result.message
+        assert "a tracked file changed" not in result.message
+
+    def test_a_never_run_collect_still_says_so(self, mini_repo):
+        result = action_check(mini_repo)
+
+        assert result.fresh is False
+        assert "never run" in result.message
+
+    def test_collect_falls_back_honestly_when_the_manifest_is_unreadable(self, mini_repo):
+        """Before V7 every full-build fallback said "no prior artifact to
+        diff against". A manifest that exists but cannot be read is not that."""
+        action_collect(mini_repo)
+        manifest_path = mini_repo / ".collect" / MANIFEST_FILENAME
+        manifest_path.write_text("{ this is not json", encoding="utf-8")
+
+        result = action_collect(mini_repo)
+
+        assert result.wrote is True
+        assert "no prior artifact" not in result.message
+        assert "unreadable" in result.message
+        assert "full build" in result.message
+
+    def test_a_missing_artifact_rebuilds_and_says_why(self, mini_repo):
+        """A tree can match its manifest while the artifact describing it is
+        gone — hand-deleted, or a build that died mid-`_write_artifact`.
+        `--collect` answering "already up to date" there would leave
+        `[collect] dir` with no artifact at all, and the tree would stay in
+        exactly that state forever: `--check` reports fresh, so nothing
+        else would ever try to fix it.
+        """
+        action_collect(mini_repo)
+        artifact = mini_repo / ".collect" / ARTIFACT_FILENAME
+        assert artifact.exists()
+        artifact.unlink()
+
+        result = action_collect(mini_repo)
+
+        assert result.wrote is True
+        assert result.fresh is True
+        assert "already up to date" not in result.message
+        assert "no prior artifact" not in result.message
+        assert "artifact.json" in result.message
+        assert "full build" in result.message
+        assert artifact.exists()
+        assert _artifact_modules(result.collect_dir)
+
+    def test_check_reports_the_missing_artifact_as_stale_too(self, mini_repo):
+        """`--check` and `--collect` share one verdict (`_freshness`): a
+        manifest whose artifact is gone is *absent*, not fresh, on both. A
+        `--check` that said "up to date" here would have told the user
+        there was nothing to do while the consumer had nothing to load —
+        and `--check` still writes nothing, anywhere."""
+        action_collect(mini_repo)
+        (mini_repo / ".collect" / ARTIFACT_FILENAME).unlink()
+
+        check = action_check(mini_repo)
+
+        assert check.fresh is False
+        assert check.wrote is False
+        assert "artifact.json" in check.message
+        assert "missing" in check.message
+        assert not (mini_repo / ".collect" / ARTIFACT_FILENAME).exists()
+
+        collect = action_collect(mini_repo)
+        assert collect.wrote is True
+
+
+# ── 11. --check and --collect keep agreeing about freshness ──────────────────
+
+
+class TestCheckAndCollectAgree:
+    """`action_collect` and `action_check` take their verdict from the one
+    `_freshness` gate — one scan, one hash pass, the artifact test
+    included. Whatever it decides for one must hold for the other, or
+    `--collect` would start doing work a `--check` told the user there
+    was none (or the reverse)."""
+
+    def test_check_fresh_iff_collect_is_a_noop(self, mini_repo):
+        """One case per way the tree can be not-fresh, plus the fresh case.
+        Each pairs the `--check` verdict with whether `--collect` actually
+        wrote anything."""
+        pairs = []
+
+        # no manifest yet
+        pairs.append((
+            "no manifest",
+            action_check(mini_repo).fresh,
+            action_collect(mini_repo).wrote is False,
+        ))
+
+        # fresh (the previous call just built it)
+        pairs.append((
+            "fresh",
+            action_check(mini_repo).fresh,
+            action_collect(mini_repo).wrote is False,
+        ))
+
+        # one file changed
+        _change_a(mini_repo)
+        pairs.append((
+            "one file changed",
+            action_check(mini_repo).fresh,
+            action_collect(mini_repo).wrote is False,
+        ))
+
+        # deletion only
+        (mini_repo / "pkg" / "b.py").unlink()
+        pairs.append((
+            "deletion only",
+            action_check(mini_repo).fresh,
+            action_collect(mini_repo).wrote is False,
+        ))
+
+        # collector_version mismatch
+        manifest_path = mini_repo / ".collect" / MANIFEST_FILENAME
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        data["collector_version"] = "999.0.0-future-schema"
+        manifest_path.write_text(json.dumps(data), encoding="utf-8")
+        pairs.append((
+            "version mismatch",
+            action_check(mini_repo).fresh,
+            action_collect(mini_repo).wrote is False,
+        ))
+
+        # unreadable manifest
+        manifest_path.write_text("{ this is not json", encoding="utf-8")
+        pairs.append((
+            "unreadable manifest",
+            action_check(mini_repo).fresh,
+            action_collect(mini_repo).wrote is False,
+        ))
+
+        for name, check_fresh, collect_noop in pairs:
+            assert check_fresh == collect_noop, (
+                f"{name}: --check says fresh={check_fresh} but --collect "
+                f"{'was a no-op' if collect_noop else 'did work'}"
+            )
+
+class TestModulePatchLeavesTheManifestWhole:
+    """`--module` is incremental by one file, but its manifest patch was not
+    incremental in the safe direction: with no previous manifest to patch
+    into it wrote a `file_hashes` map holding ONLY the patched file. The
+    next `--collect` then diffed the whole tree against that one entry,
+    saw every other module as newly "added", and re-summarized all of them.
+
+    That is V7's exact cost bug — one changed file costs the same as a
+    from-scratch build — reached through the *incremental* `--module` path
+    rather than `--collect`, so V7's fix did not cover it.
+    """
+
+    def _module_paths(self, mini_repo: Path) -> set:
+        return set(_artifact_modules(mini_repo / ".collect"))
+
+    def test_missing_manifest_records_every_module(self, mini_repo):
+        llm = _counting_llm_call()
+        action_rebuild(mini_repo, llm_call=llm)
+        n = len(self._module_paths(mini_repo))
+        assert n > 1, "sanity: multi-module repo"
+
+        (mini_repo / ".collect" / MANIFEST_FILENAME).unlink()
+        assert not (mini_repo / ".collect" / MANIFEST_FILENAME).exists()
+
+        action_module(mini_repo, "pkg/a.py", llm_call=llm)
+
+        hashes = json.loads(
+            (mini_repo / ".collect" / MANIFEST_FILENAME).read_text(encoding="utf-8")
+        )["file_hashes"]
+        assert set(hashes) == self._module_paths(mini_repo), (
+            f"the manifest recorded {sorted(hashes)} after patching one module — it "
+            f"must track every module in the tree, or the next --collect treats the "
+            f"rest as newly added and re-summarizes them all"
+        )
+
+    def test_next_collect_is_a_noop_after_a_manifestless_module_patch(self, mini_repo):
+        """The cost assertion: the patch must leave the tree fresh."""
+        llm = _counting_llm_call()
+        action_rebuild(mini_repo, llm_call=llm)
+        (mini_repo / ".collect" / MANIFEST_FILENAME).unlink()
+
+        action_module(mini_repo, "pkg/a.py", llm_call=llm)
+
+        assert action_check(mini_repo).fresh is True
+        llm.calls.clear()
+
+        result = action_collect(mini_repo, llm_call=llm)
+
+        assert result.wrote is False
+        assert llm.calls == [], (
+            f"patching one module with no prior manifest made the next --collect "
+            f"spend {len(llm.calls)} LLM call(s) — before the fix it re-summarized "
+            f"every module the truncated manifest forgot"
+        )
+
+    def test_unreadable_manifest_records_every_module(self, mini_repo):
+        """A manifest that would not parse is the same situation as an absent
+        one — the code already read it as an empty hash map."""
+        llm = _counting_llm_call()
+        action_rebuild(mini_repo, llm_call=llm)
+        (mini_repo / ".collect" / MANIFEST_FILENAME).write_text(
+            "{not json", encoding="utf-8"
+        )
+
+        action_module(mini_repo, "pkg/b.py", llm_call=llm)
+
+        hashes = json.loads(
+            (mini_repo / ".collect" / MANIFEST_FILENAME).read_text(encoding="utf-8")
+        )["file_hashes"]
+        assert len(hashes) == len(self._module_paths(mini_repo))
+        assert "pkg/b.py" in hashes
+        assert action_check(mini_repo).fresh is True
+
+    def test_usable_manifest_still_patches_one_entry_only(self, mini_repo):
+        """Non-regression: with a previous manifest there is no reason to
+        rehash the tree — only the patched file's entry changes."""
+        llm = _counting_llm_call()
+        action_rebuild(mini_repo, llm_call=llm)
+        manifest_path = mini_repo / ".collect" / MANIFEST_FILENAME
+        before = json.loads(manifest_path.read_text(encoding="utf-8"))
+        other_hashes = {
+            p: h for p, h in before["file_hashes"].items() if p != "pkg/a.py"
+        }
+
+        (mini_repo / "pkg" / "a.py").write_text(
+            "def a():\n    return 42\n\ndef extra():\n    pass\n"
+        )
+        action_module(mini_repo, "pkg/a.py", llm_call=llm)
+
+        after = json.loads(manifest_path.read_text(encoding="utf-8"))
+        assert len(after["file_hashes"]) == len(before["file_hashes"])
+        assert after["file_hashes"]["pkg/a.py"] != before["file_hashes"]["pkg/a.py"]
+        assert after["file_hashes"] == {
+            **other_hashes,
+            "pkg/a.py": after["file_hashes"]["pkg/a.py"],
+        }
+        assert action_check(mini_repo).fresh is True
+
+
+class TestSummarizerFactoryFailsOpen:
+    """`make_summarizer_call` reads many `[collect]`/`[api]` keys and can
+    raise on any of them. `main.py` has two call sites: the `--collect`
+    one-shot branch guarded it inline, the interactive `/collect` command
+    did not — and the only enclosing handlers there are `CollectCliError`
+    and `KeyboardInterrupt`/`EOFError`, so one bad key killed the whole
+    interactive shell instead of degrading one optional stage to
+    structural-only output.
+
+    The guard now lives in `make_summarizer_call_or_none`, which both entry
+    points call, so they cannot drift apart again.
+    """
+
+    def test_a_raising_factory_degrades_to_none(self, monkeypatch, caplog):
+        import tools.collect.summarizer as summarizer_mod
+
+        def _boom(config, task_mode="code"):
+            raise ValueError("config [collect] temperature is malformed")
+
+        monkeypatch.setattr(summarizer_mod, "_make_llm_call", _boom)
+        import configparser
+
+        cfg = configparser.ConfigParser()
+
+        with caplog.at_level("WARNING"):
+            assert summarizer_mod.make_summarizer_call_or_none(cfg) is None
+
+        assert any("could not build the summarizer LLM call" in r.message for r in caplog.records)
+
+    def test_a_working_factory_is_returned_untouched(self, monkeypatch):
+        import tools.collect.summarizer as summarizer_mod
+
+        fake = lambda system, user: "{}"  # noqa: E731
+        monkeypatch.setattr(summarizer_mod, "_make_llm_call", lambda config, task_mode: fake)
+        import configparser
+
+        cfg = configparser.ConfigParser()
+
+        assert summarizer_mod.make_summarizer_call_or_none(cfg) is fake
+
+    def test_mode_is_forwarded_to_the_factory(self, monkeypatch):
+        import tools.collect.summarizer as summarizer_mod
+
+        seen: dict = {}
+
+        def _spy(config, task_mode="code"):
+            seen["task_mode"] = task_mode
+            return lambda system, user: "{}"
+
+        monkeypatch.setattr(summarizer_mod, "_make_llm_call", _spy)
+        import configparser
+
+        cfg = configparser.ConfigParser()
+
+        summarizer_mod.make_summarizer_call_or_none(cfg, task_mode="docs")
+
+        assert seen["task_mode"] == "docs"
+
+
+class TestRebuildEndToEndViaMain:
+    def _make_mini_repo(self, tmp_path: Path) -> None:
+        (tmp_path / "pkg").mkdir()
+        (tmp_path / "pkg" / "__init__.py").write_text("")
+        (tmp_path / "pkg" / "a.py").write_text("def a():\n    return 1\n")
+        (tmp_path / "pkg" / "b.py").write_text("def b():\n    return 2\n")
+        _init_repo(tmp_path)
+
+    def test_collect_rebuild_via_main_writes_full_artifact(self, tmp_path, monkeypatch):
+        """`main.py --collect --rebuild` must perform a full rebuild
+        end-to-end: every module re-summarized, artifact.json written.
+        Not just dispatch to the right action name — actual behavior."""
+        import main as main_mod
+
+        calls: list = []
+
+        def _stub_llm(system: str, user: str) -> str:
+            calls.append((system, user))
+            return json.dumps({"purpose": "stub purpose", "notes": ""})
+
+        monkeypatch.setattr("tools.collect.summarizer.make_summarizer_call", lambda cfg, task_mode=None: _stub_llm)
+        monkeypatch.setattr("tools.collect.summarizer.should_run_pass_b", lambda cfg: True)
+
+        self._make_mini_repo(tmp_path)
+
+        argv = ["main.py", "--collect", "--rebuild", "--base", str(tmp_path)]
+        with patch.object(sys, "argv", argv):
+            with pytest.raises(SystemExit) as exc_info:
+                main_mod.main()
+
+        assert exc_info.value.code == 0
+        n_modules = len(_artifact_modules(tmp_path / ".collect"))
+        assert n_modules >= 2, "sanity: multi-module repo"
+        assert len(calls) == n_modules, (
+            f"--collect --rebuild made {len(calls)} LLM calls via main.py; "
+            f"expected {n_modules} (one per module)"
+        )
+        assert (tmp_path / ".collect" / ARTIFACT_FILENAME).exists()
+        assert (tmp_path / ".collect" / MANIFEST_FILENAME).exists()
+
+    def test_collect_rebuild_via_main_prints_rebuild_path(self, tmp_path, monkeypatch, capsys):
+        """The printed line must say 'collect rebuild' — proving the
+        result.action was 'rebuild' and the message names the full
+        rebuild path, not the incremental one."""
+        import main as main_mod
+
+        def _stub_llm(system: str, user: str) -> str:
+            return json.dumps({"purpose": "stub purpose", "notes": ""})
+
+        monkeypatch.setattr("tools.collect.summarizer.make_summarizer_call", lambda cfg, task_mode=None: _stub_llm)
+        monkeypatch.setattr("tools.collect.summarizer.should_run_pass_b", lambda cfg: True)
+
+        self._make_mini_repo(tmp_path)
+
+        argv = ["main.py", "--collect", "--rebuild", "--base", str(tmp_path)]
+        with patch.object(sys, "argv", argv):
+            with pytest.raises(SystemExit) as exc_info:
+                main_mod.main()
+
+        assert exc_info.value.code == 0
+        captured = capsys.readouterr()
+        assert "collect rebuild:" in captured.out, (
+            f"expected 'collect rebuild:' in output, got: {captured.out!r}"
+        )
+        assert "re-summarized" in captured.out
+
+    def test_collect_rebuild_no_llm_via_main_skips_pass_b(self, tmp_path, monkeypatch):
+        """`main.py --collect --rebuild --no-llm` must pass
+        llm_call=None to action_rebuild, skipping Pass B entirely.
+        The artifact is structural only — no summaries."""
+        import main as main_mod
+
+        called = False
+
+        def _should_never_be_called(system: str, user: str) -> str:
+            nonlocal called
+            called = True
+            return json.dumps({"purpose": "stub purpose"})
+
+        monkeypatch.setattr("tools.collect.summarizer.make_summarizer_call", _should_never_be_called)
+
+        self._make_mini_repo(tmp_path)
+
+        argv = ["main.py", "--collect", "--rebuild", "--no-llm", "--base", str(tmp_path)]
+        with patch.object(sys, "argv", argv):
+            with pytest.raises(SystemExit) as exc_info:
+                main_mod.main()
+
+        assert exc_info.value.code == 0
+        assert not called, "make_summarizer_call must not be called with --no-llm"
+        assert (tmp_path / ".collect" / ARTIFACT_FILENAME).exists()
+        payload = json.loads(
+            (tmp_path / ".collect" / ARTIFACT_FILENAME).read_text(encoding="utf-8")
+        )
+        assert all(m["summary"] is None for m in payload["modules"])

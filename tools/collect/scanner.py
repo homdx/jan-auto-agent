@@ -37,7 +37,7 @@ from __future__ import annotations
 import ast
 import configparser
 from pathlib import Path
-from typing import List, Optional
+from typing import FrozenSet, List, Optional
 
 from tools.auto.repo_ingest import RepoIngestor
 from tools.collect.ast_facts import (
@@ -166,6 +166,38 @@ def scan_file(
     return scan_module(source, module_path)
 
 
+def language_for(
+    rel_path: str,
+    config: Optional[configparser.ConfigParser] = None,
+    *,
+    java_exts: Optional[FrozenSet[str]] = None,
+) -> Optional[str]:
+    """`scan_repo`'s own extension/language decision, factored out so a
+    single file can be classified the exact same way the walk does:
+    `[collect] java_extensions` first (it can widen the fixed `.java`
+    entry to project-specific generated-source extensions `detect_language`
+    does not know about), then `detect_language`. `None` means "this
+    extension recognizes no language at all".
+
+    Two callers, deliberately: `scan_repo`'s own walk filter, and
+    `cli.action_module`, which uses it to reject a `--module <path>` whose
+    extension no language in this collector recognizes at all (a
+    `README.md`, a config file, anything without an extension). It checks
+    *recognition*, not `[collect] languages` enablement, on purpose —
+    `--module Foo.java` on a Python-only repo is the documented COLLECT-28
+    escape hatch for patching one Java file in by hand, and a full scan
+    would not have recorded it either way.
+
+    `java_exts` is `java_extensions_from_config(config)` already resolved —
+    `scan_repo` resolves it once for the whole walk rather than re-reading
+    the config for every file."""
+    if java_exts is None:
+        java_exts = java_extensions_from_config(config)
+    if Path(rel_path).suffix.lower() in java_exts:
+        return Language.JAVA
+    return detect_language(rel_path)
+
+
 def scan_repo(
     root: Path,
     *,
@@ -196,13 +228,7 @@ def scan_repo(
     java_exts = java_extensions_from_config(config)
 
     def _language(rel_path: str) -> Optional[str]:
-        # java_extensions can widen which suffixes count as Java beyond
-        # lang.py's fixed `.java` entry (e.g. a project-specific
-        # generated-sources extension); detect_language alone wouldn't
-        # know about those, so check the configurable set first.
-        if Path(rel_path).suffix.lower() in java_exts:
-            return Language.JAVA
-        return detect_language(rel_path)
+        return language_for(rel_path, config, java_exts=java_exts)
 
     scannable = sorted(
         p for p in ingestor.walk()

@@ -311,6 +311,7 @@ def build_manifest(
     *,
     collector_version: str = COLLECTOR_VERSION,
     provenance: Optional[Tuple[Optional[str], bool]] = None,
+    file_hashes: Optional[Dict[str, str]] = None,
 ) -> Manifest:
     """Build a `Manifest` for `root`. If `files` isn't given, discovers
     `*.py` files under `root` via `discover_files`.
@@ -323,6 +324,15 @@ def build_manifest(
     that doesn't reflect the actual tracked source. When omitted,
     `git_sha`/`dirty` are computed now, which is only correct for callers
     that haven't written anything yet.
+
+    `file_hashes`, if given, is a `{relative_path: sha256}` map the caller
+    already computed with `hash_tree` over the same `files` — reused verbatim
+    instead of re-hashing the tree. The incremental `--refresh` path already
+    hashes every current file once to diff against the previous manifest, and
+    the full build has the same list straight from its own scan, so without
+    this a single `--collect` on a stale tree hashed the same files twice
+    (once to decide what changed, once here, after `_write_artifact` had
+    already touched disk).
     """
     root = Path(root)
     file_list = list(files) if files is not None else discover_files(root)
@@ -335,7 +345,7 @@ def build_manifest(
         generated_at=_utc_iso_now(),
         git_sha=git_sha,
         dirty=dirty,
-        file_hashes=hash_tree(root, file_list),
+        file_hashes=file_hashes if file_hashes is not None else hash_tree(root, file_list),
     )
 
 
@@ -354,6 +364,7 @@ def is_fresh(
     root: Path,
     *,
     files: Optional[Iterable[str]] = None,
+    hashes: Optional[Dict[str, str]] = None,
 ) -> bool:
     """True iff `manifest` was built by the CURRENT collector_version AND
     `root`'s current content hashes exactly match `manifest`'s.
@@ -393,14 +404,19 @@ def is_fresh(
 
     Pass `files` explicitly to freshness-check against a specific file set
     instead of a fresh directory walk (e.g. when the caller already has the
-    scanner's own file list from EPIC B).
+    scanner's own file list from EPIC B). Pass `hashes` to skip the hash
+    pass entirely when the caller already holds a `hash_tree` result over
+    that same `files` — `action_collect` did, and hashing the tree here and
+    then again inside the `action_refresh` it delegates to was the second of
+    the three full tree hashes one stale `--collect` used to cost.
     """
     if manifest.collector_version != COLLECTOR_VERSION:
         return False
+    if hashes is not None:
+        return hashes == manifest.file_hashes
     root = Path(root)
     current_files = list(files) if files is not None else discover_files(root)
-    current = hash_tree(root, current_files)
-    return current == manifest.file_hashes
+    return hash_tree(root, current_files) == manifest.file_hashes
 
 
 @dataclass(frozen=True)

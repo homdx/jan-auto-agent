@@ -69,7 +69,9 @@ with every unchanged module reusing its existing record. `--check` reports
 staleness without writing anything; `--module <path>` patches one file;
 `--refresh` is the same incremental path without the freshness gate;
 `--rebuild` is the only unconditional full rebuild — one LLM call per module
-in the tree.
+in the tree. Conflicting flags resolve in one shared order at both entry
+points (`--collect` and `/collect`): `--check` (writes nothing) beats
+`--module`, which beats `--rebuild`, which beats `--refresh`.
 
 ### 2. Ingest — clustering the repo
 
