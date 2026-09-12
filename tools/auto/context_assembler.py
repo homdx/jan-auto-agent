@@ -39,6 +39,7 @@ from __future__ import annotations
 import logging
 import re
 from pathlib import Path
+from typing import Callable
 
 from tools.auto.utils import chars_per_token
 
@@ -150,10 +151,34 @@ def _coerce_budget(budget) -> "int | None":
     return value if value > 0 else None
 
 
+def _shrunk_lines(lines: "list[str]", remaining: "int | None") -> str:
+    """`lines` joined, with whole lines dropped from the END until the result
+    fits `remaining`. `remaining is None` keeps every line.
+
+    A line is the smallest unit of a fact for the rows that carry one fact per
+    line: `config_read` is one config key per line, `contract` is one contract
+    per line, `neighbours` is one neighbour per line. So a shorter row states
+    fewer complete facts and never a fragment of one, and the lines it keeps
+    are the ones the row's own order ranks highest. `""` when not one line
+    fits — a row that cannot say one complete thing is absent rather than
+    spending the budget on nothing.
+    """
+    if remaining is None:
+        return "\n".join(lines)
+    while lines and len("\n".join(lines)) > remaining:
+        lines.pop()
+    return "\n".join(lines)
+
+
 def _row_contract(model, target_file: str, remaining: "int | None") -> str:
     """Today's contract lines, verbatim: one per contract citing the module or
     one of its public symbols, sorted by contract name. Empty string = the row
-    is absent from this block."""
+    is absent from this block.
+
+    With a budget the row shrinks by dropping whole lines from the end — each
+    line is one complete contract — rather than vanishing, so it takes as much
+    of whatever the rows above leave as one contract at a time.
+    """
     record = model.module(target_file)
     if record is None:
         return ""
@@ -163,22 +188,39 @@ def _row_contract(model, target_file: str, remaining: "int | None") -> str:
         contracts.extend(c for c in model.contracts_for(sym.qualname) if c not in contracts)
     if not contracts:
         return ""
-    return "\n".join(
-        f"contract {c.name}: {c.description}" for c in sorted(contracts, key=lambda c: c.name)
+    return _shrunk_lines(
+        [f"contract {c.name}: {c.description}" for c in sorted(contracts, key=lambda c: c.name)],
+        remaining,
     )
 
 
 def _row_config_read(model, target_file: str, remaining: "int | None") -> str:
-    """Today's `config_read` lines, verbatim: one per call site. `remaining` is
-    unused here — the row is per-call-site fact, never summary prose."""
+    """Today's `config_read` lines: one per call site. These are static facts,
+    not prose — every line says which key the file reads and what it falls back
+    to — so they outrank `public_symbols`, which the target's own source
+    already shows.
+
+    With a budget the row shrinks by dropping whole lines from the end instead
+    of vanishing: before this the row either rendered all of its call sites or
+    none, so under pressure `public_symbols` took the budget a `config_read`
+    line could have used — the displacement L6 removes from the fact rows.
+
+    Byte-identical lines (the same `(section, key)` read through two code
+    paths — 24 such lines in today's tree) are dropped here, before the cut
+    measures the row: the block's own dedupe would remove them anyway, so a
+    row measured with them in counts budget it never spends, and a cut sized
+    on that count drops a line the budget could have afforded.
+    """
     record = model.module(target_file)
     if record is None or not record.config_reads:
         return ""
-    lines = []
+    lines: "list[str]" = []
     for cr in record.config_reads:
         mode_note = " (mode-override)" if cr.has_mode_override else ""
-        lines.append(f"config_read [{cr.section}] {cr.key}{mode_note} (fallback={cr.fallback!r})")
-    return "\n".join(lines)
+        line = f"config_read [{cr.section}] {cr.key}{mode_note} (fallback={cr.fallback!r})"
+        if line not in lines:
+            lines.append(line)
+    return _shrunk_lines(lines, remaining)
 
 
 def _row_public_symbols(model, target_file: str, remaining: "int | None") -> str:
@@ -483,10 +525,7 @@ def _row_neighbours(model, target_file: str, remaining: "int | None") -> str:
         if not purpose:
             continue
         lines.append(f"{_NEIGHBOURS_PREFIX}{path} — {purpose}{_NEIGHBOURS_LLM_LABEL}")
-    if remaining is not None:
-        while lines and len("\n".join(lines)) > remaining:
-            lines.pop()
-    return "\n".join(lines)
+    return _shrunk_lines(lines, remaining)
 
 
 # PLAN-v2: the ordered row list that IS the per-task fact pack. Highest
@@ -504,10 +543,12 @@ def _row_neighbours(model, target_file: str, remaining: "int | None") -> str:
 # rows that carry a `+N` tail (`callers`, `calls_into`, `tests`) shrink by
 # dropping names from the end down to their count alone before the loop gives
 # up on them — the count is the fact, the names are the courtesy — and
-# `public_symbols` is only ever rendered into whatever that leaves. `neighbours`
-# shrinks too, by whole entries from the end — it has no count to fall back to,
-# so it is not in `_SHRINKABLE_ROWS` (no floor is reserved for it) and simply
-# takes as many of its lines as fit what the rows above left.
+# `public_symbols` is only ever rendered into whatever that leaves. The three
+# one-fact-per-line rows (`neighbours`, `contract`, `config_read`) shrink the
+# same way, by whole lines from the end, so a line of `config_read` never loses
+# to `public_symbols` either. Nothing is ever rendered at the cost of a row
+# above it: the rendered rows are a prefix of this tuple, `public_symbols`
+# excepted, which is the only row that may appear after a gap.
 _PACK_ROWS = (
     ("callers", _row_callers),
     ("calls_into", _row_calls_into),
@@ -523,8 +564,96 @@ _PACK_ROWS = (
 # rather than a third `_PACK_ROWS` field: the tuple order is pinned byte for
 # byte by the V2/V3 tests, and it stays so. `public_symbols` is not here — it
 # already cuts at a symbol boundary on its own and stays last, so it only ever
-# takes the budget no row above it could use.
+# takes the budget no row above it could use. `neighbours` / `contract` /
+# `config_read` are not here either: they have no count to fall back to, so no
+# floor is reserved for them and they are cut to their first line and no lower.
 _SHRINKABLE_ROWS = frozenset({"callers", "calls_into", "tests"})
+
+
+def _row_cost(form: str) -> int:
+    """What a rendered row costs the block: its length plus the newline that
+    separates it from the next row. An absent row costs nothing, so freeing it
+    also reclaims that newline."""
+    return len(form) + 1 if form else 0
+
+
+def _minimum_form(name: str, renderer, full: str) -> str:
+    """The row's smallest non-empty form — the floor a budget cut may not go
+    below.
+
+    The `+N` rows are their count alone, which `_fitted_names` already returns
+    for an allowance of zero. The one-fact-per-line rows keep their first line:
+    a line is the smallest unit of a fact they can state. `public_symbols` has
+    none at all, because "public_symbols: one symbol … (+39 more, cut for
+    budget)" costs about the same as a `config_read` line for a fraction of the
+    information, and the target's own source already carries the name — so it is
+    the first row cut to nothing, never the last row left standing.
+    """
+    if name in _SHRINKABLE_ROWS:
+        return renderer(0)
+    if name == "public_symbols":
+        return ""
+    return full.split("\n")[0]
+
+
+def _fit_pack_to_budget(
+    renderers: "dict[str, Callable]",
+    full: "dict[str, str]",
+    head_len: int,
+    budget: int,
+) -> "dict[str, str]":
+    """One form per row, cut from the least valuable end down to `budget`.
+
+    The cut walks `_PACK_ROWS` backwards — `public_symbols` gives ground first,
+    `callers` last — and stops the moment the block fits. Everything above the
+    cut keeps its full form, so the cut is a function of the budget alone: a
+    larger budget only ever returns content to a row and never takes it away,
+    which is what makes the pack monotone. Cutting by "the longest form that
+    fits what the rows above happened to claim" cannot be monotone, because a
+    row above adds a whole name when its allowance crosses a name boundary, and
+    that step hands the row below it fewer characters than the budget it just
+    gained.
+
+    A row is never cut below its floor, so the counts of the `+N` rows survive
+    any cut. When even every floor does not fit, whole rows are dropped from the
+    end of the order instead, so the rendered rows stay a prefix of `_PACK_ROWS`
+    — the priority of the tuple is never inverted by the budget.
+    """
+    chosen = dict(full)
+    owed = head_len + sum(_row_cost(form) for form in full.values()) - budget
+    if owed <= 0:
+        return chosen
+
+    floors = {
+        name: _minimum_form(name, renderers[name], form)
+        for name, form in full.items()
+        if form
+    }
+    for name, _ in reversed(_PACK_ROWS):
+        if owed <= 0:
+            break
+        form = chosen[name]
+        if not form:
+            continue
+        give = min(owed, _row_cost(form) - _row_cost(floors.get(name, "")))
+        owed -= give
+        target = _row_cost(form) - give
+        chosen[name] = "" if target <= 0 else renderers[name](target - 1)
+
+    if owed > 0:
+        running, keep = head_len, 0
+        for index, (name, _) in enumerate(_PACK_ROWS):
+            floor = floors.get(name, "")
+            if not floor:
+                continue
+            running += _row_cost(floor)
+            if running > budget:
+                break
+            keep = index + 1
+        for index, (name, _) in enumerate(_PACK_ROWS):
+            if index >= keep:
+                chosen[name] = ""
+    return chosen
 
 
 def build_collect_context_block(
@@ -550,14 +679,13 @@ def build_collect_context_block(
     block worth showing.
 
     `budget=None` renders every row in full, so every existing caller keeps
-    working until V6 wires `max_context_chars_auto` in. With a budget each row
-    is asked for the largest form that fits what is left — the `+N` rows shrink
-    by dropping names from the end down to their count, `public_symbols` by
-    cutting the symbol list at a symbol boundary and announcing the remainder —
-    and only a row whose smallest form still does not fit is skipped in favour
-    of the next, shorter one. That is the L6 fix: a `tests` row no longer
-    disappears whole and hands its budget to `public_symbols`, because the count
-    it leads with is the fact the pack exists to carry.
+    working until V6 wires `max_context_chars_auto` in. With a budget the pack
+    is cut from the least valuable end down to the budget by
+    `_fit_pack_to_budget`: the `+N` rows give up names from the end down to
+    their count, the one-fact-per-line rows give up whole lines from the end,
+    and `public_symbols` — the row the target file's own source already makes
+    redundant — gives ground first of all, down to nothing. A row's count is
+    never spent to buy room for a row below it, which is the L6 fix.
 
     `task_mode` is threaded for V14's docs-mode tuple; it does not change the
     code-mode pack this ticket ships.
@@ -580,10 +708,7 @@ def build_collect_context_block(
     head = [_COLLECT_HEADER, f"module: {record.path}"]
     if record.parse_error:
         head.append(f"parse_error: {record.parse_error}")
-
-    body: "list[str]" = []
-    seen: "set[str]" = set(head)
-    used = len("\n".join(head))
+    head_len = len("\n".join(head))
 
     def _render(name: str, render, allowance: "int | None") -> str:
         """One renderer call, fail-open: a broken row is no row, never no block."""
@@ -593,38 +718,28 @@ def build_collect_context_block(
             logger.warning("collect block row %r failed for %s: %s", name, target_file, exc)
             return ""
 
-    # L6 pass one: the smallest form of every shrinkable row — its count alone,
-    # the one thing the row still says when its names do not fit.
-    floors: "dict[str, int]" = {}
-    if budget is not None:
-        for name, render in _PACK_ROWS:
-            if name not in _SHRINKABLE_ROWS:
-                continue
-            floor = _render(name, render, 0)
-            if floor:
-                floors[name] = len(floor)
+    # Every row in its uncapped form first: the cut below measures against the
+    # full pack, so it never decides what a row may keep from what the rows
+    # above it happened to claim.
+    def _allowing(name: str, render) -> "Callable[[int | None], str]":
+        return lambda allowance: _render(name, render, allowance)
 
-    # L6 pass two. The room left after every shrinkable row has taken its
-    # count, newlines included, split equally: each row gets its count plus an
-    # equal share of that room. The allowance is then a function of the budget
-    # alone — never of what the rows above happened to claim — so a larger
-    # budget only adds names and never takes them away, and no row can grow at
-    # the expense of a row below it. The share is floored, so the block never
-    # spends more than the budget.
-    share = 0
-    if budget is not None and floors:
-        room = budget - used - len(floors) - sum(floors.values())
-        if room > 0:
-            share = room // len(floors)
+    full = {name: _render(name, render, None) for name, render in _PACK_ROWS}
+    if budget is None:
+        forms = full
+    else:
+        forms = _fit_pack_to_budget(
+            {name: _allowing(name, render) for name, render in _PACK_ROWS},
+            full,
+            head_len,
+            budget,
+        )
 
+    body: "list[str]" = []
+    seen: "set[str]" = set(head)
+    used = head_len
     for name, render in _PACK_ROWS:
-        if budget is None:
-            allowance: "int | None" = None
-        elif name in floors:
-            allowance = floors[name] + share
-        else:
-            allowance = budget - used - 1
-        row = _render(name, render, allowance)
+        row = forms.get(name, "")
         if not row:
             continue
 
@@ -632,9 +747,9 @@ def build_collect_context_block(
         # inside this row — 24 of today's config_read lines are byte-identical
         # duplicates of one already shown (the same (section, key) read through
         # two code paths), and a block that repeats a fact spends budget on
-        # nothing. L6: nothing goes into `seen` here; a row that the budget
-        # check below then skips must not suppress an identical line in a later
-        # row, so this row's own lines are tracked in `fresh_seen` instead.
+        # nothing. L6: nothing goes into `seen` here; a row the budget check
+        # below then skips must not suppress an identical line in a later row,
+        # so this row's own lines are tracked in `fresh_seen` instead.
         fresh: "list[str]" = []
         fresh_seen: "set[str]" = set()
         for line in row.split("\n"):
@@ -646,9 +761,10 @@ def build_collect_context_block(
             continue
 
         if budget is not None and used + len("\n".join(fresh)) + 1 > budget:
-            # V2.5: not enough budget left for this row — try the next, shorter
-            # one. L6: `seen` is left untouched, so a skipped row leaves no
-            # trace in the block.
+            # Belt and braces: the cut above already fits the pack, and the
+            # dedupe above can only shorten it, so this is unreachable. It is
+            # kept because a row that fails a budget check must never leave its
+            # lines in `seen` and suppress an identical line in a later row.
             continue
 
         seen.update(fresh)

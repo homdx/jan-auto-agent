@@ -142,7 +142,11 @@ def _names(line: str) -> int:
 
 def _announced_total(line: str) -> int:
     """The total a `+N` row accounts for: the names it shows plus the remainder
-    it announces."""
+    it announces — or the count it states outright when it has dropped every
+    name and fallen back to its count alone."""
+    if _names(line) == 0:
+        stated = re.match(r"^\w+: (\d+) ", line)
+        return int(stated.group(1)) if stated else 0
     announced = int(line.rsplit(", +", 1)[1]) if ", +" in line else 0
     return _names(line) + announced
 
@@ -188,10 +192,16 @@ def test_a_larger_allowance_never_yields_fewer_names():
 
 
 def test_a_fact_row_vanishes_only_when_its_count_does_not_fit():
-    """Below the count the row is gone; at the count it is back, with no names
-    in it. Nothing in between."""
+    """A count is atomic: one character short of head + count the row is gone,
+    and at head + count it is back with no names in it. A count is also never
+    shown while the count above it has data and room — a lower-priority count
+    does not outrank a higher one — so the counts that render are a prefix of
+    the pack order."""
     model = _hub()
     head = _head_len()
+    priority = list(_FACT_ROWS.values())  # _PACK_ROWS order: callers, calls_into, tests
+    floor_lines = [render(model, TARGET, 0) for render, _ in _FACT_ROWS.items()]
+
     for render, prefix in _FACT_ROWS.items():
         floor = render(model, TARGET, 0)
         short_by_one = head + len(floor) + 1 - 1
@@ -200,8 +210,23 @@ def test_a_fact_row_vanishes_only_when_its_count_does_not_fit():
         ), f"{prefix.strip()} rendered inside its own count"
 
         at_the_count = head + len(floor) + 1
-        line = _line(build_collect_context_block(model, TARGET, budget=at_the_count), prefix)
-        assert line == floor, f"{line!r} is not the count-only form {floor!r}"
+        block = build_collect_context_block(model, TARGET, budget=at_the_count)
+        rendered = [p for p in priority if _line(block, p)]
+        assert rendered == priority[: len(rendered)], (
+            f"budget={at_the_count}: counts {rendered} are not a prefix of {priority} — "
+            "a lower-priority count outranked the one above it"
+        )
+        line = _line(block, prefix)
+        if line:
+            assert line == floor, f"{line!r} is not the count-only form {floor!r}"
+
+    # Where every count fits, every count renders, with no names afforded.
+    at_every_count = head + sum(len(line) + 1 for line in floor_lines)
+    block = build_collect_context_block(model, TARGET, budget=at_every_count)
+    for render, prefix in _FACT_ROWS.items():
+        assert _line(block, prefix) == render(model, TARGET, 0), (
+            f"{prefix.strip()} is not at its count at budget {at_every_count}"
+        )
 
 
 # ── L6-2: public_symbols only takes what the rows above leave ──────────────

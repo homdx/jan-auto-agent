@@ -1,6 +1,10 @@
 # L6 — the budget loop lets `public_symbols` displace the fact rows
 
-**Status:** landed — `ced5940`  
+**Status:** landed — `ced5940`; follow-up L6-2 landed — the pack is cut from the
+least valuable end (`_fit_pack_to_budget`): rendered rows are a prefix of
+`_PACK_ROWS`, `contract`/`config_read` shrink by whole lines instead of vanishing,
+and the cut is a function of the budget alone, so a larger budget never renders
+fewer rows or names (0 gaps / 0 drops on a 62-module × 216-budget sweep).  
 **Severity:** HIGH  
 **File:** `tools/auto/context_assembler.py`  
 **Symbol:** `—`  
