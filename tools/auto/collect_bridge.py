@@ -148,10 +148,19 @@ class CollectBridge:
         config=None,
         config_path=None,
         module_refresh_fn=None,
+        pack_enabled: bool = True,
     ) -> None:
         self._model = model
         self._task_mode = task_mode
         self._max_context_chars = max(200, int(max_context_chars))
+        self._pack_enabled = bool(pack_enabled)
+        # V6: per-run memo keyed by (target_file, budget, pack_enabled). The same
+        # file is a target in many tasks of one --auto run; caching the assembled
+        # (and possibly LLM-shrunk) block means a second context_for("x.py") costs
+        # zero further LLM calls. Bounded by distinct target files — the bridge is
+        # built once per run. Entries for a path are dropped by invalidate() when
+        # that path is committed dirty, so the memo never serves stale facts.
+        self._memo: dict = {}
         # `summarizer_call` is a `tools.collect.summarizer.LlmCall`:
         # Callable[[system: str, user: str], str]. None = shrink disabled,
         # falls back to hard truncation.
@@ -377,6 +386,18 @@ class CollectBridge:
         if not new_dirty:
             return
         self._dirty_paths = set(self._dirty_set() | new_dirty)
+        # V6: drop memo entries for the now-dirty paths. The cached block
+        # described the tree as it was before this commit; a later context_for
+        # must rebuild (and re-check dirt) rather than serve a stale clean
+        # result. Keys are normalized in context_for(), so they match here.
+        # `getattr` — some callers build a bridge via __new__() and never run
+        # __init__, so _memo may be absent; treat that as "nothing cached"
+        # rather than raising, matching the fail-open stance of _dirty_set().
+        memo = getattr(self, "_memo", None)
+        if memo:
+            self._memo = {
+                k: v for k, v in memo.items() if k[0] not in new_dirty
+            }
         # A new commit means new facts, so a repair that already failed for
         # these paths is worth one more attempt: an outage that started at
         # task N must not keep blinding a path that task N+2 edited again.
@@ -514,7 +535,21 @@ class CollectBridge:
     # ── 1. static per-task context ──────────────────────────────────────
 
     def context_for(self, target_file: str) -> str:
-        """Budget-aware COLLECT-23 block for `target_file`, or `""`."""
+        """Budget-aware COLLECT-23 block for `target_file`, or `""`.
+
+        V6 wires two changes into this method's three-line shape:
+
+        * `budget=self._max_context_chars` is passed into
+          `build_collect_context_block`, so the pack's static row-shrinking
+          (V2's `_fit_pack_to_budget`) runs before `_shrink` ever gets a chance
+          to pay an LLM call. Most over-budget blocks are now handled without a
+          single summarizer call; `_shrink` remains as the fail-open safety net
+          for the rare case a static cut cannot bring the block within budget.
+        * A per-run memo keyed by `(target_file, max_context_chars,
+          pack_enabled)` caches the final result — including any LLM shrink —
+          so a second `context_for("x.py")` in the same run makes zero
+          additional LLM calls. `invalidate()` drops entries for dirty paths.
+        """
         if not self.usable:
             return ""
         # V9: the model predates this path's edit, so its facts describe a
@@ -524,16 +559,34 @@ class CollectBridge:
         if self._is_dirty(target_file):
             self._miss("dirty", target_file)
             return ""
+        # V6: normalise the key so invalidate() — which stores normalized
+        # paths — can drop the right entries. Non-.py targets (None from
+        # _normalize_path) fall back to the raw string.
+        norm = self._normalize_path(target_file) or target_file
+        key = (norm, self._max_context_chars, self._pack_enabled)
+        # `setdefault` on `__dict__` rather than `self._memo`: a bridge built
+        # via `__new__()` (the probe tests) never ran `__init__`, and a missing
+        # memo is "nothing cached", not a crash — same stance as `invalidate`.
+        memo = self.__dict__.setdefault("_memo", {})
+        cached = memo.get(key)
+        if cached is not None:
+            return cached
         try:
-            raw = build_collect_context_block(self._model, target_file, task_mode=self._task_mode)
+            raw = build_collect_context_block(
+                self._model, target_file, task_mode=self._task_mode,
+                budget=self._max_context_chars, pack_enabled=self._pack_enabled,
+            )
         except Exception as exc:  # noqa: BLE001 — never block a task on this
             logger.warning("CollectBridge.context_for(%s): failed: %s", target_file, exc)
             return ""
         if not raw:
             return ""
         if len(raw) <= self._max_context_chars:
-            return raw
-        return self._shrink(raw)
+            result = raw
+        else:
+            result = self._shrink(raw)
+        memo[key] = result
+        return result
 
     def context_for_many(self, target_files) -> str:
         """Join `context_for` blocks for several files, each budgeted
@@ -901,6 +954,20 @@ def make_collect_bridge(
         )
         max_chars = _DEFAULT_MAX_CONTEXT_CHARS
 
+    # V6: `[collect] pack_enabled` (default true). When false, the fact pack
+    # collapses to the V2 baseline (contract, config_read, public_symbols only),
+    # so the block is byte-identical to a pre-V3 tree's output. A malformed
+    # value warns once and falls back to the default, like every other
+    # `[collect]` read in this function.
+    try:
+        pack_enabled = config.getboolean("collect", "pack_enabled", fallback=True)
+    except ValueError as exc:
+        logger.warning(
+            "config [collect] pack_enabled is malformed (%s) — using default True",
+            exc,
+        )
+        pack_enabled = True
+
     summarizer_call = None
     # V9: `[collect] auto_refresh_between_tasks` (default false). When true,
     # a path a task edits is repaired via the existing incremental
@@ -944,4 +1011,5 @@ def make_collect_bridge(
         base_dir=base_dir,
         config=config,
         config_path=config_path,
+        pack_enabled=pack_enabled,
     )

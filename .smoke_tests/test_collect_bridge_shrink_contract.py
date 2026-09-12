@@ -1,0 +1,1 @@
+../tests/test_collect_bridge_shrink_contract.py

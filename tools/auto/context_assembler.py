@@ -619,6 +619,18 @@ _PACK_ROWS = (
 # floor is reserved for them and they are cut to their first line and no lower.
 _SHRINKABLE_ROWS = frozenset({"callers", "calls_into", "tests"})
 
+# PLAN-v2 V6: when `pack_enabled = false`, the fact pack collapses to the V2
+# baseline — exactly the three rows V2 ported verbatim out of the old single
+# pass. The neighbourhood rows added by V3–V5 are omitted entirely, so the
+# block is byte-identical to what a pre-V3 tree produced (same rows, same
+# order, same dedupe). `pack_enabled` is a V6 bridge config; this tuple exists
+# so the two modes never drift.
+_V2_PACK_ROWS = (
+    ("contract", _row_contract),
+    ("config_read", _row_config_read),
+    ("public_symbols", _row_public_symbols),
+)
+
 
 def _row_cost(form: str) -> int:
     """What a rendered row costs the block: its length plus the newline that
@@ -651,10 +663,11 @@ def _fit_pack_to_budget(
     full: "dict[str, str]",
     head_len: int,
     budget: int,
+    rows: "tuple[tuple[str, Callable], ...]" = _PACK_ROWS,
 ) -> "dict[str, str]":
     """One form per row, cut from the least valuable end down to `budget`.
 
-    The cut walks `_PACK_ROWS` backwards — `public_symbols` gives ground first,
+    The cut walks `rows` backwards — `public_symbols` gives ground first,
     `callers` last — and stops the moment the block fits. Everything above the
     cut keeps its full form, so the cut is a function of the budget alone: a
     larger budget only ever returns content to a row and never takes it away,
@@ -664,9 +677,13 @@ def _fit_pack_to_budget(
     that step hands the row below it fewer characters than the budget it just
     gained.
 
+    `rows` selects which rows participate — `_PACK_ROWS` (full pack, the
+    default) or `_V2_PACK_ROWS` (V6 `pack_enabled=false`, the three V2 rows).
+    The cut logic is identical for both; the set of candidates is all.
+
     A row is never cut below its floor, so the counts of the `+N` rows survive
     any cut. When even every floor does not fit, whole rows are dropped from the
-    end of the order instead, so the rendered rows stay a prefix of `_PACK_ROWS`
+    end of the order instead, so the rendered rows stay a prefix of `rows`
     — the priority of the tuple is never inverted by the budget.
     """
     chosen = dict(full)
@@ -679,7 +696,7 @@ def _fit_pack_to_budget(
         for name, form in full.items()
         if form
     }
-    for name, _ in reversed(_PACK_ROWS):
+    for name, _ in reversed(rows):
         if owed <= 0:
             break
         form = chosen[name]
@@ -702,7 +719,7 @@ def _fit_pack_to_budget(
 
     if owed > 0:
         running, keep = head_len, 0
-        for index, (name, _) in enumerate(_PACK_ROWS):
+        for index, (name, _) in enumerate(rows):
             floor = floors.get(name, "")
             if not floor:
                 continue
@@ -710,7 +727,7 @@ def _fit_pack_to_budget(
             if running > budget:
                 break
             keep = index + 1
-        for index, (name, _) in enumerate(_PACK_ROWS):
+        for index, (name, _) in enumerate(rows):
             if index >= keep:
                 chosen[name] = ""
     return chosen
@@ -722,9 +739,10 @@ def build_collect_context_block(
     *,
     task_mode: str = "code",
     budget: "int | None" = None,
+    pack_enabled: bool = True,
 ) -> str:
     """AUTO-CR-23/COLLECT-23, PLAN-v2 V2: the opt-in `collect`-derived context
-    block for `target_file` — an ordered row list built by `_PACK_ROWS`.
+    block for `target_file` — an ordered row list built by the selected row set.
 
     Purely additive and read-only: this never touches a file on disk, and
     returns `""` (no block at all) whenever there is nothing to say, so a
@@ -750,6 +768,12 @@ def build_collect_context_block(
     `task_mode` is threaded for V14's docs-mode tuple; it does not change the
     code-mode pack this ticket ships.
 
+    `pack_enabled` is the V6 master switch: `True` (the default) uses the full
+    `_PACK_ROWS` set (V3–V5 neighbourhood rows included); `False` collapses to
+    `_V2_PACK_ROWS` — the three rows V2 ported verbatim (contract, config_read,
+    public_symbols) — so the block is byte-identical to what a pre-V3 tree
+    produced.
+
     `model` is a `tools.collect.loader.CollectModel` (or any absent stand-in
     with the same `.available`/`.module`/`.contracts_for` surface) — not
     imported by type here to avoid a hard dependency from `tools.auto` on
@@ -770,6 +794,8 @@ def build_collect_context_block(
         head.append(f"parse_error: {record.parse_error}")
     head_len = len("\n".join(head))
 
+    rows = _PACK_ROWS if pack_enabled else _V2_PACK_ROWS
+
     def _render(name: str, render, allowance: "int | None") -> str:
         """One renderer call, fail-open: a broken row is no row, never no block."""
         try:
@@ -784,21 +810,22 @@ def build_collect_context_block(
     def _allowing(name: str, render) -> "Callable[[int | None], str]":
         return lambda allowance: _render(name, render, allowance)
 
-    full = {name: _render(name, render, None) for name, render in _PACK_ROWS}
+    full = {name: _render(name, render, None) for name, render in rows}
     if budget is None:
         forms = full
     else:
         forms = _fit_pack_to_budget(
-            {name: _allowing(name, render) for name, render in _PACK_ROWS},
+            {name: _allowing(name, render) for name, render in rows},
             full,
             head_len,
             budget,
+            rows=rows,
         )
 
     body: "list[str]" = []
     seen: "set[str]" = set(head)
     used = head_len
-    for name, render in _PACK_ROWS:
+    for name, render in rows:
         row = forms.get(name, "")
         if not row:
             continue

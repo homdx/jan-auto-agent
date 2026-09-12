@@ -538,6 +538,8 @@ use_in_doc      = false
 use_in_bughunt  = false
 staleness       = warn      # warn | refresh | ignore, on stale reads
 llm_summaries   = true      # false = purely structural, no Pass B LLM prose
+max_context_chars_auto = 1200  # per-task budget for the collect block in a coder prompt
+pack_enabled    = true      # false = only contract / config_read / public_symbols rows (pre-V3 shape)
 ```
 
 ### Reading the architect-probe line (AUTO-P / AUTO-P4a)

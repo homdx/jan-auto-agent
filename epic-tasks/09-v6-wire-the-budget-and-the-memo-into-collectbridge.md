@@ -1,6 +1,6 @@
 # V6 — Wire the budget and the memo into `CollectBridge`
 
-**Status:** open (verified against `2f9005d`, 2026-09-12)  
+**Status:** landed — see `git log --grep 'V6:'` (budget passed to the assembler, per-run memo dropped by `invalidate()`, `[collect] pack_enabled`; the key is documented in README and `agents_256k.ini` — add `pack_enabled = true` to your own `agents_128k.ini` under `max_context_chars_auto`, unindented)  
 **Severity:** HIGH  
 **File:** `tools/auto/collect_bridge.py`  
 **Symbol:** `—`  
