@@ -167,6 +167,16 @@ def test_parse_error_and_the_module_line_are_never_cut_by_the_budget():
     assert lines[2] == "parse_error: boom"
 
 
+def test_parse_error_block_is_exact_when_the_budget_fits_only_the_head():
+    """`parse_error` is part of the head, not ranked content: when the budget is
+    exactly the header + module + error lines, that is the whole block."""
+    model = _model([_module(parse_error="boom")])
+    block = build_collect_context_block(model, "pkg/a.py")
+
+    assert len(block) == len(_COLLECT_HEADER) + 1 + len("module: pkg/a.py") + 1 + len("parse_error: boom")
+    assert build_collect_context_block(model, "pkg/a.py", budget=len(block)) == block
+
+
 # ── deduplication ──────────────────────────────────────────────────────────
 
 
@@ -329,6 +339,66 @@ def test_a_tiny_budget_yields_no_block_rather_than_a_torn_one():
     assert "contract c1:" not in block
 
 
+# ── acceptance: every fact the old block carried is still carried ────
+
+
+def test_every_fact_the_old_block_carried_is_still_carried():
+    """Acceptance: for every module whose old block was within budget,
+    the new block carries the same facts (order may differ; content
+    may not). Every unique config_read, every contract, and every
+    public symbol the record holds appears in the block when the
+    rows fit within budget.
+
+    Includes the ticket's specific case: 24 duplicate config_read
+    lines in today's tree — the 5 duplicate entries below must not
+    appear, and the 15 unique ones must all render.
+    """
+    symbols = [_symbol(f"s{i:02d}") for i in range(25)]
+    reads = [
+        ConfigRead(section="coder", key=f"k{i:02d}", fallback=i) for i in range(15)
+    ]
+    # 5 of these are byte-identical to the first 5 — 24 duplicate
+    # config_read lines exist in today's tree per the ticket; the
+    # unique facts are 15, not 20.
+    reads += [
+        ConfigRead(section="coder", key=f"k{i:02d}", fallback=i) for i in range(5)
+    ]
+    contracts = [
+        _contract(f"c{i}", "pkg/a.py", f"contract number {i}") for i in range(8)
+    ]
+    model = _model(
+        [_module(symbols=symbols, config_reads=reads)],
+        contracts,
+    )
+
+    block = build_collect_context_block(model, "pkg/a.py")
+    lines = block.split("\n")
+
+    # All 25 symbols present — no silent [:20] cap, no dropped symbols.
+    for i in range(25):
+        assert f"pkg/a.py:s{i:02d}" in block
+
+    # All 15 unique config_reads present; the 5 duplicates are dropped.
+    assert block.count("config_read [coder]") == 15
+
+    # All 8 contracts present.
+    assert block.count("contract c") == 8
+
+    # No line repeats — dedup verified at the block level too.
+    assert len(lines) == len(set(lines))
+
+    # public_symbols is the last row.
+    assert lines[-1].startswith("public_symbols:")
+    assert "contract" not in lines[-1]
+    assert "config_read" not in lines[-1]
+
+    # With a budget that fits the whole block, facts are byte-identical
+    # to the no-budget case — the budget cut is never triggered.
+    assert build_collect_context_block(
+        model, "pkg/a.py", budget=len(block) + 1000
+    ) == block
+
+
 # ── early-out ──────────────────────────────────────────────────────────────
 
 
@@ -382,6 +452,24 @@ def test_a_numeric_string_budget_is_honoured():
     assert cut != full
     assert "cut for budget" in _symbol_line(cut)
 
+def test_public_symbols_announces_the_remainder_when_a_budget_cuts_the_list():
+    """V2.3: a partial symbol list must say how many it is hiding. The old
+    silent `[:20]` made a 65-symbol module look like a 20-symbol one."""
+    model = _model([_module(symbols=[_symbol(f"s{i}") for i in range(30)])])
+
+    block = build_collect_context_block(model, "pkg/a.py", budget=250)
+    line = _symbol_line(block)
+
+    listed = [
+        part.strip()
+        for part in line[len("public_symbols: "):].split(",")
+        if part.strip() and "cut for budget" not in part
+    ]
+    remainder = 30 - len(listed)
+    assert line.endswith(f"… (+{remainder} more, cut for budget)")
+    assert listed[0] == "pkg/a.py:s0"
+    assert "pkg/a.py:s29" not in block
+
 
 def test_a_row_that_raises_is_dropped_but_the_rest_of_the_pack_survives(monkeypatch):
     """Fail-open house rule: one broken renderer degrades to "no row", never to
@@ -409,6 +497,24 @@ def test_a_row_that_raises_is_dropped_but_the_rest_of_the_pack_survives(monkeypa
     assert "contract c1: the contract" in block
     assert "public_symbols: pkg/a.py:alpha" in block
     assert "config_read" not in block
+
+
+def test_malformed_symbol_record_does_not_raise_or_hide_valid_symbols():
+    """A hand-edited artifact can carry a symbol whose `qualname` is not a
+    string. V2's fail-open rule means the malformed entry is skipped and the
+    row still renders the valid symbols it can name."""
+    malformed = FunctionRecord(
+        qualname=None,
+        module="pkg/a.py",
+        lineno=2,
+        signature="malformed(...)",
+    )
+    model = _model([_module(symbols=[malformed, _symbol("beta")])])
+
+    block = build_collect_context_block(model, "pkg/a.py")
+
+    assert "public_symbols: pkg/a.py:beta" in block
+    assert "malformed" not in block
 
 
 def test_row_renderers_return_empty_string_not_none():

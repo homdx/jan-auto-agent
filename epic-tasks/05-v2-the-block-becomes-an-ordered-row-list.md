@@ -1,6 +1,6 @@
 # V2 — The block becomes an ordered row list
 
-**Status:** landed — `72bbc86`  
+**Status:** landed — `72bbc86`; follow-up V2-2 landed — a contract line renders once before the cut, a row that cannot give ground (`calls_into` with one short target) no longer borrows the deficit from the row above it, `e.g. X` is not a sentence end, a malformed symbol record skips only itself, and AC #1 is pinned against the pre-V2 renderer and the live tree  
 **Severity:** HIGH  
 **File:** `tools/auto/context_assembler.py`  
 **Symbol:** `—`  

@@ -188,10 +188,19 @@ def _row_contract(model, target_file: str, remaining: "int | None") -> str:
         contracts.extend(c for c in model.contracts_for(sym.qualname) if c not in contracts)
     if not contracts:
         return ""
-    return _shrunk_lines(
-        [f"contract {c.name}: {c.description}" for c in sorted(contracts, key=lambda c: c.name)],
-        remaining,
-    )
+
+    # A contract may be both seeded and derived (`COLLECT-10`), so two distinct
+    # `ContractRecord`s can render byte-identically. Dedupe the rendered lines
+    # BEFORE the cut, the way `_row_config_read` already does: the block's own
+    # dedupe would remove the duplicate anyway, so a row measured with it in
+    # counts budget it never spends, and a cut sized on that count drops a
+    # contract line the budget could have afforded.
+    lines: "list[str]" = []
+    for contract in sorted(contracts, key=lambda c: c.name):
+        line = f"contract {contract.name}: {contract.description}"
+        if line not in lines:
+            lines.append(line)
+    return _shrunk_lines(lines, remaining)
 
 
 def _row_config_read(model, target_file: str, remaining: "int | None") -> str:
@@ -237,7 +246,14 @@ def _row_public_symbols(model, target_file: str, remaining: "int | None") -> str
     record = model.module(target_file)
     if record is None:
         return ""
-    symbols = [s.qualname for s in record.public_symbols]
+    # A hand-edited artifact can carry a symbol whose qualname is not a string.
+    # Skip only the malformed entry so a row still says what it can say, and a
+    # single broken record never raises into a run.
+    symbols = [
+        s.qualname
+        for s in record.public_symbols
+        if isinstance(getattr(s, "qualname", None), str)
+    ]
     if not symbols:
         return ""
     prefix = "public_symbols: "
@@ -423,6 +439,33 @@ def _row_tests(model, target_file: str, remaining: "int | None") -> str:
     return _fitted_names(f"{count}: ", count, tests, _TESTS_MAX_NAMES, remaining)
 
 
+def _is_dotted_abbreviation(flat: str, dot_index: int) -> bool:
+    """True when the token ending immediately before the `.` at `dot_index` is
+    itself dotted — `e.g`, `i.e`, `c.f`, `U.S.A`, `3.2` — so the terminator
+    closes an abbreviation rather than a sentence.
+
+    The next-word rule above only catches an abbreviation followed by a
+    *lowercase* word (`e.g. diff`). An abbreviation followed by an uppercase
+    word (`e.g. X` — the common shape, since an LLM summary tends to
+    capitalise the next word) reads to that rule like a real sentence
+    boundary, and the row renders `e.g.`: a dangling fragment that costs
+    almost nothing in budget while asserting nothing, and a reader seeing it
+    on a line already labelled weak evidence has no way to tell it is
+    truncated.
+
+    Only a `.` triggers it: `!` and `?` never close an abbreviation, so the
+    rule cannot widen the abbreviation class past periods. A version-number
+    terminator (`Ver 1.2. Next`) is treated as an abbreviation too — the
+    error is then to take the *longer* cut, which is the safe direction for a
+    row that announces its own weakness rather than one that claims to be
+    complete.
+    """
+    start = dot_index - 1
+    while start > 0 and flat[start - 1] not in " \t":
+        start -= 1
+    return "." in flat[start:dot_index]
+
+
 def _first_sentence(text: str, limit: int = _NEIGHBOURS_PURPOSE_MAX_CHARS) -> str:
     """`text` flattened to one line and cut at the first sentence, or at
     `limit` chars, whichever comes first.
@@ -442,6 +485,11 @@ def _first_sentence(text: str, limit: int = _NEIGHBOURS_PURPOSE_MAX_CHARS) -> st
     fragment. The other 225 never reach a sentence end before the ceiling, so
     the word-boundary cut below is the shape most rendered lines take.
 
+    The word-boundary rule still misses an abbreviation followed by an
+    *uppercase* word (`e.g. X`), which it would read as a real boundary;
+    `_is_dotted_abbreviation` closes that hole by looking at the token the
+    terminator closes instead of the word that follows it.
+
     When the ceiling does the cutting it backs up to the last word boundary,
     so the cut never renders a broken fragment (`"in-memor"`) that would read
     as a bug in a line already labelled weak evidence. `""` for nothing left to
@@ -458,6 +506,8 @@ def _first_sentence(text: str, limit: int = _NEIGHBOURS_PURPOSE_MAX_CHARS) -> st
         if ch in _SENTENCE_ENDINGS and i + 1 < len(flat) and flat[i + 1] == " ":
             nxt = flat[i + 2] if i + 2 < len(flat) else ""
             if nxt and not nxt.isupper():  # an abbreviation, not a sentence end
+                continue
+            if ch == "." and _is_dotted_abbreviation(flat, i):
                 continue
             return flat[: i + 1].strip()
 
@@ -635,9 +685,19 @@ def _fit_pack_to_budget(
         form = chosen[name]
         if not form:
             continue
-        give = min(owed, _row_cost(form) - _row_cost(floors.get(name, "")))
-        owed -= give
-        target = _row_cost(form) - give
+        give = _row_cost(form) - _row_cost(floors.get(name, ""))
+        if give <= 0:
+            # This row cannot give ground: its smallest form is not smaller than
+            # its full form. `calls_into` with one short target is the case —
+            # "calls_into: a.py" is 16 chars, its own count is
+            # "calls_into: 1 target" and 20. Borrowing the deficit from here
+            # would make `owed` grow and cut a row above it by more than the
+            # budget requires, which is the displacement this pass exists to
+            # avoid, so it is skipped rather than taken from.
+            continue
+        take = min(owed, give)
+        owed -= take
+        target = _row_cost(form) - take
         chosen[name] = "" if target <= 0 else renderers[name](target - 1)
 
     if owed > 0:
