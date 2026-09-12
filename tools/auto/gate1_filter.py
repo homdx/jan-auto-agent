@@ -321,6 +321,29 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         except ValueError as exc:
             logger.warning("config [%s] max_tokens is malformed (%s) — using default 512", sec, exc)
             self._max_tokens = 512
+        # GATE1-LEARN-1: remember which max_tokens budget produced a
+        # parseable verdict and START the next candidate there. Without
+        # this every candidate re-climbed the unparseable ladder from the
+        # configured max_tokens (512 -> 4096 -> 4096 -> 8192 -> 8192 ->
+        # 16384) — 5-6 calls per ticket on a model that consistently needs
+        # the same budget. The start is the MEDIAN of the last
+        # unparseable_learn_window successes, so one outlier cannot pin
+        # every later candidate to a 16k budget.
+        try:
+            self._unparseable_learn = config.getboolean(sec, "unparseable_learn", fallback=True)
+        except ValueError as exc:
+            logger.warning("config [%s] unparseable_learn is malformed (%s) — using default True", sec, exc)
+            self._unparseable_learn = True
+        try:
+            self._unparseable_learn_window = max(1, int(config.get(
+                sec, "unparseable_learn_window", fallback="8")))
+        except ValueError as exc:
+            logger.warning("config [%s] unparseable_learn_window is malformed (%s) — using default 8", sec, exc)
+            self._unparseable_learn_window = 8
+        # (max_tokens that yielded a parseable verdict, newest last), keyed
+        # by presence model — a per-candidate presence_llm_profile can
+        # switch models mid-run and their budgets are not comparable.
+        self._unparseable_samples: dict[str, list[int]] = {}
         try:
             self._skip_llm = config.getboolean(sec, "skip_llm", fallback=False)
         except ValueError as exc:
@@ -1233,6 +1256,21 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         sleep = _sleep_fn or time.sleep
         last_exc: "Exception | None" = None
         cleaned = ""
+        # GATE1-LEARN-1: the first call goes out at the budget that has
+        # been answering, not at the configured floor that has not.
+        _learned = self._learned_max_tokens()
+        _initial_tokens = (
+            self._presence_max_tokens if _learned is None else _learned
+        )
+        if _learned is not None and _learned > self._presence_max_tokens:
+            logger.info(
+                "Gate1._check_presence [%s]: starting at learned "
+                "max_tokens=%d (median of %d parseable verdict(s); "
+                "configured %d).",
+                candidate.title, _learned,
+                len(self._unparseable_samples.get(self._presence_model, ())),
+                self._presence_max_tokens,
+            )
         for attempt in range(self._llm_call_retry_max + 1):
             if attempt > 0:
                 logger.warning(
@@ -1243,7 +1281,10 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                 )
                 sleep(self._llm_call_retry_wait_sec)
             try:
-                cleaned = _call(user_msg)
+                cleaned = _call(
+                    user_msg,
+                    max_tokens=None if _learned is None else _initial_tokens,
+                )
                 last_exc = None
                 break
             except Exception as exc:
@@ -1265,6 +1306,8 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         confirmed, reason, unparseable = self._parse_presence_response(
             cleaned, candidate.title, code_block=code_block,
         )
+        if not unparseable:
+            self._record_parseable_budget(_initial_tokens)
 
         # AUTO-CR-31-style re-ask: an unparseable verdict (bad JSON, wrong
         # shape, unrecognised verdict word — as opposed to a genuine
@@ -1292,13 +1335,26 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                 else self._UNPARSEABLE_TOKENS_DEFAULT_CEILING
             )
             _n_temps = len(self._UNPARSEABLE_TEMPERATURES)
+            # GATE1-LEARN-1: the ladder starts at the first tier that is
+            # not below the budget the initial call already had — a
+            # re-ask at 4096 after a learned 16384 failed cannot help.
+            _start_tier = 0
+            while (
+                self._UNPARSEABLE_TOKENS_FLOOR
+                * int(self._UNPARSEABLE_TOKENS_STEP_MULT ** _start_tier)
+                < _initial_tokens
+                and self._UNPARSEABLE_TOKENS_FLOOR
+                * int(self._UNPARSEABLE_TOKENS_STEP_MULT ** _start_tier)
+                < ctx_ceiling
+            ):
+                _start_tier += 1
             for attempt in range(1, self._UNPARSEABLE_MAX_RETRIES + 1):
                 # AUTO-RETRY-TEMP-1: 2-D grid — every temperature in
                 # _UNPARSEABLE_TEMPERATURES is tried at the CURRENT token
                 # tier before the tier doubles. tier_index and temp_index
                 # both derive from the same attempt counter, so this
                 # needs no extra state beyond the loop variable itself.
-                tier_index = (attempt - 1) // _n_temps
+                tier_index = _start_tier + (attempt - 1) // _n_temps
                 temp_index = (attempt - 1) % _n_temps
                 _uncapped_tokens = (
                     self._UNPARSEABLE_TOKENS_FLOOR
@@ -1349,6 +1405,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                     cleaned_n, candidate.title, code_block=code_block,
                 )
                 if not unparseable_n:  # this answer was clear — use it
+                    self._record_parseable_budget(attempt_tokens)
                     return confirmed_n, reason_n
                 last_confirmed, last_reason, last_cleaned = confirmed_n, reason_n, cleaned_n
 
@@ -1360,6 +1417,30 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             return last_confirmed, last_reason
 
         return confirmed, reason
+
+    # ── GATE1-LEARN-1: learned start budget ──────────────────────────────
+    def _learned_max_tokens(self) -> "int | None":
+        """Median max_tokens of recent parseable verdicts for the current
+        presence model, or ``None`` while nothing has been learned (or the
+        feature is off). Never below the configured max_tokens."""
+        if not self._unparseable_learn:
+            return None
+        samples = self._unparseable_samples.get(self._presence_model) or []
+        if not samples:
+            return None
+        costs = sorted(samples)
+        mid = len(costs) // 2
+        median = (costs[mid] if len(costs) % 2
+                  else (costs[mid - 1] + costs[mid]) // 2)
+        return max(int(median), int(self._presence_max_tokens))
+
+    def _record_parseable_budget(self, max_tokens: int) -> None:
+        """A verdict parsed at *max_tokens* — remember it (bounded window)."""
+        if not self._unparseable_learn:
+            return
+        samples = self._unparseable_samples.setdefault(self._presence_model, [])
+        samples.append(int(max_tokens))
+        del samples[:-self._unparseable_learn_window]
 
     def _parse_presence_response(
         self,

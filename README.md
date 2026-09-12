@@ -318,9 +318,14 @@ work lives):**
   harder, not easier. Restricted to Python files by design (the
   leading-underscore convention doesn't generalise to other languages).
 - **Re-ask on unparseable reply.** A response that isn't valid JSON with a
-  recognised verdict is re-asked once with a stricter nudge before being
-  treated as a genuine failure — this is separate from (and does not
-  bypass) the evidence requirement above.
+  recognised verdict is re-asked with a stricter nudge, climbing a
+  max_tokens/temperature ladder (4096 → 8192 → 16384, each at 0.0 then
+  0.1), before being treated as a genuine failure — this is separate from
+  (and does not bypass) the evidence requirement above. The budget that
+  finally produced a verdict is remembered and the next candidate starts
+  there (`[gate1] unparseable_learn = true`, median of the last
+  `unparseable_learn_window = 8` successes), so a thinking model that
+  always needs 8k does not pay five calls per ticket to rediscover it.
 - **Collect-context notes** (when `[collect] use_in_auto = true`):
   existing test coverage and documented config-fallback notes, sourced
   from the `--collect` artifact rather than re-derived per call.
