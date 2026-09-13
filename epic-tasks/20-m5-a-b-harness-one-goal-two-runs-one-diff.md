@@ -1,6 +1,6 @@
 # M5 — A/B harness: one goal, two runs, one diff
 
-**Status:** open (verified against `2f9005d`, 2026-09-12)  
+**Status:** open (verified against `84a24b2`, 2026-09-13 — V6 landed, `pack_enabled` exists)  
 **Severity:** HIGH  
 **File:** `scripts/collect_ab.sh`  
 **Symbol:** `—`  
@@ -18,26 +18,45 @@
 
 The only way to claim "the agent works better" is to run the same thing twice.
 
-### Verified against `2f9005d` (2026-09-12) — two corrections
+### Verified against `84a24b2` (2026-09-13) — four corrections
 
 1. **Not `--dry-run`.** `MEASURE-BEFORE-AFTER.md` §"`--dry-run` skips the
    coder" is right: the collect block is built only in `Coder._build_prompt`,
    so a dry-run A/B measures nothing the pack does. Both runs must execute
-   tasks. Do it against a local stub that answers every role (copy `proxy2/`
-   to `proxy-stub/` and log requests to JSON, or the harness's own stub) —
-   never a live provider. The switch is `[collect] use_in_auto` (exists today);
-   `pack_enabled` is a finer switch that only exists once V6 lands, so this
-   ticket depends on **M4** and optionally V6, not on V6 unconditionally.
-2. "fixed seed": the run has no seed flag. Determinism comes from the stub —
-   a stub that replays recorded answers keyed by prompt hash gives
-   "two runs of A produce the same counters" for free; a live model never will.
+   tasks against a local stub that answers every role (copy `proxy2/` to
+   `proxy-stub/` and log requests to JSON, or the harness's own stub) —
+   never a live provider.
+2. **The switch is `[collect] pack_enabled`** (V6, `76fd4bd`): `false` keeps
+   the pre-V3 rows, `true` the full pack. Do **not** flip `use_in_auto` — that
+   also removes the architect probe, so the two runs would differ in more
+   than the pack.
+3. **"fixed seed": the run has no seed flag.** Determinism comes from the stub
+   replaying recorded answers. But a replay keyed by the *full prompt hash*
+   cannot serve run B from run A's recordings — the coder prompt differs by
+   exactly the block under test. Key coder replies by `(role, task_id, round)`
+   or hash the prompt with the `COLLECT MODEL (static facts` … block cut out.
+4. **Same plan in both runs.** The architect + gate-1 phase is upstream of the
+   pack; on a live model it is non-deterministic (testtext5 vs testtext6
+   differed by 52 candidates on one tree). Run the plan phase **once**, then
+   seed run B's `.agent/` from run A's (`plan.json`, `progress.json`,
+   `tickets/`) before its coding phase — the harness copies, it does not
+   re-plan. Consequently `gate1 rejected: existence / presence` rows below are a
+   **sanity check** (must be equal), not a measurement.
+5. Non-`.py` tasks (`.ini`, `.md`, `.json` targets) get no block by
+   construction and the coder loops on them (live: testtext6 T4 on four
+   `skills/*.skill.ini`, three failed rounds). Until L1 lands, the harness
+   drops them from the seeded plan the same way in both runs
+   (`target_files` all non-`.py` → remove; verify no `dependencies` point at
+   them) and reports how many it dropped.
 
 ### Do
 
-1. One goal, one base tree, fixed seed, `--dry-run`, against the local stub —
-   run A with `pack_enabled = false`, run B with `pack_enabled = true`.
-   Everything else identical, including the config file, which the script
-   copies and patches rather than editing in place.
+1. One goal, one base tree, one plan, executing tasks against the local
+   replay stub — run A with `[collect] pack_enabled = false`, run B with
+   `pack_enabled = true`. Everything else identical, including the config
+   file, which the script copies and patches rather than editing in place.
+   Counters come from M4's `collect_*` events and the gate-1 split line, read
+   from **every** `trace_*.jsonl` of the tree.
 2. Diff the Tier-2 counters:
 
 ```
@@ -45,11 +64,14 @@ The only way to claim "the agent works better" is to run the same thing twice.
 probe requests                  ___       ___
 probe misses                    ___       ___     ← want down
 context re-requests             ___       ___     ← want down
-gate1 rejected: existence       ___       ___     ← want down (fewer phantom paths)
-gate1 rejected: presence        ___       ___
+gate1 rejected: existence       ___       ___     ← must be equal (same seeded plan)
+gate1 rejected: presence        ___       ___     ← must be equal
 gate2 attempts per task         ___       ___     ← want down
 tasks blocked                   ___       ___
-prompt chars per coder call     ___       ___     ← want up only a little
+coder rounds per task           ___       ___     ← want down
+tasks done / blocked            ___       ___
+prompt chars per coder call     ___       ___     ← want up only a little (≤ max_context_chars_auto)
+collect blocks / coder calls    ___       ___     ← A must be 0 rows-from-pack, B > 0
 LLM calls, whole run            ___       ___
 ```
 
@@ -60,7 +82,8 @@ LLM calls, whole run            ___       ___
 
 ### Acceptance
 
-- [ ] Reproducible: two runs of A produce the same counters.
+- [ ] Reproducible: two runs of A produce the same counters (replay stub, seeded plan).
+- [ ] Depends on M4: uses its events; fails loudly if a trace has none.
 - [ ] Never touches `agents_128k.ini` — copies to a scratch path and patches
       the copy. (Do not point a measurement run at a live provider config.)
 - [ ] Output committed alongside the baseline JSON.

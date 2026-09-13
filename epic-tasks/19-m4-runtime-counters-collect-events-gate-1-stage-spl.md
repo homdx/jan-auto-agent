@@ -1,6 +1,6 @@
 # M4 — Runtime counters: collect events + Gate-1 stage split
 
-**Status:** open (verified against `2f9005d`, 2026-09-12)  
+**Status:** open (verified against `84a24b2`, 2026-09-13 — re-checked after V6, GATE1-LEARN-1/2, GATE1-PAR-1 and the first live execution runs)  
 **Severity:** HIGH  
 **File:** `tools/auto/run_trace.py`  
 **Symbol:** `—`  
@@ -18,7 +18,7 @@ Tier 0 and Tier 1 are static. Tier 2 needs the run to say what happened.
 (This ticket absorbs v1's C5 and B4, which were measurement work filed as
 feature work at the end of two different epics.)
 
-### Verified against `2f9005d` (2026-09-12)
+### Verified against `84a24b2` (2026-09-13)
 
 - `collect_miss` already exists: V9 emits it through `tracer.event(...,
   kind="collect_miss", params={reason, target, task_id?})` from
@@ -29,10 +29,39 @@ feature work at the end of two different epics.)
   for the literal header `COLLECT MODEL (static facts` in the coder prompt.
   Once `collect_block` events exist, the snapshot must count those instead
   (and keep the grep as a fallback for pre-M4 traces), or the before/after
-  columns are not comparable.
-- `collect_shrink` observes `_shrink` from `context_for`: `before=len(raw)`,
-  `after=len(result)`, `path="llm"` if `shrink_calls` incremented else
-  `"truncate"`. Still no edit inside `_shrink`.
+  columns are not comparable. Also: with several `trace_*.jsonl` per tree
+  (every resume writes a new one) the script reads `traces[0]` only — it must
+  read **all** of them, or take `--run-id`.
+- **Three shrink paths now, not two.** Since V6 (`76fd4bd`) the budget reaches
+  `build_collect_context_block(..., budget=, pack_enabled=)`, so the L6 row
+  cut happens *inside the assembler* and `context_for` sees a `raw` that is
+  already ≤ budget most of the time (live: every block 620–1024 chars under a
+  1200 budget, `_shrink` never ran). `collect_shrink.path` is therefore
+  `rows` (assembler cut, block fits) | `llm` (`_shrink` and `shrink_calls`
+  incremented) | `truncate` (`_shrink` without an LLM). `rows_kept` /
+  `rows_cut` are not observable from outside today — the assembler returns a
+  plain `str`. Expose them through a **new** helper (e.g.
+  `build_collect_context_block_stats(...) -> (str, stats)` that the old
+  function wraps), not by changing the return type of the existing one.
+  Still no edit inside `_shrink`.
+- **The memo (V6) hides repeats.** `context_for` returns the memoised block
+  on every round after the first, so a `collect_block` emitted only on a
+  build would undercount "blocks per coder request". Emit it on every call
+  with `memo_hit: bool`; the summary counts both.
+- **Gate-1 stages today are `existence` / `presence` / `duplicate`**
+  (`Gate1Result.stage`). There is **no** `already_safe` stage — that is V12's
+  `is_candidate_already_safe`, unlanded; print it only if V12 exists, do not
+  invent a zero column for it. What the live runs showed we *do* need is the
+  presence stage split by **how** it ended (GATE1-LEARN-2 fast mode):
+  `presence_confirmed`, `presence_rejected` (the model said so),
+  `presence_fail_closed` (empty/unparseable after the ladder — `reason`
+  starts with `JSON decode failed`, `expected JSON object` or `LLM call
+  failed`), and `presence_reask` (answered only at the 0.1 re-ask). Live on
+  `84a24b2`: testtext 142 of 403 candidates fail-closed (35 %), testtext6 95
+  of 375 (25 %) — invisible in `gate1 accepted=N rejected=M` today.
+- One more free counter, because L1 is still open: gate-1 LLM requests whose
+  `cited_location.file` is not `.py` (`non_py=N`; live 40 and 31). L1 will
+  drive it to 0 and needs the number to prove it.
 
 ### Do
 
@@ -40,8 +69,8 @@ feature work at the end of two different epics.)
 
    | event | fields |
    |---|---|
-   | `collect_block` | `task_id`, `target_file`, `chars`, `rows_kept`, `rows_cut` |
-   | `collect_shrink` | `task_id`, `target_file`, `before`, `after`, `path` = `llm` \| `truncate` |
+   | `collect_block` | `task_id`, `target_file`, `chars`, `rows_kept`, `rows_cut`, `memo_hit` |
+   | `collect_shrink` | `task_id`, `target_file`, `before`, `after`, `path` = `rows` \| `llm` \| `truncate` |
    | `collect_miss` | `task_id`, `target_file`, `reason` = `absent` \| `stale` \| `dirty` \| `unknown_module` |
    | `collect_summary` | per run: blocks injected, chars injected, shrink calls, misses |
 
@@ -49,23 +78,33 @@ feature work at the end of two different epics.)
    by comparing lengths and reading the existing `shrink_calls`. It does not
    modify `_shrink`.
 
-2. `plan_phase: gate1 accepted=N rejected=M` gains the per-stage split
-   (`existence=… already_safe=… presence=… duplicate=…`). With the feature off
-   the line still prints `already_safe=0`, so log parsing is stable across the
-   flag.
+2. `plan_phase: gate1 accepted=N rejected=M` (`tools/auto/pipeline.py:415`)
+   gains the per-stage split:
+   `existence=… presence_confirmed=… presence_rejected=… presence_fail_closed=…
+   presence_reask=… duplicate=… non_py=…`. Every field is always printed
+   (zero when the mode does not produce it), so log parsing is stable across
+   `unparseable_retry_mode` and across L1 landing.
 
 3. `analyze_logs.py` prints a **collect** section next to its existing probe
    section:
 
 ```
-collect   blocks 12/14 tasks · 6 431 chars · shrink 1 (llm) · miss 2 (dirty)
+collect   blocks 12/14 coder calls (memo 8) · 6 431 chars · shrink 1 (rows) · miss 2 (dirty)
 probe     requests 9 · hits 7 · misses 2 · declined 0 · escalated 1
-gate1     accepted 4 · existence 3 · already_safe 0 · presence 5 · duplicate 1
+gate1     accepted 4 · existence 3 · presence rejected 5 / fail-closed 2 / re-ask 3 · duplicate 1 · non-py 4
 ```
 
 ### Acceptance
 
-- [ ] A `--dry-run` against a stub emits all four events plus the summary.
+- [ ] `--dry-run` never reaches the coder, so it cannot emit `collect_block`
+      — the acceptance is a unit test that drives `CollectBridge.context_for`
+      (build, memo hit, over-budget) with a recording tracer and asserts all
+      four events plus the summary; and one that runs `Gate1Filter.filter`
+      against a stubbed `request_completion` returning confirmed / rejected /
+      `""` and asserts the split line.
+- [ ] `scripts/trace_round_snapshot.py` counts `collect_block` events when
+      present, falls back to the header grep otherwise, and reads every
+      trace file of a tree.
 - [ ] `git diff` touches no line inside `CollectBridge._shrink`.
 - [ ] Zero events and an unchanged log shape when no bridge is wired in.
 - [ ] New: `tests/test_run_trace_collect_events.py`.
