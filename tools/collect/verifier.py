@@ -181,9 +181,30 @@ _SILENT_WORDS_RE = re.compile(r"\b(silent(?:ly)?|swallow(?:s|ed|ing)?)\b", re.IG
 # claim about a genuinely UNGUARDED (crashing) access therefore survived
 # into the artifact completely unchecked — arguably worse than a false
 # crash claim, since it actively tells a reader a real risk is handled.
+# BUGFIX (verified-bugs audit #6): a safety sentence phrased with a
+# NEGATED crash word ("stack[-1] will not crash", "it won't throw", "there is
+# no risk of crash") was previously read as actual crash language:
+# _CRASH_WORDS_RE matches the literal word "crash"/"throw"/"fail" even when
+# it follows "will not"/"cannot"/"won't", so the crash branch above fired
+# first and the sentence was classified access_crash. That collapsed a true
+# "X is safe" claim into a crash claim — a true safety sentence about a
+# GUARDED access was then dropped as "contradicts-guard", and a false "X will
+# not crash" affirmation about an UNGUARDED access survived entirely
+# unchecked (as an access_crash, which has no UNGUARDED contradiction check).
+# The negation forms below (all three persons/tenses of "not", plus "never")
+# are exactly what _CRASH_WORDS_RE otherwise cannot see past. Note the same
+# problem never existed for "cannot raise"/"will not raise": the crash
+# pattern for "raise" requires a following `\bError` suffix, so plain
+# "cannot raise" never matched it — "crash"/"throw"/"fail" have no such
+# suffix and are the ones that needed this.
 _SAFE_WORDS_RE = re.compile(
-    r"\b(safe(?:ly)?|guarded|cannot\s+(?:raise|crash|fail)|"
-    r"will\s+not\s+(?:raise|crash|fail)|no\s+risk\s+of)\b",
+    r"\bsafe(?:ly)?\b|\bguarded\b|"
+    r"(?:\bcannot\b|\bcan'?t\b|\bwill\s+not\b|\bwon'?t\b|\bwould\s+not\b|\bwouldn'?t\b|"
+    r"\bdoes\s+not\b|\bdoesn'?t\b|\bdo\s+not\b|\bdon'?t\b|\bdid\s+not\b|\bdidn'?t\b|"
+    r"\bhave\s+not\b|\bhaven'?t\b|\bhas\s+not\b|\bhasn'?t\b|\bhad\s+not\b|\bhadn'?t\b|"
+    r"\bnever\b)\s+"
+    r"(?:raise|crash(?:es|ed|ing)?|fail(?:s|ure)?|throw(?:s|n|ing)?)\b|"
+    r"\bno\s+risk\s+of\s+(?:raise|crash(?:es|ed|ing)?|fail(?:s|ure)?|throw(?:s|n|ing)?)\b",
     re.IGNORECASE,
 )
 
@@ -482,7 +503,16 @@ def extract_claims(
                 continue  # real-but-unindexed name in this module — not a citation to check
             symbols.append(exact_qualname)
 
-        if accesses and _CRASH_WORDS_RE.search(sentence):
+        # BUGFIX (see _SAFE_WORDS_RE): a safety sentence like "stack[-1] will
+        # not crash" contains the literal crash word "crash", so probing the
+        # raw sentence first would classify it access_crash. Probe the crash
+        # keywords on a copy with every safe phrasing removed — only
+        # genuinely affirmative crash language then trips the crash branch.
+        # A sentence that contains BOTH a real crash assertion and safety
+        # language still keeps the existing crash-wins behavior, because the
+        # residual crash assertion survives the strip.
+        _crash_probe = _SAFE_WORDS_RE.sub("", sentence)
+        if accesses and _CRASH_WORDS_RE.search(_crash_probe):
             kind = "access_crash"
         elif accesses and _SAFE_WORDS_RE.search(sentence):
             # access_safe: the mirror image of access_crash (see

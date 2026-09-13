@@ -703,6 +703,16 @@ class Executor:
         # filename (not a flag and not already path-qualified).  idx==0 is the
         # executable itself (bash, python, …) — always skip it.
         _SHELL_OPS = frozenset({"&&", "||", ";", "|", "&"})
+        # Every shell metacharacter whose presence in the RAW command string
+        # forces the word-boundary substitution rewrite rather than a
+        # rebuild via shlex.join() — shlex.join shell-quotes any token that
+        # is not a lone safe word, so `>`/`<` redirects and `2>&1`/`|&`
+        # forms would turn into literal argv (see the route-comment in the
+        # match branch below). Superset of `_SHELL_OPS`, deliberately: a
+        # `>` glued to a word (`2>&1`) never appears as its own split
+        # element, so the token scan cannot stop on it — the string-level
+        # check is the only place it can be seen.
+        _REWRITE_PRESERVE_OPS = frozenset({"&&", "||", ";", "|", "&", ">", "<"})
         for idx, part in enumerate(parts):
             if idx == 0:
                 continue  # executable — never a filename target
@@ -732,10 +742,28 @@ class Executor:
             matches = [tf for tf in target_files if Path(tf).name == basename]
             if len(matches) == 1:
                 full_path = matches[0]
-                if "&&" in command or "||" in command or ";" in command:
-                    # The original command contains shell operators; shlex.join
-                    # would misquote them.  Do a safe word-boundary string
-                    # substitution on the original command string instead.
+                # BUGFIX: the route decision used to look for only
+                # `&&`/`||`/`;`. Every OTHER shell metacharacter a command
+                # can contain — `|`, `&`, and especially redirections
+                # `>`/`<`, `>>`, `2>&1` — went to the `shlex.join` branch
+                # below, which re-quotes every non-identifier token into
+                # literal arguments. A realistic acceptance check like
+                #   python gen_report.py > /tmp/report.html
+                # was therefore executed as
+                #   python tools/gen_report.py '>' /tmp/report.html
+                # — the redirection silently vanished, the shell passed
+                # `>` and the filename as argv entries, and any subsequent
+                # "does the output file exist" check failed spuriously.
+                # Route to the word-boundary substitution whenever the
+                # ORIGINAL string contains any metacharacter shlex.join
+                # would quote, so every non-target token survives verbatim
+                # (including inside `2>&1`, where `&` is glued to the
+                # digits and could not appear as its own token anyway).
+                if any(op in command for op in _REWRITE_PRESERVE_OPS):
+                    # The original command contains shell metacharacters;
+                    # shlex.join would misquote them.  Do a safe
+                    # word-boundary string substitution on the original
+                    # command string instead.
                     #
                     # Bugfix: full_path must NOT be passed as re.sub's string
                     # replacement argument — re.sub interprets backslash
