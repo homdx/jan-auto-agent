@@ -55,7 +55,9 @@ from __future__ import annotations
 import configparser
 import json
 import logging
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -382,6 +384,22 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         # by presence model — a per-candidate presence_llm_profile can
         # switch models mid-run and their budgets are not comparable.
         self._unparseable_samples: dict[str, list[int]] = {}
+        # GATE1-PAR-1: the learned window is shared between presence
+        # workers — one lock around its reads and appends.
+        self._learn_lock = threading.Lock()
+        # GATE1-PAR-1: how many presence checks run at once. 1 (default)
+        # is the pre-existing sequential loop, byte-for-byte. N>1 runs the
+        # Stage-B LLM calls through a thread pool of N workers; each call
+        # still honours 429/Retry-After on its own (tools.llm_stream
+        # AUTO-RATE-1), so an over-eager N degrades to waiting, not to
+        # failing. Results are collected in the original candidate order,
+        # so dedup (Stage C) sees the same sequence as before.
+        try:
+            self._presence_workers = max(1, int(config.get(
+                sec, "presence_workers", fallback="1")))
+        except ValueError as exc:
+            logger.warning("config [%s] presence_workers is malformed (%s) — using default 1", sec, exc)
+            self._presence_workers = 1
         try:
             self._skip_llm = config.getboolean(sec, "skip_llm", fallback=False)
         except ValueError as exc:
@@ -712,6 +730,61 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             presence_passed = [(c, f"existence check passed ({_why})") for c, _ in existence_passed]
         else:
             n_presence = len(existence_passed)
+
+            def _presence_one(i: int, c: CandidateTask, block: str) -> tuple[bool, str]:
+                print(f"  [{i}/{n_presence}] presence check: {c.title}")
+                module_docstring = self._module_docstring_for(c, base_dir)
+                ok, reason = self._check_presence(
+                    c, block, module_docstring=module_docstring, base_dir=base_dir,
+                )
+                # Logged here, at completion, so that with presence_workers
+                # > 1 the verdict lines still appear as soon as each check
+                # finishes rather than after the whole batch.
+                if ok:
+                    # AUTO-LOG-1: symmetric with REJECTED below — a
+                    # confirmation used to be entirely silent (no log line
+                    # at all), which made "why don't I see the ones that
+                    # passed?" a fair question with no answer. Same level
+                    # (INFO) as a genuine rejection: both are ordinary
+                    # outcomes of the same check.
+                    logger.info(
+                        "Gate1[presence] CONFIRMED %r — %s", c.title, reason,
+                    )
+                elif _is_technical_failure(reason):
+                    # AUTO-LOG-1: only an actual call/parse failure (see
+                    # _is_technical_failure) is a WARNING — that's a real
+                    # anomaly (network hiccup, malformed response) worth
+                    # standing out from routine output. An LLM reading the
+                    # code and genuinely disagreeing with the claim is
+                    # Gate 1 working correctly, logged at INFO like its
+                    # CONFIRMED counterpart just above.
+                    logger.warning(
+                        "Gate1[presence] REJECTED %r — %s", c.title, reason,
+                    )
+                else:
+                    logger.info(
+                        "Gate1[presence] REJECTED %r — %s", c.title, reason,
+                    )
+                return ok, reason
+
+            # GATE1-PAR-1: with presence_workers > 1 the LLM calls overlap;
+            # outcomes are always consumed below in the original order.
+            outcomes: list[tuple[bool, str] | None] = [None] * n_presence
+            llm_slots = [
+                (i, c, block) for i, (c, block) in enumerate(existence_passed, 1)
+                if not c.cited_location.new_file
+            ]
+            n_workers = min(self._presence_workers, len(llm_slots))
+            if n_workers > 1:
+                print(f"  presence checks: {len(llm_slots)} call(s) across {n_workers} worker(s)")
+                with ThreadPoolExecutor(max_workers=n_workers, thread_name_prefix="gate1-presence") as pool:
+                    futures = {i: pool.submit(_presence_one, i, c, block) for i, c, block in llm_slots}
+                    for i, fut in futures.items():
+                        outcomes[i - 1] = fut.result()
+            else:
+                for i, c, block in llm_slots:
+                    outcomes[i - 1] = _presence_one(i, c, block)
+
             for i, (c, block) in enumerate(existence_passed, 1):
                 if c.cited_location.new_file:
                     # AUTO-BUG (new_file): same reasoning as AUTO-CR-8 above —
@@ -722,41 +795,13 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                     presence_passed.append(
                         (c, "new file — existence check sufficient"))
                     continue
-                print(f"  [{i}/{n_presence}] presence check: {c.title}")
-                module_docstring = self._module_docstring_for(c, base_dir)
-                ok, reason = self._check_presence(
-                    c, block, module_docstring=module_docstring, base_dir=base_dir,
-                )
+                ok, reason = outcomes[i - 1]
                 if ok:
                     presence_passed.append((c, reason))
-                    # AUTO-LOG-1: symmetric with REJECTED below — a
-                    # confirmation used to be entirely silent (no log line
-                    # at all), which made "why don't I see the ones that
-                    # passed?" a fair question with no answer. Same level
-                    # (INFO) as a genuine rejection: both are ordinary
-                    # outcomes of the same check.
-                    logger.info(
-                        "Gate1[presence] CONFIRMED %r — %s", c.title, reason,
-                    )
                 else:
                     all_results.append(FilterResult(
                         candidate=c, accepted=False, stage="presence", reason=reason,
                     ))
-                    # AUTO-LOG-1: only an actual call/parse failure (see
-                    # _is_technical_failure) is a WARNING — that's a real
-                    # anomaly (network hiccup, malformed response) worth
-                    # standing out from routine output. An LLM reading the
-                    # code and genuinely disagreeing with the claim is
-                    # Gate 1 working correctly, logged at INFO like its
-                    # CONFIRMED counterpart just above.
-                    if _is_technical_failure(reason):
-                        logger.warning(
-                            "Gate1[presence] REJECTED %r — %s", c.title, reason,
-                        )
-                    else:
-                        logger.info(
-                            "Gate1[presence] REJECTED %r — %s", c.title, reason,
-                        )
 
         print(
             f"🔎 Gate 1 presence: "
@@ -1506,7 +1551,8 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         feature is off). Never below the configured max_tokens."""
         if not self._unparseable_learn:
             return None
-        samples = self._unparseable_samples.get(self._presence_model) or []
+        with self._learn_lock:
+            samples = list(self._unparseable_samples.get(self._presence_model) or [])
         if not samples:
             return None
         costs = sorted(samples)
@@ -1519,9 +1565,10 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         """A verdict parsed at *max_tokens* — remember it (bounded window)."""
         if not self._unparseable_learn:
             return
-        samples = self._unparseable_samples.setdefault(self._presence_model, [])
-        samples.append(int(max_tokens))
-        del samples[:-self._unparseable_learn_window]
+        with self._learn_lock:
+            samples = self._unparseable_samples.setdefault(self._presence_model, [])
+            samples.append(int(max_tokens))
+            del samples[:-self._unparseable_learn_window]
 
     def _parse_presence_response(
         self,

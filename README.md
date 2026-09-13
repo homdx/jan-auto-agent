@@ -332,6 +332,12 @@ work lives):**
   `unparseable_max_tokens_cap = 65536` keeps every re-ask under a
   provider's limit; `unparseable_max_retries` sets the length. Defaults
   (`strict`, `0`, `6`) are the full ladder.
+- **Parallel presence checks.** `[gate1] presence_workers = N` (default
+  `1`, sequential) runs N presence checks at once through a thread pool.
+  Each call still honours the provider's 429/Retry-After on its own, and
+  outcomes are applied in candidate order, so plan order and dedup do
+  not change — only the wall clock does. Worth `8`–`10` on a thinking
+  model where an empty reply burns minutes before the re-ask answers.
 - **Collect-context notes** (when `[collect] use_in_auto = true`):
   existing test coverage and documented config-fallback notes, sourced
   from the `--collect` artifact rather than re-derived per call.
