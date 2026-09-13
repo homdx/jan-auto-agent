@@ -340,6 +340,44 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         except ValueError as exc:
             logger.warning("config [%s] unparseable_learn_window is malformed (%s) — using default 8", sec, exc)
             self._unparseable_learn_window = 8
+        # GATE1-LEARN-2 (field report, log-test.txt: 33 candidates, 63 calls,
+        # 3.5 h — a thinking model that answers in 6-60 s when it answers,
+        # and returns an EMPTY reply after burning the whole budget (~300 s
+        # at 32k, ~650 s at 64k) when it does not; the ladder then repeated
+        # the initial call's exact settings, doubled a budget that was not
+        # the problem, and twice asked for more than the provider allows
+        # (HTTP 400)). Three opt-in knobs, all defaulting to the old
+        # behaviour:
+        #   unparseable_retry_mode = strict|fast — fast never repeats the
+        #     (max_tokens, temperature) pair the initial call already used,
+        #     and an EMPTY reply does not raise the token tier (an empty
+        #     reply is exhaustion, not truncation) — only the temperature
+        #     changes; the ladder still climbs after a non-empty garbled
+        #     reply. strict = the full ladder, every step, wait for raw.
+        #   unparseable_max_tokens_cap = 0|N — hard ceiling on any re-ask
+        #     budget (provider limit, e.g. 65536); 0 = num_ctx ceiling only.
+        #   unparseable_max_retries = N — ladder length (was fixed at 6).
+        try:
+            _mode = config.get(sec, "unparseable_retry_mode", fallback="strict").strip().lower()
+            if _mode not in ("strict", "fast"):
+                raise ValueError(f"expected strict|fast, got {_mode!r}")
+            self._unparseable_retry_mode = _mode
+        except ValueError as exc:
+            logger.warning("config [%s] unparseable_retry_mode is malformed (%s) — using default strict", sec, exc)
+            self._unparseable_retry_mode = "strict"
+        try:
+            self._unparseable_max_tokens_cap = max(0, int(config.get(
+                sec, "unparseable_max_tokens_cap", fallback="0")))
+        except ValueError as exc:
+            logger.warning("config [%s] unparseable_max_tokens_cap is malformed (%s) — using default 0", sec, exc)
+            self._unparseable_max_tokens_cap = 0
+        try:
+            self._unparseable_max_retries = max(0, int(config.get(
+                sec, "unparseable_max_retries",
+                fallback=str(self._UNPARSEABLE_MAX_RETRIES))))
+        except ValueError as exc:
+            logger.warning("config [%s] unparseable_max_retries is malformed (%s) — using default %d", sec, exc, self._UNPARSEABLE_MAX_RETRIES)
+            self._unparseable_max_retries = self._UNPARSEABLE_MAX_RETRIES
         # (max_tokens that yielded a parseable verdict, newest last), keyed
         # by presence model — a per-candidate presence_llm_profile can
         # switch models mid-run and their budgets are not comparable.
@@ -1348,7 +1386,25 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                 < ctx_ceiling
             ):
                 _start_tier += 1
-            for attempt in range(1, self._UNPARSEABLE_MAX_RETRIES + 1):
+            _max_retries = self._unparseable_max_retries
+            _fast = self._unparseable_retry_mode == "fast"
+            _hard_cap = self._unparseable_max_tokens_cap or None
+            _initial_temp = float(self._presence_temperature)
+            _tried: set = {(int(_initial_tokens), round(_initial_temp, 4))}
+            # GATE1-LEARN-2 (fast): an EMPTY reply pins the tier — the
+            # model spent the whole budget and said nothing, so more
+            # budget is more silence. None = no pin yet.
+            # A pin below the ladder floor is not honoured: a tiny
+            # budget CAN be the reason for an empty reply (a <think>
+            # block truncated before any answer strips to "").
+            _pin_floor = self._UNPARSEABLE_TOKENS_FLOOR
+            _empty_pin: "int | None" = (
+                _initial_tokens
+                if _fast and cleaned.strip() == "" and _initial_tokens >= _pin_floor
+                else None
+            )
+            _made = 0
+            for attempt in range(1, _max_retries + 1):
                 # AUTO-RETRY-TEMP-1: 2-D grid — every temperature in
                 # _UNPARSEABLE_TEMPERATURES is tried at the CURRENT token
                 # tier before the tier doubles. tier_index and temp_index
@@ -1361,7 +1417,29 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                     * int(self._UNPARSEABLE_TOKENS_STEP_MULT ** tier_index)
                 )
                 attempt_tokens = min(_uncapped_tokens, ctx_ceiling)
-                if attempt_tokens < _uncapped_tokens:
+                if _hard_cap is not None and attempt_tokens > _hard_cap:
+                    logger.info(
+                        "Gate1._check_presence [%s]: re-ask max_tokens=%d "
+                        "capped at unparseable_max_tokens_cap=%d.",
+                        candidate.title, attempt_tokens, _hard_cap,
+                    )
+                    attempt_tokens = _hard_cap
+                attempt_temp = self._UNPARSEABLE_TEMPERATURES[temp_index]
+                if _fast:
+                    if _empty_pin is not None and attempt_tokens > _empty_pin:
+                        attempt_tokens = _empty_pin
+                    _key = (int(attempt_tokens), round(float(attempt_temp), 4))
+                    if _key in _tried:
+                        logger.info(
+                            "Gate1._check_presence [%s]: fast mode — "
+                            "skipping re-ask %d/%d (max_tokens=%d, "
+                            "temperature=%.2f already tried).",
+                            candidate.title, attempt, _max_retries,
+                            attempt_tokens, attempt_temp,
+                        )
+                        continue
+                    _tried.add(_key)
+                if attempt_tokens < _uncapped_tokens and attempt_tokens == ctx_ceiling:
                     # AUTO-CTX-CAP-WARN-1: a stale/small num_ctx silently
                     # capping escalation below what it should be has
                     # bitten in the field more than once — this makes
@@ -1380,12 +1458,12 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                         self._presence_num_ctx or "unset",
                         self._UNPARSEABLE_TOKENS_CTX_FRACTION,
                     )
-                attempt_temp = self._UNPARSEABLE_TEMPERATURES[temp_index]
+                _made += 1
                 logger.info(
                     "Gate1._check_presence [%s]: verdict unparseable — "
                     "re-asking (attempt %d/%d, max_tokens=%d, temperature=%.2f). "
                     "raw=%r",
-                    candidate.title, attempt, self._UNPARSEABLE_MAX_RETRIES,
+                    candidate.title, attempt, _max_retries,
                     attempt_tokens, attempt_temp, last_cleaned[:120],
                 )
                 try:
@@ -1398,7 +1476,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                     logger.warning(
                         "Gate1._check_presence [%s]: re-ask attempt %d/%d "
                         "failed (%s) — keeping last fail-closed result.",
-                        candidate.title, attempt, self._UNPARSEABLE_MAX_RETRIES, exc,
+                        candidate.title, attempt, _max_retries, exc,
                     )
                     return last_confirmed, last_reason
                 confirmed_n, reason_n, unparseable_n = self._parse_presence_response(
@@ -1408,11 +1486,14 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                     self._record_parseable_budget(attempt_tokens)
                     return confirmed_n, reason_n
                 last_confirmed, last_reason, last_cleaned = confirmed_n, reason_n, cleaned_n
+                if _fast and cleaned_n.strip() == "" and attempt_tokens >= _pin_floor:
+                    _empty_pin = attempt_tokens
 
             logger.warning(
                 "Gate1._check_presence [%s]: verdict still unparseable after "
-                "%d retries — failing closed. raw=%r",
-                candidate.title, self._UNPARSEABLE_MAX_RETRIES, last_cleaned[:120],
+                "%d re-ask(s) (mode=%s) — failing closed. raw=%r",
+                candidate.title, _made, self._unparseable_retry_mode,
+                last_cleaned[:120],
             )
             return last_confirmed, last_reason
 

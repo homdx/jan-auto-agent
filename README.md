@@ -326,6 +326,12 @@ work lives):**
   there (`[gate1] unparseable_learn = true`, median of the last
   `unparseable_learn_window = 8` successes), so a thinking model that
   always needs 8k does not pay five calls per ticket to rediscover it.
+  The ladder is tunable: `unparseable_retry_mode = fast` never repeats the
+  pair the first call already used and treats an *empty* reply as
+  exhaustion (same tier, other temperature) rather than truncation;
+  `unparseable_max_tokens_cap = 65536` keeps every re-ask under a
+  provider's limit; `unparseable_max_retries` sets the length. Defaults
+  (`strict`, `0`, `6`) are the full ladder.
 - **Collect-context notes** (when `[collect] use_in_auto = true`):
   existing test coverage and documented config-fallback notes, sourced
   from the `--collect` artifact rather than re-derived per call.
