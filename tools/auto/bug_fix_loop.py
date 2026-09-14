@@ -257,16 +257,16 @@ class BugFixLoop:
                 "so the retry starts from round 1",
                 len(rounds), fix_id, archive.name,
             )
-            # BUGFIX: also clear deadline_started_at.txt so the retry gets a
-            # fresh wall-clock budget. OuterLoop.run_task writes this file on
-            # the first run and reads it on every resume to compute the
-            # remaining budget (outer_loop.py:147-174). Archiving the feedback
+            # BUGFIX: also clear the budget ledger (deadline_started_at.txt) so
+            # the retry gets a fresh wall-clock budget. OuterLoop.run_task
+            # opens it on entry and reads back the consumed time on every
+            # resume to compute the remaining budget. Archiving the feedback
             # rounds resets the *round* counter but not the *time* counter, so
             # a fix that exhausted most of its max_task_seconds on the first
             # attempt started the retry with ~0 seconds left and was
             # immediately re-blocked by the deadline gate — the operator reset
             # (ticket status -> "open") restored the attempt budget but the
-            # stale deadline silently defeated the retry.
+            # stale ledger silently defeated the retry.
             deadline_path = tdir / "deadline_started_at.txt"
             if deadline_path.exists():
                 try:

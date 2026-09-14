@@ -40,7 +40,9 @@ max_attempts_per_task — inner-loop cap (default 5)   [used by make_inner_loop]
 from __future__ import annotations
 
 import configparser
+import json
 import logging
+import math
 import re
 import time
 from dataclasses import dataclass, field
@@ -57,6 +59,90 @@ _DEFAULT_MAX_ROUNDS = 10
 _FEEDBACK_GLOB = "feedback_round_*.md"
 _FEEDBACK_RE = re.compile(r"feedback_round_(\d+)\.md$")
 _MAX_FEEDBACK_CHARS = 800        # keep each round file compact
+
+# RUN-2: this task's budget ledger. The name is kept so the two callers that
+# unlink it (bug_fix_loop.py, controller.py) and the tests that assert on it
+# need no change; only the content changed, from a bare start timestamp to
+# {"consumed_s": …, "session_started_at": …}.
+_BUDGET_FILE = "deadline_started_at.txt"
+
+
+@dataclass
+class _TaskBudget:
+    """One task's budget ledger for the duration of a single session."""
+    max_seconds: float                  # max_task_seconds (0 disables the guard)
+    consumed_s: float = 0.0             # seconds worked, summed over sessions
+    session_started_at: float | None = None   # wall clock; set while active
+
+
+def _nonneg_float(value: object, default: float | None) -> float | None:
+    """Coerce a persisted number to a non-negative float, else *default*.
+
+    The ledger is hand-writable and ``json.loads`` happily yields ``NaN`` and
+    ``Infinity`` — both would poison every ``max()``/``min()`` below (NaN is
+    never exhausted, Infinity always is), so they degrade to *default* too.
+    """
+    if isinstance(value, bool):
+        return default
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(seconds):
+        return default
+    return max(seconds, 0.0)
+
+
+def parse_budget_file(raw: str | None, now: float, max_seconds: float):
+    """Parse a persisted budget ledger into ``(consumed_s, is_legacy)``.
+
+    Never raises: the ledger is a hand-writable file read on every resume, and
+    ``run_task`` must not die at the resume point because of it.
+
+    * ``None`` / empty / unparseable → ``(0.0, False)`` — nothing was ever
+      recorded, so the task starts with the full budget.
+    * ``{"consumed_s": …}`` → the ledger. A ``session_started_at`` still present
+      here means the previous session opened the ledger and died without
+      closing it (Ctrl-C, OOM, kill between the two writes), so its open
+      session is folded in — capped at ``max_seconds``. A crash mid-round costs
+      at most one budget, never a night.
+    * the legacy float-only shape → ``(0.0, True)``. The pre-RUN-2 code stored
+      the task's first start timestamp and deduced consumed time from
+      calendar-elapsed time, which is exactly what made a stopped run wake up
+      exhausted. That number cannot be converted into consumed time, so it is
+      treated as "unknown → 0 consumed", flagged so the caller can warn once,
+      and rewritten by the caller in the current format.
+    """
+    if not raw:
+        return 0.0, False
+    text = str(raw).strip()
+    if not text:
+        return 0.0, False
+    try:
+        data = json.loads(text)
+    except (TypeError, ValueError):
+        data = None
+    if isinstance(data, dict):
+        consumed = _nonneg_float(data.get("consumed_s"), 0.0)
+        marker = _nonneg_float(data.get("session_started_at"), None)
+        if marker is not None:
+            # Rule 3 of RUN-2: the unclosed session consumes at most one budget.
+            consumed = consumed + min(max(now - marker, 0.0), max_seconds)
+        return consumed, False
+    try:
+        float(text)
+    except (TypeError, ValueError):
+        return 0.0, False
+    return 0.0, True
+
+
+def render_budget_file(consumed_s: float, session_started_at: float | None = None) -> str:
+    """Serialize a ledger. ``session_started_at`` is present only while the
+    session is active; a closed session stores ``consumed_s`` alone."""
+    payload = {"consumed_s": float(consumed_s)}
+    if session_started_at is not None:
+        payload["session_started_at"] = float(session_started_at)
+    return json.dumps(payload, separators=(",", ":"))
 
 
 def _coerce_impl_version(value: object) -> int:
@@ -152,57 +238,44 @@ class OuterLoop:
         round if feedback files already exist.  Never raises."""
         task_id = task.get("id", "?")
 
+        # RUN-2: open this task's budget ledger before the first round, and
+        # close it from the finally so every exit path — pass, block,
+        # exhaustion, exception, KeyboardInterrupt — folds this session's
+        # elapsed time into the persisted total in ONE place instead of once
+        # per `return OuterLoopResult(...)` scattered through the loop below.
+        _budget = self._begin_task_budget(task_id)
+        try:
+            return self._run_rounds(task, base_dir, task_id, _budget)
+        finally:
+            self._end_task_budget(task_id, _budget)
+
+    def _run_rounds(
+        self, task: dict, base_dir: str | Path, task_id: str, budget: _TaskBudget
+    ) -> OuterLoopResult:
+        """The round loop, given an already-open budget ledger."""
         # AUTO-CR-33: one wall-clock budget for the whole task (all rounds) —
         # previously each round re-entered InnerLoop.run_task and reset its own
         # start time, so the effective cap was max_rounds × max_task_seconds
         # (10 × 30 min ≈ 5h observed). Compute the deadline once here and both
         # gate the round loop and hand it to the inner loop.
-        try:
-            _mts = int(getattr(self.inner_loop, "max_task_seconds", 0) or 0)
-        except (TypeError, ValueError):
-            _mts = 0   # non-numeric (e.g. a test mock) → guard disabled
-        # BUGFIX (audit): _task_deadline was purely in-process
-        # (time.monotonic() + budget), so it reset to a fresh full budget
-        # on every process restart — the exact multi-round runaway this
-        # mechanism exists to prevent, just re-emerging across restarts
-        # instead of across rounds. monotonic() has no fixed epoch and
-        # can't be persisted meaningfully, so persist the task's
-        # wall-clock start time instead (once, the first time this task
-        # is worked) and derive the deadline from elapsed wall-clock time
-        # on every call — including resumes — so the budget is actually
-        # consumed across restarts too.
+        #
+        # BUGFIX (audit): the deadline was originally purely in-process
+        # (time.monotonic() + budget), so it reset to a fresh full budget on
+        # every process restart — the exact multi-round runaway this mechanism
+        # exists to prevent, just re-emerging across restarts instead of across
+        # rounds. monotonic() has no fixed epoch and can't be persisted
+        # meaningfully, so it was persisted as a wall-clock start timestamp.
+        #
+        # RUN-2: a start timestamp is calendar time, not run time. Stop the run
+        # in the evening, resume in the morning, and every task that had already
+        # started was over budget before a single LLM call. What survives a
+        # restart must be "seconds this task was alive and working this task",
+        # which is what the ledger holds — so the remaining budget below is the
+        # leftover of the persisted total, and it still accumulates across
+        # restarts (the AUTO-CR-33 runaway stays closed).
         _task_deadline = None
-        if _mts > 0:
-            _started_at = None
-            try:
-                _started_raw = self.state.read_task_file(task_id, "deadline_started_at.txt")
-            except OSError:
-                _started_raw = None
-            if _started_raw is not None:
-                try:
-                    _started_at = float(_started_raw.strip())
-                except ValueError:
-                    _started_at = None
-            if _started_at is None:
-                # Fresh start (or a missing/corrupted timestamp) — full
-                # budget, no elapsed-time deduction. Deliberately not
-                # computed as time.time() - time.time() (which would
-                # introduce a tiny nonzero drift from two separate real
-                # clock reads for what should be an exact zero interval).
-                _remaining = float(_mts)
-                try:
-                    self.state.write_task_file(
-                        task_id, "deadline_started_at.txt", repr(time.time()),
-                    )
-                except OSError as exc:
-                    logger.warning(
-                        "outer_loop: could not persist deadline start time for "
-                        "%s — the wall-clock budget will not survive a resume "
-                        "this time: %s", task_id, exc,
-                    )
-            else:
-                _elapsed = max(time.time() - _started_at, 0.0)
-                _remaining = max(_mts - _elapsed, 0.0)
+        if budget.max_seconds > 0:
+            _remaining = max(budget.max_seconds - budget.consumed_s, 0.0)
             _task_deadline = time.monotonic() + _remaining
         # AUTO-CR-33: only hand the deadline to inner loops that accept it, so
         # fakes/older InnerLoop signatures are not broken.
@@ -269,7 +342,7 @@ class OuterLoop:
                 logger.warning(
                     "OuterLoop: task %s wall-clock budget (%ds = %.1f min) "
                     "exhausted across rounds — stopping before round %d.",
-                    task_id, _mts, _mts / 60.0, rnd,
+                    task_id, int(budget.max_seconds), budget.max_seconds / 60.0, rnd,
                 )
                 self.state.set_task_status(task_id, STATUS_BLOCKED)
                 # BUGFIX (audit): impl_versions_used was omitted here,
@@ -500,6 +573,92 @@ class OuterLoop:
                                feedback_files, inner_results, impl_versions_used)
 
     # ── private ──────────────────────────────────────────────────────────────
+
+    def _task_budget_seconds(self) -> float:
+        """This task's wall-clock budget in seconds (0 disables the guard).
+
+        Wrapped: a malformed ``max_task_seconds`` must mean "no guard", not an
+        exception at the resume point.
+        """
+        try:
+            return float(getattr(self.inner_loop, "max_task_seconds", 0) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _begin_task_budget(self, task_id: str) -> _TaskBudget:
+        """Open this task's budget ledger and start this session's clock.
+
+        RUN-2: AUTO-CR-33 gave every task one wall-clock budget across all its
+        rounds, and the audit fix made it survive a restart by persisting the
+        task's first start time and deducting elapsed time on every resume.
+        That deduction is *calendar* time, not *run* time — stop the run in the
+        evening, resume in the morning, and every task that had already started
+        is over budget before it does anything. What survives a restart is now
+        the seconds this task was actually worked:
+
+            {"consumed_s": 1234.5, "session_started_at": 1757820964.1}
+
+        ``consumed_s`` is summed over sessions; ``session_started_at`` is
+        present only while a session is active, and _end_task_budget clears it.
+        """
+        mts = self._task_budget_seconds()
+        if mts <= 0:
+            return _TaskBudget(0.0)
+        now = time.time()
+        try:
+            raw = self.state.read_task_file(task_id, _BUDGET_FILE)
+        except OSError:
+            raw = None
+        consumed, legacy = parse_budget_file(raw, now, mts)
+        if legacy:
+            logger.warning(
+                "OuterLoop: task %s has a legacy %s holding only a start "
+                "timestamp — that value cannot be turned into consumed time, "
+                "so the budget starts at 0 consumed and the file is rewritten "
+                "in the current format", task_id, _BUDGET_FILE,
+            )
+        if consumed > 0:
+            logger.info(
+                "OuterLoop: task %s resumes with %d s of %d s budget already used",
+                task_id, int(consumed), int(mts),
+            )
+        budget = _TaskBudget(mts, consumed, now)
+        try:
+            self.state.write_task_file(
+                task_id, _BUDGET_FILE, render_budget_file(consumed, now),
+            )
+        except OSError as exc:
+            logger.warning(
+                "OuterLoop: could not persist the budget ledger for %s — the "
+                "consumed time will not survive a resume this time: %s",
+                task_id, exc,
+            )
+        return budget
+
+    def _end_task_budget(self, task_id: str, budget: _TaskBudget) -> None:
+        """Close this session's budget ledger: fold in its elapsed time.
+
+        Called from run_task's ``finally``, so this runs on every exit path —
+        pass, block, exhaustion, exception and KeyboardInterrupt alike. The
+        KeyboardInterrupt / SIGTERM case that DOES reach this line is a clean
+        stop, which is the correct behaviour. A kill that does not (SIGKILL,
+        power loss) leaves ``session_started_at`` behind, and
+        :func:`parse_budget_file` folds that open session in capped at the
+        budget — a crash mid-round consumes at most one budget, never a night.
+        """
+        if budget.max_seconds <= 0 or budget.session_started_at is None:
+            return
+        elapsed = max(time.time() - budget.session_started_at, 0.0)
+        try:
+            self.state.write_task_file(
+                task_id, _BUDGET_FILE, render_budget_file(budget.consumed_s + elapsed),
+            )
+        except OSError as exc:
+            logger.warning(
+                "OuterLoop: could not persist the consumed budget for %s — the "
+                "next resume will under-count this session's time: %s",
+                task_id, exc,
+            )
 
     def _feedback_paths(self, task_id: str) -> list[Path]:
         """Existing feedback files, sorted by round number (numeric)."""

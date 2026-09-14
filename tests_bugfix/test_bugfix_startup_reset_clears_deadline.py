@@ -19,6 +19,7 @@ resume burned a cycle and re-parked the task.
 """
 
 import configparser
+import json
 import time
 from unittest.mock import MagicMock
 
@@ -169,6 +170,10 @@ class TestBaselineWithoutReset:
 
         state = _store_with_blocked_task(tmp_path)
         _write_stale_deadline(state, 999_999)
+        # RUN-2: "already exhausted" is now a consumed total, not an old clock
+        # reading — a bare timestamp no longer reads as an exhausted budget.
+        state.write_task_file(TASK_ID, "deadline_started_at.txt",
+                              json.dumps({"consumed_s": 999_999.0}))
         # Deliberately NO _real_startup_reset here.
 
         attempts: list = []

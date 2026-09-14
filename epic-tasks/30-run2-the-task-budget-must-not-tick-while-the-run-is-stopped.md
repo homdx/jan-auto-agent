@@ -1,6 +1,6 @@
 # RUN-2 — The per-task wall-clock budget must not tick while the run is stopped
 
-**Status:** open  
+**Status:** landed — ideal patch from the round-30 competition (base: Sensenove-6-8 var1 — try/finally ledger wrap, `parse_budget_file`/`render_budget_file`, split wall/monotonic test clock; `math.isfinite` guard on ledger fields from Sensenove-6-7 var1 + its NaN/Infinity parsing test by the reviewer)  
 **Severity:** MEDIUM  
 **File:** `tools/auto/outer_loop.py`  
 **Symbol:** `OuterLoop.run_task` (the `deadline_started_at.txt` block, ≈ 155–205)  
@@ -85,22 +85,22 @@ seen".
 
 ## Acceptance
 
-- [ ] `tests_bugfix/`: a task worked for 600 s (mock `time.time` / monotonic),
+- [x] `tests_bugfix/`: a task worked for 600 s (mock `time.time` / monotonic),
       process "stopped" for 8 h (advance `time.time` only), resumed → the
       task gets `1800 - 600 = 1200 s`, not 0; round proceeds.
-- [ ] A task whose previous session crashed with `session_started_at` set
+- [x] A task whose previous session crashed with `session_started_at` set
       and `now - session_started_at = 8 h` resumes with `consumed_s`
       increased by at most `max_task_seconds`, never by 8 h.
-- [ ] Two sessions of 1000 s each on the same task → second session's
+- [x] Two sessions of 1000 s each on the same task → second session's
       second round is refused with the existing `exhausted` WARNING
       (budget really does accumulate across restarts — the AUTO-CR-33 audit
       case must still hold).
-- [ ] Legacy file containing only a float → treated as `consumed_s = 0`,
+- [x] Legacy file containing only a float → treated as `consumed_s = 0`,
       one WARNING, file rewritten in the new format.
-- [ ] `clear_task_deadline` tests (`tests_bugfix/test_bugfix_*deadline*.py`,
+- [x] `clear_task_deadline` tests (`tests_bugfix/test_bugfix_*deadline*.py`,
       5 files) still pass unchanged or with the minimal edit for the new
       file content.
-- [ ] `python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180` green (run sequentially).
+- [x] `python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180` green (run sequentially).
 
 ## Out of scope
 
