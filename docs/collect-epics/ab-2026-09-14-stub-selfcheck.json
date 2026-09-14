@@ -1,0 +1,179 @@
+{
+ "base": "<scratch>/toy",
+ "budget": 1200,
+ "config": "/home/renat/Project/opensource/github/agent-offline/qwen25/agents_128k.ini",
+ "delta": {
+  "coder_calls": 0,
+  "coder_rounds_per_task": 0.0,
+  "collect_blocks": 0,
+  "collect_pack_rows": 5,
+  "context_re_requests": 0,
+  "gate1_rejected_existence": 0,
+  "gate1_rejected_presence": 0,
+  "gate2_attempts_per_task": 0.0,
+  "llm_calls": 0,
+  "probe_misses": 0,
+  "probe_requests": 0,
+  "prompt_chars_per_coder_call": 204.0,
+  "tasks_blocked": 0,
+  "tasks_done": 0
+ },
+ "goal": "add input validation to the calculator",
+ "mode": "run",
+ "note": "Self-check on a 4-file toy tree against the built-in canned stub (no recordings): proves the harness reaches the coder in both arms, pack_enabled=false yields 0 pack rows and =true yields >0, arm A is reproducible, and the prompt growth stays under the budget. Not a measurement of the pack on a real tree — that needs recordings from a real run (see scripts/collect_ab.py docstring).",
+ "off": {
+  "coder_calls": 1,
+  "coder_rounds_per_task": 1.0,
+  "collect_blocks": 2,
+  "collect_pack_rows": 0,
+  "collect_source": "header",
+  "context_re_requests": 0,
+  "gate1_rejected_duplicate": 0,
+  "gate1_rejected_existence": 0,
+  "gate1_rejected_presence": 0,
+  "gate2_attempts": 1,
+  "gate2_attempts_per_task": 1.0,
+  "llm_calls": 3,
+  "probe_misses": 0,
+  "probe_requests": 0,
+  "prompt_chars_per_coder_call": 963.0,
+  "tasks_blocked": 0,
+  "tasks_done": 1,
+  "tasks_executed": 1,
+  "traces": [
+   "trace_09375511325d.jsonl",
+   "trace_ddf91c429355.jsonl"
+  ]
+ },
+ "on": {
+  "coder_calls": 1,
+  "coder_rounds_per_task": 1.0,
+  "collect_blocks": 2,
+  "collect_pack_rows": 5,
+  "collect_source": "header",
+  "context_re_requests": 0,
+  "gate1_rejected_duplicate": 0,
+  "gate1_rejected_existence": 0,
+  "gate1_rejected_presence": 0,
+  "gate2_attempts": 1,
+  "gate2_attempts_per_task": 1.0,
+  "llm_calls": 3,
+  "probe_misses": 0,
+  "probe_requests": 0,
+  "prompt_chars_per_coder_call": 1167.0,
+  "tasks_blocked": 0,
+  "tasks_done": 1,
+  "tasks_executed": 1,
+  "traces": [
+   "trace_09375511325d.jsonl",
+   "trace_64173b30bd60.jsonl"
+  ]
+ },
+ "pass_condition": "probe misses and gate-2 attempts do not increase, and the coder prompt grows by less than the pack budget",
+ "plan": {
+  "dangling": [],
+  "dropped": [],
+  "returncode": 0,
+  "tasks": 1
+ },
+ "reasons": [],
+ "reproducible_arm_a": true,
+ "runs": {
+  "off": [
+   {
+    "config": "<scratch>/abwork/config_off.ini",
+    "counters": {
+     "coder_calls": 1,
+     "coder_rounds_per_task": 1.0,
+     "collect_blocks": 2,
+     "collect_pack_rows": 0,
+     "collect_source": "header",
+     "context_re_requests": 0,
+     "gate1_rejected_duplicate": 0,
+     "gate1_rejected_existence": 0,
+     "gate1_rejected_presence": 0,
+     "gate2_attempts": 1,
+     "gate2_attempts_per_task": 1.0,
+     "llm_calls": 3,
+     "probe_misses": 0,
+     "probe_requests": 0,
+     "prompt_chars_per_coder_call": 963.0,
+     "tasks_blocked": 0,
+     "tasks_done": 1,
+     "tasks_executed": 1,
+     "traces": [
+      "trace_09375511325d.jsonl",
+      "trace_1b1d13a93dcb.jsonl"
+     ]
+    },
+    "returncode": 0,
+    "tree": "<scratch>/abwork/arm_off_0"
+   },
+   {
+    "config": "<scratch>/abwork/config_off.ini",
+    "counters": {
+     "coder_calls": 1,
+     "coder_rounds_per_task": 1.0,
+     "collect_blocks": 2,
+     "collect_pack_rows": 0,
+     "collect_source": "header",
+     "context_re_requests": 0,
+     "gate1_rejected_duplicate": 0,
+     "gate1_rejected_existence": 0,
+     "gate1_rejected_presence": 0,
+     "gate2_attempts": 1,
+     "gate2_attempts_per_task": 1.0,
+     "llm_calls": 3,
+     "probe_misses": 0,
+     "probe_requests": 0,
+     "prompt_chars_per_coder_call": 963.0,
+     "tasks_blocked": 0,
+     "tasks_done": 1,
+     "tasks_executed": 1,
+     "traces": [
+      "trace_09375511325d.jsonl",
+      "trace_ddf91c429355.jsonl"
+     ]
+    },
+    "returncode": 0,
+    "tree": "<scratch>/abwork/arm_off_1"
+   }
+  ],
+  "on": [
+   {
+    "config": "<scratch>/abwork/config_on.ini",
+    "counters": {
+     "coder_calls": 1,
+     "coder_rounds_per_task": 1.0,
+     "collect_blocks": 2,
+     "collect_pack_rows": 5,
+     "collect_source": "header",
+     "context_re_requests": 0,
+     "gate1_rejected_duplicate": 0,
+     "gate1_rejected_existence": 0,
+     "gate1_rejected_presence": 0,
+     "gate2_attempts": 1,
+     "gate2_attempts_per_task": 1.0,
+     "llm_calls": 3,
+     "probe_misses": 0,
+     "probe_requests": 0,
+     "prompt_chars_per_coder_call": 1167.0,
+     "tasks_blocked": 0,
+     "tasks_done": 1,
+     "tasks_executed": 1,
+     "traces": [
+      "trace_09375511325d.jsonl",
+      "trace_64173b30bd60.jsonl"
+     ]
+    },
+    "returncode": 0,
+    "tree": "<scratch>/abwork/arm_on_0"
+   }
+  ]
+ },
+ "schema": "collect-ab-1",
+ "stub_url": "http://127.0.0.1:41221/v1",
+ "taken_at": "2026-09-14T02:10:35+00:00",
+ "verdict": "pass",
+ "workdir": "<scratch>/abwork"
+}
