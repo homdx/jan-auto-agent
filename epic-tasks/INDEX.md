@@ -1,4 +1,4 @@
-# Epic round — 30 tickets, in order
+# Epic round — 34 tickets, in order
 
 One ticket per round. Every agent does the same ticket against the same
 tree; you merge the winner; the next round starts from the merged tree.
@@ -14,7 +14,7 @@ The loop and the scorecard: `docs/collect-epics/RUN-THE-EPIC-COMPETITION.md`.
 | 6 | `V3` | landed `b609492` | HIGH | S | [06-v3-rows-callers-calls-into-tests.md](06-v3-rows-callers-calls-into-tests.md) | `tools/auto/context_assembler.py` |
 | 7 | `V4` | open | HIGH | S | [07-v4-rows-fails-open-risk.md](07-v4-rows-fails-open-risk.md) | `tools/auto/context_assembler.py` |
 | 8 | `V5` | landed `da78fa3` | HIGH | M | [08-v5-row-neighbours-the-pass-b-payoff.md](08-v5-row-neighbours-the-pass-b-payoff.md) | `tools/auto/context_assembler.py` |
-| 9 | `V6` | open | HIGH | S | [09-v6-wire-the-budget-and-the-memo-into-collectbridge.md](09-v6-wire-the-budget-and-the-memo-into-collectbridge.md) | `tools/auto/collect_bridge.py` |
+| 9 | `V6` | landed `76fd4bd` | HIGH | S | [09-v6-wire-the-budget-and-the-memo-into-collectbridge.md](09-v6-wire-the-budget-and-the-memo-into-collectbridge.md) | `tools/auto/collect_bridge.py` |
 | 10 | `M2` | landed `5ace54f` | CRITICAL | S | [10-m2-block-redundancy-the-number-epic-a-exists-to-mov.md](10-m2-block-redundancy-the-number-epic-a-exists-to-mov.md) | `scripts/collect_metrics.py` |
 | 11 | `V7` | landed `25d5de8` | HIGH | M | [11-v7-collect-on-a-stale-tree-goes-incremental-fix-the.md](11-v7-collect-on-a-stale-tree-goes-incremental-fix-the.md) | `tools/collect/cli.py` |
 | 12 | `V8` | open | HIGH | M | [12-v8-no-llm-preserves-existing-summaries.md](12-v8-no-llm-preserves-existing-summaries.md) | `tools/collect/cli.py` |
@@ -24,8 +24,8 @@ The loop and the scorecard: `docs/collect-epics/RUN-THE-EPIC-COMPETITION.md`.
 | 16 | `V11` | landed `9406601` | HIGH | M | [16-v11-pass-c-stops-eating-test-file-summaries.md](16-v11-pass-c-stops-eating-test-file-summaries.md) | `tools/collect/verifier.py` |
 | 17 | `V12` | open | MEDIUM | S | [17-v12-gate-1-stage-a2-minimal-only-if-m3-says-the-ceil.md](17-v12-gate-1-stage-a2-minimal-only-if-m3-says-the-ceil.md) | `tools/auto/gate1_filter.py` |
 | 18 | `V13` | open | LOW | S | [18-v13-one-safety-note-for-the-candidates-v12-does-not.md](18-v13-one-safety-note-for-the-candidates-v12-does-not.md) | `tools/auto/gate1_grounding.py` |
-| 19 | `M4` | open | HIGH | M | [19-m4-runtime-counters-collect-events-gate-1-stage-spl.md](19-m4-runtime-counters-collect-events-gate-1-stage-spl.md) | `tools/auto/run_trace.py` |
-| 20 | `M5` | open | HIGH | M | [20-m5-a-b-harness-one-goal-two-runs-one-diff.md](20-m5-a-b-harness-one-goal-two-runs-one-diff.md) | `scripts/collect_ab.sh` |
+| 19 | `M4` | landed `13416fb` | HIGH | M | [19-m4-runtime-counters-collect-events-gate-1-stage-spl.md](19-m4-runtime-counters-collect-events-gate-1-stage-spl.md) | `tools/auto/run_trace.py` |
+| 20 | `M5` | landed `b33cb1f` | HIGH | M | [20-m5-a-b-harness-one-goal-two-runs-one-diff.md](20-m5-a-b-harness-one-goal-two-runs-one-diff.md) | `scripts/collect_ab.sh` |
 | 21 | `V14` | open | MEDIUM | S | [21-v14-turn-on-docs-mode.md](21-v14-turn-on-docs-mode.md) | `tools/auto/context_assembler.py` |
 | 22 | `V15` | open | LOW | S | [22-v15-docs-sync-and-the-consumer-column.md](22-v15-docs-sync-and-the-consumer-column.md) | `README.md` |
 | 23 | `M6` | open | MEDIUM | M | [23-m6-outcome-metric-precision-against-the-adjudicated.md](23-m6-outcome-metric-precision-against-the-adjudicated.md) | `scripts/` |
@@ -34,8 +34,37 @@ The loop and the scorecard: `docs/collect-epics/RUN-THE-EPIC-COMPETITION.md`.
 | 26 | `L5` | landed `9664530` | HIGH | S | [26-l5-test-map-scans-only-tests-the-import-graph-scans.md](26-l5-test-map-scans-only-tests-the-import-graph-scans.md) | `tools/collect/test_map.py` |
 | 27 | `L6` | landed `ced5940` | HIGH | S | [27-l6-the-budget-loop-lets-public-symbols-displace-the.md](27-l6-the-budget-loop-lets-public-symbols-displace-the.md) | `tools/auto/context_assembler.py` |
 | 28 | `V16` | landed `ac28672` | HIGH | S | [28-v16-pass-c-a-bare-name-in-a-source-summary-means-the-symbol-defined-here.md](28-v16-pass-c-a-bare-name-in-a-source-summary-means-the-symbol-defined-here.md) | `tools/collect/verifier.py` |
-| 29 | `RUN-1` | landed | HIGH | S | [29-run1-extra-file-write-is-a-warning-when-every-target-file-landed.md](29-run1-extra-file-write-is-a-warning-when-every-target-file-landed.md) | `tools/auto/coder.py` |
-| 30 | `RUN-2` | landed | MEDIUM | S | [30-run2-the-task-budget-must-not-tick-while-the-run-is-stopped.md](30-run2-the-task-budget-must-not-tick-while-the-run-is-stopped.md) | `tools/auto/outer_loop.py` |
+| 29 | `RUN-1` | landed `236855a` | HIGH | S | [29-run1-extra-file-write-is-a-warning-when-every-target-file-landed.md](29-run1-extra-file-write-is-a-warning-when-every-target-file-landed.md) | `tools/auto/coder.py` |
+| 30 | `RUN-2` | landed `6ca675c` | MEDIUM | S | [30-run2-the-task-budget-must-not-tick-while-the-run-is-stopped.md](30-run2-the-task-budget-must-not-tick-while-the-run-is-stopped.md) | `tools/auto/outer_loop.py` |
+| 31 | `RUN-3` | open | HIGH | XS | [31-run3-exec-feedback-shows-the-head-of-pytest-output-the-cause-is-at-the-tail.md](31-run3-exec-feedback-shows-the-head-of-pytest-output-the-cause-is-at-the-tail.md) | `tools/auto/inner_loop.py` |
+| 32 | `RUN-4` | open | HIGH | S | [32-run4-the-coder-answers-a-cut-off-reply-with-the-same-budget-five-times.md](32-run4-the-coder-answers-a-cut-off-reply-with-the-same-budget-five-times.md) | `tools/auto/coder.py` |
+| 33 | `RUN-5` | open | HIGH | S | [33-run5-a-technical-failure-in-the-presence-check-is-not-a-rejection.md](33-run5-a-technical-failure-in-the-presence-check-is-not-a-rejection.md) | `tools/auto/gate1_filter.py` |
+| 34 | `RUN-6` | open | HIGH | S | [34-run6-a-stale-artifact-at-session-start-switches-the-pack-off-for-the-whole-session.md](34-run6-a-stale-artifact-at-session-start-switches-the-pack-off-for-the-whole-session.md) | `tools/auto/collect_bridge.py` |
+
+## Next rounds — the order (as of `6ca675c`, 2026-09-14)
+
+Set from the live runs on `../testtext` / `../testtext6`; the reasoning and
+the measurement after each step are in
+`docs/collect-epics/NEXT-ROUNDS.md`. Rounds are one ticket each, in this
+sequence; a step is not started until the previous one is merged.
+
+| step | ticket | why here | measure after |
+|---|---|---|---|
+| 1 | `RUN-6` | the pack is off in every resumed session; nothing collect-side can be measured live until it is on | `collect blocks > 0` on the next session's snapshot |
+| 2 | `RUN-3` | 7 of 29 BLOCKED tasks ended on an exec error the coder never saw; XS | exec-rejected attempts per BLOCKED task |
+| 3 | `RUN-4` | the most frequent coder failure in both trees; 6 BLOCKED tasks | `cut off` count, done/blocked ratio |
+| 4 | `RUN-5` | 25–35 % of candidates dropped by provider silence; plan size is a coin flip until fixed | `unparsed` → `unknown` column, plan size |
+| 5 | `L1` | deterministic: 82 / 30 gate-1 calls on non-`.py` locations | non-`.py` gate-1 rows → 0 |
+| 6 | `M3` | measurement only; decides whether V12/V13 exist | ceiling number in `EPIC-M-metrics.md` |
+| 7 | `V4`, `V10` | supply rows — worth it only once step 1 puts the pack in front of the coder | M2 static numbers, block sizes |
+| 8 | `V12`/`V13` | only if step 6 says ceiling > 0 | gate-1 stage split |
+| 9 | `M6` | outcome metric against `validate1/truth.csv`; needs a plan whose membership is not decided by step 4's bug | precision/recall |
+| 10 | `V8`, `V14`, `V15`, `L3` | low value now; V14 only if docs mode is used at all | — |
+
+After steps 1–4 land: reset one tree to its `pre_run_sha`, `--collect
+--refresh`, one full `--auto` execution run, snapshot with `--run-id`, then
+the M5 A/B with recordings from that run. That is the first point at which
+"did the pack help" has a live answer.
 
 ## Working these
 

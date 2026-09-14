@@ -1,6 +1,9 @@
 # Status — where the collect epics stand, and what is being waited on
 
-**As of:** 2026-09-12, branch `tickets`, HEAD `2f9005d`.
+**As of:** 2026-09-14, branch `tickets`, HEAD `6ca675c`. The order of the
+next rounds and the live-run evidence behind it: `NEXT-ROUNDS.md`.
+Sections 2–4 below describe the wait as it stood on `2f9005d`; the run has
+since happened (`after-r31-live.json`) and NEXT-ROUNDS.md §1 is its reading.
 Ticket-by-ticket state is also stamped into every `epic-tasks/NN-*.md`
 (`**Status:**` line) and the `status` column of `epic-tasks/INDEX.md`.
 
@@ -8,7 +11,7 @@ Ticket-by-ticket state is also stamped into every `epic-tasks/NN-*.md`
 
 ## 1. Ledger
 
-### Landed — 14 of 28, the whole short path (PLAN-v2 §6) plus L2 and V16
+### Landed — 19 of 34: the short path (PLAN-v2 §6), L2, V16, V6, M4, M5, RUN-1, RUN-2
 
 | ticket | commit | one line |
 |---|---|---|
@@ -26,10 +29,20 @@ Ticket-by-ticket state is also stamped into every `epic-tasks/NN-*.md`
 | M2 | `5ace54f` | redundancy is a number: 65.1% (was ~100%), 3.608 new rows/block |
 | V16 | `ac28672` | Pass C: a bare name in a source summary is the symbol defined here |
 | V9 | `2f9005d` | a committed edit invalidates that path's facts; `auto_refresh_between_tasks` |
+| V6 | `76fd4bd` | budget reaches the assembler; one assembly per target file per run; `pack_enabled` |
+| M4 | `13416fb` | `collect_block` / `collect_shrink` / `collect_summary` / `collect_miss` events; gate-1 stage split |
+| M5 | `b33cb1f` (+ `53a2eee`) | A/B harness: one goal, one seeded plan, two runs against a replay stub, one diff |
+| RUN-1 | `236855a` | an extra file outside `target_files` is a warning, not a verdict |
+| RUN-2 | `6ca675c` | the per-task wall-clock budget does not tick while the run is stopped |
 
-### Open — 14, re-verified against `2f9005d` on 2026-09-12
+Not in the epic but on the branch since 2f9005d: GATE1-LEARN-1 `9dd644b`,
+GATE1-LEARN-2 `f11972b`, GATE1-PAR-1 `84a24b2`, user's `0eaa2cc`.
 
-Ordered by what to do next, not by the original numbering.
+### Open — 15 (11 epic + RUN-3…RUN-6)
+
+**The order below is superseded by `NEXT-ROUNDS.md` §2** (RUN-6 → RUN-3 →
+RUN-4 → RUN-5 → L1 → M3 → …). Kept for the per-ticket premise checks
+against `2f9005d`; rows 1–3 (V6, M4, M5) have landed.
 
 | # | ticket | why this position | premise moved? |
 |---|---|---|---|
