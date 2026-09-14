@@ -1,6 +1,6 @@
 # Status — where the collect epics stand, and what is being waited on
 
-**As of:** 2026-09-14, branch `tickets`, HEAD = the RUN-6 commit (next round is RUN-3). The order of the
+**As of:** 2026-09-14, branch `tickets`, HEAD = `7135844` RUN-6 (next round is RUN-3). The order of the
 next rounds and the live-run evidence behind it: `NEXT-ROUNDS.md`.
 Sections 2–4 below describe the wait as it stood on `2f9005d`; the run has
 since happened (`after-r31-live.json`) and NEXT-ROUNDS.md §1 is its reading.
@@ -34,7 +34,7 @@ Ticket-by-ticket state is also stamped into every `epic-tasks/NN-*.md`
 | M5 | `b33cb1f` (+ `53a2eee`) | A/B harness: one goal, one seeded plan, two runs against a replay stub, one diff |
 | RUN-1 | `236855a` | an extra file outside `target_files` is a warning, not a verdict |
 | RUN-2 | `6ca675c` | the per-task wall-clock budget does not tick while the run is stopped |
-| RUN-6 | this commit | a stale artifact on entry is refreshed when `auto_refresh_between_tasks = true`; stdout says stale/refreshing/OFF; `collect_refresh` event |
+| RUN-6 | `7135844` | a stale artifact on entry is refreshed when `auto_refresh_between_tasks = true`; stdout says stale/refreshing/OFF; `collect_refresh` event |
 
 Not in the epic but on the branch since 2f9005d: GATE1-LEARN-1 `9dd644b`,
 GATE1-LEARN-2 `f11972b`, GATE1-PAR-1 `84a24b2`, user's `0eaa2cc`.

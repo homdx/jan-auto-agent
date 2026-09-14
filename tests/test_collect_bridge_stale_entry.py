@@ -113,6 +113,10 @@ def test_stale_auto_refresh_true_calls_refresh_and_reloads(mini_repo, monkeypatc
     assert bridge is not None
     assert len(calls) == 1
     assert Path(calls[0][0][0]) == mini_repo
+    # The operator's config and its path reach action_refresh unchanged —
+    # Pass B (off here) and the collect dir are resolved from them.
+    assert calls[0][1]["config"].get("collect", "use_in_auto") == "true"
+    assert calls[0][1]["config_path"] == str(config_path)
     assert bridge.usable is True
     assert bridge.status == STATUS_FRESH
 
@@ -153,9 +157,10 @@ def test_second_bridge_in_the_same_run_does_not_refresh_again(mini_repo, monkeyp
 # ── 2. auto_refresh=false → today's behaviour, but said out loud ────────
 
 
-def test_stale_auto_refresh_false_no_refresh(mini_repo, monkeypatch, capsys, caplog):
+@pytest.mark.parametrize("flag", [{}, {"auto_refresh_between_tasks": "false"}], ids=["absent", "false"])
+def test_stale_auto_refresh_false_no_refresh(mini_repo, monkeypatch, capsys, caplog, flag):
     cli_mod.action_collect(mini_repo)
-    config_path = _write_ini(mini_repo)
+    config_path = _write_ini(mini_repo, **flag)
     _make_stale(mini_repo)
     calls = _count_refresh(monkeypatch)
 
