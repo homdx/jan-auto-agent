@@ -387,6 +387,18 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         # GATE1-PAR-1: the learned window is shared between presence
         # workers — one lock around its reads and appends.
         self._learn_lock = threading.Lock()
+        # M4: two counters the stage split needs and that no result record
+        # carries. `presence_reask` counts a candidate whose first verdict
+        # was unparseable and whose answer therefore came from the re-ask
+        # ladder (GATE1-LEARN-2); `non_py_requests` counts presence calls
+        # whose `cited_location.file` is not a `.py` — L1's number to drive
+        # to zero. Both are folded into the `counters` dict `filter()` fills
+        # via `split_gate1_results()`.
+        # `_counter_lock`: presence_workers > 1 increments these from a
+        # thread pool, so `x += 1` needs serialising.
+        self.presence_reask: int = 0
+        self.non_py_requests: int = 0
+        self._counter_lock = threading.Lock()
         # GATE1-PAR-1: how many presence checks run at once. 1 (default)
         # is the pre-existing sequential loop, byte-for-byte. N>1 runs the
         # Stage-B LLM calls through a thread pool of N workers; each call
@@ -662,6 +674,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         candidates: list[CandidateTask],
         base_dir: str | Path,
         cluster_files: "dict[str, set[str]] | None" = None,
+        counters: "dict | None" = None,
     ) -> tuple[list[CandidateTask], list[FilterResult]]:
         """Run Gate 1 over every candidate and split into accepted / rejected.
 
@@ -678,6 +691,13 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             ``cited_location.file`` is not in its cluster's file set is rejected
             immediately with a clear "hallucinated path" message — before any
             filesystem I/O.  Pass ``None`` to skip this check (e.g. in tests).
+        counters:
+            M4. An optional dict filled with the per-stage split
+            (`existence`, `presence_confirmed`, `presence_rejected`,
+            `presence_fail_closed`, `presence_reask`, `duplicate`, `non_py`,
+            plus `_uncounted`) before returning. `None` (the default, and what
+            every caller has always used) changes nothing — the return tuple is
+            byte-for-byte the same as before this parameter existed.
 
         Returns
         -------
@@ -894,6 +914,21 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             f"✅ Gate 1 done — {len(accepted)} accepted, "
             f"{len(rejected)} rejected ({len([r for r in rejected if r.stage == 'duplicate'])} duplicate(s))\n"
         )
+        # M4: the split is computed here, because `all_results` is the only
+        # place a `FilterResult` for an *accepted* candidate exists — the
+        # return tuple carries rejected results only. A caller that does not
+        # pass `counters` gets exactly the pre-M4 return value.
+        if counters is not None:
+            try:
+                counters.update(
+                    split_gate1_results(
+                        all_results,
+                        reask=getattr(self, "presence_reask", 0),
+                        non_py=getattr(self, "non_py_requests", 0),
+                    )
+                )
+            except Exception:  # noqa: BLE001 — never sink a run on a counter
+                pass
         return accepted, rejected
 
     # ── Stage A helpers ───────────────────────────────────────────────────────
@@ -1228,6 +1263,23 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             return ""
         return "\n" + "\n\n".join(notes) + "\n"
 
+    def _count(self, name: str, n: int = 1) -> None:
+        """M4: bump one of the two stage-split counters. Never raises.
+
+        Thread-safe for the same reason the learned budget window is: with
+        `presence_workers > 1` the presence checks run in a pool, where
+        `x += 1` loses increments.
+        """
+        try:
+            lock = getattr(self, "_counter_lock", None)
+            if lock is None:
+                setattr(self, name, int(getattr(self, name, 0)) + n)
+                return
+            with lock:
+                setattr(self, name, int(getattr(self, name, 0)) + n)
+        except Exception:  # noqa: BLE001 — a counter must never sink a run
+            pass
+
     def _check_presence(
         self,
         candidate: CandidateTask,
@@ -1265,6 +1317,16 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         """
         loc = candidate.cited_location
         location_str = _location_str(loc)
+
+        # M4: one gate-1 LLM request is about to go out, and the file it
+        # cites may not be a module at all. L1 drives this to zero and needs
+        # the number to prove it — "gate1 accepted=N rejected=M" cannot say
+        # it.
+        try:
+            if not str(getattr(loc, "file", "") or "").endswith(".py"):
+                self._count("non_py_requests")
+        except Exception:  # noqa: BLE001 — a counter must never sink a run
+            pass
 
         grounding_notes = self._build_grounding_notes(
             candidate, code_block, module_docstring, base_dir,
@@ -1529,6 +1591,13 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                 )
                 if not unparseable_n:  # this answer was clear — use it
                     self._record_parseable_budget(attempt_tokens)
+                    # M4: this candidate's answer came from the ladder, not
+                    # from the first call. Counted regardless of whether the
+                    # re-ask said confirmed or rejected — what is being
+                    # measured is how the presence stage ended, and
+                    # "the model would not answer at its normal budget" is
+                    # the fact the fail_closed counter alone cannot tell.
+                    self._count("presence_reask")
                     return confirmed_n, reason_n
                 last_confirmed, last_reason, last_cleaned = confirmed_n, reason_n, cleaned_n
                 if _fast and cleaned_n.strip() == "" and attempt_tokens >= _pin_floor:
@@ -1692,6 +1761,7 @@ def filter_candidates(
     model_override: "str | None" = None,
     active_override: "str | None" = None,
     collect_bridge=None,
+    counters: "dict | None" = None,
 ) -> tuple[list[CandidateTask], list[FilterResult]]:
     """One-call entry point for ``AutoController`` (and ``plan_validator``).
 
@@ -1728,6 +1798,10 @@ def filter_candidates(
         it once per run (same rule as COLLECT-24's own caller in
         ``AutoController._get_collect_bridge``); never build one per
         candidate.
+    counters:
+        M4. Filled with the per-stage split of this pass before returning —
+        see :meth:`Gate1Filter.filter` for the field list. Forwarded as-is;
+        `None` keeps the call exactly as it has always been.
 
     Returns
     -------
@@ -1754,7 +1828,9 @@ def filter_candidates(
         task_mode=task_mode,
         collect_bridge=collect_bridge,
     )
-    return filt.filter(candidates, base_dir, cluster_files=cluster_files)
+    return filt.filter(
+        candidates, base_dir, cluster_files=cluster_files, counters=counters,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1787,6 +1863,138 @@ def _is_technical_failure(reason: str) -> bool:
         "expected JSON object,",
         "unrecognised verdict ",
     ))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# M4: the per-stage split
+# ─────────────────────────────────────────────────────────────────────────────
+
+# The columns `plan_phase` always prints, in order. Every field is always
+# printed — zero when the mode does not produce it — so log parsing stays
+# stable across `unparseable_retry_mode` and across L1 landing. `already_safe`
+# is deliberately NOT here: it is V12's stage and it does not exist in this
+# tree, so a zero column for it would read as "V12 ran and found nothing".
+_GATE1_SPLIT_FIELDS = (
+    "existence",
+    "presence_confirmed",
+    "presence_rejected",
+    "presence_fail_closed",
+    "presence_reask",
+    "duplicate",
+    "non_py",
+)
+
+# An acceptance whose `reason` starts with one of these was never asked of an
+# LLM — skip_llm, creative mode, or a new file. Not a model verdict, so it
+# belongs in no presence column: counting it as `presence_confirmed` would
+# make the presence number larger than the number of presence calls made.
+_NON_MODEL_CONFIRMATIONS = (
+    "existence check passed",
+    "new file —",
+)
+
+# Returned for a stage this split does not know about. Distinct from `""`
+# (an existence-only acceptance, which is expected and silent): this one is a
+# gap in the split, and `split_gate1_results` warns about it.
+_UNKNOWN_STAGE = "_unknown_stage"
+
+
+def gate1_outcome(stage: str, reason: str, accepted: bool) -> str:
+    """M4: which split column one Gate-1 outcome belongs to.
+
+    Returns a bucket name, `""` when the outcome is expected to be uncounted
+    (an existence-only acceptance — nothing was asked of a model), or
+    `_UNKNOWN_STAGE` when the stage is one this split does not know about
+    (V12's `already_safe` is the next to land). Keeping the two uncounted
+    cases apart is the point: an existence-only acceptance happens on every
+    skip_llm run, so warning about it would make the warning meaningless.
+    """
+    stage = str(stage or "")
+    reason = str(reason or "")
+    if stage == "existence":
+        return "existence"
+    if stage == "duplicate":
+        return "duplicate"
+    if stage != "presence":
+        return _UNKNOWN_STAGE
+    if _is_technical_failure(reason):
+        # Empty reply, bad JSON, a call that never came back: the model was
+        # asked and never answered, and the candidate was rejected for the
+        # lack of an answer rather than for the claim. This is the number
+        # that was invisible in `gate1 accepted=N rejected=M` before M4.
+        return "presence_fail_closed"
+    if accepted and reason.startswith(_NON_MODEL_CONFIRMATIONS):
+        return ""
+    if accepted:
+        return "presence_confirmed"
+    return "presence_rejected"
+
+
+def split_gate1_results(
+    all_results,
+    *,
+    reask: int = 0,
+    non_py: int = 0,
+) -> dict:
+    """M4: the per-stage split of one Gate-1 pass, as a dict.
+
+    `all_results` is the `all_results` list `filter()` builds — it is the
+    only place a `FilterResult` for an *accepted* candidate exists, so the
+    split has to be computed where `filter()` computes the verdicts.
+
+    Every `_GATE1_SPLIT_FIELDS` key is always present, zero when the mode does
+    not produce it. `presence_reask` and `non_py` come from the filter's own
+    counters rather than from any result record: no candidate that only ever
+    answered on a re-ask, and no candidate whose cited file is not a module,
+    leaves a trace in `stage` or `reason`.
+
+    `""` outcomes are dropped silently — they are the expected case. An
+    `_UNKNOWN_STAGE` outcome is counted in `_uncounted` (never in a real
+    column) and warned about once, so the next stage added to Gate 1 cannot
+    silently vanish from the line. Never raises.
+    """
+    out = {name: 0 for name in _GATE1_SPLIT_FIELDS}
+    out["presence_reask"] = int(reask or 0)
+    out["non_py"] = int(non_py or 0)
+    unknown: set = set()
+    try:
+        for r in list(all_results or []):
+            bucket = gate1_outcome(
+                getattr(r, "stage", ""),
+                getattr(r, "reason", ""),
+                bool(getattr(r, "accepted", False)),
+            )
+            if bucket in out:
+                out[bucket] += 1
+            elif bucket == _UNKNOWN_STAGE:
+                unknown.add(str(getattr(r, "stage", "") or "?"))
+    except Exception as exc:  # noqa: BLE001 — a counter must never sink a run
+        logger.warning(
+            "M4 gate1 split: %s: %s — printing what was counted",
+            type(exc).__name__, exc,
+        )
+    out["_uncounted"] = len(unknown)
+    if unknown:
+        logger.warning(
+            "M4 gate1 split: stage(s) %s are not part of this split — their "
+            "candidate(s) are not counted in any column of the plan_phase line",
+            ", ".join(sorted(unknown)),
+        )
+    return out
+
+
+def format_gate1_split(split: dict) -> str:
+    """M4: ``existence=3 presence_confirmed=5 …`` for one Gate-1 pass.
+
+    Every field of `_GATE1_SPLIT_FIELDS`, in order, always — including the
+    zeros — so a log parser does not have to know which mode produced the
+    line. Anything in `split` that is not a known field is dropped rather
+    than appended, for the same reason.
+    """
+    return " ".join(
+        f"{name}={int((split or {}).get(name, 0) or 0)}"
+        for name in _GATE1_SPLIT_FIELDS
+    )
 
 
 def _fingerprint(c: CandidateTask) -> str:

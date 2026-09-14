@@ -69,7 +69,7 @@ def _rt(controller: "AutoController"):
 # ``patch("tools.auto.pipeline.<name>")``.
 from tools.auto.repo_ingest import ingest_repo
 from tools.auto.architect import review_clusters, ClusterReviewer, ConfigValueError
-from tools.auto.gate1_filter import filter_candidates
+from tools.auto.gate1_filter import filter_candidates, format_gate1_split
 from tools.auto.backlog_prioritiser import build_backlog, to_improvements_md
 from tools.auto.plan_emitter import PlanEmitter, IMPROVEMENTS_FILENAME
 
@@ -405,25 +405,45 @@ def _run_plan_phase(controller: "AutoController", cfg: configparser.ConfigParser
     }
     _get_bridge = getattr(controller, "_get_collect_bridge", None)
     collect_bridge = _get_bridge(getattr(controller, "task_mode", "code")) if _get_bridge else None
+    _g1_counters: dict = {}
     accepted, rejected = filter_candidates(
         candidates, controller.base_dir, cfg,
         cluster_files=cluster_files,
         task_mode=getattr(controller, "task_mode", "code"),   # AUTO-DM-1
         collect_bridge=collect_bridge,  # GATE1-CTX-1
+        counters=_g1_counters,          # M4
     )
+    # M4: the per-stage split. Every field is always printed, zero when the
+    # mode does not produce it, so log parsing is stable across
+    # unparseable_retry_mode and across L1 landing. The counters are filled
+    # by Gate1Filter.filter() itself, where all_results — the only place a
+    # result for an accepted candidate exists — is in scope; an empty dict
+    # here (a stubbed filter_candidates) prints zeros, which is the honest
+    # reading of "this pass reported nothing".
+    _g1_split_line = format_gate1_split(_g1_counters)
     logger.info(
-        "plan_phase: gate1 accepted=%d rejected=%d",
-        len(accepted), len(rejected),
+        "plan_phase: gate1 accepted=%d rejected=%d %s",
+        len(accepted), len(rejected), _g1_split_line,
     )
     controller.state.log(
-        f"plan phase: gate1 accepted={len(accepted)} rejected={len(rejected)}"
+        f"plan phase: gate1 accepted={len(accepted)} rejected={len(rejected)} "
+        f"{_g1_split_line}"
     )
+    # Trace it as well: run.log is where a human reads the line, the trace is
+    # where a later analyze run would look for it. The trace event carries
+    # accepted/rejected too, because it does not sit next to the log line and
+    # would otherwise have no denominator for the split.
+    _g1_counters["accepted"] = len(accepted)
+    _g1_counters["rejected"] = len(rejected)
+    if controller.run_trace:
+        _rt(controller).log_gate1_split(_g1_counters)
 
     if controller.run_trace:
         for r in rejected:
             _rt(controller).log_gate1_rejected(
                 getattr(r, "candidate", None) and getattr(r.candidate, "title", "?"),
                 getattr(r, "reason", ""),
+                stage=getattr(r, "stage", ""),   # M4: the split's per-event side
             )
 
     # ── Step 4: Backlog prioritise ────────────────────────────────────────────

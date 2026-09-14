@@ -1,6 +1,6 @@
 # M4 — Runtime counters: collect events + Gate-1 stage split
 
-**Status:** open (verified against `84a24b2`, 2026-09-13 — re-checked after V6, GATE1-LEARN-1/2, GATE1-PAR-1 and the first live execution runs)  
+**Status:** landed (round of 5 patches reviewed 2026-09-14; base Sensenova-6-1-var1 + reviewer fixes — see the commit message)  
 **Severity:** HIGH  
 **File:** `tools/auto/run_trace.py`  
 **Symbol:** `—`  

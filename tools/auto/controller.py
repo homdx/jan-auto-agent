@@ -1440,6 +1440,13 @@ class AutoController:
         if bridge is None:
             return
         try:
+            # M4: the trace event goes first — the run.log line below is the
+            # human-readable reader, the event is what analyze_logs renders
+            # from. Both are one-per-run.
+            bridge.emit_collect_summary()
+        except Exception:  # noqa: BLE001 — never abort the run
+            pass
+        try:
             line = bridge.summary()
         except Exception:  # noqa: BLE001 — never abort the run
             return

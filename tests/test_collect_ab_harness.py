@@ -268,12 +268,20 @@ def test_counters_read_every_trace_of_the_tree(tmp_path):
 
 
 def test_m4_collect_block_events_win_over_the_header_grep():
+    # Two coder requests, one collect_block event (M4 counts per request
+    # served, so a run whose second request got no block says 1, not 2). The
+    # pack rows still come from the prompt text: `rows_kept` counts the V2
+    # rows too, so it is not the A=0 / B>0 number.
     events = [
         _ev("llm_request", "coder", "llm", _BLOCK_ON + _PROMPT_TAIL),
-        _ev("collect_block", "collect_bridge", "coder", pack_rows=4, chars=300),
+        _ev("llm_request", "coder", "llm", _BLOCK_ON + _PROMPT_TAIL),
+        _ev("collect_block", "collect_bridge", "auto_run",
+            rows_kept="5", rows_cut="2", chars="300", memo_hit="False"),
     ]
     c = ab.counters_from_events(events)
-    assert (c["collect_blocks"], c["collect_pack_rows"], c["collect_source"]) == (1, 4, "events")
+    _, rows_in_one_prompt = ab.count_collect_blocks(_BLOCK_ON + _PROMPT_TAIL)
+    assert (c["collect_blocks"], c["collect_pack_rows"], c["collect_source"]) == (
+        1, 2 * rows_in_one_prompt, "events")
 
 
 def test_missing_tree_is_all_zero_and_not_an_error(tmp_path):

@@ -346,8 +346,11 @@ def test_shrink_still_runs_from_context_for() -> None:
     raw = "signature: fn() x" * 20
     assert len(raw) > 50
     with patch.object(
-        cb, "build_collect_context_block",
-        side_effect=lambda model, target, **_kw: raw,
+        cb, "build_collect_context_block_stats",
+        side_effect=lambda model, target, **_kw: (raw, {"chars": len(raw),
+                                                        "chars_uncapped": len(raw),
+                                                        "rows_kept": 0,
+                                                        "rows_cut": 0}),
     ):
         assert bridge.context_for("tools/example.py") == "compact facts"
     assert bridge.shrink_calls == 1 and len(calls) == 1

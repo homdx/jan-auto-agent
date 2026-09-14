@@ -12,10 +12,14 @@ by_op / chars_used / informed_facts / blind_facts` on every `probe_result`, and
 gate 1's verdicts are in the trace verbatim. That is most of a Tier-2 baseline,
 available before a single line of the epics is implemented. This reads it.
 
-This is **not** ticket `M4`. `M4` adds runtime counters that do not exist yet
-(`collect_block`, `collect_shrink`, `collect_miss`, the Gate-1 stage split).
-This only reads what is already emitted, so a "before" number survives runs that
-have since finished.
+This now reads the M4 counters too (`collect_block`, `collect_shrink`,
+`collect_miss`, `collect_summary`, `gate1_split`), which is what makes the
+before/after columns comparable: M4 replaced a grep for the literal header
+`COLLECT MODEL (static facts` in the coder prompt with a `collect_block`
+event, and this script counts the events when they exist and falls back to
+the grep when they do not. One trace per tree was also wrong — every resume
+writes a new `trace_<run_id>.jsonl`, so all of them are read and
+`--run-id` narrows it to one.
 """
 import argparse
 import subprocess
@@ -85,80 +89,130 @@ def base_sha(base, started_at=None):
     return head, at_start[1], switched
 
 
-def read_run(base):
+def read_run(base, run_id=None):
+    """One run, read out of every trace file under `base/.agent/`.
+
+    Every resume writes a new `trace_<run_id>.jsonl`, so one run's history is
+    spread across several files; reading `traces[0]` only saw the last resume
+    and undercounted everything. All of them are read, and `run_id` narrows
+    the events to one trace — the column totals are then that trace's, not
+    the tree's.
+    """
     traces = sorted(glob.glob(os.path.join(base, ".agent", "trace_*.jsonl")))
     if not traces:
         return None
     out = {
         "run": os.path.basename(os.path.abspath(base)),
         "trace": os.path.basename(traces[0]),
+        "trace_files": len(traces),
         "head_sha": "", "pre_run_sha": "", "switched_mid_run": False,
         "goal": "", "probe_usable": None, "probe_reason": None,
         "llm_by_source": collections.Counter(),
         "gate1": {"requests": 0, "confirmed": 0, "rejected": 0, "unparsed": 0},
+        "gate1_split": None,
         "gate1_location_ext": collections.Counter(),
         "probe": {"ops": 0, "hits": 0, "misses": 0, "memo_hits": 0},
         "probe_by_op": collections.Counter(),
+        # M4: events when they exist, grep otherwise — see collect_source.
+        "collect": {
+            "blocks": 0, "chars": 0, "memo_hits": 0,
+            "shrink": collections.Counter(), "miss": collections.Counter(),
+        },
+        "collect_source": "grep",
         "collect_block_occurrences": 0,
         "first_ts": None, "last_ts": None, "gate1_first_ts": None, "gate1_last_ts": None,
     }
     pending_ext = None
-    for line in open(traces[0], encoding="utf-8", errors="replace"):
-        line = line.strip()
-        if not line:
-            continue
-        if "COLLECT MODEL (static facts" in line:
-            out["collect_block_occurrences"] += 1
-        try:
-            r = json.loads(line)
-        except Exception:
-            continue
-        ts, kind, src, tgt = r.get("ts"), r.get("kind"), r.get("source"), r.get("target")
-        if ts:
-            out["first_ts"] = out["first_ts"] or ts
-            out["last_ts"] = ts
-        if kind == "run_start":
-            out["goal"] = (r.get("params") or {}).get("goal") or r.get("content", "")[:400]
-        elif kind == "probe_config":
-            p = r.get("params") or {}
-            out["probe_usable"] = p.get("usable")
-            out["probe_reason"] = p.get("reason")
-        elif kind == "llm_request":
-            out["llm_by_source"][src or "?"] += 1
-            if src == "gate1":
-                out["gate1"]["requests"] += 1
-                out["gate1_first_ts"] = out["gate1_first_ts"] or ts
-                out["gate1_last_ts"] = ts
-                m = LOC.search(r.get("content", "") or "")
-                path = m.group(1).split(",")[0].strip() if m else ""
-                pending_ext = (os.path.splitext(path)[1] or "<none>").lower()
-        elif kind == "llm_response" and tgt == "gate1":
+    header_grep = 0
+    for trace in traces:
+        for line in open(trace, encoding="utf-8", errors="replace"):
+            line = line.strip()
+            if not line:
+                continue
             try:
-                v = json.loads(r.get("content", "") or "").get("verdict")
+                r = json.loads(line)
             except Exception:
-                v = None
-            if v in ("confirmed", "rejected"):
-                out["gate1"][v] += 1
-            else:
-                out["gate1"]["unparsed"] += 1
-            if pending_ext is not None:
-                out["gate1_location_ext"][f"{pending_ext}:{v or 'unparsed'}"] += 1
-                pending_ext = None
-        elif kind == "probe_result":
-            p = r.get("params") or {}
-            for k in ("ops", "hits", "misses", "memo_hits"):
+                continue
+            if run_id and r.get("run_id") not in (None, run_id) \
+                    and run_id not in os.path.basename(trace):
+                continue
+            if "COLLECT MODEL (static facts" in line:
+                header_grep += 1
+            ts, kind, src, tgt = r.get("ts"), r.get("kind"), r.get("source"), r.get("target")
+            if ts:
+                out["first_ts"] = out["first_ts"] or ts
+                out["last_ts"] = ts
+            if kind == "run_start":
+                out["goal"] = (r.get("params") or {}).get("goal") or r.get("content", "")[:400]
+            elif kind == "probe_config":
+                p = r.get("params") or {}
+                out["probe_usable"] = p.get("usable")
+                out["probe_reason"] = p.get("reason")
+            elif kind == "llm_request":
+                out["llm_by_source"][src or "?"] += 1
+                if src == "gate1":
+                    out["gate1"]["requests"] += 1
+                    out["gate1_first_ts"] = out["gate1_first_ts"] or ts
+                    out["gate1_last_ts"] = ts
+                    m = LOC.search(r.get("content", "") or "")
+                    path = m.group(1).split(",")[0].strip() if m else ""
+                    pending_ext = (os.path.splitext(path)[1] or "<none>").lower()
+            elif kind == "llm_response" and tgt == "gate1":
                 try:
-                    out["probe"][k] += int(p.get(k, 0))
+                    v = json.loads(r.get("content", "") or "").get("verdict")
+                except Exception:
+                    v = None
+                if v in ("confirmed", "rejected"):
+                    out["gate1"][v] += 1
+                else:
+                    out["gate1"]["unparsed"] += 1
+                if pending_ext is not None:
+                    out["gate1_location_ext"][f"{pending_ext}:{v or 'unparsed'}"] += 1
+                    pending_ext = None
+            elif kind == "probe_result":
+                p = r.get("params") or {}
+                for k in ("ops", "hits", "misses", "memo_hits"):
+                    try:
+                        out["probe"][k] += int(p.get(k, 0))
+                    except (TypeError, ValueError):
+                        pass
+                for tok in (p.get("by_op") or "").split():
+                    name, _, hm = tok.partition("=")
+                    h, _, m2 = hm.partition("/")
+                    try:
+                        out["probe_by_op"][f"{name}_hit"] += int(h)
+                        out["probe_by_op"][f"{name}_miss"] += int(m2)
+                    except ValueError:
+                        pass
+            # ── M4: collect counters ───────────────────────────────────────
+            # collect_summary is one event per run and restates the totals,
+            # so it is skipped here — the per-block events are the source, and
+            # counting both would double every number in a resumed run.
+            elif kind == "collect_block":
+                p = r.get("params") or {}
+                out["collect"]["blocks"] += 1
+                try:
+                    out["collect"]["chars"] += int(p.get("chars", 0))
                 except (TypeError, ValueError):
                     pass
-            for tok in (p.get("by_op") or "").split():
-                name, _, hm = tok.partition("=")
-                h, _, m2 = hm.partition("/")
-                try:
-                    out["probe_by_op"][f"{name}_hit"] += int(h)
-                    out["probe_by_op"][f"{name}_miss"] += int(m2)
-                except ValueError:
-                    pass
+                if str(p.get("memo_hit", "")).strip().lower() in ("true", "1", "yes"):
+                    # agent_trace stringifies params: "False" is truthy.
+                    out["collect"]["memo_hits"] += 1
+            elif kind == "collect_shrink":
+                out["collect"]["shrink"][str((r.get("params") or {}).get("path") or "?")] += 1
+            elif kind == "collect_miss":
+                out["collect"]["miss"][str((r.get("params") or {}).get("reason") or "?")] += 1
+            elif kind == "gate1_split":
+                out["gate1_split"] = dict(r.get("params") or {})
+
+    # M4 events, or the pre-M4 grep. Comparability between the two is the
+    # whole point of keeping the grep at all.
+    if out["collect"]["blocks"]:
+        out["collect_source"] = "events"
+        out["collect_block_occurrences"] = out["collect"]["blocks"]
+    else:
+        out["collect_source"] = "grep"
+        out["collect_block_occurrences"] = header_grep
 
     if out["gate1_first_ts"] and out["gate1_last_ts"] and out["gate1"]["requests"] > 1:
         t0 = datetime.datetime.fromisoformat(out["gate1_first_ts"])
@@ -167,6 +221,8 @@ def read_run(base):
             (t1 - t0).total_seconds() / (out["gate1"]["requests"] - 1), 1)
     for k in ("llm_by_source", "gate1_location_ext", "probe_by_op"):
         out[k] = dict(out[k])
+    for k in ("shrink", "miss"):
+        out["collect"][k] = dict(out["collect"][k])
     out["head_sha"], out["pre_run_sha"], out["switched_mid_run"] = base_sha(
         base, out.get("first_ts"))
     return out
@@ -176,18 +232,25 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("runs", nargs="+", help="run base dirs, each holding .agent/trace_*.jsonl")
     ap.add_argument("--out", default=None, help="write the JSON here as well as printing")
+    ap.add_argument("--run-id", default=None,
+                    help="count only events from one trace_<run-id>.jsonl "
+                         "(default: every trace file in the tree)")
     a = ap.parse_args()
 
     snap = {"taken_at": datetime.datetime.now(datetime.timezone.utc)
             .isoformat(timespec="seconds"), "runs": []}
     for base in a.runs:
-        r = read_run(base)
+        r = read_run(base, a.run_id)
         if r is None:
             print(f"  no trace in {base}/.agent/ — skipped", file=sys.stderr)
             continue
         snap["runs"].append(r)
     if not snap["runs"]:
         return 1
+
+    # The suffix says which counter fed the column, because "12 blocks" from
+    # a grep and from a collect_block event are not the same measurement.
+    _block = lambda r: f"{r['collect_block_occurrences']} ({r['collect_source']})"
 
     hdr = f"{'run':12} {'probe':>6} {'reason':>14} {'arch':>5} {'gate1':>6} {'conf':>5} {'rej':>5} {'s/cand':>7} {'probe ops':>10} {'miss':>5} {'collect blocks':>15}"
     print(hdr)
@@ -206,7 +269,7 @@ def main():
               f"{r['llm_by_source'].get('architect', 0):>5} {g['requests']:>6} "
               f"{g['confirmed']:>5} {g['rejected']:>5} "
               f"{g.get('seconds_per_candidate', '—'):>7} {r['probe']['ops']:>10} "
-              f"{r['probe']['misses']:>5} {r['collect_block_occurrences']:>15}")
+              f"{r['probe']['misses']:>5} {_block(r):>15}")
     print("-" * len(hdr))
     print(f"{'TOTAL':12} {'':>6} {'':>14} {tot['arch']:>5} {tot['g1']:>6} "
           f"{tot['conf']:>5} {tot['rej']:>5} {'':>7} {tot['ops']:>10} "

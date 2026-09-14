@@ -292,9 +292,13 @@ def test_real_analyze_logs_done_site_appears_exactly_once_and_is_guarded():
     # L2: +1 more line in analyze_logs.py (the `stale_artifact` label in
     # render_run_summary's probe_config reasons) moved this site to 1726,
     # again with no code-shape change.
+    # M4: +172 lines (the runtime counter block in render_run_summary, the
+    # collect/gate1 event handlers in analyze() and the `_flag` / `_mapping`
+    # wire-shape decoders) moved it to 1904 — same guard/access pair, same
+    # shape.
     source = (REPO_ROOT / "analyze_logs.py").read_text(encoding="utf-8")
     accesses = _accesses(source, "analyze_logs.py")
-    matches = [a for a in accesses if (a.location, a.access) == ("analyze_logs.py:1726", "done[-1]")]
+    matches = [a for a in accesses if (a.location, a.access) == ("analyze_logs.py:1904", "done[-1]")]
     assert len(matches) == 1, f"expected exactly one record, got {matches!r}"
     assert matches[0].status == "GUARDED"
 

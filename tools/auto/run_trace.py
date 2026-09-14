@@ -167,7 +167,7 @@ class RunTrace:
         )
         self._state.log(f"[AUTO-F2] phase {phase} {status}  run_id={self.run_id}")
 
-    def log_gate1_rejected(self, title: str, reason: str) -> None:
+    def log_gate1_rejected(self, title: str, reason: str, stage: str = "") -> None:
         """Record a Gate-1 rejection (AUTO-G1).
 
         Parameters
@@ -176,16 +176,56 @@ class RunTrace:
             Candidate task title (may be None for malformed candidates).
         reason:
             Human-readable rejection reason from the filter.
+        stage:
+            M4. The `FilterResult.stage` that rejected it (`existence`,
+            `presence`, `duplicate`). Optional, so every pre-M4 caller keeps
+            its two-argument call; a reader that has it no longer needs the
+            reason-text vocabulary to tell the stages apart.
         """
+        params = {
+            "run_id": self.run_id,
+            "title": title or "<unknown>",
+            "reason": reason or "",
+        }
+        if stage:
+            params["stage"] = stage
         tracer.event(
             source=_SOURCE,
             target="gate1_filter",
             kind="rejected",
-            params={
-                "run_id": self.run_id,
-                "title": title or "<unknown>",
-                "reason": reason or "",
-            },
+            params=params,
+        )
+
+    def log_gate1_split(self, split: dict) -> None:
+        """Record the per-stage split of one Gate-1 pass (M4).
+
+        `run_trace.py` is the trace side of M4: the counters live on
+        `Gate1Filter` (`presence_reask`, `non_py_requests`) and in its
+        `all_results` list, the line a human reads is the `plan_phase` log
+        entry the pipeline writes next to this call, and this event is where
+        a later `analyze_logs` run reads them from — it does not parse
+        run.log.
+
+        Every field is forwarded, zeros included, so the trace carries the
+        same shape the log line prints and log parsing stays stable across
+        `unparseable_retry_mode`. Underscore-prefixed keys (`_uncounted`)
+        are dropped: they mark a gap in the split, which is a warning for
+        whoever wrote the next stage, not a column for the report. Never
+        raises — a broken counter must not stop a plan phase.
+        """
+        params: dict = {"run_id": self.run_id}
+        try:
+            for name, value in (split or {}).items():
+                if str(name).startswith("_"):
+                    continue
+                params[name] = value
+        except Exception:  # noqa: BLE001 — a counter must never sink a run
+            return
+        tracer.event(
+            source=_SOURCE,
+            target="gate1_filter",
+            kind="gate1_split",
+            params=params,
         )
 
 

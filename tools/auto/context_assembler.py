@@ -741,7 +741,45 @@ def build_collect_context_block(
     budget: "int | None" = None,
     pack_enabled: bool = True,
 ) -> str:
-    """AUTO-CR-23/COLLECT-23, PLAN-v2 V2: the opt-in `collect`-derived context
+    """The collect context block for `target_file`, as a string.
+
+    M4 kept this function's signature and return type unchanged: every
+    existing caller concatenates the result into a prompt and must keep
+    getting a plain `str`. The measurement M4 needs — how many rows the
+    budget kept and cut — comes from
+    :func:`build_collect_context_block_stats`, which this wraps.
+    """
+    block, _stats = build_collect_context_block_stats(
+        model, target_file, task_mode=task_mode, budget=budget,
+        pack_enabled=pack_enabled,
+    )
+    return block
+
+
+def build_collect_context_block_stats(
+    model,
+    target_file: str,
+    *,
+    task_mode: str = "code",
+    budget: "int | None" = None,
+    pack_enabled: bool = True,
+) -> "tuple[str, dict]":
+    """M4: the collect context block for `target_file` plus how it was cut.
+
+    Returns ``(block, stats)``. `stats` carries what a caller cannot recover
+    from the string alone:
+
+    - ``rows_kept`` / ``rows_cut`` — how many of the selected pack's rows
+      rendered at least one line, and how many the cut removed. The
+      assembler returns a plain `str`, so without this the V6 row cut
+      (`collect_shrink.path = "rows"`) is unobservable from the outside.
+    - ``chars`` / ``chars_uncapped`` — the returned block's length and the
+      length the same pack would have been with no budget. The difference
+      is the ground the assembler gave up.
+    - ``budget`` — the budget the cut was made against (`None` = no budget,
+      nothing was ever cut).
+
+    Otherwise AUTO-CR-23/COLLECT-23, PLAN-v2 V2: the opt-in `collect`-derived context
     block for `target_file` — an ordered row list built by the selected row set.
 
     Purely additive and read-only: this never touches a file on disk, and
@@ -780,14 +818,16 @@ def build_collect_context_block(
     `tools.collect` at import time; callers that don't use collect at all
     never pay for the import.
     """
+    budget = _coerce_budget(budget)
+
     if model is None or not getattr(model, "available", False):
-        return ""
+        return "", {"rows_kept": 0, "rows_cut": 0, "chars": 0,
+                    "chars_uncapped": 0, "budget": budget}
 
     record = model.module(target_file)
     if record is None:
-        return ""
-
-    budget = _coerce_budget(budget)
+        return "", {"rows_kept": 0, "rows_cut": 0, "chars": 0,
+                    "chars_uncapped": 0, "budget": budget}
 
     head = [_COLLECT_HEADER, f"module: {record.path}"]
     if record.parse_error:
@@ -822,10 +862,61 @@ def build_collect_context_block(
             rows=rows,
         )
 
+    body, kept = _pack_body(head, forms, rows, budget)
+
+    if not body and len(head) == 2:
+        # Only the header + bare module line — nothing substantive to add.
+        return "", {"rows_kept": 0, "rows_cut": len(rows), "chars": 0,
+                    "chars_uncapped": 0, "budget": budget}
+
+    block = "\n".join(head + body)
+
+    # The pack this budget would have cut: the same rows, uncut, so
+    # chars_uncapped - chars is the ground the cut gave up. Only worth
+    # rendering twice when a budget was actually applied.
+    chars_uncapped = len(block)
+    if budget is not None:
+        uncapped_body, _uncapped_kept = _pack_body(head, full, rows, None)
+        if uncapped_body:
+            chars_uncapped = len("\n".join(head + uncapped_body))
+
+    return block, {
+        "rows_kept": len(kept),
+        "rows_cut": len(rows) - len(kept),
+        "chars": len(block),
+        "chars_uncapped": chars_uncapped,
+        "budget": budget,
+    }
+
+
+def _pack_body(
+    head: "list[str]",
+    forms: "dict[str, str]",
+    rows: "tuple[tuple[str, Callable], ...]",
+    budget: "int | None",
+) -> "tuple[list[str], set[str]]":
+    """The rendered body of one pack, plus the rows that contributed to it.
+
+    One pass is shared by both the budgeted and the uncut block, so the two
+    numbers M4 compares (``chars`` vs ``chars_uncapped``, and how many rows
+    the cut removed) come from the same dedupe rules — they differ only by
+    `budget`. `budget=None` renders everything.
+
+    Returns ``(body_lines, kept_row_names)``. `kept_row_names` is what makes
+    ``rows_kept`` / ``rows_cut`` meaningful: a row that rendered but gave up
+    every one of its lines to a duplicate earlier in the block contributed
+    nothing, so it is cut as far as this measurement is concerned.
+
+    V2.4's dedupe is preserved exactly — including the L6 rule that a row
+    skipped by the belt-and-braces budget check leaves no lines behind in
+    `seen`, so it cannot suppress an identical line in a later row.
+    """
+    head_len = len("\n".join(head))
     body: "list[str]" = []
     seen: "set[str]" = set(head)
+    kept: "set[str]" = set()
     used = head_len
-    for name, render in rows:
+    for name, _render in rows:
         row = forms.get(name, "")
         if not row:
             continue
@@ -856,13 +947,9 @@ def build_collect_context_block(
 
         seen.update(fresh)
         body.extend(fresh)
+        kept.add(name)
         used += len("\n".join(fresh)) + 1
-
-    if not body and len(head) == 2:
-        # Only the header + bare module line — nothing substantive to add.
-        return ""
-
-    return "\n".join(head + body)
+    return body, kept
 
 
 def _chapter_number(filename: str) -> "int | None":

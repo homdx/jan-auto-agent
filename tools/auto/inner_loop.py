@@ -1365,7 +1365,8 @@ class InnerLoop:
         # reassignment sites re-prepend it via _with_collect_block().
         _collect_block = ""
         if self._collect_bridge is not None:
-            _collect_block = self._collect_bridge.context_for_many(target_files) or ""
+            _collect_block = self._collect_bridge.context_for_many(
+                target_files, task_id=task_id) or ""
             if _collect_block:
                 prefetched_context = _collect_block + "\n\n"
 

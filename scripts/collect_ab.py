@@ -670,7 +670,7 @@ def trace_files(tree: os.PathLike) -> List[Path]:
 def counters_from_events(events: Iterable[dict]) -> Dict[str, Any]:
     c: Dict[str, Any] = {k: 0 for k, _, _ in ROWS}
     raw = {"gate2_attempts": 0, "tasks_executed": 0, "prompt_chars": 0,
-           "blocks_from_events": 0, "rows_from_events": 0, "has_block_events": False,
+           "blocks_from_events": 0, "has_block_events": False,
            "gate1_rejected_duplicate": 0}
     for ev in events:
         kind = ev.get("kind") or ""
@@ -687,12 +687,13 @@ def counters_from_events(events: Iterable[dict]) -> Dict[str, Any]:
                 c["collect_blocks"] += blocks
                 c["collect_pack_rows"] += rows
         elif kind == "collect_block":  # M4
+            # One event per coder request that received a block (memo hits
+            # included). `rows_kept` counts the whole selected row set — the
+            # three V2 rows too — so it cannot stand in for "pack rows": that
+            # stays a grep of the prompt itself, which is where the A=0 / B>0
+            # check needs it anyway.
             raw["has_block_events"] = True
             raw["blocks_from_events"] += 1
-            try:
-                raw["rows_from_events"] += int(params.get("pack_rows", 0) or 0)
-            except (TypeError, ValueError):
-                pass
         elif kind == "llm_response":
             if _context_signals(content):
                 c["context_re_requests"] += 1
@@ -730,7 +731,6 @@ def counters_from_events(events: Iterable[dict]) -> Dict[str, Any]:
             c["tasks_done"] += 1
     if raw["has_block_events"]:  # M4 events win over the header grep
         c["collect_blocks"] = raw["blocks_from_events"]
-        c["collect_pack_rows"] = raw["rows_from_events"]
     tasks = raw["tasks_executed"]
     c["tasks_executed"] = tasks
     c["gate2_attempts"] = raw["gate2_attempts"]

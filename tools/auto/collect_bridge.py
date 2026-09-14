@@ -49,8 +49,32 @@ Three responsibilities, all opt-in via `[collect] use_in_auto` /
    (default `false`) instead re-runs the existing incremental
    `action_module` for the edited path and folds the fresh `ModuleRecord`
    back into the in-memory model. The model *object* is still built once
-   per run: records are patched, `load()` is never called a second time.
-"""
+    per run: records are patched, `load()` is never called a second time.
+
+ 5. **M4: runtime counters.** Everything this class does to a task's prompt
+    is also counted and traced, so a run can say what happened to the pack
+    instead of a human reconstructing it from the log:
+
+    - `collect_block` — every `context_for` call that returns a block, with
+      `chars`, `rows_kept`, `rows_cut` and `memo_hit`. Emitted on memo hits
+      too, because the V6 memo returns the cached block on every round after
+      the first and an event emitted only on a build would undercount
+      "blocks per coder request".
+    - `collect_shrink` — how the block got small: `rows` (the assembler's own
+      budget cut, no LLM), `llm` (`_shrink` fired and succeeded) or
+      `truncate` (`_shrink` fell back to a hard cut). Observed from
+      `context_for` by comparing lengths and reading `shrink_calls`; `_shrink`
+      itself is not modified, reordered or replaced.
+    - `collect_miss` — `absent`, `stale`, `dirty` or `unknown_module` (the
+      last one predates M4's naming, the first two were silent before).
+    - `collect_summary` — one event per run: blocks injected, chars
+      injected, shrink calls by path, misses by reason.
+
+    All four are best effort: the tracer is imported lazily inside a
+    try/except, so a missing or broken trace sink never changes what
+    `context_for` returns. With no bridge wired in there are no events at
+    all and the log looks exactly as it did before M4.
+ """
 
 from __future__ import annotations
 
@@ -61,7 +85,7 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-from tools.auto.context_assembler import build_collect_context_block
+from tools.auto.context_assembler import build_collect_context_block_stats
 
 logger = logging.getLogger(__name__)
 
@@ -123,6 +147,22 @@ def _qualname_matches(qualname: str, name: str) -> bool:
     if symbol.endswith("." + name):
         return True
     return symbol.split(".")[-1] == name
+
+
+def _memo_block(entry) -> "tuple[str, dict]":
+    """A V6 memo entry as ``(block, stats)``.
+
+    V6 cached a bare `str`; M4 caches a `(block, stats)` pair so a memo hit
+    reports the same `rows_kept` / `rows_cut` the build did. Anything that
+    is not a two-item pair degrades to the string with empty stats: a memo
+    seeded by hand in a test, or a leftover entry whose shape no longer
+    matches, must read as "a block, with no row detail" — never as a crash.
+    """
+    if isinstance(entry, (tuple, list)) and len(entry) == 2:
+        block = entry[0] if isinstance(entry[0], str) else ""
+        stats = entry[1] if isinstance(entry[1], dict) else {}
+        return block, stats
+    return (entry if isinstance(entry, str) else ""), {}
 
 
 
@@ -188,6 +228,19 @@ class CollectBridge:
         # do not exist in this tree yet, so the bridge keeps the tally
         # itself and hands it out for a run summary.
         self.collect_misses: dict = {}
+        # M4: per-run tally of what the pack actually did to prompts, read by
+        # `collect_counters()` and emitted once as `collect_summary`. Keys:
+        # blocks (context_for calls that returned a block), chars (their
+        # length), memo_hits (blocks served from the V6 memo) and
+        # shrink_by_path (rows | llm | truncate). Misses are deliberately not
+        # here: `collect_misses` is the pre-existing tally `summary()` and the
+        # run.log line already read, so one counter serves both.
+        self.collect_stats: dict = {
+            "blocks": 0,
+            "chars": 0,
+            "memo_hits": 0,
+            "shrink_by_path": {},
+        }
 
     # ── availability ─────────────────────────────────────────────────────
 
@@ -239,14 +292,18 @@ class CollectBridge:
         return bool(self._dirty_set())
 
     def summary(self) -> str:
-        """One line saying how much invalidate-on-write withheld this run.
+        """One line saying how much the artifact withheld this run.
 
         V9 item 4 says `collect_miss(reason="dirty")` is emitted so a run can
-        report how many blocks the rule suppressed; the tally lives on
-        `collect_misses`, and this is its reader — the controller logs it
-        once, at the end of the task loop. `""` when nothing was withheld
-        and nothing is still dirty, so a run with no edits adds no noise to
-        run.log. Never raises.
+        report how many blocks invalidate-on-write suppressed; the tally lives
+        on `collect_misses`, and this is its reader — the controller logs it
+        once, at the end of the task loop. M4 widened the reason set
+        (`absent`, `stale`, `unknown_module` are counted on the same tally),
+        so the wording no longer claims every withheld block was one this run
+        wrote: a stale artifact withholds for a reason this run did nothing to.
+        `""` when nothing was withheld and nothing is still dirty, so a run
+        with no edits and a clean artifact adds no noise to run.log. Never
+        raises.
         """
         withheld = {}
         try:
@@ -260,8 +317,7 @@ class CollectBridge:
             detail = ", ".join(f"{reason}={count}"
                                for reason, count in sorted(withheld.items()))
             parts.append(
-                f"collect withheld {total} block(s) for path(s) this run wrote "
-                f"({detail})"
+                f"collect withheld {total} block(s) ({detail})"
             )
         if self.has_dirty:
             parts.append(
@@ -269,6 +325,73 @@ class CollectBridge:
                 f"{', '.join(sorted(self.dirty_paths))}"
             )
         return "; ".join(parts)
+
+    def collect_counters(self) -> dict:
+        """M4: this run's collect tally, for the `collect_summary` event.
+
+        A copy — callers must not be able to make the counters lie by
+        mutating the returned mapping. Anything a caller cannot coerce to an
+        int is dropped, never raised, per this class's fail-open contract.
+        """
+        stats = getattr(self, "collect_stats", None) or {}
+        out: dict = {}
+        try:
+            for key in ("blocks", "chars", "memo_hits"):
+                out[key] = int(stats.get(key, 0) or 0)
+            out["shrink_by_path"] = {
+                str(path): int(count)
+                for path, count in (stats.get("shrink_by_path") or {}).items()
+            }
+            out["misses"] = {
+                str(reason): int(count)
+                for reason, count in (self.collect_misses or {}).items()
+            }
+        except Exception:  # noqa: BLE001 — a counter must never sink a run
+            return {}
+        return out
+
+    def emit_collect_summary(self) -> None:
+        """M4: one `collect_summary` trace event for this run.
+
+        Called once, at the end of the task loop, next to the run.log line
+        `summary()` produces. Zero events when nothing was injected and
+        nothing was withheld — a run that never touched the pack adds no
+        noise to the trace either. Never raises.
+        """
+        counts = self.collect_counters()
+        if not counts:
+            return
+        if not counts["blocks"] and not counts["misses"]:
+            return
+        self._event(
+            "collect_summary",
+            {
+                "blocks": counts["blocks"],
+                "chars": counts["chars"],
+                "memo_hits": counts["memo_hits"],
+                "shrink_calls": sum(counts["shrink_by_path"].values()),
+                "shrink_by_path": counts["shrink_by_path"],
+                "misses": counts["misses"],
+            },
+        )
+
+    def _event(self, kind: str, params: dict) -> None:
+        """One collect trace event. Lazy import, never raises.
+
+        Keeps the tracing stack out of this module's import graph — importing
+        `collect_bridge` never pays for the tracing stack — and makes sure a
+        broken sink can never change what a caller of `context_for` gets back.
+        """
+        try:
+            from tools.agent_trace import tracer
+
+            tracer.event(
+                source="collect_bridge", target="auto_run",
+                kind=kind, params=params,
+            )
+        except Exception:  # noqa: BLE001 — tracing must never sink a run
+            pass
+
 
     def _normalize_path(self, path) -> Optional[str]:
         """`pkg/a.py` from a task or git path, or `None` when it is not a
@@ -411,32 +534,27 @@ class CollectBridge:
             len(new_dirty), ", ".join(sorted(new_dirty)),
         )
 
-    def _miss(self, reason: str, target: str) -> None:
+    def _miss(self, reason: str, target: str, task_id: Optional[str] = None) -> None:
         """One `collect_miss` (M4): count it, log it, trace it. Never
         raises.
 
-        M4's `run_trace` events do not exist in this tree yet, so the tally
-        lives here on `collect_misses` (reason -> count, for a run summary)
-        and the trace call already uses M4's field names — `reason` and
-        `target_file`. `reason` is `"dirty"` for this ticket; M4 adds the
-        `absent` / `stale` / `unknown_module` reasons when it lands.
+        `reason` is `absent` (no model, or a model that is not fresh),
+        `stale` (the artifact exists and is explicitly stale), `dirty`
+        (invalidate-on-write withheld it, V9) or `unknown_module` (the model
+        is fresh but has no record for this path). The tally lives on
+        `collect_misses` — the attribute `summary()` and the run.log line
+        already read, so one counter serves both — and the counters are
+        written before the trace call, so a broken trace sink cannot make
+        them lie.
         """
         try:
             self.collect_misses[reason] = self.collect_misses.get(reason, 0) + 1
         except Exception:  # noqa: BLE001 — a counter must never sink a run
             pass
-        try:
-            # Lazy: keeps the M4 trace out of this module's import graph, so
-            # importing collect_bridge never pays for the tracing stack.
-            from tools.agent_trace import tracer
-
-            tracer.event(
-                source="collect_bridge", target="auto_run",
-                kind="collect_miss",
-                params={"reason": reason, "target_file": target},
-            )
-        except Exception:  # noqa: BLE001 — tracing must never sink a run
-            pass
+        params = {"reason": reason, "target_file": target}
+        if task_id:
+            params["task_id"] = task_id
+        self._event("collect_miss", params)
         logger.info("collect_miss reason=%s target=%s", reason, target)
 
     def _refresh_module_in_place(self, path: str):
@@ -534,7 +652,7 @@ class CollectBridge:
 
     # ── 1. static per-task context ──────────────────────────────────────
 
-    def context_for(self, target_file: str) -> str:
+    def context_for(self, target_file: str, *, task_id: Optional[str] = None) -> str:
         """Budget-aware COLLECT-23 block for `target_file`, or `""`.
 
         V6 wires two changes into this method's three-line shape:
@@ -549,15 +667,24 @@ class CollectBridge:
           pack_enabled)` caches the final result — including any LLM shrink —
           so a second `context_for("x.py")` in the same run makes zero
           additional LLM calls. `invalidate()` drops entries for dirty paths.
+
+        M4 adds the counting, and changes nothing about what is returned:
+        every request that returns a block emits `collect_block` (memo hits
+        included, flagged `memo_hit`), a block the assembler cut emits
+        `collect_shrink` with `path="rows"`, a block `_shrink` handled emits
+        one with `path="llm"` or `"truncate"`, and every empty return emits
+        `collect_miss` with the reason it came back empty for. `task_id` is
+        optional and only ever appears in the events — a caller that does not
+        pass it gets the pre-M4 events plus a missing `task_id` field.
         """
-        if not self.usable:
+        if self._miss_if_unusable(target_file, task_id=task_id):
             return ""
         # V9: the model predates this path's edit, so its facts describe a
         # tree that no longer exists. Runs before the budget check and
         # before `_shrink`, so a dirty path neither spends the shrink LLM
         # call nor returns a shrunk block of pre-edit facts.
         if self._is_dirty(target_file):
-            self._miss("dirty", target_file)
+            self._miss("dirty", target_file, task_id=task_id)
             return ""
         # V6: normalise the key so invalidate() — which stores normalized
         # paths — can drop the right entries. Non-.py targets (None from
@@ -570,9 +697,17 @@ class CollectBridge:
         memo = self.__dict__.setdefault("_memo", {})
         cached = memo.get(key)
         if cached is not None:
-            return cached
+            # V6 memoises the block so a second request in the run costs zero
+            # LLM calls; M4 still counts it, because "blocks per coder request"
+            # is the number M4 exists to measure and a build-only event would
+            # undercount it. Stats travel with the entry so the memo hit
+            # reports the same rows the build reported.
+            block, stats = _memo_block(cached)
+            self._note_block(target_file, block, stats,
+                             memo_hit=True, task_id=task_id)
+            return block
         try:
-            raw = build_collect_context_block(
+            raw, stats = build_collect_context_block_stats(
                 self._model, target_file, task_mode=self._task_mode,
                 budget=self._max_context_chars, pack_enabled=self._pack_enabled,
             )
@@ -580,20 +715,132 @@ class CollectBridge:
             logger.warning("CollectBridge.context_for(%s): failed: %s", target_file, exc)
             return ""
         if not raw:
+            # The model is fresh and usable, but has no record for this path —
+            # a file outside the artifact. Distinct from `absent` / `stale`:
+            # nothing is broken, there is simply nothing to say.
+            self._miss("unknown_module", target_file, task_id=task_id)
             return ""
         if len(raw) <= self._max_context_chars:
             result = raw
+            # V6: the budget was applied inside the assembler, so the block
+            # fits without `_shrink`. That is a shrink of its own and the one
+            # that happens on every over-budget file today — invisible before
+            # M4, because the assembler returns a bare `str`. Emitted only
+            # when the cut actually removed characters: rows with no data also
+            # leave `rows_cut > 0`, and a shrink from N chars to N chars would
+            # be a report that says nothing.
+            chars_uncapped = int(stats.get("chars_uncapped") or 0)
+            if chars_uncapped > len(raw):
+                self._note_shrink(
+                    target_file, "rows", chars_uncapped, len(raw),
+                    task_id=task_id,
+                )
         else:
+            # Observe `_shrink` from the outside: compare lengths and read the
+            # existing `shrink_calls` counter. `_shrink` is not modified.
+            calls_before = getattr(self, "shrink_calls", 0) or 0
             result = self._shrink(raw)
-        memo[key] = result
+            path = "llm" if (getattr(self, "shrink_calls", 0) or 0) > calls_before else "truncate"
+            self._note_shrink(target_file, path, len(raw), len(result),
+                              task_id=task_id)
+        memo[key] = (result, stats)
+        self._note_block(target_file, result, stats,
+                         memo_hit=False, task_id=task_id)
         return result
 
-    def context_for_many(self, target_files) -> str:
+    def context_for_many(self, target_files, *, task_id: Optional[str] = None) -> str:
         """Join `context_for` blocks for several files, each budgeted
         independently, separated by a blank line. Empty files/blocks are
         skipped; returns `""` if nothing survives."""
-        blocks = [b for b in (self.context_for(f) for f in target_files or []) if b]
+        blocks = [
+            b for b in (self.context_for(f, task_id=task_id)
+                        for f in target_files or []) if b
+        ]
         return "\n\n".join(blocks)
+
+    # ── M4: counting ─────────────────────────────────────────────────────
+
+    def _miss_if_unusable(self, target: str, task_id: Optional[str] = None) -> bool:
+        """M4: count a request the artifact could not serve at all.
+
+        Before M4 `absent` and `stale` returned `""` in silence — a run
+        against a missing or stale artifact injected nothing for every task
+        and emitted nothing, so "collect had nothing to say" was
+        indistinguishable from "collect was never wired in". Now both count
+        as `collect_miss`, and the reason tells them apart.
+
+        Returns `True` when the caller should return empty.
+        """
+        if self.usable:
+            return False
+        self._miss(
+            "stale" if self.status == "stale" else "absent",
+            target, task_id=task_id,
+        )
+        return True
+
+    def _note_block(
+        self,
+        target_file: str,
+        block: str,
+        stats: Optional[dict],
+        *,
+        memo_hit: bool,
+        task_id: Optional[str] = None,
+    ) -> None:
+        """One `collect_block` (M4): count it, trace it. Never raises."""
+        block = block or ""
+        stats = stats or {}
+        try:
+            count = self.__dict__.setdefault("collect_stats", {})
+            count["blocks"] = int(count.get("blocks", 0)) + 1
+            count["chars"] = int(count.get("chars", 0)) + len(block)
+            if memo_hit:
+                count["memo_hits"] = int(count.get("memo_hits", 0)) + 1
+        except Exception:  # noqa: BLE001 — a counter must never sink a run
+            pass
+        params = {
+            "target_file": target_file,
+            "chars": len(block),
+            "rows_kept": int(stats.get("rows_kept", 0) or 0),
+            "rows_cut": int(stats.get("rows_cut", 0) or 0),
+            "memo_hit": bool(memo_hit),
+        }
+        if task_id:
+            params["task_id"] = task_id
+        self._event("collect_block", params)
+
+    def _note_shrink(
+        self,
+        target_file: str,
+        path: str,
+        before: int,
+        after: int,
+        task_id: Optional[str] = None,
+    ) -> None:
+        """One `collect_shrink` (M4). `path` is `rows` | `llm` | `truncate`.
+
+        `rows` is the assembler's own budget cut — no LLM, and the only
+        shrink that fires on most over-budget files since V6. `llm` means
+        `_shrink`'s summarizer call succeeded; `truncate` means `_shrink`
+        fell back to the hard character cut. Never raises.
+        """
+        try:
+            count = self.__dict__.setdefault("collect_stats", {})
+            by_path = count.setdefault("shrink_by_path", {})
+            by_path[str(path)] = int(by_path.get(path, 0)) + 1
+        except Exception:  # noqa: BLE001 — a counter must never sink a run
+            pass
+        params = {
+            "target_file": target_file,
+            "path": str(path),
+            "before": int(before or 0),
+            "after": int(after or 0),
+        }
+        if task_id:
+            params["task_id"] = task_id
+        self._event("collect_shrink", params)
+
 
     def _shrink(self, raw: str) -> str:
         """Shrink `raw` to fit `_max_context_chars`. Tries the summarizer
