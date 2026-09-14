@@ -1,4 +1,4 @@
-# Epic round — 28 tickets, in order
+# Epic round — 30 tickets, in order
 
 One ticket per round. Every agent does the same ticket against the same
 tree; you merge the winner; the next round starts from the merged tree.
@@ -34,6 +34,8 @@ The loop and the scorecard: `docs/collect-epics/RUN-THE-EPIC-COMPETITION.md`.
 | 26 | `L5` | landed `9664530` | HIGH | S | [26-l5-test-map-scans-only-tests-the-import-graph-scans.md](26-l5-test-map-scans-only-tests-the-import-graph-scans.md) | `tools/collect/test_map.py` |
 | 27 | `L6` | landed `ced5940` | HIGH | S | [27-l6-the-budget-loop-lets-public-symbols-displace-the.md](27-l6-the-budget-loop-lets-public-symbols-displace-the.md) | `tools/auto/context_assembler.py` |
 | 28 | `V16` | landed `ac28672` | HIGH | S | [28-v16-pass-c-a-bare-name-in-a-source-summary-means-the-symbol-defined-here.md](28-v16-pass-c-a-bare-name-in-a-source-summary-means-the-symbol-defined-here.md) | `tools/collect/verifier.py` |
+| 29 | `RUN-1` | open | HIGH | S | [29-run1-extra-file-write-is-a-warning-when-every-target-file-landed.md](29-run1-extra-file-write-is-a-warning-when-every-target-file-landed.md) | `tools/auto/coder.py` |
+| 30 | `RUN-2` | open | MEDIUM | S | [30-run2-the-task-budget-must-not-tick-while-the-run-is-stopped.md](30-run2-the-task-budget-must-not-tick-while-the-run-is-stopped.md) | `tools/auto/outer_loop.py` |
 
 ## Working these
 
