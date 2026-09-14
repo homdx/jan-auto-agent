@@ -39,9 +39,9 @@ The loop and the scorecard: `docs/collect-epics/RUN-THE-EPIC-COMPETITION.md`.
 | 31 | `RUN-3` | open | HIGH | XS | [31-run3-exec-feedback-shows-the-head-of-pytest-output-the-cause-is-at-the-tail.md](31-run3-exec-feedback-shows-the-head-of-pytest-output-the-cause-is-at-the-tail.md) | `tools/auto/inner_loop.py` |
 | 32 | `RUN-4` | open | HIGH | S | [32-run4-the-coder-answers-a-cut-off-reply-with-the-same-budget-five-times.md](32-run4-the-coder-answers-a-cut-off-reply-with-the-same-budget-five-times.md) | `tools/auto/coder.py` |
 | 33 | `RUN-5` | open | HIGH | S | [33-run5-a-technical-failure-in-the-presence-check-is-not-a-rejection.md](33-run5-a-technical-failure-in-the-presence-check-is-not-a-rejection.md) | `tools/auto/gate1_filter.py` |
-| 34 | `RUN-6` | open | HIGH | S | [34-run6-a-stale-artifact-at-session-start-switches-the-pack-off-for-the-whole-session.md](34-run6-a-stale-artifact-at-session-start-switches-the-pack-off-for-the-whole-session.md) | `tools/auto/collect_bridge.py` |
+| 34 | `RUN-6` | landed (this commit) | HIGH | S | [34-run6-a-stale-artifact-at-session-start-switches-the-pack-off-for-the-whole-session.md](34-run6-a-stale-artifact-at-session-start-switches-the-pack-off-for-the-whole-session.md) | `tools/auto/collect_bridge.py` |
 
-## Next rounds — the order (as of `6ca675c`, 2026-09-14)
+## Next rounds — the order (as of `6ca675c`, 2026-09-14; step 1 landed (this commit))
 
 Set from the live runs on `../testtext` / `../testtext6`; the reasoning and
 the measurement after each step are in

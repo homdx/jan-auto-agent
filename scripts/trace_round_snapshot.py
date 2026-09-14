@@ -117,6 +117,10 @@ def read_run(base, run_id=None):
         "collect": {
             "blocks": 0, "chars": 0, "memo_hits": 0,
             "shrink": collections.Counter(), "miss": collections.Counter(),
+            # RUN-6: refresh-on-entry — runs, how many succeeded, modules
+            # re-summarised, seconds spent. Zero runs = the pack was fresh
+            # (or off) on every session start.
+            "refresh": {"runs": 0, "ok": 0, "modules": 0, "seconds": 0.0},
         },
         "collect_source": "grep",
         "collect_block_occurrences": 0,
@@ -202,6 +206,19 @@ def read_run(base, run_id=None):
                 out["collect"]["shrink"][str((r.get("params") or {}).get("path") or "?")] += 1
             elif kind == "collect_miss":
                 out["collect"]["miss"][str((r.get("params") or {}).get("reason") or "?")] += 1
+            elif kind == "collect_refresh":
+                p = r.get("params") or {}
+                rf = out["collect"]["refresh"]
+                rf["runs"] += 1
+                # agent_trace stringifies params: "False" is truthy.
+                if str(p.get("ok", "")).strip().lower() in ("true", "1", "yes"):
+                    rf["ok"] += 1
+                for key in ("modules", "seconds"):
+                    try:
+                        rf[key] += float(p.get(key) or 0)
+                    except (TypeError, ValueError):
+                        pass
+                rf["modules"] = int(rf["modules"])
             elif kind == "gate1_split":
                 out["gate1_split"] = dict(r.get("params") or {})
 

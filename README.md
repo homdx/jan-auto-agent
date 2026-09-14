@@ -553,11 +553,20 @@ dir             = .collect  # output dir (relative to project root)
 use_in_auto     = false     # wire artifact into /auto (Architect + Gate 1 grounding notes)
 use_in_doc      = false
 use_in_bughunt  = false
-staleness       = warn      # warn | refresh | ignore, on stale reads
+staleness       = warn      # warn | refresh | ignore, on stale reads (not needed with auto_refresh_between_tasks)
 llm_summaries   = true      # false = purely structural, no Pass B LLM prose
 max_context_chars_auto = 1200  # per-task budget for the collect block in a coder prompt
 pack_enabled    = true      # false = only contract / config_read / public_symbols rows (pre-V3 shape)
+auto_refresh_between_tasks = false  # true = repair the modules a task edits (V9) and refresh a stale artifact on entry (RUN-6)
 ```
+
+A stale artifact (its `git_sha` is behind HEAD, or a tracked file changed)
+is not used: `--auto` prints `collect: artifact stale (git_sha …, HEAD …) —
+pack OFF for this session` and every task runs with the standard context.
+Either `staleness = refresh` or `auto_refresh_between_tasks = true` turns
+that into `… — refreshing N module(s)` — the incremental pass, one Pass B
+call per changed module — and the run gets the pack; the trace records it
+as one `collect_refresh` event (`modules`, `seconds`, `ok`).
 
 ### Reading the architect-probe line (AUTO-P / AUTO-P4a)
 

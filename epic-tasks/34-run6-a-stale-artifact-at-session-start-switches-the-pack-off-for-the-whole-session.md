@@ -1,6 +1,6 @@
 # RUN-6 — A stale artifact at session start switches the pack off for the whole session
 
-**Status:** open  
+**Status:** landed — ideal patch from the round-34 competition (base: Sensenova 6-8 var2 — real mini-repo tests, stdout in both branches; 6-8 var1's provenance lookup via `resolve_collect_dir`; module-level helpers as in 6-7. Reviewer: the stdout count is the *changed* modules (Pass A + hash run once and handed to `action_refresh(modules=, hashes=)`, so it costs no extra scan), SHAs cut to 7 chars, `collect_refresh` counted by `scripts/trace_round_snapshot.py`, `staleness = refresh` interplay and "second bridge does not refresh again" pinned by tests)  
 **Severity:** HIGH  
 **File:** `tools/auto/collect_bridge.py`  
 **Symbol:** `make_collect_bridge` (≈ 1168–1195, the `status == "stale"` branch) and `CollectBridge.usable` (≈ 240–275)  
@@ -65,17 +65,17 @@ warning does not name it, and nothing in `--auto`'s startup output says
 
 ## Acceptance
 
-- [ ] `tests/`: loader stub returns `stale`, config `auto_refresh_between_tasks = true`
+- [x] `tests/`: loader stub returns `stale`, config `auto_refresh_between_tasks = true`
       → `action_refresh` called once with the tree root, bridge `usable`
       after reload.
-- [ ] Same with `auto_refresh_between_tasks = false` → no refresh, `usable`
+- [x] Same with `auto_refresh_between_tasks = false` → no refresh, `usable`
       False, warning text names `staleness = refresh` (today's path).
-- [ ] `action_refresh` raises → one WARNING, bridge falls back to stale,
+- [x] `action_refresh` raises → one WARNING, bridge falls back to stale,
       no exception reaches `--auto`.
-- [ ] `collect_refresh` event present in the trace with `modules` and `ok`.
-- [ ] Existing `tests_bugfix/test_collect_bridge_stale_after_task_commit.py`
+- [x] `collect_refresh` event present in the trace with `modules` and `ok`.
+- [x] Existing `tests_bugfix/test_collect_bridge_stale_after_task_commit.py`
       unchanged and green.
-- [ ] `python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180` green (run sequentially).
+- [x] `python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180` green (run sequentially).
 
 ## Out of scope
 

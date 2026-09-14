@@ -29,8 +29,14 @@ Three responsibilities, all opt-in via `[collect] use_in_auto` /
    file/function, unchanged from pre-COLLECT-24 behaviour. `staleness`
    in `agents.ini` still controls whether `tools.collect.loader.load()`
    itself rebuilds (`refresh`), warns (`warn`), or treats stale as absent
-   (`ignore`) — this module never triggers a rebuild on its own; it only
-   decides whether to USE whatever `load()` handed back.
+   (`ignore`). RUN-6 adds one exception to "this module never triggers a
+   rebuild on its own": with `[collect] auto_refresh_between_tasks = true`
+   a `"stale"` model on entry is refreshed in place (`_refresh_on_entry`,
+   the same incremental `action_refresh` the `refresh` policy runs) and
+   the bridge is built over the reloaded fresh model — a resumed run is
+   stale by construction, and the operator who turned V9 on has already
+   said the pack is worth keeping fresh. Fail-open: a refresh that raises
+   leaves the stale model, `usable` False, one WARNING, one stdout line.
 
 4. **V9: freshness within a run.** Item 3 only covers the artifact's
    status at load time. It says nothing about the middle of a run:
@@ -165,6 +171,116 @@ def _memo_block(entry) -> "tuple[str, dict]":
     return (entry if isinstance(entry, str) else ""), {}
 
 
+
+def _trace_event(kind: str, params: dict) -> None:
+    """One collect trace event. Lazy import, never raises.
+
+    Keeps the tracing stack out of this module's import graph — importing
+    `collect_bridge` never pays for the tracing stack — and makes sure a
+    broken sink can never change what a caller gets back. Module-level so
+    `make_collect_bridge` can trace before a bridge exists (RUN-6).
+    """
+    try:
+        from tools.agent_trace import tracer
+
+        tracer.event(
+            source="collect_bridge", target="auto_run",
+            kind=kind, params=params,
+        )
+    except Exception:  # noqa: BLE001 — tracing must never sink a run
+        pass
+
+
+def _stale_provenance(base_dir, config) -> "tuple[str, str]":
+    """`(artifact_sha, head_sha)` for the RUN-6 stdout line — the commit
+    the artifact was built at and the commit the tree is at now, 7 chars
+    each, `"?"` when unknown. Never raises: this only decorates a message.
+    """
+    artifact_sha, head_sha = "?", "?"
+    try:
+        from tools.collect import cli as cli_mod
+        from tools.collect import manifest as manifest_mod
+
+        root = Path(base_dir)
+        manifest_path = cli_mod.resolve_collect_dir(root, config) / cli_mod.MANIFEST_FILENAME
+        if manifest_path.exists():
+            artifact_sha = (manifest_mod.read_manifest(manifest_path).git_sha or "?")[:7]
+        head_sha = (manifest_mod.get_git_sha(root) or "?")[:7]
+    except Exception:  # noqa: BLE001
+        pass
+    return artifact_sha, head_sha
+
+
+def _refresh_on_entry(base_dir, config, config_path, load_fn):
+    """RUN-6: the incremental refresh `staleness = refresh` would have run
+    inside `load()`, run here instead because `[collect]
+    auto_refresh_between_tasks = true` says the operator wants the pack kept
+    fresh — and a resumed run is stale by construction (the previous
+    session's own commits moved HEAD). Returns the reloaded model when it
+    came back `"fresh"`, else `None`; never raises.
+
+    Pass A and the hash pass run once here and are handed to
+    `action_refresh` (`modules=`/`hashes=`, the `action_collect` path), so
+    the count on the stdout line — how many modules Pass B is about to
+    re-summarise, i.e. the bill — costs no extra scan. If that pre-flight
+    fails the refresh still runs, just without the count.
+    """
+    import time
+
+    from tools.collect import cli as cli_mod
+
+    root = Path(base_dir)
+    artifact_sha, head_sha = _stale_provenance(root, config)
+    modules = hashes = None
+    changed = None
+    try:
+        from tools.collect import manifest as manifest_mod
+        from tools.collect.scanner import scan_repo
+
+        modules = scan_repo(root, config=config)
+        hashes = manifest_mod.hash_tree(root, [m.path for m in modules])
+        previous = manifest_mod.read_manifest(
+            cli_mod.resolve_collect_dir(root, config) / cli_mod.MANIFEST_FILENAME)
+        changed = len(manifest_mod.diff_files(previous.file_hashes, hashes).changed)
+    except Exception:  # noqa: BLE001 — the count is a courtesy, the refresh is the point
+        modules = hashes = None
+    print(
+        f"collect: artifact stale (git_sha {artifact_sha}, HEAD {head_sha}) "
+        f"— refreshing {'?' if changed is None else changed} module(s)",
+        flush=True,
+    )
+
+    t0 = time.monotonic()
+    ok, model = False, None
+    try:
+        cli_mod.action_refresh(
+            root, config=config, config_path=config_path, modules=modules, hashes=hashes,
+        )
+        reloaded = load_fn(base_dir, config=config, config_path=config_path)
+        ok = getattr(reloaded, "status", "absent") == "fresh"
+        if ok:
+            model = reloaded
+        else:
+            logger.warning(
+                "make_collect_bridge: refresh on entry ran but the artifact reloaded as %r "
+                "— pack OFF for this session",
+                getattr(reloaded, "status", "absent"),
+            )
+    except Exception as exc:  # noqa: BLE001 — fail open, never block a run on the pack
+        logger.warning(
+            "make_collect_bridge: refresh on entry failed (%s: %s) — "
+            "pack OFF for this session (set [collect] staleness = refresh)",
+            type(exc).__name__, exc,
+        )
+    seconds = round(time.monotonic() - t0, 2)
+    _trace_event("collect_refresh", {"modules": changed, "seconds": seconds, "ok": ok})
+    if not ok:
+        print(
+            "collect: refresh failed — pack OFF for this session "
+            "(set [collect] staleness = refresh)",
+            flush=True,
+        )
+    return model
 
 class CollectBridge:
     """Consumer-facing wrapper around a loaded `CollectModel` for `--auto`.
@@ -382,15 +498,7 @@ class CollectBridge:
         `collect_bridge` never pays for the tracing stack — and makes sure a
         broken sink can never change what a caller of `context_for` gets back.
         """
-        try:
-            from tools.agent_trace import tracer
-
-            tracer.event(
-                source="collect_bridge", target="auto_run",
-                kind=kind, params=params,
-            )
-        except Exception:  # noqa: BLE001 — tracing must never sink a run
-            pass
+        _trace_event(kind, params)
 
 
     def _normalize_path(self, path) -> Optional[str]:
@@ -1178,18 +1286,53 @@ def make_collect_bridge(
         logger.warning("make_collect_bridge: load() failed: %s", exc)
         return None
 
+    # V9: `[collect] auto_refresh_between_tasks` (default false). When true,
+    # a path a task edits is repaired via the existing incremental
+    # `action_module` (one module, one LLM call) instead of being blinded
+    # for the rest of the run. RUN-6: the same flag also repairs an artifact
+    # that is already stale on entry (below) — read here, before the stale
+    # check, for that reason. A malformed value degrades to the default,
+    # like every other `[collect]` read in this function.
+    try:
+        auto_refresh = config.getboolean("collect", "auto_refresh_between_tasks", fallback=False)
+    except ValueError as exc:
+        logger.warning(
+            "config [collect] auto_refresh_between_tasks is malformed (%s) — using default False",
+            exc,
+        )
+        auto_refresh = False
+
     if getattr(model, "status", "absent") == "stale":
         # staleness=warn (default): loader already decided not to refresh.
-        # Per product decision this is treated as a plain fallback to
-        # standard --auto for the affected files — log once here so the
-        # operator can see it happened, then let `.usable` gate every
-        # subsequent call to False.
-        logger.warning(
-            "make_collect_bridge: collect artifact is stale (%s) — "
-            "falling back to standard --auto context for this run "
-            "(run --collect / --refresh to update it)",
-            getattr(model, "reason", ""),
-        )
+        refreshed = _refresh_on_entry(base_dir, config, config_path, load_collect_model) \
+            if auto_refresh else None
+        if refreshed is not None:
+            # RUN-6: the operator already pays for per-path repairs (V9); a
+            # whole-artifact repair on entry is the same operation over the
+            # set of paths that moved. The bridge below is built over a
+            # fresh model, so the pack is on for the whole session.
+            model = refreshed
+        else:
+            # Per product decision this is a plain fallback to standard
+            # --auto for the affected files — say so once in the log and
+            # once on stdout (a run.log WARNING is not where an operator
+            # looks during a run), then let `.usable` gate every call to
+            # False. With auto_refresh on, `_refresh_on_entry` has already
+            # printed and traced why the refresh did not stick.
+            logger.warning(
+                "make_collect_bridge: collect artifact is stale (%s) — "
+                "falling back to standard --auto context for this run "
+                "(set [collect] staleness = refresh, or auto_refresh_between_tasks = true, "
+                "to refresh it on entry)",
+                getattr(model, "reason", ""),
+            )
+            if not auto_refresh:
+                artifact_sha, head_sha = _stale_provenance(base_dir, config)
+                print(
+                    f"collect: artifact stale (git_sha {artifact_sha}, HEAD {head_sha}) "
+                    "— pack OFF for this session (set [collect] staleness = refresh)",
+                    flush=True,
+                )
 
     try:
         max_chars = config.getint(
@@ -1216,20 +1359,6 @@ def make_collect_bridge(
         pack_enabled = True
 
     summarizer_call = None
-    # V9: `[collect] auto_refresh_between_tasks` (default false). When true,
-    # a path a task edits is repaired via the existing incremental
-    # `action_module` (one module, one LLM call) instead of being blinded
-    # for the rest of the run. A malformed value degrades to the default,
-    # like every other `[collect]` read in this function.
-    try:
-        auto_refresh = config.getboolean("collect", "auto_refresh_between_tasks", fallback=False)
-    except ValueError as exc:
-        logger.warning(
-            "config [collect] auto_refresh_between_tasks is malformed (%s) — using default False",
-            exc,
-        )
-        auto_refresh = False
-
     # BUGFIX (audit): unguarded — the two reads above already catch
     # ValueError; this one didn't, contradicting this function's own
     # "opt-in, never fatal / fail-open" contract (a malformed value raised
