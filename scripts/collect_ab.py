@@ -59,6 +59,12 @@ bug):
                                     the pack rows (callers / calls_into /
                                     tests / neighbours) inside them; arm A
                                     must show 0 pack rows, arm B > 0
+    collect misses / shrinks        M4's collect_miss / collect_shrink events;
+                                    misses must be equal (same artifact,
+                                    same plan). An arm that reached the coder
+                                    with no collect_* event at all fails
+                                    the verdict — a pre-M4 trace is not a
+                                    measurement.
     LLM calls, whole run            every llm_request
 
 Pass condition, stated up front and deliberately weak: **probe misses and
@@ -134,9 +140,11 @@ def replay_key(system: str, user: str) -> str:
 def count_collect_blocks(content: str) -> Tuple[int, int]:
     """``(blocks, pack_rows)`` in one coder prompt.
 
-    The one place block detection lives. Today it greps the header; when M4's
-    ``collect_block`` event lands, ``counters_from_events`` prefers the event
-    and this stays as the fallback for traces written before it.
+    The one place prompt-side block detection lives. Since M4 (``13416fb``)
+    the block *count* comes from the ``collect_block`` event —
+    ``counters_from_events`` prefers it — and this grep is kept for two
+    reasons: the pack-row count (the event's ``rows_kept`` includes the V2
+    rows, so it is not the A=0 / B>0 number) and traces written before M4.
     """
     if not content:
         return 0, 0
@@ -596,6 +604,8 @@ ROWS: Tuple[Tuple[str, str, str], ...] = (
     ("prompt_chars_per_coder_call", "prompt chars per coder call", "up-little"),
     ("collect_blocks",            "collect blocks",              ""),
     ("collect_pack_rows",         "  pack rows in them",         "A=0,B>0"),
+    ("collect_misses",            "collect misses (M4)",         "equal"),
+    ("collect_shrinks",           "collect shrinks (M4)",        ""),
     ("coder_calls",               "coder calls",                 ""),
     ("llm_calls",                 "LLM calls, whole run",        ""),
 )
@@ -671,7 +681,7 @@ def counters_from_events(events: Iterable[dict]) -> Dict[str, Any]:
     c: Dict[str, Any] = {k: 0 for k, _, _ in ROWS}
     raw = {"gate2_attempts": 0, "tasks_executed": 0, "prompt_chars": 0,
            "blocks_from_events": 0, "has_block_events": False,
-           "gate1_rejected_duplicate": 0}
+           "has_m4_events": False, "gate1_rejected_duplicate": 0}
     for ev in events:
         kind = ev.get("kind") or ""
         src = ev.get("source") or ""
@@ -693,7 +703,16 @@ def counters_from_events(events: Iterable[dict]) -> Dict[str, Any]:
             # stays a grep of the prompt itself, which is where the A=0 / B>0
             # check needs it anyway.
             raw["has_block_events"] = True
+            raw["has_m4_events"] = True
             raw["blocks_from_events"] += 1
+        elif kind == "collect_miss":  # M4: absent / stale / dirty / unknown_module
+            raw["has_m4_events"] = True
+            c["collect_misses"] += 1
+        elif kind == "collect_shrink":  # M4: rows / llm / truncate, seen from outside _shrink
+            raw["has_m4_events"] = True
+            c["collect_shrinks"] += 1
+        elif kind == "collect_summary":  # M4: once per run — presence only, the tally is above
+            raw["has_m4_events"] = True
         elif kind == "llm_response":
             if _context_signals(content):
                 c["context_re_requests"] += 1
@@ -739,6 +758,7 @@ def counters_from_events(events: Iterable[dict]) -> Dict[str, Any]:
     c["prompt_chars_per_coder_call"] = round(raw["prompt_chars"] / c["coder_calls"], 1) if c["coder_calls"] else 0
     c["gate1_rejected_duplicate"] = raw["gate1_rejected_duplicate"]
     c["collect_source"] = "events" if raw["has_block_events"] else "header"
+    c["m4_events"] = raw["has_m4_events"]
     return c
 
 
@@ -761,6 +781,16 @@ def diff_arms(off: Dict[str, Any], on: Dict[str, Any], *, budget: int) -> Dict[s
                        "(a --dry-run, a plan with no .py task, or a stub that refused)")
     else:
         verdict = "pass"
+        # M5 acceptance: "uses M4's events; fails loudly if a trace has none".
+        # Both arms run the same code, so an arm that reached the coder yet
+        # wrote no collect_* event at all is a trace from before M4 or a bridge
+        # that never ran — its block row is a header grep, not a measurement.
+        for name, arm in (("A", off), ("B", on)):
+            if not arm.get("m4_events", False):
+                verdict = "fail"
+                reasons.append(f"arm {name} has coder calls but no M4 collect_* event — "
+                               "trace predates M4 (13416fb) or the collect bridge never ran; "
+                               "its block count is a header grep")
         if d["probe_misses"] > 0:
             verdict = "fail"
             reasons.append(f"probe misses rose by {d['probe_misses']}")
@@ -781,6 +811,10 @@ def diff_arms(off: Dict[str, Any], on: Dict[str, Any], *, budget: int) -> Dict[s
     sanity = [k for k in ("gate1_rejected_existence", "gate1_rejected_presence") if d[k] != 0]
     for k in sanity:
         reasons.append(f"{k} differs between arms — the plan was not seeded identically")
+    if d["collect_misses"] != 0:  # same artifact, same seeded plan → same misses
+        sanity.append("collect_misses")
+        reasons.append("collect_misses differs between arms — the arms did not see the same "
+                       ".collect artifact (or the same plan)")
     return {"off": off, "on": on, "delta": d, "budget": int(budget),
             "verdict": "fail" if sanity and verdict != "no_data" else verdict,
             "reasons": reasons}

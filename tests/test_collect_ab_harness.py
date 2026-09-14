@@ -262,7 +262,7 @@ def test_counters_read_every_trace_of_the_tree(tmp_path):
     assert c["gate2_attempts"] == 2 and c["gate2_attempts_per_task"] == 1.0
     assert c["coder_rounds_per_task"] == 1.5
     assert c["collect_blocks"] == 2 and c["collect_pack_rows"] == 3
-    assert c["collect_source"] == "header"
+    assert c["collect_source"] == "header" and c["m4_events"] is False
     expected = (len(_BLOCK_OFF + _PROMPT_TAIL) + len(_BLOCK_ON + _PROMPT_TAIL) + len(_PROMPT_TAIL)) / 3
     assert c["prompt_chars_per_coder_call"] == round(expected, 1)
 
@@ -277,11 +277,15 @@ def test_m4_collect_block_events_win_over_the_header_grep():
         _ev("llm_request", "coder", "llm", _BLOCK_ON + _PROMPT_TAIL),
         _ev("collect_block", "collect_bridge", "auto_run",
             rows_kept="5", rows_cut="2", chars="300", memo_hit="False"),
+        _ev("collect_miss", "collect_bridge", "auto_run", reason="unknown_module", target_file="z.py"),
+        _ev("collect_shrink", "collect_bridge", "auto_run", path="rows", before="900", after="300"),
+        _ev("collect_summary", "collect_bridge", "auto_run", blocks="1"),
     ]
     c = ab.counters_from_events(events)
     _, rows_in_one_prompt = ab.count_collect_blocks(_BLOCK_ON + _PROMPT_TAIL)
     assert (c["collect_blocks"], c["collect_pack_rows"], c["collect_source"]) == (
         1, 2 * rows_in_one_prompt, "events")
+    assert c["collect_misses"] == 1 and c["collect_shrinks"] == 1 and c["m4_events"] is True
 
 
 def test_missing_tree_is_all_zero_and_not_an_error(tmp_path):
@@ -294,7 +298,7 @@ def test_missing_tree_is_all_zero_and_not_an_error(tmp_path):
 def _arm(**over):
     base = {k: 0 for k, _, _ in ab.ROWS}
     base.update(coder_calls=10, collect_blocks=10, prompt_chars_per_coder_call=5000.0,
-                gate2_attempts_per_task=1.0)
+                gate2_attempts_per_task=1.0, m4_events=True)
     base.update(over)
     return base
 
@@ -325,6 +329,21 @@ def test_verdict_fails_on_each_condition(on_over, needle):
 def test_verdict_fails_when_arm_a_shows_pack_rows():
     d = ab.diff_arms(_arm(collect_pack_rows=3), _arm(collect_pack_rows=30), budget=1200)
     assert d["verdict"] == "fail" and any("pack_enabled=false did not take" in r for r in d["reasons"])
+
+
+def test_verdict_fails_loudly_when_an_arm_has_no_m4_events():
+    # M5 acceptance: both arms run post-M4 code, so a coder-reaching arm with
+    # no collect_* event is a stale trace, not a measurement.
+    d = ab.diff_arms(_arm(collect_pack_rows=0, m4_events=False), _arm(collect_pack_rows=30), budget=1200)
+    assert d["verdict"] == "fail"
+    assert any("arm A has coder calls but no M4 collect_* event" in r for r in d["reasons"])
+
+
+def test_collect_misses_must_be_equal_between_arms():
+    d = ab.diff_arms(_arm(collect_pack_rows=0, collect_misses=2),
+                     _arm(collect_pack_rows=30, collect_misses=3), budget=1200)
+    assert d["verdict"] == "fail"
+    assert any("collect_misses differs" in r for r in d["reasons"])
 
 
 def test_verdict_no_data_when_the_coder_was_never_reached():
@@ -426,11 +445,13 @@ def test_report_command_diffs_two_trees_and_writes_json(tmp_path, capsys):
     _write_trace(off / ".agent" / "trace_run.jsonl", [
         _ev("call", "controller", "outer_loop", task_id="AUTO-T1"),
         _ev("llm_request", "coder", "llm", _BLOCK_OFF + _PROMPT_TAIL),
+        _ev("collect_block", "collect_bridge", "auto_run", rows_kept="3", rows_cut="0", memo_hit="False"),
         _ev("decision", "overall", "inner_loop", "APPROVED", stage="overall"),
     ])
     _write_trace(on / ".agent" / "trace_run.jsonl", [
         _ev("call", "controller", "outer_loop", task_id="AUTO-T1"),
         _ev("llm_request", "coder", "llm", _BLOCK_ON + _PROMPT_TAIL),
+        _ev("collect_block", "collect_bridge", "auto_run", rows_kept="6", rows_cut="0", memo_hit="False"),
         _ev("decision", "overall", "inner_loop", "APPROVED", stage="overall"),
     ])
     out = tmp_path / "ab.json"
@@ -442,6 +463,7 @@ def test_report_command_diffs_two_trees_and_writes_json(tmp_path, capsys):
     assert payload["mode"] == "report" and payload["verdict"] == "pass"
     assert payload["off"]["gate1_rejected_existence"] == payload["on"]["gate1_rejected_existence"] == 1
     assert payload["delta"]["collect_pack_rows"] == 3
+    assert payload["off"]["collect_source"] == payload["on"]["collect_source"] == "events"
 
 
 def test_main_refuses_a_live_stub_url_with_exit_3(tmp_path, capsys):

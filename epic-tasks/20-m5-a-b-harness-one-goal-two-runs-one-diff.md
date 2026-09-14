@@ -1,6 +1,6 @@
 # M5 — A/B harness: one goal, two runs, one diff
 
-**Status:** open (verified against `84a24b2`, 2026-09-13 — V6 landed, `pack_enabled` exists)  
+**Status:** landed (`b33cb1f`, round reviewed 2026-09-14; corrected after M4 `13416fb` landed behind it — the harness now counts `collect_block` / `collect_miss` / `collect_shrink` events, requires `collect_misses` equal between arms, and fails loudly when a coder-reaching arm has no M4 event at all; pack rows stay a prompt grep because `rows_kept` includes the V2 rows)  
 **Severity:** HIGH  
 **File:** `scripts/collect_ab.sh`  
 **Symbol:** `—`  
@@ -82,9 +82,9 @@ LLM calls, whole run            ___       ___
 
 ### Acceptance
 
-- [ ] Reproducible: two runs of A produce the same counters (replay stub, seeded plan).
-- [ ] Depends on M4: uses its events; fails loudly if a trace has none.
-- [ ] Never touches `agents_128k.ini` — copies to a scratch path and patches
+- [x] Reproducible: two runs of A produce the same counters (replay stub, seeded plan).
+- [x] Depends on M4: uses its events; fails loudly if a trace has none (post-`13416fb` correction).
+- [x] Never touches `agents_128k.ini` — copies to a scratch path and patches
       the copy. (Do not point a measurement run at a live provider config.)
 - [ ] Output committed alongside the baseline JSON.
 
