@@ -32,8 +32,9 @@ Three responsibilities, all opt-in via `[collect] use_in_auto` /
    (`ignore`). RUN-6 adds one exception to "this module never triggers a
    rebuild on its own": with `[collect] auto_refresh_between_tasks = true`
    a `"stale"` model on entry is refreshed in place (`_refresh_on_entry`,
-   the same incremental `action_refresh` the `refresh` policy runs) and
-   the bridge is built over the reloaded fresh model — a resumed run is
+   the same incremental `action_refresh` the `refresh` policy runs, with
+   the bridge's own Pass B summarizer so only the changed modules are
+   re-summarised) and the bridge is built over the reloaded fresh model — a resumed run is
    stale by construction, and the operator who turned V9 on has already
    said the pack is worth keeping fresh. Fail-open: a refresh that raises
    leaves the stale model, `usable` False, one WARNING, one stdout line.
@@ -211,13 +212,17 @@ def _stale_provenance(base_dir, config) -> "tuple[str, str]":
     return artifact_sha, head_sha
 
 
-def _refresh_on_entry(base_dir, config, config_path, load_fn):
+def _refresh_on_entry(base_dir, config, config_path, load_fn, *, llm_call=None):
     """RUN-6: the incremental refresh `staleness = refresh` would have run
     inside `load()`, run here instead because `[collect]
     auto_refresh_between_tasks = true` says the operator wants the pack kept
     fresh — and a resumed run is stale by construction (the previous
     session's own commits moved HEAD). Returns the reloaded model when it
     came back `"fresh"`, else `None`; never raises.
+
+    `llm_call` is the bridge's Pass B summarizer (the one a V9 per-path
+    repair uses): with it, only the changed modules are re-summarised;
+    `None` (`llm_summaries = false`) keeps the refresh structural-only.
 
     Pass A and the hash pass run once here and are handed to
     `action_refresh` (`modules=`/`hashes=`, the `action_collect` path), so
@@ -254,7 +259,8 @@ def _refresh_on_entry(base_dir, config, config_path, load_fn):
     ok, model = False, None
     try:
         cli_mod.action_refresh(
-            root, config=config, config_path=config_path, modules=modules, hashes=hashes,
+            root, config=config, config_path=config_path, llm_call=llm_call,
+            modules=modules, hashes=hashes,
         )
         reloaded = load_fn(base_dir, config=config, config_path=config_path)
         ok = getattr(reloaded, "status", "absent") == "fresh"
@@ -1302,10 +1308,34 @@ def make_collect_bridge(
         )
         auto_refresh = False
 
+    summarizer_call = None
+    # BUGFIX (audit): unguarded — the two reads above already catch
+    # ValueError; this one didn't, contradicting this function's own
+    # "opt-in, never fatal / fail-open" contract (a malformed value raised
+    # straight out instead of degrading to the documented default).
+    try:
+        _llm_summaries = config.getboolean("collect", "llm_summaries", fallback=True)
+    except ValueError as exc:
+        logger.warning(
+            "config [collect] llm_summaries is malformed (%s) — using default True", exc,
+        )
+        _llm_summaries = True
+    if _llm_summaries:
+        try:
+            from tools.collect.summarizer import make_summarizer_call
+            summarizer_call = make_summarizer_call(config, task_mode=task_mode)
+        except Exception as exc:  # noqa: BLE001 — shrink is a nice-to-have
+            logger.warning("make_collect_bridge: summarizer unavailable, will hard-truncate: %s", exc)
+            summarizer_call = None
+
     if getattr(model, "status", "absent") == "stale":
         # staleness=warn (default): loader already decided not to refresh.
-        refreshed = _refresh_on_entry(base_dir, config, config_path, load_collect_model) \
-            if auto_refresh else None
+        # The summarizer is built above, before this branch: the entry refresh
+        # is the V9 repair over every path that moved, so it takes the same
+        # Pass B call (`llm_summaries = true`) — or none, structural-only.
+        refreshed = _refresh_on_entry(
+            base_dir, config, config_path, load_collect_model, llm_call=summarizer_call,
+        ) if auto_refresh else None
         if refreshed is not None:
             # RUN-6: the operator already pays for per-path repairs (V9); a
             # whole-artifact repair on entry is the same operation over the
@@ -1357,26 +1387,6 @@ def make_collect_bridge(
             exc,
         )
         pack_enabled = True
-
-    summarizer_call = None
-    # BUGFIX (audit): unguarded — the two reads above already catch
-    # ValueError; this one didn't, contradicting this function's own
-    # "opt-in, never fatal / fail-open" contract (a malformed value raised
-    # straight out instead of degrading to the documented default).
-    try:
-        _llm_summaries = config.getboolean("collect", "llm_summaries", fallback=True)
-    except ValueError as exc:
-        logger.warning(
-            "config [collect] llm_summaries is malformed (%s) — using default True", exc,
-        )
-        _llm_summaries = True
-    if _llm_summaries:
-        try:
-            from tools.collect.summarizer import make_summarizer_call
-            summarizer_call = make_summarizer_call(config, task_mode=task_mode)
-        except Exception as exc:  # noqa: BLE001 — shrink is a nice-to-have
-            logger.warning("make_collect_bridge: summarizer unavailable, will hard-truncate: %s", exc)
-            summarizer_call = None
 
     return CollectBridge(
         model,

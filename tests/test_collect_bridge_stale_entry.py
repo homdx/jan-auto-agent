@@ -154,6 +154,31 @@ def test_second_bridge_in_the_same_run_does_not_refresh_again(mini_repo, monkeyp
     assert len(calls) == 1
 
 
+def test_entry_refresh_takes_the_bridge_pass_b_summarizer(mini_repo, monkeypatch):
+    """The entry refresh is the V9 repair over every path that moved, so it
+    re-summarises the changed modules with the same Pass B call a per-path
+    repair uses (Hy3's point) — and none at all under `llm_summaries = false`,
+    where the refresh stays structural-only."""
+    cli_mod.action_collect(mini_repo)
+    _make_stale(mini_repo)
+    calls = _count_refresh(monkeypatch)
+
+    def _pass_b(prompt: str, source: str) -> str:
+        return "summary"
+
+    monkeypatch.setattr("tools.collect.summarizer.make_summarizer_call", lambda config, task_mode="code": _pass_b)
+
+    config_path = _write_ini(mini_repo, auto_refresh_between_tasks="true", llm_summaries="true")
+    assert _bridge(mini_repo, config_path).usable is True
+    assert calls[-1][1]["llm_call"] is _pass_b
+
+    _make_stale(mini_repo)
+    (mini_repo / "pkg" / "b.py").write_text("def b():\n    return 3\n")
+    config_path = _write_ini(mini_repo, auto_refresh_between_tasks="true", llm_summaries="false")
+    assert _bridge(mini_repo, config_path).usable is True
+    assert calls[-1][1]["llm_call"] is None
+
+
 # ── 2. auto_refresh=false → today's behaviour, but said out loud ────────
 
 
