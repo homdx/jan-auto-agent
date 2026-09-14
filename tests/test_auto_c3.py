@@ -31,6 +31,7 @@ from tools.auto.inner_loop import (
 class FakeCoderResult:
     succeeded: bool = True
     files_written: list = field(default_factory=lambda: ["f.py"])
+    files_skipped: list = field(default_factory=list)
     error: str = ""
     raw_response: str = ""
 
@@ -139,6 +140,71 @@ class TestCoderFailure:
         r = loop.run_task(TASK, tmp_path)
         assert r.passed and r.attempts_used == 2
         assert any("bad json" in fb for fb in coder.calls[1])
+
+
+class TestSkippedExtraFiles:
+    """RUN-1: a target_files skip is protection, not a rejected attempt.
+
+    The model ships a test file alongside its code change, the guard drops
+    that file, and the attempt must still reach the executor — otherwise a
+    perfectly good implementation never gets validated and the model just
+    repeats the same extra file on every retry.
+    """
+
+    def test_skipped_extra_file_proceeds_to_executor(self, tmp_path):
+        coder = FakeCoder([
+            FakeCoderResult(succeeded=True, files_written=["f.py"],
+                            files_skipped=["tests/test_f.py"]),
+            FakeCoderResult(),
+        ])
+        ex = FakeExecutor([FakeExecResult(passed=False, exit_code=1,
+                                          traceback="boom")])
+        loop = InnerLoop(coder, ex, FakeValidator([(True, "")]))
+        r = loop.run_task(TASK, tmp_path)
+
+        assert r.passed and r.attempts_used == 2
+        assert ex.runs == 2  # the skip did not stop the pipeline
+
+    def test_skip_note_reaches_next_attempt_without_coder_failed(self, tmp_path):
+        coder = FakeCoder([
+            FakeCoderResult(succeeded=True, files_written=["f.py"],
+                            files_skipped=["tests/test_f.py"]),
+            FakeCoderResult(),
+        ])
+        ex = FakeExecutor([FakeExecResult(passed=False, exit_code=1,
+                                          traceback="boom")])
+        loop = InnerLoop(coder, ex, FakeValidator([(True, "")]))
+        loop.run_task(TASK, tmp_path)
+
+        fb = "\n".join(coder.calls[1])
+        assert "tests/test_f.py" in fb
+        assert "attempt 1: note:" in fb
+        assert "only the listed target files are editable in this task" in fb
+        assert "coder failed" not in fb
+
+    def test_skipped_extra_file_count_is_worded_correctly(self, tmp_path):
+        coder = FakeCoder([
+            FakeCoderResult(succeeded=True, files_written=["f.py"],
+                            files_skipped=["tests/test_f.py", "docs/x.md"]),
+            FakeCoderResult(),
+        ])
+        ex = FakeExecutor([FakeExecResult(passed=False, exit_code=1)])
+        loop = InnerLoop(coder, ex, FakeValidator([(True, "")]))
+        loop.run_task(TASK, tmp_path)
+
+        fb = "\n".join(coder.calls[1])
+        assert "2 files outside target_files were not written" in fb
+        assert "tests/test_f.py, docs/x.md" in fb
+
+    def test_no_skip_means_no_note(self, tmp_path):
+        coder = FakeCoder([FakeCoderResult(), FakeCoderResult()])
+        ex = FakeExecutor([FakeExecResult(passed=False, exit_code=1)])
+        loop = InnerLoop(coder, ex, FakeValidator([(True, "")]))
+        loop.run_task(TASK, tmp_path)
+
+        fb = "\n".join(coder.calls[1])
+        assert "note:" not in fb
+        assert "outside target_files" not in fb
 
 
 class TestExhaustion:

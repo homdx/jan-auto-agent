@@ -51,6 +51,7 @@ def _write(
     tmp_path: Path,
     parsed_files: list[dict],
     allowed: frozenset[str] | None = None,
+    skipped_out: list[str] | None = None,
 ) -> tuple[list[str], str]:
     """Call Coder._write_files with a minimal Coder instance."""
     # Coder.__init__ needs a real ConfigParser — build a minimal one.
@@ -71,7 +72,7 @@ def _write(
         verify_ssl = True,
     )
     return coder._write_files(parsed_files, base_dir=tmp_path, task_id="T1",
-                              allowed_paths=allowed)
+                              allowed_paths=allowed, skipped_out=skipped_out)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -382,19 +383,26 @@ class TestWriteFilesContentGuard:
         assert not (tmp_path / "evil.py.coder.bak").exists()
 
     def test_allowed_paths_guard_fires_before_content_guard(self, tmp_path: Path) -> None:
-        """Path not in allowed_paths is rejected by Guard 2, not Guard 3.
+        """Path not in allowed_paths is dropped by Guard 2, not Guard 3.
 
-        The error message should mention 'target_files', not content patterns,
-        confirming the guards run in the documented order.
+        The path is recorded in ``skipped_out`` and no content-pattern error
+        is raised, confirming the guards run in the documented order.
+
+        RUN-1: the skip no longer sets ``err`` — it is protection, not a
+        verdict. The file is still never created.
         """
         dangerous = "import shutil\nshutil.rmtree('/')\n"
+        skipped: list[str] = []
         _, err = _write(
             tmp_path,
             [{"path": "evil.py", "content": dangerous}],
             allowed=frozenset({"safe.py"}),       # evil.py not allowed
+            skipped_out=skipped,
         )
-        # Guard 2 fires first: error is about target_files, not content.
-        assert "target_files" in err or "not in" in err.lower()
+        # Guard 2 fires first: the path is a target_files skip, not a content hit
+        assert skipped == ["evil.py"]
+        assert err == ""
+        assert not (tmp_path / "evil.py").exists()
 
     def test_clean_file_written_successfully(self, tmp_path: Path) -> None:
         safe_code = "def add(a, b):\n    return a + b\n"

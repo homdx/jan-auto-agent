@@ -1,6 +1,6 @@
 # RUN-1 — An extra file outside `target_files` must not fail an attempt whose target files all landed
 
-**Status:** open  
+**Status:** landed — ideal patch from the round-29 competition (base: Sensenova-6-8 var2b/var3; skip-message helper, all-skipped error naming every path, plural feedback grammar and REJECTED-trace `skipped` from Sensenova-6-7 var1; uniform Guard 2 for deletes by the reviewer)  
 **Severity:** HIGH  
 **File:** `tools/auto/coder.py`  
 **Symbol:** `Coder._write_files`, `Coder.generate`, `CoderResult.succeeded`  
@@ -95,20 +95,20 @@ unrelated was touched, so there is nothing to reject.
 
 ## Acceptance
 
-- [ ] `tests/test_coder_safety_domain.py`: target file written + one extra
+- [x] `tests/test_coder_safety_domain.py`: target file written + one extra
       path → `CoderResult.succeeded is True`, `files_written == [target]`,
       `files_skipped == [extra]`, `error == ""`; the extra file does not
       exist on disk.
-- [ ] Same test file: *only* extra paths, no target → `succeeded is False`,
+- [x] Same test file: *only* extra paths, no target → `succeeded is False`,
       nothing on disk, error mentions `[SAFETY]` (unchanged behaviour).
-- [ ] Guard 1 (`../escape.py`) still fails the attempt (unchanged).
-- [ ] Inner-loop test: an attempt with a skipped extra file proceeds to the
+- [x] Guard 1 (`../escape.py`) still fails the attempt (unchanged).
+- [x] Inner-loop test: an attempt with a skipped extra file proceeds to the
       executor (`_trace_stage("executor", …)` is recorded for that attempt),
       and the feedback for the next attempt contains the skipped path and
       does not contain `coder failed`.
-- [ ] Nothing in the SAFETY guard's *blocking* semantics changes: the file
+- [x] Nothing in the SAFETY guard's *blocking* semantics changes: the file
       outside `target_files` is never written, not even partially.
-- [ ] `python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180` green (run sequentially).
+- [x] `python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180` green (run sequentially).
 
 ## Ground rules (same as every round)
 

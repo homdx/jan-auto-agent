@@ -18,6 +18,7 @@ Public surface consumed by the attempt loop (AUTO-C3)::
 
     result.succeeded       # True iff ≥1 file was written without error
     result.files_written   # list[str] of relative paths written to disk
+    result.files_skipped   # list[str] of extra paths dropped by the target_files guard
     result.error           # non-empty string on failure
 
 Output contract
@@ -224,6 +225,12 @@ class CoderResult:
     files_written:
         Relative paths of files that were successfully written to *base_dir*.
         Empty when the generation failed before writing.
+    files_skipped:
+        Relative paths the LLM asked for that were NOT written because they
+        fall outside the task's ``target_files`` (RUN-1 "Guard 2" skips).
+        These are protection skips, not failures: they never set ``error`` and
+        never affect :attr:`succeeded`, so an attempt whose target files all
+        landed still succeeds when the model added extra files.
     error:
         Human-readable error description; empty string on success.
     raw_response:
@@ -232,6 +239,7 @@ class CoderResult:
 
     task_id:       str = ""
     files_written: list[str] = field(default_factory=list)
+    files_skipped: list[str] = field(default_factory=list)
     error:         str = ""
     raw_response:  str = field(default="", repr=False)
     missing_context: list[str] = field(default_factory=list)
@@ -245,7 +253,9 @@ class CoderResult:
     def summary(self) -> str:
         """One-line status string for logging."""
         if self.succeeded:
-            return f"[{self.task_id}] CODER OK — wrote {self.files_written}"
+            skipped = (f" (skipped extra: {self.files_skipped})"
+                       if self.files_skipped else "")
+            return f"[{self.task_id}] CODER OK — wrote {self.files_written}{skipped}"
         return f"[{self.task_id}] CODER FAIL — {self.error or 'no files written'}"
 
 
@@ -278,6 +288,39 @@ def _is_truthy_delete(value) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"true", "yes", "1"}
     return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Guard-2 skip messages (RUN-1)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _guard2_skip_message(rel: str) -> str:
+    """The [SAFETY] text for one path outside the task's ``target_files``.
+
+    Kept in one place so the WARNING line in ``_write_files`` and the failure
+    message used when *nothing* was written stay word-for-word identical (the
+    latter is what the model reads back as feedback).
+    """
+    return (
+        f"[SAFETY] LLM tried to write {rel!r} which is not in "
+        f"target_files — skipped to protect unrelated files"
+    )
+
+
+def _guard2_all_skipped_error(skipped: list[str]) -> str:
+    """Error for an attempt where every returned path was outside target_files.
+
+    Guard 2 no longer records a skip as ``first_error`` (a skip is protection,
+    not a verdict). But when *nothing* was written there is no code for the
+    executor or validator to look at, so the attempt must still fail — with
+    the existing [SAFETY] wording, naming every dropped path, so the model
+    learns which of its files never landed instead of seeing a bare
+    "no files written".
+    """
+    if not skipped:
+        return ""
+    return "; ".join(_guard2_skip_message(p) for p in skipped[:5])
 
 
 class Coder(_llm_stream.LLMClientBase):
@@ -628,13 +671,25 @@ class Coder(_llm_stream.LLMClientBase):
         # ── Write files to disk ───────────────────────────────────────────────
         target_files = task.get("target_files") or []
         allowed = frozenset(target_files) if target_files else None
+        files_skipped: list[str] = []
         written, write_error = self._write_files(
-            parsed_files, base_dir, task_id, allowed_paths=allowed
+            parsed_files, base_dir, task_id, allowed_paths=allowed,
+            skipped_out=files_skipped,
         )
+        # RUN-1: nothing landed and no write error was recorded — every path
+        # the LLM returned sat outside target_files, so Guard 2 protected all
+        # of them. Nothing was touched on disk, but there is no code for the
+        # executor to validate either, so this is still a failure; keep the
+        # original [SAFETY] wording (naming every dropped path) as the reason
+        # the model can act on. A real error (path escape, blocked content,
+        # I/O) wins as-is.
+        if not written and not write_error and files_skipped:
+            write_error = _guard2_all_skipped_error(files_skipped)
         if write_error and not written:
             return CoderResult(
                 task_id=task_id, error=write_error, raw_response=cleaned,
                 missing_context=missing_ctx, context_satisfied=context_satisfied,
+                files_skipped=files_skipped,
             )
 
         result = CoderResult(
@@ -644,6 +699,7 @@ class Coder(_llm_stream.LLMClientBase):
             raw_response=cleaned,
             missing_context=missing_ctx,
             context_satisfied=context_satisfied,
+            files_skipped=files_skipped,
         )
         logger.info("coder.generate: %s", result.summary())
         return result
@@ -1863,6 +1919,7 @@ class Coder(_llm_stream.LLMClientBase):
         base_dir: Path,
         task_id: str,
         allowed_paths: "frozenset[str] | None" = None,
+        skipped_out: "list[str] | None" = None,
     ) -> tuple[list[str], str]:
         """Write parsed files to *base_dir*.
 
@@ -1883,13 +1940,21 @@ class Coder(_llm_stream.LLMClientBase):
             Normalised relative paths the task declared as ``target_files``.
             When not ``None``, any path outside this set is skipped with a
             warning so the LLM cannot silently touch unrelated files.
+        skipped_out:
+            Optional list that receives the relative paths dropped by the
+            ``target_files`` guard.  Pass ``None`` to keep the legacy
+            two-tuple-only behaviour (nothing is recorded).  RUN-1: these
+            skips are protection, not a verdict, so they never set
+            *first_error_message* — a skipped write and a skipped delete are
+            treated alike (neither touches the file).
 
         Returns
         -------
         (written_paths, first_error_message)
             *written_paths* contains every path successfully written even when
             a later file errors.  *first_error_message* is ``""`` when all
-            writes succeed.
+            writes succeed — and also when the only thing that happened was a
+            ``target_files`` skip (see *skipped_out*).
         """
         written: list[str] = []
         first_error = ""
@@ -1921,13 +1986,19 @@ class Coder(_llm_stream.LLMClientBase):
                 norm = _norm_target(rel)
                 allowed_norm = {_norm_target(p) for p in allowed_paths}
                 if norm not in allowed_norm:
-                    msg = (
-                        f"[SAFETY] LLM tried to write {rel!r} which is not in "
-                        f"target_files — skipped to protect unrelated files"
-                    )
+                    msg = _guard2_skip_message(rel)
                     logger.warning("coder._write_files [%s]: %s", task_id, msg)
-                    if not first_error:
-                        first_error = msg
+                    # RUN-1: a Guard-2 skip is protection, not a verdict. The
+                    # path outside target_files is never written (or deleted),
+                    # so nothing was harmed and an attempt whose target files
+                    # all landed must not be failed for it — record the skip
+                    # instead of poisoning first_error. (Observed live:
+                    # AUTO-T29 burned ~40 attempts because a test file the
+                    # model shipped alongside its code kept failing the whole
+                    # attempt.) generate() still fails the attempt when
+                    # NOTHING landed — see _guard2_all_skipped_error.
+                    if skipped_out is not None:
+                        skipped_out.append(rel)
                     continue
 
             # ── Delete branch (pullrun-sim): {"path": ..., "delete": true} ──

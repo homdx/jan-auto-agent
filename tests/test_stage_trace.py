@@ -136,6 +136,36 @@ def test_executor_rejected_is_traced(traced):
     assert ex_events[0]["params"]["exit_code"] == "1"  # tracer stringifies params
 
 
+class _SkippedExtraCoder:
+    """Coder that succeeds while Guard 2 dropped one extra file (RUN-1)."""
+
+    def generate(self, task, base_dir, prior_feedback=None, prefetched_context=""):
+        target = (task.get("target_files") or ["f.py"])[0]
+        (Path(base_dir) / target).write_text("x", encoding="utf-8")
+        return SimpleNamespace(
+            succeeded=True, files_written=[target],
+            files_skipped=["tests/test_f.py"],
+            missing_context=[], context_satisfied=True, error="",
+        )
+
+
+def test_coder_skipped_extra_files_is_traced_and_executor_runs(traced):
+    """RUN-1: a target_files skip is a warning, not a coder-stage rejection."""
+    loop = InnerLoop(_SkippedExtraCoder(), _FailingExecutor(), _OkValidator(), max_attempts=1)
+    result = loop.run_task(TASK_CODE, Path(tempfile.mkdtemp()))
+    assert result.passed is False
+    events = _read_events(traced)
+    coder_events = _decisions(events, "coder")
+    assert len(coder_events) == 1
+    assert coder_events[0]["content"] == "OK_WITH_SKIPS"
+    assert json.loads(coder_events[0]["params"]["written"]) == ["f.py"]
+    assert json.loads(coder_events[0]["params"]["skipped"]) == ["tests/test_f.py"]
+    # the attempt was not rejected at the coder stage: the executor ran
+    exec_events = _decisions(events, "executor")
+    assert len(exec_events) == 1
+    assert exec_events[0]["params"]["attempt"] == "1"
+
+
 def test_gate2_rejected_then_overall_approved_is_traced(traced):
     coder = _WritingCoder()
     loop = InnerLoop(coder, _OkExecutor(),

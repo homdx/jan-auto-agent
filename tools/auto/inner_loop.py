@@ -1474,15 +1474,41 @@ class InnerLoop:
                 logger.info("InnerLoop: attempt %d coder requested context %s — accumulated (%d total)",
                             attempt, coder_missing, len(resolved_context))
 
+            # RUN-1: paths outside target_files were dropped by the coder's
+            # allow-list guard. Collected before the success check so the
+            # REJECTED trace (nothing landed at all) can name them too.
+            files_skipped = list(getattr(coder_result, "files_skipped", []) or [])
+
             if not getattr(coder_result, "succeeded", True):
                 # Context is accumulated above even on coder failure: the next
                 # attempt benefits from symbols already resolved, regardless of
                 # whether the current attempt produced valid code.
                 fb = f"attempt {attempt}: coder failed — {getattr(coder_result, 'error', 'unknown error')}"
-                _trace_stage(task_id, attempt, "coder", "REJECTED")
+                _trace_stage(task_id, attempt, "coder", "REJECTED", skipped=files_skipped)
                 feedback.append(fb)
                 records.append(AttemptRecord(attempt, False, False, False, fb))
                 continue
+
+            # RUN-1: a `target_files` skip is protection, not a verdict — the
+            # attempt goes on to the executor, but the model must still learn
+            # that its extra files never hit disk, otherwise a test file it
+            # "wrote" will be missing when it reasons about the next round.
+            # The note must not read "coder failed": _write_round_feedback and
+            # the prompt-optimizer summariser key on that prefix to mean a
+            # rejected attempt. Traced through the existing coder stage (no new
+            # event kind) so trace_round_snapshot / the M5 harness can count it.
+            if files_skipped:
+                _trace_stage(task_id, attempt, "coder", "OK_WITH_SKIPS",
+                             written=list(getattr(coder_result, "files_written", []) or []),
+                             skipped=files_skipped)
+                _n = len(files_skipped)
+                feedback.append(
+                    f"attempt {attempt}: note: {_n} file"
+                    f"{'s' if _n != 1 else ''} outside target_files "
+                    f"{'were' if _n != 1 else 'was'} not written "
+                    f"({', '.join(str(p) for p in files_skipped)}) — "
+                    f"only the listed target files are editable in this task"
+                )
 
             # ── 2. Executor (objective half of Gate 2) ────────────────────────
             try:
