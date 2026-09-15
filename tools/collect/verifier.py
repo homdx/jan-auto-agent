@@ -812,15 +812,25 @@ def verify_claims(
 
         provisionally_kept.append(claim)
 
-    failed_sentences = {d.claim.text for d in dropped}
+    # First failure per sentence, so the swept-in siblings below can name the
+    # actual reason a sentence failed instead of always blaming citation —
+    # `contradiction_check` drops land here exactly as often as `citation_check`
+    # ones do, and BUGFIX above already established the two are not the same.
+    failed_sentence_source: Dict[str, DroppedClaim] = {}
+    for d in dropped:
+        failed_sentence_source.setdefault(d.claim.text, d)
     kept: List[Claim] = []
     for claim in provisionally_kept:
-        if claim.text in failed_sentences:
+        origin = failed_sentence_source.get(claim.text)
+        if origin is not None:
             dropped.append(
                 DroppedClaim(
                     claim=claim,
                     reason=REASON_SIBLING_CITATION_FAILED,
-                    detail="a different citation in the same sentence did not verify",
+                    detail=(
+                        f"a different citation in the same sentence failed "
+                        f"({origin.reason}): {origin.detail}"
+                    ),
                 )
             )
         else:
