@@ -35,7 +35,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import tools.llm_stream as llm_stream_mod
 from tools.auto.architect import CandidateTask, CitedLocation
-from tools.auto.gate1_filter import Gate1Filter
+from tools.auto.gate1_filter import UNKNOWN_PRESENCE_REASON, Gate1Filter
 
 
 @pytest.fixture(autouse=True)
@@ -180,14 +180,27 @@ class TestParallel:
         assert rejected == []
 
     def test_worker_exception_is_a_fail_closed_rejection_not_a_crash(self, repo):
+        """A worker that raises must not kill the pool, and its silence must
+        not be read as a verdict. RUN-5: the default keep policy keeps the
+        three candidates as unknown; the reject policy drops them and the
+        reason keeps the technical cause behind the "no verdict" label."""
         def boom(url, headers, payload, timeout, **kw):
             raise RuntimeError("provider exploded")
+
         with patch("tools.llm_stream.request_completion", side_effect=boom):
             accepted, rejected = _make_filter(presence_workers="3").filter(
                 [_candidate(i) for i in range(3)], repo)
+        assert len(accepted) == 3
+        assert rejected == []
+
+        with patch("tools.llm_stream.request_completion", side_effect=boom):
+            accepted, rejected = _make_filter(
+                presence_workers="3", presence_unknown="reject",
+            ).filter([_candidate(i) for i in range(3)], repo)
         assert accepted == []
         assert len(rejected) == 3
-        assert all("LLM call failed" in r.reason for r in rejected)
+        assert all(UNKNOWN_PRESENCE_REASON in r.reason
+                   and "LLM call failed" in r.reason for r in rejected)
 
     def test_learned_window_is_shared_and_bounded_under_workers(self, repo):
         prov = _Provider(delay=0.01, confirm=lambda n: True)

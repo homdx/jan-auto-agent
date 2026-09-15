@@ -86,6 +86,11 @@ so a task that needed 12 000 once is not re-climbed from 3 000 next round.
 ratio; the new `max_tokens=` param on coder decision events.
 
 ### Step 4 — `RUN-5` presence unknown ≠ rejected
+*Landed* — the commit after `24d9028`. Note for the measurement: under the
+default `keep` a kept-unknown task carries a *Gate 1 note: presence unknown …*
+line in its instruction, so a plan diff shows which tasks nobody verified;
+the snapshot's `unk` column comes from the `gate1_split` event, not from
+the per-reply `unparsed` count.
 *Why:* plan size stops depending on the provider's mood; M3/M6 become
 measurable.
 *Measure after:* snapshot column `unknown` (new) vs `unparsed`; plan size

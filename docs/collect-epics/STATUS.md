@@ -1,6 +1,6 @@
 # Status — where the collect epics stand, and what is being waited on
 
-**As of:** 2026-09-15, branch `tickets`, HEAD = `ade28e6` = RUN-4 (on top of `26b5d7f` = RUN-3; next round is RUN-5). The order of the
+**As of:** 2026-09-15, branch `tickets`, HEAD = the commit after `24d9028` = RUN-5 (on top of `ade28e6` = RUN-4; next round is L1). The order of the
 next rounds and the live-run evidence behind it: `NEXT-ROUNDS.md`.
 Sections 2–4 below describe the wait as it stood on `2f9005d`; the run has
 since happened (`after-r31-live.json`) and NEXT-ROUNDS.md §1 is its reading.
@@ -38,10 +38,12 @@ Ticket-by-ticket state is also stamped into every `epic-tasks/NN-*.md`
 | RUN-3 | `26b5d7f` | exec feedback reads a pytest run's tail (last `ERRORS`/`FAILURES` box, banners stripped, 1 500 chars); exit 5 says *no tests collected*; workspace pytest runs in-process (`-n 0`, `[executor] pytest_serial`) when the project's addopts ask for a pool |
 | RUN-4 | `ade28e6` | a reply cut off mid-JSON (or mid-sentence in creative mode) sends the next attempt of the same task at `max_tokens × 2`, up to `[coder] max_tokens_cap` (default 4×); prose/malformed JSON keep the budget; the parseable budget is learned per `Coder` instance; feedback says *output budget was raised to N*; `max_tokens`/`budget_raised` on the coder decision event, `cod esc` in the snapshot |
 
+| RUN-5 | after `24d9028` | a presence check the provider never answered (empty/unparseable reply, transport error after every retry) is `unknown`, not a rejection; `[gate1] presence_unknown = keep` (default) keeps the candidate with a *presence unknown — provider gave no verdict after N re-ask(s): …* note in its instruction, `reject` = the old drop; `UNKNOWN` at WARNING, `REJECTED` only for a model's no; `presence_unknown` M4 counter next to `presence_reask`, `unk` column in the snapshot |
+
 Not in the epic but on the branch since 2f9005d: GATE1-LEARN-1 `9dd644b`,
 GATE1-LEARN-2 `f11972b`, GATE1-PAR-1 `84a24b2`, user's `0eaa2cc`.
 
-### Open — 12 (11 epic + RUN-5)
+### Open — 11 (all epic; RUN-1…RUN-6 landed)
 
 **The order below is superseded by `NEXT-ROUNDS.md` §2** (RUN-6 → RUN-3 →
 RUN-4 → RUN-5 → L1 → M3 → …). Kept for the per-ticket premise checks

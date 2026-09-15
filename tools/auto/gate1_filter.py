@@ -380,6 +380,25 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         except ValueError as exc:
             logger.warning("config [%s] unparseable_max_retries is malformed (%s) — using default %d", sec, exc, self._UNPARSEABLE_MAX_RETRIES)
             self._unparseable_max_retries = self._UNPARSEABLE_MAX_RETRIES
+        # RUN-5: what to do with a presence check the provider never
+        # answered. Before this key there were only two outcomes — the
+        # ladder's exit was `return False, reason` whether the model had
+        # examined the code and disagreed or had returned nothing at all
+        # (empty reply, unparseable reply, transport error after every
+        # retry), and both were dropped from the plan exactly like a
+        # genuine rejection. Live runs: 35 % of gate-1 candidates in one
+        # run were in the second group and none of them had been examined.
+        # Default keep — silence is not a verdict; reject = the old
+        # behaviour, for operators who would rather have a small, certain
+        # plan than a large, partly unverified one.
+        try:
+            _unknown_policy = config.get(sec, "presence_unknown", fallback="keep").strip().lower()
+            if _unknown_policy not in ("keep", "reject"):
+                raise ValueError(f"expected keep|reject, got {_unknown_policy!r}")
+            self._presence_unknown_policy = _unknown_policy
+        except ValueError as exc:
+            logger.warning("config [%s] presence_unknown is malformed (%s) — using default keep", sec, exc)
+            self._presence_unknown_policy = "keep"
         # (max_tokens that yielded a parseable verdict, newest last), keyed
         # by presence model — a per-candidate presence_llm_profile can
         # switch models mid-run and their budgets are not comparable.
@@ -387,16 +406,23 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         # GATE1-PAR-1: the learned window is shared between presence
         # workers — one lock around its reads and appends.
         self._learn_lock = threading.Lock()
-        # M4: two counters the stage split needs and that no result record
+        # M4: counters the stage split needs and that no result record
         # carries. `presence_reask` counts a candidate whose first verdict
         # was unparseable and whose answer therefore came from the re-ask
         # ladder (GATE1-LEARN-2); `non_py_requests` counts presence calls
         # whose `cited_location.file` is not a `.py` — L1's number to drive
-        # to zero. Both are folded into the `counters` dict `filter()` fills
-        # via `split_gate1_results()`.
+        # to zero. RUN-5 adds `presence_unknown`: a candidate the presence
+        # ladder ended without any verdict from the model (empty reply,
+        # JSON decode failure, transport error after every retry). It is a
+        # counter rather than a column derivable from `all_results` for the
+        # same reason `presence_reask` is — a candidate that was kept as
+        # unknown and then dropped as a duplicate leaves only a `duplicate`
+        # record behind. All three are folded into the `counters` dict
+        # `filter()` fills via `split_gate1_results()`.
         # `_counter_lock`: presence_workers > 1 increments these from a
         # thread pool, so `x += 1` needs serialising.
         self.presence_reask: int = 0
+        self.presence_unknown: int = 0
         self.non_py_requests: int = 0
         self._counter_lock = threading.Lock()
         # GATE1-PAR-1: how many presence checks run at once. 1 (default)
@@ -694,10 +720,11 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         counters:
             M4. An optional dict filled with the per-stage split
             (`existence`, `presence_confirmed`, `presence_rejected`,
-            `presence_fail_closed`, `presence_reask`, `duplicate`, `non_py`,
-            plus `_uncounted`) before returning. `None` (the default, and what
-            every caller has always used) changes nothing — the return tuple is
-            byte-for-byte the same as before this parameter existed.
+            `presence_fail_closed`, `presence_unknown`, `presence_reask`,
+            `duplicate`, `non_py`, plus `_uncounted`) before returning.
+            `None` (the default, and what every caller has always used)
+            changes nothing — the return tuple is byte-for-byte the same as
+            before this parameter existed.
 
         Returns
         -------
@@ -754,12 +781,32 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             def _presence_one(i: int, c: CandidateTask, block: str) -> tuple[bool, str]:
                 print(f"  [{i}/{n_presence}] presence check: {c.title}")
                 module_docstring = self._module_docstring_for(c, base_dir)
-                ok, reason = self._check_presence(
+                ok, reason, verdict = self._check_presence(
                     c, block, module_docstring=module_docstring, base_dir=base_dir,
                 )
                 # Logged here, at completion, so that with presence_workers
                 # > 1 the verdict lines still appear as soon as each check
                 # finishes rather than after the whole batch.
+                if verdict == _PRESENCE_UNKNOWN:
+                    # RUN-5: the ladder ended with no verdict at all — the
+                    # provider returned nothing, or nothing parseable, or the
+                    # call never came back. WARNING, like any anomaly. Never
+                    # REJECTED: that word is reserved for a model that read
+                    # the code and disagreed, so a log grep for "REJECTED"
+                    # still counts exactly what the model rejected. What the
+                    # candidate does instead is [gate1] presence_unknown.
+                    logger.warning(
+                        "Gate1[presence] UNKNOWN %r — %s", c.title, reason,
+                    )
+                    if self._presence_unknown_policy == "reject":
+                        # Today's behaviour, for operators who would rather
+                        # have a small, certain plan.
+                        return False, reason
+                    logger.info(
+                        "Gate1[presence] KEPT (presence_unknown = keep) %r — %s",
+                        c.title, reason,
+                    )
+                    return True, reason
                 if ok:
                     # AUTO-LOG-1: symmetric with REJECTED below — a
                     # confirmation used to be entirely silent (no log line
@@ -770,18 +817,10 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                     logger.info(
                         "Gate1[presence] CONFIRMED %r — %s", c.title, reason,
                     )
-                elif _is_technical_failure(reason):
-                    # AUTO-LOG-1: only an actual call/parse failure (see
-                    # _is_technical_failure) is a WARNING — that's a real
-                    # anomaly (network hiccup, malformed response) worth
-                    # standing out from routine output. An LLM reading the
-                    # code and genuinely disagreeing with the claim is
-                    # Gate 1 working correctly, logged at INFO like its
-                    # CONFIRMED counterpart just above.
-                    logger.warning(
-                        "Gate1[presence] REJECTED %r — %s", c.title, reason,
-                    )
                 else:
+                    # A model that answered "rejected". `_finish_presence`
+                    # hands any technical failure to the UNKNOWN branch
+                    # above, so no failure can reach this line as a rejection.
                     logger.info(
                         "Gate1[presence] REJECTED %r — %s", c.title, reason,
                     )
@@ -817,15 +856,34 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                     continue
                 ok, reason = outcomes[i - 1]
                 if ok:
+                    if reason.startswith(UNKNOWN_PRESENCE_REASON):
+                        # RUN-5: the reason travels with the task. The plan
+                        # phase keeps only the CandidateTask (the FilterResult
+                        # stays here), so the one field that reaches plan.json
+                        # and the coder prompt is the instruction — a task the
+                        # model never verified says so where the coder reads
+                        # it, instead of looking like every confirmed one.
+                        c.instruction = _with_presence_unknown_note(c.instruction, reason)
                     presence_passed.append((c, reason))
                 else:
                     all_results.append(FilterResult(
                         candidate=c, accepted=False, stage="presence", reason=reason,
                     ))
 
+        # RUN-5: "confirmed" now covers candidates the presence stage let
+        # through, which under `presence_unknown = keep` includes ones the
+        # model never answered. Say how many those are on the same line, or
+        # the number above silently mixes verified and unverified tasks.
+        _unknown_kept = sum(
+            1 for _, r in presence_passed if r.startswith(UNKNOWN_PRESENCE_REASON)
+        )
         print(
             f"🔎 Gate 1 presence: "
             f"{len(presence_passed)}/{len(existence_passed)} candidate(s) confirmed"
+            + (
+                f" ({_unknown_kept} without a verdict — presence_unknown = keep)"
+                if _unknown_kept else ""
+            )
         )
 
         # ── Stage C: deduplication ────────────────────────────────────────────
@@ -924,6 +982,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                     split_gate1_results(
                         all_results,
                         reask=getattr(self, "presence_reask", 0),
+                        unknown=getattr(self, "presence_unknown", 0),
                         non_py=getattr(self, "non_py_requests", 0),
                     )
                 )
@@ -1280,6 +1339,42 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         except Exception:  # noqa: BLE001 — a counter must never sink a run
             pass
 
+    def _finish_presence(
+        self, confirmed: bool, reason: str, *, reasks: int = 0
+    ) -> tuple[bool, str, str]:
+        """RUN-5: turn ``confirmed`` + ``reason`` into the three-outcome form
+        ``(confirmed, reason, verdict)`` with
+        ``verdict ∈ {"confirmed", "rejected", "unknown"}``.
+
+        ``unknown`` is produced only when the ladder (or the outer call retry)
+        ended with ``_is_technical_failure(reason)`` true — the provider gave
+        no verdict at all, so there is nothing to count as an answer. A model
+        that answered ``rejected``, even with an empty ``reason`` field, is
+        still ``rejected``; so is a ``confirmed`` verdict the evidence check
+        (AUTO-H3) downgraded to rejection for wanting a fabricated quote.
+
+        On ``unknown`` the reason is rewritten to ``UNKNOWN_PRESENCE_REASON``
+        with the underlying technical cause and the number of re-asks behind
+        it, so the string that travels with the candidate says what happened
+        instead of looking like a verdict the model gave. The technical cause
+        is preserved verbatim after the prefix, and ``_is_technical_failure``
+        recognises the prefix, so plan_validator's AUTO-REMOVE-GUARD-1 still
+        treats the result as "no verdict" rather than "already fixed".
+
+        Increments the M4 ``presence_unknown`` counter; ``_count`` never
+        raises, so a broken counter cannot sink a run.
+        """
+        if confirmed:
+            return True, reason, _PRESENCE_CONFIRMED
+        if not _is_technical_failure(reason):
+            return False, reason, _PRESENCE_REJECTED
+        self._count("presence_unknown")
+        return (
+            False,
+            f"{UNKNOWN_PRESENCE_REASON} after {reasks} re-ask(s): {reason}",
+            _PRESENCE_UNKNOWN,
+        )
+
     def _check_presence(
         self,
         candidate: CandidateTask,
@@ -1288,7 +1383,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         module_docstring: str = "",
         base_dir: "Path | None" = None,
         _sleep_fn=None,
-    ) -> tuple[bool, str]:
+    ) -> tuple[bool, str, str]:
         """Call the LLM to confirm the claimed problem is present.
 
         Parameters
@@ -1307,13 +1402,18 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             that doesn't actually block — see AUTO-RETRY-BACKOFF-1 below.
             ``None`` (the default) uses the real ``time.sleep``.
 
-        Returns (confirmed: bool, reason: str).
-        Fail-closed: any error → (False, reason), after
+        Returns ``(confirmed: bool, reason: str, verdict: str)`` where
+        ``verdict ∈ {"confirmed", "rejected", "unknown"}`` (RUN-5).
+
+        Fail-closed: any error → ``(False, reason, verdict)`` after
         ``self._llm_call_retry_max`` retries of the LLM call itself (see
         AUTO-RETRY-BACKOFF-1 below), each separated by a real
         ``self._llm_call_retry_wait_sec``-second pause — a transient
         network/provider outage gets a real chance to clear before the
-        candidate is treated as resolved.
+        candidate is treated as resolved. Since RUN-5 such a failure is a
+        third outcome, ``unknown``, not a rejection: the ladder ended
+        without the model ever answering, so ``filter()`` decides what to
+        do with it via ``[gate1] presence_unknown``.
         """
         loc = candidate.cited_location
         location_str = _location_str(loc)
@@ -1440,13 +1540,16 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             # like any other real anomaly, not INFO like a routine
             # rejection.
             reason = f"LLM call failed: {last_exc} (after {self._llm_call_retry_max} retries)"
-            logger.warning("Gate1._check_presence: %s — failing closed", reason)
+            logger.warning("Gate1._check_presence: %s — no verdict obtained", reason)
             tracer.event(
                 source="gate1", target="llm", kind="llm_response",
                 content=f"[ERROR] {last_exc}", model=self._presence_model,
                 params={"candidate": candidate.title},
             )
-            return False, reason
+            # RUN-5: no verdict was ever received, so this is `unknown`, not a
+            # rejection. reasks=0 — the ladder never ran; the outer call
+            # itself was the thing that failed.
+            return self._finish_presence(False, reason)
 
         confirmed, reason, unparseable = self._parse_presence_response(
             cleaned, candidate.title, code_block=code_block,
@@ -1585,7 +1688,9 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                         "failed (%s) — keeping last fail-closed result.",
                         candidate.title, attempt, _max_retries, exc,
                     )
-                    return last_confirmed, last_reason
+                    return self._finish_presence(
+                        last_confirmed, last_reason, reasks=_made,
+                    )
                 confirmed_n, reason_n, unparseable_n = self._parse_presence_response(
                     cleaned_n, candidate.title, code_block=code_block,
                 )
@@ -1598,20 +1703,20 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                     # "the model would not answer at its normal budget" is
                     # the fact the fail_closed counter alone cannot tell.
                     self._count("presence_reask")
-                    return confirmed_n, reason_n
+                    return self._finish_presence(confirmed_n, reason_n, reasks=_made)
                 last_confirmed, last_reason, last_cleaned = confirmed_n, reason_n, cleaned_n
                 if _fast and cleaned_n.strip() == "" and attempt_tokens >= _pin_floor:
                     _empty_pin = attempt_tokens
 
             logger.warning(
                 "Gate1._check_presence [%s]: verdict still unparseable after "
-                "%d re-ask(s) (mode=%s) — failing closed. raw=%r",
+                "%d re-ask(s) (mode=%s) — no verdict, ending unknown. raw=%r",
                 candidate.title, _made, self._unparseable_retry_mode,
                 last_cleaned[:120],
             )
-            return last_confirmed, last_reason
+            return self._finish_presence(last_confirmed, last_reason, reasks=_made)
 
-        return confirmed, reason
+        return self._finish_presence(confirmed, reason)
 
     # ── GATE1-LEARN-1: learned start budget ──────────────────────────────
     def _learned_max_tokens(self) -> "int | None":
@@ -1837,6 +1942,49 @@ def filter_candidates(
 # Internal helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────────────────────
+# RUN-5: three presence outcomes, not two
+# ─────────────────────────────────────────────────────────────────────────────
+
+# The third presence outcome. `_check_presence` returns it as the verdict when
+# the re-ask ladder (or the outer call retry) ends with `_is_technical_failure`
+# true — the provider never gave a verdict at all.
+_PRESENCE_CONFIRMED = "confirmed"
+_PRESENCE_REJECTED = "rejected"
+_PRESENCE_UNKNOWN = "unknown"
+
+# The reason a candidate is accepted with no verdict behind it. Prefix-matched
+# by `gate1_outcome()` (so an acceptance that was never a model verdict is not
+# counted as `presence_confirmed`) and by `_is_technical_failure()` (so
+# plan_validator's AUTO-REMOVE-GUARD-1 still refuses to delete it from
+# plan.json instead of reading "no verdict" as "already fixed").
+UNKNOWN_PRESENCE_REASON = "presence unknown — provider gave no verdict"
+
+# RUN-5: the line appended to a kept-unknown candidate's instruction, so the
+# reason reaches plan.json and the coder prompt (the FilterResult never
+# leaves filter()). `_with_presence_unknown_note` appends it once.
+_PRESENCE_UNKNOWN_NOTE_HEAD = "Gate 1 note: "
+
+
+def _with_presence_unknown_note(instruction: str, reason: str) -> str:
+    """RUN-5: append the ``presence unknown`` reason to *instruction*, once.
+
+    The coder is told to check the claim before touching code — the only
+    thing Gate 1 knows about this task is that nobody verified it. Idempotent
+    so a `--validate-plan` re-check that ends unknown again does not stack a
+    second note.
+    """
+    marker = _PRESENCE_UNKNOWN_NOTE_HEAD + UNKNOWN_PRESENCE_REASON
+    if marker in instruction:
+        return instruction
+    return (
+        instruction.rstrip()
+        + f"\n\n{_PRESENCE_UNKNOWN_NOTE_HEAD}{reason}. Gate 1 could not verify "
+        "this claim — confirm the described problem is actually present at "
+        "the cited location before changing code."
+    )
+
+
 def _is_technical_failure(reason: str) -> bool:
     """Return True when *reason* names a call/parse failure, not a genuine
     LLM verdict.
@@ -1862,6 +2010,7 @@ def _is_technical_failure(reason: str) -> bool:
         "JSON decode failed",
         "expected JSON object,",
         "unrecognised verdict ",
+        UNKNOWN_PRESENCE_REASON,
     ))
 
 
@@ -1879,6 +2028,7 @@ _GATE1_SPLIT_FIELDS = (
     "presence_confirmed",
     "presence_rejected",
     "presence_fail_closed",
+    "presence_unknown",
     "presence_reask",
     "duplicate",
     "non_py",
@@ -1888,9 +2038,14 @@ _GATE1_SPLIT_FIELDS = (
 # LLM — skip_llm, creative mode, or a new file. Not a model verdict, so it
 # belongs in no presence column: counting it as `presence_confirmed` would
 # make the presence number larger than the number of presence calls made.
+# RUN-5 adds `presence_unknown`: a candidate the provider never answered at
+# all, passed through by `[gate1] presence_unknown = keep`. Also not a model
+# verdict, so it is counted only by the `presence_unknown` column (fed from
+# the filter's own counter), never as a confirmation.
 _NON_MODEL_CONFIRMATIONS = (
     "existence check passed",
     "new file —",
+    UNKNOWN_PRESENCE_REASON,
 )
 
 # Returned for a stage this split does not know about. Distinct from `""`
@@ -1908,6 +2063,12 @@ def gate1_outcome(stage: str, reason: str, accepted: bool) -> str:
     (V12's `already_safe` is the next to land). Keeping the two uncounted
     cases apart is the point: an existence-only acceptance happens on every
     skip_llm run, so warning about it would make the warning meaningless.
+
+    A `presence_unknown` outcome (RUN-5) also returns `""`: its number is
+    fed from the filter's `presence_unknown` counter, not from these records,
+    because a candidate kept as unknown and then dropped as a duplicate
+    leaves only a `duplicate` record behind. Checked before
+    `_is_technical_failure` because an unknown reason is one too.
     """
     stage = str(stage or "")
     reason = str(reason or "")
@@ -1917,11 +2078,14 @@ def gate1_outcome(stage: str, reason: str, accepted: bool) -> str:
         return "duplicate"
     if stage != "presence":
         return _UNKNOWN_STAGE
+    if reason.startswith(UNKNOWN_PRESENCE_REASON):
+        return ""
     if _is_technical_failure(reason):
         # Empty reply, bad JSON, a call that never came back: the model was
         # asked and never answered, and the candidate was rejected for the
-        # lack of an answer rather than for the claim. This is the number
-        # that was invisible in `gate1 accepted=N rejected=M` before M4.
+        # lack of an answer rather than for the claim. Only reachable now
+        # when `[gate1] presence_unknown = reject` — with the default `keep`
+        # the same outcome is counted in `presence_unknown` instead.
         return "presence_fail_closed"
     if accepted and reason.startswith(_NON_MODEL_CONFIRMATIONS):
         return ""
@@ -1934,6 +2098,7 @@ def split_gate1_results(
     all_results,
     *,
     reask: int = 0,
+    unknown: int = 0,
     non_py: int = 0,
 ) -> dict:
     """M4: the per-stage split of one Gate-1 pass, as a dict.
@@ -1943,9 +2108,10 @@ def split_gate1_results(
     split has to be computed where `filter()` computes the verdicts.
 
     Every `_GATE1_SPLIT_FIELDS` key is always present, zero when the mode does
-    not produce it. `presence_reask` and `non_py` come from the filter's own
-    counters rather than from any result record: no candidate that only ever
-    answered on a re-ask, and no candidate whose cited file is not a module,
+    not produce it. `presence_reask`, `presence_unknown` and `non_py` come
+    from the filter's own counters rather than from any result record: no
+    candidate that only ever answered on a re-ask, no candidate the provider
+    never answered at all, and no candidate whose cited file is not a module,
     leaves a trace in `stage` or `reason`.
 
     `""` outcomes are dropped silently — they are the expected case. An
@@ -1955,6 +2121,7 @@ def split_gate1_results(
     """
     out = {name: 0 for name in _GATE1_SPLIT_FIELDS}
     out["presence_reask"] = int(reask or 0)
+    out["presence_unknown"] = int(unknown or 0)
     out["non_py"] = int(non_py or 0)
     unknown: set = set()
     try:

@@ -115,7 +115,11 @@ class TestStrictIsTheOldLadder:
             (32768, 0.0), (32768, 0.0), (32768, 0.1), (65536, 0.0),
             (65536, 0.1), (131072, 0.0), (131072, 0.1),
         ]
-        assert len(rejected) == 1
+        # RUN-5: the ladder never got a verdict, so the candidate is kept as
+        # unknown rather than rejected. This test is about the grid, but the
+        # outcome must not be misread as a model rejection.
+        assert rejected == []
+        assert filt.presence_unknown == 1
 
     def test_cap_alone_keeps_the_ladder_but_never_exceeds_the_provider(self, repo):
         filt = _make_filter(unparseable_max_tokens_cap="65536")
@@ -127,7 +131,9 @@ class TestStrictIsTheOldLadder:
         filt = _make_filter(unparseable_max_retries="2")
         payloads, _, rejected = _run(filt, repo, [""] * 3)
         assert len(payloads) == 3  # initial + 2
-        assert len(rejected) == 1
+        # RUN-5: no verdict from the ladder = kept as unknown, not rejected.
+        assert rejected == []
+        assert filt.presence_unknown == 1
 
 
 class TestFastMode:
@@ -138,7 +144,9 @@ class TestFastMode:
         filt = _make_filter(unparseable_retry_mode="fast")
         payloads, _, rejected = _run(filt, repo, [""] * 7)
         assert _grid(payloads) == [(32768, 0.0), (32768, 0.1)]
-        assert len(rejected) == 1
+        # RUN-5: no verdict from the ladder = kept as unknown, not rejected.
+        assert rejected == []
+        assert filt.presence_unknown == 1
 
     def test_second_temperature_answers(self, repo):
         # candidates #25-27: succeeded at 32768/0.1 on the 3rd call — now the 2nd.

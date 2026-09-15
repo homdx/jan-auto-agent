@@ -238,9 +238,17 @@ class TestPresenceRejectionLevelDependsOnCause:
                 side_effect=RuntimeError("HTTP 500 from server"),
             ):
                 accepted, rejected = filt.filter([c], repo)
-        assert accepted == []
+        # RUN-5: no verdict is not a rejection, so the default policy keeps
+        # the candidate — but it must still be a WARNING, and it must not be
+        # logged as REJECTED, or a grep for REJECTED would count a failure
+        # as if the model had rejected the claim.
+        # The kept candidate is the same object, with the "presence unknown"
+        # note appended to its instruction (the reason travels with the task).
+        assert accepted == [c]
+        assert "Gate 1 note: presence unknown" in c.instruction
         warning_records = [r for r in caplog.records if r.levelno == logging.WARNING]
-        assert any("REJECTED" in r.message for r in warning_records)
+        assert any("Gate1[presence] UNKNOWN" in r.message for r in warning_records)
+        assert not any("Gate1[presence] REJECTED" in r.message for r in caplog.records)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

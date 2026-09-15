@@ -355,12 +355,14 @@ def test_no_bridge_no_events_and_zeroed_split(monkeypatch):
     # what a stubbed filter_candidates leaves behind — prints all zeros.
     assert format_gate1_split({}) == (
         "existence=0 presence_confirmed=0 presence_rejected=0 "
-        "presence_fail_closed=0 presence_reask=0 duplicate=0 non_py=0"
+        "presence_fail_closed=0 presence_unknown=0 presence_reask=0 "
+        "duplicate=0 non_py=0"
     )
     # Unknown fields are dropped, not appended: the field order is the contract.
     assert format_gate1_split({"accepted": 9, "rejected": 3, "_uncounted": 2}) == (
         "existence=0 presence_confirmed=0 presence_rejected=0 "
-        "presence_fail_closed=0 presence_reask=0 duplicate=0 non_py=0"
+        "presence_fail_closed=0 presence_unknown=0 presence_reask=0 "
+        "duplicate=0 non_py=0"
     )
     assert rec.events == []
 
@@ -481,7 +483,11 @@ def test_gate1_split_line(monkeypatch):
     assert "existence=0" in line
     assert "presence_confirmed=3" in line        # c1, c4 (on the re-ask), c5
     assert "presence_rejected=1" in line          # c2
-    assert "presence_fail_closed=1" in line       # c3, "" after the ladder
+    # RUN-5: c3 is not a rejection — the ladder never got a verdict, so the
+    # default keep policy passes it through and fail_closed stays empty.
+    # `presence_unknown` is where c3 shows up.
+    assert "presence_fail_closed=0" in line
+    assert "presence_unknown=1" in line           # c3, "" after the ladder
     assert "presence_reask=1" in line             # c4 only
     assert "duplicate=0" in line
     assert "non_py=1" in line                     # docs/notes.md
@@ -489,15 +495,19 @@ def test_gate1_split_line(monkeypatch):
     # Every field, in order, always.
     assert line == (
         "existence=0 presence_confirmed=3 presence_rejected=1 "
-        "presence_fail_closed=1 presence_reask=1 duplicate=0 non_py=1"
+        "presence_fail_closed=0 presence_unknown=1 presence_reask=1 "
+        "duplicate=0 non_py=1"
     )
-    # The buckets add up to the candidates they describe.
-    assert len(accepted) == 3
-    assert len(rejected) == 2
+    # The buckets add up to the candidates they describe. c3 is accepted
+    # without a verdict, so it is not counted as a confirmation.
+    assert len(accepted) == 4
+    assert len(rejected) == 1
+    assert counts["presence_confirmed"] == 3
     assert counts["presence_rejected"] + counts["presence_fail_closed"] == len(rejected)
     # And the counter the log line used to hide: without it, c3 and c2 look
     # the same.
     assert filt.presence_reask == 1
+    assert filt.presence_unknown == 1
     assert filt.non_py_requests == 1
     assert total_calls > 2, "the empty reply went through the ladder"
 
@@ -525,11 +535,13 @@ def test_gate1_split_all_fields_zero_for_existence_only_mode(monkeypatch):
     assert len(accepted) == 1 and not rejected
     assert format_gate1_split(counts) == (
         "existence=0 presence_confirmed=0 presence_rejected=0 "
-        "presence_fail_closed=0 presence_reask=0 duplicate=0 non_py=0"
+        "presence_fail_closed=0 presence_unknown=0 presence_reask=0 "
+        "duplicate=0 non_py=0"
     )
     # An existence-only acceptance is not a model verdict, so it is not counted
     # as one: counting it would make the presence number exceed the calls made.
     assert counts["presence_confirmed"] == 0
+    assert counts["presence_unknown"] == 0
 
 
 def test_gate1_split_counts_existence_and_duplicate(monkeypatch):
@@ -600,6 +612,7 @@ def test_split_gate1_results_marks_what_it_cannot_count():
         "presence_confirmed": 1,
         "presence_rejected": 0,
         "presence_fail_closed": 1,
+        "presence_unknown": 0,
         "presence_reask": 2,
         "duplicate": 1,
         "non_py": 4,

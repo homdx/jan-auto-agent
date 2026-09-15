@@ -79,7 +79,12 @@ def minimal_config() -> configparser.ConfigParser:
             "model":      "test-model",
             "api_format": "openai",
         },
-        "gate1": {"temperature": "0.0", "max_tokens": "64", "skip_llm": "false"},
+        # RUN-5: this file's acceptance criteria are the fail-closed DROP of
+        # an unanswerable presence check, so it pins the reject policy
+        # explicitly. The default (keep) and its counter are covered in
+        # tests/test_gate1_presence_unknown.py.
+        "gate1": {"temperature": "0.0", "max_tokens": "64", "skip_llm": "false",
+                  "presence_unknown": "reject"},
         "loop":  {"timeout_seconds": "10"},
     })
     return cfg

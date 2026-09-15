@@ -200,11 +200,11 @@ class RunTrace:
         """Record the per-stage split of one Gate-1 pass (M4).
 
         `run_trace.py` is the trace side of M4: the counters live on
-        `Gate1Filter` (`presence_reask`, `non_py_requests`) and in its
-        `all_results` list, the line a human reads is the `plan_phase` log
-        entry the pipeline writes next to this call, and this event is where
-        a later `analyze_logs` run reads them from — it does not parse
-        run.log.
+        `Gate1Filter` (`presence_reask`, `presence_unknown`,
+        `non_py_requests`) and in its `all_results` list, the line a human
+        reads is the `plan_phase` log entry the pipeline writes next to this
+        call, and this event is where a later `analyze_logs` run reads them
+        from — it does not parse run.log.
 
         Every field is forwarded, zeros included, so the trace carries the
         same shape the log line prints and log parsing stays stable across

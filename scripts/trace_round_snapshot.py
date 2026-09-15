@@ -108,7 +108,8 @@ def read_run(base, run_id=None):
         "head_sha": "", "pre_run_sha": "", "switched_mid_run": False,
         "goal": "", "probe_usable": None, "probe_reason": None,
         "llm_by_source": collections.Counter(),
-        "gate1": {"requests": 0, "confirmed": 0, "rejected": 0, "unparsed": 0},
+        "gate1": {"requests": 0, "confirmed": 0, "rejected": 0, "unparsed": 0,
+                   "unknown": 0},
         "gate1_split": None,
         "gate1_location_ext": collections.Counter(),
         # RUN-4: the coder's truncation ladder — how many rejected coder
@@ -257,6 +258,18 @@ def read_run(base, run_id=None):
         t1 = datetime.datetime.fromisoformat(out["gate1_last_ts"])
         out["gate1"]["seconds_per_candidate"] = round(
             (t1 - t0).total_seconds() / (out["gate1"]["requests"] - 1), 1)
+    # RUN-5: `presence_unknown` gets its own column instead of being folded
+    # into `unparsed`. `unparsed` counts per-response what the snapshot could
+    # not read as a verdict; `unknown` counts per-candidate what the presence
+    # stage ended without a verdict from the model at all, and it only exists
+    # once the M4 gate1_split event carries it. agent_trace stringifies
+    # params, so decode before trusting it.
+    if out["gate1_split"] is not None:
+        try:
+            out["gate1"]["unknown"] = int(
+                out["gate1_split"].get("presence_unknown", 0) or 0)
+        except (TypeError, ValueError):
+            out["gate1"]["unknown"] = 0
     for k in ("llm_by_source", "gate1_location_ext", "probe_by_op"):
         out[k] = dict(out[k])
     out["coder_budgets"] = dict(out["coder_budgets"])
@@ -291,7 +304,7 @@ def main():
     # a grep and from a collect_block event are not the same measurement.
     _block = lambda r: f"{r['collect_block_occurrences']} ({r['collect_source']})"
 
-    hdr = f"{'run':12} {'probe':>6} {'reason':>14} {'arch':>5} {'gate1':>6} {'conf':>5} {'rej':>5} {'s/cand':>7} {'probe ops':>10} {'miss':>5} {'collect blocks':>15} {'cod esc':>8}"
+    hdr = f"{'run':12} {'probe':>6} {'reason':>14} {'arch':>5} {'gate1':>6} {'conf':>5} {'rej':>5} {'unk':>4} {'s/cand':>7} {'probe ops':>10} {'miss':>5} {'collect blocks':>15} {'cod esc':>8}"
     print(hdr)
     print("-" * len(hdr))
     tot = collections.Counter()
@@ -301,19 +314,20 @@ def main():
         tot["g1"] += g["requests"]
         tot["conf"] += g["confirmed"]
         tot["rej"] += g["rejected"]
+        tot["unk"] += g.get("unknown", 0)
         tot["ops"] += r["probe"]["ops"]
         tot["miss"] += r["probe"]["misses"]
         tot["blocks"] += r["collect_block_occurrences"]
         tot["codesc"] += r.get("coder_budget_escalations", 0)
         print(f"{r['run']:12} {str(r['probe_usable']):>6} {str(r['probe_reason']):>14} "
               f"{r['llm_by_source'].get('architect', 0):>5} {g['requests']:>6} "
-              f"{g['confirmed']:>5} {g['rejected']:>5} "
+              f"{g['confirmed']:>5} {g['rejected']:>5} {g.get('unknown', 0):>4} "
               f"{g.get('seconds_per_candidate', '—'):>7} {r['probe']['ops']:>10} "
               f"{r['probe']['misses']:>5} {_block(r):>15} "
               f"{r.get('coder_budget_escalations', 0):>8}")
     print("-" * len(hdr))
     print(f"{'TOTAL':12} {'':>6} {'':>14} {tot['arch']:>5} {tot['g1']:>6} "
-          f"{tot['conf']:>5} {tot['rej']:>5} {'':>7} {tot['ops']:>10} "
+          f"{tot['conf']:>5} {tot['rej']:>5} {tot['unk']:>4} {'':>7} {tot['ops']:>10} "
           f"{tot['miss']:>5} {tot['blocks']:>15} {tot['codesc']:>8}")
     snap["totals"] = dict(tot)
 

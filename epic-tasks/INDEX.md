@@ -38,10 +38,10 @@ The loop and the scorecard: `docs/collect-epics/RUN-THE-EPIC-COMPETITION.md`.
 | 30 | `RUN-2` | landed `6ca675c` | MEDIUM | S | [30-run2-the-task-budget-must-not-tick-while-the-run-is-stopped.md](30-run2-the-task-budget-must-not-tick-while-the-run-is-stopped.md) | `tools/auto/outer_loop.py` |
 | 31 | `RUN-3` | landed `26b5d7f` | HIGH | XS | [31-run3-exec-feedback-shows-the-head-of-pytest-output-the-cause-is-at-the-tail.md](31-run3-exec-feedback-shows-the-head-of-pytest-output-the-cause-is-at-the-tail.md) | `tools/auto/inner_loop.py` |
 | 32 | `RUN-4` | landed `ade28e6` | HIGH | S | [32-run4-the-coder-answers-a-cut-off-reply-with-the-same-budget-five-times.md](32-run4-the-coder-answers-a-cut-off-reply-with-the-same-budget-five-times.md) | `tools/auto/coder.py` |
-| 33 | `RUN-5` | open | HIGH | S | [33-run5-a-technical-failure-in-the-presence-check-is-not-a-rejection.md](33-run5-a-technical-failure-in-the-presence-check-is-not-a-rejection.md) | `tools/auto/gate1_filter.py` |
+| 33 | `RUN-5` | landed (after `24d9028`) | HIGH | S | [33-run5-a-technical-failure-in-the-presence-check-is-not-a-rejection.md](33-run5-a-technical-failure-in-the-presence-check-is-not-a-rejection.md) | `tools/auto/gate1_filter.py` |
 | 34 | `RUN-6` | landed `7135844` | HIGH | S | [34-run6-a-stale-artifact-at-session-start-switches-the-pack-off-for-the-whole-session.md](34-run6-a-stale-artifact-at-session-start-switches-the-pack-off-for-the-whole-session.md) | `tools/auto/collect_bridge.py` |
 
-## Next rounds — the order (as of `6ca675c`, 2026-09-14; step 1 landed — `7135844` (+`5788423`, `d4ffb12`); step 2 landed — RUN-3)
+## Next rounds — the order (as of `6ca675c`, 2026-09-14; step 1 landed — `7135844` (+`5788423`, `d4ffb12`); step 2 landed — RUN-3; step 3 landed — `ade28e6`; step 4 landed — RUN-5)
 
 Set from the live runs on `../testtext` / `../testtext6`; the reasoning and
 the measurement after each step are in
@@ -53,7 +53,7 @@ sequence; a step is not started until the previous one is merged.
 | 1 | `RUN-6` | the pack is off in every resumed session; nothing collect-side can be measured live until it is on | `collect blocks > 0` on the next session's snapshot |
 | 2 | `RUN-3` | 7 of 29 BLOCKED tasks ended on an exec error the coder never saw; XS | exec-rejected attempts per BLOCKED task |
 | 3 | `RUN-4` | the most frequent coder failure in both trees; 6 BLOCKED tasks | `cut off` count, done/blocked ratio |
-| 4 | `RUN-5` | 25–35 % of candidates dropped by provider silence; plan size is a coin flip until fixed | `unparsed` → `unknown` column, plan size |
+| 4 | `RUN-5` | *landed* — 25–35 % of candidates dropped by provider silence; plan size is a coin flip until fixed | `unparsed` → `unknown` column, plan size |
 | 5 | `L1` | deterministic: 82 / 30 gate-1 calls on non-`.py` locations | non-`.py` gate-1 rows → 0 |
 | 6 | `M3` | measurement only; decides whether V12/V13 exist | ceiling number in `EPIC-M-metrics.md` |
 | 7 | `V4`, `V10` | supply rows — worth it only once step 1 puts the pack in front of the coder | M2 static numbers, block sizes |
