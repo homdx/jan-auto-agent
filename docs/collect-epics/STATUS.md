@@ -1,6 +1,6 @@
 # Status — where the collect epics stand, and what is being waited on
 
-**As of:** 2026-09-14, branch `tickets`, HEAD = `7135844` RUN-6 (next round is RUN-3). The order of the
+**As of:** 2026-09-15, branch `tickets`, HEAD = RUN-3 (on top of `d4ffb12`; RUN-6 follow-ups `5788423`, `d4ffb12`; next round is RUN-4). The order of the
 next rounds and the live-run evidence behind it: `NEXT-ROUNDS.md`.
 Sections 2–4 below describe the wait as it stood on `2f9005d`; the run has
 since happened (`after-r31-live.json`) and NEXT-ROUNDS.md §1 is its reading.
@@ -11,7 +11,7 @@ Ticket-by-ticket state is also stamped into every `epic-tasks/NN-*.md`
 
 ## 1. Ledger
 
-### Landed — 20 of 34: the short path (PLAN-v2 §6), L2, V16, V6, M4, M5, RUN-1, RUN-2, RUN-6
+### Landed — 21 of 34: the short path (PLAN-v2 §6), L2, V16, V6, M4, M5, RUN-1, RUN-2, RUN-6, RUN-3
 
 | ticket | commit | one line |
 |---|---|---|
@@ -35,11 +35,12 @@ Ticket-by-ticket state is also stamped into every `epic-tasks/NN-*.md`
 | RUN-1 | `236855a` | an extra file outside `target_files` is a warning, not a verdict |
 | RUN-2 | `6ca675c` | the per-task wall-clock budget does not tick while the run is stopped |
 | RUN-6 | `7135844` | a stale artifact on entry is refreshed when `auto_refresh_between_tasks = true`; stdout says stale/refreshing/OFF; `collect_refresh` event |
+| RUN-3 | after `d4ffb12` | exec feedback reads a pytest run's tail (last `ERRORS`/`FAILURES` box, banners stripped, 1 500 chars); exit 5 says *no tests collected*; workspace pytest runs in-process (`-n 0`, `[executor] pytest_serial`) when the project's addopts ask for a pool |
 
 Not in the epic but on the branch since 2f9005d: GATE1-LEARN-1 `9dd644b`,
 GATE1-LEARN-2 `f11972b`, GATE1-PAR-1 `84a24b2`, user's `0eaa2cc`.
 
-### Open — 14 (11 epic + RUN-3…RUN-5)
+### Open — 13 (11 epic + RUN-4, RUN-5)
 
 **The order below is superseded by `NEXT-ROUNDS.md` §2** (RUN-6 → RUN-3 →
 RUN-4 → RUN-5 → L1 → M3 → …). Kept for the per-ticket premise checks

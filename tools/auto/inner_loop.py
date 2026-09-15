@@ -31,6 +31,7 @@ agents.ini keys consumed
 [auto]  max_attempts_per_task   — attempt cap per round (default 5)
 [validator_agent] temperature   — validator temperature (default 0.1)
 [validator_agent] max_hints     — max hint items in rejection (default 3)
+[executor] pytest_serial        — run workspace pytest in-process (default true; RUN-3)
 """
 
 from __future__ import annotations
@@ -38,12 +39,14 @@ from __future__ import annotations
 import configparser
 import json
 import logging
+import re
 import time
 from tools.auto.context_broker import ContextBroker
 from tools.auto.gate_registry import (  # GATES-1 / GATES-2
     build_validators, resolve_gate_order, run_gates,
 )
 from tools.agent_trace import tracer   # AUTO-CR-27: per-stage decision tracing
+from tools.auto.utils import is_pytest_command   # RUN-3
 
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1202,6 +1205,123 @@ def _format_gate2_feedback(parsed: dict, max_hints: int) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# RUN-3: exec-failure detail — for a test runner the cause is at the tail
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# The feedback the coder gets after a failed acceptance check used to be the
+# first 400 characters of the winning stream. For a script that is the
+# interesting part; for pytest it is xdist's "bringing up nodes..." banner
+# plus the frame of the error box, and the one line that says what went
+# wrong (``E   ModuleNotFoundError: …``) sits at the END of the box. Live
+# runs on ../testtext and ../testtext6: 438 executor rejections, every exit-1
+# collection error and every exit-5 run cut before that line — AUTO-T11
+# re-emitted the same file 25 times.
+
+# Head budget, unchanged, for non-pytest commands.
+_EXEC_HEAD_BUDGET = 400
+# Tail budget for a pytest run: 400 characters do not hold one collection
+# error; the validator prompt already allows 2 000 for this same stream.
+_EXEC_TAIL_BUDGET = 1500
+
+# pytest exit 5 is "no tests were collected" — the one exit code whose output
+# carries no diagnostic at all, so the coder gets the interpretation spelled
+# out instead of a code from a table it does not have.
+_NO_TESTS_COLLECTED_MSG = (
+    "no tests collected — the -k expression matched nothing "
+    "or the file defines no test_* function"
+)
+
+# The two report sections that hold the ``E   …`` line:
+#   ==================================== ERRORS ====================================
+#   =================================== FAILURES ===================================
+# ``short test summary info`` is deliberately NOT an anchor: pytest prints it
+# AFTER the boxes, so starting there would hand the coder the one-line digest
+# and drop the diagnostic line this fix exists to deliver. It still arrives —
+# it follows the last box — and it is what the plain-tail fallback shows when
+# there is no box at all.
+_PYTEST_BOX_HEADER_RE = re.compile(r"^=+ (?:ERRORS|FAILURES) =+\s*$", re.MULTILINE)
+# xdist prints one of these per worker while the pool starts.
+_XDIST_BANNER_RE = re.compile(r"^\s*bringing up nodes\.\.\.\s*$")
+_TRIM_MARK = "... [trimmed]\n"
+
+
+def _strip_pytest_noise(text: str) -> str:
+    """Drop xdist's ``bringing up nodes...`` lines and runs of blank lines.
+
+    Neither carries information, and stripping them *before* the budget is
+    applied means the budget buys traceback lines instead of whitespace.
+    """
+    out: list[str] = []
+    blank = False
+    for line in text.splitlines():
+        if _XDIST_BANNER_RE.match(line):
+            continue
+        if line.strip():
+            out.append(line)
+            blank = False
+        elif not blank and out:
+            out.append("")
+            blank = True
+    return "\n".join(out).strip("\n")
+
+
+def _pytest_tail(text: str, budget: int = _EXEC_TAIL_BUDGET) -> str:
+    """The diagnostic slice of a pytest run's stdout — its tail (RUN-3).
+
+    Strip the noise, then start at the last ``ERRORS`` / ``FAILURES`` header
+    so the final box arrives whole (header, frames, ``E`` line, and the short
+    summary that follows it); with no box, take the plain tail. Over budget,
+    the box is cut from the FRONT — its header line is kept so it still reads
+    as a box, the middle is marked as trimmed, and the last lines, where the
+    diagnostic sits, always survive.
+    """
+    cleaned = _strip_pytest_noise(text or "")
+    boxes = list(_PYTEST_BOX_HEADER_RE.finditer(cleaned))
+    window = cleaned[boxes[-1].start():] if boxes else cleaned
+    if len(window) <= budget:
+        return window
+    header, sep, rest = window.partition("\n")
+    if boxes and sep and len(header) + len(sep) + len(_TRIM_MARK) < budget:
+        keep = budget - len(header) - len(sep) - len(_TRIM_MARK)
+        return header + sep + _TRIM_MARK + _whole_lines(rest[-keep:])
+    return _TRIM_MARK + _whole_lines(window[-(budget - len(_TRIM_MARK)):])
+
+
+def _whole_lines(tail: str) -> str:
+    """Drop the partial first line a character-count cut leaves behind."""
+    nl = tail.find("\n")
+    return tail[nl + 1:] if 0 <= nl < len(tail) - 1 else tail
+
+
+def _build_exec_detail(exec_result) -> str:
+    """The detail block of one exec-failure feedback message (RUN-3).
+
+    Stream priority is unchanged — traceback > stderr > stdout, the most
+    diagnostic first — and so is the 400-character head for every command
+    that is not a test runner (script output is head-interesting). For a
+    pytest run the stdout slice is the tail instead, on the larger budget,
+    and exit 5 is prefixed with the sentence its empty output is missing.
+    """
+    tb  = getattr(exec_result, "traceback", "") or ""
+    out = getattr(exec_result, "stdout",    "") or ""
+    err = getattr(exec_result, "stderr",    "") or ""
+    ec  = getattr(exec_result, "exit_code", 1)
+    cmd = getattr(exec_result, "command",   "") or ""
+    pytest_run = is_pytest_command(cmd)
+    if tb:
+        detail = f"traceback:\n{tb}"
+    elif err:
+        detail = f"stderr:\n{err[:_EXEC_HEAD_BUDGET]}"
+    elif pytest_run:
+        detail = f"stdout:\n{_pytest_tail(out)}"
+    else:
+        detail = f"stdout:\n{out[:_EXEC_HEAD_BUDGET]}"
+    if pytest_run and ec == 5:
+        detail = f"{_NO_TESTS_COLLECTED_MSG}\n{detail}"
+    return detail
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # InnerLoop
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1554,19 +1674,14 @@ class InnerLoop:
                 continue
 
             if not getattr(exec_result, "passed", False):
-                tb  = getattr(exec_result, "traceback", "") or ""
-                out = getattr(exec_result, "stdout",    "") or ""
-                err = getattr(exec_result, "stderr",    "") or ""
                 ec  = getattr(exec_result, "exit_code", 1)
                 cmd = getattr(exec_result, "command",   "") or ""
                 # Include stderr so argparse / runtime error messages reach the coder.
                 # Priority: traceback > stderr > stdout (most diagnostic first).
-                if tb:
-                    detail = f"traceback:\n{tb}"
-                elif err:
-                    detail = f"stderr:\n{err[:400]}"
-                else:
-                    detail = f"stdout:\n{out[:400]}"
+                # RUN-3: for a pytest run the stdout slice is the TAIL — the
+                # head is xdist's banner and the top of the error box, and
+                # the E-line that names the cause used to be cut at 400 chars.
+                detail = _build_exec_detail(exec_result)
                 fb  = (
                     f"attempt {attempt}: exec failed (exit {ec})"
                     + (f"  cmd={cmd!r}" if cmd else "")
@@ -1843,6 +1958,10 @@ def make_inner_loop(
     except ValueError as exc:
         logger.warning("config [auto] workspace_retain_count invalid (%s) — using 5", exc)
         ws_retain = 5
+    # RUN-3: workspace pytest runs in-process unless the project opts back
+    # into the xdist pool. safe_getboolean returns the fallback for an absent
+    # [executor] section, a missing key and a malformed value alike.
+    pytest_serial = safe_getboolean(config, "executor", "pytest_serial", fallback=True)
 
     # ── Coder ─────────────────────────────────────────────────────────────────
     if coder is None:
@@ -1860,6 +1979,7 @@ def make_inner_loop(
             executor = make_executor(
                 base_dir=base_dir, timeout_sec=exec_timeout,
                 max_retained_workspaces=ws_retain,
+                pytest_serial=pytest_serial,
             )
         except ImportError:
             logger.warning("Executor not found — using _StubExecutor (tests only)")

@@ -728,6 +728,9 @@ class AutoController:
             self.base_dir,
             timeout_sec=self.limits.exec_timeout_sec,
             max_retained_workspaces=self.limits.workspace_retain_count,
+            # RUN-3: the same [executor] pytest_serial the task loop's
+            # executor reads (make_inner_loop) — one setting, both executors.
+            pytest_serial=safe_getboolean(cfg, "executor", "pytest_serial", fallback=True),
         )
         bug_fix_loop = make_bug_fix_loop(
             cfg, self.base_dir, self.state,

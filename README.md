@@ -403,6 +403,17 @@ coder (writes/fixes code) → executor (runs acceptance_check) → validator (LL
 If the executor fails, the validator is never called — there's no point
 asking an LLM to judge output that's already objectively broken.
 
+What the coder sees from a failed execution is the *diagnostic* end of the
+output. For a pytest run that is the tail: from the last `ERRORS`/`FAILURES`
+box, xdist's `bringing up nodes...` lines stripped, up to 1 500 characters,
+so the `E   ModuleNotFoundError: …` line that says what to fix always
+arrives; for any other command the first 400 characters as before. Exit 5
+is spelled out — *no tests collected — the -k expression matched nothing or
+the file defines no `test_*` function* — instead of an empty stdout. A
+workspace pytest run is one file, so it runs in one process (`-n 0`,
+`[executor] pytest_serial = true` by default) when the project's own
+`addopts` would otherwise start an xdist pool.
+
 Only a task that passes **both** halves is committed. A task that
 exhausts `max_attempts` without passing both stays `pending`/failed in
 `plan.json` for the next run (or for a human to look at) rather than being

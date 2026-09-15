@@ -44,6 +44,12 @@ Public surface consumed by the Coder loop (AUTO-C2/C3)::
 Configuration (agents.ini [auto])
 -----------------------------------
 exec_timeout_sec   — per-execution wall-clock cap in seconds (default 120).
+
+Configuration (agents.ini [executor])
+-------------------------------------
+pytest_serial      — run a workspace pytest in-process (``-n 0``) instead of
+                     the xdist worker pool the project's ``addopts`` asks for
+                     (default true; RUN-3). One acceptance check is one file.
                      0 disables the timeout entirely — the subprocess runs
                      forever if it blocks (e.g. a script that prompts for
                      console input).  Only set to 0 intentionally.
@@ -63,6 +69,7 @@ from pathlib import Path
 from typing import Optional
 
 from tools.agent_trace import tracer
+from tools.auto.utils import is_pytest_command, is_xdist_flag   # RUN-3
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +98,23 @@ _MAX_OUTPUT_CHARS = 64_000
 
 # Maximum traceback snippet length returned in ExecutionResult.traceback.
 _MAX_TRACEBACK_CHARS = 4_000
+
+# RUN-3: appended to a workspace pytest run when ``[executor] pytest_serial``
+# is on and the project's own pytest config asks for an xdist pool. A task
+# workspace holds one changed file, so xdist has nothing to distribute — yet
+# the workspace inherits the project's ``pytest.ini`` (``addopts = -n auto -q
+# --dist=loadgroup`` in this repo) and every attempt spawned a worker per CPU,
+# paid the "bringing up nodes..." startup twice, and interleaved the output.
+# ``-n 0`` is xdist's own in-process switch and, given on the command line,
+# overrides the earlier ``-n auto`` from addopts. ``-p no:xdist`` is NOT safe
+# here: it unregisters the plugin that defines ``-n``/``--dist``, so addopts'
+# ``-n auto`` becomes "unrecognized arguments" and every workspace run exits 4
+# before collecting a test (reproduced on pytest 8.3.5 / xdist 3.8.0).
+_PYTEST_SERIAL_FLAG = "-n 0"
+
+# The config files pytest reads for ``addopts``, in pytest's own precedence
+# order; the first one present wins — pytest never merges a second file.
+_PYTEST_CONFIG_FILES = ("pytest.ini", "pyproject.toml", "tox.ini", "setup.cfg")
 
 # Directories excluded when mirroring base_dir into a task workspace (see
 # _prepare_workspace / AUTO-FIX-1): VCS metadata, the agent's own
@@ -206,6 +230,13 @@ class Executor:
         tasks. After each :meth:`run`, the oldest sibling task workspaces
         beyond this count are pruned (the one just created is always kept).
         ``0`` disables pruning entirely (old behaviour). Default ``5``.
+    pytest_serial:
+        RUN-3: run a workspace pytest in-process (``-n 0``) instead of
+        letting the project's ``addopts = -n auto`` spawn a worker pool for
+        a single file (``[executor] pytest_serial``, default ``True``). The
+        flag is appended only when the project's pytest config actually
+        asks for a pool — a project without pytest-xdist never sees an
+        unknown ``-n``. ``False`` keeps the project's own xdist settings.
     """
 
     def __init__(
@@ -215,6 +246,7 @@ class Executor:
         timeout_sec:    float = 120,
         python_bin:     Optional[str] = None,
         max_retained_workspaces: int = 5,
+        pytest_serial:  bool = True,
     ) -> None:
         self._base_dir      = Path(base_dir).resolve()
         self._workspace_root = (
@@ -225,6 +257,11 @@ class Executor:
         self._timeout_sec = max(0.0, float(timeout_sec))
         self._python_bin  = python_bin or sys.executable
         self._max_retained_workspaces = max(0, int(max_retained_workspaces))
+        self._pytest_serial = bool(pytest_serial)
+        # RUN-3: the addopts scan is one file read per repo; cached so the
+        # AUTO-G5 regression loop, which re-runs the executor for every DONE
+        # task after each commit, pays it once.
+        self._xdist_pool_requested: Optional[bool] = None
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -272,6 +309,11 @@ class Executor:
 
         # Resolve the command to run.
         command = self._resolve_command(acceptance_check, target_files, workspace)
+
+        # RUN-3: one file per workspace, so xdist here is startup cost and
+        # interleaved output only. Applied after _resolve_command so the
+        # resolved (and safety-checked) command is what gets the flag.
+        command = self._serialise_pytest(command)
 
         # AUTO-CR-12: cross-platform no-op acceptance — creative/docs tasks
         # default acceptance_check to "true" (a Unix builtin), but on Windows
@@ -795,6 +837,35 @@ class Executor:
 
         return command
 
+    def _serialise_pytest(self, command: str) -> str:
+        """Append ``-n 0`` to a pytest run so the workspace stays in-process (RUN-3).
+
+        No-op when ``pytest_serial`` is off, when *command* is not a pytest
+        invocation, when the command already chooses a worker count (an
+        explicit ``-n 4`` in an acceptance check is the Architect's decision),
+        or when the project's pytest config asks for no pool at all — there
+        is nothing to suppress, and on a project without pytest-xdist the
+        flag would be an unrecognised argument that turns every green check
+        into a fake exit 4.
+        """
+        if not self._pytest_serial or not is_pytest_command(command):
+            return command
+        try:
+            parts = shlex.split(command, posix=(os.name != "nt"))
+        except ValueError:
+            return command          # un-parseable quoting — don't guess at the flags
+        if any(is_xdist_flag(p) for p in parts[1:]):
+            return command
+        if not self._pytest_config_requests_pool():
+            return command
+        return f"{command.rstrip()} {_PYTEST_SERIAL_FLAG}"
+
+    def _pytest_config_requests_pool(self) -> bool:
+        """Cached: does this repo's pytest config (or ``PYTEST_ADDOPTS``) ask for xdist workers?"""
+        if self._xdist_pool_requested is None:
+            self._xdist_pool_requested = pytest_config_requests_pool(self._base_dir)
+        return self._xdist_pool_requested
+
     def _rewrite_python(self, command: str) -> str:
         """Replace a leading ``python`` / ``python3`` token with the real interpreter path.
 
@@ -970,6 +1041,38 @@ def _truncate(text: str, max_chars: int) -> str:
     return text[:max_chars] + notice
 
 
+def pytest_config_requests_pool(base_dir: "str | Path") -> bool:
+    """True when *base_dir*'s pytest ``addopts`` (or ``PYTEST_ADDOPTS``) name an xdist flag (RUN-3).
+
+    Reads the first config file pytest would use (``pytest.ini`` >
+    ``pyproject.toml`` > ``tox.ini`` > ``setup.cfg``) and answers from that
+    file alone — pytest does not merge a second one, and consulting it would
+    report a pool pytest never starts. Parsing is deliberately loose: the
+    question is only "does this project start an xdist pool". Unreadable
+    files are skipped, never raised on — this runs before every acceptance
+    check and must not be the reason one fails.
+    """
+    tokens: list[str] = []
+    root = Path(base_dir)
+    for name in _PYTEST_CONFIG_FILES:
+        path = root / name
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped.startswith("addopts"):
+                continue
+            _, _, value = stripped.partition("=")
+            # pyproject.toml quotes its value (and may use the list form).
+            tokens = value.replace(",", " ").replace("[", " ").replace("]", " ").split()
+            break
+        break
+    tokens += os.environ.get("PYTEST_ADDOPTS", "").split()
+    return any(is_xdist_flag(t) for t in tokens)
+
+
 # Matches a likely-secret CLI option (--api-key, --token, etc.) followed by
 # a single-token value, so the value can be redacted while the option name
 # — useful for debugging what the command was doing — stays visible.
@@ -1048,6 +1151,7 @@ def make_executor(
     timeout_sec:    float = 120,
     python_bin:     Optional[str] = None,
     max_retained_workspaces: int = 5,
+    pytest_serial:  bool = True,
 ) -> Executor:
     """Create and return an :class:`Executor` with the given configuration.
 
@@ -1065,6 +1169,10 @@ def make_executor(
         From ``agents.ini [auto] workspace_retain_count`` (default 5).
         Bounds how many per-task workspace mirrors (each a full repo copy,
         see AUTO-FIX-1) are kept on disk at once. ``0`` disables pruning.
+    pytest_serial:
+        From ``agents.ini [executor] pytest_serial`` (default ``True``).
+        RUN-3: append ``-n 0`` to a workspace pytest run whose project config
+        asks for an xdist pool, so one file runs in one process.
     """
     return Executor(
         base_dir       = base_dir,
@@ -1072,4 +1180,5 @@ def make_executor(
         timeout_sec    = timeout_sec,
         python_bin     = python_bin,
         max_retained_workspaces = max_retained_workspaces,
+        pytest_serial  = pytest_serial,
     )

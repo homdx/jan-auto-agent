@@ -69,6 +69,9 @@ scripts/trace_round_snapshot.py ../testtext --run-id <new>` shows
 config (see §4) — same effect, one key.
 
 ### Step 2 — `RUN-3` exec feedback tail
+*Landed* — the commit after `d4ffb12`. Note for the measurement: the
+workspace pytest command now ends in `-n 0`, so `bringing up nodes...`
+disappears from every `exec failed` detail, not only from the tail slice.
 *Why:* XS, deterministic, 7 blocked tasks, and it separates "coder could
 not see the error" from "coder could not fix it" in the next snapshot.
 *Measure after:* count of `exec failed` attempts whose detail contains an

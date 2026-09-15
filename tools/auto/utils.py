@@ -6,6 +6,7 @@ import hashlib
 import logging
 import os
 import re
+import shlex
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -448,3 +449,89 @@ def human_duration(seconds: float) -> str:
     if s or not parts:
         parts.append(f"{s}s")
     return sign + " ".join(parts)
+
+
+# ── RUN-3: is this command a pytest invocation? ──────────────────────────────
+#
+# Shared by ``Executor._serialise_pytest`` (which appends the in-process flag)
+# and ``inner_loop._build_exec_detail`` (which reads a failed run's tail
+# instead of its head), so the two can never disagree about what a pytest
+# run is. Token-position matching, never a substring: ``echo pytest`` and
+# ``bash pytest_runner.sh`` are script runs.
+
+PYTEST_TOKENS = ("pytest", "py.test")
+
+# Shell tokens that end one command and start the next — a pytest invocation
+# is recognised at a command position: the first token, or the one after
+# any of these (``cd sub && pytest``).
+_COMMAND_SEPARATORS = frozenset({"&&", "||", ";", "|", "&"})
+
+# An xdist flag in every spelling: ``-n 4`` / ``-n4`` / ``-nauto`` / ``--dist=loadgroup``
+# / ``--numprocesses 4`` / ``--numprocesses=4``. Anchored, so ``--no-header``
+# and other long options that merely begin with "-n" do not match.
+_XDIST_FLAG_RE = re.compile(r"^(?:-n(?:\d+|auto|logical)?|--numprocesses(?:=.*)?|--dist(?:=.*)?)$")
+
+
+def is_xdist_flag(token: str) -> bool:
+    """True when *token* is an xdist worker-count / ``--dist`` flag (RUN-3).
+
+    Answers "does this pytest invocation (or this ``addopts``) ask xdist for
+    a worker pool" — in an acceptance check and in a config file alike.
+    """
+    return bool(_XDIST_FLAG_RE.match(token.strip().strip("\"'")))
+
+
+def _basename(token: str) -> str:
+    return token.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+
+
+def _tokens_run_pytest(parts: list[str]) -> bool:
+    expect_command = True
+    for i, part in enumerate(parts):
+        base = _basename(part)
+        if expect_command:
+            if base in PYTEST_TOKENS or base in ("pytest.exe", "py.test.exe"):
+                return True
+            # ``python -m pytest``: the module is two tokens on. The
+            # interpreter is matched by name (``python``, ``python3``,
+            # ``python3.11``, ``python.exe``, the ``py`` launcher) so the
+            # absolute-path rewrite the executor performs does not defeat it.
+            if (base == "py" or base.startswith("python")) and i + 2 < len(parts):
+                if parts[i + 1] == "-m" and _basename(parts[i + 2]) in PYTEST_TOKENS:
+                    return True
+            expect_command = False
+        elif part in _COMMAND_SEPARATORS:
+            expect_command = True
+    return False
+
+
+def is_pytest_command(command: str) -> bool:
+    """Return True when *command* runs pytest (RUN-3).
+
+    Recognised forms::
+
+        pytest …                                  pytest tests/test_x.py -q
+        python -m pytest …                        /venv/bin/python3.11 -m pytest …
+        C:\\venv\\Scripts\\python.exe -m pytest …    cd sub && pytest …
+
+    Splitting is tried POSIX-style and Windows-style (POSIX shlex eats the
+    backslashes of a Windows path; ``posix=False`` leaves quotes attached to
+    a POSIX argument), and the command is a pytest run when either reading
+    says so. Un-parseable quoting falls back to a substring test — a false
+    negative would cost the coder the tail of the output.
+    """
+    cmd = (command or "").strip()
+    if not cmd:
+        return False
+    parsed = False
+    for posix in (os.name != "nt", os.name == "nt"):
+        try:
+            parts = shlex.split(cmd, posix=posix)
+        except ValueError:
+            continue
+        parsed = True
+        if parts and _tokens_run_pytest(parts):
+            return True
+    if not parsed:
+        return "pytest" in cmd or "py.test" in cmd
+    return False
