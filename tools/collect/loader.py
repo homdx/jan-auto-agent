@@ -290,11 +290,11 @@ class CollectModel:
         """
         if not self.available or not path:
             return []
-        known = {m.path for m in self.modules} if self.modules else None
+        known = {m.path for m in self.modules}
         out = sorted(
             target
             for target in self.import_edges.get(path, ())
-            if known is None or target in known
+            if target in known
         )
         return out if limit <= 0 else out[:limit]
 

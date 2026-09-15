@@ -42,6 +42,7 @@ from tools.collect.loader import (
     STATUS_FRESH,
     CollectModel,
 )
+from tools.collect.model import ModuleRecord
 from tools.collect.risk import RiskEntry
 
 
@@ -190,6 +191,18 @@ class TestGraphTablesLoaded:
         model = _collect_and_load(mini_repo)
         assert model.calls_into("pkg/mid.py") == ["pkg/core.py"]
         assert model.calls_into("pkg/leaf3.py") == ["pkg/core.py"]
+        assert model.calls_into("pkg/core.py") == []
+
+    def test_calls_into_drops_all_targets_when_the_modules_table_is_empty(self, mini_repo):
+        """An empty `modules` table means zero known modules, not "the filter
+        is off" — every import_edges target must be treated as unknown and
+        dropped, the same phantom-dependency guard the docstring promises for
+        a partial artifact."""
+        model = CollectModel(
+            status=STATUS_FRESH,
+            modules=(),
+            import_edges={"pkg/core.py": ("pkg/phantom.py",)},
+        )
         assert model.calls_into("pkg/core.py") == []
 
     def test_unknown_path_is_empty(self, mini_repo):
@@ -394,6 +407,7 @@ class TestModelLevel:
     def test_queries_do_not_mutate_the_model(self):
         """V1-8"""
         model = _model(
+            modules=(ModuleRecord(path="pkg/core.py"), ModuleRecord(path="pkg/mid.py")),
             import_edges={"pkg/core.py": ("pkg/mid.py",)},
             imported_by={"pkg/core.py": ("pkg/leaf3.py", "pkg/mid.py")},
             entry_points=("pkg/core.py",),
