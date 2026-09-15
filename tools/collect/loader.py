@@ -339,6 +339,31 @@ def _string_tuple(value: object, name: str) -> Tuple[str, ...]:
     return tuple(value)
 
 
+def _test_map_table(value: object) -> Dict[str, Tuple[str, ...]]:
+    """Normalise the `test_map` artifact key to `{path: (test_path, ...)}`.
+
+    Same split as `_graph_table`: `None` means the producer never wrote the
+    key, so an empty dict keeps the rest of the artifact alive; anything else
+    with the wrong shape raises `TypeError`, which `_load_from_dir`'s guarded
+    block already turns into an absent model — a `test_map` that is present
+    *and* garbled must not silently load as `status="fresh"` with corrupted
+    test data, the same stance `_graph_table`/`_string_tuple` take for the
+    other artifact keys.
+    """
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise TypeError(f"test_map must be an object, got {type(value).__name__}")
+    out: Dict[str, Tuple[str, ...]] = {}
+    for path, tests in value.items():
+        if not isinstance(path, str) or not isinstance(tests, (list, tuple)):
+            raise TypeError(f"test_map entry {path!r} is not path -> [path]")
+        if not all(isinstance(test, str) for test in tests):
+            raise TypeError(f"test_map entry {path!r} has a non-string test path")
+        out[path] = tuple(tests)
+    return out
+
+
 def _absent(collect_dir: Optional[Path], reason: str) -> CollectModel:
     return CollectModel(status=STATUS_ABSENT, collect_dir=collect_dir, reason=reason)
 
@@ -380,12 +405,14 @@ def _load_from_dir(collect_dir: Path, *, status: str, reason: str = "") -> Colle
             )
             for g in payload.get("gates", [])
         )
-        test_map = {k: tuple(v) for k, v in payload.get("test_map", {}).items()}
         # V1: the three graph tables the producer has always written but this
         # reader dropped. Each is normalised through a helper that raises
         # TypeError on a wrong shape — the guard below already turns that into
         # an absent model — while a missing or null key yields an empty
         # container, so an older artifact still loads with the rest of its data.
+        test_map = _test_map_table(payload.get("test_map"))
+        zero_coverage_list = _string_tuple(payload.get("zero_coverage"), "zero_coverage")
+        thin_coverage_list = _string_tuple(payload.get("thin_coverage"), "thin_coverage")
         import_edges = _graph_table(payload.get("import_edges"))
         imported_by = _graph_table(payload.get("imported_by"))
         entry_points = _string_tuple(payload.get("entry_points"), "entry_points")
@@ -420,8 +447,8 @@ def _load_from_dir(collect_dir: Path, *, status: str, reason: str = "") -> Colle
         fail_open_registry=fail_open,
         gates=gates,
         test_map=test_map,
-        zero_coverage_list=tuple(payload.get("zero_coverage", [])),
-        thin_coverage_list=tuple(payload.get("thin_coverage", [])),
+        zero_coverage_list=zero_coverage_list,
+        thin_coverage_list=thin_coverage_list,
         risk_index=risk_index,
         config_map=config_map,
         import_edges=import_edges,

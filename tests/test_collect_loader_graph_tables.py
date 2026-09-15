@@ -275,6 +275,64 @@ class TestGraphTablesSchema:
         }))
         assert model.status == loader_mod.STATUS_ABSENT
 
+    def test_missing_test_map_and_coverage_keys_load_with_empty_containers(self, mini_repo):
+        def _drop(payload):
+            for key in ("test_map", "zero_coverage", "thin_coverage"):
+                payload.pop(key, None)
+
+        model = _rewrite_artifact(mini_repo, _drop)
+        assert model.status == loader_mod.STATUS_FRESH
+        assert model.test_map == {}
+        assert model.zero_coverage_list == ()
+        assert model.thin_coverage_list == ()
+        assert model.module("pkg/core.py") is not None
+
+    def test_null_test_map_and_coverage_keys_load_with_empty_containers(self, mini_repo):
+        model = _rewrite_artifact(mini_repo, lambda p: p.update({
+            "test_map": None, "zero_coverage": None, "thin_coverage": None,
+        }))
+        assert model.status == loader_mod.STATUS_FRESH
+        assert (model.test_map, model.zero_coverage_list, model.thin_coverage_list) == ({}, (), ())
+
+    def test_test_map_with_a_non_dict_value_yields_absent(self, mini_repo):
+        """A wrong outer type — no shape guard at all before this fix, so a
+        string here loaded as `status="fresh"` with an empty `test_map`."""
+        model = _rewrite_artifact(mini_repo, lambda p: p.update({"test_map": "garbage"}))
+        assert model.status == loader_mod.STATUS_ABSENT
+
+    def test_test_map_entry_with_a_non_list_value_yields_absent(self, mini_repo):
+        """The actually-dangerous shape: a correctly-typed dict whose value is a
+        bare string. Without a per-entry guard this loaded as `status="fresh"`
+        with the string silently shredded into a tuple of its own characters."""
+        model = _rewrite_artifact(mini_repo, lambda p: p.update({
+            "test_map": {"pkg/core.py": "tests/test_leaf1.py"},
+        }))
+        assert model.status == loader_mod.STATUS_ABSENT
+
+    def test_test_map_entry_with_a_non_string_test_path_yields_absent(self, mini_repo):
+        model = _rewrite_artifact(mini_repo, lambda p: p.update({
+            "test_map": {"pkg/core.py": ["tests/test_leaf1.py", 7]},
+        }))
+        assert model.status == loader_mod.STATUS_ABSENT
+
+    def test_zero_coverage_with_a_non_list_value_yields_absent(self, mini_repo):
+        model = _rewrite_artifact(mini_repo, lambda p: p.update({"zero_coverage": "garbage"}))
+        assert model.status == loader_mod.STATUS_ABSENT
+
+    def test_zero_coverage_entry_with_a_non_string_path_yields_absent(self, mini_repo):
+        """Correctly-typed outer list, wrong-typed element — the shape a plain
+        `tuple(payload.get(...))` cannot catch."""
+        model = _rewrite_artifact(mini_repo, lambda p: p.update({
+            "zero_coverage": ["pkg/core.py", 123],
+        }))
+        assert model.status == loader_mod.STATUS_ABSENT
+
+    def test_thin_coverage_entry_with_a_non_string_path_yields_absent(self, mini_repo):
+        model = _rewrite_artifact(mini_repo, lambda p: p.update({
+            "thin_coverage": [456],
+        }))
+        assert model.status == loader_mod.STATUS_ABSENT
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # V1-2 / V1-7 / V1-8 / V1-10 — model-level, no collect run needed
