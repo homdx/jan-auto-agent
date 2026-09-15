@@ -696,6 +696,33 @@ def test_the_row_skips_a_neighbour_the_module_table_does_not_know():
     assert row.count(_NEIGHBOURS_PREFIX) == _NEIGHBOURS_MAX_ENTRIES
 
 
+def test_the_row_skips_a_neighbour_marked_dirty_by_is_dirty():
+    """A neighbour edited since the last collect run has a purpose describing
+    a tree that no longer exists; the row must not render it just because the
+    caller (e.g. `context_for`) checked dirtiness only on the target file."""
+    model = _rich_model()
+    row = _row_neighbours(model, TARGET, None, is_dirty=lambda path: path == CALLERS[0])
+    assert CALLERS[0] not in row
+    assert CALLERS[1] in row
+
+
+def test_is_dirty_none_renders_exactly_as_without_the_argument():
+    """The default keeps existing callers (and every test above) unaffected."""
+    model = _rich_model()
+    assert _row_neighbours(model, TARGET, None) == _row_neighbours(model, TARGET, None, is_dirty=None)
+
+
+def test_build_collect_context_block_forwards_is_dirty_to_the_neighbours_row():
+    model = _rich_model()
+    without = build_collect_context_block(model, TARGET)
+    assert any(CALLERS[0] in line for line in _neighbour_lines(without))
+
+    with_dirty = build_collect_context_block(model, TARGET, is_dirty=lambda path: path == CALLERS[0])
+    with_dirty_lines = _neighbour_lines(with_dirty)
+    assert not any(CALLERS[0] in line for line in with_dirty_lines)
+    assert any(CALLERS[1] in line for line in with_dirty_lines)
+
+
 def test_the_row_skips_a_neighbour_with_a_malformed_summary():
     """Fail-open house rule for the one field this row is built on. A produced
     artifact always carries an `LLMSummary`, but a hand-edited one can carry a

@@ -824,6 +824,7 @@ class CollectBridge:
             raw, stats = build_collect_context_block_stats(
                 self._model, target_file, task_mode=self._task_mode,
                 budget=self._max_context_chars, pack_enabled=self._pack_enabled,
+                is_dirty=self._is_dirty,
             )
         except Exception as exc:  # noqa: BLE001 — never block a task on this
             logger.warning("CollectBridge.context_for(%s): failed: %s", target_file, exc)

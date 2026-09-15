@@ -207,6 +207,30 @@ def test_invalidate_drops_memo_entry_for_dirty_path():
         assert key[0] != "pkg/a.py"
 
 
+def test_context_for_withholds_a_dirty_neighbours_purpose():
+    """A caller only invalidates the file it edited (`pkg/caller_a.py`), never
+    the unrelated file it is requesting context for (`pkg/a.py`). Before this
+    fix, `context_for`'s own `_is_dirty` check only covered the requested path
+    — the `neighbours` row rendered `pkg/caller_a.py`'s pre-edit purpose
+    straight from the static model regardless.
+
+    A control bridge (no invalidation) proves the row would otherwise render;
+    `invalidate` runs before the first `context_for` call on the affected
+    bridge so this exercises `_row_neighbours`'s own dirty check rather than
+    the (separate, untouched-by-this-fix) memo, which only drops entries
+    keyed by the dirtied path itself, not paths that merely cite it."""
+    control = CollectBridge(_neighbourhood_model(), max_context_chars=5000, summarizer_call=None)
+    assert "Calls into the hub." in control.context_for("pkg/a.py")
+
+    bridge = CollectBridge(_neighbourhood_model(), max_context_chars=5000, summarizer_call=None)
+    bridge.invalidate(["pkg/caller_a.py"])
+    after = bridge.context_for("pkg/a.py")
+    assert "Calls into the hub." not in after
+    # the caller can still appear in the static `callers:` fact row — only
+    # its LLM-derived purpose in `neighbours:` must be withheld
+    assert not any(line.startswith("neighbours:") for line in after.split("\n"))
+
+
 def _neighbourhood_model():
     """Model with callers, callees, tests, and a neighbour that has a purpose
     — enough to populate the V3–V5 rows."""

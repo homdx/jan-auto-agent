@@ -518,7 +518,12 @@ def _first_sentence(text: str, limit: int = _NEIGHBOURS_PURPOSE_MAX_CHARS) -> st
     return flat[: space if space > 0 else end].strip()
 
 
-def _row_neighbours(model, target_file: str, remaining: "int | None") -> str:
+def _row_neighbours(
+    model,
+    target_file: str,
+    remaining: "int | None",
+    is_dirty: "Callable[[str], bool] | None" = None,
+) -> str:
     """The purpose of this module's *neighbours*, never of the module itself.
 
     The target's source is already in the prompt, so a paraphrase of it is
@@ -548,6 +553,11 @@ def _row_neighbours(model, target_file: str, remaining: "int | None") -> str:
     module table does not know, or a stand-in model with no summary table
     all yield `""`, and a neighbour whose summary is not an `LLMSummary` is
     skipped rather than raising into a run.
+
+    `is_dirty`, when given, drops any candidate the caller considers stale
+    (an edit made since the last collect run) — its purpose describes a tree
+    that no longer exists, and this row has no way to re-derive it live the
+    way `context_for`'s own dirty check does for the target file itself.
     """
     if model.module(target_file) is None:
         return ""
@@ -565,6 +575,8 @@ def _row_neighbours(model, target_file: str, remaining: "int | None") -> str:
     for path in candidates:
         if len(lines) >= _NEIGHBOURS_MAX_ENTRIES:
             break
+        if is_dirty is not None and is_dirty(path):
+            continue
         neighbour = model.module(path)
         if neighbour is None or neighbour.summary is None:
             continue
@@ -740,6 +752,7 @@ def build_collect_context_block(
     task_mode: str = "code",
     budget: "int | None" = None,
     pack_enabled: bool = True,
+    is_dirty: "Callable[[str], bool] | None" = None,
 ) -> str:
     """The collect context block for `target_file`, as a string.
 
@@ -751,7 +764,7 @@ def build_collect_context_block(
     """
     block, _stats = build_collect_context_block_stats(
         model, target_file, task_mode=task_mode, budget=budget,
-        pack_enabled=pack_enabled,
+        pack_enabled=pack_enabled, is_dirty=is_dirty,
     )
     return block
 
@@ -763,6 +776,7 @@ def build_collect_context_block_stats(
     task_mode: str = "code",
     budget: "int | None" = None,
     pack_enabled: bool = True,
+    is_dirty: "Callable[[str], bool] | None" = None,
 ) -> "tuple[str, dict]":
     """M4: the collect context block for `target_file` plus how it was cut.
 
@@ -817,6 +831,10 @@ def build_collect_context_block_stats(
     imported by type here to avoid a hard dependency from `tools.auto` on
     `tools.collect` at import time; callers that don't use collect at all
     never pay for the import.
+
+    `is_dirty`, when given, is forwarded to the `neighbours` row so a caller
+    that tracks edits made since the last collect run (e.g. `CollectBridge`)
+    can keep a stale neighbour's purpose out of an otherwise-clean block.
     """
     budget = _coerce_budget(budget)
 
@@ -839,6 +857,8 @@ def build_collect_context_block_stats(
     def _render(name: str, render, allowance: "int | None") -> str:
         """One renderer call, fail-open: a broken row is no row, never no block."""
         try:
+            if name == "neighbours":
+                return render(model, target_file, allowance, is_dirty)
             return render(model, target_file, allowance)
         except Exception as exc:  # noqa: BLE001
             logger.warning("collect block row %r failed for %s: %s", name, target_file, exc)
