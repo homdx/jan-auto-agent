@@ -986,8 +986,21 @@ class CollectBridge:
                     )
             except Exception as exc:  # noqa: BLE001 — fail open to truncation
                 logger.warning("CollectBridge: shrink call failed: %s — hard-truncating", exc)
-        excess = len(raw) - self._max_context_chars
-        return raw[: self._max_context_chars] + f"\n… [+{excess} chars truncated by CollectBridge]\n"
+        # The notice itself takes budget too — appending it after a cut at
+        # exactly _max_context_chars made the returned string overshoot by
+        # the notice's own length. Reserve room for it first; the notice's
+        # length depends on `excess`, which depends on the cut, so converge
+        # in a few steps (the digit count of `excess` rarely needs more).
+        cut = self._max_context_chars
+        notice = ""
+        for _ in range(4):
+            excess = len(raw) - cut
+            notice = f"\n… [+{excess} chars truncated by CollectBridge]\n"
+            new_cut = max(0, self._max_context_chars - len(notice))
+            if new_cut == cut:
+                break
+            cut = new_cut
+        return raw[:cut] + notice
 
     # ── 2. pull-model symbol resolution ─────────────────────────────────
 

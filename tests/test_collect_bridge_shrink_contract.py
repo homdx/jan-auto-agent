@@ -14,7 +14,9 @@ does not touch.
 Pinned behaviours (from the V6 plan):
   * summarizer within budget*1.15 -> returned verbatim
   * beyond 1.15 -> hard truncation with `[+N chars truncated by CollectBridge]`,
-    overshoot logged
+    overshoot logged, and the notice's own length counted against the budget
+    (the hard-truncation path's one guarantee: the returned string, notice
+    included, never exceeds `_max_context_chars`)
   * summarizer raises -> hard truncation, failure logged
   * summarizer_call is None -> hard truncation, shrink_calls stays 0
   * shrink_calls increments once per attempt, including failed ones
@@ -30,6 +32,23 @@ from tools.auto.collect_bridge import _SHRINK_SYSTEM_PROMPT, CollectBridge
 _BUDGET = 400
 _RAW = "R" * 800
 _TRUNC_NOTICE = "chars truncated by CollectBridge"
+
+
+def _hard_truncated(raw: str, budget: int) -> str:
+    """The hard-truncation result `_shrink` must produce: `raw` cut, plus the
+    notice, with the notice's own length counted against `budget` so the
+    total never exceeds it. Computed independently of `_shrink`'s own
+    convergence loop so this is a black-box check, not a copy of it."""
+    cut = budget
+    notice = ""
+    for _ in range(4):
+        excess = len(raw) - cut
+        notice = f"\n… [+{excess} chars truncated by CollectBridge]\n"
+        new_cut = max(0, budget - len(notice))
+        if new_cut == cut:
+            break
+        cut = new_cut
+    return raw[:cut] + notice
 
 
 def _bare_bridge(summarizer_call=None) -> CollectBridge:
@@ -92,8 +111,8 @@ def test_shrink_summarizer_overshoot_hard_truncates_and_logs(caplog):
     with caplog.at_level(logging.WARNING):
         result = bridge._shrink(_RAW)
 
-    excess = len(_RAW) - _BUDGET
-    assert result == _RAW[:_BUDGET] + f"\n… [+{excess} {_TRUNC_NOTICE}]\n"
+    assert result == _hard_truncated(_RAW, _BUDGET)
+    assert len(result) <= _BUDGET
     assert len(result) < len(overshoot)
     assert bridge.shrink_calls == 1
     assert any("overshot" in r.message for r in caplog.records)
@@ -108,8 +127,8 @@ def test_shrink_summarizer_returns_empty_string_hard_truncates():
     bridge = _bare_bridge(_summ)
     result = bridge._shrink(_RAW)
 
-    excess = len(_RAW) - _BUDGET
-    assert result == _RAW[:_BUDGET] + f"\n… [+{excess} {_TRUNC_NOTICE}]\n"
+    assert result == _hard_truncated(_RAW, _BUDGET)
+    assert len(result) <= _BUDGET
     assert bridge.shrink_calls == 1
 
 
@@ -126,8 +145,8 @@ def test_shrink_summarizer_exception_hard_truncates_and_logs(caplog):
     with caplog.at_level(logging.WARNING):
         result = bridge._shrink(_RAW)
 
-    excess = len(_RAW) - _BUDGET
-    assert result == _RAW[:_BUDGET] + f"\n… [+{excess} {_TRUNC_NOTICE}]\n"
+    assert result == _hard_truncated(_RAW, _BUDGET)
+    assert len(result) <= _BUDGET
     assert bridge.shrink_calls == 1
     assert any("shrink call failed" in r.message for r in caplog.records)
 
@@ -141,8 +160,8 @@ def test_shrink_without_summarizer_hard_truncates_shrink_calls_zero():
     bridge = _bare_bridge(None)
     result = bridge._shrink(_RAW)
 
-    excess = len(_RAW) - _BUDGET
-    assert result == _RAW[:_BUDGET] + f"\n… [+{excess} {_TRUNC_NOTICE}]\n"
+    assert result == _hard_truncated(_RAW, _BUDGET)
+    assert len(result) <= _BUDGET
     assert bridge.shrink_calls == 0
 
 
@@ -165,6 +184,28 @@ def test_shrink_calls_increments_per_attempt_including_failed_ones():
 
     assert bridge.shrink_calls == 2
     assert len(attempts) == 2  # summarizer was actually invoked both times
+
+
+# ── the truncated result never exceeds the budget ───────────────────────────
+
+
+def test_hard_truncation_never_exceeds_budget_reported_repro():
+    """The reported repro: budget=200 previously returned 243 chars — the
+    notice appended after the cut pushed the total past the budget it was
+    supposed to respect."""
+    bridge = CollectBridge(None, max_context_chars=200, summarizer_call=None)
+    result = bridge._shrink("R" * 1000)
+    assert len(result) <= 200
+
+
+def test_hard_truncation_never_exceeds_budget_across_budgets_and_lengths():
+    # __init__ floors max_context_chars at 200, so budgets below that are not
+    # reachable — start at the floor itself.
+    for budget in (200, 400, 999, 1000, 9999, 10000):
+        for raw_len in (budget + 1, budget + 40, budget * 3, budget * 50):
+            bridge = CollectBridge(None, max_context_chars=budget, summarizer_call=None)
+            result = bridge._shrink("R" * raw_len)
+            assert len(result) <= budget, f"budget={budget} raw_len={raw_len}: {len(result)}"
 
 
 def test_shrink_system_prompt_and_user_budget_are_wired():
