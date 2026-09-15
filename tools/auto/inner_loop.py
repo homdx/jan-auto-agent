@@ -1599,12 +1599,25 @@ class InnerLoop:
             # REJECTED trace (nothing landed at all) can name them too.
             files_skipped = list(getattr(coder_result, "files_skipped", []) or [])
 
+            # RUN-4: the budget this attempt went out at, plus whether its
+            # cut-off reply just raised it for the next one. The ladder is
+            # only visible on the coder decision events, so
+            # trace_round_snapshot.py counts it from these two params. Fakes
+            # without the fields add nothing.
+            _budget = int(getattr(coder_result, "max_tokens", 0) or 0)
+            _trace_extra: dict = {}
+            if _budget:
+                _trace_extra["max_tokens"] = _budget
+                _trace_extra["budget_raised"] = bool(
+                    getattr(coder_result, "budget_raised", False))
+
             if not getattr(coder_result, "succeeded", True):
                 # Context is accumulated above even on coder failure: the next
                 # attempt benefits from symbols already resolved, regardless of
                 # whether the current attempt produced valid code.
                 fb = f"attempt {attempt}: coder failed — {getattr(coder_result, 'error', 'unknown error')}"
-                _trace_stage(task_id, attempt, "coder", "REJECTED", skipped=files_skipped)
+                _trace_stage(task_id, attempt, "coder", "REJECTED",
+                             skipped=files_skipped, **_trace_extra)
                 feedback.append(fb)
                 records.append(AttemptRecord(attempt, False, False, False, fb))
                 continue
@@ -1620,7 +1633,7 @@ class InnerLoop:
             if files_skipped:
                 _trace_stage(task_id, attempt, "coder", "OK_WITH_SKIPS",
                              written=list(getattr(coder_result, "files_written", []) or []),
-                             skipped=files_skipped)
+                             skipped=files_skipped, **_trace_extra)
                 _n = len(files_skipped)
                 feedback.append(
                     f"attempt {attempt}: note: {_n} file"

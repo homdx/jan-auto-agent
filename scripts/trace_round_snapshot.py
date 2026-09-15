@@ -111,6 +111,12 @@ def read_run(base, run_id=None):
         "gate1": {"requests": 0, "confirmed": 0, "rejected": 0, "unparsed": 0},
         "gate1_split": None,
         "gate1_location_ext": collections.Counter(),
+        # RUN-4: the coder's truncation ladder — how many rejected coder
+        # attempts had just raised the output budget for the next one, and
+        # at which tier the attempts went out. The ladder is only visible in
+        # the coder decision event, which carries max_tokens + budget_raised.
+        "coder_budget_escalations": 0,
+        "coder_budgets": collections.Counter(),
         "probe": {"ops": 0, "hits": 0, "misses": 0, "memo_hits": 0},
         "probe_by_op": collections.Counter(),
         # M4: events when they exist, grep otherwise — see collect_source.
@@ -221,6 +227,21 @@ def read_run(base, run_id=None):
                 rf["modules"] = int(rf["modules"])
             elif kind == "gate1_split":
                 out["gate1_split"] = dict(r.get("params") or {})
+            # ── RUN-4: the coder's truncation ladder ───────────────────────
+            # Only the coder's REJECTED decision carries the budget; a coder
+            # attempt that went out at 12000 instead of 3000 is visible here
+            # and nowhere else, so this is what tells you the ladder was
+            # needed (and how often the cap got in the way).
+            elif kind == "decision" \
+                    and str((r.get("params") or {}).get("stage")) == "coder":
+                p = r.get("params") or {}
+                _mt = p.get("max_tokens")
+                if _mt in (None, ""):
+                    continue
+                out["coder_budgets"][str(_mt)] += 1
+                # agent_trace stringifies params: "False" is truthy.
+                if str(p.get("budget_raised", "")).strip().lower() in ("true", "1", "yes"):
+                    out["coder_budget_escalations"] += 1
 
     # M4 events, or the pre-M4 grep. Comparability between the two is the
     # whole point of keeping the grep at all.
@@ -238,6 +259,7 @@ def read_run(base, run_id=None):
             (t1 - t0).total_seconds() / (out["gate1"]["requests"] - 1), 1)
     for k in ("llm_by_source", "gate1_location_ext", "probe_by_op"):
         out[k] = dict(out[k])
+    out["coder_budgets"] = dict(out["coder_budgets"])
     for k in ("shrink", "miss"):
         out["collect"][k] = dict(out["collect"][k])
     out["head_sha"], out["pre_run_sha"], out["switched_mid_run"] = base_sha(
@@ -269,7 +291,7 @@ def main():
     # a grep and from a collect_block event are not the same measurement.
     _block = lambda r: f"{r['collect_block_occurrences']} ({r['collect_source']})"
 
-    hdr = f"{'run':12} {'probe':>6} {'reason':>14} {'arch':>5} {'gate1':>6} {'conf':>5} {'rej':>5} {'s/cand':>7} {'probe ops':>10} {'miss':>5} {'collect blocks':>15}"
+    hdr = f"{'run':12} {'probe':>6} {'reason':>14} {'arch':>5} {'gate1':>6} {'conf':>5} {'rej':>5} {'s/cand':>7} {'probe ops':>10} {'miss':>5} {'collect blocks':>15} {'cod esc':>8}"
     print(hdr)
     print("-" * len(hdr))
     tot = collections.Counter()
@@ -282,15 +304,17 @@ def main():
         tot["ops"] += r["probe"]["ops"]
         tot["miss"] += r["probe"]["misses"]
         tot["blocks"] += r["collect_block_occurrences"]
+        tot["codesc"] += r.get("coder_budget_escalations", 0)
         print(f"{r['run']:12} {str(r['probe_usable']):>6} {str(r['probe_reason']):>14} "
               f"{r['llm_by_source'].get('architect', 0):>5} {g['requests']:>6} "
               f"{g['confirmed']:>5} {g['rejected']:>5} "
               f"{g.get('seconds_per_candidate', '—'):>7} {r['probe']['ops']:>10} "
-              f"{r['probe']['misses']:>5} {_block(r):>15}")
+              f"{r['probe']['misses']:>5} {_block(r):>15} "
+              f"{r.get('coder_budget_escalations', 0):>8}")
     print("-" * len(hdr))
     print(f"{'TOTAL':12} {'':>6} {'':>14} {tot['arch']:>5} {tot['g1']:>6} "
           f"{tot['conf']:>5} {tot['rej']:>5} {'':>7} {tot['ops']:>10} "
-          f"{tot['miss']:>5} {tot['blocks']:>15}")
+          f"{tot['miss']:>5} {tot['blocks']:>15} {tot['codesc']:>8}")
     snap["totals"] = dict(tot)
 
     if a.out:

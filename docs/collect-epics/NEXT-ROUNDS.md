@@ -78,6 +78,9 @@ not see the error" from "coder could not fix it" in the next snapshot.
 `E   ` line; BLOCKED tasks ending on `exit 1/5`.
 
 ### Step 3 — `RUN-4` coder output budget ladder
+*Landed* — the commit after `26b5d7f`. Note for the measurement: a retry of
+the same task keeps its climbed budget across outer rounds (task-id cursor),
+so a task that needed 12 000 once is not re-climbed from 3 000 next round.
 *Why:* the most frequent coder failure in both trees.
 *Measure after:* `cut off before the JSON` occurrences per task; done/blocked
 ratio; the new `max_tokens=` param on coder decision events.

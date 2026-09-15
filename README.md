@@ -414,6 +414,18 @@ workspace pytest run is one file, so it runs in one process (`-n 0`,
 `[executor] pytest_serial = true` by default) when the project's own
 `addopts` would otherwise start an xdist pool.
 
+A reply that stops mid-JSON was cut by the output budget, not by the
+model: the next attempt of the same task goes out at `max_tokens × 2`, up
+to `[coder] max_tokens_cap` (default 4 × `max_tokens`, so 3000 → 6000 →
+12000 and stops), and the feedback line says *output budget was raised to
+6000 tokens for this attempt* instead of asking the model to shorten a file
+that has to be complete. Only a cut-off climbs — prose or malformed JSON
+gets the same budget again — and the budget that produced a parseable
+reply is remembered on the `Coder` instance, so the next task starts at
+`max(config, learned)`; a new run starts cold. The coder decision events
+carry `max_tokens` / `budget_raised`, which `scripts/trace_round_snapshot.py`
+totals in its `cod esc` column.
+
 Only a task that passes **both** halves is committed. A task that
 exhausts `max_attempts` without passing both stays `pending`/failed in
 `plan.json` for the next run (or for a human to look at) rather than being
