@@ -122,6 +122,12 @@ def main():
         print("Fix this one ticket, commit it, record it with append_task.py, "
               "then run this command again for the next.")
     print("=" * 72)
+    print(f"YOUR TASK: change the CODE so that the defect described below is fixed.")
+    print(f"  ticket file : {os.path.join(a.tasks, nxt['name'])}  (already exists — do NOT create,")
+    print(f"                edit or rewrite it; it is the description of your task, not the deliverable)")
+    print(f"  code to fix : {nxt['finding'] or '(see the ticket body)'}")
+    print(f"  deliverable : one local commit that changes that code + a test that fails without it")
+    print("=" * 72)
     print(nxt["body"].rstrip())
     print("=" * 72)
     print(f"When the fix is committed, record it:")

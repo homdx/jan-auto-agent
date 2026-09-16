@@ -112,7 +112,11 @@ wrong (see `INDEX.md` §"Numbers in this file … are hand-measured").
 > python3 scripts/next_task.py --tasks epic-tasks/ --progress runs/<YOUR NAME>/PROGRESS.csv
 > ```
 >
-> Implement **exactly that ticket**. Then record it:
+> The command prints a ticket: a description of a defect in the code named on
+> its `**File:**` / `**Symbol:**` lines. The ticket file itself already exists
+> in `epic-tasks/` — do **not** create, edit or rewrite it; it is your task
+> description, not your deliverable. Your deliverable is a change to the code
+> it names, plus a test. Implement **exactly that ticket**. Then record it:
 >
 > ```bash
 > python3 scripts/append_task.py --progress runs/<YOUR NAME>/PROGRESS.csv \
