@@ -39,7 +39,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
-COLLECTOR_VERSION = "1"
+COLLECTOR_VERSION = "2"  # V10: real parameter lists in `signature` — forces one full rebuild
 
 #: Default directories skipped when discovering files for a manifest —
 #: mirrors the spirit of `[search] skip_dirs` used elsewhere in this repo.

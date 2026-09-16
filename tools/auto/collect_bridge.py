@@ -1212,9 +1212,11 @@ class CollectBridge:
     def _format_module_block(self, module) -> str:
         """One line per symbol: `name(sig) :line — first docstring line`.
 
-        The line number and docstring are not decoration. `signature` from
-        collect is elided to `name(...)` with no parameter list, so a bare
-        name+signature listing tells the model almost nothing it did not
+        The line number and docstring are not decoration. Before V10
+        `signature` from collect was elided to `name(...)` with no parameter
+        list (it is the real list now, cut at 160 chars — and still
+        `name(...)` for a class without its own `__init__`), so a bare
+        name+signature listing told the model almost nothing it did not
         already know. `docstring_first_line` is populated for 37% of symbols
         in this tree and is the only prose in the record; `lineno` lets the
         Architect emit an accurate `cited_location.line_start` instead of
@@ -1230,7 +1232,7 @@ class CollectBridge:
         for sym in syms[: self._MODULE_SYMBOL_LIMIT]:
             qn = getattr(sym, "qualname", "") or ""
             bare = qn.split(":", 1)[-1] if ":" in qn else qn
-            # collect stores `signature` as "name(...)", NOT "(...)" — a
+            # collect stores `signature` as "name(a, b)" / "name(...)", NOT "(...)" — a
             # naive f"{bare}{signature}" renders "backoff_secondsbackoff_seconds(...)".
             # Found on a live artifact, not in a fixture: the test double had
             # the same shape and the doubled text still contained the expected
