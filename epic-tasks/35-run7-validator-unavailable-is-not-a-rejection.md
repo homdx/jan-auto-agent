@@ -1,6 +1,6 @@
 # RUN-7 — "validator unavailable" is not a rejection
 
-**Status:** open (base: `55bffc9`, the `tickets` branch head, 2026-09-16)  
+**Status:** open (base: `c8da303`+ (origin/tickets with L1 landed; take the current `tickets` head), 2026-09-16)  
 **Severity:** HIGH  
 **File:** `tools/auto/inner_loop.py`  
 **Symbol:** `LLMGate2Validator.approve` (≈ 586–820, the `except Exception` exit that returns `(False, "validator unavailable: …")`) and the validator branch of `InnerLoop.run_task` (≈ 1708–1752, `if not approved:`)  

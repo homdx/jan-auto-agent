@@ -8,7 +8,7 @@ The loop and the scorecard: `docs/collect-epics/RUN-THE-EPIC-COMPETITION.md`.
 |---|---|---|---|---|---|---|
 | 1 | `L2` | landed `8212df1` | HIGH | XS | [01-l2-probe-config-must-say-stale-not-no-artifact.md](01-l2-probe-config-must-say-stale-not-no-artifact.md) | `tools/auto/architect.py` |
 | 2 | `M1` | landed `5fe7737` | CRITICAL | M | [02-m1-scripts-collect-metrics-py-the-static-baseline.md](02-m1-scripts-collect-metrics-py-the-static-baseline.md) | `scripts/collect_metrics.py` |
-| 3 | `L1` | open | HIGH | S | [03-l1-gate-1-stage-a0-a-location-that-is-not-an-indexe.md](03-l1-gate-1-stage-a0-a-location-that-is-not-an-indexe.md) | `tools/auto/gate1_filter.py` |
+| 3 | `L1` | landed `ff22c04` | HIGH | S | [03-l1-gate-1-stage-a0-a-location-that-is-not-an-indexe.md](03-l1-gate-1-stage-a0-a-location-that-is-not-an-indexe.md) | `tools/auto/gate1_filter.py` |
 | 4 | `V1` | landed `81658b6` | HIGH | S | [04-v1-loader-keeps-the-import-graph-and-three-queries.md](04-v1-loader-keeps-the-import-graph-and-three-queries.md) | `tools/collect/loader.py` |
 | 5 | `V2` | landed `72bbc86` | HIGH | M | [05-v2-the-block-becomes-an-ordered-row-list.md](05-v2-the-block-becomes-an-ordered-row-list.md) | `tools/auto/context_assembler.py` |
 | 6 | `V3` | landed `b609492` | HIGH | S | [06-v3-rows-callers-calls-into-tests.md](06-v3-rows-callers-calls-into-tests.md) | `tools/auto/context_assembler.py` |
@@ -58,7 +58,7 @@ sequence; a step is not started until the previous one is merged.
 | 4 | `RUN-5` | *landed* — 25–35 % of candidates dropped by provider silence; plan size is a coin flip until fixed | `unparsed` → `unknown` column, plan size |
 | 5 | `RUN-7` | live `../testtext2` (`baa9da87a2ab`): a validator outage (ollama.com 429) was recorded as 5 rejections, the task went BLOCKED unreviewed | `validator_status = unavailable` rows, tasks left `todo` instead of BLOCKED |
 | 6 | `RUN-8` | same run: one 80-min hung coder stream = one burned attempt + the whole task budget → BLOCKED after one round | `cod transport` column, deadline credited |
-| 7 | `L1` | deterministic: 82 / 30 gate-1 calls on non-`.py` locations | non-`.py` gate-1 rows → 0 |
+| 7 | `L1` | *landed* `ff22c04` — deterministic: 82 / 30 gate-1 calls on non-`.py` locations | non-`.py` gate-1 rows → 0 |
 | 8 | `M3` | measurement only; decides whether V12/V13 exist | ceiling number in `EPIC-M-metrics.md` |
 | 9 | `V4`, `V10` | supply rows — worth it only once step 1 puts the pack in front of the coder | M2 static numbers, block sizes |
 | 10 | `V12`/`V13` | only if step 8 says ceiling > 0 | gate-1 stage split |
