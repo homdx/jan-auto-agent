@@ -1,6 +1,6 @@
 # V8 — `--no-llm` preserves existing summaries
 
-**Status:** open (base: `e5d46fc` — the `tickets` head with RUN-7/RUN-8 landed; re-verified 2026-09-16 — reproduced: a module summarized by Pass B (`provenance: llm`) loses its summary (`None`) after one source edit and a `refresh --no-llm`)  
+**Status:** landed — `da1e9b3` (base `74cd58f`; done in-session, not as a contest: `Provenance.LLM_STALE` on `LLMSummary` only, carry-forward in `_full_build` / `action_refresh` / `action_module`, `--drop-summaries` on both entry points, Pass C over carried summaries so the file count is stable, stale modules re-summarized by the next Pass B run; 11 tests in `tests_bugfix/test_collect_no_llm_preserves_summaries.py`)  
 **Severity:** HIGH  
 **File:** `tools/collect/cli.py`  
 **Symbol:** `—`  

@@ -17,9 +17,9 @@ The loop and the scorecard: `docs/collect-epics/RUN-THE-EPIC-COMPETITION.md`.
 | 9 | `V6` | landed `76fd4bd` | HIGH | S | [09-v6-wire-the-budget-and-the-memo-into-collectbridge.md](09-v6-wire-the-budget-and-the-memo-into-collectbridge.md) | `tools/auto/collect_bridge.py` |
 | 10 | `M2` | landed `5ace54f` | CRITICAL | S | [10-m2-block-redundancy-the-number-epic-a-exists-to-mov.md](10-m2-block-redundancy-the-number-epic-a-exists-to-mov.md) | `scripts/collect_metrics.py` |
 | 11 | `V7` | landed `25d5de8` | HIGH | M | [11-v7-collect-on-a-stale-tree-goes-incremental-fix-the.md](11-v7-collect-on-a-stale-tree-goes-incremental-fix-the.md) | `tools/collect/cli.py` |
-| 12 | `V8` | **open** (base `e5d46fc`) | HIGH | M | [12-v8-no-llm-preserves-existing-summaries.md](12-v8-no-llm-preserves-existing-summaries.md) | `tools/collect/cli.py` |
+| 12 | `V8` | **landed** (`da1e9b3`) | HIGH | M | [12-v8-no-llm-preserves-existing-summaries.md](12-v8-no-llm-preserves-existing-summaries.md) | `tools/collect/cli.py` |
 | 13 | `V9` | landed `2f9005d` | HIGH | M | [13-v9-freshness-is-checked-once-and-then-believed-all.md](13-v9-freshness-is-checked-once-and-then-believed-all.md) | `tools/auto/collect_bridge.py` |
-| 14 | `V10` | **open** (base `e5d46fc`) | MEDIUM | M | [14-v10-real-signatures.md](14-v10-real-signatures.md) | `tools/collect/ast_facts.py` |
+| 14 | `V10` | **landed** (`74cd58f`) | MEDIUM | M | [14-v10-real-signatures.md](14-v10-real-signatures.md) | `tools/collect/ast_facts.py` |
 | 15 | `M3` | open | CRITICAL | M | [15-m3-suppressor-ceiling-the-go-no-go-for-epic-b.md](15-m3-suppressor-ceiling-the-go-no-go-for-epic-b.md) | `scripts/collect_metrics.py` |
 | 16 | `V11` | landed `9406601` | HIGH | M | [16-v11-pass-c-stops-eating-test-file-summaries.md](16-v11-pass-c-stops-eating-test-file-summaries.md) | `tools/collect/verifier.py` |
 | 17 | `V12` | open | MEDIUM | S | [17-v12-gate-1-stage-a2-minimal-only-if-m3-says-the-ceil.md](17-v12-gate-1-stage-a2-minimal-only-if-m3-says-the-ceil.md) | `tools/auto/gate1_filter.py` |
@@ -42,7 +42,7 @@ The loop and the scorecard: `docs/collect-epics/RUN-THE-EPIC-COMPETITION.md`.
 | 34 | `RUN-6` | landed `7135844` | HIGH | S | [34-run6-a-stale-artifact-at-session-start-switches-the-pack-off-for-the-whole-session.md](34-run6-a-stale-artifact-at-session-start-switches-the-pack-off-for-the-whole-session.md) | `tools/auto/collect_bridge.py` |
 | 35 | `RUN-7` | landed (the commit after `acbfd61`) | HIGH | S | [35-run7-validator-unavailable-is-not-a-rejection.md](35-run7-validator-unavailable-is-not-a-rejection.md) | `tools/auto/inner_loop.py` |
 | 36 | `RUN-8` | landed (the commit after `97983d8`) | HIGH | S | [36-run8-a-transport-failure-mid-stream-is-charged-to-the-coder.md](36-run8-a-transport-failure-mid-stream-is-charged-to-the-coder.md) | `tools/auto/coder.py` |
-| 37 | `RUN-9` | **open** (base `e5d46fc`) | HIGH | M | [37-run9-an-empty-presence-reply-is-not-a-garbled-verdict.md](37-run9-an-empty-presence-reply-is-not-a-garbled-verdict.md) | `tools/auto/gate1_filter.py` |
+| 37 | `RUN-9` | **open** (base `da1e9b3`) | HIGH | M | [37-run9-an-empty-presence-reply-is-not-a-garbled-verdict.md](37-run9-an-empty-presence-reply-is-not-a-garbled-verdict.md) | `tools/auto/gate1_filter.py` |
 
 ## Next rounds — the order (as of `6ca675c`, 2026-09-14; step 1 landed — `7135844` (+`5788423`, `d4ffb12`); step 2 landed — RUN-3; step 3 landed — `ade28e6`; step 4 landed — RUN-5)
 

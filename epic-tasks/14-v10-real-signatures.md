@@ -1,6 +1,6 @@
 # V10 — Real signatures
 
-**Status:** open (base: `e5d46fc` — the `tickets` head with RUN-7/RUN-8 landed; re-verified 2026-09-16 — `README.md:233` promises `facts <symbol>` = signature + contracts, `ast_facts.py:72` still emits `name(...)` for every symbol)  
+**Status:** landed — `74cd58f` (base `e5d46fc`; done in-session, not as a contest: `_signature()` in `ast_facts.py`, 160-char cut on a parameter boundary, `ast.unparse` fallback to `name(...)`, `COLLECTOR_VERSION` "1" → "2" for the one intentional full rebuild; 8 tests in `tests/test_collect_real_signatures.py`)  
 **Severity:** MEDIUM  
 **File:** `tools/collect/ast_facts.py`  
 **Symbol:** `—`  
