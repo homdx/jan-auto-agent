@@ -829,6 +829,27 @@ class AutoController:
                 # sees is HEAD, and paths from both commits must be dirty.
                 self._invalidate_collect(task["id"], collect_bridge, commit_hash)
 
+            elif getattr(result, "unavailable", False) is True:
+                # ── RUN-7: the Gate-2 reviewer never answered ─────────────
+                # A provider outage, not an exhaustion. OuterLoop already put
+                # the task back to TODO with no round consumed and no
+                # feedback_round_N.md, so there is nothing to review, no
+                # knowledge note to write and no investigation ticket to
+                # open — an AUTO-C6 ticket here would send someone chasing a
+                # review that never happened. Before this result existed
+                # `not passed` always meant `exhausted`, which is what the
+                # plain `else` below still handles.
+                #
+                # The coder's unreviewed candidate is still dirty in base_dir
+                # (Bug 2 below): the next session re-runs the coder from a
+                # clean tree anyway, so discard it now rather than let the
+                # next successful task's commit sweep it in.
+                self.state.log(
+                    f"task {task['id']} left todo — validator unavailable "
+                    f"(no feedback, no knowledge note, no ticket)"
+                )
+                self._discard_exhausted_residue(task["id"], reason="validator unavailable")
+
             else:
                 # ── AUTO-G4: exhaustion → knowledge note + ticket ──────────
                 ex_outcome = exhaustion_handler.handle(task, result)
@@ -868,6 +889,11 @@ class AutoController:
                     feedback=last_feedback,
                     attempts=total_attempts,
                     prompt_store=self.auto_tuner.prompt_store,
+                    # RUN-7: an outage is neither an approval nor a rejection
+                    # — its own status keeps the auto-tuner from demoting a
+                    # validator prompt nobody wrote (a "rejected" row here
+                    # would). record_gate2() ignores `approved` when set.
+                    unavailable=getattr(result, "unavailable", False) is True,
                 )
                 tune_outcome = self.auto_tuner.maybe_tune()
                 if tune_outcome.promoted:
@@ -894,8 +920,13 @@ class AutoController:
         self._log_collect_summary(collect_bridge)
         return None, tasks_done  # all tasks done / no tasks
 
-    def _discard_exhausted_residue(self, task_id: str) -> None:
-        """Discard the uncommitted edits left behind by an exhausted task.
+    def _discard_exhausted_residue(
+        self, task_id: str, reason: str = "exhausted",
+    ) -> None:
+        """Discard the uncommitted edits left behind by a task that did not commit.
+
+        ``reason`` names the run.log line: ``exhausted`` (the AUTO-G4 path) or
+        ``validator unavailable`` (RUN-7 — the task went back to todo).
 
         The coder writes its candidate into base_dir before validation, so an
         exhausted task leaves that edit dirty -- and commit() stages
@@ -926,9 +957,9 @@ class AutoController:
             self.git.discard_working_changes()
         except GitError as exc:
             logger.warning(
-                "task %s: could not discard uncommitted edits after "
-                "exhaustion — continuing (residue may be swept into the next "
-                "commit): %s", task_id, exc,
+                "task %s: could not discard uncommitted edits (%s) — "
+                "continuing (residue may be swept into the next commit): %s",
+                task_id, reason, exc,
             )
             self.state.log(
                 f"task {task_id} uncommitted edits NOT discarded "
@@ -938,7 +969,7 @@ class AutoController:
             return
         self.state.log(
             f"task {task_id} uncommitted edits discarded "
-            f"(exhausted, not committed)"
+            f"({reason}, not committed)"
         )
 
     def _check_regressions(

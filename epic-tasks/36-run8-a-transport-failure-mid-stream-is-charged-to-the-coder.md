@@ -1,6 +1,6 @@
 # RUN-8 — A transport failure mid-stream is charged to the coder
 
-**Status:** queued — written 2026-09-16; on offer once RUN-7 (ticket 35) has landed  
+**Status:** open (base: the commit after `acbfd61` — the `tickets` head with RUN-7 landed; take the current `tickets` head, 2026-09-16)  
 **Severity:** HIGH  
 **File:** `tools/auto/coder.py`  
 **Symbol:** `Coder.generate` (≈ 615–633, the `except Exception` around `request_completion` that returns `CoderResult(error="LLM call failed: …")`) and the `if not coder_result.succeeded` branch of `InnerLoop.run_task` (`tools/auto/inner_loop.py` ≈ 1612–1622)  

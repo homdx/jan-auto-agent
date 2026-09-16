@@ -102,6 +102,19 @@ Deterministic: 82 (testtext) / 30 (testtext6) gate-1 LLM calls on
 *Measure after:* `gate1_location_ext` in the snapshot has no non-`.py`
 rows.
 
+*Landed* — `ff22c04`.
+
+### Step 5a — `RUN-7` validator unavailable ≠ rejected
+Live `../testtext2` (`baa9da87a2ab`): five "validator rejected / validator
+unavailable: HTTP 429" attempts on AUTO-T6, ≈ 13 min of coder + executor
+work each, then BLOCKED with a knowledge file for code nobody reviewed.
+*Landed* — the commit after `acbfd61`. Note for the measurement: an outage
+now leaves the task `todo` with its round counter as it was, so a session
+that ran through a provider outage shows the same tasks pending on the next
+run, not BLOCKED; `metrics.json` rows carry `validator_status: unavailable`;
+the snapshot's `g2 unavail` column counts one event per outage (retries are
+visible as Gate-2 LLM calls, not as extra events).
+
 ### Step 6 — `M3` suppressor ceiling
 Measurement only. Its number decides whether V12/V13 exist.
 

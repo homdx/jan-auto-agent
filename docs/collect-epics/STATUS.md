@@ -1,6 +1,6 @@
 # Status — where the collect epics stand, and what is being waited on
 
-**As of:** 2026-09-15, branch `tickets`, HEAD = the commit after `24d9028` = RUN-5 (on top of `ade28e6` = RUN-4; next round is L1). The order of the
+**As of:** 2026-09-16, branch `tickets`, HEAD = the commit after `acbfd61` = RUN-7 (on top of `ff22c04` = L1 and `d22c197` = RUN-5; next round is RUN-8). The order of the
 next rounds and the live-run evidence behind it: `NEXT-ROUNDS.md`.
 Sections 2–4 below describe the wait as it stood on `2f9005d`; the run has
 since happened (`after-r31-live.json`) and NEXT-ROUNDS.md §1 is its reading.
@@ -11,7 +11,7 @@ Ticket-by-ticket state is also stamped into every `epic-tasks/NN-*.md`
 
 ## 1. Ledger
 
-### Landed — 22 of 34: the short path (PLAN-v2 §6), L2, V16, V6, M4, M5, RUN-1, RUN-2, RUN-6, RUN-3, RUN-4
+### Landed — 25 of 37: the short path (PLAN-v2 §6), L2, V16, V6, M4, M5, RUN-1, RUN-2, RUN-6, RUN-3, RUN-4, RUN-5, L1, RUN-7
 
 | ticket | commit | one line |
 |---|---|---|
@@ -39,11 +39,13 @@ Ticket-by-ticket state is also stamped into every `epic-tasks/NN-*.md`
 | RUN-4 | `ade28e6` | a reply cut off mid-JSON (or mid-sentence in creative mode) sends the next attempt of the same task at `max_tokens × 2`, up to `[coder] max_tokens_cap` (default 4×); prose/malformed JSON keep the budget; the parseable budget is learned per `Coder` instance; feedback says *output budget was raised to N*; `max_tokens`/`budget_raised` on the coder decision event, `cod esc` in the snapshot |
 
 | RUN-5 | after `24d9028` | a presence check the provider never answered (empty/unparseable reply, transport error after every retry) is `unknown`, not a rejection; `[gate1] presence_unknown = keep` (default) keeps the candidate with a *presence unknown — provider gave no verdict after N re-ask(s): …* note in its instruction, `reject` = the old drop; `UNKNOWN` at WARNING, `REJECTED` only for a model's no; `presence_unknown` M4 counter next to `presence_reask`, `unk` column in the snapshot |
+| L1 | `ff22c04` | Gate-1 Stage A0 asks the collect model "do you know this path" and rejects a genuinely unindexed location before the presence LLM call; code mode only, `new_file` exempt, a dirtied path reads as known; `[gate1] skip_llm_for_unindexed` |
+| RUN-7 | after `acbfd61` | a Gate-2 call that came back without a verdict (transport/parse error) is `unavailable`, not a rejection: only the validator call is re-run (`[auto] validator_unavailable_retries = 2`, `[collect] error_retry_wait_sec` between calls); if still unavailable the round ends unreviewed — no attempt charged, no feedback line, `_prior_validator_critique` untouched — and the task goes back to `todo` with its round counter as it was, no `feedback_round_N.md`, no knowledge note, no ticket; `validator_status = unavailable` rows that the tuner ignores; `g2 rej` / `g2 err` / `g2 unavail` snapshot columns |
 
 Not in the epic but on the branch since 2f9005d: GATE1-LEARN-1 `9dd644b`,
 GATE1-LEARN-2 `f11972b`, GATE1-PAR-1 `84a24b2`, user's `0eaa2cc`.
 
-### Open — 11 (all epic; RUN-1…RUN-6 landed)
+### Open — 12 (RUN-8 open, RUN-9 queued, 10 epic; RUN-1…RUN-7 and L1 landed)
 
 **The order below is superseded by `NEXT-ROUNDS.md` §2** (RUN-6 → RUN-3 →
 RUN-4 → RUN-5 → L1 → M3 → …). Kept for the per-ticket premise checks
@@ -123,7 +125,7 @@ Side by side: `baseline-live-2026-09-09.json` vs `after-r14-live.json`
 | `collect blocks` | **verdict.** 0 → >0 is the pass | baseline is 0 for all five (dry-run). Any positive number passes. **It will be lower than a no-V9 tree would give**: after the first commit, every already-edited file's block is withheld (`auto_refresh_between_tasks = false`). That is the fix working, not a regression. With the flag `true` in a *copied* config the blocks come back at one Pass B call per repaired file. |
 | `reason` on `testtext7` | verdict | must be `stale_artifact` or usable, never `no_artifact`, after the refresh |
 | `probe misses` | verdict (floor) | must not rise above the baseline 24/773 ops |
-| gate-1 requests on non-`.py` | verdict once **L1** lands | still ~74 today; L1 is open |
+| gate-1 requests on non-`.py` | verdict — **L1** landed `ff22c04` | still ~74 on the pre-L1 snapshots (`after-run6-live.json` is `fa199c5`); must be 0 on the first post-L1 run |
 | confirm rate | floor | should not fall materially below 37% |
 | `arch` / `gate1` / `conf` / `rej` counts, `s/cand` | **weather** | the model is non-deterministic; testtext5 vs testtext6 differed by 52 candidates on the same tree |
 

@@ -112,6 +112,13 @@ def read_run(base, run_id=None):
                    "unknown": 0},
         "gate1_split": None,
         "gate1_location_ext": collections.Counter(),
+        # RUN-7: Gate-2's own stage-decision events, keyed by the status each
+        # carries in `content` (APPROVED / REJECTED / ERROR / UNAVAILABLE —
+        # see tools.auto.inner_loop._trace_stage's "gate2" calls). Read the
+        # same way as the coder-budget decision events just below, so a
+        # validator-provider outage is its own counted column instead of
+        # being invisible (dropped) or folded into "rejected".
+        "gate2": collections.Counter(),
         # RUN-4: the coder's truncation ladder — how many rejected coder
         # attempts had just raised the output budget for the next one, and
         # at which tier the attempts went out. The ladder is only visible in
@@ -243,6 +250,12 @@ def read_run(base, run_id=None):
                 # agent_trace stringifies params: "False" is truthy.
                 if str(p.get("budget_raised", "")).strip().lower() in ("true", "1", "yes"):
                     out["coder_budget_escalations"] += 1
+            # ── RUN-7: Gate-2 validator outcomes, including "unavailable" ──
+            # (a provider outage, counted separately from a real rejection —
+            # see tools.auto.inner_loop.LLMGate2Validator.approve_verdict).
+            elif kind == "decision" \
+                    and str((r.get("params") or {}).get("stage")) == "gate2":
+                out["gate2"][str(r.get("content") or "?")] += 1
 
     # M4 events, or the pre-M4 grep. Comparability between the two is the
     # whole point of keeping the grep at all.
@@ -270,7 +283,7 @@ def read_run(base, run_id=None):
                 out["gate1_split"].get("presence_unknown", 0) or 0)
         except (TypeError, ValueError):
             out["gate1"]["unknown"] = 0
-    for k in ("llm_by_source", "gate1_location_ext", "probe_by_op"):
+    for k in ("llm_by_source", "gate1_location_ext", "probe_by_op", "gate2"):
         out[k] = dict(out[k])
     out["coder_budgets"] = dict(out["coder_budgets"])
     for k in ("shrink", "miss"):
@@ -304,12 +317,23 @@ def main():
     # a grep and from a collect_block event are not the same measurement.
     _block = lambda r: f"{r['collect_block_occurrences']} ({r['collect_source']})"
 
-    hdr = f"{'run':12} {'probe':>6} {'reason':>14} {'arch':>5} {'gate1':>6} {'conf':>5} {'rej':>5} {'unk':>4} {'s/cand':>7} {'probe ops':>10} {'miss':>5} {'collect blocks':>15} {'cod esc':>8}"
+    # RUN-7: the Gate-2 decisions get their own columns, separate from "rej"
+    # (gate1's confirmed/rejected) and never folded into it — a Gate-2
+    # provider outage is not a rejection. g2 rej = a real model verdict,
+    # g2 err = the validator raised, g2 unavail = the validator was never
+    # reached (one event per outage, retries folded into its `calls=`). The
+    # three side by side are the measurement: what share of "no" was ever
+    # said by a model. See tools.auto.inner_loop._trace_stage's "gate2"
+    # events and the module docstring above.
+    hdr = f"{'run':12} {'probe':>6} {'reason':>14} {'arch':>5} {'gate1':>6} {'conf':>5} {'rej':>5} {'unk':>4} {'s/cand':>7} {'probe ops':>10} {'miss':>5} {'collect blocks':>15} {'cod esc':>8} {'g2 rej':>6} {'g2 err':>6} {'g2 unavail':>10}"
     print(hdr)
     print("-" * len(hdr))
     tot = collections.Counter()
     for r in snap["runs"]:
         g = r["gate1"]
+        g2 = r.get("gate2", {})
+        g2_rej, g2_err, g2_unavail = (g2.get("REJECTED", 0), g2.get("ERROR", 0),
+                                      g2.get("UNAVAILABLE", 0))
         tot["arch"] += r["llm_by_source"].get("architect", 0)
         tot["g1"] += g["requests"]
         tot["conf"] += g["confirmed"]
@@ -319,16 +343,19 @@ def main():
         tot["miss"] += r["probe"]["misses"]
         tot["blocks"] += r["collect_block_occurrences"]
         tot["codesc"] += r.get("coder_budget_escalations", 0)
+        tot["g2rej"] += g2_rej
+        tot["g2err"] += g2_err
+        tot["g2unavail"] += g2_unavail
         print(f"{r['run']:12} {str(r['probe_usable']):>6} {str(r['probe_reason']):>14} "
               f"{r['llm_by_source'].get('architect', 0):>5} {g['requests']:>6} "
               f"{g['confirmed']:>5} {g['rejected']:>5} {g.get('unknown', 0):>4} "
               f"{g.get('seconds_per_candidate', '—'):>7} {r['probe']['ops']:>10} "
               f"{r['probe']['misses']:>5} {_block(r):>15} "
-              f"{r.get('coder_budget_escalations', 0):>8}")
+              f"{r.get('coder_budget_escalations', 0):>8} {g2_rej:>6} {g2_err:>6} {g2_unavail:>10}")
     print("-" * len(hdr))
     print(f"{'TOTAL':12} {'':>6} {'':>14} {tot['arch']:>5} {tot['g1']:>6} "
           f"{tot['conf']:>5} {tot['rej']:>5} {tot['unk']:>4} {'':>7} {tot['ops']:>10} "
-          f"{tot['miss']:>5} {tot['blocks']:>15} {tot['codesc']:>8}")
+          f"{tot['miss']:>5} {tot['blocks']:>15} {tot['codesc']:>8} {tot['g2rej']:>6} {tot['g2err']:>6} {tot['g2unavail']:>10}")
     snap["totals"] = dict(tot)
 
     if a.out:

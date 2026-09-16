@@ -8,6 +8,11 @@ Scoring weights (no LLM call for baseline; pure arithmetic on MetricsLog):
   - improvement_json_ok rate      35 %
   - validator_status == approved  25 %
 
+RUN-7: a record with validator_status == "unavailable" (the Gate-2 provider
+never answered — see tools.auto.inner_loop) is dropped before any term is
+computed, by ``scoreable_records``: no verdict was reached, so it counts
+neither for nor against a prompt.
+
 Shadow mode: ValidatorAgent is called directly with the candidate prompt
 injected temporarily via a one-shot duck-typed PromptStore.  Falls back
 to a metric-projection heuristic when the LLM is unavailable.
@@ -34,6 +39,21 @@ logger = logging.getLogger(__name__)
 # get a loud warning rather than silently scoring against the wrong ceiling.
 _MAX_ITER_ASSUMED = 3
 _UNSET = object()
+
+
+def scoreable_records(records: List[RunRecord]) -> List[RunRecord]:
+    """*records* minus the ones whose validator never reached a verdict.
+
+    RUN-7: ``validator_status == "unavailable"`` is a provider outage, not a
+    review — it says nothing about the validator prompt, and its zero
+    iterations would flatter one. Excluded from numerator and denominator
+    alike, the same "not applicable" rule ``improvement_json_ok is None``
+    already gets. A record without a readable status is scored as before.
+    """
+    return [
+        r for r in records
+        if str(getattr(r, "validator_status", "") or "") != "unavailable"
+    ]
 
 # Synthetic payloads for shadow evaluation.
 # These exercise the full validator prompt format without needing stored inputs.
@@ -148,7 +168,12 @@ class PromptEvaluator:
                 score=0.0,
             )
 
-        recent: List[RunRecord] = self.metrics_collector.load_recent(5)
+        # RUN-7: filtered here as well as in _score_from_records so a batch
+        # of pure outages is the honest "no baseline runs" refusal below,
+        # not "5 baseline runs" scoring 0.0.
+        recent: List[RunRecord] = scoreable_records(
+            self.metrics_collector.load_recent(5)
+        )
 
         if not recent:
             return EvalResult(
@@ -199,6 +224,7 @@ class PromptEvaluator:
           improvement_json_ok rate      → 35 %
           validator_status == approved  → 25 %
         """
+        records = scoreable_records(records)   # RUN-7: outages are not evidence
         n = len(records)
         if n == 0:
             return 0.0
@@ -350,7 +376,9 @@ class PromptEvaluator:
         while still allowing the candidate to pass the 0.05 gate when
         the current prompt is clearly struggling.
         """
-        recent = self.metrics_collector.load_recent(5)
+        # RUN-7: the same exclusion _score_from_records applies, so the
+        # uplift heuristic's own n / approved_rate agree with `base`.
+        recent = scoreable_records(self.metrics_collector.load_recent(5))
         if not recent:
             return 0.0
 

@@ -140,6 +140,7 @@ class AutoMetricsStream:
         attempts_used: int | None = None,
         attempts: int = 0,   # backward-compatible alias — prefer attempts_used
         prompt_store=None,  # Optional[PromptStore]
+        unavailable: bool = False,   # RUN-7: a provider outage, not a verdict
     ) -> None:
         """
         Record a Gate-2 validation outcome to the auto metrics stream.
@@ -151,6 +152,13 @@ class AutoMetricsStream:
         ``improvement_json_ok`` is always ``None`` so these records are
         excluded from the interactive optimizer's json_parse_failure_rate
         computation even if the paths were accidentally shared.
+
+        RUN-7: ``unavailable=True`` records ``validator_status="unavailable"``
+        instead of "approved"/"rejected" — the Gate-2 validator never reached
+        a verdict (a transport/parse error on every retry), so this round is
+        not evidence about the validator prompt's quality. ``approved`` is
+        ignored when ``unavailable`` is set (the caller always has it False
+        for an unavailable round anyway — see ``InnerLoopResult.unavailable``).
 
         Never raises — errors are logged and swallowed.
 
@@ -172,6 +180,7 @@ class AutoMetricsStream:
                     feedback=feedback,
                     attempts_used=effective_attempts,
                     prompt_store=prompt_store,
+                    unavailable=unavailable,
                 )
         except Exception as exc:
             logger.error("AutoMetricsStream.record_gate2: failed to record metric — %s", exc)
@@ -267,6 +276,7 @@ def _record_gate2_locked(
     feedback: str,
     attempts_used: int,
     prompt_store=None,
+    unavailable: bool = False,   # RUN-7: a provider outage, not a verdict
 ) -> None:
     """
     Inner write primitive — no locking.  Callers MUST hold any relevant lock.
@@ -290,12 +300,21 @@ def _record_gate2_locked(
                 "recording prompt_version='auto': %s", exc,
             )
 
+    # RUN-7: "unavailable" wins over approved/rejected — a validator that
+    # never reached a verdict is neither. Checked first so a caller that
+    # (incorrectly) also passes approved=True/False alongside unavailable=True
+    # can't produce a misleading "approved"/"rejected" status.
+    if unavailable:
+        _status = "unavailable"
+    else:
+        _status = "approved" if approved else "rejected"
+
     record = RunRecord(
         timestamp=datetime.now(timezone.utc).isoformat(),
         intent=task_id,
         prompt_version=prompt_version,
         iterations_used=attempts_used,
-        validator_status="approved" if approved else "rejected",
+        validator_status=_status,
         validator_feedback=feedback,
         improvement_json_ok=None,   # AUTO-E2: never set — excluded from interactive rate
         elapsed_seconds=0.0,
@@ -311,6 +330,7 @@ def record_gate2_result(
     feedback: str,
     attempts_used: int,
     prompt_store=None,  # Optional[PromptStore]
+    unavailable: bool = False,   # RUN-7: a provider outage, not a verdict
 ) -> None:
     """
     Write a Gate-2 validation outcome directly to a MetricsCollector.
@@ -336,6 +356,7 @@ def record_gate2_result(
             feedback=feedback,
             attempts_used=attempts_used,
             prompt_store=prompt_store,
+            unavailable=unavailable,
         )
     except Exception as exc:
         logger.error("record_gate2_result: failed to record metric — %s", exc)

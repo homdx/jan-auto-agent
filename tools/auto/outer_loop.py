@@ -49,7 +49,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from tools.agent_trace import tracer
-from tools.auto.state import StateStore, STATUS_IN_PROGRESS, STATUS_DONE, STATUS_BLOCKED
+from tools.auto.state import (
+    StateStore, STATUS_IN_PROGRESS, STATUS_DONE, STATUS_BLOCKED, STATUS_TODO,
+)
 from tools.auto.inner_loop import make_inner_loop
 from tools.auto.utils import highest_completed_round
 
@@ -193,10 +195,16 @@ class OuterLoopResult:
     feedback_files:      list[str] = field(default_factory=list)
     inner_results:       list = field(default_factory=list)   # list[InnerLoopResult]
     impl_versions_used:  list = field(default_factory=list)   # list[int] — LOOP-3
+    # RUN-7: True when this round ended because the Gate-2 validator was
+    # unavailable (not a real rejection) — the task was left `todo`, not
+    # blocked, and no feedback file / knowledge / ticket was written for it.
+    unavailable:         bool = False
 
     def summary(self) -> str:
         if self.passed:
             return f"[{self.task_id}] DONE in {self.rounds_used} round(s)"
+        if self.unavailable:
+            return f"[{self.task_id}] LEFT TODO — validator unavailable"
         return f"[{self.task_id}] EXHAUSTED after {self.rounds_used} round(s)"
 
     def knowledge(self) -> str:
@@ -356,8 +364,11 @@ class OuterLoop:
 
             # Fresh context: seed ONLY with the compact prior-round summaries.
             prior = self._read_round_feedback(task_id)
+            # RUN-7: the round counter as persisted before this round bumps
+            # it — an unavailable exit puts it back exactly here. Read from
+            # the store, not *task*: the caller's dict is a detached copy.
+            _round_at_entry = (self.state.get_task(task_id) or {}).get("round", rnd - 1)
             self.state.set_task_status(task_id, STATUS_IN_PROGRESS, round=rnd)
-            impl_versions_used.append(impl_version)
 
             # LOOP-4: build prior implementation history so the coder knows
             # which strategies already failed and must not be repeated.
@@ -403,6 +414,36 @@ class OuterLoop:
             self.state.increment_task_counters(
                 task_id, attempt_delta=getattr(res, "attempts_used", 0),
             )
+
+            # RUN-7: the Gate-2 validator never answered (a transport/parse
+            # error on every re-run, not a real {"approved": false}) — this
+            # round never happened as far as the task is concerned. Undo the
+            # STATUS_IN_PROGRESS/round=rnd set above, write no
+            # feedback_round_N.md (the resume logic counts those files, so
+            # one here would burn the round AND hand the next coder a verdict
+            # nobody made), burn no impl version, and never reach the rewrite
+            # check below. The task goes back to `todo` so the next session
+            # offers it again once the provider is back. Identity check, not
+            # truthiness: an unconfigured MagicMock inner result answers any
+            # attribute with a truthy MagicMock.
+            if getattr(res, "unavailable", False) is True:
+                logger.warning(
+                    "OuterLoop: task %s left todo — validator unavailable (%s)",
+                    task_id, getattr(res, "unavailable_reason", "") or "no detail",
+                )
+                self.state.set_task_status(task_id, STATUS_TODO, round=_round_at_entry)
+                self.state.log(
+                    f"{task_id}: round {rnd} — validator unavailable, left todo "
+                    f"(no feedback file, no round consumed)"
+                )
+                tracer.event("outer_loop", "controller", "result",
+                             params={"task": task_id, "passed": False,
+                                     "round": rnd, "unavailable": True})
+                return OuterLoopResult(task_id, False, rnd - 1, False,
+                                       feedback_files, inner_results,
+                                       impl_versions_used, unavailable=True)
+
+            impl_versions_used.append(impl_version)
 
             if getattr(res, "passed", False):
                 self.state.set_task_status(task_id, STATUS_DONE)

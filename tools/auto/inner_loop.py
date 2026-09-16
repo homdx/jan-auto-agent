@@ -29,6 +29,10 @@ Public surface::
 agents.ini keys consumed
 ------------------------
 [auto]  max_attempts_per_task   — attempt cap per round (default 5)
+[auto]  validator_unavailable_retries — re-runs of ONLY the Gate-2 call when
+        it came back without a verdict (transport/parse error) before the
+        round is left unreviewed (default 2; RUN-7)
+[collect] error_retry_wait_sec  — pause between those re-runs (default 60; RUN-7)
 [validator_agent] temperature   — validator temperature (default 0.1)
 [validator_agent] max_hints     — max hint items in rejection (default 3)
 [executor] pytest_serial        — run workspace pytest in-process (default true; RUN-3)
@@ -56,6 +60,16 @@ logger = logging.getLogger(__name__)
 
 
 _DEFAULT_MAX_ATTEMPTS = 5
+# RUN-7: re-runs of ONLY the Gate-2 validator call (never the coder or the
+# executor) when it came back without a verdict — a transport/parse error
+# such as the HTTP 429 "monthly usage limit" that blocked AUTO-T6 on
+# ../testtext2. [auto] validator_unavailable_retries is the count; the pause
+# between calls is [collect] error_retry_wait_sec, the one existing knob
+# that already names the project's HTTP retry pause (request_completion's
+# own per-request retries sit below this layer and are exhausted by the
+# time approve() reports "validator unavailable").
+_DEFAULT_VALIDATOR_UNAVAILABLE_RETRIES  = 2
+_DEFAULT_VALIDATOR_UNAVAILABLE_WAIT_SEC = 60.0
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Data classes
@@ -84,6 +98,16 @@ class InnerLoopResult:
     last_feedback: str   = ""
     records:       list  = field(default_factory=list)   # list[AttemptRecord]
     context_satisfied: bool = True   # pull-model: False ⇒ last attempt still needed context
+    # RUN-7: True when the round ended because the Gate-2 validator was
+    # unreachable/unparseable on every retry — a technical failure, never a
+    # real {"approved": false}. ``passed`` is False alongside this, but the
+    # attempt that hit it is NOT counted in ``attempts_used`` and no
+    # "validator rejected" line was appended to feedback — the coder must
+    # never be told the reviewer rejected it when no reviewer ever answered.
+    unavailable:   bool  = False
+    # RUN-7: the last "validator unavailable: …" text, kept ONLY for the
+    # outer loop's WARNING log line — never fed to a coder/feedback file.
+    unavailable_reason: str = ""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -245,10 +269,19 @@ class Gate2Verdict:
         ``Reason: …`` / ``Hints: …`` block on rejection). Kept under its
         existing name for callers that read the tuple's second element
         directly.
+    unavailable:
+        RUN-7: ``True`` only when ``approved is False`` because the
+        ``except Exception`` exit fired (a transport or parse error) —
+        never for a model that actually answered ``{"approved": false}``.
+        The inner loop uses this to tell a real rejection from a provider
+        outage that happens to look like one; ``approve()``'s own
+        two-tuple return does not carry this distinction, so it is only
+        available through :meth:`LLMGate2Validator.approve_verdict`.
     """
 
     approved: bool
     reason: str = ""
+    unavailable: bool = False
 
     def feedback(self) -> str:
         """Coder-facing message. Empty on acceptance, the reason on rejection."""
@@ -300,6 +333,12 @@ class LLMGate2Validator:
         self.ssl_context = ssl_context
         self.base_dir    = Path(base_dir)
         self.last_missing_context: list[str] = []
+        # RUN-7: side channel mirroring last_missing_context — True only
+        # when the most recent approve() call fell through to the
+        # `except Exception` exit (transport/parse error), never for a
+        # model-issued rejection. approve_verdict() reads this into
+        # Gate2Verdict.unavailable.
+        self.last_unavailable: bool = False
         self.num_ctx     = int(num_ctx)
         self.max_tokens  = int(max_tokens)
         self.task_mode   = str(task_mode)
@@ -604,6 +643,7 @@ class LLMGate2Validator:
         detailed verdict instead of repeating itself.
         """
         self.last_missing_context = []
+        self.last_unavailable = False   # RUN-7: reset every call, like last_missing_context
 
         # AUTO-FIX: cheap deterministic language pre-gate for creative mode —
         # catches a chapter that drifted into the wrong language WITHOUT
@@ -817,6 +857,7 @@ class LLMGate2Validator:
         except Exception as exc:
             logger.warning("LLMGate2Validator error: %s", exc)
             self.last_missing_context = []
+            self.last_unavailable = True   # RUN-7: transport/parse error, not a verdict
             return False, f"validator unavailable: {exc}"
 
     def approve_verdict(
@@ -841,7 +882,10 @@ class LLMGate2Validator:
             task, exec_result, coder_result,
             base_dir=base_dir, prior_critique=prior_critique,
         )
-        return Gate2Verdict(approved=approved, reason=reason)
+        # RUN-7: last_unavailable is set by approve() itself only on the
+        # `except Exception` exit — never for a real {"approved": false}.
+        return Gate2Verdict(approved=approved, reason=reason,
+                            unavailable=self.last_unavailable)
 
 
 def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
@@ -1368,6 +1412,8 @@ class InnerLoop:
         max_task_seconds: int = 0,
         run_goal: str = "",
         collect_bridge=None,
+        validator_unavailable_retries: int = _DEFAULT_VALIDATOR_UNAVAILABLE_RETRIES,
+        validator_unavailable_wait_sec: float = _DEFAULT_VALIDATOR_UNAVAILABLE_WAIT_SEC,
     ):
         self.coder        = coder
         self.executor     = executor
@@ -1404,6 +1450,19 @@ class InnerLoop:
         # otherwise only see the keyword if it happened to be echoed into the
         # per-task instruction text.
         self._run_goal    = str(run_goal or "")
+        # RUN-7: bounds on re-running ONLY the Gate-2 validator call when it
+        # reports "unavailable" rather than a verdict. 0 retries = one call,
+        # then the round is left unreviewed. Guarded here as well as in
+        # make_inner_loop so a direct caller (tests, embedders) handing over a
+        # bad value degrades to the default instead of raising into a run.
+        try:
+            self._validator_unavailable_retries = max(0, int(validator_unavailable_retries))
+        except (TypeError, ValueError):
+            self._validator_unavailable_retries = _DEFAULT_VALIDATOR_UNAVAILABLE_RETRIES
+        try:
+            self._validator_unavailable_wait_sec = max(0.0, float(validator_unavailable_wait_sec))
+        except (TypeError, ValueError):
+            self._validator_unavailable_wait_sec = _DEFAULT_VALIDATOR_UNAVAILABLE_WAIT_SEC
 
     # ------------------------------------------------------------------
 
@@ -1449,15 +1508,27 @@ class InnerLoop:
         task_id = task.get("id", "")
         feedback: list[str] = list(prior_feedback or [])
         _prior_validator_critique: str = ""   # AUTO-CR-30: last Gate-2 critique
-        # AUTO-CR-30: detect (once) whether this validator's approve() accepts
-        # prior_critique, so we never break fakes/older validators that don't.
+        # RUN-7: only a validator that exposes approve_verdict() can ever
+        # report `unavailable` (a fake/older validator with just approve()
+        # keeps today's two-outcome behaviour — approve()'s own tuple return
+        # is unchanged and carries no such distinction).
+        _validator_has_verdict = hasattr(self.validator, "approve_verdict")
+        # AUTO-CR-30: detect (once) whether the validator method we will
+        # actually call accepts prior_critique, so we never break fakes/older
+        # validators that don't. RUN-7: that is approve_verdict() when the
+        # validator has one — inspecting approve() instead would pass the
+        # kwarg to a method that may not take it.
         try:
             import inspect as _inspect
+            _validator_method = (
+                self.validator.approve_verdict if _validator_has_verdict
+                else self.validator.approve
+            )
             _validator_accepts_prior = (
                 "prior_critique"
-                in _inspect.signature(self.validator.approve).parameters
+                in _inspect.signature(_validator_method).parameters
             )
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, AttributeError):
             _validator_accepts_prior = False
         records:  list[AttemptRecord] = []
         # Pull-model state (carried across attempts within this round)
@@ -1706,22 +1777,92 @@ class InnerLoop:
                 continue
 
             # ── 3. Validator (subjective half of Gate 2) ─────────────────────
-            try:
-                # AUTO-CR-30: only pass prior_critique to validators that accept
-                # it (real LLMGate2Validator); fakes/older validators are unaffected.
-                _ap_kwargs = {"base_dir": base_dir_path}
-                if _validator_accepts_prior:
-                    _ap_kwargs["prior_critique"] = _prior_validator_critique
-                approved, vfb = self.validator.approve(
-                    task, exec_result, coder_result, **_ap_kwargs
+            # AUTO-CR-30: only pass prior_critique to validators that accept
+            # it (real LLMGate2Validator); fakes/older validators are unaffected.
+            _ap_kwargs = {"base_dir": base_dir_path}
+            if _validator_accepts_prior:
+                _ap_kwargs["prior_critique"] = _prior_validator_critique
+
+            # RUN-7: "validator unavailable: …" (a transport/parse error) is
+            # not a verdict. Re-run ONLY this call — the coder output and the
+            # executor result are still valid — up to
+            # validator_unavailable_retries times, then give up on the WHOLE
+            # round rather than charge the attempt as a rejection. A model
+            # that answered {"approved": false} is a rejection however terse:
+            # Gate2Verdict.unavailable is set only on approve()'s except exit.
+            approved = None
+            vfb = ""
+            _gate2_unavailable = False
+            _gate2_raised: Exception | None = None
+            _val_calls_allowed = 1 + self._validator_unavailable_retries
+            for _val_call in range(_val_calls_allowed):
+                try:
+                    if _validator_has_verdict:
+                        verdict = self.validator.approve_verdict(
+                            task, exec_result, coder_result, **_ap_kwargs
+                        )
+                        approved = verdict.approved
+                        vfb      = verdict.feedback()
+                        _gate2_unavailable = bool(getattr(verdict, "unavailable", False))
+                    else:
+                        # A fake/older validator with only approve() keeps
+                        # today's behaviour: its tuple carries no third
+                        # outcome, so an outage string stays a rejection.
+                        approved, vfb = self.validator.approve(
+                            task, exec_result, coder_result, **_ap_kwargs
+                        )
+                        _gate2_unavailable = False
+                except Exception as exc:
+                    _gate2_raised = exc
+                    break
+
+                if not _gate2_unavailable:
+                    break   # a real verdict (approved or rejected) — proceed normally
+
+                _retries_left = _val_calls_allowed - _val_call - 1
+                if _retries_left <= 0:
+                    break
+                logger.warning(
+                    "InnerLoop: attempt %d gate2 validator unavailable "
+                    "(call %d/%d) — retrying in %.1fs: %s",
+                    attempt, _val_call + 1, _val_calls_allowed,
+                    self._validator_unavailable_wait_sec, vfb,
                 )
-            except Exception as exc:
-                logger.error("InnerLoop: validator raised on attempt %d: %s", attempt, exc)
-                fb = f"attempt {attempt}: validator error — {exc}"
-                _trace_stage(task_id, attempt, "gate2", "ERROR", error=str(exc))
+                if self._validator_unavailable_wait_sec > 0:
+                    time.sleep(self._validator_unavailable_wait_sec)
+
+            if _gate2_raised is not None:
+                logger.error("InnerLoop: validator raised on attempt %d: %s",
+                             attempt, _gate2_raised)
+                fb = f"attempt {attempt}: validator error — {_gate2_raised}"
+                _trace_stage(task_id, attempt, "gate2", "ERROR", error=str(_gate2_raised))
                 feedback.append(fb)
                 records.append(AttemptRecord(attempt, True, True, False, fb))
                 continue
+
+            if _gate2_unavailable:
+                # RUN-7: every retry came back unavailable — this attempt is
+                # NOT charged (attempts_used below excludes it) and NO
+                # feedback line is appended: the coder must not be told the
+                # reviewer rejected it when no reviewer ever answered.
+                # _prior_validator_critique is untouched by design.
+                logger.warning(
+                    "InnerLoop: task %s attempt %d — gate2 validator still "
+                    "unavailable after %d call(s): %s",
+                    task_id, attempt, _val_calls_allowed, vfb,
+                )
+                _trace_stage(task_id, attempt, "gate2", "UNAVAILABLE",
+                            calls=_val_calls_allowed)
+                return InnerLoopResult(
+                    task_id=task_id,
+                    passed=False,
+                    unavailable=True,
+                    unavailable_reason=vfb,
+                    attempts_used=attempt - 1,   # only attempts that reached a verdict
+                    last_feedback="",
+                    records=records,
+                    context_satisfied=not _any_missing,
+                )
 
             if not approved:
                 fb = f"attempt {attempt}: validator rejected\n{vfb}"
@@ -2083,12 +2224,42 @@ def make_inner_loop(
         )
         require_tests = False
 
+    # RUN-7: how many times to re-run ONLY the Gate-2 validator call when it
+    # came back without a verdict (transport/parse error) before the round is
+    # left unreviewed, and the pause between those calls. The pause reuses
+    # [collect] error_retry_wait_sec — the same outage-class wait the collect
+    # summarizer already reads — so an operator tunes one knob for both.
+    try:
+        validator_unavailable_retries = config.getint(
+            "auto", "validator_unavailable_retries",
+            fallback=_DEFAULT_VALIDATOR_UNAVAILABLE_RETRIES,
+        )
+    except ValueError as exc:
+        logger.warning(
+            "config [auto] validator_unavailable_retries is malformed (%s) — using default %d",
+            exc, _DEFAULT_VALIDATOR_UNAVAILABLE_RETRIES,
+        )
+        validator_unavailable_retries = _DEFAULT_VALIDATOR_UNAVAILABLE_RETRIES
+    try:
+        validator_unavailable_wait_sec = config.getfloat(
+            "collect", "error_retry_wait_sec",
+            fallback=_DEFAULT_VALIDATOR_UNAVAILABLE_WAIT_SEC,
+        )
+    except ValueError as exc:
+        logger.warning(
+            "config [collect] error_retry_wait_sec is malformed (%s) — using default %.0f",
+            exc, _DEFAULT_VALIDATOR_UNAVAILABLE_WAIT_SEC,
+        )
+        validator_unavailable_wait_sec = _DEFAULT_VALIDATOR_UNAVAILABLE_WAIT_SEC
+
     loop = InnerLoop(coder, executor, validator, max_attempts=max_attempts,
                      context_broker=broker,
                      **_gate_validators,
                      require_tests=require_tests,
                      task_mode=task_mode, max_task_seconds=max_task_seconds,
-                     run_goal=run_goal, collect_bridge=collect_bridge)
+                     run_goal=run_goal, collect_bridge=collect_bridge,
+                     validator_unavailable_retries=validator_unavailable_retries,
+                     validator_unavailable_wait_sec=validator_unavailable_wait_sec)
     loop.gate_order = _gate_order
     logger.info(
         "InnerLoop: Gate-3 order for %s mode — %s",
