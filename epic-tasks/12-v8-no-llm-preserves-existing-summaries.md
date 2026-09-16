@@ -1,6 +1,6 @@
 # V8 — `--no-llm` preserves existing summaries
 
-**Status:** queued — open, verified against `2f9005d` (2026-09-12); not on offer until INDEX.md "Next rounds" reaches it  
+**Status:** open (base: `e5d46fc` — the `tickets` head with RUN-7/RUN-8 landed; re-verified 2026-09-16 — reproduced: a module summarized by Pass B (`provenance: llm`) loses its summary (`None`) after one source edit and a `refresh --no-llm`)  
 **Severity:** HIGH  
 **File:** `tools/collect/cli.py`  
 **Symbol:** `—`  

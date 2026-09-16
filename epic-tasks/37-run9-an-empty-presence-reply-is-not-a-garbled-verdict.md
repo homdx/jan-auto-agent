@@ -1,6 +1,6 @@
 # RUN-9 — An empty presence reply is not a garbled verdict
 
-**Status:** open (base: the `tickets` head with RUN-8 landed — the commit after `97983d8`; take the current `tickets` head, 2026-09-16)  
+**Status:** open (base: `e5d46fc` — the `tickets` head with RUN-7/RUN-8 landed; re-verified against it 2026-09-16 — `gate1_filter.py` unchanged since `ff22c04`, the ladder still treats an empty reply as a garbled one outside the opt-in `fast` mode)  
 **Severity:** HIGH  
 **File:** `tools/auto/gate1_filter.py`  
 **Symbol:** `Gate1Filter._check_presence` — the `_call` closure (≈ 1569–1610) and the GATE1-LEARN-2 re-ask ladder below it (≈ 1727–1845: `_empty_pin`, the `_tried` grid, the `nudge` re-ask, the final `ending unknown` return)  

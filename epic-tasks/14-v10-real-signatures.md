@@ -1,6 +1,6 @@
 # V10 — Real signatures
 
-**Status:** queued — open, verified against `2f9005d` (2026-09-12); not on offer until INDEX.md "Next rounds" reaches it  
+**Status:** open (base: `e5d46fc` — the `tickets` head with RUN-7/RUN-8 landed; re-verified 2026-09-16 — `README.md:233` promises `facts <symbol>` = signature + contracts, `ast_facts.py:72` still emits `name(...)` for every symbol)  
 **Severity:** MEDIUM  
 **File:** `tools/collect/ast_facts.py`  
 **Symbol:** `—`  
