@@ -9,6 +9,17 @@ Stage A — Existence check (no LLM, instant):
   2. If a symbol is cited, ``block_extractor.extract_block`` finds it.
   3. If only a line range is cited, those line numbers are within the file.
 
+Stage A0 — Unindexed location (no LLM, instant, L1):
+  A candidate that survived Stage A whose cited location the collect model
+  does not index (an ``.ini``/``.md``/``.yaml`` the architect was handed
+  verbatim) is rejected before its presence call is ever made — 74 of 834
+  live Stage-B calls were spent judging non-code files. It asks the model
+  "do you know this path" (``CollectBridge.module_symbols``), never "is this
+  extension allowed", so a file the artifact indexes is never rejected
+  (``.py`` *and* ``.java``). Code mode only — docs/creative runs are about
+  the prose the model does not index — and off entirely when there is no
+  usable collect model or ``[gate1] skip_llm_for_unindexed = false``.
+
 Stage B — Problem-presence check (one LLM call per surviving candidate):
   An LLM reads the exact code block (or line range) and answers whether
   the problem described in the candidate's instruction is actually present
@@ -45,6 +56,9 @@ think         — Ollama "think" toggle for reasoning models (default false —
                 the reply; set true to re-enable a model's thinking mode)
 system        — override the built-in system prompt (optional)
 skip_llm      — "true" to run existence checks only, skip LLM stage (testing)
+skip_llm_for_unindexed — "false" to disable Stage A0 and let a candidate
+                 whose cited location the collect model does not index
+                 still reach the presence check (default true; L1)
 
 agents.ini [api] / [api_local] / [api_remote] supply the same connection
 keys used everywhere else in this codebase.
@@ -443,6 +457,25 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         except ValueError as exc:
             logger.warning("config [%s] skip_llm is malformed (%s) — using default False", sec, exc)
             self._skip_llm = False
+        # L1: Stage A0 — a candidate whose cited location the collect model
+        # does not index (an .ini/.md/.yaml the architect was handed
+        # verbatim) costs no presence LLM call. Live: 74 of 834 Stage-B calls
+        # were spent judging non-code files, 23 of them CONFIRMED, so the
+        # stage asks "does the model know this path" and never "is this
+        # extension allowed" (the artifact indexes .py and .java; a language
+        # it learns tomorrow needs no allowlist change here). Code mode only
+        # — docs/creative runs are about the prose the model does not index.
+        # `false` makes Stage A0 a no-op and every candidate reaches Stage B
+        # exactly as before.
+        try:
+            self._skip_llm_for_unindexed = config.getboolean(
+                sec, "skip_llm_for_unindexed", fallback=True)
+        except ValueError as exc:
+            logger.warning(
+                "config [%s] skip_llm_for_unindexed is malformed (%s) — using default True",
+                sec, exc,
+            )
+            self._skip_llm_for_unindexed = True
         try:
             self._timeout = float(config.get("loop", "timeout_seconds", fallback="300"))
         except ValueError as exc:
@@ -763,6 +796,61 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             f"{len(existence_passed)}/{len(candidates)} candidate(s) passed"
         )
 
+        # ── Stage A0 (L1): a location the collect model does not index costs
+        # no LLM call ──────────────────────────────────────────────────────
+        # The architect is handed config/doc files verbatim (one observed
+        # prompt was 12k chars of agents*.ini), and Stage B would spend one
+        # presence call per candidate judging a claim against a file that is
+        # not code. 23 of the 74 live non-code calls were CONFIRMED — a doc
+        # that contradicts the code is a real finding — so this stage never
+        # rejects non-code outright: it asks the model "do you know this
+        # path" and drops only the genuinely unindexed. Code mode only, and
+        # a new_file citation is exempt (its path does not exist yet by
+        # design). Fail-open at every step: no bridge, an unusable model, a
+        # bridge that raises, or `skip_llm_for_unindexed = false` all leave
+        # every candidate exactly where Stage A put it.
+        if (
+            self._skip_llm_for_unindexed
+            and self._task_mode == "code"
+            and getattr(self, "_collect_bridge", None) is not None
+        ):
+            a0_passed: list[tuple[CandidateTask, str]] = []
+            a0_removed = 0
+            for c, block in existence_passed:
+                if getattr(c.cited_location, "new_file", False) or self._location_is_indexed(c):
+                    a0_passed.append((c, block))
+                    continue
+                a0_removed += 1
+                ext = Path(c.cited_location.file).suffix or "no extension"
+                # Recorded through the existing stage="existence" channel so
+                # the split's Stage-A bucket counts it and analyze_logs.py
+                # needs no change; the distinct prefix keeps the two
+                # separable in the log and the trace's per-candidate event.
+                reason = (
+                    f"location is not an indexed source file ({ext}) — the "
+                    f"collect model does not index {c.cited_location.file!r}, "
+                    f"so a presence check cannot ground a claim against it "
+                    f"(set [gate1] skip_llm_for_unindexed = false to check "
+                    f"it anyway)"
+                )
+                all_results.append(FilterResult(
+                    candidate=c, accepted=False, stage="existence", reason=reason,
+                ))
+                logger.info(
+                    "Gate1[existence] REJECTED %r — %s", c.title, reason,
+                )
+            if a0_removed:
+                print(
+                    f"🔎 Gate 1 unindexed: {a0_removed} candidate(s) skipped "
+                    f"the presence check (location not in the collect model)"
+                )
+                logger.info(
+                    "Gate1[a0] skipped the presence check for %d candidate(s) "
+                    "whose cited location the collect model does not index",
+                    a0_removed,
+                )
+            existence_passed = a0_passed
+
         # ── Stage B: LLM problem-presence check ───────────────────────────────
         presence_passed: list[tuple[CandidateTask, str]] = []  # (task, reason)
 
@@ -991,6 +1079,45 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         return accepted, rejected
 
     # ── Stage A helpers ───────────────────────────────────────────────────────
+
+    def _location_is_indexed(self, candidate: CandidateTask) -> bool:
+        """L1 (Stage A0): does the collect model know the file this candidate
+        cites?
+
+        MEMBERSHIP, not an extension allowlist: the artifact indexes whatever
+        the collector scans (``.py``, ``.java``), so "does the model know this
+        path" is the honest question, and a language the collector learns
+        tomorrow needs no allowlist change here. ``module_symbols`` answers it
+        exactly — no suffix or bare-name fallback — so an ``agents.ini`` that
+        genuinely sits in the tree still misses, which is the point.
+
+        V9 wrinkle: a path a task of this run already edited is *indexed*,
+        just stale — ``module_symbols`` withholds it, and reading that empty
+        answer as "unindexed" would start rejecting ``.py`` files mid-run.
+        Dirty is known.
+
+        Fail-open by construction: a missing bridge, an unusable model, a path
+        the candidate does not name, or ANY exception means "proceed", never a
+        rejection — this gate's savings must never cost a candidate its Stage
+        B check.
+        """
+        bridge = self._collect_bridge
+        if bridge is None:
+            return True
+        try:
+            if not bool(getattr(bridge, "usable", False)):
+                # Stale/absent: no membership question can be asked, so every
+                # candidate reaches Stage B exactly as it did before L1.
+                return True
+            path = str(getattr(candidate.cited_location, "file", "") or "")
+            if not path:
+                return True
+            dirty = getattr(bridge, "dirty_paths", None)
+            if dirty is not None and path in dirty:
+                return True
+            return bool(bridge.module_symbols(path))
+        except Exception:  # noqa: BLE001 — fail open, never block a candidate
+            return True
 
     def _check_existence(
         self,
