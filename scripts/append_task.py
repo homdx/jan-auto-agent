@@ -39,6 +39,11 @@ def main():
     a = ap.parse_args()
 
     outcome = a.outcome.strip().upper()
+    # The epic-round prompt (docs/collect-epics/RUN-THE-EPIC-COMPETITION.md)
+    # says `--outcome DONE`; it means FIXED. Rejecting it left the agent's
+    # ticket unrecorded and next_task.py handing it out again.
+    if outcome == "DONE":
+        outcome = "FIXED"
     row = {
         "ticket": os.path.basename(a.ticket.strip()),
         "finding": a.finding.strip(),

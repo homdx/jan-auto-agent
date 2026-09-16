@@ -1,6 +1,6 @@
 # V15 — Docs sync and the consumer column
 
-**Status:** open (verified against `2f9005d`, 2026-09-12)  
+**Status:** queued — open, verified against `2f9005d` (2026-09-12); not on offer until INDEX.md "Next rounds" reaches it  
 **Severity:** LOW  
 **File:** `README.md`  
 **Symbol:** `—`  

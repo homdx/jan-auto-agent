@@ -1,4 +1,4 @@
-# Epic round — 34 tickets, in order
+# Epic round — 36 tickets, in order
 
 One ticket per round. Every agent does the same ticket against the same
 tree; you merge the winner; the next round starts from the merged tree.
@@ -40,6 +40,8 @@ The loop and the scorecard: `docs/collect-epics/RUN-THE-EPIC-COMPETITION.md`.
 | 32 | `RUN-4` | landed `ade28e6` | HIGH | S | [32-run4-the-coder-answers-a-cut-off-reply-with-the-same-budget-five-times.md](32-run4-the-coder-answers-a-cut-off-reply-with-the-same-budget-five-times.md) | `tools/auto/coder.py` |
 | 33 | `RUN-5` | landed (after `24d9028`) | HIGH | S | [33-run5-a-technical-failure-in-the-presence-check-is-not-a-rejection.md](33-run5-a-technical-failure-in-the-presence-check-is-not-a-rejection.md) | `tools/auto/gate1_filter.py` |
 | 34 | `RUN-6` | landed `7135844` | HIGH | S | [34-run6-a-stale-artifact-at-session-start-switches-the-pack-off-for-the-whole-session.md](34-run6-a-stale-artifact-at-session-start-switches-the-pack-off-for-the-whole-session.md) | `tools/auto/collect_bridge.py` |
+| 35 | `RUN-7` | **open** | HIGH | S | [35-run7-validator-unavailable-is-not-a-rejection.md](35-run7-validator-unavailable-is-not-a-rejection.md) | `tools/auto/inner_loop.py` |
+| 36 | `RUN-8` | queued (after RUN-7) | HIGH | S | [36-run8-a-transport-failure-mid-stream-is-charged-to-the-coder.md](36-run8-a-transport-failure-mid-stream-is-charged-to-the-coder.md) | `tools/auto/coder.py` |
 
 ## Next rounds — the order (as of `6ca675c`, 2026-09-14; step 1 landed — `7135844` (+`5788423`, `d4ffb12`); step 2 landed — RUN-3; step 3 landed — `ade28e6`; step 4 landed — RUN-5)
 
@@ -54,17 +56,28 @@ sequence; a step is not started until the previous one is merged.
 | 2 | `RUN-3` | 7 of 29 BLOCKED tasks ended on an exec error the coder never saw; XS | exec-rejected attempts per BLOCKED task |
 | 3 | `RUN-4` | the most frequent coder failure in both trees; 6 BLOCKED tasks | `cut off` count, done/blocked ratio |
 | 4 | `RUN-5` | *landed* — 25–35 % of candidates dropped by provider silence; plan size is a coin flip until fixed | `unparsed` → `unknown` column, plan size |
-| 5 | `L1` | deterministic: 82 / 30 gate-1 calls on non-`.py` locations | non-`.py` gate-1 rows → 0 |
-| 6 | `M3` | measurement only; decides whether V12/V13 exist | ceiling number in `EPIC-M-metrics.md` |
-| 7 | `V4`, `V10` | supply rows — worth it only once step 1 puts the pack in front of the coder | M2 static numbers, block sizes |
-| 8 | `V12`/`V13` | only if step 6 says ceiling > 0 | gate-1 stage split |
-| 9 | `M6` | outcome metric against `validate1/truth.csv`; needs a plan whose membership is not decided by step 4's bug | precision/recall |
-| 10 | `V8`, `V14`, `V15`, `L3` | low value now; V14 only if docs mode is used at all | — |
+| 5 | `RUN-7` | live `../testtext2` (`baa9da87a2ab`): a validator outage (ollama.com 429) was recorded as 5 rejections, the task went BLOCKED unreviewed | `validator_status = unavailable` rows, tasks left `todo` instead of BLOCKED |
+| 6 | `RUN-8` | same run: one 80-min hung coder stream = one burned attempt + the whole task budget → BLOCKED after one round | `cod transport` column, deadline credited |
+| 7 | `L1` | deterministic: 82 / 30 gate-1 calls on non-`.py` locations | non-`.py` gate-1 rows → 0 |
+| 8 | `M3` | measurement only; decides whether V12/V13 exist | ceiling number in `EPIC-M-metrics.md` |
+| 9 | `V4`, `V10` | supply rows — worth it only once step 1 puts the pack in front of the coder | M2 static numbers, block sizes |
+| 10 | `V12`/`V13` | only if step 8 says ceiling > 0 | gate-1 stage split |
+| 11 | `M6` | outcome metric against `validate1/truth.csv`; needs a plan whose membership is not decided by step 4's bug | precision/recall |
+| 12 | `V8`, `V14`, `V15`, `L3` | low value now; V14 only if docs mode is used at all | — |
 
 After steps 1–4 land: reset one tree to its `pre_run_sha`, `--collect
 --refresh`, one full `--auto` execution run, snapshot with `--run-id`, then
 the M5 A/B with recordings from that run. That is the first point at which
 "did the pack help" has a live answer.
+
+## Hand-out
+
+`scripts/next_task.py --tasks epic-tasks/ --progress runs/<name>/PROGRESS.csv`
+offers only tickets whose `**Status:**` is neither `landed` nor `queued`
+— i.e. the one ticket of the current round. Landing it (status → `landed`)
+or the agent recording it (`append_task.py`, `DONE` = `FIXED`) takes it off
+offer; flipping the next ticket from `queued` to `open` starts the next
+round.
 
 ## Working these
 

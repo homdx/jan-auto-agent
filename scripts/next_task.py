@@ -25,6 +25,12 @@ import sys
 
 TICKET_RE = re.compile(r"^(\d+)-.*\.md$")
 
+# A ticket whose **Status:** line starts with one of these is not on offer:
+# `landed` — merged, the round is over; `queued` — written, but not this
+# round (INDEX.md "Next rounds" says when). Everything else (`open`, no
+# status line at all — the tasks/ tickets have none) is handed out.
+SKIP_STATUS = ("landed", "queued")
+
 
 def load_tickets(tasks_dir):
     """Every NN-*.md in tasks/, in numeric order, with its finding key."""
@@ -39,9 +45,19 @@ def load_tickets(tasks_dir):
         symbol = _field(body, "Symbol")
         sev = _field(body, "Severity")
         finding = f"{file_}::{symbol}" if file_ and symbol and symbol != "—" else file_
+        status = _status(body)
         out.append({"num": int(m.group(1)), "name": name, "finding": finding,
-                    "severity": sev, "body": body})
+                    "severity": sev, "body": body,
+                    "offered": not status.startswith(SKIP_STATUS)})
     return out
+
+
+def _status(body):
+    """The **Status:** line's first word, lower-cased — `_field` wants a
+    single back-quoted token and the epic tickets' status lines carry
+    commit shas and dates after it."""
+    m = re.search(r"^\*\*Status:\*\*\s*(\S+)", body, re.MULTILINE)
+    return m.group(1).strip("`*").lower() if m else ""
 
 
 def _field(body, label):
@@ -77,10 +93,16 @@ def main():
         return 1
 
     done = recorded(progress)
+    skipped = [t for t in tickets if not t["offered"]]
+    tickets = [t for t in tickets if t["offered"]]
     todo = [t for t in tickets if t["name"] not in done]
     n_all, n_done = len(tickets), len(tickets) - len(todo)
 
-    print(f"progress: {n_done}/{n_all} recorded, {len(todo)} remaining")
+    print(f"progress: {n_done}/{n_all} recorded, {len(todo)} remaining"
+          + (f" ({len(skipped)} landed/queued, not on offer)" if skipped else ""))
+    if not tickets:
+        print("\nNothing on offer: every ticket is landed or queued. Stop.")
+        return 3
     if done:
         tally = {}
         for o in done.values():

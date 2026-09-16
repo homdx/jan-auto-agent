@@ -1,6 +1,6 @@
 # L3 — Gate 1 asks a presence question that three of five goals cannot answer
 
-**Status:** open (verified against `2f9005d`, 2026-09-12)  
+**Status:** queued — open, verified against `2f9005d` (2026-09-12); not on offer until INDEX.md "Next rounds" reaches it  
 **Severity:** MEDIUM  
 **File:** `—`  
 **Symbol:** `—`  

@@ -1,6 +1,6 @@
 # M3 — Suppressor ceiling: the go/no-go for EPIC B
 
-**Status:** open (verified against `2f9005d`, 2026-09-12)  
+**Status:** queued — open, verified against `2f9005d` (2026-09-12); not on offer until INDEX.md "Next rounds" reaches it  
 **Severity:** CRITICAL  
 **File:** `scripts/collect_metrics.py`  
 **Symbol:** `—`  
