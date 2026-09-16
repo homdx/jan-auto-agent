@@ -119,6 +119,12 @@ def read_run(base, run_id=None):
         # validator-provider outage is its own counted column instead of
         # being invisible (dropped) or folded into "rejected".
         "gate2": collections.Counter(),
+        # RUN-8: the coder's own stage-decision events, keyed by the status
+        # each carries in `content` (OK / REJECTED / ERROR / TRANSPORT /
+        # OK_WITH_SKIPS — see tools.auto.inner_loop._trace_stage's "coder"
+        # calls). TRANSPORT is a call that died before the model could
+        # answer: not a rejection, not a budget tier, its own column.
+        "coder": collections.Counter(),
         # RUN-4: the coder's truncation ladder — how many rejected coder
         # attempts had just raised the output budget for the next one, and
         # at which tier the attempts went out. The ladder is only visible in
@@ -243,6 +249,7 @@ def read_run(base, run_id=None):
             elif kind == "decision" \
                     and str((r.get("params") or {}).get("stage")) == "coder":
                 p = r.get("params") or {}
+                out["coder"][str(r.get("content") or "?")] += 1
                 _mt = p.get("max_tokens")
                 if _mt in (None, ""):
                     continue
@@ -283,7 +290,7 @@ def read_run(base, run_id=None):
                 out["gate1_split"].get("presence_unknown", 0) or 0)
         except (TypeError, ValueError):
             out["gate1"]["unknown"] = 0
-    for k in ("llm_by_source", "gate1_location_ext", "probe_by_op", "gate2"):
+    for k in ("llm_by_source", "gate1_location_ext", "probe_by_op", "gate2", "coder"):
         out[k] = dict(out[k])
     out["coder_budgets"] = dict(out["coder_budgets"])
     for k in ("shrink", "miss"):
@@ -325,7 +332,13 @@ def main():
     # three side by side are the measurement: what share of "no" was ever
     # said by a model. See tools.auto.inner_loop._trace_stage's "gate2"
     # events and the module docstring above.
-    hdr = f"{'run':12} {'probe':>6} {'reason':>14} {'arch':>5} {'gate1':>6} {'conf':>5} {'rej':>5} {'unk':>4} {'s/cand':>7} {'probe ops':>10} {'miss':>5} {'collect blocks':>15} {'cod esc':>8} {'g2 rej':>6} {'g2 err':>6} {'g2 unavail':>10}"
+    #
+    # RUN-8: `cod transport` sits next to `cod esc` (the coder's truncation
+    # ladder) for the same reason — the two look identical in a trace line
+    # ("the coder came back without files") and only the status tells them
+    # apart: a cut-off reply climbed the budget, a dead socket got the
+    # attempt back.
+    hdr = f"{'run':12} {'probe':>6} {'reason':>14} {'arch':>5} {'gate1':>6} {'conf':>5} {'rej':>5} {'unk':>4} {'s/cand':>7} {'probe ops':>10} {'miss':>5} {'collect blocks':>15} {'cod esc':>8} {'cod transport':>13} {'g2 rej':>6} {'g2 err':>6} {'g2 unavail':>10}"
     print(hdr)
     print("-" * len(hdr))
     tot = collections.Counter()
@@ -334,6 +347,10 @@ def main():
         g2 = r.get("gate2", {})
         g2_rej, g2_err, g2_unavail = (g2.get("REJECTED", 0), g2.get("ERROR", 0),
                                       g2.get("UNAVAILABLE", 0))
+        # RUN-8: coder calls that died on the wire before the model could
+        # answer — next to `cod esc` (the budget ladder) so a hung socket is
+        # not mistaken for a cut-off reply.
+        cod_transport = r.get("coder", {}).get("TRANSPORT", 0)
         tot["arch"] += r["llm_by_source"].get("architect", 0)
         tot["g1"] += g["requests"]
         tot["conf"] += g["confirmed"]
@@ -343,6 +360,7 @@ def main():
         tot["miss"] += r["probe"]["misses"]
         tot["blocks"] += r["collect_block_occurrences"]
         tot["codesc"] += r.get("coder_budget_escalations", 0)
+        tot["codtransport"] += cod_transport
         tot["g2rej"] += g2_rej
         tot["g2err"] += g2_err
         tot["g2unavail"] += g2_unavail
@@ -351,11 +369,12 @@ def main():
               f"{g['confirmed']:>5} {g['rejected']:>5} {g.get('unknown', 0):>4} "
               f"{g.get('seconds_per_candidate', '—'):>7} {r['probe']['ops']:>10} "
               f"{r['probe']['misses']:>5} {_block(r):>15} "
-              f"{r.get('coder_budget_escalations', 0):>8} {g2_rej:>6} {g2_err:>6} {g2_unavail:>10}")
+              f"{r.get('coder_budget_escalations', 0):>8} {cod_transport:>13} "
+              f"{g2_rej:>6} {g2_err:>6} {g2_unavail:>10}")
     print("-" * len(hdr))
     print(f"{'TOTAL':12} {'':>6} {'':>14} {tot['arch']:>5} {tot['g1']:>6} "
           f"{tot['conf']:>5} {tot['rej']:>5} {tot['unk']:>4} {'':>7} {tot['ops']:>10} "
-          f"{tot['miss']:>5} {tot['blocks']:>15} {tot['codesc']:>8} {tot['g2rej']:>6} {tot['g2err']:>6} {tot['g2unavail']:>10}")
+          f"{tot['miss']:>5} {tot['blocks']:>15} {tot['codesc']:>8} {tot['codtransport']:>13} {tot['g2rej']:>6} {tot['g2err']:>6} {tot['g2unavail']:>10}")
     snap["totals"] = dict(tot)
 
     if a.out:

@@ -1,6 +1,6 @@
 # RUN-9 — An empty presence reply is not a garbled verdict
 
-**Status:** queued — written 2026-09-16; on offer once RUN-7 (ticket 35) has landed (handed out by hand meanwhile)  
+**Status:** open (base: the `tickets` head with RUN-8 landed — the commit after `97983d8`; take the current `tickets` head, 2026-09-16)  
 **Severity:** HIGH  
 **File:** `tools/auto/gate1_filter.py`  
 **Symbol:** `Gate1Filter._check_presence` — the `_call` closure (≈ 1569–1610) and the GATE1-LEARN-2 re-ask ladder below it (≈ 1727–1845: `_empty_pin`, the `_tried` grid, the `nudge` re-ask, the final `ending unknown` return)  

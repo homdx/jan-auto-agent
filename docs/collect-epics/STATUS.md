@@ -1,6 +1,6 @@
 # Status — where the collect epics stand, and what is being waited on
 
-**As of:** 2026-09-16, branch `tickets`, HEAD = the commit after `acbfd61` = RUN-7 (on top of `ff22c04` = L1 and `d22c197` = RUN-5; next round is RUN-8). The order of the
+**As of:** 2026-09-16, branch `tickets`, HEAD = the commit after `97983d8` = RUN-8 (on top of `97983d8` = RUN-7, `ff22c04` = L1 and `d22c197` = RUN-5; next round is RUN-9). The order of the
 next rounds and the live-run evidence behind it: `NEXT-ROUNDS.md`.
 Sections 2–4 below describe the wait as it stood on `2f9005d`; the run has
 since happened (`after-r31-live.json`) and NEXT-ROUNDS.md §1 is its reading.
@@ -11,7 +11,7 @@ Ticket-by-ticket state is also stamped into every `epic-tasks/NN-*.md`
 
 ## 1. Ledger
 
-### Landed — 25 of 37: the short path (PLAN-v2 §6), L2, V16, V6, M4, M5, RUN-1, RUN-2, RUN-6, RUN-3, RUN-4, RUN-5, L1, RUN-7
+### Landed — 26 of 37: the short path (PLAN-v2 §6), L2, V16, V6, M4, M5, RUN-1, RUN-2, RUN-6, RUN-3, RUN-4, RUN-5, L1, RUN-7, RUN-8
 
 | ticket | commit | one line |
 |---|---|---|
@@ -41,11 +41,12 @@ Ticket-by-ticket state is also stamped into every `epic-tasks/NN-*.md`
 | RUN-5 | after `24d9028` | a presence check the provider never answered (empty/unparseable reply, transport error after every retry) is `unknown`, not a rejection; `[gate1] presence_unknown = keep` (default) keeps the candidate with a *presence unknown — provider gave no verdict after N re-ask(s): …* note in its instruction, `reject` = the old drop; `UNKNOWN` at WARNING, `REJECTED` only for a model's no; `presence_unknown` M4 counter next to `presence_reask`, `unk` column in the snapshot |
 | L1 | `ff22c04` | Gate-1 Stage A0 asks the collect model "do you know this path" and rejects a genuinely unindexed location before the presence LLM call; code mode only, `new_file` exempt, a dirtied path reads as known; `[gate1] skip_llm_for_unindexed` |
 | RUN-7 | after `acbfd61` | a Gate-2 call that came back without a verdict (transport/parse error) is `unavailable`, not a rejection: only the validator call is re-run (`[auto] validator_unavailable_retries = 2`, `[collect] error_retry_wait_sec` between calls); if still unavailable the round ends unreviewed — no attempt charged, no feedback line, `_prior_validator_critique` untouched — and the task goes back to `todo` with its round counter as it was, no `feedback_round_N.md`, no knowledge note, no ticket; `validator_status = unavailable` rows that the tuner ignores; `g2 rej` / `g2 err` / `g2 unavail` snapshot columns |
+| RUN-8 | after `97983d8` | a coder call whose `request_completion` raised (dead socket / stream-read timeout, `URLError`, `HTTPError`) is `CoderResult.error_kind = "transport"`, not a rejection: only the coder call is re-run on the same attempt (`[auto] coder_transport_retries = 2`, `[collect] error_retry_wait_sec` between calls), traced `TRANSPORT`, no feedback line; the seconds inside a failing call are credited back to `_eff_deadline` and, via `deadline_credit_s`, to the outer loop's `_task_deadline` and out of RUN-2's persisted ledger; if every call dies the round ends `unavailable` with `unavailable_stage = "coder"` — task back to `todo`, round counter untouched, no `feedback_round_N.md`, no knowledge note, no ticket, `validator_status = unavailable`; `cod transport` snapshot column next to `cod esc` |
 
 Not in the epic but on the branch since 2f9005d: GATE1-LEARN-1 `9dd644b`,
 GATE1-LEARN-2 `f11972b`, GATE1-PAR-1 `84a24b2`, user's `0eaa2cc`.
 
-### Open — 12 (RUN-8 open, RUN-9 queued, 10 epic; RUN-1…RUN-7 and L1 landed)
+### Open — 11 (RUN-9 open, 10 epic; RUN-1…RUN-8 and L1 landed)
 
 **The order below is superseded by `NEXT-ROUNDS.md` §2** (RUN-6 → RUN-3 →
 RUN-4 → RUN-5 → L1 → M3 → …). Kept for the per-ticket premise checks

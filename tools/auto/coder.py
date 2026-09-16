@@ -47,6 +47,15 @@ Any LLM / network error, JSON parse failure, or missing required key returns a
 attempt loop (AUTO-C3) treats this as a failed attempt and may feed it back as
 feedback for the next round.
 
+RUN-8: ``error_kind`` distinguishes the two halves of that.  ``"transport"``
+means the socket gave up before the model could answer (a stream-read
+timeout, ``URLError``, ``HTTPError``) — nothing was produced, so the attempt
+is re-run instead of being charged and no ``coder failed`` line reaches the
+next prompt.  ``"parse"`` means the call did come back and this attempt still
+could not turn it into files (NO-JSON, malformed or cut-off JSON, a duplicate
+chapter, a failed write) — those stay charged attempts, and the RUN-4 budget
+ladder still climbs on a cut-off reply.
+
 Configuration (agents.ini [coder])
 ------------------------------------
 temperature    — sampling temperature (default 0.2)
@@ -274,6 +283,15 @@ class CoderResult:
         RUN-4: True when this attempt's cut-off reply just raised the budget
         for the next attempt of the same task. False both when the budget did
         not move and when the reply was not a truncation.
+    error_kind:
+        RUN-8: what kind of failure ``error`` is — ``"transport"`` when the
+        LLM call itself failed before the model could answer (a read timeout,
+        ``URLError``, ``HTTPError`` …, so nothing was produced and the attempt
+        should not be charged), ``"parse"`` when the call returned something
+        that this attempt could not turn into written files (NO-JSON,
+        malformed or cut-off JSON, a duplicate chapter, a failed write), and
+        ``""`` when the result carries no classification at all. ``error``
+        itself is unchanged by this field.
     """
 
     task_id:       str = ""
@@ -285,6 +303,7 @@ class CoderResult:
     context_satisfied: bool = True  # False when the LLM reported missing_context
     max_tokens:    int = 0
     budget_raised: bool = False
+    error_kind:    str = ""   # RUN-8: "" / "parse" / "transport"
 
     @property
     def succeeded(self) -> bool:
@@ -624,13 +643,16 @@ class Coder(_llm_stream.LLMClientBase):
             raw_text = raw_text or "".join(_coder_tokens)
             print("\n" + "═" * 80 + "\n")
         except Exception as exc:
+            # RUN-8: the call itself failed — nothing was produced, so the
+            # attempt is a transport failure, not a rejected answer.
             msg = f"LLM call failed: {exc}"
             logger.warning("coder.generate [%s]: %s", task_id, msg)
             tracer.event(
                 source="coder", target="llm", kind="llm_response", model=self._model,
                 content=f"[ERROR] {exc}", params={"task_id": task_id},
             )
-            return CoderResult(task_id=task_id, error=msg, max_tokens=budget)
+            return CoderResult(task_id=task_id, error=msg, max_tokens=budget,
+                               error_kind="transport")
 
         # ── Strip think blocks; check for missing-context signal ─────────────
         cleaned = strip_think(raw_text)
@@ -748,6 +770,7 @@ class Coder(_llm_stream.LLMClientBase):
                 raw_response=cleaned, missing_context=missing_ctx,
                 context_satisfied=context_satisfied,
                 max_tokens=budget, budget_raised=_raised,
+                error_kind="parse",
             )
 
         # RUN-4: this budget produced a parseable reply — the next task on
@@ -765,6 +788,7 @@ class Coder(_llm_stream.LLMClientBase):
                     task_id=task_id, error=dup_error, raw_response=cleaned,
                     missing_context=missing_ctx, context_satisfied=context_satisfied,
                     max_tokens=budget,
+                    error_kind="parse",
                 )
 
         # ── Write files to disk ───────────────────────────────────────────────
@@ -790,6 +814,7 @@ class Coder(_llm_stream.LLMClientBase):
                 missing_context=missing_ctx, context_satisfied=context_satisfied,
                 files_skipped=files_skipped,
                 max_tokens=budget,
+                error_kind="parse",
             )
 
         result = CoderResult(
@@ -801,6 +826,9 @@ class Coder(_llm_stream.LLMClientBase):
             context_satisfied=context_satisfied,
             files_skipped=files_skipped,
             max_tokens=budget,
+            # A partial write that still records an error is a reply that
+            # could not be fully landed — "parse", never "transport".
+            error_kind="parse" if write_error else "",
         )
         logger.info("coder.generate: %s", result.summary())
         return result

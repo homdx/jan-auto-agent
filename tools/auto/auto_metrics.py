@@ -140,7 +140,7 @@ class AutoMetricsStream:
         attempts_used: int | None = None,
         attempts: int = 0,   # backward-compatible alias — prefer attempts_used
         prompt_store=None,  # Optional[PromptStore]
-        unavailable: bool = False,   # RUN-7: a provider outage, not a verdict
+        unavailable: bool = False,   # RUN-7/RUN-8: a provider outage, not a verdict
     ) -> None:
         """
         Record a Gate-2 validation outcome to the auto metrics stream.
@@ -156,7 +156,11 @@ class AutoMetricsStream:
         RUN-7: ``unavailable=True`` records ``validator_status="unavailable"``
         instead of "approved"/"rejected" — the Gate-2 validator never reached
         a verdict (a transport/parse error on every retry), so this round is
-        not evidence about the validator prompt's quality. ``approved`` is
+        not evidence about the validator prompt's quality. RUN-8 reuses the
+        same value for the coder half of that outage: the coder call died
+        before the model could answer, so no verdict was reached there either
+        (``InnerLoopResult.unavailable`` with ``unavailable_stage="coder"``).
+        ``approved`` is
         ignored when ``unavailable`` is set (the caller always has it False
         for an unavailable round anyway — see ``InnerLoopResult.unavailable``).
 

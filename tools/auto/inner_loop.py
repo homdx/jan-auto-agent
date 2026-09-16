@@ -32,6 +32,9 @@ agents.ini keys consumed
 [auto]  validator_unavailable_retries — re-runs of ONLY the Gate-2 call when
         it came back without a verdict (transport/parse error) before the
         round is left unreviewed (default 2; RUN-7)
+[auto]  coder_transport_retries — re-runs of ONLY the coder call when it died
+        before the model could answer (``CoderResult.error_kind ==
+        "transport"``) before the round is left unreviewed (default 2; RUN-8)
 [collect] error_retry_wait_sec  — pause between those re-runs (default 60; RUN-7)
 [validator_agent] temperature   — validator temperature (default 0.1)
 [validator_agent] max_hints     — max hint items in rejection (default 3)
@@ -70,6 +73,15 @@ _DEFAULT_MAX_ATTEMPTS = 5
 # time approve() reports "validator unavailable").
 _DEFAULT_VALIDATOR_UNAVAILABLE_RETRIES  = 2
 _DEFAULT_VALIDATOR_UNAVAILABLE_WAIT_SEC = 60.0
+# RUN-8: the coder side of the same shape. The socket sat silent for 80
+# minutes on a live run before the stream-read timeout fired and the coder
+# came back with nothing; before this key that ate the task's
+# max_task_seconds budget, charged the attempt, and told the model it had
+# failed. [auto] coder_transport_retries is the count; the pause between
+# calls reuses [collect] error_retry_wait_sec, the same outage-class wait
+# RUN-7's validator re-runs use.
+_DEFAULT_CODER_TRANSPORT_RETRIES   = 2
+_DEFAULT_CODER_TRANSPORT_WAIT_SEC  = 60.0
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Data classes
@@ -108,6 +120,19 @@ class InnerLoopResult:
     # RUN-7: the last "validator unavailable: …" text, kept ONLY for the
     # outer loop's WARNING log line — never fed to a coder/feedback file.
     unavailable_reason: str = ""
+    # RUN-8: which stage ended this round unavailable — "coder" (the coder
+    # call died before the model could answer, RUN-8) or "gate2" (RUN-7).
+    # "" on a legacy/older result and on a Round that was not left
+    # unavailable; the outer loop and the controller key their log line off
+    # it, so a coder outage reads as a coder outage rather than as a
+    # validator that never answered.
+    unavailable_stage: str = ""
+    # RUN-8: wall-clock seconds spent inside a coder call that ended in a
+    # transport failure, credited back against this task's deadline inside
+    # run_task. The outer loop adds it to its own shared _task_deadline so
+    # the seconds are not charged twice. 0.0 when nothing died on the wire
+    # or when there was no deadline to credit against.
+    deadline_credit_s: float = 0.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1414,6 +1439,8 @@ class InnerLoop:
         collect_bridge=None,
         validator_unavailable_retries: int = _DEFAULT_VALIDATOR_UNAVAILABLE_RETRIES,
         validator_unavailable_wait_sec: float = _DEFAULT_VALIDATOR_UNAVAILABLE_WAIT_SEC,
+        coder_transport_retries: int = _DEFAULT_CODER_TRANSPORT_RETRIES,
+        coder_transport_wait_sec: float = _DEFAULT_CODER_TRANSPORT_WAIT_SEC,
     ):
         self.coder        = coder
         self.executor     = executor
@@ -1463,6 +1490,16 @@ class InnerLoop:
             self._validator_unavailable_wait_sec = max(0.0, float(validator_unavailable_wait_sec))
         except (TypeError, ValueError):
             self._validator_unavailable_wait_sec = _DEFAULT_VALIDATOR_UNAVAILABLE_WAIT_SEC
+        # RUN-8: same guards — a bad value degrades to the default rather
+        # than raising into a run.
+        try:
+            self._coder_transport_retries = max(0, int(coder_transport_retries))
+        except (TypeError, ValueError):
+            self._coder_transport_retries = _DEFAULT_CODER_TRANSPORT_RETRIES
+        try:
+            self._coder_transport_wait_sec = max(0.0, float(coder_transport_wait_sec))
+        except (TypeError, ValueError):
+            self._coder_transport_wait_sec = _DEFAULT_CODER_TRANSPORT_WAIT_SEC
 
     # ------------------------------------------------------------------
 
@@ -1582,6 +1619,12 @@ class InnerLoop:
             _eff_deadline = _start_time + self.max_task_seconds
         else:
             _eff_deadline = None
+        # RUN-8: seconds returned to the deadline by coder calls that ended in
+        # a transport failure. Credited against _eff_deadline in the coder step
+        # below as they happen, and handed back to the outer loop with the
+        # result so its own shared _task_deadline is not short the same
+        # seconds. 0.0 when nothing died on the wire or there is no deadline.
+        _deadline_credit_s = 0.0
 
         # LOOP-4: prepend prior implementation history
         if prior_implementations:
@@ -1633,21 +1676,98 @@ class InnerLoop:
                         last_feedback=last,
                         records=records,
                         context_satisfied=not _any_missing,
+                        deadline_credit_s=_deadline_credit_s,
                     )
 
             # ── 1. Coder ──────────────────────────────────────────────────────
-            try:
-                coder_result = self.coder.generate(
-                    task, base_dir, prior_feedback=feedback,
-                    prefetched_context=prefetched_context,
+            # RUN-8: a coder call that died before the model could answer
+            # (CoderResult.error_kind == "transport") is not an attempt —
+            # nothing was produced, so there is nothing to feed back and no
+            # attempt to charge. Re-run ONLY the call, on the same attempt
+            # number, without appending a feedback line and without touching
+            # prior_feedback. Any result without the field (a fake or older
+            # coder) is treated as today's charged attempt.
+            _coder_calls_allowed = 1 + self._coder_transport_retries
+            _transport_exhausted = False
+            _coder_raised: Exception | None = None
+            for _c_call in range(_coder_calls_allowed):
+                # Measured so the call can give its wall-clock back to the
+                # shared deadline below: time spent waiting on a dead socket
+                # is not this task's budget.
+                _call_start = time.monotonic()
+                try:
+                    coder_result = self.coder.generate(
+                        task, base_dir, prior_feedback=feedback,
+                        prefetched_context=prefetched_context,
+                    )
+                except Exception as exc:
+                    _coder_raised = exc
+                    break
+
+                if str(getattr(coder_result, "error_kind", "") or "") != "transport":
+                    break   # a reply came back (parsed or not) — a charged attempt
+
+                _elapsed = time.monotonic() - _call_start
+                _t_budget = 0
+                try:  # a malformed field must not raise into the run
+                    _t_budget = int(getattr(coder_result, "max_tokens", 0) or 0)
+                except (TypeError, ValueError):
+                    _t_budget = 0
+                _t_extra: dict = {"budget_raised": False}
+                if _t_budget:
+                    _t_extra["max_tokens"] = _t_budget
+                _trace_stage(task_id, attempt, "coder", "TRANSPORT",
+                             error=str(getattr(coder_result, "error", "") or ""),
+                             calls=_coder_calls_allowed, **_t_extra)
+                if _eff_deadline is not None:
+                    _eff_deadline += _elapsed
+                    _deadline_credit_s += _elapsed
+                if _coder_calls_allowed - _c_call - 1 <= 0:
+                    _transport_exhausted = True
+                    break
+                logger.warning(
+                    "InnerLoop: task %s attempt %d coder transport failure "
+                    "(call %d/%d, %.1fs credited back) — retrying in %.1fs: %s",
+                    task_id, attempt, _c_call + 1, _coder_calls_allowed,
+                    _elapsed, self._coder_transport_wait_sec,
+                    str(getattr(coder_result, "error", "") or ""),
                 )
-            except Exception as exc:
-                logger.error("InnerLoop: coder raised on attempt %d: %s", attempt, exc)
-                fb = f"attempt {attempt}: coder error — {exc}"
-                _trace_stage(task_id, attempt, "coder", "ERROR", error=str(exc))
+                if self._coder_transport_wait_sec > 0:
+                    time.sleep(self._coder_transport_wait_sec)
+
+            if _coder_raised is not None:
+                logger.error("InnerLoop: coder raised on attempt %d: %s",
+                             attempt, _coder_raised)
+                fb = f"attempt {attempt}: coder error — {_coder_raised}"
+                _trace_stage(task_id, attempt, "coder", "ERROR", error=str(_coder_raised))
                 feedback.append(fb)
                 records.append(AttemptRecord(attempt, False, False, False, fb))
                 continue
+
+            if _transport_exhausted:
+                # RUN-8: every re-run died before the model answered — this
+                # attempt produced nothing, so it is not charged
+                # (attempts_used below excludes it) and NO feedback line is
+                # appended: the coder must not be told it failed when it
+                # never got to say anything. Same left-todo exit as RUN-7.
+                logger.warning(
+                    "InnerLoop: task %s attempt %d — coder transport failure "
+                    "after %d call(s): %s",
+                    task_id, attempt, _coder_calls_allowed,
+                    str(getattr(coder_result, "error", "") or ""),
+                )
+                return InnerLoopResult(
+                    task_id=task_id,
+                    passed=False,
+                    unavailable=True,
+                    unavailable_reason=str(getattr(coder_result, "error", "") or ""),
+                    unavailable_stage="coder",
+                    attempts_used=attempt - 1,   # only attempts that reached a reply
+                    last_feedback="",
+                    records=records,
+                    context_satisfied=not _any_missing,
+                    deadline_credit_s=_deadline_credit_s,
+                )
 
             # Pull-model: resolve any context the coder asked for, for the NEXT attempt.
             coder_missing = list(getattr(coder_result, "missing_context", []) or [])
@@ -1858,10 +1978,12 @@ class InnerLoop:
                     passed=False,
                     unavailable=True,
                     unavailable_reason=vfb,
+                    unavailable_stage="gate2",
                     attempts_used=attempt - 1,   # only attempts that reached a verdict
                     last_feedback="",
                     records=records,
                     context_satisfied=not _any_missing,
+                    deadline_credit_s=_deadline_credit_s,
                 )
 
             if not approved:
@@ -1926,6 +2048,7 @@ class InnerLoop:
                 last_feedback="",
                 records=records,
                 context_satisfied=True,
+                deadline_credit_s=_deadline_credit_s,
             )
 
         # All attempts exhausted
@@ -1938,6 +2061,7 @@ class InnerLoop:
             last_feedback=last,
             records=records,
             context_satisfied=not _any_missing,
+            deadline_credit_s=_deadline_credit_s,
         )
 
 
@@ -2252,6 +2376,23 @@ def make_inner_loop(
         )
         validator_unavailable_wait_sec = _DEFAULT_VALIDATOR_UNAVAILABLE_WAIT_SEC
 
+    # RUN-8: how many times to re-run ONLY the coder call when it came back
+    # without the model having answered at all (CoderResult.error_kind ==
+    # "transport" — a stream-read timeout, URLError, HTTPError). The wait
+    # between those calls reuses [collect] error_retry_wait_sec, the same
+    # outage-class knob the validator re-runs above read.
+    try:
+        coder_transport_retries = config.getint(
+            "auto", "coder_transport_retries",
+            fallback=_DEFAULT_CODER_TRANSPORT_RETRIES,
+        )
+    except ValueError as exc:
+        logger.warning(
+            "config [auto] coder_transport_retries is malformed (%s) — using default %d",
+            exc, _DEFAULT_CODER_TRANSPORT_RETRIES,
+        )
+        coder_transport_retries = _DEFAULT_CODER_TRANSPORT_RETRIES
+
     loop = InnerLoop(coder, executor, validator, max_attempts=max_attempts,
                      context_broker=broker,
                      **_gate_validators,
@@ -2259,7 +2400,9 @@ def make_inner_loop(
                      task_mode=task_mode, max_task_seconds=max_task_seconds,
                      run_goal=run_goal, collect_bridge=collect_bridge,
                      validator_unavailable_retries=validator_unavailable_retries,
-                     validator_unavailable_wait_sec=validator_unavailable_wait_sec)
+                     validator_unavailable_wait_sec=validator_unavailable_wait_sec,
+                     coder_transport_retries=coder_transport_retries,
+                     coder_transport_wait_sec=validator_unavailable_wait_sec)
     loop.gate_order = _gate_order
     logger.info(
         "InnerLoop: Gate-3 order for %s mode — %s",

@@ -843,12 +843,22 @@ class AutoController:
                 # The coder's unreviewed candidate is still dirty in base_dir
                 # (Bug 2 below): the next session re-runs the coder from a
                 # clean tree anyway, so discard it now rather than let the
-                # next successful task's commit sweep it in.
+                # next successful task's commit sweep it in. RUN-8: the same
+                # path serves a coder call that died before the model
+                # answered (unavailable_stage == "coder") — nothing was
+                # produced at all, so the wording must not blame the coder
+                # for a rejection it did not receive.
+                _u_stage = ""
+                if result.inner_results:
+                    _u_stage = str(
+                        getattr(result.inner_results[-1], "unavailable_stage", "") or "")
+                _u_label = ("coder transport failure" if _u_stage == "coder"
+                            else "validator unavailable")
                 self.state.log(
-                    f"task {task['id']} left todo — validator unavailable "
+                    f"task {task['id']} left todo — {_u_label} "
                     f"(no feedback, no knowledge note, no ticket)"
                 )
-                self._discard_exhausted_residue(task["id"], reason="validator unavailable")
+                self._discard_exhausted_residue(task["id"], reason=_u_label)
 
             else:
                 # ── AUTO-G4: exhaustion → knowledge note + ticket ──────────

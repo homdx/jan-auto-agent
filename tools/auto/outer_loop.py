@@ -75,6 +75,12 @@ class _TaskBudget:
     max_seconds: float                  # max_task_seconds (0 disables the guard)
     consumed_s: float = 0.0             # seconds worked, summed over sessions
     session_started_at: float | None = None   # wall clock; set while active
+    # RUN-8: seconds this session spent inside coder calls that died on the
+    # wire. They are in this session's elapsed time (session_started_at is
+    # wall clock), so _end_task_budget takes them back out before the ledger
+    # is persisted — otherwise the task left todo after an 80-minute hang
+    # resumes with its whole max_task_seconds already consumed.
+    credit_s: float = 0.0
 
 
 def _nonneg_float(value: object, default: float | None) -> float | None:
@@ -199,11 +205,17 @@ class OuterLoopResult:
     # unavailable (not a real rejection) — the task was left `todo`, not
     # blocked, and no feedback file / knowledge / ticket was written for it.
     unavailable:         bool = False
+    # RUN-8: which stage left the round unavailable — "coder" (the coder call
+    # died before the model could answer) or "gate2" (RUN-7). "" on a legacy
+    # result; the summary and the controller key their wording off it.
+    unavailable_stage:   str = ""
 
     def summary(self) -> str:
         if self.passed:
             return f"[{self.task_id}] DONE in {self.rounds_used} round(s)"
         if self.unavailable:
+            if self.unavailable_stage == "coder":
+                return f"[{self.task_id}] LEFT TODO — coder transport failure"
             return f"[{self.task_id}] LEFT TODO — validator unavailable"
         return f"[{self.task_id}] EXHAUSTED after {self.rounds_used} round(s)"
 
@@ -409,6 +421,22 @@ class OuterLoop:
                                        feedback_files, inner_results,
                                        impl_versions_used)
             inner_results.append(res)
+            # RUN-8: a coder call that died before the model could answer
+            # spent wall-clock that is not this task's budget — the inner loop
+            # credited it against its own _eff_deadline, and this shared one is
+            # the same monotonic budget, so add the same seconds here. Fail-
+            # open: an older inner result without the field credits 0.
+            try:
+                _credit = float(getattr(res, "deadline_credit_s", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                _credit = 0.0
+            if _task_deadline is not None and _credit > 0:
+                _task_deadline += _credit
+            # …and out of the persisted ledger too (RUN-2): the session's
+            # elapsed time is wall clock and still contains the dead-socket
+            # wait, so _end_task_budget must not fold it into consumed_s.
+            if _credit > 0:
+                budget.credit_s += _credit
             # round is set authoritatively above via set_task_status(round=rnd);
             # here we only accumulate the attempt count.
             self.state.increment_task_counters(
@@ -427,21 +455,29 @@ class OuterLoop:
             # truthiness: an unconfigured MagicMock inner result answers any
             # attribute with a truthy MagicMock.
             if getattr(res, "unavailable", False) is True:
+                # RUN-8: which half never answered — the wording is different
+                # for the two outages, but the exit is the same either way.
+                _u_stage = str(getattr(res, "unavailable_stage", "") or "")
+                _u_label = ("coder transport failure" if _u_stage == "coder"
+                            else "validator unavailable")
                 logger.warning(
-                    "OuterLoop: task %s left todo — validator unavailable (%s)",
-                    task_id, getattr(res, "unavailable_reason", "") or "no detail",
+                    "OuterLoop: task %s left todo — %s (%s)",
+                    task_id, _u_label,
+                    getattr(res, "unavailable_reason", "") or "no detail",
                 )
                 self.state.set_task_status(task_id, STATUS_TODO, round=_round_at_entry)
                 self.state.log(
-                    f"{task_id}: round {rnd} — validator unavailable, left todo "
+                    f"{task_id}: round {rnd} — {_u_label}, left todo "
                     f"(no feedback file, no round consumed)"
                 )
                 tracer.event("outer_loop", "controller", "result",
                              params={"task": task_id, "passed": False,
-                                     "round": rnd, "unavailable": True})
+                                     "round": rnd, "unavailable": True,
+                                     "unavailable_stage": _u_stage})
                 return OuterLoopResult(task_id, False, rnd - 1, False,
                                        feedback_files, inner_results,
-                                       impl_versions_used, unavailable=True)
+                                       impl_versions_used, unavailable=True,
+                                       unavailable_stage=_u_stage)
 
             impl_versions_used.append(impl_version)
 
@@ -690,6 +726,9 @@ class OuterLoop:
         if budget.max_seconds <= 0 or budget.session_started_at is None:
             return
         elapsed = max(time.time() - budget.session_started_at, 0.0)
+        # RUN-8: the wall-clock spent inside coder calls that died on the wire
+        # is not this task's — take it back out before the total is persisted.
+        elapsed = max(elapsed - max(budget.credit_s, 0.0), 0.0)
         try:
             self.state.write_task_file(
                 task_id, _BUDGET_FILE, render_budget_file(budget.consumed_s + elapsed),
