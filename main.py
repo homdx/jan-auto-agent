@@ -894,7 +894,12 @@ def _parse_args():
                              "and patch it into the existing artifact + manifest.")
     parser.add_argument("--no-llm", action="store_true", default=False,
                         help="With --collect: skip Pass B (LLM module summaries) even if "
-                             "[collect] llm_summaries is true — a purely structural build.")
+                             "[collect] llm_summaries is true. Existing summaries are kept "
+                             "(marked llm-stale where the file changed); add "
+                             "--drop-summaries for a purely structural artifact.")
+    parser.add_argument("--drop-summaries", action="store_true", default=False,
+                        help="With --collect --no-llm: discard the previous artifact's "
+                             "summaries instead of carrying them forward.")
     # JSON output flag — used together with --faq
     parser.add_argument("--json", action="store_true", default=False,
                         help="With --faq: print ONLY a JSON object to stdout and suppress "
@@ -1255,6 +1260,7 @@ def main():
             result = collect_run(
                 base_dir, action, config=config, config_path=args.config,
                 module_path=args.module, llm_call=llm_call,
+                drop_summaries=args.drop_summaries,
             )
             print(f"collect {result.action}: {result.message}")
             sys.exit(0)

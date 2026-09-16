@@ -226,12 +226,14 @@ class TestModuleEqualsForm:
         assert parse_collect_args(["--module=pkg/a.py"]) == {
             "action": "module",
             "module_path": "pkg/a.py",
+            "drop_summaries": False,
         }
 
     def test_space_form_still_works(self):
         assert parse_collect_args(["--module", "pkg/a.py"]) == {
             "action": "module",
             "module_path": "pkg/a.py",
+            "drop_summaries": False,
         }
 
     def test_both_entry_points_agree(self, tmp_path):
@@ -259,6 +261,7 @@ class TestModuleEqualsForm:
         assert parse_collect_args(["--rebuild", "--module=pkg/a.py"]) == {
             "action": "module",
             "module_path": "pkg/a.py",
+            "drop_summaries": False,
         }
         assert parse_collect_args(["--check", "--module=pkg/a.py"])["action"] == "check"
 

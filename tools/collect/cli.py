@@ -76,7 +76,7 @@ from tools.collect import risk as risk_mod
 from tools.collect import test_map as test_map_mod
 from tools.collect import verifier as verifier_mod
 from tools.collect._determinism import canonical_dumps
-from tools.collect.model import ModuleRecord
+from tools.collect.model import LLMSummary, ModuleRecord, Provenance
 from tools.collect.scanner import language_for, scan_file, scan_repo
 from tools.collect.summarizer import LlmCall, collect_max_retries, summarize_repo
 
@@ -257,6 +257,78 @@ class CollectContext:
     config_map: list
     sibling_gaps: list
     verification_report: Optional[Dict[str, Any]]
+    # V8: what happened to Pass B prose on this build. `pass_b_ran` is the
+    # honest flag (`verification_report` alone no longer implies it — Pass
+    # C also runs over carried-forward summaries); the counters feed the
+    # result message so a `--no-llm` build says what it kept.
+    pass_b_ran: bool = False
+    summaries_carried: int = 0
+    summaries_stale: int = 0
+    summaries_dropped: int = 0
+
+
+def _previous_summaries(collect_dir: Path) -> Tuple[Dict[str, LLMSummary], Dict[str, str]]:
+    """V8: every summary the previous artifact holds, by module path, and
+    the previous manifest's file hashes. Read-only, fail-open: an absent,
+    unreadable or malformed artifact/manifest yields empty maps — "nothing
+    to carry forward" is the same outcome as a first-ever build, never an
+    error out of a build that does not need the previous one."""
+    summaries: Dict[str, LLMSummary] = {}
+    hashes: Dict[str, str] = {}
+    artifact_path = collect_dir / ARTIFACT_FILENAME
+    try:
+        payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+        for d in payload.get("modules", []):
+            rec = ModuleRecord.from_dict(d)
+            if rec.summary is not None:
+                summaries[rec.path] = rec.summary
+    except (AttributeError, OSError, ValueError, KeyError, TypeError):
+        return {}, {}
+    previous_manifest, _problem = _read_previous_manifest(collect_dir)
+    if previous_manifest is not None:
+        hashes = dict(previous_manifest.file_hashes)
+    return summaries, hashes
+
+
+def _carry_summaries(
+    modules: List[ModuleRecord],
+    previous: Dict[str, LLMSummary],
+    previous_hashes: Dict[str, str],
+    current_hashes: Dict[str, str],
+) -> Tuple[List[ModuleRecord], int, int]:
+    """V8: attach the previous artifact's summary to every module of
+    `modules` that has none. A module whose content hash differs from the
+    one the previous manifest recorded (or that the manifest did not
+    record at all) gets the prose tagged `llm-stale`; an unchanged module
+    keeps it as it was. Returns `(modules, carried, stale)`."""
+    out: List[ModuleRecord] = []
+    carried = stale = 0
+    for m in modules:
+        prev = previous.get(m.path)
+        if m.summary is not None or prev is None:
+            out.append(m)
+            continue
+        old_hash = previous_hashes.get(m.path)
+        if old_hash is None or old_hash != current_hashes.get(m.path):
+            prev = prev.as_stale()
+        if prev.provenance == Provenance.LLM_STALE:
+            stale += 1
+        carried += 1
+        out.append(m.with_llm_summary(prev))
+    return out, carried, stale
+
+
+def _pass_b_suffix(ctx: "CollectContext") -> str:
+    """The parenthesised tail of a build message when Pass B was skipped:
+    what a `--no-llm` build did with the summaries it did not re-derive."""
+    if ctx.summaries_dropped:
+        return f"; {ctx.summaries_dropped} summaries dropped (--drop-summaries), no {VERIFICATION_REPORT_FILENAME}"
+    if ctx.summaries_carried:
+        return (
+            f"; {ctx.summaries_carried} summaries carried forward, "
+            f"{ctx.summaries_stale} marked llm-stale"
+        )
+    return ""
 
 
 def _sources_for(root: Path, modules: List[ModuleRecord]) -> Dict[str, str]:
@@ -594,6 +666,7 @@ def _full_build(
     llm_call: Optional[LlmCall],
     modules: Optional[List[ModuleRecord]] = None,
     hashes: Optional[Dict[str, str]] = None,
+    drop_summaries: bool = False,
 ) -> Tuple[Path, List[str], CollectContext]:
     # Captured before anything under `[collect] dir` is written: `.collect/`
     # isn't git-ignored, so if this ran *after* `_write_artifact`, the
@@ -615,7 +688,32 @@ def _full_build(
         # Hashed once, here, and reused by `_write_manifest` below instead of
         # being recomputed after `_write_artifact` has written to disk.
         hashes = manifest_mod.hash_tree(root, [m.path for m in modules])
+    # V8: a full build without Pass B (`--no-llm`, `[collect] llm_summaries
+    # = false`, no summarizer) used to write `summary: null` for every
+    # module — the previous artifact's prose destroyed by a build that
+    # never asked for it. Carry it forward instead, tagged `llm-stale`
+    # where the file changed; `--drop-summaries` is the explicit way to
+    # get the old behaviour. Pass C still runs over what was carried, so
+    # a stale summary's citations are re-checked against the current tree.
+    pass_b_ran = llm_call is not None
+    carried = stale = dropped = 0
+    if not pass_b_ran:
+        previous, previous_hashes = _previous_summaries(collect_dir)
+        if drop_summaries:
+            dropped = sum(1 for m in modules if m.path in previous)
+        elif previous:
+            modules, carried, stale = _carry_summaries(modules, previous, previous_hashes, hashes)
     ctx = build_context(root, modules, config=config, config_path=config_path, llm_call=llm_call)
+    if carried and any(m.summary is not None for m in ctx.modules):
+        sources = _sources_for(root, ctx.modules)
+        verified_modules, report = verifier_mod.verify_repo(
+            ctx.modules, sources, root=root, import_edges=ctx.import_edges,
+        )
+        ctx = replace(ctx, modules=verified_modules, verification_report=report)
+    ctx = replace(
+        ctx, pass_b_ran=pass_b_ran,
+        summaries_carried=carried, summaries_stale=stale, summaries_dropped=dropped,
+    )
     written = _write_artifact(collect_dir, ctx)
     _write_manifest(root, collect_dir, ctx.modules, provenance=provenance, file_hashes=hashes)
     written = sorted(set(written) | {MANIFEST_FILENAME})
@@ -640,11 +738,11 @@ def _full_build_message(why: str, ctx: CollectContext, written: List[str], colle
       nothing says so rather than claiming Pass B was skipped."""
     total = len(ctx.modules)
     summarized = sum(1 for m in ctx.modules if m.summary is not None)
-    pass_b_ran = ctx.verification_report is not None
-    if summarized == total:
+    pass_b_ran = ctx.pass_b_ran
+    if not pass_b_ran:
+        what = f"{total} module(s) re-scanned (Pass B skipped{_pass_b_suffix(ctx)})"
+    elif summarized == total:
         what = f"{total} module(s) re-summarized"
-    elif not pass_b_ran:
-        what = f"{total} module(s) re-scanned (Pass B skipped)"
     elif summarized:
         what = f"{total} module(s) re-scanned, {summarized} re-summarized"
     else:
@@ -658,6 +756,7 @@ def action_rebuild(
     config: Optional[configparser.ConfigParser] = None,
     config_path: Optional[str] = None,
     llm_call: Optional[LlmCall] = None,
+    drop_summaries: bool = False,
 ) -> CollectResult:
     """`--collect --rebuild` / `/collect --rebuild`: unconditional full
     rebuild.
@@ -673,9 +772,15 @@ def action_rebuild(
 
     One Pass B call per module, which is exactly why this is a flag you
     opt into rather than what `--collect` does by default.
+
+    With `--no-llm` (V8) the previous artifact's summaries are carried
+    forward — `llm-stale` where the file changed — unless
+    `drop_summaries` asks for the structural-only artifact explicitly.
     """
     root = Path(root)
-    collect_dir, written, ctx = _full_build(root, config=config, config_path=config_path, llm_call=llm_call)
+    collect_dir, written, ctx = _full_build(
+        root, config=config, config_path=config_path, llm_call=llm_call, drop_summaries=drop_summaries,
+    )
     return CollectResult(
         action="rebuild", wrote=True, fresh=True,
         message=_full_build_message("", ctx, written, collect_dir),
@@ -691,6 +796,7 @@ def action_refresh(
     llm_call: Optional[LlmCall] = None,
     modules: Optional[List[ModuleRecord]] = None,
     hashes: Optional[Dict[str, str]] = None,
+    drop_summaries: bool = False,
 ) -> CollectResult:
     """`--refresh`: diff-driven incremental rebuild (COLLECT-24).
 
@@ -820,7 +926,7 @@ def action_refresh(
     if previous_manifest is None:
         collect_dir, written, ctx = _full_build(
             root, config=config, config_path=config_path, llm_call=llm_call,
-            modules=current_modules, hashes=current_hashes,
+            modules=current_modules, hashes=current_hashes, drop_summaries=drop_summaries,
         )
         return CollectResult(
             action="refresh", wrote=True, fresh=True,
@@ -837,6 +943,16 @@ def action_refresh(
     changes = manifest_mod.diff_files(previous_manifest.file_hashes, current_hashes)
 
     to_summarize = [m for m in current_modules if m.path in changes.changed]
+    # V8: a summary carried forward as `llm-stale` by an earlier `--no-llm`
+    # build is owed a real one — an unchanged file is not re-sent to Pass B
+    # by the diff alone, so a stale summary would otherwise stay stale until
+    # the file happened to change again.
+    stale_paths = {
+        p for p, prev in previous_by_path.items()
+        if p not in changes.changed and prev.summary is not None
+        and prev.summary.provenance == Provenance.LLM_STALE
+    }
+    to_summarize += [m for m in current_modules if m.path in stale_paths]
 
     settings = read_collect_settings(config)
     # "Skipped" is only honest when there was something to summarize: a
@@ -880,10 +996,26 @@ def action_refresh(
             )
         }
 
+    # V8: with Pass B skipped, a changed module keeps the summary it had
+    # (tagged `llm-stale` — the source moved under it) instead of losing it
+    # to `summary: null`; `--drop-summaries` is the explicit opt-out.
+    carried = stale = dropped = 0
     merged: List[ModuleRecord] = []
     for m in current_modules:
-        if m.path in changes.changed:
-            merged.append(summarized_by_path.get(m.path, m))
+        if m.path in summarized_by_path:
+            merged.append(summarized_by_path[m.path])
+        elif m.path in changes.changed:
+            prev = previous_by_path.get(m.path)
+            if pass_b_skipped and prev is not None and prev.summary is not None:
+                if drop_summaries:
+                    dropped += 1
+                    merged.append(m)
+                else:
+                    carried += 1
+                    stale += 1
+                    merged.append(m.with_llm_summary(prev.summary.as_stale()))
+            else:
+                merged.append(m)
         else:
             # Unchanged since the last manifest: reuse the previous
             # record verbatim (summary included) rather than the
@@ -899,6 +1031,10 @@ def action_refresh(
             merged, sources, root=root, import_edges=ctx.import_edges,
         )
         ctx = replace(ctx, modules=verified_modules, verification_report=report)
+    ctx = replace(
+        ctx, pass_b_ran=bool(to_summarize) and not pass_b_skipped,
+        summaries_carried=carried, summaries_stale=stale, summaries_dropped=dropped,
+    )
 
     written = _write_artifact(collect_dir, ctx)
     # Reuse the hashes already computed for the diff above: the manifest
@@ -932,7 +1068,7 @@ def action_refresh(
         # the same asymmetry `_full_build_message`'s else branch already
         # names for the sibling rebuild path ("Pass B produced no summary").
         if pass_b_skipped:
-            suffix = " (Pass B skipped)"
+            suffix = f" (Pass B skipped{_pass_b_suffix(ctx)})"
         elif to_summarize and not summarized_by_path:
             suffix = " (Pass B produced no summary)"
         else:
@@ -951,6 +1087,7 @@ def action_collect(
     config: Optional[configparser.ConfigParser] = None,
     config_path: Optional[str] = None,
     llm_call: Optional[LlmCall] = None,
+    drop_summaries: bool = False,
 ) -> CollectResult:
     """`--collect` / `/collect`: one-shot, freshness-gated.
 
@@ -989,7 +1126,7 @@ def action_collect(
         )
     result = action_refresh(
         root, config=config, config_path=config_path, llm_call=llm_call,
-        modules=modules, hashes=hashes,
+        modules=modules, hashes=hashes, drop_summaries=drop_summaries,
     )
     return CollectResult(
         action="collect", wrote=result.wrote, fresh=result.fresh,
@@ -1055,6 +1192,7 @@ def action_module(
     config: Optional[configparser.ConfigParser] = None,
     config_path: Optional[str] = None,
     llm_call: Optional[LlmCall] = None,
+    drop_summaries: bool = False,
 ) -> CollectResult:
     """`--module <path>`: incremental. Re-scans and re-parses *only*
     `module_path`; every other module's `ModuleRecord` is reused verbatim
@@ -1140,6 +1278,7 @@ def action_module(
         raise CollectCliError(f"--module path is unreadable: {module_path}: {exc}") from exc
     patched = scan_file(source, module_path, config=config)
 
+    previous_record = by_path.get(module_path)
     if module_path not in by_path:
         modules.append(patched)
     else:
@@ -1183,6 +1322,12 @@ def action_module(
         if summarized and summarized[0].summary is not None:
             patched = summarized[0]
             modules = [patched if m.path == module_path else m for m in modules]
+    elif pass_b_skipped and not drop_summaries and previous_record is not None and previous_record.summary is not None:
+        # V8: same rule as `action_refresh` — the re-scanned module keeps
+        # the summary it had, tagged `llm-stale` (the file was just
+        # re-read, so it may have changed), instead of `summary: null`.
+        patched = patched.with_llm_summary(previous_record.summary.as_stale())
+        modules = [patched if m.path == module_path else m for m in modules]
 
     # Captured before `_write_artifact` below writes anything under
     # `.collect/` — see `capture_provenance`'s docstring. Same ordering
@@ -1267,7 +1412,9 @@ def action_module(
     # has no summary (a parse error, or a summarizer that exhausted its
     # retries) — but `--module`'s own message never did, so a patched
     # module with no summary silently read as if it had been re-summarized.
-    if pass_b_skipped:
+    if pass_b_skipped and patched.summary is not None:
+        suffix = " (Pass B skipped; summary carried forward, marked llm-stale)"
+    elif pass_b_skipped:
         suffix = " (Pass B skipped)"
     elif patched.summary is None:
         suffix = " (Pass B produced no summary)"
@@ -1288,6 +1435,7 @@ def run(
     config_path: Optional[str] = None,
     module_path: Optional[str] = None,
     llm_call: Optional[LlmCall] = None,
+    drop_summaries: bool = False,
 ) -> CollectResult:
     """Single dispatch point for all five actions — what `main.py`'s
     `/collect` command / `--collect`/`--check`/`--refresh`/`--rebuild`/
@@ -1306,14 +1454,23 @@ def run(
             collect_dir=resolve_collect_dir(root, config),
         )
     if action == "refresh":
-        return action_refresh(root, config=config, config_path=config_path, llm_call=llm_call)
+        return action_refresh(
+            root, config=config, config_path=config_path, llm_call=llm_call, drop_summaries=drop_summaries,
+        )
     if action == "rebuild":
-        return action_rebuild(root, config=config, config_path=config_path, llm_call=llm_call)
+        return action_rebuild(
+            root, config=config, config_path=config_path, llm_call=llm_call, drop_summaries=drop_summaries,
+        )
     if action == "module":
         if not module_path:
             raise CollectCliError("action='module' requires module_path")
-        return action_module(root, module_path, config=config, config_path=config_path, llm_call=llm_call)
-    return action_collect(root, config=config, config_path=config_path, llm_call=llm_call)
+        return action_module(
+            root, module_path, config=config, config_path=config_path, llm_call=llm_call,
+            drop_summaries=drop_summaries,
+        )
+    return action_collect(
+        root, config=config, config_path=config_path, llm_call=llm_call, drop_summaries=drop_summaries,
+    )
 
 
 # ── argparse-level entry point (mirrors --auto / --faq in main.py) ─────────
@@ -1391,7 +1548,7 @@ def parse_collect_args(argv: List[str]) -> Dict[str, Any]:
         rebuild="--rebuild" in argv,
         refresh="--refresh" in argv,
     )
-    return {"action": action, "module_path": module_path}
+    return {"action": action, "module_path": module_path, "drop_summaries": "--drop-summaries" in argv}
 
 
 def _module_path_from(argv: List[str]) -> str:

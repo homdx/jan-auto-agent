@@ -98,23 +98,23 @@ class TestCheckShortCircuitsModule:
         was resolved, so `parse_collect_args(['--check', '--module'])`
         raised CollectCliError instead of returning check."""
         result = parse_collect_args(["--check", "--module"])
-        assert result == {"action": "check", "module_path": None}
+        assert result == {"action": "check", "module_path": None, "drop_summaries": False}
 
     def test_check_with_empty_module_returns_check(self):
         """Same precedence violation with an explicit empty value."""
         result = parse_collect_args(["--check", "--module", ""])
-        assert result == {"action": "check", "module_path": None}
+        assert result == {"action": "check", "module_path": None, "drop_summaries": False}
 
     def test_check_with_equals_form_malformed_returns_check(self):
         """`--module=` with no value, guarded by `--check`."""
         result = parse_collect_args(["--check", "--module="])
-        assert result == {"action": "check", "module_path": None}
+        assert result == {"action": "check", "module_path": None, "drop_summaries": False}
 
     def test_check_with_flag_value_malformed_returns_check(self):
         """`--module` followed by another flag — still caught by
         `--check` short-circuit, never reaches _module_path_from."""
         result = parse_collect_args(["--check", "--module", "--no-llm"])
-        assert result == {"action": "check", "module_path": None}
+        assert result == {"action": "check", "module_path": None, "drop_summaries": False}
 
     def test_malformed_module_without_check_still_raises(self):
         """Without `--check`, the existing guard must still fire —

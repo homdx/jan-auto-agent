@@ -54,18 +54,18 @@ class TestCheckBeatsMalformedModule:
         """Before the fix this raised CollectCliError instead of returning
         the check action."""
         result = parse_collect_args(["--check", "--module"])
-        assert result == {"action": "check", "module_path": None}
+        assert result == {"action": "check", "module_path": None, "drop_summaries": False}
 
     def test_check_with_empty_equals_module_returns_check(self):
         result = parse_collect_args(["--check", "--module="])
-        assert result == {"action": "check", "module_path": None}
+        assert result == {"action": "check", "module_path": None, "drop_summaries": False}
 
     def test_check_with_module_looking_like_a_flag_returns_check(self):
         """`--module --no-llm` would normally be rejected by
         `_module_path_from` as "looks like a flag rather than a path" —
         but --check must win before that validation ever runs."""
         result = parse_collect_args(["--check", "--module", "--no-llm"])
-        assert result == {"action": "check", "module_path": None}
+        assert result == {"action": "check", "module_path": None, "drop_summaries": False}
 
     def test_check_with_valid_module_still_returns_check(self):
         """check outranks module even when the module value is perfectly
@@ -92,4 +92,4 @@ class TestMalformedModuleStillRaisesWithoutCheck:
 
     def test_valid_module_without_check_still_returns_module(self):
         result = parse_collect_args(["--module", "pkg/a.py"])
-        assert result == {"action": "module", "module_path": "pkg/a.py"}
+        assert result == {"action": "module", "module_path": "pkg/a.py", "drop_summaries": False}

@@ -430,7 +430,7 @@ class TestRefreshMessageReportsSkippedPassB:
         result = action_collect(mini_repo)  # llm_call=None
 
         assert "incrementally refreshed 1 changed" in result.message
-        assert "(Pass B skipped)" in result.message
+        assert "(Pass B skipped" in result.message
 
     def test_collect_with_llm_does_not_claim_pass_b_skipped(self, mini_repo):
         action_collect(mini_repo, llm_call=_counting_llm_call())
@@ -442,14 +442,17 @@ class TestRefreshMessageReportsSkippedPassB:
         assert "Pass B skipped" not in result.message
 
     def test_no_llm_drops_only_the_changed_module_summary(self, mini_repo):
-        """The incremental guarantee under `--no-llm`: the changed module
-        loses its summary, every unchanged module keeps its own."""
+        """The incremental guarantee under `--no-llm --drop-summaries`: the
+        changed module loses its summary, every unchanged module keeps its
+        own. (V8: without `--drop-summaries` the changed module keeps its
+        summary too, tagged `llm-stale` — see
+        `test_collect_no_llm_preserves_summaries.py`.)"""
         llm = _counting_llm_call()
         action_collect(mini_repo, llm_call=llm)
         before = _artifact_modules(mini_repo / ".collect")
         (mini_repo / "pkg" / "a.py").write_text("def a():\n    return 42\n")
 
-        result = action_collect(mini_repo)  # llm_call=None
+        result = action_collect(mini_repo, drop_summaries=True)  # llm_call=None
         after = _artifact_modules(result.collect_dir)
 
         assert before["pkg/b.py"]["summary"] == after["pkg/b.py"]["summary"]

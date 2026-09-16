@@ -883,8 +883,8 @@ def verify_module(
     A module with no summary (Pass B skipped, or `--no-llm`) passes through
     unchanged — there is no prose to verify. Otherwise `purpose` and
     `notes` are each independently filtered down to their surviving claims
-    and reattached as a fresh `LLMSummary` (COLLECT-1's whitelist — still,
-    and always, `provenance="llm"`).
+    and reattached as a fresh `LLMSummary` (COLLECT-1's whitelist — still
+    `provenance="llm"`, or `"llm-stale"` when that is what came in: V8).
 
     `known_names` — this module's own broader "every name defined
     anywhere" set (`ast_facts.extract_all_defined_names`), used only to
@@ -915,7 +915,12 @@ def verify_module(
         known_names=known_names, citable_modules=citable_modules,
     )
 
-    verified_summary = LLMSummary(purpose=verified_purpose, notes=verified_notes)
+    # V8: a carried-forward `llm-stale` summary stays stale through Pass C —
+    # verification drops fabricated citations, it does not make old prose
+    # current.
+    verified_summary = LLMSummary(
+        purpose=verified_purpose, notes=verified_notes, provenance=module.summary.provenance,
+    )
     return module.with_llm_summary(verified_summary), dropped_purpose + dropped_notes
 
 

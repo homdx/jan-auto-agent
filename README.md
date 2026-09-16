@@ -540,7 +540,17 @@ collect rebuild: 493 module(s) re-summarized; wrote 11 file(s) in .../.collect
 
 $ python main.py --collect --module tools/collect/model.py
 collect module: patched tools/collect/model.py and refreshed 11 file(s)
+
+$ python main.py --collect --rebuild --no-llm   # no Pass B: summaries are kept, not nulled
+collect rebuild: 493 module(s) re-scanned (Pass B skipped; 469 summaries carried forward, 3 marked llm-stale); wrote 12 file(s) in .../.collect
+
+$ python main.py --collect --rebuild --no-llm --drop-summaries   # the structural-only artifact, on request
+collect rebuild: 493 module(s) re-scanned (Pass B skipped; 469 summaries dropped (--drop-summaries), no verification_report.json); wrote 11 file(s) in .../.collect
 ```
+
+`--no-llm` never destroys prose (V8): a module whose source changed since
+Pass B wrote its summary keeps it tagged `provenance: llm-stale`, and the
+next build that does run Pass B re-summarizes exactly those modules.
 
 ### What gets written to `.collect/`
 

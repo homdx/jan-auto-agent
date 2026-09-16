@@ -58,21 +58,28 @@ from typing import Any, Dict, Optional, Tuple
 
 
 class Provenance:
-    """The three provenance tags a field/record can carry.
+    """The provenance tags a field/record can carry.
 
-    static  — produced directly by Pass A's AST walk; ground truth.
-    llm     — produced by Pass B's summarizer; prose, not authoritative.
-    derived — computed from other static facts (e.g. contracts inferred
-              from guarded_accesses + the call graph); not LLM, not raw AST,
-              but still trustworthy because it's a pure function of static
-              facts.
+    static    — produced directly by Pass A's AST walk; ground truth.
+    llm       — produced by Pass B's summarizer; prose, not authoritative.
+    llm-stale — Pass B prose carried forward by a `--no-llm` build (V8)
+                over a module whose source changed since it was written;
+                still prose, still unauthoritative, and additionally known
+                to describe an older version of the file. Only an
+                `LLMSummary` may carry it — it is a *narrower* claim than
+                `llm`, never a wider one.
+    derived   — computed from other static facts (e.g. contracts inferred
+                from guarded_accesses + the call graph); not LLM, not raw
+                AST, but still trustworthy because it's a pure function of
+                static facts.
     """
 
     STATIC = "static"
     LLM = "llm"
+    LLM_STALE = "llm-stale"
     DERIVED = "derived"
 
-    ALL = frozenset({STATIC, LLM, DERIVED})
+    ALL = frozenset({STATIC, LLM, LLM_STALE, DERIVED})
 
 
 class ProvenanceViolation(RuntimeError):
@@ -217,7 +224,7 @@ class LLMSummary:
     provenance: str = Provenance.LLM
 
     def __post_init__(self) -> None:
-        _require_provenance(self, frozenset({Provenance.LLM}))
+        _require_provenance(self, frozenset({Provenance.LLM, Provenance.LLM_STALE}))
         extra = {
             f.name
             for f in fields(self)
@@ -228,6 +235,13 @@ class LLMSummary:
                 f"LLMSummary must only contain {sorted(LLM_WRITABLE_FIELDS)}; "
                 f"found unexpected field(s) {sorted(extra)}"
             )
+
+    def as_stale(self) -> "LLMSummary":
+        """The same prose tagged `llm-stale` (V8): the module it describes
+        has changed since Pass B wrote it. Idempotent."""
+        if self.provenance == Provenance.LLM_STALE:
+            return self
+        return dataclasses.replace(self, provenance=Provenance.LLM_STALE)
 
 
 # ── Composite records (structural facts + optional LLM summary) ───────────────

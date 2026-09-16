@@ -376,6 +376,7 @@ def render_config_map(
 _GLOSSARY_TERMS: Tuple[Tuple[str, str], ...] = (
     ("static", "A fact produced directly by Pass A's AST walk (EPIC B); ground truth, never LLM prose (COLLECT-1)."),
     ("llm", "Prose written by Pass B's summarizer (COLLECT-16); always unverified until Pass C (COLLECT-17) checks it."),
+    ("llm-stale", "Pass B prose carried forward by a `--no-llm` build (V8) over a module whose source has changed since it was written; describes an older version of the file."),
     ("derived", "A fact computed by a pure function of other static facts (e.g. RISK_INDEX, a contract inferred from the call graph); not raw AST, not LLM, but still trustworthy."),
     ("GUARDED / UNGUARDED", "Whether a `GuardedAccess` (an indexed access like `stack[-1]`) has a dataflow-provable guard above it (COLLECT-7)."),
     ("fail-open", "An `except` block whose body silently swallows the exception (e.g. `pass`) rather than logging, re-raising, or altering control flow (COLLECT-6)."),

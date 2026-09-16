@@ -342,20 +342,27 @@ def test_run_module_requires_module_path(mini_repo):
 
 
 def test_parse_collect_args_defaults_to_collect():
-    assert parse_collect_args([]) == {"action": "collect", "module_path": None}
+    assert parse_collect_args([]) == {"action": "collect", "module_path": None, "drop_summaries": False}
 
 
 def test_parse_collect_args_check():
-    assert parse_collect_args(["--check"]) == {"action": "check", "module_path": None}
+    assert parse_collect_args(["--check"]) == {"action": "check", "module_path": None, "drop_summaries": False}
 
 
 def test_parse_collect_args_refresh():
-    assert parse_collect_args(["--refresh"]) == {"action": "refresh", "module_path": None}
+    assert parse_collect_args(["--refresh"]) == {"action": "refresh", "module_path": None, "drop_summaries": False}
+
+
+def test_parse_collect_args_drop_summaries():
+    # V8: `--drop-summaries` rides along with whichever action was asked for.
+    assert parse_collect_args(["--rebuild", "--no-llm", "--drop-summaries"]) == {
+        "action": "rebuild", "module_path": None, "drop_summaries": True,
+    }
 
 
 def test_parse_collect_args_module():
     assert parse_collect_args(["--module", "pkg/a.py"]) == {
-        "action": "module", "module_path": "pkg/a.py",
+        "action": "module", "module_path": "pkg/a.py", "drop_summaries": False,
     }
 
 

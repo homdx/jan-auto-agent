@@ -380,9 +380,11 @@ class TestRebuildIsUnconditionalFullBuild:
         re-summarized."""
         action_collect(mini_repo, llm_call=_counting_llm_call())
 
-        result = action_rebuild(mini_repo)  # llm_call=None
+        # V8: `--drop-summaries` is the build that ends with no summaries; a
+        # plain `--no-llm` rebuild carries the previous ones forward.
+        result = action_rebuild(mini_repo, drop_summaries=True)  # llm_call=None
 
-        assert f"{_module_count(mini_repo)} module(s) re-scanned (Pass B skipped)" in result.message
+        assert f"{_module_count(mini_repo)} module(s) re-scanned (Pass B skipped" in result.message
         assert "re-summarized" not in result.message
         assert all(m["summary"] is None for m in _artifact_modules(result.collect_dir).values())
 
@@ -496,7 +498,7 @@ class TestVersionMismatchStillForcesFullBuild:
 
 class TestRebuildWiring:
     def test_parse_collect_args_rebuild(self):
-        assert parse_collect_args(["--rebuild"]) == {"action": "rebuild", "module_path": None}
+        assert parse_collect_args(["--rebuild"]) == {"action": "rebuild", "module_path": None, "drop_summaries": False}
 
     def test_parse_collect_args_module_beats_rebuild(self):
         """`--module` names one specific file, so it wins over the
@@ -508,10 +510,11 @@ class TestRebuildWiring:
         assert parse_collect_args(["--rebuild", "--module", "pkg/a.py"]) == {
             "action": "module",
             "module_path": "pkg/a.py",
+            "drop_summaries": False,
         }
 
     def test_parse_collect_args_check_still_wins(self):
-        assert parse_collect_args(["--check", "--rebuild"]) == {"action": "check", "module_path": None}
+        assert parse_collect_args(["--check", "--rebuild"]) == {"action": "check", "module_path": None, "drop_summaries": False}
 
     def test_rebuild_wins_over_refresh_in_both_entry_points(self, tmp_path):
         """`/collect --refresh --rebuild` (parse_collect_args) and
@@ -716,7 +719,7 @@ class TestDeletionOnlyMessage:
 
         _change_a(mini_repo)
         changed_without_llm = action_collect(mini_repo, llm_call=None)
-        assert "1 changed module(s) (Pass B skipped)" in changed_without_llm.message
+        assert "1 changed module(s) (Pass B skipped" in changed_without_llm.message
 
     def test_change_and_deletion_together_name_both_counts(self, mini_repo):
         action_collect(mini_repo)
@@ -821,7 +824,10 @@ class TestNoStaleVerificationReport:
         assert report.exists()
         assert any(m["summary"] is not None for m in _artifact_modules(first.collect_dir).values())
 
-        result = action_rebuild(mini_repo)  # llm_call=None -> Pass B/C skipped
+        # V8: a plain `--no-llm` rebuild now carries the summaries forward and
+        # Pass C still verifies them, so the report is legitimately rewritten;
+        # `--drop-summaries` is the build with nothing left for it to describe.
+        result = action_rebuild(mini_repo, drop_summaries=True)  # llm_call=None -> Pass B/C skipped
 
         assert not report.exists()
         assert cli_mod.VERIFICATION_REPORT_FILENAME not in result.written_files
