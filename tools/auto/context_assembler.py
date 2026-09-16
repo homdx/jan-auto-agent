@@ -933,7 +933,16 @@ def _pack_body(
     """
     head_len = len("\n".join(head))
     body: "list[str]" = []
-    seen: "set[str]" = set(head)
+    # BUGFIX: `seen` used to be seeded with `head`'s own lines (the fixed
+    # `_COLLECT_HEADER` / `module: {path}` / `parse_error: {...}` lines that
+    # sit outside the row loop). Those aren't ranked content a row can ever
+    # legitimately restate — they exist purely so `seen` only ever holds
+    # facts *rows* already rendered, per the class docstring above. Seeding
+    # it with `head` meant a row whose own, genuinely distinct fact happened
+    # to render a line byte-identical to one of those — coincidence, not
+    # repetition — was silently dropped as a "duplicate" of the header
+    # rather than shown, and its row miscounted as cut instead of kept.
+    seen: "set[str]" = set()
     kept: "set[str]" = set()
     used = head_len
     for name, _render in rows:

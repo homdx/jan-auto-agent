@@ -923,7 +923,20 @@ def action_refresh(
         # could not be built all make this path run with zero LLM calls, so
         # the honest verb is "re-scanned", never "refreshed" in a way that
         # implies a summary was re-derived.
-        suffix = " (Pass B skipped)" if pass_b_skipped else ""
+        # BUGFIX: `pass_b_skipped` only covers Pass B being skipped by
+        # config/no `llm_call` — not the case where Pass B ran but every
+        # changed module had a `parse_error` (or exhausted its retries) and
+        # so none of them made it into `summarized_by_path`. That left
+        # `suffix` empty and the message read "incrementally refreshed N
+        # changed module(s)" with no hint Pass B produced zero summaries —
+        # the same asymmetry `_full_build_message`'s else branch already
+        # names for the sibling rebuild path ("Pass B produced no summary").
+        if pass_b_skipped:
+            suffix = " (Pass B skipped)"
+        elif to_summarize and not summarized_by_path:
+            suffix = " (Pass B produced no summary)"
+        else:
+            suffix = ""
         message = f"incrementally refreshed {scope} module(s){suffix}; wrote {len(written)} file(s) in {collect_dir}"
 
     return CollectResult(
@@ -1151,7 +1164,16 @@ def action_module(
     # `action_refresh` (via the `any(m.summary is not None …)` branch
     # there), so verification of the newly-updated summary is not skipped.
     settings = read_collect_settings(config)
-    if llm_call is not None and settings.llm_summaries and patched.parse_error is None:
+    # BUGFIX: `pass_b_skipped` mirrors `action_refresh`'s own flag exactly —
+    # `--no-llm` / `[collect] llm_summaries = false` means Pass B was never
+    # attempted at all, the "(Pass B skipped)" case. A parse error is a
+    # *different* reason `patched.summary` can end up None: Pass B would
+    # have run but there is nothing to summarize, which is
+    # "(Pass B produced no summary)" below, not "skipped" — same split
+    # `action_refresh` makes between `pass_b_skipped` and an empty
+    # `summarized_by_path`.
+    pass_b_skipped = llm_call is None or not settings.llm_summaries
+    if not pass_b_skipped and patched.parse_error is None:
         summarized = summarize_repo(
             [patched], {module_path: source}, llm_call,
             max_retries=collect_max_retries(config),
@@ -1239,9 +1261,21 @@ def action_module(
     manifest_mod.write_manifest(patched_manifest, manifest_path)
     written = sorted(set(written) | {MANIFEST_FILENAME})
 
+    # BUGFIX: `action_refresh` and `_full_build_message` both name Pass B's
+    # outcome — "(Pass B skipped)" when it was never attempted, "(Pass B
+    # produced no summary)" when it ran (or would have) but `patched` still
+    # has no summary (a parse error, or a summarizer that exhausted its
+    # retries) — but `--module`'s own message never did, so a patched
+    # module with no summary silently read as if it had been re-summarized.
+    if pass_b_skipped:
+        suffix = " (Pass B skipped)"
+    elif patched.summary is None:
+        suffix = " (Pass B produced no summary)"
+    else:
+        suffix = ""
     return CollectResult(
         action="module", wrote=True, fresh=True,
-        message=f"patched {module_path} and refreshed {len(written)} file(s) in {collect_dir}",
+        message=f"patched {module_path} and refreshed {len(written)} file(s) in {collect_dir}{suffix}",
         collect_dir=collect_dir, written_files=tuple(written),
     )
 
@@ -1331,8 +1365,19 @@ def parse_collect_args(argv: List[str]) -> Dict[str, Any]:
     parser and just forward here — see that module's own `_parse_args` for
     the actual flag definitions. Flag precedence is `action_from_flags`,
     shared with `main.py` so the two entry points dispatch identically."""
+    check = "--check" in argv
     module_path = None
-    if "--module" in argv or any(a.startswith("--module=") for a in argv):
+    # BUGFIX: `--check` must win over `--module` per `action_from_flags`'s
+    # documented precedence table (check is the most specific, read-only
+    # request and must never be preempted). Resolving `_module_path_from`
+    # unconditionally whenever `--module` appeared — before `action_from_flags`
+    # got a chance to apply that precedence — meant a malformed `--module`
+    # (no value, or a value that looks like another flag) raised
+    # `CollectCliError` even when `--check` was also present and should have
+    # short-circuited first: `parse_collect_args(["--check", "--module"])`
+    # raised instead of returning the `check` action. Only resolve the
+    # module value when `--check` isn't already going to take precedence.
+    if not check and ("--module" in argv or any(a.startswith("--module=") for a in argv)):
         # BUGFIX: only the space form was recognised. argparse (main.py's
         # parser) accepts both `--module <path>` and `--module=<path>`, so
         # `main.py --collect --module=pkg/a.py` patched one module while
@@ -1341,7 +1386,7 @@ def parse_collect_args(argv: List[str]) -> Dict[str, Any]:
         module_path = _module_path_from(argv)
 
     action, _ = action_from_flags(
-        check="--check" in argv,
+        check=check,
         module_path=module_path,
         rebuild="--rebuild" in argv,
         refresh="--refresh" in argv,
