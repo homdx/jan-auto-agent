@@ -590,6 +590,25 @@ def _row_neighbours(
     return _shrunk_lines(lines, remaining)
 
 
+def _neighbour_paths_in(lines) -> "tuple[str, ...]":
+    """The paths a `neighbours` row named, in the order it named them.
+
+    The inverse of `_row_neighbours`'s own line format. Reported in stats so a
+    caller can tell *which* cached block quotes *which* neighbour, and therefore
+    which block goes stale when a neighbour is edited — see
+    `CollectBridge.invalidate`, which drops exactly those entries and no more.
+
+    Only paths the block actually rendered. A path the row skipped for being
+    empty, dirty, unknown to the module table, or cut away by the budget was
+    never shown to a coder, so invalidating it cannot make a block stale.
+    """
+    return tuple(
+        line[len(_NEIGHBOURS_PREFIX):].split(" — ", 1)[0]
+        for line in lines
+        if line.startswith(_NEIGHBOURS_PREFIX) and " — " in line
+    )
+
+
 # PLAN-v2: the ordered row list that IS the per-task fact pack. Highest
 # value first — "value" = how hard this fact is to get from the target file's
 # own source, which the coder already has in full in the same prompt. The
@@ -792,6 +811,14 @@ def build_collect_context_block_stats(
       is the ground the assembler gave up.
     - ``budget`` — the budget the cut was made against (`None` = no budget,
       nothing was ever cut).
+    - ``neighbours_paths`` — the paths the rendered `neighbours:` row named,
+      in render order. The block's prose about *other* modules is exactly
+      these paths' summaries, so a caller that tracks edits made since the
+      artifact was built can invalidate any cached block that names a path it
+      just dirtied (`CollectBridge.invalidate`). Without this the bridge can
+      only invalidate the block for the dirtied path itself and keeps serving
+      a sibling's pre-edit purpose under a header that says "do not
+      contradict." `()` when the row did not render.
 
     Otherwise AUTO-CR-23/COLLECT-23, PLAN-v2 V2: the opt-in `collect`-derived context
     block for `target_file` — an ordered row list built by the selected row set.
@@ -840,12 +867,14 @@ def build_collect_context_block_stats(
 
     if model is None or not getattr(model, "available", False):
         return "", {"rows_kept": 0, "rows_cut": 0, "chars": 0,
-                    "chars_uncapped": 0, "budget": budget}
+                    "chars_uncapped": 0, "budget": budget,
+                    "neighbours_paths": ()}
 
     record = model.module(target_file)
     if record is None:
         return "", {"rows_kept": 0, "rows_cut": 0, "chars": 0,
-                    "chars_uncapped": 0, "budget": budget}
+                    "chars_uncapped": 0, "budget": budget,
+                    "neighbours_paths": ()}
 
     head = [_COLLECT_HEADER, f"module: {record.path}"]
     if record.parse_error:
@@ -887,7 +916,8 @@ def build_collect_context_block_stats(
     if not body and len(head) == 2:
         # Only the header + bare module line — nothing substantive to add.
         return "", {"rows_kept": 0, "rows_cut": len(rows), "chars": 0,
-                    "chars_uncapped": 0, "budget": budget}
+                    "chars_uncapped": 0, "budget": budget,
+                    "neighbours_paths": ()}
 
     block = "\n".join(head + body)
 
@@ -906,6 +936,9 @@ def build_collect_context_block_stats(
         "chars": len(block),
         "chars_uncapped": chars_uncapped,
         "budget": budget,
+        # Read off the rendered body, not `full`: a path the cut dropped, or
+        # the dedupe above skipped, was never shown, so it cannot go stale.
+        "neighbours_paths": _neighbour_paths_in(body),
     }
 
 

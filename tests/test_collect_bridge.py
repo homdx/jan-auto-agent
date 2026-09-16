@@ -216,9 +216,10 @@ def test_context_for_withholds_a_dirty_neighbours_purpose():
 
     A control bridge (no invalidation) proves the row would otherwise render;
     `invalidate` runs before the first `context_for` call on the affected
-    bridge so this exercises `_row_neighbours`'s own dirty check rather than
-    the (separate, untouched-by-this-fix) memo, which only drops entries
-    keyed by the dirtied path itself, not paths that merely cite it."""
+    bridge so this exercises `_row_neighbours`'s own dirty check — the fresh
+    build path. The other half, a block already sitting in the V6 memo that
+    cites the dirtied path, is pinned separately in
+    `tests_bugfix/test_bugfix_collect_bridge_memo_dirty_neighbour.py`."""
     control = CollectBridge(_neighbourhood_model(), max_context_chars=5000, summarizer_call=None)
     assert "Calls into the hub." in control.context_for("pkg/a.py")
 

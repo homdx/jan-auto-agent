@@ -174,6 +174,56 @@ def _memo_block(entry) -> "tuple[str, dict]":
     return (entry if isinstance(entry, str) else ""), {}
 
 
+def _memo_neighbours(entry) -> "tuple[str, ...]":
+    """The other modules a memo entry's block quotes, or `()`.
+
+    `stats["neighbours_paths"]` is the rendered `neighbours:` row's paths, which
+    are the only cross-module facts in a block with LLM prose. Any memo entry
+    whose list intersects a commit's dirt is stale even when its own key was
+    not touched by that commit — the block's header promises "static facts, do
+    not contradict," and a pre-edit purpose is not one. Entries whose stats
+    carry no such key (a block built before this fix, a hand-seeded string in
+    a test) read as "quotes nothing", so they are never wrongly dropped: the
+    one miss is a wasted rebuild, never a stale fact.
+    """
+    stats = _memo_block(entry)[1]
+    paths = stats.get("neighbours_paths", ())
+    if not isinstance(paths, (list, tuple, set, frozenset)):
+        return ()
+    return tuple(paths)
+
+
+def _drop_stale_memo(memo: dict, new_dirty: "set[str]") -> dict:
+    """Memo entries a commit's dirt invalidates, kept. Never raises.
+
+    Two independent reasons an entry goes: its own key is dirtied (the entry
+    is *about* that file), or it quotes a dirtied neighbour (the entry is
+    about another file but renders that one's purpose). Everything else is
+    untouched — an entry that merely names a dirtied path in the static
+    `callers:` / `calls_into:` rows is not stale, those are graph facts the
+    artifact already froze and the fix deliberately leaves in place.
+    """
+    out = {}
+    dropped = 0
+    for key, entry in memo.items():
+        try:
+            target = key[0] if isinstance(key, tuple) and key else key
+            quoted = set(_memo_neighbours(entry))
+        except Exception:  # noqa: BLE001 — a bad entry is dropped, never fatal
+            dropped += 1
+            continue
+        if target in new_dirty or (quoted & new_dirty):
+            dropped += 1
+            continue
+        out[key] = entry
+    if dropped:
+        logger.info(
+            "CollectBridge.invalidate: %d cached block(s) dropped — they were "
+            "about a dirtied path or quoted one",
+            dropped,
+        )
+    return out
+
 
 def _trace_event(kind: str, params: dict) -> None:
     """One collect trace event. Lazy import, never raises.
@@ -322,8 +372,9 @@ class CollectBridge:
         # file is a target in many tasks of one --auto run; caching the assembled
         # (and possibly LLM-shrunk) block means a second context_for("x.py") costs
         # zero further LLM calls. Bounded by distinct target files — the bridge is
-        # built once per run. Entries for a path are dropped by invalidate() when
-        # that path is committed dirty, so the memo never serves stale facts.
+        # built once per run. Entries are dropped by invalidate() when that path
+        # is committed dirty — or when the entry quotes a dirtied neighbour in its
+        # `neighbours:` row — so the memo never serves stale facts.
         self._memo: dict = {}
         # `summarizer_call` is a `tools.collect.summarizer.LlmCall`:
         # Callable[[system: str, user: str], str]. None = shrink disabled,
@@ -598,7 +649,11 @@ class CollectBridge:
         and `status` — computed once inside `load()` — cannot detect it.
         Afterwards `context_for` / `pull_symbol` / `module_symbols` /
         `contracts_for_symbol` return nothing for a dirty path, while every
-        clean path keeps its block for the rest of the run (V9, item 1).
+        clean path keeps its block for the rest of the run (V9, item 1) —
+        except a clean path whose block renders a dirtied neighbour's LLM
+        purpose in its `neighbours:` row. That cached block is dropped here
+        and rebuilt on the next request, which is what re-checks dirt for the
+        neighbour; the row's own dirty check makes the rebuild withhold it.
 
         This only records dirt. With `auto_refresh=True`, the repair itself
         happens lazily the first time a dirty path is actually asked for —
@@ -629,14 +684,19 @@ class CollectBridge:
         # described the tree as it was before this commit; a later context_for
         # must rebuild (and re-check dirt) rather than serve a stale clean
         # result. Keys are normalized in context_for(), so they match here.
+        # BUGFIX: the key alone is not enough. The `neighbours:` row renders
+        # another module's LLM purpose, so a block for `pkg/a.py` goes stale
+        # when `pkg/caller_a.py` is edited — and that block is keyed by
+        # `pkg/a.py`, which this commit did not touch. `stats["neighbours_paths"]`
+        # names exactly the paths whose prose each entry quotes, so those
+        # entries are dropped too. Dropped, not patched: the block is an
+        # immutable string and rebuilding is what re-checks dirt per path.
         # `getattr` — some callers build a bridge via __new__() and never run
         # __init__, so _memo may be absent; treat that as "nothing cached"
         # rather than raising, matching the fail-open stance of _dirty_set().
         memo = getattr(self, "_memo", None)
         if memo:
-            self._memo = {
-                k: v for k, v in memo.items() if k[0] not in new_dirty
-            }
+            self._memo = _drop_stale_memo(memo, new_dirty)
         # A new commit means new facts, so a repair that already failed for
         # these paths is worth one more attempt: an outage that started at
         # task N must not keep blinding a path that task N+2 edited again.
