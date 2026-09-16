@@ -144,8 +144,9 @@ wrong (see `INDEX.md` §"Numbers in this file … are hand-measured").
 >
 > When you are done, report: the commit sha, each Acceptance checkbox and
 > whether you met it, and anything in the ticket you found to be wrong about the
-> live code — the tickets were written against commit `68b78a0` and the code is
-> the authority, not the ticket.
+> live code — each ticket names the commit it was written against in its
+> `**Status:**` line (the original 24 used `68b78a0`); the code is the
+> authority, not the ticket.
 
 **▲▲▲ PROMPT ENDS ▲▲▲**
 
