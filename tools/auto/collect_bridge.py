@@ -55,8 +55,10 @@ Three responsibilities, all opt-in via `[collect] use_in_auto` /
    the pack for the other hundreds. `[collect] auto_refresh_between_tasks`
    (default `false`) instead re-runs the existing incremental
    `action_module` for the edited path and folds the fresh `ModuleRecord`
-   back into the in-memory model. The model *object* is still built once
-    per run: records are patched, `load()` is never called a second time.
+   back into the in-memory model. This repair path never calls `load()`
+   again: records are patched in place. (The RUN-6 entry refresh in item 3
+   above is the one deliberate exception — it calls `load()` a second
+   time, before this bridge exists, to load the model it just repaired.)
 
  5. **M4: runtime counters.** Everything this class does to a task's prompt
     is also counted and traced, so a run can say what happened to the pack
@@ -1277,10 +1279,15 @@ def make_collect_bridge(
 
     `None` is a valid, expected return — every caller must treat it as
     "no collect context this run" (identical to pre-COLLECT-24 behaviour),
-    not as an error. This is the ONLY place `tools.collect.loader.load()`
-    is called per run — callers must build this once and reuse it across
-    every task, never call this per-task (see AUTO-METRIC test:
-    `test_collect_model_loaded_once_per_run`).
+    not as an error. Callers must build this once and reuse it across every
+    task, never call this per-task (see AUTO-METRIC test:
+    `test_collect_model_loaded_once_per_run_not_per_task`). On the normal
+    path this is the only `tools.collect.loader.load()` call per run; the
+    one deliberate exception is RUN-6's stale-artifact entry refresh, which
+    calls `load()` once more (via `_refresh_on_entry`) to load the model it
+    just repaired — two calls total, both here in the factory, never
+    per-task. Pinned by
+    `tests_bugfix/test_collect_bridge_entry_refresh_loads_twice.py`.
     """
     key = "use_in_doc" if task_mode == "docs" else "use_in_auto"
     # Bugfix (config-crash audit): unguarded. Wrapped per-call, not via a
