@@ -54,6 +54,11 @@ max_tokens    — token cap for the presence-check call (default 512; thinking
 think         — Ollama "think" toggle for reasoning models (default false —
                 Gate 1 wants a tiny deterministic verdict, not reasoning in
                 the reply; set true to re-enable a model's thinking mode)
+presence_empty_retries — RUN-9: how many times an EMPTY reply whose stream
+                metadata shows no sign the budget was spent (a degraded
+                provider, not an exhausted model) is re-issued unchanged
+                before the re-ask ladder runs (default 2; 0 = today's
+                behaviour, every empty reply goes straight into the ladder)
 system        — override the built-in system prompt (optional)
 skip_llm      — "true" to run existence checks only, skip LLM stage (testing)
 skip_llm_for_unindexed — "false" to disable Stage A0 and let a candidate
@@ -394,6 +399,24 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         except ValueError as exc:
             logger.warning("config [%s] unparseable_max_retries is malformed (%s) — using default %d", sec, exc, self._UNPARSEABLE_MAX_RETRIES)
             self._unparseable_max_retries = self._UNPARSEABLE_MAX_RETRIES
+        # RUN-9: how many times to re-issue the SAME request (same
+        # max_tokens, same temperature, no nudge) when the reply came back
+        # empty AND the stream metadata says the budget was never spent —
+        # no content chunks, no finish_reason="length", completion_tokens
+        # nowhere near the cap, no reasoning streamed. That is a degraded
+        # provider (HTTP 200 with a role-only chunk, 20-60 s, `429 Server is
+        # busy` on the neighbouring calls), not the exhausted thinking model
+        # GATE1-LEARN-2 was written for; the ladder's nudge ("your previous
+        # reply was not valid JSON") and empty-pin were the wrong answer to
+        # it — one re-ask out of six and the candidate ended UNKNOWN. The
+        # retry is the RUN-5 shape: a technical failure, tried again, outside
+        # the ladder. 0 restores today's behaviour exactly.
+        try:
+            self._presence_empty_retries = max(0, int(config.get(
+                sec, "presence_empty_retries", fallback="2")))
+        except ValueError as exc:
+            logger.warning("config [%s] presence_empty_retries is malformed (%s) — using default 2", sec, exc)
+            self._presence_empty_retries = 2
         # RUN-5: what to do with a presence check the provider never
         # answered. Before this key there were only two outcomes — the
         # ladder's exit was `return False, reason` whether the model had
@@ -437,8 +460,25 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         # thread pool, so `x += 1` needs serialising.
         self.presence_reask: int = 0
         self.presence_unknown: int = 0
+        # RUN-9: WHY the empty replies were empty. `presence_empty_transport`
+        # counts candidates whose FIRST reply was empty with no evidence the
+        # budget was spent (the degraded-provider shape — retried, not
+        # nudged); `presence_empty_exhausted` counts ones whose first reply
+        # finished with "length", burned ~all of max_tokens, or streamed
+        # only reasoning (the shape the empty-pin is for). Each candidate
+        # lands in at most one of the two. `presence_nothink_ignored` is per
+        # (base_url, model) per run: the provider streamed reasoning on a
+        # think=false call, so `reasoning.exclude` is not honoured there and
+        # a no-think rung cannot help that model.
+        self.presence_empty_transport: int = 0
+        self.presence_empty_exhausted: int = 0
+        self.presence_nothink_ignored: int = 0
         self.non_py_requests: int = 0
         self._counter_lock = threading.Lock()
+        # RUN-9: (base_url, model) pairs already warned about ignoring
+        # `reasoning.exclude` — one WARNING per pair per run, not one per
+        # candidate, so a fleet of empty replies stays one line.
+        self._nothink_warned: set = set()
         # GATE1-PAR-1: how many presence checks run at once. 1 (default)
         # is the pre-existing sequential loop, byte-for-byte. N>1 runs the
         # Stage-B LLM calls through a thread pool of N workers; each call
@@ -1072,6 +1112,9 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                         reask=getattr(self, "presence_reask", 0),
                         unknown=getattr(self, "presence_unknown", 0),
                         non_py=getattr(self, "non_py_requests", 0),
+                        empty_transport=getattr(self, "presence_empty_transport", 0),
+                        empty_exhausted=getattr(self, "presence_empty_exhausted", 0),
+                        nothink_ignored=getattr(self, "presence_nothink_ignored", 0),
                     )
                 )
             except Exception:  # noqa: BLE001 — never sink a run on a counter
@@ -1502,6 +1545,57 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             _PRESENCE_UNKNOWN,
         )
 
+    def _log_empty_reply(self, title: str, kind: str, meta) -> None:
+        """RUN-9: one line per empty reply, with the numbers it was classified
+        from. Never raises — a log line must not sink a run."""
+        try:
+            logger.warning(
+                "Gate1._check_presence [%s]: empty reply — kind=%s "
+                "finish_reason=%s completion_tokens=%s reasoning_chars=%d "
+                "elapsed=%.1fs",
+                title, kind,
+                getattr(meta, "finish_reason", None),
+                getattr(meta, "completion_tokens", None),
+                int(getattr(meta, "reasoning_chars", 0) or 0),
+                float(getattr(meta, "elapsed", 0.0) or 0.0),
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _note_reasoning_despite_no_think(self, think: "bool | None", meta) -> None:
+        """RUN-9: the no-think request was not honoured by this provider.
+
+        ``reasoning_chars > 0`` on a call that went out with ``think=False``
+        means ``reasoning.exclude`` was ignored: the provider thinks
+        regardless, an empty reply from it is exhaustion (the budget went
+        into the chain-of-thought), and the no-think rung has nothing left to
+        switch off. Logged at WARNING once per (base_url, model) per run and
+        counted in ``presence_nothink_ignored`` on the same key — that number
+        is what decides whether a per-URL cascade of vendor no-think fields
+        (``enable_thinking``, ``chat_template_kwargs``, …) is worth writing;
+        none is sent from here, that is the HTTP-400 minefield
+        AUTO-THINKDEPTH-2 documents.
+        """
+        if meta is None or think is not False:
+            return
+        if int(getattr(meta, "reasoning_chars", 0) or 0) <= 0:
+            return
+        key = (self._presence_base_url, self._presence_model)
+        try:
+            with self._counter_lock:
+                if key in self._nothink_warned:
+                    return
+                self._nothink_warned.add(key)
+                self.presence_nothink_ignored += 1
+        except Exception:  # noqa: BLE001 — a counter must never sink a run
+            return
+        logger.warning(
+            "provider streams reasoning_content despite think=false — the "
+            "no-think request is not honoured by %s/%s; empty replies from "
+            "this model are exhaustion, not transport",
+            self._presence_base_url, self._presence_model,
+        )
+
     def _check_presence(
         self,
         candidate: CandidateTask,
@@ -1571,7 +1665,16 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             *,
             max_tokens: "int | None" = None,
             temperature: "float | None" = None,
-        ) -> str:
+            think_off: bool = False,
+        ) -> "tuple[str, object | None]":
+            """One presence call. Returns ``(cleaned_text, meta)`` where
+            ``meta`` is the reply's ``CompletionMeta`` — or ``None`` when the
+            transport reported none (a test stub): then there is no evidence
+            to classify an empty reply with, and it is left to the ladder
+            exactly as before RUN-9. ``think_off=True`` is the no-think rung:
+            this one call goes out with ``think=False`` whatever the config
+            says."""
+            _think = False if think_off else self._presence_think
             url, headers, payload = _llm_stream.build_chat_request(
                 base_url=self._presence_base_url, api_key=self._presence_api_key,
                 model=self._presence_model,
@@ -1579,10 +1682,16 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                 temperature=self._presence_temperature if temperature is None else temperature,
                 max_tokens=self._presence_max_tokens if max_tokens is None else max_tokens,
                 system=self._system, user_msg=msg,
-                num_ctx=self._presence_num_ctx, think=self._presence_think,
+                num_ctx=self._presence_num_ctx, think=_think,
                 response_format=self._presence_response_format,
                 think_effort=self._presence_think_effort,
+                # RUN-9: ask for the trailing usage chunk — it is what lets
+                # an empty reply be classified. A gateway that rejects the
+                # field 400s once, has it stripped for the rest of the run,
+                # and its replies simply carry no token count.
+                stream=True,
             )
+            _meta_box: list = []
             tracer.event(
                 source="gate1",
                 target="llm",
@@ -1598,8 +1707,11 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                 stream=True,
                 api_format=self._presence_api_format,
                 ssl_context=self._presence_ssl_context,
+                on_meta=_meta_box.append,
             )
             cleaned = strip_think(text)
+            meta = _meta_box[0] if _meta_box else None
+            self._note_reasoning_despite_no_think(_think, meta)
             tracer.event(
                 source="llm",
                 target="gate1",
@@ -1607,7 +1719,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                 content=cleaned, model=self._presence_model,
                 params={"candidate": candidate.title},
             )
-            return cleaned
+            return cleaned, meta
 
         # AUTO-RETRY-BACKOFF-1 (field report: agents_128k.ini + kenari.id
         # returned HTTP 400 "upstream_rejected" for three consecutive
@@ -1643,24 +1755,65 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                 len(self._unparseable_samples.get(self._presence_model, ())),
                 self._presence_max_tokens,
             )
-        for attempt in range(self._llm_call_retry_max + 1):
-            if attempt > 0:
+        # RUN-9: an empty reply whose metadata shows no sign the budget was
+        # spent is a transport failure and takes the same road as an
+        # exception — the same request again, after the same wait — not the
+        # ladder's nudge. The two budgets are independent: an exception
+        # during a transport retry still gets its `llm_call_retry_max`
+        # chances (a 404 in the middle of a retry is not a verdict either),
+        # and a transport-empty never consumes the exception budget. `meta`
+        # is the CompletionMeta of the LAST reply, `empty_kind` its
+        # classification (None once a non-empty reply arrived, or when the
+        # transport reported no metadata to classify from);
+        # `first_empty_kind` is what the candidate is counted as.
+        meta = None
+        empty_kind: "str | None" = None
+        first_empty_kind: "str | None" = None
+        _exc_attempt = 0
+        _empty_retry = 0
+        _initial_call_tokens = None if _learned is None else _initial_tokens
+        while True:
+            try:
+                cleaned, meta = _call(user_msg, max_tokens=_initial_call_tokens)
+            except Exception as exc:
+                last_exc = exc
+                if _exc_attempt >= self._llm_call_retry_max:
+                    break
+                _exc_attempt += 1
                 logger.warning(
                     "Gate1._check_presence [%s]: LLM call failed (%s) — "
                     "retrying in %.0fs (attempt %d/%d).",
                     candidate.title, last_exc, self._llm_call_retry_wait_sec,
-                    attempt, self._llm_call_retry_max,
+                    _exc_attempt, self._llm_call_retry_max,
                 )
                 sleep(self._llm_call_retry_wait_sec)
-            try:
-                cleaned = _call(
-                    user_msg,
-                    max_tokens=None if _learned is None else _initial_tokens,
-                )
-                last_exc = None
-                break
-            except Exception as exc:
-                last_exc = exc
+                continue
+            last_exc = None
+            empty_kind = None
+            if cleaned.strip() == "" and meta is not None:
+                empty_kind = _classify_empty_reply(meta, _initial_tokens)
+                self._log_empty_reply(candidate.title, empty_kind, meta)
+                if first_empty_kind is None:
+                    first_empty_kind = empty_kind
+                    self._count(
+                        "presence_empty_transport"
+                        if empty_kind == _EMPTY_KIND_TRANSPORT
+                        else "presence_empty_exhausted"
+                    )
+                if (empty_kind == _EMPTY_KIND_TRANSPORT
+                        and _empty_retry < self._presence_empty_retries):
+                    _empty_retry += 1
+                    logger.info(
+                        "Gate1._check_presence [%s]: empty (transport) — "
+                        "re-issuing the same request in %.0fs (retry %d/%d, "
+                        "max_tokens=%d, temperature=%.2f, no nudge).",
+                        candidate.title, self._llm_call_retry_wait_sec,
+                        _empty_retry, self._presence_empty_retries,
+                        _initial_tokens, float(self._presence_temperature),
+                    )
+                    sleep(self._llm_call_retry_wait_sec)
+                    continue
+            break
         if last_exc is not None:
             # NOTE: must keep the exact "LLM call failed:" prefix (see
             # _is_technical_failure below) so this still logs at WARNING
@@ -1678,9 +1831,15 @@ class Gate1Filter(_llm_stream.LLMClientBase):
             # itself was the thing that failed.
             return self._finish_presence(False, reason)
 
-        confirmed, reason, unparseable = self._parse_presence_response(
-            cleaned, candidate.title, code_block=code_block,
-        )
+        if empty_kind is not None:
+            # RUN-9: the reply never started — say what the stream metadata
+            # said instead of running an empty string through the JSON
+            # decoder for "Expecting value: line 1 column 1".
+            confirmed, reason, unparseable = False, _empty_cause(empty_kind), True
+        else:
+            confirmed, reason, unparseable = self._parse_presence_response(
+                cleaned, candidate.title, code_block=code_block,
+            )
         if not unparseable:
             self._record_parseable_budget(_initial_tokens)
 
@@ -1691,6 +1850,11 @@ class Gate1Filter(_llm_stream.LLMClientBase):
         # with a hard nudge up to _UNPARSEABLE_MAX_RETRIES extra calls
         # before falling back to fail-closed.
         if unparseable:
+            # RUN-9: whether the ladder starts from an EMPTY reply (with a
+            # classification) or from a garbled one — decides the think=off
+            # rung below. Taken here, before the ladder overwrites
+            # `empty_kind` with its own replies' classifications.
+            _ladder_entered_empty = empty_kind is not None
             nudge = (
                 "\n\nIMPORTANT: your previous reply was not valid JSON with a "
                 "\"verdict\" field. Reply AGAIN with ONLY a JSON object of the "
@@ -1754,12 +1918,8 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                     * int(self._UNPARSEABLE_TOKENS_STEP_MULT ** tier_index)
                 )
                 attempt_tokens = min(_uncapped_tokens, ctx_ceiling)
-                if _hard_cap is not None and attempt_tokens > _hard_cap:
-                    logger.info(
-                        "Gate1._check_presence [%s]: re-ask max_tokens=%d "
-                        "capped at unparseable_max_tokens_cap=%d.",
-                        candidate.title, attempt_tokens, _hard_cap,
-                    )
+                _capped_by_provider = _hard_cap is not None and attempt_tokens > _hard_cap
+                if _capped_by_provider:
                     attempt_tokens = _hard_cap
                 attempt_temp = self._UNPARSEABLE_TEMPERATURES[temp_index]
                 if _fast:
@@ -1776,6 +1936,17 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                         )
                         continue
                     _tried.add(_key)
+                if _capped_by_provider and attempt_tokens == _hard_cap:
+                    # RUN-9: logged here, after the empty-pin clamp and the
+                    # already-tried skip, so the line names the budget that
+                    # is actually about to be sent. Logged before the clamp
+                    # it used to say "max_tokens=131072 capped at 65536" and
+                    # the very next line "max_tokens=32768 already tried".
+                    logger.info(
+                        "Gate1._check_presence [%s]: re-ask max_tokens=%d "
+                        "capped at unparseable_max_tokens_cap=%d.",
+                        candidate.title, attempt_tokens, _hard_cap,
+                    )
                 if attempt_tokens < _uncapped_tokens and attempt_tokens == ctx_ceiling:
                     # AUTO-CTX-CAP-WARN-1: a stale/small num_ctx silently
                     # capping escalation below what it should be has
@@ -1804,8 +1975,11 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                     attempt_tokens, attempt_temp, last_cleaned[:120],
                 )
                 try:
-                    cleaned_n = _call(
-                        user_msg + nudge,
+                    cleaned_n, meta = _call(
+                        # RUN-9: the nudge ("your previous reply was not valid
+                        # JSON") goes out only after a NON-empty reply. A
+                        # model that said nothing has nothing to correct.
+                        user_msg if last_cleaned.strip() == "" else user_msg + nudge,
                         max_tokens=attempt_tokens,
                         temperature=attempt_temp,
                     )
@@ -1834,14 +2008,83 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                 last_confirmed, last_reason, last_cleaned = confirmed_n, reason_n, cleaned_n
                 if _fast and cleaned_n.strip() == "" and attempt_tokens >= _pin_floor:
                     _empty_pin = attempt_tokens
+                empty_kind = None
+                if cleaned_n.strip() == "" and meta is not None:
+                    # Every empty reply gets its classification line, the
+                    # ladder's included — at the budget it was made with.
+                    empty_kind = _classify_empty_reply(meta, attempt_tokens)
+                    self._log_empty_reply(candidate.title, empty_kind, meta)
+                    last_reason = _empty_cause(empty_kind)
 
+            # RUN-9: the rung today's ladder does not have. When the operator
+            # asked for thinking and the ladder was entered on an EMPTY
+            # reply, one more re-ask with think=False at the pinned budget
+            # and the initial temperature is a real, cheap thing to try
+            # before giving up — the thinking is what ate the budget. Skipped
+            # (and said so, once per candidate) when think is already off:
+            # there is nothing to switch off, and the presence_nothink_ignored
+            # diagnostic above is what says whether "off" even took.
+            if (_ladder_entered_empty and _max_retries > 0
+                    and self._presence_think is True):
+                _rung_tokens = _empty_pin if _empty_pin is not None else _initial_tokens
+                _made += 1
+                logger.info(
+                    "Gate1._check_presence [%s]: verdict unparseable — "
+                    "re-asking (final rung, max_tokens=%d, temperature=%.2f, "
+                    "think=off). raw=%r",
+                    candidate.title, _rung_tokens, _initial_temp, last_cleaned[:120],
+                )
+                try:
+                    cleaned_n, meta = _call(
+                        user_msg if last_cleaned.strip() == "" else user_msg + nudge,
+                        max_tokens=_rung_tokens,
+                        temperature=_initial_temp,
+                        think_off=True,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Gate1._check_presence [%s]: final think=off re-ask "
+                        "failed (%s) — keeping last fail-closed result.",
+                        candidate.title, exc,
+                    )
+                    return self._finish_presence(
+                        last_confirmed, last_reason, reasks=_made,
+                    )
+                confirmed_n, reason_n, unparseable_n = self._parse_presence_response(
+                    cleaned_n, candidate.title, code_block=code_block,
+                )
+                if not unparseable_n:
+                    self._record_parseable_budget(_rung_tokens)
+                    self._count("presence_reask")
+                    return self._finish_presence(confirmed_n, reason_n, reasks=_made)
+                last_confirmed, last_reason, last_cleaned = confirmed_n, reason_n, cleaned_n
+                empty_kind = None
+                if cleaned_n.strip() == "" and meta is not None:
+                    empty_kind = _classify_empty_reply(meta, _rung_tokens)
+                    self._log_empty_reply(candidate.title, empty_kind, meta)
+                    last_reason = _empty_cause(empty_kind)
+            elif _ladder_entered_empty and _max_retries > 0:
+                logger.info(
+                    "Gate1._check_presence [%s]: no think=off rung — the "
+                    "presence call already went out with think=false, "
+                    "nothing to switch off.",
+                    candidate.title,
+                )
+
+            # RUN-9: the cause that travels with the candidate names the
+            # shape of the last reply — `empty (transport)`, `empty
+            # (exhausted)`, `garbled` — not the JSON decoder's view of an
+            # empty string. Without stream metadata (nothing to classify
+            # from) the parse reason is kept, so a run against such a
+            # provider reads exactly as before.
+            _cause = _reply_cause(last_cleaned, last_reason, empty_kind)
             logger.warning(
                 "Gate1._check_presence [%s]: verdict still unparseable after "
-                "%d re-ask(s) (mode=%s) — no verdict, ending unknown. raw=%r",
-                candidate.title, _made, self._unparseable_retry_mode,
+                "%d re-ask(s) (mode=%s) — no verdict, ending unknown: %s. raw=%r",
+                candidate.title, _made, self._unparseable_retry_mode, _cause,
                 last_cleaned[:120],
             )
-            return self._finish_presence(last_confirmed, last_reason, reasks=_made)
+            return self._finish_presence(last_confirmed, _cause, reasks=_made)
 
         return self._finish_presence(confirmed, reason)
 
@@ -2112,6 +2355,68 @@ def _with_presence_unknown_note(instruction: str, reason: str) -> str:
     )
 
 
+# RUN-9: the two kinds of empty reply, and the cause strings that travel
+# with a candidate that ended without a verdict. A *transport*-empty showed
+# no evidence the budget was spent (no content chunks, no
+# finish_reason="length", completion_tokens nowhere near the cap, no
+# reasoning streamed) — a degraded provider, worth the same request again.
+# An *exhausted*-empty finished with "length", burned ~all of max_tokens, or
+# streamed only reasoning — the budget went somewhere, and more budget is
+# more silence. `garbled` is a non-empty reply that never parsed. All three
+# are prefix-matched by `_is_technical_failure`, so a candidate that ended
+# on one of them is still "no verdict", never a rejection.
+_EMPTY_KIND_TRANSPORT = "transport"
+_EMPTY_KIND_EXHAUSTED = "exhausted"
+_GARBLED_CAUSE = "garbled"
+# completion_tokens at or above this fraction of max_tokens counts as "the
+# budget was spent" even when the provider never sent finish_reason.
+_EXHAUSTED_TOKEN_FRACTION = 0.9
+
+
+def _empty_cause(kind: str) -> str:
+    """RUN-9: the cause string for an empty reply classified as *kind*."""
+    return f"empty ({kind})"
+
+
+def _reply_cause(cleaned: str, reason: str, empty_kind: "str | None") -> str:
+    """RUN-9: the cause an unknown presence verdict carries — the shape of
+    the last reply. An empty reply says ``empty (transport)`` / ``empty
+    (exhausted)`` and nothing else (it was never parsed, so the JSON
+    decoder's "Expecting value: line 1 column 1" said nothing true about
+    it); a garbled one keeps the parser's own reason, which names what was
+    wrong with a reply that did arrive, behind a ``garbled: `` prefix. With
+    no classification (the transport reported no metadata) the parse reason
+    is kept unchanged."""
+    if cleaned.strip() == "":
+        return _empty_cause(empty_kind) if empty_kind else reason
+    return f"{_GARBLED_CAUSE}: {reason}"
+
+
+def _classify_empty_reply(meta, max_tokens: "int | None") -> str:
+    """RUN-9: ``"exhausted"`` or ``"transport"`` for an empty reply, from its
+    ``CompletionMeta``.
+
+    Exhausted when ``finish_reason == "length"``, or ``completion_tokens`` is
+    within ``_EXHAUSTED_TOKEN_FRACTION`` of *max_tokens*, or any reasoning
+    was streamed; transport otherwise — including the degraded-gateway shape
+    ``completion_tokens is None`` with ``finish_reason`` in (None, "stop") and
+    zero content chunks. ``None`` tokens never exhaust by themselves. Never
+    raises.
+    """
+    try:
+        if getattr(meta, "finish_reason", None) == "length":
+            return _EMPTY_KIND_EXHAUSTED
+        if int(getattr(meta, "reasoning_chars", 0) or 0) > 0:
+            return _EMPTY_KIND_EXHAUSTED
+        tokens = getattr(meta, "completion_tokens", None)
+        if (isinstance(tokens, (int, float)) and not isinstance(tokens, bool)
+                and max_tokens and tokens >= _EXHAUSTED_TOKEN_FRACTION * float(max_tokens)):
+            return _EMPTY_KIND_EXHAUSTED
+    except Exception:  # noqa: BLE001 — classification must never sink a run
+        pass
+    return _EMPTY_KIND_TRANSPORT
+
+
 def _is_technical_failure(reason: str) -> bool:
     """Return True when *reason* names a call/parse failure, not a genuine
     LLM verdict.
@@ -2138,6 +2443,10 @@ def _is_technical_failure(reason: str) -> bool:
         "expected JSON object,",
         "unrecognised verdict ",
         UNKNOWN_PRESENCE_REASON,
+        # RUN-9: the causes an empty / garbled reply ends on (see
+        # `_reply_cause`) — no verdict, never a rejection.
+        "empty (",
+        _GARBLED_CAUSE,
     ))
 
 
@@ -2157,6 +2466,10 @@ _GATE1_SPLIT_FIELDS = (
     "presence_fail_closed",
     "presence_unknown",
     "presence_reask",
+    # RUN-9: why the empty replies were empty — see Gate1Filter.__init__.
+    "presence_empty_transport",
+    "presence_empty_exhausted",
+    "presence_nothink_ignored",
     "duplicate",
     "non_py",
 )
@@ -2227,8 +2540,16 @@ def split_gate1_results(
     reask: int = 0,
     unknown: int = 0,
     non_py: int = 0,
+    empty_transport: int = 0,
+    empty_exhausted: int = 0,
+    nothink_ignored: int = 0,
 ) -> dict:
     """M4: the per-stage split of one Gate-1 pass, as a dict.
+
+    RUN-9 adds `presence_empty_transport`, `presence_empty_exhausted` and
+    `presence_nothink_ignored`, counter-fed like `presence_reask`: an empty
+    reply leaves no trace in `stage` or `reason` once the candidate has a
+    verdict.
 
     `all_results` is the `all_results` list `filter()` builds — it is the
     only place a `FilterResult` for an *accepted* candidate exists, so the
@@ -2250,6 +2571,9 @@ def split_gate1_results(
     out["presence_reask"] = int(reask or 0)
     out["presence_unknown"] = int(unknown or 0)
     out["non_py"] = int(non_py or 0)
+    out["presence_empty_transport"] = int(empty_transport or 0)
+    out["presence_empty_exhausted"] = int(empty_exhausted or 0)
+    out["presence_nothink_ignored"] = int(nothink_ignored or 0)
     unknown: set = set()
     try:
         for r in list(all_results or []):

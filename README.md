@@ -332,6 +332,21 @@ work lives):**
   `unparseable_max_tokens_cap = 65536` keeps every re-ask under a
   provider's limit; `unparseable_max_retries` sets the length. Defaults
   (`strict`, `0`, `6`) are the full ladder.
+- **An empty reply is classified before the ladder runs** (RUN-9). The
+  stream metadata (`finish_reason`, `usage.completion_tokens` — asked for
+  with `stream_options.include_usage`, dropped for the run after one HTTP
+  400 — and any reasoning streamed) tells *exhausted* (`length`, tokens
+  near the cap, reasoning seen: the ladder above, pinned) from *transport*
+  (none of that: HTTP 200 with a role-only chunk from a degraded gateway).
+  A transport-empty is re-issued unchanged — same budget, same
+  temperature, no nudge — up to `[gate1] presence_empty_retries = 2` times
+  before the ladder sees it; a model that said nothing never gets the
+  "your previous reply was not valid JSON" nudge; with `think = true` the
+  last rung of an exhausted ladder goes out with thinking off. The Gate 1
+  split counts `presence_empty_transport` / `presence_empty_exhausted`,
+  and once per provider per run `presence_nothink_ignored` (reasoning
+  streamed despite `think = false`). A candidate that still ends without a
+  verdict says `empty (transport)` / `empty (exhausted)` / `garbled: …`.
 - **Parallel presence checks.** `[gate1] presence_workers = N` (default
   `1`, sequential) runs N presence checks at once through a thread pool.
   Each call still honours the provider's 429/Retry-After on its own, and

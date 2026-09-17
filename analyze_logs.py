@@ -1260,6 +1260,18 @@ def render_runtime_counters(run: dict) -> None:
             f"re-ask {_int_or(split.get('presence_reask'), 0)} · "
             f"duplicate {_int_or(split.get('duplicate'), 0)} · "
             f"non-py {_int_or(split.get('non_py'), 0)}"
+            # RUN-5 / RUN-9: candidates that ended without a verdict, and why
+            # the empty replies were empty. Only when the split carries the
+            # keys, so a pre-RUN-9 trace renders exactly as before.
+            + (
+                f" · unknown {_int_or(split.get('presence_unknown'), 0)}"
+                if "presence_unknown" in split else ""
+            )
+            + (
+                f" · empty {_int_or(split.get('presence_empty_transport'), 0)} transport / "
+                f"{_int_or(split.get('presence_empty_exhausted'), 0)} exhausted"
+                if "presence_empty_transport" in split else ""
+            )
         )
 
 

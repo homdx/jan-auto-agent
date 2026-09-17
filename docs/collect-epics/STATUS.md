@@ -1,6 +1,6 @@
 # Status — where the collect epics stand, and what is being waited on
 
-**As of:** 2026-09-16, branch `tickets`, HEAD = the commit after `97983d8` = RUN-8 (on top of `97983d8` = RUN-7, `ff22c04` = L1 and `d22c197` = RUN-5; next round is RUN-9). The order of the
+**As of:** 2026-09-17, branch `tickets`, HEAD = the commit after `da1e9b3` = RUN-9 (on top of `da1e9b3` = V8, `74cd58f` = V10, `e5d46fc` = RUN-8, `97983d8` = RUN-7, `ff22c04` = L1 and `d22c197` = RUN-5). The order of the
 next rounds and the live-run evidence behind it: `NEXT-ROUNDS.md`.
 Sections 2–4 below describe the wait as it stood on `2f9005d`; the run has
 since happened (`after-r31-live.json`) and NEXT-ROUNDS.md §1 is its reading.
@@ -11,7 +11,7 @@ Ticket-by-ticket state is also stamped into every `epic-tasks/NN-*.md`
 
 ## 1. Ledger
 
-### Landed — 26 of 37: the short path (PLAN-v2 §6), L2, V16, V6, M4, M5, RUN-1, RUN-2, RUN-6, RUN-3, RUN-4, RUN-5, L1, RUN-7, RUN-8
+### Landed — 29 of 37: the short path (PLAN-v2 §6), L2, V16, V6, M4, M5, RUN-1, RUN-2, RUN-6, RUN-3, RUN-4, RUN-5, L1, RUN-7, RUN-8, V10, V8, RUN-9
 
 | ticket | commit | one line |
 |---|---|---|
@@ -42,11 +42,14 @@ Ticket-by-ticket state is also stamped into every `epic-tasks/NN-*.md`
 | L1 | `ff22c04` | Gate-1 Stage A0 asks the collect model "do you know this path" and rejects a genuinely unindexed location before the presence LLM call; code mode only, `new_file` exempt, a dirtied path reads as known; `[gate1] skip_llm_for_unindexed` |
 | RUN-7 | after `acbfd61` | a Gate-2 call that came back without a verdict (transport/parse error) is `unavailable`, not a rejection: only the validator call is re-run (`[auto] validator_unavailable_retries = 2`, `[collect] error_retry_wait_sec` between calls); if still unavailable the round ends unreviewed — no attempt charged, no feedback line, `_prior_validator_critique` untouched — and the task goes back to `todo` with its round counter as it was, no `feedback_round_N.md`, no knowledge note, no ticket; `validator_status = unavailable` rows that the tuner ignores; `g2 rej` / `g2 err` / `g2 unavail` snapshot columns |
 | RUN-8 | after `97983d8` | a coder call whose `request_completion` raised (dead socket / stream-read timeout, `URLError`, `HTTPError`) is `CoderResult.error_kind = "transport"`, not a rejection: only the coder call is re-run on the same attempt (`[auto] coder_transport_retries = 2`, `[collect] error_retry_wait_sec` between calls), traced `TRANSPORT`, no feedback line; the seconds inside a failing call are credited back to `_eff_deadline` and, via `deadline_credit_s`, to the outer loop's `_task_deadline` and out of RUN-2's persisted ledger; if every call dies the round ends `unavailable` with `unavailable_stage = "coder"` — task back to `todo`, round counter untouched, no `feedback_round_N.md`, no knowledge note, no ticket, `validator_status = unavailable`; `cod transport` snapshot column next to `cod esc` |
+| V10 | `74cd58f` | `facts <symbol>` returns the real parameter list (160-char cut on a parameter boundary), `COLLECTOR_VERSION` 1 → 2 for the one intentional full rebuild |
+| V8 | `da1e9b3` | `--no-llm` preserves existing summaries (`Provenance.LLM_STALE` on a changed module), `--drop-summaries` is the explicit opt-out |
+| RUN-9 | after `da1e9b3` | an empty presence reply is classified from the stream metadata before the ladder runs (`request_completion(on_meta=)` / `request_completion_ex` → `CompletionMeta`: `finish_reason`, `usage.completion_tokens` via `stream_options.include_usage` behind a per-`(url, model)` HTTP-400 memory, reasoning chars, content chunks, elapsed): *transport* (no sign the budget was spent) is re-issued unchanged up to `[gate1] presence_empty_retries = 2` times on the same road as an exception (RUN-5 shape), *exhausted* keeps the pinned ladder plus a `think=off` last rung when `think = true`; no nudge after an empty reply; `presence_empty_transport` / `presence_empty_exhausted` / `presence_nothink_ignored` in the split, `empty t/x` snapshot column; unknown candidates say `empty (transport)` / `empty (exhausted)` / `garbled: …`; the cap log names the budget actually sent |
 
 Not in the epic but on the branch since 2f9005d: GATE1-LEARN-1 `9dd644b`,
 GATE1-LEARN-2 `f11972b`, GATE1-PAR-1 `84a24b2`, user's `0eaa2cc`.
 
-### Open — 11 (RUN-9 open, 10 epic; RUN-1…RUN-8 and L1 landed)
+### Open — 8 epic (RUN-1…RUN-9, L1, V10, V8 landed)
 
 **The order below is superseded by `NEXT-ROUNDS.md` §2** (RUN-6 → RUN-3 →
 RUN-4 → RUN-5 → L1 → M3 → …). Kept for the per-ticket premise checks

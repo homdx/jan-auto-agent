@@ -485,6 +485,8 @@ class TestPresenceUnknownCounter:
         assert format_gate1_split({}) == (
             "existence=0 presence_confirmed=0 presence_rejected=0 "
             "presence_fail_closed=0 presence_unknown=0 presence_reask=0 "
+            "presence_empty_transport=0 presence_empty_exhausted=0 "
+            "presence_nothink_ignored=0 "
             "duplicate=0 non_py=0"
         )
 

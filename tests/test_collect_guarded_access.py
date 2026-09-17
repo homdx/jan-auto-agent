@@ -296,9 +296,12 @@ def test_real_analyze_logs_done_site_appears_exactly_once_and_is_guarded():
     # collect/gate1 event handlers in analyze() and the `_flag` / `_mapping`
     # wire-shape decoders) moved it to 1904 — same guard/access pair, same
     # shape.
+    # RUN-9: +12 lines (the `unknown` / `empty … transport / … exhausted`
+    # suffix of the gate1 line in render_run_summary) moved it to 1916 —
+    # same guard/access pair, same shape.
     source = (REPO_ROOT / "analyze_logs.py").read_text(encoding="utf-8")
     accesses = _accesses(source, "analyze_logs.py")
-    matches = [a for a in accesses if (a.location, a.access) == ("analyze_logs.py:1904", "done[-1]")]
+    matches = [a for a in accesses if (a.location, a.access) == ("analyze_logs.py:1916", "done[-1]")]
     assert len(matches) == 1, f"expected exactly one record, got {matches!r}"
     assert matches[0].status == "GUARDED"
 

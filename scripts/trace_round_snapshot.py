@@ -290,6 +290,16 @@ def read_run(base, run_id=None):
                 out["gate1_split"].get("presence_unknown", 0) or 0)
         except (TypeError, ValueError):
             out["gate1"]["unknown"] = 0
+        # RUN-9: why the empty replies were empty — `presence_empty_transport`
+        # (a degraded provider, retried unchanged) and
+        # `presence_empty_exhausted` (the budget went into thinking, pinned).
+        # Same source as `unknown`; zero when the split predates RUN-9.
+        for _key, _col in (("presence_empty_transport", "empty_transport"),
+                           ("presence_empty_exhausted", "empty_exhausted")):
+            try:
+                out["gate1"][_col] = int(out["gate1_split"].get(_key, 0) or 0)
+            except (TypeError, ValueError):
+                out["gate1"][_col] = 0
     for k in ("llm_by_source", "gate1_location_ext", "probe_by_op", "gate2", "coder"):
         out[k] = dict(out[k])
     out["coder_budgets"] = dict(out["coder_budgets"])
@@ -338,7 +348,7 @@ def main():
     # ("the coder came back without files") and only the status tells them
     # apart: a cut-off reply climbed the budget, a dead socket got the
     # attempt back.
-    hdr = f"{'run':12} {'probe':>6} {'reason':>14} {'arch':>5} {'gate1':>6} {'conf':>5} {'rej':>5} {'unk':>4} {'s/cand':>7} {'probe ops':>10} {'miss':>5} {'collect blocks':>15} {'cod esc':>8} {'cod transport':>13} {'g2 rej':>6} {'g2 err':>6} {'g2 unavail':>10}"
+    hdr = f"{'run':12} {'probe':>6} {'reason':>14} {'arch':>5} {'gate1':>6} {'conf':>5} {'rej':>5} {'unk':>4} {'empty t/x':>9} {'s/cand':>7} {'probe ops':>10} {'miss':>5} {'collect blocks':>15} {'cod esc':>8} {'cod transport':>13} {'g2 rej':>6} {'g2 err':>6} {'g2 unavail':>10}"
     print(hdr)
     print("-" * len(hdr))
     tot = collections.Counter()
@@ -356,6 +366,10 @@ def main():
         tot["conf"] += g["confirmed"]
         tot["rej"] += g["rejected"]
         tot["unk"] += g.get("unknown", 0)
+        # RUN-9: empty presence replies by kind — transport (t) / exhausted (x).
+        tot["empty_t"] += g.get("empty_transport", 0)
+        tot["empty_x"] += g.get("empty_exhausted", 0)
+        empty_tx = f"{g.get('empty_transport', 0)}/{g.get('empty_exhausted', 0)}"
         tot["ops"] += r["probe"]["ops"]
         tot["miss"] += r["probe"]["misses"]
         tot["blocks"] += r["collect_block_occurrences"]
@@ -367,13 +381,15 @@ def main():
         print(f"{r['run']:12} {str(r['probe_usable']):>6} {str(r['probe_reason']):>14} "
               f"{r['llm_by_source'].get('architect', 0):>5} {g['requests']:>6} "
               f"{g['confirmed']:>5} {g['rejected']:>5} {g.get('unknown', 0):>4} "
+              f"{empty_tx:>9} "
               f"{g.get('seconds_per_candidate', '—'):>7} {r['probe']['ops']:>10} "
               f"{r['probe']['misses']:>5} {_block(r):>15} "
               f"{r.get('coder_budget_escalations', 0):>8} {cod_transport:>13} "
               f"{g2_rej:>6} {g2_err:>6} {g2_unavail:>10}")
     print("-" * len(hdr))
     print(f"{'TOTAL':12} {'':>6} {'':>14} {tot['arch']:>5} {tot['g1']:>6} "
-          f"{tot['conf']:>5} {tot['rej']:>5} {tot['unk']:>4} {'':>7} {tot['ops']:>10} "
+          f"{tot['conf']:>5} {tot['rej']:>5} {tot['unk']:>4} "
+          f"{str(tot['empty_t']) + '/' + str(tot['empty_x']):>9} {'':>7} {tot['ops']:>10} "
           f"{tot['miss']:>5} {tot['blocks']:>15} {tot['codesc']:>8} {tot['codtransport']:>13} {tot['g2rej']:>6} {tot['g2err']:>6} {tot['g2unavail']:>10}")
     snap["totals"] = dict(tot)
 

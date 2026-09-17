@@ -356,12 +356,16 @@ def test_no_bridge_no_events_and_zeroed_split(monkeypatch):
     assert format_gate1_split({}) == (
         "existence=0 presence_confirmed=0 presence_rejected=0 "
         "presence_fail_closed=0 presence_unknown=0 presence_reask=0 "
+        "presence_empty_transport=0 presence_empty_exhausted=0 "
+        "presence_nothink_ignored=0 "
         "duplicate=0 non_py=0"
     )
     # Unknown fields are dropped, not appended: the field order is the contract.
     assert format_gate1_split({"accepted": 9, "rejected": 3, "_uncounted": 2}) == (
         "existence=0 presence_confirmed=0 presence_rejected=0 "
         "presence_fail_closed=0 presence_unknown=0 presence_reask=0 "
+        "presence_empty_transport=0 presence_empty_exhausted=0 "
+        "presence_nothink_ignored=0 "
         "duplicate=0 non_py=0"
     )
     assert rec.events == []
@@ -496,6 +500,8 @@ def test_gate1_split_line(monkeypatch):
     assert line == (
         "existence=0 presence_confirmed=3 presence_rejected=1 "
         "presence_fail_closed=0 presence_unknown=1 presence_reask=1 "
+        "presence_empty_transport=0 presence_empty_exhausted=0 "
+        "presence_nothink_ignored=0 "
         "duplicate=0 non_py=1"
     )
     # The buckets add up to the candidates they describe. c3 is accepted
@@ -536,6 +542,8 @@ def test_gate1_split_all_fields_zero_for_existence_only_mode(monkeypatch):
     assert format_gate1_split(counts) == (
         "existence=0 presence_confirmed=0 presence_rejected=0 "
         "presence_fail_closed=0 presence_unknown=0 presence_reask=0 "
+        "presence_empty_transport=0 presence_empty_exhausted=0 "
+        "presence_nothink_ignored=0 "
         "duplicate=0 non_py=0"
     )
     # An existence-only acceptance is not a model verdict, so it is not counted
@@ -614,6 +622,10 @@ def test_split_gate1_results_marks_what_it_cannot_count():
         "presence_fail_closed": 1,
         "presence_unknown": 0,
         "presence_reask": 2,
+        # RUN-9: counter-fed like presence_reask, zero when not passed.
+        "presence_empty_transport": 0,
+        "presence_empty_exhausted": 0,
+        "presence_nothink_ignored": 0,
         "duplicate": 1,
         "non_py": 4,
         "_uncounted": 1,
