@@ -347,6 +347,11 @@ work lives):**
   and once per provider per run `presence_nothink_ignored` (reasoning
   streamed despite `think = false`). A candidate that still ends without a
   verdict says `empty (transport)` / `empty (exhausted)` / `garbled: …`.
+  Before a long run, `python3 scripts/probe_gate1_endpoint.py --config
+  agents_128k.ini` makes two presence-shaped calls against the configured
+  profile and reports what the classification will have to work with
+  there — usage chunk, `stream_options` accepted or stripped, reasoning
+  visible with `think = true`, `think = false` honoured.
 - **Parallel presence checks.** `[gate1] presence_workers = N` (default
   `1`, sequential) runs N presence checks at once through a thread pool.
   Each call still honours the provider's 429/Retry-After on its own, and
