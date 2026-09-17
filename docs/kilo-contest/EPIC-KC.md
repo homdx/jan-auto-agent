@@ -190,3 +190,13 @@ model.
   scoring side reads code.
 - Parallel rounds — rounds stay serial for the reason `RUN-THE-EPIC-COMPETITION.md` gives.
 - Any change under `tools/auto/`; `CollectBridge._shrink` stays byte-identical.
+
+## 9. Added 2026-09-17 (second pass) — three more rounds
+
+| round | id | what lands | size |
+|---|---|---|---|
+| 48 | KC-9 | an idle that is a cut-off, not a finish, gets `continue` into the same session (bounded by `max_continues`) | S |
+| 49 | KC-10 | context fill from the server's token counts; `POST /session/{id}/summarize` at 80 %, and once on `ContextOverflowError` | S |
+| 50 | KC-11 | each roster model probed once at the highest thinking `variant` that answers `say: hello`; cached in `contest-probe.json`; models without reasoning skip it | M |
+
+Order of implementation as requested: KC-9, then KC-10, then KC-11.

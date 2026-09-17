@@ -1,4 +1,4 @@
-# Epic round — 47 tickets, in order
+# Epic round — 50 tickets, in order
 
 One ticket per round. Every agent does the same ticket against the same
 tree; you merge the winner; the next round starts from the merged tree.
@@ -53,6 +53,9 @@ The loop and the scorecard: `docs/collect-epics/RUN-THE-EPIC-COMPETITION.md`.
 | 45 | `KC-6` | queued — after KC-5 | CRITICAL | M | [45-kc6-runner-prompt-wait-harvest-rework-in-the-same-session-for-n-agents.md](45-kc6-runner-prompt-wait-harvest-rework-in-the-same-session-for-n-agents.md) | `tools/contest/runner.py` |
 | 46 | `KC-7` | queued — after KC-6 | HIGH | M | [46-kc7-export-and-cli-intake-dry-run-resume-and-the-folder-the-bench-reads.md](46-kc7-export-and-cli-intake-dry-run-resume-and-the-folder-the-bench-reads.md) | `tools/contest/cli.py` |
 | 47 | `KC-8` | queued — after KC-7; no contest, by hand | MEDIUM | S | [47-kc8-the-runbook-reset-run-score-and-the-first-live-round.md](47-kc8-the-runbook-reset-run-score-and-the-first-live-round.md) | `docs/kilo-contest/RUN-THE-KILO-CONTEST.md` |
+| 48 | `KC-9` | queued — after KC-6 | HIGH | S | [48-kc9-a-silent-idle-is-nudged-with-continue-into-the-same-session.md](48-kc9-a-silent-idle-is-nudged-with-continue-into-the-same-session.md) | `tools/contest/runner.py` |
+| 49 | `KC-10` | queued — after KC-9 | HIGH | S | [49-kc10-context-fill-is-watched-and-the-session-is-compacted-at-80-percent.md](49-kc10-context-fill-is-watched-and-the-session-is-compacted-at-80-percent.md) | `tools/contest/runner.py` |
+| 50 | `KC-11` | queued — after KC-10 | MEDIUM | M | [50-kc11-a-thinking-model-is-probed-once-at-the-highest-variant-that-answers.md](50-kc11-a-thinking-model-is-probed-once-at-the-highest-variant-that-answers.md) | `tools/contest/think_probe.py` |
 
 ## Next rounds — the order (as of `6ca675c`, 2026-09-14; step 1 landed — `7135844` (+`5788423`, `d4ffb12`); step 2 landed — RUN-3; step 3 landed — `ade28e6`; step 4 landed — RUN-5)
 
