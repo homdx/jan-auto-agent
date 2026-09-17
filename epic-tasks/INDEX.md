@@ -1,4 +1,4 @@
-# Epic round — 39 tickets, in order
+# Epic round — 47 tickets, in order
 
 One ticket per round. Every agent does the same ticket against the same
 tree; you merge the winner; the next round starts from the merged tree.
@@ -45,6 +45,14 @@ The loop and the scorecard: `docs/collect-epics/RUN-THE-EPIC-COMPETITION.md`.
 | 37 | `RUN-9` | **landed** (`4ee7a28`) | HIGH | M | [37-run9-an-empty-presence-reply-is-not-a-garbled-verdict.md](37-run9-an-empty-presence-reply-is-not-a-garbled-verdict.md) | `tools/auto/gate1_filter.py` |
 | 38 | `RUN-10` | queued — after the RUN-9 live verification; no contest, by hand | MEDIUM | S | [38-run10-the-http-retry-budget-of-every-auto-mode-call-is-hard-wired.md](38-run10-the-http-retry-budget-of-every-auto-mode-call-is-hard-wired.md) | `tools/llm_stream.py` |
 | 39 | `RUN-11` | queued — after the RUN-9 live verification; no contest, by hand | MEDIUM | S | [39-run11-a-ctrl-c-during-collect-pass-b-loses-every-summary-already-paid-for.md](39-run11-a-ctrl-c-during-collect-pass-b-loses-every-summary-already-paid-for.md) | `tools/collect/cli.py` |
+| 40 | `KC-1` | open — EPIC KC (`docs/kilo-contest/EPIC-KC.md`) | HIGH | M | [40-kc1-kilo-client-and-the-fake-server-built-from-the-probe.md](40-kc1-kilo-client-and-the-fake-server-built-from-the-probe.md) | `tools/contest/kilo_client.py` |
+| 41 | `KC-2` | queued — after KC-1 | MEDIUM | S | [41-kc2-roster-and-contest-ini-agents-limits-and-the-gate-profile.md](41-kc2-roster-and-contest-ini-agents-limits-and-the-gate-profile.md) | `tools/contest/roster.py` |
+| 42 | `KC-3` | queued — after KC-2 | CRITICAL | M | [42-kc3-policy-three-layers-and-a-second-model-decides-what-the-rules-cannot.md](42-kc3-policy-three-layers-and-a-second-model-decides-what-the-rules-cannot.md) | `tools/contest/policy.py` |
+| 43 | `KC-4` | queued — after KC-2 | HIGH | M | [43-kc4-workspace-one-worktree-per-agent-at-the-base-idempotent.md](43-kc4-workspace-one-worktree-per-agent-at-the-base-idempotent.md) | `tools/contest/workspace.py` |
+| 44 | `KC-5` | queued — after KC-4 | HIGH | M | [44-kc5-gates-and-harvest-the-scorers-checks-become-the-runners-verdict.md](44-kc5-gates-and-harvest-the-scorers-checks-become-the-runners-verdict.md) | `tools/contest/harvest.py` |
+| 45 | `KC-6` | queued — after KC-5 | CRITICAL | M | [45-kc6-runner-prompt-wait-harvest-rework-in-the-same-session-for-n-agents.md](45-kc6-runner-prompt-wait-harvest-rework-in-the-same-session-for-n-agents.md) | `tools/contest/runner.py` |
+| 46 | `KC-7` | queued — after KC-6 | HIGH | M | [46-kc7-export-and-cli-intake-dry-run-resume-and-the-folder-the-bench-reads.md](46-kc7-export-and-cli-intake-dry-run-resume-and-the-folder-the-bench-reads.md) | `tools/contest/cli.py` |
+| 47 | `KC-8` | queued — after KC-7; no contest, by hand | MEDIUM | S | [47-kc8-the-runbook-reset-run-score-and-the-first-live-round.md](47-kc8-the-runbook-reset-run-score-and-the-first-live-round.md) | `docs/kilo-contest/RUN-THE-KILO-CONTEST.md` |
 
 ## Next rounds — the order (as of `6ca675c`, 2026-09-14; step 1 landed — `7135844` (+`5788423`, `d4ffb12`); step 2 landed — RUN-3; step 3 landed — `ade28e6`; step 4 landed — RUN-5)
 
