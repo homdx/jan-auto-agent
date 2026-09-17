@@ -84,3 +84,26 @@ a taste call, not the ticket's letter. Without it they are tied on the ticket.
 * L1: the transport retry re-issues the request at the *learned* budget, not
   the configured one.
 * L3: one `llm_request` / `llm_response` trace event per HTTP call, retries included.
+
+## Outcome — the ideal patch (`4ee7a28`)
+
+Written from the skeleton (`sn68-v3`) with `ds41-v3` as the cross-check and
+one structural change of my own: the transport retry lives in the *outer*
+retry loop next to the exception retry (both re-issue the same request
+after `llm_call_retry_wait_sec`, each with its own budget), which is what
+makes a 404 inside a transport retry take another chance instead of ending
+the candidate — the `K8` row every entry missed. Scored on the same data
+as the entries (row `ideal-4ee7a28` in `results.json`): **211/211 + the
+K4 bonus** on every behavioural check. The two static misses on that row
+are the landing itself, not defects — `agents_128k.ini` *must* get the new
+key when a round lands (a rule for me, not for entrants), and the tree
+sits two commits above the base because `contest-bench/` landed first.
+
+Decisions taken where the ticket reads two ways (see the commit message):
+no nudge after an empty reply (§4 over AC-3), `presence_nothink_ignored`
+per `(url, model)` (AC-5's `== 1`), a garbled reply keeps the parser's
+reason behind a `garbled:` prefix.
+
+Tests shipped: `tests/test_llm_stream_completion_meta.py` (40) and
+`tests/test_gate1_empty_reply.py` (61) — the bench scenarios rewritten as
+self-contained pytest, plus the classifier table and config edges.

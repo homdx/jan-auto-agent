@@ -6,6 +6,7 @@
 | sn68-v3 | 210/211 | 56/56 | 22/22 | 13/13 | 10/10 | 9/9 | 13/13 | 5/5 | 18/18 | 5/5 | 51/52 | 1/1 | 8/8 |  |
 | ds41-v1 | 209/211 | 54/56 | 22/22 | 13/13 | 10/10 | 9/9 | 13/13 | 5/5 | 18/18 | 5/5 | 52/52 | 0/1 | 8/8 |  |
 | ds41-v2 | 209/211 | 54/56 | 22/22 | 13/13 | 10/10 | 9/9 | 13/13 | 5/5 | 18/18 | 5/5 | 52/52 | 0/1 | 8/8 |  |
+| ideal-4ee7a28 | 209/211 | 56/56 | 22/22 | 13/13 | 10/10 | 9/9 | 13/13 | 5/5 | 18/18 | 5/5 | 52/52 | 1/1 | 6/8 |  |
 | aria | 208/211 | 55/56 | 22/22 | 13/13 | 10/10 | 9/9 | 13/13 | 5/5 | 18/18 | 5/5 | 51/52 | 0/1 | 7/8 |  |
 | sn67-v2 | 208/211 | 53/56 | 22/22 | 13/13 | 10/10 | 9/9 | 13/13 | 5/5 | 18/18 | 5/5 | 52/52 | 0/1 | 8/8 |  |
 | laguna | 207/211 | 53/56 | 22/22 | 12/13 | 10/10 | 9/9 | 13/13 | 5/5 | 18/18 | 5/5 | 52/52 | 0/1 | 8/8 |  |
@@ -44,6 +45,10 @@
 - `A1.split line has new counters` — got: `existence=0 presence_confirmed=0 presence_rejected=1 presence_fail_closed=0 presence_unknown=0 presence_reask=0 duplicate=0 non_py=0`
 - `A1.split shows presence_empty_transport=1` — got: `existence=0 presence_confirmed=0 presence_rejected=1 presence_fail_closed=0 presence_unknown=0 presence_reask=0 duplicate=0 non_py=0`
 - `K4.bonus: OpenRouter `reasoning` delta key counted as reasoning (→ exhausted)` (bonus, not counted) — got: `['Gate1._check_presence [candidate 0]: empty reply — kind=transport finish_reason=stop completion_tokens=12 reasoning_chars=0 elapsed=0.0s']`
+
+### ideal-4ee7a28 (209/211) — 2 missed
+- `S.agents_128k.ini untouched` — got: ``
+- `S.one commit` — got: `2`
 
 ### aria (208/211) — 4 missed
 - `S.ships tests (new file or new test functions)` — got: `new_files=0 new_test_fns=0`

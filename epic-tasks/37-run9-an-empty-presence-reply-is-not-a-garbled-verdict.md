@@ -1,6 +1,6 @@
 # RUN-9 — An empty presence reply is not a garbled verdict
 
-**Status:** open (base: `da1e9b3` — the `tickets` head with RUN-7/RUN-8, V10 and V8 landed; re-verified against it 2026-09-16 — `gate1_filter.py` unchanged since `ff22c04`, the ladder still treats an empty reply as a garbled one outside the opt-in `fast` mode)  
+**Status:** landed — `4ee7a28` (base `da1e9b3`; the ideal patch written from a 20-entry contest scored on shared test data, `contest-bench/run9/` — skeleton SenseNova-6.8 var3, donor DeepSeek-v4.1 var3; `CompletionMeta` via `request_completion(on_meta=)` / `request_completion_ex`, `stream_options.include_usage` behind a per-`(url, model)` HTTP-400 memory, transport-empty re-issued unchanged in the outer retry loop (a failure inside the retry is never a verdict), `think=off` last rung, no nudge after an empty reply, three new split counters + `empty t/x` snapshot column, cap log after the pin clamp; `[gate1] presence_empty_retries = 2`; 40 + 61 tests in `tests/test_llm_stream_completion_meta.py` / `tests/test_gate1_empty_reply.py`; bench 211/211 + bonus)  
 **Severity:** HIGH  
 **File:** `tools/auto/gate1_filter.py`  
 **Symbol:** `Gate1Filter._check_presence` — the `_call` closure (≈ 1569–1610) and the GATE1-LEARN-2 re-ask ladder below it (≈ 1727–1845: `_empty_pin`, the `_tried` grid, the `nudge` re-ask, the final `ending unknown` return)  

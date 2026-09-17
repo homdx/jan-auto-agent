@@ -72460,5 +72460,3932 @@
    "error": null,
    "wall": 0.01
   }
+ },
+ "ideal-4ee7a28": {
+  "S0_static": {
+   "scenario": "S0_static",
+   "worktree": "ideal-4ee7a28",
+   "checks": [
+    {
+     "name": "S.CollectBridge._shrink / collect_bridge.py untouched",
+     "ok": true,
+     "detail": "['.smoke_tests/test_gate1_empty_reply.py', '.smoke_tests/test_llm_stream_completion_meta.py', 'README.md', 'agents.ini', 'agents_128k.ini', 'analyze_logs.py', 'contest-bench/README.md', 'contest-bench/harness/catalogue.py', 'contest-bench/harness/provider.py', 'contest-bench/harness/run_all.py', 'co"
+    },
+    {
+     "name": "S.epic-tasks/ untouched",
+     "ok": true,
+     "detail": "[]"
+    },
+    {
+     "name": "S.agents_128k.ini untouched",
+     "ok": false,
+     "detail": ""
+    },
+    {
+     "name": "S.one commit",
+     "ok": false,
+     "detail": "2"
+    },
+    {
+     "name": "S.ships tests (new file or new test functions)",
+     "ok": true,
+     "detail": "new_files=2 new_test_fns=92"
+    },
+    {
+     "name": "S.smoke mirror in sync (sync_test_tiers --check)",
+     "ok": true,
+     "detail": "tiers OK \u2014 smoke=168 regression=31\n"
+    },
+    {
+     "name": "S.presence_empty_retries documented in agents.ini [gate1]",
+     "ok": true,
+     "detail": "present"
+    },
+    {
+     "name": "S.presence_empty_retries default 2 in agents.ini",
+     "ok": true,
+     "detail": "['presence_empty_retries     = 2']"
+    }
+   ],
+   "info": {
+    "base": "777535b",
+    "commits": 2,
+    "diff_lines_tools": "+648/-32",
+    "changed": [
+     ".smoke_tests/test_gate1_empty_reply.py",
+     ".smoke_tests/test_llm_stream_completion_meta.py",
+     "README.md",
+     "agents.ini",
+     "agents_128k.ini",
+     "analyze_logs.py",
+     "contest-bench/README.md",
+     "contest-bench/harness/catalogue.py",
+     "contest-bench/harness/provider.py",
+     "contest-bench/harness/run_all.py",
+     "contest-bench/harness/run_one.py",
+     "contest-bench/harness/setup_worktrees.py",
+     "contest-bench/harness/static_checks.py",
+     "contest-bench/harness/table.py",
+     "contest-bench/harness/validate_inputs.py",
+     "contest-bench/run9/REPORT.md",
+     "contest-bench/run9/RESULTS.md",
+     "contest-bench/run9/SCENARIOS.md",
+     "contest-bench/run9/entrants.json",
+     "contest-bench/run9/results.json",
+     "contest-bench/run9/scenarios.py",
+     "docs/collect-epics/STATUS.md",
+     "scripts/trace_round_snapshot.py",
+     "tests/test_collect_guarded_access.py",
+     "tests/test_gate1_empty_reply.py",
+     "tests/test_gate1_presence_unknown.py",
+     "tests/test_llm_stream_completion_meta.py",
+     "tests/test_run_trace_collect_events.py",
+     "tools/auto/gate1_filter.py",
+     "tools/llm_stream.py"
+    ],
+    "new_tests": [
+     "tests/test_gate1_empty_reply.py",
+     "tests/test_llm_stream_completion_meta.py"
+    ],
+    "n_new_test_fns": 92,
+    "touched_existing_tests": [
+     "tests/test_collect_guarded_access.py",
+     "tests/test_gate1_presence_unknown.py",
+     "tests/test_run_trace_collect_events.py"
+    ]
+   },
+   "error": null
+  },
+  "A1_transport_then_verdict": {
+   "scenario": "A1_transport_then_verdict",
+   "worktree": "ideal-4ee7a28",
+   "checks": [
+    {
+     "name": "A.verdict REJECTED",
+     "ok": true,
+     "detail": "{'candidate 0': 'rejected'}"
+    },
+    {
+     "name": "A.3 calls",
+     "ok": true,
+     "detail": "calls=3"
+    },
+    {
+     "name": "A.same (max_tokens,temperature)",
+     "ok": true,
+     "detail": "[(4096, 0.0)]"
+    },
+    {
+     "name": "A.no nudge in 2nd/3rd",
+     "ok": true,
+     "detail": "[False, False, False]"
+    },
+    {
+     "name": "A.retry request byte-identical (messages) to the first",
+     "ok": true,
+     "detail": "n/a"
+    },
+    {
+     "name": "A.presence_empty_transport==1",
+     "ok": true,
+     "detail": "1"
+    },
+    {
+     "name": "A.presence_reask==0",
+     "ok": true,
+     "detail": "0"
+    },
+    {
+     "name": "A.presence_unknown==0",
+     "ok": true,
+     "detail": "0"
+    },
+    {
+     "name": "A1.classification line kind=transport",
+     "ok": true,
+     "detail": "['Gate1._check_presence [candidate 0]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.0s', 'Gate1._check_presence [candidate 0]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.0s']"
+    },
+    {
+     "name": "A1.classification line carries numbers",
+     "ok": true,
+     "detail": "['Gate1._check_presence [candidate 0]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.0s']"
+    },
+    {
+     "name": "A1.exactly one classification line per empty reply",
+     "ok": true,
+     "detail": "2"
+    },
+    {
+     "name": "A1.split line has new counters",
+     "ok": true,
+     "detail": "existence=0 presence_confirmed=0 presence_rejected=1 presence_fail_closed=0 presence_unknown=0 presence_reask=0 presence_empty_transport=1 presence_empty_exhausted=0 presence_nothink_ignored=0 duplicate=0 non_py=0"
+    },
+    {
+     "name": "A1.counters dict has new keys",
+     "ok": true,
+     "detail": "['_uncounted', 'duplicate', 'existence', 'non_py', 'presence_confirmed', 'presence_empty_exhausted', 'presence_empty_transport', 'presence_fail_closed', 'presence_nothink_ignored', 'presence_reask', 'presence_rejected', 'presence_unknown']"
+    },
+    {
+     "name": "A1.split shows presence_empty_transport=1",
+     "ok": true,
+     "detail": "existence=0 presence_confirmed=0 presence_rejected=1 presence_fail_closed=0 presence_unknown=0 presence_reask=0 presence_empty_transport=1 presence_empty_exhausted=0 presence_nothink_ignored=0 duplicate=0 non_py=0"
+    }
+   ],
+   "info": {
+    "outcome": {
+     "candidate 0": "rejected"
+    },
+    "counters": {
+     "existence": 0,
+     "presence_confirmed": 0,
+     "presence_rejected": 1,
+     "presence_fail_closed": 0,
+     "presence_unknown": 0,
+     "presence_reask": 0,
+     "presence_empty_transport": 1,
+     "presence_empty_exhausted": 0,
+     "presence_nothink_ignored": 0,
+     "duplicate": 0,
+     "non_py": 0
+    },
+    "split_line": "existence=0 presence_confirmed=0 presence_rejected=1 presence_fail_closed=0 presence_unknown=0 presence_reask=0 presence_empty_transport=1 presence_empty_exhausted=0 presence_nothink_ignored=0 duplicate=0 non_py=0",
+    "calls": {
+     "tools/c0.py": 3
+    },
+    "params": {
+     "tools/c0.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.0
+      ]
+     ]
+    },
+    "sleeps": [
+     0.0,
+     0.0
+    ],
+    "warnings": [
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.0s",
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.0s"
+    ]
+   },
+   "error": null,
+   "wall": 0.07
+  },
+  "A2_transport_role_content_empty": {
+   "scenario": "A2_transport_role_content_empty",
+   "worktree": "ideal-4ee7a28",
+   "checks": [
+    {
+     "name": "A2.verdict REJECTED",
+     "ok": true,
+     "detail": "{'candidate 0': 'rejected'}"
+    },
+    {
+     "name": "A2.3 calls",
+     "ok": true,
+     "detail": "calls=3"
+    },
+    {
+     "name": "A2.same (max_tokens,temperature)",
+     "ok": true,
+     "detail": "[(4096, 0.0)]"
+    },
+    {
+     "name": "A2.no nudge in 2nd/3rd",
+     "ok": true,
+     "detail": "[False, False, False]"
+    },
+    {
+     "name": "A2.retry request byte-identical (messages) to the first",
+     "ok": true,
+     "detail": "n/a"
+    },
+    {
+     "name": "A2.presence_empty_transport==1",
+     "ok": true,
+     "detail": "1"
+    },
+    {
+     "name": "A2.presence_reask==0",
+     "ok": true,
+     "detail": "0"
+    },
+    {
+     "name": "A2.presence_unknown==0",
+     "ok": true,
+     "detail": "0"
+    }
+   ],
+   "info": {
+    "outcome": {
+     "candidate 0": "rejected"
+    },
+    "counters": {
+     "existence": 0,
+     "presence_confirmed": 0,
+     "presence_rejected": 1,
+     "presence_fail_closed": 0,
+     "presence_unknown": 0,
+     "presence_reask": 0,
+     "presence_empty_transport": 1,
+     "presence_empty_exhausted": 0,
+     "presence_nothink_ignored": 0,
+     "duplicate": 0,
+     "non_py": 0
+    },
+    "split_line": "existence=0 presence_confirmed=0 presence_rejected=1 presence_fail_closed=0 presence_unknown=0 presence_reask=0 presence_empty_transport=1 presence_empty_exhausted=0 presence_nothink_ignored=0 duplicate=0 non_py=0",
+    "calls": {
+     "tools/c0.py": 3
+    },
+    "params": {
+     "tools/c0.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.0
+      ]
+     ]
+    },
+    "sleeps": [
+     0.0,
+     0.0
+    ],
+    "warnings": [
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.0s",
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.0s"
+    ]
+   },
+   "error": null,
+   "wall": 0.03
+  },
+  "A3_transport_bare_no_usage_no_finish": {
+   "scenario": "A3_transport_bare_no_usage_no_finish",
+   "worktree": "ideal-4ee7a28",
+   "checks": [
+    {
+     "name": "A3.verdict REJECTED",
+     "ok": true,
+     "detail": "{'candidate 0': 'rejected'}"
+    },
+    {
+     "name": "A3.3 calls",
+     "ok": true,
+     "detail": "calls=3"
+    },
+    {
+     "name": "A3.same (max_tokens,temperature)",
+     "ok": true,
+     "detail": "[(4096, 0.0)]"
+    },
+    {
+     "name": "A3.no nudge in 2nd/3rd",
+     "ok": true,
+     "detail": "[False, False, False]"
+    },
+    {
+     "name": "A3.retry request byte-identical (messages) to the first",
+     "ok": true,
+     "detail": "n/a"
+    },
+    {
+     "name": "A3.presence_empty_transport==1",
+     "ok": true,
+     "detail": "1"
+    },
+    {
+     "name": "A3.presence_reask==0",
+     "ok": true,
+     "detail": "0"
+    },
+    {
+     "name": "A3.presence_unknown==0",
+     "ok": true,
+     "detail": "0"
+    }
+   ],
+   "info": {
+    "outcome": {
+     "candidate 0": "rejected"
+    },
+    "counters": {
+     "existence": 0,
+     "presence_confirmed": 0,
+     "presence_rejected": 1,
+     "presence_fail_closed": 0,
+     "presence_unknown": 0,
+     "presence_reask": 0,
+     "presence_empty_transport": 1,
+     "presence_empty_exhausted": 0,
+     "presence_nothink_ignored": 0,
+     "duplicate": 0,
+     "non_py": 0
+    },
+    "split_line": "existence=0 presence_confirmed=0 presence_rejected=1 presence_fail_closed=0 presence_unknown=0 presence_reask=0 presence_empty_transport=1 presence_empty_exhausted=0 presence_nothink_ignored=0 duplicate=0 non_py=0",
+    "calls": {
+     "tools/c0.py": 3
+    },
+    "params": {
+     "tools/c0.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.0
+      ]
+     ]
+    },
+    "sleeps": [
+     0.0,
+     0.0
+    ],
+    "warnings": [
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=transport finish_reason=None completion_tokens=None reasoning_chars=0 elapsed=0.0s",
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=transport finish_reason=None completion_tokens=None reasoning_chars=0 elapsed=0.0s"
+    ]
+   },
+   "error": null,
+   "wall": 0.03
+  },
+  "A4_transport_forever_keep": {
+   "scenario": "A4_transport_forever_keep",
+   "worktree": "ideal-4ee7a28",
+   "checks": [
+    {
+     "name": "A4.ends UNKNOWN, kept",
+     "ok": true,
+     "detail": "{'candidate 0': 'unknown-kept'}"
+    },
+    {
+     "name": "A4.4 calls (1 + 2 retries + 1 pinned re-ask)",
+     "ok": true,
+     "detail": "calls=4 params=[(4096, 0.0), (4096, 0.0), (4096, 0.0), (4096, 0.1)]"
+    },
+    {
+     "name": "A4.first 3 calls identical params, no nudge",
+     "ok": true,
+     "detail": "[(4096, 0.0, False), (4096, 0.0, False), (4096, 0.0, False)]"
+    },
+    {
+     "name": "A4.UNKNOWN line says 'empty (transport)'",
+     "ok": true,
+     "detail": "Gate1[presence] UNKNOWN 'candidate 0' \u2014 presence unknown \u2014 provider gave no verdict after 1 re-ask(s): empty (transport)"
+    },
+    {
+     "name": "A4.'ending unknown' WARNING says 'empty (transport)'",
+     "ok": true,
+     "detail": "Gate1._check_presence [candidate 0]: verdict still unparseable after 1 re-ask(s) (mode=fast) \u2014 no verdict, ending unknown: empty (transport). raw=''"
+    },
+    {
+     "name": "A4.generic 'JSON decode failed (Expecting value' replaced in UNKNOWN line",
+     "ok": true,
+     "detail": "Gate1[presence] UNKNOWN 'candidate 0' \u2014 presence unknown \u2014 provider gave no verdict after 1 re-ask(s): empty (transport)"
+    },
+    {
+     "name": "A4.presence_empty_transport==1",
+     "ok": true,
+     "detail": "1"
+    },
+    {
+     "name": "A4.presence_unknown==1",
+     "ok": true,
+     "detail": "1"
+    },
+    {
+     "name": "A4.presence_empty_exhausted==0",
+     "ok": true,
+     "detail": "0"
+    }
+   ],
+   "info": {
+    "outcome": {
+     "candidate 0": "unknown-kept"
+    },
+    "counters": {
+     "existence": 0,
+     "presence_confirmed": 0,
+     "presence_rejected": 0,
+     "presence_fail_closed": 0,
+     "presence_unknown": 1,
+     "presence_reask": 0,
+     "presence_empty_transport": 1,
+     "presence_empty_exhausted": 0,
+     "presence_nothink_ignored": 0,
+     "duplicate": 0,
+     "non_py": 0
+    },
+    "split_line": "existence=0 presence_confirmed=0 presence_rejected=0 presence_fail_closed=0 presence_unknown=1 presence_reask=0 presence_empty_transport=1 presence_empty_exhausted=0 presence_nothink_ignored=0 duplicate=0 non_py=0",
+    "calls": {
+     "tools/c0.py": 4
+    },
+    "params": {
+     "tools/c0.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.1
+      ]
+     ]
+    },
+    "sleeps": [
+     0.0,
+     0.0
+    ],
+    "warnings": [
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.0s",
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.0s",
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.0s",
+     "Gate1._parse_presence_response [candidate 0]: JSON decode failed (Expecting value: line 1 column 1 (char 0)) \u2014 failing closed  raw=",
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.0s",
+     "Gate1._check_presence [candidate 0]: verdict still unparseable after 1 re-ask(s) (mode=fast) \u2014 no verdict, ending unknown: empty (transport). raw=''",
+     "Gate1[presence] UNKNOWN 'candidate 0' \u2014 presence unknown \u2014 provider gave no verdict after 1 re-ask(s): empty (transport)"
+    ]
+   },
+   "error": null,
+   "wall": 0.04
+  },
+  "A5_transport_forever_reject": {
+   "scenario": "A5_transport_forever_reject",
+   "worktree": "ideal-4ee7a28",
+   "checks": [
+    {
+     "name": "A5.ends UNKNOWN, dropped (presence_unknown=reject)",
+     "ok": true,
+     "detail": "{'candidate 0': 'unknown-dropped'}"
+    },
+    {
+     "name": "A5.UNKNOWN line says 'empty (transport)'",
+     "ok": true,
+     "detail": "Gate1[presence] UNKNOWN 'candidate 0' \u2014 presence unknown \u2014 provider gave no verdict after 1 re-ask(s): empty (transport)"
+    },
+    {
+     "name": "A5.4 calls",
+     "ok": true,
+     "detail": "4"
+    }
+   ],
+   "info": {
+    "outcome": {
+     "candidate 0": "unknown-dropped"
+    },
+    "counters": {
+     "existence": 0,
+     "presence_confirmed": 0,
+     "presence_rejected": 0,
+     "presence_fail_closed": 0,
+     "presence_unknown": 1,
+     "presence_reask": 0,
+     "presence_empty_transport": 1,
+     "presence_empty_exhausted": 0,
+     "presence_nothink_ignored": 0,
+     "duplicate": 0,
+     "non_py": 0
+    },
+    "split_line": "existence=0 presence_confirmed=0 presence_rejected=0 presence_fail_closed=0 presence_unknown=1 presence_reask=0 presence_empty_transport=1 presence_empty_exhausted=0 presence_nothink_ignored=0 duplicate=0 non_py=0",
+    "calls": {
+     "tools/c0.py": 4
+    },
+    "params": {
+     "tools/c0.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.1
+      ]
+     ]
+    },
+    "sleeps": [
+     0.0,
+     0.0
+    ],
+    "warnings": [
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.0s",
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.0s",
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.0s",
+     "Gate1._parse_presence_response [candidate 0]: JSON decode failed (Expecting value: line 1 column 1 (char 0)) \u2014 failing closed  raw=",
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.0s",
+     "Gate1._check_presence [candidate 0]: verdict still unparseable after 1 re-ask(s) (mode=fast) \u2014 no verdict, ending unknown: empty (transport). raw=''",
+     "Gate1[presence] UNKNOWN 'candidate 0' \u2014 presence unknown \u2014 provider gave no verdict after 1 re-ask(s): empty (transport)"
+    ]
+   },
+   "error": null,
+   "wall": 0.03
+  },
+  "A6_retries0_transport_forever": {
+   "scenario": "A6_retries0_transport_forever",
+   "worktree": "ideal-4ee7a28",
+   "checks": [
+    {
+     "name": "A6.retries=0: today's 2 calls",
+     "ok": true,
+     "detail": "calls=2"
+    },
+    {
+     "name": "A6.retries=0: 2nd call is the pinned (4096,0.1) re-ask",
+     "ok": true,
+     "detail": "[(4096, 0.0), (4096, 0.1)]"
+    },
+    {
+     "name": "A6.ends UNKNOWN kept",
+     "ok": true,
+     "detail": "{'candidate 0': 'unknown-kept'}"
+    },
+    {
+     "name": "A6.UNKNOWN or 'ending unknown' line says 'empty (transport)'",
+     "ok": true,
+     "detail": "Gate1[presence] UNKNOWN 'candidate 0' \u2014 presence unknown \u2014 provider gave no verdict after 1 re-ask(s): empty (transport)"
+    },
+    {
+     "name": "A6.classification line present",
+     "ok": true,
+     "detail": "['Gate1._check_presence [candidate 0]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.0s']"
+    }
+   ],
+   "info": {
+    "outcome": {
+     "candidate 0": "unknown-kept"
+    },
+    "counters": {
+     "existence": 0,
+     "presence_confirmed": 0,
+     "presence_rejected": 0,
+     "presence_fail_closed": 0,
+     "presence_unknown": 1,
+     "presence_reask": 0,
+     "presence_empty_transport": 1,
+     "presence_empty_exhausted": 0,
+     "presence_nothink_ignored": 0,
+     "duplicate": 0,
+     "non_py": 0
+    },
+    "split_line": "existence=0 presence_confirmed=0 presence_rejected=0 presence_fail_closed=0 presence_unknown=1 presence_reask=0 presence_empty_transport=1 presence_empty_exhausted=0 presence_nothink_ignored=0 duplicate=0 non_py=0",
+    "calls": {
+     "tools/c0.py": 2
+    },
+    "params": {
+     "tools/c0.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.1
+      ]
+     ]
+    },
+    "sleeps": [],
+    "warnings": [
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.0s",
+     "Gate1._parse_presence_response [candidate 0]: JSON decode failed (Expecting value: line 1 column 1 (char 0)) \u2014 failing closed  raw=",
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.0s",
+     "Gate1._check_presence [candidate 0]: verdict still unparseable after 1 re-ask(s) (mode=fast) \u2014 no verdict, ending unknown: empty (transport). raw=''",
+     "Gate1[presence] UNKNOWN 'candidate 0' \u2014 presence unknown \u2014 provider gave no verdict after 1 re-ask(s): empty (transport)"
+    ]
+   },
+   "error": null,
+   "wall": 0.03
+  },
+  "A7_retries0_transport_then_verdict": {
+   "scenario": "A7_retries0_transport_then_verdict",
+   "worktree": "ideal-4ee7a28",
+   "checks": [
+    {
+     "name": "A7.retries=0 + verdict on re-ask: REJECTED",
+     "ok": true,
+     "detail": "{'candidate 0': 'rejected'}"
+    },
+    {
+     "name": "A7.2 calls",
+     "ok": true,
+     "detail": "2"
+    },
+    {
+     "name": "A7.presence_reask==1 (today's path)",
+     "ok": true,
+     "detail": "1"
+    },
+    {
+     "name": "A7.presence_empty_transport==1 (still classified)",
+     "ok": true,
+     "detail": "1"
+    }
+   ],
+   "info": {
+    "outcome": {
+     "candidate 0": "rejected"
+    },
+    "counters": {
+     "existence": 0,
+     "presence_confirmed": 0,
+     "presence_rejected": 1,
+     "presence_fail_closed": 0,
+     "presence_unknown": 0,
+     "presence_reask": 1,
+     "presence_empty_transport": 1,
+     "presence_empty_exhausted": 0,
+     "presence_nothink_ignored": 0,
+     "duplicate": 0,
+     "non_py": 0
+    },
+    "split_line": "existence=0 presence_confirmed=0 presence_rejected=1 presence_fail_closed=0 presence_unknown=0 presence_reask=1 presence_empty_transport=1 presence_empty_exhausted=0 presence_nothink_ignored=0 duplicate=0 non_py=0",
+    "calls": {
+     "tools/c0.py": 2
+    },
+    "params": {
+     "tools/c0.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.1
+      ]
+     ]
+    },
+    "sleeps": [],
+    "warnings": [
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.0s"
+    ]
+   },
+   "error": null,
+   "wall": 0.03
+  },
+  "A8_retries1_transport_forever": {
+   "scenario": "A8_retries1_transport_forever",
+   "worktree": "ideal-4ee7a28",
+   "checks": [
+    {
+     "name": "A8.presence_empty_retries=1 \u2192 3 calls",
+     "ok": true,
+     "detail": "calls=3"
+    },
+    {
+     "name": "A8.ends UNKNOWN",
+     "ok": true,
+     "detail": "{'candidate 0': 'unknown-kept'}"
+    }
+   ],
+   "info": {
+    "outcome": {
+     "candidate 0": "unknown-kept"
+    },
+    "counters": {
+     "existence": 0,
+     "presence_confirmed": 0,
+     "presence_rejected": 0,
+     "presence_fail_closed": 0,
+     "presence_unknown": 1,
+     "presence_reask": 0,
+     "presence_empty_transport": 1,
+     "presence_empty_exhausted": 0,
+     "presence_nothink_ignored": 0,
+     "duplicate": 0,
+     "non_py": 0
+    },
+    "split_line": "existence=0 presence_confirmed=0 presence_rejected=0 presence_fail_closed=0 presence_unknown=1 presence_reask=0 presence_empty_transport=1 presence_empty_exhausted=0 presence_nothink_ignored=0 duplicate=0 non_py=0",
+    "calls": {
+     "tools/c0.py": 3
+    },
+    "params": {
+     "tools/c0.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.1
+      ]
+     ]
+    },
+    "sleeps": [
+     0.0
+    ],
+    "warnings": [
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.0s",
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.0s",
+     "Gate1._parse_presence_response [candidate 0]: JSON decode failed (Expecting value: line 1 column 1 (char 0)) \u2014 failing closed  raw=",
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.0s",
+     "Gate1._check_presence [candidate 0]: verdict still unparseable after 1 re-ask(s) (mode=fast) \u2014 no verdict, ending unknown: empty (transport). raw=''",
+     "Gate1[presence] UNKNOWN 'candidate 0' \u2014 presence unknown \u2014 provider gave no verdict after 1 re-ask(s): empty (transport)"
+    ]
+   },
+   "error": null,
+   "wall": 0.03
+  },
+  "A9_transport_retry_sleeps": {
+   "scenario": "A9_transport_retry_sleeps",
+   "worktree": "ideal-4ee7a28",
+   "checks": [
+    {
+     "name": "A9.sleeps llm_call_retry_wait_sec (7s) between the 2 transport retries",
+     "ok": true,
+     "detail": "[7.0, 7.0]"
+    },
+    {
+     "name": "A9.no sleep before the first call",
+     "ok": true,
+     "detail": "[7.0, 7.0]"
+    },
+    {
+     "name": "A9.ends UNKNOWN",
+     "ok": true,
+     "detail": "{'candidate 0': 'unknown-kept'}"
+    }
+   ],
+   "info": {
+    "outcome": {
+     "candidate 0": "unknown-kept"
+    },
+    "counters": {
+     "existence": 0,
+     "presence_confirmed": 0,
+     "presence_rejected": 0,
+     "presence_fail_closed": 0,
+     "presence_unknown": 1,
+     "presence_reask": 0,
+     "presence_empty_transport": 1,
+     "presence_empty_exhausted": 0,
+     "presence_nothink_ignored": 0,
+     "duplicate": 0,
+     "non_py": 0
+    },
+    "split_line": "existence=0 presence_confirmed=0 presence_rejected=0 presence_fail_closed=0 presence_unknown=1 presence_reask=0 presence_empty_transport=1 presence_empty_exhausted=0 presence_nothink_ignored=0 duplicate=0 non_py=0",
+    "calls": {
+     "tools/c0.py": 4
+    },
+    "params": {
+     "tools/c0.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.1
+      ]
+     ]
+    },
+    "sleeps": [
+     7.0,
+     7.0
+    ],
+    "warnings": [
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.0s",
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.0s",
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.0s",
+     "Gate1._parse_presence_response [candidate 0]: JSON decode failed (Expecting value: line 1 column 1 (char 0)) \u2014 failing closed  raw=",
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.0s",
+     "Gate1._check_presence [candidate 0]: verdict still unparseable after 1 re-ask(s) (mode=fast) \u2014 no verdict, ending unknown: empty (transport). raw=''",
+     "Gate1[presence] UNKNOWN 'candidate 0' \u2014 presence unknown \u2014 provider gave no verdict after 1 re-ask(s): empty (transport)"
+    ]
+   },
+   "error": null,
+   "wall": 0.03
+  },
+  "J2_429_then_transport_then_verdict": {
+   "scenario": "J2_429_then_transport_then_verdict",
+   "worktree": "ideal-4ee7a28",
+   "checks": [
+    {
+     "name": "J2.429 \u2192 transport-empty \u2192 verdict: REJECTED",
+     "ok": true,
+     "detail": "{'candidate 0': 'rejected'}"
+    },
+    {
+     "name": "J2.3 HTTP requests (429 retry + transport retry)",
+     "ok": true,
+     "detail": "3"
+    },
+    {
+     "name": "J2.presence_empty_transport==1",
+     "ok": true,
+     "detail": "1"
+    },
+    {
+     "name": "J2.presence_unknown==0",
+     "ok": true,
+     "detail": "0"
+    },
+    {
+     "name": "J2.no nudge anywhere",
+     "ok": true,
+     "detail": "[False, False, False]"
+    }
+   ],
+   "info": {
+    "outcome": {
+     "candidate 0": "rejected"
+    },
+    "counters": {
+     "existence": 0,
+     "presence_confirmed": 0,
+     "presence_rejected": 1,
+     "presence_fail_closed": 0,
+     "presence_unknown": 0,
+     "presence_reask": 0,
+     "presence_empty_transport": 1,
+     "presence_empty_exhausted": 0,
+     "presence_nothink_ignored": 0,
+     "duplicate": 0,
+     "non_py": 0
+    },
+    "split_line": "existence=0 presence_confirmed=0 presence_rejected=1 presence_fail_closed=0 presence_unknown=0 presence_reask=0 presence_empty_transport=1 presence_empty_exhausted=0 presence_nothink_ignored=0 duplicate=0 non_py=0",
+    "calls": {
+     "tools/c0.py": 3
+    },
+    "params": {
+     "tools/c0.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.0
+      ]
+     ]
+    },
+    "sleeps": [
+     1.0,
+     0.0
+    ],
+    "warnings": [
+     "request_completion: HTTP 429 from http://stub.local:1337/v1/chat/completions (Server is busy, retry in 1s), waiting 1.0s and retrying (attempt 1/60)",
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.0s"
+    ]
+   },
+   "error": null,
+   "wall": 0.03
+  },
+  "B1_exhausted_then_verdict": {
+   "scenario": "B1_exhausted_then_verdict",
+   "worktree": "ideal-4ee7a28",
+   "checks": [
+    {
+     "name": "B1.exhausted then verdict: REJECTED",
+     "ok": true,
+     "detail": "{'candidate 0': 'rejected'}"
+    },
+    {
+     "name": "B1.2 calls (no transport retry)",
+     "ok": true,
+     "detail": "calls=2 params=[(4096, 0.0), (4096, 0.1)]"
+    },
+    {
+     "name": "B1.2nd call pinned at (4096,0.1)",
+     "ok": true,
+     "detail": "[(4096, 0.0), (4096, 0.1)]"
+    },
+    {
+     "name": "B1.presence_reask==1",
+     "ok": true,
+     "detail": "1"
+    },
+    {
+     "name": "B1.presence_empty_exhausted==1",
+     "ok": true,
+     "detail": "1"
+    },
+    {
+     "name": "B1.presence_empty_transport==0",
+     "ok": true,
+     "detail": "0"
+    },
+    {
+     "name": "B1.classification kind=exhausted",
+     "ok": true,
+     "detail": "['Gate1._check_presence [candidate 0]: empty reply \u2014 kind=exhausted finish_reason=length completion_tokens=4096 reasoning_chars=0 elapsed=0.0s']"
+    }
+   ],
+   "info": {
+    "outcome": {
+     "candidate 0": "rejected"
+    },
+    "counters": {
+     "existence": 0,
+     "presence_confirmed": 0,
+     "presence_rejected": 1,
+     "presence_fail_closed": 0,
+     "presence_unknown": 0,
+     "presence_reask": 1,
+     "presence_empty_transport": 0,
+     "presence_empty_exhausted": 1,
+     "presence_nothink_ignored": 0,
+     "duplicate": 0,
+     "non_py": 0
+    },
+    "split_line": "existence=0 presence_confirmed=0 presence_rejected=1 presence_fail_closed=0 presence_unknown=0 presence_reask=1 presence_empty_transport=0 presence_empty_exhausted=1 presence_nothink_ignored=0 duplicate=0 non_py=0",
+    "calls": {
+     "tools/c0.py": 2
+    },
+    "params": {
+     "tools/c0.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.1
+      ]
+     ]
+    },
+    "sleeps": [],
+    "warnings": [
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=exhausted finish_reason=length completion_tokens=4096 reasoning_chars=0 elapsed=0.0s"
+    ],
+    "B1.nudge_on_exhausted_reask": false
+   },
+   "error": null,
+   "wall": 0.03
+  },
+  "B2_exhausted_forever_think_false": {
+   "scenario": "B2_exhausted_forever_think_false",
+   "worktree": "ideal-4ee7a28",
+   "checks": [
+    {
+     "name": "B2.exhausted forever (think=false): UNKNOWN kept",
+     "ok": true,
+     "detail": "{'candidate 0': 'unknown-kept'}"
+    },
+    {
+     "name": "B2.2 calls \u2014 no extra no-think call",
+     "ok": true,
+     "detail": "calls=2"
+    },
+    {
+     "name": "B2.UNKNOWN line says 'empty (exhausted)'",
+     "ok": true,
+     "detail": "Gate1[presence] UNKNOWN 'candidate 0' \u2014 presence unknown \u2014 provider gave no verdict after 1 re-ask(s): empty (exhausted)"
+    },
+    {
+     "name": "B2.'ending unknown' WARNING says 'empty (exhausted)'",
+     "ok": true,
+     "detail": "Gate1._check_presence [candidate 0]: verdict still unparseable after 1 re-ask(s) (mode=fast) \u2014 no verdict, ending unknown: empty (exhausted). raw=''"
+    },
+    {
+     "name": "B2.presence_empty_exhausted==1",
+     "ok": true,
+     "detail": "1"
+    },
+    {
+     "name": "B2.every call think=off (unchanged)",
+     "ok": true,
+     "detail": "[(True, 'disabled'), (True, 'disabled')]"
+    }
+   ],
+   "info": {
+    "outcome": {
+     "candidate 0": "unknown-kept"
+    },
+    "counters": {
+     "existence": 0,
+     "presence_confirmed": 0,
+     "presence_rejected": 0,
+     "presence_fail_closed": 0,
+     "presence_unknown": 1,
+     "presence_reask": 0,
+     "presence_empty_transport": 0,
+     "presence_empty_exhausted": 1,
+     "presence_nothink_ignored": 0,
+     "duplicate": 0,
+     "non_py": 0
+    },
+    "split_line": "existence=0 presence_confirmed=0 presence_rejected=0 presence_fail_closed=0 presence_unknown=1 presence_reask=0 presence_empty_transport=0 presence_empty_exhausted=1 presence_nothink_ignored=0 duplicate=0 non_py=0",
+    "calls": {
+     "tools/c0.py": 2
+    },
+    "params": {
+     "tools/c0.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.1
+      ]
+     ]
+    },
+    "sleeps": [],
+    "warnings": [
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=exhausted finish_reason=length completion_tokens=4096 reasoning_chars=0 elapsed=0.0s",
+     "Gate1._parse_presence_response [candidate 0]: JSON decode failed (Expecting value: line 1 column 1 (char 0)) \u2014 failing closed  raw=",
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=exhausted finish_reason=length completion_tokens=4096 reasoning_chars=0 elapsed=0.0s",
+     "Gate1._check_presence [candidate 0]: verdict still unparseable after 1 re-ask(s) (mode=fast) \u2014 no verdict, ending unknown: empty (exhausted). raw=''",
+     "Gate1[presence] UNKNOWN 'candidate 0' \u2014 presence unknown \u2014 provider gave no verdict after 1 re-ask(s): empty (exhausted)"
+    ],
+    "B2.nothink_skip_log": [
+     "Gate1._check_presence [candidate 0]: no think=off rung \u2014 the presence call already went out with think=false, nothing to switch off."
+    ]
+   },
+   "error": null,
+   "wall": 0.03
+  },
+  "B3_exhausted_by_usage_ratio": {
+   "scenario": "B3_exhausted_by_usage_ratio",
+   "worktree": "ideal-4ee7a28",
+   "checks": [
+    {
+     "name": "B3.finish=stop but completion_tokens=0.95*max \u2192 exhausted",
+     "ok": true,
+     "detail": "['Gate1._check_presence [candidate 0]: empty reply \u2014 kind=exhausted finish_reason=stop completion_tokens=3891 reasoning_chars=0 elapsed=0.0s']"
+    },
+    {
+     "name": "B3.no transport retry (2 calls)",
+     "ok": true,
+     "detail": "2"
+    },
+    {
+     "name": "B3.presence_empty_exhausted==1",
+     "ok": true,
+     "detail": "1"
+    }
+   ],
+   "info": {
+    "outcome": {
+     "candidate 0": "rejected"
+    },
+    "counters": {
+     "existence": 0,
+     "presence_confirmed": 0,
+     "presence_rejected": 1,
+     "presence_fail_closed": 0,
+     "presence_unknown": 0,
+     "presence_reask": 1,
+     "presence_empty_transport": 0,
+     "presence_empty_exhausted": 1,
+     "presence_nothink_ignored": 0,
+     "duplicate": 0,
+     "non_py": 0
+    },
+    "split_line": "existence=0 presence_confirmed=0 presence_rejected=1 presence_fail_closed=0 presence_unknown=0 presence_reask=1 presence_empty_transport=0 presence_empty_exhausted=1 presence_nothink_ignored=0 duplicate=0 non_py=0",
+    "calls": {
+     "tools/c0.py": 2
+    },
+    "params": {
+     "tools/c0.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.1
+      ]
+     ]
+    },
+    "sleeps": [],
+    "warnings": [
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=exhausted finish_reason=stop completion_tokens=3891 reasoning_chars=0 elapsed=0.0s"
+    ]
+   },
+   "error": null,
+   "wall": 0.03
+  },
+  "B4_exhausted_by_reasoning_finish_stop": {
+   "scenario": "B4_exhausted_by_reasoning_finish_stop",
+   "worktree": "ideal-4ee7a28",
+   "checks": [
+    {
+     "name": "B4.reasoning_content + finish=stop \u2192 exhausted",
+     "ok": true,
+     "detail": "['Gate1._check_presence [candidate 0]: empty reply \u2014 kind=exhausted finish_reason=stop completion_tokens=12 reasoning_chars=230 elapsed=0.0s']"
+    },
+    {
+     "name": "B4.no transport retry (2 calls)",
+     "ok": true,
+     "detail": "2"
+    },
+    {
+     "name": "B4.nothink-ignored WARNING emitted",
+     "ok": true,
+     "detail": "['provider streams reasoning_content despite think=false \u2014 the no-think request is not honoured by http://stub.local:1337/v1/test-model; empty replies from this model are exhaustion, not transport']"
+    },
+    {
+     "name": "B4.presence_nothink_ignored>=1",
+     "ok": true,
+     "detail": "1"
+    }
+   ],
+   "info": {
+    "outcome": {
+     "candidate 0": "rejected"
+    },
+    "counters": {
+     "existence": 0,
+     "presence_confirmed": 0,
+     "presence_rejected": 1,
+     "presence_fail_closed": 0,
+     "presence_unknown": 0,
+     "presence_reask": 1,
+     "presence_empty_transport": 0,
+     "presence_empty_exhausted": 1,
+     "presence_nothink_ignored": 1,
+     "duplicate": 0,
+     "non_py": 0
+    },
+    "split_line": "existence=0 presence_confirmed=0 presence_rejected=1 presence_fail_closed=0 presence_unknown=0 presence_reask=1 presence_empty_transport=0 presence_empty_exhausted=1 presence_nothink_ignored=1 duplicate=0 non_py=0",
+    "calls": {
+     "tools/c0.py": 2
+    },
+    "params": {
+     "tools/c0.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.1
+      ]
+     ]
+    },
+    "sleeps": [],
+    "warnings": [
+     "provider streams reasoning_content despite think=false \u2014 the no-think request is not honoured by http://stub.local:1337/v1/test-model; empty replies from this model are exhaustion, not transport",
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=exhausted finish_reason=stop completion_tokens=12 reasoning_chars=230 elapsed=0.0s"
+    ]
+   },
+   "error": null,
+   "wall": 0.03
+  },
+  "B5_unclosed_think_length": {
+   "scenario": "B5_unclosed_think_length",
+   "worktree": "ideal-4ee7a28",
+   "checks": [
+    {
+     "name": "B5.unclosed <think> + finish=length: not retried as transport",
+     "ok": true,
+     "detail": "calls=2"
+    },
+    {
+     "name": "B5.classified exhausted",
+     "ok": true,
+     "detail": "['Gate1._check_presence [candidate 0]: empty reply \u2014 kind=exhausted finish_reason=length completion_tokens=4096 reasoning_chars=0 elapsed=0.0s']"
+    }
+   ],
+   "info": {
+    "outcome": {
+     "candidate 0": "rejected"
+    },
+    "counters": {
+     "existence": 0,
+     "presence_confirmed": 0,
+     "presence_rejected": 1,
+     "presence_fail_closed": 0,
+     "presence_unknown": 0,
+     "presence_reask": 1,
+     "presence_empty_transport": 0,
+     "presence_empty_exhausted": 1,
+     "presence_nothink_ignored": 0,
+     "duplicate": 0,
+     "non_py": 0
+    },
+    "split_line": "existence=0 presence_confirmed=0 presence_rejected=1 presence_fail_closed=0 presence_unknown=0 presence_reask=1 presence_empty_transport=0 presence_empty_exhausted=1 presence_nothink_ignored=0 duplicate=0 non_py=0",
+    "calls": {
+     "tools/c0.py": 2
+    },
+    "params": {
+     "tools/c0.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.1
+      ]
+     ]
+    },
+    "sleeps": [],
+    "warnings": [
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=exhausted finish_reason=length completion_tokens=4096 reasoning_chars=0 elapsed=0.0s"
+    ],
+    "B5.kind": [
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=exhausted finish_reason=length completion_tokens=4096 reasoning_chars=0 elapsed=0.0s"
+    ]
+   },
+   "error": null,
+   "wall": 0.03
+  },
+  "C1_nothink_rung_verdict": {
+   "scenario": "C1_nothink_rung_verdict",
+   "worktree": "ideal-4ee7a28",
+   "checks": [
+    {
+     "name": "C1.think=true: a think=off re-ask was made",
+     "ok": true,
+     "detail": "off=[2] on=[0, 1] n=3"
+    },
+    {
+     "name": "C1.think=off call is the LAST call",
+     "ok": true,
+     "detail": "last reasoning={'effort': 'low', 'exclude': True} thinking={'type': 'disabled'}"
+    },
+    {
+     "name": "C1.exactly one think=off call",
+     "ok": true,
+     "detail": "[2]"
+    },
+    {
+     "name": "C1.think=off payload: no think/reasoning_effort, reasoning.exclude=true",
+     "ok": true,
+     "detail": "['max_tokens', 'messages', 'model', 'reasoning', 'stream', 'stream_options', 'temperature', 'thinking']"
+    },
+    {
+     "name": "C1.think=off payload: thinking.type=disabled (AUTO-ZAITHINK-1 parity)",
+     "ok": true,
+     "detail": "{'type': 'disabled'}"
+    },
+    {
+     "name": "C1.think=off at pinned budget + initial temperature",
+     "ok": true,
+     "detail": "(4096, 0.0)"
+    },
+    {
+     "name": "C1.earlier calls went out with think=on",
+     "ok": true,
+     "detail": "[(None, {'type': 'enabled'}), (None, {'type': 'enabled'})]"
+    },
+    {
+     "name": "C1.verdict from think=off call used \u2192 REJECTED",
+     "ok": true,
+     "detail": "{'candidate 0': 'rejected'}"
+    },
+    {
+     "name": "C1.logged as think=off re-ask",
+     "ok": true,
+     "detail": "[\"Gate1._check_presence [candidate 0]: verdict unparseable \u2014 re-asking (final rung, max_tokens=4096, temperature=0.00, think=off). raw=''\"]"
+    },
+    {
+     "name": "C1.presence_reask==1 (counts as a re-ask)",
+     "ok": true,
+     "detail": "1"
+    }
+   ],
+   "info": {
+    "outcome": {
+     "candidate 0": "rejected"
+    },
+    "counters": {
+     "existence": 0,
+     "presence_confirmed": 0,
+     "presence_rejected": 1,
+     "presence_fail_closed": 0,
+     "presence_unknown": 0,
+     "presence_reask": 1,
+     "presence_empty_transport": 0,
+     "presence_empty_exhausted": 1,
+     "presence_nothink_ignored": 0,
+     "duplicate": 0,
+     "non_py": 0
+    },
+    "split_line": "existence=0 presence_confirmed=0 presence_rejected=1 presence_fail_closed=0 presence_unknown=0 presence_reask=1 presence_empty_transport=0 presence_empty_exhausted=1 presence_nothink_ignored=0 duplicate=0 non_py=0",
+    "calls": {
+     "tools/c0.py": 3
+    },
+    "params": {
+     "tools/c0.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.1
+      ],
+      [
+       4096,
+       0.0
+      ]
+     ]
+    },
+    "sleeps": [],
+    "warnings": [
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=exhausted finish_reason=length completion_tokens=4096 reasoning_chars=0 elapsed=0.0s",
+     "Gate1._parse_presence_response [candidate 0]: JSON decode failed (Expecting value: line 1 column 1 (char 0)) \u2014 failing closed  raw=",
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=exhausted finish_reason=length completion_tokens=4096 reasoning_chars=0 elapsed=0.0s"
+    ]
+   },
+   "error": null,
+   "wall": 0.03
+  },
+  "C2_nothink_rung_exhausted_forever": {
+   "scenario": "C2_nothink_rung_exhausted_forever",
+   "worktree": "ideal-4ee7a28",
+   "checks": [
+    {
+     "name": "C2.think=true exhausted forever: exactly one think=off call",
+     "ok": true,
+     "detail": "off=[2] n=3"
+    },
+    {
+     "name": "C2.3 calls total (initial + pinned re-ask + think=off)",
+     "ok": true,
+     "detail": "[(4096, 0.0, False), (4096, 0.1, False), (4096, 0.0, True)]"
+    },
+    {
+     "name": "C2.ends UNKNOWN 'empty (exhausted)'",
+     "ok": true,
+     "detail": "Gate1[presence] UNKNOWN 'candidate 0' \u2014 presence unknown \u2014 provider gave no verdict after 2 re-ask(s): empty (exhausted)"
+    }
+   ],
+   "info": {
+    "outcome": {
+     "candidate 0": "unknown-kept"
+    },
+    "counters": {
+     "existence": 0,
+     "presence_confirmed": 0,
+     "presence_rejected": 0,
+     "presence_fail_closed": 0,
+     "presence_unknown": 1,
+     "presence_reask": 0,
+     "presence_empty_transport": 0,
+     "presence_empty_exhausted": 1,
+     "presence_nothink_ignored": 0,
+     "duplicate": 0,
+     "non_py": 0
+    },
+    "split_line": "existence=0 presence_confirmed=0 presence_rejected=0 presence_fail_closed=0 presence_unknown=1 presence_reask=0 presence_empty_transport=0 presence_empty_exhausted=1 presence_nothink_ignored=0 duplicate=0 non_py=0",
+    "calls": {
+     "tools/c0.py": 3
+    },
+    "params": {
+     "tools/c0.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.1
+      ],
+      [
+       4096,
+       0.0
+      ]
+     ]
+    },
+    "sleeps": [],
+    "warnings": [
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=exhausted finish_reason=length completion_tokens=4096 reasoning_chars=0 elapsed=0.0s",
+     "Gate1._parse_presence_response [candidate 0]: JSON decode failed (Expecting value: line 1 column 1 (char 0)) \u2014 failing closed  raw=",
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=exhausted finish_reason=length completion_tokens=4096 reasoning_chars=0 elapsed=0.0s",
+     "Gate1._parse_presence_response [candidate 0]: JSON decode failed (Expecting value: line 1 column 1 (char 0)) \u2014 failing closed  raw=",
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=exhausted finish_reason=length completion_tokens=4096 reasoning_chars=0 elapsed=0.0s",
+     "Gate1._check_presence [candidate 0]: verdict still unparseable after 2 re-ask(s) (mode=fast) \u2014 no verdict, ending unknown: empty (exhausted). raw=''",
+     "Gate1[presence] UNKNOWN 'candidate 0' \u2014 presence unknown \u2014 provider gave no verdict after 2 re-ask(s): empty (exhausted)"
+    ]
+   },
+   "error": null,
+   "wall": 0.03
+  },
+  "D1_nothink_ignored_5": {
+   "scenario": "D1_nothink_ignored_5",
+   "worktree": "ideal-4ee7a28",
+   "checks": [
+    {
+     "name": "D1.WARNING emitted exactly once for 5 candidates",
+     "ok": true,
+     "detail": "n=1 ['provider streams reasoning_content despite think=false \u2014 the no-think request is not honoured by http://stub.local:1337/v1/test-model; empty replies from this model are exhaustion, not transport']"
+    },
+    {
+     "name": "D1.WARNING names url/model",
+     "ok": true,
+     "detail": "['provider streams reasoning_content despite think=false \u2014 the no-think request is not honoured by http://stub.local:1337/v1/test-model; empty replies from this model are exhaustion, not transport']"
+    },
+    {
+     "name": "D1.presence_nothink_ignored counted (>=1)",
+     "ok": true,
+     "detail": "1"
+    },
+    {
+     "name": "D1.presence_empty_exhausted==5",
+     "ok": true,
+     "detail": "5"
+    },
+    {
+     "name": "D1.presence_empty_transport==0",
+     "ok": true,
+     "detail": "0"
+    },
+    {
+     "name": "D1.all 5 UNKNOWN kept",
+     "ok": true,
+     "detail": "{'candidate 0': 'unknown-kept', 'candidate 1': 'unknown-kept', 'candidate 2': 'unknown-kept', 'candidate 3': 'unknown-kept', 'candidate 4': 'unknown-kept'}"
+    },
+    {
+     "name": "D1.2 calls per candidate (no transport retry)",
+     "ok": true,
+     "detail": "{'tools/c0.py': 2, 'tools/c1.py': 2, 'tools/c2.py': 2, 'tools/c3.py': 2, 'tools/c4.py': 2}"
+    }
+   ],
+   "info": {
+    "outcome": {
+     "candidate 0": "unknown-kept",
+     "candidate 1": "unknown-kept",
+     "candidate 2": "unknown-kept",
+     "candidate 3": "unknown-kept",
+     "candidate 4": "unknown-kept"
+    },
+    "counters": {
+     "existence": 0,
+     "presence_confirmed": 0,
+     "presence_rejected": 0,
+     "presence_fail_closed": 0,
+     "presence_unknown": 5,
+     "presence_reask": 0,
+     "presence_empty_transport": 0,
+     "presence_empty_exhausted": 5,
+     "presence_nothink_ignored": 1,
+     "duplicate": 0,
+     "non_py": 0
+    },
+    "split_line": "existence=0 presence_confirmed=0 presence_rejected=0 presence_fail_closed=0 presence_unknown=5 presence_reask=0 presence_empty_transport=0 presence_empty_exhausted=5 presence_nothink_ignored=1 duplicate=0 non_py=0",
+    "calls": {
+     "tools/c0.py": 2,
+     "tools/c1.py": 2,
+     "tools/c2.py": 2,
+     "tools/c3.py": 2,
+     "tools/c4.py": 2
+    },
+    "params": {
+     "tools/c0.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.1
+      ]
+     ],
+     "tools/c1.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.1
+      ]
+     ],
+     "tools/c2.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.1
+      ]
+     ],
+     "tools/c3.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.1
+      ]
+     ],
+     "tools/c4.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.1
+      ]
+     ]
+    },
+    "sleeps": [],
+    "warnings": [
+     "provider streams reasoning_content despite think=false \u2014 the no-think request is not honoured by http://stub.local:1337/v1/test-model; empty replies from this model are exhaustion, not transport",
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=exhausted finish_reason=length completion_tokens=4096 reasoning_chars=230 elapsed=0.0s",
+     "Gate1._parse_presence_response [candidate 0]: JSON decode failed (Expecting value: line 1 column 1 (char 0)) \u2014 failing closed  raw=",
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=exhausted finish_reason=length completion_tokens=4096 reasoning_chars=230 elapsed=0.0s",
+     "Gate1._check_presence [candidate 0]: verdict still unparseable after 1 re-ask(s) (mode=fast) \u2014 no verdict, ending unknown: empty (exhausted). raw=''",
+     "Gate1[presence] UNKNOWN 'candidate 0' \u2014 presence unknown \u2014 provider gave no verdict after 1 re-ask(s): empty (exhausted)",
+     "Gate1._check_presence [candidate 1]: empty reply \u2014 kind=exhausted finish_reason=length completion_tokens=4096 reasoning_chars=230 elapsed=0.0s",
+     "Gate1._parse_presence_response [candidate 1]: JSON decode failed (Expecting value: line 1 column 1 (char 0)) \u2014 failing closed  raw=",
+     "Gate1._check_presence [candidate 1]: empty reply \u2014 kind=exhausted finish_reason=length completion_tokens=4096 reasoning_chars=230 elapsed=0.0s",
+     "Gate1._check_presence [candidate 1]: verdict still unparseable after 1 re-ask(s) (mode=fast) \u2014 no verdict, ending unknown: empty (exhausted). raw=''",
+     "Gate1[presence] UNKNOWN 'candidate 1' \u2014 presence unknown \u2014 provider gave no verdict after 1 re-ask(s): empty (exhausted)",
+     "Gate1._check_presence [candidate 2]: empty reply \u2014 kind=exhausted finish_reason=length completion_tokens=4096 reasoning_chars=230 elapsed=0.0s"
+    ],
+    "D1.presence_nothink_ignored": 1
+   },
+   "error": null,
+   "wall": 0.03
+  },
+  "D2_nothink_ignored_workers4": {
+   "scenario": "D2_nothink_ignored_workers4",
+   "worktree": "ideal-4ee7a28",
+   "checks": [
+    {
+     "name": "D2.workers=4: nothink WARNING still exactly once",
+     "ok": true,
+     "detail": "n=1"
+    },
+    {
+     "name": "D2.workers=4: presence_empty_exhausted==8",
+     "ok": true,
+     "detail": "8"
+    },
+    {
+     "name": "D2.workers=4: all UNKNOWN kept",
+     "ok": true,
+     "detail": "{'candidate 0': 'unknown-kept', 'candidate 1': 'unknown-kept', 'candidate 2': 'unknown-kept', 'candidate 3': 'unknown-kept', 'candidate 4': 'unknown-kept', 'candidate 5': 'unknown-kept', 'candidate 6': 'unknown-kept', 'candidate 7': 'unknown-kept'}"
+    }
+   ],
+   "info": {
+    "outcome": {
+     "candidate 0": "unknown-kept",
+     "candidate 1": "unknown-kept",
+     "candidate 2": "unknown-kept",
+     "candidate 3": "unknown-kept",
+     "candidate 4": "unknown-kept",
+     "candidate 5": "unknown-kept",
+     "candidate 6": "unknown-kept",
+     "candidate 7": "unknown-kept"
+    },
+    "counters": {
+     "existence": 0,
+     "presence_confirmed": 0,
+     "presence_rejected": 0,
+     "presence_fail_closed": 0,
+     "presence_unknown": 8,
+     "presence_reask": 0,
+     "presence_empty_transport": 0,
+     "presence_empty_exhausted": 8,
+     "presence_nothink_ignored": 1,
+     "duplicate": 0,
+     "non_py": 0
+    },
+    "split_line": "existence=0 presence_confirmed=0 presence_rejected=0 presence_fail_closed=0 presence_unknown=8 presence_reask=0 presence_empty_transport=0 presence_empty_exhausted=8 presence_nothink_ignored=1 duplicate=0 non_py=0",
+    "calls": {
+     "tools/c0.py": 2,
+     "tools/c2.py": 2,
+     "tools/c1.py": 2,
+     "tools/c3.py": 2,
+     "tools/c6.py": 2,
+     "tools/c4.py": 2,
+     "tools/c7.py": 2,
+     "tools/c5.py": 2
+    },
+    "params": {
+     "tools/c0.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.1
+      ]
+     ],
+     "tools/c2.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.1
+      ]
+     ],
+     "tools/c1.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.1
+      ]
+     ],
+     "tools/c3.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.1
+      ]
+     ],
+     "tools/c6.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.1
+      ]
+     ],
+     "tools/c4.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.1
+      ]
+     ],
+     "tools/c7.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.1
+      ]
+     ],
+     "tools/c5.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.1
+      ]
+     ]
+    },
+    "sleeps": [],
+    "warnings": [
+     "provider streams reasoning_content despite think=false \u2014 the no-think request is not honoured by http://stub.local:1337/v1/test-model; empty replies from this model are exhaustion, not transport",
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=exhausted finish_reason=length completion_tokens=4096 reasoning_chars=230 elapsed=0.0s",
+     "Gate1._parse_presence_response [candidate 0]: JSON decode failed (Expecting value: line 1 column 1 (char 0)) \u2014 failing closed  raw=",
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=exhausted finish_reason=length completion_tokens=4096 reasoning_chars=230 elapsed=0.0s",
+     "Gate1._check_presence [candidate 0]: verdict still unparseable after 1 re-ask(s) (mode=fast) \u2014 no verdict, ending unknown: empty (exhausted). raw=''",
+     "Gate1[presence] UNKNOWN 'candidate 0' \u2014 presence unknown \u2014 provider gave no verdict after 1 re-ask(s): empty (exhausted)",
+     "Gate1._check_presence [candidate 2]: empty reply \u2014 kind=exhausted finish_reason=length completion_tokens=4096 reasoning_chars=230 elapsed=0.0s",
+     "Gate1._parse_presence_response [candidate 2]: JSON decode failed (Expecting value: line 1 column 1 (char 0)) \u2014 failing closed  raw=",
+     "Gate1._check_presence [candidate 2]: empty reply \u2014 kind=exhausted finish_reason=length completion_tokens=4096 reasoning_chars=230 elapsed=0.0s",
+     "Gate1._check_presence [candidate 2]: verdict still unparseable after 1 re-ask(s) (mode=fast) \u2014 no verdict, ending unknown: empty (exhausted). raw=''",
+     "Gate1[presence] UNKNOWN 'candidate 2' \u2014 presence unknown \u2014 provider gave no verdict after 1 re-ask(s): empty (exhausted)",
+     "Gate1._check_presence [candidate 1]: empty reply \u2014 kind=exhausted finish_reason=length completion_tokens=4096 reasoning_chars=230 elapsed=0.0s"
+    ]
+   },
+   "error": null,
+   "wall": 0.04
+  },
+  "E1_stream_options_present": {
+   "scenario": "E1_stream_options_present",
+   "worktree": "ideal-4ee7a28",
+   "checks": [
+    {
+     "name": "E1.stream_options.include_usage=true in payload",
+     "ok": true,
+     "detail": "{'include_usage': True}"
+    },
+    {
+     "name": "E1.stream=true",
+     "ok": true,
+     "detail": "True"
+    },
+    {
+     "name": "E1.verdict REJECTED",
+     "ok": true,
+     "detail": "{'candidate 0': 'rejected'}"
+    }
+   ],
+   "info": {
+    "outcome": {
+     "candidate 0": "rejected"
+    },
+    "counters": {
+     "existence": 0,
+     "presence_confirmed": 0,
+     "presence_rejected": 1,
+     "presence_fail_closed": 0,
+     "presence_unknown": 0,
+     "presence_reask": 0,
+     "presence_empty_transport": 0,
+     "presence_empty_exhausted": 0,
+     "presence_nothink_ignored": 0,
+     "duplicate": 0,
+     "non_py": 0
+    },
+    "split_line": "existence=0 presence_confirmed=0 presence_rejected=1 presence_fail_closed=0 presence_unknown=0 presence_reask=0 presence_empty_transport=0 presence_empty_exhausted=0 presence_nothink_ignored=0 duplicate=0 non_py=0",
+    "calls": {
+     "tools/c0.py": 1
+    },
+    "params": {
+     "tools/c0.py": [
+      [
+       4096,
+       0.0
+      ]
+     ]
+    },
+    "sleeps": [],
+    "warnings": []
+   },
+   "error": null,
+   "wall": 0.03
+  },
+  "E2_stream_options_400_memory": {
+   "scenario": "E2_stream_options_400_memory",
+   "worktree": "ideal-4ee7a28",
+   "checks": [
+    {
+     "name": "E2.first request carried stream_options",
+     "ok": true,
+     "detail": "{'include_usage': True}"
+    },
+    {
+     "name": "E2.after HTTP 400 the retry omits stream_options",
+     "ok": true,
+     "detail": "[True, None]"
+    },
+    {
+     "name": "E2.candidate 0 still completes REJECTED",
+     "ok": true,
+     "detail": "{'candidate 0': 'rejected', 'candidate 1': 'rejected'}"
+    },
+    {
+     "name": "E2.candidate 1 (same url/model) never sends it again",
+     "ok": true,
+     "detail": "[None]"
+    },
+    {
+     "name": "E2.candidate 1 REJECTED in one call",
+     "ok": true,
+     "detail": "1"
+    },
+    {
+     "name": "E2.presence_unknown==0",
+     "ok": true,
+     "detail": "0"
+    }
+   ],
+   "info": {
+    "outcome": {
+     "candidate 0": "rejected",
+     "candidate 1": "rejected"
+    },
+    "counters": {
+     "existence": 0,
+     "presence_confirmed": 0,
+     "presence_rejected": 2,
+     "presence_fail_closed": 0,
+     "presence_unknown": 0,
+     "presence_reask": 0,
+     "presence_empty_transport": 0,
+     "presence_empty_exhausted": 0,
+     "presence_nothink_ignored": 0,
+     "duplicate": 0,
+     "non_py": 0
+    },
+    "split_line": "existence=0 presence_confirmed=0 presence_rejected=2 presence_fail_closed=0 presence_unknown=0 presence_reask=0 presence_empty_transport=0 presence_empty_exhausted=0 presence_nothink_ignored=0 duplicate=0 non_py=0",
+    "calls": {
+     "tools/c0.py": 2,
+     "tools/c1.py": 1
+    },
+    "params": {
+     "tools/c0.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.0
+      ]
+     ],
+     "tools/c1.py": [
+      [
+       4096,
+       0.0
+      ]
+     ]
+    },
+    "sleeps": [],
+    "warnings": [
+     "request_completion: HTTP 400 from http://stub.local:1337/v1/chat/completions: provider does not support 'stream_options' (streamed usage reporting, RUN-9) \u2014 disabling it for this endpoint for the rest"
+    ]
+   },
+   "error": null,
+   "wall": 0.03
+  },
+  "F1_garbled_forever_strict": {
+   "scenario": "F1_garbled_forever_strict",
+   "worktree": "ideal-4ee7a28",
+   "checks": [
+    {
+     "name": "F1.garbled forever: UNKNOWN kept",
+     "ok": true,
+     "detail": "{'candidate 0': 'unknown-kept'}"
+    },
+    {
+     "name": "F1.UNKNOWN or 'ending unknown' line says 'garbled'",
+     "ok": true,
+     "detail": "(\"Gate1[presence] UNKNOWN 'candidate 0' \u2014 presence unknown \u2014 provider gave no verdict after 6 re-ask(s): garbled: JSON dec\", 'Gate1._check_presence [candidate 0]: verdict still unparseable after 6 re-ask(s) (mode=strict) \u2014 no verdict, ending unkn')"
+    },
+    {
+     "name": "F1.no classification line for a non-empty reply",
+     "ok": true,
+     "detail": "[]"
+    },
+    {
+     "name": "F1.presence_empty_* both 0",
+     "ok": true,
+     "detail": "(0, 0)"
+    },
+    {
+     "name": "F1.nudge sent on garbled re-asks (unchanged)",
+     "ok": true,
+     "detail": "[False, True, True, True, True, True, True]"
+    },
+    {
+     "name": "F1.strict ladder still 7 calls",
+     "ok": true,
+     "detail": "7"
+    }
+   ],
+   "info": {
+    "outcome": {
+     "candidate 0": "unknown-kept"
+    },
+    "counters": {
+     "existence": 0,
+     "presence_confirmed": 0,
+     "presence_rejected": 0,
+     "presence_fail_closed": 0,
+     "presence_unknown": 1,
+     "presence_reask": 0,
+     "presence_empty_transport": 0,
+     "presence_empty_exhausted": 0,
+     "presence_nothink_ignored": 0,
+     "duplicate": 0,
+     "non_py": 0
+    },
+    "split_line": "existence=0 presence_confirmed=0 presence_rejected=0 presence_fail_closed=0 presence_unknown=1 presence_reask=0 presence_empty_transport=0 presence_empty_exhausted=0 presence_nothink_ignored=0 duplicate=0 non_py=0",
+    "calls": {
+     "tools/c0.py": 7
+    },
+    "params": {
+     "tools/c0.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.1
+      ],
+      [
+       8192,
+       0.0
+      ],
+      [
+       8192,
+       0.1
+      ],
+      [
+       16384,
+       0.0
+      ],
+      [
+       16384,
+       0.1
+      ]
+     ]
+    },
+    "sleeps": [],
+    "warnings": [
+     "Gate1._parse_presence_response [candidate 0]: JSON decode failed (Expecting value: line 1 column 1 (char 0)) \u2014 failing closed  raw=Sure! The problem is present, I think. verdict: maybe",
+     "Gate1._parse_presence_response [candidate 0]: JSON decode failed (Expecting value: line 1 column 1 (char 0)) \u2014 failing closed  raw=Sure! The problem is present, I think. verdict: maybe",
+     "Gate1._parse_presence_response [candidate 0]: JSON decode failed (Expecting value: line 1 column 1 (char 0)) \u2014 failing closed  raw=Sure! The problem is present, I think. verdict: maybe",
+     "Gate1._parse_presence_response [candidate 0]: JSON decode failed (Expecting value: line 1 column 1 (char 0)) \u2014 failing closed  raw=Sure! The problem is present, I think. verdict: maybe",
+     "Gate1._parse_presence_response [candidate 0]: JSON decode failed (Expecting value: line 1 column 1 (char 0)) \u2014 failing closed  raw=Sure! The problem is present, I think. verdict: maybe",
+     "Gate1._parse_presence_response [candidate 0]: JSON decode failed (Expecting value: line 1 column 1 (char 0)) \u2014 failing closed  raw=Sure! The problem is present, I think. verdict: maybe",
+     "Gate1._parse_presence_response [candidate 0]: JSON decode failed (Expecting value: line 1 column 1 (char 0)) \u2014 failing closed  raw=Sure! The problem is present, I think. verdict: maybe",
+     "Gate1._check_presence [candidate 0]: verdict still unparseable after 6 re-ask(s) (mode=strict) \u2014 no verdict, ending unknown: garbled: JSON decode failed (Expecting value: line 1 column 1 (char 0)) \u2014 f",
+     "Gate1[presence] UNKNOWN 'candidate 0' \u2014 presence unknown \u2014 provider gave no verdict after 6 re-ask(s): garbled: JSON decode failed (Expecting value: line 1 column 1 (char 0)) \u2014 failing closed"
+    ]
+   },
+   "error": null,
+   "wall": 0.03
+  },
+  "F2_garbled_forever_fast": {
+   "scenario": "F2_garbled_forever_fast",
+   "worktree": "ideal-4ee7a28",
+   "checks": [
+    {
+     "name": "F2.fast garbled: 6 calls (no pin, full grid)",
+     "ok": true,
+     "detail": "[(4096, 0.0), (4096, 0.1), (8192, 0.0), (8192, 0.1), (16384, 0.0), (16384, 0.1)]"
+    },
+    {
+     "name": "F2.ends UNKNOWN kept",
+     "ok": true,
+     "detail": "{'candidate 0': 'unknown-kept'}"
+    },
+    {
+     "name": "F2.presence_empty_* both 0",
+     "ok": true,
+     "detail": "(0, 0)"
+    }
+   ],
+   "info": {
+    "outcome": {
+     "candidate 0": "unknown-kept"
+    },
+    "counters": {
+     "existence": 0,
+     "presence_confirmed": 0,
+     "presence_rejected": 0,
+     "presence_fail_closed": 0,
+     "presence_unknown": 1,
+     "presence_reask": 0,
+     "presence_empty_transport": 0,
+     "presence_empty_exhausted": 0,
+     "presence_nothink_ignored": 0,
+     "duplicate": 0,
+     "non_py": 0
+    },
+    "split_line": "existence=0 presence_confirmed=0 presence_rejected=0 presence_fail_closed=0 presence_unknown=1 presence_reask=0 presence_empty_transport=0 presence_empty_exhausted=0 presence_nothink_ignored=0 duplicate=0 non_py=0",
+    "calls": {
+     "tools/c0.py": 6
+    },
+    "params": {
+     "tools/c0.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.1
+      ],
+      [
+       8192,
+       0.0
+      ],
+      [
+       8192,
+       0.1
+      ],
+      [
+       16384,
+       0.0
+      ],
+      [
+       16384,
+       0.1
+      ]
+     ]
+    },
+    "sleeps": [],
+    "warnings": [
+     "Gate1._parse_presence_response [candidate 0]: JSON decode failed (Expecting value: line 1 column 1 (char 0)) \u2014 failing closed  raw=Sure! The problem is present, I think. verdict: maybe",
+     "Gate1._parse_presence_response [candidate 0]: JSON decode failed (Expecting value: line 1 column 1 (char 0)) \u2014 failing closed  raw=Sure! The problem is present, I think. verdict: maybe",
+     "Gate1._parse_presence_response [candidate 0]: JSON decode failed (Expecting value: line 1 column 1 (char 0)) \u2014 failing closed  raw=Sure! The problem is present, I think. verdict: maybe",
+     "Gate1._parse_presence_response [candidate 0]: JSON decode failed (Expecting value: line 1 column 1 (char 0)) \u2014 failing closed  raw=Sure! The problem is present, I think. verdict: maybe",
+     "Gate1._parse_presence_response [candidate 0]: JSON decode failed (Expecting value: line 1 column 1 (char 0)) \u2014 failing closed  raw=Sure! The problem is present, I think. verdict: maybe",
+     "Gate1._parse_presence_response [candidate 0]: JSON decode failed (Expecting value: line 1 column 1 (char 0)) \u2014 failing closed  raw=Sure! The problem is present, I think. verdict: maybe",
+     "Gate1._check_presence [candidate 0]: verdict still unparseable after 5 re-ask(s) (mode=fast) \u2014 no verdict, ending unknown: garbled: JSON decode failed (Expecting value: line 1 column 1 (char 0)) \u2014 fai",
+     "Gate1[presence] UNKNOWN 'candidate 0' \u2014 presence unknown \u2014 provider gave no verdict after 5 re-ask(s): garbled: JSON decode failed (Expecting value: line 1 column 1 (char 0)) \u2014 failing closed"
+    ]
+   },
+   "error": null,
+   "wall": 0.03
+  },
+  "F4_concurrency_counters": {
+   "scenario": "F4_concurrency_counters",
+   "worktree": "ideal-4ee7a28",
+   "checks": [
+    {
+     "name": "F4.workers=4: presence_empty_transport==12",
+     "ok": true,
+     "detail": "12"
+    },
+    {
+     "name": "F4.all 12 REJECTED",
+     "ok": true,
+     "detail": "{'candidate 0': 'rejected', 'candidate 1': 'rejected', 'candidate 2': 'rejected', 'candidate 3': 'rejected', 'candidate 4': 'rejected', 'candidate 5': 'rejected', 'candidate 6': 'rejected', 'candidate 7': 'rejected', 'candidate 8': 'rejected', 'candidate 9': 'rejected', 'candidate 10': 'rejected', '"
+    },
+    {
+     "name": "F4.presence_unknown==0",
+     "ok": true,
+     "detail": "0"
+    },
+    {
+     "name": "F4.3 calls each",
+     "ok": true,
+     "detail": "{'tools/c1.py': 3, 'tools/c2.py': 3, 'tools/c0.py': 3, 'tools/c3.py': 3, 'tools/c6.py': 3, 'tools/c5.py': 3, 'tools/c4.py': 3, 'tools/c9.py': 3, 'tools/c8.py': 3, 'tools/c10.py': 3, 'tools/c7.py': 3, 'tools/c11.py': 3}"
+    }
+   ],
+   "info": {
+    "outcome": {
+     "candidate 0": "rejected",
+     "candidate 1": "rejected",
+     "candidate 2": "rejected",
+     "candidate 3": "rejected",
+     "candidate 4": "rejected",
+     "candidate 5": "rejected",
+     "candidate 6": "rejected",
+     "candidate 7": "rejected",
+     "candidate 8": "rejected",
+     "candidate 9": "rejected",
+     "candidate 10": "rejected",
+     "candidate 11": "rejected"
+    },
+    "counters": {
+     "existence": 0,
+     "presence_confirmed": 0,
+     "presence_rejected": 12,
+     "presence_fail_closed": 0,
+     "presence_unknown": 0,
+     "presence_reask": 0,
+     "presence_empty_transport": 12,
+     "presence_empty_exhausted": 0,
+     "presence_nothink_ignored": 0,
+     "duplicate": 0,
+     "non_py": 0
+    },
+    "split_line": "existence=0 presence_confirmed=0 presence_rejected=12 presence_fail_closed=0 presence_unknown=0 presence_reask=0 presence_empty_transport=12 presence_empty_exhausted=0 presence_nothink_ignored=0 duplicate=0 non_py=0",
+    "calls": {
+     "tools/c1.py": 3,
+     "tools/c2.py": 3,
+     "tools/c0.py": 3,
+     "tools/c3.py": 3,
+     "tools/c6.py": 3,
+     "tools/c5.py": 3,
+     "tools/c4.py": 3,
+     "tools/c9.py": 3,
+     "tools/c8.py": 3,
+     "tools/c10.py": 3,
+     "tools/c7.py": 3,
+     "tools/c11.py": 3
+    },
+    "params": {
+     "tools/c1.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.0
+      ]
+     ],
+     "tools/c2.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.0
+      ]
+     ],
+     "tools/c0.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.0
+      ]
+     ],
+     "tools/c3.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.0
+      ]
+     ],
+     "tools/c6.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.0
+      ]
+     ],
+     "tools/c5.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.0
+      ]
+     ],
+     "tools/c4.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.0
+      ]
+     ],
+     "tools/c9.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.0
+      ]
+     ],
+     "tools/c8.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.0
+      ]
+     ],
+     "tools/c10.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.0
+      ]
+     ],
+     "tools/c7.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.0
+      ]
+     ],
+     "tools/c11.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.0
+      ]
+     ]
+    },
+    "sleeps": [
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0,
+     0.0
+    ],
+    "warnings": [
+     "Gate1._check_presence [candidate 1]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.0s",
+     "Gate1._check_presence [candidate 1]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.0s",
+     "Gate1._check_presence [candidate 2]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.0s",
+     "Gate1._check_presence [candidate 2]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.0s",
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.0s",
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.0s",
+     "Gate1._check_presence [candidate 3]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.0s",
+     "Gate1._check_presence [candidate 3]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.0s",
+     "Gate1._check_presence [candidate 6]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.0s",
+     "Gate1._check_presence [candidate 6]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.0s",
+     "Gate1._check_presence [candidate 5]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.0s",
+     "Gate1._check_presence [candidate 5]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.0s"
+    ]
+   },
+   "error": null,
+   "wall": 1.15
+  },
+  "G1_malformed_retries": {
+   "scenario": "G1_malformed_retries",
+   "worktree": "ideal-4ee7a28",
+   "checks": [
+    {
+     "name": "G1.malformed presence_empty_retries \u2192 WARNING",
+     "ok": true,
+     "detail": "[\"config [gate1] presence_empty_retries is malformed (invalid literal for int() with base 10: 'abc') \u2014 using default 2\"]"
+    },
+    {
+     "name": "G1.malformed \u2192 default 2 (4 calls)",
+     "ok": true,
+     "detail": "4"
+    },
+    {
+     "name": "G1.no crash, ends UNKNOWN",
+     "ok": true,
+     "detail": "{'candidate 0': 'unknown-kept'}"
+    }
+   ],
+   "info": {
+    "outcome": {
+     "candidate 0": "unknown-kept"
+    },
+    "counters": {
+     "existence": 0,
+     "presence_confirmed": 0,
+     "presence_rejected": 0,
+     "presence_fail_closed": 0,
+     "presence_unknown": 1,
+     "presence_reask": 0,
+     "presence_empty_transport": 1,
+     "presence_empty_exhausted": 0,
+     "presence_nothink_ignored": 0,
+     "duplicate": 0,
+     "non_py": 0
+    },
+    "split_line": "existence=0 presence_confirmed=0 presence_rejected=0 presence_fail_closed=0 presence_unknown=1 presence_reask=0 presence_empty_transport=1 presence_empty_exhausted=0 presence_nothink_ignored=0 duplicate=0 non_py=0",
+    "calls": {
+     "tools/c0.py": 4
+    },
+    "params": {
+     "tools/c0.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.1
+      ]
+     ]
+    },
+    "sleeps": [
+     0.0,
+     0.0
+    ],
+    "warnings": [
+     "config [gate1] presence_empty_retries is malformed (invalid literal for int() with base 10: 'abc') \u2014 using default 2",
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.0s",
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.0s",
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.0s",
+     "Gate1._parse_presence_response [candidate 0]: JSON decode failed (Expecting value: line 1 column 1 (char 0)) \u2014 failing closed  raw=",
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.0s",
+     "Gate1._check_presence [candidate 0]: verdict still unparseable after 1 re-ask(s) (mode=fast) \u2014 no verdict, ending unknown: empty (transport). raw=''",
+     "Gate1[presence] UNKNOWN 'candidate 0' \u2014 presence unknown \u2014 provider gave no verdict after 1 re-ask(s): empty (transport)"
+    ]
+   },
+   "error": null,
+   "wall": 0.03
+  },
+  "H1_cap_log": {
+   "scenario": "H1_cap_log",
+   "worktree": "ideal-4ee7a28",
+   "checks": [
+    {
+     "name": "H1.no cap line followed by 'already tried' quoting another max_tokens",
+     "ok": true,
+     "detail": "[]"
+    },
+    {
+     "name": "H1.ends UNKNOWN exhausted",
+     "ok": true,
+     "detail": "Gate1[presence] UNKNOWN 'candidate 0' \u2014 presence unknown \u2014 provider gave no verdict after 1 re-ask(s): empty (exhausted)"
+    }
+   ],
+   "info": {
+    "outcome": {
+     "candidate 0": "unknown-kept"
+    },
+    "counters": {
+     "existence": 0,
+     "presence_confirmed": 0,
+     "presence_rejected": 0,
+     "presence_fail_closed": 0,
+     "presence_unknown": 1,
+     "presence_reask": 0,
+     "presence_empty_transport": 0,
+     "presence_empty_exhausted": 1,
+     "presence_nothink_ignored": 0,
+     "duplicate": 0,
+     "non_py": 0
+    },
+    "split_line": "existence=0 presence_confirmed=0 presence_rejected=0 presence_fail_closed=0 presence_unknown=1 presence_reask=0 presence_empty_transport=0 presence_empty_exhausted=1 presence_nothink_ignored=0 duplicate=0 non_py=0",
+    "calls": {
+     "tools/c0.py": 2
+    },
+    "params": {
+     "tools/c0.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.1
+      ]
+     ]
+    },
+    "sleeps": [],
+    "warnings": [
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=exhausted finish_reason=length completion_tokens=4096 reasoning_chars=0 elapsed=0.0s",
+     "Gate1._parse_presence_response [candidate 0]: JSON decode failed (Expecting value: line 1 column 1 (char 0)) \u2014 failing closed  raw=",
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=exhausted finish_reason=length completion_tokens=4096 reasoning_chars=0 elapsed=0.0s",
+     "Gate1._check_presence [candidate 0]: verdict still unparseable after 1 re-ask(s) (mode=fast) \u2014 no verdict, ending unknown: empty (exhausted). raw=''",
+     "Gate1[presence] UNKNOWN 'candidate 0' \u2014 presence unknown \u2014 provider gave no verdict after 1 re-ask(s): empty (exhausted)"
+    ],
+    "H1.cap_lines": 0
+   },
+   "error": null,
+   "wall": 0.03
+  },
+  "I1_stream_meta": {
+   "scenario": "I1_stream_meta",
+   "worktree": "ideal-4ee7a28",
+   "checks": [
+    {
+     "name": "I1.plain request_completion: normal text unchanged",
+     "ok": true,
+     "detail": "{\"verdict\": \"rejected\", \"reason\": \"already handled\"}"
+    },
+    {
+     "name": "I1.plain: role-only+[DONE] \u2192 ''",
+     "ok": true,
+     "detail": "''"
+    },
+    {
+     "name": "I1.plain: reasoning-only \u2192 ''",
+     "ok": true,
+     "detail": "''"
+    },
+    {
+     "name": "I1.plain: ollama text unchanged",
+     "ok": true,
+     "detail": "'hello'"
+    },
+    {
+     "name": "I2.meta API exists",
+     "ok": true,
+     "detail": "request_completion_ex"
+    },
+    {
+     "name": "I2.meta: role-only \u2192 text ''",
+     "ok": true,
+     "detail": "''"
+    },
+    {
+     "name": "I2.meta: role-only content_chunks==0",
+     "ok": true,
+     "detail": "0"
+    },
+    {
+     "name": "I2.meta: role-only finish_reason=='stop'",
+     "ok": true,
+     "detail": "stop"
+    },
+    {
+     "name": "I2.meta: role-only completion_tokens==0 (usage chunk)",
+     "ok": true,
+     "detail": "0"
+    },
+    {
+     "name": "I2.meta: no usage chunk \u2192 completion_tokens is None",
+     "ok": true,
+     "detail": "None"
+    },
+    {
+     "name": "I2.meta: no finish chunk \u2192 finish_reason is None",
+     "ok": true,
+     "detail": "None"
+    },
+    {
+     "name": "I2.meta: reasoning-only \u2192 text '' and reasoning_chars>0",
+     "ok": true,
+     "detail": "230"
+    },
+    {
+     "name": "I2.meta: reasoning-only finish_reason=='length'",
+     "ok": true,
+     "detail": "length"
+    },
+    {
+     "name": "I2.meta: exhausted completion_tokens==4096",
+     "ok": true,
+     "detail": "4096"
+    },
+    {
+     "name": "I2.meta: normal content_chunks>0",
+     "ok": true,
+     "detail": "4"
+    },
+    {
+     "name": "I2.meta: elapsed is a number",
+     "ok": true,
+     "detail": "0.0001350679995084647"
+    },
+    {
+     "name": "I4.meta: finish_reason on content chunk survives a trailing usage chunk (last non-null)",
+     "ok": true,
+     "detail": "stop"
+    },
+    {
+     "name": "I4.meta: completion_tokens from trailing usage chunk",
+     "ok": true,
+     "detail": "31"
+    },
+    {
+     "name": "I4.meta: usage inline on the finish chunk is read",
+     "ok": true,
+     "detail": "4096"
+    },
+    {
+     "name": "I3.meta: ollama done_reason\u2192finish_reason",
+     "ok": true,
+     "detail": "length"
+    },
+    {
+     "name": "I3.meta: ollama eval_count\u2192completion_tokens",
+     "ok": true,
+     "detail": "77"
+    }
+   ],
+   "info": {
+    "meta_api": "request_completion_ex",
+    "stream": {
+     "normal": {
+      "plain": "{\"verdict\": \"rejected\", \"reason\": \"already handled\"}",
+      "meta": {
+       "finish_reason": "stop",
+       "completion_tokens": "24",
+       "reasoning_chars": "0",
+       "content_chunks": "4",
+       "elapsed": "0.0001350679995084647"
+      },
+      "err": null
+     },
+     "role_only": {
+      "plain": "",
+      "meta": {
+       "finish_reason": "stop",
+       "completion_tokens": "0",
+       "reasoning_chars": "0",
+       "content_chunks": "0",
+       "elapsed": "6.196599952090764e-05"
+      },
+      "err": null
+     },
+     "role_only_no_finish_no_usage": {
+      "plain": "",
+      "meta": {
+       "finish_reason": "None",
+       "completion_tokens": "None",
+       "reasoning_chars": "0",
+       "content_chunks": "0",
+       "elapsed": "0.00010201999975834042"
+      },
+      "err": null
+     },
+     "reasoning_only": {
+      "plain": "",
+      "meta": {
+       "finish_reason": "length",
+       "completion_tokens": "4096",
+       "reasoning_chars": "230",
+       "content_chunks": "0",
+       "elapsed": "0.00011182900016137864"
+      },
+      "err": null
+     },
+     "exhausted": {
+      "plain": "",
+      "meta": {
+       "finish_reason": "length",
+       "completion_tokens": "4096",
+       "reasoning_chars": "0",
+       "content_chunks": "0",
+       "elapsed": "6.465499973273836e-05"
+      },
+      "err": null
+     },
+     "ollama": {
+      "plain": "hello",
+      "meta": {
+       "finish_reason": "length",
+       "completion_tokens": "77",
+       "reasoning_chars": "0",
+       "content_chunks": "5",
+       "elapsed": "8.659899958729511e-05"
+      },
+      "err": null
+     },
+     "finish_on_content_then_usage": {
+      "plain": "{\"verdict\": \"rejected\", \"reason\": \"already handled\"}",
+      "meta": {
+       "finish_reason": "stop",
+       "completion_tokens": "31",
+       "reasoning_chars": "0",
+       "content_chunks": "4",
+       "elapsed": "0.0001249389997610706"
+      },
+      "err": null
+     },
+     "usage_inline_on_finish": {
+      "plain": "",
+      "meta": {
+       "finish_reason": "length",
+       "completion_tokens": "4096",
+       "reasoning_chars": "0",
+       "content_chunks": "0",
+       "elapsed": "5.4254999668046366e-05"
+      },
+      "err": null
+     }
+    }
+   },
+   "error": null,
+   "wall": 0.01
+  },
+  "K1_ollama_transport_then_verdict": {
+   "scenario": "K1_ollama_transport_then_verdict",
+   "worktree": "ideal-4ee7a28",
+   "checks": [
+    {
+     "name": "K1.ollama transport-empty \u00d72 then verdict: REJECTED",
+     "ok": true,
+     "detail": "{'candidate 0': 'rejected'}"
+    },
+    {
+     "name": "K1.ollama 3 calls, same params",
+     "ok": true,
+     "detail": "calls=3 [(None, None)]"
+    },
+    {
+     "name": "K1.ollama presence_empty_transport==1",
+     "ok": true,
+     "detail": "1"
+    },
+    {
+     "name": "K1.ollama payload carries no stream_options",
+     "ok": true,
+     "detail": "[['messages', 'model', 'options', 'stream', 'think']]"
+    },
+    {
+     "name": "K1.ollama classification line kind=transport",
+     "ok": true,
+     "detail": "['Gate1._check_presence [candidate 0]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.0s']"
+    }
+   ],
+   "info": {
+    "outcome": {
+     "candidate 0": "rejected"
+    },
+    "counters": {
+     "existence": 0,
+     "presence_confirmed": 0,
+     "presence_rejected": 1,
+     "presence_fail_closed": 0,
+     "presence_unknown": 0,
+     "presence_reask": 0,
+     "presence_empty_transport": 1,
+     "presence_empty_exhausted": 0,
+     "presence_nothink_ignored": 0,
+     "duplicate": 0,
+     "non_py": 0
+    },
+    "split_line": "existence=0 presence_confirmed=0 presence_rejected=1 presence_fail_closed=0 presence_unknown=0 presence_reask=0 presence_empty_transport=1 presence_empty_exhausted=0 presence_nothink_ignored=0 duplicate=0 non_py=0",
+    "calls": {
+     "tools/c0.py": 3
+    },
+    "params": {
+     "tools/c0.py": [
+      [
+       null,
+       null
+      ],
+      [
+       null,
+       null
+      ],
+      [
+       null,
+       null
+      ]
+     ]
+    },
+    "sleeps": [
+     0.0,
+     0.0
+    ],
+    "warnings": [
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.0s",
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.0s"
+    ]
+   },
+   "error": null,
+   "wall": 0.03
+  },
+  "K1b_ollama_exhausted_then_verdict": {
+   "scenario": "K1b_ollama_exhausted_then_verdict",
+   "worktree": "ideal-4ee7a28",
+   "checks": [
+    {
+     "name": "K1b.ollama done_reason=length/eval_count=max \u2192 exhausted (2 calls)",
+     "ok": true,
+     "detail": "calls=2 ['Gate1._check_presence [candidate 0]: empty reply \u2014 kind=exhausted finish_reason=length completion_tokens=0 reasoning_chars=0 elapsed=0.0s']"
+    },
+    {
+     "name": "K1b.ollama presence_empty_exhausted==1",
+     "ok": true,
+     "detail": "1"
+    },
+    {
+     "name": "K1b.ollama REJECTED via pinned re-ask",
+     "ok": true,
+     "detail": "{'candidate 0': 'rejected'}"
+    }
+   ],
+   "info": {
+    "outcome": {
+     "candidate 0": "rejected"
+    },
+    "counters": {
+     "existence": 0,
+     "presence_confirmed": 0,
+     "presence_rejected": 1,
+     "presence_fail_closed": 0,
+     "presence_unknown": 0,
+     "presence_reask": 1,
+     "presence_empty_transport": 0,
+     "presence_empty_exhausted": 1,
+     "presence_nothink_ignored": 0,
+     "duplicate": 0,
+     "non_py": 0
+    },
+    "split_line": "existence=0 presence_confirmed=0 presence_rejected=1 presence_fail_closed=0 presence_unknown=0 presence_reask=1 presence_empty_transport=0 presence_empty_exhausted=1 presence_nothink_ignored=0 duplicate=0 non_py=0",
+    "calls": {
+     "tools/c0.py": 2
+    },
+    "params": {
+     "tools/c0.py": [
+      [
+       null,
+       null
+      ],
+      [
+       null,
+       null
+      ]
+     ]
+    },
+    "sleeps": [],
+    "warnings": [
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=exhausted finish_reason=length completion_tokens=0 reasoning_chars=0 elapsed=0.0s"
+    ]
+   },
+   "error": null,
+   "wall": 0.03
+  },
+  "K2_usage_inline_on_finish_chunk": {
+   "scenario": "K2_usage_inline_on_finish_chunk",
+   "worktree": "ideal-4ee7a28",
+   "checks": [
+    {
+     "name": "K2.usage inline on finish chunk: completion_tokens read \u2192 exhausted",
+     "ok": true,
+     "detail": "['Gate1._check_presence [candidate 0]: empty reply \u2014 kind=exhausted finish_reason=stop completion_tokens=4096 reasoning_chars=0 elapsed=0.0s']"
+    },
+    {
+     "name": "K2.2 calls (no transport retry)",
+     "ok": true,
+     "detail": "2"
+    },
+    {
+     "name": "K2.classification line shows completion_tokens=4096",
+     "ok": true,
+     "detail": "['Gate1._check_presence [candidate 0]: empty reply \u2014 kind=exhausted finish_reason=stop completion_tokens=4096 reasoning_chars=0 elapsed=0.0s']"
+    }
+   ],
+   "info": {
+    "outcome": {
+     "candidate 0": "rejected"
+    },
+    "counters": {
+     "existence": 0,
+     "presence_confirmed": 0,
+     "presence_rejected": 1,
+     "presence_fail_closed": 0,
+     "presence_unknown": 0,
+     "presence_reask": 1,
+     "presence_empty_transport": 0,
+     "presence_empty_exhausted": 1,
+     "presence_nothink_ignored": 0,
+     "duplicate": 0,
+     "non_py": 0
+    },
+    "split_line": "existence=0 presence_confirmed=0 presence_rejected=1 presence_fail_closed=0 presence_unknown=0 presence_reask=1 presence_empty_transport=0 presence_empty_exhausted=1 presence_nothink_ignored=0 duplicate=0 non_py=0",
+    "calls": {
+     "tools/c0.py": 2
+    },
+    "params": {
+     "tools/c0.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.1
+      ]
+     ]
+    },
+    "sleeps": [],
+    "warnings": [
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=exhausted finish_reason=stop completion_tokens=4096 reasoning_chars=0 elapsed=0.0s"
+    ]
+   },
+   "error": null,
+   "wall": 0.03
+  },
+  "K4_bonus_reasoning_key_openrouter": {
+   "scenario": "K4_bonus_reasoning_key_openrouter",
+   "worktree": "ideal-4ee7a28",
+   "checks": [
+    {
+     "name": "K4.bonus: OpenRouter `reasoning` delta key counted as reasoning (\u2192 exhausted)",
+     "ok": true,
+     "detail": "['Gate1._check_presence [candidate 0]: empty reply \u2014 kind=exhausted finish_reason=stop completion_tokens=12 reasoning_chars=230 elapsed=0.0s']"
+    }
+   ],
+   "info": {
+    "outcome": {
+     "candidate 0": "rejected"
+    },
+    "counters": {
+     "existence": 0,
+     "presence_confirmed": 0,
+     "presence_rejected": 1,
+     "presence_fail_closed": 0,
+     "presence_unknown": 0,
+     "presence_reask": 1,
+     "presence_empty_transport": 0,
+     "presence_empty_exhausted": 1,
+     "presence_nothink_ignored": 1,
+     "duplicate": 0,
+     "non_py": 0
+    },
+    "split_line": "existence=0 presence_confirmed=0 presence_rejected=1 presence_fail_closed=0 presence_unknown=0 presence_reask=1 presence_empty_transport=0 presence_empty_exhausted=1 presence_nothink_ignored=1 duplicate=0 non_py=0",
+    "calls": {
+     "tools/c0.py": 2
+    },
+    "params": {
+     "tools/c0.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.1
+      ]
+     ]
+    },
+    "sleeps": [],
+    "warnings": [
+     "provider streams reasoning_content despite think=false \u2014 the no-think request is not honoured by http://stub.local:1337/v1/test-model; empty replies from this model are exhaustion, not transport",
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=exhausted finish_reason=stop completion_tokens=12 reasoning_chars=230 elapsed=0.0s"
+    ],
+    "K4.kind": [
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=exhausted finish_reason=stop completion_tokens=12 reasoning_chars=230 elapsed=0.0s"
+    ]
+   },
+   "error": null,
+   "wall": 0.03
+  },
+  "K5_transport_then_garbled_forever": {
+   "scenario": "K5_transport_then_garbled_forever",
+   "worktree": "ideal-4ee7a28",
+   "checks": [
+    {
+     "name": "K5.transport then garbled forever: 7 calls (retry + full fast grid, no pin)",
+     "ok": true,
+     "detail": "[(4096, 0.0), (4096, 0.0), (4096, 0.1), (8192, 0.0), (8192, 0.1), (16384, 0.0), (16384, 0.1)]"
+    },
+    {
+     "name": "K5.presence_empty_transport==1",
+     "ok": true,
+     "detail": "1"
+    },
+    {
+     "name": "K5.ends UNKNOWN 'garbled'",
+     "ok": true,
+     "detail": "(\"Gate1[presence] UNKNOWN 'candidate 0' \u2014 presence unknown \u2014 provider gave no verdict after 5 re-ask(s\", 'Gate1._check_presence [candidate 0]: verdict still unparseable after 5 re-ask(s) (mode=fast) \u2014 no ve')"
+    },
+    {
+     "name": "K5.nudge on the ladder re-asks (garbled path unchanged)",
+     "ok": true,
+     "detail": "[False, False, True, True, True, True, True]"
+    },
+    {
+     "name": "K5.no nudge on the transport retry",
+     "ok": true,
+     "detail": "False"
+    }
+   ],
+   "info": {
+    "outcome": {
+     "candidate 0": "unknown-kept"
+    },
+    "counters": {
+     "existence": 0,
+     "presence_confirmed": 0,
+     "presence_rejected": 0,
+     "presence_fail_closed": 0,
+     "presence_unknown": 1,
+     "presence_reask": 0,
+     "presence_empty_transport": 1,
+     "presence_empty_exhausted": 0,
+     "presence_nothink_ignored": 0,
+     "duplicate": 0,
+     "non_py": 0
+    },
+    "split_line": "existence=0 presence_confirmed=0 presence_rejected=0 presence_fail_closed=0 presence_unknown=1 presence_reask=0 presence_empty_transport=1 presence_empty_exhausted=0 presence_nothink_ignored=0 duplicate=0 non_py=0",
+    "calls": {
+     "tools/c0.py": 7
+    },
+    "params": {
+     "tools/c0.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.1
+      ],
+      [
+       8192,
+       0.0
+      ],
+      [
+       8192,
+       0.1
+      ],
+      [
+       16384,
+       0.0
+      ],
+      [
+       16384,
+       0.1
+      ]
+     ]
+    },
+    "sleeps": [
+     0.0
+    ],
+    "warnings": [
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.0s",
+     "Gate1._parse_presence_response [candidate 0]: JSON decode failed (Expecting value: line 1 column 1 (char 0)) \u2014 failing closed  raw=Sure! The problem is present, I think. verdict: maybe",
+     "Gate1._parse_presence_response [candidate 0]: JSON decode failed (Expecting value: line 1 column 1 (char 0)) \u2014 failing closed  raw=Sure! The problem is present, I think. verdict: maybe",
+     "Gate1._parse_presence_response [candidate 0]: JSON decode failed (Expecting value: line 1 column 1 (char 0)) \u2014 failing closed  raw=Sure! The problem is present, I think. verdict: maybe",
+     "Gate1._parse_presence_response [candidate 0]: JSON decode failed (Expecting value: line 1 column 1 (char 0)) \u2014 failing closed  raw=Sure! The problem is present, I think. verdict: maybe",
+     "Gate1._parse_presence_response [candidate 0]: JSON decode failed (Expecting value: line 1 column 1 (char 0)) \u2014 failing closed  raw=Sure! The problem is present, I think. verdict: maybe",
+     "Gate1._parse_presence_response [candidate 0]: JSON decode failed (Expecting value: line 1 column 1 (char 0)) \u2014 failing closed  raw=Sure! The problem is present, I think. verdict: maybe",
+     "Gate1._check_presence [candidate 0]: verdict still unparseable after 5 re-ask(s) (mode=fast) \u2014 no verdict, ending unknown: garbled: JSON decode failed (Expecting value: line 1 column 1 (char 0)) \u2014 fai",
+     "Gate1[presence] UNKNOWN 'candidate 0' \u2014 presence unknown \u2014 provider gave no verdict after 5 re-ask(s): garbled: JSON decode failed (Expecting value: line 1 column 1 (char 0)) \u2014 failing closed"
+    ]
+   },
+   "error": null,
+   "wall": 0.03
+  },
+  "K6_transport_then_exhausted_then_verdict": {
+   "scenario": "K6_transport_then_exhausted_then_verdict",
+   "worktree": "ideal-4ee7a28",
+   "checks": [
+    {
+     "name": "K6.transport \u2192 exhausted \u2192 verdict: REJECTED",
+     "ok": true,
+     "detail": "{'candidate 0': 'rejected'}"
+    },
+    {
+     "name": "K6.presence_unknown==0",
+     "ok": true,
+     "detail": "0"
+    }
+   ],
+   "info": {
+    "outcome": {
+     "candidate 0": "rejected"
+    },
+    "counters": {
+     "existence": 0,
+     "presence_confirmed": 0,
+     "presence_rejected": 1,
+     "presence_fail_closed": 0,
+     "presence_unknown": 0,
+     "presence_reask": 1,
+     "presence_empty_transport": 1,
+     "presence_empty_exhausted": 0,
+     "presence_nothink_ignored": 0,
+     "duplicate": 0,
+     "non_py": 0
+    },
+    "split_line": "existence=0 presence_confirmed=0 presence_rejected=1 presence_fail_closed=0 presence_unknown=0 presence_reask=1 presence_empty_transport=1 presence_empty_exhausted=0 presence_nothink_ignored=0 duplicate=0 non_py=0",
+    "calls": {
+     "tools/c0.py": 3
+    },
+    "params": {
+     "tools/c0.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.1
+      ]
+     ]
+    },
+    "sleeps": [
+     0.0
+    ],
+    "warnings": [
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.0s",
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=exhausted finish_reason=length completion_tokens=4096 reasoning_chars=0 elapsed=0.0s"
+    ],
+    "K6.calls": [
+     [
+      4096,
+      0.0,
+      false
+     ],
+     [
+      4096,
+      0.0,
+      false
+     ],
+     [
+      4096,
+      0.1,
+      false
+     ]
+    ],
+    "K6.kinds": [
+     "transport fi",
+     "exhausted fi"
+    ]
+   },
+   "error": null,
+   "wall": 0.03
+  },
+  "K7_elapsed_measured": {
+   "scenario": "K7_elapsed_measured",
+   "worktree": "ideal-4ee7a28",
+   "checks": [
+    {
+     "name": "K7.elapsed in classification line is measured (>=0.1s for a 0.15s stream)",
+     "ok": true,
+     "detail": "[0.2]"
+    }
+   ],
+   "info": {
+    "outcome": {
+     "candidate 0": "rejected"
+    },
+    "counters": {
+     "existence": 0,
+     "presence_confirmed": 0,
+     "presence_rejected": 1,
+     "presence_fail_closed": 0,
+     "presence_unknown": 0,
+     "presence_reask": 0,
+     "presence_empty_transport": 1,
+     "presence_empty_exhausted": 0,
+     "presence_nothink_ignored": 0,
+     "duplicate": 0,
+     "non_py": 0
+    },
+    "split_line": "existence=0 presence_confirmed=0 presence_rejected=1 presence_fail_closed=0 presence_unknown=0 presence_reask=0 presence_empty_transport=1 presence_empty_exhausted=0 presence_nothink_ignored=0 duplicate=0 non_py=0",
+    "calls": {
+     "tools/c0.py": 2
+    },
+    "params": {
+     "tools/c0.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.0
+      ]
+     ]
+    },
+    "sleeps": [
+     0.0
+    ],
+    "warnings": [
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.2s"
+    ]
+   },
+   "error": null,
+   "wall": 0.18
+  },
+  "E3_stream_options_400_openai_wording": {
+   "scenario": "E3_stream_options_400_openai_wording",
+   "worktree": "ideal-4ee7a28",
+   "checks": [
+    {
+     "name": "E3.OpenAI wording 'Unknown parameter: stream_options' \u2192 stripped",
+     "ok": true,
+     "detail": "[True, None]"
+    },
+    {
+     "name": "E3.candidate 0 REJECTED",
+     "ok": true,
+     "detail": "{'candidate 0': 'rejected', 'candidate 1': 'rejected'}"
+    },
+    {
+     "name": "E3.candidate 1 never sends it",
+     "ok": true,
+     "detail": "[None]"
+    }
+   ],
+   "info": {
+    "outcome": {
+     "candidate 0": "rejected",
+     "candidate 1": "rejected"
+    },
+    "counters": {
+     "existence": 0,
+     "presence_confirmed": 0,
+     "presence_rejected": 2,
+     "presence_fail_closed": 0,
+     "presence_unknown": 0,
+     "presence_reask": 0,
+     "presence_empty_transport": 0,
+     "presence_empty_exhausted": 0,
+     "presence_nothink_ignored": 0,
+     "duplicate": 0,
+     "non_py": 0
+    },
+    "split_line": "existence=0 presence_confirmed=0 presence_rejected=2 presence_fail_closed=0 presence_unknown=0 presence_reask=0 presence_empty_transport=0 presence_empty_exhausted=0 presence_nothink_ignored=0 duplicate=0 non_py=0",
+    "calls": {
+     "tools/c0.py": 2,
+     "tools/c1.py": 1
+    },
+    "params": {
+     "tools/c0.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.0
+      ]
+     ],
+     "tools/c1.py": [
+      [
+       4096,
+       0.0
+      ]
+     ]
+    },
+    "sleeps": [],
+    "warnings": [
+     "request_completion: HTTP 400 from http://stub.local:1337/v1/chat/completions: provider does not support 'stream_options' (streamed usage reporting, RUN-9) \u2014 disabling it for this endpoint for the rest"
+    ]
+   },
+   "error": null,
+   "wall": 0.04
+  },
+  "E4_unrelated_400_keeps_stream_options": {
+   "scenario": "E4_unrelated_400_keeps_stream_options",
+   "worktree": "ideal-4ee7a28",
+   "checks": [
+    {
+     "name": "E4.unrelated 400: stream_options NOT stripped for later calls",
+     "ok": true,
+     "detail": "[True]"
+    },
+    {
+     "name": "E4.unrelated 400: candidate 0 ends UNKNOWN (LLM call failed)",
+     "ok": true,
+     "detail": "{'candidate 0': 'unknown-kept', 'candidate 1': 'rejected'}"
+    },
+    {
+     "name": "E4.unrelated 400: retry still carried stream_options",
+     "ok": true,
+     "detail": "[True, True]"
+    },
+    {
+     "name": "E4.candidate 1 REJECTED",
+     "ok": true,
+     "detail": "{'candidate 0': 'unknown-kept', 'candidate 1': 'rejected'}"
+    }
+   ],
+   "info": {
+    "outcome": {
+     "candidate 0": "unknown-kept",
+     "candidate 1": "rejected"
+    },
+    "counters": {
+     "existence": 0,
+     "presence_confirmed": 0,
+     "presence_rejected": 1,
+     "presence_fail_closed": 0,
+     "presence_unknown": 1,
+     "presence_reask": 0,
+     "presence_empty_transport": 0,
+     "presence_empty_exhausted": 0,
+     "presence_nothink_ignored": 0,
+     "duplicate": 0,
+     "non_py": 0
+    },
+    "split_line": "existence=0 presence_confirmed=0 presence_rejected=1 presence_fail_closed=0 presence_unknown=1 presence_reask=0 presence_empty_transport=0 presence_empty_exhausted=0 presence_nothink_ignored=0 duplicate=0 non_py=0",
+    "calls": {
+     "tools/c0.py": 2,
+     "tools/c1.py": 1
+    },
+    "params": {
+     "tools/c0.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.0
+      ]
+     ],
+     "tools/c1.py": [
+      [
+       4096,
+       0.0
+      ]
+     ]
+    },
+    "sleeps": [
+     0.0
+    ],
+    "warnings": [
+     "Gate1._check_presence [candidate 0]: LLM call failed (HTTP 400 from http://stub.local:1337/v1/chat/completions: {\"error\": {\"message\": \"The model `test-model` does not exist\", \"type\": \"invalid_request_",
+     "Gate1._check_presence: LLM call failed: HTTP 400 from http://stub.local:1337/v1/chat/completions: {\"error\": {\"message\": \"The model `test-model` does not exist\", \"type\": \"invalid_request_error\"}} (afte",
+     "Gate1[presence] UNKNOWN 'candidate 0' \u2014 presence unknown \u2014 provider gave no verdict after 0 re-ask(s): LLM call failed: HTTP 400 from http://stub.local:1337/v1/chat/completions: {\"error\": {\"message\": "
+    ]
+   },
+   "error": null,
+   "wall": 0.03
+  },
+  "H2_cap_legit_strict": {
+   "scenario": "H2_cap_legit_strict",
+   "worktree": "ideal-4ee7a28",
+   "checks": [
+    {
+     "name": "H2.strict+cap: cap line exists (legit cap use)",
+     "ok": true,
+     "detail": "2"
+    },
+    {
+     "name": "H2.strict+cap: every cap line is followed by a re-ask at max_tokens=8192",
+     "ok": true,
+     "detail": "[]"
+    },
+    {
+     "name": "H2.strict+cap: no request above 8192",
+     "ok": true,
+     "detail": "[4096, 8192]"
+    }
+   ],
+   "info": {
+    "outcome": {
+     "candidate 0": "unknown-kept"
+    },
+    "counters": {
+     "existence": 0,
+     "presence_confirmed": 0,
+     "presence_rejected": 0,
+     "presence_fail_closed": 0,
+     "presence_unknown": 1,
+     "presence_reask": 0,
+     "presence_empty_transport": 0,
+     "presence_empty_exhausted": 0,
+     "presence_nothink_ignored": 0,
+     "duplicate": 0,
+     "non_py": 0
+    },
+    "split_line": "existence=0 presence_confirmed=0 presence_rejected=0 presence_fail_closed=0 presence_unknown=1 presence_reask=0 presence_empty_transport=0 presence_empty_exhausted=0 presence_nothink_ignored=0 duplicate=0 non_py=0",
+    "calls": {
+     "tools/c0.py": 7
+    },
+    "params": {
+     "tools/c0.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.1
+      ],
+      [
+       8192,
+       0.0
+      ],
+      [
+       8192,
+       0.1
+      ],
+      [
+       8192,
+       0.0
+      ],
+      [
+       8192,
+       0.1
+      ]
+     ]
+    },
+    "sleeps": [],
+    "warnings": [
+     "Gate1._parse_presence_response [candidate 0]: JSON decode failed (Expecting value: line 1 column 1 (char 0)) \u2014 failing closed  raw=Sure! The problem is present, I think. verdict: maybe",
+     "Gate1._parse_presence_response [candidate 0]: JSON decode failed (Expecting value: line 1 column 1 (char 0)) \u2014 failing closed  raw=Sure! The problem is present, I think. verdict: maybe",
+     "Gate1._parse_presence_response [candidate 0]: JSON decode failed (Expecting value: line 1 column 1 (char 0)) \u2014 failing closed  raw=Sure! The problem is present, I think. verdict: maybe",
+     "Gate1._parse_presence_response [candidate 0]: JSON decode failed (Expecting value: line 1 column 1 (char 0)) \u2014 failing closed  raw=Sure! The problem is present, I think. verdict: maybe",
+     "Gate1._parse_presence_response [candidate 0]: JSON decode failed (Expecting value: line 1 column 1 (char 0)) \u2014 failing closed  raw=Sure! The problem is present, I think. verdict: maybe",
+     "Gate1._parse_presence_response [candidate 0]: JSON decode failed (Expecting value: line 1 column 1 (char 0)) \u2014 failing closed  raw=Sure! The problem is present, I think. verdict: maybe",
+     "Gate1._parse_presence_response [candidate 0]: JSON decode failed (Expecting value: line 1 column 1 (char 0)) \u2014 failing closed  raw=Sure! The problem is present, I think. verdict: maybe",
+     "Gate1._check_presence [candidate 0]: verdict still unparseable after 6 re-ask(s) (mode=strict) \u2014 no verdict, ending unknown: garbled: JSON decode failed (Expecting value: line 1 column 1 (char 0)) \u2014 f",
+     "Gate1[presence] UNKNOWN 'candidate 0' \u2014 presence unknown \u2014 provider gave no verdict after 6 re-ask(s): garbled: JSON decode failed (Expecting value: line 1 column 1 (char 0)) \u2014 failing closed"
+    ]
+   },
+   "error": null,
+   "wall": 0.03
+  },
+  "C3a_profile_think_true": {
+   "scenario": "C3a_profile_think_true",
+   "worktree": "ideal-4ee7a28",
+   "checks": [
+    {
+     "name": "C3a.profile think=true (gate1 think=false): think=off rung fires",
+     "ok": true,
+     "detail": "off=[2] n=3"
+    },
+    {
+     "name": "C3a.calls go to the profile model",
+     "ok": true,
+     "detail": "profile-model"
+    },
+    {
+     "name": "C3a.REJECTED from the think=off call",
+     "ok": true,
+     "detail": "{'candidate 0': 'rejected'}"
+    }
+   ],
+   "info": {
+    "outcome": {
+     "candidate 0": "rejected"
+    },
+    "counters": {
+     "existence": 0,
+     "presence_confirmed": 0,
+     "presence_rejected": 1,
+     "presence_fail_closed": 0,
+     "presence_unknown": 0,
+     "presence_reask": 1,
+     "presence_empty_transport": 0,
+     "presence_empty_exhausted": 1,
+     "presence_nothink_ignored": 0,
+     "duplicate": 0,
+     "non_py": 0
+    },
+    "split_line": "existence=0 presence_confirmed=0 presence_rejected=1 presence_fail_closed=0 presence_unknown=0 presence_reask=1 presence_empty_transport=0 presence_empty_exhausted=1 presence_nothink_ignored=0 duplicate=0 non_py=0",
+    "calls": {
+     "tools/c0.py": 3
+    },
+    "params": {
+     "tools/c0.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.1
+      ],
+      [
+       4096,
+       0.0
+      ]
+     ]
+    },
+    "sleeps": [],
+    "warnings": [
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=exhausted finish_reason=length completion_tokens=4096 reasoning_chars=0 elapsed=0.0s",
+     "Gate1._parse_presence_response [candidate 0]: JSON decode failed (Expecting value: line 1 column 1 (char 0)) \u2014 failing closed  raw=",
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=exhausted finish_reason=length completion_tokens=4096 reasoning_chars=0 elapsed=0.0s"
+    ]
+   },
+   "error": null,
+   "wall": 0.03
+  },
+  "C3b_profile_think_false": {
+   "scenario": "C3b_profile_think_false",
+   "worktree": "ideal-4ee7a28",
+   "checks": [
+    {
+     "name": "C3b.profile think=false (gate1 think=true): no think=off rung, 2 calls",
+     "ok": true,
+     "detail": "n=2 [True, True]"
+    },
+    {
+     "name": "C3b.ends UNKNOWN exhausted",
+     "ok": true,
+     "detail": "Gate1[presence] UNKNOWN 'candidate 0' \u2014 presence unknown \u2014 provider gave no verdict after 1 re-ask(s): empty (exhausted)"
+    }
+   ],
+   "info": {
+    "outcome": {
+     "candidate 0": "unknown-kept"
+    },
+    "counters": {
+     "existence": 0,
+     "presence_confirmed": 0,
+     "presence_rejected": 0,
+     "presence_fail_closed": 0,
+     "presence_unknown": 1,
+     "presence_reask": 0,
+     "presence_empty_transport": 0,
+     "presence_empty_exhausted": 1,
+     "presence_nothink_ignored": 0,
+     "duplicate": 0,
+     "non_py": 0
+    },
+    "split_line": "existence=0 presence_confirmed=0 presence_rejected=0 presence_fail_closed=0 presence_unknown=1 presence_reask=0 presence_empty_transport=0 presence_empty_exhausted=1 presence_nothink_ignored=0 duplicate=0 non_py=0",
+    "calls": {
+     "tools/c0.py": 2
+    },
+    "params": {
+     "tools/c0.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.1
+      ]
+     ]
+    },
+    "sleeps": [],
+    "warnings": [
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=exhausted finish_reason=length completion_tokens=4096 reasoning_chars=0 elapsed=0.0s",
+     "Gate1._parse_presence_response [candidate 0]: JSON decode failed (Expecting value: line 1 column 1 (char 0)) \u2014 failing closed  raw=",
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=exhausted finish_reason=length completion_tokens=4096 reasoning_chars=0 elapsed=0.0s",
+     "Gate1._check_presence [candidate 0]: verdict still unparseable after 1 re-ask(s) (mode=fast) \u2014 no verdict, ending unknown: empty (exhausted). raw=''",
+     "Gate1[presence] UNKNOWN 'candidate 0' \u2014 presence unknown \u2014 provider gave no verdict after 1 re-ask(s): empty (exhausted)"
+    ]
+   },
+   "error": null,
+   "wall": 0.03
+  },
+  "L1_learned_budget_reused_by_transport_retry": {
+   "scenario": "L1_learned_budget_reused_by_transport_retry",
+   "worktree": "ideal-4ee7a28",
+   "checks": [
+    {
+     "name": "L1.learned budget (8192) reused by every transport retry",
+     "ok": true,
+     "detail": "[8192, 8192, 8192]"
+    },
+    {
+     "name": "L1.candidate 1 REJECTED",
+     "ok": true,
+     "detail": "{'candidate 0': 'rejected', 'candidate 1': 'rejected'}"
+    },
+    {
+     "name": "L1.candidate 0 learned at 8192 (precondition)",
+     "ok": true,
+     "detail": "[4096, 4096, 8192, 8192]"
+    }
+   ],
+   "info": {
+    "outcome": {
+     "candidate 0": "rejected",
+     "candidate 1": "rejected"
+    },
+    "counters": {
+     "existence": 0,
+     "presence_confirmed": 0,
+     "presence_rejected": 2,
+     "presence_fail_closed": 0,
+     "presence_unknown": 0,
+     "presence_reask": 1,
+     "presence_empty_transport": 1,
+     "presence_empty_exhausted": 0,
+     "presence_nothink_ignored": 0,
+     "duplicate": 0,
+     "non_py": 0
+    },
+    "split_line": "existence=0 presence_confirmed=0 presence_rejected=2 presence_fail_closed=0 presence_unknown=0 presence_reask=1 presence_empty_transport=1 presence_empty_exhausted=0 presence_nothink_ignored=0 duplicate=0 non_py=0",
+    "calls": {
+     "tools/c0.py": 4,
+     "tools/c1.py": 3
+    },
+    "params": {
+     "tools/c0.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.1
+      ],
+      [
+       8192,
+       0.0
+      ],
+      [
+       8192,
+       0.1
+      ]
+     ],
+     "tools/c1.py": [
+      [
+       8192,
+       0.0
+      ],
+      [
+       8192,
+       0.0
+      ],
+      [
+       8192,
+       0.0
+      ]
+     ]
+    },
+    "sleeps": [
+     0.0,
+     0.0
+    ],
+    "warnings": [
+     "Gate1._parse_presence_response [candidate 0]: JSON decode failed (Expecting value: line 1 column 1 (char 0)) \u2014 failing closed  raw=Sure! The problem is present, I think. verdict: maybe",
+     "Gate1._parse_presence_response [candidate 0]: JSON decode failed (Expecting value: line 1 column 1 (char 0)) \u2014 failing closed  raw=Sure! The problem is present, I think. verdict: maybe",
+     "Gate1._parse_presence_response [candidate 0]: JSON decode failed (Expecting value: line 1 column 1 (char 0)) \u2014 failing closed  raw=Sure! The problem is present, I think. verdict: maybe",
+     "Gate1._check_presence [candidate 1]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.0s",
+     "Gate1._check_presence [candidate 1]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.0s"
+    ]
+   },
+   "error": null,
+   "wall": 0.03
+  },
+  "L2_L3_reask_count_and_trace": {
+   "scenario": "L2_L3_reask_count_and_trace",
+   "worktree": "ideal-4ee7a28",
+   "checks": [
+    {
+     "name": "L2.UNKNOWN reason counts ladder re-asks only ('after 1 re-ask(s)')",
+     "ok": true,
+     "detail": "Gate1[presence] UNKNOWN 'candidate 0' \u2014 presence unknown \u2014 provider gave no verdict after 1 re-ask(s): empty (transport)"
+    },
+    {
+     "name": "L3.trace: one llm_request event per HTTP call (4)",
+     "ok": true,
+     "detail": "4"
+    },
+    {
+     "name": "L3.trace: one llm_response event per HTTP call (4)",
+     "ok": true,
+     "detail": "4"
+    },
+    {
+     "name": "L3.trace: llm_request params carry the candidate title",
+     "ok": true,
+     "detail": "[{'source': 'gate1', 'target': 'llm', 'kind': 'llm_request', 'params': {'model': 'test-model', 'candidate': 'candidate 0'}, 'content': 'Claimed problem: fix the problem described in the claim\\n\\nLocation: tools/c0.py, symbol=\\'parse_config_0\\'\\n\\nCode at that location:\\n```\\ndef parse_config_0(raw):"
+    }
+   ],
+   "info": {
+    "outcome": {
+     "candidate 0": "unknown-kept"
+    },
+    "counters": {
+     "existence": 0,
+     "presence_confirmed": 0,
+     "presence_rejected": 0,
+     "presence_fail_closed": 0,
+     "presence_unknown": 1,
+     "presence_reask": 0,
+     "presence_empty_transport": 1,
+     "presence_empty_exhausted": 0,
+     "presence_nothink_ignored": 0,
+     "duplicate": 0,
+     "non_py": 0
+    },
+    "split_line": "existence=0 presence_confirmed=0 presence_rejected=0 presence_fail_closed=0 presence_unknown=1 presence_reask=0 presence_empty_transport=1 presence_empty_exhausted=0 presence_nothink_ignored=0 duplicate=0 non_py=0",
+    "calls": {
+     "tools/c0.py": 4
+    },
+    "params": {
+     "tools/c0.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.1
+      ]
+     ]
+    },
+    "sleeps": [
+     0.0,
+     0.0
+    ],
+    "warnings": [
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.0s",
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.0s",
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.0s",
+     "Gate1._parse_presence_response [candidate 0]: JSON decode failed (Expecting value: line 1 column 1 (char 0)) \u2014 failing closed  raw=",
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.0s",
+     "Gate1._check_presence [candidate 0]: verdict still unparseable after 1 re-ask(s) (mode=fast) \u2014 no verdict, ending unknown: empty (transport). raw=''",
+     "Gate1[presence] UNKNOWN 'candidate 0' \u2014 presence unknown \u2014 provider gave no verdict after 1 re-ask(s): empty (transport)"
+    ]
+   },
+   "error": null,
+   "wall": 0.03
+  },
+  "L4_elapsed_per_call": {
+   "scenario": "L4_elapsed_per_call",
+   "worktree": "ideal-4ee7a28",
+   "checks": [
+    {
+     "name": "L4.elapsed is per call, not cumulative (every logged value 0.1\u20130.3s)",
+     "ok": true,
+     "detail": "[0.2, 0.2]"
+    }
+   ],
+   "info": {
+    "outcome": {
+     "candidate 0": "rejected"
+    },
+    "counters": {
+     "existence": 0,
+     "presence_confirmed": 0,
+     "presence_rejected": 1,
+     "presence_fail_closed": 0,
+     "presence_unknown": 0,
+     "presence_reask": 0,
+     "presence_empty_transport": 1,
+     "presence_empty_exhausted": 0,
+     "presence_nothink_ignored": 0,
+     "duplicate": 0,
+     "non_py": 0
+    },
+    "split_line": "existence=0 presence_confirmed=0 presence_rejected=1 presence_fail_closed=0 presence_unknown=0 presence_reask=0 presence_empty_transport=1 presence_empty_exhausted=0 presence_nothink_ignored=0 duplicate=0 non_py=0",
+    "calls": {
+     "tools/c0.py": 3
+    },
+    "params": {
+     "tools/c0.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.0
+      ]
+     ]
+    },
+    "sleeps": [
+     0.0,
+     0.0
+    ],
+    "warnings": [
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.2s",
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.2s"
+    ]
+   },
+   "error": null,
+   "wall": 0.33
+  },
+  "K8_404_during_transport_retry": {
+   "scenario": "K8_404_during_transport_retry",
+   "worktree": "ideal-4ee7a28",
+   "checks": [
+    {
+     "name": "K8.404 during a transport retry: filter() does not raise",
+     "ok": true,
+     "detail": "{'candidate 0': 'rejected'}"
+    },
+    {
+     "name": "K8.404 is never turned into a REJECTED verdict (RUN-5 shape kept)",
+     "ok": true,
+     "detail": "rejected calls=3"
+    },
+    {
+     "name": "K8.soft: outer llm_call_retry gives the candidate one more chance \u2192 REJECTED",
+     "ok": true,
+     "detail": "rejected calls=3"
+    }
+   ],
+   "info": {
+    "outcome": {
+     "candidate 0": "rejected"
+    },
+    "counters": {
+     "existence": 0,
+     "presence_confirmed": 0,
+     "presence_rejected": 1,
+     "presence_fail_closed": 0,
+     "presence_unknown": 0,
+     "presence_reask": 0,
+     "presence_empty_transport": 1,
+     "presence_empty_exhausted": 0,
+     "presence_nothink_ignored": 0,
+     "duplicate": 0,
+     "non_py": 0
+    },
+    "split_line": "existence=0 presence_confirmed=0 presence_rejected=1 presence_fail_closed=0 presence_unknown=0 presence_reask=0 presence_empty_transport=1 presence_empty_exhausted=0 presence_nothink_ignored=0 duplicate=0 non_py=0",
+    "calls": {
+     "tools/c0.py": 3
+    },
+    "params": {
+     "tools/c0.py": [
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.0
+      ],
+      [
+       4096,
+       0.0
+      ]
+     ]
+    },
+    "sleeps": [
+     0.0,
+     0.0
+    ],
+    "warnings": [
+     "Gate1._check_presence [candidate 0]: empty reply \u2014 kind=transport finish_reason=stop completion_tokens=0 reasoning_chars=0 elapsed=0.0s",
+     "Gate1._check_presence [candidate 0]: LLM call failed (HTTP 404 from http://stub.local:1337/v1/chat/completions: not found) \u2014 retrying in 0s (attempt 1/1)."
+    ],
+    "K8.outcome": {
+     "candidate 0": "rejected"
+    },
+    "K8.calls": 3
+   },
+   "error": null,
+   "wall": 0.03
+  },
+  "I5_stream_options_only_when_streaming": {
+   "scenario": "I5_stream_options_only_when_streaming",
+   "worktree": "ideal-4ee7a28",
+   "checks": [
+    {
+     "name": "I5.stream=False request carries NO stream_options (OpenAI 400s otherwise)",
+     "ok": true,
+     "detail": "None"
+    },
+    {
+     "name": "I5.stream=True request carries stream_options.include_usage",
+     "ok": true,
+     "detail": "{'include_usage': True}"
+    },
+    {
+     "name": "I6.on_token still receives every content piece",
+     "ok": true,
+     "detail": "(4, '{\"verdict\": \"rejected\", \"reason\": \"alrea')"
+    },
+    {
+     "name": "I6.non-stream text unchanged",
+     "ok": true,
+     "detail": "{\"verdict\": \"rejected\", \"reason\": \"already handled\"}"
+    }
+   ],
+   "info": {
+    "build_chat_request_has_stream_param": true
+   },
+   "error": null,
+   "wall": 0.01
+  }
  }
 }
