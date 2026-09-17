@@ -639,6 +639,7 @@ class Coder(_llm_stream.LLMClientBase):
                 on_token=_coder_on_token,
                 api_format=self._api_format,
                 ssl_context=self._ssl_context,
+                **self._retry_kwargs,
             )
             raw_text = raw_text or "".join(_coder_tokens)
             print("\n" + "═" * 80 + "\n")
@@ -702,6 +703,7 @@ class Coder(_llm_stream.LLMClientBase):
                         on_token=_probe_on_token,
                         api_format=self._api_format,
                         ssl_context=self._ssl_context,
+                        **self._retry_kwargs,
                     )
                     raw_text = raw_text or "".join(_probe_tokens)
                     print("\n" + "═" * 80 + "\n")

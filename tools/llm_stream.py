@@ -22,6 +22,16 @@ from dataclasses import dataclass
 logger = logging.getLogger(__name__)
 
 
+# AUTO-RATE-1 / RUN-10: the HTTP retry budget every auto-mode caller passes
+# through. These three are request_completion()'s signature defaults (below)
+# and the numbers retry_kwargs_from_config() falls back to when a .ini has no
+# [loop] error_retries / error_retry_wait_sec / max_retry_after_sec — so a
+# config without the keys still gets byte-for-byte AUTO-RATE-1 behaviour.
+DEFAULT_ERROR_RETRIES = 60
+DEFAULT_ERROR_RETRY_WAIT_SEC = 10.0
+DEFAULT_MAX_RETRY_AFTER_SEC = 180.0
+
+
 @dataclass
 class CompletionMeta:
     """RUN-9: what a completed chat call actually did, alongside its text.
@@ -864,8 +874,21 @@ class LLMClientBase:
     TaskRewriter: the connection fields and SSL context are identical
     across all four; each subclass adds its own model/prompt settings."""
 
+    # RUN-10: the [loop] retry budget, resolved in __init__ below. The class
+    # default is empty on purpose: an object built with object.__new__() (a
+    # couple of tests bypass __init__) keeps calling request_completion() with
+    # no retry kwargs at all, which is byte-identical to the pre-RUN-10
+    # behaviour, instead of losing the call to an AttributeError.
+    _retry_kwargs: dict = {}
+
     def __init__(self, config, base_url: str, api_key: str, model: str,
                  api_format: str = "openai", verify_ssl: bool = True) -> None:
+        # RUN-10: the [loop] HTTP retry budget, resolved once here so every
+        # request_completion() call in Coder, Gate1Filter, ClusterReviewer
+        # and TaskRewriter passes the same error_retries /
+        # error_retry_wait_sec / max_retry_after_sec instead of silently
+        # inheriting request_completion()'s built-ins.
+        self._retry_kwargs = retry_kwargs_from_config(config)
         self._config     = config
         self._base_url   = base_url.rstrip("/")
         self._api_key    = api_key
@@ -1131,10 +1154,79 @@ def build_chat_request(
     return url, headers, payload
 
 
+def _retry_value(config, section: str, key: str, default, cast):
+    """Read one retry knob out of *section*; never raises.
+
+    A *missing* config, section or key gives *default* — that is what a
+    config without the keys gets today, so adding the keys changes nothing
+    for existing profiles. A *present but unparseable* value logs the RUN-9
+    warning (``config [loop] error_retries is malformed (…) — using default
+    60``) and falls back to that one key's default only, leaving the other
+    two keys intact. A negative value is clamped to zero: a budget of "-5"
+    attempts or "-1.0" seconds is nonsense, not a request to skip retrying.
+    """
+    if config is None:
+        return default
+    try:
+        raw = config.get(section, key, fallback=None)
+    except Exception as exc:  # noqa: BLE001 - fail-open by contract
+        logger.warning(
+            "config [%s] %s could not be read (%s) — using default %s",
+            section, key, exc, default,
+        )
+        return default
+    if raw is None:
+        return default
+    try:
+        value = cast(raw)
+    except (TypeError, ValueError) as exc:
+        logger.warning(
+            "config [%s] %s is malformed (%s) — using default %s",
+            section, key, exc, default,
+        )
+        return default
+    # A type-matched floor: max(0, 0.0) returns the int 0, which would turn a
+    # float knob into an int silently.
+    return max(0 if cast is int else 0.0, value)
+
+
+def retry_kwargs_from_config(config, section: str = "loop") -> dict:
+    """The auto-mode HTTP retry budget, resolved once from *section*.
+
+    RUN-10: request_completion() has carried its own retry budget since
+    AUTO-RATE-1 — 60 extra attempts, 10 s apart, on a Retry-After capped at
+    180 s — and every auto-mode caller (architect, Gate 1, coder, Gate 2
+    validator, story bible, summary memory) silently inherited it. This is
+    the one reader for the three [loop] keys that make it visible, read the
+    same way [loop] timeout_seconds already is:
+
+        retry_kwargs = retry_kwargs_from_config(config)
+        _llm_stream.request_completion(url, headers, payload,
+                                       timeout=self._timeout, **retry_kwargs)
+
+    Returns ``{"error_retries": int, "error_retry_wait_sec": float,
+    "max_retry_after_sec": float}`` — splat it straight into
+    request_completion(). [collect] is deliberately NOT read here: the Pass B
+    summarizer has its own three keys and defaults (2 / 60 / 180).
+    """
+    return {
+        "error_retries": _retry_value(
+            config, section, "error_retries", DEFAULT_ERROR_RETRIES, int),
+        "error_retry_wait_sec": _retry_value(
+            config, section, "error_retry_wait_sec",
+            DEFAULT_ERROR_RETRY_WAIT_SEC, float),
+        "max_retry_after_sec": _retry_value(
+            config, section, "max_retry_after_sec",
+            DEFAULT_MAX_RETRY_AFTER_SEC, float),
+    }
+
+
 def request_completion(url, headers, payload, timeout, stream=False, on_token=None,
                        api_format: str = "openai", ssl_context: "ssl.SSLContext | None" = None,
-                       error_retries: int = 60, error_retry_wait_sec: float = 10.0,
-                       max_retry_after_sec: float = 180.0, on_retry=None,
+                       error_retries: int = DEFAULT_ERROR_RETRIES,
+                       error_retry_wait_sec: float = DEFAULT_ERROR_RETRY_WAIT_SEC,
+                       max_retry_after_sec: float = DEFAULT_MAX_RETRY_AFTER_SEC,
+                       on_retry=None,
                        _sleep_fn=None, on_meta=None):
     """
     POST a chat-completions request and return the assistant message text.

@@ -1708,6 +1708,7 @@ class Gate1Filter(_llm_stream.LLMClientBase):
                 api_format=self._presence_api_format,
                 ssl_context=self._presence_ssl_context,
                 on_meta=_meta_box.append,
+                **self._retry_kwargs,
             )
             cleaned = strip_think(text)
             meta = _meta_box[0] if _meta_box else None

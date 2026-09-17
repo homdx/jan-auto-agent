@@ -800,6 +800,10 @@ def _make_llm_call(
     think_effort    = settings.think_effort
 
     timeout = safe_getint(config, "loop", "timeout_seconds", fallback=300)
+    # RUN-10: the [loop] HTTP retry budget, read the same way as the timeout
+    # above — one reader for every auto-mode caller, request_completion()'s
+    # built-in defaults when the keys are absent.
+    retry_kwargs = _llm_stream.retry_kwargs_from_config(config)
 
     ssl_context: ssl.SSLContext | None = _llm_stream.make_unverified_context() if not verify_ssl else None
 
@@ -857,6 +861,7 @@ def _make_llm_call(
                 timeout=timeout,
                 api_format=api_format,
                 ssl_context=ssl_context,
+                **retry_kwargs,
             ) or ""
         )
 

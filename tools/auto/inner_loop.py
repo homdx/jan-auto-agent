@@ -320,6 +320,13 @@ class LLMGate2Validator:
     Any network / parse error returns ``(False, "validator unavailable: …")``.
     """
 
+    # RUN-10: the [loop] retry budget for this validator's own call, resolved
+    # in __init__ below. Empty on purpose at class level: several tests build
+    # the validator with object.__new__() and hand it only the attributes they
+    # need, and those stay on request_completion()'s built-in budget exactly as
+    # they were before RUN-10, instead of losing the call to an AttributeError.
+    _retry_kwargs: dict = {}
+
     def __init__(
         self,
         base_url:   str  = "http://localhost:1337/v1",
@@ -368,6 +375,13 @@ class LLMGate2Validator:
         self.max_tokens  = int(max_tokens)
         self.task_mode   = str(task_mode)
         self._config     = config
+        # RUN-10: the [loop] HTTP retry budget for this validator's own
+        # request_completion() call — read once here, next to the timeout the
+        # make_inner_loop factory resolves from the same [loop] section. A
+        # None config (a directly constructed validator, as tests do) gives
+        # request_completion()'s built-in defaults.
+        from tools.llm_stream import retry_kwargs_from_config
+        self._retry_kwargs = retry_kwargs_from_config(config)
         # AUTO-FIX (fable follow-up): Gate-2 in code/docs mode requires
         # strict JSON with no soft-parse fallback (see AUTO-BUG-10) — a
         # thinking model truncated mid-<think> here fails closed exactly
@@ -758,6 +772,7 @@ class LLMGate2Validator:
                     timeout=self.timeout,
                     api_format=self.api_format,
                     ssl_context=self.ssl_context,
+                    **self._retry_kwargs,
                 )
                 return strip_think(_r or "")
 

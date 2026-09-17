@@ -150,5 +150,5 @@ def test_ac_real_repo_reference_sites_are_all_registered():
     registry = build_fail_open_registry(modules, root=REPO_ROOT)
     locations = fail_open_locations(registry)
     assert "tools/auto/auto_metrics.py:263" in locations  # NOTE: line tracks _warn_if_contaminated's corrupt-file swallow (documented rationale); update if it shifts (250 → 259: RUN-7's unavailable= plumbing; → 263: RUN-8's unavailable_stage note)
-    assert "tools/auto/coder.py:1290" in locations  # NOTE: line tracks the dup_reject_ratio config-fallback bare except (was :834's _extract_missing_context, fixed — now logs, correctly dropped out); update if it shifts (→ 1290: RUN-8's error_kind docstrings)
-    assert "tools/auto/inner_loop.py:513" in locations  # NOTE: line tracks _fetch_needed_flat's bare except (449 → 488: RUN-7 docstring keys, defaults and the retry loop); update if it shifts (→ 513: RUN-8's InnerLoopResult fields)
+    assert "tools/auto/coder.py:1292" in locations  # NOTE: line tracks the dup_reject_ratio config-fallback bare except (was :834's _extract_missing_context, fixed — now logs, correctly dropped out); update if it shifts (→ 1290: RUN-8's error_kind docstrings; → 1292: RUN-10's retry kwargs)
+    assert "tools/auto/inner_loop.py:527" in locations  # NOTE: line tracks _fetch_needed_flat's bare except (449 → 488: RUN-7 docstring keys, defaults and the retry loop); update if it shifts (→ 513: RUN-8's InnerLoopResult fields; → 527: RUN-10's retry kwargs)

@@ -1408,6 +1408,7 @@ class ClusterReviewer(_llm_stream.LLMClientBase):
                         on_token=streaming_callback,
                         api_format=self._api_format,
                         ssl_context=self._ssl_context,
+                        **self._retry_kwargs,
                     )
                     # request_completion returns the full accumulated response; prefer it
                     # and fall back to the streamed tokens if the return is empty.
@@ -2757,6 +2758,7 @@ class TaskRewriter(_llm_stream.LLMClientBase):
                 timeout=self._timeout,
                 api_format=self._api_format,
                 ssl_context=self._ssl_context,
+                **self._retry_kwargs,
             )
         except Exception as exc:
             logger.warning("TaskRewriter: LLM call failed for task %r: %s",
