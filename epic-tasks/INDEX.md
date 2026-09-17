@@ -1,4 +1,4 @@
-# Epic round — 38 tickets, in order
+# Epic round — 39 tickets, in order
 
 One ticket per round. Every agent does the same ticket against the same
 tree; you merge the winner; the next round starts from the merged tree.
@@ -44,6 +44,7 @@ The loop and the scorecard: `docs/collect-epics/RUN-THE-EPIC-COMPETITION.md`.
 | 36 | `RUN-8` | landed (the commit after `97983d8`) | HIGH | S | [36-run8-a-transport-failure-mid-stream-is-charged-to-the-coder.md](36-run8-a-transport-failure-mid-stream-is-charged-to-the-coder.md) | `tools/auto/coder.py` |
 | 37 | `RUN-9` | **landed** (`4ee7a28`) | HIGH | M | [37-run9-an-empty-presence-reply-is-not-a-garbled-verdict.md](37-run9-an-empty-presence-reply-is-not-a-garbled-verdict.md) | `tools/auto/gate1_filter.py` |
 | 38 | `RUN-10` | queued — after the RUN-9 live verification; no contest, by hand | MEDIUM | S | [38-run10-the-http-retry-budget-of-every-auto-mode-call-is-hard-wired.md](38-run10-the-http-retry-budget-of-every-auto-mode-call-is-hard-wired.md) | `tools/llm_stream.py` |
+| 39 | `RUN-11` | queued — after the RUN-9 live verification; no contest, by hand | MEDIUM | S | [39-run11-a-ctrl-c-during-collect-pass-b-loses-every-summary-already-paid-for.md](39-run11-a-ctrl-c-during-collect-pass-b-loses-every-summary-already-paid-for.md) | `tools/collect/cli.py` |
 
 ## Next rounds — the order (as of `6ca675c`, 2026-09-14; step 1 landed — `7135844` (+`5788423`, `d4ffb12`); step 2 landed — RUN-3; step 3 landed — `ade28e6`; step 4 landed — RUN-5)
 
