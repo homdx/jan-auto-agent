@@ -279,7 +279,20 @@ _NOT_A_PATH = (" ", "\t", "\n", "|", ">", "<", "&", ";", "`")
 
 
 def _pathlike(text: str) -> bool:
-    return not any(ch in text for ch in _NOT_A_PATH)
+    """True only for a value that *names* a path, not a bare command word.
+
+    A single-token destructive command (``reboot``, ``shutdown``) has none
+    of the ``_NOT_A_PATH`` shell-syntax characters, so the old space/pipe
+    check alone let it through: ``Path("reboot").resolve()`` lands under
+    this process's cwd, reads as "inside the worktree", and the mechanical
+    layer auto-approves a reboot without ever consulting ``deny_commands``
+    or the gate. A real path is always absolute or explicitly relative
+    (``/...``, ``~...``, ``./...``, ``../...``); anything else — including
+    every bare command word — is judged as a command instead.
+    """
+    if any(ch in text for ch in _NOT_A_PATH):
+        return False
+    return text.startswith(("/", "~", "./", "../"))
 
 
 def _extract_paths(props: dict) -> list:
