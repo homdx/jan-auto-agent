@@ -1,6 +1,6 @@
 # KC-6 — `tools/contest/runner.py`: prompt → wait → harvest → rework, in the same session, for N agents at once, resumable
 
-**Status:** queued — after KC-5 (round 44); needs KC-1, KC-2, KC-3, KC-4, KC-5. Written against `67e834d`.  
+**Status:** queued — after KC-5 (round 44); needs KC-1, KC-2, KC-3, KC-4, KC-5. Written against `docs/kilo-contest/PROBE.md`.  
 **Severity:** CRITICAL  
 **File:** `tools/contest/runner.py` (new)  
 **Symbol:** `AgentRun`, `AgentState`, `run_agent`, `run_round`, `round_prompt`, `RoundState`  

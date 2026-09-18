@@ -1,6 +1,6 @@
 # KC-9 — A session that went idle without finishing is nudged with `continue` — same session, bounded
 
-**Status:** queued — after KC-6 (round 45); lands before KC-7 is run live. Written against `f069f07`.  
+**Status:** queued — after KC-6 (round 45); lands before KC-7 is run live. Written against `docs/kilo-contest/PROBE.md`.  
 **Severity:** HIGH  
 **File:** `tools/contest/runner.py`  
 **Symbol:** `run_agent` (the `WAITING → HARVESTING` edge), `classify_idle`, `CONTINUE_PROMPT`, `IdleKind`  

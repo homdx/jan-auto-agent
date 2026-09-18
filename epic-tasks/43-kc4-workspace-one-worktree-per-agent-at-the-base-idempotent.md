@@ -1,6 +1,6 @@
 # KC-4 — `tools/contest/workspace.py` + `scripts/contest_reset.sh`: one worktree (or clone) per agent at the base commit, again and again
 
-**Status:** queued — after KC-2 (round 41); independent of KC-3. Written against `67e834d`.  
+**Status:** queued — after KC-2 (round 41); independent of KC-3. Written against `docs/kilo-contest/PROBE.md`.  
 **Severity:** HIGH  
 **File:** `tools/contest/workspace.py` (new)  
 **Symbol:** `Workspace`, `prepare_round`, `reset_worktree`, `attach_clone`, `WorkspaceError`  
@@ -63,7 +63,7 @@ means removing everything by hand first.
 5. **`scripts/contest_reset.sh`** — the operator's one-liner:
    `scripts/contest_reset.sh <round> [base_ref] [--clone name=path …] [--force-clone]`
    → `python3 -m tools.contest.workspace …` and prints one line per
-   agent: `laguna  ../rounds/40-laguna  contest/40/laguna  @ 67e834d  (worktree, fresh)`.
+   agent: `laguna  ../rounds/40-laguna  contest/40/laguna  @ <base_ref>  (worktree, fresh)`.
    The last word is `fresh` | `reset` | `clone`.
 
 6. **`remove_round(repo, config, round_no)`** — `git worktree remove --force`

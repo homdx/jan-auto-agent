@@ -1,12 +1,12 @@
 # KC-1 — `tools/contest/kilo_client.py`: the probe's five primitives as a module, and a fake Kilo server to test against
 
-**Status:** landed — `3edbab1` (ideal patch from a 4-entry contest, `kc1/*.patch`: DeepSeek-Flash-v4-1, LagunaS-2-1, SenSenova6-7-var2, SenSenova6-8 — two more submissions never touched `kilo_client.py` and one failed to apply, both dropped before scoring. Winner SenSenova6-8 taken as-is: own tests, symbol/stdlib/print static checks, and code read on `EventTap.stop()` — the ticket's hardest bullet — found DeepSeek closes the SSE response from the wrong thread (CPython deadlock risk) and LagunaS-2-1 never closes it at all (thread outlives the call, violating "stop() ... closes the response so the thread ends"); only SenSenova6-7-var2 and SenSenova6-8 use a read-side `socket.shutdown()`, and 6-8 also uses `time.monotonic()` for the timeout and keeps `tool_parts()` shaped exactly as spec'd (var2 flattens `state`, off-spec). `tests` + `tests_bugfix` green on `tickets`.)  
+**Status:** landed — ideal patch from a 4-entry contest, `kc1/*.patch`: DeepSeek-Flash-v4-1, LagunaS-2-1, SenSenova6-7-var2, SenSenova6-8 — two more submissions never touched `kilo_client.py` and one failed to apply, both dropped before scoring. Winner SenSenova6-8 taken as-is: own tests, symbol/stdlib/print static checks, and code read on `EventTap.stop()` — the ticket's hardest bullet — found DeepSeek closes the SSE response from the wrong thread (CPython deadlock risk) and LagunaS-2-1 never closes it at all (thread outlives the call, violating "stop() ... closes the response so the thread ends"); only SenSenova6-7-var2 and SenSenova6-8 use a read-side `socket.shutdown()`, and 6-8 also uses `time.monotonic()` for the timeout and keeps `tool_parts()` shaped exactly as spec'd (var2 flattens `state`, off-spec). `tests` + `tests_bugfix` green. Re-verified live against all three real models — see `docs/kilo-contest/PROBE.md`'s "KC-1 module re-verified live" section.  
 **Severity:** HIGH  
 **File:** `tools/contest/kilo_client.py` (new)  
 **Symbol:** `KiloServer`, `KiloClient`, `EventTap`, `find_kilo_binary`, `SessionRef`  
 **Round:** 40  
 **Size:** M  
-**Source:** `scripts/kilo_hello.py` (commit `67e834d`) and `docs/kilo-contest/PROBE.md`. The script proved, live, everything this module must do: spawn `kilo serve` and wait for `/global/health`; `POST /session?directory=` with `{"providerID","id"}` and a `permission` rule list; `POST /session/{id}/prompt_async` with `{"providerID","modelID"}`; an SSE tap on `GET /event?directory=` consumed from a cursor; `POST /permission/{id}/reply` (`once|reject`, `message`); `GET /session/{id}/message` and its `tool` parts; `GET /session/{id}/diff`; `POST /session/{id}/abort`. The script is a probe; the contest needs the same calls as a class with no `print`, no `sys.exit`, and a test double.  
+**Source:** `scripts/kilo_hello.py` and `docs/kilo-contest/PROBE.md`. The script proved, live, everything this module must do: spawn `kilo serve` and wait for `/global/health`; `POST /session?directory=` with `{"providerID","id"}` and a `permission` rule list; `POST /session/{id}/prompt_async` with `{"providerID","modelID"}`; an SSE tap on `GET /event?directory=` consumed from a cursor; `POST /permission/{id}/reply` (`once|reject`, `message`); `GET /session/{id}/message` and its `tool` parts; `GET /session/{id}/diff`; `POST /session/{id}/abort`. The script is a probe; the contest needs the same calls as a class with no `print`, no `sys.exit`, and a test double.  
 **Depends on:** nothing.  
 **Also touches:** `tools/contest/__init__.py` (new, empty), `tests/_kilo_fake.py` (new: the fake server), `tests/test_contest_kilo_client.py` (new), `scripts/kilo_hello.py` (unchanged — it stays a standalone probe; do not make it import the module)
 
@@ -130,7 +130,7 @@ not from `/event`.
       with the recorded keys.
 - [ ] `tests/test_contest_kilo_client.py` covers the eight cases above;
       all carry the `port_bound_http_servers` group.
-- [ ] `scripts/kilo_hello.py` is untouched (`git diff 67e834d -- scripts/kilo_hello.py` empty).
+- [ ] `scripts/kilo_hello.py` is untouched (matches the version referenced by `docs/kilo-contest/PROBE.md`, no diff).
 - [ ] `python3 scripts/sync_test_tiers.py` run; `python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180` green (sequentially).
 
 ## Out of scope

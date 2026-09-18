@@ -1,6 +1,6 @@
 # KC-3 — `tools/contest/policy.py`: every permission is decided — by the rules, by geometry, or by a second model; never by silence
 
-**Status:** queued — after KC-2 (round 41). Written against `67e834d`.  
+**Status:** queued — after KC-2 (round 41). Written against `docs/kilo-contest/PROBE.md`.  
 **Severity:** CRITICAL (this is the thing that lets N agents run unattended)  
 **File:** `tools/contest/policy.py` (new)  
 **Symbol:** `Policy`, `Decision`, `PolicyContext`, `decide`, `_mechanical`, `_ask_gate`, `GATE_SYSTEM_PROMPT`  

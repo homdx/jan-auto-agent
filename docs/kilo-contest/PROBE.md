@@ -105,6 +105,23 @@ With `"reply": "once"`: `status=completed output="removed '/tmp/testfile'\n"`.
    `GET /session/{id}/message`, and the fact of an edit shows up as
    `file.edited` + `session.diff`.
 
+## KC-1 module re-verified live (2026-09-18)
+
+`tools/contest/kilo_client.py` (the module built from this probe) was run
+live against a real `kilo` server and all three models, independently of
+`kilo_hello.py`: same two-turn same-session flow (write `hello.txt`, then
+append a line) plus the `rm -v` outside-directory boundary check, using
+`KiloClient`/`EventTap`/`wait_idle` as shipped. All three passed —
+`session.idle` observed on both turns, file content correct,
+`permission.asked` fired and `reject` was honored on the boundary turn.
+
+Timings (turn 1 / turn 2, seconds to idle): laguna 13.8 / 23.2, mistral
+15.8 / 15.6, hy3 16.8 / 19.2 — consistent with the original probe numbers
+above. `tool_parts()` per model: laguna and hy3 both did
+`write → read → edit`, mistral did `write → edit` only. Boundary permission
+count: laguna 2, mistral 2, hy3 1 (mistral's retry-with-`workdir` behaviour
+noted in fact 3 above still holds).
+
 ## Side observations
 
 - The VS Code extension keeps its own `kilo serve --port 0` processes

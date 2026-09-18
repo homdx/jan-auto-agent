@@ -1,6 +1,6 @@
 # KC-11 — Each roster model is probed once: the highest thinking variant that answers `hello` is the one the round uses, saved next to the roster
 
-**Status:** queued — after KC-10 (round 49); runs at intake (KC-7). Written against `f069f07`.  
+**Status:** queued — after KC-10 (round 49); runs at intake (KC-7). Written against `docs/kilo-contest/PROBE.md`.  
 **Severity:** MEDIUM  
 **File:** `tools/contest/think_probe.py` (new)  
 **Symbol:** `probe_model`, `ProbeResult`, `load_probe_cache`, `save_probe_cache`, `VARIANT_LADDER`  

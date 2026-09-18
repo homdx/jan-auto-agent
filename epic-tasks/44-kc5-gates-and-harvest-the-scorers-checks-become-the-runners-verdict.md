@@ -1,6 +1,6 @@
 # KC-5 — `tools/contest/gates.py` + `harvest.py`: the checks the round is scored on become the checks the runner sends back
 
-**Status:** queued — after KC-4 (round 43). Written against `67e834d`.  
+**Status:** queued — after KC-4 (round 43). Written against `docs/kilo-contest/PROBE.md`.  
 **Severity:** HIGH  
 **File:** `tools/contest/gates.py` (new), `tools/contest/harvest.py` (new), `scripts/judge_epic_round.py` (becomes a thin wrapper)  
 **Symbol:** `judge_worktree` (moved from `judge_epic_round.judge`), `extract_shrink`, `ticket_for_round`, `harvest`, `Harvest`, `Reason`  
@@ -70,11 +70,11 @@ done; nothing today combines the claim with the facts.
 ## Acceptance
 
 - [ ] Golden test: `scripts/judge_epic_round.py --round 1 --worktree a=… --worktree b=… --csv out.csv`
-      on a temp round produces the same stdout and CSV bytes as at
-      `67e834d` (capture with `git stash`-free method: the test builds the
-      expected strings from the *moved* function and the *old* function
-      imported from `git show 67e834d:scripts/judge_epic_round.py` into a
-      temp module).
+      on a temp round produces the same stdout and CSV bytes as it did
+      before this change (capture with a `git stash`-free method: the test
+      builds the expected strings from the *moved* function and the *old*
+      function imported from a pre-change copy of `scripts/judge_epic_round.py`
+      into a temp module).
 - [ ] `tests/test_contest_harvest.py` on temp worktrees: no
       `PROGRESS.csv` → REWORK `no_progress_row`; a DONE row with a commit
       that is on the branch, one commit, a `tests/test_x.py` in the diff,

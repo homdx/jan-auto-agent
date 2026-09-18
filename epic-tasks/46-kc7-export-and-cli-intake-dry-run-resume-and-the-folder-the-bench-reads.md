@@ -1,6 +1,6 @@
 # KC-7 — `tools/contest/export.py` + `cli.py`: `python3 -m tools.contest run` — intake, the round, and the folder `contest-bench` reads
 
-**Status:** queued — after KC-6 (round 45). Written against `67e834d`.  
+**Status:** queued — after KC-6 (round 45). Written against `docs/kilo-contest/PROBE.md`.  
 **Severity:** HIGH  
 **File:** `tools/contest/cli.py` (new), `tools/contest/export.py` (new), `tools/contest/__main__.py` (new)  
 **Symbol:** `main`, `cmd_run`, `cmd_status`, `intake`, `export_round`, `write_summary`, `write_entrants`  

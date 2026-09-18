@@ -1,6 +1,6 @@
 # KC-10 — Context fill is measured after every turn; at 80 % the session is compacted, not abandoned
 
-**Status:** queued — after KC-9 (round 48). Written against `f069f07`.  
+**Status:** queued — after KC-9 (round 48). Written against `docs/kilo-contest/PROBE.md`.  
 **Severity:** HIGH  
 **File:** `tools/contest/runner.py`, `tools/contest/kilo_client.py`  
 **Symbol:** `KiloClient.model_limit`, `KiloClient.session_tokens`, `KiloClient.compact`, `runner.context_fill`, `runner.maybe_compact`  
