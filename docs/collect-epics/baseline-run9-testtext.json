@@ -1,0 +1,112 @@
+{
+ "taken_at": "2026-09-17T09:23:30+00:00",
+ "runs": [
+  {
+   "run": "testtext",
+   "trace": "trace_11831c8fe70b.jsonl",
+   "trace_files": 3,
+   "head_sha": "fc21fde",
+   "pre_run_sha": "e5d46fc",
+   "switched_mid_run": true,
+   "goal": "",
+   "probe_usable": "True",
+   "probe_reason": "ok",
+   "llm_by_source": {
+    "architect": 22,
+    "gate1": 744,
+    "coder": 246,
+    "search_agent": 34,
+    "task_rewriter": 10,
+    "prompt_optimizer": 17
+   },
+   "gate1": {
+    "requests": 744,
+    "confirmed": 58,
+    "rejected": 216,
+    "unparsed": 470,
+    "unknown": 164,
+    "seconds_per_candidate": 27.1,
+    "empty_transport": 0,
+    "empty_exhausted": 0
+   },
+   "gate1_split": {
+    "run_id": "6b4d312b7187",
+    "existence": "91",
+    "presence_confirmed": "58",
+    "presence_rejected": "216",
+    "presence_fail_closed": "0",
+    "presence_unknown": "164",
+    "presence_reask": "142",
+    "duplicate": "0",
+    "non_py": "0",
+    "accepted": "222",
+    "rejected": "307"
+   },
+   "gate1_location_ext": {
+    ".py:rejected": 213,
+    ".py:confirmed": 58,
+    ".py:unparsed": 463
+   },
+   "gate2": {
+    "REJECTED": 30
+   },
+   "coder": {
+    "REJECTED": 141
+   },
+   "coder_budget_escalations": 2,
+   "coder_budgets": {
+    "3000": 1,
+    "6000": 1,
+    "12000": 139
+   },
+   "probe": {
+    "ops": 2,
+    "hits": 2,
+    "misses": 0,
+    "memo_hits": 0
+   },
+   "probe_by_op": {
+    "module_hit": 2,
+    "module_miss": 0
+   },
+   "collect": {
+    "blocks": 64,
+    "chars": 56628,
+    "memo_hits": 41,
+    "shrink": {
+     "rows": 4
+    },
+    "miss": {},
+    "refresh": {
+     "runs": 1,
+     "ok": 1,
+     "modules": 116,
+     "seconds": 4422.72
+    }
+   },
+   "collect_source": "events",
+   "collect_block_occurrences": 64,
+   "first_ts": "2026-09-16T15:44:26.388580+00:00",
+   "last_ts": "2026-09-17T06:30:16.349386+00:00",
+   "gate1_first_ts": "2026-09-16T17:16:31.388979+00:00",
+   "gate1_last_ts": "2026-09-16T22:51:39.678401+00:00"
+  }
+ ],
+ "totals": {
+  "arch": 22,
+  "g1": 744,
+  "conf": 58,
+  "rej": 216,
+  "unk": 164,
+  "empty_t": 0,
+  "empty_x": 0,
+  "ops": 2,
+  "miss": 0,
+  "blocks": 64,
+  "codesc": 2,
+  "codtransport": 0,
+  "g2rej": 30,
+  "g2err": 0,
+  "g2unavail": 0
+ }
+}

@@ -18,6 +18,7 @@ from tools.collect.ast_facts import extract_all_defined_names
 from tools.collect.model import GuardedAccess, ModuleRecord, Provenance
 from tools.collect.scanner import scan_module
 from tools.collect.verifier import (
+    REASON_CONTRADICTS_GUARD,
     REASON_NO_CITATION,
     REASON_SIBLING_CITATION_FAILED,
     Claim,
@@ -531,6 +532,40 @@ def test_two_location_citations_one_sentence_real_and_out_of_range_both_dropped(
     reasons = {d.reason for d in dropped}
     assert REASON_NO_CITATION in reasons
     assert REASON_SIBLING_CITATION_FAILED in reasons
+
+
+def test_sibling_swept_claim_names_the_real_reason_not_always_citation():
+    """A sentence can fail its *contradiction* check, not its citation check
+    — before this fix the sibling swept into `dropped` alongside it always
+    got the generic "a different citation ... did not verify" detail
+    regardless, mislabeling a contradiction failure as a citation one."""
+    mod_path = "pkg/prompt_store.py"
+    module = ModuleRecord(
+        path=mod_path,
+        guarded_accesses=(
+            GuardedAccess(
+                location=f"{mod_path}:10", access="stack[-1]",
+                guard="early-return at L9", status="GUARDED",
+            ),
+        ),
+    )
+    text = "stack[-1] is accessed here and this sentence also says something else."
+    contradicting = Claim(text=text, module=mod_path, kind="access_crash", access="stack[-1]")
+    generic_sibling = Claim(text=text, module=mod_path, kind="generic")
+
+    kept, dropped = verify_claims(
+        [contradicting, generic_sibling], module=module,
+        known_symbols=frozenset(), line_counts={}, fail_open_locs=frozenset(),
+    )
+    assert kept == []
+    assert len(dropped) == 2
+    by_claim = {d.claim is contradicting: d for d in dropped}
+    origin = by_claim[True]
+    swept = by_claim[False]
+    assert origin.reason == REASON_CONTRADICTS_GUARD
+    assert swept.reason == REASON_SIBLING_CITATION_FAILED
+    assert REASON_CONTRADICTS_GUARD in swept.detail
+    assert origin.detail in swept.detail
 
 
 def test_two_real_citations_one_sentence_both_survive_without_duplicating_text():

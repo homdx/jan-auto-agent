@@ -532,6 +532,7 @@ class TestG2Observability:
             feedback="",       # last inner result on pass has empty feedback
             attempts=2,        # sum of attempts_used across inner_results
             prompt_store=ctrl.auto_tuner.prompt_store,
+            unavailable=False,  # RUN-7: no OuterLoopResult.unavailable on this path
         )
         ctrl.auto_tuner.maybe_tune.assert_called_once()
 

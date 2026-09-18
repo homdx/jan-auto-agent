@@ -62,10 +62,16 @@ This is **not** required to run `--auto`, but when `[collect] use_in_auto
 = true`, both the Architect and Gate 1 get a `CollectBridge` that injects
 grounding context per task — e.g. *"this file already has 90% test
 coverage"* or *"this config key already has a documented fallback"* — which
-measurably reduces false-positive task proposals. Re-run `--collect
---check` to see if the artifact is stale (source changed since last
-build); `--refresh` forces a full rebuild; `--module <path>` patches one
-file incrementally.
+measurably reduces false-positive task proposals. Re-run `--collect` after
+editing the source: it is a no-op (zero writes) while the artifact is fresh,
+and otherwise refreshes incrementally — one LLM call per *changed* module,
+with every unchanged module reusing its existing record. `--check` reports
+staleness without writing anything; `--module <path>` patches one file;
+`--refresh` is the same incremental path without the freshness gate;
+`--rebuild` is the only unconditional full rebuild — one LLM call per module
+in the tree. Conflicting flags resolve in one shared order at both entry
+points (`--collect` and `/collect`): `--check` (writes nothing) beats
+`--module`, which beats `--rebuild`, which beats `--refresh`.
 
 ### 2. Ingest — clustering the repo
 
@@ -312,9 +318,46 @@ work lives):**
   harder, not easier. Restricted to Python files by design (the
   leading-underscore convention doesn't generalise to other languages).
 - **Re-ask on unparseable reply.** A response that isn't valid JSON with a
-  recognised verdict is re-asked once with a stricter nudge before being
-  treated as a genuine failure — this is separate from (and does not
-  bypass) the evidence requirement above.
+  recognised verdict is re-asked with a stricter nudge, climbing a
+  max_tokens/temperature ladder (4096 → 8192 → 16384, each at 0.0 then
+  0.1), before being treated as a genuine failure — this is separate from
+  (and does not bypass) the evidence requirement above. The budget that
+  finally produced a verdict is remembered and the next candidate starts
+  there (`[gate1] unparseable_learn = true`, median of the last
+  `unparseable_learn_window = 8` successes), so a thinking model that
+  always needs 8k does not pay five calls per ticket to rediscover it.
+  The ladder is tunable: `unparseable_retry_mode = fast` never repeats the
+  pair the first call already used and treats an *empty* reply as
+  exhaustion (same tier, other temperature) rather than truncation;
+  `unparseable_max_tokens_cap = 65536` keeps every re-ask under a
+  provider's limit; `unparseable_max_retries` sets the length. Defaults
+  (`strict`, `0`, `6`) are the full ladder.
+- **An empty reply is classified before the ladder runs** (RUN-9). The
+  stream metadata (`finish_reason`, `usage.completion_tokens` — asked for
+  with `stream_options.include_usage`, dropped for the run after one HTTP
+  400 — and any reasoning streamed) tells *exhausted* (`length`, tokens
+  near the cap, reasoning seen: the ladder above, pinned) from *transport*
+  (none of that: HTTP 200 with a role-only chunk from a degraded gateway).
+  A transport-empty is re-issued unchanged — same budget, same
+  temperature, no nudge — up to `[gate1] presence_empty_retries = 2` times
+  before the ladder sees it; a model that said nothing never gets the
+  "your previous reply was not valid JSON" nudge; with `think = true` the
+  last rung of an exhausted ladder goes out with thinking off. The Gate 1
+  split counts `presence_empty_transport` / `presence_empty_exhausted`,
+  and once per provider per run `presence_nothink_ignored` (reasoning
+  streamed despite `think = false`). A candidate that still ends without a
+  verdict says `empty (transport)` / `empty (exhausted)` / `garbled: …`.
+  Before a long run, `python3 scripts/probe_gate1_endpoint.py --config
+  agents_128k.ini` makes two presence-shaped calls against the configured
+  profile and reports what the classification will have to work with
+  there — usage chunk, `stream_options` accepted or stripped, reasoning
+  visible with `think = true`, `think = false` honoured.
+- **Parallel presence checks.** `[gate1] presence_workers = N` (default
+  `1`, sequential) runs N presence checks at once through a thread pool.
+  Each call still honours the provider's 429/Retry-After on its own, and
+  outcomes are applied in candidate order, so plan order and dedup do
+  not change — only the wall clock does. Worth `8`–`10` on a thinking
+  model where an empty reply burns minutes before the re-ask answers.
 - **Collect-context notes** (when `[collect] use_in_auto = true`):
   existing test coverage and documented config-fallback notes, sourced
   from the `--collect` artifact rather than re-derived per call.
@@ -379,6 +422,29 @@ coder (writes/fixes code) → executor (runs acceptance_check) → validator (LL
 
 If the executor fails, the validator is never called — there's no point
 asking an LLM to judge output that's already objectively broken.
+
+What the coder sees from a failed execution is the *diagnostic* end of the
+output. For a pytest run that is the tail: from the last `ERRORS`/`FAILURES`
+box, xdist's `bringing up nodes...` lines stripped, up to 1 500 characters,
+so the `E   ModuleNotFoundError: …` line that says what to fix always
+arrives; for any other command the first 400 characters as before. Exit 5
+is spelled out — *no tests collected — the -k expression matched nothing or
+the file defines no `test_*` function* — instead of an empty stdout. A
+workspace pytest run is one file, so it runs in one process (`-n 0`,
+`[executor] pytest_serial = true` by default) when the project's own
+`addopts` would otherwise start an xdist pool.
+
+A reply that stops mid-JSON was cut by the output budget, not by the
+model: the next attempt of the same task goes out at `max_tokens × 2`, up
+to `[coder] max_tokens_cap` (default 4 × `max_tokens`, so 3000 → 6000 →
+12000 and stops), and the feedback line says *output budget was raised to
+6000 tokens for this attempt* instead of asking the model to shorten a file
+that has to be complete. Only a cut-off climbs — prose or malformed JSON
+gets the same budget again — and the budget that produced a parseable
+reply is remembered on the `Coder` instance, so the next task starts at
+`max(config, learned)`; a new run starts cold. The coder decision events
+carry `max_tokens` / `budget_raised`, which `scripts/trace_round_snapshot.py`
+totals in its `cod esc` column.
 
 Only a task that passes **both** halves is committed. A task that
 exhausts `max_attempts` without passing both stays `pending`/failed in
@@ -473,22 +539,38 @@ that would need its own content-aware checkpoint (same pattern as
 $ python main.py --collect --check
 collect check: no manifest at .../.collect/collect_manifest.json — collect has never run
 
-$ python main.py --collect
-collect collect: built 11 file(s) in .../.collect
+$ python main.py --collect            # nothing to diff against -> full build
+collect collect: no prior artifact to diff against — full build: 493 module(s) re-summarized; wrote 11 file(s) in .../.collect
 
-$ python main.py --collect          # run again, nothing changed
+$ python main.py --collect            # run again, nothing changed
 collect collect: already up to date — nothing to do
 
 $ echo "# comment" >> tools/collect/model.py   # simulate an edit
 $ python main.py --collect --check
 collect check: stale — a tracked file changed since the last collect run
 
-$ python main.py --collect --refresh
-collect refresh: tree unchanged — recomputed derived artifacts only, wrote 11 file(s)
+$ python main.py --collect            # stale tree -> incremental, just the changed module
+collect collect: incrementally refreshed 1 changed module(s); wrote 11 file(s) in .../.collect
+
+$ python main.py --collect            # still fresh -> pure no-op, zero writes
+collect collect: already up to date — nothing to do
+
+$ python main.py --collect --rebuild  # opt into the expensive path: every module
+collect rebuild: 493 module(s) re-summarized; wrote 11 file(s) in .../.collect
 
 $ python main.py --collect --module tools/collect/model.py
 collect module: patched tools/collect/model.py and refreshed 11 file(s)
+
+$ python main.py --collect --rebuild --no-llm   # no Pass B: summaries are kept, not nulled
+collect rebuild: 493 module(s) re-scanned (Pass B skipped; 469 summaries carried forward, 3 marked llm-stale); wrote 12 file(s) in .../.collect
+
+$ python main.py --collect --rebuild --no-llm --drop-summaries   # the structural-only artifact, on request
+collect rebuild: 493 module(s) re-scanned (Pass B skipped; 469 summaries dropped (--drop-summaries), no verification_report.json); wrote 11 file(s) in .../.collect
 ```
+
+`--no-llm` never destroys prose (V8): a module whose source changed since
+Pass B wrote its summary keeps it tagged `provenance: llm-stale`, and the
+next build that does run Pass B re-summarizes exactly those modules.
 
 ### What gets written to `.collect/`
 
@@ -524,9 +606,20 @@ dir             = .collect  # output dir (relative to project root)
 use_in_auto     = false     # wire artifact into /auto (Architect + Gate 1 grounding notes)
 use_in_doc      = false
 use_in_bughunt  = false
-staleness       = warn      # warn | refresh | ignore, on stale reads
+staleness       = warn      # warn | refresh | ignore, on stale reads (not needed with auto_refresh_between_tasks)
 llm_summaries   = true      # false = purely structural, no Pass B LLM prose
+max_context_chars_auto = 1200  # per-task budget for the collect block in a coder prompt
+pack_enabled    = true      # false = only contract / config_read / public_symbols rows (pre-V3 shape)
+auto_refresh_between_tasks = false  # true = repair the modules a task edits (V9) and refresh a stale artifact on entry (RUN-6)
 ```
+
+A stale artifact (its `git_sha` is behind HEAD, or a tracked file changed)
+is not used: `--auto` prints `collect: artifact stale (git_sha …, HEAD …) —
+pack OFF for this session` and every task runs with the standard context.
+Either `staleness = refresh` or `auto_refresh_between_tasks = true` turns
+that into `… — refreshing N module(s)` — the incremental pass, one Pass B
+call per changed module — and the run gets the pack; the trace records it
+as one `collect_refresh` event (`modules`, `seconds`, `ok`).
 
 ### Reading the architect-probe line (AUTO-P / AUTO-P4a)
 

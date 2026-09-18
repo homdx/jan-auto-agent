@@ -15,7 +15,7 @@ adds exactly one write surface: `_write_artifact`/`_write_manifest` below,
 and every path either writes is built from `resolve_collect_dir`, which
 always returns a path under `root / [collect] dir` (default
 `root/.collect`). There is no other `open(..., "w")` / `Path.write_text` /
-`Path.mkdir` anywhere in this module's four actions — that is what makes
+`Path.mkdir` anywhere in this module's five actions — that is what makes
 "collect physically cannot modify a file outside `[collect] dir`" true by
 construction rather than by convention, and what `tests/test_collect_cli.py`
 checks by hashing the whole source tree before/after every action.
@@ -24,9 +24,13 @@ Actions
 -------
 ``check``   — freshness check only (`manifest.is_fresh`). Never writes
               anything, anywhere — matches `--check`'s brief exactly.
-``collect`` — one-shot (`--collect` / `/collect`): build if `.collect/` is
-              missing or stale, otherwise a no-op. This is what running
-              `collect` "just in case" should cost: nothing, once fresh.
+``collect`` — one-shot (`--collect` / `/collect`): freshness-gated. A
+              fresh tree is a no-op (no write of any kind). A stale tree
+              delegates to `action_refresh`, so only the modules whose
+              content hash changed since the last manifest are re-summarized
+              — never the whole tree. This is what running `collect` "just
+              in case" should cost: nothing once fresh, and one Pass B call
+              per *changed* module when something moved.
 ``refresh`` — diff-driven incremental rebuild (`--refresh`), regardless of
               current freshness: Pass A always re-runs (cheap, no LLM),
               but Pass B (`llm_call`) only runs for modules whose content
@@ -34,6 +38,14 @@ Actions
               module's record, summary included, is reused verbatim
               (COLLECT-24). Falls back to a full build when there is no
               prior artifact to diff against.
+``rebuild`` — unconditional full rebuild (`--collect --rebuild` /
+              `/collect --rebuild`): `action_rebuild` → `_full_build`,
+              every module re-scanned and re-summarized regardless of
+              freshness, of which files changed, and of any prior
+              artifact. The deliberate escape hatch (after a
+              `collector_version` bump, or to discard a suspect artifact),
+              not the default — `collect` and `refresh` are both
+              incremental.
 ``module``  — incremental (`--module <path>`): re-scan *only* that file,
               patch its record into the existing artifact (every other
               module's `ModuleRecord` is reused, not re-parsed), and patch
@@ -64,8 +76,8 @@ from tools.collect import risk as risk_mod
 from tools.collect import test_map as test_map_mod
 from tools.collect import verifier as verifier_mod
 from tools.collect._determinism import canonical_dumps
-from tools.collect.model import ModuleRecord
-from tools.collect.scanner import scan_file, scan_repo
+from tools.collect.model import LLMSummary, ModuleRecord, Provenance
+from tools.collect.scanner import language_for, scan_file, scan_repo
 from tools.collect.summarizer import LlmCall, collect_max_retries, summarize_repo
 
 
@@ -82,12 +94,33 @@ def _print_summarize_error(module_path: str, exc: Exception, error_count: int) -
     same progress stream instead of just going quiet for a while."""
     print(f"  ! {module_path}: {exc} (retry {error_count})", flush=True)
 
+
+def _print_summarize_resume(kept: int, dropped: int) -> None:
+    """RUN-11: one line for a Pass B batch that resumed from the checkpoint
+    an interrupted run left behind. `kept` modules attached without an LLM
+    call, `dropped` re-summarised because their source moved (the entry's
+    sha no longer matched). Printed once per run — `summarize_repo` calls
+    the callback before the loop, not per module — so the operator sees the
+    recovery before the `[k/N]` stream, where `N` is what is still owed."""
+    line = (
+        f"[collect] Pass B resumes: {kept} module(s) kept from the interrupted run, "
+        f"{dropped} re-summarised (source changed)"
+    )
+    print(line, flush=True)
+    logger.info("%s", line)
+
 DEFAULT_COLLECT_DIR = ".collect"
 ARTIFACT_FILENAME = "artifact.json"
 MANIFEST_FILENAME = "collect_manifest.json"
 VERIFICATION_REPORT_FILENAME = "verification_report.json"
+# RUN-11: Pass B's checkpoint — every landed summary, one atomic write per
+# module, cleared when the batch completes. The name the summarizer's own
+# checkpoint tests already use. Lives in `[collect] dir`, which is
+# git-ignored and excluded by path from `manifest.is_dirty`, so the file
+# never turns a build's provenance `dirty` on.
+SUMMARIZE_CHECKPOINT_FILENAME = "collect_summarize_state.json"
 
-VALID_ACTIONS = frozenset({"check", "collect", "refresh", "module"})
+VALID_ACTIONS = frozenset({"check", "collect", "refresh", "rebuild", "module"})
 
 
 class CollectCliError(RuntimeError):
@@ -101,8 +134,8 @@ class CollectCliError(RuntimeError):
 @dataclass
 class CollectResult:
     """What every action returns: whether anything was written, why (or
-    why not), and — for `check`/`collect`/`refresh` — the freshness verdict
-    that drove the decision."""
+    why not), and — for `check`/`collect`/`refresh`/`rebuild` — the
+    freshness verdict that drove the decision."""
 
     action: str
     wrote: bool
@@ -245,6 +278,78 @@ class CollectContext:
     config_map: list
     sibling_gaps: list
     verification_report: Optional[Dict[str, Any]]
+    # V8: what happened to Pass B prose on this build. `pass_b_ran` is the
+    # honest flag (`verification_report` alone no longer implies it — Pass
+    # C also runs over carried-forward summaries); the counters feed the
+    # result message so a `--no-llm` build says what it kept.
+    pass_b_ran: bool = False
+    summaries_carried: int = 0
+    summaries_stale: int = 0
+    summaries_dropped: int = 0
+
+
+def _previous_summaries(collect_dir: Path) -> Tuple[Dict[str, LLMSummary], Dict[str, str]]:
+    """V8: every summary the previous artifact holds, by module path, and
+    the previous manifest's file hashes. Read-only, fail-open: an absent,
+    unreadable or malformed artifact/manifest yields empty maps — "nothing
+    to carry forward" is the same outcome as a first-ever build, never an
+    error out of a build that does not need the previous one."""
+    summaries: Dict[str, LLMSummary] = {}
+    hashes: Dict[str, str] = {}
+    artifact_path = collect_dir / ARTIFACT_FILENAME
+    try:
+        payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+        for d in payload.get("modules", []):
+            rec = ModuleRecord.from_dict(d)
+            if rec.summary is not None:
+                summaries[rec.path] = rec.summary
+    except (AttributeError, OSError, ValueError, KeyError, TypeError):
+        return {}, {}
+    previous_manifest, _problem = _read_previous_manifest(collect_dir)
+    if previous_manifest is not None:
+        hashes = dict(previous_manifest.file_hashes)
+    return summaries, hashes
+
+
+def _carry_summaries(
+    modules: List[ModuleRecord],
+    previous: Dict[str, LLMSummary],
+    previous_hashes: Dict[str, str],
+    current_hashes: Dict[str, str],
+) -> Tuple[List[ModuleRecord], int, int]:
+    """V8: attach the previous artifact's summary to every module of
+    `modules` that has none. A module whose content hash differs from the
+    one the previous manifest recorded (or that the manifest did not
+    record at all) gets the prose tagged `llm-stale`; an unchanged module
+    keeps it as it was. Returns `(modules, carried, stale)`."""
+    out: List[ModuleRecord] = []
+    carried = stale = 0
+    for m in modules:
+        prev = previous.get(m.path)
+        if m.summary is not None or prev is None:
+            out.append(m)
+            continue
+        old_hash = previous_hashes.get(m.path)
+        if old_hash is None or old_hash != current_hashes.get(m.path):
+            prev = prev.as_stale()
+        if prev.provenance == Provenance.LLM_STALE:
+            stale += 1
+        carried += 1
+        out.append(m.with_llm_summary(prev))
+    return out, carried, stale
+
+
+def _pass_b_suffix(ctx: "CollectContext") -> str:
+    """The parenthesised tail of a build message when Pass B was skipped:
+    what a `--no-llm` build did with the summaries it did not re-derive."""
+    if ctx.summaries_dropped:
+        return f"; {ctx.summaries_dropped} summaries dropped (--drop-summaries), no {VERIFICATION_REPORT_FILENAME}"
+    if ctx.summaries_carried:
+        return (
+            f"; {ctx.summaries_carried} summaries carried forward, "
+            f"{ctx.summaries_stale} marked llm-stale"
+        )
+    return ""
 
 
 def _sources_for(root: Path, modules: List[ModuleRecord]) -> Dict[str, str]:
@@ -292,12 +397,34 @@ def build_context(
     config: Optional[configparser.ConfigParser] = None,
     config_path: Optional[str] = None,
     llm_call: Optional[LlmCall] = None,
+    checkpoint_path: Optional[Path] = None,
+    hashes: Optional[Dict[str, str]] = None,
 ) -> CollectContext:
     """Run Pass B (only if `llm_call` is given) → Pass C → every EPIC C/D
     builder, over an already-scanned `modules` list. Kept separate from
     `scan_repo` so `--module`'s incremental path can call this over a
-    patched module list without re-scanning the whole tree."""
+    patched module list without re-scanning the whole tree.
+
+    RUN-11: `checkpoint_path` forwards to `summarize_repo`, so a full build
+    whose Pass B dies at module *k* (Ctrl-C, `kill`, an OOM, a lost
+    terminal) leaves the *k − 1* summaries the provider already returned
+    in `<collect dir>/collect_summarize_state.json` instead of nowhere —
+    `_write_artifact` is the only thing that touches `.collect/`, and it
+    runs after Pass C and every builder. The same path is reused by
+    `action_refresh`'s incremental batch, so the whole `.collect/`
+    vocabulary for interrupted Pass B work is one file. `hashes` tags each
+    saved entry with the source hash it was summarized from, so a resume
+    re-derives a summary whose file moved. `None` (the default, and what
+    `action_module` passes by not passing it) means no checkpoint at all —
+    a one-module batch has nothing to resume, and `summarize_repo`'s
+    `clear_state` at the end would otherwise wipe an interrupted full
+    build's checkpoint.
+    """
     sources = _sources_for(root, modules)
+
+    # Built before Pass B/C on purpose: Pass C (V11) needs the import graph
+    # to know what a test file may cite, and a summary changes no import.
+    edges = graph_mod.import_edges(modules)
 
     verification_report: Optional[Dict[str, Any]] = None
     if llm_call is not None:
@@ -306,10 +433,14 @@ def build_context(
             max_retries=collect_max_retries(config),
             progress_fn=_print_summarize_progress,
             on_error=_print_summarize_error,
+            checkpoint_path=checkpoint_path,
+            hashes=hashes,
+            on_resume=_print_summarize_resume,
         )
-        modules, verification_report = verifier_mod.verify_repo(summarized, sources, root=root)
+        modules, verification_report = verifier_mod.verify_repo(
+            summarized, sources, root=root, import_edges=edges,
+        )
 
-    edges = graph_mod.import_edges(modules)
     reverse = graph_mod.imported_by(edges)
     entries = graph_mod.entry_points(edges, reverse)
 
@@ -384,6 +515,18 @@ def _write_artifact(collect_dir: Path, ctx: CollectContext) -> List[str]:
     what happens on failure (still raises — a partial collect artifact is
     a genuine build failure, not something to silently skip past), just
     what the caller sees when it does.
+
+    BUGFIX: `verification_report.json` is the one derived file whose write
+    is conditional (`ctx.verification_report is not None` — Pass B/C only
+    ran when there is something to verify), while every rendered page is
+    rewritten unconditionally. A run where Pass B/C skipped — `--no-llm`,
+    `[collect] llm_summaries = false`, a summarizer that could not be
+    built, or an incremental refresh whose only change was a deletion —
+    therefore left the *previous* run's report sitting next to an
+    `artifact.json` that no longer carries any summary for it to describe:
+    a stale artifact whose presence looks like a claim about the current
+    build. Remove it in that case so the directory contents always describe
+    exactly one build.
     """
     try:
         collect_dir.mkdir(parents=True, exist_ok=True)
@@ -401,13 +544,21 @@ def _write_artifact(collect_dir: Path, ctx: CollectContext) -> List[str]:
     _write(artifact_path, canonical_dumps(_artifact_dict(ctx), check_forbidden=False) + "\n")
     written.append(ARTIFACT_FILENAME)
 
+    report_path = collect_dir / VERIFICATION_REPORT_FILENAME
     if ctx.verification_report is not None:
-        report_path = collect_dir / VERIFICATION_REPORT_FILENAME
         _write(
             report_path,
             json.dumps(ctx.verification_report, indent=2, sort_keys=True, ensure_ascii=False) + "\n",
         )
         written.append(VERIFICATION_REPORT_FILENAME)
+    elif report_path.exists():
+        # A failed delete is a nuisance, not a build failure: the run's
+        # own artifact is already written and correct, and one stale derived
+        # report should not turn a cosmetic leftover into an aborted collect.
+        try:
+            report_path.unlink()
+        except OSError as exc:
+            logger.warning("could not remove stale %s: %s", report_path, exc)
 
     pages = render_mod.render_all(
         modules=ctx.modules,
@@ -437,44 +588,116 @@ def _write_manifest(
     modules: List[ModuleRecord],
     *,
     provenance: Optional[Tuple[Optional[str], bool]] = None,
+    file_hashes: Optional[Dict[str, str]] = None,
 ) -> None:
     """`provenance`, if given, must be a `(git_sha, dirty)` pair captured
     via `manifest_mod.capture_provenance(root)` *before* `_write_artifact`
-    ran — see that function's docstring for why the ordering matters."""
+    ran — see that function's docstring for why the ordering matters.
+
+    `file_hashes`, if given, is the `{path: sha256}` map the caller already
+    computed for this same set of modules, reused instead of re-hashing the
+    tree here (see `manifest.build_manifest`)."""
     files = sorted(m.path for m in modules)
-    manifest = manifest_mod.build_manifest(root, files, provenance=provenance)
+    manifest = manifest_mod.build_manifest(
+        root, files, provenance=provenance, file_hashes=file_hashes,
+    )
     manifest_mod.write_manifest(manifest, collect_dir / MANIFEST_FILENAME)
 
 
-# ── the four actions ─────────────────────────────────────────────────────────
+# ── the five actions ─────────────────────────────────────────────────────────
+
+
+def _read_previous_manifest(collect_dir: Path) -> Tuple[Optional[manifest_mod.Manifest], Optional[str]]:
+    """The previous run's manifest, or why there isn't one.
+
+    Returns `(manifest, None)` when it read, `(None, None)` when the file
+    simply isn't there yet (collect has never run), and `(None, reason)`
+    when it is there but can't be used — that last case is the one that
+    used to be indistinguishable from "never run" to every caller, so a
+    build that had to fall back to a full rebuild reported "no prior
+    artifact to diff against" for a manifest that was sitting right there,
+    unreadable.
+
+    `Manifest.from_dict` converts every malformed shape it can hit (missing
+    key, a non-dict JSON root) into `ValueError`, so `(OSError, ValueError)`
+    is the complete guard — matching the four existing call sites.
+    """
+    path = collect_dir / MANIFEST_FILENAME
+    if not path.exists():
+        return None, None
+    try:
+        return manifest_mod.read_manifest(path), None
+    except (OSError, ValueError) as exc:
+        return None, f"{path} is unreadable ({exc})"
+
+
+def _freshness(
+    root: Path, config: Optional[configparser.ConfigParser],
+) -> Tuple[CollectResult, Optional[List[ModuleRecord]], Optional[Dict[str, str]]]:
+    """The one freshness verdict — what `--check` reports and what
+    `--collect` gates on — plus the Pass A scan and `{path: sha256}` map it
+    cost, so a stale `--collect` hands them to `action_refresh` instead of
+    scanning and hashing the same tree a second time. Both are `None` when
+    the verdict needed neither (no manifest, an unreadable one, a manifest
+    whose artifact is gone): the refresh that follows scans for itself.
+
+    One function for both callers on purpose: `action_collect` used to ask
+    `action_check` for the verdict and then `action_refresh` re-derived the
+    same scan, and a later fix that inlined the gate into `action_collect`
+    would have left two copies of the rules to drift apart — which is how
+    the artifact test below was missing from one of them.
+
+    BUGFIX: the manifest records the tree's hashes; the artifact is the model
+    the hashes point at. The loader (`_load_model`) and `action_refresh` both
+    treat the pair as a unit, but the verdict read only the manifest — so a
+    manifest whose `artifact.json` had been deleted (hand-cleaned
+    `.collect/`, a build that died mid-write) reported "up to date" against
+    an unchanged tree, and `action_collect`, trusting that, printed "already
+    up to date — nothing to do" and wrote nothing: a state nothing else
+    would ever repair, with the consumer handed no artifact at all. A
+    manifest with no artifact beside it is not fresh; it is absent.
+    """
+    collect_dir = resolve_collect_dir(root, config)
+    manifest_path = collect_dir / MANIFEST_FILENAME
+    artifact_path = collect_dir / ARTIFACT_FILENAME
+
+    def _verdict(fresh: bool, message: str) -> CollectResult:
+        return CollectResult(action="check", wrote=False, fresh=fresh, message=message, collect_dir=collect_dir)
+
+    existing, manifest_problem = _read_previous_manifest(collect_dir)
+    if manifest_problem is not None:
+        return _verdict(False, f"manifest {manifest_problem} — treat as stale"), None, None
+    if existing is None:
+        return _verdict(False, f"no manifest at {manifest_path} — collect has never run"), None, None
+    if not artifact_path.exists():
+        return _verdict(
+            False,
+            f"manifest present at {manifest_path} but the artifact at "
+            f"{artifact_path} is missing — needs a full rebuild",
+        ), None, None
+
+    modules = scan_repo(root, config=config)
+    hashes = manifest_mod.hash_tree(root, [m.path for m in modules])
+    fresh = manifest_mod.is_fresh(existing, root, files=[m.path for m in modules], hashes=hashes)
+    if fresh:
+        reason = "up to date"
+    elif existing.collector_version != manifest_mod.COLLECTOR_VERSION:
+        # No file changed at all — the reason is the schema, and the old
+        # blanket message claimed the opposite of what was true.
+        reason = (
+            f"stale — manifest was built by collector_version="
+            f"{existing.collector_version!r}, current is {manifest_mod.COLLECTOR_VERSION!r}"
+        )
+    else:
+        reason = "stale — a tracked file changed since the last collect run"
+    return _verdict(fresh, reason), modules, hashes
 
 
 def action_check(root: Path, *, config: Optional[configparser.ConfigParser] = None) -> CollectResult:
     """`--check`: freshness only. Never writes — not the manifest, not the
-    artifact, nothing — regardless of what it finds."""
-    collect_dir = resolve_collect_dir(root, config)
-    manifest_path = collect_dir / MANIFEST_FILENAME
-    if not manifest_path.exists():
-        return CollectResult(
-            action="check", wrote=False, fresh=False,
-            message=f"no manifest at {manifest_path} — collect has never run",
-            collect_dir=collect_dir,
-        )
-    try:
-        existing = manifest_mod.read_manifest(manifest_path)
-    except (OSError, ValueError) as exc:
-        return CollectResult(
-            action="check", wrote=False, fresh=False,
-            message=f"manifest at {manifest_path} is unreadable ({exc}) — treat as stale",
-            collect_dir=collect_dir,
-        )
-    current_paths = [m.path for m in scan_repo(root, config=config)]
-    fresh = manifest_mod.is_fresh(existing, root, files=current_paths)
-    return CollectResult(
-        action="check", wrote=False, fresh=fresh,
-        message="up to date" if fresh else "stale — a tracked file changed since the last collect run",
-        collect_dir=collect_dir,
-    )
+    artifact, nothing — regardless of what it finds. The verdict is
+    `_freshness`'s, the same one `--collect` gates on."""
+    return _freshness(Path(root), config)[0]
 
 
 def _full_build(
@@ -483,6 +706,9 @@ def _full_build(
     config: Optional[configparser.ConfigParser],
     config_path: Optional[str],
     llm_call: Optional[LlmCall],
+    modules: Optional[List[ModuleRecord]] = None,
+    hashes: Optional[Dict[str, str]] = None,
+    drop_summaries: bool = False,
 ) -> Tuple[Path, List[str], CollectContext]:
     # Captured before anything under `[collect] dir` is written: `.collect/`
     # isn't git-ignored, so if this ran *after* `_write_artifact`, the
@@ -494,12 +720,121 @@ def _full_build(
     # build (see `manifest.is_dirty`).
     collect_dir = resolve_collect_dir(root, config)
     provenance = manifest_mod.capture_provenance(root, collect_dir=collect_dir)
-    modules = scan_repo(root, config=config)
-    ctx = build_context(root, modules, config=config, config_path=config_path, llm_call=llm_call)
+    # `modules`/`hashes`, if given, are the caller's own scan and hash of
+    # this same tree (`action_refresh` has both before it decides to fall
+    # back here), reused rather than re-run — otherwise a `--collect` that
+    # falls back to a full build would still cost two Pass A scans.
+    if modules is None:
+        modules = scan_repo(root, config=config)
+    if hashes is None:
+        # Hashed once, here, and reused by `_write_manifest` below instead of
+        # being recomputed after `_write_artifact` has written to disk.
+        hashes = manifest_mod.hash_tree(root, [m.path for m in modules])
+    # V8: a full build without Pass B (`--no-llm`, `[collect] llm_summaries
+    # = false`, no summarizer) used to write `summary: null` for every
+    # module — the previous artifact's prose destroyed by a build that
+    # never asked for it. Carry it forward instead, tagged `llm-stale`
+    # where the file changed; `--drop-summaries` is the explicit way to
+    # get the old behaviour. Pass C still runs over what was carried, so
+    # a stale summary's citations are re-checked against the current tree.
+    pass_b_ran = llm_call is not None
+    carried = stale = dropped = 0
+    if not pass_b_ran:
+        previous, previous_hashes = _previous_summaries(collect_dir)
+        if drop_summaries:
+            dropped = sum(1 for m in modules if m.path in previous)
+        elif previous:
+            modules, carried, stale = _carry_summaries(modules, previous, previous_hashes, hashes)
+    ctx = build_context(
+        root, modules, config=config, config_path=config_path, llm_call=llm_call,
+        # RUN-11: a full build's Pass B checkpoints every landed summary, so
+        # a Ctrl-C mid-batch costs the one in-flight module. `hashes` was
+        # already computed for this same tree above (or was handed in), so
+        # the sha each entry records is the one Pass B summarized from.
+        checkpoint_path=collect_dir / SUMMARIZE_CHECKPOINT_FILENAME, hashes=hashes,
+    )
+    if carried and any(m.summary is not None for m in ctx.modules):
+        sources = _sources_for(root, ctx.modules)
+        verified_modules, report = verifier_mod.verify_repo(
+            ctx.modules, sources, root=root, import_edges=ctx.import_edges,
+        )
+        ctx = replace(ctx, modules=verified_modules, verification_report=report)
+    ctx = replace(
+        ctx, pass_b_ran=pass_b_ran,
+        summaries_carried=carried, summaries_stale=stale, summaries_dropped=dropped,
+    )
     written = _write_artifact(collect_dir, ctx)
-    _write_manifest(root, collect_dir, ctx.modules, provenance=provenance)
+    _write_manifest(root, collect_dir, ctx.modules, provenance=provenance, file_hashes=hashes)
     written = sorted(set(written) | {MANIFEST_FILENAME})
     return collect_dir, written, ctx
+
+
+def _full_build_message(why: str, ctx: CollectContext, written: List[str], collect_dir: Path) -> str:
+    """The one line every full build reports, whichever path reached it
+    (`--rebuild`, a first-ever run, a `collector_version` mismatch). It
+    leads with `why` so the reader sees which path ran, and it counts what
+    Pass B actually did, in both directions:
+
+    - `--no-llm` / `[collect] llm_summaries = false` / a summarizer that
+      could not be built never run Pass B (`build_context` leaves
+      `verification_report` None), and then the honest verb is
+      "re-scanned (Pass B skipped)", not "re-summarized";
+    - a module with a parse error is never summarized, and a summarizer
+      that exhausts its retries leaves `summary` empty too, so "N
+      module(s) re-summarized" for a tree where only some were was a
+      literal overclaim on the one number V7 made this line report. A
+      partial batch names both halves; a batch that ran and produced
+      nothing says so rather than claiming Pass B was skipped."""
+    total = len(ctx.modules)
+    summarized = sum(1 for m in ctx.modules if m.summary is not None)
+    pass_b_ran = ctx.pass_b_ran
+    if not pass_b_ran:
+        what = f"{total} module(s) re-scanned (Pass B skipped{_pass_b_suffix(ctx)})"
+    elif summarized == total:
+        what = f"{total} module(s) re-summarized"
+    elif summarized:
+        what = f"{total} module(s) re-scanned, {summarized} re-summarized"
+    else:
+        what = f"{total} module(s) re-scanned, none re-summarized (Pass B produced no summary)"
+    return f"{why}{what}; wrote {len(written)} file(s) in {collect_dir}"
+
+
+def action_rebuild(
+    root: Path,
+    *,
+    config: Optional[configparser.ConfigParser] = None,
+    config_path: Optional[str] = None,
+    llm_call: Optional[LlmCall] = None,
+    drop_summaries: bool = False,
+) -> CollectResult:
+    """`--collect --rebuild` / `/collect --rebuild`: unconditional full
+    rebuild.
+
+    This is `_full_build`'s path as a first-class action rather than a
+    fallback only: every module in the tree is re-scanned and re-summarized
+    regardless of freshness, regardless of which files changed, and
+    regardless of whether a prior artifact exists. That is what you want
+    after a `collector_version` bump, when the artifact is suspect, or
+    when a summarizer prompt changed and every module's `purpose` should be
+    re-derived — previously the only way to get that was to delete
+    `[collect] dir` (or point `--base` at an empty artifact dir) first.
+
+    One Pass B call per module, which is exactly why this is a flag you
+    opt into rather than what `--collect` does by default.
+
+    With `--no-llm` (V8) the previous artifact's summaries are carried
+    forward — `llm-stale` where the file changed — unless
+    `drop_summaries` asks for the structural-only artifact explicitly.
+    """
+    root = Path(root)
+    collect_dir, written, ctx = _full_build(
+        root, config=config, config_path=config_path, llm_call=llm_call, drop_summaries=drop_summaries,
+    )
+    return CollectResult(
+        action="rebuild", wrote=True, fresh=True,
+        message=_full_build_message("", ctx, written, collect_dir),
+        collect_dir=collect_dir, written_files=tuple(written),
+    )
 
 
 def action_refresh(
@@ -508,8 +843,16 @@ def action_refresh(
     config: Optional[configparser.ConfigParser] = None,
     config_path: Optional[str] = None,
     llm_call: Optional[LlmCall] = None,
+    modules: Optional[List[ModuleRecord]] = None,
+    hashes: Optional[Dict[str, str]] = None,
+    drop_summaries: bool = False,
 ) -> CollectResult:
     """`--refresh`: diff-driven incremental rebuild (COLLECT-24).
+
+    This is the function `action_collect` delegates a stale tree to, so
+    `--collect` and `--refresh` share one implementation for the
+    "something changed" case and differ only in that `collect` is
+    freshness-gated (a fresh tree is a no-op) and never reaches here.
 
     Pass A (AST scan) is always cheap and re-runs over the whole tree —
     it does no network I/O and is byte-deterministic (COLLECT-3), so
@@ -522,6 +865,15 @@ def action_refresh(
     its previous `ModuleRecord` verbatim, `summary` (and thus `purpose`)
     included, so it is never re-sent to an LLM.
 
+    `modules`, if given, is a `scan_repo` result the caller already has
+    (`action_collect` needs one for its own freshness gate anyway): Pass A
+    is run exactly once across the two instead of twice over the same tree,
+    which is what the stale-tree path used to do — one scan to decide
+    whether anything changed, a second to do something about it. `hashes`,
+    if given, is the `hash_tree` result over that same file set, so the
+    tree is hashed once too rather than once here and once in the caller's
+    freshness gate.
+
     Pass C (`verifier.verify_repo`) still runs over the full merged
     module list on every call, because a citation check needs the
     *current* whole-repo symbol table to be correct — but Pass C is pure
@@ -529,22 +881,26 @@ def action_refresh(
     `--refresh`-costs-zero-LLM-calls-on-an-unchanged-tree measure
     (COLLECT-24 AC).
 
-    Falls back to an unconditional full build — today's previous
-    behaviour — when there is no existing manifest+artifact pair to diff
-    against; there is nothing to be "incremental" relative to.
+    Falls back to an unconditional full build (`_full_build`) when there is
+    no existing manifest+artifact pair to diff against — nothing to be
+    "incremental" relative to — and also when the existing manifest was
+    written by a different `collector_version`. `action_rebuild` reaches
+    the same path directly, without either condition.
     """
     root = Path(root)
     collect_dir = resolve_collect_dir(root, config)
-    manifest_path = collect_dir / MANIFEST_FILENAME
     artifact_path = collect_dir / ARTIFACT_FILENAME
 
-    previous_manifest: Optional[manifest_mod.Manifest] = None
+    previous_manifest, manifest_problem = _read_previous_manifest(collect_dir)
     previous_by_path: Dict[str, ModuleRecord] = {}
-    if manifest_path.exists() and artifact_path.exists():
+    artifact_problem: Optional[str] = None
+    if previous_manifest is not None:
         try:
-            previous_manifest = manifest_mod.read_manifest(manifest_path)
-            payload = json.loads(artifact_path.read_text(encoding="utf-8"))
-            previous_by_path = {d["path"]: ModuleRecord.from_dict(d) for d in payload.get("modules", [])}
+            if artifact_path.exists():
+                payload = json.loads(artifact_path.read_text(encoding="utf-8"))
+                previous_by_path = {d["path"]: ModuleRecord.from_dict(d) for d in payload.get("modules", [])}
+            else:
+                artifact_problem = f"{artifact_path} is absent (the manifest has nothing to diff against)"
         # BUGFIX: ConfigRead/ExceptSite/GuardedAccess are frozen dataclasses
         # with required (no-default) fields, so a stored artifact.json missing
         # one of those keys (schema drift, hand-edited file, partial/corrupted
@@ -553,9 +909,20 @@ def action_refresh(
         # artifact degrades to "no previous manifest" instead of crashing.
         # AttributeError added: a valid-JSON-but-non-dict artifact (bare
         # list/number/string/null) makes payload.get(...) raise it.
-        except (AttributeError, OSError, ValueError, KeyError, TypeError):
+        except (AttributeError, OSError, ValueError, KeyError, TypeError) as exc:
+            artifact_problem = f"{artifact_path} is unreadable or malformed ({exc})"
+        if artifact_problem is None and not previous_by_path:
+            # A `modules: []` artifact alongside a manifest that lists files
+            # is the "partial write" hazard the guard above already covers
+            # for a corrupt record — the same thing that used to be absorbed
+            # silently, here as an empty list instead of a missing key.
+            artifact_problem = f"{artifact_path} carries no module records to reuse"
+        if artifact_problem is not None:
+            # A usable manifest with an unusable artifact is not "incremental
+            # against nothing" — it is "nothing to diff against", so the
+            # manifest stops counting too. This is the coupling the original
+            # combined try/except had, preserved while keeping the reason.
             previous_manifest = None
-            previous_by_path = {}
 
     # BUGFIX: manifest.py's own docstring documents `collector_version`
     # as existing "so a format change can be detected" — but nothing
@@ -573,7 +940,20 @@ def action_refresh(
     # existing "no previous manifest" case — fall back to a full build —
     # closes it the same way that case is already closed, and is the
     # literal mechanism the docstring already promised existed.
+    # BUGFIX: `manifest_problem`/`artifact_problem` keep the honest reason
+    # here. Both fallbacks used to read "no prior artifact to diff against",
+    # which is false when a manifest is sitting right there unreadable, or
+    # when the artifact exists but is corrupt.
+    why = "no prior artifact to diff against — full build: "
+    if manifest_problem is not None:
+        why = f"{manifest_problem} — full build: "
+    elif artifact_problem is not None:
+        why = f"{artifact_problem} — full build: "
     if previous_manifest is not None and previous_manifest.collector_version != manifest_mod.COLLECTOR_VERSION:
+        why = (
+            f"manifest was built by collector_version={previous_manifest.collector_version!r}, "
+            f"current is {manifest_mod.COLLECTOR_VERSION!r} — full build: "
+        )
         logger.info(
             "collect --refresh: manifest was built by collector_version=%r, "
             "current is %r — falling back to a full build instead of "
@@ -583,11 +963,23 @@ def action_refresh(
         previous_manifest = None
         previous_by_path = {}
 
+    # Scanned and hashed once, before either branch: the incremental path
+    # diffs this against the previous manifest, and the full-build fallback
+    # below needs the same scan — so it is shared rather than the fallback
+    # re-running Pass A and the hash pass for the same tree.
+    current_modules = modules if modules is not None else scan_repo(root, config=config)
+    current_hashes = hashes if hashes is not None else manifest_mod.hash_tree(
+        root, [m.path for m in current_modules],
+    )
+
     if previous_manifest is None:
-        collect_dir, written, _ctx = _full_build(root, config=config, config_path=config_path, llm_call=llm_call)
+        collect_dir, written, ctx = _full_build(
+            root, config=config, config_path=config_path, llm_call=llm_call,
+            modules=current_modules, hashes=current_hashes, drop_summaries=drop_summaries,
+        )
         return CollectResult(
             action="refresh", wrote=True, fresh=True,
-            message=f"no prior artifact to diff against — full build: rebuilt {len(written)} file(s) in {collect_dir}",
+            message=_full_build_message(why, ctx, written, collect_dir),
             collect_dir=collect_dir, written_files=tuple(written),
         )
 
@@ -597,15 +989,27 @@ def action_refresh(
     # output is already untracked before this run writes anything.
     provenance = manifest_mod.capture_provenance(root, collect_dir=collect_dir)
 
-    current_modules = scan_repo(root, config=config)
-    current_hashes = manifest_mod.hash_tree(root, [m.path for m in current_modules])
     changes = manifest_mod.diff_files(previous_manifest.file_hashes, current_hashes)
 
     to_summarize = [m for m in current_modules if m.path in changes.changed]
+    # V8: a summary carried forward as `llm-stale` by an earlier `--no-llm`
+    # build is owed a real one — an unchanged file is not re-sent to Pass B
+    # by the diff alone, so a stale summary would otherwise stay stale until
+    # the file happened to change again.
+    stale_paths = {
+        p for p, prev in previous_by_path.items()
+        if p not in changes.changed and prev.summary is not None
+        and prev.summary.provenance == Provenance.LLM_STALE
+    }
+    to_summarize += [m for m in current_modules if m.path in stale_paths]
 
     settings = read_collect_settings(config)
+    # "Skipped" is only honest when there was something to summarize: a
+    # deletion-only refresh has no changed module, so Pass B had no work,
+    # not a reason to stay silent about.
+    pass_b_skipped = bool(to_summarize) and (llm_call is None or not settings.llm_summaries)
     summarized_by_path: Dict[str, ModuleRecord] = {}
-    if llm_call is not None and settings.llm_summaries and to_summarize:
+    if to_summarize and not pass_b_skipped:
         sources_for_summary: Dict[str, str] = {}
         for m in to_summarize:
             if m.parse_error is not None:
@@ -622,19 +1026,52 @@ def action_refresh(
                 # summarization batch, the same fail-open posture
                 # `_sources_for` (Pass C) already gives the same situation.
                 continue
+        # BUGFIX: the loop above skips a module it cannot re-read, but
+        # `to_summarize` still contained it — and `summarize_repo` falls
+        # back to `sources.get(path, "")`, so that module was summarized
+        # from an EMPTY source: Pass A facts plus no code at all. The reply
+        # still parsed into a plausible-looking `purpose`, which then
+        # landed in artifact.json as grounded prose about a file the
+        # summarizer never read. Summarize only the modules that actually
+        # have a source this round; the rest stay structural-only for this
+        # run and get picked up next time.
+        batch = [m for m in to_summarize if m.path in sources_for_summary]
         summarized_by_path = {
             m.path: m for m in summarize_repo(
-                to_summarize, sources_for_summary, llm_call,
+                batch, sources_for_summary, llm_call,
                 max_retries=collect_max_retries(config),
                 progress_fn=_print_summarize_progress,
                 on_error=_print_summarize_error,
+                # RUN-11: same checkpoint as the full build's Pass B — this
+                # batch is the one an interrupted `--collect` most often
+                # dies in (the version-bump fallback), and it too writes
+                # nothing until Pass C and every builder are done.
+                checkpoint_path=collect_dir / SUMMARIZE_CHECKPOINT_FILENAME,
+                hashes=current_hashes,
+                on_resume=_print_summarize_resume,
             )
         }
 
+    # V8: with Pass B skipped, a changed module keeps the summary it had
+    # (tagged `llm-stale` — the source moved under it) instead of losing it
+    # to `summary: null`; `--drop-summaries` is the explicit opt-out.
+    carried = stale = dropped = 0
     merged: List[ModuleRecord] = []
     for m in current_modules:
-        if m.path in changes.changed:
-            merged.append(summarized_by_path.get(m.path, m))
+        if m.path in summarized_by_path:
+            merged.append(summarized_by_path[m.path])
+        elif m.path in changes.changed:
+            prev = previous_by_path.get(m.path)
+            if pass_b_skipped and prev is not None and prev.summary is not None:
+                if drop_summaries:
+                    dropped += 1
+                    merged.append(m)
+                else:
+                    carried += 1
+                    stale += 1
+                    merged.append(m.with_llm_summary(prev.summary.as_stale()))
+            else:
+                merged.append(m)
         else:
             # Unchanged since the last manifest: reuse the previous
             # record verbatim (summary included) rather than the
@@ -646,20 +1083,53 @@ def action_refresh(
     ctx = build_context(root, merged, config=config, config_path=config_path, llm_call=None)
     if any(m.summary is not None for m in merged):
         sources = _sources_for(root, merged)
-        verified_modules, report = verifier_mod.verify_repo(merged, sources, root=root)
+        verified_modules, report = verifier_mod.verify_repo(
+            merged, sources, root=root, import_edges=ctx.import_edges,
+        )
         ctx = replace(ctx, modules=verified_modules, verification_report=report)
+    ctx = replace(
+        ctx, pass_b_ran=bool(to_summarize) and not pass_b_skipped,
+        summaries_carried=carried, summaries_stale=stale, summaries_dropped=dropped,
+    )
 
     written = _write_artifact(collect_dir, ctx)
-    _write_manifest(root, collect_dir, ctx.modules, provenance=provenance)
+    # Reuse the hashes already computed for the diff above: the manifest
+    # tracks exactly this same set of paths, so a second tree-wide hash
+    # pass here (after `_write_artifact` has written to disk) was pure
+    # duplication of the one done at the top of this function.
+    _write_manifest(root, collect_dir, ctx.modules, provenance=provenance, file_hashes=current_hashes)
     written = sorted(set(written) | {MANIFEST_FILENAME})
 
     if changes.is_empty():
         message = f"tree unchanged — recomputed derived artifacts only, wrote {len(written)} file(s) in {collect_dir}"
     else:
-        message = (
-            f"incrementally refreshed {len(changes.changed)} changed and "
-            f"{len(changes.removed)} removed module(s); wrote {len(written)} file(s) in {collect_dir}"
-        )
+        # Zero counts are noise in both directions: "and 0 removed" on the
+        # common path (one edited file) and a leading "0 changed" when the
+        # only change was a deletion — the count that's zero says nothing,
+        # the one that isn't is the whole message.
+        scope = f"{len(changes.changed)} changed" if changes.changed else f"{len(changes.removed)} removed"
+        if changes.changed and changes.removed:
+            scope += f" and {len(changes.removed)} removed"
+        # V7's "the line says which path ran" applies to Pass B too:
+        # `--no-llm` / `[collect] llm_summaries = false` / a summarizer that
+        # could not be built all make this path run with zero LLM calls, so
+        # the honest verb is "re-scanned", never "refreshed" in a way that
+        # implies a summary was re-derived.
+        # BUGFIX: `pass_b_skipped` only covers Pass B being skipped by
+        # config/no `llm_call` — not the case where Pass B ran but every
+        # changed module had a `parse_error` (or exhausted its retries) and
+        # so none of them made it into `summarized_by_path`. That left
+        # `suffix` empty and the message read "incrementally refreshed N
+        # changed module(s)" with no hint Pass B produced zero summaries —
+        # the same asymmetry `_full_build_message`'s else branch already
+        # names for the sibling rebuild path ("Pass B produced no summary").
+        if pass_b_skipped:
+            suffix = f" (Pass B skipped{_pass_b_suffix(ctx)})"
+        elif to_summarize and not summarized_by_path:
+            suffix = " (Pass B produced no summary)"
+        else:
+            suffix = ""
+        message = f"incrementally refreshed {scope} module(s){suffix}; wrote {len(written)} file(s) in {collect_dir}"
 
     return CollectResult(
         action="refresh", wrote=True, fresh=True,
@@ -673,23 +1143,102 @@ def action_collect(
     config: Optional[configparser.ConfigParser] = None,
     config_path: Optional[str] = None,
     llm_call: Optional[LlmCall] = None,
+    drop_summaries: bool = False,
 ) -> CollectResult:
-    """`--collect` / `/collect`: one-shot. Builds only if there is no
-    manifest yet, or the existing one is stale; a fresh tree is a no-op —
-    no write of any kind, same as `check` would report."""
-    check_result = action_check(root, config=config)
-    if check_result.fresh:
+    """`--collect` / `/collect`: one-shot, freshness-gated.
+
+    A fresh tree is a no-op — no write of any kind, same as `check` would
+    report. A stale tree delegates to `action_refresh`, so only the modules
+    whose content hash changed since the last manifest are re-summarized and
+    every unchanged module keeps its previous record (summary included)
+    verbatim. The previous behaviour was to call `_full_build` here, which
+    re-ran Pass B over *every* module in the tree for every single changed
+    file — one changed file cost the same as a from-scratch build.
+
+    The delegated result's own message is passed through unchanged, so the
+    printed line always says which path actually ran ("incrementally
+    refreshed N changed module(s)" vs "no prior artifact ... full build")
+    while `action` stays "collect" — the flag the user typed. The
+    unconditional full rebuild lives in `action_rebuild` (`--rebuild`); a
+    `collector_version` mismatch still forces one, because `action_refresh`
+    drops a version-mismatched previous manifest and falls back to
+    `_full_build`.
+
+    Cost: one Pass A scan and one hash pass. `_freshness` — the same verdict
+    `action_check` reports — returns the scan and the hash map it computed,
+    and they are handed to `action_refresh` (`modules=`/`hashes=`), which
+    passes the map on to `_write_manifest`. This used to scan the tree twice
+    and hash it three times (freshness gate, the diff, then again inside
+    `manifest.build_manifest`); Pass B was already down to one call per
+    changed module, so Pass A and the hash passes were the next largest
+    things on the receipt.
+    """
+    verdict, modules, hashes = _freshness(Path(root), config)
+    if verdict.fresh:
         return CollectResult(
             action="collect", wrote=False, fresh=True,
             message="already up to date — nothing to do",
-            collect_dir=check_result.collect_dir,
+            collect_dir=verdict.collect_dir,
         )
-    collect_dir, written, _ctx = _full_build(root, config=config, config_path=config_path, llm_call=llm_call)
-    return CollectResult(
-        action="collect", wrote=True, fresh=True,
-        message=f"built {len(written)} file(s) in {collect_dir}",
-        collect_dir=collect_dir, written_files=tuple(written),
+    result = action_refresh(
+        root, config=config, config_path=config_path, llm_call=llm_call,
+        modules=modules, hashes=hashes, drop_summaries=drop_summaries,
     )
+    return CollectResult(
+        action="collect", wrote=result.wrote, fresh=result.fresh,
+        message=result.message,
+        collect_dir=result.collect_dir, written_files=result.written_files,
+    )
+
+
+def _normalize_module_path(
+    root: Path, module_path: str, config: Optional[configparser.ConfigParser]
+) -> str:
+    """Turn a `--module <path>` argument into the one form the rest of
+    `action_module` (and every other part of the collector) speaks.
+
+    BUGFIX: the raw argument used to be threaded through unchanged as both
+    the module's `path` and its manifest key, so `--module ./pkg/a.py`
+    produced an artifact with *two* records for the same file (`pkg/a.py`,
+    reused from the previous artifact, and `./pkg/a.py`, freshly scanned)
+    and a manifest carrying the key `./pkg/a.py`. The manifest's keys are
+    exactly what `is_fresh` compares against the scanner's own path list,
+    and the scanner never yields a `./`-prefixed path — so that phantom
+    key stayed in the manifest forever, `is_fresh` returned False forever,
+    and `--collect` could never take V7's no-op path again: one mistyped
+    `--module` made the incremental fast path permanently unreachable.
+    Normalizing here removes the duplicate and keeps the manifest's keys in
+    the same shape `scan_repo` produces.
+
+    The same rule applies to any path whose extension no language in this
+    collector recognizes at all — a `README.md`, a config file, anything
+    without an extension: `scan_repo` would never record it, so `is_fresh`
+    could never see it either. `language_for` is the scanner's own test
+    (recognition, not `[collect] languages` enablement — `--module
+    Foo.java` on a Python-only repo stays the documented COLLECT-28 escape
+    hatch), so there is one place that decides what counts as a source
+    file.
+    """
+    raw = (module_path or "").strip()
+    if not raw:
+        raise CollectCliError("--module requires a path argument")
+    if Path(raw).is_absolute():
+        raise CollectCliError(
+            f"--module path must be relative to {root}, got an absolute path: {raw!r}"
+        )
+    normalized = os.path.normpath(raw)
+    if Path(normalized).parts[:1] == ("..",):
+        raise CollectCliError(
+            f"--module path escapes the project root {root}: {raw!r}"
+        )
+    rel = normalized.replace(os.sep, "/")
+    if language_for(rel, config) is None:
+        raise CollectCliError(
+            f"--module path {raw!r} (normalized: {rel!r}) has an extension "
+            f"this collector does not recognize — refusing to patch it into "
+            f"the artifact, where it would also mark the tree stale forever"
+        )
+    return rel
 
 
 def action_module(
@@ -699,6 +1248,7 @@ def action_module(
     config: Optional[configparser.ConfigParser] = None,
     config_path: Optional[str] = None,
     llm_call: Optional[LlmCall] = None,
+    drop_summaries: bool = False,
 ) -> CollectResult:
     """`--module <path>`: incremental. Re-scans and re-parses *only*
     `module_path`; every other module's `ModuleRecord` is reused verbatim
@@ -706,6 +1256,7 @@ def action_module(
     no existing artifact to patch into (nothing to be "incremental"
     relative to)."""
     root = Path(root)
+    module_path = _normalize_module_path(root, module_path, config)
     collect_dir = resolve_collect_dir(root, config)
     artifact_path = collect_dir / ARTIFACT_FILENAME
     manifest_path = collect_dir / MANIFEST_FILENAME
@@ -783,6 +1334,7 @@ def action_module(
         raise CollectCliError(f"--module path is unreadable: {module_path}: {exc}") from exc
     patched = scan_file(source, module_path, config=config)
 
+    previous_record = by_path.get(module_path)
     if module_path not in by_path:
         modules.append(patched)
     else:
@@ -807,7 +1359,21 @@ def action_module(
     # `action_refresh` (via the `any(m.summary is not None …)` branch
     # there), so verification of the newly-updated summary is not skipped.
     settings = read_collect_settings(config)
-    if llm_call is not None and settings.llm_summaries and patched.parse_error is None:
+    # BUGFIX: `pass_b_skipped` mirrors `action_refresh`'s own flag exactly —
+    # `--no-llm` / `[collect] llm_summaries = false` means Pass B was never
+    # attempted at all, the "(Pass B skipped)" case. A parse error is a
+    # *different* reason `patched.summary` can end up None: Pass B would
+    # have run but there is nothing to summarize, which is
+    # "(Pass B produced no summary)" below, not "skipped" — same split
+    # `action_refresh` makes between `pass_b_skipped` and an empty
+    # `summarized_by_path`.
+    pass_b_skipped = llm_call is None or not settings.llm_summaries
+    if not pass_b_skipped and patched.parse_error is None:
+        # RUN-11: deliberately NO checkpoint_path here. A one-module batch
+        # has nothing to resume, and `summarize_repo` clears its checkpoint
+        # when the batch completes — passing the shared path would have a
+        # `--module` run delete the checkpoint an interrupted full build
+        # left behind (the exact data this ticket saves).
         summarized = summarize_repo(
             [patched], {module_path: source}, llm_call,
             max_retries=collect_max_retries(config),
@@ -817,6 +1383,12 @@ def action_module(
         if summarized and summarized[0].summary is not None:
             patched = summarized[0]
             modules = [patched if m.path == module_path else m for m in modules]
+    elif pass_b_skipped and not drop_summaries and previous_record is not None and previous_record.summary is not None:
+        # V8: same rule as `action_refresh` — the re-scanned module keeps
+        # the summary it had, tagged `llm-stale` (the file was just
+        # re-read, so it may have changed), instead of `summary: null`.
+        patched = patched.with_llm_summary(previous_record.summary.as_stale())
+        modules = [patched if m.path == module_path else m for m in modules]
 
     # Captured before `_write_artifact` below writes anything under
     # `.collect/` — see `capture_provenance`'s docstring. Same ordering
@@ -841,7 +1413,9 @@ def action_module(
     # `--module` gets the same guarantee.
     if any(m.summary is not None for m in modules):
         sources = _sources_for(root, modules)
-        verified_modules, report = verifier_mod.verify_repo(modules, sources, root=root)
+        verified_modules, report = verifier_mod.verify_repo(
+            modules, sources, root=root, import_edges=ctx.import_edges,
+        )
         modules = verified_modules
         ctx = replace(ctx, modules=verified_modules, verification_report=report)
 
@@ -859,7 +1433,30 @@ def action_module(
             hashes = {}
     else:
         hashes = {}
-    hashes[module_path] = manifest_mod.hash_file(abs_module)
+
+    if hashes:
+        # A usable previous manifest: patch just this one entry. `hash_tree`
+        # (rather than the unguarded `hash_file` this used to call) so a file
+        # that vanished or went unreadable in the window since it was read
+        # above is dropped from the map instead of raising — `is_fresh` treats
+        # a missing key as "stale", which is the safe direction.
+        fresh_hashes = manifest_mod.hash_tree(root, [module_path])
+        if module_path in fresh_hashes:
+            hashes[module_path] = fresh_hashes[module_path]
+        else:
+            hashes.pop(module_path, None)
+    else:
+        # BUGFIX: nothing usable to patch into (no previous manifest, or one
+        # that would not parse). Writing a manifest that tracked ONLY this one
+        # file made the next `--collect`/`--refresh` diff an N-file tree
+        # against a 1-entry map — every other module looked "added" and got
+        # re-summarized by the LLM. That is V7's exact cost bug (one changed
+        # file == one call per module in the tree), reached through the
+        # incremental `--module` path instead of `--collect`. Record the whole
+        # merged set so the manifest stays whole and the next run is
+        # incremental for real.
+        hashes = manifest_mod.hash_tree(root, sorted(m.path for m in modules))
+
     patched_manifest = manifest_mod.Manifest(
         collector_version=manifest_mod.COLLECTOR_VERSION,
         generated_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -870,9 +1467,23 @@ def action_module(
     manifest_mod.write_manifest(patched_manifest, manifest_path)
     written = sorted(set(written) | {MANIFEST_FILENAME})
 
+    # BUGFIX: `action_refresh` and `_full_build_message` both name Pass B's
+    # outcome — "(Pass B skipped)" when it was never attempted, "(Pass B
+    # produced no summary)" when it ran (or would have) but `patched` still
+    # has no summary (a parse error, or a summarizer that exhausted its
+    # retries) — but `--module`'s own message never did, so a patched
+    # module with no summary silently read as if it had been re-summarized.
+    if pass_b_skipped and patched.summary is not None:
+        suffix = " (Pass B skipped; summary carried forward, marked llm-stale)"
+    elif pass_b_skipped:
+        suffix = " (Pass B skipped)"
+    elif patched.summary is None:
+        suffix = " (Pass B produced no summary)"
+    else:
+        suffix = ""
     return CollectResult(
         action="module", wrote=True, fresh=True,
-        message=f"patched {module_path} and refreshed {len(written)} file(s) in {collect_dir}",
+        message=f"patched {module_path} and refreshed {len(written)} file(s) in {collect_dir}{suffix}",
         collect_dir=collect_dir, written_files=tuple(written),
     )
 
@@ -885,10 +1496,11 @@ def run(
     config_path: Optional[str] = None,
     module_path: Optional[str] = None,
     llm_call: Optional[LlmCall] = None,
+    drop_summaries: bool = False,
 ) -> CollectResult:
-    """Single dispatch point for all four actions — what `main.py`'s
-    `/collect` command / `--collect`/`--check`/`--refresh`/`--module`
-    flags call."""
+    """Single dispatch point for all five actions — what `main.py`'s
+    `/collect` command / `--collect`/`--check`/`--refresh`/`--rebuild`/
+    `--module` flags call."""
     if action not in VALID_ACTIONS:
         raise CollectCliError(f"unknown collect action {action!r}; must be one of {sorted(VALID_ACTIONS)}")
     root = Path(root)
@@ -903,36 +1515,127 @@ def run(
             collect_dir=resolve_collect_dir(root, config),
         )
     if action == "refresh":
-        return action_refresh(root, config=config, config_path=config_path, llm_call=llm_call)
+        return action_refresh(
+            root, config=config, config_path=config_path, llm_call=llm_call, drop_summaries=drop_summaries,
+        )
+    if action == "rebuild":
+        return action_rebuild(
+            root, config=config, config_path=config_path, llm_call=llm_call, drop_summaries=drop_summaries,
+        )
     if action == "module":
         if not module_path:
             raise CollectCliError("action='module' requires module_path")
-        return action_module(root, module_path, config=config, config_path=config_path, llm_call=llm_call)
-    return action_collect(root, config=config, config_path=config_path, llm_call=llm_call)
+        return action_module(
+            root, module_path, config=config, config_path=config_path, llm_call=llm_call,
+            drop_summaries=drop_summaries,
+        )
+    return action_collect(
+        root, config=config, config_path=config_path, llm_call=llm_call, drop_summaries=drop_summaries,
+    )
 
 
 # ── argparse-level entry point (mirrors --auto / --faq in main.py) ─────────
 
 
+def action_from_flags(
+    *,
+    check: bool = False,
+    module_path: Optional[str] = None,
+    rebuild: bool = False,
+    refresh: bool = False,
+) -> Tuple[str, Optional[str]]:
+    """The one precedence table that maps a set of collect flags to an
+    action, so both entry points agree: `parse_collect_args` (the `/collect`
+    command) and `main.py`'s one-shot `--collect` if-chain.
+
+    Before this existed each entry point had its own ordering and they
+    disagreed on `--module` + `--rebuild` — `/collect --module pkg/a.py
+    --rebuild` ran a full rebuild while `--collect --module pkg/a.py
+    --rebuild` ran the single-file patch — and on `--check` + `--module`,
+    where the interactive path honoured `--check` and the one-shot path
+    ignored it and *wrote* anyway, breaking `--check`'s "writes nothing,
+    anywhere" promise on one of the two entry points.
+
+    Precedence, most to least specific:
+      check   — read-only; a freshness report must never silently become
+                a write, whatever else was also asked for.
+      module  — the most specific write request: one named file.
+      rebuild — the explicit whole-tree request; must beat `refresh`, or
+                asking for both silently downgrades to the cheap path.
+      refresh — the cheapest write request; the fallback.
+    None of them → `collect`, the freshness-gated one-shot default.
+    """
+    if check:
+        return "check", None
+    if module_path:
+        return "module", module_path
+    if rebuild:
+        return "rebuild", None
+    if refresh:
+        return "refresh", None
+    return "collect", None
+
+
 def parse_collect_args(argv: List[str]) -> Dict[str, Any]:
     """Parse the collect-specific slice of argv into `run()` kwargs. Kept
     separate from stdlib `argparse` so `main.py` can add `--collect`,
-    `--check`, `--refresh`, and `--module` to its existing parser and just
-    forward here — see that module's own `_parse_args` for the actual flag
-    definitions."""
-    action = "collect"
+    `--check`, `--refresh`, `--rebuild`, and `--module` to its existing
+    parser and just forward here — see that module's own `_parse_args` for
+    the actual flag definitions. Flag precedence is `action_from_flags`,
+    shared with `main.py` so the two entry points dispatch identically."""
+    check = "--check" in argv
     module_path = None
-    if "--check" in argv:
-        action = "check"
-    elif "--refresh" in argv:
-        action = "refresh"
-    elif "--module" in argv:
-        action = "module"
+    # BUGFIX: `--check` must win over `--module` per `action_from_flags`'s
+    # documented precedence table (check is the most specific, read-only
+    # request and must never be preempted). Resolving `_module_path_from`
+    # unconditionally whenever `--module` appeared — before `action_from_flags`
+    # got a chance to apply that precedence — meant a malformed `--module`
+    # (no value, or a value that looks like another flag) raised
+    # `CollectCliError` even when `--check` was also present and should have
+    # short-circuited first: `parse_collect_args(["--check", "--module"])`
+    # raised instead of returning the `check` action. Only resolve the
+    # module value when `--check` isn't already going to take precedence.
+    if not check and ("--module" in argv or any(a.startswith("--module=") for a in argv)):
+        # BUGFIX: only the space form was recognised. argparse (main.py's
+        # parser) accepts both `--module <path>` and `--module=<path>`, so
+        # `main.py --collect --module=pkg/a.py` patched one module while
+        # `/collect --module=pkg/a.py` silently ran a full-tree collect —
+        # the same "the two entry points disagree" defect, one flag later.
+        module_path = _module_path_from(argv)
+
+    action, _ = action_from_flags(
+        check=check,
+        module_path=module_path,
+        rebuild="--rebuild" in argv,
+        refresh="--refresh" in argv,
+    )
+    return {"action": action, "module_path": module_path, "drop_summaries": "--drop-summaries" in argv}
+
+
+def _module_path_from(argv: List[str]) -> str:
+    """The path `--module` names, from either `--module <path>` or
+    `--module=<path>`. Raises `CollectCliError` instead of returning
+    something unusable: with no value at all, with an empty value, or with
+    a value that is really another flag (which would otherwise be handed to
+    `action_module` as a path and reported as "does not exist"). argparse
+    rejects `--module --no-llm` with "expected one argument" — this mirrors
+    that rather than guessing at what was meant."""
+    equals_values = [a.split("=", 1)[1] for a in argv if a.startswith("--module=")]
+    if equals_values:
+        value = equals_values[-1]
+    else:
         idx = argv.index("--module")
         if idx + 1 >= len(argv):
             raise CollectCliError("--module requires a path argument")
-        module_path = argv[idx + 1]
-    return {"action": action, "module_path": module_path}
+        value = argv[idx + 1]
+    if not value:
+        raise CollectCliError("--module requires a path argument")
+    if value.startswith("-"):
+        raise CollectCliError(
+            f"--module got {value!r}, which looks like a flag rather than a path — "
+            "pass the path after the flag: --module <path>"
+        )
+    return value
 
 
 def main(argv: List[str], root: Optional[str] = None, config_path: str = "agents.ini") -> int:

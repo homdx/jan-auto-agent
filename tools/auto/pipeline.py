@@ -69,7 +69,7 @@ def _rt(controller: "AutoController"):
 # ``patch("tools.auto.pipeline.<name>")``.
 from tools.auto.repo_ingest import ingest_repo
 from tools.auto.architect import review_clusters, ClusterReviewer, ConfigValueError
-from tools.auto.gate1_filter import filter_candidates
+from tools.auto.gate1_filter import filter_candidates, format_gate1_split
 from tools.auto.backlog_prioritiser import build_backlog, to_improvements_md
 from tools.auto.plan_emitter import PlanEmitter, IMPROVEMENTS_FILENAME
 
@@ -148,6 +148,7 @@ def run_pipeline(controller: "AutoController") -> tuple[Optional[str], int]:
         ``tasks_done`` is the count of tasks completed this session.
     """
     cfg = _load_config(controller)
+    _log_retry_budget(cfg, controller)  # RUN-10: say which budget is in force
 
     # ── PLAN phase ────────────────────────────────────────────────────────────
     _run_plan_phase(controller, cfg)
@@ -405,25 +406,45 @@ def _run_plan_phase(controller: "AutoController", cfg: configparser.ConfigParser
     }
     _get_bridge = getattr(controller, "_get_collect_bridge", None)
     collect_bridge = _get_bridge(getattr(controller, "task_mode", "code")) if _get_bridge else None
+    _g1_counters: dict = {}
     accepted, rejected = filter_candidates(
         candidates, controller.base_dir, cfg,
         cluster_files=cluster_files,
         task_mode=getattr(controller, "task_mode", "code"),   # AUTO-DM-1
         collect_bridge=collect_bridge,  # GATE1-CTX-1
+        counters=_g1_counters,          # M4
     )
+    # M4: the per-stage split. Every field is always printed, zero when the
+    # mode does not produce it, so log parsing is stable across
+    # unparseable_retry_mode and across L1 landing. The counters are filled
+    # by Gate1Filter.filter() itself, where all_results — the only place a
+    # result for an accepted candidate exists — is in scope; an empty dict
+    # here (a stubbed filter_candidates) prints zeros, which is the honest
+    # reading of "this pass reported nothing".
+    _g1_split_line = format_gate1_split(_g1_counters)
     logger.info(
-        "plan_phase: gate1 accepted=%d rejected=%d",
-        len(accepted), len(rejected),
+        "plan_phase: gate1 accepted=%d rejected=%d %s",
+        len(accepted), len(rejected), _g1_split_line,
     )
     controller.state.log(
-        f"plan phase: gate1 accepted={len(accepted)} rejected={len(rejected)}"
+        f"plan phase: gate1 accepted={len(accepted)} rejected={len(rejected)} "
+        f"{_g1_split_line}"
     )
+    # Trace it as well: run.log is where a human reads the line, the trace is
+    # where a later analyze run would look for it. The trace event carries
+    # accepted/rejected too, because it does not sit next to the log line and
+    # would otherwise have no denominator for the split.
+    _g1_counters["accepted"] = len(accepted)
+    _g1_counters["rejected"] = len(rejected)
+    if controller.run_trace:
+        _rt(controller).log_gate1_split(_g1_counters)
 
     if controller.run_trace:
         for r in rejected:
             _rt(controller).log_gate1_rejected(
                 getattr(r, "candidate", None) and getattr(r.candidate, "title", "?"),
                 getattr(r, "reason", ""),
+                stage=getattr(r, "stage", ""),   # M4: the split's per-event side
             )
 
     # ── Step 4: Backlog prioritise ────────────────────────────────────────────
@@ -508,3 +529,53 @@ def _load_config(controller: "AutoController") -> configparser.ConfigParser:
     if p.exists():
         cfg.read(p, encoding="utf-8")
     return cfg
+
+
+# ── RUN-10: the retry budget the operator is about to pay for ──────────────────
+
+
+def _state_log(controller: "AutoController", msg: str) -> None:
+    """state.log(*msg*) when a state store is wired, otherwise a no-op.
+
+    run.log is where the operator reads this line during a 429 storm, so the
+    same sentence goes to stderr (logger.info) and to run.log — the
+    convention every other pipeline phase line above already follows.
+    controller.state is only guaranteed to exist once run_pipeline() is
+    running for real; a test that drives run_pipeline() with a bare stand-in
+    controller loses the run.log copy, not the run itself.
+    """
+    state = getattr(controller, "state", None)
+    if state is not None:
+        try:
+            state.log(msg)
+        except Exception as exc:  # noqa: BLE001 - diagnostic line, never a run stopper
+            logger.warning("could not log the retry budget line — %s", exc)
+
+
+def _log_retry_budget(cfg: configparser.ConfigParser, controller: "AutoController") -> None:
+    """One INFO line for the [loop] HTTP retry budget now in force.
+
+    Emitted once, at pipeline start, after the config is loaded and before the
+    architect runs, naming the numbers actually resolved — defaults included —
+    so the operator can tell which knob an inner "attempt 7/60" belongs to.
+    Fail-open: the line is diagnostic, so a config that can't be read degrades
+    to the [loop] defaults instead of raising into the run.
+    """
+    from tools.llm_stream import retry_kwargs_from_config
+    budget = retry_kwargs_from_config(cfg)
+    try:
+        timeout = float(cfg.get("loop", "timeout_seconds", fallback="300"))
+    except Exception as exc:  # noqa: BLE001 - fail-open by contract
+        logger.warning(
+            "config [loop] timeout_seconds is malformed (%s) — using 300", exc,
+        )
+        timeout = 300.0
+    msg = (
+        "LLM retry budget [loop]: "
+        f"error_retries={budget['error_retries']} "
+        f"wait={budget['error_retry_wait_sec']:.1f}s "
+        f"retry_after_cap={budget['max_retry_after_sec']:.0f}s "
+        f"timeout={timeout:.0f}s"
+    )
+    logger.info(msg)
+    _state_log(controller, msg)

@@ -29,8 +29,16 @@ Public surface::
 agents.ini keys consumed
 ------------------------
 [auto]  max_attempts_per_task   — attempt cap per round (default 5)
+[auto]  validator_unavailable_retries — re-runs of ONLY the Gate-2 call when
+        it came back without a verdict (transport/parse error) before the
+        round is left unreviewed (default 2; RUN-7)
+[auto]  coder_transport_retries — re-runs of ONLY the coder call when it died
+        before the model could answer (``CoderResult.error_kind ==
+        "transport"``) before the round is left unreviewed (default 2; RUN-8)
+[collect] error_retry_wait_sec  — pause between those re-runs (default 60; RUN-7)
 [validator_agent] temperature   — validator temperature (default 0.1)
 [validator_agent] max_hints     — max hint items in rejection (default 3)
+[executor] pytest_serial        — run workspace pytest in-process (default true; RUN-3)
 """
 
 from __future__ import annotations
@@ -38,12 +46,14 @@ from __future__ import annotations
 import configparser
 import json
 import logging
+import re
 import time
 from tools.auto.context_broker import ContextBroker
 from tools.auto.gate_registry import (  # GATES-1 / GATES-2
     build_validators, resolve_gate_order, run_gates,
 )
 from tools.agent_trace import tracer   # AUTO-CR-27: per-stage decision tracing
+from tools.auto.utils import is_pytest_command   # RUN-3
 
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -53,6 +63,25 @@ logger = logging.getLogger(__name__)
 
 
 _DEFAULT_MAX_ATTEMPTS = 5
+# RUN-7: re-runs of ONLY the Gate-2 validator call (never the coder or the
+# executor) when it came back without a verdict — a transport/parse error
+# such as the HTTP 429 "monthly usage limit" that blocked AUTO-T6 on
+# ../testtext2. [auto] validator_unavailable_retries is the count; the pause
+# between calls is [collect] error_retry_wait_sec, the one existing knob
+# that already names the project's HTTP retry pause (request_completion's
+# own per-request retries sit below this layer and are exhausted by the
+# time approve() reports "validator unavailable").
+_DEFAULT_VALIDATOR_UNAVAILABLE_RETRIES  = 2
+_DEFAULT_VALIDATOR_UNAVAILABLE_WAIT_SEC = 60.0
+# RUN-8: the coder side of the same shape. The socket sat silent for 80
+# minutes on a live run before the stream-read timeout fired and the coder
+# came back with nothing; before this key that ate the task's
+# max_task_seconds budget, charged the attempt, and told the model it had
+# failed. [auto] coder_transport_retries is the count; the pause between
+# calls reuses [collect] error_retry_wait_sec, the same outage-class wait
+# RUN-7's validator re-runs use.
+_DEFAULT_CODER_TRANSPORT_RETRIES   = 2
+_DEFAULT_CODER_TRANSPORT_WAIT_SEC  = 60.0
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Data classes
@@ -81,6 +110,29 @@ class InnerLoopResult:
     last_feedback: str   = ""
     records:       list  = field(default_factory=list)   # list[AttemptRecord]
     context_satisfied: bool = True   # pull-model: False ⇒ last attempt still needed context
+    # RUN-7: True when the round ended because the Gate-2 validator was
+    # unreachable/unparseable on every retry — a technical failure, never a
+    # real {"approved": false}. ``passed`` is False alongside this, but the
+    # attempt that hit it is NOT counted in ``attempts_used`` and no
+    # "validator rejected" line was appended to feedback — the coder must
+    # never be told the reviewer rejected it when no reviewer ever answered.
+    unavailable:   bool  = False
+    # RUN-7: the last "validator unavailable: …" text, kept ONLY for the
+    # outer loop's WARNING log line — never fed to a coder/feedback file.
+    unavailable_reason: str = ""
+    # RUN-8: which stage ended this round unavailable — "coder" (the coder
+    # call died before the model could answer, RUN-8) or "gate2" (RUN-7).
+    # "" on a legacy/older result and on a Round that was not left
+    # unavailable; the outer loop and the controller key their log line off
+    # it, so a coder outage reads as a coder outage rather than as a
+    # validator that never answered.
+    unavailable_stage: str = ""
+    # RUN-8: wall-clock seconds spent inside a coder call that ended in a
+    # transport failure, credited back against this task's deadline inside
+    # run_task. The outer loop adds it to its own shared _task_deadline so
+    # the seconds are not charged twice. 0.0 when nothing died on the wire
+    # or when there was no deadline to credit against.
+    deadline_credit_s: float = 0.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -242,10 +294,19 @@ class Gate2Verdict:
         ``Reason: …`` / ``Hints: …`` block on rejection). Kept under its
         existing name for callers that read the tuple's second element
         directly.
+    unavailable:
+        RUN-7: ``True`` only when ``approved is False`` because the
+        ``except Exception`` exit fired (a transport or parse error) —
+        never for a model that actually answered ``{"approved": false}``.
+        The inner loop uses this to tell a real rejection from a provider
+        outage that happens to look like one; ``approve()``'s own
+        two-tuple return does not carry this distinction, so it is only
+        available through :meth:`LLMGate2Validator.approve_verdict`.
     """
 
     approved: bool
     reason: str = ""
+    unavailable: bool = False
 
     def feedback(self) -> str:
         """Coder-facing message. Empty on acceptance, the reason on rejection."""
@@ -258,6 +319,13 @@ class LLMGate2Validator:
     Calls the model and parses ``{"approved": bool, "feedback": str, ...}``.
     Any network / parse error returns ``(False, "validator unavailable: …")``.
     """
+
+    # RUN-10: the [loop] retry budget for this validator's own call, resolved
+    # in __init__ below. Empty on purpose at class level: several tests build
+    # the validator with object.__new__() and hand it only the attributes they
+    # need, and those stay on request_completion()'s built-in budget exactly as
+    # they were before RUN-10, instead of losing the call to an AttributeError.
+    _retry_kwargs: dict = {}
 
     def __init__(
         self,
@@ -297,10 +365,23 @@ class LLMGate2Validator:
         self.ssl_context = ssl_context
         self.base_dir    = Path(base_dir)
         self.last_missing_context: list[str] = []
+        # RUN-7: side channel mirroring last_missing_context — True only
+        # when the most recent approve() call fell through to the
+        # `except Exception` exit (transport/parse error), never for a
+        # model-issued rejection. approve_verdict() reads this into
+        # Gate2Verdict.unavailable.
+        self.last_unavailable: bool = False
         self.num_ctx     = int(num_ctx)
         self.max_tokens  = int(max_tokens)
         self.task_mode   = str(task_mode)
         self._config     = config
+        # RUN-10: the [loop] HTTP retry budget for this validator's own
+        # request_completion() call — read once here, next to the timeout the
+        # make_inner_loop factory resolves from the same [loop] section. A
+        # None config (a directly constructed validator, as tests do) gives
+        # request_completion()'s built-in defaults.
+        from tools.llm_stream import retry_kwargs_from_config
+        self._retry_kwargs = retry_kwargs_from_config(config)
         # AUTO-FIX (fable follow-up): Gate-2 in code/docs mode requires
         # strict JSON with no soft-parse fallback (see AUTO-BUG-10) — a
         # thinking model truncated mid-<think> here fails closed exactly
@@ -601,6 +682,7 @@ class LLMGate2Validator:
         detailed verdict instead of repeating itself.
         """
         self.last_missing_context = []
+        self.last_unavailable = False   # RUN-7: reset every call, like last_missing_context
 
         # AUTO-FIX: cheap deterministic language pre-gate for creative mode —
         # catches a chapter that drifted into the wrong language WITHOUT
@@ -690,6 +772,7 @@ class LLMGate2Validator:
                     timeout=self.timeout,
                     api_format=self.api_format,
                     ssl_context=self.ssl_context,
+                    **self._retry_kwargs,
                 )
                 return strip_think(_r or "")
 
@@ -814,6 +897,7 @@ class LLMGate2Validator:
         except Exception as exc:
             logger.warning("LLMGate2Validator error: %s", exc)
             self.last_missing_context = []
+            self.last_unavailable = True   # RUN-7: transport/parse error, not a verdict
             return False, f"validator unavailable: {exc}"
 
     def approve_verdict(
@@ -838,7 +922,10 @@ class LLMGate2Validator:
             task, exec_result, coder_result,
             base_dir=base_dir, prior_critique=prior_critique,
         )
-        return Gate2Verdict(approved=approved, reason=reason)
+        # RUN-7: last_unavailable is set by approve() itself only on the
+        # `except Exception` exit — never for a real {"approved": false}.
+        return Gate2Verdict(approved=approved, reason=reason,
+                            unavailable=self.last_unavailable)
 
 
 def _parse_verdict_soft(text: str) -> tuple[bool, str, bool]:
@@ -1202,6 +1289,123 @@ def _format_gate2_feedback(parsed: dict, max_hints: int) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# RUN-3: exec-failure detail — for a test runner the cause is at the tail
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# The feedback the coder gets after a failed acceptance check used to be the
+# first 400 characters of the winning stream. For a script that is the
+# interesting part; for pytest it is xdist's "bringing up nodes..." banner
+# plus the frame of the error box, and the one line that says what went
+# wrong (``E   ModuleNotFoundError: …``) sits at the END of the box. Live
+# runs on ../testtext and ../testtext6: 438 executor rejections, every exit-1
+# collection error and every exit-5 run cut before that line — AUTO-T11
+# re-emitted the same file 25 times.
+
+# Head budget, unchanged, for non-pytest commands.
+_EXEC_HEAD_BUDGET = 400
+# Tail budget for a pytest run: 400 characters do not hold one collection
+# error; the validator prompt already allows 2 000 for this same stream.
+_EXEC_TAIL_BUDGET = 1500
+
+# pytest exit 5 is "no tests were collected" — the one exit code whose output
+# carries no diagnostic at all, so the coder gets the interpretation spelled
+# out instead of a code from a table it does not have.
+_NO_TESTS_COLLECTED_MSG = (
+    "no tests collected — the -k expression matched nothing "
+    "or the file defines no test_* function"
+)
+
+# The two report sections that hold the ``E   …`` line:
+#   ==================================== ERRORS ====================================
+#   =================================== FAILURES ===================================
+# ``short test summary info`` is deliberately NOT an anchor: pytest prints it
+# AFTER the boxes, so starting there would hand the coder the one-line digest
+# and drop the diagnostic line this fix exists to deliver. It still arrives —
+# it follows the last box — and it is what the plain-tail fallback shows when
+# there is no box at all.
+_PYTEST_BOX_HEADER_RE = re.compile(r"^=+ (?:ERRORS|FAILURES) =+\s*$", re.MULTILINE)
+# xdist prints one of these per worker while the pool starts.
+_XDIST_BANNER_RE = re.compile(r"^\s*bringing up nodes\.\.\.\s*$")
+_TRIM_MARK = "... [trimmed]\n"
+
+
+def _strip_pytest_noise(text: str) -> str:
+    """Drop xdist's ``bringing up nodes...`` lines and runs of blank lines.
+
+    Neither carries information, and stripping them *before* the budget is
+    applied means the budget buys traceback lines instead of whitespace.
+    """
+    out: list[str] = []
+    blank = False
+    for line in text.splitlines():
+        if _XDIST_BANNER_RE.match(line):
+            continue
+        if line.strip():
+            out.append(line)
+            blank = False
+        elif not blank and out:
+            out.append("")
+            blank = True
+    return "\n".join(out).strip("\n")
+
+
+def _pytest_tail(text: str, budget: int = _EXEC_TAIL_BUDGET) -> str:
+    """The diagnostic slice of a pytest run's stdout — its tail (RUN-3).
+
+    Strip the noise, then start at the last ``ERRORS`` / ``FAILURES`` header
+    so the final box arrives whole (header, frames, ``E`` line, and the short
+    summary that follows it); with no box, take the plain tail. Over budget,
+    the box is cut from the FRONT — its header line is kept so it still reads
+    as a box, the middle is marked as trimmed, and the last lines, where the
+    diagnostic sits, always survive.
+    """
+    cleaned = _strip_pytest_noise(text or "")
+    boxes = list(_PYTEST_BOX_HEADER_RE.finditer(cleaned))
+    window = cleaned[boxes[-1].start():] if boxes else cleaned
+    if len(window) <= budget:
+        return window
+    header, sep, rest = window.partition("\n")
+    if boxes and sep and len(header) + len(sep) + len(_TRIM_MARK) < budget:
+        keep = budget - len(header) - len(sep) - len(_TRIM_MARK)
+        return header + sep + _TRIM_MARK + _whole_lines(rest[-keep:])
+    return _TRIM_MARK + _whole_lines(window[-(budget - len(_TRIM_MARK)):])
+
+
+def _whole_lines(tail: str) -> str:
+    """Drop the partial first line a character-count cut leaves behind."""
+    nl = tail.find("\n")
+    return tail[nl + 1:] if 0 <= nl < len(tail) - 1 else tail
+
+
+def _build_exec_detail(exec_result) -> str:
+    """The detail block of one exec-failure feedback message (RUN-3).
+
+    Stream priority is unchanged — traceback > stderr > stdout, the most
+    diagnostic first — and so is the 400-character head for every command
+    that is not a test runner (script output is head-interesting). For a
+    pytest run the stdout slice is the tail instead, on the larger budget,
+    and exit 5 is prefixed with the sentence its empty output is missing.
+    """
+    tb  = getattr(exec_result, "traceback", "") or ""
+    out = getattr(exec_result, "stdout",    "") or ""
+    err = getattr(exec_result, "stderr",    "") or ""
+    ec  = getattr(exec_result, "exit_code", 1)
+    cmd = getattr(exec_result, "command",   "") or ""
+    pytest_run = is_pytest_command(cmd)
+    if tb:
+        detail = f"traceback:\n{tb}"
+    elif err:
+        detail = f"stderr:\n{err[:_EXEC_HEAD_BUDGET]}"
+    elif pytest_run:
+        detail = f"stdout:\n{_pytest_tail(out)}"
+    else:
+        detail = f"stdout:\n{out[:_EXEC_HEAD_BUDGET]}"
+    if pytest_run and ec == 5:
+        detail = f"{_NO_TESTS_COLLECTED_MSG}\n{detail}"
+    return detail
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # InnerLoop
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1248,6 +1452,10 @@ class InnerLoop:
         max_task_seconds: int = 0,
         run_goal: str = "",
         collect_bridge=None,
+        validator_unavailable_retries: int = _DEFAULT_VALIDATOR_UNAVAILABLE_RETRIES,
+        validator_unavailable_wait_sec: float = _DEFAULT_VALIDATOR_UNAVAILABLE_WAIT_SEC,
+        coder_transport_retries: int = _DEFAULT_CODER_TRANSPORT_RETRIES,
+        coder_transport_wait_sec: float = _DEFAULT_CODER_TRANSPORT_WAIT_SEC,
     ):
         self.coder        = coder
         self.executor     = executor
@@ -1284,6 +1492,29 @@ class InnerLoop:
         # otherwise only see the keyword if it happened to be echoed into the
         # per-task instruction text.
         self._run_goal    = str(run_goal or "")
+        # RUN-7: bounds on re-running ONLY the Gate-2 validator call when it
+        # reports "unavailable" rather than a verdict. 0 retries = one call,
+        # then the round is left unreviewed. Guarded here as well as in
+        # make_inner_loop so a direct caller (tests, embedders) handing over a
+        # bad value degrades to the default instead of raising into a run.
+        try:
+            self._validator_unavailable_retries = max(0, int(validator_unavailable_retries))
+        except (TypeError, ValueError):
+            self._validator_unavailable_retries = _DEFAULT_VALIDATOR_UNAVAILABLE_RETRIES
+        try:
+            self._validator_unavailable_wait_sec = max(0.0, float(validator_unavailable_wait_sec))
+        except (TypeError, ValueError):
+            self._validator_unavailable_wait_sec = _DEFAULT_VALIDATOR_UNAVAILABLE_WAIT_SEC
+        # RUN-8: same guards — a bad value degrades to the default rather
+        # than raising into a run.
+        try:
+            self._coder_transport_retries = max(0, int(coder_transport_retries))
+        except (TypeError, ValueError):
+            self._coder_transport_retries = _DEFAULT_CODER_TRANSPORT_RETRIES
+        try:
+            self._coder_transport_wait_sec = max(0.0, float(coder_transport_wait_sec))
+        except (TypeError, ValueError):
+            self._coder_transport_wait_sec = _DEFAULT_CODER_TRANSPORT_WAIT_SEC
 
     # ------------------------------------------------------------------
 
@@ -1329,15 +1560,27 @@ class InnerLoop:
         task_id = task.get("id", "")
         feedback: list[str] = list(prior_feedback or [])
         _prior_validator_critique: str = ""   # AUTO-CR-30: last Gate-2 critique
-        # AUTO-CR-30: detect (once) whether this validator's approve() accepts
-        # prior_critique, so we never break fakes/older validators that don't.
+        # RUN-7: only a validator that exposes approve_verdict() can ever
+        # report `unavailable` (a fake/older validator with just approve()
+        # keeps today's two-outcome behaviour — approve()'s own tuple return
+        # is unchanged and carries no such distinction).
+        _validator_has_verdict = hasattr(self.validator, "approve_verdict")
+        # AUTO-CR-30: detect (once) whether the validator method we will
+        # actually call accepts prior_critique, so we never break fakes/older
+        # validators that don't. RUN-7: that is approve_verdict() when the
+        # validator has one — inspecting approve() instead would pass the
+        # kwarg to a method that may not take it.
         try:
             import inspect as _inspect
+            _validator_method = (
+                self.validator.approve_verdict if _validator_has_verdict
+                else self.validator.approve
+            )
             _validator_accepts_prior = (
                 "prior_critique"
-                in _inspect.signature(self.validator.approve).parameters
+                in _inspect.signature(_validator_method).parameters
             )
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, AttributeError):
             _validator_accepts_prior = False
         records:  list[AttemptRecord] = []
         # Pull-model state (carried across attempts within this round)
@@ -1365,7 +1608,8 @@ class InnerLoop:
         # reassignment sites re-prepend it via _with_collect_block().
         _collect_block = ""
         if self._collect_bridge is not None:
-            _collect_block = self._collect_bridge.context_for_many(target_files) or ""
+            _collect_block = self._collect_bridge.context_for_many(
+                target_files, task_id=task_id) or ""
             if _collect_block:
                 prefetched_context = _collect_block + "\n\n"
 
@@ -1390,6 +1634,12 @@ class InnerLoop:
             _eff_deadline = _start_time + self.max_task_seconds
         else:
             _eff_deadline = None
+        # RUN-8: seconds returned to the deadline by coder calls that ended in
+        # a transport failure. Credited against _eff_deadline in the coder step
+        # below as they happen, and handed back to the outer loop with the
+        # result so its own shared _task_deadline is not short the same
+        # seconds. 0.0 when nothing died on the wire or there is no deadline.
+        _deadline_credit_s = 0.0
 
         # LOOP-4: prepend prior implementation history
         if prior_implementations:
@@ -1441,21 +1691,98 @@ class InnerLoop:
                         last_feedback=last,
                         records=records,
                         context_satisfied=not _any_missing,
+                        deadline_credit_s=_deadline_credit_s,
                     )
 
             # ── 1. Coder ──────────────────────────────────────────────────────
-            try:
-                coder_result = self.coder.generate(
-                    task, base_dir, prior_feedback=feedback,
-                    prefetched_context=prefetched_context,
+            # RUN-8: a coder call that died before the model could answer
+            # (CoderResult.error_kind == "transport") is not an attempt —
+            # nothing was produced, so there is nothing to feed back and no
+            # attempt to charge. Re-run ONLY the call, on the same attempt
+            # number, without appending a feedback line and without touching
+            # prior_feedback. Any result without the field (a fake or older
+            # coder) is treated as today's charged attempt.
+            _coder_calls_allowed = 1 + self._coder_transport_retries
+            _transport_exhausted = False
+            _coder_raised: Exception | None = None
+            for _c_call in range(_coder_calls_allowed):
+                # Measured so the call can give its wall-clock back to the
+                # shared deadline below: time spent waiting on a dead socket
+                # is not this task's budget.
+                _call_start = time.monotonic()
+                try:
+                    coder_result = self.coder.generate(
+                        task, base_dir, prior_feedback=feedback,
+                        prefetched_context=prefetched_context,
+                    )
+                except Exception as exc:
+                    _coder_raised = exc
+                    break
+
+                if str(getattr(coder_result, "error_kind", "") or "") != "transport":
+                    break   # a reply came back (parsed or not) — a charged attempt
+
+                _elapsed = time.monotonic() - _call_start
+                _t_budget = 0
+                try:  # a malformed field must not raise into the run
+                    _t_budget = int(getattr(coder_result, "max_tokens", 0) or 0)
+                except (TypeError, ValueError):
+                    _t_budget = 0
+                _t_extra: dict = {"budget_raised": False}
+                if _t_budget:
+                    _t_extra["max_tokens"] = _t_budget
+                _trace_stage(task_id, attempt, "coder", "TRANSPORT",
+                             error=str(getattr(coder_result, "error", "") or ""),
+                             calls=_coder_calls_allowed, **_t_extra)
+                if _eff_deadline is not None:
+                    _eff_deadline += _elapsed
+                    _deadline_credit_s += _elapsed
+                if _coder_calls_allowed - _c_call - 1 <= 0:
+                    _transport_exhausted = True
+                    break
+                logger.warning(
+                    "InnerLoop: task %s attempt %d coder transport failure "
+                    "(call %d/%d, %.1fs credited back) — retrying in %.1fs: %s",
+                    task_id, attempt, _c_call + 1, _coder_calls_allowed,
+                    _elapsed, self._coder_transport_wait_sec,
+                    str(getattr(coder_result, "error", "") or ""),
                 )
-            except Exception as exc:
-                logger.error("InnerLoop: coder raised on attempt %d: %s", attempt, exc)
-                fb = f"attempt {attempt}: coder error — {exc}"
-                _trace_stage(task_id, attempt, "coder", "ERROR", error=str(exc))
+                if self._coder_transport_wait_sec > 0:
+                    time.sleep(self._coder_transport_wait_sec)
+
+            if _coder_raised is not None:
+                logger.error("InnerLoop: coder raised on attempt %d: %s",
+                             attempt, _coder_raised)
+                fb = f"attempt {attempt}: coder error — {_coder_raised}"
+                _trace_stage(task_id, attempt, "coder", "ERROR", error=str(_coder_raised))
                 feedback.append(fb)
                 records.append(AttemptRecord(attempt, False, False, False, fb))
                 continue
+
+            if _transport_exhausted:
+                # RUN-8: every re-run died before the model answered — this
+                # attempt produced nothing, so it is not charged
+                # (attempts_used below excludes it) and NO feedback line is
+                # appended: the coder must not be told it failed when it
+                # never got to say anything. Same left-todo exit as RUN-7.
+                logger.warning(
+                    "InnerLoop: task %s attempt %d — coder transport failure "
+                    "after %d call(s): %s",
+                    task_id, attempt, _coder_calls_allowed,
+                    str(getattr(coder_result, "error", "") or ""),
+                )
+                return InnerLoopResult(
+                    task_id=task_id,
+                    passed=False,
+                    unavailable=True,
+                    unavailable_reason=str(getattr(coder_result, "error", "") or ""),
+                    unavailable_stage="coder",
+                    attempts_used=attempt - 1,   # only attempts that reached a reply
+                    last_feedback="",
+                    records=records,
+                    context_satisfied=not _any_missing,
+                    deadline_credit_s=_deadline_credit_s,
+                )
 
             # Pull-model: resolve any context the coder asked for, for the NEXT attempt.
             coder_missing = list(getattr(coder_result, "missing_context", []) or [])
@@ -1473,15 +1800,54 @@ class InnerLoop:
                 logger.info("InnerLoop: attempt %d coder requested context %s — accumulated (%d total)",
                             attempt, coder_missing, len(resolved_context))
 
+            # RUN-1: paths outside target_files were dropped by the coder's
+            # allow-list guard. Collected before the success check so the
+            # REJECTED trace (nothing landed at all) can name them too.
+            files_skipped = list(getattr(coder_result, "files_skipped", []) or [])
+
+            # RUN-4: the budget this attempt went out at, plus whether its
+            # cut-off reply just raised it for the next one. The ladder is
+            # only visible on the coder decision events, so
+            # trace_round_snapshot.py counts it from these two params. Fakes
+            # without the fields add nothing.
+            _budget = int(getattr(coder_result, "max_tokens", 0) or 0)
+            _trace_extra: dict = {}
+            if _budget:
+                _trace_extra["max_tokens"] = _budget
+                _trace_extra["budget_raised"] = bool(
+                    getattr(coder_result, "budget_raised", False))
+
             if not getattr(coder_result, "succeeded", True):
                 # Context is accumulated above even on coder failure: the next
                 # attempt benefits from symbols already resolved, regardless of
                 # whether the current attempt produced valid code.
                 fb = f"attempt {attempt}: coder failed — {getattr(coder_result, 'error', 'unknown error')}"
-                _trace_stage(task_id, attempt, "coder", "REJECTED")
+                _trace_stage(task_id, attempt, "coder", "REJECTED",
+                             skipped=files_skipped, **_trace_extra)
                 feedback.append(fb)
                 records.append(AttemptRecord(attempt, False, False, False, fb))
                 continue
+
+            # RUN-1: a `target_files` skip is protection, not a verdict — the
+            # attempt goes on to the executor, but the model must still learn
+            # that its extra files never hit disk, otherwise a test file it
+            # "wrote" will be missing when it reasons about the next round.
+            # The note must not read "coder failed": _write_round_feedback and
+            # the prompt-optimizer summariser key on that prefix to mean a
+            # rejected attempt. Traced through the existing coder stage (no new
+            # event kind) so trace_round_snapshot / the M5 harness can count it.
+            if files_skipped:
+                _trace_stage(task_id, attempt, "coder", "OK_WITH_SKIPS",
+                             written=list(getattr(coder_result, "files_written", []) or []),
+                             skipped=files_skipped, **_trace_extra)
+                _n = len(files_skipped)
+                feedback.append(
+                    f"attempt {attempt}: note: {_n} file"
+                    f"{'s' if _n != 1 else ''} outside target_files "
+                    f"{'were' if _n != 1 else 'was'} not written "
+                    f"({', '.join(str(p) for p in files_skipped)}) — "
+                    f"only the listed target files are editable in this task"
+                )
 
             # ── 2. Executor (objective half of Gate 2) ────────────────────────
             try:
@@ -1527,19 +1893,14 @@ class InnerLoop:
                 continue
 
             if not getattr(exec_result, "passed", False):
-                tb  = getattr(exec_result, "traceback", "") or ""
-                out = getattr(exec_result, "stdout",    "") or ""
-                err = getattr(exec_result, "stderr",    "") or ""
                 ec  = getattr(exec_result, "exit_code", 1)
                 cmd = getattr(exec_result, "command",   "") or ""
                 # Include stderr so argparse / runtime error messages reach the coder.
                 # Priority: traceback > stderr > stdout (most diagnostic first).
-                if tb:
-                    detail = f"traceback:\n{tb}"
-                elif err:
-                    detail = f"stderr:\n{err[:400]}"
-                else:
-                    detail = f"stdout:\n{out[:400]}"
+                # RUN-3: for a pytest run the stdout slice is the TAIL — the
+                # head is xdist's banner and the top of the error box, and
+                # the E-line that names the cause used to be cut at 400 chars.
+                detail = _build_exec_detail(exec_result)
                 fb  = (
                     f"attempt {attempt}: exec failed (exit {ec})"
                     + (f"  cmd={cmd!r}" if cmd else "")
@@ -1551,22 +1912,94 @@ class InnerLoop:
                 continue
 
             # ── 3. Validator (subjective half of Gate 2) ─────────────────────
-            try:
-                # AUTO-CR-30: only pass prior_critique to validators that accept
-                # it (real LLMGate2Validator); fakes/older validators are unaffected.
-                _ap_kwargs = {"base_dir": base_dir_path}
-                if _validator_accepts_prior:
-                    _ap_kwargs["prior_critique"] = _prior_validator_critique
-                approved, vfb = self.validator.approve(
-                    task, exec_result, coder_result, **_ap_kwargs
+            # AUTO-CR-30: only pass prior_critique to validators that accept
+            # it (real LLMGate2Validator); fakes/older validators are unaffected.
+            _ap_kwargs = {"base_dir": base_dir_path}
+            if _validator_accepts_prior:
+                _ap_kwargs["prior_critique"] = _prior_validator_critique
+
+            # RUN-7: "validator unavailable: …" (a transport/parse error) is
+            # not a verdict. Re-run ONLY this call — the coder output and the
+            # executor result are still valid — up to
+            # validator_unavailable_retries times, then give up on the WHOLE
+            # round rather than charge the attempt as a rejection. A model
+            # that answered {"approved": false} is a rejection however terse:
+            # Gate2Verdict.unavailable is set only on approve()'s except exit.
+            approved = None
+            vfb = ""
+            _gate2_unavailable = False
+            _gate2_raised: Exception | None = None
+            _val_calls_allowed = 1 + self._validator_unavailable_retries
+            for _val_call in range(_val_calls_allowed):
+                try:
+                    if _validator_has_verdict:
+                        verdict = self.validator.approve_verdict(
+                            task, exec_result, coder_result, **_ap_kwargs
+                        )
+                        approved = verdict.approved
+                        vfb      = verdict.feedback()
+                        _gate2_unavailable = bool(getattr(verdict, "unavailable", False))
+                    else:
+                        # A fake/older validator with only approve() keeps
+                        # today's behaviour: its tuple carries no third
+                        # outcome, so an outage string stays a rejection.
+                        approved, vfb = self.validator.approve(
+                            task, exec_result, coder_result, **_ap_kwargs
+                        )
+                        _gate2_unavailable = False
+                except Exception as exc:
+                    _gate2_raised = exc
+                    break
+
+                if not _gate2_unavailable:
+                    break   # a real verdict (approved or rejected) — proceed normally
+
+                _retries_left = _val_calls_allowed - _val_call - 1
+                if _retries_left <= 0:
+                    break
+                logger.warning(
+                    "InnerLoop: attempt %d gate2 validator unavailable "
+                    "(call %d/%d) — retrying in %.1fs: %s",
+                    attempt, _val_call + 1, _val_calls_allowed,
+                    self._validator_unavailable_wait_sec, vfb,
                 )
-            except Exception as exc:
-                logger.error("InnerLoop: validator raised on attempt %d: %s", attempt, exc)
-                fb = f"attempt {attempt}: validator error — {exc}"
-                _trace_stage(task_id, attempt, "gate2", "ERROR", error=str(exc))
+                if self._validator_unavailable_wait_sec > 0:
+                    time.sleep(self._validator_unavailable_wait_sec)
+
+            if _gate2_raised is not None:
+                logger.error("InnerLoop: validator raised on attempt %d: %s",
+                             attempt, _gate2_raised)
+                fb = f"attempt {attempt}: validator error — {_gate2_raised}"
+                _trace_stage(task_id, attempt, "gate2", "ERROR", error=str(_gate2_raised))
                 feedback.append(fb)
                 records.append(AttemptRecord(attempt, True, True, False, fb))
                 continue
+
+            if _gate2_unavailable:
+                # RUN-7: every retry came back unavailable — this attempt is
+                # NOT charged (attempts_used below excludes it) and NO
+                # feedback line is appended: the coder must not be told the
+                # reviewer rejected it when no reviewer ever answered.
+                # _prior_validator_critique is untouched by design.
+                logger.warning(
+                    "InnerLoop: task %s attempt %d — gate2 validator still "
+                    "unavailable after %d call(s): %s",
+                    task_id, attempt, _val_calls_allowed, vfb,
+                )
+                _trace_stage(task_id, attempt, "gate2", "UNAVAILABLE",
+                            calls=_val_calls_allowed)
+                return InnerLoopResult(
+                    task_id=task_id,
+                    passed=False,
+                    unavailable=True,
+                    unavailable_reason=vfb,
+                    unavailable_stage="gate2",
+                    attempts_used=attempt - 1,   # only attempts that reached a verdict
+                    last_feedback="",
+                    records=records,
+                    context_satisfied=not _any_missing,
+                    deadline_credit_s=_deadline_credit_s,
+                )
 
             if not approved:
                 fb = f"attempt {attempt}: validator rejected\n{vfb}"
@@ -1630,6 +2063,7 @@ class InnerLoop:
                 last_feedback="",
                 records=records,
                 context_satisfied=True,
+                deadline_credit_s=_deadline_credit_s,
             )
 
         # All attempts exhausted
@@ -1642,6 +2076,7 @@ class InnerLoop:
             last_feedback=last,
             records=records,
             context_satisfied=not _any_missing,
+            deadline_credit_s=_deadline_credit_s,
         )
 
 
@@ -1816,6 +2251,10 @@ def make_inner_loop(
     except ValueError as exc:
         logger.warning("config [auto] workspace_retain_count invalid (%s) — using 5", exc)
         ws_retain = 5
+    # RUN-3: workspace pytest runs in-process unless the project opts back
+    # into the xdist pool. safe_getboolean returns the fallback for an absent
+    # [executor] section, a missing key and a malformed value alike.
+    pytest_serial = safe_getboolean(config, "executor", "pytest_serial", fallback=True)
 
     # ── Coder ─────────────────────────────────────────────────────────────────
     if coder is None:
@@ -1833,6 +2272,7 @@ def make_inner_loop(
             executor = make_executor(
                 base_dir=base_dir, timeout_sec=exec_timeout,
                 max_retained_workspaces=ws_retain,
+                pytest_serial=pytest_serial,
             )
         except ImportError:
             logger.warning("Executor not found — using _StubExecutor (tests only)")
@@ -1923,12 +2363,61 @@ def make_inner_loop(
         )
         require_tests = False
 
+    # RUN-7: how many times to re-run ONLY the Gate-2 validator call when it
+    # came back without a verdict (transport/parse error) before the round is
+    # left unreviewed, and the pause between those calls. The pause reuses
+    # [collect] error_retry_wait_sec — the same outage-class wait the collect
+    # summarizer already reads — so an operator tunes one knob for both.
+    try:
+        validator_unavailable_retries = config.getint(
+            "auto", "validator_unavailable_retries",
+            fallback=_DEFAULT_VALIDATOR_UNAVAILABLE_RETRIES,
+        )
+    except ValueError as exc:
+        logger.warning(
+            "config [auto] validator_unavailable_retries is malformed (%s) — using default %d",
+            exc, _DEFAULT_VALIDATOR_UNAVAILABLE_RETRIES,
+        )
+        validator_unavailable_retries = _DEFAULT_VALIDATOR_UNAVAILABLE_RETRIES
+    try:
+        validator_unavailable_wait_sec = config.getfloat(
+            "collect", "error_retry_wait_sec",
+            fallback=_DEFAULT_VALIDATOR_UNAVAILABLE_WAIT_SEC,
+        )
+    except ValueError as exc:
+        logger.warning(
+            "config [collect] error_retry_wait_sec is malformed (%s) — using default %.0f",
+            exc, _DEFAULT_VALIDATOR_UNAVAILABLE_WAIT_SEC,
+        )
+        validator_unavailable_wait_sec = _DEFAULT_VALIDATOR_UNAVAILABLE_WAIT_SEC
+
+    # RUN-8: how many times to re-run ONLY the coder call when it came back
+    # without the model having answered at all (CoderResult.error_kind ==
+    # "transport" — a stream-read timeout, URLError, HTTPError). The wait
+    # between those calls reuses [collect] error_retry_wait_sec, the same
+    # outage-class knob the validator re-runs above read.
+    try:
+        coder_transport_retries = config.getint(
+            "auto", "coder_transport_retries",
+            fallback=_DEFAULT_CODER_TRANSPORT_RETRIES,
+        )
+    except ValueError as exc:
+        logger.warning(
+            "config [auto] coder_transport_retries is malformed (%s) — using default %d",
+            exc, _DEFAULT_CODER_TRANSPORT_RETRIES,
+        )
+        coder_transport_retries = _DEFAULT_CODER_TRANSPORT_RETRIES
+
     loop = InnerLoop(coder, executor, validator, max_attempts=max_attempts,
                      context_broker=broker,
                      **_gate_validators,
                      require_tests=require_tests,
                      task_mode=task_mode, max_task_seconds=max_task_seconds,
-                     run_goal=run_goal, collect_bridge=collect_bridge)
+                     run_goal=run_goal, collect_bridge=collect_bridge,
+                     validator_unavailable_retries=validator_unavailable_retries,
+                     validator_unavailable_wait_sec=validator_unavailable_wait_sec,
+                     coder_transport_retries=coder_transport_retries,
+                     coder_transport_wait_sec=validator_unavailable_wait_sec)
     loop.gate_order = _gate_order
     logger.info(
         "InnerLoop: Gate-3 order for %s mode — %s",

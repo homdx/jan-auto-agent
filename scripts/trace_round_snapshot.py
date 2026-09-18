@@ -1,0 +1,405 @@
+#!/usr/bin/env python3
+"""Snapshot what a round of `--auto` runs already reports, from their traces.
+
+Read-only. Touches nothing but `.agent/trace_*.jsonl`, so it is safe to point
+at runs that are still in flight — which is the case it was written for.
+
+    python3 scripts/trace_round_snapshot.py ../testtext ../testtext3 \\
+        --out docs/collect-epics/baseline-live.json
+
+Why this exists: the probe already emits `ops / hits / misses / memo_hits /
+by_op / chars_used / informed_facts / blind_facts` on every `probe_result`, and
+gate 1's verdicts are in the trace verbatim. That is most of a Tier-2 baseline,
+available before a single line of the epics is implemented. This reads it.
+
+This now reads the M4 counters too (`collect_block`, `collect_shrink`,
+`collect_miss`, `collect_summary`, `gate1_split`), which is what makes the
+before/after columns comparable: M4 replaced a grep for the literal header
+`COLLECT MODEL (static facts` in the coder prompt with a `collect_block`
+event, and this script counts the events when they exist and falls back to
+the grep when they do not. One trace per tree was also wrong — every resume
+writes a new `trace_<run_id>.jsonl`, so all of them are read and
+`--run-id` narrows it to one.
+"""
+import argparse
+import subprocess
+import collections
+import datetime
+import glob
+import json
+import os
+import re
+import sys
+
+LOC = re.compile(r"^Location:\s*(.+)$", re.M)
+
+
+def base_sha(base, started_at=None):
+    """The commit the tree sat on when the run started.
+
+    Walking back from HEAD is not enough. Four of the five baseline trees were
+    checked out to a *different branch* while their `--auto` run was still in
+    the plan phase, so the run's own plan commit landed on a history the run
+    never ingested. The reflog is the only record of what was actually on disk
+    at ingest time, so resolve `started_at` (the trace's first timestamp)
+    against it and fall back to HEAD only when there is no reflog.
+
+    Returns ``(head_sha, pre_run_sha, switched_mid_run)``.
+    """
+    def git(*args):
+        try:
+            return subprocess.run(("git", "-C", base) + args, capture_output=True,
+                                  text=True, timeout=15).stdout
+        except Exception:
+            return ""
+
+    head = git("rev-parse", "--short=7", "HEAD").strip()
+    if not head:
+        return "", "", False
+
+    entries = []          # (datetime, sha) — newest first, as git prints them
+    for line in git("reflog", "--date=iso", "--format=%h%x09%gd%x09%gs").splitlines():
+        m = re.search(r"HEAD@\{([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:]{8} [+-][0-9]{4})\}", line)
+        if not m:
+            continue
+        try:
+            when = datetime.datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S %z")
+        except ValueError:
+            continue
+        entries.append((when, line.split("\t")[0].strip(), line))
+
+    if not entries or started_at is None:
+        return head, head, False
+
+    try:
+        t0 = datetime.datetime.fromisoformat(started_at)
+    except (TypeError, ValueError):
+        return head, head, False
+
+    # The entry in effect at t0 is the newest one at or before it. Its sha is
+    # where HEAD moved *to*, which is exactly the tree the run ingested.
+    at_start = next((e for e in entries if e[0] <= t0), None)
+    if at_start is None:
+        return head, head, False
+
+    # Anything logged between the run's start and now that moved HEAD is a
+    # mid-run switch: the trace and the current history describe different trees.
+    switched = any(e[0] > t0 and not e[2].endswith("emit plan")
+                   and "commit: auto(" not in e[2] for e in entries)
+    return head, at_start[1], switched
+
+
+def read_run(base, run_id=None):
+    """One run, read out of every trace file under `base/.agent/`.
+
+    Every resume writes a new `trace_<run_id>.jsonl`, so one run's history is
+    spread across several files; reading `traces[0]` only saw the last resume
+    and undercounted everything. All of them are read, and `run_id` narrows
+    the events to one trace — the column totals are then that trace's, not
+    the tree's.
+    """
+    traces = sorted(glob.glob(os.path.join(base, ".agent", "trace_*.jsonl")))
+    if not traces:
+        return None
+    out = {
+        "run": os.path.basename(os.path.abspath(base)),
+        "trace": os.path.basename(traces[0]),
+        "trace_files": len(traces),
+        "head_sha": "", "pre_run_sha": "", "switched_mid_run": False,
+        "goal": "", "probe_usable": None, "probe_reason": None,
+        "llm_by_source": collections.Counter(),
+        "gate1": {"requests": 0, "confirmed": 0, "rejected": 0, "unparsed": 0,
+                   "unknown": 0},
+        "gate1_split": None,
+        "gate1_location_ext": collections.Counter(),
+        # RUN-7: Gate-2's own stage-decision events, keyed by the status each
+        # carries in `content` (APPROVED / REJECTED / ERROR / UNAVAILABLE —
+        # see tools.auto.inner_loop._trace_stage's "gate2" calls). Read the
+        # same way as the coder-budget decision events just below, so a
+        # validator-provider outage is its own counted column instead of
+        # being invisible (dropped) or folded into "rejected".
+        "gate2": collections.Counter(),
+        # RUN-8: the coder's own stage-decision events, keyed by the status
+        # each carries in `content` (OK / REJECTED / ERROR / TRANSPORT /
+        # OK_WITH_SKIPS — see tools.auto.inner_loop._trace_stage's "coder"
+        # calls). TRANSPORT is a call that died before the model could
+        # answer: not a rejection, not a budget tier, its own column.
+        "coder": collections.Counter(),
+        # RUN-4: the coder's truncation ladder — how many rejected coder
+        # attempts had just raised the output budget for the next one, and
+        # at which tier the attempts went out. The ladder is only visible in
+        # the coder decision event, which carries max_tokens + budget_raised.
+        "coder_budget_escalations": 0,
+        "coder_budgets": collections.Counter(),
+        "probe": {"ops": 0, "hits": 0, "misses": 0, "memo_hits": 0},
+        "probe_by_op": collections.Counter(),
+        # M4: events when they exist, grep otherwise — see collect_source.
+        "collect": {
+            "blocks": 0, "chars": 0, "memo_hits": 0,
+            "shrink": collections.Counter(), "miss": collections.Counter(),
+            # RUN-6: refresh-on-entry — runs, how many succeeded, modules
+            # re-summarised, seconds spent. Zero runs = the pack was fresh
+            # (or off) on every session start.
+            "refresh": {"runs": 0, "ok": 0, "modules": 0, "seconds": 0.0},
+        },
+        "collect_source": "grep",
+        "collect_block_occurrences": 0,
+        "first_ts": None, "last_ts": None, "gate1_first_ts": None, "gate1_last_ts": None,
+    }
+    pending_ext = None
+    header_grep = 0
+    for trace in traces:
+        for line in open(trace, encoding="utf-8", errors="replace"):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+            except Exception:
+                continue
+            if run_id and r.get("run_id") not in (None, run_id) \
+                    and run_id not in os.path.basename(trace):
+                continue
+            if "COLLECT MODEL (static facts" in line:
+                header_grep += 1
+            ts, kind, src, tgt = r.get("ts"), r.get("kind"), r.get("source"), r.get("target")
+            if ts:
+                out["first_ts"] = out["first_ts"] or ts
+                out["last_ts"] = ts
+            if kind == "run_start":
+                out["goal"] = (r.get("params") or {}).get("goal") or r.get("content", "")[:400]
+            elif kind == "probe_config":
+                p = r.get("params") or {}
+                out["probe_usable"] = p.get("usable")
+                out["probe_reason"] = p.get("reason")
+            elif kind == "llm_request":
+                out["llm_by_source"][src or "?"] += 1
+                if src == "gate1":
+                    out["gate1"]["requests"] += 1
+                    out["gate1_first_ts"] = out["gate1_first_ts"] or ts
+                    out["gate1_last_ts"] = ts
+                    m = LOC.search(r.get("content", "") or "")
+                    path = m.group(1).split(",")[0].strip() if m else ""
+                    pending_ext = (os.path.splitext(path)[1] or "<none>").lower()
+            elif kind == "llm_response" and tgt == "gate1":
+                try:
+                    v = json.loads(r.get("content", "") or "").get("verdict")
+                except Exception:
+                    v = None
+                if v in ("confirmed", "rejected"):
+                    out["gate1"][v] += 1
+                else:
+                    out["gate1"]["unparsed"] += 1
+                if pending_ext is not None:
+                    out["gate1_location_ext"][f"{pending_ext}:{v or 'unparsed'}"] += 1
+                    pending_ext = None
+            elif kind == "probe_result":
+                p = r.get("params") or {}
+                for k in ("ops", "hits", "misses", "memo_hits"):
+                    try:
+                        out["probe"][k] += int(p.get(k, 0))
+                    except (TypeError, ValueError):
+                        pass
+                for tok in (p.get("by_op") or "").split():
+                    name, _, hm = tok.partition("=")
+                    h, _, m2 = hm.partition("/")
+                    try:
+                        out["probe_by_op"][f"{name}_hit"] += int(h)
+                        out["probe_by_op"][f"{name}_miss"] += int(m2)
+                    except ValueError:
+                        pass
+            # ── M4: collect counters ───────────────────────────────────────
+            # collect_summary is one event per run and restates the totals,
+            # so it is skipped here — the per-block events are the source, and
+            # counting both would double every number in a resumed run.
+            elif kind == "collect_block":
+                p = r.get("params") or {}
+                out["collect"]["blocks"] += 1
+                try:
+                    out["collect"]["chars"] += int(p.get("chars", 0))
+                except (TypeError, ValueError):
+                    pass
+                if str(p.get("memo_hit", "")).strip().lower() in ("true", "1", "yes"):
+                    # agent_trace stringifies params: "False" is truthy.
+                    out["collect"]["memo_hits"] += 1
+            elif kind == "collect_shrink":
+                out["collect"]["shrink"][str((r.get("params") or {}).get("path") or "?")] += 1
+            elif kind == "collect_miss":
+                out["collect"]["miss"][str((r.get("params") or {}).get("reason") or "?")] += 1
+            elif kind == "collect_refresh":
+                p = r.get("params") or {}
+                rf = out["collect"]["refresh"]
+                rf["runs"] += 1
+                # agent_trace stringifies params: "False" is truthy.
+                if str(p.get("ok", "")).strip().lower() in ("true", "1", "yes"):
+                    rf["ok"] += 1
+                for key in ("modules", "seconds"):
+                    try:
+                        rf[key] += float(p.get(key) or 0)
+                    except (TypeError, ValueError):
+                        pass
+                rf["modules"] = int(rf["modules"])
+            elif kind == "gate1_split":
+                out["gate1_split"] = dict(r.get("params") or {})
+            # ── RUN-4: the coder's truncation ladder ───────────────────────
+            # Only the coder's REJECTED decision carries the budget; a coder
+            # attempt that went out at 12000 instead of 3000 is visible here
+            # and nowhere else, so this is what tells you the ladder was
+            # needed (and how often the cap got in the way).
+            elif kind == "decision" \
+                    and str((r.get("params") or {}).get("stage")) == "coder":
+                p = r.get("params") or {}
+                out["coder"][str(r.get("content") or "?")] += 1
+                _mt = p.get("max_tokens")
+                if _mt in (None, ""):
+                    continue
+                out["coder_budgets"][str(_mt)] += 1
+                # agent_trace stringifies params: "False" is truthy.
+                if str(p.get("budget_raised", "")).strip().lower() in ("true", "1", "yes"):
+                    out["coder_budget_escalations"] += 1
+            # ── RUN-7: Gate-2 validator outcomes, including "unavailable" ──
+            # (a provider outage, counted separately from a real rejection —
+            # see tools.auto.inner_loop.LLMGate2Validator.approve_verdict).
+            elif kind == "decision" \
+                    and str((r.get("params") or {}).get("stage")) == "gate2":
+                out["gate2"][str(r.get("content") or "?")] += 1
+
+    # M4 events, or the pre-M4 grep. Comparability between the two is the
+    # whole point of keeping the grep at all.
+    if out["collect"]["blocks"]:
+        out["collect_source"] = "events"
+        out["collect_block_occurrences"] = out["collect"]["blocks"]
+    else:
+        out["collect_source"] = "grep"
+        out["collect_block_occurrences"] = header_grep
+
+    if out["gate1_first_ts"] and out["gate1_last_ts"] and out["gate1"]["requests"] > 1:
+        t0 = datetime.datetime.fromisoformat(out["gate1_first_ts"])
+        t1 = datetime.datetime.fromisoformat(out["gate1_last_ts"])
+        out["gate1"]["seconds_per_candidate"] = round(
+            (t1 - t0).total_seconds() / (out["gate1"]["requests"] - 1), 1)
+    # RUN-5: `presence_unknown` gets its own column instead of being folded
+    # into `unparsed`. `unparsed` counts per-response what the snapshot could
+    # not read as a verdict; `unknown` counts per-candidate what the presence
+    # stage ended without a verdict from the model at all, and it only exists
+    # once the M4 gate1_split event carries it. agent_trace stringifies
+    # params, so decode before trusting it.
+    if out["gate1_split"] is not None:
+        try:
+            out["gate1"]["unknown"] = int(
+                out["gate1_split"].get("presence_unknown", 0) or 0)
+        except (TypeError, ValueError):
+            out["gate1"]["unknown"] = 0
+        # RUN-9: why the empty replies were empty — `presence_empty_transport`
+        # (a degraded provider, retried unchanged) and
+        # `presence_empty_exhausted` (the budget went into thinking, pinned).
+        # Same source as `unknown`; zero when the split predates RUN-9.
+        for _key, _col in (("presence_empty_transport", "empty_transport"),
+                           ("presence_empty_exhausted", "empty_exhausted")):
+            try:
+                out["gate1"][_col] = int(out["gate1_split"].get(_key, 0) or 0)
+            except (TypeError, ValueError):
+                out["gate1"][_col] = 0
+    for k in ("llm_by_source", "gate1_location_ext", "probe_by_op", "gate2", "coder"):
+        out[k] = dict(out[k])
+    out["coder_budgets"] = dict(out["coder_budgets"])
+    for k in ("shrink", "miss"):
+        out["collect"][k] = dict(out["collect"][k])
+    out["head_sha"], out["pre_run_sha"], out["switched_mid_run"] = base_sha(
+        base, out.get("first_ts"))
+    return out
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("runs", nargs="+", help="run base dirs, each holding .agent/trace_*.jsonl")
+    ap.add_argument("--out", default=None, help="write the JSON here as well as printing")
+    ap.add_argument("--run-id", default=None,
+                    help="count only events from one trace_<run-id>.jsonl "
+                         "(default: every trace file in the tree)")
+    a = ap.parse_args()
+
+    snap = {"taken_at": datetime.datetime.now(datetime.timezone.utc)
+            .isoformat(timespec="seconds"), "runs": []}
+    for base in a.runs:
+        r = read_run(base, a.run_id)
+        if r is None:
+            print(f"  no trace in {base}/.agent/ — skipped", file=sys.stderr)
+            continue
+        snap["runs"].append(r)
+    if not snap["runs"]:
+        return 1
+
+    # The suffix says which counter fed the column, because "12 blocks" from
+    # a grep and from a collect_block event are not the same measurement.
+    _block = lambda r: f"{r['collect_block_occurrences']} ({r['collect_source']})"
+
+    # RUN-7: the Gate-2 decisions get their own columns, separate from "rej"
+    # (gate1's confirmed/rejected) and never folded into it — a Gate-2
+    # provider outage is not a rejection. g2 rej = a real model verdict,
+    # g2 err = the validator raised, g2 unavail = the validator was never
+    # reached (one event per outage, retries folded into its `calls=`). The
+    # three side by side are the measurement: what share of "no" was ever
+    # said by a model. See tools.auto.inner_loop._trace_stage's "gate2"
+    # events and the module docstring above.
+    #
+    # RUN-8: `cod transport` sits next to `cod esc` (the coder's truncation
+    # ladder) for the same reason — the two look identical in a trace line
+    # ("the coder came back without files") and only the status tells them
+    # apart: a cut-off reply climbed the budget, a dead socket got the
+    # attempt back.
+    hdr = f"{'run':12} {'probe':>6} {'reason':>14} {'arch':>5} {'gate1':>6} {'conf':>5} {'rej':>5} {'unk':>4} {'empty t/x':>9} {'s/cand':>7} {'probe ops':>10} {'miss':>5} {'collect blocks':>15} {'cod esc':>8} {'cod transport':>13} {'g2 rej':>6} {'g2 err':>6} {'g2 unavail':>10}"
+    print(hdr)
+    print("-" * len(hdr))
+    tot = collections.Counter()
+    for r in snap["runs"]:
+        g = r["gate1"]
+        g2 = r.get("gate2", {})
+        g2_rej, g2_err, g2_unavail = (g2.get("REJECTED", 0), g2.get("ERROR", 0),
+                                      g2.get("UNAVAILABLE", 0))
+        # RUN-8: coder calls that died on the wire before the model could
+        # answer — next to `cod esc` (the budget ladder) so a hung socket is
+        # not mistaken for a cut-off reply.
+        cod_transport = r.get("coder", {}).get("TRANSPORT", 0)
+        tot["arch"] += r["llm_by_source"].get("architect", 0)
+        tot["g1"] += g["requests"]
+        tot["conf"] += g["confirmed"]
+        tot["rej"] += g["rejected"]
+        tot["unk"] += g.get("unknown", 0)
+        # RUN-9: empty presence replies by kind — transport (t) / exhausted (x).
+        tot["empty_t"] += g.get("empty_transport", 0)
+        tot["empty_x"] += g.get("empty_exhausted", 0)
+        empty_tx = f"{g.get('empty_transport', 0)}/{g.get('empty_exhausted', 0)}"
+        tot["ops"] += r["probe"]["ops"]
+        tot["miss"] += r["probe"]["misses"]
+        tot["blocks"] += r["collect_block_occurrences"]
+        tot["codesc"] += r.get("coder_budget_escalations", 0)
+        tot["codtransport"] += cod_transport
+        tot["g2rej"] += g2_rej
+        tot["g2err"] += g2_err
+        tot["g2unavail"] += g2_unavail
+        print(f"{r['run']:12} {str(r['probe_usable']):>6} {str(r['probe_reason']):>14} "
+              f"{r['llm_by_source'].get('architect', 0):>5} {g['requests']:>6} "
+              f"{g['confirmed']:>5} {g['rejected']:>5} {g.get('unknown', 0):>4} "
+              f"{empty_tx:>9} "
+              f"{g.get('seconds_per_candidate', '—'):>7} {r['probe']['ops']:>10} "
+              f"{r['probe']['misses']:>5} {_block(r):>15} "
+              f"{r.get('coder_budget_escalations', 0):>8} {cod_transport:>13} "
+              f"{g2_rej:>6} {g2_err:>6} {g2_unavail:>10}")
+    print("-" * len(hdr))
+    print(f"{'TOTAL':12} {'':>6} {'':>14} {tot['arch']:>5} {tot['g1']:>6} "
+          f"{tot['conf']:>5} {tot['rej']:>5} {tot['unk']:>4} "
+          f"{str(tot['empty_t']) + '/' + str(tot['empty_x']):>9} {'':>7} {tot['ops']:>10} "
+          f"{tot['miss']:>5} {tot['blocks']:>15} {tot['codesc']:>8} {tot['codtransport']:>13} {tot['g2rej']:>6} {tot['g2err']:>6} {tot['g2unavail']:>10}")
+    snap["totals"] = dict(tot)
+
+    if a.out:
+        os.makedirs(os.path.dirname(os.path.abspath(a.out)), exist_ok=True)
+        with open(a.out, "w", encoding="utf-8") as fh:
+            json.dump(snap, fh, indent=1, ensure_ascii=False)
+        print(f"\n-> {a.out}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

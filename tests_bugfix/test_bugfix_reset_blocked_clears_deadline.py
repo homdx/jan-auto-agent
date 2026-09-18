@@ -27,6 +27,7 @@ clears the status, so the two halves of "fresh start" stay together.
 from __future__ import annotations
 
 import configparser
+import json
 import sys
 import time
 from pathlib import Path
@@ -169,9 +170,9 @@ def test_stale_deadline_is_what_blocks_the_attempt(tmp_path):
     """Causal link, pinned so the file-existence assertions above stay
     meaningful.
 
-    With the stale file present OuterLoop grants 0 seconds of budget and
-    returns exhausted WITHOUT running a single round — the exact livelock.
-    With the file gone it grants the full budget and runs the round.
+    With the budget file present and fully consumed OuterLoop grants 0 seconds
+    of budget and returns exhausted WITHOUT running a single round — the exact
+    livelock. With the file gone it grants the full budget and runs the round.
 
     (OuterLoop itself is correct; this test only documents that the file is
     the whole story, so that the reset test above is not asserting on a
@@ -180,8 +181,11 @@ def test_stale_deadline_is_what_blocks_the_attempt(tmp_path):
     store = _store(tmp_path)
     loop, inner = _outer_loop(store, tmp_path)
     store.set_task_status(RESETTABLE_ID, STATUS_TODO)
+    # RUN-2: "no budget left" is now a consumed total, not an old start time —
+    # a bare timestamp can no longer be read as "already exhausted".
     store.write_task_file(
-        RESETTABLE_ID, "deadline_started_at.txt", repr(time.time() - 36000)
+        RESETTABLE_ID, "deadline_started_at.txt",
+        json.dumps({"consumed_s": 1e9}),
     )
 
     res = loop.run_task(store.get_task(RESETTABLE_ID), tmp_path)
@@ -211,8 +215,11 @@ def test_reset_then_resume_actually_runs_the_task(tmp_path):
     """
     store = _store(tmp_path)
     store.set_task_status(RESETTABLE_ID, STATUS_BLOCKED)
+    # RUN-2: an exhausted ledger, in the current format — so that without the
+    # reset the resume would start with 0 seconds and be re-blocked.
     store.write_task_file(
-        RESETTABLE_ID, "deadline_started_at.txt", repr(time.time() - 36000)
+        RESETTABLE_ID, "deadline_started_at.txt",
+        json.dumps({"consumed_s": 1e9}),
     )
 
     # The resumed session: startup reset, then the main queue picks the task up.

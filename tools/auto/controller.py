@@ -728,6 +728,9 @@ class AutoController:
             self.base_dir,
             timeout_sec=self.limits.exec_timeout_sec,
             max_retained_workspaces=self.limits.workspace_retain_count,
+            # RUN-3: the same [executor] pytest_serial the task loop's
+            # executor reads (make_inner_loop) — one setting, both executors.
+            pytest_serial=safe_getboolean(cfg, "executor", "pytest_serial", fallback=True),
         )
         bug_fix_loop = make_bug_fix_loop(
             cfg, self.base_dir, self.state,
@@ -744,6 +747,7 @@ class AutoController:
                     "processed (%d passed) — stopping",
                     reason, tasks_processed, tasks_done,
                 )
+                self._log_collect_summary(collect_bridge)
                 return reason, tasks_done
 
             failed_deps = []
@@ -819,6 +823,43 @@ class AutoController:
                         f"continuing with remaining tasks"
                     )
 
+                # ── V9: the collect artifact predates this commit ───────────
+                # Placed after the regression loop on purpose: those fixes
+                # commit on top of `commit_hash`, so the tree the NEXT task
+                # sees is HEAD, and paths from both commits must be dirty.
+                self._invalidate_collect(task["id"], collect_bridge, commit_hash)
+
+            elif getattr(result, "unavailable", False) is True:
+                # ── RUN-7: the Gate-2 reviewer never answered ─────────────
+                # A provider outage, not an exhaustion. OuterLoop already put
+                # the task back to TODO with no round consumed and no
+                # feedback_round_N.md, so there is nothing to review, no
+                # knowledge note to write and no investigation ticket to
+                # open — an AUTO-C6 ticket here would send someone chasing a
+                # review that never happened. Before this result existed
+                # `not passed` always meant `exhausted`, which is what the
+                # plain `else` below still handles.
+                #
+                # The coder's unreviewed candidate is still dirty in base_dir
+                # (Bug 2 below): the next session re-runs the coder from a
+                # clean tree anyway, so discard it now rather than let the
+                # next successful task's commit sweep it in. RUN-8: the same
+                # path serves a coder call that died before the model
+                # answered (unavailable_stage == "coder") — nothing was
+                # produced at all, so the wording must not blame the coder
+                # for a rejection it did not receive.
+                _u_stage = ""
+                if result.inner_results:
+                    _u_stage = str(
+                        getattr(result.inner_results[-1], "unavailable_stage", "") or "")
+                _u_label = ("coder transport failure" if _u_stage == "coder"
+                            else "validator unavailable")
+                self.state.log(
+                    f"task {task['id']} left todo — {_u_label} "
+                    f"(no feedback, no knowledge note, no ticket)"
+                )
+                self._discard_exhausted_residue(task["id"], reason=_u_label)
+
             else:
                 # ── AUTO-G4: exhaustion → knowledge note + ticket ──────────
                 ex_outcome = exhaustion_handler.handle(task, result)
@@ -858,6 +899,11 @@ class AutoController:
                     feedback=last_feedback,
                     attempts=total_attempts,
                     prompt_store=self.auto_tuner.prompt_store,
+                    # RUN-7: an outage is neither an approval nor a rejection
+                    # — its own status keeps the auto-tuner from demoting a
+                    # validator prompt nobody wrote (a "rejected" row here
+                    # would). record_gate2() ignores `approved` when set.
+                    unavailable=getattr(result, "unavailable", False) is True,
                 )
                 tune_outcome = self.auto_tuner.maybe_tune()
                 if tune_outcome.promoted:
@@ -881,10 +927,16 @@ class AutoController:
                         f"{getattr(tune_outcome, 'reason', '')}"
                     )
 
+        self._log_collect_summary(collect_bridge)
         return None, tasks_done  # all tasks done / no tasks
 
-    def _discard_exhausted_residue(self, task_id: str) -> None:
-        """Discard the uncommitted edits left behind by an exhausted task.
+    def _discard_exhausted_residue(
+        self, task_id: str, reason: str = "exhausted",
+    ) -> None:
+        """Discard the uncommitted edits left behind by a task that did not commit.
+
+        ``reason`` names the run.log line: ``exhausted`` (the AUTO-G4 path) or
+        ``validator unavailable`` (RUN-7 — the task went back to todo).
 
         The coder writes its candidate into base_dir before validation, so an
         exhausted task leaves that edit dirty -- and commit() stages
@@ -915,9 +967,9 @@ class AutoController:
             self.git.discard_working_changes()
         except GitError as exc:
             logger.warning(
-                "task %s: could not discard uncommitted edits after "
-                "exhaustion — continuing (residue may be swept into the next "
-                "commit): %s", task_id, exc,
+                "task %s: could not discard uncommitted edits (%s) — "
+                "continuing (residue may be swept into the next commit): %s",
+                task_id, reason, exc,
             )
             self.state.log(
                 f"task {task_id} uncommitted edits NOT discarded "
@@ -927,7 +979,7 @@ class AutoController:
             return
         self.state.log(
             f"task {task_id} uncommitted edits discarded "
-            f"(exhausted, not committed)"
+            f"({reason}, not committed)"
         )
 
     def _check_regressions(
@@ -1142,15 +1194,14 @@ class AutoController:
         honestly reflects reality. Only genuinely-resettable tasks (case 1,
         or anything that hasn't used up its rounds) are reset.
 
-        The same reset also unlinks the task's ``deadline_started_at.txt``.
-        Bugfix: it used to clear only the STATUS half of "give this task a
-        fresh start", so on resume OuterLoop re-read the persisted start time,
-        the elapsed wall-clock time already exceeded the budget, the remaining
-        budget was 0, and the task was re-blocked immediately — the reset was
-        structurally incapable of granting the attempt it exists to grant, and
-        every resume burned a cycle and re-parked the task. The unlink is
-        scoped to the task that was actually reset: tasks left BLOCKED keep
-        their deadline files untouched.
+        The same reset also unlinks the task's ``deadline_started_at.txt``
+        budget ledger. Bugfix: it used to clear only the STATUS half of "give
+        this task a fresh start", so on resume OuterLoop re-read the persisted
+        consumed time, the remaining budget was 0, and the task was re-blocked
+        immediately — the reset was structurally incapable of granting the
+        attempt it exists to grant, and every resume burned a cycle and
+        re-parked the task. The unlink is scoped to the task that was actually
+        reset: tasks left BLOCKED keep their ledgers untouched.
         """
         from tools.auto.bug_fix_loop import _FIX_PREFIX
 
@@ -1193,9 +1244,9 @@ class AutoController:
             # Give the retry a full fresh wall-clock budget, not the leftover
             # one from the blocked attempt. Without this the reset is a no-op
             # in disguise: OuterLoop.run_task reads this file back on resume
-            # and computes _remaining = max(_mts - elapsed, 0), which is 0 for
-            # a task that was already parked, so it stops before round 1 and
-            # sets the status straight back to BLOCKED.
+            # and computes _remaining = max(budget - consumed, 0), which is 0
+            # for a task that was already parked, so it stops before round 1
+            # and sets the status straight back to BLOCKED.
             try:
                 self.state.clear_task_deadline(task["id"])
             except OSError as exc:
@@ -1312,6 +1363,142 @@ class AutoController:
         )
         cache[task_mode] = bridge
         return bridge
+
+    def _invalidate_collect(self, task_id: str, bridge, commit_hash: Optional[str]) -> None:
+        """V9: mark the paths this task wrote as dirty on the collect bridge.
+
+        The model was built once, at `load()`, before this commit happened,
+        so `status` still reads `"fresh"` while its facts describe a tree
+        that no longer exists. The paths the commit actually touched are the
+        authoritative answer to "what did this task write" — more accurate
+        than the task's declared `target_files`, which can both
+        under-report (the coder fixed a helper too) and over-report (a task
+        that staged nothing). Without git, or when git cannot be asked, the
+        task's declared `target_files` are the fallback — the safer guess:
+        blinding a path that turned out clean costs a block, serving stale
+        facts costs a wrong one. With no bridge this is a no-op.
+
+        Called after the post-commit regression loop, so the bug-fix
+        commits it produces are dirty as well: `paths_changed_between`
+        covers `commit_hash..HEAD` rather than just the one commit. Never
+        raises — a collect bookkeeping hiccup must not cost the remaining
+        tasks in plan.json.
+        """
+        if bridge is None:
+            return
+        # A commit was attempted (git is configured) but produced no hash.
+        # Two different reasons land here, and only one of them is stale:
+        #   * git said there was nothing to commit — the coder wrote nothing,
+        #     the tree is unchanged, and every block in the artifact is still
+        #     exactly right. Blind nothing. Falling back to `target_files`
+        #     here would suppress a fact that predates no edit at all.
+        #   * git could not commit (index.lock, a hung hook) after staging —
+        #     the tree really does hold a change. `has_staged_changes()`
+        #     says so, so `target_files` is still the safer guess.
+        if not commit_hash and self.git is not None and not self._tree_has_uncommitted_changes():
+            logger.info(
+                "_invalidate_collect: task %s committed nothing and the tree "
+                "is clean — nothing was written, collect blocks stay valid",
+                task_id,
+            )
+            return
+        paths: Optional[list] = None
+        if commit_hash and self.git is not None:
+            try:
+                paths = list(self.git.paths_changed_in(commit_hash))
+                tip = self.git.get_current_hash()
+                if tip and tip != commit_hash:
+                    paths = sorted(set(paths) | set(self.git.paths_changed_between(commit_hash, tip)))
+            except Exception as exc:  # noqa: BLE001 — never abort the run
+                logger.warning(
+                    "_invalidate_collect: could not list the paths committed "
+                    "for task %s (%s) — falling back to target_files",
+                    task_id, exc,
+                )
+                paths = None
+        if paths is None:
+            # No git, or git could not be asked. An *empty* answer is not
+            # this case: `diff-tree` lists nothing for a merge or an
+            # `--allow-empty` commit, and then nothing was written, so
+            # nothing is stale — falling back would blind files the task
+            # never touched.
+            paths = list(self._task_target_files(task_id))
+        try:
+            bridge.invalidate(paths)
+        except Exception as exc:  # noqa: BLE001 — never abort the run
+            logger.warning(
+                "_invalidate_collect: bridge.invalidate failed for task %s "
+                "(%s) — collect blocks may stay stale for the paths this "
+                "task wrote", task_id, exc,
+            )
+
+    def _task_target_files(self, task_id: str) -> list:
+        """A task's declared `target_files`, for the no-git invalidation
+        fallback. Returns `[]` when the task record is gone or malformed
+        rather than raising."""
+        try:
+            task = self.state.get_task(task_id)
+            if not isinstance(task, dict):
+                return []
+            files = task.get("target_files")
+            if not isinstance(files, (list, tuple)):
+                return []
+            return [str(f) for f in files]
+        except Exception:  # noqa: BLE001 — never abort the run
+            return []
+
+    def _tree_has_uncommitted_changes(self) -> bool:
+        """V9: does the tree still hold a change git could not commit?
+
+        `GitManager.commit()` stages everything before it decides whether
+        there is anything to commit, so a `None` commit hash is ambiguous:
+        the coder may have written nothing, or git may have failed after
+        staging a real edit. Staged changes are the answer — `True` means
+        the edit exists and the collect facts for it are stale, `False`
+        means nothing was written and the facts are still correct.
+
+        Fail-open to `True`: if git cannot be asked, assuming a write
+        happened is the safer guess — blinding a path that turned out
+        clean costs one block, serving stale facts costs a wrong one.
+        Never raises.
+        """
+        git = getattr(self, "git", None)
+        if git is None:
+            return True
+        try:
+            return bool(git.has_staged_changes())
+        except Exception:  # noqa: BLE001 — never abort the run
+            return True
+
+    def _log_collect_summary(self, bridge) -> None:
+        """V9 item 4: one run.log line for how much invalidate-on-write
+        withheld this run.
+
+        `collect_miss(reason="dirty")` is counted on the bridge; this is the
+        reader. Called once, at the end of the task loop (both exit paths),
+        so the line is the whole run's picture rather than a per-task echo.
+        A bridge that withheld nothing and has nothing still dirty reports
+        nothing — a run with no edits adds no noise. Never raises.
+        """
+        if bridge is None:
+            return
+        try:
+            # M4: the trace event goes first — the run.log line below is the
+            # human-readable reader, the event is what analyze_logs renders
+            # from. Both are one-per-run.
+            bridge.emit_collect_summary()
+        except Exception:  # noqa: BLE001 — never abort the run
+            pass
+        try:
+            line = bridge.summary()
+        except Exception:  # noqa: BLE001 — never abort the run
+            return
+        if not line:
+            return
+        try:
+            self.state.log(f"collect summary ({self.task_mode}): {line}")
+        except Exception:  # noqa: BLE001 — a broken log sink is not a blocker
+            pass
 
     def collect_context_for(self, target_file: str) -> str:
         """The opt-in COLLECT-23 context block for `target_file` — kept for

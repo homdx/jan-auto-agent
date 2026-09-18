@@ -1,0 +1,27 @@
+{
+  "ticket": "epic-tasks/37-run9-an-empty-presence-reply-is-not-a-garbled-verdict.md",
+  "base": "da1e9b3",
+  "inputs": "run9/",
+  "entrants": {
+    "agness":      {"source": "run9/agness-2-5-Flash.patch", "model": "Agness 2.5 Flash"},
+    "aria":        {"source": "run9/AriaDawn-not-all-test-passed.patch", "model": "Aria Dawn (self-reported: not all tests passed)"},
+    "ling3":       {"source": "run9/Carefully-Freezed-test-Ling3-0.patch", "model": "Ling 3.0"},
+    "ds41-v1":     {"source": "run9/Deepseek-v-4-1-var1.patch", "model": "DeepSeek v4.1 var1"},
+    "ds41-v2":     {"source": "run9/Deepseek-v-4-1-var2.patch", "model": "DeepSeek v4.1 var2"},
+    "ds41-v3":     {"source": "run9/Deepseek-v-4-1-var3.patch", "model": "DeepSeek v4.1 var3"},
+    "glm47":       {"source": "run9/GLM4-7.patch", "model": "GLM 4.7"},
+    "glm47-flash": {"source": "run9/GLM4-7-Flash.patch", "model": "GLM 4.7 Flash (3-commit series)"},
+    "hy3":         {"source": "run9/Hy3.patch", "model": "Hy3"},
+    "laguna":      {"source": "run9/LagunaS-2-1.patch", "model": "Laguna S 2.1"},
+    "sn67-v1":     {"source": "run9/SenSenova-6-7-var1.patch", "model": "SenseNova 6.7 var1", "duplicate_of": "ds41-v1"},
+    "sn67-v2":     {"source": "run9/SenSenova-6-7-var2.patch", "model": "SenseNova 6.7 var2"},
+    "sn68-v1":     {"source": "run9/SenSenova-6-8-var1.patch", "model": "SenseNova 6.8 var1"},
+    "sn68-v2":     {"source": "run9/SenSenova-6-8-var2.patch", "model": "SenseNova 6.8 var2 (6-commit series, first 5 = tickets history 9fcaba0..777535b)", "base": "777535b", "mail_index": 6},
+    "sn68-v3":     {"source": "run9/SenSenova-6-8-var3.patch", "model": "SenseNova 6.8 var3"},
+    "stepfun":     {"source": "run9/Stepfun3-7.patch", "model": "StepFun 3.7"},
+    "sonet46-v1":  {"source": "run9/sonets/sonet-4-6-var1-run9-changes.zip", "inner": "run9-zip/run9.patch", "model": "Sonnet 4.6 var1"},
+    "sonet5-v1":   {"source": "run9/sonets/sonet-5-var1-run9-changes.zip", "inner": "run9-zip/run9.patch", "model": "Sonnet 5 var1", "duplicate_of": "sonet46-v1"},
+    "sonet5-v2":   {"source": "run9/sonets/sonet5-var2-run9-empty-presence-final.zip", "inner": "run9-full.patch", "model": "Sonnet 5 var2"},
+    "sonet5-v3":   {"source": "run9/sonets/sonet5-var3-RUN-9-deliverable.zip", "inner": "RUN-9.diff", "model": "Sonnet 5 var3"}
+  }
+}

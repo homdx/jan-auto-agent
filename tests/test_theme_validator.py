@@ -323,13 +323,19 @@ def test_write_files_deletes_with_backup(tmp_path):
 
 
 def test_delete_respects_target_files_guard(tmp_path):
+    """A delete outside target_files is never applied. RUN-1: like a skipped
+    write it is reported through the skip channel, not as first_error —
+    generate() still fails the attempt when nothing at all landed."""
     c = _make_coder(tmp_path)
     (tmp_path / "secret.py").write_text("keep me\n", encoding="utf-8")
+    skipped: list[str] = []
     written, err = c._write_files(
         [{"path": "secret.py", "delete": True}], tmp_path, "T",
-        allowed_paths=frozenset({"other.py"}))
-    assert written == [] and "not in target_files" in err
+        allowed_paths=frozenset({"other.py"}), skipped_out=skipped)
+    assert written == [] and err == ""
+    assert skipped == ["secret.py"]
     assert (tmp_path / "secret.py").exists()
+    assert (tmp_path / "secret.py").read_text() == "keep me\n"
 
 
 def test_delete_of_absent_file_is_idempotent_success(tmp_path):

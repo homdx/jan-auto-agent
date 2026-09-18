@@ -18,6 +18,7 @@ Public surface consumed by the attempt loop (AUTO-C3)::
 
     result.succeeded       # True iff ≥1 file was written without error
     result.files_written   # list[str] of relative paths written to disk
+    result.files_skipped   # list[str] of extra paths dropped by the target_files guard
     result.error           # non-empty string on failure
 
 Output contract
@@ -46,11 +47,23 @@ Any LLM / network error, JSON parse failure, or missing required key returns a
 attempt loop (AUTO-C3) treats this as a failed attempt and may feed it back as
 feedback for the next round.
 
+RUN-8: ``error_kind`` distinguishes the two halves of that.  ``"transport"``
+means the socket gave up before the model could answer (a stream-read
+timeout, ``URLError``, ``HTTPError``) — nothing was produced, so the attempt
+is re-run instead of being charged and no ``coder failed`` line reaches the
+next prompt.  ``"parse"`` means the call did come back and this attempt still
+could not turn it into files (NO-JSON, malformed or cut-off JSON, a duplicate
+chapter, a failed write) — those stay charged attempts, and the RUN-4 budget
+ladder still climbs on a cut-off reply.
+
 Configuration (agents.ini [coder])
 ------------------------------------
-temperature   — sampling temperature (default 0.2)
-max_tokens    — token budget (default 4096)
-system        — override the built-in system prompt (optional)
+temperature    — sampling temperature (default 0.2)
+max_tokens     — token budget (default 16384)
+max_tokens_cap — ceiling for the RUN-4 truncation ladder: a reply cut off by
+                 the output budget is re-asked with max_tokens × 2, up to here
+                 (default 4 × max_tokens)
+system         — override the built-in system prompt (optional)
 
 agents.ini [api] / [api_local] / [api_remote] supply base_url, api_key, model,
 api_format, verify_ssl — the same pattern used throughout this codebase.
@@ -85,6 +98,34 @@ logger = logging.getLogger(__name__)
 # _MAX_FILE_CHARS is now read from [coder] max_file_chars in agents.ini.
 # This default is used only when the key is absent.
 _DEFAULT_MAX_FILE_CHARS = 8_000
+
+# RUN-4: the truncation ladder. A reply that stops mid-JSON was cut by the
+# output budget, so the next attempt of the SAME task doubles it; the
+# configured cap is where it stops. Prose and malformed JSON never climb —
+# more tokens do not fix either (GATE1-LEARN-2 applied the same reasoning to
+# empty replies).
+_TRUNCATION_HEAD = "LLM response was cut off before the JSON was complete"
+# The creative-mode counterpart (see _parse_response_prose): a chapter that
+# stops mid-sentence at the budget is the same cut-off, so it climbs the same
+# ladder — its message is appended to rather than swapped (from Hy3 / SN-67).
+_TRUNCATION_HEAD_PROSE = "creative coder: response hit the token budget mid-sentence"
+_TRUNCATION_HEADS = (_TRUNCATION_HEAD, _TRUNCATION_HEAD_PROSE)
+# The advice a cut-off reply gets once the budget actually climbed: the file
+# must be COMPLETE, so "shorten it" would send the model the wrong way.
+# {budget} is the number the NEXT attempt (the one reading this line) goes
+# out at — the feedback always addresses the following attempt.
+_TRUNCATION_RAISED_ADVICE = (
+    "Emit the COMPLETE file content — the output budget was raised to "
+    "{budget} tokens for this attempt, so do NOT shorten the file. "
+)
+# ...and the advice at the cap, where there is no more room and shortening is
+# the only lever left.
+_TRUNCATION_ADVICE = (
+    "Emit the COMPLETE file content and keep the response minimal (only the "
+    "required files), or raise [coder] max_tokens. "
+)
+_BUDGET_STEP_MULT = 2
+_DEFAULT_BUDGET_CAP_MULT = 4
 
 # ── Coder system prompt ───────────────────────────────────────────────────────
 _SYSTEM_PROMPT = (
@@ -224,18 +265,45 @@ class CoderResult:
     files_written:
         Relative paths of files that were successfully written to *base_dir*.
         Empty when the generation failed before writing.
+    files_skipped:
+        Relative paths the LLM asked for that were NOT written because they
+        fall outside the task's ``target_files`` (RUN-1 "Guard 2" skips).
+        These are protection skips, not failures: they never set ``error`` and
+        never affect :attr:`succeeded`, so an attempt whose target files all
+        landed still succeeds when the model added extra files.
     error:
         Human-readable error description; empty string on success.
     raw_response:
         The raw (post-strip_think) LLM text; kept for logging / feedback.
+    max_tokens:
+        The token budget THIS attempt went out at (RUN-4). InnerLoop traces it
+        on the coder decision event so a trace can show at which tier a task
+        was running. 0 when the result did not come from Coder.generate().
+    budget_raised:
+        RUN-4: True when this attempt's cut-off reply just raised the budget
+        for the next attempt of the same task. False both when the budget did
+        not move and when the reply was not a truncation.
+    error_kind:
+        RUN-8: what kind of failure ``error`` is — ``"transport"`` when the
+        LLM call itself failed before the model could answer (a read timeout,
+        ``URLError``, ``HTTPError`` …, so nothing was produced and the attempt
+        should not be charged), ``"parse"`` when the call returned something
+        that this attempt could not turn into written files (NO-JSON,
+        malformed or cut-off JSON, a duplicate chapter, a failed write), and
+        ``""`` when the result carries no classification at all. ``error``
+        itself is unchanged by this field.
     """
 
     task_id:       str = ""
     files_written: list[str] = field(default_factory=list)
+    files_skipped: list[str] = field(default_factory=list)
     error:         str = ""
     raw_response:  str = field(default="", repr=False)
     missing_context: list[str] = field(default_factory=list)
     context_satisfied: bool = True  # False when the LLM reported missing_context
+    max_tokens:    int = 0
+    budget_raised: bool = False
+    error_kind:    str = ""   # RUN-8: "" / "parse" / "transport"
 
     @property
     def succeeded(self) -> bool:
@@ -245,7 +313,9 @@ class CoderResult:
     def summary(self) -> str:
         """One-line status string for logging."""
         if self.succeeded:
-            return f"[{self.task_id}] CODER OK — wrote {self.files_written}"
+            skipped = (f" (skipped extra: {self.files_skipped})"
+                       if self.files_skipped else "")
+            return f"[{self.task_id}] CODER OK — wrote {self.files_written}{skipped}"
         return f"[{self.task_id}] CODER FAIL — {self.error or 'no files written'}"
 
 
@@ -278,6 +348,39 @@ def _is_truthy_delete(value) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"true", "yes", "1"}
     return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Guard-2 skip messages (RUN-1)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _guard2_skip_message(rel: str) -> str:
+    """The [SAFETY] text for one path outside the task's ``target_files``.
+
+    Kept in one place so the WARNING line in ``_write_files`` and the failure
+    message used when *nothing* was written stay word-for-word identical (the
+    latter is what the model reads back as feedback).
+    """
+    return (
+        f"[SAFETY] LLM tried to write {rel!r} which is not in "
+        f"target_files — skipped to protect unrelated files"
+    )
+
+
+def _guard2_all_skipped_error(skipped: list[str]) -> str:
+    """Error for an attempt where every returned path was outside target_files.
+
+    Guard 2 no longer records a skip as ``first_error`` (a skip is protection,
+    not a verdict). But when *nothing* was written there is no code for the
+    executor or validator to look at, so the attempt must still fail — with
+    the existing [SAFETY] wording, naming every dropped path, so the model
+    learns which of its files never landed instead of seeing a bare
+    "no files written".
+    """
+    if not skipped:
+        return ""
+    return "; ".join(_guard2_skip_message(p) for p in skipped[:5])
 
 
 class Coder(_llm_stream.LLMClientBase):
@@ -345,6 +448,38 @@ class Coder(_llm_stream.LLMClientBase):
         except ValueError as exc:
             logger.warning("config [%s] max_tokens is malformed (%s) — using 16384", sec, exc)
             self._max_tokens = 16384
+        # RUN-4: ceiling for the truncation ladder. A reply cut off by the
+        # output budget is re-asked with max_tokens × 2, up to this cap.
+        # Default = 4 × max_tokens, so a 3 000 config climbs 3 000 → 6 000 →
+        # 12 000 and stops. The cap is the operator's guard against a runaway
+        # provider bill; raise it only when the model's context window can
+        # actually hold the bigger reply.
+        # Resolved per mode like max_tokens itself (max_tokens_cap_creative
+        # over max_tokens_cap), so a creative budget gets a creative ceiling.
+        _default_cap = int(self._max_tokens) * _DEFAULT_BUDGET_CAP_MULT
+        try:
+            self._max_tokens_cap = int(_cfg_mode(
+                config, sec, "max_tokens_cap", task_mode, fallback=str(_default_cap)))
+        except ValueError as exc:
+            logger.warning("config [%s] max_tokens_cap is malformed (%s) — using %d",
+                           sec, exc, _default_cap)
+            self._max_tokens_cap = _default_cap
+        # A cap below the base budget would cap the FIRST attempt down. The
+        # ladder exists to grow, never to shrink, so clamp it up (loudly)
+        # instead of silently lowering every call.
+        if self._max_tokens_cap < int(self._max_tokens):
+            logger.warning(
+                "config [%s] max_tokens_cap=%d is below max_tokens=%d — "
+                "using %d (the ladder cannot shrink a budget)",
+                sec, self._max_tokens_cap, self._max_tokens, self._max_tokens,
+            )
+            self._max_tokens_cap = int(self._max_tokens)
+        # RUN-4 ladder state, in memory only — a new run starts cold, the
+        # same way Gate 1's learned budget is kept per process and never
+        # written to disk.
+        self._learned_max_tokens: Optional[int] = None  # last budget that parsed
+        self._task_id: str = ""                          # same-task cursor
+        self._task_max_tokens: int = int(self._max_tokens)  # same-task budget
         # Select system prompt by task_mode (mirrors architect / validator).
         # Priority: mode-specific ini key > legacy "system" key > built-in constant.
         _mode_key = f"system_{self._task_mode}" if self._task_mode != "code" else None
@@ -456,13 +591,18 @@ class Coder(_llm_stream.LLMClientBase):
         task_id = (task.get("id") or "").strip()
         base_dir = Path(base_dir).resolve()
 
+        # RUN-4: the budget this attempt goes out at. A retry of the SAME task
+        # keeps whatever the previous attempt set — that is the ladder; a new
+        # task starts at max(config, learned).
+        budget = self._budget_for_task(task_id)
+
         # ── Build and send the prompt ─────────────────────────────────────────
         user_msg = self._build_prompt(task, base_dir, prior_feedback or [], prefetched_context)
 
         url, headers, payload = _llm_stream.build_chat_request(
             base_url=self._base_url, api_key=self._api_key, model=self._model,
             api_format=self._api_format, temperature=self._temperature,
-            max_tokens=self._max_tokens, system=self._system, user_msg=user_msg,
+            max_tokens=budget, system=self._system, user_msg=user_msg,
             num_ctx=self._num_ctx, think=self._think,
         )
 
@@ -499,17 +639,21 @@ class Coder(_llm_stream.LLMClientBase):
                 on_token=_coder_on_token,
                 api_format=self._api_format,
                 ssl_context=self._ssl_context,
+                **self._retry_kwargs,
             )
             raw_text = raw_text or "".join(_coder_tokens)
             print("\n" + "═" * 80 + "\n")
         except Exception as exc:
+            # RUN-8: the call itself failed — nothing was produced, so the
+            # attempt is a transport failure, not a rejected answer.
             msg = f"LLM call failed: {exc}"
             logger.warning("coder.generate [%s]: %s", task_id, msg)
             tracer.event(
                 source="coder", target="llm", kind="llm_response", model=self._model,
                 content=f"[ERROR] {exc}", params={"task_id": task_id},
             )
-            return CoderResult(task_id=task_id, error=msg)
+            return CoderResult(task_id=task_id, error=msg, max_tokens=budget,
+                               error_kind="transport")
 
         # ── Strip think blocks; check for missing-context signal ─────────────
         cleaned = strip_think(raw_text)
@@ -559,6 +703,7 @@ class Coder(_llm_stream.LLMClientBase):
                         on_token=_probe_on_token,
                         api_format=self._api_format,
                         ssl_context=self._ssl_context,
+                        **self._retry_kwargs,
                     )
                     raw_text = raw_text or "".join(_probe_tokens)
                     print("\n" + "═" * 80 + "\n")
@@ -607,11 +752,32 @@ class Coder(_llm_stream.LLMClientBase):
             cleaned, task_id, task.get("target_files") or []
         )
         if parse_error:
+            # RUN-4: only a reply cut off by the budget climbs it — NO-JSON
+            # and malformed-JSON replies get the same budget again. When it
+            # did climb, the feedback must not tell the model to shorten a
+            # file that has to be complete: the budget just grew.
+            _raised = self._raise_budget_after_truncation(task_id, budget, parse_error)
+            if _raised and parse_error.startswith(_TRUNCATION_HEAD_PROSE):
+                parse_error += (
+                    f" Output budget raised to {self._task_max_tokens} tokens "
+                    "for this attempt — finish the chapter, do not shorten it."
+                )
+            elif _raised:
+                parse_error = parse_error.replace(
+                    _TRUNCATION_ADVICE,
+                    _TRUNCATION_RAISED_ADVICE.format(budget=self._task_max_tokens),
+                )
             return CoderResult(
                 task_id=task_id, error=parse_error,
                 raw_response=cleaned, missing_context=missing_ctx,
                 context_satisfied=context_satisfied,
+                max_tokens=budget, budget_raised=_raised,
+                error_kind="parse",
             )
+
+        # RUN-4: this budget produced a parseable reply — the next task on
+        # this instance starts no lower than it.
+        self._record_parseable_budget(budget)
 
         # ── AUTO-CR-18: reject chapter duplication BEFORE writing to disk ────
         if self._task_mode == "creative":
@@ -623,18 +789,34 @@ class Coder(_llm_stream.LLMClientBase):
                 return CoderResult(
                     task_id=task_id, error=dup_error, raw_response=cleaned,
                     missing_context=missing_ctx, context_satisfied=context_satisfied,
+                    max_tokens=budget,
+                    error_kind="parse",
                 )
 
         # ── Write files to disk ───────────────────────────────────────────────
         target_files = task.get("target_files") or []
         allowed = frozenset(target_files) if target_files else None
+        files_skipped: list[str] = []
         written, write_error = self._write_files(
-            parsed_files, base_dir, task_id, allowed_paths=allowed
+            parsed_files, base_dir, task_id, allowed_paths=allowed,
+            skipped_out=files_skipped,
         )
+        # RUN-1: nothing landed and no write error was recorded — every path
+        # the LLM returned sat outside target_files, so Guard 2 protected all
+        # of them. Nothing was touched on disk, but there is no code for the
+        # executor to validate either, so this is still a failure; keep the
+        # original [SAFETY] wording (naming every dropped path) as the reason
+        # the model can act on. A real error (path escape, blocked content,
+        # I/O) wins as-is.
+        if not written and not write_error and files_skipped:
+            write_error = _guard2_all_skipped_error(files_skipped)
         if write_error and not written:
             return CoderResult(
                 task_id=task_id, error=write_error, raw_response=cleaned,
                 missing_context=missing_ctx, context_satisfied=context_satisfied,
+                files_skipped=files_skipped,
+                max_tokens=budget,
+                error_kind="parse",
             )
 
         result = CoderResult(
@@ -644,9 +826,91 @@ class Coder(_llm_stream.LLMClientBase):
             raw_response=cleaned,
             missing_context=missing_ctx,
             context_satisfied=context_satisfied,
+            files_skipped=files_skipped,
+            max_tokens=budget,
+            # A partial write that still records an error is a reply that
+            # could not be fully landed — "parse", never "transport".
+            error_kind="parse" if write_error else "",
         )
         logger.info("coder.generate: %s", result.summary())
         return result
+
+    # ── RUN-4: the truncation ladder ─────────────────────────────────────────
+    # A whole-file rewrite that stops mid-JSON was cut by the output budget.
+    # Sending it back with the same budget just reproduces the same cut five
+    # times, so the next attempt of the SAME task doubles the budget instead —
+    # up to [coder] max_tokens_cap. This is Gate 1's re-ask ladder
+    # (GATE1-LEARN-1/2) ported to the coder; the state is kept on the instance
+    # and never written to disk.
+
+    def _budget_for_task(self, task_id: str) -> int:
+        """The token budget the current ``generate()`` call goes out at.
+
+        A retry of the SAME task keeps whatever the previous attempt set —
+        that cursor IS the ladder (see :meth:`_raise_budget_after_truncation`).
+        A new task starts at :meth:`_start_task_budget`. An empty ``task_id``
+        always starts a fresh budget: with no id there is no "same task" to
+        climb from, so the ladder would otherwise leak across tasks forever.
+        """
+        if task_id and task_id == self._task_id and self._task_max_tokens > 0:
+            return int(self._task_max_tokens)
+        budget = self._start_task_budget()
+        self._task_id = task_id
+        self._task_max_tokens = budget
+        return budget
+
+    def _start_task_budget(self) -> int:
+        """The configured budget, or the largest one that already produced a
+        parseable reply on this instance, whichever is bigger — Gate 1's
+        ``_record_parseable_budget``, task-local. Never below the configured
+        budget and never above the cap."""
+        start = int(self._max_tokens)
+        if self._learned_max_tokens is not None:
+            start = max(start, int(self._learned_max_tokens))
+        return min(start, int(self._max_tokens_cap))
+
+    def _record_parseable_budget(self, max_tokens: int) -> None:
+        """A reply parsed at *max_tokens* — the next task starts no lower."""
+        self._learned_max_tokens = (
+            int(max_tokens)
+            if self._learned_max_tokens is None
+            else max(int(self._learned_max_tokens), int(max_tokens))
+        )
+
+    def _raise_budget_after_truncation(
+        self, task_id: str, used: int, parse_error: str,
+    ) -> bool:
+        """A reply cut off by the output budget: the next attempt of this task
+        goes out at ``used × 2``, capped at [coder] max_tokens_cap.
+
+        Only truncation climbs. The NO-JSON and ``JSON decode failed`` cases
+        get the same budget again, because more tokens do not fix a reply with
+        no JSON in it or one whose object is malformed — the same reasoning
+        GATE1-LEARN-2 applied to empty replies.
+
+        Returns ``True`` iff the budget actually rose. ``False`` at the cap is
+        the one case where "shorten the file" is real advice, so the feedback
+        keeps the existing sentence there.
+        """
+        if not parse_error.startswith(_TRUNCATION_HEADS):
+            return False
+        wanted = int(used) * _BUDGET_STEP_MULT
+        capped = min(wanted, int(self._max_tokens_cap))
+        if capped <= int(used):
+            logger.warning(
+                "coder [%s]: reply cut off at max_tokens=%d, which is already "
+                "max_tokens_cap=%d — the budget cannot climb; raise "
+                "[coder] max_tokens_cap or make the file smaller.",
+                task_id, used, self._max_tokens_cap,
+            )
+            return False
+        self._task_max_tokens = capped
+        logger.info(
+            "coder [%s]: reply cut off at max_tokens=%d — next attempt of this "
+            "task raised to %d (cap %d).",
+            task_id, used, capped, self._max_tokens_cap,
+        )
+        return True
 
     # ── Private helpers ───────────────────────────────────────────────────────
 
@@ -1354,13 +1618,15 @@ class Coder(_llm_stream.LLMClientBase):
                     or "Expecting" in str(exc)
                 ) and not stripped.rstrip().endswith("}")
                 if truncated:
-                    msg = (
-                        "LLM response was cut off before the JSON was complete — the "
-                        "revised file was too long for the output token budget. Emit "
-                        "the COMPLETE file content and keep the response minimal (only "
-                        "the required files), or raise [coder] max_tokens. "
-                        f"(decode error: {exc})"
-                    )
+                    # RUN-4: the head is the stable marker
+                    # _raise_budget_after_truncation keys on; generate() swaps
+                    # the advice clause out when the budget actually climbed
+                    # for the next attempt of this task.
+                    msg = (_TRUNCATION_HEAD
+                           + " — the revised file was too long for the output "
+                             "token budget. "
+                           + _TRUNCATION_ADVICE
+                           + f"(decode error: {exc})")
                 else:
                     msg = f"JSON decode failed: {exc} — raw[:200]={text[:200]!r}"
             logger.warning("coder._parse_response [%s]: %s", task_id, msg)
@@ -1506,12 +1772,16 @@ class Coder(_llm_stream.LLMClientBase):
         # language, instead of a hardcoded Latin-only ratio letting a
         # truncated chapter through silently.
         from tools.auto.utils import chars_per_token
-        char_budget = self._max_tokens * chars_per_token(body)
+        # RUN-4: measure against the budget this attempt actually got — after
+        # a truncation climb this is bigger than [coder] max_tokens, and
+        # judging a complete chapter by the old number would report a cut-off
+        # that did not happen.
+        char_budget = self._task_max_tokens * chars_per_token(body)
         last_char = body[-1] if body else ""
         ends_mid_sentence = last_char not in {".", "!", "?", '"', "'", "\n", "…"}
         if ends_mid_sentence and len(body) >= char_budget * 0.95:
             msg = (
-                "creative coder: response hit the token budget mid-sentence — "
+                _TRUNCATION_HEAD_PROSE + " — "
                 "raise [coder] max_tokens or shorten the chapter target. "
                 f"(body length {len(body)} chars ≈ budget {char_budget:.0f} chars)"
             )
@@ -1863,6 +2133,7 @@ class Coder(_llm_stream.LLMClientBase):
         base_dir: Path,
         task_id: str,
         allowed_paths: "frozenset[str] | None" = None,
+        skipped_out: "list[str] | None" = None,
     ) -> tuple[list[str], str]:
         """Write parsed files to *base_dir*.
 
@@ -1883,13 +2154,21 @@ class Coder(_llm_stream.LLMClientBase):
             Normalised relative paths the task declared as ``target_files``.
             When not ``None``, any path outside this set is skipped with a
             warning so the LLM cannot silently touch unrelated files.
+        skipped_out:
+            Optional list that receives the relative paths dropped by the
+            ``target_files`` guard.  Pass ``None`` to keep the legacy
+            two-tuple-only behaviour (nothing is recorded).  RUN-1: these
+            skips are protection, not a verdict, so they never set
+            *first_error_message* — a skipped write and a skipped delete are
+            treated alike (neither touches the file).
 
         Returns
         -------
         (written_paths, first_error_message)
             *written_paths* contains every path successfully written even when
             a later file errors.  *first_error_message* is ``""`` when all
-            writes succeed.
+            writes succeed — and also when the only thing that happened was a
+            ``target_files`` skip (see *skipped_out*).
         """
         written: list[str] = []
         first_error = ""
@@ -1921,13 +2200,19 @@ class Coder(_llm_stream.LLMClientBase):
                 norm = _norm_target(rel)
                 allowed_norm = {_norm_target(p) for p in allowed_paths}
                 if norm not in allowed_norm:
-                    msg = (
-                        f"[SAFETY] LLM tried to write {rel!r} which is not in "
-                        f"target_files — skipped to protect unrelated files"
-                    )
+                    msg = _guard2_skip_message(rel)
                     logger.warning("coder._write_files [%s]: %s", task_id, msg)
-                    if not first_error:
-                        first_error = msg
+                    # RUN-1: a Guard-2 skip is protection, not a verdict. The
+                    # path outside target_files is never written (or deleted),
+                    # so nothing was harmed and an attempt whose target files
+                    # all landed must not be failed for it — record the skip
+                    # instead of poisoning first_error. (Observed live:
+                    # AUTO-T29 burned ~40 attempts because a test file the
+                    # model shipped alongside its code kept failing the whole
+                    # attempt.) generate() still fails the attempt when
+                    # NOTHING landed — see _guard2_all_skipped_error.
+                    if skipped_out is not None:
+                        skipped_out.append(rel)
                     continue
 
             # ── Delete branch (pullrun-sim): {"path": ..., "delete": true} ──

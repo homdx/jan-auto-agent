@@ -44,6 +44,10 @@ def main():
     for col in COLUMNS:
         ap.add_argument("--" + col.replace("_", "-"), default="")
     ap.add_argument("--allow-duplicate", action="store_true")
+    ap.add_argument("--repo-root", default=".",
+                    help="root the --file path is resolved against (default: cwd)")
+    ap.add_argument("--allow-missing-file", action="store_true",
+                    help="record a finding whose --file is not on disk (deleted file)")
     a = vars(ap.parse_args())
 
     row = {c: str(a.get(c) or "").replace("\n", "; ").strip() for c in COLUMNS}
@@ -80,6 +84,18 @@ def main():
         problems.append(f"--caller-mutates must be YES/NO/UNKNOWN, got {row['caller_mutates']!r}")
     if not row["file"]:
         problems.append("--file is required — a finding with no location cannot be checked")
+    elif not a.get("allow_missing_file") and not os.path.exists(
+            os.path.join(a.get("repo_root") or ".", row["file"])):
+        # A reviewer that has not opened the file can still satisfy a non-empty
+        # --file by typing something. glm-4.5-flash filled 13 of its 45 rows with
+        # "tools/auto/x.py", which does not exist: those rows grouped under a
+        # path nobody else used, so they read as solo discoveries instead of
+        # merging with everyone else's verdict on the same symbol. A finding is
+        # about live code, so the path has to resolve.
+        problems.append(f"--file {row['file']!r} does not exist under "
+                        f"{a.get('repo_root') or '.'!r} — "
+                        f"a finding is about live code, so give the real path you read "
+                        f"(--allow-missing-file if the file genuinely was deleted)")
     if v == "CONFIRMED" and not row["evidence"]:
         problems.append("a CONFIRMED verdict needs --evidence quoting the line that proves it")
     if v in {"CONFIRMED", "ALREADY_FIXED"} and not row["disproof"]:

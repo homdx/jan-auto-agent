@@ -47,8 +47,10 @@ from pathlib import Path
 from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Tuple
 
 from tools.collect.ast_facts import extract_all_defined_names
+from tools.collect.graph import Graph, import_edges as _import_edges
 from tools.collect.model import LLMSummary, ModuleRecord, Provenance, ProvenanceViolation
 from tools.collect.registries import build_fail_open_registry, fail_open_locations
+from tools.collect.test_paths import is_test_path
 
 # ── reason codes ────────────────────────────────────────────────────────────────
 
@@ -179,9 +181,30 @@ _SILENT_WORDS_RE = re.compile(r"\b(silent(?:ly)?|swallow(?:s|ed|ing)?)\b", re.IG
 # claim about a genuinely UNGUARDED (crashing) access therefore survived
 # into the artifact completely unchecked — arguably worse than a false
 # crash claim, since it actively tells a reader a real risk is handled.
+# BUGFIX (verified-bugs audit #6): a safety sentence phrased with a
+# NEGATED crash word ("stack[-1] will not crash", "it won't throw", "there is
+# no risk of crash") was previously read as actual crash language:
+# _CRASH_WORDS_RE matches the literal word "crash"/"throw"/"fail" even when
+# it follows "will not"/"cannot"/"won't", so the crash branch above fired
+# first and the sentence was classified access_crash. That collapsed a true
+# "X is safe" claim into a crash claim — a true safety sentence about a
+# GUARDED access was then dropped as "contradicts-guard", and a false "X will
+# not crash" affirmation about an UNGUARDED access survived entirely
+# unchecked (as an access_crash, which has no UNGUARDED contradiction check).
+# The negation forms below (all three persons/tenses of "not", plus "never")
+# are exactly what _CRASH_WORDS_RE otherwise cannot see past. Note the same
+# problem never existed for "cannot raise"/"will not raise": the crash
+# pattern for "raise" requires a following `\bError` suffix, so plain
+# "cannot raise" never matched it — "crash"/"throw"/"fail" have no such
+# suffix and are the ones that needed this.
 _SAFE_WORDS_RE = re.compile(
-    r"\b(safe(?:ly)?|guarded|cannot\s+(?:raise|crash|fail)|"
-    r"will\s+not\s+(?:raise|crash|fail)|no\s+risk\s+of)\b",
+    r"\bsafe(?:ly)?\b|\bguarded\b|"
+    r"(?:\bcannot\b|\bcan'?t\b|\bwill\s+not\b|\bwon'?t\b|\bwould\s+not\b|\bwouldn'?t\b|"
+    r"\bdoes\s+not\b|\bdoesn'?t\b|\bdo\s+not\b|\bdon'?t\b|\bdid\s+not\b|\bdidn'?t\b|"
+    r"\bhave\s+not\b|\bhaven'?t\b|\bhas\s+not\b|\bhasn'?t\b|\bhad\s+not\b|\bhadn'?t\b|"
+    r"\bnever\b)\s+"
+    r"(?:raise|crash(?:es|ed|ing)?|fail(?:s|ure)?|throw(?:s|n|ing)?)\b|"
+    r"\bno\s+risk\s+of\s+(?:raise|crash(?:es|ed|ing)?|fail(?:s|ure)?|throw(?:s|n|ing)?)\b",
     re.IGNORECASE,
 )
 
@@ -279,11 +302,54 @@ def _symbol_patterns(known_symbols: FrozenSet[str]) -> Tuple[Tuple[str, "re.Patt
     return tuple(patterns)
 
 
+def _prefer_citable_homonyms(
+    symbols: List[str], citable_modules: Optional[FrozenSet[str]]
+) -> List[str]:
+    """V11: resolve a bare short-name mention to the citable homonym.
+
+    `_symbol_patterns` is keyed per *qualname*, so one bare mention of
+    `load_events` in a sentence yields one candidate per module that
+    defines a `load_events` — repo-wide, 514 such names sit behind the
+    imports of 215 of this repo's 383 test files. Without this step every
+    one of those candidates became its own `Claim`; the ones outside the
+    citable set failed `citation_check`, and `verify_claims`'s sink-or-swim
+    rule then took the sentence down *with* the correctly-resolved one —
+    so widening the citable set for a test would have kept nothing.
+
+    When `citable_modules` is given and at least one candidate for a short
+    name belongs to it, only those candidates stay; a short name with no
+    citable candidate keeps all of them, and they fail exactly as before.
+    `None` — the public default, for callers that never build a set — is a
+    no-op and keeps every homonym. `verify_repo` builds a set for *every*
+    module since V16: a test file's is its own path plus its imports (V11),
+    a source module's is just `{own path}`, so a bare name in a source-file
+    summary resolves to the symbol defined *here* instead of to every
+    module that defines one by that name. Explicit `path.py:name` citations
+    never pass through here — the caller appends those after this step,
+    unfiltered.
+    """
+    if citable_modules is None or not symbols:
+        return symbols
+    by_short: Dict[str, List[str]] = {}
+    for sym in symbols:
+        by_short.setdefault(sym.split(":")[-1], []).append(sym)
+    kept: List[str] = []
+    for sym in symbols:
+        siblings = by_short[sym.split(":")[-1]]
+        if any(s.partition(":")[0] in citable_modules for s in siblings):
+            if sym.partition(":")[0] in citable_modules:
+                kept.append(sym)
+        else:
+            kept.append(sym)
+    return kept
+
+
 def extract_claims(
     text: str,
     module_path: str,
     known_symbols: FrozenSet[str] = frozenset(),
     known_names: FrozenSet[str] = frozenset(),
+    citable_modules: Optional[FrozenSet[str]] = None,
 ) -> List[Claim]:
     """Split `text` (Pass B's raw ``purpose``/``notes`` prose) into
     sentence-level `Claim`s, tagging each with whatever a claim needs to be
@@ -426,6 +492,7 @@ def extract_claims(
                 continue  # bare single lowercase word — too generic to trust
             if pattern.search(sentence):
                 symbols.append(sym)
+        symbols = _prefer_citable_homonyms(symbols, citable_modules)
 
         for sym_citation_match in _SYMBOL_CITATION_RE.finditer(sentence):
             cited_path, cited_ident = sym_citation_match.group(1), sym_citation_match.group(2)
@@ -436,7 +503,16 @@ def extract_claims(
                 continue  # real-but-unindexed name in this module — not a citation to check
             symbols.append(exact_qualname)
 
-        if accesses and _CRASH_WORDS_RE.search(sentence):
+        # BUGFIX (see _SAFE_WORDS_RE): a safety sentence like "stack[-1] will
+        # not crash" contains the literal crash word "crash", so probing the
+        # raw sentence first would classify it access_crash. Probe the crash
+        # keywords on a copy with every safe phrasing removed — only
+        # genuinely affirmative crash language then trips the crash branch.
+        # A sentence that contains BOTH a real crash assertion and safety
+        # language still keeps the existing crash-wins behavior, because the
+        # residual crash assertion survives the strip.
+        _crash_probe = _SAFE_WORDS_RE.sub("", sentence)
+        if accesses and _CRASH_WORDS_RE.search(_crash_probe):
             kind = "access_crash"
         elif accesses and _SAFE_WORDS_RE.search(sentence):
             # access_safe: the mirror image of access_crash (see
@@ -479,17 +555,22 @@ def citation_check(
     known_symbols: FrozenSet[str],
     line_counts: Dict[str, int],
     known_accesses: FrozenSet[str] = frozenset(),
+    citable_modules: Optional[FrozenSet[str]] = None,
 ) -> Optional[str]:
     """Return `None` if `claim` cites something real, else a detail string
     explaining what didn't resolve.
 
     * A cited `symbol` must be in `known_symbols` (Pass A's own index —
       COLLECT-4's `public_symbols`, nothing derived or LLM-sourced) *and*
-      must belong to the same module this claim is about (`claim.module`)
-      — see the BUGFIX note below.
+      must belong to one of `citable_modules` — by default just the module
+      this claim is about (`claim.module`), see the BUGFIX note below; for
+      a test file `verify_repo` widens that to the modules the test
+      imports (V11, see `verify_repo`).
     * A cited `location` (`path:line`) must name a scanned module and a
       line number within that file's actual line count, and that module
-      must be `claim.module` itself — same BUGFIX, same reasoning.
+      must be `claim.module` itself — same BUGFIX, same reasoning. V11
+      does not widen this one: Pass B never saw another module's source,
+      so a line number in it is not something a test could have read off.
     * An `access_crash` claim's cited `access` (e.g. `"cache[-1]"`) must be
       one COLLECT-7's dataflow pass actually recorded for this module — in
       `known_accesses`, regardless of GUARDED/UNGUARDED status. Without
@@ -527,15 +608,32 @@ def citation_check(
     are real *somewhere*. That is exactly the class of fabrication
     COLLECT-17 exists to catch — a citation that resolves globally but not
     locally is not a citation of this module at all.
+
+    V11: for a *test* file that reasoning inverts — a test exists to name
+    the symbols of the module it exercises, and its own source (which Pass
+    B was shown) is where those imports sit. So `citable_modules` is the
+    set of modules a symbol citation may resolve to: `None` means the
+    original `{claim.module}` rule, and `verify_repo` passes the test's own
+    path plus every module `graph.import_edges` says it imports. A symbol
+    from a module the test does *not* import is still outside the set and
+    still drops.
     """
+    citable = citable_modules if citable_modules is not None else frozenset({claim.module})
+
     if claim.symbol is not None:
         if claim.symbol not in known_symbols:
             return f"cited symbol {claim.symbol!r} not found in Pass A index"
         symbol_module, _, _ = claim.symbol.partition(":")
-        if symbol_module != claim.module:
+        if symbol_module not in citable:
             return (
                 f"cited symbol {claim.symbol!r} belongs to module "
                 f"{symbol_module!r}, not {claim.module!r}"
+                # V16: the suffix describes a set actually widened past the
+                # module itself. A source module's set is `{claim.module}`
+                # alone (what `None` folds into above), so its detail string
+                # stays byte-identical to the pre-V11 wording — `.collect/`
+                # diffs and the M-tickets' reason counters read it.
+                + (" or any module it imports" if len(citable) > 1 else "")
             )
 
     if claim.location is not None:
@@ -663,6 +761,7 @@ def verify_claims(
     known_symbols: FrozenSet[str],
     line_counts: Dict[str, int],
     fail_open_locs: FrozenSet[str],
+    citable_modules: Optional[FrozenSet[str]] = None,
 ) -> Tuple[List[Claim], List[DroppedClaim]]:
     """Run every check in order on each of `claims`; return `(kept, dropped)`.
 
@@ -690,12 +789,17 @@ def verify_claims(
     Every claim ends up in exactly one of `kept`/`dropped` either way —
     the same "nothing vanishes silently" invariant `verify_repo`'s
     `kept_count` bookkeeping already depends on (see its own BUGFIX note).
+
+    `citable_modules` (V11) goes straight to `citation_check`; `None` is
+    the same-module-only rule every caller had before.
     """
     known_accesses = frozenset(_normalize_access(ga.access) for ga in module.guarded_accesses)
     provisionally_kept: List[Claim] = []
     dropped: List[DroppedClaim] = []
     for claim in claims:
-        no_citation = citation_check(claim, known_symbols, line_counts, known_accesses)
+        no_citation = citation_check(
+            claim, known_symbols, line_counts, known_accesses, citable_modules,
+        )
         if no_citation is not None:
             dropped.append(DroppedClaim(claim=claim, reason=REASON_NO_CITATION, detail=no_citation))
             continue
@@ -708,15 +812,25 @@ def verify_claims(
 
         provisionally_kept.append(claim)
 
-    failed_sentences = {d.claim.text for d in dropped}
+    # First failure per sentence, so the swept-in siblings below can name the
+    # actual reason a sentence failed instead of always blaming citation —
+    # `contradiction_check` drops land here exactly as often as `citation_check`
+    # ones do, and BUGFIX above already established the two are not the same.
+    failed_sentence_source: Dict[str, DroppedClaim] = {}
+    for d in dropped:
+        failed_sentence_source.setdefault(d.claim.text, d)
     kept: List[Claim] = []
     for claim in provisionally_kept:
-        if claim.text in failed_sentences:
+        origin = failed_sentence_source.get(claim.text)
+        if origin is not None:
             dropped.append(
                 DroppedClaim(
                     claim=claim,
                     reason=REASON_SIBLING_CITATION_FAILED,
-                    detail="a different citation in the same sentence did not verify",
+                    detail=(
+                        f"a different citation in the same sentence failed "
+                        f"({origin.reason}): {origin.detail}"
+                    ),
                 )
             )
         else:
@@ -732,16 +846,18 @@ def _verify_text(
     line_counts: Dict[str, int],
     fail_open_locs: FrozenSet[str],
     known_names: FrozenSet[str] = frozenset(),
+    citable_modules: Optional[FrozenSet[str]] = None,
 ) -> Tuple[str, List[DroppedClaim]]:
     """Extract + verify claims from one prose field (`purpose` or `notes`),
     return the reconstructed (filtered) text and whatever got dropped."""
-    claims = extract_claims(text, module.path, known_symbols, known_names)
+    claims = extract_claims(text, module.path, known_symbols, known_names, citable_modules)
     kept, dropped = verify_claims(
         claims,
         module=module,
         known_symbols=known_symbols,
         line_counts=line_counts,
         fail_open_locs=fail_open_locs,
+        citable_modules=citable_modules,
     )
     # BUGFIX (companion to `verify_claims`'s "sink or swim together" fix
     # above): a sentence with *multiple* citations that all individually
@@ -760,14 +876,15 @@ def verify_module(
     line_counts: Dict[str, int],
     fail_open_locs: FrozenSet[str],
     known_names: FrozenSet[str] = frozenset(),
+    citable_modules: Optional[FrozenSet[str]] = None,
 ) -> Tuple[ModuleRecord, List[DroppedClaim]]:
     """Run Pass C on one already-summarized module.
 
     A module with no summary (Pass B skipped, or `--no-llm`) passes through
     unchanged — there is no prose to verify. Otherwise `purpose` and
     `notes` are each independently filtered down to their surviving claims
-    and reattached as a fresh `LLMSummary` (COLLECT-1's whitelist — still,
-    and always, `provenance="llm"`).
+    and reattached as a fresh `LLMSummary` (COLLECT-1's whitelist — still
+    `provenance="llm"`, or `"llm-stale"` when that is what came in: V8).
 
     `known_names` — this module's own broader "every name defined
     anywhere" set (`ast_facts.extract_all_defined_names`), used only to
@@ -776,6 +893,11 @@ def verify_module(
     Defaults to empty, same fail-safe posture as an absent artifact: no
     broader set to check against just means this guard can't help, not
     that anything crashes.
+
+    `citable_modules` (V11) — the modules a symbol citation in this
+    module's prose may resolve to; `None` is the own-module rule. It
+    reaches both `extract_claims` (bare-name resolution) and
+    `citation_check` (the gate) through `_verify_text`.
     """
     if module.summary is None:
         return module, []
@@ -784,16 +906,21 @@ def verify_module(
         module.summary.purpose,
         module=module, known_symbols=known_symbols,
         line_counts=line_counts, fail_open_locs=fail_open_locs,
-        known_names=known_names,
+        known_names=known_names, citable_modules=citable_modules,
     )
     verified_notes, dropped_notes = _verify_text(
         module.summary.notes,
         module=module, known_symbols=known_symbols,
         line_counts=line_counts, fail_open_locs=fail_open_locs,
-        known_names=known_names,
+        known_names=known_names, citable_modules=citable_modules,
     )
 
-    verified_summary = LLMSummary(purpose=verified_purpose, notes=verified_notes)
+    # V8: a carried-forward `llm-stale` summary stays stale through Pass C —
+    # verification drops fabricated citations, it does not make old prose
+    # current.
+    verified_summary = LLMSummary(
+        purpose=verified_purpose, notes=verified_notes, provenance=module.summary.provenance,
+    )
     return module.with_llm_summary(verified_summary), dropped_purpose + dropped_notes
 
 
@@ -802,8 +929,22 @@ def verify_repo(
     sources: Dict[str, str],
     *,
     root: Optional[Path] = None,
+    import_edges: Optional[Graph] = None,
 ) -> Tuple[List[ModuleRecord], Dict[str, Any]]:
     """Run Pass C over every summarized module in `modules`.
+
+    V11 — test files may cite what they import. A module
+    `test_paths.is_test_path` calls test code (under a test root, or a
+    `conftest.py`; the L5 rule — a bare `test_*.py` name is not a signal,
+    `tools/collect/test_map.py` ships) gets `citable_modules` = its own
+    path plus every module `import_edges` says it imports. Every other
+    module gets `{own path}` (V16; it was `None` before, which let a bare
+    name in a source summary expand to every homonym repo-wide and sink the
+    sentence) — the own-module-only rule, unchanged in effect. `import_edges`
+    is the same `graph.import_edges(modules)` the artifact is built from —
+    `cli.py` passes the one it already has; a caller without one gets it
+    computed here, so the rule is never silently off. A test citing a
+    module it does not import still drops.
 
     `sources` maps module path -> its source text, used to compute each
     file's line count for the citation-check's range test, and (COLLECT-17
@@ -820,6 +961,14 @@ def verify_repo(
     modules = list(modules)
     known_symbols = frozenset(sym.qualname for m in modules for sym in m.public_symbols)
     line_counts = {m.path: len(sources.get(m.path, "").splitlines()) for m in modules}
+
+    if import_edges is None:
+        import_edges = _import_edges(modules)
+    citable_by_module: Dict[str, FrozenSet[str]] = {
+        m.path: frozenset({m.path}) | import_edges.get(m.path, frozenset())
+        if is_test_path(m.path) else frozenset({m.path})
+        for m in modules
+    }
 
     # Broader "every name this module defines anywhere" index (COLLECT-17
     # fabricated-symbol-citation fix), one per module, built directly from
@@ -882,18 +1031,23 @@ def verify_repo(
         # here would desync this count from what `verify_module` actually
         # processes, breaking the `total - len(dropped) == len(kept)`
         # invariant this whole block exists to guarantee.
+        # V11: the same holds for `citable_modules` — it changes how many
+        # `Claim`s a bare homonym mention produces (`extract_claims`), so
+        # this count and `verify_module` must see the same set.
         total_claims = 0
+        m_citable = citable_by_module.get(m.path)
         if m.summary is not None:
             m_known_names = known_names_by_module.get(m.path, frozenset())
             total_claims = len(
-                extract_claims(m.summary.purpose, m.path, known_symbols, m_known_names)
+                extract_claims(m.summary.purpose, m.path, known_symbols, m_known_names, m_citable)
             ) + len(
-                extract_claims(m.summary.notes, m.path, known_symbols, m_known_names)
+                extract_claims(m.summary.notes, m.path, known_symbols, m_known_names, m_citable)
             )
 
         verified, dropped = verify_module(
             m, known_symbols=known_symbols, line_counts=line_counts, fail_open_locs=fail_open_locs,
             known_names=known_names_by_module.get(m.path, frozenset()),
+            citable_modules=m_citable,
         )
         verified_modules.append(verified)
         all_dropped.extend(dropped)

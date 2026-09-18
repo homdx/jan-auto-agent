@@ -58,21 +58,28 @@ from typing import Any, Dict, Optional, Tuple
 
 
 class Provenance:
-    """The three provenance tags a field/record can carry.
+    """The provenance tags a field/record can carry.
 
-    static  — produced directly by Pass A's AST walk; ground truth.
-    llm     — produced by Pass B's summarizer; prose, not authoritative.
-    derived — computed from other static facts (e.g. contracts inferred
-              from guarded_accesses + the call graph); not LLM, not raw AST,
-              but still trustworthy because it's a pure function of static
-              facts.
+    static    — produced directly by Pass A's AST walk; ground truth.
+    llm       — produced by Pass B's summarizer; prose, not authoritative.
+    llm-stale — Pass B prose carried forward by a `--no-llm` build (V8)
+                over a module whose source changed since it was written;
+                still prose, still unauthoritative, and additionally known
+                to describe an older version of the file. Only an
+                `LLMSummary` may carry it — it is a *narrower* claim than
+                `llm`, never a wider one.
+    derived   — computed from other static facts (e.g. contracts inferred
+                from guarded_accesses + the call graph); not LLM, not raw
+                AST, but still trustworthy because it's a pure function of
+                static facts.
     """
 
     STATIC = "static"
     LLM = "llm"
+    LLM_STALE = "llm-stale"
     DERIVED = "derived"
 
-    ALL = frozenset({STATIC, LLM, DERIVED})
+    ALL = frozenset({STATIC, LLM, LLM_STALE, DERIVED})
 
 
 class ProvenanceViolation(RuntimeError):
@@ -217,7 +224,7 @@ class LLMSummary:
     provenance: str = Provenance.LLM
 
     def __post_init__(self) -> None:
-        _require_provenance(self, frozenset({Provenance.LLM}))
+        _require_provenance(self, frozenset({Provenance.LLM, Provenance.LLM_STALE}))
         extra = {
             f.name
             for f in fields(self)
@@ -228,6 +235,13 @@ class LLMSummary:
                 f"LLMSummary must only contain {sorted(LLM_WRITABLE_FIELDS)}; "
                 f"found unexpected field(s) {sorted(extra)}"
             )
+
+    def as_stale(self) -> "LLMSummary":
+        """The same prose tagged `llm-stale` (V8): the module it describes
+        has changed since Pass B wrote it. Idempotent."""
+        if self.provenance == Provenance.LLM_STALE:
+            return self
+        return dataclasses.replace(self, provenance=Provenance.LLM_STALE)
 
 
 # ── Composite records (structural facts + optional LLM summary) ───────────────
@@ -320,6 +334,12 @@ class ModuleRecord:
     path: str
     public_symbols: Tuple[FunctionRecord, ...] = ()
     imports: Tuple[str, ...] = ()
+    # L4: `"pkg.name"` for every `from pkg import name` — the submodule-
+    # qualified candidates `graph.import_edges` resolves *in addition to*
+    # `imports`. Kept apart from `imports` so the Pass A facts block and
+    # the rendered `Imports:` line stay the coarse list they always were.
+    # Absent from an older artifact -> `()` -> the pre-L4 graph, fail open.
+    from_imports: Tuple[str, ...] = ()
     config_reads: Tuple[ConfigRead, ...] = ()
     except_sites: Tuple[ExceptSite, ...] = ()
     guarded_accesses: Tuple[GuardedAccess, ...] = ()
@@ -337,6 +357,7 @@ class ModuleRecord:
             "path",
             "public_symbols",
             "imports",
+            "from_imports",
             "config_reads",
             "except_sites",
             "guarded_accesses",
@@ -354,6 +375,7 @@ class ModuleRecord:
             "path": self.path,
             "public_symbols": [s.to_dict() for s in self.public_symbols],
             "imports": list(self.imports),
+            "from_imports": list(self.from_imports),
             "config_reads": [dataclasses.asdict(c) for c in self.config_reads],
             "except_sites": [dataclasses.asdict(e) for e in self.except_sites],
             "guarded_accesses": [dataclasses.asdict(g) for g in self.guarded_accesses],
@@ -381,6 +403,7 @@ class ModuleRecord:
                 path=d["path"],
                 public_symbols=symbols,
                 imports=tuple(d.get("imports", ())),
+                from_imports=tuple(d.get("from_imports", ())),
                 config_reads=config_reads,
                 except_sites=except_sites,
                 guarded_accesses=guarded_accesses,

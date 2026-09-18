@@ -1,0 +1,192 @@
+{
+ "taken_at": "2026-09-18T03:06:47+00:00",
+ "runs": [
+  {
+   "run": "testtext",
+   "trace": "trace_3b40c2f9ada4.jsonl",
+   "trace_files": 3,
+   "head_sha": "7208c96",
+   "pre_run_sha": "e5d46fc",
+   "switched_mid_run": false,
+   "goal": "",
+   "probe_usable": "True",
+   "probe_reason": "ok",
+   "llm_by_source": {
+    "gate1": 1705,
+    "architect": 1,
+    "coder": 1
+   },
+   "gate1": {
+    "requests": 1705,
+    "confirmed": 116,
+    "rejected": 620,
+    "unparsed": 947,
+    "unknown": 2,
+    "seconds_per_candidate": 19.1,
+    "empty_transport": 0,
+    "empty_exhausted": 318
+   },
+   "gate1_split": {
+    "run_id": "f25f2c675005",
+    "existence": "91",
+    "presence_confirmed": "66",
+    "presence_rejected": "370",
+    "presence_fail_closed": "0",
+    "presence_unknown": "2",
+    "presence_reask": "316",
+    "presence_empty_transport": "0",
+    "presence_empty_exhausted": "318",
+    "presence_nothink_ignored": "0",
+    "duplicate": "0",
+    "non_py": "0",
+    "accepted": "68",
+    "rejected": "461"
+   },
+   "gate1_location_ext": {
+    ".py:rejected": 616,
+    ".py:unparsed": 940,
+    ".py:confirmed": 116
+   },
+   "gate2": {},
+   "coder": {},
+   "coder_budget_escalations": 0,
+   "coder_budgets": {},
+   "probe": {
+    "ops": 0,
+    "hits": 0,
+    "misses": 0,
+    "memo_hits": 0
+   },
+   "probe_by_op": {},
+   "collect": {
+    "blocks": 1,
+    "chars": 1029,
+    "memo_hits": 0,
+    "shrink": {},
+    "miss": {},
+    "refresh": {
+     "runs": 0,
+     "ok": 0,
+     "modules": 0,
+     "seconds": 0.0
+    }
+   },
+   "collect_source": "events",
+   "collect_block_occurrences": 1,
+   "first_ts": "2026-09-17T17:58:35.030004+00:00",
+   "last_ts": "2026-09-18T03:03:40.457310+00:00",
+   "gate1_first_ts": "2026-09-17T17:59:29.637941+00:00",
+   "gate1_last_ts": "2026-09-18T03:02:48.428237+00:00"
+  },
+  {
+   "run": "testtext6",
+   "trace": "trace_09c54db1a84d.jsonl",
+   "trace_files": 10,
+   "head_sha": "29ddf43",
+   "pre_run_sha": "e5d46fc",
+   "switched_mid_run": true,
+   "goal": "Trace every write to a JSON state file and identify paths where data reaches the file without passing the schema validation that the module's own setters apply. Add validation at the boundary or document why the write is already safe.",
+   "probe_usable": "True",
+   "probe_reason": "ok",
+   "llm_by_source": {
+    "architect": 19,
+    "gate1": 1459,
+    "coder": 62,
+    "search_agent": 15,
+    "task_rewriter": 3
+   },
+   "gate1": {
+    "requests": 1459,
+    "confirmed": 110,
+    "rejected": 600,
+    "unparsed": 677,
+    "unknown": 1,
+    "seconds_per_candidate": 14.4,
+    "empty_transport": 0,
+    "empty_exhausted": 230
+   },
+   "gate1_split": {
+    "run_id": "c425e5b4ae9b",
+    "existence": "88",
+    "presence_confirmed": "66",
+    "presence_rejected": "349",
+    "presence_fail_closed": "0",
+    "presence_unknown": "1",
+    "presence_reask": "229",
+    "presence_empty_transport": "0",
+    "presence_empty_exhausted": "230",
+    "presence_nothink_ignored": "0",
+    "duplicate": "0",
+    "non_py": "0",
+    "accepted": "67",
+    "rejected": "437"
+   },
+   "gate1_location_ext": {
+    ".py:rejected": 597,
+    ".py:confirmed": 109,
+    ".py:unparsed": 666
+   },
+   "gate2": {
+    "REJECTED": 12
+   },
+   "coder": {
+    "REJECTED": 32
+   },
+   "coder_budget_escalations": 1,
+   "coder_budgets": {
+    "3000": 1,
+    "6000": 31
+   },
+   "probe": {
+    "ops": 41,
+    "hits": 41,
+    "misses": 0,
+    "memo_hits": 0
+   },
+   "probe_by_op": {
+    "module_hit": 27,
+    "module_miss": 0,
+    "facts_hit": 6,
+    "facts_miss": 0,
+    "read_hit": 8,
+    "read_miss": 0
+   },
+   "collect": {
+    "blocks": 13,
+    "chars": 10262,
+    "memo_hits": 11,
+    "shrink": {},
+    "miss": {},
+    "refresh": {
+     "runs": 2,
+     "ok": 2,
+     "modules": 2,
+     "seconds": 41650.31
+    }
+   },
+   "collect_source": "events",
+   "collect_block_occurrences": 13,
+   "first_ts": "2026-09-17T10:20:41.913878+00:00",
+   "last_ts": "2026-09-17T20:32:32.114757+00:00",
+   "gate1_first_ts": "2026-09-17T14:41:31.716214+00:00",
+   "gate1_last_ts": "2026-09-17T20:32:32.114757+00:00"
+  }
+ ],
+ "totals": {
+  "arch": 20,
+  "g1": 3164,
+  "conf": 226,
+  "rej": 1220,
+  "unk": 3,
+  "empty_t": 0,
+  "empty_x": 548,
+  "ops": 41,
+  "miss": 0,
+  "blocks": 14,
+  "codesc": 1,
+  "codtransport": 0,
+  "g2rej": 12,
+  "g2err": 0,
+  "g2unavail": 0
+ }
+}

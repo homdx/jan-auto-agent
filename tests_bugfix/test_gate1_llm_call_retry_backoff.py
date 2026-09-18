@@ -34,7 +34,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import tools.llm_stream as llm_stream_mod
 from tools.auto.architect import CandidateTask, CitedLocation
-from tools.auto.gate1_filter import Gate1Filter, _is_technical_failure
+from tools.auto.gate1_filter import (UNKNOWN_PRESENCE_REASON, Gate1Filter, _is_technical_failure)
 
 
 @pytest.fixture(autouse=True)
@@ -46,7 +46,11 @@ def _reset_caches():
 
 def _make_filter(*, llm_call_retry_max=None, llm_call_retry_wait_sec=None) -> Gate1Filter:
     cfg = configparser.ConfigParser()
-    gate1 = {"temperature": "0.0", "max_tokens": "512", "skip_llm": "false"}
+    # RUN-5: these tests assert the pre-existing "no verdict = dropped"
+    # behaviour, so they run the reject policy explicitly instead of the
+    # default keep. The retry budget itself is unaffected by the policy.
+    gate1 = {"temperature": "0.0", "max_tokens": "512", "skip_llm": "false",
+             "presence_unknown": "reject"}
     if llm_call_retry_max is not None:
         gate1["llm_call_retry_max"] = str(llm_call_retry_max)
     if llm_call_retry_wait_sec is not None:
@@ -145,9 +149,11 @@ class TestRetryBehaviorOnPersistentFailure:
 
         assert accepted == []
         assert len(rejected) == 1
-        assert rejected[0].reason.startswith("LLM call failed:")
+        # RUN-5: the reason says what it means — no verdict was obtained —
+        # and keeps the technical cause behind it.
+        assert rejected[0].reason.startswith(UNKNOWN_PRESENCE_REASON)
+        assert "LLM call failed: HTTP 400" in rejected[0].reason
         assert "(after 2 retries)" in rejected[0].reason
-        assert "HTTP 400" in rejected[0].reason
 
     def test_reason_is_classified_as_technical_failure(self, repo):
         """The whole point of AUTO-REMOVE-GUARD-1 (plan_validator.py)

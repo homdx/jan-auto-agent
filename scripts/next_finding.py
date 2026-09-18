@@ -36,7 +36,13 @@ def parse_improvements(path):
         body = "\n".join(lines[i:end]).rstrip()
         # a trailing '---' separator belongs to the entry, not the next one
         body = re.sub(r"\n-{3,}\s*$", "", body)
-        entries.append({"task_id": tid, "title": title, "body": body})
+        # A rendered entry carries Location, Target files, Acceptance check and
+        # Instruction. One that has only a heading is not a task a reviewer can
+        # judge — it is a truncated file, and handing it over silently produces
+        # 53 confident verdicts formed from a title alone. Flag it here rather
+        # than letting the run look successful.
+        thin = "**Instruction:**" not in body and "**Location:**" not in body
+        entries.append({"task_id": tid, "title": title, "body": body, "thin": thin})
     return entries
 
 
@@ -52,6 +58,8 @@ def main():
     ap.add_argument("--improvements", required=True)
     ap.add_argument("--out", required=True, help="the CSV append_finding.py writes to")
     ap.add_argument("--status", action="store_true", help="progress only, hand out nothing")
+    ap.add_argument("--allow-thin", action="store_true",
+                    help="hand out entries that carry no Location/Instruction anyway")
     a = ap.parse_args()
 
     if not os.path.exists(a.improvements):
@@ -72,10 +80,37 @@ def main():
         print(f"error: no '### <id>: <title>' sections in {a.improvements}", file=sys.stderr)
         return 1
 
+    # A thin entry — heading only, no Location and no Instruction — cannot be
+    # judged, and handing one over silently buys a confident verdict formed from
+    # a title. Skip those and say so, rather than failing the whole round: one
+    # broken entry should not cost the other fifty-two. A file that is entirely
+    # thin is a different thing — there is nothing to review at all, so stop.
+    thin = [e["task_id"] for e in entries if e["thin"]]
+    # --status only reports; it hands nothing over, so it must keep working on a
+    # broken file — that is exactly when you want to look at the state.
+    if thin and not a.allow_thin and not a.status:
+        if len(thin) == len(entries):
+            print(f"error: every entry in {a.improvements} ({len(entries)}) is a heading "
+                  f"with no Location and no Instruction — there is nothing to review.",
+                  file=sys.stderr)
+            print(f"  Regenerate it with --auto ... --dry-run, or pass --allow-thin to "
+                  f"review titles only and record that the input was thin.", file=sys.stderr)
+            return 1
+        print(f"warning: skipping {len(thin)} entry/entries with no Location and no "
+              f"Instruction — they cannot be judged: {', '.join(thin[:8])}"
+              + (" ..." if len(thin) > 8 else ""), file=sys.stderr)
+        print(f"  reviewing the remaining {len(entries) - len(thin)}. "
+              f"--allow-thin includes them anyway.", file=sys.stderr)
+        entries = [e for e in entries if not e["thin"]]
+
     done = recorded_ids(a.out)
     todo = [e for e in entries if e["task_id"] not in done]
     n_done, n_all = len(entries) - len(todo), len(entries)
     extra = sorted(i for i in done if i.startswith("NEW-"))
+
+    if a.status and thin:
+        print(f"note: {len(thin)}/{len(entries)} entries carry no Location and no "
+              f"Instruction and would be skipped in a real run", file=sys.stderr)
 
     if a.status or not todo:
         print(f"progress: {n_done}/{n_all} recorded, {len(todo)} remaining"

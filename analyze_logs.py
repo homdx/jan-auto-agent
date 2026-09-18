@@ -100,7 +100,7 @@ def _chapter_num(task: dict) -> int:
 # (code | docs | creative — tools/auto/utils.py normalize_task_mode). Unlike
 # creative mode, docs tasks don't emit a distinguishing structural marker like
 # a chapter number: the architect/gate1/validator prompts differ (see
-# docs/Readme.MD §4 "Task Modes"), but the trace shape is identical to plain
+# docs/archive/Readme.MD §4 "Task Modes"), but the trace shape is identical to plain
 # code tasks (coder → Gate-2, no Gate-3 prose gates). So detection here is a
 # best-effort heuristic based on which files a task actually touched.
 _DOC_EXTENSIONS = (".md", ".mdx", ".rst", ".txt", ".adoc")
@@ -402,6 +402,36 @@ def _frac_or(value, default: tuple) -> tuple:
         return default
 
 
+def _flag(value) -> bool:
+    """A boolean param as the trace carries it.
+
+    agent_trace stringifies every param, so a `memo_hit=False` arrives as the
+    string "False" — truthy to `bool()`. Synthetic traces and tests pass real
+    bools; both must read the same.
+    """
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes")
+    return bool(value)
+
+
+def _mapping(value) -> dict:
+    """A nested-dict param as the trace carries it.
+
+    agent_trace JSON-encodes a dict param into a string (`{"rows": 1}`), so
+    the reader has to decode it again; a real dict (synthetic trace) passes
+    through, anything else reads as empty rather than raising into a report.
+    """
+    if isinstance(value, dict):
+        return dict(value)
+    if isinstance(value, str) and value.strip().startswith("{"):
+        try:
+            loaded = json.loads(value)
+        except ValueError:
+            return {}
+        return loaded if isinstance(loaded, dict) else {}
+    return {}
+
+
 def _int_or(value, default: int) -> int:
     """int(value), or *default* when value is missing or unparseable.
 
@@ -466,6 +496,19 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
                 # to a human reading the report; it only ever showed up in
                 # the raw JSONL.
                 "probe_escalated": [],
+                # M4: runtime counters. `collect_block` / `collect_shrink` /
+                # `collect_miss` are emitted per request by
+                # tools/auto/collect_bridge.py; `collect_summary` is one
+                # event per run, at the end of the task loop; `gate1_split`
+                # is one event per plan phase, from run_trace.py. The three
+                # per-event lists are what the summary is derived from when
+                # it is absent — a run that never reached the end of the
+                # task loop, or a trace from before the events existed.
+                "collect_blocks":  [],
+                "collect_shrinks": [],
+                "collect_misses":  [],
+                "collect_summary": None,
+                "gate1_split":     None,
                 "total_events":   0,
                 "plan_total":     0,         # filled by plan_ready event — total tasks in plan
                 "files_preparing": [],       # [{ts, task, file_count, files_copied, files_missing, files}]
@@ -744,6 +787,39 @@ def analyze(events: list[dict], run_id_filter: Optional[str] = None) -> dict:
             # the "new prompt" half of a rewrite attempt.
             if src == "llm" and tgt == "prompt_optimizer":
                 run["_pending_new_prompt"] = str(content or "")
+
+        # ── M4 runtime counters ──────────────────────────────────────────
+        # collect_block / collect_shrink / collect_miss / collect_summary
+        # come from tools/auto/collect_bridge.py; gate1_split from
+        # tools/auto/run_trace.py. The per-event lists are kept because
+        # collect_summary is best effort — it is emitted once at the end of
+        # the task loop, and a run that crashed before that has the events
+        # but not the summary.
+        elif kind == "collect_block":
+            run["collect_blocks"].append({
+                "chars":     _int_or(params.get("chars"), 0),
+                "rows_kept": _int_or(params.get("rows_kept"), 0),
+                "rows_cut":  _int_or(params.get("rows_cut"), 0),
+                "memo_hit":  _flag(params.get("memo_hit", False)),
+                "task_id":   params.get("task_id"),
+            })
+        elif kind == "collect_shrink":
+            run["collect_shrinks"].append({
+                "path":    str(params.get("path", "?") or "?"),
+                "before":  _int_or(params.get("before"), 0),
+                "after":   _int_or(params.get("after"), 0),
+                "task_id": params.get("task_id"),
+            })
+        elif kind == "collect_miss":
+            run["collect_misses"].append({
+                "reason":      str(params.get("reason", "?") or "?"),
+                "target_file": params.get("target_file"),
+                "task_id":     params.get("task_id"),
+            })
+        elif kind == "collect_summary":
+            run["collect_summary"] = dict(params)
+        elif kind == "gate1_split":
+            run["gate1_split"] = dict(params)
 
         # ── AUTO-P architect context probes ────────────────────────────────
         # Emitted by tools/auto/architect.py: kind="probe_request" when the
@@ -1086,6 +1162,119 @@ def print_section(title: str) -> None:
     print(bold(f"── {title} " + "─" * max(0, 60 - len(title))))
 
 
+def _count_by(rows: list, key: str) -> dict:
+    """{value: count} over rows[key] — the shape `collect_summary`'s tallies
+    use, rebuilt from the per-event lists when the summary event is absent."""
+    out: dict = {}
+    for row in rows:
+        value = str((row or {}).get(key, "?") or "?")
+        out[value] = int(out.get(value, 0)) + 1
+    return out
+
+
+def _collect_totals(run: dict) -> dict:
+    """M4: the collect pack's tally for one run.
+
+    `collect_summary` is read first — it is the bridge's own per-run number —
+    and the per-event lists are the fallback, so a run that died before the
+    end of the task loop still reports what it did, and a pre-M4 trace
+    reports nothing at all rather than inventing zeros.
+    """
+    summary = run.get("collect_summary") or {}
+    blocks  = run.get("collect_blocks") or []
+    shrinks = run.get("collect_shrinks") or []
+    misses  = run.get("collect_misses") or []
+    return {
+        "blocks":       _int_or(summary.get("blocks"), len(blocks)),
+        "chars":        _int_or(summary.get("chars"), sum(b.get("chars", 0) for b in blocks)),
+        "memo_hits":    _int_or(summary.get("memo_hits"), sum(1 for b in blocks if b.get("memo_hit"))),
+        "shrink_calls": _int_or(summary.get("shrink_calls"), len(shrinks)),
+        "shrink_by_path": _mapping(summary.get("shrink_by_path")) or _count_by(shrinks, "path"),
+        "misses":       _mapping(summary.get("misses")) or _count_by(misses, "reason"),
+    }
+
+
+def render_runtime_counters(run: dict) -> None:
+    """M4: the collect / probe / gate1 block, next to the existing probe
+    section.
+
+    Three aligned lines, one fact per field. Printed only when the run has
+    anything to say on at least one of them — a pre-M4 trace with no probes
+    and no collect events renders nothing, which is how the report looked
+    before. Never raises: a half-recorded run must not break the report.
+    """
+    try:
+        col = _collect_totals(run)
+    except Exception:  # noqa: BLE001 — a report must not die on a counter
+        return
+    probes = run.get("probe_requests") or []
+    split = run.get("gate1_split") or {}
+    if not (col["blocks"] or col["misses"] or probes or split):
+        return
+
+    print()
+    print(bold(cyan("RUNTIME COUNTERS")))
+
+    if col["blocks"] or col["misses"]:
+        _shrink_bits = ", ".join(
+            f"{int(n)} {p}"
+            for p, n in sorted(col["shrink_by_path"].items(), key=lambda kv: -kv[1])
+        ) or "0"
+        _miss_bits = ", ".join(
+            f"{int(n)} {r}"
+            for r, n in sorted(col["misses"].items(), key=lambda kv: -kv[1])
+        ) or "0"
+        print(
+            f"  {'collect':9} blocks {col['blocks']} · "
+            f"{col['chars']} chars · memo {col['memo_hits']} · "
+            f"shrink {col['shrink_calls']} ({_shrink_bits}) · "
+            f"miss {sum(int(n) for n in col['misses'].values())} ({_miss_bits})"
+        )
+
+    if probes or run.get("probe_config"):
+        # Only non-zero fields. `declined 0` on a pre-AUTO-P4a trace would read
+        # as "declines are recorded and there were none" when the truth is
+        # that declines were not recorded at all — and the detailed
+        # "Architect probes" block below is where the zeros are stated.
+        _res = run.get("probe_results") or []
+        _hits = sum(r["hits"] for r in _res if r.get("hits", -1) >= 0)
+        _miss = sum(r["misses"] for r in _res if r.get("misses", -1) >= 0)
+        _parts = [f"requests {len(probes)}"]
+        if _hits or any(r.get("hits", -1) >= 0 for r in _res):
+            _parts.append(f"hits {_hits}")
+        if _miss or any(r.get("misses", -1) >= 0 for r in _res):
+            _parts.append(f"misses {_miss}")
+        for _label, _rows in (("declined", run.get("probe_declined") or []),
+                              ("escalated", run.get("probe_escalated") or [])):
+            if _rows:
+                _parts.append(f"{_label} {len(_rows)}")
+        print(f"  {'probe':9} " + " · ".join(_parts))
+
+    if split:
+        print(
+            f"  {'gate1':9} accepted {_int_or(split.get('accepted'), 0)} · "
+            f"existence {_int_or(split.get('existence'), 0)} · "
+            f"presence confirmed {_int_or(split.get('presence_confirmed'), 0)} / "
+            f"rejected {_int_or(split.get('presence_rejected'), 0)} / "
+            f"fail-closed {_int_or(split.get('presence_fail_closed'), 0)} / "
+            f"re-ask {_int_or(split.get('presence_reask'), 0)} · "
+            f"duplicate {_int_or(split.get('duplicate'), 0)} · "
+            f"non-py {_int_or(split.get('non_py'), 0)}"
+            # RUN-5 / RUN-9: candidates that ended without a verdict, and why
+            # the empty replies were empty. Only when the split carries the
+            # keys, so a pre-RUN-9 trace renders exactly as before.
+            + (
+                f" · unknown {_int_or(split.get('presence_unknown'), 0)}"
+                if "presence_unknown" in split else ""
+            )
+            + (
+                f" · empty {_int_or(split.get('presence_empty_transport'), 0)} transport / "
+                f"{_int_or(split.get('presence_empty_exhausted'), 0)} exhausted"
+                if "presence_empty_transport" in split else ""
+            )
+        )
+
+
 def render_run_summary(run: dict) -> None:
     tasks  = run["tasks"]
     real   = {k: v for k, v in tasks.items() if not k.startswith("gate1:")}
@@ -1126,6 +1315,7 @@ def render_run_summary(run: dict) -> None:
           f"approved={green(str(total_approved))}  "
           f"rejected={red(str(total_rejected))}")
     print(f"  {bold('LLM calls')}:       {run['llm_calls']}")
+    render_runtime_counters(run)
     _ctx_reqs = run.get("context_requests", [])
     if _ctx_reqs:
         _total_syms = sum(len(r["symbols"]) for r in _ctx_reqs)
@@ -1142,6 +1332,7 @@ def render_run_summary(run: dict) -> None:
             # reason that has nothing to do with whether the model wants them.
             _why = {
                 "no_artifact":  "no fresh collect artifact ([collect] use_in_auto)",
+                "stale_artifact": "collect artifact is stale (run --collect --refresh)",
                 "bridge_error": "collect bridge failed to build",
             }.get(_probe_cfg["reason"], _probe_cfg["reason"])
             print(f"  {bold('Architect probes')}: {yellow('enabled but unavailable')} — {_why}")
@@ -1349,7 +1540,7 @@ def render_applied_tasks(run: dict, mode: str = "code") -> None:
 
     ``mode`` (AUTO-CR-35) only changes the section header and per-task file
     annotation — docs runs share the exact same task shape as code runs, just
-    with prose files instead of source files (see docs/Readme.MD §4).
+    with prose files instead of source files (see docs/archive/Readme.MD §4).
     """
     tasks = run["tasks"]
     done = [
@@ -1863,7 +2054,7 @@ def render_run(
         ``"code"``     — standard code-pipeline layout
         ``"creative"`` — story-progress layout with chapter ordering
         ``"docs"``     — standard code-pipeline layout, relabelled for
-                         documentation runs (AUTO-CR-35; see docs/Readme.MD
+                         documentation runs (AUTO-CR-35; see docs/archive/Readme.MD
                          §4 "Task Modes" — docs runs share the code-mode
                          trace shape, just with different architect/gate1/
                          validator prompts, so no separate renderer is needed)

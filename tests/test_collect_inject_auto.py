@@ -91,6 +91,46 @@ def test_build_collect_context_block_includes_module_record(mini_repo):
     assert "a" in block and "b" in block
 
 
+def test_build_collect_context_block_pins_its_content_after_the_row_rewrite(mini_repo):
+    """PLAN-v2 V2 rebuilt the block as an ordered row list, and V3 prepended
+    the three neighbourhood rows. The V2 content may not change: same header,
+    same module line, same symbol list — V3 only adds rows above it and never
+    rewrites a row V2 already rendered.
+
+    The two rows added here are both V3 absences rendered as facts: `pkg/a.py`
+    is imported by nothing and covered by no test in this one-file repo, so
+    both are said out loud rather than left as gaps.
+    """
+    cli_mod.action_collect(mini_repo)
+    model = loader_mod.load(mini_repo)
+
+    block = build_collect_context_block(model, "pkg/a.py")
+
+    assert block.split("\n") == [
+        "COLLECT MODEL (static facts, do not contradict):",
+        "module: pkg/a.py",
+        "callers: entry point — nothing imports this",
+        "tests: no test covers this file",
+        "public_symbols: pkg/a.py:a, pkg/a.py:b",
+    ]
+    assert block == "COLLECT MODEL (static facts, do not contradict):\n" \
+                    "module: pkg/a.py\n" \
+                    "callers: entry point — nothing imports this\n" \
+                    "tests: no test covers this file\n" \
+                    "public_symbols: pkg/a.py:a, pkg/a.py:b"
+
+
+def test_build_collect_context_block_budget_none_matches_the_implicit_default(mini_repo):
+    """V2.5: `budget=None` renders everything, so the pre-V6 shape of every
+    existing caller is unchanged by the new keyword."""
+    cli_mod.action_collect(mini_repo)
+    model = loader_mod.load(mini_repo)
+
+    assert build_collect_context_block(model, "pkg/a.py", budget=None) == \
+        build_collect_context_block(model, "pkg/a.py")
+
+
+
 # ── controller-level: use_in_auto opt-in + regression when off ─────────
 
 

@@ -1,0 +1,1 @@
+../tests/test_collect_block_shrink_contract.py

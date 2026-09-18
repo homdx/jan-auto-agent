@@ -17,8 +17,60 @@ import ssl
 import time
 import urllib.request
 import urllib.error
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
+
+
+# AUTO-RATE-1 / RUN-10: the HTTP retry budget every auto-mode caller passes
+# through. These three are request_completion()'s signature defaults (below)
+# and the numbers retry_kwargs_from_config() falls back to when a .ini has no
+# [loop] error_retries / error_retry_wait_sec / max_retry_after_sec — so a
+# config without the keys still gets byte-for-byte AUTO-RATE-1 behaviour.
+DEFAULT_ERROR_RETRIES = 60
+DEFAULT_ERROR_RETRY_WAIT_SEC = 10.0
+DEFAULT_MAX_RETRY_AFTER_SEC = 180.0
+
+
+@dataclass
+class CompletionMeta:
+    """RUN-9: what a completed chat call actually did, alongside its text.
+
+    Collected by ``request_completion`` on both branches (blocking and
+    streaming) and handed to the caller through ``on_meta`` /
+    ``request_completion_ex``. It is what lets Gate 1 tell an *empty reply
+    that spent the whole budget* (exhaustion — more tokens buys more silence)
+    from an *empty reply that never got the chance to say anything* (a
+    degraded provider: HTTP 200, a role-only chunk or an empty stream). Until
+    this existed the SSE branch kept only ``delta.content``, so both looked
+    exactly like a garbled verdict.
+
+    finish_reason:
+        The last non-null one seen on the stream (``choices[0].finish_reason``;
+        Ollama ``done_reason``). ``None`` when the provider never sent one.
+        ``"length"`` is the exhaustion signal.
+    completion_tokens:
+        ``usage.completion_tokens`` when the provider sent a usage object —
+        on a stream only with ``stream_options.include_usage`` (see
+        ``build_chat_request``); Ollama ``eval_count``. ``None`` is a legal
+        value: a gateway that omits usage still leaves the other signals.
+    reasoning_chars:
+        Characters of ``reasoning_content`` (or OpenRouter's ``reasoning``,
+        Ollama's ``message.thinking``) streamed. ``> 0`` with empty content
+        is either exhaustion (the budget went into the chain-of-thought) or a
+        ``reasoning.exclude`` request the provider ignored.
+    content_chunks:
+        Chunks that carried non-empty content. ``0`` with no finish reason
+        and no token count is the degraded-provider shape.
+    elapsed:
+        Wall-clock seconds from entry to return, retries included.
+    """
+
+    finish_reason: "str | None" = None
+    completion_tokens: "int | None" = None
+    reasoning_chars: int = 0
+    content_chunks: int = 0
+    elapsed: float = 0.0
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 
@@ -200,6 +252,32 @@ def zai_thinking_is_supported(url: str, model=None) -> bool:
     for this exact (url, model) pair in this process; `True` otherwise
     (including for pairs never tried)."""
     return (url, model) not in _ZAI_THINKING_UNSUPPORTED_KEYS
+
+
+# RUN-9: the same per-process, per-(url, model) "stop asking" memory as
+# AUTO-JSONMODE-1 above, for OpenAI's `stream_options: {"include_usage":
+# true}` — the only way a STREAMED reply carries `usage.completion_tokens`,
+# which is what tells an empty reply that exhausted its budget from one that
+# never got to answer. Some strict-schema gateways 400 on the field; keyed by
+# (url, model) like the other caches so one model's rejection does not poison
+# a sibling behind the same router, and so a gateway that chokes on it costs
+# one failed call per (url, model) per run — after that the caller simply
+# gets `completion_tokens = None`, a legal value.
+_STREAM_OPTIONS_UNSUPPORTED_KEYS: set = set()
+
+
+def mark_stream_options_unsupported(url: str, model=None) -> None:
+    """Record that *model* on *url* rejects `stream_options`, so future
+    `build_chat_request(stream=True)` calls for this exact (url, model) pair
+    never send it again this process. Idempotent; safe from any thread."""
+    _STREAM_OPTIONS_UNSUPPORTED_KEYS.add((url, model))
+
+
+def stream_options_is_supported(url: str, model=None) -> bool:
+    """`False` once `mark_stream_options_unsupported(url, model)` has fired
+    for this exact (url, model) pair in this process; `True` otherwise
+    (including for pairs never tried)."""
+    return (url, model) not in _STREAM_OPTIONS_UNSUPPORTED_KEYS
 
 
 # MASK-KEY-1: matches an ini-style `api_key = <value>` assignment line,
@@ -409,6 +487,105 @@ def _extract_content(raw: dict, api_format: str) -> str:
         ) from exc
 
 
+def _reasoning_text(container) -> str:
+    """RUN-9: the reasoning string a delta/message carries, or ``""``.
+
+    ``reasoning_content`` is the DeepSeek/vLLM/SGLang field the ticket names;
+    ``reasoning`` is what OpenRouter-style gateways (the free-tier routers this
+    project targets) stream instead; ``thinking`` is Ollama's. Only string
+    values count — OpenRouter's request-side ``reasoning`` is an object and
+    must not be mistaken for streamed text.
+    """
+    if not isinstance(container, dict):
+        return ""
+    for key in ("reasoning_content", "reasoning", "thinking"):
+        value = container.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
+def _as_int_or_none(value) -> "int | None":
+    """RUN-9: ``usage.completion_tokens`` / ``eval_count`` as an int, or
+    ``None`` for anything that is not a number (``bool`` included)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return int(value)
+
+
+def _meta_from_chunk(chunk, meta: CompletionMeta, api_format: str) -> None:
+    """RUN-9: fold one streamed chunk into *meta*, in place. Never raises —
+    a non-standard chunk must not turn a delivered stream into an exception.
+
+    Reads only shapes both branches of ``request_completion`` already
+    tolerate (null ``delta``, empty ``choices``, null ``message``). The usage
+    chunk OpenAI sends with ``include_usage`` has an EMPTY ``choices`` array,
+    so ``usage`` is read before and independently of ``choices``; a
+    ``finish_reason`` is only ever overwritten by a non-null one, so a
+    trailing usage chunk cannot erase the ``"stop"`` that came before it.
+    """
+    try:
+        if not isinstance(chunk, dict):
+            return
+        if api_format == "ollama":
+            meta.reasoning_chars += len(_reasoning_text(chunk.get("message")))
+            done_reason = chunk.get("done_reason")
+            if isinstance(done_reason, str) and done_reason:
+                meta.finish_reason = done_reason
+            eval_count = _as_int_or_none(chunk.get("eval_count"))
+            if eval_count is not None:
+                meta.completion_tokens = eval_count
+            return
+        usage = chunk.get("usage")
+        if isinstance(usage, dict):
+            completion_tokens = _as_int_or_none(usage.get("completion_tokens"))
+            if completion_tokens is not None:
+                meta.completion_tokens = completion_tokens
+        choices = chunk.get("choices") or []
+        if not choices or not isinstance(choices[0], dict):
+            return
+        finish_reason = choices[0].get("finish_reason")
+        if isinstance(finish_reason, str) and finish_reason:
+            meta.finish_reason = finish_reason
+        meta.reasoning_chars += len(_reasoning_text(choices[0].get("delta")))
+    except Exception:  # noqa: BLE001 — metadata must never break a delivered stream
+        pass
+
+
+def _response_meta(raw: dict, api_format: str, *, content: str, elapsed: float) -> CompletionMeta:
+    """RUN-9: ``CompletionMeta`` for a blocking (non-streamed) reply. Never
+    raises — a reply shaped differently still returns the defaults."""
+    meta = CompletionMeta(elapsed=elapsed, content_chunks=1 if content else 0)
+    try:
+        if api_format == "ollama":
+            _meta_from_chunk(raw, meta, api_format)
+            return meta
+        usage = raw.get("usage")
+        if isinstance(usage, dict):
+            meta.completion_tokens = _as_int_or_none(usage.get("completion_tokens"))
+        choices = raw.get("choices") or []
+        if choices and isinstance(choices[0], dict):
+            finish_reason = choices[0].get("finish_reason")
+            if isinstance(finish_reason, str) and finish_reason:
+                meta.finish_reason = finish_reason
+            meta.reasoning_chars = len(_reasoning_text(choices[0].get("message")))
+    except Exception:  # noqa: BLE001 — see above
+        pass
+    return meta
+
+
+def _notify_meta(on_meta, meta: CompletionMeta) -> None:
+    """RUN-9: hand *meta* to the caller's ``on_meta``, if any. A callback
+    that raises is swallowed: metadata is diagnostic, and a caller bug must
+    never turn a delivered reply into a failure the ladder then retries."""
+    if on_meta is None:
+        return
+    try:
+        on_meta(meta)
+    except Exception:  # noqa: BLE001 — see above
+        pass
+
+
 def _build_payload(payload: dict, api_format: str, stream: bool) -> dict:
     """
     Return a copy of payload shaped for the target API format.
@@ -456,6 +633,9 @@ def _build_payload(payload: dict, api_format: str, stream: bool) -> dict:
         if options:
             body["options"] = options
         body["stream"] = stream
+        # RUN-9: an OpenAI-only field; Ollama reports eval_count on its final
+        # NDJSON line unconditionally and does not recognise this one.
+        body.pop("stream_options", None)
         # /api/chat does not use a separate system message list entry —
         # system content is passed as a messages entry with role "system",
         # which is already the format callers use, so nothing extra needed.
@@ -465,6 +645,12 @@ def _build_payload(payload: dict, api_format: str, stream: bool) -> dict:
         body.pop("num_ctx", None)
         if stream:
             body["stream"] = True
+        else:
+            # RUN-9: OpenAI rejects `stream_options` on a blocking request
+            # ("only allowed when stream is true"), so a payload built for
+            # streaming and then sent blocking is trimmed here rather than
+            # 400ed.
+            body.pop("stream_options", None)
     return body
 
 
@@ -688,8 +874,21 @@ class LLMClientBase:
     TaskRewriter: the connection fields and SSL context are identical
     across all four; each subclass adds its own model/prompt settings."""
 
+    # RUN-10: the [loop] retry budget, resolved in __init__ below. The class
+    # default is empty on purpose: an object built with object.__new__() (a
+    # couple of tests bypass __init__) keeps calling request_completion() with
+    # no retry kwargs at all, which is byte-identical to the pre-RUN-10
+    # behaviour, instead of losing the call to an AttributeError.
+    _retry_kwargs: dict = {}
+
     def __init__(self, config, base_url: str, api_key: str, model: str,
                  api_format: str = "openai", verify_ssl: bool = True) -> None:
+        # RUN-10: the [loop] HTTP retry budget, resolved once here so every
+        # request_completion() call in Coder, Gate1Filter, ClusterReviewer
+        # and TaskRewriter passes the same error_retries /
+        # error_retry_wait_sec / max_retry_after_sec instead of silently
+        # inheriting request_completion()'s built-ins.
+        self._retry_kwargs = retry_kwargs_from_config(config)
         self._config     = config
         self._base_url   = base_url.rstrip("/")
         self._api_key    = api_key
@@ -703,10 +902,24 @@ def build_chat_request(
     temperature: float, max_tokens: int, system: str, user_msg: str,
     num_ctx: int = 0, think: "bool | None" = None,
     response_format: bool = False, think_effort: "str | None" = None,
+    stream: bool = False,
 ) -> tuple[str, dict, dict]:
     """
     Build the (url, headers, payload) triple for a one-shot system/user chat
     call, branching on *api_format* ("ollama" vs an openai-compatible API).
+
+    RUN-9: *stream*, when ``True``, adds ``stream_options: {"include_usage":
+    true}`` to the openai-branch payload so the streamed reply ends with a
+    ``usage`` chunk — the ``completion_tokens`` a caller needs to tell "the
+    model exhausted its budget and said nothing" from "the provider returned
+    HTTP 200 with an empty stream" (``request_completion``'s ``on_meta``).
+    Gated by ``stream_options_is_supported(url, model)``: a gateway that
+    rejects the field with HTTP 400 has it stripped for that exact (url,
+    model) pair for the rest of the process, same mechanics as the JSON-mode
+    cache, so one unsupported gateway costs one failed call rather than
+    every call. Ollama never gets it (``eval_count`` arrives on its own).
+    Defaults to ``False``: every existing caller builds a byte-identical
+    payload to before this parameter existed.
 
     Shared by Coder, Gate1Filter, Architect, and TaskRewriter — all four send
     the same single-turn system+user request and only differ in which
@@ -934,16 +1147,97 @@ def build_chat_request(
             payload["thinking"] = {"type": "enabled" if think else "disabled"}
         if response_format and response_format_is_supported(url, model):
             payload["response_format"] = {"type": "json_object"}
+        if stream and stream_options_is_supported(url, model):
+            # RUN-9: see the docstring — a trailing usage chunk on a streamed
+            # reply, or `completion_tokens = None` once this endpoint said no.
+            payload["stream_options"] = {"include_usage": True}
     return url, headers, payload
+
+
+def _retry_value(config, section: str, key: str, default, cast):
+    """Read one retry knob out of *section*; never raises.
+
+    A *missing* config, section or key gives *default* — that is what a
+    config without the keys gets today, so adding the keys changes nothing
+    for existing profiles. A *present but unparseable* value logs the RUN-9
+    warning (``config [loop] error_retries is malformed (…) — using default
+    60``) and falls back to that one key's default only, leaving the other
+    two keys intact. A negative value is clamped to zero: a budget of "-5"
+    attempts or "-1.0" seconds is nonsense, not a request to skip retrying.
+    """
+    if config is None:
+        return default
+    try:
+        raw = config.get(section, key, fallback=None)
+    except Exception as exc:  # noqa: BLE001 - fail-open by contract
+        logger.warning(
+            "config [%s] %s could not be read (%s) — using default %s",
+            section, key, exc, default,
+        )
+        return default
+    if raw is None:
+        return default
+    try:
+        value = cast(raw)
+    except (TypeError, ValueError) as exc:
+        logger.warning(
+            "config [%s] %s is malformed (%s) — using default %s",
+            section, key, exc, default,
+        )
+        return default
+    # A type-matched floor: max(0, 0.0) returns the int 0, which would turn a
+    # float knob into an int silently.
+    return max(0 if cast is int else 0.0, value)
+
+
+def retry_kwargs_from_config(config, section: str = "loop") -> dict:
+    """The auto-mode HTTP retry budget, resolved once from *section*.
+
+    RUN-10: request_completion() has carried its own retry budget since
+    AUTO-RATE-1 — 60 extra attempts, 10 s apart, on a Retry-After capped at
+    180 s — and every auto-mode caller (architect, Gate 1, coder, Gate 2
+    validator, story bible, summary memory) silently inherited it. This is
+    the one reader for the three [loop] keys that make it visible, read the
+    same way [loop] timeout_seconds already is:
+
+        retry_kwargs = retry_kwargs_from_config(config)
+        _llm_stream.request_completion(url, headers, payload,
+                                       timeout=self._timeout, **retry_kwargs)
+
+    Returns ``{"error_retries": int, "error_retry_wait_sec": float,
+    "max_retry_after_sec": float}`` — splat it straight into
+    request_completion(). [collect] is deliberately NOT read here: the Pass B
+    summarizer has its own three keys and defaults (2 / 60 / 180).
+    """
+    return {
+        "error_retries": _retry_value(
+            config, section, "error_retries", DEFAULT_ERROR_RETRIES, int),
+        "error_retry_wait_sec": _retry_value(
+            config, section, "error_retry_wait_sec",
+            DEFAULT_ERROR_RETRY_WAIT_SEC, float),
+        "max_retry_after_sec": _retry_value(
+            config, section, "max_retry_after_sec",
+            DEFAULT_MAX_RETRY_AFTER_SEC, float),
+    }
 
 
 def request_completion(url, headers, payload, timeout, stream=False, on_token=None,
                        api_format: str = "openai", ssl_context: "ssl.SSLContext | None" = None,
-                       error_retries: int = 60, error_retry_wait_sec: float = 10.0,
-                       max_retry_after_sec: float = 180.0, on_retry=None,
-                       _sleep_fn=None):
+                       error_retries: int = DEFAULT_ERROR_RETRIES,
+                       error_retry_wait_sec: float = DEFAULT_ERROR_RETRY_WAIT_SEC,
+                       max_retry_after_sec: float = DEFAULT_MAX_RETRY_AFTER_SEC,
+                       on_retry=None,
+                       _sleep_fn=None, on_meta=None):
     """
     POST a chat-completions request and return the assistant message text.
+
+    RUN-9: *on_meta*, if given, is called once with the ``CompletionMeta`` of
+    the reply being returned (``finish_reason``, ``completion_tokens`` or
+    ``None``, ``reasoning_chars``, ``content_chunks``, ``elapsed``) — on both
+    branches, right before the return. ``None`` (the default) keeps every
+    existing caller byte-for-byte as before: the return value is still the
+    plain ``str``. ``request_completion_ex`` is the same call returning the
+    metadata alongside the text. A callback that raises is swallowed.
 
     api_format : "openai"  → /v1/chat/completions  (SSE streaming, choices[])
                  "ollama"  → /api/chat              (NDJSON streaming, message{})
@@ -1004,6 +1298,9 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
         method="POST",
     )
     sleep = _sleep_fn or time.sleep
+    # RUN-9: CompletionMeta.elapsed counts from before the first attempt, so
+    # a caller sees the whole cost of the call, retries included.
+    _started = time.monotonic()
 
     # AUTO-REASONING-1: `build_chat_request`'s think=False path sends an
     # OpenRouter-style `reasoning: {"effort": "low", "exclude": true}`
@@ -1092,6 +1389,20 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
     # two keeps working exactly as it did before this field existed.
     _zai_thinking_stripped = False
 
+    # RUN-9: mirrors _response_format_stripped above — a payload-shape fix
+    # (this gateway does not accept OpenAI's stream_options field), not a
+    # transient error, so it fires ONCE per call, immediately, without
+    # touching error_retries/backoff.
+    _stream_options_stripped = False
+
+    def _looks_like_unknown_stream_options_field(detail: str) -> bool:
+        low = detail.lower()
+        # Gateways echo the field name in different ways — the whole field,
+        # only the option inside it, or the words with a space. Any mention
+        # next to a 400 is the field being rejected, not a transient error.
+        return ("stream_options" in low or "include_usage" in low
+                or "stream options" in low)
+
     def _looks_like_unknown_zai_thinking_field(detail: str) -> bool:
         low = detail.lower()
         return "thinking" in low and (
@@ -1101,7 +1412,7 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
         )
 
     def _open():
-        nonlocal body, req, _reasoning_stripped, _response_format_stripped, _think_depth_stripped, _reasoning_effort_toplevel_stripped, _zai_thinking_stripped
+        nonlocal body, req, _reasoning_stripped, _response_format_stripped, _think_depth_stripped, _reasoning_effort_toplevel_stripped, _zai_thinking_stripped, _stream_options_stripped
         attempt = 0
         while True:
             try:
@@ -1236,6 +1547,38 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
                     logger.warning("=" * 78)
                     logger.warning("request_completion: %s", msg)
                     logger.warning("=" * 78)
+                    if on_retry:
+                        on_retry(msg)
+                    continue
+
+                # RUN-9: provider rejected OpenAI's `stream_options` field
+                # outright — strip ONLY that field, remember the (url,
+                # model) pair so build_chat_request() stops asking for the
+                # rest of the process, and retry ONCE, immediately. The
+                # reply then just carries no usage chunk (completion_tokens
+                # = None, a legal value) instead of a 400 on every call.
+                _has_stream_options_field = (
+                    isinstance(body, dict) and "stream_options" in body
+                )
+                if (e.code == 400 and not _stream_options_stripped
+                        and _has_stream_options_field
+                        and _looks_like_unknown_stream_options_field(detail)):
+                    _stream_options_stripped = True
+                    mark_stream_options_unsupported(url, body.get("model"))
+                    body = {k: v for k, v in body.items() if k != "stream_options"}
+                    req = urllib.request.Request(
+                        url, data=json.dumps(body).encode("utf-8"),
+                        headers=headers, method="POST",
+                    )
+                    msg = (
+                        f"HTTP 400 from {url}: provider does not support "
+                        f"'stream_options' (streamed usage reporting, RUN-9) "
+                        f"— disabling it for this endpoint for the rest of "
+                        f"the run and retrying once without it. Replies "
+                        f"from it will carry no token count; everything "
+                        f"else is unchanged."
+                    )
+                    logger.warning("request_completion: %s", msg)
                     if on_retry:
                         on_retry(msg)
                     continue
@@ -1407,10 +1750,22 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
                 # distinct outcome the caller must see right away — feeding
                 # it back into this loop would retry a deterministic shape
                 # mismatch error_retries times instead of surfacing it.
-                return _extract_content(raw, api_format)
+                text = _extract_content(raw, api_format)
+                # RUN-9: a blocking reply carries its own finish_reason and
+                # usage, so an empty non-streamed reply is classifiable too.
+                _notify_meta(on_meta, _response_meta(
+                    raw, api_format, content=text,
+                    elapsed=time.monotonic() - _started,
+                ))
+                return text
 
     # ── Streaming ────────────────────────────────────────────────────────
     parts = []
+    # RUN-9: what this stream actually did, folded in chunk by chunk below.
+    # An untouched CompletionMeta() — nothing seen — is a legal result: a
+    # stream with no finish reason, no usage and no content is exactly the
+    # degraded-provider shape the caller needs to see, not an error.
+    meta = CompletionMeta()
     # BUGFIX (audit): same gap as the non-streaming path above — the
     # `for raw_line in response:` iteration was outside _open()'s retry
     # loop. Unlike the non-streaming path, tokens may already have been
@@ -1447,6 +1802,7 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
                             done  = chunk.get("done", False)
                         except json.JSONDecodeError:
                             continue
+                        _meta_from_chunk(chunk, meta, api_format)
                     else:
                         # OpenAI SSE: "data: {...}" lines
                         if not line.startswith("data:"):
@@ -1487,9 +1843,13 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
                             done  = False
                         except (json.JSONDecodeError, KeyError):
                             continue
+                        _meta_from_chunk(chunk, meta, api_format)
 
                     if token:
                         parts.append(token)
+                        # RUN-9: a chunk that carried content, as opposed to
+                        # a role-only, reasoning or usage chunk.
+                        meta.content_chunks += 1
                         if on_token is not None:
                             on_token(token)
                     if done:
@@ -1513,4 +1873,28 @@ def request_completion(url, headers, payload, timeout, stream=False, on_token=No
             sleep(error_retry_wait_sec)
             _stream_attempt += 1
 
+    meta.elapsed = time.monotonic() - _started
+    _notify_meta(on_meta, meta)
     return "".join(parts).strip()
+
+
+def request_completion_ex(*args, **kwargs) -> "tuple[str, CompletionMeta]":
+    """RUN-9: ``request_completion`` plus its ``CompletionMeta``.
+
+    The text is the exact string ``request_completion`` returns — only the
+    metadata rides along. Implemented on top of ``request_completion`` (not
+    the other way round) so a test that stubs ``tools.llm_stream.
+    request_completion`` still intercepts every call made through here; such
+    a stub reports no metadata, and the result is then
+    ``(text, CompletionMeta())`` — a default-filled object a caller must read
+    as "no evidence", never as "empty stream".
+    """
+    box: list = []
+
+    def _capture(meta: CompletionMeta) -> None:
+        if not box:
+            box.append(meta)
+
+    kwargs.pop("on_meta", None)
+    text = request_completion(*args, **kwargs, on_meta=_capture)
+    return text, (box[0] if box else CompletionMeta())

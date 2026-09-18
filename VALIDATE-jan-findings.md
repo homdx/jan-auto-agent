@@ -1,11 +1,56 @@
 # Validating jan's findings — prompts for reviewer models
 
-`TASK-jan-selfaudit.md` produces `IMPROVEMENTS.md`: a list of *proposed* defects.
+`docs/TASK-jan-selfaudit.md` produces `IMPROVEMENTS.md`: a list of *proposed* defects.
 This file turns that into a graded result you can compare across reviewer models.
 
 Each reviewer gets: the **core prompt**, one **variant block**, that variant's
 `IMPROVEMENTS.md`, and read access to the repo. It writes findings one at a time
 into its own CSV.
+
+## Where the prompt is — what to paste into a reviewer model
+
+The prompt lives in **this file**. There is no separate prompt file. Assemble it
+by copying two blocks of text from below, in order:
+
+1. **`## Core prompt — prepend to every variant`** — the whole block-quoted body
+   under that heading. Same for every reviewer, every run.
+2. **One `### Variant N` block** — pick the variant that produced the list you
+   are handing over. The current round is **Variant 1 — mutable state escaping
+   accessors** (every entry is an aliasing / defensive-copy task).
+
+Then attach, in the same message:
+
+3. **The findings list**: `validate1/IMPROVEMENTS.md` (for this round). The
+   reviewer does **not** open it directly — it is fed one entry at a time by
+   `scripts/next_finding.py` — but the file must be present in the working tree.
+4. **Read access to the repo.** The reviewer runs no code beyond a throwaway
+   `python3 -c` / grep to check its own claim, and it touches nothing under
+   `jan` / `main.py` — that was stage 1 and is already done.
+
+The reviewer runs inside whatever agent shell you like (Kilo plugin, etc.); it
+only needs a terminal in the repo root and the two loop scripts
+(`scripts/next_finding.py`, `scripts/append_finding.py`).
+
+### If `next_finding.py` says the list is "thin"
+
+> `error: every entry in validate1/IMPROVEMENTS.md has no Location and no Instruction`
+
+That means the `IMPROVEMENTS.md` copy was truncated to headings only (stage 1
+sometimes renders just the `### ID: title` line and the `**Cluster:**` line).
+A reviewer cannot judge a title alone, so the tool refuses it. Recover it one of
+two ways:
+
+- **Regenerate from stage 1** — the real, full list:
+  ```bash
+  python3 main.py --auto "<goal from docs/TASK-jan-selfaudit.md>" --dry-run \
+      --config agents_128k.ini --base .
+  cp IMPROVEMENTS.md validate1/IMPROVEMENTS.md
+  ```
+- **Or** pass `--allow-thin` to review titles only (weaker — records that the
+  input was thin).
+
+The `validate1/IMPROVEMENTS.md` in the tree now carries `**Location:**` /
+`**Target files:**` / `**Instruction:**` for all 53 entries, so it passes as-is.
 
 > **Revision 2**, after the first three-model run on Variant 1. What changed and
 > why is in "What the first run showed" at the end — read it if you are tuning
@@ -14,6 +59,14 @@ into its own CSV.
 ---
 
 ## Core prompt — prepend to every variant
+
+This stage is **script-driven only** — there is no by-hand variant. The reviewer
+loops on `next_finding.py` / `append_finding.py`, one entry at a time.
+
+**▼▼▼ PROMPT STARTS (part 1 of 2) — paste from the next line down to the
+"CSV columns" table inclusive, i.e. everything under this heading and the
+`### CSV columns` / Verdicts / Severity that follow it. Then append part 2:
+exactly one `### Variant N` block from "Variant blocks" below. ▼▼▼**
 
 > You are auditing a list of proposed code defects against the live source. The
 > list was produced by an automated agent and **its claims are unverified** —
@@ -32,7 +85,7 @@ into its own CSV.
 > # 2. judge that one entry, then record it
 > python3 scripts/append_finding.py --out validation-v<N>-<yourname>.csv \
 >     --variant <N> --task-id <the id you were just given> --title "..." \
->     --file tools/auto/x.py --symbol ClassName.method \
+>     --file <the path the entry cites> --symbol <ClassName.method> \
 >     --verdict CONFIRMED --severity MEDIUM --defect-class mutable-state-leak \
 >     --caller-mutates YES \
 >     --impact "..." --repro "..." --evidence "..." --disproof "..." \
@@ -54,10 +107,26 @@ into its own CSV.
 > number is your only measure of progress; if it is not moving, you are not
 > working. **These lists are long — 50+ entries is normal.** Keep cycling.
 >
+> ### Your job ends at the CSV
+>
+> You are reviewing, not fixing. **Do not edit any source file, do not write or
+> run tests, do not commit anything.** Read the code, decide, record the row.
+> Fixing the confirmed defects — with a regression test per fix, run against all
+> four test roots, one commit each — is a separate round with its own
+> instruction (`docs/FIX-round.md`), and it is scored on ground truth that does
+> not exist yet while you are working. A reviewer that patches the tree
+> invalidates the comparison every other reviewer is being measured against.
+>
+> The one thing you may run is a throwaway check of your own claim — a
+> `python3 -c "..."` identity test, a grep. Keep it out of the repo and put what
+> it showed into `--evidence` or `--disproof`.
+>
 > ### Name your file after yourself, once
 >
 > Use `--reviewer <your model name, lowercase>` and let the helper build the
-> filename, or pass the same `--out` every single time. Two spellings that
+> filename, or pass the same `--out` every single time. Write it into the round's
+> folder (`--out validate<N>/validation-v<N>-<yourname>.csv`), not the repo root
+> — that folder is what the analysis scripts glob. Two spellings that
 > differ only in case (`Kilo.csv`, `kilo.csv`) become two files, splitting your
 > work and defeating the duplicate check, which is per-file. The tools now
 > refuse the second spelling rather than start a rival file.
@@ -79,6 +148,11 @@ into its own CSV.
 > If `append_finding.py` rejects a row, it names the one thing missing. Fix that
 > and call it again; do not re-judge the entry from scratch. If it says a
 > finding is already recorded, that entry is done — go to step 1.
+>
+> `--file` must be a path that exists in the repo. It is the key every reviewer's
+> verdict on the same symbol is grouped under, so a placeholder path does not
+> just weaken your row — it hides it from the comparison, and your judgement is
+> read as something only you saw. Pass the path you actually opened.
 >
 > Anything you find that is *not* on the list gets recorded the same way, with
 > `--task-id NEW-1`, `NEW-2`, …
@@ -164,9 +238,16 @@ case · `MEDIUM` degrades a documented guarantee, or is real but unreachable
 today · `LOW` bounded — a missing log line, a bad message, wasted work · `NONE`
 no describable consequence.
 
+**▲▲▲ PROMPT part 1 ENDS here. Now append part 2: one variant block below. ▲▲▲**
+
 ---
 
 ## Variant blocks — append one to the core prompt
+
+**Part 2 of the prompt.** Paste **exactly one** of the block-quotes below —
+the variant that produced the list you are handing over — immediately after
+part 1. Stop at the next `###`. That completes the reviewer prompt; nothing
+after the variant block is part of it.
 
 ### Variant 1 — mutable state escaping accessors
 
@@ -278,7 +359,56 @@ no describable consequence.
    same command and the same CSV; the queue picks up where it stopped. Two or
    three sessions to finish a 53-entry list is normal and costs nothing extra —
    the first run's work is already on disk.
-4. Grade the reviewers, not only the findings:
+4. **Build the report and score the reviewers:**
+   ```bash
+   python3 scripts/harvest_report.py validate1/*.csv \
+       --truth validate1/truth.csv \
+       --report harvest.md --actions actions.csv --solo solo.csv
+   ```
+   `harvest.md` sorts findings into **Act / Disputed / Already fixed /
+   Dismissed**, adds a **Solo findings** table, and scores each reviewer.
+
+### Judging which model is better
+
+Skepticism alone does not rank reviewers. On a noisy list everybody scores 90%+
+by rejecting nearly everything, which is the correct behaviour and therefore not
+a discriminator. Rank on two things instead, in this order:
+
+**1. Accuracy against ground truth.** Keep a `truth.csv` of findings you have
+personally checked:
+
+```csv
+finding,truth,checked_by,how
+tools/search_agent.py::_DEFAULT_SKIP_DIRS,REAL,you,"identity check: instance list is the module list"
+tools/metrics_collector.py::MetricsCollector._load_all_cached,FALSE,you,"sole caller copies before mutating"
+tools/auto/state.py::StateStore.get_task,FIXED,you,"returns self._detached(t) since 4796e0a"
+```
+
+`REAL` / `FALSE` / `FIXED`. Only score what you actually verified — an unchecked
+finding is left out of the maths rather than counted as a pass, so a reviewer
+cannot gain by guessing. Nine checked findings were enough to separate the field
+in practice.
+
+**2. Solo discoveries that survive checking.** A `NEW-*` row only one reviewer
+produced is the highest-value output of the whole exercise, *and* the highest-
+risk: it is either the best result of the run or a hallucination, with nothing in
+between. The report puts these in their own table so you check them by hand.
+
+**A single vote is weak evidence about the finding and strong evidence about the
+reviewer.** Do not dismiss a solo find for being solo — nobody else was looking
+there. Check it, then add the answer to `truth.csv`, which raises the resolution
+of every future run.
+
+### Reading the solo table
+
+It separates two things that must not be averaged:
+
+- **Discoveries** — `NEW-*` rows nobody else raised. Judgement signal.
+- **Unshared judgements** — list entries nobody else reached. Coverage gap, and
+  says nothing about anyone's ability. Re-run a second reviewer over those ids
+  before trusting a lone verdict.
+
+### Grade the reviewers, not only the findings:
    - **Unanimous `CONFIRMED` with matching evidence** → trust the finding.
    - **Split verdicts** → the interesting rows; one reviewer read the code and
      the other read the proposal.

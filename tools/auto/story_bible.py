@@ -882,6 +882,10 @@ def _build_llm_call(
     except ValueError as exc:
         logger.warning("config [loop] timeout_seconds is malformed (%s) — using 300", exc)
         timeout = 300
+    # RUN-10: the [loop] HTTP retry budget, read next to the timeout above —
+    # one reader for every auto-mode caller, request_completion()'s built-in
+    # defaults when the keys are absent.
+    retry_kwargs = _llm_stream.retry_kwargs_from_config(config)
     # AUTO-FIX (fable follow-up 3): the bible generator used to borrow
     # [validator_agent] max_tokens (a cap sized for a short JSON verdict /
     # numbered critique). Raising the validator budget silently inflated the
@@ -972,6 +976,7 @@ def _build_llm_call(
                 timeout=timeout,
                 api_format=api_format,
                 ssl_context=ssl_context,
+                **retry_kwargs,
             )
             or ""
         )

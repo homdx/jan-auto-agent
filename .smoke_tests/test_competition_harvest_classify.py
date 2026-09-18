@@ -1,0 +1,1 @@
+../tests/test_competition_harvest_classify.py

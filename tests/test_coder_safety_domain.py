@@ -27,15 +27,18 @@ Verifies that _check_content_safety is mode-aware:
 from __future__ import annotations
 
 import configparser
+import contextlib
+import json
 import sys
 from pathlib import Path
+from unittest.mock import patch
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from tools.auto.coder import Coder, make_coder
+from tools.auto.coder import Coder, CoderResult, make_coder
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -324,3 +327,175 @@ class TestWriteFilesUsesTaskMode:
         )
         assert "poem.txt" in written
         assert err == ""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RUN-1: an extra file outside target_files is a warning, not a verdict
+# ─────────────────────────────────────────────────────────────────────────────
+
+_TARGET  = "scripts/next_task.py"
+_EXTRA   = "tests/test_next_task.py"
+_CONTENT = "def run(path):\n    return path\n"
+
+
+def _generate(
+    tmp_path: Path,
+    response: str,
+    target_files: list[str],
+    force_write_error: bool = False,
+) -> tuple[CoderResult, Path]:
+    """Run ``Coder.generate`` end to end against a stubbed LLM response.
+
+    Returns ``(result, base_dir)`` so a test can inspect what actually
+    landed on disk.  ``force_write_error`` makes the atomic writer blow up,
+    to check that a real I/O error still fails the attempt even when a
+    target_files skip happens in the same response.
+    """
+    cfg = _minimal_config()
+    cfg["api_local"]["api_format"] = "openai"
+    base_dir = tmp_path / "repo"
+    base_dir.mkdir(parents=True, exist_ok=True)
+    coder = Coder(cfg, "http://localhost:9999", "", "x", task_mode="code")
+    task = {
+        "id": "AUTO-T29",
+        "title": "Add schema validation",
+        "instruction": "Add schema validation to the PROGRESS.csv reader.",
+        "target_files": target_files,
+        "cited_locations": [{
+            "file": target_files[0], "symbol": "run",
+            "line_start": None, "line_end": None,
+        }],
+    }
+    patches = [("tools.llm_stream.request_completion", {"return_value": response})]
+    if force_write_error:
+        patches.append((
+            "tools.auto.coder.atomic_write_text",
+            {"side_effect": OSError("disk full")},
+        ))
+    with contextlib.ExitStack() as stack:
+        for name, kwargs in patches:
+            stack.enter_context(patch(name, **kwargs))
+        return coder.generate(task, base_dir), base_dir
+
+
+class TestRun1TargetFilesSkips:
+    """Guard 2 protects unrelated files by SKIPPING them.
+
+    Before RUN-1 that skip was also recorded as ``first_error``, so an attempt
+    whose target file landed perfectly was still reported as ``CODER FAIL`` —
+    and the model repeated the same extra file on every retry (AUTO-T29 burned
+    ~40 attempts on one path for this reason).
+    """
+
+    def test_target_written_plus_extra_path_is_success(self, tmp_path: Path) -> None:
+        response = json.dumps({"files": [
+            {"path": _TARGET, "content": _CONTENT},
+            {"path": _EXTRA,  "content": _CONTENT},
+        ]})
+        result, base_dir = _generate(tmp_path, response, [_TARGET])
+
+        assert result.succeeded is True
+        assert result.files_written == [_TARGET]
+        assert result.files_skipped == [_EXTRA]
+        assert result.error == ""
+        assert (base_dir / _TARGET).exists()
+        # the guard still protects: the extra file was never written, not even
+        # partially
+        assert not (base_dir / _EXTRA).exists()
+        assert not (base_dir / _EXTRA).parent.exists()
+
+    def test_only_extra_paths_is_failure(self, tmp_path: Path) -> None:
+        """Nothing landed → nothing to validate; unchanged failure semantics."""
+        response = json.dumps({"files": [
+            {"path": _EXTRA, "content": _CONTENT},
+        ]})
+        result, base_dir = _generate(tmp_path, response, [_TARGET])
+
+        assert result.succeeded is False
+        assert result.files_written == []
+        assert result.files_skipped == [_EXTRA]
+        assert "[SAFETY]" in result.error
+        assert _EXTRA in result.error
+        assert not list(base_dir.rglob("*"))
+
+    def test_only_extra_paths_error_names_every_dropped_path(self, tmp_path: Path) -> None:
+        """The all-skipped failure lists each dropped path, so the model's
+        feedback says exactly which files never landed."""
+        response = json.dumps({"files": [
+            {"path": _EXTRA,         "content": _CONTENT},
+            {"path": "docs/x.md",    "content": "# x\n"},
+        ]})
+        result, base_dir = _generate(tmp_path, response, [_TARGET])
+
+        assert result.succeeded is False
+        assert result.files_skipped == [_EXTRA, "docs/x.md"]
+        assert _EXTRA in result.error and "docs/x.md" in result.error
+        assert result.error.count("[SAFETY]") == 2
+        assert not list(base_dir.rglob("*"))
+
+    def test_skipped_delete_outside_target_files_does_not_fail_attempt(
+        self, tmp_path: Path,
+    ) -> None:
+        """A delete of a non-target file is dropped like a write: the file
+        stays, the target landed, the attempt succeeds."""
+        base_dir = tmp_path / "repo"
+        base_dir.mkdir(parents=True, exist_ok=True)
+        (base_dir / "keep.py").write_text("keep = 1\n", encoding="utf-8")
+        response = json.dumps({"files": [
+            {"path": _TARGET,  "content": _CONTENT},
+            {"path": "keep.py", "delete": True},
+        ]})
+        result, base_dir = _generate(tmp_path, response, [_TARGET])
+
+        assert result.succeeded is True
+        assert result.files_written == [_TARGET]
+        assert result.files_skipped == ["keep.py"]
+        assert (base_dir / "keep.py").read_text() == "keep = 1\n"
+
+    def test_guard1_escape_still_fails_the_attempt(self, tmp_path: Path) -> None:
+        """A path escaping base_dir is still a hard error (unchanged)."""
+        response = json.dumps({"files": [
+            {"path": "../escape.py", "content": _CONTENT},
+            {"path": _TARGET,        "content": _CONTENT},
+        ]})
+        result, base_dir = _generate(tmp_path, response, [_TARGET])
+
+        assert result.succeeded is False
+        assert "[SAFETY]" in result.error
+        assert "escapes base_dir" in result.error
+        # the target file still landed — only the verdict changed
+        assert result.files_written == [_TARGET]
+        assert (base_dir / _TARGET).exists()
+
+    def test_real_write_error_still_fails_even_with_a_skip(
+        self, tmp_path: Path,
+    ) -> None:
+        """A target_files skip must not mask a genuine I/O failure."""
+        response = json.dumps({"files": [
+            {"path": _TARGET, "content": _CONTENT},
+            {"path": _EXTRA,  "content": _CONTENT},
+        ]})
+        result, base_dir = _generate(
+            tmp_path, response, [_TARGET], force_write_error=True,
+        )
+
+        assert result.succeeded is False
+        assert "write failed" in result.error
+        assert result.files_written == []
+        assert result.files_skipped == [_EXTRA]
+        assert not (base_dir / _TARGET).exists()
+
+    def test_write_files_keeps_its_legacy_two_tuple(self, tmp_path: Path) -> None:
+        """Old callers that unpack (written, err) keep working untouched."""
+        cfg = _minimal_config()
+        coder = Coder(cfg, "http://localhost:9999", "", "x", task_mode="code")
+        written, err = coder._write_files(
+            [{"path": _TARGET, "content": _CONTENT},
+             {"path": _EXTRA,  "content": _CONTENT}],
+            base_dir=tmp_path, task_id="T1",
+            allowed_paths=frozenset({_TARGET}),
+        )
+        assert written == [_TARGET]
+        assert err == ""
+        assert (tmp_path / _TARGET).exists()
+        assert not (tmp_path / _EXTRA).exists()

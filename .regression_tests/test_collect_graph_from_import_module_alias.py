@@ -1,0 +1,1 @@
+../tests/test_collect_graph_from_import_module_alias.py

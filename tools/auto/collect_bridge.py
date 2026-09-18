@@ -29,17 +29,72 @@ Three responsibilities, all opt-in via `[collect] use_in_auto` /
    file/function, unchanged from pre-COLLECT-24 behaviour. `staleness`
    in `agents.ini` still controls whether `tools.collect.loader.load()`
    itself rebuilds (`refresh`), warns (`warn`), or treats stale as absent
-   (`ignore`) — this module never triggers a rebuild on its own; it only
-   decides whether to USE whatever `load()` handed back.
-"""
+   (`ignore`). RUN-6 adds one exception to "this module never triggers a
+   rebuild on its own": with `[collect] auto_refresh_between_tasks = true`
+   a `"stale"` model on entry is refreshed in place (`_refresh_on_entry`,
+   the same incremental `action_refresh` the `refresh` policy runs, with
+   the bridge's own Pass B summarizer so only the changed modules are
+   re-summarised) and the bridge is built over the reloaded fresh model — a resumed run is
+   stale by construction, and the operator who turned V9 on has already
+   said the pack is worth keeping fresh. Fail-open: a refresh that raises
+   leaves the stale model, `usable` False, one WARNING, one stdout line.
+
+4. **V9: freshness within a run.** Item 3 only covers the artifact's
+   status at load time. It says nothing about the middle of a run:
+   `status` is computed once inside `load()`, the bridge is cached for
+   the lifetime of the `Controller`, and `--auto` edits and commits
+   source files in between. Without item 4 a task that edits
+   `pkg/a.py` hands every later task a symbol list, `guarded` count and
+   risk score describing that file as it was before the run started,
+   under a header that says "do not contradict". `invalidate(paths)`
+   fixes it on write rather than on a timer: the controller marks the
+   paths a task committed dirty, and `context_for` / `pull_symbol` /
+   `module_symbols` / `contracts_for_symbol` return `""` / `[]` for a
+   dirty path — the item-3 contract, now applied per path instead of per
+   artifact. Clean paths are untouched, so one edited file does not blind
+   the pack for the other hundreds. `[collect] auto_refresh_between_tasks`
+   (default `false`) instead re-runs the existing incremental
+   `action_module` for the edited path and folds the fresh `ModuleRecord`
+   back into the in-memory model. This repair path never calls `load()`
+   again: records are patched in place. (The RUN-6 entry refresh in item 3
+   above is the one deliberate exception — it calls `load()` a second
+   time, before this bridge exists, to load the model it just repaired.)
+
+ 5. **M4: runtime counters.** Everything this class does to a task's prompt
+    is also counted and traced, so a run can say what happened to the pack
+    instead of a human reconstructing it from the log:
+
+    - `collect_block` — every `context_for` call that returns a block, with
+      `chars`, `rows_kept`, `rows_cut` and `memo_hit`. Emitted on memo hits
+      too, because the V6 memo returns the cached block on every round after
+      the first and an event emitted only on a build would undercount
+      "blocks per coder request".
+    - `collect_shrink` — how the block got small: `rows` (the assembler's own
+      budget cut, no LLM), `llm` (`_shrink` fired and succeeded) or
+      `truncate` (`_shrink` fell back to a hard cut). Observed from
+      `context_for` by comparing lengths and reading `shrink_calls`; `_shrink`
+      itself is not modified, reordered or replaced.
+    - `collect_miss` — `absent`, `stale`, `dirty` or `unknown_module` (the
+      last one predates M4's naming, the first two were silent before).
+    - `collect_summary` — one event per run: blocks injected, chars
+      injected, shrink calls by path, misses by reason.
+
+    All four are best effort: the tracer is imported lazily inside a
+    try/except, so a missing or broken trace sink never changes what
+    `context_for` returns. With no bridge wired in there are no events at
+    all and the log looks exactly as it did before M4.
+ """
 
 from __future__ import annotations
 
 import configparser
+import dataclasses
+import json
 import logging
+from pathlib import Path
 from typing import Optional
 
-from tools.auto.context_assembler import build_collect_context_block
+from tools.auto.context_assembler import build_collect_context_block_stats
 
 logger = logging.getLogger(__name__)
 
@@ -103,6 +158,223 @@ def _qualname_matches(qualname: str, name: str) -> bool:
     return symbol.split(".")[-1] == name
 
 
+def _memo_block(entry) -> "tuple[str, dict]":
+    """A V6 memo entry as ``(block, stats)``.
+
+    V6 cached a bare `str`; M4 caches a `(block, stats)` pair so a memo hit
+    reports the same `rows_kept` / `rows_cut` the build did. Anything that
+    is not a two-item pair degrades to the string with empty stats: a memo
+    seeded by hand in a test, or a leftover entry whose shape no longer
+    matches, must read as "a block, with no row detail" — never as a crash.
+    """
+    if isinstance(entry, (tuple, list)) and len(entry) == 2:
+        block = entry[0] if isinstance(entry[0], str) else ""
+        stats = entry[1] if isinstance(entry[1], dict) else {}
+        return block, stats
+    return (entry if isinstance(entry, str) else ""), {}
+
+
+def _memo_neighbours(entry) -> "tuple[str, ...]":
+    """The other modules a memo entry's block quotes, or `()`.
+
+    `stats["neighbours_paths"]` is the rendered `neighbours:` row's paths, which
+    are the only cross-module facts in a block with LLM prose. Any memo entry
+    whose list intersects a commit's dirt is stale even when its own key was
+    not touched by that commit — the block's header promises "static facts, do
+    not contradict," and a pre-edit purpose is not one. Entries whose stats
+    carry no such key (a block built before this fix, a hand-seeded string in
+    a test) read as "quotes nothing", so they are never wrongly dropped: the
+    one miss is a wasted rebuild, never a stale fact.
+    """
+    stats = _memo_block(entry)[1]
+    paths = stats.get("neighbours_paths", ())
+    if not isinstance(paths, (list, tuple, set, frozenset)):
+        return ()
+    return tuple(paths)
+
+
+def _drop_stale_memo(memo: dict, new_dirty: "set[str]") -> dict:
+    """Memo entries a commit's dirt invalidates, kept. Never raises.
+
+    Two independent reasons an entry goes: its own key is dirtied (the entry
+    is *about* that file), or it quotes a dirtied neighbour (the entry is
+    about another file but renders that one's purpose). Everything else is
+    untouched — an entry that merely names a dirtied path in the static
+    `callers:` / `calls_into:` rows is not stale, those are graph facts the
+    artifact already froze and the fix deliberately leaves in place.
+    """
+    out = {}
+    dropped = 0
+    for key, entry in memo.items():
+        try:
+            target = key[0] if isinstance(key, tuple) and key else key
+            quoted = set(_memo_neighbours(entry))
+        except Exception:  # noqa: BLE001 — a bad entry is dropped, never fatal
+            dropped += 1
+            continue
+        if target in new_dirty or (quoted & new_dirty):
+            dropped += 1
+            continue
+        out[key] = entry
+    if dropped:
+        logger.info(
+            "CollectBridge.invalidate: %d cached block(s) dropped — they were "
+            "about a dirtied path or quoted one",
+            dropped,
+        )
+    return out
+
+
+def _trace_event(kind: str, params: dict) -> None:
+    """One collect trace event. Lazy import, never raises.
+
+    Keeps the tracing stack out of this module's import graph — importing
+    `collect_bridge` never pays for the tracing stack — and makes sure a
+    broken sink can never change what a caller gets back. Module-level so
+    `make_collect_bridge` can trace before a bridge exists (RUN-6).
+    """
+    try:
+        from tools.agent_trace import tracer
+
+        tracer.event(
+            source="collect_bridge", target="auto_run",
+            kind=kind, params=params,
+        )
+    except Exception:  # noqa: BLE001 — tracing must never sink a run
+        pass
+
+
+def _stale_provenance(base_dir, config) -> "tuple[str, str]":
+    """`(artifact_sha, head_sha)` for the RUN-6 stdout line — the commit
+    the artifact was built at and the commit the tree is at now, 7 chars
+    each, `"?"` when unknown. Never raises: this only decorates a message.
+    """
+    artifact_sha, head_sha = "?", "?"
+    try:
+        from tools.collect import cli as cli_mod
+        from tools.collect import manifest as manifest_mod
+
+        root = Path(base_dir)
+        manifest_path = cli_mod.resolve_collect_dir(root, config) / cli_mod.MANIFEST_FILENAME
+        if manifest_path.exists():
+            artifact_sha = (manifest_mod.read_manifest(manifest_path).git_sha or "?")[:7]
+        head_sha = (manifest_mod.get_git_sha(root) or "?")[:7]
+    except Exception:  # noqa: BLE001
+        pass
+    return artifact_sha, head_sha
+
+
+def _refresh_on_entry(base_dir, config, config_path, load_fn, *, llm_call=None):
+    """RUN-6: the incremental refresh `staleness = refresh` would have run
+    inside `load()`, run here instead because `[collect]
+    auto_refresh_between_tasks = true` says the operator wants the pack kept
+    fresh — and a resumed run is stale by construction (the previous
+    session's own commits moved HEAD). Returns the reloaded model when it
+    came back `"fresh"`, else `None`; never raises.
+
+    `llm_call` is the bridge's Pass B summarizer (the one a V9 per-path
+    repair uses): with it, only the changed modules are re-summarised;
+    `None` (`llm_summaries = false`) keeps the refresh structural-only.
+
+    Pass A and the hash pass run once here and are handed to
+    `action_refresh` (`modules=`/`hashes=`, the `action_collect` path), so
+    the count on the stdout line — how many modules Pass B is about to
+    re-summarise, i.e. the bill — costs no extra scan. If that pre-flight
+    fails the refresh still runs, just without the count.
+
+    RUN-11: the count is only the bill when Pass B actually gets the files
+    the hash diff says moved. A `collector_version` bump makes
+    `action_refresh` drop the previous manifest entirely and take the
+    full-build fallback over *every* module, so the hash-diff number (the
+    live run read `refreshing 1 module(s)` while Pass B was about to work
+    over 543) understates the bill by three orders of magnitude. The line
+    and the `collect_refresh` event now name the reason — `version` for a
+    bump, `sha` for a changed file — and carry the number Pass B is really
+    asked for. `KeyboardInterrupt` deliberately still propagates: Ctrl-C is
+    the cheap way out of a 429 storm, and the checkpoint Pass B writes
+    (`[collect] dir/collect_summarize_state.json`) makes the next run pay
+    for the interrupted module only.
+    """
+    import time
+
+    from tools.collect import cli as cli_mod
+
+    root = Path(base_dir)
+    artifact_sha, head_sha = _stale_provenance(root, config)
+    modules = hashes = None
+    changed = None
+    reason: Optional[str] = None
+    previous_version: Optional[str] = None
+    current_version: Optional[str] = None
+    try:
+        from tools.collect import manifest as manifest_mod
+        from tools.collect.scanner import scan_repo
+
+        modules = scan_repo(root, config=config)
+        hashes = manifest_mod.hash_tree(root, [m.path for m in modules])
+        previous = manifest_mod.read_manifest(
+            cli_mod.resolve_collect_dir(root, config) / cli_mod.MANIFEST_FILENAME)
+        changed = len(manifest_mod.diff_files(previous.file_hashes, hashes).changed)
+        previous_version = previous.collector_version
+        current_version = manifest_mod.COLLECTOR_VERSION
+        if previous_version != current_version:
+            # `action_refresh` falls back to a full build here and asks Pass
+            # B for every module, not the diff — the bill is the tree.
+            changed = len(modules)
+            reason = "version"
+        else:
+            reason = "sha"
+    except Exception:  # noqa: BLE001 — the count is a courtesy, the refresh is the point
+        modules = hashes = None
+        changed = None
+        reason = None
+        previous_version = current_version = None
+    if reason == "version":
+        print(
+            f"collect: artifact stale (git_sha {artifact_sha}, HEAD {head_sha}; "
+            f"collector_version {previous_version!r} → {current_version!r}) — "
+            f"full rebuild, {changed} module(s)",
+            flush=True,
+        )
+    else:
+        print(
+            f"collect: artifact stale (git_sha {artifact_sha}, HEAD {head_sha}) "
+            f"— refreshing {'?' if changed is None else changed} module(s)",
+            flush=True,
+        )
+
+    t0 = time.monotonic()
+    ok, model = False, None
+    try:
+        cli_mod.action_refresh(
+            root, config=config, config_path=config_path, llm_call=llm_call,
+            modules=modules, hashes=hashes,
+        )
+        reloaded = load_fn(base_dir, config=config, config_path=config_path)
+        ok = getattr(reloaded, "status", "absent") == "fresh"
+        if ok:
+            model = reloaded
+        else:
+            logger.warning(
+                "make_collect_bridge: refresh on entry ran but the artifact reloaded as %r "
+                "— pack OFF for this session",
+                getattr(reloaded, "status", "absent"),
+            )
+    except Exception as exc:  # noqa: BLE001 — fail open, never block a run on the pack
+        logger.warning(
+            "make_collect_bridge: refresh on entry failed (%s: %s) — "
+            "pack OFF for this session (set [collect] staleness = refresh)",
+            type(exc).__name__, exc,
+        )
+    seconds = round(time.monotonic() - t0, 2)
+    _trace_event("collect_refresh", {"modules": changed, "seconds": seconds, "ok": ok, "reason": reason})
+    if not ok:
+        print(
+            "collect: refresh failed — pack OFF for this session "
+            "(set [collect] staleness = refresh)",
+            flush=True,
+        )
+    return model
 
 class CollectBridge:
     """Consumer-facing wrapper around a loaded `CollectModel` for `--auto`.
@@ -121,10 +393,25 @@ class CollectBridge:
         task_mode: str = "code",
         max_context_chars: int = _DEFAULT_MAX_CONTEXT_CHARS,
         summarizer_call=None,
+        auto_refresh: bool = False,
+        base_dir=None,
+        config=None,
+        config_path=None,
+        module_refresh_fn=None,
+        pack_enabled: bool = True,
     ) -> None:
         self._model = model
         self._task_mode = task_mode
         self._max_context_chars = max(200, int(max_context_chars))
+        self._pack_enabled = bool(pack_enabled)
+        # V6: per-run memo keyed by (target_file, budget, pack_enabled). The same
+        # file is a target in many tasks of one --auto run; caching the assembled
+        # (and possibly LLM-shrunk) block means a second context_for("x.py") costs
+        # zero further LLM calls. Bounded by distinct target files — the bridge is
+        # built once per run. Entries are dropped by invalidate() when that path
+        # is committed dirty — or when the entry quotes a dirtied neighbour in its
+        # `neighbours:` row — so the memo never serves stale facts.
+        self._memo: dict = {}
         # `summarizer_call` is a `tools.collect.summarizer.LlmCall`:
         # Callable[[system: str, user: str], str]. None = shrink disabled,
         # falls back to hard truncation.
@@ -132,38 +419,641 @@ class CollectBridge:
         # AUTO-METRIC: how many times the LLM shrink path actually fired
         # this run — surfaced for tests and for run-summary logging.
         self.shrink_calls = 0
+        # V9: module paths written by a task of this run since `load()`.
+        # `load()` saw the tree before any of them; `status` cannot have
+        # changed to say so, so this set is what carries it.
+        self._dirty_paths: set = set()
+        # Paths whose in-run repair already failed once — not retried again
+        # until the next commit dirties the path, at which point
+        # `invalidate()` drops them from here so the repair is re-attempted.
+        self._repair_failed: set = set()
+        # V9: `[collect] auto_refresh_between_tasks` (default false).
+        self._auto_refresh = bool(auto_refresh)
+        self._base_dir = base_dir
+        self._config = config
+        self._config_path = config_path
+        # Injectable replacement for `action_module` — one module, one LLM
+        # call. Tests pass a stub; production uses `_action_module_record`.
+        self._module_refresh_fn = module_refresh_fn
+        # M4 `collect_miss` counters: reason -> count. M4's run_trace events
+        # do not exist in this tree yet, so the bridge keeps the tally
+        # itself and hands it out for a run summary.
+        self.collect_misses: dict = {}
+        # M4: per-run tally of what the pack actually did to prompts, read by
+        # `collect_counters()` and emitted once as `collect_summary`. Keys:
+        # blocks (context_for calls that returned a block), chars (their
+        # length), memo_hits (blocks served from the V6 memo) and
+        # shrink_by_path (rows | llm | truncate). Misses are deliberately not
+        # here: `collect_misses` is the pre-existing tally `summary()` and the
+        # run.log line already read, so one counter serves both.
+        self.collect_stats: dict = {
+            "blocks": 0,
+            "chars": 0,
+            "memo_hits": 0,
+            "shrink_by_path": {},
+        }
 
     # ── availability ─────────────────────────────────────────────────────
+
+    @property
+    def status(self) -> str:
+        """`"fresh"` / `"stale"` / `"absent"` — the model's own status, so a
+        caller can distinguish "there is an artifact, it is just old" from
+        "there is nothing at all".
+
+        Fail-open like the rest of this class: no model, no attribute, a
+        non-string value or an object whose `__getattr__` raises all read as
+        `"absent"`, never as an exception into a run.
+        """
+        if self._model is None:
+            return "absent"
+        try:
+            value = getattr(self._model, "status", "absent")
+        except Exception:  # noqa: BLE001 — diagnostics, never a run blocker
+            return "absent"
+        return value if isinstance(value, str) else "absent"
 
     @property
     def usable(self) -> bool:
         """`True` only when the model is FRESH. A stale artifact is treated
         exactly like no artifact at all — see module docstring, item 3."""
-        return bool(self._model is not None and getattr(self._model, "status", "absent") == "fresh")
+        return bool(self._model is not None and self.status == "fresh")
+
+    # ── V9: invalidate on write ─────────────────────────────────────────
+
+    def _dirty_set(self) -> frozenset:
+        """The dirty paths, or `()` when `__init__` never ran.
+
+        `getattr` rather than a plain attribute read: some tests build a
+        bridge via `__new__()` and skip `__init__` entirely, and a missing
+        set must read as "nothing was written" — the pre-V9 behaviour —
+        rather than raising into a run.
+        """
+        return frozenset(getattr(self, "_dirty_paths", ()))
+
+    @property
+    def dirty_paths(self) -> frozenset:
+        """Module paths this run has written since `load()`, so a caller can
+        tell "no data at all" from "the model is there, it just predates this
+        task's commit"."""
+        return self._dirty_set()
+
+    @property
+    def has_dirty(self) -> bool:
+        return bool(self._dirty_set())
+
+    def summary(self) -> str:
+        """One line saying how much the artifact withheld this run.
+
+        V9 item 4 says `collect_miss(reason="dirty")` is emitted so a run can
+        report how many blocks invalidate-on-write suppressed; the tally lives
+        on `collect_misses`, and this is its reader — the controller logs it
+        once, at the end of the task loop. M4 widened the reason set
+        (`absent`, `stale`, `unknown_module` are counted on the same tally),
+        so the wording no longer claims every withheld block was one this run
+        wrote: a stale artifact withholds for a reason this run did nothing to.
+        `""` when nothing was withheld and nothing is still dirty, so a run
+        with no edits and a clean artifact adds no noise to run.log. Never
+        raises.
+        """
+        withheld = {}
+        try:
+            for reason, count in (self.collect_misses or {}).items():
+                withheld[str(reason)] = int(count)
+        except Exception:  # noqa: BLE001 — a summary must never sink a run
+            return ""
+        parts = []
+        if withheld:
+            total = sum(withheld.values())
+            detail = ", ".join(f"{reason}={count}"
+                               for reason, count in sorted(withheld.items()))
+            parts.append(
+                f"collect withheld {total} block(s) ({detail})"
+            )
+        if self.has_dirty:
+            parts.append(
+                f"{len(self.dirty_paths)} path(s) still unrefreshed at run end: "
+                f"{', '.join(sorted(self.dirty_paths))}"
+            )
+        return "; ".join(parts)
+
+    def collect_counters(self) -> dict:
+        """M4: this run's collect tally, for the `collect_summary` event.
+
+        A copy — callers must not be able to make the counters lie by
+        mutating the returned mapping. Anything a caller cannot coerce to an
+        int is dropped, never raised, per this class's fail-open contract.
+        """
+        stats = getattr(self, "collect_stats", None) or {}
+        out: dict = {}
+        try:
+            for key in ("blocks", "chars", "memo_hits"):
+                out[key] = int(stats.get(key, 0) or 0)
+            out["shrink_by_path"] = {
+                str(path): int(count)
+                for path, count in (stats.get("shrink_by_path") or {}).items()
+            }
+            out["misses"] = {
+                str(reason): int(count)
+                for reason, count in (self.collect_misses or {}).items()
+            }
+        except Exception:  # noqa: BLE001 — a counter must never sink a run
+            return {}
+        return out
+
+    def emit_collect_summary(self) -> None:
+        """M4: one `collect_summary` trace event for this run.
+
+        Called once, at the end of the task loop, next to the run.log line
+        `summary()` produces. Zero events when nothing was injected and
+        nothing was withheld — a run that never touched the pack adds no
+        noise to the trace either. Never raises.
+        """
+        counts = self.collect_counters()
+        if not counts:
+            return
+        if not counts["blocks"] and not counts["misses"]:
+            return
+        self._event(
+            "collect_summary",
+            {
+                "blocks": counts["blocks"],
+                "chars": counts["chars"],
+                "memo_hits": counts["memo_hits"],
+                "shrink_calls": sum(counts["shrink_by_path"].values()),
+                "shrink_by_path": counts["shrink_by_path"],
+                "misses": counts["misses"],
+            },
+        )
+
+    def _event(self, kind: str, params: dict) -> None:
+        """One collect trace event. Lazy import, never raises.
+
+        Keeps the tracing stack out of this module's import graph — importing
+        `collect_bridge` never pays for the tracing stack — and makes sure a
+        broken sink can never change what a caller of `context_for` gets back.
+        """
+        _trace_event(kind, params)
+
+
+    def _normalize_path(self, path) -> Optional[str]:
+        """`pkg/a.py` from a task or git path, or `None` when it is not a
+        collect-modelled module.
+
+        Collect keys modules by a repo-relative POSIX path ending in `.py`;
+        anything else — a doc, a config file, `.agent/` state — is not in
+        the model, so a write to it must never blind the pack. Non-strings
+        (`Path`, `bytes`, …) are coerced rather than raising, per the
+        fail-open stance every other method here takes.
+        """
+        if path is None:
+            return None
+        if not isinstance(path, str):
+            try:
+                path = str(path)
+            except Exception:  # noqa: BLE001 — fail open, never a run blocker
+                return None
+        ref = path.strip().strip("`\"'")
+        if not ref:
+            return None
+        ref = ref.replace("\\", "/")
+        while ref.startswith("./"):
+            ref = ref[2:]
+        if ref == ".." or ref.startswith("../"):
+            # Above the tree root: git never reports such a path and the
+            # model holds nothing there, so there is nothing to blind.
+            return None
+        if ref.startswith("/"):
+            # An absolute path only means something relative to the tree the
+            # model was built from; outside it there is nothing to blind.
+            base = getattr(self, "_base_dir", None)
+            try:
+                ref = Path(ref).resolve().relative_to(Path(base).resolve()).as_posix() \
+                    if base is not None else ref.lstrip("/")
+            except (ValueError, OSError):
+                return None
+        return ref if ref.endswith(".py") else None
+
+    def _is_dirty(self, ref: str) -> bool:
+        """Whether a lookup for `ref` must be withheld.
+
+        Normalises first, so `"pkg/a.py"`, `"./pkg/a.py"`,
+        `"/pkg/a.py"` and a `Path` all mean the same thing. When
+        `auto_refresh=True`, a dirty path is repaired in place before
+        answering — one module, one LLM call — and only paths the repair
+        could not fix stay withheld (V9, items 1 and 2).
+        """
+        if not ref:
+            return False
+        dirty_paths = self._dirty_set()
+        norm = self._normalize_path(ref) or ref
+        if norm not in dirty_paths:
+            return False
+        if not getattr(self, "_auto_refresh", False):
+            return True
+        failed = getattr(self, "_repair_failed", None)
+        if failed is None:
+            failed = self._repair_failed = set()
+        if norm in failed:
+            # Already tried once this run and could not repair it. Every
+            # caller would otherwise re-run action_module — and re-pay its
+            # LLM call — on each lookup of a path that is going to stay dirty.
+            return True
+        if self._refresh_module_in_place(norm):
+            self._dirty_paths = set(dirty_paths - {norm})
+            logger.info("CollectBridge: %s refreshed in place — not blinded", norm)
+            return False
+        failed.add(norm)
+        return True
+
+    def _module_record(self, path: str):
+        """The model's current `ModuleRecord` for `path`, or `None`. Used to
+        re-read a module after `_is_dirty` repaired it mid-scan."""
+        try:
+            for module in self._model.modules:
+                if module.path == path:
+                    return module
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+
+    def invalidate(self, paths) -> None:
+        """Mark every module path `paths` names as written since `load()`.
+
+        Call this with the paths a task's commit actually changed, right
+        after a successful commit: the artifact was built before that edit,
+        and `status` — computed once inside `load()` — cannot detect it.
+        Afterwards `context_for` / `pull_symbol` / `module_symbols` /
+        `contracts_for_symbol` return nothing for a dirty path, while every
+        clean path keeps its block for the rest of the run (V9, item 1) —
+        except a clean path whose block renders a dirtied neighbour's LLM
+        purpose in its `neighbours:` row. That cached block is dropped here
+        and rebuilt on the next request, which is what re-checks dirt for the
+        neighbour; the row's own dirty check makes the rebuild withhold it.
+
+        This only records dirt. With `auto_refresh=True`, the repair itself
+        happens lazily the first time a dirty path is actually asked for —
+        the existing incremental `action_module`, one module, one LLM call —
+        so a path no later task reads is never paid for (V9, item 2).
+
+        `paths` may be anything iterable; `None`, an empty list, or a
+        generator that raises all degrade to "nothing was written" rather
+        than to an exception. Non-module entries are dropped, so a commit
+        that only touched `README.md` or `agents.ini` invalidates nothing.
+        Never raises.
+        """
+        new_dirty = set()
+        try:
+            for path in paths or []:
+                norm = self._normalize_path(path)
+                if norm is not None:
+                    new_dirty.add(norm)
+        except Exception as exc:  # noqa: BLE001 — malformed input, fail open
+            logger.warning(
+                "CollectBridge.invalidate: malformed paths (%s) — using the "
+                "paths that parsed: %s", type(exc).__name__, exc,
+            )
+        if not new_dirty:
+            return
+        self._dirty_paths = set(self._dirty_set() | new_dirty)
+        # V6: drop memo entries for the now-dirty paths. The cached block
+        # described the tree as it was before this commit; a later context_for
+        # must rebuild (and re-check dirt) rather than serve a stale clean
+        # result. Keys are normalized in context_for(), so they match here.
+        # BUGFIX: the key alone is not enough. The `neighbours:` row renders
+        # another module's LLM purpose, so a block for `pkg/a.py` goes stale
+        # when `pkg/caller_a.py` is edited — and that block is keyed by
+        # `pkg/a.py`, which this commit did not touch. `stats["neighbours_paths"]`
+        # names exactly the paths whose prose each entry quotes, so those
+        # entries are dropped too. Dropped, not patched: the block is an
+        # immutable string and rebuilding is what re-checks dirt per path.
+        # `getattr` — some callers build a bridge via __new__() and never run
+        # __init__, so _memo may be absent; treat that as "nothing cached"
+        # rather than raising, matching the fail-open stance of _dirty_set().
+        memo = getattr(self, "_memo", None)
+        if memo:
+            self._memo = _drop_stale_memo(memo, new_dirty)
+        # A new commit means new facts, so a repair that already failed for
+        # these paths is worth one more attempt: an outage that started at
+        # task N must not keep blinding a path that task N+2 edited again.
+        # The attempt stays once per *edit* — never once per lookup.
+        failed = getattr(self, "_repair_failed", None)
+        if failed is not None and new_dirty & failed:
+            failed -= new_dirty
+        logger.info(
+            "CollectBridge.invalidate: %d path(s) now dirty — collect "
+            "blocks withheld for them: %s",
+            len(new_dirty), ", ".join(sorted(new_dirty)),
+        )
+
+    def _miss(self, reason: str, target: str, task_id: Optional[str] = None) -> None:
+        """One `collect_miss` (M4): count it, log it, trace it. Never
+        raises.
+
+        `reason` is `absent` (no model, or a model that is not fresh),
+        `stale` (the artifact exists and is explicitly stale), `dirty`
+        (invalidate-on-write withheld it, V9) or `unknown_module` (the model
+        is fresh but has no record for this path). The tally lives on
+        `collect_misses` — the attribute `summary()` and the run.log line
+        already read, so one counter serves both — and the counters are
+        written before the trace call, so a broken trace sink cannot make
+        them lie.
+        """
+        try:
+            self.collect_misses[reason] = self.collect_misses.get(reason, 0) + 1
+        except Exception:  # noqa: BLE001 — a counter must never sink a run
+            pass
+        params = {"reason": reason, "target_file": target}
+        if task_id:
+            params["task_id"] = task_id
+        self._event("collect_miss", params)
+        logger.info("collect_miss reason=%s target=%s", reason, target)
+
+    def _refresh_module_in_place(self, path: str):
+        """`auto_refresh=True`: re-scan one edited module and fold the fresh
+        `ModuleRecord` into the in-memory model. Returns the record, or
+        `None` to keep the path dirty (the blind is the safe outcome).
+
+        The model *object* is still built once per run: `load()` is never
+        called here, only the one module's record is replaced in a copy of
+        the loaded model (V9, item 3).
+        """
+        if self._model is None:
+            return None
+        status = getattr(self._model, "status", "absent")
+        if status != "fresh":
+            # `usable` is False for such a model anyway, so repairing it
+            # would spend an LLM call that no block would ever be served.
+            return None
+        try:
+            known = {m.path for m in (getattr(self._model, "modules", ()) or ())}
+        except Exception:  # noqa: BLE001
+            return None
+        if path not in known:
+            # Not in the model: no prior record to update, so a refresh would
+            # only invent one. Leave it dirty.
+            return None
+
+        record = None
+        if getattr(self, "_module_refresh_fn", None) is not None:
+            try:
+                record = self._module_refresh_fn(path)
+            except Exception as exc:  # noqa: BLE001 — fail open to a blind
+                logger.warning(
+                    "CollectBridge: auto refresh of %s failed (%s: %s) — "
+                    "keeping it dirty", path, type(exc).__name__, exc,
+                )
+                return None
+        else:
+            record = self._action_module_record(path)
+
+        if record is None or getattr(record, "path", None) != path:
+            return None
+        try:
+            modules = tuple(record if m.path == path else m for m in self._model.modules)
+            self._model = dataclasses.replace(self._model, modules=modules)
+        except Exception as exc:  # noqa: BLE001 — keep the model as loaded
+            logger.warning(
+                "CollectBridge: could not fold the refreshed record for %s "
+                "into the model (%s: %s) — keeping it dirty",
+                path, type(exc).__name__, exc,
+            )
+            return None
+        return record
+
+    def _action_module_record(self, path: str):
+        """Run the existing incremental `action_module` for one module and
+        read the patched `ModuleRecord` back out of the artifact it wrote.
+
+        One module, one LLM call — the incremental path `--module` already
+        documents. The artifact is written to `.collect/`, which is
+        git-ignored, so this adds no git noise; and the on-disk artifact
+        ends the run describing the tree it describes. Any failure — no
+        base_dir, no config, unreadable artifact, a missing module entry —
+        returns `None` and the caller keeps the path dirty.
+        """
+        if getattr(self, "_base_dir", None) is None or getattr(self, "_config", None) is None:
+            return None
+        try:
+            from tools.collect import cli as cli_mod
+            from tools.collect.model import ModuleRecord
+
+            # The same Pass B summarizer `_shrink` uses — `make_collect_bridge`
+            # already built it under `[collect] llm_summaries`, so a repair
+            # is one LLM call with the flag on and structural-only without.
+            cli_mod.action_module(
+                self._base_dir, path,
+                config=self._config, config_path=self._config_path,
+                llm_call=getattr(self, "_summarizer_call", None),
+            )
+            artifact = (
+                cli_mod.resolve_collect_dir(self._base_dir, self._config)
+                / cli_mod.ARTIFACT_FILENAME
+            )
+            payload = json.loads(artifact.read_text(encoding="utf-8"))
+            for entry in payload.get("modules", []):
+                if entry.get("path") == path:
+                    return ModuleRecord.from_dict(entry)
+            return None
+        except Exception as exc:  # noqa: BLE001 — repair is best effort
+            logger.warning(
+                "CollectBridge: auto refresh of %s failed (%s: %s) — keeping "
+                "it dirty", path, type(exc).__name__, exc,
+            )
+            return None
 
     # ── 1. static per-task context ──────────────────────────────────────
 
-    def context_for(self, target_file: str) -> str:
-        """Budget-aware COLLECT-23 block for `target_file`, or `""`."""
-        if not self.usable:
+    def context_for(self, target_file: str, *, task_id: Optional[str] = None) -> str:
+        """Budget-aware COLLECT-23 block for `target_file`, or `""`.
+
+        V6 wires two changes into this method's three-line shape:
+
+        * `budget=self._max_context_chars` is passed into
+          `build_collect_context_block`, so the pack's static row-shrinking
+          (V2's `_fit_pack_to_budget`) runs before `_shrink` ever gets a chance
+          to pay an LLM call. Most over-budget blocks are now handled without a
+          single summarizer call; `_shrink` remains as the fail-open safety net
+          for the rare case a static cut cannot bring the block within budget.
+        * A per-run memo keyed by `(target_file, max_context_chars,
+          pack_enabled)` caches the final result — including any LLM shrink —
+          so a second `context_for("x.py")` in the same run makes zero
+          additional LLM calls. `invalidate()` drops entries for dirty paths.
+
+        M4 adds the counting, and changes nothing about what is returned:
+        every request that returns a block emits `collect_block` (memo hits
+        included, flagged `memo_hit`), a block the assembler cut emits
+        `collect_shrink` with `path="rows"`, a block `_shrink` handled emits
+        one with `path="llm"` or `"truncate"`, and every empty return emits
+        `collect_miss` with the reason it came back empty for. `task_id` is
+        optional and only ever appears in the events — a caller that does not
+        pass it gets the pre-M4 events plus a missing `task_id` field.
+        """
+        if self._miss_if_unusable(target_file, task_id=task_id):
             return ""
+        # V9: the model predates this path's edit, so its facts describe a
+        # tree that no longer exists. Runs before the budget check and
+        # before `_shrink`, so a dirty path neither spends the shrink LLM
+        # call nor returns a shrunk block of pre-edit facts.
+        if self._is_dirty(target_file):
+            self._miss("dirty", target_file, task_id=task_id)
+            return ""
+        # V6: normalise the key so invalidate() — which stores normalized
+        # paths — can drop the right entries. Non-.py targets (None from
+        # _normalize_path) fall back to the raw string.
+        norm = self._normalize_path(target_file) or target_file
+        key = (norm, self._max_context_chars, self._pack_enabled)
+        # `setdefault` on `__dict__` rather than `self._memo`: a bridge built
+        # via `__new__()` (the probe tests) never ran `__init__`, and a missing
+        # memo is "nothing cached", not a crash — same stance as `invalidate`.
+        memo = self.__dict__.setdefault("_memo", {})
+        cached = memo.get(key)
+        if cached is not None:
+            # V6 memoises the block so a second request in the run costs zero
+            # LLM calls; M4 still counts it, because "blocks per coder request"
+            # is the number M4 exists to measure and a build-only event would
+            # undercount it. Stats travel with the entry so the memo hit
+            # reports the same rows the build reported.
+            block, stats = _memo_block(cached)
+            self._note_block(target_file, block, stats,
+                             memo_hit=True, task_id=task_id)
+            return block
         try:
-            raw = build_collect_context_block(self._model, target_file, task_mode=self._task_mode)
+            raw, stats = build_collect_context_block_stats(
+                self._model, target_file, task_mode=self._task_mode,
+                budget=self._max_context_chars, pack_enabled=self._pack_enabled,
+                is_dirty=self._is_dirty,
+            )
         except Exception as exc:  # noqa: BLE001 — never block a task on this
             logger.warning("CollectBridge.context_for(%s): failed: %s", target_file, exc)
             return ""
         if not raw:
+            # The model is fresh and usable, but has no record for this path —
+            # a file outside the artifact. Distinct from `absent` / `stale`:
+            # nothing is broken, there is simply nothing to say.
+            self._miss("unknown_module", target_file, task_id=task_id)
             return ""
         if len(raw) <= self._max_context_chars:
-            return raw
-        return self._shrink(raw)
+            result = raw
+            # V6: the budget was applied inside the assembler, so the block
+            # fits without `_shrink`. That is a shrink of its own and the one
+            # that happens on every over-budget file today — invisible before
+            # M4, because the assembler returns a bare `str`. Emitted only
+            # when the cut actually removed characters: rows with no data also
+            # leave `rows_cut > 0`, and a shrink from N chars to N chars would
+            # be a report that says nothing.
+            chars_uncapped = int(stats.get("chars_uncapped") or 0)
+            if chars_uncapped > len(raw):
+                self._note_shrink(
+                    target_file, "rows", chars_uncapped, len(raw),
+                    task_id=task_id,
+                )
+        else:
+            # Observe `_shrink` from the outside: compare lengths and read the
+            # existing `shrink_calls` counter. `_shrink` is not modified.
+            calls_before = getattr(self, "shrink_calls", 0) or 0
+            result = self._shrink(raw)
+            path = "llm" if (getattr(self, "shrink_calls", 0) or 0) > calls_before else "truncate"
+            self._note_shrink(target_file, path, len(raw), len(result),
+                              task_id=task_id)
+        memo[key] = (result, stats)
+        self._note_block(target_file, result, stats,
+                         memo_hit=False, task_id=task_id)
+        return result
 
-    def context_for_many(self, target_files) -> str:
+    def context_for_many(self, target_files, *, task_id: Optional[str] = None) -> str:
         """Join `context_for` blocks for several files, each budgeted
         independently, separated by a blank line. Empty files/blocks are
         skipped; returns `""` if nothing survives."""
-        blocks = [b for b in (self.context_for(f) for f in target_files or []) if b]
+        blocks = [
+            b for b in (self.context_for(f, task_id=task_id)
+                        for f in target_files or []) if b
+        ]
         return "\n\n".join(blocks)
+
+    # ── M4: counting ─────────────────────────────────────────────────────
+
+    def _miss_if_unusable(self, target: str, task_id: Optional[str] = None) -> bool:
+        """M4: count a request the artifact could not serve at all.
+
+        Before M4 `absent` and `stale` returned `""` in silence — a run
+        against a missing or stale artifact injected nothing for every task
+        and emitted nothing, so "collect had nothing to say" was
+        indistinguishable from "collect was never wired in". Now both count
+        as `collect_miss`, and the reason tells them apart.
+
+        Returns `True` when the caller should return empty.
+        """
+        if self.usable:
+            return False
+        self._miss(
+            "stale" if self.status == "stale" else "absent",
+            target, task_id=task_id,
+        )
+        return True
+
+    def _note_block(
+        self,
+        target_file: str,
+        block: str,
+        stats: Optional[dict],
+        *,
+        memo_hit: bool,
+        task_id: Optional[str] = None,
+    ) -> None:
+        """One `collect_block` (M4): count it, trace it. Never raises."""
+        block = block or ""
+        stats = stats or {}
+        try:
+            count = self.__dict__.setdefault("collect_stats", {})
+            count["blocks"] = int(count.get("blocks", 0)) + 1
+            count["chars"] = int(count.get("chars", 0)) + len(block)
+            if memo_hit:
+                count["memo_hits"] = int(count.get("memo_hits", 0)) + 1
+        except Exception:  # noqa: BLE001 — a counter must never sink a run
+            pass
+        params = {
+            "target_file": target_file,
+            "chars": len(block),
+            "rows_kept": int(stats.get("rows_kept", 0) or 0),
+            "rows_cut": int(stats.get("rows_cut", 0) or 0),
+            "memo_hit": bool(memo_hit),
+        }
+        if task_id:
+            params["task_id"] = task_id
+        self._event("collect_block", params)
+
+    def _note_shrink(
+        self,
+        target_file: str,
+        path: str,
+        before: int,
+        after: int,
+        task_id: Optional[str] = None,
+    ) -> None:
+        """One `collect_shrink` (M4). `path` is `rows` | `llm` | `truncate`.
+
+        `rows` is the assembler's own budget cut — no LLM, and the only
+        shrink that fires on most over-budget files since V6. `llm` means
+        `_shrink`'s summarizer call succeeded; `truncate` means `_shrink`
+        fell back to the hard character cut. Never raises.
+        """
+        try:
+            count = self.__dict__.setdefault("collect_stats", {})
+            by_path = count.setdefault("shrink_by_path", {})
+            by_path[str(path)] = int(by_path.get(path, 0)) + 1
+        except Exception:  # noqa: BLE001 — a counter must never sink a run
+            pass
+        params = {
+            "target_file": target_file,
+            "path": str(path),
+            "before": int(before or 0),
+            "after": int(after or 0),
+        }
+        if task_id:
+            params["task_id"] = task_id
+        self._event("collect_shrink", params)
+
 
     def _shrink(self, raw: str) -> str:
         """Shrink `raw` to fit `_max_context_chars`. Tries the summarizer
@@ -194,8 +1084,21 @@ class CollectBridge:
                     )
             except Exception as exc:  # noqa: BLE001 — fail open to truncation
                 logger.warning("CollectBridge: shrink call failed: %s — hard-truncating", exc)
-        excess = len(raw) - self._max_context_chars
-        return raw[: self._max_context_chars] + f"\n… [+{excess} chars truncated by CollectBridge]\n"
+        # The notice itself takes budget too — appending it after a cut at
+        # exactly _max_context_chars made the returned string overshoot by
+        # the notice's own length. Reserve room for it first; the notice's
+        # length depends on `excess`, which depends on the cut, so converge
+        # in a few steps (the digit count of `excess` rarely needs more).
+        cut = self._max_context_chars
+        notice = ""
+        for _ in range(4):
+            excess = len(raw) - cut
+            notice = f"\n… [+{excess} chars truncated by CollectBridge]\n"
+            new_cut = max(0, self._max_context_chars - len(notice))
+            if new_cut == cut:
+                break
+            cut = new_cut
+        return raw[:cut] + notice
 
     # ── 2. pull-model symbol resolution ─────────────────────────────────
 
@@ -207,21 +1110,71 @@ class CollectBridge:
         Matched against every module's `public_symbols` by, in order:
         exact qualname, dotted-suffix (`"method"` matches `"Class.method"`),
         then bare last-component match. First hit wins.
+
+        V9: symbols whose module was edited by a task of this run are
+        skipped, because their record predates the edit — a clean duplicate
+        in another module still answers. When the only matches were dirty
+        the lookup returns `""` and a `collect_miss` is counted.
         """
         if not self.usable or not symbol_name:
             return ""
         name = symbol_name.strip()
         if not name:
             return ""
+        dirty_hit = False
+        dirty_paths = self._dirty_set()
+        deferred: list = []
         try:
-            for module in self._model.modules:
+            for module in list(self._model.modules):
+                path = module.path
+                if path in dirty_paths:
+                    if not any(
+                        _qualname_matches(s.qualname, name) for s in module.public_symbols
+                    ):
+                        # The pre-edit record does not know the name — but
+                        # the edit may have ADDED it. Repairing now would
+                        # pay an LLM call for every dirty path on every
+                        # pull; a clean record elsewhere may still answer,
+                        # so the repair waits until nothing else did.
+                        deferred.append(path)
+                        continue
+                    # V9: this record predates the edit, so it cannot be
+                    # trusted as is. `_is_dirty` repairs it when
+                    # auto_refresh is on; otherwise a clean duplicate
+                    # elsewhere still wins, so the loop keeps going.
+                    if self._is_dirty(path):
+                        dirty_hit = True
+                        continue
+                    module = self._module_record(path) or module
                 for sym in module.public_symbols:
-                    qn = sym.qualname
-                    if _qualname_matches(qn, name):
-                        return self._format_symbol_block(module.path, sym)
+                    if _qualname_matches(sym.qualname, name):
+                        return self._format_symbol_block(path, sym)
+            for path, module in self._repaired_deferred(deferred):
+                for sym in module.public_symbols:
+                    if _qualname_matches(sym.qualname, name):
+                        return self._format_symbol_block(path, sym)
         except Exception as exc:  # noqa: BLE001 — never block a pull on this
             logger.warning("CollectBridge.pull_symbol(%s): failed: %s", symbol_name, exc)
+        if dirty_hit:
+            self._miss("dirty", name)
         return ""
+
+    def _repaired_deferred(self, paths):
+        """Yield `(path, ModuleRecord)` for each dirty `paths` entry that
+        `_is_dirty` could repair in place — the second look a symbol lookup
+        takes when no pre-edit record answered.
+
+        With `auto_refresh` off this yields nothing: an added symbol is
+        withheld like every other post-edit fact, and no miss is counted
+        for it, since the pre-edit model never claimed to know it.
+        """
+        if not paths or not getattr(self, "_auto_refresh", False):
+            return
+        for path in paths:
+            if not self._is_dirty(path):
+                module = self._module_record(path)
+                if module is not None:
+                    yield path, module
 
     def _format_symbol_block(self, module_path: str, sym) -> str:
         lines = [f"module: {module_path}", f"symbol: {sym.qualname}"]
@@ -257,6 +1210,11 @@ class CollectBridge:
         meant or a different file entirely, and answering with a "closest
         match" would hand the Architect an inventory of the wrong module
         while looking like a successful lookup. A miss here is honest.
+
+        V9: a module edited by a task of this run returns `""` — every
+        candidate spelling of `module_ref` that the bridge considers is
+        checked, so `"tools/backoff"` and `"tools.backoff"` are withheld
+        just as surely as `"tools/backoff.py"` is.
         """
         if not self.usable or not module_ref:
             return ""
@@ -267,6 +1225,9 @@ class CollectBridge:
         if not ref.endswith(".py"):
             candidates.add(ref + ".py")
             candidates.add(ref.replace(".", "/") + ".py")
+        if any(self._is_dirty(c) for c in candidates):
+            self._miss("dirty", ref)
+            return ""
         try:
             for module in self._model.modules:
                 if module.path in candidates:
@@ -287,9 +1248,11 @@ class CollectBridge:
     def _format_module_block(self, module) -> str:
         """One line per symbol: `name(sig) :line — first docstring line`.
 
-        The line number and docstring are not decoration. `signature` from
-        collect is elided to `name(...)` with no parameter list, so a bare
-        name+signature listing tells the model almost nothing it did not
+        The line number and docstring are not decoration. Before V10
+        `signature` from collect was elided to `name(...)` with no parameter
+        list (it is the real list now, cut at 160 chars — and still
+        `name(...)` for a class without its own `__init__`), so a bare
+        name+signature listing told the model almost nothing it did not
         already know. `docstring_first_line` is populated for 37% of symbols
         in this tree and is the only prose in the record; `lineno` lets the
         Architect emit an accurate `cited_location.line_start` instead of
@@ -305,7 +1268,7 @@ class CollectBridge:
         for sym in syms[: self._MODULE_SYMBOL_LIMIT]:
             qn = getattr(sym, "qualname", "") or ""
             bare = qn.split(":", 1)[-1] if ":" in qn else qn
-            # collect stores `signature` as "name(...)", NOT "(...)" — a
+            # collect stores `signature` as "name(a, b)" / "name(...)", NOT "(...)" — a
             # naive f"{bare}{signature}" renders "backoff_secondsbackoff_seconds(...)".
             # Found on a live artifact, not in a fixture: the test double had
             # the same shape and the doubled text still contained the expected
@@ -335,20 +1298,46 @@ class CollectBridge:
         """Every `ContractRecord` naming `symbol_name` (bare name, dotted
         suffix, or full qualname), or `[]` when unusable/unknown. Read-only
         variant of `pull_symbol` for a caller (Gate1) that wants the
-        contract objects themselves, not a pre-formatted text block."""
+        contract objects themselves, not a pre-formatted text block.
+
+        V9: symbols whose module was edited this run are skipped, exactly
+        like `pull_symbol` — a contract is a fact about that module's code,
+        and the artifact was built before the edit. Gate1's grounding notes
+        would otherwise assert pre-edit contracts as ground truth."""
         if not self.usable or not symbol_name:
             return []
         name = symbol_name.strip()
         if not name:
             return []
+        dirty_hit = False
+        dirty_paths = self._dirty_set()
+        deferred: list = []
         try:
-            for module in self._model.modules:
+            for module in list(self._model.modules):
+                path = module.path
+                if path in dirty_paths:
+                    if not any(
+                        _qualname_matches(s.qualname, name) for s in module.public_symbols
+                    ):
+                        deferred.append(path)   # maybe added by the edit
+                        continue
+                    if self._is_dirty(path):
+                        dirty_hit = True
+                        continue
+                    module = self._module_record(path) or module
+                for sym in module.public_symbols:
+                    qn = sym.qualname
+                    if _qualname_matches(qn, name):
+                        return list(self._model.contracts_for(qn))
+            for path, module in self._repaired_deferred(deferred):
                 for sym in module.public_symbols:
                     qn = sym.qualname
                     if _qualname_matches(qn, name):
                         return list(self._model.contracts_for(qn))
         except Exception as exc:  # noqa: BLE001
             logger.warning("CollectBridge.contracts_for_symbol(%s): failed: %s", symbol_name, exc)
+        if dirty_hit:
+            self._miss("dirty", name)
         return []
 
     def tests_covering(self, file_path: str):
@@ -357,7 +1346,14 @@ class CollectBridge:
         pass — module-level granularity, not symbol-level). `()` when
         unusable, the file has no entry, or it genuinely has zero covering
         tests (all three cases collapse to "nothing to report" for a
-        grounding note either way)."""
+        grounding note either way).
+
+        Deliberately NOT blinded by `invalidate()`: `test_map` records which
+        *test* files import which modules — an edit to a source module does
+        not change that mapping, only a change to a test file or its imports
+        does, and the block for the edited path is already withheld by
+        `context_for`.
+        """
         if not self.usable or not file_path:
             return ()
         try:
@@ -381,10 +1377,15 @@ def make_collect_bridge(
 
     `None` is a valid, expected return — every caller must treat it as
     "no collect context this run" (identical to pre-COLLECT-24 behaviour),
-    not as an error. This is the ONLY place `tools.collect.loader.load()`
-    is called per run — callers must build this once and reuse it across
-    every task, never call this per-task (see AUTO-METRIC test:
-    `test_collect_model_loaded_once_per_run`).
+    not as an error. Callers must build this once and reuse it across every
+    task, never call this per-task (see AUTO-METRIC test:
+    `test_collect_model_loaded_once_per_run_not_per_task`). On the normal
+    path this is the only `tools.collect.loader.load()` call per run; the
+    one deliberate exception is RUN-6's stale-artifact entry refresh, which
+    calls `load()` once more (via `_refresh_on_entry`) to load the model it
+    just repaired — two calls total, both here in the factory, never
+    per-task. Pinned by
+    `tests_bugfix/test_collect_bridge_entry_refresh_loads_twice.py`.
     """
     key = "use_in_doc" if task_mode == "docs" else "use_in_auto"
     # Bugfix (config-crash audit): unguarded. Wrapped per-call, not via a
@@ -410,28 +1411,21 @@ def make_collect_bridge(
         logger.warning("make_collect_bridge: load() failed: %s", exc)
         return None
 
-    if getattr(model, "status", "absent") == "stale":
-        # staleness=warn (default): loader already decided not to refresh.
-        # Per product decision this is treated as a plain fallback to
-        # standard --auto for the affected files — log once here so the
-        # operator can see it happened, then let `.usable` gate every
-        # subsequent call to False.
-        logger.warning(
-            "make_collect_bridge: collect artifact is stale (%s) — "
-            "falling back to standard --auto context for this run "
-            "(run --collect / --refresh to update it)",
-            getattr(model, "reason", ""),
-        )
-
+    # V9: `[collect] auto_refresh_between_tasks` (default false). When true,
+    # a path a task edits is repaired via the existing incremental
+    # `action_module` (one module, one LLM call) instead of being blinded
+    # for the rest of the run. RUN-6: the same flag also repairs an artifact
+    # that is already stale on entry (below) — read here, before the stale
+    # check, for that reason. A malformed value degrades to the default,
+    # like every other `[collect]` read in this function.
     try:
-        max_chars = config.getint(
-            "collect", "max_context_chars_auto", fallback=_DEFAULT_MAX_CONTEXT_CHARS)
+        auto_refresh = config.getboolean("collect", "auto_refresh_between_tasks", fallback=False)
     except ValueError as exc:
         logger.warning(
-            "config [collect] max_context_chars_auto is malformed (%s) — using default %r",
-            exc, _DEFAULT_MAX_CONTEXT_CHARS,
+            "config [collect] auto_refresh_between_tasks is malformed (%s) — using default False",
+            exc,
         )
-        max_chars = _DEFAULT_MAX_CONTEXT_CHARS
+        auto_refresh = False
 
     summarizer_call = None
     # BUGFIX (audit): unguarded — the two reads above already catch
@@ -453,9 +1447,74 @@ def make_collect_bridge(
             logger.warning("make_collect_bridge: summarizer unavailable, will hard-truncate: %s", exc)
             summarizer_call = None
 
+    if getattr(model, "status", "absent") == "stale":
+        # staleness=warn (default): loader already decided not to refresh.
+        # The summarizer is built above, before this branch: the entry refresh
+        # is the V9 repair over every path that moved, so it takes the same
+        # Pass B call (`llm_summaries = true`) — or none, structural-only.
+        refreshed = _refresh_on_entry(
+            base_dir, config, config_path, load_collect_model, llm_call=summarizer_call,
+        ) if auto_refresh else None
+        if refreshed is not None:
+            # RUN-6: the operator already pays for per-path repairs (V9); a
+            # whole-artifact repair on entry is the same operation over the
+            # set of paths that moved. The bridge below is built over a
+            # fresh model, so the pack is on for the whole session.
+            model = refreshed
+        else:
+            # Per product decision this is a plain fallback to standard
+            # --auto for the affected files — say so once in the log and
+            # once on stdout (a run.log WARNING is not where an operator
+            # looks during a run), then let `.usable` gate every call to
+            # False. With auto_refresh on, `_refresh_on_entry` has already
+            # printed and traced why the refresh did not stick.
+            logger.warning(
+                "make_collect_bridge: collect artifact is stale (%s) — "
+                "falling back to standard --auto context for this run "
+                "(set [collect] staleness = refresh, or auto_refresh_between_tasks = true, "
+                "to refresh it on entry)",
+                getattr(model, "reason", ""),
+            )
+            if not auto_refresh:
+                artifact_sha, head_sha = _stale_provenance(base_dir, config)
+                print(
+                    f"collect: artifact stale (git_sha {artifact_sha}, HEAD {head_sha}) "
+                    "— pack OFF for this session (set [collect] staleness = refresh)",
+                    flush=True,
+                )
+
+    try:
+        max_chars = config.getint(
+            "collect", "max_context_chars_auto", fallback=_DEFAULT_MAX_CONTEXT_CHARS)
+    except ValueError as exc:
+        logger.warning(
+            "config [collect] max_context_chars_auto is malformed (%s) — using default %r",
+            exc, _DEFAULT_MAX_CONTEXT_CHARS,
+        )
+        max_chars = _DEFAULT_MAX_CONTEXT_CHARS
+
+    # V6: `[collect] pack_enabled` (default true). When false, the fact pack
+    # collapses to the V2 baseline (contract, config_read, public_symbols only),
+    # so the block is byte-identical to a pre-V3 tree's output. A malformed
+    # value warns once and falls back to the default, like every other
+    # `[collect]` read in this function.
+    try:
+        pack_enabled = config.getboolean("collect", "pack_enabled", fallback=True)
+    except ValueError as exc:
+        logger.warning(
+            "config [collect] pack_enabled is malformed (%s) — using default True",
+            exc,
+        )
+        pack_enabled = True
+
     return CollectBridge(
         model,
         task_mode=task_mode,
         max_context_chars=max_chars,
         summarizer_call=summarizer_call,
+        auto_refresh=auto_refresh,
+        base_dir=base_dir,
+        config=config,
+        config_path=config_path,
+        pack_enabled=pack_enabled,
     )

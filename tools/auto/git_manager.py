@@ -368,6 +368,50 @@ class GitManager:
             "git log message failed",
         ).strip()
 
+    def paths_changed_in(self, sha: str) -> list[str]:
+        """Return the repo-relative paths committed in *sha*.
+
+        V9: ``commit()`` stages everything, so the paths a commit actually
+        touched are the authoritative answer to "what did this task write" —
+        more accurate than the task's declared ``target_files``, which can
+        both under-report (the coder also fixed a helper) and over-report
+        (a task that committed nothing staged).
+
+        Fail-open: any git failure returns ``[]`` so a caller that marks
+        these paths dirty never blinds more of a collect model than the
+        commit really changed, and never raises.
+        """
+        if not sha:
+            return []
+        try:
+            out = self._run(
+                ["git", "diff-tree", "--no-commit-id", "--name-only", "-r", sha],
+                "git diff-tree failed",
+            )
+        except GitError:
+            return []
+        return [line.strip() for line in out.splitlines() if line.strip()]
+
+    def paths_changed_between(self, base: str, tip: str) -> list[str]:
+        """Repo-relative paths changed in the ``base..tip`` range.
+
+        V9: ``commit()`` returns the sha of a single commit, but the
+        controller's post-commit regression loop can commit further fixes on
+        top of it, so the tree state a later task sees is ``tip`` and not
+        the original commit. Any git failure returns ``[]`` — see
+        :meth:`paths_changed_in`.
+        """
+        if not base or not tip or base == tip:
+            return []
+        try:
+            out = self._run(
+                ["git", "diff", "--name-only", f"{base}..{tip}"],
+                "git diff base..tip failed",
+            )
+        except GitError:
+            return []
+        return [line.strip() for line in out.splitlines() if line.strip()]
+
     # ── Private ──────────────────────────────────────────────────────────────
 
     def _run(self, cmd: list[str], error_msg: str) -> str:

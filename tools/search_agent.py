@@ -91,7 +91,7 @@ class SearchAgent:
         # None  → use the project-wide defaults
         # []    → skip nothing (caller explicitly wants no exclusions)
         # [...]  → use exactly what the caller passed
-        self.skip_dirs: List[str] = _DEFAULT_SKIP_DIRS if skip_dirs is None else skip_dirs
+        self.skip_dirs: List[str] = list(_DEFAULT_SKIP_DIRS) if skip_dirs is None else skip_dirs
         self.max_depth = max_depth
         # LLM noise-filter config. When model/base_url are absent the filter is
         # disabled and every reference is approved (backward-compatible no-LLM mode).

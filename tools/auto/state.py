@@ -831,11 +831,18 @@ class StateStore:
     def clear_task_deadline(self, task_id: str) -> None:
         """Remove this task's ``deadline_started_at.txt`` (no-op if absent).
 
-        OuterLoop.run_task writes this file the first time a task is worked and
-        reads it back on every resume to compute the remaining wall-clock
-        budget. Clearing it is what makes a retry start with a full budget;
-        leaving it means the retry inherits the elapsed time of the attempt it
-        replaced and can be re-blocked before round 1.
+        RUN-2: the file is now the task's budget ledger — a JSON object holding
+        the seconds the task has actually been worked, summed over sessions
+        (``{"consumed_s": 1234.5}``, plus ``"session_started_at"`` while a
+        session is active) — rather than the wall-clock timestamp of the first
+        time it was worked. ``OuterLoop.run_task`` opens it on entry, folds a
+        stale open session in, and closes it on every exit path.
+
+        Deleting it is what makes a retry start with a full budget: leaving it
+        means the retry inherits the time already consumed by the attempt it
+        replaced and can be re-blocked before round 1. It is a plain unlink —
+        there is no partial "zero the consumed time" to do, and the ledger is
+        cheap to rebuild from the next session.
 
         No directories are created: the point of this call is usually to
         finish a task that was never worked, so ``task_dir()`` (which creates)

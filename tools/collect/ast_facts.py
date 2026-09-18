@@ -9,12 +9,17 @@ module trivially unit-testable against bare `ast.Module` trees.
 Two extractors live here today:
 
 * `extract_symbols` — public/private classes and functions at module scope
-  (COLLECT-4). Order is stable: by source line, then qualname, so a rerun
-  of Pass A never reorders symbols for reasons unrelated to the code
-  (COLLECT-3's determinism guarantee starts here).
+  (COLLECT-4), each with its real parameter list as `signature` (V10 —
+  `name(...)` only where there is none to show). Order is stable: by source
+  line, then qualname, so a rerun of Pass A never reorders symbols for
+  reasons unrelated to the code (COLLECT-3's determinism guarantee starts
+  here).
 * `extract_imports` — the set of module names touched by `import` /
   `from ... import ...` statements anywhere in the tree, deduplicated and
   sorted (COLLECT-4).
+* `extract_from_import_names` — the submodule-qualified spelling of every
+  `from pkg import name` (L4): `"pkg.name"`, so the import graph can reach
+  `pkg/name.py` where `extract_imports` alone only reaches `pkg/__init__.py`.
 """
 
 from __future__ import annotations
@@ -52,9 +57,10 @@ def extract_symbols(tree: ast.Module, module_path: str) -> List[FunctionRecord]:
 
     Each becomes a `FunctionRecord` with `provenance` implicitly "static"
     (that's the only value `FunctionRecord`'s frozen dataclass ever carries
-    for these fields — see COLLECT-1). Signature is a placeholder shape
-    `name(...)`: COLLECT-4's job is symbol inventory, not full signature
-    reconstruction.
+    for these fields — see COLLECT-1). The signature is the real parameter
+    list (V10 — `_signature`): `name(a, b=1, *, c)` for functions, the
+    `__init__` parameter list (minus `self`) for a class that defines one
+    directly, and the placeholder `name(...)` for everything else.
     """
     symbols: List[FunctionRecord] = []
     for node in ast.iter_child_nodes(tree):
@@ -66,7 +72,7 @@ def extract_symbols(tree: ast.Module, module_path: str) -> List[FunctionRecord]:
                     qualname=f"{module_path}:{node.name}",
                     module=module_path,
                     lineno=node.lineno,
-                    signature=f"{node.name}(...)",
+                    signature=_signature(node),
                     docstring_first_line=first_line,
                     is_private=node.name.startswith("_"),
                 )
@@ -74,6 +80,91 @@ def extract_symbols(tree: ast.Module, module_path: str) -> List[FunctionRecord]:
     # Stable order independent of AST traversal quirks: by source position,
     # then qualname as a tiebreaker (COLLECT-3 determinism).
     return sorted(symbols, key=lambda s: (s.lineno, s.qualname))
+
+
+#: V10: a rendered parameter list longer than this is cut on a parameter
+#: boundary and closed with `, …)` — a 40-symbol `module` block has to stay
+#: readable, and a 300-char signature is not what "readable" means.
+_SIGNATURE_MAX_CHARS = 160
+
+
+def _signature(node: ast.AST) -> str:
+    """`name(<real parameter list>)` for a function, or for a class whose
+    body defines `__init__` directly (the `self` parameter dropped);
+    `name(...)` for any other class, for a parameter list `ast.unparse`
+    cannot render (Python < 3.9 has no `ast.unparse` — `AttributeError`),
+    and for anything else that goes wrong. Never raises: the placeholder
+    is what every consumer already handles.
+
+    Longer than `_SIGNATURE_MAX_CHARS`: parameters are dropped from the end
+    until the rest fits, and the list is closed with `, …)` so the reader
+    can see it is cut. Deterministic — same AST, same string (COLLECT-3).
+    """
+    name = getattr(node, "name", "") or ""
+    args: Optional[ast.arguments] = None
+    drop_self = False
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        args = node.args
+    elif isinstance(node, ast.ClassDef):
+        for child in node.body:
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) and child.name == "__init__":
+                args = child.args
+                drop_self = True
+                break
+    if args is None:
+        return f"{name}(...)"
+    try:
+        rendered = ast.unparse(args)
+    except Exception:  # AttributeError on < 3.9; anything else → placeholder
+        return f"{name}(...)"
+    if drop_self:
+        # `ast.unparse` gives "self, a, b" / "self" / "self, *args"; the
+        # first parameter of `__init__` is not part of the calling
+        # convention the reader is after.
+        head, sep, rest = rendered.partition(", ")
+        rendered = rest if sep else ""
+    full = f"{name}({rendered})"
+    if len(full) <= _SIGNATURE_MAX_CHARS:
+        return full
+    parts = _split_params(rendered)
+    while parts:
+        parts.pop()
+        cut = f"{name}({', '.join(parts)}, …)" if parts else f"{name}(…)"
+        if len(cut) <= _SIGNATURE_MAX_CHARS:
+            return cut
+    return f"{name}(…)"
+
+
+def _split_params(rendered: str) -> List[str]:
+    """Split an `ast.unparse(arguments)` string on top-level commas — the
+    commas inside a default value (`x=(1, 2)`, `y={'a': 1}`, `z='a, b'`)
+    or an annotation (`Dict[str, int]`) do not separate parameters."""
+    parts: List[str] = []
+    depth = 0
+    quote: Optional[str] = None
+    start = 0
+    i = 0
+    while i < len(rendered):
+        ch = rendered[i]
+        if quote:
+            if ch == "\\":
+                i += 1
+            elif ch == quote:
+                quote = None
+        elif ch in ("'", '"'):
+            quote = ch
+        elif ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            parts.append(rendered[start:i].strip())
+            start = i + 1
+        i += 1
+    tail = rendered[start:].strip()
+    if tail:
+        parts.append(tail)
+    return parts
 
 
 def extract_all_defined_names(tree: ast.Module) -> "frozenset[str]":
@@ -228,6 +319,49 @@ def extract_imports(tree: ast.Module) -> List[str]:
                 # list itself.
                 for alias in node.names:
                     names.add(prefix + alias.name)
+    return sorted(names)
+
+
+def extract_from_import_names(tree: ast.Module) -> List[str]:
+    """Sorted, deduplicated `"pkg.name"` for every `from pkg import name`.
+
+    L4: `extract_imports` records `from tools.collect import test_map as
+    test_map_mod` as just `"tools.collect"` — the right *coarse* fact for
+    the Pass A prompt and the rendered pages (the package really is what
+    the statement imports first), but `graph.resolve_import` can only land
+    that on `tools/collect/__init__.py`, so the edge to the module actually
+    named — `tools/collect/test_map.py` — was never emitted. All nine
+    sibling imports in `tools/collect/cli.py` use exactly this house style,
+    so the V3 `callers:` row for every one of those siblings was missing its
+    main shipped consumer, under a header that says *do not contradict*.
+
+    This is the finer spelling that fixes it, kept as a **separate** list
+    (`ModuleRecord.from_imports`) on purpose: joining it into `imports`
+    would triple the `imports:` line of every Pass A facts block (measured:
+    +11% facts characters across this repo, all of it `typing.Any`-style
+    noise) for a benefit only `graph.import_edges` consumes.
+
+    Each entry is a *candidate*, not a claim — the same reconstruction
+    `test_map._rich_import_targets` already does on the test side. When
+    `name` is a real module (`pkg/name.py`, `pkg/name/__init__.py`)
+    `resolve_import`'s exact match lands it there; when it is a symbol
+    defined in `pkg/__init__.py` the prefix fallback lands it on that
+    `__init__.py`, the edge `imports` already produced, so nothing new
+    appears. `alias.name`, never `alias.asname`: the alias is a local
+    binding and means nothing to resolution. `from pkg import *` yields no
+    candidate (`"pkg.*"` names nothing); `from . import x` yields none
+    either — `extract_imports` already records that form at full precision
+    (`".x"`), see its BUGFIX note. Relative forms keep their dots
+    (`from .sub import mod` -> `".sub.mod"`) so the importer-anchored branch
+    of `resolve_import` handles them exactly as it does `imports`.
+    """
+    names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            base = "." * node.level + node.module
+            for alias in node.names:
+                if alias.name != "*":
+                    names.add(f"{base}.{alias.name}")
     return sorted(names)
 
 

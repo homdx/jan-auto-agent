@@ -161,6 +161,11 @@ api_format = openai
 
 [gate1]
 skip_llm = false
+; RUN-5: these tests assert the AUTO-REMOVE-GUARD-1 behaviour for a
+; candidate that gets no verdict, which is exactly the reject policy
+; (today's behaviour). The default keep policy would keep the outage
+; task in plan.json outright, so it is not the case under test here.
+presence_unknown = reject
 llm_call_retry_max = {llm_call_retry_max}
 llm_call_retry_wait_sec = {llm_call_retry_wait_sec}
 """)
