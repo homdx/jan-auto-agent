@@ -48,6 +48,7 @@ def sandbox(tmp_path: Path) -> Path:
     os.chmod(root / "githooks" / "pre-commit", 0o755)
 
     (root / "tests" / "_pass_a_stub.py").write_text("", encoding="utf-8")
+    (root / "tests" / "_kilo_fake.py").write_text("", encoding="utf-8")
     (root / "tests" / "test_fast.py").write_text("def test_a(): pass\n", encoding="utf-8")
     (root / "tests" / "test_heavy.py").write_text("def test_b(): pass\n", encoding="utf-8")
     (root / "tests" / "SLOW_TESTS.txt").write_text("test_heavy.py\n", encoding="utf-8")
