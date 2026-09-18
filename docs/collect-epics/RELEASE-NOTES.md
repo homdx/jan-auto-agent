@@ -97,7 +97,10 @@ coder as rejections.
   collect_miss` events and the Gate-1 stage split, read by
   `scripts/trace_round_snapshot.py`.
 - **M5** `scripts/collect_ab.py` — one goal, one seeded plan, two runs
-  against a replay stub, one diff.
+  against a replay stub, one diff. Its `serve` / `configs` subcommands are
+  also the standard way to run anything without touching a live provider
+  config (loopback-only guard; see RUN-THE-EPIC-COMPETITION.md, "Running
+  against a stub").
 - **contest-bench/** (`e9a19d9`) — black-box scoring of contest entries by
   shared test data against a fake provider; first used for RUN-9 (20
   submissions, 18 unique, 45 scenarios, 211 checks; base scored 73/211).

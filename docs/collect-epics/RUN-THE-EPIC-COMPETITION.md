@@ -274,12 +274,53 @@ that end a round rather than cost it points.
    `judge_epic_round.py`. New work runs before it, never instead of it.
 2. **Nothing runs against a live provider config.** Copy `agents_128k.ini` to a
    scratch path and stub every `base_url`. `M5`'s A/B harness carries this in
-   its own Acceptance list; it applies to every round.
+   its own Acceptance list; it applies to every round. How to, see
+   "Running against a stub" below.
 3. **Never `git push`.** Local commits only, for every agent, every round.
 4. **Do not overwrite a `.collect/` artifact without backing it up.** Several
    tickets rebuild one; the trees under `../testtext*` are live competition data.
 5. **Four separate pytest invocations.** One combined call produces ~362 false
    errors from a conftest collision.
+
+---
+
+## Running against a stub
+
+The owner's `agents_128k.ini` holds real provider keys and is never an input
+to an agent's run — not for tests, not for a measurement, not "just once".
+Every live-shaped step goes through a loopback stub:
+
+```bash
+# 1. a stub OpenAI-compatible server on loopback (replays recorded replies,
+#    or answers with a canned completion when there is no recording)
+python3 scripts/collect_ab.py serve --port 14141 --recordings run9/recordings.jsonl
+
+# 2. a scratch config: every base_url → the stub, every api_key scrubbed (`config_off.ini` / `config_on.ini`),
+#    the original file untouched
+python3 scripts/collect_ab.py configs --config agents_128k.ini \
+    --out-dir /tmp/stub-cfg --stub-url http://127.0.0.1:14141/v1
+
+# 3. point the run at the copy
+python3 main.py --config /tmp/stub-cfg/config_off.ini --auto "<goal>"
+```
+
+`guard_stub_url` in `collect_ab.py` refuses any `--stub-url` whose host is
+not loopback, so a typo cannot reach a provider. `collect_ab.py run` does all
+three steps by itself for an A/B measurement.
+
+If you need a richer fake (rate limits, latency, a specific model name), the
+untracked `proxy2/` folder is an OpenAI-compatible Python proxy: copy it to
+`proxy-stub/`, edit `config.toml` (`server.port`, the upstream disabled), run
+`python3 proxy-stub/python_proxy.py` and use its port in step 2. Never edit
+`proxy2/` in place — it is the owner's working copy.
+
+Rules that follow from this:
+- an agent never asks for, prints or copies a key out of `agents_128k.ini`;
+  the committed version of that file is updated only by the round owner;
+- a new config key that a landed round introduces is added to the scratch
+  config for the measurement and to `agents_128k.ini` by the owner afterwards;
+- `contest-bench/` scoring already ships its own fake provider — no config
+  needed there.
 
 ---
 
