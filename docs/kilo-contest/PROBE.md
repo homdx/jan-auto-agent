@@ -133,6 +133,43 @@ prompted with `"Reply with exactly: OK"`. All three reached `session.idle`
 and replied `OK` (laguna 9.2 s, mistral 9.2 s, hy3 7.6 s). No fix needed —
 the roster's parsing and rule list work as shipped against a real server.
 
+## KC-3 policy re-verified live (2026-09-18)
+
+`tools/contest/policy.py` (winner `SenSenova6-7-var`, landed `1499cd8`, plus
+the `_pathlike` bare-command fix, `5214138`) was checked against a real
+`permission.asked` event instead of a synthetic one. For each of the three
+roster models a live session was prompted to "run exactly `whoami` (bare
+command, no arguments, no path)" with `bash: ask`; the raw event was fed
+into `Policy.decide()` built from the real, committed `contest.ini` via
+`load_roster`.
+
+All three models produced the same event shape — a bare, path-free command:
+
+```
+{"permission": "bash", "patterns": ["whoami"], "always": ["whoami *"],
+ "metadata": {"command": "whoami", ...}}
+```
+
+Before the `_pathlike` fix this shape was the exact bug: `Path("whoami").resolve()`
+resolves against cwd and reads as "inside the worktree", so the mechanical
+layer auto-approved it, skipping `deny_commands` and the gate entirely.
+With the fix, `_pathlike()` requires a leading `/`, `~`, `./` or `../`, so
+`"whoami"` no longer qualifies as a path and the event falls through to the
+gate check. Confirmed live: `policy.decide()` returned
+`Decision(reply='reject', layer='budget', reason='gate budget exhausted (0)')`
+for all three models — i.e. the mechanical layer did **not** auto-approve,
+it correctly deferred to the gate. (`gate_budget_left=0` was used because no
+real `contest_gate_llm`/`gate1_llm` credential exists in this repo yet —
+both are unfilled `${ENV}`/placeholder values — so the gate call itself
+could not be exercised live; only the mechanical-layer routing was
+verified against genuine events.)
+
+No fix needed as a result of this check — `_pathlike()` holds against real
+model-generated events, not just the synthetic `reboot` repro. `kilo_hello.py`
+was not touched (per KC-1's acceptance rule); no minimal-example update was
+warranted since the throwaway probe script, not the shipped hello-world
+template, was what exercised the real Kilo protocol here.
+
 ## Side observations
 
 - The VS Code extension keeps its own `kilo serve --port 0` processes
