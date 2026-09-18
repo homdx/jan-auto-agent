@@ -1,0 +1,875 @@
+"""tests/test_contest_policy.py — KC-3: ``tools/contest/policy.py`` — three layers, no silence.
+
+``KiloClient.reply_permission`` (KC-1) can only answer ``once`` or ``reject``,
+and the probe (``scripts/kilo_hello.py``, commit 67e834d) answered every
+permission with one flag. This module decides which of the two, by geometry
+first and a second model second, so that an unattended round never answers a
+permission by silence. Without the module every test below fails at import.
+
+The mechanical cases are table-driven on the two payloads PROBE.md recorded
+live on Kilo 7.6.2, verbatim — the ``external_directory`` event for
+``/tmp/*`` and the ``bash`` event for ``rm -v /tmp/testfile``. Every gate
+case stubs ``completion_fn``: no test here calls a provider or a kilo server.
+
+The cases, in the ticket's acceptance order:
+
+  1. ``external_directory`` ``/tmp/*`` with ``tmp_roots = /tmp/kilo/*`` →
+     layer ``gate``; with ``tmp_roots = /tmp/*`` → ``once``, mechanical;
+  2. a pattern inside the worktree → ``once``, mechanical, no gate call;
+  3. a pattern under another round's worktree → ``reject``, mechanical;
+  4. a symlink inside the worktree pointing out of it → ``reject``;
+  5. ``doom_loop`` → ``reject``; the ``bash`` event with
+     ``deny_commands = rm -v /tmp/*`` → ``reject``, naming the pattern;
+  6. the gate: ``allow`` → ``once``/``gate``, ``reject`` → ``reject``/``gate``,
+     a think-wrapped reply is honoured, prose without JSON / an unknown
+     verdict / a raised ``TimeoutError`` → ``reject``/``gate-failed``, and
+     an empty budget → ``reject``/``budget`` without any call;
+  7. the user message carries the command, the worktree, the ticket title and
+     a recent tool line; the default ``completion_fn`` sends the
+     ``gate_settings`` temperature, max_tokens and response_format;
+  8. ``"always"`` occurs once in the module — in its docstring;
+  9. ``record`` writes one line per decision with the documented keys.
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+from dataclasses import FrozenInstanceError
+from pathlib import Path
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from tools.auto.llm_profile import LlmSettings
+from tools.contest import policy as policy_mod
+from tools.contest.policy import (
+    DECISION_KEYS,
+    GATE_SYSTEM_PROMPT,
+    GATE_TIMEOUT,
+    HARD_DENYLIST,
+    LAYERS,
+    MAX_REASON_CHARS,
+    REPLIES,
+    Decision,
+    Policy,
+    PolicyContext,
+)
+from tools.contest.roster import ContestConfig
+
+POLICY_FILE = REPO_ROOT / "tools" / "contest" / "policy.py"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# the recorded payloads (PROBE.md, "The permission payloads, verbatim")
+# ─────────────────────────────────────────────────────────────────────────────
+
+EXTERNAL_DIRECTORY_EVENT = {
+    "type": "permission.asked",
+    "properties": {
+        "id": "per_0afb2bf60001KFTnUBoT5JQbJe",
+        "sessionID": "ses_f504d5ef4ffeAbHyyPaAMRYROL",
+        "permission": "external_directory",
+        "patterns": ["/tmp/*"],
+        "metadata": {
+            "command": "rm -v /tmp/testfile",
+            "description": "Remove test file with verbose output",
+            "directories": ["/tmp"],
+            "patterns": ["/tmp/*"],
+        },
+        "always": ["/tmp/*"],
+        "tool": {
+            "messageID": "msg_0afb2a8f0001UeomCvVgJT2RDL",
+            "callID": "call_chatcmpl-tool-7721747835df45abb0e8b79792ad1114",
+        },
+    },
+}
+
+BASH_EVENT = {
+    "type": "permission.asked",
+    "properties": {
+        "id": "per_0afb32854001mmQjaA39GfX6Jf",
+        "sessionID": "ses_f504d18f0ffehKDcvqpkphdcji",
+        "permission": "bash",
+        "patterns": ["rm -v /tmp/testfile"],
+        "metadata": {
+            "command": "rm -v /tmp/testfile",
+            "description": "Remove test file at /tmp/testfile",
+        },
+        "always": ["rm *"],
+        "tool": {
+            "messageID": "msg_0afb3022c001E6ls3tt0MQ6Z4K",
+            "callID": "call_chatcmpl-tool-af873cc4dfef4ad68913fdaa72d6b7de",
+        },
+    },
+}
+
+TICKET_TITLE = "42-kc3-policy — three layers, no silence"
+TICKET_FILES = ("tools/contest/policy.py", "tests/test_contest_policy.py")
+RECENT_TOOLS = (
+    {
+        "type": "tool",
+        "tool": "bash",
+        "state": {
+            "status": "error",
+            "input": {"command": "rm -v /tmp/testfile", "workdir": "/tmp"},
+            "output": [{"type": "text", "text": "The user rejected permission"}],
+        },
+    },
+)
+
+ALLOW = {"verdict": "allow", "reason": "scratch path under tmp_roots"}
+REJECT = {"verdict": "reject", "reason": "writes outside the worktree"}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+_UNSET = object()
+
+
+def make_config(*, tmp_roots=(), deny_commands=(), settings=_UNSET) -> ContestConfig:
+    """A round: the gate settings from contest.ini, and the two policy inputs."""
+    if settings is _UNSET:
+        settings = LlmSettings(
+            base_url="https://policy-test/v1",
+            api_key="test-gate-key",
+            model="policy/gate-model",
+            api_format="openai",
+            response_format=True,
+            temperature=0.0,
+            max_tokens=256,
+        )
+    return ContestConfig(
+        tmp_roots=tmp_roots, deny_commands=deny_commands, gate_settings=settings,
+    )
+
+
+class StubGate:
+    """A ``completion_fn`` stand-in: returns or raises *reply*, records calls."""
+
+    def __init__(self, reply):
+        self.reply = reply
+        self.calls = []
+
+    def __call__(self, url, headers, payload, timeout, **kwargs):
+        self.calls.append({
+            "url": url,
+            "headers": headers,
+            "payload": payload,
+            "timeout": timeout,
+            **kwargs,
+        })
+        if isinstance(self.reply, BaseException):
+            raise self.reply
+        return self.reply
+
+    def user_message(self, index: int = 0) -> str:
+        (message,) = [
+            part for part in self.calls[index]["payload"]["messages"]
+            if part["role"] == "user"
+        ]
+        return message["content"]
+
+
+class FakeClock:
+    """A monotonic stand-in so ``gate_elapsed`` is deterministic under test."""
+
+    def __init__(self, step: float = 0.5):
+        self.now = 0.0
+        self.step = step
+        self.ticks = 0
+
+    def __call__(self) -> float:
+        value = self.now
+        self.now += self.step
+        self.ticks += 1
+        return value
+
+
+def make_ctx(worktree: Path, **overrides) -> PolicyContext:
+    defaults = {
+        "worktree": worktree,
+        "tmp_roots": (),
+        "forbidden": HARD_DENYLIST,
+        "ticket_title": TICKET_TITLE,
+        "ticket_files": TICKET_FILES,
+        "recent_tools": RECENT_TOOLS,
+        "gate_budget_left": 20,
+    }
+    defaults.update(overrides)
+    return PolicyContext(**defaults)
+
+
+def make_event(*, permission="external_directory", patterns=(), directories=(),
+               command="", description="", pid="per_test01",
+               sid="ses_test01", metadata=True) -> dict:
+    """A permission event in the shape PROBE.md recorded."""
+    properties = {
+        "id": pid,
+        "sessionID": sid,
+        "permission": permission,
+        "patterns": list(patterns),
+        "always": list(patterns),
+        "tool": {"messageID": "msg_test", "callID": "call_test"},
+    }
+    if metadata:
+        meta = {}
+        if directories:
+            meta["directories"] = list(directories)
+        if command:
+            meta["command"] = command
+        if description:
+            meta["description"] = description
+        if meta:
+            properties["metadata"] = meta
+    return {"type": "permission.asked", "properties": properties}
+
+
+def decide(policy: Policy, event: dict, worktree: Path, **overrides) -> Decision:
+    return policy.decide(event, make_ctx(worktree, **overrides))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# layer 1: geometry, on the recorded payloads
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_external_directory_outside_tmp_roots_asks_the_gate(tmp_path):
+    gate = StubGate(json.dumps(ALLOW))
+    policy = Policy(make_config(tmp_roots=("/tmp/kilo/*", "/tmp/contest/*")),
+                    completion_fn=gate, clock=FakeClock())
+
+    decision = decide(policy, EXTERNAL_DIRECTORY_EVENT, tmp_path)
+
+    assert decision.reply == "once"
+    assert decision.layer == "gate"
+    assert decision.gate_elapsed == 0.5
+    assert "Remove test file" not in decision.reason
+    assert decision.gate_raw == json.dumps(ALLOW)
+    assert len(gate.calls) == 1
+
+
+def test_external_directory_inside_tmp_roots_is_mechanical(tmp_path):
+    gate = StubGate(json.dumps(ALLOW))
+    policy = Policy(make_config(tmp_roots=("/tmp/*",)),
+                    completion_fn=gate, clock=FakeClock())
+
+    decision = decide(policy, EXTERNAL_DIRECTORY_EVENT, tmp_path)
+
+    assert (decision.reply, decision.layer) == ("once", "mechanical")
+    assert decision.reason == "inside worktree/tmp_roots"
+    assert decision.gate_elapsed is None
+    assert decision.gate_raw is None
+    assert gate.calls == []
+
+
+@pytest.mark.parametrize("pattern_suffix,roots", [
+    ("/tmp/kilo/scratch", ("/tmp/kilo/*",)),
+    ("/tmp/kilo/scratch/nested", ("/tmp/kilo/*",)),
+    ("/tmp/kilo/scratch/*", ("/tmp/kilo/*",)),
+    ("/tmp/contest/round-1", ("/tmp/kilo/*", "/tmp/contest/*")),
+])
+def test_tmp_roots_match_the_resolved_path_and_the_pattern(tmp_path,
+                                                           pattern_suffix, roots):
+    gate = StubGate(json.dumps(ALLOW))
+    policy = Policy(make_config(tmp_roots=roots), completion_fn=gate, clock=FakeClock())
+    event = make_event(patterns=[pattern_suffix], directories=[pattern_suffix])
+
+    decision = decide(policy, event, tmp_path)
+
+    assert (decision.reply, decision.layer) == ("once", "mechanical")
+    assert gate.calls == []
+
+
+def test_pattern_inside_the_worktree_is_mechanical_without_a_gate_call(tmp_path):
+    worktree = (tmp_path / "rounds" / "r1" / "hy3").resolve()
+    worktree.mkdir(parents=True)
+    gate = StubGate(json.dumps(ALLOW))
+    policy = Policy(make_config(), completion_fn=gate, clock=FakeClock())
+    event = make_event(patterns=[str(worktree / "src" / "main.py")],
+                       directories=[str(worktree / "src")])
+
+    decision = decide(policy, event, worktree)
+
+    assert (decision.reply, decision.layer) == ("once", "mechanical")
+    assert decision.reason == "inside worktree/tmp_roots"
+    assert gate.calls == []
+
+
+def test_pattern_under_another_rounds_worktree_is_rejected(tmp_path):
+    other = (tmp_path / "rounds" / "r1" / "laguna").resolve()
+    other.mkdir(parents=True)
+    worktree = (tmp_path / "rounds" / "r1" / "hy3").resolve()
+    worktree.mkdir(parents=True)
+    gate = StubGate(json.dumps(ALLOW))
+    policy = Policy(make_config(), completion_fn=gate, clock=FakeClock())
+    event = make_event(patterns=[str(other / "tools" / "contest" / "policy.py")])
+
+    decision = decide(policy, event, worktree, forbidden=HARD_DENYLIST + (other,))
+
+    assert (decision.reply, decision.layer) == ("reject", "mechanical")
+    assert str(other) in decision.reason
+    assert gate.calls == []
+
+
+def test_symlink_out_of_the_worktree_is_judged_by_its_target(tmp_path):
+    worktree = (tmp_path / "rounds" / "r1" / "hy3").resolve()
+    worktree.mkdir(parents=True)
+    target = (tmp_path / "ssh").resolve()
+    target.mkdir()
+    (worktree / "link").symlink_to(target)
+    gate = StubGate(json.dumps(ALLOW))
+    policy = Policy(make_config(), completion_fn=gate, clock=FakeClock())
+
+    decision = decide(policy, make_event(patterns=[str(worktree / "link")]),
+                      worktree, forbidden=HARD_DENYLIST + (target,))
+
+    assert (decision.reply, decision.layer) == ("reject", "mechanical")
+    assert str(target) in decision.reason
+    assert gate.calls == []
+
+
+def test_doom_loop_is_rejected_outright(tmp_path):
+    gate = StubGate(json.dumps(ALLOW))
+    policy = Policy(make_config(), completion_fn=gate, clock=FakeClock())
+    event = make_event(permission="doom_loop", patterns=[str(tmp_path / "ok.txt")])
+
+    decision = decide(policy, event, tmp_path)
+
+    assert (decision.reply, decision.layer) == ("reject", "mechanical")
+    assert decision.reason == "doom loop"
+    assert decision.gate_elapsed is None
+    assert gate.calls == []
+
+
+def test_bash_command_matching_deny_commands_is_rejected_and_named(tmp_path):
+    gate = StubGate(json.dumps(ALLOW))
+    policy = Policy(make_config(deny_commands=("git push*", "rm -v /tmp/*")),
+                    completion_fn=gate, clock=FakeClock())
+
+    decision = decide(policy, BASH_EVENT, tmp_path)
+
+    assert (decision.reply, decision.layer) == ("reject", "mechanical")
+    assert "rm -v /tmp/*" in decision.reason
+    assert "deny_commands" in decision.reason
+    assert gate.calls == []
+
+
+def test_bash_command_not_in_deny_commands_reaches_the_gate(tmp_path):
+    gate = StubGate(json.dumps(REJECT))
+    policy = Policy(make_config(deny_commands=("git push*",)),
+                    completion_fn=gate, clock=FakeClock())
+
+    decision = decide(policy, BASH_EVENT, tmp_path)
+
+    assert decision.layer == "gate"
+    assert len(gate.calls) == 1
+
+
+def test_forbidden_beats_the_worktree(tmp_path):
+    """The denylist is checked before the worktree, so a forbidden path is not
+    rescued by sitting inside it."""
+    worktree = tmp_path.resolve()
+    gated = (worktree / ".ssh").resolve()
+    gated.mkdir()
+    gate = StubGate(json.dumps(ALLOW))
+    policy = Policy(make_config(), completion_fn=gate, clock=FakeClock())
+
+    decision = decide(policy, make_event(patterns=[str(gated / "id_rsa")]),
+                      worktree, forbidden=HARD_DENYLIST + (gated,))
+
+    assert (decision.reply, decision.layer) == ("reject", "mechanical")
+    assert str(gated) in decision.reason
+    assert gate.calls == []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# reading the event
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_paths_are_extracted_deduped_and_trailing_star_stripped():
+    pairs = policy_mod._extract_paths(EXTERNAL_DIRECTORY_EVENT["properties"])
+
+    assert len(pairs) == 1
+    resolved, originals = pairs[0]
+    assert resolved == Path("/tmp")
+    # both spellings the event uses for the same path, in the order read
+    assert originals == ("/tmp/*", "/tmp")
+
+
+def test_command_text_in_patterns_is_not_a_path():
+    """PROBE.md §Facts 2: a ``bash: ask`` event keeps the command in
+    ``patterns``; resolving it would land under the caller's cwd and read as
+    "inside the worktree", which is backwards."""
+    assert policy_mod._extract_paths(BASH_EVENT["properties"]) == []
+
+
+def test_command_text_with_a_star_is_still_command_text():
+    assert policy_mod._extract_paths(
+        {"patterns": ["rm -rf /tmp/*"], "metadata": {"command": "rm -rf /tmp/*"}}
+    ) == []
+
+
+def test_root_and_home_match_on_identity_alone():
+    """``/`` and ``$HOME`` are ancestors of every worktree, so they may only
+    name themselves — otherwise every worktree path is forbidden."""
+    assert policy_mod._forbidden_match(Path("/"), HARD_DENYLIST) == Path("/")
+    assert policy_mod._forbidden_match(Path("/"), HARD_DENYLIST + (Path("/"),)) == Path("/")
+    assert policy_mod._forbidden_match(Path.home(), HARD_DENYLIST) == Path.home()
+    assert policy_mod._forbidden_match(
+        Path.home() / ".ssh" / "id_rsa", HARD_DENYLIST
+    ) == Path.home() / ".ssh"
+    # the checkout — and every worktree under it — is under $HOME, yet allowed
+    assert policy_mod._forbidden_match(REPO_ROOT, HARD_DENYLIST) is None
+    assert policy_mod._forbidden_match(REPO_ROOT / "tests", HARD_DENYLIST) is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# layer 2: the gate
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize(
+    "reply,expected_reply,expected_reason_in",
+    [
+        (json.dumps(ALLOW), "once", "scratch path under tmp_roots"),
+        (json.dumps(REJECT), "reject", "writes outside the worktree"),
+        # the same verdict behind a reasoning block: strip_think first
+        ("</think>wandering thoughts</think>" + json.dumps(ALLOW), "once", "scratch"),
+        # and one buried in prose, which is where the tolerant extractor earns
+        ("Sure — " + json.dumps(ALLOW) + " hope that's fine", "once", "scratch"),
+        ('{"verdict": "ALLOW", "reason": "caps"}', "once", "caps"),
+        ('{"verdict": "REJECT", "reason": "caps"}', "reject", "caps"),
+        ('```json\n' + json.dumps(ALLOW) + '\n```', "once", "scratch"),
+    ],
+)
+def test_gate_verdicts(tmp_path, reply, expected_reply, expected_reason_in):
+    gate = StubGate(reply)
+    clock = FakeClock(step=0.25)
+    policy = Policy(make_config(), completion_fn=gate, clock=clock)
+
+    decision = decide(policy, EXTERNAL_DIRECTORY_EVENT, tmp_path,
+                      tmp_roots=("/tmp/kilo/*",))
+
+    assert decision.reply == expected_reply
+    assert decision.layer == "gate"
+    assert expected_reason_in in decision.reason
+    assert decision.reason.startswith("gate:")
+    assert decision.gate_elapsed == 0.25
+    assert decision.gate_raw == reply
+    assert clock.ticks == 2
+    assert len(gate.calls) == 1
+
+
+@pytest.mark.parametrize("reply", [
+    "I think this looks fine, go ahead and run it.",
+    '{"verdict": "maybe", "reason": "not sure"}',
+    '{"reason": "no verdict key at all"}',
+    '{"verdict": 7, "reason": "not a string"}',
+    "",
+    None,
+    "[]",
+])
+def test_gate_without_a_verdict_fails_closed(tmp_path, reply):
+    gate = StubGate(reply)
+    policy = Policy(make_config(), completion_fn=gate, clock=FakeClock())
+
+    decision = decide(policy, EXTERNAL_DIRECTORY_EVENT, tmp_path,
+                      tmp_roots=("/tmp/kilo/*",))
+
+    assert decision.reply == "reject"
+    assert decision.layer == "gate-failed"
+    assert decision.reason.startswith("gate unavailable:")
+    assert len(gate.calls) == 1
+
+
+def test_gate_exception_fails_closed_and_names_the_class(tmp_path):
+    gate = StubGate(TimeoutError("https://policy-test/v1 timed out"))
+    clock = FakeClock(step=0.125)
+    policy = Policy(make_config(), completion_fn=gate, clock=clock)
+
+    decision = decide(policy, EXTERNAL_DIRECTORY_EVENT, tmp_path,
+                      tmp_roots=("/tmp/kilo/*",))
+
+    assert decision.reply == "reject"
+    assert decision.layer == "gate-failed"
+    assert decision.reason == "gate unavailable: TimeoutError"
+    assert decision.gate_elapsed == 0.125
+    assert decision.gate_raw is None
+
+
+def test_gate_empty_reply_quotes_what_came_back(tmp_path):
+    gate = StubGate("thinking hard about the answer but not emitting any json at all")
+    policy = Policy(make_config(), completion_fn=gate, clock=FakeClock())
+
+    decision = decide(policy, EXTERNAL_DIRECTORY_EVENT, tmp_path,
+                      tmp_roots=("/tmp/kilo/*",))
+
+    assert decision.layer == "gate-failed"
+    assert decision.reason.startswith("gate unavailable: thinking hard")
+    assert len(decision.reason) <= MAX_REASON_CHARS
+
+
+def test_gate_budget_zero_rejects_without_calling_the_gate(tmp_path):
+    gate = StubGate(json.dumps(ALLOW))
+    policy = Policy(make_config(), completion_fn=gate, clock=FakeClock())
+
+    decision = decide(policy, EXTERNAL_DIRECTORY_EVENT, tmp_path,
+                      tmp_roots=("/tmp/kilo/*",), gate_budget_left=0)
+
+    assert (decision.reply, decision.layer) == ("reject", "budget")
+    assert decision.reason == "gate budget exhausted (0)"
+    assert decision.gate_elapsed is None
+    assert gate.calls == []
+
+
+def test_gate_without_a_gate_model_fails_closed(tmp_path):
+    gate = StubGate(json.dumps(ALLOW))
+    policy = Policy(make_config(settings=None), completion_fn=gate, clock=FakeClock())
+
+    decision = decide(policy, EXTERNAL_DIRECTORY_EVENT, tmp_path,
+                      tmp_roots=("/tmp/kilo/*",))
+
+    assert decision.reply == "reject"
+    assert decision.layer == "gate-failed"
+    assert "no gate model" in decision.reason
+    assert gate.calls == []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# what the gate is shown
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_gate_user_message_carries_the_context(tmp_path):
+    gate = StubGate(json.dumps(ALLOW))
+    policy = Policy(make_config(tmp_roots=("/tmp/kilo/*", "/tmp/contest/*")),
+                    completion_fn=gate, clock=FakeClock())
+    worktree = (tmp_path / "rounds" / "r1" / "hy3").resolve()
+    worktree.mkdir(parents=True)
+
+    decision = decide(policy, EXTERNAL_DIRECTORY_EVENT, worktree)
+
+    assert decision.layer == "gate"
+    message = gate.user_message()
+    assert "rm -v /tmp/testfile" in message
+    assert str(worktree) in message
+    assert TICKET_TITLE in message
+    assert "tools/contest/policy.py" in message
+    assert "/tmp/kilo/*" in message
+    assert "Remove test file with verbose output" in message
+    assert "external_directory" in message
+    # one recent tool line, name, input and status
+    tool_lines = [line for line in message.splitlines() if line.strip().startswith("bash")]
+    assert len(tool_lines) == 1
+    assert '"command": "rm -v /tmp/testfile"' in tool_lines[0]
+    assert "-> error" in tool_lines[0]
+
+
+def test_gate_user_message_omits_the_parts_that_were_not_asked(tmp_path):
+    gate = StubGate(json.dumps(ALLOW))
+    policy = Policy(make_config(), completion_fn=gate, clock=FakeClock())
+
+    decide(policy, make_event(permission="external_directory",
+                              patterns=["/tmp/kilo/x"], metadata=False),
+           tmp_path, ticket_files=(), recent_tools=(), ticket_title="")
+
+    message = gate.user_message()
+    assert "command: -" in message
+    assert "description: -" in message
+    assert "directories: -" in message
+    assert "patterns: /tmp/kilo/x" in message
+    assert "ticket: -" in message
+    assert "ticket files: -" in message
+    assert "recent tools: none" in message
+
+
+def test_default_completion_builds_the_call_from_gate_settings(tmp_path, monkeypatch):
+    seen = {}
+
+    def fake_request_completion(url, headers, payload, timeout, **kwargs):
+        seen.update(url=url, headers=headers, payload=payload,
+                    timeout=timeout, **kwargs)
+        return json.dumps(ALLOW)
+
+    monkeypatch.setattr(policy_mod, "request_completion", fake_request_completion)
+    settings = LlmSettings(
+        base_url="https://policy-test/v1",
+        api_key="test-gate-key",
+        model="policy/gate-model",
+        api_format="openai",
+        response_format=True,
+        temperature=0.2,
+        max_tokens=512,
+        num_ctx=4096,
+        think=True,
+    )
+    policy = Policy(make_config(settings=settings), clock=FakeClock())
+
+    decision = decide(policy, EXTERNAL_DIRECTORY_EVENT, tmp_path,
+                      tmp_roots=("/tmp/kilo/*",))
+
+    assert decision.reply == "once"
+    payload = seen["payload"]
+    assert payload["model"] == "policy/gate-model"
+    assert payload["temperature"] == 0.2
+    assert payload["max_tokens"] == 512
+    assert payload["response_format"] == {"type": "json_object"}
+    assert payload.get("stream") is not True
+    roles = [part["role"] for part in payload["messages"]]
+    assert roles == ["system", "user"]
+    assert payload["messages"][0]["content"] == GATE_SYSTEM_PROMPT
+    assert seen["url"] == "https://policy-test/v1/chat/completions"
+    assert seen["timeout"] == GATE_TIMEOUT == 60.0
+    assert seen["stream"] is False
+    assert seen["api_format"] == "openai"
+    assert seen["error_retries"] == 0
+    assert seen["ssl_context"] is None
+    assert seen["headers"]["Authorization"].startswith("Bearer ")
+
+
+def test_default_completion_builds_an_ollama_call(tmp_path, monkeypatch):
+    seen = {}
+
+    def fake_request_completion(url, headers, payload, timeout, **kwargs):
+        seen.update(url=url, payload=payload, **kwargs)
+        return json.dumps(REJECT)
+
+    monkeypatch.setattr(policy_mod, "request_completion", fake_request_completion)
+    settings = LlmSettings(
+        base_url="http://127.0.0.1:11434/api", api_key="",
+        model="gate-ollama", api_format="ollama", response_format=True,
+    )
+    policy = Policy(make_config(settings=settings), clock=FakeClock())
+
+    decision = decide(policy, EXTERNAL_DIRECTORY_EVENT, tmp_path,
+                      tmp_roots=("/tmp/kilo/*",))
+
+    assert decision.reply == "reject"
+    assert seen["url"].endswith("/api/chat")
+    assert seen["payload"]["format"] == "json"
+    assert "response_format" not in seen["payload"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# the invariants
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_always_occurs_once_and_only_in_the_module_docstring():
+    """grep -c '"always"' counts one line — the module docstring's."""
+    source = POLICY_FILE.read_text(encoding="utf-8")
+    lines = [line for line in source.splitlines() if '"always"' in line]
+    assert len(lines) == 1
+    assert '"always"' in policy_mod.__doc__
+    assert set(REPLIES) == {"once", "reject"}
+    assert "always" not in REPLIES
+    assert not any(reply == "always" for reply in REPLIES)
+
+
+def test_decision_rejects_an_always_reply():
+    with pytest.raises(ValueError, match="must be one of"):
+        Decision("always", "mechanical", "whitelist /tmp/*")
+
+
+def test_decision_rejects_an_unknown_layer():
+    with pytest.raises(ValueError, match="must be one of"):
+        Decision("reject", "intuition", "seemed safe")
+
+
+def test_decision_reason_is_one_line_and_clamped():
+    long = ("a" * 300).replace("aaaa", "a b", 1)
+    decision = Decision("reject", "gate", "line one\nline two   spaced out   " + long)
+
+    assert "\n" not in decision.reason
+    assert "  " not in decision.reason
+    assert len(decision.reason) <= MAX_REASON_CHARS
+    assert decision.reason.startswith("line one line two spaced")
+
+
+def test_records_are_frozen():
+    with pytest.raises(FrozenInstanceError):
+        PolicyContext(worktree=Path("/tmp")).gate_budget_left = 0
+    with pytest.raises(FrozenInstanceError):
+        Decision("reject", "mechanical", "x").reason = "y"
+
+
+def test_gate_prompt_is_bounded_and_ends_with_the_closing_line():
+    assert len(GATE_SYSTEM_PROMPT.splitlines()) <= 40
+    closing = ("When unsure, reject — a rejection costs the agent one retry; "
+               "an allow can cost the machine.")
+    assert closing in GATE_SYSTEM_PROMPT.replace("\n", " ")
+    assert GATE_SYSTEM_PROMPT.strip().endswith("cost the machine.")
+    for phrase in ("tmp_roots", ".git", "~/.ssh", "curl", "git push",
+                   '{"verdict": "allow" or "reject", "reason": "one line"}'):
+        assert phrase in GATE_SYSTEM_PROMPT
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# the audit trail
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_record_appends_one_line_per_decision(tmp_path):
+    log = tmp_path / "out" / "decisions.jsonl"
+    policy = Policy(make_config(), completion_fn=StubGate(json.dumps(ALLOW)),
+                    clock=FakeClock())
+    worktree = tmp_path.resolve()
+
+    doom = make_event(permission="doom_loop", patterns=[str(worktree / "a")],
+                      pid="per_one")
+    policy.record(decide(policy, doom, worktree), doom, log)
+    policy.record(decide(policy, EXTERNAL_DIRECTORY_EVENT, worktree,
+                         tmp_roots=("/tmp/*",)),
+        EXTERNAL_DIRECTORY_EVENT, log)
+    policy.record(decide(policy, EXTERNAL_DIRECTORY_EVENT, worktree,
+                         tmp_roots=("/tmp/kilo/*",)),
+        EXTERNAL_DIRECTORY_EVENT, log)
+
+    lines = log.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 3
+    entries = [json.loads(line) for line in lines]
+    for entry in entries:
+        assert tuple(entry) == DECISION_KEYS
+
+    first, second, third = entries
+    assert first["sessionID"] == "ses_test01"
+    assert first["permission_id"] == "per_one"
+    assert first["permission"] == "doom_loop"
+    assert first["patterns"] == [str(worktree / "a")]
+    assert first["command"] == ""
+    assert (first["layer"], first["reply"]) == ("mechanical", "reject")
+    assert first["reason"] == "doom loop"
+    assert first["gate_elapsed"] is None
+    assert isinstance(first["t"], float)
+
+    assert second["sessionID"] == EXTERNAL_DIRECTORY_EVENT["properties"]["sessionID"]
+    assert second["permission_id"] == EXTERNAL_DIRECTORY_EVENT["properties"]["id"]
+    assert second["permission"] == "external_directory"
+    assert second["patterns"] == ["/tmp/*"]
+    assert second["command"] == "rm -v /tmp/testfile"
+    assert (second["layer"], second["reply"]) == ("mechanical", "once")
+    assert second["reason"] == "inside worktree/tmp_roots"
+    assert second["gate_elapsed"] is None
+
+    # the gate branch: an elapsed time, and the gate model that answered
+    assert (third["layer"], third["reply"]) == ("gate", "once")
+    assert isinstance(third["gate_elapsed"], float)
+    assert third["gate_elapsed"] == pytest.approx(0.5)
+    assert third["gate_model"] == "policy/gate-model"
+    assert all(entry["gate_model"] == "policy/gate-model" for entry in entries)
+    assert entries[0]["t"] <= entries[2]["t"]
+
+
+def test_record_never_raises_on_a_broken_artifact(tmp_path):
+    policy = Policy(make_config(), clock=FakeClock())
+    decision = Decision("reject", "budget", "gate budget exhausted (0)")
+
+    policy.record(decision, None, tmp_path / "decisions.jsonl")      # bad event
+    policy.record(decision, {}, tmp_path / "decisions.jsonl")         # no properties
+    policy.record(decision, {"properties": []}, tmp_path / "decisions.jsonl")
+    policy.record(None, EXTERNAL_DIRECTORY_EVENT, tmp_path / "decisions.jsonl")
+
+    entries = [json.loads(line)
+               for line in (tmp_path / "decisions.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert len(entries) == 4
+    assert all(tuple(entry) == DECISION_KEYS for entry in entries)
+    assert all(entry["gate_elapsed"] is None for entry in entries)
+    assert all(entry["gate_model"] == "policy/gate-model" for entry in entries)
+    assert [entry["permission_id"] for entry in entries] == [
+        "", "", "", "per_0afb2bf60001KFTnUBoT5JQbJe",
+    ]
+    # the fourth record had no Decision: the line still lands, with no reply
+    assert [entry["reply"] for entry in entries] == ["reject", "reject", "reject", ""]
+    assert [entry["layer"] for entry in entries] == ["budget", "budget", "budget", ""]
+    assert entries[3]["permission"] == "external_directory"
+    assert entries[3]["command"] == "rm -v /tmp/testfile"
+
+    # a path that cannot be opened is logged, not raised
+    policy.record(decision, EXTERNAL_DIRECTORY_EVENT, tmp_path / "decisions.jsonl" / "deeper")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# fail open: decide never raises
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("event,ctx_extra", [
+    ("not a mapping", {}),
+    ({"properties": "no"}, {}),
+    ({"properties": ["a", "b"]}, {}),
+    ({}, {}),
+    (EXTERNAL_DIRECTORY_EVENT, {"gate_budget_left": "soon"}),
+    (EXTERNAL_DIRECTORY_EVENT, {"tmp_roots": "not-a-tuple"}),
+    (EXTERNAL_DIRECTORY_EVENT, {"forbidden": "not-a-tuple"}),
+    (EXTERNAL_DIRECTORY_EVENT, {"recent_tools": "not-a-tuple"}),
+    (EXTERNAL_DIRECTORY_EVENT, {"ticket_files": "not-a-tuple"}),
+])
+def test_decide_never_raises(tmp_path, event, ctx_extra):
+    policy = Policy(make_config(), completion_fn=StubGate(json.dumps(ALLOW)),
+                    clock=FakeClock())
+    decision = policy.decide(event, make_ctx(tmp_path, **ctx_extra))
+
+    assert isinstance(decision, Decision)
+    assert decision.reply in REPLIES
+    assert decision.layer in LAYERS
+    assert len(decision.reason) <= MAX_REASON_CHARS
+
+
+def test_decide_resolves_a_relative_worktree(tmp_path):
+    """A worktree that is not absolute is resolved against the cwd, not fatal."""
+    policy = Policy(make_config(), completion_fn=StubGate(json.dumps(ALLOW)),
+                    clock=FakeClock())
+    ctx = PolicyContext(worktree="relative/and/unresolved",
+                        tmp_roots=("/tmp/kilo/*",))
+
+    decision = policy.decide(EXTERNAL_DIRECTORY_EVENT, ctx)
+
+    assert decision.reply == "once"
+    assert decision.layer == "gate"
+
+
+def test_decide_with_no_config_or_no_event_shape(tmp_path):
+    policy = Policy(None, completion_fn=StubGate(json.dumps(ALLOW)), clock=FakeClock())
+
+    decision = policy.decide(EXTERNAL_DIRECTORY_EVENT, make_ctx(tmp_path))
+
+    assert decision.reply == "reject"
+    assert decision.layer == "gate-failed"
+    assert "no gate model" in decision.reason
+
+    policy = Policy(make_config(), completion_fn=StubGate(json.dumps(ALLOW)),
+                    clock=FakeClock())
+    for bad_ctx in (None, "no", 42, []):
+        decision = policy.decide(EXTERNAL_DIRECTORY_EVENT, bad_ctx)
+        assert decision.reply == "reject"
+        assert decision.layer == "gate-failed"
+
+
+def test_mechanical_layers_do_not_burn_gate_budget(tmp_path):
+    """The budget counts gate calls only — geometry is free."""
+    gate = StubGate(json.dumps(ALLOW))
+    policy = Policy(make_config(deny_commands=("git push*", "rm -v /tmp/*")),
+                    completion_fn=gate, clock=FakeClock())
+    worktree = tmp_path.resolve()
+
+    for event in (
+        make_event(permission="doom_loop", patterns=[str(worktree / "a")]),
+        make_event(patterns=[str(worktree / "b.py")]),
+        BASH_EVENT,
+    ):
+        decision = policy.decide(event, make_ctx(worktree))
+        assert decision.layer == "mechanical"
+    assert gate.calls == []
+
+
+def test_two_mixed_paths_are_not_rescued_by_the_first_one(tmp_path):
+    """One path inside the worktree does not make a mixed event allowed."""
+    worktree = tmp_path.resolve()
+    worktree.mkdir(exist_ok=True)
+    gate = StubGate(json.dumps(ALLOW))
+    policy = Policy(make_config(), completion_fn=gate, clock=FakeClock())
+    event = make_event(patterns=[str(worktree / "ok.py"), "/etc/passwd"])
+
+    decision = decide(policy, event, worktree)
+
+    assert decision.layer == "gate"
+    assert len(gate.calls) == 1
