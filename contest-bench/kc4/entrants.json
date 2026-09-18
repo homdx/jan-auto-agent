@@ -1,0 +1,14 @@
+{
+  "base": "1b34384",
+  "entrants": {
+    "agnes-2-5-flash": {"source": "kc4/kc-4-Agnes-2-5-Flash.patch"},
+    "deepseek-v4-1-flash": {"source": "kc4/kc-4-DeepSeek-V4-1-Flash.patch"},
+    "glm4-7": {"source": "kc4/kc-4-GLM4-7.patch"},
+    "hy3": {"source": "kc4/kc-4-hy3.patch"},
+    "laguna-s-2-1": {"source": "kc4/kc-4-LagunaS-2-1.patch"},
+    "sn67-var1": {"source": "kc4/kc-4-Sensenova-6-7-var1.patch"},
+    "sn68-var1": {"source": "kc4/kc-4-Sensenova-6-8-var1.patch"},
+    "sn68-var2": {"source": "kc4/kc-4-Sensenova-6-8-var2.patch"},
+    "sn68-var3": {"source": "kc4/kc-4-Sensenova-6-8-var3.patch"}
+  }
+}
