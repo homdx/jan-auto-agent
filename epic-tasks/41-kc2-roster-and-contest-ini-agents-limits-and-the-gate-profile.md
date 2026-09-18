@@ -1,6 +1,6 @@
 # KC-2 — `tools/contest/roster.py`: `contest.ini` — the agents, the limits, and the gate model's profile
 
-**Status:** queued — after KC-1 (round 40). Written against `67e834d`.  
+**Status:** open — round 2 of EPIC KC (`docs/kilo-contest/EPIC-KC.md`); KC-1 landed `3edbab1`. Written against `67e834d`.  
 **Severity:** MEDIUM  
 **File:** `tools/contest/roster.py` (new)  
 **Symbol:** `ContestConfig`, `AgentSpec`, `load_roster`, `DEFAULTS`  

@@ -1,6 +1,6 @@
 # KC-1 — `tools/contest/kilo_client.py`: the probe's five primitives as a module, and a fake Kilo server to test against
 
-**Status:** open — round 1 of EPIC KC (`docs/kilo-contest/EPIC-KC.md`). Written against `67e834d`.  
+**Status:** landed — `3edbab1` (ideal patch from a 4-entry contest, `kc1/*.patch`: DeepSeek-Flash-v4-1, LagunaS-2-1, SenSenova6-7-var2, SenSenova6-8 — two more submissions never touched `kilo_client.py` and one failed to apply, both dropped before scoring. Winner SenSenova6-8 taken as-is: own tests, symbol/stdlib/print static checks, and code read on `EventTap.stop()` — the ticket's hardest bullet — found DeepSeek closes the SSE response from the wrong thread (CPython deadlock risk) and LagunaS-2-1 never closes it at all (thread outlives the call, violating "stop() ... closes the response so the thread ends"); only SenSenova6-7-var2 and SenSenova6-8 use a read-side `socket.shutdown()`, and 6-8 also uses `time.monotonic()` for the timeout and keeps `tool_parts()` shaped exactly as spec'd (var2 flattens `state`, off-spec). `tests` + `tests_bugfix` green on `tickets`.)  
 **Severity:** HIGH  
 **File:** `tools/contest/kilo_client.py` (new)  
 **Symbol:** `KiloServer`, `KiloClient`, `EventTap`, `find_kilo_binary`, `SessionRef`  
