@@ -1,6 +1,6 @@
 # KC-5 — `tools/contest/gates.py` + `harvest.py`: the checks the round is scored on become the checks the runner sends back
 
-**Status:** queued — after KC-4 (round 43). Written against `docs/kilo-contest/PROBE.md`.  
+**Status:** open — round 44 of EPIC KC (`docs/kilo-contest/EPIC-KC.md`); KC-4 (round 43) landed. Written against `docs/kilo-contest/PROBE.md`.  
 **Severity:** HIGH  
 **File:** `tools/contest/gates.py` (new), `tools/contest/harvest.py` (new), `scripts/judge_epic_round.py` (becomes a thin wrapper)  
 **Symbol:** `judge_worktree` (moved from `judge_epic_round.judge`), `extract_shrink`, `ticket_for_round`, `harvest`, `Harvest`, `Reason`  
