@@ -326,7 +326,7 @@ def test_invalidate_ignores_non_module_paths():
     module = _module("pkg/a.py", [_symbol("pkg/a.py:a")])
     bridge = CollectBridge(_fresh_model([module]))
 
-    bridge.invalidate(["README.md", "agents.ini", "docs/COLLECT-24-SUMMARY.md",
+    bridge.invalidate(["README.md", "agents.ini", "docs/archive/COLLECT-24-SUMMARY.md",
                        ".agent/plan.json", ".collect/artifact.json"])
     assert bridge.dirty_paths == frozenset()
     assert bridge.context_for("pkg/a.py") != ""

@@ -552,7 +552,7 @@ rows carrying new information ___ / pack     (baseline 0)
 bytes of artifact reachable   ___ %          (baseline 38%)
 ```
 
-Add the same numbers to `docs/COLLECT-24-SUMMARY.md` (or a new
+Add the same numbers to `docs/archive/COLLECT-24-SUMMARY.md` (or a new
 `docs/COLLECT-USE-SUMMARY.md`) so the next round can diff against them.
 
 ### Acceptance

@@ -382,7 +382,7 @@ about the file than it does today, so the cost of believing it grows.
 ## C9 — Docs sync
 
 **Priority:** Low · **Size:** S · **Files:** `README.md`, `Collect.MD`,
-`docs/COLLECT-24-SUMMARY.md`
+`docs/archive/COLLECT-24-SUMMARY.md`
 **Depends on:** all of A, B, C
 
 Last ticket in the epic. Bring every document that describes collect into line

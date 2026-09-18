@@ -100,7 +100,7 @@ def _chapter_num(task: dict) -> int:
 # (code | docs | creative — tools/auto/utils.py normalize_task_mode). Unlike
 # creative mode, docs tasks don't emit a distinguishing structural marker like
 # a chapter number: the architect/gate1/validator prompts differ (see
-# docs/Readme.MD §4 "Task Modes"), but the trace shape is identical to plain
+# docs/archive/Readme.MD §4 "Task Modes"), but the trace shape is identical to plain
 # code tasks (coder → Gate-2, no Gate-3 prose gates). So detection here is a
 # best-effort heuristic based on which files a task actually touched.
 _DOC_EXTENSIONS = (".md", ".mdx", ".rst", ".txt", ".adoc")
@@ -1540,7 +1540,7 @@ def render_applied_tasks(run: dict, mode: str = "code") -> None:
 
     ``mode`` (AUTO-CR-35) only changes the section header and per-task file
     annotation — docs runs share the exact same task shape as code runs, just
-    with prose files instead of source files (see docs/Readme.MD §4).
+    with prose files instead of source files (see docs/archive/Readme.MD §4).
     """
     tasks = run["tasks"]
     done = [
@@ -2054,7 +2054,7 @@ def render_run(
         ``"code"``     — standard code-pipeline layout
         ``"creative"`` — story-progress layout with chapter ordering
         ``"docs"``     — standard code-pipeline layout, relabelled for
-                         documentation runs (AUTO-CR-35; see docs/Readme.MD
+                         documentation runs (AUTO-CR-35; see docs/archive/Readme.MD
                          §4 "Task Modes" — docs runs share the code-mode
                          trace shape, just with different architect/gate1/
                          validator prompts, so no separate renderer is needed)

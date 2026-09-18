@@ -63,8 +63,8 @@ If a future round needs tickets again, regenerate them outside the tree:
 
 ## Background (not part of the loop)
 
-`docs/ARCHITECTURE.md`, `docs/AUTO-P-ARCH-PROBE.md`, `AUTO-P-GROUND.md`,
-`docs/AUTO-H2-CHANGES.md`, `docs/CHANGES-SUMMARY.md`, `docs/COLLECT-24-SUMMARY.md`
+`docs/archive/ARCHITECTURE.md`, `docs/archive/AUTO-P-ARCH-PROBE.md`, `AUTO-P-GROUND.md`,
+`docs/archive/AUTO-H2-CHANGES.md`, `docs/archive/CHANGES-SUMMARY.md`, `docs/archive/COLLECT-24-SUMMARY.md`
 — feature design and change logs for the agent itself. `habr-article.md` and the
 `habr-test*.md` drafts are the published write-up. `bugs-validate.md`,
 `jan-auto-agent-bugs-corrected.md`, `TODO-FIX-pullv3.md`, `FIX-2-ground-file(1).md`
