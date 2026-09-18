@@ -1,0 +1,119 @@
+{
+ "taken_at": "2026-09-17T09:23:30+00:00",
+ "runs": [
+  {
+   "run": "testtext6",
+   "trace": "trace_3d901f545cce.jsonl",
+   "trace_files": 3,
+   "head_sha": "8ae0b05",
+   "pre_run_sha": "e5d46fc",
+   "switched_mid_run": true,
+   "goal": "",
+   "probe_usable": "True",
+   "probe_reason": "ok",
+   "llm_by_source": {
+    "architect": 65,
+    "gate1": 630,
+    "coder": 281,
+    "task_rewriter": 15,
+    "search_agent": 51,
+    "prompt_optimizer": 6
+   },
+   "gate1": {
+    "requests": 630,
+    "confirmed": 63,
+    "rejected": 223,
+    "unparsed": 344,
+    "unknown": 122,
+    "seconds_per_candidate": 19.6,
+    "empty_transport": 0,
+    "empty_exhausted": 0
+   },
+   "gate1_split": {
+    "run_id": "3d901f545cce",
+    "existence": "88",
+    "presence_confirmed": "63",
+    "presence_rejected": "223",
+    "presence_fail_closed": "0",
+    "presence_unknown": "122",
+    "presence_reask": "100",
+    "duplicate": "0",
+    "non_py": "0",
+    "accepted": "185",
+    "rejected": "311"
+   },
+   "gate1_location_ext": {
+    ".py:rejected": 223,
+    ".py:unparsed": 334,
+    ".py:confirmed": 63
+   },
+   "gate2": {
+    "REJECTED": 59
+   },
+   "coder": {
+    "REJECTED": 155,
+    "TRANSPORT": 1
+   },
+   "coder_budget_escalations": 2,
+   "coder_budgets": {
+    "3000": 1,
+    "6000": 1,
+    "12000": 154
+   },
+   "probe": {
+    "ops": 115,
+    "hits": 109,
+    "misses": 4,
+    "memo_hits": 0
+   },
+   "probe_by_op": {
+    "module_hit": 59,
+    "module_miss": 2,
+    "read_hit": 29,
+    "read_miss": 1,
+    "facts_hit": 21,
+    "facts_miss": 1
+   },
+   "collect": {
+    "blocks": 66,
+    "chars": 60298,
+    "memo_hits": 55,
+    "shrink": {
+     "rows": 3
+    },
+    "miss": {
+     "unknown_module": 6
+    },
+    "refresh": {
+     "runs": 1,
+     "ok": 1,
+     "modules": 113,
+     "seconds": 4691.61
+    }
+   },
+   "collect_source": "events",
+   "collect_block_occurrences": 66,
+   "first_ts": "2026-09-16T15:44:03.550327+00:00",
+   "last_ts": "2026-09-17T06:30:36.146520+00:00",
+   "gate1_first_ts": "2026-09-16T17:26:16.112240+00:00",
+   "gate1_last_ts": "2026-09-16T20:52:05.518555+00:00"
+  }
+ ],
+ "totals": {
+  "arch": 65,
+  "g1": 630,
+  "conf": 63,
+  "rej": 223,
+  "unk": 122,
+  "empty_t": 0,
+  "empty_x": 0,
+  "ops": 115,
+  "miss": 4,
+  "blocks": 66,
+  "codesc": 2,
+  "codtransport": 1,
+  "g2rej": 59,
+  "g2err": 0,
+  "g2unavail": 0
+ }
+}

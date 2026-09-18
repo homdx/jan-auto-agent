@@ -15,7 +15,7 @@
 > So C1's stale-tree full rebuild is 469 LLM calls, not 483, and C4's
 > signature work covers 4030 symbols, not 4093. Both conclusions are
 > unchanged — C1's diff-driven path and C4's real signatures are still the
-> whole point. Full table: [`baseline.json`](baseline.json).
+> whole point. Full table: [`baseline.json`](../baseline.json).
 
 ## Problem
 

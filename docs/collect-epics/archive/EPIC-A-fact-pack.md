@@ -16,7 +16,7 @@
 > silently, 24 duplicate `config_read` lines in 11 modules. A1's premise — "the
 > block describes the file the coder already has" — is no longer true as
 > written: V3's `callers`/`calls_into`/`tests` rows are new facts, 2.559 of
-> them per block. Full table: [`baseline.json`](baseline.json).
+> them per block. Full table: [`baseline.json`](../baseline.json).
 
 ## Problem
 

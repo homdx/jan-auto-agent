@@ -61,7 +61,7 @@ The loop and the scorecard: `docs/collect-epics/RUN-THE-EPIC-COMPETITION.md`.
 
 Set from the live runs on `../testtext` / `../testtext6`; the reasoning and
 the measurement after each step are in
-`docs/collect-epics/NEXT-ROUNDS.md`. Rounds are one ticket each, in this
+`docs/collect-epics/archive/NEXT-ROUNDS.md`. Rounds are one ticket each, in this
 sequence; a step is not started until the previous one is merged.
 
 | step | ticket | why here | measure after |

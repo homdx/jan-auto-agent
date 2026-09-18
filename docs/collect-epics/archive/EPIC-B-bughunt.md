@@ -16,7 +16,7 @@
 > carrying a rationale, 4 contracts, 0 methods indexed. The ceiling is
 > unchanged in shape — about 144 of 2646 locations (5.4%) can answer
 > `safe=True` — because none of its three inputs moved. Full table:
-> [`baseline.json`](baseline.json).
+> [`baseline.json`](../baseline.json).
 
 ## Problem
 

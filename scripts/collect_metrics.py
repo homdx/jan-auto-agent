@@ -8,7 +8,7 @@ on stdout, and `--json` for diffing.
     python3 scripts/collect_metrics.py --collect-dir ../jan-to-fix-pull-v2/.collect \\
         --json docs/collect-epics/baseline.json
 
-Tier 0 and Tier 1 of `docs/collect-epics/EPIC-M-metrics.md`, measured from
+Tier 0 and Tier 1 of `docs/collect-epics/archive/EPIC-M-metrics.md`, measured from
 `artifact.json` alone — M1's table, plus M2's three numbers (redundant share
 of block chars, blocks with a new row, mean new rows per block), which are
 EPIC A's claim *"the block describes the file the coder already has"* made

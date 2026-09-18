@@ -75,7 +75,7 @@ python3 scripts/collect_metrics.py --collect-dir ../jan-to-fix-pull-v2/.collect 
 
 Regenerated 2026-09-10 by `scripts/collect_metrics.py --collect-dir .collect`;
 the same numbers, flat and diffable, are committed as
-[`baseline.json`](baseline.json). The ticket as written carried hand-measured
+[`baseline.json`](../baseline.json). The ticket as written carried hand-measured
 values in the block section — taken from a rebuilt 483-module artifact and a
 pack that still had the silent `[:20]` symbol cap. The artifact on disk says
 469, and PLAN-v2 V2.3/V3 has since changed both those lines, so those four
@@ -432,7 +432,7 @@ findings produced               ___          ___
 ## Measured
 
 Fill in as tickets land. The `baseline` column is `scripts/collect_metrics.py`
-output, committed as [`baseline.json`](baseline.json); every later column is
+output, committed as [`baseline.json`](../baseline.json); every later column is
 the same script after the named epic, so a column is a diff, not a
 re-measurement. M1 wrote it on 2026-09-10 against a 469-module artifact; M2
 re-wrote it on 2026-09-11 against the artifact then on disk (497 modules,

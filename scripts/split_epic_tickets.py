@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Split the collect epics into one self-contained ticket per file.
 
-`docs/collect-epics/` holds three multi-ticket documents. The competition
+`docs/collect-epics/archive/` holds three multi-ticket documents. The competition
 machinery (`scripts/next_task.py` / `scripts/append_task.py`) reads a folder of
 `NN-*.md` tickets with `**File:**` / `**Symbol:**` / `**Severity:**` fields —
 the same shape `make_jira_tasks.py` emits. This script produces that folder,
@@ -12,9 +12,9 @@ so an epic round runs on exactly the machinery a fix round already uses.
 
 Sources (heading level differs per file, on purpose — it is what they use):
 
-    docs/collect-epics/EPIC-M-metrics.md       ## M1 — ...
-    docs/collect-epics/PLAN-v2.md              #### V1 — ...
-    docs/collect-epics/EPIC-L-live-findings.md ## L1 — ...
+    docs/collect-epics/archive/EPIC-M-metrics.md       ## M1 — ...
+    docs/collect-epics/archive/PLAN-v2.md              #### V1 — ...
+    docs/collect-epics/archive/EPIC-L-live-findings.md ## L1 — ...
 
 The round order is `ROUND_ORDER` below and it is the point of the script:
 ticket N assumes the merged result of tickets 1..N-1. Editing that list is how
@@ -28,7 +28,7 @@ import re
 import sys
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-EPICS = os.path.join("docs", "collect-epics")
+EPICS = os.path.join("docs", "collect-epics", "archive")
 
 # (path, heading regex). The regex must capture (id, title).
 SOURCES = [
