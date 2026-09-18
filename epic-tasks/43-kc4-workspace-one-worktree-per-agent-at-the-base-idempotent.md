@@ -1,6 +1,6 @@
 # KC-4 — `tools/contest/workspace.py` + `scripts/contest_reset.sh`: one worktree (or clone) per agent at the base commit, again and again
 
-**Status:** queued — after KC-2 (round 41); independent of KC-3. Written against `docs/kilo-contest/PROBE.md`.  
+**Status:** landed `hy3`'s submission (9-entry contest, scored black-box via `contest-bench/kc4/`); two entries (agnes-2-5-flash, glm4-7) crashed on a stale branch left by an externally-removed worktree. Written against `docs/kilo-contest/PROBE.md`.  
 **Severity:** HIGH  
 **File:** `tools/contest/workspace.py` (new)  
 **Symbol:** `Workspace`, `prepare_round`, `reset_worktree`, `attach_clone`, `WorkspaceError`  
