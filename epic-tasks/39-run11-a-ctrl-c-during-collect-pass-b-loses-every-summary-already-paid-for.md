@@ -1,6 +1,6 @@
 # RUN-11 — A Ctrl-C during the collect Pass B loses every summary already paid for
 
-**Status:** queued — opens after the RUN-9 live verification (`../prep-run9/BASELINE.md`, runs of 2026-09-17), next to [38-run10-the-http-retry-budget-of-every-auto-mode-call-is-hard-wired.md](38-run10-the-http-retry-budget-of-every-auto-mode-call-is-hard-wired.md). Not a contest: size S, one design, landed by hand in one commit.  
+**Status:** landed — `e84240b` (by hand, no contest; Pass B checkpoints every landed summary to `<dir>/collect_summarize_state.json`, resumed by the next `--collect --refresh` / `--auto` start; the entry line bills the true rebuild — `collector_version` change = full rebuild, `collect_refresh` carries `reason: "version" | "sha"`; tests in `tests/test_collect_summarizer.py`, `tests/test_collect_cli.py`, `tests/test_collect_bridge_stale_entry.py`).
 **Severity:** MEDIUM  
 **File:** `tools/collect/cli.py`  
 **Symbol:** the two batch calls of `summarize_repo` — `build_context` ≈ 392 (the full build: first run, `--rebuild`, a `collector_version` mismatch) and `action_refresh` ≈ 991 (the incremental batch) — and `tools/auto/collect_bridge._refresh_on_entry` ≈ 267–340 (the stdout line and the `collect_refresh` trace event)  

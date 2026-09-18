@@ -1,6 +1,6 @@
 # RUN-10 — The HTTP retry budget of every auto-mode LLM call is hard-wired
 
-**Status:** queued — opens after the RUN-9 live verification (`../prep-run9/BASELINE.md`, runs of 2026-09-17). Not a contest: size S, one design, landed by hand in one commit.  
+**Status:** landed — `13314e2` (by hand, no contest; `[loop] error_retries / error_retry_wait_sec / max_retry_after_sec` read once by `tools.llm_stream.retry_kwargs_from_config()` for every auto-mode call, resolved numbers logged at run start; 786-line `tests/test_llm_stream_retry_budget.py`; keys added to `agents.ini` and `agents_128k.ini`).
 **Severity:** MEDIUM  
 **File:** `tools/llm_stream.py`  
 **Symbol:** `request_completion` — the signature defaults `error_retries=60, error_retry_wait_sec=10.0, max_retry_after_sec=180.0` (≈ 1136) and the eight `tools/auto` call sites that inherit them: `architect.py` ≈ 1402 / 2753, `gate1_filter.py` ≈ 1702 (`_check_presence._call`), `coder.py` ≈ 633 / 696, `inner_loop.py` ≈ 754 (`_call_validator`), `story_bible.py` ≈ 968, `summary_memory.py` ≈ 853  

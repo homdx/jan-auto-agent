@@ -42,9 +42,9 @@ The loop and the scorecard: `docs/collect-epics/RUN-THE-EPIC-COMPETITION.md`.
 | 34 | `RUN-6` | landed `7135844` | HIGH | S | [34-run6-a-stale-artifact-at-session-start-switches-the-pack-off-for-the-whole-session.md](34-run6-a-stale-artifact-at-session-start-switches-the-pack-off-for-the-whole-session.md) | `tools/auto/collect_bridge.py` |
 | 35 | `RUN-7` | landed (the commit after `acbfd61`) | HIGH | S | [35-run7-validator-unavailable-is-not-a-rejection.md](35-run7-validator-unavailable-is-not-a-rejection.md) | `tools/auto/inner_loop.py` |
 | 36 | `RUN-8` | landed (the commit after `97983d8`) | HIGH | S | [36-run8-a-transport-failure-mid-stream-is-charged-to-the-coder.md](36-run8-a-transport-failure-mid-stream-is-charged-to-the-coder.md) | `tools/auto/coder.py` |
-| 37 | `RUN-9` | **landed** (`4ee7a28`) | HIGH | M | [37-run9-an-empty-presence-reply-is-not-a-garbled-verdict.md](37-run9-an-empty-presence-reply-is-not-a-garbled-verdict.md) | `tools/auto/gate1_filter.py` |
-| 38 | `RUN-10` | queued — after the RUN-9 live verification; no contest, by hand | MEDIUM | S | [38-run10-the-http-retry-budget-of-every-auto-mode-call-is-hard-wired.md](38-run10-the-http-retry-budget-of-every-auto-mode-call-is-hard-wired.md) | `tools/llm_stream.py` |
-| 39 | `RUN-11` | queued — after the RUN-9 live verification; no contest, by hand | MEDIUM | S | [39-run11-a-ctrl-c-during-collect-pass-b-loses-every-summary-already-paid-for.md](39-run11-a-ctrl-c-during-collect-pass-b-loses-every-summary-already-paid-for.md) | `tools/collect/cli.py` |
+| 37 | `RUN-9` | landed `4ee7a28`, live-verified 2026-09-18 (unknown 164→2 / 122→1) | HIGH | M | [37-run9-an-empty-presence-reply-is-not-a-garbled-verdict.md](37-run9-an-empty-presence-reply-is-not-a-garbled-verdict.md) | `tools/auto/gate1_filter.py` |
+| 38 | `RUN-10` | landed `13314e2` | MEDIUM | S | [38-run10-the-http-retry-budget-of-every-auto-mode-call-is-hard-wired.md](38-run10-the-http-retry-budget-of-every-auto-mode-call-is-hard-wired.md) | `tools/llm_stream.py` |
+| 39 | `RUN-11` | landed `e84240b` | MEDIUM | S | [39-run11-a-ctrl-c-during-collect-pass-b-loses-every-summary-already-paid-for.md](39-run11-a-ctrl-c-during-collect-pass-b-loses-every-summary-already-paid-for.md) | `tools/collect/cli.py` |
 | 40 | `KC-1` | open — EPIC KC (`docs/kilo-contest/EPIC-KC.md`) | HIGH | M | [40-kc1-kilo-client-and-the-fake-server-built-from-the-probe.md](40-kc1-kilo-client-and-the-fake-server-built-from-the-probe.md) | `tools/contest/kilo_client.py` |
 | 41 | `KC-2` | queued — after KC-1 | MEDIUM | S | [41-kc2-roster-and-contest-ini-agents-limits-and-the-gate-profile.md](41-kc2-roster-and-contest-ini-agents-limits-and-the-gate-profile.md) | `tools/contest/roster.py` |
 | 42 | `KC-3` | queued — after KC-2 | CRITICAL | M | [42-kc3-policy-three-layers-and-a-second-model-decides-what-the-rules-cannot.md](42-kc3-policy-three-layers-and-a-second-model-decides-what-the-rules-cannot.md) | `tools/contest/policy.py` |
@@ -72,6 +72,9 @@ sequence; a step is not started until the previous one is merged.
 | 4 | `RUN-5` | *landed* — 25–35 % of candidates dropped by provider silence; plan size is a coin flip until fixed | `unparsed` → `unknown` column, plan size |
 | 5 | `RUN-7` | *landed* — live `../testtext2` (`baa9da87a2ab`): a validator outage (ollama.com 429) was recorded as 5 rejections, the task went BLOCKED unreviewed | `validator_status = unavailable` rows, tasks left `todo` instead of BLOCKED |
 | 6 | `RUN-8` | *landed* — same run: one 80-min hung coder stream = one burned attempt + the whole task budget → BLOCKED after one round | `cod transport` column, deadline credited |
+| 8 | `RUN-9` | *landed* `4ee7a28`, live-verified 2026-09-18 (`../prep-run9/BASELINE.md`): presence UNKNOWN 164→2 (testtext), 122→1 (testtext6); every empty reply re-asked; gate-1 wall +20–25 % | `unk` column, `empty t/x`, `presence_reask` |
+| 9 | `RUN-10` | *landed* `13314e2` — one HTTP retry budget for every auto-mode call, from `[loop]` | resolved numbers in the run-start line |
+| 10 | `RUN-11` | *landed* `e84240b` — Pass B checkpoints every landed summary; Ctrl-C costs one module | `collect_summarize_state.json` after an interrupted refresh |
 | 7 | `L1` | *landed* `ff22c04` — deterministic: 82 / 30 gate-1 calls on non-`.py` locations | non-`.py` gate-1 rows → 0 |
 | 8 | `M3` | measurement only; decides whether V12/V13 exist | ceiling number in `EPIC-M-metrics.md` |
 | 9 | `V4`, `V10` | supply rows — worth it only once step 1 puts the pack in front of the coder | M2 static numbers, block sizes |
