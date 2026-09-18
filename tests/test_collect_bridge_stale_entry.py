@@ -99,6 +99,27 @@ def _count_refresh(monkeypatch):
     return calls
 
 
+def _write_version1_manifest(mini_repo: Path) -> None:
+    """Rewrite the manifest as if it had been built before V10: the live
+    clones all carried version "1" while the code was on "2", which is what
+    made every `--auto` start take the full-build fallback."""
+    import json as _json
+
+    from tools.collect import manifest as manifest_mod
+
+    path = cli_mod.resolve_collect_dir(mini_repo, None) / cli_mod.MANIFEST_FILENAME
+    payload = _json.loads(path.read_text(encoding="utf-8"))
+    assert payload["collector_version"] != "1"
+    payload["collector_version"] = "1"
+    manifest_mod.write_manifest(manifest_mod.Manifest.from_dict(payload), path)
+
+
+def _n_modules(mini_repo: Path) -> int:
+    from tools.collect.scanner import scan_repo
+
+    return len(scan_repo(mini_repo))
+
+
 # ── 1. auto_refresh=true → refresh once, reload, usable ────────────────
 
 
@@ -308,4 +329,118 @@ def test_no_event_without_the_flag(mini_repo, monkeypatch):
 
     _bridge(mini_repo, config_path)
 
+    assert [e for e in events if e.get("kind") == "collect_refresh"] == []
+
+
+# ── RUN-11: the line and the event say what Pass B is about to do ───────────
+#
+# The count was the hash diff, which understates the bill three orders of
+# magnitude on a collector_version bump: the live run read "refreshing 1
+# module(s)" while Pass B was about to work over 543 modules, and
+# collect_refresh.modules recorded the same 1.
+
+
+def test_entry_refresh_reports_a_version_bump_as_a_full_rebuild(mini_repo, monkeypatch, capsys):
+    cli_mod.action_collect(mini_repo)
+    _write_version1_manifest(mini_repo)
+    config_path = _write_ini(mini_repo, auto_refresh_between_tasks="true")
+    events = _capture_events(monkeypatch)
+
+    bridge = _bridge(mini_repo, config_path)
+
+    assert bridge is not None and bridge.usable is True
+
+    n = _n_modules(mini_repo)
+    out = capsys.readouterr().out
+    # The reason is named, and the count is the number Pass B is asked for.
+    assert f"collector_version '1' → '2') — full rebuild, {n} module(s)" in out
+    assert "refreshing" not in out
+
+    refresh = [e for e in events if e.get("kind") == "collect_refresh"]
+    assert len(refresh) == 1
+    params = refresh[0]["params"]
+    assert params["modules"] == n
+    assert params["reason"] == "version"
+    assert params["ok"] is True
+
+
+def test_entry_refresh_reports_the_hash_diff_reason_when_the_version_matches(mini_repo, monkeypatch, capsys):
+    cli_mod.action_collect(mini_repo)
+    config_path = _write_ini(mini_repo, auto_refresh_between_tasks="true")
+    # All three modules of this repo move: the count is the diff.
+    (mini_repo / "pkg" / "__init__.py").write_text("# regenerated\n")
+    _make_stale(mini_repo)
+    (mini_repo / "pkg" / "b.py").write_text("def b():\n    return 3\n")
+    events = _capture_events(monkeypatch)
+
+    bridge = _bridge(mini_repo, config_path)
+
+    assert bridge is not None and bridge.usable is True
+
+    out = capsys.readouterr().out
+    assert "refreshing 3 module(s)" in out
+    assert "collector_version" not in out
+
+    refresh = [e for e in events if e.get("kind") == "collect_refresh"]
+    assert len(refresh) == 1
+    params = refresh[0]["params"]
+    assert params["modules"] == 3
+    assert params["reason"] == "sha"
+    assert params["ok"] is True
+
+
+def test_entry_refresh_no_count_when_the_pre_flight_fails(mini_repo, monkeypatch, capsys):
+    """Fail-open: the version check must not turn a failed pre-flight into
+    anything other than what it always was — "?" on the line, no reason in
+    the event, and the refresh still runs. Only the bridge's own lazy
+    `scan_repo` import is patched: `cli_mod.scan_repo` is bound at import,
+    so `action_refresh` rescans for itself and the refresh completes."""
+    cli_mod.action_collect(mini_repo)
+    config_path = _write_ini(mini_repo, auto_refresh_between_tasks="true")
+    _make_stale(mini_repo)
+    events = _capture_events(monkeypatch)
+    monkeypatch.setattr(
+        "tools.collect.scanner.scan_repo",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("walk failed")),
+    )
+
+    bridge = _bridge(mini_repo, config_path)
+
+    assert bridge is not None and bridge.usable is True
+    out = capsys.readouterr().out
+    assert "collect: artifact stale" in out
+    assert "refreshing ? module(s)" in out
+    assert "collector_version" not in out
+    assert "pack OFF" not in out
+
+    refresh = [e for e in events if e.get("kind") == "collect_refresh"]
+    assert len(refresh) == 1
+    assert refresh[0]["params"]["modules"] is None
+    assert refresh[0]["params"]["reason"] is None
+    assert refresh[0]["params"]["ok"] is True
+
+
+# ── RUN-11: Ctrl-C is the cheap way out ─────────────────────────────────────
+
+
+def test_keyboard_interrupt_from_action_refresh_propagates(mini_repo, monkeypatch, capsys):
+    """Ctrl-C is not a failure of the collect pack: it is the operator
+    leaving. It must not read as one — no "pack OFF" line, no
+    `collect_refresh` event (the run is gone, there is nothing to report)."""
+    cli_mod.action_collect(mini_repo)
+    config_path = _write_ini(mini_repo, auto_refresh_between_tasks="true")
+    _make_stale(mini_repo)
+    events = _capture_events(monkeypatch)
+
+    def _interrupt(*args, **kwargs):
+        raise KeyboardInterrupt("the operator hit Ctrl-C")
+
+    monkeypatch.setattr("tools.collect.cli.action_refresh", _interrupt)
+
+    with pytest.raises(KeyboardInterrupt):
+        _bridge(mini_repo, config_path)
+
+    out = capsys.readouterr().out
+    assert "collect: artifact stale" in out  # the entry line was printed
+    assert "pack OFF" not in out
     assert [e for e in events if e.get("kind") == "collect_refresh"] == []

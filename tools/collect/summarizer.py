@@ -265,6 +265,56 @@ def summarize_module(
 # ── batch Pass B: retry / resume over a whole repo ───────────────────────────────
 
 
+def _load_collect_checkpoint(checkpoint_path: Path, hashes: Optional[Dict[str, str]]):
+    """`(entries, read, kept, dropped)` for a saved Pass B batch.
+
+    RUN-11: a saved entry is reused only if it describes the source the
+    next run is about to summarize. With `hashes` (the caller's own
+    `{path: sha256}` map for this same tree) an entry is kept only when
+    `entry["sha"]` still matches the current hash — a summary of a file
+    that moved between the interrupted run and this one is re-summarized,
+    not reused. Without `hashes` every entry is kept, the EPIC E contract.
+
+    `read` is True only when the file was there and carried this loop's
+    own state — a corrupt or foreign file (`load_state` -> None, a
+    different `loop`, a non-dict `modules`) is "no checkpoint at all", so
+    the caller does not report a resume it did not have. Everything here
+    degrades to "nothing to resume"; nothing raises.
+    """
+    from tools.backoff import load_state
+
+    state = load_state(checkpoint_path)
+    if not isinstance(state, dict) or state.get("loop") != "collect_summarize":
+        return {}, False, 0, 0
+    raw = state.get("modules")
+    if not isinstance(raw, dict):
+        raw = {}
+    if not isinstance(hashes, dict):
+        hashes = None
+    entries: Dict[str, dict] = {}
+    kept = dropped = 0
+    for path, entry in raw.items():
+        key = str(path)
+        if not isinstance(entry, dict):
+            dropped += 1
+            continue
+        # `entry.get("sha")` is None for a pre-RUN-11 entry that never
+        # tagged one; `hashes.get(key)` is None only for a path no longer
+        # in the tree. Either way None != <real hash> lands the entry here
+        # and it gets re-summarized — the safe direction when the source a
+        # cached summary was grounded in cannot be verified.
+        if hashes is not None and entry.get("sha") != hashes.get(key):
+            dropped += 1
+            continue
+        entries[key] = entry
+        kept += 1
+    # `raw` empty (a hand-made file, or one whose entries were all rejected)
+    # is "no checkpoint" for the callback: there is nothing to report, and
+    # a "resumes: 0 module(s) kept" line would be pure noise at the top of
+    # the progress stream. Entries recorded is the test, not entries kept.
+    return entries, bool(raw), kept, dropped
+
+
 def summarize_repo(
     modules: Iterable[ModuleRecord],
     sources: Dict[str, str],
@@ -277,6 +327,8 @@ def summarize_repo(
     on_error: Optional[Callable[[str, Exception, int], None]] = None,
     checkpoint_path: Optional[Path] = None,
     progress_fn: Optional[Callable[[int, int, str], None]] = None,
+    hashes: Optional[Dict[str, str]] = None,
+    on_resume: Optional[Callable[[int, int], None]] = None,
 ) -> List[ModuleRecord]:
     """Run Pass B over every module, in order.
 
@@ -291,7 +343,18 @@ def summarize_repo(
         persisted immediately (`tools.backoff.save_state`); a run that
         restarts with the same `checkpoint_path` picks up already-summarized
         modules from the checkpoint instead of re-calling the LLM for them,
-        and the checkpoint is cleared once the whole batch completes.
+        and the checkpoint is cleared once the whole batch completes. That
+        is what makes a Ctrl-C mid-batch cost the one in-flight module
+        instead of the whole batch — nothing is written to `.collect/` until
+        Pass C and every builder are done, so an interrupted batch otherwise
+        leaves nothing behind.
+      * With `hashes` (a `{path: sha256}` map for the tree being summarized)
+        each saved entry carries its own `sha`, and a resume only reuses an
+        entry whose `sha` still matches the current hash — see
+        `_load_collect_checkpoint`. `on_resume(kept, dropped)` is called once,
+        before the loop, when a checkpoint was read: `kept` entries attached
+        without an LLM call, `dropped` rejected by the sha check. It is not
+        called when there was no checkpoint to read.
 
     `sleep_fn` defaults to `time.sleep` but is injectable so tests can run
     the retry path without actually waiting.
@@ -301,13 +364,19 @@ def summarize_repo(
     or parse-error modules don't count toward the total, since nothing is
     sent for them). Pass a no-op lambda to silence progress reporting.
     """
-    from tools.backoff import retry_with_backoff, clear_state, load_state, save_state
+    from tools.backoff import retry_with_backoff, clear_state, save_state
 
     done: Dict[str, dict] = {}
     if checkpoint_path is not None:
-        state = load_state(checkpoint_path)
-        if state and state.get("loop") == "collect_summarize":
-            done = dict(state.get("modules", {}))
+        done, read_checkpoint, kept, dropped = _load_collect_checkpoint(checkpoint_path, hashes)
+        if read_checkpoint and on_resume is not None:
+            try:
+                on_resume(kept, dropped)
+            except Exception as exc:  # noqa: BLE001 — a resume notice must not kill the batch
+                logger.warning("collect summarizer: on_resume callback failed (%s)", exc)
+    # Kept as a dict-or-None the same way the loader normalizes it, so the
+    # entry's `sha` and the resume-time sha check read the same map.
+    save_hashes = hashes if isinstance(hashes, dict) else None
 
     # Modules that will actually need an LLM call (used for progress totals).
     # AUTO-FIX: `modules` is only required to be an iterable but is
@@ -363,10 +432,16 @@ def summarize_repo(
         if progress_fn is not None:
             progress_fn(sent, total, module.path)
         if checkpoint_path is not None and result.summary is not None:
-            done[result.path] = {
+            entry = {
                 "purpose": result.summary.purpose,
                 "notes": result.summary.notes,
             }
+            if save_hashes is not None:
+                # `.get` rather than `[]`: a path hash_tree could not read
+                # (deleted or unreadable between the scan and this point) is
+                # absent from the map, and the entry still lands.
+                entry["sha"] = save_hashes.get(result.path)
+            done[result.path] = entry
             save_state({"loop": "collect_summarize", "modules": done}, checkpoint_path)
 
     if checkpoint_path is not None:

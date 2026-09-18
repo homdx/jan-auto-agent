@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import configparser
 import hashlib
+import json
 import subprocess
 from pathlib import Path
 
@@ -22,10 +23,12 @@ from tools.collect import cli as cli_mod
 from tools.collect.cli import (
     ARTIFACT_FILENAME,
     MANIFEST_FILENAME,
+    SUMMARIZE_CHECKPOINT_FILENAME,
     CollectCliError,
     action_check,
     action_collect,
     action_module,
+    action_rebuild,
     action_refresh,
     parse_collect_args,
     resolve_collect_dir,
@@ -369,3 +372,203 @@ def test_parse_collect_args_module():
 def test_parse_collect_args_module_missing_path_raises():
     with pytest.raises(CollectCliError):
         parse_collect_args(["--module"])
+
+
+# ── RUN-11: a Ctrl-C mid-Pass B costs one module ─────────────────────────────
+#
+# Nothing touches `.collect/` until Pass C, the registries, the test map and
+# the risk index have run, so an interrupt anywhere in a six-hour batch used
+# to leave `.collect/` exactly as it was — the next `--collect` or `--auto`
+# start took the same decision and paid for the same summaries again. The
+# two batch calls now checkpoint every landed summary into
+# `<collect dir>/collect_summarize_state.json`.
+
+
+def _interrupting_llm(after: int):
+    """An LLM that lands `after` modules and then behaves like a Ctrl-C."""
+    calls = {"n": 0}
+
+    def _call(system, user):
+        calls["n"] += 1
+        if calls["n"] > after:
+            raise KeyboardInterrupt("operator gave up on the 429 storm")
+        return json.dumps({"purpose": "landed purpose", "notes": ""})
+
+    return _call, calls
+
+
+def _counting_llm():
+    calls = {"n": 0}
+
+    def _call(system, user):
+        calls["n"] += 1
+        return json.dumps({"purpose": "counted purpose", "notes": ""})
+
+    return _call, calls
+
+
+def test_collect_keyboard_interrupt_keeps_the_landed_summaries(mini_repo):
+    llm, calls = _interrupting_llm(after=2)
+
+    with pytest.raises(KeyboardInterrupt):
+        action_collect(mini_repo, llm_call=llm)
+
+    collect_dir = resolve_collect_dir(mini_repo, None)
+    checkpoint = collect_dir / SUMMARIZE_CHECKPOINT_FILENAME
+    assert checkpoint.exists()
+    state = json.loads(checkpoint.read_text(encoding="utf-8"))
+    assert state["loop"] == "collect_summarize"
+    # Three modules in this repo, interrupted on the third call: two landed.
+    assert calls["n"] == 3
+    assert len(state["modules"]) == 2
+    for entry in state["modules"].values():
+        # Each entry is tied to the source it was summarized from.
+        assert set(entry) == {"purpose", "notes", "sha"}
+        assert entry["sha"]
+        assert entry["purpose"] == "landed purpose"
+    # Nothing else was written: the interrupted run left no artifact.
+    assert not (collect_dir / ARTIFACT_FILENAME).exists()
+    assert not (collect_dir / MANIFEST_FILENAME).exists()
+
+
+def test_collect_resumes_the_interrupted_batch_and_writes_every_summary(mini_repo, capsys):
+    with pytest.raises(KeyboardInterrupt):
+        action_collect(mini_repo, llm_call=_interrupting_llm(after=2)[0])
+
+    collect_dir = resolve_collect_dir(mini_repo, None)
+    checkpoint = collect_dir / SUMMARIZE_CHECKPOINT_FILENAME
+    assert checkpoint.exists()
+
+    llm, calls = _counting_llm()
+    result = action_collect(mini_repo, llm_call=llm)
+
+    assert result.wrote is True
+    # Only what was still owed was asked for: 3 modules, 2 already paid for.
+    assert calls["n"] == 3 - 2
+    artifact = json.loads((collect_dir / ARTIFACT_FILENAME).read_text(encoding="utf-8"))
+    assert len(artifact["modules"]) == 3
+    assert all(m["summary"] is not None for m in artifact["modules"])
+    assert {m["summary"]["purpose"] for m in artifact["modules"]} == {
+        "landed purpose", "counted purpose",
+    }
+    # The batch completed, so the checkpoint is gone.
+    assert not checkpoint.exists()
+
+    resume_lines = [ln for ln in capsys.readouterr().out.splitlines() if "Pass B resumes" in ln]
+    assert len(resume_lines) == 1
+    assert resume_lines[0] == (
+        "[collect] Pass B resumes: 2 module(s) kept from the interrupted run, "
+        "0 re-summarised (source changed)"
+    )
+
+
+@pytest.fixture
+def mini_repo_six(tmp_path: Path) -> Path:
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    for i in range(1, 6):
+        (pkg / f"m{i}.py").write_text(f"def m{i}():\n    return {i}\n")
+    (tmp_path / ".gitignore").write_text(".collect/\n")
+    _init_repo(tmp_path)
+    return tmp_path
+
+
+def test_refresh_resumes_the_interrupted_incremental_batch(mini_repo_six, capsys):
+    """Same round-trip through `action_refresh`'s incremental batch — the
+    path a `collector_version`-bump fallback takes, and the one a 429 storm
+    kills: 5 files changed, interrupted after 2 landed."""
+    action_collect(mini_repo_six)  # artifact + manifest, Pass B off
+    for i in range(1, 6):
+        (mini_repo_six / "pkg" / f"m{i}.py").write_text(f"def m{i}():\n    return {i * 100}\n")
+
+    llm1, calls1 = _interrupting_llm(after=2)
+    with pytest.raises(KeyboardInterrupt):
+        action_refresh(mini_repo_six, llm_call=llm1)
+
+    collect_dir = resolve_collect_dir(mini_repo_six, None)
+    checkpoint = collect_dir / SUMMARIZE_CHECKPOINT_FILENAME
+    assert calls1["n"] == 3
+    state = json.loads(checkpoint.read_text(encoding="utf-8"))
+    assert state["loop"] == "collect_summarize"
+    assert set(state["modules"]) == {"pkg/m1.py", "pkg/m2.py"}
+    for entry in state["modules"].values():
+        assert set(entry) == {"purpose", "notes", "sha"}
+        assert entry["sha"]
+    # The interrupted run wrote nothing else: the previous artifact stands,
+    # with every summary still null (Pass B never ran in run 1).
+    before = json.loads((collect_dir / ARTIFACT_FILENAME).read_text(encoding="utf-8"))
+    assert len(before["modules"]) == 6
+    assert all(m["summary"] is None for m in before["modules"])
+
+    llm2, calls2 = _counting_llm()
+    result = action_refresh(mini_repo_six, llm_call=llm2)
+
+    assert result.wrote is True
+    assert calls2["n"] == 5 - 2
+    artifact = json.loads((collect_dir / ARTIFACT_FILENAME).read_text(encoding="utf-8"))
+    assert len(artifact["modules"]) == 6
+    summarized = [m for m in artifact["modules"] if m["summary"] is not None]
+    assert len(summarized) == 5
+    assert {m["path"] for m in summarized} == {f"pkg/m{i}.py" for i in range(1, 6)}
+    assert not checkpoint.exists()
+    assert capsys.readouterr().out.count("Pass B resumes: 2 module(s) kept") == 1
+
+
+def test_module_creates_no_checkpoint(mini_repo):
+    """A one-module batch has nothing to resume, so it must not create the
+    file — and must not touch the one an interrupted full build left."""
+    action_collect(mini_repo)
+    (mini_repo / "pkg" / "a.py").write_text("def a():\n    return 42\n")
+
+    result = action_module(mini_repo, "pkg/a.py", llm_call=_counting_llm()[0])
+
+    assert result.wrote is True
+    assert not (resolve_collect_dir(mini_repo, None) / SUMMARIZE_CHECKPOINT_FILENAME).exists()
+
+
+def test_module_leaves_an_interrupted_full_builds_checkpoint_untouched(mini_repo):
+    """`summarize_repo` clears its checkpoint when a batch completes; a
+    `--module` run without a checkpoint path must not delete the file an
+    interrupted full build is waiting on."""
+    action_collect(mini_repo)
+
+    with pytest.raises(KeyboardInterrupt):
+        action_rebuild(mini_repo, llm_call=_interrupting_llm(after=1)[0])
+
+    checkpoint = resolve_collect_dir(mini_repo, None) / SUMMARIZE_CHECKPOINT_FILENAME
+    assert checkpoint.exists()
+    before = checkpoint.read_bytes()
+
+    (mini_repo / "pkg" / "a.py").write_text("def a():\n    return 42\n")
+    result = action_module(mini_repo, "pkg/a.py", llm_call=_counting_llm()[0])
+
+    assert result.wrote is True
+    assert checkpoint.read_bytes() == before
+
+
+def test_checkpointed_entries_are_not_reused_after_the_source_moves(mini_repo, capsys):
+    """The entry's `sha` is what ties it to its source: a file that changed
+    between the interrupted run and this one is re-summarized, not reused,
+    and the resume line says how many."""
+    with pytest.raises(KeyboardInterrupt):
+        action_collect(mini_repo, llm_call=_interrupting_llm(after=1)[0])
+
+    collect_dir = resolve_collect_dir(mini_repo, None)
+    checkpoint = collect_dir / SUMMARIZE_CHECKPOINT_FILENAME
+
+    # Move the one file the interrupted run had already paid for.
+    (mini_repo / "pkg" / "__init__.py").write_text("# regenerated\n")
+
+    llm, calls = _counting_llm()
+    result = action_collect(mini_repo, llm_call=llm)
+
+    assert result.wrote is True
+    assert calls["n"] == 3  # nothing from the checkpoint was reusable
+    artifact = json.loads((collect_dir / ARTIFACT_FILENAME).read_text(encoding="utf-8"))
+    assert all(m["summary"] is not None for m in artifact["modules"])
+    assert not checkpoint.exists()
+    out = capsys.readouterr().out
+    resume_lines = [ln for ln in out.splitlines() if "Pass B resumes" in ln]
+    assert len(resume_lines) == 1
+    assert "1 re-summarised (source changed)" in resume_lines[0]

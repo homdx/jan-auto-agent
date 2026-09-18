@@ -430,6 +430,293 @@ def test_summarize_repo_checkpoint_skips_already_done_modules_on_resume(tmp_path
     assert out[0].summary.purpose == "cached"
 
 
+# ── RUN-11: a Ctrl-C mid-Pass B costs one module, and a resume is honest ────
+#
+# summarize_repo already checkpointed every landed summary (EPIC E) but no
+# production caller passed checkpoint_path, so an interrupted full build
+# wrote nothing. These tests pin the half that lives here: an entry is tied
+# to the source it was summarized from (sha), a resume says what it kept
+# and what it re-derived, and a broken checkpoint degrades instead of
+# raising.
+
+
+def _two_modules():
+    return [_module(), ModuleRecord(path="pkg/other.py")]
+
+
+def _two_sources():
+    return {"pkg/error_handling.py": _source(), "pkg/other.py": ""}
+
+
+def _interrupting_llm(after: int):
+    """An LLM that lands `after` modules and then behaves like a Ctrl-C."""
+    calls = {"n": 0}
+
+    def _call(system, user):
+        calls["n"] += 1
+        if calls["n"] > after:
+            raise KeyboardInterrupt("operator gave up on the 429 storm")
+        return json.dumps({"purpose": f"landed {calls['n']}", "notes": "n"})
+
+    return _call, calls
+
+
+def test_summarize_repo_checkpoint_entry_carries_the_sha_it_was_summarised_from(tmp_path):
+    checkpoint = tmp_path / "collect_summarize_state.json"
+    hashes = {"pkg/error_handling.py": "sha-a", "pkg/other.py": "sha-b"}
+    llm, calls = _interrupting_llm(after=1)
+
+    with pytest.raises(KeyboardInterrupt):
+        summarize_repo(
+            _two_modules(), _two_sources(), llm, sleep_fn=lambda s: None,
+            checkpoint_path=checkpoint, hashes=hashes, progress_fn=lambda *a: None,
+        )
+
+    state = json.loads(checkpoint.read_text(encoding="utf-8"))
+    assert state["loop"] == "collect_summarize"
+    assert calls["n"] == 2  # the interrupt landed after the second call started
+    assert state["modules"] == {
+        "pkg/error_handling.py": {"purpose": "landed 1", "notes": "n", "sha": "sha-a"},
+    }
+
+
+def test_summarize_repo_checkpoint_entry_has_no_sha_without_hashes(tmp_path):
+    """`hashes=None` keeps the EPIC E shape — no `sha` key at all, so a
+    caller that does not have a hash map does not get a bogus entry field."""
+    checkpoint = tmp_path / "collect_summarize_state.json"
+    llm, _ = _interrupting_llm(after=1)
+
+    with pytest.raises(KeyboardInterrupt):
+        summarize_repo(
+            _two_modules(), _two_sources(), llm, sleep_fn=lambda s: None,
+            checkpoint_path=checkpoint, progress_fn=lambda *a: None,
+        )
+
+    state = json.loads(checkpoint.read_text(encoding="utf-8"))
+    assert "sha" not in state["modules"]["pkg/error_handling.py"]
+
+
+def test_summarize_repo_resume_reuses_matching_sha_and_re_summarises_a_changed_one(tmp_path):
+    from tools.backoff import save_state
+
+    checkpoint = tmp_path / "collect_summarize_state.json"
+    save_state(
+        {
+            "loop": "collect_summarize",
+            "modules": {
+                # Same file, same summary — reusable without an LLM call.
+                "pkg/error_handling.py": {"purpose": "cached", "notes": "n", "sha": "same"},
+                # Moved since the interrupted run — must be re-derived.
+                "pkg/other.py": {"purpose": "stale cached", "notes": "n", "sha": "old"},
+            },
+        },
+        checkpoint,
+    )
+    hashes = {"pkg/error_handling.py": "same", "pkg/other.py": "new"}
+    calls = {"n": 0}
+    totals = []
+
+    def stub_llm(system, user):
+        calls["n"] += 1
+        return json.dumps({"purpose": "re-derived", "notes": ""})
+
+    out = summarize_repo(
+        _two_modules(), _two_sources(), stub_llm, sleep_fn=lambda s: None,
+        checkpoint_path=checkpoint, hashes=hashes,
+        progress_fn=lambda done, total, path: totals.append((done, total, path)),
+    )
+
+    assert out[0].summary.purpose == "cached"
+    assert out[1].summary.purpose == "re-derived"
+    # Exactly the one module whose sha moved was sent to the LLM.
+    assert calls["n"] == 1
+    # The progress total is what is still owed, not the whole batch.
+    assert totals == [(1, 1, "pkg/other.py")]
+    assert not checkpoint.exists()  # batch completed → cleared
+
+
+def test_summarize_repo_resume_drops_an_entry_without_a_sha(tmp_path):
+    """An entry written by a pre-RUN-11 run (or any run without `hashes`)
+    carries no `sha` at all. `entry.get("sha")` is then `None`, and
+    `hashes.get(path)` is a real hash for any path still in the tree — the
+    two can never match, so the entry lands in `dropped` and is
+    re-summarised. This is the safe direction: a cached summary whose
+    source cannot be verified must never be trusted silently."""
+    from tools.backoff import save_state
+
+    checkpoint = tmp_path / "collect_summarize_state.json"
+    save_state(
+        {
+            "loop": "collect_summarize",
+            "modules": {
+                "pkg/error_handling.py": {"purpose": "cached, no sha", "notes": "n"},
+            },
+        },
+        checkpoint,
+    )
+
+    calls = {"n": 0}
+    seen = {}
+
+    def stub_llm(system, user):
+        calls["n"] += 1
+        return json.dumps({"purpose": "re-derived", "notes": ""})
+
+    def on_resume(kept, dropped):
+        seen["kept"] = kept
+        seen["dropped"] = dropped
+
+    out = summarize_repo(
+        [_module()], {"pkg/error_handling.py": _source()}, stub_llm, sleep_fn=lambda s: None,
+        checkpoint_path=checkpoint, hashes={"pkg/error_handling.py": "current"},
+        on_resume=on_resume,
+    )
+
+    assert calls["n"] == 1
+    assert out[0].summary.purpose == "re-derived"
+    assert seen == {"kept": 0, "dropped": 1}
+
+
+def test_summarize_repo_on_resume_called_once_with_kept_and_dropped(tmp_path):
+    from tools.backoff import save_state
+
+    checkpoint = tmp_path / "collect_summarize_state.json"
+    save_state(
+        {
+            "loop": "collect_summarize",
+            "modules": {
+                "pkg/error_handling.py": {"purpose": "a", "notes": "", "sha": "h1"},
+                "pkg/other.py": {"purpose": "b", "notes": "", "sha": "h2"},
+                "pkg/moved.py": {"purpose": "c", "notes": "", "sha": "old"},
+            },
+        },
+        checkpoint,
+    )
+    calls = []
+
+    out = summarize_repo(
+        _two_modules(), _two_sources(),
+        lambda system, user: json.dumps({"purpose": "fresh", "notes": ""}),
+        sleep_fn=lambda s: None, checkpoint_path=checkpoint,
+        hashes={"pkg/error_handling.py": "h1", "pkg/other.py": "h2"},
+        on_resume=lambda kept, dropped: calls.append((kept, dropped)),
+        progress_fn=lambda *a: None,
+    )
+
+    assert calls == [(2, 1)]  # once, before the loop, kept then dropped
+    assert [m.summary.purpose for m in out] == ["a", "b"]
+
+
+def test_summarize_repo_on_resume_not_called_when_there_is_no_checkpoint(tmp_path):
+    checkpoint = tmp_path / "collect_summarize_state.json"  # absent
+    calls = []
+
+    summarize_repo(
+        [_module()], {"pkg/error_handling.py": _source()},
+        lambda system, user: json.dumps({"purpose": "fresh", "notes": ""}),
+        sleep_fn=lambda s: None, checkpoint_path=checkpoint,
+        hashes={"pkg/error_handling.py": "h1"},
+        on_resume=lambda kept, dropped: calls.append((kept, dropped)),
+        progress_fn=lambda *a: None,
+    )
+    assert calls == []
+
+
+def _checkpoint_bytes(state) -> bytes:
+    """A checkpoint file body — corrupt shapes are written raw."""
+    if isinstance(state, bytes):
+        return state
+    return json.dumps(state).encode("utf-8")
+
+
+def test_summarize_repo_corrupt_or_foreign_checkpoint_degrades_to_no_checkpoint(tmp_path):
+    """Fail-open: a broken checkpoint file is "nothing to resume", never an
+    exception out of a run — and no resume is claimed for a checkpoint the
+    caller cannot use (foreign `loop`, non-dict `modules`, a non-dict
+    entry, or a file truncated mid-write)."""
+    hashes = {"pkg/error_handling.py": "h1", "pkg/other.py": "h2"}
+    cases = [
+        ("truncated", b'{"loop": "collect_summarize", "modules": {"pkg/'),
+        ("foreign_loop", _checkpoint_bytes(
+            {"loop": "some_other_loop", "modules": {"pkg/error_handling.py": {"purpose": "x", "notes": "", "sha": "h1"}}})),
+        ("non_dict_modules", _checkpoint_bytes(
+            {"loop": "collect_summarize", "modules": ["not", "a", "map"]})),
+        ("not_json_at_all", b"definitely not json"),
+        ("empty_modules", _checkpoint_bytes({"loop": "collect_summarize", "modules": {}})),
+    ]
+    for label, body in cases:
+        checkpoint = tmp_path / f"{label}_state.json"
+        checkpoint.write_bytes(body)
+        calls = []
+
+        out = summarize_repo(
+            _two_modules(), _two_sources(),
+            lambda system, user: json.dumps({"purpose": "fresh", "notes": ""}),
+            sleep_fn=lambda s: None, checkpoint_path=checkpoint, hashes=hashes,
+            on_resume=lambda kept, dropped: calls.append((kept, dropped)),
+            progress_fn=lambda *a: None,
+        )
+
+        assert calls == [], f"{label}: no resume may be claimed"
+        assert [m.summary.purpose for m in out] == ["fresh", "fresh"], label
+
+    # A file whose entries were recorded but are individually malformed is
+    # still a checkpoint that was read: all of them are rejected and the
+    # operator is told so, rather than silently losing the attempt.
+    checkpoint = tmp_path / "non_dict_entry_state.json"
+    checkpoint.write_bytes(_checkpoint_bytes(
+        {"loop": "collect_summarize",
+         "modules": {"pkg/error_handling.py": "not a dict", "pkg/other.py": None}},
+    ))
+    calls = []
+
+    out = summarize_repo(
+        _two_modules(), _two_sources(),
+        lambda system, user: json.dumps({"purpose": "fresh", "notes": ""}),
+        sleep_fn=lambda s: None, checkpoint_path=checkpoint, hashes=hashes,
+        on_resume=lambda kept, dropped: calls.append((kept, dropped)),
+        progress_fn=lambda *a: None,
+    )
+
+    assert calls == [(0, 2)]
+    assert [m.summary.purpose for m in out] == ["fresh", "fresh"]
+
+
+def test_summarize_repo_on_resume_reports_all_dropped_when_every_sha_moved(tmp_path):
+    """Every entry rejected is still a resume worth one line — the operator
+    needs to know the checkpoint was found and then invalidated."""
+    from tools.backoff import save_state
+
+    checkpoint = tmp_path / "collect_summarize_state.json"
+    save_state(
+        {
+            "loop": "collect_summarize",
+            "modules": {
+                "pkg/error_handling.py": {"purpose": "old", "notes": "", "sha": "old-1"},
+                "pkg/other.py": {"purpose": "old", "notes": "", "sha": "old-2"},
+            },
+        },
+        checkpoint,
+    )
+    calls = []
+    llm_calls = {"n": 0}
+
+    def stub_llm(system, user):
+        llm_calls["n"] += 1
+        return json.dumps({"purpose": "fresh", "notes": ""})
+
+    summarize_repo(
+        _two_modules(), _two_sources(), stub_llm, sleep_fn=lambda s: None,
+        checkpoint_path=checkpoint,
+        hashes={"pkg/error_handling.py": "new-1", "pkg/other.py": "new-2"},
+        on_resume=lambda kept, dropped: calls.append((kept, dropped)),
+        progress_fn=lambda *a: None,
+    )
+
+    assert calls == [(0, 2)]
+    assert llm_calls["n"] == 2
+
+
 # ── config wiring: collect_llm_budget / should_run_pass_b / _make_llm_call ────
 
 

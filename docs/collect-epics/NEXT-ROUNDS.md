@@ -59,6 +59,14 @@ one is merged; steps 2–4 do not depend on each other in code, but the
 snapshot after each is only readable if one thing changed.
 
 ### Step 1 — `RUN-6` stale artifact at session start
+*Landed.* Note from RUN-11: the entry line's count is now the bill, not the
+hash diff — when the previous manifest's `collector_version` differs the line
+reads `collector_version '1' → '2') — full rebuild, N module(s)` (Pass B is
+asked for all N modules, not the `1` the diff said) and `collect_refresh`
+carries `reason: "version" | "sha"`. The same round makes Ctrl-C mid-Pass B
+cost one module: every landed summary checkpoints to
+`[collect] dir/collect_summarize_state.json`, and the next `--collect
+--refresh` or `--auto` start resumes where the interrupted run stopped.
 *Why first:* until the pack is on in a resumed session, no collect-side
 number from a live run means anything. Also the smallest change with the
 largest effect on what the next runs can show.

@@ -281,6 +281,19 @@ def _refresh_on_entry(base_dir, config, config_path, load_fn, *, llm_call=None):
     the count on the stdout line — how many modules Pass B is about to
     re-summarise, i.e. the bill — costs no extra scan. If that pre-flight
     fails the refresh still runs, just without the count.
+
+    RUN-11: the count is only the bill when Pass B actually gets the files
+    the hash diff says moved. A `collector_version` bump makes
+    `action_refresh` drop the previous manifest entirely and take the
+    full-build fallback over *every* module, so the hash-diff number (the
+    live run read `refreshing 1 module(s)` while Pass B was about to work
+    over 543) understates the bill by three orders of magnitude. The line
+    and the `collect_refresh` event now name the reason — `version` for a
+    bump, `sha` for a changed file — and carry the number Pass B is really
+    asked for. `KeyboardInterrupt` deliberately still propagates: Ctrl-C is
+    the cheap way out of a 429 storm, and the checkpoint Pass B writes
+    (`[collect] dir/collect_summarize_state.json`) makes the next run pay
+    for the interrupted module only.
     """
     import time
 
@@ -290,6 +303,9 @@ def _refresh_on_entry(base_dir, config, config_path, load_fn, *, llm_call=None):
     artifact_sha, head_sha = _stale_provenance(root, config)
     modules = hashes = None
     changed = None
+    reason: Optional[str] = None
+    previous_version: Optional[str] = None
+    current_version: Optional[str] = None
     try:
         from tools.collect import manifest as manifest_mod
         from tools.collect.scanner import scan_repo
@@ -299,13 +315,33 @@ def _refresh_on_entry(base_dir, config, config_path, load_fn, *, llm_call=None):
         previous = manifest_mod.read_manifest(
             cli_mod.resolve_collect_dir(root, config) / cli_mod.MANIFEST_FILENAME)
         changed = len(manifest_mod.diff_files(previous.file_hashes, hashes).changed)
+        previous_version = previous.collector_version
+        current_version = manifest_mod.COLLECTOR_VERSION
+        if previous_version != current_version:
+            # `action_refresh` falls back to a full build here and asks Pass
+            # B for every module, not the diff — the bill is the tree.
+            changed = len(modules)
+            reason = "version"
+        else:
+            reason = "sha"
     except Exception:  # noqa: BLE001 — the count is a courtesy, the refresh is the point
         modules = hashes = None
-    print(
-        f"collect: artifact stale (git_sha {artifact_sha}, HEAD {head_sha}) "
-        f"— refreshing {'?' if changed is None else changed} module(s)",
-        flush=True,
-    )
+        changed = None
+        reason = None
+        previous_version = current_version = None
+    if reason == "version":
+        print(
+            f"collect: artifact stale (git_sha {artifact_sha}, HEAD {head_sha}; "
+            f"collector_version {previous_version!r} → {current_version!r}) — "
+            f"full rebuild, {changed} module(s)",
+            flush=True,
+        )
+    else:
+        print(
+            f"collect: artifact stale (git_sha {artifact_sha}, HEAD {head_sha}) "
+            f"— refreshing {'?' if changed is None else changed} module(s)",
+            flush=True,
+        )
 
     t0 = time.monotonic()
     ok, model = False, None
@@ -331,7 +367,7 @@ def _refresh_on_entry(base_dir, config, config_path, load_fn, *, llm_call=None):
             type(exc).__name__, exc,
         )
     seconds = round(time.monotonic() - t0, 2)
-    _trace_event("collect_refresh", {"modules": changed, "seconds": seconds, "ok": ok})
+    _trace_event("collect_refresh", {"modules": changed, "seconds": seconds, "ok": ok, "reason": reason})
     if not ok:
         print(
             "collect: refresh failed — pack OFF for this session "

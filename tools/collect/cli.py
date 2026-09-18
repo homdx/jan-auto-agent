@@ -94,10 +94,31 @@ def _print_summarize_error(module_path: str, exc: Exception, error_count: int) -
     same progress stream instead of just going quiet for a while."""
     print(f"  ! {module_path}: {exc} (retry {error_count})", flush=True)
 
+
+def _print_summarize_resume(kept: int, dropped: int) -> None:
+    """RUN-11: one line for a Pass B batch that resumed from the checkpoint
+    an interrupted run left behind. `kept` modules attached without an LLM
+    call, `dropped` re-summarised because their source moved (the entry's
+    sha no longer matched). Printed once per run — `summarize_repo` calls
+    the callback before the loop, not per module — so the operator sees the
+    recovery before the `[k/N]` stream, where `N` is what is still owed."""
+    line = (
+        f"[collect] Pass B resumes: {kept} module(s) kept from the interrupted run, "
+        f"{dropped} re-summarised (source changed)"
+    )
+    print(line, flush=True)
+    logger.info("%s", line)
+
 DEFAULT_COLLECT_DIR = ".collect"
 ARTIFACT_FILENAME = "artifact.json"
 MANIFEST_FILENAME = "collect_manifest.json"
 VERIFICATION_REPORT_FILENAME = "verification_report.json"
+# RUN-11: Pass B's checkpoint — every landed summary, one atomic write per
+# module, cleared when the batch completes. The name the summarizer's own
+# checkpoint tests already use. Lives in `[collect] dir`, which is
+# git-ignored and excluded by path from `manifest.is_dirty`, so the file
+# never turns a build's provenance `dirty` on.
+SUMMARIZE_CHECKPOINT_FILENAME = "collect_summarize_state.json"
 
 VALID_ACTIONS = frozenset({"check", "collect", "refresh", "rebuild", "module"})
 
@@ -376,11 +397,29 @@ def build_context(
     config: Optional[configparser.ConfigParser] = None,
     config_path: Optional[str] = None,
     llm_call: Optional[LlmCall] = None,
+    checkpoint_path: Optional[Path] = None,
+    hashes: Optional[Dict[str, str]] = None,
 ) -> CollectContext:
     """Run Pass B (only if `llm_call` is given) → Pass C → every EPIC C/D
     builder, over an already-scanned `modules` list. Kept separate from
     `scan_repo` so `--module`'s incremental path can call this over a
-    patched module list without re-scanning the whole tree."""
+    patched module list without re-scanning the whole tree.
+
+    RUN-11: `checkpoint_path` forwards to `summarize_repo`, so a full build
+    whose Pass B dies at module *k* (Ctrl-C, `kill`, an OOM, a lost
+    terminal) leaves the *k − 1* summaries the provider already returned
+    in `<collect dir>/collect_summarize_state.json` instead of nowhere —
+    `_write_artifact` is the only thing that touches `.collect/`, and it
+    runs after Pass C and every builder. The same path is reused by
+    `action_refresh`'s incremental batch, so the whole `.collect/`
+    vocabulary for interrupted Pass B work is one file. `hashes` tags each
+    saved entry with the source hash it was summarized from, so a resume
+    re-derives a summary whose file moved. `None` (the default, and what
+    `action_module` passes by not passing it) means no checkpoint at all —
+    a one-module batch has nothing to resume, and `summarize_repo`'s
+    `clear_state` at the end would otherwise wipe an interrupted full
+    build's checkpoint.
+    """
     sources = _sources_for(root, modules)
 
     # Built before Pass B/C on purpose: Pass C (V11) needs the import graph
@@ -394,6 +433,9 @@ def build_context(
             max_retries=collect_max_retries(config),
             progress_fn=_print_summarize_progress,
             on_error=_print_summarize_error,
+            checkpoint_path=checkpoint_path,
+            hashes=hashes,
+            on_resume=_print_summarize_resume,
         )
         modules, verification_report = verifier_mod.verify_repo(
             summarized, sources, root=root, import_edges=edges,
@@ -703,7 +745,14 @@ def _full_build(
             dropped = sum(1 for m in modules if m.path in previous)
         elif previous:
             modules, carried, stale = _carry_summaries(modules, previous, previous_hashes, hashes)
-    ctx = build_context(root, modules, config=config, config_path=config_path, llm_call=llm_call)
+    ctx = build_context(
+        root, modules, config=config, config_path=config_path, llm_call=llm_call,
+        # RUN-11: a full build's Pass B checkpoints every landed summary, so
+        # a Ctrl-C mid-batch costs the one in-flight module. `hashes` was
+        # already computed for this same tree above (or was handed in), so
+        # the sha each entry records is the one Pass B summarized from.
+        checkpoint_path=collect_dir / SUMMARIZE_CHECKPOINT_FILENAME, hashes=hashes,
+    )
     if carried and any(m.summary is not None for m in ctx.modules):
         sources = _sources_for(root, ctx.modules)
         verified_modules, report = verifier_mod.verify_repo(
@@ -993,6 +1042,13 @@ def action_refresh(
                 max_retries=collect_max_retries(config),
                 progress_fn=_print_summarize_progress,
                 on_error=_print_summarize_error,
+                # RUN-11: same checkpoint as the full build's Pass B — this
+                # batch is the one an interrupted `--collect` most often
+                # dies in (the version-bump fallback), and it too writes
+                # nothing until Pass C and every builder are done.
+                checkpoint_path=collect_dir / SUMMARIZE_CHECKPOINT_FILENAME,
+                hashes=current_hashes,
+                on_resume=_print_summarize_resume,
             )
         }
 
@@ -1313,6 +1369,11 @@ def action_module(
     # `summarized_by_path`.
     pass_b_skipped = llm_call is None or not settings.llm_summaries
     if not pass_b_skipped and patched.parse_error is None:
+        # RUN-11: deliberately NO checkpoint_path here. A one-module batch
+        # has nothing to resume, and `summarize_repo` clears its checkpoint
+        # when the batch completes — passing the shared path would have a
+        # `--module` run delete the checkpoint an interrupted full build
+        # left behind (the exact data this ticket saves).
         summarized = summarize_repo(
             [patched], {module_path: source}, llm_call,
             max_retries=collect_max_retries(config),
