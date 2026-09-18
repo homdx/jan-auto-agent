@@ -122,6 +122,17 @@ above. `tool_parts()` per model: laguna and hy3 both did
 count: laguna 2, mistral 2, hy3 1 (mistral's retry-with-`workdir` behaviour
 noted in fact 3 above still holds).
 
+## KC-2 roster re-verified live (2026-09-18)
+
+`tools/contest/roster.py`'s `load_roster("contest.ini")` was used, unmodified,
+to drive real sessions: for each of the three `AgentSpec`s it returned
+(`laguna`, `mistral`, `hy3` — provider/model split at the first `/`),
+`KiloClient.create_session` was called with that spec's `provider_id`/
+`model_id` and `ContestConfig.session_rules()` as the permission list, then
+prompted with `"Reply with exactly: OK"`. All three reached `session.idle`
+and replied `OK` (laguna 9.2 s, mistral 9.2 s, hy3 7.6 s). No fix needed —
+the roster's parsing and rule list work as shipped against a real server.
+
 ## Side observations
 
 - The VS Code extension keeps its own `kilo serve --port 0` processes
