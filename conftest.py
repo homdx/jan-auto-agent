@@ -15,8 +15,10 @@ Handles two things:
                                    empty shell so the file is never imported.
 """
 
+import os
 import subprocess
 import sys
+import tempfile
 
 
 import pytest
@@ -29,6 +31,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+# ── 1a. Keep .pyc cache out of the checkout ─────────────────────────────────────
+#
+# Without this, every module pytest imports (tools/*, tests/*, and whatever
+# test_story_*.py's subprocess imports) writes its .pyc next to the source
+# inside this checkout. That's `git status` noise (masked only by
+# .gitignore) and, on repos checked out on a slow/networked filesystem,
+# real per-file write overhead on every run. Redirect both this process and
+# any subprocess it spawns (test_story_*.py scripts run via
+# `python main.py ...`, ScriptTestItem.runtest above) to a prefix under the
+# system temp dir, keyed by this repo's folder name so it doesn't collide
+# with a sibling checkout.
+_PYCACHE_PREFIX = str(Path(tempfile.gettempdir()) / ROOT.name)
+sys.pycache_prefix = _PYCACHE_PREFIX
+os.environ.setdefault("PYTHONPYCACHEPREFIX", _PYCACHE_PREFIX)
 
 
 # ── 1b. Cache scan_repo(REPO_ROOT) across the test session ─────────────────────
