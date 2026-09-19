@@ -16,6 +16,13 @@ The cases, from the ticket:
   6. tool_parts in order, last_assistant_text == "done";
   7. KiloServer.spawn on a binary that exits immediately raises with the tail;
   8. find_kilo_binary orders 7.10.0 above 7.6.2.
+
+KC-12 (round 51) adds four cases to the wait: `idle_event_timeout` aborts a
+session that goes silent for longer than it, long before the overall
+`timeout`; any event of the session — not only the ones the wait acts on —
+resets that clock, across several windows; a neighbour session on the same
+tap does not count at all; and the clock runs from the start of the wait, so
+a turn that never emits anything is cut at the window too.
 """
 
 from __future__ import annotations
@@ -24,6 +31,7 @@ import json
 import os
 import stat
 import sys
+import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -354,6 +362,117 @@ def test_timeout_aborts_the_session(tmp_path):
     assert aborts[0]["body"] is None
     assert aborts[0]["query"]["directory"] == h.directory
     assert h.fake.sessions()[0].aborted is True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3b — KC-12: the silence clock, separate from the overall timeout
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_wait_idle_aborts_on_stall(tmp_path):
+    """A session silent for longer than ``idle_event_timeout`` is aborted
+    well before the overall ``timeout`` elapses. The fake emits one
+    ``session.status busy`` and then goes silent for 2 s without ever
+    idling, so the wait must be bounded by the 0.5 s silence window — not by
+    the 2 s pause it would have waited out, and not by the 10 s deadline."""
+    scenario = {"turns": [{"pause_before_idle_sec": 2, "assistant": "still running"}]}
+    with _probe(tmp_path, scenario) as h:
+        h.client.prompt(h.session, "run the slow command")
+        started = time.monotonic()
+        res = h.client.wait_idle(h.tap, h.session, 10.0, idle_event_timeout=0.5,
+                                 on_permission=_reject, on_question=lambda event: None)
+        elapsed = time.monotonic() - started
+    assert res.status == "timeout"
+    assert res.error is None
+    assert res.permissions == [] and res.questions == []
+    assert res.elapsed < 1.5, res.elapsed      # the 0.5 s window, not the 2 s pause
+    assert elapsed < 1.5
+    # the shape's heartbeat went out, no idle ever did, and one abort was sent
+    assert h.fake.events_of("session.status")
+    assert h.fake.events_of("session.idle") == []
+    assert h.fake.recorded_abort_for(h.session.id)
+
+
+def test_events_of_the_session_keep_wait_idle_alive(tmp_path):
+    """The silence clock counts every event of the session, not only the ones
+    ``wait_idle`` acts on: a ``session.status busy`` every 0.15 s is eight
+    0.3 s windows, and the turn still reaches idle — several windows past
+    the first one. No abort, no early cut-off."""
+    scenario = {"turns": [{"events": ["busy"], "delay": 1.0, "assistant": "done"}]}
+    with _probe(tmp_path, scenario) as h:
+        def heartbeat():
+            for _ in range(8):
+                time.sleep(0.15)
+                h.fake._emit({"type": "session.status",
+                              "properties": {"sessionID": h.session.id,
+                                             "status": "busy"}})
+
+        threading.Thread(target=heartbeat, daemon=True).start()
+        started = time.monotonic()
+        h.client.prompt(h.session, "slow turn")
+        res = h.client.wait_idle(h.tap, h.session, 5.0, idle_event_timeout=0.3,
+                                 on_permission=_reject, on_question=lambda event: None)
+        elapsed = time.monotonic() - started
+    assert res.status == "idle"
+    assert res.elapsed > 0.9, res.elapsed      # it really waited out the heartbeats
+    assert elapsed > 0.9
+    assert not h.fake.recorded_abort_for(h.session.id)
+    # busy plus at least two beats: with idle_event_timeout=0.3 and no
+    # heartbeat counted, this wait would have stalled out at ~0.3 s
+    assert len(h.fake.events_of("session.status")) >= 3
+
+
+def test_a_neighbours_events_do_not_keep_a_silent_session_alive(tmp_path):
+    """The clock is the session's own: the tap reads every session of the
+    directory, so a chatty neighbour must not push a silent one past its
+    silence window. The silent session is aborted at 0.5 s while the other
+    keeps emitting."""
+    scenario = {"turns": [{"pause_before_idle_sec": 2}]}
+    with _probe(tmp_path, scenario) as h:
+        neighbour = h.client.create_session("kenary", "hy3:free", rules=RULES,
+                                            title="the chatty one")
+        h.client.prompt(h.session, "go quiet")
+
+        def chat():
+            for _ in range(10):
+                time.sleep(0.1)
+                h.fake._emit({"type": "session.status",
+                              "properties": {"sessionID": neighbour.id,
+                                             "status": "busy"}})
+
+        threading.Thread(target=chat, daemon=True).start()
+        started = time.monotonic()
+        res = h.client.wait_idle(h.tap, h.session, 10.0, idle_event_timeout=0.5,
+                                 on_permission=_reject, on_question=lambda event: None)
+        elapsed = time.monotonic() - started
+    assert res.status == "timeout"
+    assert res.elapsed < 1.5, res.elapsed
+    assert elapsed < 1.5
+    assert h.fake.recorded_abort_for(h.session.id)
+    assert not h.fake.recorded_abort_for(neighbour.id)
+
+
+def test_a_turn_with_no_event_at_all_is_cut_at_the_window(tmp_path):
+    """The clock starts when the wait does, not at the first event: a second
+    turn whose prompt is accepted and then answered with nothing — no busy,
+    no idle — is a stall at 0.5 s, not a turn that waits out the 10 s
+    deadline. (A first turn always has ``session.created`` on the tap ahead
+    of it, which is why this needs a second one.)"""
+    scenario = {"turns": [{"events": ["busy", "idle"], "assistant": "one"},
+                          {"events": [], "idle": False}]}
+    with _probe(tmp_path, scenario) as h:
+        h.client.prompt(h.session, "first")
+        res = h.client.wait_idle(h.tap, h.session, 10.0, idle_event_timeout=1.0,
+                                 on_permission=_reject, on_question=lambda event: None)
+        assert res.status == "idle"
+        h.client.prompt(h.session, "second")
+        started = time.monotonic()
+        res = h.client.wait_idle(h.tap, h.session, 10.0, idle_event_timeout=0.5,
+                                 on_permission=_reject, on_question=lambda event: None)
+        elapsed = time.monotonic() - started
+    assert res.status == "timeout"
+    assert res.elapsed < 1.5, res.elapsed
+    assert elapsed < 1.5
+    assert h.fake.recorded_abort_for(h.session.id)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

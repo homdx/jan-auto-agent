@@ -22,15 +22,18 @@ After every transition `on_transition(run)` fires — `run_round` writes
 Every artifact write is fail-open: a log line or a state file that cannot be
 written is a warning, never an exception into a round.
 
-Stall detection: KC-12 (round 51) gives `wait_idle` an `idle_event_timeout=`;
-when the client has it, the number goes there. Until then `_silence_watch`
-keeps the same clock here — the last event *of this session* on the tap — so
-one agent's traffic on a shared stream cannot keep another agent's turn alive.
+Stall detection: KC-12 (round 51) gives `wait_idle` an `idle_event_timeout=`,
+so this module only passes the round's `idle_event_timeout_sec` (KC-2's
+`[contest]` key) and reads the result. The primitive owns the clock — the last
+event *of this session* on the tap, in `time.monotonic()` — and sends the
+`abort` itself. A silence stall and the overall `turn_timeout_sec` both come
+back as `IdleResult.status == "timeout"`; `elapsed` tells them apart. The
+third-question edge is the runner's own, still: `stall()` aborts and closes
+the tap, and the wait wakes on `tap.closed`.
 """
 
 from __future__ import annotations
 
-import inspect
 import json
 import logging
 import threading
@@ -55,8 +58,6 @@ _log = logging.getLogger(__name__)
 
 #: How many of the session's latest tool parts the gate sees.
 RECENT_TOOLS = 8
-#: How often the silence watcher looks at the tap (seconds).
-_WATCH_POLL = 0.1
 
 
 class AgentState(str, Enum):
@@ -288,58 +289,21 @@ def _abort_quietly(client: KiloClient, session: SessionRef) -> None:
 # the wait, with the round's stall edge
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _session_events(tap: EventTap, session_id: str) -> int:
-    """How many events of *this* session the tap has read — the silence clock."""
-    with tap.lock:
-        return sum(1 for e in tap.events
-                   if (e.get("properties") or {}).get("sessionID") == session_id)
-
-
-def _silence_watch(tap: EventTap, session_id: str, seconds: float,
-                   stop: threading.Event, on_silence: Callable[[], None]) -> threading.Thread:
-    """A thread that calls *on_silence* once when no event of the session
-    arrives for *seconds*. Stopped by *stop*; never raises."""
-    def run() -> None:
-        last, since = _session_events(tap, session_id), time.monotonic()
-        while not stop.wait(_WATCH_POLL):
-            count = _session_events(tap, session_id)
-            if count != last:
-                last, since = count, time.monotonic()
-            elif time.monotonic() - since >= seconds:
-                on_silence()
-                return
-
-    thread = threading.Thread(target=run, name="contest-silence-watch", daemon=True)
-    thread.start()
-    return thread
-
-
 def _wait_turn(client: KiloClient, tap: EventTap, session: SessionRef, config: ContestConfig,
-               *, on_permission, on_question, stall: Callable[[str], None]):
-    """`client.wait_idle` for one turn, with silence and the question budget wired in.
+               *, on_permission, on_question):
+    """`client.wait_idle` for one turn, with the round's stall edge wired in.
 
-    Returns the `IdleResult`. `stall(reason)` is the runner's own edge: it is
-    called at most once, from the watcher or from the third question, and is
-    expected to abort the session and close the tap so the wait wakes up.
+    Returns the `IdleResult`. `idle_event_timeout` is the round's
+    `idle_event_timeout_sec`: a session silent for that long is aborted by the
+    primitive and comes back as `status="timeout"`, at an `elapsed` well under
+    `turn_timeout_sec` — which is how the runner names it a silence stall
+    rather than a turn timeout. Zero or unset disables the clock, which is
+    `wait_idle`'s behaviour without the argument.
     """
-    turn_timeout = float(config.turn_timeout_sec)
     silence = float(config.idle_event_timeout_sec or 0)
-    if "idle_event_timeout" in inspect.signature(client.wait_idle).parameters:
-        # KC-12 landed: the primitive owns the clock and the abort.
-        return client.wait_idle(tap, session, turn_timeout, idle_event_timeout=silence or None,
-                                on_permission=on_permission, on_question=on_question)
-    stop = threading.Event()
-    watcher = None
-    if silence > 0:
-        watcher = _silence_watch(tap, session.id, silence, stop,
-                                 lambda: stall(f"no event for {silence:g}s"))
-    try:
-        return client.wait_idle(tap, session, turn_timeout,
-                                on_permission=on_permission, on_question=on_question)
-    finally:
-        stop.set()
-        if watcher is not None:
-            watcher.join(1.0)
+    return client.wait_idle(tap, session, float(config.turn_timeout_sec),
+                            idle_event_timeout=silence or None,
+                            on_permission=on_permission, on_question=on_question)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -447,16 +411,23 @@ def run_agent(run: AgentRun, *, client: KiloClient, tap: EventTap, policy: Polic
             transition(AgentState.WAITING)
             questions_this_turn[0] = 0
             idle = _wait_turn(client, tap, session, config,
-                              on_permission=on_permission, on_question=on_question, stall=stall)
+                              on_permission=on_permission, on_question=on_question)
             turn["idle_at"] = time.time()
             turn["idle_status"] = idle.status
             if stalled:
                 turn["idle_status"] = "stalled"
                 error, state = stalled[0], AgentState.STALLED
             elif idle.status == "timeout":
+                # KC-12 sends the silence stall back as "timeout" too, so the
+                # label comes from elapsed: under the overall deadline means
+                # the silence window fired, at it means the turn never idled.
                 silence = float(config.idle_event_timeout_sec or 0)
                 quiet = 0 < silence and idle.elapsed < float(config.turn_timeout_sec)
-                error = f"no event for {silence:g}s" if quiet else f"no idle after {config.turn_timeout_sec}s"
+                if quiet:
+                    turn["idle_status"] = "stalled"
+                    error = f"no event for {silence:g}s"
+                else:
+                    error = f"no idle after {config.turn_timeout_sec}s"
                 state = AgentState.STALLED
             elif idle.status == "error":
                 error, state = f"session.error: {_brief(idle.error)}", AgentState.ERROR

@@ -27,6 +27,9 @@ Everything here is scripted by one scenario dict, per session:
                 "diff": [...],       # replaces the session diff after this turn
                 "info": {...},       # merged into GET /session/{id} after this turn
                 "delay": 2.5,        # seconds to hold before going idle
+                "pause_before_idle_sec": 2,  # session.status busy, then that many
+                                     # seconds of silence: no idle, no error,
+                                     # nothing — a stalled turn (KC-12)
                 "idle": false,       # never go idle (a stalled turn)
                 "error": {...},      # session.error instead of idle
             },
@@ -267,6 +270,16 @@ class FakeKiloServer:
             out.append(record)
         return out
 
+    def recorded_abort_for(self, session_id: str) -> bool:
+        """True when ``POST /session/{session_id}/abort`` reached the fake.
+
+        The stall and timeout paths of ``wait_idle`` both send exactly one
+        abort, so an assertion reads it back instead of re-deriving it from
+        the request list.
+        """
+        path = f"/session/{session_id}/abort"
+        return any(r["path"] == path for r in self.requests)
+
     def sessions(self) -> list:
         return list(self._sessions.values())
 
@@ -390,6 +403,15 @@ class FakeKiloServer:
             "info": {"role": "user", "sessionID": session.id, "time": time.time()},
             "parts": [{"type": "text", "text": text}],
         })
+
+        pause = turn.get("pause_before_idle_sec")
+        if pause is not None:
+            # KC-12's stall shape: one heartbeat, then that many seconds of
+            # nothing — no idle, no error, no turn.close. The wait is what has
+            # to notice; the sleep only keeps the turn "running" that long.
+            self._emit(self._event_for(session, "busy"))
+            self._sleep(float(pause))
+            return
 
         names = list(turn.get("events") or [])
         for name in names:

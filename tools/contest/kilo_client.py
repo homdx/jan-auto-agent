@@ -19,6 +19,10 @@ Two things the probe learned live are behaviour here, not comments:
     ``GET /session/{id}/message`` (``KiloClient.tool_parts``), never from
     the event stream — ``session.next.tool.*`` never appeared on
     ``/event`` in this build (PROBE.md, §Facts 7).
+  * ``wait_idle`` acts on ``_SESSION_EVENTS`` only; with a silence clock set
+    (KC-12), every other event carrying this session's ``sessionID`` — a
+    ``session.status busy``, a ``file.edited`` — resets that clock and
+    nothing else.
 
 Nothing here decides a permission: ``KiloClient.wait_idle`` hands the event
 to a callback and sends back what the callback says. Reporting is by value
@@ -159,6 +163,11 @@ class IdleResult:
     (the event stream ended; ``error`` holds the tap's reason).
     ``permissions`` and ``questions`` hold the full events that were
     answered, in order, so a caller can audit or persist them.
+
+    A silence stall and the overall ``timeout`` share ``"timeout"`` —
+    ``wait_idle`` does not invent a fourth status for it. A caller that needs
+    to tell them apart reads ``elapsed``: a stall lands well under the
+    overall deadline.
     """
 
     status: Literal["idle", "error", "timeout", "closed"]
@@ -808,6 +817,7 @@ class KiloClient:
             _log.warning("abort(%s) after a timeout failed: %s", session.id, e)
 
     def wait_idle(self, tap: EventTap, session: SessionRef, timeout: float, *,
+                  idle_event_timeout: float | None = None,
                   on_permission: Callable[[dict], tuple],
                   on_question: Callable[[dict], None]) -> IdleResult:
         """Block until this session goes idle, answering on the way.
@@ -820,6 +830,20 @@ class KiloClient:
         whose ``properties.sessionID`` is this session's are examined, and
         each is examined exactly once — the cursor is the tap's.
 
+        ``timeout`` bounds the whole wait; ``idle_event_timeout`` (seconds,
+        ``None`` = off, which is exactly the behaviour without it) bounds the
+        silence. Neither is a constant here — the caller decides both, so the
+        same primitive can be timed by a round's config, a script, or a test.
+        A session that stays silent for longer than ``idle_event_timeout`` is
+        aborted and returned as ``status="timeout"``, the same status the
+        overall ``timeout`` produces: the clock is ``time.monotonic()`` from
+        the session's *last* event of any type, and it races ``timeout``
+        independently, so a session idle within the overall deadline that goes
+        quiet partway through is still caught. The silence counts only this
+        session's events — the tap reads every session of the directory, and
+        a neighbour's traffic on the same stream does not keep this turn
+        alive.
+
         Events that a permission or a question was *answered* for are
         collected in ``permissions`` / ``questions``, so a caller can audit
         or persist the turn. A timeout sends ``abort`` first; a failure of
@@ -830,6 +854,12 @@ class KiloClient:
         started = time.monotonic()
         deadline = started + float(timeout)
         session_id = session.id
+        # KC-12: the silence clock. None (or a non-positive number) is off,
+        # and then the loop below is KC-1's, event for event.
+        silence = float(idle_event_timeout) if idle_event_timeout is not None else None
+        if silence is not None and silence <= 0:
+            silence = None
+        last_seen = started
         permissions: list = []
         questions: list = []
 
@@ -839,11 +869,20 @@ class KiloClient:
                 # a tap-level event: it has no sessionID, and it applies to
                 # whatever stream this tap is reading
                 return True
-            return (etype in _SESSION_EVENTS
-                    and (event.get("properties") or {}).get("sessionID") == session_id)
+            if (event.get("properties") or {}).get("sessionID") != session_id:
+                return False
+            # with the silence clock on, every event of this session wakes the
+            # wait: the ones acted on below are handled, the rest only reset
+            # the clock — a `session.status busy` or a `file.edited` is the
+            # session working, not stalled
+            return silence is not None or etype in _SESSION_EVENTS
 
         while True:
-            left = deadline - time.monotonic()
+            now = time.monotonic()
+            left = deadline - now
+            if silence is not None:
+                # the two bounds race: whichever runs out first ends the wait
+                left = min(left, silence - (now - last_seen))
             if left <= 0:
                 self._abort_quietly(session)
                 return IdleResult(status="timeout", elapsed=time.monotonic() - started,
@@ -851,6 +890,7 @@ class KiloClient:
             event = tap.wait(wanted, left)
             if event is None:
                 continue
+            last_seen = time.monotonic()
 
             etype = event.get("type")
             props = event.get("properties") or {}
@@ -884,5 +924,9 @@ class KiloClient:
                 return IdleResult(status="closed", error=props.get("error"),
                                   elapsed=elapsed, permissions=permissions,
                                   questions=questions)
+            if etype != "session.idle":
+                # only with the silence clock on: an event of this session
+                # that reset it and asks for nothing
+                continue
             return IdleResult(status="idle", elapsed=elapsed,
                               permissions=permissions, questions=questions)
