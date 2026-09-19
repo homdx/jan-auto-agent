@@ -128,5 +128,4 @@ the windowed wait), Ctrl-C = `stop.set()` → save → abort + close taps →
 re-raise, one `turns.jsonl` line per turn, `RoundState.from_dict` for KC-7,
 the sibling-worktree rule, 622 lines. 28/28 here, 28 tests of its own.
 
-Re-run: worktrees under `<scratch>/kc6/<entry>` plus `<scratch>/kc6/base`,
-`run_all_kc6.py` next to `run_one_kc6.py` in `<scratch>/bench6/`.
+Re-run: `RUNBOOK.md` (`setup_kc6.sh` builds the worktrees, `run_all_kc6.py --wt`).

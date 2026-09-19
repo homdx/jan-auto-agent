@@ -37,6 +37,8 @@ contest-bench/
     results.json            raw results (every check, every entrant, with details)
     RESULTS.md              generated table + misses (got)
     REPORT.md               hand-written: findings, nominations, decisions for the ideal patch
+  kc4/ kc5/ kc6/             KC rounds: self-contained (run_one_kcN.py + run_all_kcN.py, no harness/ dependency)
+    kc6/RUNBOOK.md          the full procedure, and how to reuse KC-6 as the benchmark ticket for a live multi-agent run
 ```
 
 The submissions themselves (`run9/*.patch`, `run9/sonets/*.zip`) are **not**
