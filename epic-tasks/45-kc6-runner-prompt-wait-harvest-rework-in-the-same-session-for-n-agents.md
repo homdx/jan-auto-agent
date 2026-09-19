@@ -1,6 +1,6 @@
 # KC-6 — `tools/contest/runner.py`: prompt → wait → harvest → rework, in the same session, for N agents at once, resumable
 
-**Status:** open — round 45 of EPIC KC (`docs/kilo-contest/EPIC-KC.md`); KC-5 (round 44) landed `0d91dd6`. Needs KC-1 … KC-5 and KC-12 (round 51, open in parallel — `wait_idle(..., idle_event_timeout=)` is the primitive this runner's STALLED edge calls; do not re-implement it here). Written against `docs/kilo-contest/PROBE.md`.  
+**Status:** landed `e8c6ad3` — ideal patch from a 7-entry contest, `kc6/*.patch`, scored black-box via `contest-bench/kc6/` (28 scenarios: the Acceptance list plus three agents reworking at once, a silent agent next to a chatty one, Ctrl-C then resume). Winner Sensenova-6-8-var1 (27/28); DeepSeek 27/28 but disqualified (read other agents' folders). What sank the rest: silence clocked on any tap event instead of the session's own (5 of 7), `with ThreadPoolExecutor` joining every worker before Ctrl-C's abort, four `turns.jsonl` lines per turn, a windowed `wait_idle` that aborts a live session at every window edge, `time.time()` subtracted from `time.monotonic()`, `AgentState` as a `typing.Literal`. `tests` + `tests_bugfix` green. Written against `docs/kilo-contest/PROBE.md`.  
 **Severity:** CRITICAL  
 **File:** `tools/contest/runner.py` (new)  
 **Symbol:** `AgentRun`, `AgentState`, `run_agent`, `run_round`, `round_prompt`, `RoundState`  

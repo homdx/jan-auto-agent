@@ -1,6 +1,6 @@
 # KC-12 — `wait_idle` aborts on silence: no `/event` for `idle_event_timeout_sec` seconds is a stall, not a slow answer
 
-**Status:** open — round 51 of EPIC KC (`docs/kilo-contest/EPIC-KC.md`).
+**Status:** open — round 51 of EPIC KC (`docs/kilo-contest/EPIC-KC.md`); KC-6 (round 45) landed `e8c6ad3`. The caller already exists: `tools/contest/runner.py::_wait_turn` passes `idle_event_timeout=config.idle_event_timeout_sec` when `inspect.signature(client.wait_idle)` has the keyword and otherwise runs its own `_silence_watch` (a thread counting the session's events on the tap). Once this ticket lands, that fallback is dead code: delete `_silence_watch` and the `inspect` branch in the same commit, and leave `tests/test_contest_runner.py` **unmodified** — its stall tests (`test_idle_event_timeout_stalls_a_silent_session_within_3s`, `test_events_of_the_session_keep_a_turn_alive`, `test_a_silent_agent_stalls_next_to_a_chatty_one`) are this primitive's acceptance through the runner and must stay green.
 **Severity:** MEDIUM
 **File:** `tools/contest/kilo_client.py` (`wait_idle`)
 **Symbol:** `wait_idle`, `IdleResult`
@@ -8,7 +8,7 @@
 **Size:** S
 **Source:** [KC-1](40-kc1-kilo-client-and-the-fake-server-built-from-the-probe.md) gives `wait_idle` one overall `timeout`; [KC-6](45-kc6-runner-prompt-wait-harvest-rework-in-the-same-session-for-n-agents.md) already assumes a *separate* `idle_event_timeout_sec` exists ("no event for `idle_event_timeout_sec` → abort → STALLED", line 56, and the acceptance case "`idle_event_timeout_sec = 1` with a fake that emits nothing → `STALLED` within 3 s", line 109) but KC-1's `wait_idle` signature never grew that parameter. This ticket closes that gap at the primitive, so KC-6 can wire it through instead of inventing it.
 **Depends on:** KC-1 (`tools/contest/kilo_client.py` must exist), KC-2 (`contest.ini`'s `[contest] idle_event_timeout_sec` — this ticket is the primitive KC-2's key is meant to drive; it must not invent its own constant or a second config path).
-**Also touches:** `tests/_kilo_fake.py` (needs a turn shape that goes silent for N seconds before `idle`/nothing), `tests/test_contest_kilo_client.py`
+**Also touches:** `tests/_kilo_fake.py` (needs a turn shape that goes silent for N seconds before `idle`/nothing), `tests/test_contest_kilo_client.py`, `tools/contest/runner.py` (only the deletion described in **Status:**)
 
 ---
 
@@ -36,7 +36,12 @@ be killed early. `timeout` alone cannot tell them apart.
    idea of what "too quiet" means.
 2. When set: track the timestamp of the *last* event seen for this
    `sessionID` (any type, not just the ones `wait_idle` already filters
-   on — a `file.edited` or `session.status busy` counts as "alive"). If
+   on — a `file.edited` or `session.status busy` counts as "alive"). **This
+   session's only**: the tap sees every session of the directory and, on the
+   fake, every session of the server — KC-6's bench sank five of seven entries
+   whose clock counted any event on the tap (`contest-bench/kc6/RESULTS.md`,
+   s30). `time.monotonic()` on both sides of the subtraction (another entry
+   mixed it with `time.time()` and never fired). If
    more than `idle_event_timeout` seconds pass with no such event, call
    `session.abort` (as timeout already does) and return
    `IdleResult(status="timeout", ...)` — same status the overall timeout
@@ -125,9 +130,8 @@ Every line below is a way a KC-5 entry lost points on the round bench;
 the scorer checks all of them mechanically, so check them yourself first.
 
 - [ ] `python3 --version` on the judge is **3.10.12**. Every new/changed
-      module imports there: `python3 -c "import tools.contest.kilo_client"` from the
-      repo root **and** from `/tmp` (with `PYTHONPATH` unset — the sys.path
-      bootstrap is yours to ship). No backslash and no nested same-quote
+      module imports there: `python3 -c "import tools.contest.kilo_client, tools.contest.runner"`
+      from the repo root. No backslash and no nested same-quote
       inside an f-string expression (a 3.12-only `f"{x.split("\t")}"`
       is a `SyntaxError` here and scores 0).
 - [ ] Exactly **one** commit on top of the base: `git log --oneline <base>..HEAD`
