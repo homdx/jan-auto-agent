@@ -253,3 +253,51 @@ What the live stream taught (none of it visible on the fake):
   with `cost` 0 on the free tier; `Harvest.commit` is whatever sha the model
   wrote into `PROGRESS.csv` (mistral: a 7-char short sha) — the harvest
   resolves it, the summary shows it as written.
+
+## 11. Live run, 2026-09-19 — twelve more free models through `--models`
+
+`live_smoke.py --models a:free,b:free,…` runs a roster built from the list
+instead of `contest.ini`'s (provider `kenary` unless the id carries one; the
+agent name is the model id without its `:tag`), `--max-parallel N` sets the
+pool. The list is not scored anywhere — the point was more models against
+the same runner, not a table.
+
+```bash
+python3 contest-bench/kc6/live_smoke.py --round 1 --max-parallel 4 \
+  --models agnes-2-0-flash:free,agnes-2-5-flash:free,agnes-3-0-flash:free,glm-4-7-flash:free,laguna-xs-2-1:free,mimo-v2-5:free,muse-spark-1-3-contributor:free,nemotron-3-super-120b-a12b:free,nemotron-3-ultra-550b-a55b:free,nex-n2-5-pro:free,north-mini-code:free,step-3-7-flash:free
+python3 contest-bench/kc6/live_smoke.py --round 2 --max-parallel 3 \
+  --models agnes-2-0-flash:free,agnes-2-5-flash:free,glm-4-7-flash:free,mimo-v2-5:free,step-3-7-flash:free,nemotron-3-super-120b-a12b:free
+```
+
+| run | result | what it exercised |
+|---|---|---|
+| round 1, 12 models, 4 at a time | 285 s. **5 READY** (agnes-2-0-flash, agnes-2-5-flash, glm-4-7-flash, mimo-v2-5, step-3-7-flash: one turn, one commit, 5/5 tests, a `PROGRESS.csv` row). **5 ERROR in ~1 s** — `session.error … Model not found: kenary/<id>. Did you mean: …` for agnes-3-0-flash, laguna-xs-2-1, muse-spark-1-3-contributor, nex-n2-5-pro, north-mini-code (not on this Kilo 7.6.2's kenary list; `kilo models` agrees). **2 ERROR from the provider** — nemotron-3-super-120b-a12b after 48 s, nemotron-3-ultra-550b-a55b after 198 s and four free-tier retries: `"the model's provider rejected the request. check the model id, request fields, and context length"` | s13 live (the error body is readable in `last_error` and the table); a wave of four with 12 agents; heartbeats-only silence on the 550B model for 35 s was *not* a stall (own-session clock, 120 s) |
+| round 2, 6 models, 3 at a time | 591 s. **5/5 READY** of the models that exist: agnes-2-0, agnes-2-5, mimo → `commits_ne_1` → amended → READY at attempt 1; glm-4-7-flash → `commits_ne_1`, then `commit_not_on_branch` (it recorded a sha, then reset and re-committed) → READY at attempt 2 — the last allowed one, 1.2 M input tokens; step-3-7-flash squashed before recording → READY at attempt 0. nemotron-super made its two commits and asked one permission, then the provider rejected the next request at 127 k input tokens → ERROR | the rework loop across five different model families; `attempt == max_rework` → READY, not GAVE_UP, when the last rework lands |
+
+No runner change came out of it. Two findings became tickets:
+
+- **KC-14 — `harvest` accepts `--commit HEAD`.** agnes-2-0-flash recorded
+  `…,FIXED,HEAD,"…"`; `git merge-base --is-ancestor HEAD HEAD` is true, the
+  verdict was READY and `Harvest.commit == "HEAD"` went into `state.json`
+  and the round table. The claim must be a 7–40 hex sha that resolves;
+  `tools/contest/harvest.py`.
+- **KC-15 — a bash redirect outside the worktree raises no permission at
+  all.** In round 2 four of five models wrote `/tmp/kc6-outside-<name>.txt`
+  with a bare `echo "…" > /tmp/kc6-outside-….txt`; `decisions.jsonl` has
+  one line per agent (the `mkdir -p /tmp/contest/notes && …` call, which
+  asked `external_directory` for the `mkdir` argument and was `once` under
+  tmp_roots), step-3-7-flash asked nothing at all because the notes folder
+  already existed. Kilo's `external_directory` reads command *arguments* of
+  the commands it knows; a redirect target is not one. §10's hy3 case was
+  caught only because the redirect shared a line with a `mkdir`. The fix is
+  a `bash` ask for write-shaped commands (`ask_commands`) plus a layer-1
+  rule that keeps path-less bash commands free — after KC-13.
+
+Also seen: the free tier's rate limit is per account, not per model — four
+sessions at once spend most of the first minute in
+`session.status {"type": "retry"}`; three at a time was smoother. One
+model (step-3-7-flash) took "your name" as `$USER` for the note files
+(`/tmp/contest/notes/renat.txt`) but used the prompt's
+`runs/step-3-7-flash/PROGRESS.csv` for the claim — harvest reads
+`ws.progress_csv`, so a model that also invented its own `runs/<name>` folder
+would be `no_progress_row` and told the path in the rework message.

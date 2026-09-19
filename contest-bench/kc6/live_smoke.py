@@ -6,6 +6,7 @@ contest.ini (the three kenary free models), one small ticket in a sandbox repo.
     python3 contest-bench/kc6/live_smoke.py --round 2          # ticket 02: forces a rework and two permissions
     python3 contest-bench/kc6/live_smoke.py --round 2 --resume # after a Ctrl-C: state.json → resume
     python3 contest-bench/kc6/live_smoke.py --round 1 --agents hy3,mistral
+    python3 contest-bench/kc6/live_smoke.py --round 1 --models agnes-2-5-flash:free,glm-4-7-flash:free --max-parallel 4
 
 The sandbox (/tmp/contest/live-kc6/repo, rebuilt on --round 1) has the real
 scripts/next_task.py and append_task.py, a stub CollectBridge, pkg/thing.py
@@ -16,9 +17,9 @@ mechanically, a sibling worktree is forbidden, and anything else outside
 goes to the gate — which, with contest.ini's placeholder gate URL, fails
 closed (a `gate-failed` reject the model can read).
 
-What the 2026-09-19 runs showed is in RUNBOOK.md §10. Requires the Kilo
-VS Code extension's `bin/kilo` (find_kilo_binary) and the kenary provider
-signed in there; nothing here is a test — it costs real (free-tier) calls.
+What the 2026-09-19 runs showed is in RUNBOOK.md §10 (the roster) and §11
+(`--models`, twelve more). Requires the Kilo VS Code extension's `bin/kilo`
+(find_kilo_binary) and the kenary provider signed in there; nothing here is a test — it costs real (free-tier) calls.
 """
 from __future__ import annotations
 
@@ -38,7 +39,7 @@ sys.path.insert(0, str(REPO))
 os.environ.setdefault("CONTEST_GATE_API_KEY", "unset-for-the-smoke")
 
 from tools.contest.kilo_client import KiloServer, find_kilo_binary  # noqa: E402
-from tools.contest.roster import load_roster  # noqa: E402
+from tools.contest.roster import AgentSpec, load_roster  # noqa: E402
 from tools.contest.runner import RoundState, run_round  # noqa: E402
 from tools.contest.workspace import prepare_round  # noqa: E402
 
@@ -179,11 +180,25 @@ def build_sandbox(round_no: int) -> None:
         (Path("/tmp/contest/notes")).mkdir(parents=True, exist_ok=True)
 
 
+def agents_from_models(models: str, provider: str = "kenary") -> tuple[AgentSpec, ...]:
+    """``--models a:free,b:free`` → a roster of AgentSpecs; the name is the model id
+    without its ``:tag``, squeezed to the ``[a-z0-9][a-z0-9_-]*`` a branch needs."""
+    specs = []
+    for item in filter(None, (m.strip() for m in models.split(","))):
+        prov, _, model_id = item.rpartition("/")
+        name = "".join(c if c.isalnum() or c in "_-" else "-" for c in model_id.split(":")[0].lower())
+        specs.append(AgentSpec(name=name.lstrip("_-"), provider_id=prov or provider, model_id=model_id))
+    return tuple(specs)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--round", type=int, default=1, choices=sorted(TICKETS))
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--agents", default="", help="comma-separated roster names to keep")
+    ap.add_argument("--models", default="",
+                    help="comma-separated kenary model ids to run INSTEAD of contest.ini's roster")
+    ap.add_argument("--max-parallel", type=int, default=3)
     ap.add_argument("--turn-timeout", type=int, default=600)
     ap.add_argument("--idle-timeout", type=int, default=120)
     args = ap.parse_args()
@@ -194,7 +209,10 @@ def main() -> int:
     ticket = SANDBOX / "epic-tasks" / TICKETS[args.round]
     config = load_roster(REPO / "contest.ini")
     config = replace(config, rounds_dir=str(LIVE / "rounds"), turn_timeout_sec=args.turn_timeout,
-                     idle_event_timeout_sec=args.idle_timeout, max_rework=2, max_parallel=3)
+                     idle_event_timeout_sec=args.idle_timeout, max_rework=2,
+                     max_parallel=args.max_parallel)
+    if args.models:
+        config = replace(config, agents=agents_from_models(args.models))
     if args.agents:
         keep = args.agents.split(",")
         config = replace(config, agents=tuple(a for a in config.agents if a.name in keep))
