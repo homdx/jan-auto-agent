@@ -1,6 +1,6 @@
 # KC-7 — `tools/contest/export.py` + `cli.py`: `python3 -m tools.contest run` — intake, the round, and the folder `contest-bench` reads
 
-**Status:** queued — after KC-6 (round 45). Written against `docs/kilo-contest/PROBE.md`.  
+**Status:** open — round 46 of EPIC KC (`docs/kilo-contest/EPIC-KC.md`); KC-6 (round 45) landed `e8c6ad3` and was run live on 2026-09-19 (`contest-bench/kc6/RUNBOOK.md` §10–§11 — `live_smoke.py` is the hand-written stand-in for this CLI). The last round run by hand: from here on tickets go through `python3 -m tools.contest run`. Independent of KC-12, KC-13 and KC-14 (different files); can run in parallel with any of them. Written against `docs/kilo-contest/PROBE.md`.  
 **Severity:** HIGH  
 **File:** `tools/contest/cli.py` (new), `tools/contest/export.py` (new), `tools/contest/__main__.py` (new)  
 **Symbol:** `main`, `cmd_run`, `cmd_status`, `intake`, `export_round`, `write_summary`, `write_entrants`  
