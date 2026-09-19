@@ -1,0 +1,15 @@
+{
+  "round": "KC-6 (epic-tasks/45-kc6-runner-prompt-wait-harvest-rework-in-the-same-session-for-n-agents.md)",
+  "base": "f48a92c",
+  "inputs": "kc6/ (not committed)",
+  "entrants": {
+    "deepseek": {"file": "kc6/kc5-deepseek-v1.patch", "model": "DeepSeek (misnamed kc5-*)", "commits": 1, "disqualified": "operator: read other agents' folders during the run"},
+    "sn67v1":   {"file": "kc6/kc6-Sensenova6-7-var.patch", "model": "Sensenova 6-7", "commits": 1, "duplicate_of_content": "kc6/kc6-Sensenova6-7-var2.patch (same diff, different commit date)", "touches_kilo_client": "+8"},
+    "sn67v3":   {"file": "kc6/kc6-Sensenova6-7-var3.patch", "model": "Sensenova 6-7", "commits": 1, "touches_kilo_client": "+27"},
+    "sn68v1":   {"file": "kc6/kc6-Sensenova6-8-var1.patch", "model": "Sensenova 6-8", "commits": 1},
+    "sn68v2":   {"file": "kc6/kc6-Sensenova6-8-var2.patch", "model": "Sensenova 6-8", "commits": 2, "duplicate_of_content": "kc6/kc6-Sensenova6-8-KC6-plus-last-fix.patch (byte-identical)", "touches": "tests/_kilo_fake.py"},
+    "sn68v3":   {"file": "kc6/kc6-Sensenova6-8-var3.patch", "model": "Sensenova 6-8", "commits": 1},
+    "sn68v4":   {"file": "kc6/kc6-Sensenova6-8-var4.patch", "model": "Sensenova 6-8", "commits": 2, "note": "AgentState is a typing.Literal, not an enum; AgentRun immutable"},
+    "laguna":   {"file": null, "model": "Laguna S-2-1", "note": "no submission"}
+  }
+}
