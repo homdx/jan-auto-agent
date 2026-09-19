@@ -119,6 +119,50 @@ the literal sleep the test suite should perform.)
 - Deciding the default value of `idle_event_timeout_sec` — already fixed
   at `300` in KC-2's `contest.ini`; not this ticket's call to change.
 
+## Self-check before `append_task.py` (required — every item, in the worktree you submit)
+
+Every line below is a way a KC-5 entry lost points on the round bench;
+the scorer checks all of them mechanically, so check them yourself first.
+
+- [ ] `python3 --version` on the judge is **3.10.12**. Every new/changed
+      module imports there: `python3 -c "import tools.contest.kilo_client"` from the
+      repo root **and** from `/tmp` (with `PYTHONPATH` unset — the sys.path
+      bootstrap is yours to ship). No backslash and no nested same-quote
+      inside an f-string expression (a 3.12-only `f"{x.split("\t")}"`
+      is a `SyntaxError` here and scores 0).
+- [ ] Exactly **one** commit on top of the base: `git log --oneline <base>..HEAD`
+      prints one line. Only this ticket's work is in it — no other KC
+      ticket, no "while I was here" fixes; amend, do not stack.
+- [ ] `git diff --stat <base>..HEAD` names only the files under **File:**
+      and **Also touches:** (plus `.smoke_tests/` links). Never `epic-tasks/`.
+- [ ] Names and signatures are the ticket's, verbatim — **Symbol:** is the
+      contract the bench calls: `wait_idle(tap, session, timeout, *, idle_event_timeout=None, on_permission, on_question) -> IdleResult`, `IdleResult`. Read the modules this ticket
+      builds on before calling them (`tools/contest/kilo_client.py` — `EventTap.wait(pred, timeout=)` and the KC-1 `wait_idle` loop you extend); a keyword you invented
+      (`run_tests_flag=`, `base="HEAD"`) is a `TypeError` on every scenario.
+- [ ] `python3 scripts/sync_test_tiers.py --check` is clean (the new test
+      file has its `.smoke_tests/` symlink; the pre-commit hook runs this).
+- [ ] The new test is red without the change: check the test file alone
+      out onto the base (`git stash` / `git checkout <base> -- <src>`),
+      run it, see it fail; restore.
+- [ ] `python3 -m pytest tests -q --timeout=180` then
+      `python3 -m pytest tests_bugfix -q --timeout=180`, **sequentially**,
+      both green.
+- [ ] `CollectBridge._shrink` byte-identical:
+      `git diff <base> HEAD -- tools/auto/collect_bridge.py` is empty.
+- [ ] Then, and only then, `scripts/append_task.py` from the worktree;
+      open `runs/<you>/PROGRESS.csv` and see your row with the sha of the
+      one commit (the script stores `--outcome DONE` as `FIXED`; that is fine).
+- [ ] What you hand in is `git format-patch <base>..HEAD` of that one
+      commit — not a raw `git diff`, not the whole branch, not an empty file.
+- [ ] The KC-1 tests in `tests/test_contest_kilo_client.py` are **unmodified**
+      (`git diff <base> HEAD -- tests/test_contest_kilo_client.py` shows only
+      added tests) and still pass — omitting `idle_event_timeout` is today's
+      behaviour byte-for-byte.
+- [ ] The stall test finishes in under 3 s wall time and asserts the fake
+      recorded an `abort` for that session; the numbers are test-speed
+      (`pause_before_idle_sec=2`, `idle_event_timeout=0.5`), not 120/60.
+- [ ] No number is hardcoded in `wait_idle`; `grep -n 'contest.ini\|300' tools/contest/kilo_client.py` finds nothing new.
+
 ## Ground rules (same as every round)
 
 - Do not touch `CollectBridge._shrink`.
