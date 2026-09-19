@@ -1,0 +1,595 @@
+"""tests/test_contest_cli.py — KC-16: `python3 -m tools.contest run --ticket NN`.
+
+Every test builds a temp repo with a committed `epic-tasks/` of two open
+tickets and a roster of two agents, chdirs into it (`cmd_run` takes the repo
+from `cwd`), monkeypatches `KiloServer.spawn` onto the fake so no `kilo`
+binary and no provider is ever touched, and calls `cli.main` for the exit
+code and the printed plan. The harvest runs with `--no-tests` in all but one of
+them: `run_tests` is the `tools/contest/runner.py` thread covered in
+`tests/test_contest_runner.py`, and the one test that leaves the roots on runs
+them in a temp worktree, not in this repo's own `tests/`.
+
+The ticket's H1 here is `# 01 — first`, so `intake`'s "in the way" line reads
+`01 (1) is open too — …`; a real ticket with `# KC-7 — …` reads
+`KC-7 (46) is open too — …`, the same line either way.
+"""
+
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+from dataclasses import replace
+from pathlib import Path
+
+import pytest
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+TESTS_DIR = Path(__file__).resolve().parent
+for _p in (str(REPO_ROOT), str(TESTS_DIR)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+from _kilo_fake import FakeKiloServer  # noqa: E402
+from tools.contest import cli  # noqa: E402
+from tools.contest.kilo_client import KiloServer  # noqa: E402
+from tools.contest.roster import AgentSpec, load_roster  # noqa: E402
+from tools.contest.runner import AgentRun, AgentState, RoundState  # noqa: E402
+from tools.contest.workspace import prepare_round  # noqa: E402
+
+# every test binds an ephemeral-port HTTP server: one xdist worker for all of them
+pytestmark = pytest.mark.xdist_group(name="port_bound_http_servers")
+
+ROUND = 1
+TICKET_01 = "01-first.md"
+TICKET_02 = "02-second.md"
+OUT = Path("contest-out") / f"{ROUND:02d}"
+PLANNED = ("ticket", "base", "agents", "parallel", "tests", "gate", "out")
+
+BRIDGE = '''"""stub for the round's ground rule"""
+
+
+class CollectBridge:
+    def _shrink(self, raw: str) -> str:
+        return raw.strip()[:10]
+'''
+
+TICKET = """# {num} — {title}
+
+**Status:** {status} — round {num} of the KC-16 CLI test.
+**Severity:** MEDIUM
+**File:** `pkg/thing.py`
+**Symbol:** `thing`
+**Round:** {num}
+**Size:** S
+**Also touches:** `tests/test_thing.py` (new)
+
+body
+"""
+
+THING_CHANGED = "def thing():\n    return 42\n"
+TEST = "def test_thing():\n    assert 1 + 1 == 2\n"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# the sandbox
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _git(cwd, *args) -> str:
+    result = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True)
+    assert result.returncode == 0, f"git {' '.join(args)}: {result.stderr}"
+    return result.stdout.strip()
+
+
+def _write(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def _ticket(num: str, title: str, status: str = "open") -> str:
+    return TICKET.format(num=num, title=title, status=status)
+
+
+class Sandbox:
+    """A repo with a base commit, a committed `epic-tasks/` of two open tickets
+    and a roster of two agents, whose worktrees go outside it."""
+
+    def __init__(self, tmp_path, agents=("agent-a", "agent-b")):
+        self.tmp = tmp_path
+        self.repo = tmp_path / "repo"
+        self.rounds = tmp_path / "rounds"
+        self.kilo = tmp_path / "kilo"
+
+        self.repo.mkdir()
+        self.rounds.mkdir()
+        self.kilo.write_text("", encoding="utf-8")
+        _write(self.repo / "tools" / "auto" / "collect_bridge.py", BRIDGE)
+        _write(self.repo / "pkg" / "__init__.py", "")
+        _write(self.repo / "pkg" / "thing.py", "def thing():\n    return 1\n")
+        _write(self.repo / "tests" / "test_base.py", "def test_base():\n    assert True\n")
+        _write(self.repo / ".gitignore", "contest-out/\nruns/\n__pycache__/\n")
+        _write(self.repo / "epic-tasks" / TICKET_01, _ticket("01", "first"))
+        _write(self.repo / "epic-tasks" / TICKET_02, _ticket("02", "second"))
+        _write(self.repo / "contest.ini", self._roster(agents))
+
+        _git(self.repo, "init", "-q", "-b", "main")
+        _git(self.repo, "config", "user.email", "cli@example.invalid")
+        _git(self.repo, "config", "user.name", "cli")
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-q", "-m", "base")
+        self.base = _git(self.repo, "rev-parse", "HEAD")
+
+    def _roster(self, agents: tuple) -> str:
+        blocks = "".join(
+            f"\n[contest.agent.{agent}]\nmodel = kenary/{agent}:free\n" for agent in agents
+        )
+        return f"""[contest]
+kilo_bin = {self.kilo}
+server = spawn
+max_parallel = 2
+max_rework = 1
+turn_timeout_sec = 60
+idle_event_timeout_sec = 30
+max_questions_per_turn = 3
+tmp_roots = /nowhere/*
+gate_llm_profile = contest_gate_llm
+gate_max_calls_per_session = 20
+out_dir = contest-out
+rounds_dir = {self.rounds}
+
+[contest_gate_llm]
+base_url = http://127.0.0.1:1/v1
+api_key = ${{CONTEST_GATE_API_KEY}}
+model = test/gate
+api_format = openai
+response_format = true
+{blocks}"""
+
+    def config(self, **overrides):
+        """This sandbox's roster, with the overrides applied on top of it."""
+        config = load_roster(self.repo / "contest.ini")
+        for key, value in overrides.items():
+            config = replace(config, **{key: value})
+        return config
+
+    def commit_ticket(self, ticket: str, body: str) -> None:
+        """A change to `epic-tasks/`, committed — the intake check wants it clean."""
+        _write(self.repo / "epic-tasks" / ticket, body)
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-q", "-m", f"epic-tasks: {ticket}")
+
+    def out(self) -> Path:
+        return self.repo / OUT
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# the agents' turn
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _commits(directory: str) -> int:
+    base = _git(directory, "merge-base", "main", "HEAD")
+    return len(_git(directory, "log", "--oneline", f"{base}..HEAD").splitlines())
+
+
+def _commit(directory: str) -> str:
+    """`add -A`, one commit — amended, since a rework keeps the branch at one."""
+    _git(directory, "add", "-A")
+    if _commits(directory) >= 1:
+        _git(directory, "commit", "-q", "--amend", "--no-edit")
+    else:
+        _git(directory, "commit", "-q", "-m", "KC-16: thing")
+    return _git(directory, "rev-parse", "HEAD")
+
+
+def _claim(directory: str, sha: str) -> None:
+    """The row `append_task.py` writes for the round's ticket."""
+    agent = Path(directory).name.split("-", 1)[1]
+    csv_path = Path(directory) / "runs" / agent / "PROGRESS.csv"
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    new = not csv_path.exists()
+    with csv_path.open("a", encoding="utf-8", newline="") as handle:
+        if new:
+            handle.write("ticket,finding,outcome,commit,note\n")
+        handle.write(f"{TICKET_01},,FIXED,{sha},test\n")
+
+
+def work_ready(directory, text):
+    """A change, a test, one commit, the claim: READY for the harvest."""
+    _write(Path(directory) / "pkg" / "thing.py", THING_CHANGED)
+    _write(Path(directory) / "tests" / "test_thing.py", TEST)
+    _claim(directory, _commit(directory))
+
+
+def work_no_test(directory, text):
+    """The same, without the test file: REWORK, then GAVE_UP at max_rework=1."""
+    _write(Path(directory) / "pkg" / "thing.py", THING_CHANGED)
+    _claim(directory, _commit(directory))
+
+
+def _permission_outside(pattern: str) -> dict:
+    root = pattern.rstrip("/*")
+    return {"permission": "external_directory", "patterns": [pattern],
+            "metadata": {"command": f"rm -v {root}/x", "directories": [root]}}
+
+
+def _one_ready_turn(directory, text):
+    """agent-a ships a test and is READY; agent-b does not, and gives up."""
+    if Path(directory).name.endswith("agent-a"):
+        work_ready(directory, text)
+    else:
+        work_no_test(directory, text)
+
+
+SCENARIO_ONE_READY = {"turns": [{"on_prompt": _one_ready_turn, "events": ["busy", "idle"]},
+                                {"on_prompt": work_no_test, "events": ["busy", "idle"]}]}
+SCENARIO_NO_TEST = {"turns": [{"on_prompt": work_no_test, "events": ["busy", "idle"]},
+                              {"on_prompt": work_no_test, "events": ["busy", "idle"]}]}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# fixtures and read-outs
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.fixture(autouse=True)
+def gate_key(monkeypatch):
+    """The roster reads the gate key from the environment, as `contest.ini` does.
+    These tests are not about that credential, so it is always resolvable here."""
+    monkeypatch.setenv("CONTEST_GATE_API_KEY", "unset-for-the-test")
+
+
+@pytest.fixture
+def sandbox(tmp_path, monkeypatch):
+    """The temp repo, as `cmd_run`'s repo: the cwd is the checkout itself."""
+    sb = Sandbox(tmp_path)
+    monkeypatch.chdir(sb.repo)
+    return sb
+
+
+@pytest.fixture
+def spawn_holder(monkeypatch):
+    """`KiloServer.spawn` → attach to the fake: no binary, no provider."""
+    holder: list = []
+
+    def spawn_server(binary, *, log_path, **kwargs):
+        return KiloServer.attach(holder[-1].url)
+
+    monkeypatch.setattr(cli.KiloServer, "spawn", staticmethod(spawn_server))
+    return holder
+
+
+def run_fake(sb, scenario, argv, holder):
+    """`cli.main(["run", *argv])` against a fresh fake replaying *scenario*."""
+    with FakeKiloServer(scenario) as fake:
+        holder.append(fake)
+        code = cli.main(["run", *argv])
+    return code, fake
+
+
+def _sessions(fake) -> list:
+    return [record for record in fake.calls("POST") if record["path"] == "/session"]
+
+
+def _prompts(fake) -> list:
+    out = []
+    for record in fake.calls("POST"):
+        if record["path"].endswith("/prompt_async"):
+            text = "".join(part.get("text", "") for part in (record["body"] or {}).get("parts", []))
+            out.append((record["path"].split("/")[2], text))
+    return out
+
+
+def _jsonl(path: Path) -> list:
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+
+
+def _table(stdout: str) -> list:
+    return [json.loads(line) for line in stdout.splitlines() if line.strip().startswith("{")]
+
+
+def _plan(stdout: str) -> dict:
+    """The printed plan: `{fact: value}` for the seven facts."""
+    out = {}
+    for line in stdout.splitlines():
+        key, _, value = line.partition(" ")
+        if key in PLANNED:
+            out[key] = value.strip()
+    return out
+
+
+def _patches(stdout: str) -> list:
+    return [line[len("patch: "):] for line in stdout.splitlines() if line.startswith("patch: ")]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# intake
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_intake_rejects_a_ticket_that_is_not_the_lowest_open_one(sandbox, capsys):
+    """`--ticket 2` with `01` still open: in the way, named, nothing created."""
+    code = cli.main(["run", "--ticket", "2", "--no-tests", "--no-gate"])
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "01 (1) is open too — set it to queued or run it first" in captured.err
+    assert not (sandbox.rounds / f"{ROUND:02d}-agent-a").exists()
+    assert not sandbox.out().exists()
+
+
+def test_intake_passes_once_the_way_is_set_to_queued(sandbox):
+    """`02` set to `queued` in a second commit: `intake` returns the `Intake`."""
+    sandbox.commit_ticket(TICKET_02, _ticket("02", "second", status="queued"))
+    result = cli.intake(sandbox.repo, sandbox.repo / "epic-tasks", ROUND, "HEAD", sandbox.config())
+    assert result is not None
+    assert result.ticket_path.name == TICKET_01
+    assert result.title == "01 — first"
+    assert result.base_sha == _git(sandbox.repo, "rev-parse", "HEAD")
+    assert result.out_dir == sandbox.out()
+
+
+def test_intake_rejects_a_ticket_whose_status_is_queued(sandbox, capsys):
+    sandbox.commit_ticket(TICKET_01, _ticket("01", "first", status="queued"))
+    code = cli.main(["run", "--ticket", "1", "--no-tests", "--no-gate"])
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "01-first.md is not open (**Status:** queued)" in captured.err
+
+
+def test_intake_rejects_a_ticket_number_with_no_file(sandbox, capsys):
+    code = cli.main(["run", "--ticket", "9", "--no-tests", "--no-gate"])
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "no ticket numbered 9 in" in captured.err
+
+
+def test_intake_names_an_unresolvable_base(sandbox, capsys):
+    code = cli.main(["run", "--ticket", "1", "--base", "no-such-ref", "--no-tests", "--no-gate"])
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "no-such-ref" in captured.err and "does not resolve" in captured.err
+
+
+def test_intake_names_a_dirty_epic_tasks(sandbox, capsys):
+    _write(sandbox.repo / "epic-tasks" / "03-uncommitted.md", _ticket("03", "dirty"))
+    code = cli.main(["run", "--ticket", "1", "--no-tests", "--no-gate"])
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "epic-tasks/ has uncommitted or untracked changes" in captured.err
+
+
+def test_intake_reports_every_failure_at_once(sandbox, capsys):
+    """Two problems, two lines: intake runs all its checks before it stops."""
+    _write(sandbox.repo / "epic-tasks" / "03-uncommitted.md", _ticket("03", "dirty"))
+    code = cli.main(["run", "--ticket", "2", "--base", "no-such-ref", "--no-tests", "--no-gate"])
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "01 (1) is open too" in captured.err
+    assert "does not resolve" in captured.err
+
+
+def test_intake_names_a_server_that_does_not_answer(sandbox, capsys):
+    """`server = http://…` is answered, not trusted: the health poll decides."""
+    result = cli.intake(sandbox.repo, sandbox.repo / "epic-tasks", ROUND, "HEAD",
+                        sandbox.config(server="http://127.0.0.1:1"))
+    captured = capsys.readouterr()
+    assert result is None
+    assert "not healthy" in captured.err
+
+
+def test_agents_from_models_squeezes_the_name_and_keeps_its_own_provider():
+    specs = cli.agents_from_models("x:free,y:free")
+    assert [spec.model for spec in specs] == ["kenary/x:free", "kenary/y:free"]
+    (explicit,) = cli.agents_from_models("anthropic/claude-haiku-latest:free")
+    assert explicit.provider_id == "anthropic"
+    assert explicit.name == "claude-haiku-latest"
+
+
+def test_export_patches_skips_a_claimed_commit_without_a_workspace(tmp_path):
+    """A claimed commit with no workspace to format from: no file, just a warning."""
+    state = RoundState(round_no=ROUND, ticket=TICKET_01, base_sha="0" * 40, started_at=1.0,
+                       agents=[AgentRun(agent=AgentSpec("agent-a", "kenary", "agent-a:free"),
+                                        workspace=None, commit="1" * 40)])
+    written = cli.export_patches(state, [], tmp_path / "out")
+    assert written == []
+    assert not (tmp_path / "out").exists()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# the round, end to end
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_run_exports_a_patch_per_agent_and_exits_zero(sandbox, capsys, spawn_holder):
+    """One READY and one GAVE_UP with a commit: exit 0, a `.patch` and a
+    `.GAVE_UP.patch`, both present, the tree of the branch, the table printed."""
+    code, fake = run_fake(sandbox, SCENARIO_ONE_READY,
+                          ["--ticket", "1", "--no-gate", "--no-tests"], spawn_holder)
+    captured = capsys.readouterr()
+    out = sandbox.out()
+
+    assert code == 0
+    assert (out / "agent-a.patch").is_file()
+    assert not (out / "agent-a.GAVE_UP.patch").exists()
+    assert (out / "agent-b.GAVE_UP.patch").is_file()
+    assert not (out / "agent-b.patch").exists()
+    assert (out / "state.json").is_file()
+    assert (out / "agent-a" / "turns.jsonl").is_file()
+
+    state = RoundState.from_dict(json.loads((out / "state.json").read_text(encoding="utf-8")))
+    by_name = {run.agent.name: run for run in state.agents}
+    assert sorted(by_name) == ["agent-a", "agent-b"]
+    assert by_name["agent-a"].state is AgentState.READY
+    assert by_name["agent-b"].state is AgentState.GAVE_UP
+    assert by_name["agent-b"].commit
+
+    rows = _table(captured.out)
+    assert [row["name"] for row in rows] == ["agent-a", "agent-b"]
+    assert [row["state"] for row in rows] == ["READY", "GAVE_UP"]
+    assert _patches(captured.out) == [str(out / "agent-a.patch"),
+                                      str(out / "agent-b.GAVE_UP.patch")]
+
+    worktree = sandbox.rounds / f"{ROUND:02d}-agent-a"
+    assert _git(worktree, "rev-parse", "HEAD") == by_name["agent-a"].commit
+
+    fresh = sandbox.tmp / "am"
+    fresh.mkdir()
+    _git(fresh, "init", "-q", "-b", "main")
+    _git(fresh, "config", "user.email", "am@example.invalid")
+    _git(fresh, "config", "user.name", "am")
+    _git(fresh, "fetch", "-q", str(sandbox.repo), f"{sandbox.base}:base")
+    _git(fresh, "checkout", "-q", "base")
+    _git(fresh, "am", "-q", str(out / "agent-a.patch"))
+    assert _git(fresh, "rev-parse", "HEAD^{tree}") == _git(worktree, "rev-parse", "HEAD^{tree}")
+
+
+def test_run_exits_two_when_every_agent_gave_up(sandbox, capsys, spawn_holder):
+    code, fake = run_fake(sandbox, SCENARIO_NO_TEST,
+                          ["--ticket", "1", "--no-gate", "--no-tests"], spawn_holder)
+    captured = capsys.readouterr()
+    assert code == 2
+    assert [row["state"] for row in _table(captured.out)] == ["GAVE_UP", "GAVE_UP"]
+
+
+def test_run_rejects_when_the_roster_is_missing(sandbox, capsys):
+    code = cli.main(["run", "--ticket", "1", "--roster", "no-such.ini", "--no-tests", "--no-gate"])
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "roster file does not exist" in captured.err
+
+
+def test_resume_restarts_only_the_mid_flight_agent(sandbox, capsys, spawn_holder):
+    """`state.json` with one READY and one mid-flight: only the second is
+    prompted, and only inside its own worktree."""
+    config = sandbox.config()
+    prepared = {ws.agent: ws for ws in prepare_round(sandbox.repo, config, ROUND, "HEAD")}
+    a, b = prepared["agent-a"], prepared["agent-b"]
+    _write(a.path / "pkg" / "thing.py", THING_CHANGED)
+    _git(a.path, "add", "-A")
+    _git(a.path, "commit", "-q", "-m", "KC-16: thing")
+    commit = _git(a.path, "rev-parse", "HEAD")
+
+    spec_a = next(spec for spec in config.agents if spec.name == "agent-a")
+    spec_b = next(spec for spec in config.agents if spec.name == "agent-b")
+    prior = RoundState(round_no=ROUND, ticket=TICKET_01, base_sha=sandbox.base, started_at=1.0,
+                       agents=[AgentRun(agent=spec_a, workspace=a, state=AgentState.READY, commit=commit),
+                               AgentRun(agent=spec_b, workspace=b, state=AgentState.WAITING,
+                                        session_id="ses_gone")])
+    _write(sandbox.out() / "state.json", json.dumps(prior.to_dict()))
+
+    code, fake = run_fake(sandbox, {"turns": [{"on_prompt": work_ready, "events": ["busy", "idle"]}]},
+                          ["--ticket", "1", "--no-gate", "--no-tests", "--resume"], spawn_holder)
+    sessions = _sessions(fake)
+    assert code == 0
+    assert len(sessions) == 1
+    assert sessions[0]["query"]["directory"] == str(b.path)
+    assert "runs/agent-b/PROGRESS.csv" in _prompts(fake)[0][1]
+    state = RoundState.from_dict(json.loads((sandbox.out() / "state.json").read_text(encoding="utf-8")))
+    assert {run.state for run in state.agents} == {AgentState.READY}
+
+
+def test_resume_without_a_state_file_is_an_intake_failure(sandbox, capsys):
+    code = cli.main(["run", "--ticket", "1", "--no-gate", "--no-tests", "--resume"])
+    captured = capsys.readouterr()
+    assert code == 1
+    assert "state.json" in captured.err and "nothing to resume" in captured.err
+
+
+def test_models_and_max_parallel_replace_the_roster(sandbox, capsys, spawn_holder):
+    """`--models x:free,y:free --max-parallel 1`: the plan names only those two
+    models, and the worktrees are theirs alone."""
+    code, fake = run_fake(sandbox, {"turns": [{"on_prompt": work_ready, "events": ["busy", "idle"]}]},
+                          ["--ticket", "1", "--models", "x:free,y:free", "--max-parallel", "1",
+                           "--no-gate", "--no-tests"], spawn_holder)
+    captured = capsys.readouterr()
+    plan = _plan(captured.out)
+    assert code == 0
+    assert plan["agents"] == "2: kenary/x:free, kenary/y:free"
+    assert plan["parallel"] == "1" and plan["tests"] == "off" and plan["gate"] == "off"
+    assert plan["out"] == str(sandbox.out())
+    assert "agent-a" not in captured.out and "agent-b" not in captured.out
+    assert sorted(entry.name for entry in sandbox.rounds.iterdir()) == ["01-x", "01-y"]
+    creates = [record["query"]["directory"] for record in _sessions(fake)]
+    assert len(creates) == 2
+    assert all("01-x" in path or "01-y" in path for path in creates)
+
+
+def test_no_gate_records_gate_failed_and_makes_no_call(sandbox, capsys, spawn_holder, monkeypatch):
+    """`--no-gate` with no resolvable api_key at all: the mechanical layer still
+    decides, and every ask it cannot decide is the existing `gate-failed` reject
+    — with no HTTP call attempted and no key check at intake."""
+    calls = []
+
+    def request_completion(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("the gate must not be called with --no-gate")
+
+    monkeypatch.delenv("CONTEST_GATE_API_KEY")
+    monkeypatch.setattr("tools.contest.policy.request_completion", request_completion)
+    monkeypatch.setattr("tools.llm_stream.request_completion", request_completion)
+    scenario = {"turns": [{"on_prompt": work_ready, "events": ["busy", "idle"],
+                           "permission": _permission_outside("/var/lib/*")},
+                          {"on_prompt": work_ready, "events": ["busy", "idle"]}]}
+    code, fake = run_fake(sandbox, scenario, ["--ticket", "1", "--no-gate", "--no-tests"],
+                          spawn_holder)
+    captured = capsys.readouterr()
+    assert code == 0
+    assert calls == []
+    assert _plan(captured.out)["gate"] == "off"
+    decisions = _jsonl(sandbox.out() / "agent-a" / "decisions.jsonl")
+    assert decisions, "the ask must be recorded like any decision"
+    (line,) = decisions
+    assert (line["layer"], line["reply"]) == ("gate-failed", "reject")
+    assert line["reason"] == "gate unavailable: no gate model configured"
+    assert line["gate_model"] == ""
+
+
+def test_the_round_starts_without_a_resolvable_gate_key(sandbox, capsys, spawn_holder, monkeypatch):
+    """No `--no-gate` and no key in the environment: the roster still loads and
+    the round runs — the gate answers `gate unavailable: …` per ask instead."""
+    calls = []
+
+    def request_completion(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("the gate must not be called with --no-gate")
+
+    monkeypatch.delenv("CONTEST_GATE_API_KEY")
+    monkeypatch.setattr("tools.contest.policy.request_completion", request_completion)
+    monkeypatch.setattr("tools.llm_stream.request_completion", request_completion)
+    scenario = {"turns": [{"on_prompt": work_ready, "events": ["busy", "idle"],
+                           "permission": _permission_outside("/var/lib/*")},
+                          {"on_prompt": work_ready, "events": ["busy", "idle"]}]}
+    code, fake = run_fake(sandbox, scenario, ["--ticket", "1", "--no-tests"], spawn_holder)
+    captured = capsys.readouterr()
+    assert code == 0
+    assert _plan(captured.out)["gate"] == "on"
+    decisions = _jsonl(sandbox.out() / "agent-a" / "decisions.jsonl")
+    (line,) = decisions
+    assert line["layer"] == "gate-failed" and line["reply"] == "reject"
+    assert "gate unavailable" in line["reason"]
+    assert line["gate_model"] == "test/gate"
+
+
+def test_tests_flag_toggles_the_roots_in_the_plan(sandbox, capsys, spawn_holder):
+    """The default is on: the plan says so, and the roots really run in the
+    worktree — in a temp dir, not in this repo's own `tests/`."""
+    one_turn = {"turns": [{"on_prompt": work_ready, "events": ["busy", "idle"]}]}
+    code, fake = run_fake(sandbox, one_turn, ["--ticket", "1", "--no-gate", "--no-tests"],
+                          spawn_holder)
+    assert code == 0 and _plan(capsys.readouterr().out)["tests"] == "off"
+
+    code, fake = run_fake(sandbox, one_turn, ["--ticket", "1", "--no-gate"], spawn_holder)
+    assert code == 0 and _plan(capsys.readouterr().out)["tests"] == "on"
+    turns = _jsonl(sandbox.out() / "agent-a" / "turns.jsonl")
+    assert turns[0]["harvest"]["verdict"] == "READY"
+
+
+def test_module_entry_point_help_and_usage():
+    """`run --help` lists every flag; a bare call is usage with exit 2."""
+    help_out = subprocess.run([sys.executable, "-m", "tools.contest", "run", "--help"],
+                              capture_output=True, text=True, cwd=REPO_ROOT)
+    assert help_out.returncode == 0
+    for flag in ("--ticket", "--roster", "--base", "--models", "--max-parallel",
+                 "--no-tests", "--no-gate", "--resume", "--out"):
+        assert flag in help_out.stdout
+
+    bare = subprocess.run([sys.executable, "-m", "tools.contest"],
+                          capture_output=True, text=True, cwd=REPO_ROOT)
+    assert bare.returncode == 2
+    assert "usage: tools.contest" in bare.stderr

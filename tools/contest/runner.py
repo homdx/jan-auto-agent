@@ -30,6 +30,12 @@ event *of this session* on the tap, in `time.monotonic()` — and sends the
 back as `IdleResult.status == "timeout"`; `elapsed` tells them apart. The
 third-question edge is the runner's own, still: `stall()` aborts and closes
 the tap, and the wait wakes on `tap.closed`.
+
+The harvest's tests: `run_round(..., run_tests=True)` (KC-16, round 55) makes
+the four pytest roots the round's judge — a tree that breaks `tests/` is
+REWORK with the pytest tail in the rework prompt, instead of READY. The roots
+are slow (about 105 s here for one suite), so they run one worktree at a time
+under `_TEST_RUNS_LOCK` while the rest of the round stays parallel.
 """
 
 from __future__ import annotations
@@ -58,6 +64,21 @@ _log = logging.getLogger(__name__)
 
 #: How many of the session's latest tool parts the gate sees.
 RECENT_TOOLS = 8
+
+#: The four pytest roots run one worktree at a time. The judge machine takes
+#: about 20 minutes for eight parallel suites and about 105 s for one, so two
+#: agents harvesting at once must not fan the roots out; only the test run is
+#: slow, so the lock is held for the whole `harvest` call — its mechanical part
+#: is a handful of `git` calls and costs nothing next to the roots.
+_TEST_RUNS_LOCK = threading.Lock()
+
+
+def _harvest(ws, ticket_path, run_tests):
+    """`harvest` for one worktree, with the pytest roots serialized round-wide."""
+    if not run_tests:
+        return harvest(ws, ticket_path)
+    with _TEST_RUNS_LOCK:
+        return harvest(ws, ticket_path, run_tests=True)
 
 
 class AgentState(str, Enum):
@@ -312,12 +333,18 @@ def _wait_turn(client: KiloClient, tap: EventTap, session: SessionRef, config: C
 
 def run_agent(run: AgentRun, *, client: KiloClient, tap: EventTap, policy: Policy,
               config: ContestConfig, ticket_path: Path, out_dir: Path,
-              on_transition: Callable[[AgentRun], None]) -> AgentRun:
+              on_transition: Callable[[AgentRun], None],
+              run_tests: bool = False) -> AgentRun:
     """Drive *run* to a terminal state — single-threaded, one session for every turn.
 
     `on_transition(run)` is called after every state change. In `finally`, on a
     terminal state, the session's `cost` and `tokens` are read and its messages
     are written to `out_dir/<agent>.session.json`.
+
+    *run_tests* passes the harvest's `run_tests` through to it after every turn:
+    the four pytest roots are then the round's judge (KC-16) and run one
+    worktree at a time, instead of the ticket's own self-check being the only
+    evidence. Off by default, so every earlier call of this function is unchanged.
     """
     out_dir = Path(out_dir)
     ws, spec = run.workspace, run.agent
@@ -442,7 +469,7 @@ def run_agent(run: AgentRun, *, client: KiloClient, tap: EventTap, policy: Polic
 
             # ── HARVESTING ─────────────────────────────────────────────────
             transition(AgentState.HARVESTING)
-            verdict = harvest(ws, ticket_path)
+            verdict = _harvest(ws, ticket_path, run_tests)
             turn["harvest"] = {"verdict": verdict.verdict, "reasons": [r.code for r in verdict.reasons]}
             run.turns.append(turn)
             _append_jsonl(agent_dir / "turns.jsonl", {"agent": spec.name, **turn})
@@ -483,8 +510,12 @@ class _Stopped(Exception):
 
 
 def _plan(config: ContestConfig, workspaces: list, ticket_path: Path,
-          resume: RoundState | None) -> list:
-    """The `AgentRun` per workspace: fresh, carried over, or restarted for resume."""
+          resume: RoundState | None, run_tests: bool = False) -> list:
+    """The `AgentRun` per workspace: fresh, carried over, or restarted for resume.
+
+    *run_tests* applies to the mid-flight harvest too: a resume must not call a
+    tree READY that the round's own pytest roots would have rejected.
+    """
     specs = {spec.name: spec for spec in config.agents}
     prior = {run.agent.name: run for run in resume.agents} if resume is not None else {}
     runs = []
@@ -495,7 +526,7 @@ def _plan(config: ContestConfig, workspaces: list, ticket_path: Path,
         elif not run.terminal:
             # mid-flight when the round died: the session is gone, the worktree is not
             run.workspace = ws
-            verdict = harvest(ws, ticket_path)
+            verdict = _harvest(ws, ticket_path, run_tests)
             if verdict.verdict == "READY":
                 run.state, run.commit = AgentState.READY, verdict.commit
             else:
@@ -505,7 +536,8 @@ def _plan(config: ContestConfig, workspaces: list, ticket_path: Path,
 
 
 def run_round(config: ContestConfig, round_no: int, ticket_path: Path, workspaces: list, *,
-              server, out_dir: Path, resume: RoundState | None = None) -> RoundState:
+              server, out_dir: Path, resume: RoundState | None = None,
+              run_tests: bool = False) -> RoundState:
     """One round: a `run_agent` per workspace in a pool of `config.max_parallel`.
 
     Each agent gets its own `KiloClient` and `EventTap` for its directory.
@@ -514,10 +546,15 @@ def run_round(config: ContestConfig, round_no: int, ticket_path: Path, workspace
     their worktree (a tree that already scores READY needs no session). Ctrl-C
     tells the pool to stop, aborts every running session, writes `state.json`
     and re-raises.
+
+    *run_tests* is the one KC-16 keyword: it is passed unchanged to the harvest
+    after every turn and to the resume's mid-flight harvest, so the four pytest
+    roots become the round's judge instead of the ticket's self-check. Off by
+    default, and keyword-only — every earlier call of this function is untouched.
     """
     out_dir, ticket_path = Path(out_dir), Path(ticket_path)
     workspaces = list(workspaces)
-    runs = _plan(config, workspaces, ticket_path, resume)
+    runs = _plan(config, workspaces, ticket_path, resume, run_tests=run_tests)
     state = RoundState(round_no=round_no, ticket=ticket_path.name,
                        base_sha=workspaces[0].base_sha if workspaces else "",
                        started_at=resume.started_at if resume is not None else time.time(),
@@ -549,7 +586,8 @@ def run_round(config: ContestConfig, round_no: int, ticket_path: Path, workspace
         _wait_for_stream(tap)
         try:
             run_agent(run, client=client, tap=tap, policy=policy, config=config,
-                      ticket_path=ticket_path, out_dir=out_dir, on_transition=on_transition)
+                      ticket_path=ticket_path, out_dir=out_dir, on_transition=on_transition,
+                      run_tests=run_tests)
         except _Stopped:
             pass
         finally:

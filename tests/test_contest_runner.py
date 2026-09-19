@@ -797,3 +797,152 @@ def test_resume_adopts_a_ready_worktree_without_a_session(tmp_path):
     _assert_ready(runs["agent-b"], sb.ws("agent-b"))
     assert not creates
     assert state.started_at == 1.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# run_tests — KC-16: the pytest roots inside the harvest
+# ─────────────────────────────────────────────────────────────────────────────
+
+THING_CHANGED = "def thing():\n    return 42\n"
+TEST_BREAKS = "def test_thing():\n    assert False\n"
+TEST_PASSES = "def test_thing():\n    assert 1 + 1 == 2\n"
+ALL_ROOTS_PASS = "tests:PASS tests_bugfix:absent .smoke_tests:absent .regression_tests:absent"
+
+
+def _commit(directory: str) -> str:
+    """`add -A`, one commit — amended, since a rework keeps the branch at one commit."""
+    _git(directory, "add", "-A")
+    if _commits(directory) >= 1:
+        _git(directory, "commit", "-q", "--amend", "--no-edit")
+    else:
+        _git(directory, "commit", "-q", "-m", "KC-16: thing")
+    return _git(directory, "rev-parse", "HEAD")
+
+
+def work_breaking_test(directory, text):
+    """A change plus a test that fails: READY for the ticket, REWORK for the suite."""
+    _write(Path(directory) / "pkg" / "thing.py", THING_CHANGED)
+    _write(Path(directory) / "tests" / "test_thing.py", TEST_BREAKS)
+    _claim(directory, _commit(directory))
+
+
+def work_passing_test(directory, text):
+    """The same worktree with a test that passes: the rework's second turn."""
+    _write(Path(directory) / "tests" / "test_thing.py", TEST_PASSES)
+    _claim(directory, _commit(directory))
+
+
+def test_run_round_run_tests_is_keyword_only_with_a_false_default():
+    """KC-16 adds one keyword to `run_round`; nothing else about it moves."""
+    import inspect
+
+    params = inspect.signature(run_round).parameters
+    assert list(params) == ["config", "round_no", "ticket_path", "workspaces",
+                            "server", "out_dir", "resume", "run_tests"]
+    for name in ("server", "out_dir", "resume", "run_tests"):
+        assert params[name].kind is inspect.Parameter.KEYWORD_ONLY, name
+    assert params["resume"].default is None
+    assert params["run_tests"].default is False
+    assert inspect.signature(run_agent).parameters["run_tests"].default is False
+
+
+def test_run_tests_true_makes_the_failed_suite_a_rework_with_the_pytest_tail(tmp_path):
+    """`run_tests=True` judges the tree with the roots: the failing suite is
+    REWORK with `tests_failed`, the pytest tail in the rework prompt, and the
+    fixed suite READY on the second turn."""
+    cfg = make_config(["agent-a"], max_parallel=1)
+    scenario = {"turns": [{"on_prompt": work_breaking_test, "events": ["busy", "idle"]},
+                          {"on_prompt": work_passing_test, "events": ["busy", "idle"]}]}
+    sb = Sandbox(tmp_path)
+    with _BenchFake(scenario) as fake:
+        state = run_round(cfg, ROUND, sb.ticket_path, list(sb.workspaces),
+                          server=KiloServer.attach(fake.url), out_dir=sb.out_dir,
+                          run_tests=True)
+    (run,) = state.agents
+    assert run.state is AgentState.READY
+    first, second = run.turns
+    assert first["harvest"] == {"verdict": "REWORK", "reasons": ["tests_failed"]}
+    assert second["harvest"] == {"verdict": "READY", "reasons": []}
+    assert run.attempt == 1
+    (sid, _), (_, rework) = _prompts(fake)
+    assert "FAILED tests/test_thing.py::test_thing" in rework
+    assert "Attempt 1 of 2" in rework
+
+
+def test_run_tests_false_is_ready_after_one_turn_on_the_same_tree(tmp_path):
+    """The same tree, the roots off: the ticket's self-check is the only judge
+    and one turn is enough — the default every earlier test runs on."""
+    cfg = make_config(["agent-a"], max_parallel=1)
+    scenario = {"turns": [{"on_prompt": work_breaking_test, "events": ["busy", "idle"]}]}
+    sb = Sandbox(tmp_path)
+    with _BenchFake(scenario) as fake:
+        state = run_round(cfg, ROUND, sb.ticket_path, list(sb.workspaces),
+                          server=KiloServer.attach(fake.url), out_dir=sb.out_dir)
+    (run,) = state.agents
+    _assert_ready(run, sb.ws("agent-a"))
+    assert len(run.turns) == 1 and run.turns[0]["harvest"] == {"verdict": "READY", "reasons": []}
+
+
+def test_run_tests_true_never_runs_the_roots_twice_at_once(tmp_path, monkeypatch):
+    """Two agents harvested at once, `run_tests=True`: the roots run one
+    worktree at a time, so the counter never leaves zero until one suite is done."""
+    import tools.contest.harvest as harvest_module
+
+    agents = ["agent-a", "agent-b"]
+    sb = Sandbox(tmp_path, agents)
+    cfg = make_config(agents, max_parallel=2)
+    barrier = threading.Barrier(len(agents))
+    counter = [0]
+    peaks = []
+
+    def roots(cwd):
+        counter[0] += 1
+        peaks.append(counter[0])
+        time.sleep(0.2)
+        counter[0] -= 1
+        return ALL_ROOTS_PASS, []
+
+    def on_prompt(directory, text):
+        barrier.wait(2)
+        work_ready(directory, text)
+
+    monkeypatch.setattr(harvest_module, "run_tests_detail", roots)
+    scenario = {"turns": [{"on_prompt": on_prompt, "events": ["busy", "idle"]},
+                          {"on_prompt": work_ready, "events": ["busy", "idle"]}]}
+    with _BenchFake(scenario) as fake:
+        state = run_round(cfg, ROUND, sb.ticket_path, list(sb.workspaces),
+                          server=KiloServer.attach(fake.url), out_dir=sb.out_dir,
+                          run_tests=True)
+    for name in agents:
+        _assert_ready(_by_name(state)[name], sb.ws(name))
+    assert len(peaks) == 2 and max(peaks) == 1, peaks
+
+
+def test_resume_harvests_the_mid_flight_worktree_with_the_roots(tmp_path, monkeypatch):
+    """`_plan` takes the same `run_tests`: a resumed tree that breaks the suite is
+    not adopted as READY just because it committed and claimed."""
+    import tools.contest.harvest as harvest_module
+
+    sb = Sandbox(tmp_path, ["agent-a", "agent-b"])
+    cfg = make_config(["agent-a", "agent-b"], max_parallel=2)
+    _work(str(sb.ws("agent-b").path), test=True)
+    harvested = []
+
+    def roots(cwd):
+        harvested.append(cwd)
+        return ALL_ROOTS_PASS, []
+
+    prior = RoundState(round_no=ROUND, ticket=TICKET, base_sha=sb.base_sha, started_at=1.0, agents=[
+        AgentRun(agent=cfg.agents[0], workspace=sb.ws("agent-a"), state=AgentState.READY, commit="0" * 40),
+        AgentRun(agent=cfg.agents[1], workspace=sb.ws("agent-b"), state=AgentState.WAITING, session_id="ses_gone"),
+    ])
+    monkeypatch.setattr(harvest_module, "run_tests_detail", roots)
+    with _BenchFake({"turns": []}) as fake:
+        state = run_round(cfg, ROUND, sb.ticket_path, list(sb.workspaces),
+                          server=KiloServer.attach(fake.url), out_dir=sb.out_dir,
+                          resume=prior, run_tests=True)
+    runs = _by_name(state)
+    assert runs["agent-b"].state is AgentState.READY
+    assert runs["agent-a"].commit == "0" * 40
+    assert not _session_posts(fake)
+    assert harvested == [str(sb.ws("agent-b").path)]
