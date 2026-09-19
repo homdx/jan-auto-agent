@@ -1,0 +1,622 @@
+"""tools/contest/runner.py — KC-6: prompt → wait → harvest → rework, in the same
+session, for N agents at once, resumable.
+
+`scripts/kilo_hello.py --append-model` (PROBE.md §4) is this loop for one agent
+and two turns: prompt, `wait_idle`, check the disk, prompt again into the *same*
+session, `wait_idle`, check again. This module is that loop with the probe's
+flag replaced by the policy (KC-3), the disk check replaced by the harvest
+(KC-5), the second prompt replaced by `rework_message`, and N of them in a pool.
+
+Per agent, `run_agent` walks the states in order:
+
+    CREATED → PROMPTED → WAITING → HARVESTING → READY
+                 ▲                     │
+                 └──── REWORK ◄────────┤  (attempts left)
+                                       └→ GAVE_UP
+    WAITING → STALLED  (turn timeout, silence, a third question — abort sent)
+    WAITING → ERROR    (session.error, the stream closed)
+    CREATED → ERROR    (POST /session refused)
+
+After every transition `on_transition(run)` fires — `run_round` writes
+`state.json` there — and one line per turn goes to `out_dir/<agent>/turns.jsonl`.
+Every artifact write is fail-open: a log line or a state file that cannot be
+written is a warning, never an exception into a round.
+
+Stall detection: KC-12 (round 51) gives `wait_idle` an `idle_event_timeout=`;
+when the client has it, the number goes there. Until then `_silence_watch`
+keeps the same clock here — the last event *of this session* on the tap — so
+one agent's traffic on a shared stream cannot keep another agent's turn alive.
+"""
+
+from __future__ import annotations
+
+import inspect
+import json
+import logging
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict, dataclass, field
+from enum import Enum
+from pathlib import Path
+from typing import Callable
+
+from tools.backoff import save_state
+from tools.contest.gates import declared_files
+from tools.contest.harvest import harvest, rework_message
+from tools.contest.kilo_client import EventTap, KiloClient, KiloHttpError, SessionRef
+from tools.contest.policy import HARD_DENYLIST, Policy, PolicyContext
+from tools.contest.roster import AgentSpec, ContestConfig
+from tools.contest.workspace import Workspace
+
+__all__ = ["AgentRun", "AgentState", "RoundState", "round_prompt", "run_agent", "run_round"]
+
+_log = logging.getLogger(__name__)
+
+#: How many of the session's latest tool parts the gate sees.
+RECENT_TOOLS = 8
+#: How often the silence watcher looks at the tap (seconds).
+_WATCH_POLL = 0.1
+
+
+class AgentState(str, Enum):
+    """One agent's position in the loop. The last four are terminal."""
+
+    CREATED = "CREATED"
+    PROMPTED = "PROMPTED"
+    WAITING = "WAITING"
+    HARVESTING = "HARVESTING"
+    REWORK = "REWORK"
+    READY = "READY"
+    GAVE_UP = "GAVE_UP"
+    STALLED = "STALLED"
+    ERROR = "ERROR"
+
+    @property
+    def terminal(self) -> bool:
+        return self in (AgentState.READY, AgentState.GAVE_UP, AgentState.STALLED, AgentState.ERROR)
+
+
+def _counters() -> dict:
+    return {"asked": 0, "allowed": 0, "rejected": 0, "gated": 0, "gate_failed": 0}
+
+
+@dataclass
+class AgentRun:
+    """One agent's run: mutable, and JSON-round-trippable through `to_dict`/`from_dict`.
+
+    `attempt` is 0 for the first turn and grows by one per rework. `turns` holds
+    one dict per turn: `kind` (`initial`/`rework`), `attempt`, `sent_at`,
+    `idle_at`, `idle_status`, and `harvest` = `{"verdict", "reasons": [codes]}`
+    once the turn was scored. `permissions` counts what the policy was asked
+    and how it answered; `questions` counts the questions over the whole run.
+    """
+
+    agent: AgentSpec
+    workspace: Workspace
+    session_id: str | None = None
+    state: AgentState = AgentState.CREATED
+    attempt: int = 0
+    turns: list = field(default_factory=list)
+    permissions: dict = field(default_factory=_counters)
+    questions: int = 0
+    last_error: str | None = None
+    commit: str | None = None
+    cost: float | None = None
+    tokens: dict | None = None
+
+    @property
+    def terminal(self) -> bool:
+        return self.state.terminal
+
+    def to_dict(self) -> dict:
+        data = asdict(self)
+        data["workspace"]["path"] = str(self.workspace.path)
+        data["state"] = self.state.value
+        return data
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "AgentRun":
+        ws = dict(data["workspace"])
+        ws["path"] = Path(ws["path"])
+        run = cls(agent=AgentSpec(**data["agent"]), workspace=Workspace(**ws))
+        for name in ("session_id", "attempt", "turns", "permissions", "questions",
+                     "last_error", "commit", "cost", "tokens"):
+            if name in data:
+                setattr(run, name, data[name])
+        run.state = AgentState(data.get("state", "CREATED"))
+        return run
+
+    def last_reason(self) -> str:
+        """`last_error`, else the last scored turn's verdict and reason codes."""
+        if self.last_error:
+            return self.last_error
+        for turn in reversed(self.turns):
+            h = turn.get("harvest")
+            if h:
+                return " ".join([h.get("verdict", "")] + [str(c) for c in h.get("reasons", [])]).strip()
+        return ""
+
+
+@dataclass
+class RoundState:
+    """One round: what `out_dir/state.json` holds, and what `--resume` reads back."""
+
+    round_no: int
+    ticket: str
+    base_sha: str
+    started_at: float
+    agents: list = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {"round_no": self.round_no, "ticket": self.ticket, "base_sha": self.base_sha,
+                "started_at": self.started_at, "agents": [run.to_dict() for run in self.agents]}
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "RoundState":
+        return cls(round_no=int(data["round_no"]), ticket=str(data["ticket"]),
+                   base_sha=str(data["base_sha"]), started_at=float(data["started_at"]),
+                   agents=[AgentRun.from_dict(a) for a in data.get("agents", [])])
+
+    def table_rows(self) -> list:
+        """One dict per agent — the SUMMARY's inputs; KC-7 renders them."""
+        return [{
+            "name": run.agent.name,
+            "model": run.agent.model,
+            "state": run.state.value,
+            "attempts": run.attempt,
+            "turns": len(run.turns),
+            "permissions": dict(run.permissions),
+            "questions": run.questions,
+            "cost": run.cost,
+            "tokens": run.tokens,
+            "commit": run.commit,
+            "last_reason": run.last_reason(),
+        } for run in self.agents]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# the prompt
+# ─────────────────────────────────────────────────────────────────────────────
+
+#: `docs/collect-epics/RUN-THE-EPIC-COMPETITION.md` §Stage 1, "PROMPT STARTS …
+#: PROMPT ENDS", with the blockquote markers dropped and `<YOUR NAME>` as
+#: `{name}`. A module string on purpose: the runbook is documentation and may
+#: drift; the text the agents are scored against must not.
+_PROMPT = """\
+You are implementing one ticket from an epic round. Every agent in this round
+is implementing the same ticket against the same starting tree; the best
+implementation is merged and becomes the base for the next round. You are
+being scored on the implementation, not on speed.
+
+Get your ticket:
+
+```bash
+python3 scripts/next_task.py --tasks epic-tasks/ --progress runs/{name}/PROGRESS.csv
+```
+
+The command prints a ticket: a description of a defect in the code named on
+its `**File:**` / `**Symbol:**` lines. The ticket file itself already exists
+in `epic-tasks/` — do **not** create, edit or rewrite it; it is your task
+description, not your deliverable. Your deliverable is a change to the code
+it names, plus a test. Implement **exactly that ticket**. Then record it:
+
+```bash
+python3 scripts/append_task.py --progress runs/{name}/PROGRESS.csv \\
+    --ticket <the NN-*.md you were given> --outcome DONE --commit <sha> \\
+    --note "one line: what changed + the test that covers it"
+```
+
+Stop after **one** ticket. Do not call `next_task.py` again — the next round
+is handed out separately, from a different tree.
+
+The ground rules are printed inside the ticket. Three of them settle the round
+on their own, so read them before you start:
+
+- `CollectBridge._shrink` must be **byte-identical** when you are done. New
+  work runs *before* it, never instead of it. This is checked mechanically.
+- **One local commit.** Never `git push`.
+- **A test ships with the change**, and it must fail without the change.
+
+Two more that are checked by reading your diff:
+
+- Everything you add is **fail-open**: an absent collect model, a malformed
+  config key or a broken artifact degrades to "no collect data" and never
+  raises into a run.
+- **Stay on the ticket.** Touching files the ticket does not name counts
+  against you unless you say why in the commit message.
+
+Never point any command at a live provider config. If a step needs one, copy
+`agents_128k.ini` to a scratch path and stub every `base_url` first.
+
+When you are done, report: the commit sha, each Acceptance checkbox and
+whether you met it, and anything in the ticket you found to be wrong about the
+live code — each ticket names the commit it was written against in its
+`**Status:**` line (the original 24 used `68b78a0`); the code is the
+authority, not the ticket.
+
+Your starting tree is commit {base_sha}; your one commit goes on top of it.
+Any command that reaches outside your worktree is decided by a reviewer, and a
+rejection is final for that command — do not retry it.
+"""
+
+
+def round_prompt(agent_name: str, ticket_path: Path, base_sha: str) -> str:
+    """The runbook's prompt for *agent_name*, plus the base sha and the permission rule.
+
+    The ticket is not repeated: the session reads it from its own worktree via
+    `next_task.py`, so *ticket_path* is accepted for the caller's clarity only.
+    """
+    del ticket_path
+    return _PROMPT.format(name=agent_name, base_sha=base_sha)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# artifacts — every write fail-open
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _append_jsonl(path: Path, entry: dict) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+    except Exception as exc:  # noqa: BLE001 — a log line is not a round
+        _log.warning("could not append %s: %s: %s", path, type(exc).__name__, exc)
+
+
+def _write_json(path: Path, data) -> None:
+    try:
+        save_state(data, path)  # tmp + fsync + rename, so a reader never sees a torn file
+    except Exception as exc:  # noqa: BLE001 — see the module docstring
+        _log.warning("could not write %s: %s: %s", path, type(exc).__name__, exc)
+
+
+def _brief(value) -> str:
+    """A one-line, bounded rendering of a server payload for `last_error`."""
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+    return " ".join(text.split())[:300]
+
+
+def _abort_quietly(client: KiloClient, session: SessionRef) -> None:
+    try:
+        client.abort(session)
+    except Exception as exc:  # noqa: BLE001 — the session may already be gone
+        _log.warning("abort(%s) failed: %s: %s", session.id, type(exc).__name__, exc)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# the wait, with the round's stall edge
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _session_events(tap: EventTap, session_id: str) -> int:
+    """How many events of *this* session the tap has read — the silence clock."""
+    with tap.lock:
+        return sum(1 for e in tap.events
+                   if (e.get("properties") or {}).get("sessionID") == session_id)
+
+
+def _silence_watch(tap: EventTap, session_id: str, seconds: float,
+                   stop: threading.Event, on_silence: Callable[[], None]) -> threading.Thread:
+    """A thread that calls *on_silence* once when no event of the session
+    arrives for *seconds*. Stopped by *stop*; never raises."""
+    def run() -> None:
+        last, since = _session_events(tap, session_id), time.monotonic()
+        while not stop.wait(_WATCH_POLL):
+            count = _session_events(tap, session_id)
+            if count != last:
+                last, since = count, time.monotonic()
+            elif time.monotonic() - since >= seconds:
+                on_silence()
+                return
+
+    thread = threading.Thread(target=run, name="contest-silence-watch", daemon=True)
+    thread.start()
+    return thread
+
+
+def _wait_turn(client: KiloClient, tap: EventTap, session: SessionRef, config: ContestConfig,
+               *, on_permission, on_question, stall: Callable[[str], None]):
+    """`client.wait_idle` for one turn, with silence and the question budget wired in.
+
+    Returns the `IdleResult`. `stall(reason)` is the runner's own edge: it is
+    called at most once, from the watcher or from the third question, and is
+    expected to abort the session and close the tap so the wait wakes up.
+    """
+    turn_timeout = float(config.turn_timeout_sec)
+    silence = float(config.idle_event_timeout_sec or 0)
+    if "idle_event_timeout" in inspect.signature(client.wait_idle).parameters:
+        # KC-12 landed: the primitive owns the clock and the abort.
+        return client.wait_idle(tap, session, turn_timeout, idle_event_timeout=silence or None,
+                                on_permission=on_permission, on_question=on_question)
+    stop = threading.Event()
+    watcher = None
+    if silence > 0:
+        watcher = _silence_watch(tap, session.id, silence, stop,
+                                 lambda: stall(f"no event for {silence:g}s"))
+    try:
+        return client.wait_idle(tap, session, turn_timeout,
+                                on_permission=on_permission, on_question=on_question)
+    finally:
+        stop.set()
+        if watcher is not None:
+            watcher.join(1.0)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# one agent
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_agent(run: AgentRun, *, client: KiloClient, tap: EventTap, policy: Policy,
+              config: ContestConfig, ticket_path: Path, out_dir: Path,
+              on_transition: Callable[[AgentRun], None]) -> AgentRun:
+    """Drive *run* to a terminal state — single-threaded, one session for every turn.
+
+    `on_transition(run)` is called after every state change. In `finally`, on a
+    terminal state, the session's `cost` and `tokens` are read and its messages
+    are written to `out_dir/<agent>.session.json`.
+    """
+    out_dir = Path(out_dir)
+    ws, spec = run.workspace, run.agent
+    agent_dir = out_dir / spec.name
+    session: SessionRef | None = None
+    stalled: list = []          # the reason, once the runner's stall edge fired
+    questions_this_turn = [0]
+    try:
+        ticket_files = declared_files(ticket_path)
+    except OSError:
+        ticket_files = ()
+
+    def transition(state: AgentState, error: str | None = None) -> None:
+        run.state = state
+        if error is not None:
+            run.last_error = error
+        on_transition(run)
+
+    def stall(reason: str) -> None:
+        """Abort the session and close the tap; the wait wakes on `tap.closed`."""
+        if stalled:
+            return
+        stalled.append(reason)
+        _abort_quietly(client, session)
+        tap.stop()
+
+    def on_permission(event: dict) -> tuple:
+        props = event.get("properties") or {}
+        run.permissions["asked"] += 1
+        try:
+            recent = tuple(client.tool_parts(session)[-RECENT_TOOLS:])
+        except Exception:  # noqa: BLE001 — a history that cannot be read is an empty one
+            recent = ()
+        spent = run.permissions["gated"] + run.permissions["gate_failed"]
+        ctx = PolicyContext(
+            worktree=ws.path,
+            tmp_roots=tuple(config.tmp_roots),
+            # the other agents' worktrees are this one's siblings: never theirs to read
+            forbidden=tuple(HARD_DENYLIST) + (ws.path.parent,),
+            ticket_title=Path(ticket_path).name,
+            ticket_files=tuple(ticket_files),
+            recent_tools=recent,
+            gate_budget_left=max(0, int(config.gate_max_calls_per_session) - spent),
+        )
+        decision = policy.decide(event, ctx)
+        policy.record(decision, event, agent_dir / "decisions.jsonl")
+        run.permissions["allowed" if decision.reply == "once" else "rejected"] += 1
+        if decision.layer == "gate":
+            run.permissions["gated"] += 1
+        elif decision.layer in ("gate-failed", "budget"):
+            run.permissions["gate_failed"] += 1
+        _log.info("%s: permission %s -> %s (%s)", spec.name, props.get("permission"),
+                  decision.reply, decision.layer)
+        return decision.reply, decision.reason
+
+    def on_question(event: dict) -> None:
+        del event  # rejected by wait_idle regardless; only the count matters here
+        run.questions += 1
+        questions_this_turn[0] += 1
+        if questions_this_turn[0] >= int(config.max_questions_per_turn):
+            stall(f"{questions_this_turn[0]} questions in one turn")
+
+    def finish(state: AgentState, error: str | None = None) -> AgentRun:
+        transition(state, error)
+        return run
+
+    try:
+        # ── CREATED: one session, kept for every turn ─────────────────────
+        try:
+            session = client.create_session(
+                spec.provider_id, spec.model_id, rules=config.session_rules(),
+                title=ws.branch, agent=spec.kilo_agent)
+        except (KiloHttpError, ValueError) as exc:
+            return finish(AgentState.ERROR, f"POST /session failed: {_brief(str(exc))}")
+        run.session_id = session.id
+
+        rework_text = None
+        while True:
+            # ── PROMPTED ───────────────────────────────────────────────────
+            kind = "initial" if rework_text is None else "rework"
+            text = rework_text if rework_text is not None else round_prompt(
+                spec.name, ticket_path, ws.base_sha)
+            turn = {"kind": kind, "attempt": run.attempt, "sent_at": time.time()}
+            transition(AgentState.PROMPTED)
+            try:
+                client.prompt(session, text)
+            except KiloHttpError as exc:
+                return finish(AgentState.ERROR, f"prompt failed: {_brief(str(exc))}")
+
+            # ── WAITING ────────────────────────────────────────────────────
+            transition(AgentState.WAITING)
+            questions_this_turn[0] = 0
+            idle = _wait_turn(client, tap, session, config,
+                              on_permission=on_permission, on_question=on_question, stall=stall)
+            turn["idle_at"] = time.time()
+            turn["idle_status"] = idle.status
+            if stalled:
+                turn["idle_status"] = "stalled"
+                error, state = stalled[0], AgentState.STALLED
+            elif idle.status == "timeout":
+                silence = float(config.idle_event_timeout_sec or 0)
+                quiet = 0 < silence and idle.elapsed < float(config.turn_timeout_sec)
+                error = f"no event for {silence:g}s" if quiet else f"no idle after {config.turn_timeout_sec}s"
+                state = AgentState.STALLED
+            elif idle.status == "error":
+                error, state = f"session.error: {_brief(idle.error)}", AgentState.ERROR
+            elif idle.status == "closed":
+                error, state = f"event stream closed: {_brief(idle.error)}", AgentState.ERROR
+            else:
+                error = state = None
+            if state is not None:
+                run.turns.append(turn)
+                _append_jsonl(agent_dir / "turns.jsonl", {"agent": spec.name, **turn})
+                return finish(state, error)
+
+            # ── HARVESTING ─────────────────────────────────────────────────
+            transition(AgentState.HARVESTING)
+            verdict = harvest(ws, ticket_path)
+            turn["harvest"] = {"verdict": verdict.verdict, "reasons": [r.code for r in verdict.reasons]}
+            run.turns.append(turn)
+            _append_jsonl(agent_dir / "turns.jsonl", {"agent": spec.name, **turn})
+            run.commit = verdict.commit
+            if verdict.verdict == "READY":
+                return finish(AgentState.READY)
+            if run.attempt >= int(config.max_rework):
+                return finish(AgentState.GAVE_UP, "REWORK after the last attempt: "
+                              + ", ".join(r.code for r in verdict.reasons if r.blocking))
+            run.attempt += 1
+            transition(AgentState.REWORK)
+            rework_text = rework_message(verdict, run.attempt, int(config.max_rework))
+    finally:
+        if session is not None and run.terminal:
+            _record_session(run, client, session, out_dir)
+
+
+def _record_session(run: AgentRun, client: KiloClient, session: SessionRef, out_dir: Path) -> None:
+    """Cost, tokens and the transcript of a finished session. Fail-open."""
+    try:
+        info = client.session_info(session)
+        run.cost = info.get("cost")
+        run.tokens = info.get("tokens")
+    except Exception as exc:  # noqa: BLE001 — the server may be gone
+        _log.warning("session_info(%s) failed: %s: %s", session.id, type(exc).__name__, exc)
+    try:
+        _write_json(out_dir / f"{run.agent.name}.session.json", client.messages(session))
+    except Exception as exc:  # noqa: BLE001
+        _log.warning("messages(%s) failed: %s: %s", session.id, type(exc).__name__, exc)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# the round
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _Stopped(Exception):
+    """Raised inside a worker's `on_transition` once Ctrl-C asked the round to stop."""
+
+
+def _plan(config: ContestConfig, workspaces: list, ticket_path: Path,
+          resume: RoundState | None) -> list:
+    """The `AgentRun` per workspace: fresh, carried over, or restarted for resume."""
+    specs = {spec.name: spec for spec in config.agents}
+    prior = {run.agent.name: run for run in resume.agents} if resume is not None else {}
+    runs = []
+    for ws in workspaces:
+        run = prior.get(ws.agent)
+        if run is None:
+            run = AgentRun(agent=specs.get(ws.agent) or AgentSpec(ws.agent, "", ""), workspace=ws)
+        elif not run.terminal:
+            # mid-flight when the round died: the session is gone, the worktree is not
+            run.workspace = ws
+            verdict = harvest(ws, ticket_path)
+            if verdict.verdict == "READY":
+                run.state, run.commit = AgentState.READY, verdict.commit
+            else:
+                run.state, run.session_id, run.attempt = AgentState.CREATED, None, 0
+        runs.append(run)
+    return runs
+
+
+def run_round(config: ContestConfig, round_no: int, ticket_path: Path, workspaces: list, *,
+              server, out_dir: Path, resume: RoundState | None = None) -> RoundState:
+    """One round: a `run_agent` per workspace in a pool of `config.max_parallel`.
+
+    Each agent gets its own `KiloClient` and `EventTap` for its directory.
+    `state.json` is rewritten atomically after every transition of any agent.
+    With *resume*, terminal agents are skipped and mid-flight agents restart in
+    their worktree (a tree that already scores READY needs no session). Ctrl-C
+    tells the pool to stop, aborts every running session, writes `state.json`
+    and re-raises.
+    """
+    out_dir, ticket_path = Path(out_dir), Path(ticket_path)
+    workspaces = list(workspaces)
+    runs = _plan(config, workspaces, ticket_path, resume)
+    state = RoundState(round_no=round_no, ticket=ticket_path.name,
+                       base_sha=workspaces[0].base_sha if workspaces else "",
+                       started_at=resume.started_at if resume is not None else time.time(),
+                       agents=runs)
+    lock = threading.Lock()
+    stop = threading.Event()
+
+    def save() -> None:
+        with lock:
+            _write_json(out_dir / "state.json", state.to_dict())
+
+    def on_transition(run: AgentRun) -> None:
+        if stop.is_set():
+            raise _Stopped()
+        save()
+
+    policy = Policy(config)
+    live: list = []                     # (run, client, tap) of every agent in the pool
+    for run in runs:
+        if run.terminal:
+            continue
+        client = KiloClient(server, str(run.workspace.path))
+        tap = EventTap(server.base_url, str(run.workspace.path),
+                       str(out_dir / run.agent.name / "events.jsonl")).start()
+        live.append((run, client, tap))
+    save()
+
+    def work(run: AgentRun, client: KiloClient, tap: EventTap) -> None:
+        _wait_for_stream(tap)
+        try:
+            run_agent(run, client=client, tap=tap, policy=policy, config=config,
+                      ticket_path=ticket_path, out_dir=out_dir, on_transition=on_transition)
+        except _Stopped:
+            pass
+        finally:
+            tap.stop()
+            tap.join(2.0)
+
+    pool = ThreadPoolExecutor(max_workers=max(1, int(config.max_parallel)),
+                              thread_name_prefix="contest")
+    try:
+        futures = {pool.submit(work, *item): item[0] for item in live}
+        for future in as_completed(futures):
+            run = futures[future]
+            try:
+                future.result()
+            except Exception as exc:  # noqa: BLE001 — one agent's crash is that agent's ERROR
+                _log.exception("agent %s crashed", run.agent.name)
+                run.state, run.last_error = AgentState.ERROR, f"runner: {type(exc).__name__}: {exc}"
+                save()
+    except KeyboardInterrupt:
+        stop.set()  # from here on a worker's transition raises instead of saving
+        save()      # the round as it stood: mid-flight agents stay mid-flight for --resume
+        for run, client, tap in live:
+            if not run.terminal and run.session_id:
+                _abort_quietly(client, SessionRef(run.session_id, run.agent.provider_id,
+                                                  run.agent.model_id, str(run.workspace.path),
+                                                  run.agent.kilo_agent))
+            tap.stop()  # wakes the worker's wait
+        raise
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+    save()
+    return state
+
+
+def _wait_for_stream(tap: EventTap, timeout: float = 5.0) -> None:
+    """Give the tap's reader a moment to connect: an event published before the
+    stream is open is lost, and the first one is the session's own."""
+    deadline = time.monotonic() + timeout
+    while getattr(tap, "_socket", None) is None and time.monotonic() < deadline:
+        if tap.join(0.02):
+            return  # the reader already ended: the wait will see tap.closed
