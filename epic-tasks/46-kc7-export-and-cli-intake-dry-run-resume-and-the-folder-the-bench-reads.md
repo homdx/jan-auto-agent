@@ -1,6 +1,6 @@
 # KC-7 — `tools/contest/export.py` + `cli.py`: `python3 -m tools.contest run` — intake, the round, and the folder `contest-bench` reads
 
-**Status:** open — round 46 of EPIC KC (`docs/kilo-contest/EPIC-KC.md`); KC-6 (round 45) landed `e8c6ad3` and was run live on 2026-09-19 (`contest-bench/kc6/RUNBOOK.md` §10–§11 — `live_smoke.py` is the hand-written stand-in for this CLI). The last round run by hand: from here on tickets go through `python3 -m tools.contest run`. Independent of KC-12, KC-13 and KC-14 (different files); can run in parallel with any of them. Written against `docs/kilo-contest/PROBE.md`.  
+**Status:** queued — after KC-16 (round 55), which takes this ticket's core: `run --ticket NN`, `intake`'s ticket/base/kilo checks, `run_round(…, run_tests=)`, `<agent>.patch` / `<agent>.GAVE_UP.patch`, `--resume`, `__main__.py`. What stays here, on top of KC-16's `cli.py`: the full intake (`**File:**`/`**Symbol:**` lines, the gate `api_key` after env expansion), `--dry-run` (prints the prompt, starts no server), `--attach`, `--clone`, `entrants.json` with `duplicate_of`, `SUMMARY.md` with the decisions list and the three next commands, and `status`. Read KC-16's `cli.py` first and extend it — do not rewrite `cmd_run`. Written against `docs/kilo-contest/PROBE.md`.  
 **Severity:** HIGH  
 **File:** `tools/contest/cli.py` (new), `tools/contest/export.py` (new), `tools/contest/__main__.py` (new)  
 **Symbol:** `main`, `cmd_run`, `cmd_status`, `intake`, `export_round`, `write_summary`, `write_entrants`  
