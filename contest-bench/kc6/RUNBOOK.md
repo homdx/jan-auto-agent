@@ -203,3 +203,53 @@ and the runner's round is the runner's own score. What to look at first:
 `s30` (the concurrency edge nobody's own tests caught), `s26` (Ctrl-C), and
 the static checks in §4 — a live agent that stacks commits or edits
 `kilo_client.py` fails the harvest before the bench sees it.
+
+## 10. Live runs, 2026-09-19 — the runner against `kilo serve` and the three free models
+
+`live_smoke.py` (this folder) builds a sandbox repo under `/tmp/contest/live-kc6`
+with the real `scripts/next_task.py` / `append_task.py`, a stub
+`CollectBridge`, `pkg/thing.py` and two tickets, then runs the ideal runner
+with the roster of `contest.ini` (`kenary/laguna-s-2-1:free`,
+`mistral-medium-3-5:free`, `hy3:free`), `max_parallel = 3`,
+`turn_timeout 600`, `idle_event_timeout 120`, the gate left at contest.ini's
+placeholder URL (so every gated permission fails closed).
+
+```bash
+python3 contest-bench/kc6/live_smoke.py --round 1            # one turn each
+python3 contest-bench/kc6/live_smoke.py --round 2            # two commits + two outside writes: rework + permissions
+python3 contest-bench/kc6/live_smoke.py --round 2 --resume   # after a Ctrl-C
+```
+
+| run | result | what it exercised |
+|---|---|---|
+| round 1 (×2) | 3/3 READY in 118 s and 127 s, one turn each, 5/5 tests green in every worktree, one commit, `PROGRESS.csv` row with the sha | create → prompt → idle → harvest; free-tier rate limits (`session.status {"type": "retry"}`) retried by Kilo itself |
+| round 2 (×2) | 3/3 READY in 295 s both times; laguna REWORK `commits_ne_1` → amended in the same session → READY at attempt 1 (first run), hy3 and mistral the same in the other runs | the rework loop live: the model remembered the ticket and squashed |
+| round 2, permissions | laguna `cat …/rounds/01-laguna/runs/laguna/PROGRESS.csv` → **reject (mechanical, forbidden: the rounds folder)**; `/tmp/contest/notes/*` → `once` (tmp_roots); `/tmp/kc6-outside-*` → gate → `gate-failed` reject; laguna retried the rejected write 5× (the counters: asked 7, rejected 5) | the sibling-worktree rule against the exact DeepSeek pattern; the budget counters |
+| Ctrl-C at 45 s, then `--resume` | `KeyboardInterrupt` propagated (rc 130), `state.json` = three agents WAITING, server closed; resume restarted all three from CREATED in the same worktrees → 3/3 READY in 295 s | s26 live |
+
+What the live stream taught (none of it visible on the fake):
+
+- **`server.heartbeat` every 10 s, no `sessionID`**, plus `sync`,
+  `plugin.added`, `file.watcher.updated`, `indexing.status` … without a
+  session. A silence clock that counts *any* event never fires on the live
+  server — the five KC-6 entries that lost s30 would never detect a stall
+  at all. `file.edited` also carries no `sessionID` live
+  (`{"file": "..."}` only), so a per-session clock does not see edits; the
+  session's own `message.part.*` / `session.status` events are the liveness
+  signal, and a long silent tool call is exactly what `idle_event_timeout_sec`
+  = 300 is for. Recorded in the KC-12 ticket.
+- **`external_directory` names one path per bash command.** For
+  `mkdir -p /tmp/contest/notes && … > /tmp/contest/notes/x && … > /tmp/kc6-outside-x`
+  Kilo asked with `patterns: ["/tmp/contest/notes/*"]` only; the redirect
+  target outside was not in the event, the policy judged only `patterns` /
+  `metadata.directories`, answered `once`, and the outside file was written.
+  KC-13 (new ticket) makes the policy read every absolute path in
+  `metadata.command` too.
+- **Models retry a rejected command** (laguna: five times in one turn)
+  although the prompt says a rejection is final; `gate_max_calls_per_session`
+  is what bounds it — with the gate placeholder every retry is a fast
+  `gate-failed`, with a real gate each is a paid call.
+- Token counts come back as `{"input", "output", "reasoning", "cache": {"read", "write"}}`
+  with `cost` 0 on the free tier; `Harvest.commit` is whatever sha the model
+  wrote into `PROGRESS.csv` (mistral: a 7-char short sha) — the harvest
+  resolves it, the summary shows it as written.
