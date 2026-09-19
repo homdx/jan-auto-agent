@@ -1,6 +1,6 @@
 # KC-3 — `tools/contest/policy.py`: every permission is decided — by the rules, by geometry, or by a second model; never by silence
 
-**Status:** queued — after KC-2 (round 41). Written against `docs/kilo-contest/PROBE.md`.  
+**Status:** landed `1499cd8` (+ `5214138`: a bare single-word bash command is judged as a command, not a path); re-verified live `c6438bf`. Follow-up: KC-13 (round 52) — paths inside `metadata.command` are judged too. Written against `docs/kilo-contest/PROBE.md`.  
 **Severity:** CRITICAL (this is the thing that lets N agents run unattended)  
 **File:** `tools/contest/policy.py` (new)  
 **Symbol:** `Policy`, `Decision`, `PolicyContext`, `decide`, `_mechanical`, `_ask_gate`, `GATE_SYSTEM_PROMPT`  
