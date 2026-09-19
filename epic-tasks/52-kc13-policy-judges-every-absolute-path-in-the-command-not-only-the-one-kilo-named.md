@@ -64,6 +64,12 @@ Kilo chose to report; the other rides along on the same `once`.
   scan is the point — false positives go to the gate, which reads the
   whole command anyway; false negatives are what this ticket closes.
 - Changing what Kilo reports.
+- A command that raises **no** permission at all — `echo x > /tmp/outside.txt`
+  on its own never reaches the policy (Kilo's `external_directory` looks at
+  arguments, not redirect targets; seen live on 2026-09-19 for four of five
+  models). That is KC-15 (round 54, after this one): `ask_commands` makes
+  such a command a `bash` ask, and the scan this ticket adds is what then
+  judges it.
 - Rate-limiting a model that retries a rejected command (laguna: 5× in one
   turn) — that is `gate_max_calls_per_session` today and KC-9's ground.
 

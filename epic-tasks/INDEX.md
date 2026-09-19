@@ -56,8 +56,10 @@ The loop and the scorecard: `docs/collect-epics/RUN-THE-EPIC-COMPETITION.md`.
 | 48 | `KC-9` | queued — after KC-6 | HIGH | S | [48-kc9-a-silent-idle-is-nudged-with-continue-into-the-same-session.md](48-kc9-a-silent-idle-is-nudged-with-continue-into-the-same-session.md) | `tools/contest/runner.py` |
 | 49 | `KC-10` | queued — after KC-9 | HIGH | S | [49-kc10-context-fill-is-watched-and-the-session-is-compacted-at-80-percent.md](49-kc10-context-fill-is-watched-and-the-session-is-compacted-at-80-percent.md) | `tools/contest/runner.py` |
 | 50 | `KC-11` | queued — after KC-10 | MEDIUM | M | [50-kc11-a-thinking-model-is-probed-once-at-the-highest-variant-that-answers.md](50-kc11-a-thinking-model-is-probed-once-at-the-highest-variant-that-answers.md) | `tools/contest/think_probe.py` |
-| 51 | `KC-12` | open — next round (with KC-13 in parallel) | MEDIUM | S | [51-kc12-stall-detection-wait-idle-aborts-when-no-event-arrives.md](51-kc12-stall-detection-wait-idle-aborts-when-no-event-arrives.md) | `tools/contest/kilo_client.py` |
+| 51 | `KC-12` | open — next round (with KC-13 and KC-14 in parallel) | MEDIUM | S | [51-kc12-stall-detection-wait-idle-aborts-when-no-event-arrives.md](51-kc12-stall-detection-wait-idle-aborts-when-no-event-arrives.md) | `tools/contest/kilo_client.py` |
 | 52 | `KC-13` | open — found live 2026-09-19 | HIGH | S | [52-kc13-policy-judges-every-absolute-path-in-the-command-not-only-the-one-kilo-named.md](52-kc13-policy-judges-every-absolute-path-in-the-command-not-only-the-one-kilo-named.md) | `tools/contest/policy.py` |
+| 53 | `KC-14` | open — found live 2026-09-19 (12-model run) | MEDIUM | S | [53-kc14-harvest-accepts-only-a-hex-sha-as-the-claimed-commit-not-head-or-a-ref.md](53-kc14-harvest-accepts-only-a-hex-sha-as-the-claimed-commit-not-head-or-a-ref.md) | `tools/contest/harvest.py` |
+| 54 | `KC-15` | queued — after KC-13; found live 2026-09-19 (12-model run) | HIGH | S | [54-kc15-a-bash-redirect-outside-the-worktree-is-never-asked-ask-commands-make-it-a-permission.md](54-kc15-a-bash-redirect-outside-the-worktree-is-never-asked-ask-commands-make-it-a-permission.md) | `tools/contest/roster.py`, `tools/contest/policy.py` |
 
 ## Next rounds — the order (as of `6ca675c`, 2026-09-14; step 1 landed — `7135844` (+`5788423`, `d4ffb12`); step 2 landed — RUN-3; step 3 landed — `ade28e6`; step 4 landed — RUN-5)
 
