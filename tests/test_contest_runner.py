@@ -601,6 +601,170 @@ def test_server_going_away_mid_turn_is_error(tmp_path):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# KC-19: retryable session errors — bounded retry into the same session
+# ─────────────────────────────────────────────────────────────────────────────
+
+_ECONNRESET = {"name": "APIError", "data": {"message": "Connection reset by server",
+               "isRetryable": True, "metadata": {"code": "ECONNRESET"}}}
+
+
+def _make_retry_config(**over) -> ContestConfig:
+    kw = dict(max_error_retries=2, error_retry_backoff_sec=0,
+              turn_timeout_sec=30, idle_event_timeout_sec=60)
+    kw.update(over)
+    return make_config(["agent-a"], **kw)
+
+
+def test_retryable_error_reprompts_same_session_and_recovers(tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger="tools.contest.runner")
+    """Turn 1 errors with ECONNRESET, turn 2 answers with work_ready → READY,
+    attempt == 0, kinds are ['initial', 'retry'], one POST /session, second
+    prompt text contains 'dropped the connection' and 'Connection reset by
+    server'."""
+    scenario = {"turns": [
+        {"events": ["busy"], "error": _ECONNRESET},
+        {"on_prompt": work_ready, "events": ["busy", "idle"]},
+    ]}
+    cfg = _make_retry_config()
+    sb, fake, h, run, _ = _run_one(tmp_path, scenario, cfg)
+    assert run.state is AgentState.READY
+    assert run.attempt == 0
+    assert [t["kind"] for t in run.turns] == ["initial", "retry"]
+    assert run.turns[0]["idle_status"] == "error"
+    assert run.turns[0]["idle_at"] >= run.turns[0]["sent_at"]
+    prompts = _prompts(fake)
+    assert len(prompts) == 2
+    sid1, _ = prompts[0]
+    sid2, retry_text = prompts[1]
+    assert sid1 == sid2
+    assert "dropped the connection" in retry_text
+    assert "Connection reset by server" in retry_text
+    # the INFO line names the cause as `data.message`, not the payload's JSON
+    assert "agent-a: retry 1/2 in 0s — Connection reset by server" in [
+        r.getMessage() for r in caplog.records if r.name == "tools.contest.runner"]
+    assert len(_session_posts(fake)) == 1
+
+
+def test_retry_backoff_is_observed(tmp_path):
+    """error_retry_backoff_sec=1: the second prompt arrives >= 1 s after the
+    error event, and the run still finishes in < 5 s."""
+    scenario = {"turns": [
+        {"events": ["busy"], "error": _ECONNRESET},
+        {"on_prompt": work_ready, "events": ["busy", "idle"]},
+    ]}
+    cfg = _make_retry_config(error_retry_backoff_sec=1)
+    started = time.monotonic()
+    sb, fake, h, run, _ = _run_one(tmp_path, scenario, cfg)
+    elapsed = time.monotonic() - started
+    assert run.state is AgentState.READY
+    assert elapsed >= 1.0
+    assert elapsed < 5.0
+
+
+def test_retries_exhausted_then_error(tmp_path):
+    """max_error_retries=1, two retryable errors in a row → ERROR, last_error
+    starts with 'after 1 retries: session.error:', turns are
+    ['initial', 'retry']."""
+    scenario = {"turns": [
+        {"events": ["busy"], "error": _ECONNRESET},
+        {"events": ["busy"], "error": _ECONNRESET},
+    ]}
+    cfg = _make_retry_config(max_error_retries=1)
+    sb, fake, h, run, _ = _run_one(tmp_path, scenario, cfg)
+    assert run.state is AgentState.ERROR
+    assert run.last_error.startswith("after 1 retries: session.error:")
+    assert [t["kind"] for t in run.turns] == ["initial", "retry"]
+    assert len(_prompts(fake)) == 2
+
+
+def test_max_error_retries_zero_means_no_retry(tmp_path):
+    """max_error_retries=0 with a retryable error → ERROR after one turn, no
+    second prompt (today's behaviour)."""
+    scenario = {"turns": [
+        {"events": ["busy"], "error": _ECONNRESET},
+    ]}
+    cfg = _make_retry_config(max_error_retries=0)
+    sb, fake, h, run, _ = _run_one(tmp_path, scenario, cfg)
+    assert run.state is AgentState.ERROR
+    assert len(_prompts(fake)) == 1
+    assert len(run.turns) == 1
+
+
+def test_non_retryable_error_is_not_retried(tmp_path):
+    """A non-retryable payload → ERROR after one turn, no second prompt, even
+    with retries left."""
+    scenario = {"turns": [
+        {"events": ["busy"],
+         "error": {"name": "UnknownError",
+                   "data": {"message": "Model not found: kenary/x"}}},
+    ]}
+    cfg = _make_retry_config()
+    sb, fake, h, run, _ = _run_one(tmp_path, scenario, cfg)
+    assert run.state is AgentState.ERROR
+    assert len(_prompts(fake)) == 1
+    assert len(run.turns) == 1
+
+
+def test_502_message_is_retryable(tmp_path):
+    """'502 Bad Gateway' without isRetryable → retried by the message rule."""
+    scenario = {"turns": [
+        {"events": ["busy"],
+         "error": {"name": "APIError", "data": {"message": "502 Bad Gateway"}}},
+        {"on_prompt": work_ready, "events": ["busy", "idle"]},
+    ]}
+    cfg = _make_retry_config()
+    sb, fake, h, run, _ = _run_one(tmp_path, scenario, cfg)
+    assert run.state is AgentState.READY
+    assert [t["kind"] for t in run.turns] == ["initial", "retry"]
+    assert len(_prompts(fake)) == 2
+
+
+def test_session_error_is_error_with_the_payload_unchanged(tmp_path):
+    """The existing ProviderError/boom-42 test: not retryable, ERROR."""
+    scenario = {"turns": [{"events": ["busy"],
+                           "error": {"name": "ProviderError", "message": "boom-42"}}]}
+    sb, _fake, _h, run, _ = _run_one(tmp_path, scenario)
+    assert run.state is AgentState.ERROR
+    assert "boom-42" in run.last_error
+    assert run.turns[0]["idle_status"] == "error"
+    assert (sb.out_dir / "agent-a.session.json").is_file()
+
+
+def test_retry_does_not_increment_attempt(tmp_path):
+    """A retry is not a rework: attempt stays 0."""
+    scenario = {"turns": [
+        {"events": ["busy"], "error": _ECONNRESET},
+        {"on_prompt": work_ready, "events": ["busy", "idle"]},
+    ]}
+    cfg = _make_retry_config()
+    sb, fake, h, run, _ = _run_one(tmp_path, scenario, cfg)
+    assert run.attempt == 0
+    assert run.turns[1]["attempt"] == 0
+
+
+def test_ctrl_c_during_retry_backoff_ends_the_round(tmp_path):
+    """SIGINT to the process during the backoff wait ends the round within 2 s."""
+    sb = Sandbox(tmp_path)
+    cfg = _make_retry_config(error_retry_backoff_sec=60)
+    pid = os.getpid()
+
+    def on_error(directory, text):
+        threading.Timer(0.5, os.kill, args=[pid, signal.SIGINT]).start()
+
+    scenario = {"turns": [
+        {"on_prompt": on_error, "events": ["busy"],
+         "error": _ECONNRESET},
+    ]}
+    started = time.monotonic()
+    with _BenchFake(scenario) as fake:
+        with pytest.raises(KeyboardInterrupt):
+            run_round(cfg, ROUND, sb.ticket_path, list(sb.workspaces),
+                      server=KiloServer.attach(fake.url), out_dir=sb.out_dir)
+        elapsed = time.monotonic() - started
+    assert elapsed < 2.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # run_round
 # ─────────────────────────────────────────────────────────────────────────────
 

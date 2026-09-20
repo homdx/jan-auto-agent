@@ -13,8 +13,9 @@ Per agent, `run_agent` walks the states in order:
                  ▲                     │
                  └──── REWORK ◄────────┤  (attempts left)
                                        └→ GAVE_UP
+    WAITING → (retry) → PROMPTED  (retryable error, retries left — bounded)
     WAITING → STALLED  (turn timeout, silence, a third question — abort sent)
-    WAITING → ERROR    (session.error, the stream closed)
+    WAITING → ERROR    (session.error, the stream closed, retries exhausted)
     CREATED → ERROR    (POST /session refused)
 
 After every transition `on_transition(run)` fires — `run_round` writes
@@ -49,6 +50,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -78,6 +80,57 @@ RECENT_TOOLS = 8
 #: slow, so the lock is held for the whole `harvest` call — its mechanical part
 #: is a handful of `git` calls and costs nothing next to the roots.
 _TEST_RUNS_LOCK = threading.Lock()
+
+
+#: The prompt sent after a retryable session error (KC-19).  The
+#: ``{reason}`` placeholder is filled with ``_brief(data["message"])``.
+RETRY_PROMPT = (
+    "The provider dropped the connection mid-turn ({reason}). "
+    "Your worktree and this conversation are intact — continue from where you "
+    "were; do not start over."
+)
+
+_RETRYABLE_CODES = frozenset({
+    "ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "EPIPE", "UND_ERR_SOCKET",
+})
+_RETRYABLE_MSG_RE = re.compile(
+    r"429|502|503|504|overloaded|rate limit|timeout", re.IGNORECASE
+)
+
+
+def _retryable(error) -> bool:
+    """True when *error* is a retryable provider error (KC-19).
+
+    Retryable when ``data.isRetryable`` is truthy, or ``data.metadata.code``
+    is one of the known transient socket codes, or the message matches a
+    status-code or overload pattern.  A payload that is not a dict, or has
+    no recognizable retryable signal, is not retryable.
+    """
+    if not isinstance(error, dict):
+        return False
+    data = error.get("data") or {}
+    if isinstance(data, dict) and data.get("isRetryable"):
+        return True
+    metadata = data.get("metadata") if isinstance(data, dict) else None
+    if isinstance(metadata, dict) and metadata.get("code") in _RETRYABLE_CODES:
+        return True
+    msg = ""
+    if isinstance(data, dict) and isinstance(data.get("message"), str):
+        msg = data["message"]
+    elif isinstance(error.get("message"), str):
+        msg = error["message"]
+    if _RETRYABLE_MSG_RE.search(msg):
+        return True
+    return False
+
+
+def _retry_reason(error) -> str:
+    """The brief reason string for ``RETRY_PROMPT`` from a retryable payload."""
+    if isinstance(error, dict):
+        data = error.get("data") or {}
+        if isinstance(data, dict) and isinstance(data.get("message"), str):
+            return _brief(data["message"])
+    return _brief(error)
 
 
 def _harvest(ws, ticket_path, run_tests):
@@ -431,11 +484,18 @@ def run_agent(run: AgentRun, *, client: KiloClient, tap: EventTap, policy: Polic
         run.session_id = session.id
 
         rework_text = None
+        retry_text = None
+        retries_used = 0
         while True:
             # ── PROMPTED ───────────────────────────────────────────────────
-            kind = "initial" if rework_text is None else "rework"
-            text = rework_text if rework_text is not None else round_prompt(
-                spec.name, ticket_path, ws.base_sha)
+            if retry_text is not None:
+                kind, text = "retry", retry_text
+                retry_text = None
+            elif rework_text is not None:
+                kind, text = "rework", rework_text
+            else:
+                kind = "initial"
+                text = round_prompt(spec.name, ticket_path, ws.base_sha)
             turn = {"kind": kind, "attempt": run.attempt, "sent_at": time.time()}
             transition(AgentState.PROMPTED, note=f"attempt {run.attempt} ({kind})")
             try:
@@ -466,7 +526,40 @@ def run_agent(run: AgentRun, *, client: KiloClient, tap: EventTap, policy: Polic
                     error = f"no idle after {config.turn_timeout_sec}s"
                 state = AgentState.STALLED
             elif idle.status == "error":
-                error, state = f"session.error: {_brief(idle.error)}", AgentState.ERROR
+                if _retryable(idle.error) and retries_used < int(config.max_error_retries):
+                    run.turns.append(turn)
+                    _append_jsonl(agent_dir / "turns.jsonl", {"agent": spec.name, **turn})
+                    retries_used += 1
+                    backoff = int(config.error_retry_backoff_sec) * (2 ** (retries_used - 1))
+                    _log.info("%s: retry %d/%d in %ds — %s", spec.name,
+                              retries_used, int(config.max_error_retries),
+                              backoff, _retry_reason(idle.error))
+                    if backoff > 0:
+                        _backoff_event = threading.Event()
+                        _timer = threading.Timer(backoff, _backoff_event.set)
+                        _timer.daemon = True
+                        _timer.start()
+                        try:
+                            while not _backoff_event.is_set():
+                                _backoff_event.wait(timeout=0.2)
+                                if stalled or tap._stop.is_set():
+                                    break
+                        finally:
+                            _timer.cancel()
+                    if stalled:
+                        turn_r = {"kind": "retry", "attempt": run.attempt,
+                                  "sent_at": time.time(), "idle_at": time.time(),
+                                  "idle_status": "stalled"}
+                        run.turns.append(turn_r)
+                        _append_jsonl(agent_dir / "turns.jsonl",
+                                      {"agent": spec.name, **turn_r})
+                        return finish(AgentState.STALLED, stalled[0])
+                    retry_text = RETRY_PROMPT.format(reason=_retry_reason(idle.error))
+                    continue
+                error = f"session.error: {_brief(idle.error)}"
+                if retries_used:
+                    error = f"after {retries_used} retries: {error}"
+                state = AgentState.ERROR
             elif idle.status == "closed":
                 error, state = f"event stream closed: {_brief(idle.error)}", AgentState.ERROR
             else:

@@ -295,6 +295,8 @@ model = kenary/hy3:free
     assert cfg.turn_timeout_sec == 1800
     assert cfg.idle_event_timeout_sec == 300
     assert cfg.max_questions_per_turn == 3
+    assert cfg.max_error_retries == 2
+    assert cfg.error_retry_backoff_sec == 15
     assert cfg.progress_every_sec == 60
     assert cfg.tmp_roots == ()
     assert cfg.deny_commands == ()
@@ -320,6 +322,28 @@ model = kenary/hy3:free
     assert load_roster(write_ini(tmp_path, base % "15")).progress_every_sec == 15
     assert load_roster(write_ini(tmp_path, base % "0")).progress_every_sec == 0
     assert "progress_every_sec" in CONTEST_KEYS
+
+
+def test_max_error_retries_and_error_retry_backoff_sec_parse_and_default(tmp_path):
+    """KC-19: both keys parse, default, and are in CONTEST_KEYS."""
+    assert "max_error_retries" in CONTEST_KEYS
+    assert "error_retry_backoff_sec" in CONTEST_KEYS
+    base = """
+[contest]
+max_error_retries = %s
+error_retry_backoff_sec = %s
+
+[contest.agent.alpha]
+model = kenary/hy3:free
+"""
+    cfg = load_roster(write_ini(tmp_path, base % ("5", "30")))
+    assert cfg.max_error_retries == 5
+    assert cfg.error_retry_backoff_sec == 30
+    cfg0 = load_roster(write_ini(tmp_path, base % ("0", "0")))
+    assert cfg0.max_error_retries == 0
+    assert cfg0.error_retry_backoff_sec == 0
+    for key in ("max_error_retries", "error_retry_backoff_sec"):
+        assert isinstance(getattr(cfg, key), int)
 
 
 def test_malformed_limit_falls_back_to_the_default(tmp_path):
