@@ -73,6 +73,7 @@ CONTEST_KEYS = (
     "server",
     "max_parallel",
     "max_rework",
+    "max_continues_per_attempt",
     "turn_timeout_sec",
     "idle_event_timeout_sec",
     "max_questions_per_turn",
@@ -173,6 +174,7 @@ class ContestConfig:
     server: str = "spawn"
     max_parallel: int = 3
     max_rework: int = 2
+    max_continues_per_attempt: int = 2
     turn_timeout_sec: int = 1800
     idle_event_timeout_sec: int = 300
     max_questions_per_turn: int = 3
@@ -361,6 +363,7 @@ def _build(parser: configparser.ConfigParser) -> ContestConfig:
         server=scalar("server", "spawn"),
         max_parallel=limit("max_parallel", 3),
         max_rework=limit("max_rework", 2),
+        max_continues_per_attempt=limit("max_continues_per_attempt", 2),
         turn_timeout_sec=limit("turn_timeout_sec", 1800),
         idle_event_timeout_sec=limit("idle_event_timeout_sec", 300),
         max_questions_per_turn=limit("max_questions_per_turn", 3),

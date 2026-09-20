@@ -355,6 +355,37 @@ model = kenary/hy3:free
         assert isinstance(getattr(cfg, key), int)
 
 
+def test_max_continues_per_attempt_defaults_to_two_and_parses(tmp_path):
+    """KC-22: the key, its default, and that it is in CONTEST_KEYS."""
+    assert "max_continues_per_attempt" in CONTEST_KEYS
+    cfg = load_roster(write_ini(tmp_path, MINIMAL))
+    assert cfg.max_continues_per_attempt == 2
+    base = """
+[contest]
+max_continues_per_attempt = %s
+
+[contest.agent.alpha]
+model = kenary/hy3:free
+"""
+    assert load_roster(write_ini(tmp_path, base % "1")).max_continues_per_attempt == 1
+    # 0 disables the mechanism; a negative value parses to itself and the
+    # runner's `> 0` guard reads it as off, like the other [contest] ints.
+    assert load_roster(write_ini(tmp_path, base % "0")).max_continues_per_attempt == 0
+    assert load_roster(write_ini(tmp_path, base % "-1")).max_continues_per_attempt == -1
+
+
+def test_max_continues_per_attempt_malformed_falls_back_to_the_default(tmp_path):
+    """KC-22: like the other [contest] ints, a malformed value is fail-open — it
+    falls back to the default (2), never aborting a round."""
+    for bad in ("three", "1.5"):
+        text = add_to_contest(MINIMAL, f"max_continues_per_attempt = {bad}")
+        assert load_roster(write_ini(tmp_path, text)).max_continues_per_attempt == 2
+
+
+def test_committed_max_continues_per_attempt_is_two(gate_key):
+    assert load_roster(COMMITTED).max_continues_per_attempt == 2
+
+
 def test_malformed_limit_falls_back_to_the_default(tmp_path):
     text = add_to_contest(MINIMAL, "turn_timeout_sec = three")
     assert load_roster(write_ini(tmp_path, text)).turn_timeout_sec == 1800

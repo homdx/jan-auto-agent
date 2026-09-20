@@ -176,6 +176,13 @@ def work_no_claim(directory, text):
     _work(directory, test=True, claim=False)
 
 
+def work_edit_no_commit(directory, text):
+    """Edit a file in the worktree but commit nothing — a turn that ends idle
+    with uncommitted work (KC-22)."""
+    _write(Path(directory) / "pkg" / "thing.py",
+           f"def thing():\n    return 7  # {time.time()}\n")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # the fake, with the two knobs the scenarios need
 # ─────────────────────────────────────────────────────────────────────────────
@@ -764,6 +771,128 @@ def test_a_terminal_harvest_runs_the_roots_under_the_rounds_lock(tmp_path, monke
     assert run.commit == _branch_sha(sb.ws("agent-a"))
     assert seen == [str(sb.ws("agent-a").path)]
     assert run.turns[0]["harvest"] == {"verdict": "READY", "reasons": []}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KC-22: a turn that ends idle with uncommitted work gets a continue, not a rework
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _harvest_calls(monkeypatch):
+    """Monkeypatch `_harvest` with a counting wrapper; return the counter list."""
+    import tools.contest.runner as runner_mod
+
+    seen = []
+    real = runner_mod._harvest
+
+    def wrap(ws, ticket_path, run_tests):
+        seen.append(1)
+        return real(ws, ticket_path, run_tests)
+
+    monkeypatch.setattr("tools.contest.runner._harvest", wrap)
+    return seen
+
+
+def test_idle_with_uncommitted_work_continues_then_commits_ready(tmp_path, monkeypatch):
+    """Turn 0 edits and goes idle without committing; turn 1 commits the entry
+    and writes the row → READY, `run.attempt == 0`, the turns are
+    `['initial', 'continue']`, the second prompt carries the edited file's name
+    and the word `uncommitted`, and `_harvest` ran exactly once."""
+    counts = _harvest_calls(monkeypatch)
+    scenario = {"turns": [
+        {"on_prompt": work_edit_no_commit, "events": ["busy", "idle"]},
+        {"on_prompt": work_ready, "events": ["busy", "idle"]},
+    ]}
+    sb, fake, _h, run, _ = _run_one(tmp_path, scenario)
+    _assert_ready(run, sb.ws("agent-a"))
+    assert run.attempt == 0
+    assert [t["kind"] for t in run.turns] == ["initial", "continue"]
+    (sid0, first), (_sid1, second) = _prompts(fake)
+    assert "pkg/thing.py" in second and "uncommitted" in second
+    assert len(counts) == 1
+
+
+def test_idle_edit_never_commit_exhausts_continues_then_gives_up(tmp_path, monkeypatch):
+    """Edits and never commits, `max_continues_per_attempt = 1`,
+    `max_rework = 1`: turns are `initial, continue, rework, continue` and the
+    run ends GAVE_UP; the harvest ran twice."""
+    counts = _harvest_calls(monkeypatch)
+    scenario = {"turns": [
+        {"on_prompt": work_edit_no_commit, "events": ["busy", "idle"]},
+        {"on_prompt": work_edit_no_commit, "events": ["busy", "idle"]},
+        {"on_prompt": work_edit_no_commit, "events": ["busy", "idle"]},
+        {"on_prompt": work_edit_no_commit, "events": ["busy", "idle"]},
+    ]}
+    cfg = make_config(["agent-a"], max_continues_per_attempt=1, max_rework=1)
+    sb, fake, _h, run, _ = _run_one(tmp_path, scenario, cfg)
+    assert run.state is AgentState.GAVE_UP
+    assert [t["kind"] for t in run.turns] == ["initial", "continue", "rework", "continue"]
+    assert run.attempt == 1
+    assert len(counts) == 2
+
+
+def test_idle_on_a_clean_tree_is_harvested_at_once(tmp_path):
+    """A turn that goes idle on a clean tree is NOT a continue: it is harvested
+    at once (the first turn carries the REWORK verdict) and the run never sees a
+    `continue` turn. `max_rework = 0` so the single harvest settles the run
+    without the fake looping into more turns."""
+    cfg = make_config(["agent-a"], max_rework=0)
+    scenario = {"turns": [{"events": ["busy", "idle"]}]}
+    sb, fake, _h, run, _ = _run_one(tmp_path, scenario, cfg)
+    assert run.state is AgentState.GAVE_UP
+    assert run.turns[0]["kind"] == "initial"
+    assert run.turns[0]["harvest"]["verdict"] == "REWORK"
+    assert [t["kind"] for t in run.turns if t["kind"] == "continue"] == []
+
+
+def test_max_continues_zero_harvests_a_dirty_idle_turn_at_once(tmp_path):
+    """`max_continues_per_attempt = 0` disables the mechanism: a dirty idle turn
+    is harvested at once, exactly as before this ticket — no `continue` turn."""
+    scenario = {"turns": [{"on_prompt": work_edit_no_commit, "events": ["busy", "idle"]}]}
+    cfg = make_config(["agent-a"], max_continues_per_attempt=0, max_rework=0)
+    sb, fake, _h, run, _ = _run_one(tmp_path, scenario, cfg)
+    assert run.state is AgentState.GAVE_UP
+    assert run.turns[0]["kind"] == "initial"
+    assert run.turns[0]["harvest"]["verdict"] == "REWORK"
+    assert [t["kind"] for t in run.turns if t["kind"] == "continue"] == []
+
+
+def test_resume_into_a_dirty_worktree_first_prompt_names_it(tmp_path):
+    """`--resume` with a dirty non-READY worktree: the new session's first prompt
+    contains the `round_prompt` text AND the dirty file's name; a clean one gets
+    the unchanged `round_prompt`."""
+    sb = Sandbox(tmp_path, ["agent-a", "agent-b"])
+    cfg = make_config(["agent-a", "agent-b"], max_parallel=2)
+    _write(sb.ws("agent-b").path / "pkg" / "thing.py", "def thing():\n    return 99\n")
+    prior = RoundState(round_no=ROUND, ticket=TICKET, base_sha=sb.base_sha, started_at=1.0, agents=[
+        AgentRun(agent=cfg.agents[0], workspace=sb.ws("agent-a"), state=AgentState.READY, commit="0" * 40),
+        AgentRun(agent=cfg.agents[1], workspace=sb.ws("agent-b"), state=AgentState.WAITING, session_id="ses_gone"),
+    ])
+    with _BenchFake({"turns": [{"on_prompt": work_ready, "events": ["busy", "idle"]}]}) as fake:
+        state = _round(sb, fake, cfg, resume=prior)
+        prompts = _prompts(fake)
+    runs = _by_name(state)
+    _assert_ready(runs["agent-b"], sb.ws("agent-b"))
+    b_session = fake.sessions()[-1].id
+    b_prompts = [text for sid, text in prompts if sid == b_session]
+    assert len(b_prompts) == 1
+    assert "runs/agent-b/PROGRESS.csv" in b_prompts[0]   # round_prompt text present
+    assert "pkg/thing.py" in b_prompts[0]                # dirty file named
+
+    # a clean mid-flight worktree gets the unchanged round_prompt
+    sb2 = Sandbox(tmp_path / "clean", ["agent-a", "agent-b"])
+    cfg2 = make_config(["agent-a", "agent-b"], max_parallel=2)
+    prior2 = RoundState(round_no=ROUND, ticket=TICKET, base_sha=sb2.base_sha, started_at=1.0, agents=[
+        AgentRun(agent=cfg2.agents[0], workspace=sb2.ws("agent-a"), state=AgentState.READY, commit="0" * 40),
+        AgentRun(agent=cfg2.agents[1], workspace=sb2.ws("agent-b"), state=AgentState.WAITING, session_id="ses_gone"),
+    ])
+    with _BenchFake({"turns": [{"on_prompt": work_ready, "events": ["busy", "idle"]}]}) as fake2:
+        state2 = _round(sb2, fake2, cfg2, resume=prior2)
+        prompts2 = _prompts(fake2)
+    _assert_ready(_by_name(state2)["agent-b"], sb2.ws("agent-b"))
+    b_session2 = fake2.sessions()[-1].id
+    b_prompts2 = [text for sid, text in prompts2 if sid == b_session2]
+    assert len(b_prompts2) == 1
+    assert "uncommitted" not in b_prompts2[0]
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -193,8 +193,8 @@ class AgentRun:
     """One agent's run: mutable, and JSON-round-trippable through `to_dict`/`from_dict`.
 
     `attempt` is 0 for the first turn and grows by one per rework. `turns` holds
-    one dict per turn: `kind` (`initial`/`rework`), `attempt`, `sent_at`,
-    `idle_at`, `idle_status`, and `harvest` = `{"verdict", "reasons": [codes]}`
+    one dict per turn: `kind` (`initial`/`continue`/`rework`/`retry`), `attempt`,
+    `sent_at`, `idle_at`, `idle_status`, and `harvest` = `{"verdict", "reasons": [codes]}`
     once the turn was scored. `permissions` counts what the policy was asked
     and how it answered; `questions` counts the questions over the whole run.
     """
@@ -348,14 +348,65 @@ rejection is final for that command — do not retry it.
 """
 
 
-def round_prompt(agent_name: str, ticket_path: Path, base_sha: str) -> str:
+def round_prompt(agent_name: str, ticket_path: Path, base_sha: str, *, dirty: str = "") -> str:
     """The runbook's prompt for *agent_name*, plus the base sha and the permission rule.
 
     The ticket is not repeated: the session reads it from its own worktree via
     `next_task.py`, so *ticket_path* is accepted for the caller's clarity only.
+    When *dirty* is non-empty (a `--resume` into a worktree that still holds
+    uncommitted work, KC-22), the `continue_message` paragraph is appended so the
+    fresh session learns of the work on its first prompt — every existing caller
+    passes no *dirty* and gets the unchanged text.
     """
     del ticket_path
-    return _PROMPT.format(name=agent_name, base_sha=base_sha)
+    text = _PROMPT.format(name=agent_name, base_sha=base_sha)
+    if dirty:
+        text = text + "\n\n" + continue_message(dirty)
+    return text
+
+
+def continue_message(dirty: str) -> str:
+    """The nudge sent when a turn ends `idle` with uncommitted work (KC-22).
+
+    The session already holds the ticket and the preceding `round_prompt`, so
+    neither is repeated: just the `git status --porcelain` lines, indented, and
+    the instruction to finish in this same worktree. *dirty* is the porcelain
+    output (KC-22's `git status` lines) — already excluding `runs/`.
+    """
+    indented = "\n".join("  " + ln for ln in dirty.splitlines())
+    return (
+        "Your turn ended before anything was committed. The worktree still "
+        "holds your uncommitted work:\n"
+        + indented + "\n"
+        "Finish the ticket in this same worktree: one commit, the test, "
+        "append_task.py with the commit's sha. Do not start over and do not "
+        "discard these files."
+    )
+
+
+def _dirty_tree(ws: Workspace) -> str:
+    """The uncommitted work of *ws* as `git status --porcelain
+    --untracked-files=all`, with `runs/` excluded — fail-open.
+
+    `runs/<agent>/PROGRESS.csv` rows live under `runs/` and must not count as
+    the agent's work. Empty string when the tree is clean or when git cannot
+    answer, so an unreadable worktree degrades to "no collect data" and the
+    runner harvests as it always did, never raising.
+    """
+    try:
+        out = git(ws.path, "status", "--porcelain", "--untracked-files=all")
+    except Exception:  # noqa: BLE001 — a status that cannot be read is a clean one
+        return ""
+    lines = []
+    for ln in out.splitlines():
+        if not ln.strip():
+            continue
+        body = ln[3:] if len(ln) > 3 else ln  # drop the two status chars + space
+        name = body.rsplit(" -> ", 1)[-1]
+        if name.startswith("runs/"):
+            continue
+        lines.append(ln)
+    return "\n".join(lines)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -510,6 +561,8 @@ def run_agent(run: AgentRun, *, client: KiloClient, tap: EventTap, policy: Polic
 
         rework_text = None
         retry_text = None
+        continue_text = None
+        continue_used = 0
         retries_used = 0
         while True:
             # ── PROMPTED ───────────────────────────────────────────────────
@@ -518,11 +571,27 @@ def run_agent(run: AgentRun, *, client: KiloClient, tap: EventTap, policy: Polic
                 retry_text = None
             elif rework_text is not None:
                 kind, text = "rework", rework_text
+                rework_text = None
+            elif continue_text is not None:
+                kind, text = "continue", continue_text
+                continue_text = None
             else:
                 kind = "initial"
-                text = round_prompt(spec.name, ticket_path, ws.base_sha)
+                dirty = getattr(run, "dirty_on_resume", "") or ""
+                if dirty:
+                    # KC-22, `--resume` into a worktree that still holds the
+                    # work: the fresh session learns of it on its first prompt.
+                    text = round_prompt(spec.name, ticket_path, ws.base_sha, dirty=dirty)
+                    run.dirty_on_resume = ""  # only the first prompt carries it
+                else:
+                    text = round_prompt(spec.name, ticket_path, ws.base_sha)
             turn = {"kind": kind, "attempt": run.attempt, "sent_at": time.time()}
-            transition(AgentState.PROMPTED, note=f"attempt {run.attempt} ({kind})")
+            if kind == "continue":
+                note = (f"attempt {run.attempt} (continue {continue_used} of "
+                        f"{int(config.max_continues_per_attempt)})")
+            else:
+                note = f"attempt {run.attempt} ({kind})"
+            transition(AgentState.PROMPTED, note=note)
             try:
                 client.prompt(session, text)
             except KiloHttpError as exc:
@@ -587,6 +656,31 @@ def run_agent(run: AgentRun, *, client: KiloClient, tap: EventTap, policy: Polic
                 state = AgentState.ERROR
             elif idle.status == "closed":
                 error, state = f"event stream closed: {_brief(idle.error)}", AgentState.ERROR
+            elif idle.status == "idle":
+                # KC-22: a turn that ended idle with edits in the tree but no
+                # commit is a model that has not handed in yet, not one that
+                # handed in a wrong entry. Nudge it on in this same session —
+                # do not harvest, which would fail every hard gate by
+                # construction and burn the pytest roots on an unfinished tree.
+                # A clean tree (the model did nothing) is *not* a continue: it
+                # falls through to today's path (HARVESTING → REWORK/GAVE_UP),
+                # which is the right answer for "you did nothing". A rework
+                # resets the counter; it is exhausted here only when the branch
+                # still has no commit after the last nudge.
+                budget = int(config.max_continues_per_attempt)
+                if 0 < budget and continue_used < budget:
+                    dirty = _dirty_tree(ws) if _commits_above(ws) == 0 else ""
+                    if dirty:
+                        # the current turn keeps its own kind (initial/rework);
+                        # the continue becomes the *next* PROMPTED turn, whose
+                        # PROMPTED transition (with "(continue N of M)") runs at
+                        # the top of the loop. Record this idle turn as it stands.
+                        continue_text = continue_message(dirty)
+                        continue_used += 1
+                        run.turns.append(turn)
+                        _append_jsonl(agent_dir / "turns.jsonl", {"agent": spec.name, **turn})
+                        continue
+                error = state = None
             else:
                 error = state = None
             if state is not None:
@@ -631,6 +725,7 @@ def run_agent(run: AgentRun, *, client: KiloClient, tap: EventTap, policy: Polic
                 return finish(AgentState.GAVE_UP, "REWORK after the last attempt: "
                               + ", ".join(r.code for r in verdict.reasons if r.blocking))
             run.attempt += 1
+            continue_used = 0  # KC-22: a rework resets the per-attempt continue counter
             transition(AgentState.REWORK, note=f"attempt {run.attempt} — "
                        + ", ".join(r.code for r in verdict.reasons))
             rework_text = rework_message(verdict, run.attempt, int(config.max_rework))
@@ -683,6 +778,15 @@ def _plan(config: ContestConfig, workspaces: list, ticket_path: Path,
                 run.state, run.commit = AgentState.READY, verdict.commit
             else:
                 run.state, run.session_id, run.attempt = AgentState.CREATED, None, 0
+                # KC-22, `--resume` into a worktree that still holds the agent's
+                # uncommitted work: the fresh session learns of it on its first
+                # prompt. A clean tree (or one with a commit under it) carries no
+                # `dirty_on_resume`, so the prompt is unchanged and the agent
+                # may not start over or discard the files.
+                if _commits_above(ws) == 0:
+                    dirty = _dirty_tree(ws)
+                    if dirty:
+                        run.dirty_on_resume = dirty
         runs.append(run)
     return runs
 
