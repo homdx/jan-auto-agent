@@ -200,3 +200,9 @@ model.
 | 50 | KC-11 | each roster model probed once at the highest thinking `variant` that answers `say: hello`; cached in `contest-probe.json`; models without reasoning skip it | M |
 
 Order of implementation as requested: KC-9, then KC-10, then KC-11.
+
+## 10. Added 2026-09-20 — operator comfort, last in the queue
+
+| round | id | what lands | size |
+|---|---|---|---|
+| 66 | KC-27 | the heartbeat shows each agent's phase, a files-count progress bar against the pack's median (60 % working, 70 % committed, 80 % tests, 100 % READY) and how long the judge's tests took; `turn["harvest"]["elapsed"]` persisted | S |
