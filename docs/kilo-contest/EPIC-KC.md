@@ -210,3 +210,4 @@ Order of implementation as requested: KC-9, then KC-10, then KC-11.
 | round | id | what lands | size |
 |---|---|---|---|
 | 66 | KC-27 | the heartbeat shows each agent's phase, a files-count progress bar against the pack's median (60 % working, 70 % committed, 80 % tests, 100 % READY) and how long the judge's tests took; `turn["harvest"]["elapsed"]` persisted | S |
+| 67 | KC-28 | `/dev/null`, `/dev/stdout`, `/dev/stderr`, `/dev/tty` are dropped by `_extract_paths`, so a `> /dev/null` is a no-path bash ask (KC-15's `once`/`mechanical`) and not a gate call out of the session's twenty | S |
