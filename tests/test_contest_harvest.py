@@ -159,6 +159,16 @@ def _codes(h: Harvest) -> list[str]:
     return [r.code for r in h.reasons]
 
 
+def _with_origin(repo: Path, tmp_path: Path) -> Path:
+    """KC-20: the base branch pushed to a bare `origin` under *tmp_path* — the
+    way every real round starts, with the base already on a remote."""
+    bare = tmp_path / "remote.git"
+    _git(tmp_path, "init", "-q", "--bare", str(bare))
+    _git(repo, "remote", "add", "origin", str(bare))
+    _git(repo, "push", "-q", "origin", "HEAD")
+    return bare
+
+
 def _blocking(h: Harvest) -> list[str]:
     return [r.code for r in h.reasons if r.blocking]
 
@@ -678,6 +688,57 @@ def test_harvest_flags_a_pushed_commit(round_, tmp_path):
     _git(wt.path, "remote", "add", "origin", str(bare))
     _git(wt.path, "push", "-q", "origin", wt.branch)
 
+    _record(wt, ticket.name, outcome="DONE", commit=_git(wt.path, "rev-parse", "HEAD"))
+    h = harvest(wt, ticket)
+    assert h.verdict == "REWORK"
+    assert "pushed" in _codes(h)
+
+
+def test_harvest_zero_commits_no_pushed_when_base_on_origin(round_, tmp_path):
+    """KC-20: a worktree with no commits must not be flagged as pushed even when
+    the base itself has been pushed to origin."""
+    repo, base, ticket = round_
+    _with_origin(repo, tmp_path)
+    # A worktree with zero agent commits sits at the base.
+    wt = _worktree(repo, base, tmp_path)
+    _record(wt, ticket.name, outcome="DONE", commit=base)
+    h = harvest(wt, ticket)
+    assert h.verdict == "REWORK"
+    assert "commits_ne_1" in _codes(h)
+    assert "pushed" not in _codes(h)
+
+
+def test_judge_worktree_zero_commits_not_pushed(round_, tmp_path):
+    """KC-20: `judge_worktree` directly returns pushed=no when commits==0."""
+    repo, base, ticket = round_
+    _with_origin(repo, tmp_path)
+    wt = _worktree(repo, base, tmp_path)
+    declared = list(declared_files(ticket))
+    row = judge_worktree(wt.agent, str(wt.path), base, declared, False)
+    assert row["commits"] == 0
+    assert row["pushed"] == "no"
+
+
+def test_harvest_one_unpushed_commit_no_pushed_when_base_on_origin(round_, tmp_path):
+    """KC-20: one agent commit above a base that lives on origin is fine."""
+    repo, base, ticket = round_
+    _with_origin(repo, tmp_path)
+    wt = _worktree(repo, base, tmp_path)
+    sha = _accepting(wt)
+    # Do NOT push this commit.
+    _record(wt, ticket.name, outcome="DONE", commit=sha)
+    h = harvest(wt, ticket)
+    assert h.verdict == "READY"
+    assert "pushed" not in _codes(h)
+
+
+def test_harvest_one_pushed_commit_flags_pushed_when_base_on_origin(round_, tmp_path):
+    """KC-20: pushing the agent commit still reports pushed."""
+    repo, base, ticket = round_
+    _with_origin(repo, tmp_path)
+    wt = _worktree(repo, base, tmp_path)
+    _accepting(wt)
+    _git(wt.path, "push", "-q", "origin", wt.branch)
     _record(wt, ticket.name, outcome="DONE", commit=_git(wt.path, "rev-parse", "HEAD"))
     h = harvest(wt, ticket)
     assert h.verdict == "REWORK"

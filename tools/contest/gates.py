@@ -238,8 +238,14 @@ def judge_worktree(name, path, base, declared, want_tests):
         row["shrink"] = "same" if before == after else "CHANGED"
 
     # ── hard gate 2: nothing pushed ──────────────────────────────────────
-    remotes = git(path, "branch", "-r", "--contains", "HEAD")
-    row["pushed"] = "yes" if remotes.strip() else "no"
+    # KC-20: with no agent commit HEAD *is* the base, and the base is on
+    # `origin` in every real round — only the agent's own commits can have
+    # been pushed, so a zero-commit worktree is never "pushed".
+    if not commits:
+        row["pushed"] = "no"
+    else:
+        remotes = git(path, "branch", "-r", "--contains", "HEAD")
+        row["pushed"] = "yes" if remotes.strip() else "no"
 
     # ── diff shape ───────────────────────────────────────────────────────
     stat = git(path, "diff", "--numstat", f"{merge_base}..HEAD")
