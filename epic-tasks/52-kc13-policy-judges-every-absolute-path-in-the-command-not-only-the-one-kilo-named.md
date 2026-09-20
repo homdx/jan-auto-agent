@@ -1,6 +1,6 @@
 # KC-13 — `Policy`: every absolute path in the command is judged, not only the one Kilo put in `patterns`
 
-**Status:** open — round 52 of EPIC KC (`docs/kilo-contest/EPIC-KC.md`); found live on 2026-09-19 (`contest-bench/kc6/RUNBOOK.md` §10). Independent of KC-12 (round 51, open in parallel — different file).
+**Status:** open — round 52 of EPIC KC (`docs/kilo-contest/EPIC-KC.md`); found live on 2026-09-19 (`contest-bench/kc6/RUNBOOK.md` §10). Independent of KC-12 (round 51, open in parallel — different file). **Corrected 2026-09-20** after the first manager run of this round (`contest-out/52`): the first text said "existing KC-3 tests unmodified" while asking for a change that two of them assert the opposite of — `mistral-medium-3-5:free` spent three turns proving the contradiction and never committed. Point 3 and the Acceptance now say which two tests are **rewritten** (and how) and that the command scan is for `permission == "bash"` only.
 **Severity:** HIGH
 **File:** `tools/contest/policy.py` (`_extract_paths`)
 **Symbol:** `_extract_paths`, `PolicyContext`, `Policy.decide`
@@ -33,8 +33,14 @@ Kilo chose to report; the other rides along on the same `once`.
    match anywhere → `reject`; every path inside the worktree or `tmp_roots`
    → `once`; otherwise layer 2 (the gate), which already receives the whole
    command in its user message.
-3. `metadata.command` is bash's; for a permission with no `command`
-   (`external_directory` from a file tool, `doom_loop`) nothing changes.
+3. The command scan runs **only when `props["permission"] == "bash"`**.
+   `metadata.command` is bash's; an `external_directory` event carries the
+   command too (the fixture `EXTERNAL_DIRECTORY_EVENT` has
+   `metadata.command: "rm -v /tmp/testfile"`) but its paths are
+   `metadata.directories`/`.patterns`, already read — for it, `doom_loop`,
+   and every permission that is not `bash`, nothing changes and
+   `test_paths_are_extracted_deduped_and_trailing_star_stripped` stays as
+   it is.
 4. Fail-open on garbage: a non-string command, a token that does not
    resolve, a path with a NUL — skipped, never raised (`decide` never
    raises; keep it so).
@@ -55,7 +61,24 @@ Kilo chose to report; the other rides along on the same `once`.
         the worktree, absolute second under tmp_roots) is `once`;
       - a bare command word (`reboot`), `2>&1`, `$HOME/x`, a URL
         (`https://…`) and a quoted path with spaces do not become paths or
-        do not crash; existing KC-3 tests unmodified and green.
+        do not crash.
+      - **Two KC-3 tests assert today's blind spot and are rewritten by
+        this ticket** — same names, same docstring intent (command text in
+        `patterns` is never a path), new expectation for the command:
+        `test_command_text_in_patterns_is_not_a_path` →
+        `_extract_paths(BASH_EVENT["properties"]) == [(Path("/tmp/testfile"), ("/tmp/testfile",))]`
+        (the `patterns` entry `rm -v /tmp/testfile` still yields nothing; the
+        command's `/tmp/testfile` is the one pair);
+        `test_command_text_with_a_star_is_still_command_text` →
+        `[(Path("/tmp"), ("/tmp/*",))]` (`patterns` still nothing; the
+        command's `/tmp/*` is read like a `patterns` glob — trailing `/*`
+        stripped, as `_extract_paths` already does).
+        **Every other** `tests/test_contest_policy.py` test is unmodified and
+        green — in particular `test_paths_are_extracted_deduped_and_trailing_star_stripped`
+        (an `external_directory` event: no command scan) and the two
+        `decide(policy, BASH_EVENT, …)` tests (deny_commands → `mechanical`
+        reject; no deny match → the `gate`, which is where `/tmp/testfile`,
+        outside the worktree and `tmp_roots`, belongs anyway).
 - [ ] `python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180` green.
 
 ## Out of scope
