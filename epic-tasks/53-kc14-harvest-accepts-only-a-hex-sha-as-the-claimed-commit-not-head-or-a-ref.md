@@ -1,6 +1,6 @@
 # KC-14 — `harvest`: the claimed commit must be a hex sha that resolves — `HEAD`, a branch or a tag is `commit_not_on_branch`
 
-**Status:** open — round 53 of EPIC KC (`docs/kilo-contest/EPIC-KC.md`); found live on 2026-09-19 (`contest-bench/kc6/RUNBOOK.md` §11). Independent of KC-12 and KC-13 (different file); can run in parallel with either.
+**Status:** queued — round 53 in flight on hp-uz since 2026-09-20 (agnes-2-0/2-5, mimo-v2-5, step-3-7, hy3); `queued` and not `running` because `scripts/next_task.py` offers every status but landed/queued and a round 54 session would otherwise be handed this ticket; round 53 of EPIC KC (`docs/kilo-contest/EPIC-KC.md`); found live on 2026-09-19 (`contest-bench/kc6/RUNBOOK.md` §11). Independent of KC-12 and KC-13 (different file); can run in parallel with either.
 **Severity:** MEDIUM
 **File:** `tools/contest/harvest.py` (`_is_ancestor`, `harvest`)
 **Symbol:** `_is_ancestor`, `harvest`, `Harvest.commit`
