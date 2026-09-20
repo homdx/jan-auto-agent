@@ -1,6 +1,6 @@
 # KC-20 — `judge_worktree`'s `pushed` gate fires on a worktree with **no** commit, because the base itself is on `origin`
 
-**Status:** open — round 59 of EPIC KC (`docs/kilo-contest/EPIC-KC.md`); found live on 2026-09-20 in the first manager-run round (`python3 -m tools.contest run --ticket 52`). Independent of every other open ticket except KC-17 (same file, different function — disjoint lines).
+**Status:** landed `fe25a3e` — round 59, the fourth manager-run round (`python3 -m tools.contest run --ticket 59`, four kenary free slots, base `befce7c`); one harvest, no bench: winner agnes-2-5-flash (`4402c0f`). All four agents wrote the same `if row["commits"] == 0` fix — mimo-v2-5 died on `the model's provider interrupted the response stream` (not in KC-19's retry list), step-3-7-flash and hy3 were STALLED with the change edited but uncommitted (KC-21). Ideal = the winner with its four tests sharing a `_with_origin` helper that pushes `HEAD`, not a hard-coded `master`. Was: open — round 59 of EPIC KC (`docs/kilo-contest/EPIC-KC.md`); found live on 2026-09-20 in the first manager-run round (`python3 -m tools.contest run --ticket 52`). Independent of every other open ticket except KC-17 (same file, different function — disjoint lines).
 **Severity:** MEDIUM
 **File:** `tools/contest/gates.py` (`judge_worktree`, hard gate 2)
 **Symbol:** `judge_worktree`
