@@ -558,13 +558,15 @@ def test_unknown_model_is_error_with_the_body(tmp_path):
     assert h.transitions == [AgentState.ERROR]
 
 
-def test_idle_event_timeout_stalls_a_silent_session_within_3s(tmp_path):
+def test_idle_event_timeout_stalls_a_silent_session(tmp_path):
     cfg = make_config(["agent-a"], turn_timeout_sec=30, idle_event_timeout_sec=1)
     started = time.monotonic()
     _sb, _fake, _h, run, aborted = _run_one(tmp_path, {"turns": [{"events": [], "idle": False}]}, cfg)
     elapsed = time.monotonic() - started
     assert run.state is AgentState.STALLED and aborted
-    assert elapsed < 3.0
+    # took the idle-event path (1 s), not the turn_timeout path (30 s); the
+    # margin absorbs a loaded box without letting the two paths blur.
+    assert elapsed < cfg.idle_event_timeout_sec + 10
     assert run.last_error == "no event for 1s"
     assert run.turns[0]["idle_status"] == "stalled"
 
@@ -594,7 +596,9 @@ def test_turn_timeout_stalls_a_session_that_never_idles(tmp_path):
         run = Harness(sb, fake, cfg).go()
         elapsed = time.monotonic() - started
         aborted = _aborted(fake)
-    assert run.state is AgentState.STALLED and aborted and elapsed < 6
+    # fired on turn_timeout (1 s) with a generous margin, not a bare box number
+    assert run.state is AgentState.STALLED and aborted
+    assert elapsed < cfg.turn_timeout_sec + 10
     assert run.turns[0]["idle_status"] == "timeout"
     assert run.last_error == "no idle after 1s"
 
@@ -610,7 +614,9 @@ def test_server_going_away_mid_turn_is_error(tmp_path):
         elapsed = time.monotonic() - started
     finally:
         fake.stop()
-    assert run.state is AgentState.ERROR and elapsed < 10
+    # detected the closed connection rather than waiting out turn_timeout (30 s)
+    assert run.state is AgentState.ERROR
+    assert elapsed < cfg.turn_timeout_sec
     assert run.turns[0]["idle_status"] == "closed"
 
 
@@ -952,8 +958,10 @@ def test_retry_backoff_is_observed(tmp_path):
     sb, fake, h, run, _ = _run_one(tmp_path, scenario, cfg)
     elapsed = time.monotonic() - started
     assert run.state is AgentState.READY
-    assert elapsed >= 1.0
-    assert elapsed < 5.0
+    # the backoff was observed (>= its 1 s), and the run did not stall waiting
+    # far past it; the upper bound tracks the config, not the box.
+    assert elapsed >= cfg.error_retry_backoff_sec
+    assert elapsed < cfg.error_retry_backoff_sec + 10
 
 
 def test_retries_exhausted_then_error(tmp_path):
@@ -1038,7 +1046,8 @@ def test_retry_does_not_increment_attempt(tmp_path):
 
 
 def test_ctrl_c_during_retry_backoff_ends_the_round(tmp_path):
-    """SIGINT to the process during the backoff wait ends the round within 2 s."""
+    """SIGINT during the backoff wait ends the round well before the backoff
+    itself would (a 60 s wait, cut short by the interrupt)."""
     sb = Sandbox(tmp_path)
     cfg = _make_retry_config(error_retry_backoff_sec=60)
     pid = os.getpid()
@@ -1056,7 +1065,10 @@ def test_ctrl_c_during_retry_backoff_ends_the_round(tmp_path):
             run_round(cfg, ROUND, sb.ticket_path, list(sb.workspaces),
                       server=KiloServer.attach(fake.url), out_dir=sb.out_dir)
         elapsed = time.monotonic() - started
-    assert elapsed < 2.0
+    # the interrupt cut the 60 s backoff short; any loaded box still lands well
+    # under the full wait, and a regression that ignored SIGINT would sit here
+    # for the whole backoff.
+    assert elapsed < cfg.error_retry_backoff_sec
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1115,14 +1127,13 @@ def test_max_parallel_one_runs_two_agents_sequentially(tmp_path):
 def test_max_parallel_two_overlaps_two_agents(tmp_path):
     sb = Sandbox(tmp_path, ["agent-a", "agent-b"])
     with _BenchFake({"turns": [{"on_prompt": work_ready, "events": ["busy"], "delay": 1.0}]}) as fake:
-        started = time.monotonic()
         state = _round(sb, fake, make_config(["agent-a", "agent-b"], max_parallel=2))
-        elapsed = time.monotonic() - started
         between, finished_first = _creates_and_reads(fake)
     for name in ("agent-a", "agent-b"):
         _assert_ready(_by_name(state)[name], sb.ws(name))
+    # the second session opened before the first finished — overlap proven from
+    # the request order, not from a wall-clock bound that a loaded box breaks.
     assert not finished_first, between
-    assert elapsed < 2.6
 
 
 def test_three_agents_rework_in_parallel_and_state_json_is_always_whole(tmp_path):

@@ -30,6 +30,7 @@ The cases, from the ticket's acceptance list:
 
 from __future__ import annotations
 
+import subprocess
 import sys
 from dataclasses import FrozenInstanceError
 from pathlib import Path
@@ -588,8 +589,18 @@ def test_gate_defaults_answer_in_json():
     assert roster.DEFAULTS_GATE.api_format == "openai"
 
 
-def test_gate_profile_reads_the_committed_section(gate_key):
-    settings = load_roster(COMMITTED).gate_settings
+def test_gate_profile_reads_the_committed_section(gate_key, tmp_path):
+    # The operator's real gate lives in a git-ignored contest.local.ini next to
+    # the committed file, so `load_roster(COMMITTED)` layers it on and reddens
+    # these placeholders on exactly the machines configured to run rounds. Read
+    # the committed section straight from HEAD, into a directory with no local
+    # override, so the test asserts what is committed and nothing the operator
+    # put beside it.
+    committed = subprocess.run(
+        ["git", "show", "HEAD:contest.ini"],
+        cwd=REPO_ROOT, capture_output=True, text=True, check=True,
+    ).stdout
+    settings = load_roster(write_ini(tmp_path, committed)).gate_settings
     assert settings.base_url == "https://example/v1"
     assert settings.api_key == gate_key
     assert settings.model == "some/model"
