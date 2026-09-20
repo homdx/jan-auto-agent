@@ -211,3 +211,7 @@ Order of implementation as requested: KC-9, then KC-10, then KC-11.
 |---|---|---|---|
 | 66 | KC-27 | the heartbeat shows each agent's phase, a files-count progress bar against the pack's median (60 % working, 70 % committed, 80 % tests, 100 % READY) and how long the judge's tests took; `turn["harvest"]["elapsed"]` persisted | S |
 | 67 | KC-28 | `/dev/null`, `/dev/stdout`, `/dev/stderr`, `/dev/tty` are dropped by `_extract_paths`, so a `> /dev/null` is a no-path bash ask (KC-15's `once`/`mechanical`) and not a gate call out of the session's twenty | S |
+| 68 | KC-29 | a stall the runner asked for (the questions cap) keeps its `STALLED` and exports its patch — only a session that died on its own is promoted to `READY` | S |
+| 69 | KC-30 | `harvest` names the branch's one commit when no `PROGRESS.csv` row does, so `export_patches` has a sha and no caller re-derives one | S |
+| 70 | KC-31 | a `STALLED`/`ERROR` worktree with edits and no commit is exported as `<agent>.STALLED.diff` | S |
+| 71 | KC-32 | the contest tests stop failing on the operator's own box: `contest.local.ini` is not the committed roster, and no test bounds wall-clock under a round's load | S |
