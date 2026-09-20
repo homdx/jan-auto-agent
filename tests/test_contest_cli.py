@@ -35,7 +35,7 @@ from tools.contest import cli  # noqa: E402
 from tools.contest.kilo_client import KiloServer  # noqa: E402
 from tools.contest.roster import AgentSpec, load_roster  # noqa: E402
 from tools.contest.runner import AgentRun, AgentState, RoundState  # noqa: E402
-from tools.contest.workspace import prepare_round  # noqa: E402
+from tools.contest.workspace import Workspace, prepare_round  # noqa: E402
 
 # every test binds an ephemeral-port HTTP server: one xdist worker for all of them
 pytestmark = pytest.mark.xdist_group(name="port_bound_http_servers")
@@ -390,6 +390,80 @@ def test_export_patches_skips_a_claimed_commit_without_a_workspace(tmp_path):
     written = cli.export_patches(state, [], tmp_path / "out")
     assert written == []
     assert not (tmp_path / "out").exists()
+
+
+def test_export_patches_names_a_stalled_or_error_patch_by_its_state(tmp_path):
+    """A `STALLED` agent with a commit gets `.STALLED.patch`, an `ERROR` one
+    `.ERROR.patch`; `READY` and `GAVE_UP` keep their names, and each file is the
+    branch's own `git format-patch`."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write(repo / "pkg" / "__init__.py", "")
+    _write(repo / "pkg" / "thing.py", "def thing():\n    return 1\n")
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "user.email", "patch@example.invalid")
+    _git(repo, "config", "user.name", "patch")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "base")
+    base = _git(repo, "rev-parse", "HEAD")
+
+    workspaces: dict = {}
+    shas: dict = {}
+    runs: list = []
+    for name, state in (("agent-a", AgentState.READY), ("agent-b", AgentState.GAVE_UP),
+                        ("agent-c", AgentState.STALLED), ("agent-d", AgentState.ERROR)):
+        path = tmp_path / "wt" / name
+        _git(repo, "worktree", "add", "-q", "-b", f"contest/{ROUND:02d}/{name}", str(path), base)
+        _write(path / "pkg" / "thing.py", THING_CHANGED)
+        _git(path, "add", "-A")
+        _git(path, "commit", "-q", "-m", f"KC-21: {name}")
+        shas[name] = _git(path, "rev-parse", "HEAD")
+        workspaces[name] = Workspace(agent=name, path=path, branch=f"contest/{ROUND:02d}/{name}",
+                                     base_sha=base, kind="worktree")
+        runs.append(AgentRun(agent=AgentSpec(name, "kenary", f"{name}:free"), workspace=workspaces[name],
+                             state=state, commit=shas[name]))
+    state = RoundState(round_no=ROUND, ticket=TICKET_01, base_sha=base, started_at=1.0, agents=runs)
+
+    out = tmp_path / "out"
+    written = cli.export_patches(state, list(workspaces.values()), out)
+    assert [path.name for path in written] == ["agent-a.patch", "agent-b.GAVE_UP.patch",
+                                               "agent-c.STALLED.patch", "agent-d.ERROR.patch"]
+    for name, patch in zip(("agent-a", "agent-b", "agent-c", "agent-d"), written):
+        text = patch.read_text(encoding="utf-8")
+        assert text.startswith(f"From {shas[name]}")
+        assert "def thing():" in text
+    assert not (out / "agent-c.patch").exists() and not (out / "agent-d.GAVE_UP.patch").exists()
+
+
+def test_a_stall_with_a_valid_commit_counts_as_ready_and_exits_zero(sandbox, capsys, spawn_holder):
+    """A silence stall after the commit: the terminal harvest scores agent-a READY,
+    so the run exports `agent-a.patch` and exits 0, while agent-b stalled with an
+    empty branch stays STALLED with no patch and no harvest."""
+    ini = sandbox.repo / "contest.ini"
+    ini.write_text(ini.read_text(encoding="utf-8").replace("idle_event_timeout_sec = 30",
+                                                           "idle_event_timeout_sec = 1"),
+                   encoding="utf-8")
+    scenario = {"turns": [{"on_prompt": lambda directory, text: work_ready(directory, text)
+                                          if Path(directory).name.endswith("agent-a") else None,
+                           "events": [], "idle": False}]}
+    code, fake = run_fake(sandbox, scenario, ["--ticket", "1", "--no-gate", "--no-tests"],
+                          spawn_holder)
+    captured = capsys.readouterr()
+    out = sandbox.out()
+
+    assert code == 0
+    assert [row["state"] for row in _table(captured.out)] == ["READY", "STALLED"]
+    assert (out / "agent-a.patch").is_file()
+    assert not (out / "agent-a.STALLED.patch").exists()
+    assert not (out / "agent-b.patch").exists() and not (out / "agent-b.STALLED.patch").exists()
+
+    state = RoundState.from_dict(json.loads((out / "state.json").read_text(encoding="utf-8")))
+    ready, stalled = state.agents
+    assert ready.commit and ready.state is AgentState.READY
+    assert ready.turns[0]["idle_status"] == "stalled"
+    assert ready.turns[0]["harvest"]["verdict"] == "READY"
+    assert stalled.commit is None and stalled.state is AgentState.STALLED
+    assert "harvest" not in stalled.turns[0]
 
 
 # ─────────────────────────────────────────────────────────────────────────────

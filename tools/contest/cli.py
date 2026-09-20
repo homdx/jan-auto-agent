@@ -238,8 +238,11 @@ def export_patches(state: RoundState, workspaces: list, out_dir) -> list:
     operator then applies by hand (`docs/collect-epics/
     RUN-THE-EPIC-COMPETITION.md` stages 3–5). A `GAVE_UP` keeps its patch too,
     named `<agent>.GAVE_UP.patch`, because the operator still wants to read
-    those. An empty diff writes no file and says so: a READY without a commit
-    cannot happen, the harvest sets it, so there is no fake sha to fall back on.
+    those — as does a `STALLED` or `ERROR` whose branch has a commit on it (KC-21
+    harvests it, so `run.commit` is set), named `<agent>.STALLED.patch` and
+    `<agent>.ERROR.patch`: the terminal state is the file name. An empty diff
+    writes no file and says so: a READY without a commit cannot happen, the
+    harvest sets it, so there is no fake sha to fall back on.
     """
     out = Path(out_dir)
     by_agent = {ws.agent: ws for ws in workspaces}
@@ -253,7 +256,7 @@ def export_patches(state: RoundState, workspaces: list, out_dir) -> list:
             print(f"warning: {name} claimed a commit but has no workspace — no patch",
                   file=sys.stderr)
             continue
-        suffix = ".GAVE_UP.patch" if run.state is AgentState.GAVE_UP else ".patch"
+        suffix = ".patch" if run.state is AgentState.READY else f".{run.state.value}.patch"
         target = out / f"{name}{suffix}"
         proc = subprocess.run(
             ["git", "-C", str(ws.path), "format-patch", "--stdout", f"{ws.base_sha}..HEAD"],

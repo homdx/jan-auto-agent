@@ -44,6 +44,15 @@ the four pytest roots the round's judge — a tree that breaks `tests/` is
 REWORK with the pytest tail in the rework prompt, instead of READY. The roots
 are slow (about 105 s here for one suite), so they run one worktree at a time
 under `_TEST_RUNS_LOCK` while the rest of the round stays parallel.
+
+A STALLED or ERROR turn with a commit on its branch is harvested too (KC-21,
+round 60): the turn goes to the terminal state with `harvest` recorded on it
+and `run.commit` set, so `export_patches` names it by the terminal state
+(`<agent>.STALLED.patch`) instead of dropping it; a READY verdict finishes the
+run as READY with the note `<sha12> after <the turn's error>`, and a REWORK
+verdict keeps the state the turn earned — no rework prompt, the session is gone.
+A branch with no commit above the base keeps today's path byte for byte: no
+harvest, no pytest, `commit: null`.
 """
 
 from __future__ import annotations
@@ -60,7 +69,7 @@ from pathlib import Path
 from typing import Callable
 
 from tools.backoff import save_state
-from tools.contest.gates import declared_files
+from tools.contest.gates import declared_files, git
 from tools.contest.harvest import harvest, rework_message
 from tools.contest.kilo_client import EventTap, KiloClient, KiloHttpError, SessionRef
 from tools.contest.policy import HARD_DENYLIST, Policy, PolicyContext
@@ -139,6 +148,22 @@ def _harvest(ws, ticket_path, run_tests):
         return harvest(ws, ticket_path)
     with _TEST_RUNS_LOCK:
         return harvest(ws, ticket_path, run_tests=True)
+
+
+def _commits_above(ws: Workspace) -> int:
+    """The commits on the branch above its base — `judge_worktree`'s `commits`.
+
+    KC-21's gate: a turn that died with one under it has work to be scored. Zero
+    both when the branch is at the base and when the count cannot be read — a
+    worktree with nothing on it keeps the old path, with no harvest and no pytest.
+    """
+    count = git(ws.path, "rev-list", "--count", f"{ws.base_sha}..HEAD")
+    return int(count) if count.isdigit() else 0
+
+
+def _head_sha(ws: Workspace) -> str | None:
+    """HEAD of *ws* as a full sha, or None when it cannot be read."""
+    return git(ws.path, "rev-parse", "HEAD") or None
 
 
 class AgentState(str, Enum):
@@ -565,9 +590,33 @@ def run_agent(run: AgentRun, *, client: KiloClient, tap: EventTap, policy: Polic
             else:
                 error = state = None
             if state is not None:
+                # KC-21: a turn that died with a commit under it has finished work,
+                # so it is scored once before the terminal state lands — exactly as
+                # the HARVESTING step and `_plan`'s resume branch score it. The
+                # session is gone, the worktree is not; the verdict decides whether
+                # the run counts as READY or stays in the state the turn earned.
+                note = None
+                if state in (AgentState.STALLED, AgentState.ERROR):
+                    above = _commits_above(ws)
+                    if above:
+                        verdict = _harvest(ws, ticket_path, run_tests)
+                        turn["harvest"] = {
+                            "verdict": verdict.verdict,
+                            "reasons": [r.code for r in verdict.reasons],
+                        }
+                        run.commit = None
+                        if above == 1:
+                            # the claim's sha once the harvest resolved it, else the
+                            # one commit on the branch — `None` when there are two
+                            # (amend them into one) or none (no harvest was run)
+                            run.commit = verdict.commit or _head_sha(ws)
+                        if verdict.verdict == "READY":
+                            note = f"{(run.commit or '')[:12]} after {error}"
+                            state = AgentState.READY
+                            error = None
                 run.turns.append(turn)
                 _append_jsonl(agent_dir / "turns.jsonl", {"agent": spec.name, **turn})
-                return finish(state, error)
+                return finish(state, error, note=note)
 
             # ── HARVESTING ─────────────────────────────────────────────────
             transition(AgentState.HARVESTING, note="tests on" if run_tests else "tests off")

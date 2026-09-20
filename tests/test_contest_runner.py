@@ -144,7 +144,7 @@ def _claim(directory: str, sha: str, outcome: str = "FIXED") -> None:
         fh.write(f"{TICKET},,{outcome},{sha},test\n")
 
 
-def _work(directory: str, *, test: bool) -> str:
+def _work(directory: str, *, test: bool, claim: bool = True) -> str:
     """The agent's turn: a change (+ a test), one commit (amended on a rework), the claim."""
     d = Path(directory)
     _write(d / "pkg" / "thing.py", f"def thing():\n    return 42  # {time.time()}\n")
@@ -157,7 +157,8 @@ def _work(directory: str, *, test: bool) -> str:
     else:
         _git(directory, "commit", "-q", "-m", "KC-6: thing")
     sha = _git(directory, "rev-parse", "HEAD")
-    _claim(directory, sha)
+    if claim:
+        _claim(directory, sha)
     return sha
 
 
@@ -167,6 +168,12 @@ def work_ready(directory, text):
 
 def work_no_test(directory, text):
     _work(directory, test=False)
+
+
+def work_no_claim(directory, text):
+    """A change and a test, one commit, no `runs/<agent>/PROGRESS.csv` row: the
+    harvest rejects it with `no_progress_row` and resolves no claim."""
+    _work(directory, test=True, claim=False)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -598,6 +605,165 @@ def test_server_going_away_mid_turn_is_error(tmp_path):
         fake.stop()
     assert run.state is AgentState.ERROR and elapsed < 10
     assert run.turns[0]["idle_status"] == "closed"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KC-21: a STALLED / ERROR turn with a commit on its branch is harvested
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _stall_config(**over) -> ContestConfig:
+    """A silence stall inside the turn deadline, so the turn is `stalled`, not a
+    turn timeout."""
+    kw = dict(turn_timeout_sec=30, idle_event_timeout_sec=1)
+    kw.update(over)
+    return make_config(["agent-a"], **kw)
+
+
+def _runner_lines(caplog) -> list:
+    return [r.getMessage() for r in caplog.records if r.name == "tools.contest.runner"]
+
+
+def _runner_has(caplog, needle: str) -> bool:
+    return any(needle in line for line in _runner_lines(caplog))
+
+
+def _branch_sha(ws) -> str:
+    return _git(ws.path, "rev-parse", "HEAD")
+
+
+def test_a_stalled_turn_with_a_valid_commit_is_harvested_to_ready(tmp_path, caplog):
+    """The work is committed and claimed, then the session goes silent: READY,
+    `run.commit` is that sha, the single turn carries `idle_status == "stalled"`
+    and the READY harvest, and the KC-18 line reads
+    `<agent>: READY — <sha12> after no event for 1s`."""
+    caplog.set_level(logging.INFO, logger="tools.contest.runner")
+    cfg = _stall_config()
+    scenario = {"turns": [{"on_prompt": work_ready, "events": [], "idle": False}]}
+    started = time.monotonic()
+    sb, fake, _h, run, aborted = _run_one(tmp_path, scenario, cfg)
+    ws = sb.ws("agent-a")
+    assert run.state is AgentState.READY, (run.state, run.last_error)
+    assert run.commit == _branch_sha(ws)
+    assert aborted and time.monotonic() - started < 5
+    assert run.last_error is None and run.attempt == 0
+    (turn,) = run.turns
+    assert turn["idle_status"] == "stalled"
+    assert turn["harvest"] == {"verdict": "READY", "reasons": []}
+    assert _runner_has(caplog, f"agent-a: READY — {run.commit[:12]} after no event for 1s")
+    (line,) = _jsonl(sb.out_dir / "agent-a" / "turns.jsonl")
+    assert line["idle_status"] == "stalled" and line["harvest"]["verdict"] == "READY"
+
+
+def test_a_stalled_turn_with_a_rejected_commit_stays_stalled_without_a_reprompt(tmp_path):
+    """One commit with no `PROGRESS.csv` row: STALLED, `run.commit` is that sha,
+    the turn's harvest is REWORK, `last_error` is the stall text, `attempt` is
+    unchanged, and no second prompt went to the fake."""
+    sb, fake, _h, run, _ = _run_one(tmp_path,
+        {"turns": [{"on_prompt": work_no_claim, "events": [], "idle": False}]}, _stall_config())
+    ws = sb.ws("agent-a")
+    assert run.state is AgentState.STALLED, run.last_error
+    assert run.commit == _branch_sha(ws)
+    assert run.last_error == "no event for 1s"
+    assert run.attempt == 0
+    (turn,) = run.turns
+    assert turn["idle_status"] == "stalled"
+    assert turn["harvest"] == {"verdict": "REWORK", "reasons": ["no_progress_row"]}
+    assert len(_prompts(fake)) == 1
+
+
+def test_an_error_turn_with_a_valid_commit_is_harvested_to_ready(tmp_path, caplog):
+    """`session.error` after the commit and the claim: the same harvest as the
+    stall, ERROR standing in for STALLED."""
+    caplog.set_level(logging.INFO, logger="tools.contest.runner")
+    scenario = {"turns": [{"on_prompt": work_ready, "events": ["busy"],
+                           "error": {"name": "ProviderError", "message": "boom-42"}}]}
+    sb, _fake, _h, run, _ = _run_one(tmp_path, scenario, _stall_config())
+    ws = sb.ws("agent-a")
+    assert run.state is AgentState.READY, (run.state, run.last_error)
+    assert run.commit == _branch_sha(ws)
+    assert run.last_error is None and run.attempt == 0
+    (turn,) = run.turns
+    assert turn["idle_status"] == "error"
+    assert turn["harvest"] == {"verdict": "READY", "reasons": []}
+    assert _runner_has(caplog, f"agent-a: READY — {run.commit[:12]} after session.error:")
+
+
+def test_an_error_turn_with_a_rejected_commit_stays_error_without_a_reprompt(tmp_path):
+    sb, fake, _h, run, _ = _run_one(tmp_path,
+        {"turns": [{"on_prompt": work_no_claim, "events": ["busy"],
+                    "error": {"name": "ProviderError", "message": "boom-42"}}]},
+        _stall_config())
+    ws = sb.ws("agent-a")
+    assert run.state is AgentState.ERROR, run.last_error
+    assert run.commit == _branch_sha(ws)
+    assert "boom-42" in run.last_error
+    assert run.attempt == 0
+    (turn,) = run.turns
+    assert turn["idle_status"] == "error"
+    assert turn["harvest"] == {"verdict": "REWORK", "reasons": ["no_progress_row"]}
+    assert len(_prompts(fake)) == 1
+
+
+def test_a_stall_with_no_commit_is_not_harvested(tmp_path, monkeypatch):
+    """Nothing above the base: today's path byte for byte — STALLED, `commit`
+    None, no `harvest` key on the turn, and the harvest is never called."""
+    def boom(*args, **kwargs):
+        raise AssertionError("_harvest must not run for a branch with no commit")
+
+    monkeypatch.setattr("tools.contest.runner._harvest", boom)
+    sb, fake, _h, run, aborted = _run_one(tmp_path, {"turns": [{"events": [], "idle": False}]},
+                                          _stall_config())
+    assert run.state is AgentState.STALLED and aborted
+    assert run.last_error == "no event for 1s"
+    assert run.commit is None
+    (turn,) = run.turns
+    assert turn["idle_status"] == "stalled" and "harvest" not in turn
+    (line,) = _jsonl(sb.out_dir / "agent-a" / "turns.jsonl")
+    assert line["agent"] == "agent-a" and "harvest" not in line
+
+
+def test_a_terminal_harvest_skips_the_commit_when_the_branch_has_two(tmp_path):
+    """Two commits, the claim naming the older of the two: the verdict is REWORK
+    and there is no single commit to point at, so `run.commit` stays None."""
+    def two_commits(directory, text):
+        work_ready(directory, text)
+        _git(directory, "commit", "-q", "--allow-empty", "-m", "KC-21: second")
+
+    sb, fake, _h, run, _ = _run_one(tmp_path,
+        {"turns": [{"on_prompt": two_commits, "events": [], "idle": False}]}, _stall_config())
+    ws = sb.ws("agent-a")
+    assert run.state is AgentState.STALLED
+    assert run.commit is None
+    (turn,) = run.turns
+    assert turn["harvest"]["verdict"] == "REWORK"
+    assert "commits_ne_1" in turn["harvest"]["reasons"]
+    assert _git(ws.path, "rev-list", "--count", f"{ws.base_sha}..HEAD") == "2"
+
+
+def test_a_terminal_harvest_runs_the_roots_under_the_rounds_lock(tmp_path, monkeypatch):
+    """`run_tests=True`: the stall's harvest is the round's harvest — the pytest
+    roots run in that worktree, through the same `_harvest` that serialises them
+    round-wide, and the stall still settles the run READY."""
+    import tools.contest.harvest as harvest_module
+
+    sb = Sandbox(tmp_path)
+    seen: list = []
+
+    def roots(cwd):
+        seen.append(cwd)
+        return ALL_ROOTS_PASS, []
+
+    monkeypatch.setattr(harvest_module, "run_tests_detail", roots)
+    scenario = {"turns": [{"on_prompt": work_ready, "events": [], "idle": False}]}
+    with _BenchFake(scenario) as fake:
+        state = run_round(_stall_config(), ROUND, sb.ticket_path, list(sb.workspaces),
+                          server=KiloServer.attach(fake.url), out_dir=sb.out_dir,
+                          run_tests=True)
+    (run,) = state.agents
+    assert run.state is AgentState.READY, (run.state, run.last_error)
+    assert run.commit == _branch_sha(sb.ws("agent-a"))
+    assert seen == [str(sb.ws("agent-a").path)]
+    assert run.turns[0]["harvest"] == {"verdict": "READY", "reasons": []}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
