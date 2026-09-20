@@ -1,0 +1,13 @@
+{
+  "base": "5ee8417",
+  "ticket": "epic-tasks/52-kc13-policy-judges-every-absolute-path-in-the-command-not-only-the-one-kilo-named.md",
+  "note": "every entry came out of `python3 -m tools.contest run --ticket 52` (runs 2 and 3, contest-out/52-run{2,3}-5ee8417/); run 1 (base 70a708a, the uncorrected ticket) produced no entry",
+  "entries": {
+    "hy3":     {"model": "hy3:free",               "file": "contest-out/52-run2-5ee8417/hy3.patch",                    "run": "READY e71f221, 1 turn"},
+    "mistral": {"model": "mistral-medium-3-5:free", "file": "contest-out/52-run2-5ee8417/mistral.STALLED.patch",        "run": "STALLED at 1800 s with the commit on the branch; exported by hand (KC-21)"},
+    "agnes":   {"model": "agnes-2-5-flash:free",    "file": "contest-out/52-run3-5ee8417/agnes-2-5-flash.patch",        "run": "READY 8b67636, 1 turn"},
+    "mimo":    {"model": "mimo-v2-5:free",          "file": "contest-out/52-run3-5ee8417/mimo-v2-5.patch",              "run": "READY 8f19de7 after one rework (turn 0 idled with edits and no commit — KC-22)"},
+    "step":    {"model": "step-3-7-flash:free",     "file": "contest-out/52-run3-5ee8417/step-3-7-flash.patch",         "run": "READY c846d30, 1 turn; 6 external_directory asks all gate-failed (no gate profile) and it finished anyway"},
+    "glm":     {"model": "glm-4-7-flash:free",      "file": "contest-out/52-run3-5ee8417/glm-4-7-flash.GAVE_UP.patch",  "run": "GAVE_UP after 2 reworks (commit_not_on_branch); 10.2M input tokens"}
+  }
+}
