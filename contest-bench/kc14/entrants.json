@@ -1,0 +1,10 @@
+{
+  "base": "0f4eb02",
+  "ticket": "epic-tasks/53-kc14-harvest-accepts-only-a-hex-sha-as-the-claimed-commit-not-head-or-a-ref.md",
+  "note": "three hand-run Sensenova entries (kc14/*.patch, 2026-09-20). The manager round on hp-uz (`python3 -m tools.contest run --ticket 53`, five kenary free models, kc14/contest-out/53/) produced no .patch: every harvest was REWORK on tests_failed (KC-26 — `tests:0✗` under -qq, timing tests red under load) and off_ticket_files (KC-17); agnes-2-0-flash fb71b69 and step-3-7-flash e1f67da are still on their branches on hp-uz, STALLED after the second attempt (KC-21).",
+  "entries": {
+    "sn68":      {"model": "Sensenova 6-8",      "file": "kc14/kc14-Sensenova-6-8.patch"},
+    "sn68-var2": {"model": "Sensenova 6-8 var2", "file": "kc14/kc14-Sensenova-6-8-var2.patch"},
+    "sn67":      {"model": "Sensenova 6-7",      "file": "kc14/kc14-Sensenova-6-7.patch"}
+  }
+}
