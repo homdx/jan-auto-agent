@@ -357,6 +357,85 @@ def test_run_tests_summary_and_tail_agree(round_, tmp_path):
     assert tail and any("boom-marker-42" in line for line in tail)
 
 
+def test_run_tests_counts_failures_when_the_ini_silences_the_stats_line(round_, tmp_path):
+    """KC-26: `-qq` prints no `N failed in Xs` line; the count comes from the
+    short summary instead of collapsing to `0✗`, and the tail names its root."""
+    repo, base, ticket = round_
+    wt = _worktree(repo, base, tmp_path)
+    _accepting(wt)
+    _edit(wt, "pytest.ini", "[pytest]\naddopts = -qq\n")
+    _edit(wt, "tests/test_probe.py",
+          "def test_probe():\n    assert False, 'boom-marker-42'\n"
+          "def test_other():\n    assert False\n")
+    _commit(wt, "break two tests under -qq")
+    summary, tail = run_tests_detail(str(wt.path))
+    assert summary.split()[0] == "tests:2✗"
+    assert tail[0] == "--- tests"
+    assert any("boom-marker-42" in line for line in tail)
+
+
+def test_run_tests_keeps_a_tail_per_failing_root(round_, tmp_path):
+    """Two roots fail: both tails are kept, each under its own `--- <root>` line —
+    not only the last root's."""
+    repo, base, ticket = round_
+    wt = _worktree(repo, base, tmp_path)
+    _accepting(wt)
+    _edit(wt, "tests/test_probe.py", "def test_probe():\n    assert False, 'first-root-7'\n")
+    _edit(wt, "tests_bugfix/test_b.py", "def test_b():\n    assert False, 'second-root-9'\n")
+    _commit(wt, "break both roots")
+    summary, tail = run_tests_detail(str(wt.path))
+    assert summary.startswith("tests:1✗ tests_bugfix:1✗")
+    first, second = tail.index("--- tests"), tail.index("--- tests_bugfix")
+    assert first < second
+    assert any("first-root-7" in l for l in tail[first:second])
+    assert any("second-root-9" in l for l in tail[second:])
+
+
+_FLAKY = """\
+import pathlib
+FLAG = pathlib.Path(__file__).with_suffix(".flag")
+
+def test_flaky():
+    if FLAG.exists():
+        return
+    FLAG.write_text("seen")
+    assert False, "first run only"
+"""
+
+
+def test_run_tests_reruns_the_failed_tests_alone_and_marks_a_flake(round_, tmp_path):
+    """A test that fails once and passes on its serial rerun is `PASS*1`, named
+    in the tail, and not a `tests_failed` reason — a timing test under round
+    load is not a failure of the tree."""
+    repo, base, ticket = round_
+    wt = _worktree(repo, base, tmp_path)
+    _stage_probe(wt)
+    _edit(wt, "tests/test_flaky.py", _FLAKY)
+    _record(wt, ticket.name, outcome="DONE", commit=_commit(wt, "probe, plus a flaky test"))
+    summary, tail = run_tests_detail(str(wt.path))
+    assert summary.split()[0] == "tests:PASS*1"
+    assert "✗" not in summary
+    assert len(tail) == 1 and "flaky" in tail[0] and "tests/test_flaky.py::test_flaky" in tail[0]
+
+    (wt.path / "tests" / "test_flaky.flag").unlink()
+    h = harvest(wt, ticket, run_tests=True)
+    assert h.verdict == "READY" and "tests_failed" not in _codes(h)
+    assert h.facts["tests_run"].startswith("tests:PASS*1")
+
+
+def test_run_tests_reports_a_non_zero_exit_without_a_failed_test(round_, tmp_path):
+    """pytest dying before any test (a collection error here) is `✗` with the
+    exit code, never a silent `PASS`."""
+    repo, base, ticket = round_
+    wt = _worktree(repo, base, tmp_path)
+    _accepting(wt)
+    _edit(wt, "tests/test_probe.py", "import does_not_exist_zz\n")
+    _commit(wt, "collection error")
+    summary, tail = run_tests_detail(str(wt.path))
+    assert "✗" in summary.split()[0] and summary.split()[0] != "tests:PASS"
+    assert tail[0] == "--- tests"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 3. `harvest`: the claim and the facts become a verdict
 # ─────────────────────────────────────────────────────────────────────────────

@@ -22,6 +22,7 @@ Standard library only.
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import re
 import subprocess
@@ -139,31 +140,75 @@ def run_tests(cwd):
     return run_tests_detail(cwd)[0]
 
 
+#: A `FAILED` / `ERROR` line of pytest's short test summary: the node id, with
+#: xdist's `@group` suffix (`--dist=loadgroup`) and the ` - message` dropped.
+_SUMMARY_LINE = re.compile(r"^(?:FAILED|ERROR) (\S+?)(?:@[^\s\[]+)?(?: - .*)?$")
+
+
+def _failures(lines: list[str]) -> tuple[int, list[str]]:
+    """`(count, node ids)` of the failed and errored tests in a pytest run.
+
+    The count is the stats line's (`3 failed, 1 error, 40 passed in 2s`) when
+    pytest printed one; under `-qq` — an ini `-q` on top of a `-q` on the
+    command line — it prints none, and the count is the number of short-summary
+    lines instead, which `-rfE` (the default) always prints.
+    """
+    ids = []
+    for line in lines:
+        m = _SUMMARY_LINE.match(line)
+        if m:
+            ids.append(m.group(1))
+    for line in reversed(lines):
+        nfail = re.search(r"(\d+) failed", line)
+        nerr = re.search(r"(\d+) error", line)
+        if (nfail or nerr) and re.search(r" in [\d.]+s", line):
+            return int(nfail.group(1) if nfail else 0) + int(nerr.group(1) if nerr else 0), ids
+    return len(ids), ids
+
+
+def _pytest(cwd, *args) -> subprocess.CompletedProcess:
+    return subprocess.run([sys.executable, "-m", "pytest", *args, "--timeout=180"],
+                          cwd=cwd, capture_output=True, text=True)
+
+
 def run_tests_detail(cwd) -> tuple[str, list[str]]:
     """Same four roots as `run_tests`, plus the tail of the failing output.
 
-    Returns `(summary, tail_lines)`: the summary is byte-identical to what
-    `run_tests` has always returned, and `tail_lines` are the last
-    `FAIL_TAIL_LINES` lines of the pytest output of the roots that failed —
-    the cause is at the tail, not the head, so that is what an agent gets.
+    Returns `(summary, tail_lines)`. The summary is one token per root:
+    `PASS`, `absent`, `3✗` (failed + errored), `rc4✗` (pytest exited non-zero
+    without a failed test — a usage or collection error, an interrupt), or
+    `PASS*2`: two tests failed under the full run and passed when rerun alone
+    (`-n0`, by node id) — a timing test that flakes under round load, not a
+    failure of the tree. The rerun happens once per failing root and only for
+    the tests that failed; a real failure stays `✗`.
+
+    `tail_lines` carries, per root that did not pass, a `--- <root>` line and
+    the last `FAIL_TAIL_LINES` lines of that root's output — the cause is at
+    the tail, not the head, so that is what an agent gets — and, for a root
+    that passed on rerun, one line naming the flaky tests.
     """
     out = []
     tail: list[str] = []
+    serial = ["-n0"] if importlib.util.find_spec("xdist") else []
     for d in TEST_ROOTS:
         if not os.path.isdir(os.path.join(cwd, d)):
             out.append(f"{d}:absent")
             continue
-        r = subprocess.run([sys.executable, "-m", "pytest", d, "-q", "--timeout=180"],
-                           cwd=cwd, capture_output=True, text=True)
+        r = _pytest(cwd, d)
+        if r.returncode == 0:
+            out.append(f"{d}:PASS")
+            continue
         lines = (r.stdout or "").strip().splitlines()
-        summary = lines[-1] if lines else ""
-        nfail = re.search(r"(\d+) failed", summary)
-        nerr = re.search(r"(\d+) error", summary)
-        bad = int(nfail.group(1) if nfail else 0) + int(nerr.group(1) if nerr else 0)
-        out.append(f"{d}:{'PASS' if r.returncode == 0 else f'{bad}✗'}")
-        if r.returncode:
-            tail.extend(lines)
-    return " ".join(out), tail[-FAIL_TAIL_LINES:]
+        bad, ids = _failures(lines)
+        if bad and ids and _pytest(cwd, *ids, *serial).returncode == 0:
+            out.append(f"{d}:PASS*{bad}")
+            tail.append(f"--- {d}: {bad} test(s) failed under the full run and passed "
+                        f"alone on rerun (flaky, not counted): {' '.join(ids)}")
+            continue
+        out.append(f"{d}:{bad}✗" if bad else f"{d}:rc{r.returncode}✗")
+        tail.append(f"--- {d}")
+        tail.extend(lines[-FAIL_TAIL_LINES:] or (r.stderr or "").strip().splitlines()[-FAIL_TAIL_LINES:])
+    return " ".join(out), tail
 
 
 def judge_worktree(name, path, base, declared, want_tests):
