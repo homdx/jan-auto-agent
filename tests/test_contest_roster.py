@@ -144,6 +144,9 @@ def test_committed_contest_ini_loads(gate_key):
     assert cfg.idle_event_timeout_sec == 300
     assert cfg.max_questions_per_turn == 3
     assert cfg.tmp_roots == ("/tmp/kilo/*", "/tmp/contest/*")
+    assert cfg.ask_commands == (
+        "*>*", "*|*tee *", "cp *", "mv *", "ln *", "rsync *", "install *", "dd *",
+    )
     assert cfg.gate_max_calls_per_session == 20
     assert cfg.out_dir == "contest-out"
     assert cfg.rounds_dir == "../rounds"
@@ -156,6 +159,12 @@ def test_committed_limits_are_ints(gate_key):
                 "idle_event_timeout_sec", "max_questions_per_turn",
                 "progress_every_sec", "gate_max_calls_per_session"):
         assert isinstance(getattr(cfg, key), int), key
+
+
+def test_committed_ask_commands_keep_their_text_and_order(gate_key):
+    assert load_roster(COMMITTED).ask_commands == (
+        "*>*", "*|*tee *", "cp *", "mv *", "ln *", "rsync *", "install *", "dd *",
+    )
 
 
 def test_committed_denied_commands_keep_their_text_and_order(gate_key):
@@ -445,8 +454,56 @@ def test_session_rules_follow_the_order_of_deny_commands():
                for rule in rules[3:])
 
 
-def test_session_rules_have_no_deny_without_deny_commands():
-    assert ContestConfig().session_rules() == PROBE_RULES
+def test_session_rules_ask_before_deny(tmp_path):
+    cfg = ContestConfig(
+        ask_commands=("*>*", "cp *"),
+        deny_commands=("git push*",),
+    )
+    rules = cfg.session_rules()
+
+    assert rules[:3] == PROBE_RULES
+    assert rules == PROBE_RULES + [
+        {"permission": "bash", "pattern": "*>*", "action": "ask"},
+        {"permission": "bash", "pattern": "cp *", "action": "ask"},
+        {"permission": "bash", "pattern": "git push*", "action": "deny"},
+    ]
+
+
+def test_session_rules_ask_commands_empty_keeps_probe_rules(tmp_path):
+    cfg = ContestConfig()
+    assert cfg.session_rules() == PROBE_RULES
+
+
+def test_session_rules_ask_and_deny_in_file_order(tmp_path):
+    rules = ContestConfig(
+        ask_commands=("z*", "a*"),
+        deny_commands=("z*", "a*"),
+    ).session_rules()
+    asks = [r for r in rules if r["action"] == "ask" and r["permission"] == "bash"]
+    denies = [r for r in rules if r["action"] == "deny" and r["permission"] == "bash"]
+    assert [r["pattern"] for r in asks] == ["z*", "a*"]
+    assert [r["pattern"] for r in denies] == ["z*", "a*"]
+    assert all(r["permission"] == "bash" for r in asks)
+    assert all(r["permission"] == "bash" for r in denies)
+    # asks come before denies
+    assert rules.index(asks[0]) < rules.index(denies[0])
+
+
+def test_absent_ask_commands_key_defaults_to_empty(tmp_path):
+    text = """
+[contest]
+
+[contest.agent.alpha]
+model = kenary/hy3:free
+"""
+    cfg = load_roster(write_ini(tmp_path, text))
+    assert cfg.ask_commands == ()
+    assert cfg.session_rules() == PROBE_RULES
+
+
+def test_ask_commands_in_contest_keys():
+    assert "ask_commands" in CONTEST_KEYS
+    assert "deny_commands" in CONTEST_KEYS
 
 
 def test_session_rules_returns_a_fresh_list_every_call():
@@ -461,8 +518,9 @@ def test_committed_rules_match_the_probe(gate_key):
     cfg = load_roster(COMMITTED)
     rules = cfg.session_rules()
     assert rules[:3] == PROBE_RULES
-    assert len(rules) == 3 + len(cfg.deny_commands)
-    assert [rule["pattern"] for rule in rules[3:]] == list(cfg.deny_commands)
+    assert len(rules) == 3 + len(cfg.ask_commands) + len(cfg.deny_commands)
+    assert [rule["pattern"] for rule in rules[3:3 + len(cfg.ask_commands)]] == list(cfg.ask_commands)
+    assert [rule["pattern"] for rule in rules[3 + len(cfg.ask_commands):]] == list(cfg.deny_commands)
     assert list(BASE_RULES) == PROBE_RULES
 
 

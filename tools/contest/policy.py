@@ -589,7 +589,8 @@ class Policy:
 
         In order: ``doom_loop``; any path at or under a forbidden entry;
         every path inside the worktree or under a ``tmp_roots`` glob; a
-        ``bash`` command matching ``deny_commands``.
+        ``bash`` command matching ``deny_commands``; a ``bash`` ask with no
+        path outside the worktree/tmp_roots; otherwise ``None``.
         """
         permission = _as_str(props.get("permission"))
         if permission == "doom_loop":
@@ -614,6 +615,11 @@ class Policy:
                 return Decision(
                     "reject", "mechanical",
                     f"deny_commands match: {pattern}",
+                )
+            if not pairs:
+                return Decision(
+                    "once", "mechanical",
+                    "bash: no path outside worktree/tmp_roots",
                 )
         return None
 

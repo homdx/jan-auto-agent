@@ -76,14 +76,18 @@ contest-out/<NN>/                    one folder per round (git-ignored)
 Created with `directory = <worktree>`, the roster's model, and these rules:
 
 ```
-* allow · external_directory ask · doom_loop ask · bash deny for each `deny_commands` pattern
+* allow · external_directory ask · doom_loop ask · bash ask for each `ask_commands` pattern · bash deny for each `deny_commands` pattern
 ```
 
 `bash` stays `allow` (the probe showed `bash: ask` turns every `pytest` and
 `git` into a round trip). The `deny_commands` patterns (`git push*`,
 `sudo *`, `rm -rf /*`, …) are refused by Kilo itself, no round trip, no
-LLM. Everything else that leaves the worktree arrives as
-`external_directory` and goes through the policy.
+LLM. The `ask_commands` patterns catch shell writes that do not name a path
+argument — redirects, `tee`, `cp`/`mv`/`ln`/`rsync`/`dd` destinations and
+installer commands — and raise `bash` instead of falling through to an
+invisible `external_directory` that cannot parse redirect targets.
+Everything else that leaves the worktree arrives as `external_directory` and
+goes through the policy.
 
 ## 4. The approver — three layers, the third is a second model
 
@@ -94,8 +98,8 @@ the reason go back to Kilo and the model reads the reason.
 | layer | decides when | verdict | LLM call |
 |---|---|---|---|
 | 0 server rules | command matches `deny_commands` | Kilo denies | none |
-| 1 mechanical | every path in `patterns` / `metadata.directories` is inside the worktree or inside a `tmp_roots` glob → allow; any path under a hard denylist (`/`, `$HOME` itself, `~/.ssh`, `~/.config`, the repo's `.git/hooks`, any other worktree of the round) → reject; `permission == doom_loop` → reject | final | none |
-| 2 LLM safety gate | everything layer 1 could not settle (a path outside both lists, a command it cannot classify) | `allow` or `reject` with a one-line reason | **one call to the gate model** |
+| 1 mechanical | every path in `patterns` / `metadata.directories` is inside the worktree or inside a `tmp_roots` glob → allow; any path under a hard denylist (`/`, `$HOME` itself, `~/.ssh`, `~/.config`, the repo's `.git/hooks`, any other worktree of the round) → reject; `permission == doom_loop` → reject; `permission == bash` with no path outside the worktree/tmp_roots (a redirect, `2>&1`, a relative write, or a bare command like `pytest -q`) → allow | final | none |
+| 2 LLM safety gate | everything layer 1 could not settle (a path outside both lists, a `bash` ask with an outside path) | `allow` or `reject` with a one-line reason | **one call to the gate model** |
 
 The gate model is **not** the agent's model. It is a named profile
 (`[contest] gate_llm_profile = contest_gate_llm`) resolved with

@@ -81,6 +81,7 @@ CONTEST_KEYS = (
     "progress_every_sec",
     "tmp_roots",
     "deny_commands",
+    "ask_commands",
     "gate_llm_profile",
     "gate_max_calls_per_session",
     "out_dir",
@@ -180,6 +181,7 @@ class ContestConfig:
     progress_every_sec: int = 60
     tmp_roots: tuple[str, ...] = ()
     deny_commands: tuple[str, ...] = ()
+    ask_commands: tuple[str, ...] = ()
     gate_llm_profile: str = ""
     gate_max_calls_per_session: int = 20
     out_dir: str = "contest-out"
@@ -190,11 +192,15 @@ class ContestConfig:
     def session_rules(self) -> list[dict]:
         """The rule list ``KiloClient.create_session`` sends, per session.
 
-        The probe's three fixed rules first, then one ``bash`` deny per
-        ``deny_commands`` entry in the order ``contest.ini`` lists them. A new
-        list on every call, so a caller can append without affecting another.
+        The probe's three fixed rules first, then one ``bash`` ask per
+        ``ask_commands`` entry in the order ``contest.ini`` lists them, then
+        one ``bash`` deny per ``deny_commands`` entry. A command matching both
+        is denied — Kilo's last match wins, which is what the probe relied on
+        for ``*`` allow followed by ``external_directory`` ask.
         """
         rules = [dict(rule) for rule in BASE_RULES]
+        for pattern in self.ask_commands:
+            rules.append({"permission": "bash", "pattern": pattern, "action": "ask"})
         for pattern in self.deny_commands:
             rules.append({"permission": "bash", "pattern": pattern, "action": "deny"})
         return rules
@@ -363,6 +369,7 @@ def _build(parser: configparser.ConfigParser) -> ContestConfig:
         progress_every_sec=limit("progress_every_sec", 60),
         tmp_roots=list_("tmp_roots"),
         deny_commands=list_("deny_commands"),
+        ask_commands=list_("ask_commands"),
         gate_llm_profile=gate_profile,
         gate_max_calls_per_session=limit("gate_max_calls_per_session", 20),
         out_dir=scalar("out_dir", "contest-out"),

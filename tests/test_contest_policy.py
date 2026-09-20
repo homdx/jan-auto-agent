@@ -505,7 +505,8 @@ def test_command_with_relative_and_absolute_path_is_once(tmp_path):
 
 def test_command_bare_words_and_shell_syntax_are_not_paths(tmp_path):
     """A bare command word, 2>&1, $HOME/x, a URL, and a quoted path with
-    spaces do not become paths or crash."""
+    spaces do not become paths or crash. With KC-15, a bash command that
+    names no path outside the worktree is mechanically allowed."""
     event = make_event(
         permission="bash",
         patterns=[],
@@ -519,7 +520,9 @@ def test_command_bare_words_and_shell_syntax_are_not_paths(tmp_path):
     assert pairs == []
 
     decision = decide(policy, event, tmp_path)
-    assert len(gate.calls) == 1
+    assert (decision.reply, decision.layer) == ("once", "mechanical")
+    assert "no path outside" in decision.reason
+    assert gate.calls == []
 
 
 def test_command_scan_skips_non_string_command(tmp_path):
@@ -582,8 +585,152 @@ def test_root_and_home_match_on_identity_alone():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# layer 2: the gate
+# KC-15: bash ask for redirect/tee/cp outside the worktree; no-path bash is free
 # ─────────────────────────────────────────────────────────────────────────────
+
+def test_live_redirect_outside_worktree_to_gate(tmp_path):
+    """`echo x > /tmp/kc6-outside-a.txt` has no path in patterns but the
+    command scan finds /tmp/kc6-outside-a.txt, which is not under tmp_roots."""
+    event = make_event(
+        permission="bash",
+        patterns=[],
+        command="echo x > /tmp/kc6-outside-a.txt",
+        description="write outside file via redirect",
+    )
+    gate = StubGate(json.dumps(REJECT))
+    policy = Policy(make_config(tmp_roots=("/tmp/contest/*",)),
+                    completion_fn=gate, clock=FakeClock())
+
+    decision = decide(policy, event, tmp_path)
+
+    assert decision.layer == "gate"
+    assert "/tmp/kc6-outside-a.txt" in gate.user_message()
+
+
+def test_bash_no_path_outside_is_mechanical(tmp_path):
+    """`pytest -q 2>&1 | tail -n 20` has no path outside the worktree."""
+    event = make_event(
+        permission="bash",
+        patterns=[],
+        command="python3 -m pytest tests -q 2>&1 | tail -n 20",
+        description="run tests",
+    )
+    gate = StubGate(json.dumps(ALLOW))
+    policy = Policy(make_config(), completion_fn=gate, clock=FakeClock())
+
+    decision = decide(policy, event, tmp_path)
+
+    assert (decision.reply, decision.layer) == ("once", "mechanical")
+    assert "no path outside" in decision.reason
+    assert gate.calls == []
+
+
+def test_bash_relative_redirect_is_mechanical(tmp_path):
+    """`echo x > out.txt` — a relative redirect stays inside the worktree."""
+    event = make_event(
+        permission="bash",
+        patterns=[],
+        command="echo x > out.txt",
+        description="write relative file",
+    )
+    gate = StubGate(json.dumps(ALLOW))
+    policy = Policy(make_config(), completion_fn=gate, clock=FakeClock())
+
+    decision = decide(policy, event, tmp_path)
+
+    assert (decision.reply, decision.layer) == ("once", "mechanical")
+    assert "no path outside" in decision.reason
+    assert gate.calls == []
+
+
+def test_bash_cp_to_tmp_roots_is_mechanical(tmp_path):
+    """`cp README.md /tmp/contest/notes/a.md` — target is under tmp_roots."""
+    event = make_event(
+        permission="bash",
+        patterns=[],
+        command="cp README.md /tmp/contest/notes/a.md",
+        description="copy to contest notes",
+    )
+    gate = StubGate(json.dumps(ALLOW))
+    policy = Policy(make_config(tmp_roots=("/tmp/contest/*",)),
+                    completion_fn=gate, clock=FakeClock())
+
+    decision = decide(policy, event, tmp_path)
+
+    assert (decision.reply, decision.layer) == ("once", "mechanical")
+    assert gate.calls == []
+
+
+def test_bash_cp_outside_tmp_roots_to_gate(tmp_path):
+    """`cp README.md /tmp/elsewhere/a.md` — target is not under tmp_roots."""
+    event = make_event(
+        permission="bash",
+        patterns=[],
+        command="cp README.md /tmp/elsewhere/a.md",
+        description="copy elsewhere",
+    )
+    gate = StubGate(json.dumps(REJECT))
+    policy = Policy(make_config(tmp_roots=("/tmp/contest/*",)),
+                    completion_fn=gate, clock=FakeClock())
+
+    decision = decide(policy, event, tmp_path)
+
+    assert decision.layer == "gate"
+    assert "/tmp/elsewhere/a.md" in gate.user_message()
+
+
+def test_bash_forbidden_redirect_is_mechanical_reject(tmp_path):
+    """`cat x > ~/.ssh/authorized_keys` — target is on the hard denylist."""
+    event = make_event(
+        permission="bash",
+        patterns=[],
+        command="cat x > ~/.ssh/authorized_keys",
+        description="write to ssh dir",
+    )
+    gate = StubGate(json.dumps(ALLOW))
+    policy = Policy(make_config(), completion_fn=gate, clock=FakeClock())
+
+    decision = decide(policy, event, tmp_path)
+
+    assert (decision.reply, decision.layer) == ("reject", "mechanical")
+    assert "forbidden" in decision.reason
+    assert gate.calls == []
+
+
+def test_bash_deny_beats_no_path_rule(tmp_path):
+    """`git push origin HEAD` matches deny_commands even though it has no path."""
+    event = make_event(
+        permission="bash",
+        patterns=[],
+        command="git push origin HEAD",
+        description="push to remote",
+    )
+    gate = StubGate(json.dumps(ALLOW))
+    policy = Policy(make_config(deny_commands=("git push*",)),
+                    completion_fn=gate, clock=FakeClock())
+
+    decision = decide(policy, event, tmp_path)
+
+    assert (decision.reply, decision.layer) == ("reject", "mechanical")
+    assert "deny_commands" in decision.reason
+    assert "no path outside" not in decision.reason
+    assert gate.calls == []
+
+
+def test_external_directory_no_paths_still_gates(tmp_path):
+    """An external_directory event with no paths still goes to the gate."""
+    event = make_event(
+        permission="external_directory",
+        patterns=[],
+    )
+    gate = StubGate(json.dumps(ALLOW))
+    policy = Policy(make_config(tmp_roots=("/tmp/kilo/*",)),
+                    completion_fn=gate, clock=FakeClock())
+
+    decision = decide(policy, event, tmp_path)
+
+    assert decision.layer == "gate"
+    assert len(gate.calls) == 1
 
 @pytest.mark.parametrize(
     "reply,expected_reply,expected_reason_in",
