@@ -40,6 +40,8 @@ from __future__ import annotations
 import fnmatch
 import json
 import logging
+import os
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -295,6 +297,36 @@ def _pathlike(text: str) -> bool:
     return text.startswith(("/", "~", "./", "../"))
 
 
+#: One token of a ``bash`` command: a quoted string kept whole (so
+#: ``"/tmp/my dir/f"`` is one token, not a path and a bare word), else a
+#: maximal run up to whitespace or a shell operator — ``>``, ``>>``, ``<``,
+#: ``|``, ``&&``, ``;``, ``(`` and ``)`` each end a token, so a redirect
+#: target or the second command of a pipeline starts fresh.
+_CMD_TOKEN = re.compile(r'"[^"]*"|\'[^\']*\'|[^\s<>|&;()"\']+')
+
+
+def _command_paths(command) -> list:
+    """The path-shaped tokens of a ``bash`` command, quotes stripped (KC-13).
+
+    Kilo names the *first* outside directory it detects in ``patterns``; a
+    redirect target, a second argument or a ``cd`` elsewhere on the same line
+    is only in ``metadata.command``. Every token that ``_pathlike`` accepts
+    (``/…``, ``~…``, ``./…``, ``../…``) is returned in command order; a bare
+    word (``reboot``), ``2>&1``, ``$HOME/x`` and a URL are not paths and are
+    dropped. String work only: no shell is started. Fail-open — a non-string
+    command or one holding a NUL yields ``[]``.
+    """
+    if not isinstance(command, str) or "\x00" in command:
+        return []
+    paths = []
+    for token in _CMD_TOKEN.findall(command):
+        if len(token) >= 2 and token[0] == token[-1] and token[0] in "\"'":
+            token = token[1:-1]
+        if token and _pathlike(token):
+            paths.append(token)
+    return paths
+
+
 def _extract_paths(props: dict) -> list:
     """The event's paths as ``(resolved, (original, ...))`` pairs.
 
@@ -305,11 +337,19 @@ def _extract_paths(props: dict) -> list:
     two spellings (``patterns: ["/tmp/*"]`` and
     ``metadata.directories: ["/tmp"]`` in PROBE.md), and both spellings are
     kept for the glob match, so neither one fails on its own.
+
+    For a ``bash`` permission ``metadata.command`` is scanned too (KC-13):
+    every path token of the command joins the same list, so a command that
+    touches two outside places is judged by both, not by the one Kilo chose
+    to report. A leading ``~`` is expanded for every source, so ``~/.ssh/x``
+    meets the hard denylist instead of resolving under the caller's cwd.
     """
     meta = _metadata(props)
     raw = list(_as_list(props.get("patterns")))
     raw.extend(_as_list(meta.get("directories")))
     raw.extend(_as_list(meta.get("patterns")))
+    if _as_str(props.get("permission")) == "bash":
+        raw.extend(_command_paths(meta.get("command")))
 
     originals: dict = {}
     order: list = []
@@ -318,6 +358,9 @@ def _extract_paths(props: dict) -> list:
         if not original or not _pathlike(original):
             continue
         target = original.removesuffix("/*")
+        if target.startswith("~"):
+            # ``~/.ssh/x`` must land on the home denylist, not under the cwd
+            target = os.path.expanduser(target)
         resolved = _resolve(target)
         if resolved is None:
             continue

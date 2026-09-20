@@ -403,14 +403,168 @@ def test_paths_are_extracted_deduped_and_trailing_star_stripped():
 def test_command_text_in_patterns_is_not_a_path():
     """PROBE.md §Facts 2: a ``bash: ask`` event keeps the command in
     ``patterns``; resolving it would land under the caller's cwd and read as
-    "inside the worktree", which is backwards."""
-    assert policy_mod._extract_paths(BASH_EVENT["properties"]) == []
+    "inside the worktree", which is backwards.  The patterns entry still
+    yields nothing; the command's ``/tmp/testfile`` is the one pair."""
+    assert policy_mod._extract_paths(BASH_EVENT["properties"]) == [
+        (Path("/tmp/testfile"), ("/tmp/testfile",)),
+    ]
 
 
 def test_command_text_with_a_star_is_still_command_text():
+    """The ``patterns`` entry ``rm -rf /tmp/*`` still yields nothing; the
+    command's ``/tmp/*`` is read like a ``patterns`` glob — trailing ``/*``
+    stripped, as ``_extract_paths`` already does."""
     assert policy_mod._extract_paths(
-        {"patterns": ["rm -rf /tmp/*"], "metadata": {"command": "rm -rf /tmp/*"}}
-    ) == []
+        {"permission": "bash", "patterns": ["rm -rf /tmp/*"],
+         "metadata": {"command": "rm -rf /tmp/*"}}
+    ) == [(Path("/tmp"), ("/tmp/*",))]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KC-13: command path scanning for bash permissions
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_command_scans_paths_outside_tmp_roots_to_the_gate(tmp_path):
+    """Live event verbatim: patterns name /tmp/contest/notes/* but the
+    command also redirects to /tmp/kc6-outside-x.txt — not under tmp_roots."""
+    event = make_event(
+        permission="bash",
+        patterns=["/tmp/contest/notes/*"],
+        command="mkdir -p /tmp/contest/notes && echo hi > /tmp/contest/notes/hy3.txt && echo hi > /tmp/kc6-outside-x.txt",
+        description="create notes and outside file",
+    )
+    gate = StubGate(json.dumps(REJECT))
+    policy = Policy(make_config(tmp_roots=("/tmp/contest/*",)),
+                    completion_fn=gate, clock=FakeClock())
+
+    decision = decide(policy, event, tmp_path)
+
+    assert decision.layer == "gate"
+    assert decision.reply == "reject"
+    assert "/tmp/kc6-outside-x.txt" in gate.user_message()
+
+
+def test_command_with_both_targets_under_tmp_roots_is_mechanical(tmp_path):
+    """Both paths in the command land under /tmp/contest/*."""
+    event = make_event(
+        permission="bash",
+        patterns=["/tmp/contest/notes/*"],
+        command="mkdir -p /tmp/contest/notes && echo hi > /tmp/contest/out.txt",
+        description="create notes",
+    )
+    gate = StubGate(json.dumps(ALLOW))
+    policy = Policy(make_config(tmp_roots=("/tmp/contest/*",)),
+                    completion_fn=gate, clock=FakeClock())
+
+    decision = decide(policy, event, tmp_path)
+
+    assert (decision.reply, decision.layer) == ("once", "mechanical")
+    assert gate.calls == []
+
+
+def test_command_with_second_path_on_denylist_is_rejected(tmp_path):
+    """A command whose second path is under HARD_DENYLIST is reject/mechanical."""
+    event = make_event(
+        permission="bash",
+        patterns=[],
+        command="cat /tmp/ok.txt > ~/.ssh/x",
+        description="read and write",
+    )
+    gate = StubGate(json.dumps(ALLOW))
+    policy = Policy(make_config(tmp_roots=("/tmp/*",)),
+                    completion_fn=gate, clock=FakeClock())
+
+    decision = decide(policy, event, tmp_path)
+
+    assert decision.reply == "reject"
+    assert decision.layer == "mechanical"
+    assert "forbidden" in decision.reason
+    assert gate.calls == []
+
+
+def test_command_with_relative_and_absolute_path_is_once(tmp_path):
+    """cat scripts/x.py > /tmp/contest/out.txt — relative path inside worktree,
+    absolute second under tmp_roots."""
+    worktree = (tmp_path / "rounds" / "r1" / "hy3").resolve()
+    worktree.mkdir(parents=True)
+    event = make_event(
+        permission="bash",
+        patterns=[],
+        command="cat scripts/x.py > /tmp/contest/out.txt",
+        description="copy file",
+    )
+    gate = StubGate(json.dumps(ALLOW))
+    policy = Policy(make_config(tmp_roots=("/tmp/contest/*",)),
+                    completion_fn=gate, clock=FakeClock())
+
+    decision = decide(policy, event, worktree)
+
+    assert (decision.reply, decision.layer) == ("once", "mechanical")
+    assert gate.calls == []
+
+
+def test_command_bare_words_and_shell_syntax_are_not_paths(tmp_path):
+    """A bare command word, 2>&1, $HOME/x, a URL, and a quoted path with
+    spaces do not become paths or crash."""
+    event = make_event(
+        permission="bash",
+        patterns=[],
+        command='reboot 2>&1 $HOME/x https://example.com/p "path with spaces"',
+        description="various tokens",
+    )
+    gate = StubGate(json.dumps(ALLOW))
+    policy = Policy(make_config(), completion_fn=gate, clock=FakeClock())
+
+    pairs = policy_mod._extract_paths(event["properties"])
+    assert pairs == []
+
+    decision = decide(policy, event, tmp_path)
+    assert len(gate.calls) == 1
+
+
+def test_command_scan_skips_non_string_command(tmp_path):
+    """A non-string command is silently skipped (fail-open)."""
+    event = make_event(permission="bash", patterns=[], metadata=False)
+    event["properties"]["metadata"] = {"command": 12345}
+    pairs = policy_mod._extract_paths(event["properties"])
+    assert pairs == []
+
+
+def test_command_scan_skips_nul_in_token(tmp_path):
+    """A path containing a NUL byte is skipped (fail-open)."""
+    event = make_event(
+        permission="bash", patterns=[],
+        command="echo \x00/tmp/evil",
+    )
+    pairs = policy_mod._extract_paths(event["properties"])
+    assert pairs == []
+
+
+def test_command_scan_only_for_bash(tmp_path):
+    """The command is NOT scanned when permission is not bash."""
+    event = make_event(
+        permission="external_directory",
+        patterns=["/tmp/contest/*"],
+        command="/tmp/outside.txt",
+    )
+    pairs = policy_mod._extract_paths(event["properties"])
+    # only the pattern is read, not the command
+    assert len(pairs) == 1
+    assert pairs[0][1] == ("/tmp/contest/*",)
+
+
+def test_command_scan_deduplicates_paths(tmp_path):
+    """The same path in patterns and command appears only once."""
+    event = make_event(
+        permission="bash",
+        patterns=["/tmp/contest/out.txt"],
+        command="cat /tmp/contest/out.txt",
+    )
+    pairs = policy_mod._extract_paths(event["properties"])
+    assert len(pairs) == 1
+    resolved, originals = pairs[0]
+    assert resolved == Path("/tmp/contest/out.txt")
+    assert "/tmp/contest/out.txt" in originals
 
 
 def test_root_and_home_match_on_identity_alone():
@@ -873,3 +1027,19 @@ def test_two_mixed_paths_are_not_rescued_by_the_first_one(tmp_path):
 
     assert decision.layer == "gate"
     assert len(gate.calls) == 1
+
+
+def test_tilde_in_patterns_meets_the_home_denylist(tmp_path):
+    """``~`` is expanded for every source, not only the command scan: an
+    ``external_directory`` pattern ``~/.ssh/*`` is forbidden, not "inside the
+    worktree" because ``Path("~/.ssh").resolve()`` landed under the cwd."""
+    event = make_event(permission="external_directory", patterns=["~/.ssh/*"],
+                       command="ls ~/.ssh")
+    gate = StubGate(json.dumps(ALLOW))
+    policy = Policy(make_config(), completion_fn=gate, clock=FakeClock())
+
+    decision = decide(policy, event, tmp_path)
+
+    assert (decision.reply, decision.layer) == ("reject", "mechanical")
+    assert "forbidden" in decision.reason
+    assert gate.calls == []
