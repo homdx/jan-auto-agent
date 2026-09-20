@@ -21,6 +21,7 @@ Standard library only.
 from __future__ import annotations
 
 import csv
+import re
 import subprocess
 import time
 from dataclasses import dataclass
@@ -63,6 +64,13 @@ _DONE_OUTCOMES = frozenset({"DONE", "FIXED"})
 #: cause is at the tail, so that is what the agent needs.
 TEXT_LIMIT = 200
 
+#: A claim is a commit only when it is written as a hex sha. `HEAD`, `@`, a
+#: branch and a tag all resolve in git, so `merge-base --is-ancestor` cannot
+#: tell them from a sha — a symbolic name pins nothing, it resolves to
+#: something else on every branch it is read from. 7 chars is the shortest
+#: length git resolves unambiguously, 40 is a commit object in full.
+_SHA_RE = re.compile(r"[0-9a-f]{7,40}", re.IGNORECASE)
+
 
 @dataclass(frozen=True)
 class Reason:
@@ -85,9 +93,10 @@ class Harvest:
 
     `verdict` is `READY` iff no reason is blocking. `reasons` lists everything
     found — a `READY` can still carry the non-blocking off-ticket note. `commit`
-    is the sha the agent claimed in `PROGRESS.csv`, or None when the row (or its
-    commit) is missing. `facts` is the `judge_worktree` row (plus `tests_run`
-    when tests ran); `elapsed` is the wall time of this harvest in seconds.
+    is the full 40-char sha the agent's claim in `PROGRESS.csv` resolves to, or
+    None when the row, its commit or its sha is missing or unresolvable.
+    `facts` is the `judge_worktree` row (plus `tests_run` when tests ran);
+    `elapsed` is the wall time of this harvest in seconds.
     """
 
     verdict: Literal["READY", "REWORK"]
@@ -120,6 +129,23 @@ def _is_ancestor(path: Path, commit: str) -> bool:
     return r.returncode == 0
 
 
+def _resolve_claim(path: Path, claimed: str) -> str | None:
+    """The full 40-char sha *claimed* names in *path*, or None.
+
+    Two checks, in front of `_is_ancestor`: the shape (`_SHA_RE` — `HEAD`, `@`,
+    a branch, a tag and a 6-char prefix are refused even though git would
+    resolve them; a claim pins one commit, not a name that stands for a
+    different commit on every branch it is read from) and
+    `git rev-parse --verify --quiet <claimed>^{commit}`, which refuses a hex
+    string that is not a commit of this worktree — an ambiguous prefix, a
+    typo. The resolution is returned, not the claim as written: a short sha
+    becomes the 40-char one, an upper-case one lower-case.
+    """
+    if not _SHA_RE.fullmatch(claimed):
+        return None
+    return git(str(path), "rev-parse", "--verify", "--quiet", f"{claimed}^{{commit}}") or None
+
+
 def harvest(ws: Workspace, ticket_path: Path, *, run_tests: bool = False) -> Harvest:
     """Score one worktree against its ticket and return the verdict.
 
@@ -144,6 +170,7 @@ def harvest(ws: Workspace, ticket_path: Path, *, run_tests: bool = False) -> Har
 
     progress = f"runs/{ws.agent}/PROGRESS.csv"  # ws.progress_csv, for a short reason
     reasons: list[Reason] = []
+    resolved: str | None = None  # the full sha the claim names, once it is on the branch
     if claim is None:
         reasons.append(Reason(
             "no_progress_row",
@@ -163,13 +190,28 @@ def harvest(ws: Workspace, ticket_path: Path, *, run_tests: bool = False) -> Har
                 f"{progress} row for {ticket} has an empty commit — "
                 "commit once, then append_task.py --commit <sha>",
             ))
-        elif not _is_ancestor(ws.path, claimed_commit):
-            head = git(str(ws.path), "rev-parse", "--short", "HEAD")
+        elif not _SHA_RE.fullmatch(claimed_commit):
+            # `HEAD`, `@`, a branch and a tag all resolve in git, so they would
+            # pass `merge-base --is-ancestor` too — but a claim must name a
+            # commit, not a name that stands for a different one on every
+            # branch. Quoted as written (cut to a sha's length), so the agent
+            # sees what it put in the row.
             reasons.append(Reason(
                 "commit_not_on_branch",
-                f"commit {claimed_commit[:12]} is not an ancestor of HEAD "
-                f"({head or 'unresolved'}) on {ws.branch} — rebase it onto the branch",
+                f"commit {claimed_commit[:40]} is not a sha — commit once, then "
+                "append_task.py --commit $(git rev-parse HEAD)",
             ))
+        else:
+            sha = _resolve_claim(ws.path, claimed_commit)
+            if sha is not None and _is_ancestor(ws.path, sha):
+                resolved = sha
+            else:
+                head = git(str(ws.path), "rev-parse", "--short", "HEAD")
+                reasons.append(Reason(
+                    "commit_not_on_branch",
+                    f"commit {(sha or claimed_commit)[:12]} is not an ancestor of HEAD "
+                    f"({head or 'unresolved'}) on {ws.branch} — rebase it onto the branch",
+                ))
 
     # ── the facts: the mechanical scorecard row ───────────────────────────
     facts = judge_worktree(ws.agent, str(ws.path), ws.base_sha, list(declared),
@@ -228,7 +270,7 @@ def harvest(ws: Workspace, ticket_path: Path, *, run_tests: bool = False) -> Har
     return Harvest(
         verdict=verdict,
         reasons=tuple(reasons),
-        commit=claimed_commit or None,
+        commit=resolved,
         facts=facts,
         elapsed=time.monotonic() - start,
     )

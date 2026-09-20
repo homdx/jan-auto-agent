@@ -530,6 +530,106 @@ def test_harvest_flags_a_bogus_commit_sha(round_, tmp_path):
     assert "commit_not_on_branch" in _codes(harvest(wt, ticket))
 
 
+def test_harvest_flags_every_symbolic_claim_as_not_a_sha(round_, tmp_path):
+    """`HEAD`, `@`, a branch and a tag all resolve in git, and none of them is a claim.
+
+    A symbolic name pins nothing: it resolves to something else on every branch
+    it is read from, so the claim must be written as a sha.
+    """
+    repo, base, ticket = round_
+    wt = _worktree(repo, base, tmp_path)
+    _accepting(wt)
+    _git(wt.path, "tag", "kc-14-tag")
+
+    for claim in ("HEAD", "@", "HEAD~0", wt.branch, "kc-14-tag"):
+        _record(wt, ticket.name, outcome="DONE", commit=claim)  # last row wins
+        h = harvest(wt, ticket)
+
+        assert h.verdict == "REWORK"
+        assert _codes(h) == ["commit_not_on_branch"]
+        text = _reason(h, "commit_not_on_branch").text
+        assert claim in text
+        assert "rev-parse" in text
+        assert len(text) <= TEXT_LIMIT
+        assert h.commit is None
+        assert h.facts["commits"] == 1  # the worktree itself is fine
+
+
+def test_harvest_accepts_a_short_sha_and_reports_the_full_one(round_, tmp_path):
+    """A 7-char prefix is a claim; `Harvest.commit` is the 40-char sha it names."""
+    repo, base, ticket = round_
+    wt = _worktree(repo, base, tmp_path)
+    full = _accepting(wt)
+    _record(wt, ticket.name, outcome="DONE", commit=full[:7])
+
+    h = harvest(wt, ticket)
+    assert h.verdict == "READY"
+    assert h.commit == full
+    assert len(h.commit) == 40
+
+
+def test_harvest_accepts_an_uppercase_sha_and_stores_it_lowercase(round_, tmp_path):
+    repo, base, ticket = round_
+    wt = _worktree(repo, base, tmp_path)
+    full = _accepting(wt)
+    _record(wt, ticket.name, outcome="DONE", commit=full.upper())
+
+    h = harvest(wt, ticket)
+    assert h.verdict == "READY"
+    assert h.commit == full.lower()
+
+
+def test_harvest_flags_a_sub_7_char_prefix(round_, tmp_path):
+    """git resolves 6 chars; a claim must pin one commit, not a range."""
+    repo, base, ticket = round_
+    wt = _worktree(repo, base, tmp_path)
+    full = _accepting(wt)
+    _record(wt, ticket.name, outcome="DONE", commit=full[:6])
+
+    h = harvest(wt, ticket)
+    assert h.verdict == "REWORK"
+    assert _codes(h) == ["commit_not_on_branch"]
+    text = _reason(h, "commit_not_on_branch").text
+    assert full[:6] in text
+    assert "rev-parse" in text
+    assert h.commit is None
+
+
+def test_harvest_off_branch_sha_is_rejected_with_no_commit(round_, tmp_path):
+    """A real sha off the branch keeps KC-5's sentence — and `Harvest.commit` is
+    None, not the sha it resolves to: a rejected claim carries no commit."""
+    repo, base, ticket = round_
+    wt = _worktree(repo, base, tmp_path)
+    _accepting(wt)
+    _git(wt.path, "checkout", "-q", "-b", "side", base)
+    _edit(wt, "side.txt", "side\n")
+    side = _commit(wt, "side")
+    _git(wt.path, "checkout", "-q", wt.branch)
+
+    for claim in (side, side[:7], side.upper()):
+        _record(wt, ticket.name, outcome="DONE", commit=claim)
+        h = harvest(wt, ticket)
+        assert _codes(h) == ["commit_not_on_branch"]
+        text = _reason(h, "commit_not_on_branch").text
+        assert side[:7] in text and "not an ancestor of HEAD" in text and "rebase" in text
+        assert h.commit is None
+
+
+def test_harvest_not_a_sha_sentence_stays_within_the_budget(round_, tmp_path):
+    """The claim is quoted as written but cut to a sha's length: a 300-char
+    row value must not push the sentence past `TEXT_LIMIT`."""
+    repo, base, ticket = round_
+    wt = _worktree(repo, base, tmp_path)
+    _accepting(wt)
+    _record(wt, ticket.name, outcome="DONE", commit="x" * 300)
+
+    h = harvest(wt, ticket)
+    text = _reason(h, "commit_not_on_branch").text
+    assert text.startswith("commit " + "x" * 40 + " is not a sha")
+    assert len(text) <= TEXT_LIMIT
+    assert h.commit is None
+
+
 def test_harvest_flags_two_commits(round_, tmp_path):
     repo, base, ticket = round_
     wt = _worktree(repo, base, tmp_path)
