@@ -1,6 +1,6 @@
 # KC-15 — a bash redirect outside the worktree is never asked: `ask_commands` turns it into a permission, layer 1 keeps the harmless ones free
 
-**Status:** queued — after KC-13 (round 52); round 54 of EPIC KC (`docs/kilo-contest/EPIC-KC.md`); found live on 2026-09-19 (`contest-bench/kc6/RUNBOOK.md` §11). **After KC-13** (round 52): both edit `tools/contest/policy.py`, and the scan KC-13 adds is what makes the asked command judgeable. Independent of KC-12 and KC-14.
+**Status:** open — KC-13 landed `3e4b41b` on 2026-09-20; round 54 of EPIC KC (`docs/kilo-contest/EPIC-KC.md`); found live on 2026-09-19 (`contest-bench/kc6/RUNBOOK.md` §11). **After KC-13** (round 52): both edit `tools/contest/policy.py`, and the scan KC-13 adds is what makes the asked command judgeable. Independent of KC-12 and KC-14.
 **Severity:** HIGH
 **File:** `tools/contest/roster.py` (`ContestConfig.session_rules`, `CONTEST_KEYS`, `load_roster`), `contest.ini`, `tools/contest/policy.py` (`Policy._mechanical`)
 **Symbol:** `ContestConfig.ask_commands`, `ContestConfig.session_rules`, `Policy._mechanical`
