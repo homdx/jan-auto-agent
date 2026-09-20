@@ -76,6 +76,7 @@ CONTEST_KEYS = (
     "turn_timeout_sec",
     "idle_event_timeout_sec",
     "max_questions_per_turn",
+    "progress_every_sec",
     "tmp_roots",
     "deny_commands",
     "gate_llm_profile",
@@ -172,6 +173,7 @@ class ContestConfig:
     turn_timeout_sec: int = 1800
     idle_event_timeout_sec: int = 300
     max_questions_per_turn: int = 3
+    progress_every_sec: int = 60
     tmp_roots: tuple[str, ...] = ()
     deny_commands: tuple[str, ...] = ()
     gate_llm_profile: str = ""
@@ -352,6 +354,7 @@ def _build(parser: configparser.ConfigParser) -> ContestConfig:
         turn_timeout_sec=limit("turn_timeout_sec", 1800),
         idle_event_timeout_sec=limit("idle_event_timeout_sec", 300),
         max_questions_per_turn=limit("max_questions_per_turn", 3),
+        progress_every_sec=limit("progress_every_sec", 60),
         tmp_roots=list_("tmp_roots"),
         deny_commands=list_("deny_commands"),
         gate_llm_profile=gate_profile,

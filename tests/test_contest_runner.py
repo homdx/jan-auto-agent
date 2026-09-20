@@ -15,6 +15,7 @@ neighbour, three agents reworking at once, Ctrl-C mid-turn).
 from __future__ import annotations
 
 import json
+import logging
 import os
 import signal
 import subprocess
@@ -946,3 +947,71 @@ def test_resume_harvests_the_mid_flight_worktree_with_the_roots(tmp_path, monkey
     assert runs["agent-a"].commit == "0" * 40
     assert not _session_posts(fake)
     assert harvested == [str(sb.ws("agent-b").path)]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KC-18: the round narrates itself — one INFO line per transition, a heartbeat
+# ─────────────────────────────────────────────────────────────────────────────
+
+LOGGER = "tools.contest.runner"
+
+
+def _lines(caplog, prefix: str) -> list:
+    return [r.getMessage() for r in caplog.records
+            if r.name == LOGGER and r.levelno == logging.INFO and r.getMessage().startswith(prefix)]
+
+
+def test_every_transition_is_one_info_line_with_the_agents_name_first(tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger=LOGGER)
+    scenario = {"turns": [{"on_prompt": work_ready, "events": ["busy", "idle"]}]}
+    _sb, _fake, h, run, _ = _run_one(tmp_path, scenario)
+    assert run.state is AgentState.READY
+    lines = _lines(caplog, "agent-a: ")
+    assert [l.split()[1] for l in lines] == ["PROMPTED", "WAITING", "HARVESTING", "READY"]
+    assert len(lines) == len(h.transitions)
+    assert "attempt 0 (initial)" in lines[0]
+    assert "tests off" in lines[2]
+    assert run.commit[:12] in lines[3]
+
+
+def test_rework_and_error_lines_carry_the_codes_and_the_payload(tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger=LOGGER)
+    scenario = {"turns": [{"on_prompt": work_no_test, "events": ["busy", "idle"]},
+                          {"on_prompt": work_ready, "events": ["busy", "idle"]}]}
+    _run_one(tmp_path, scenario)
+    (rework,) = _lines(caplog, "agent-a: REWORK")
+    assert "attempt 1" in rework and "no_test_file" in rework
+    assert any("(rework)" in l for l in _lines(caplog, "agent-a: PROMPTED"))
+
+    caplog.clear()
+    scenario = {"turns": [{"events": ["busy"], "error": {"name": "ProviderError", "message": "boom-42"}}]}
+    _run_one(tmp_path / "second", scenario)
+    (error,) = _lines(caplog, "agent-a: ERROR")
+    assert "session.error" in error and "boom-42" in error
+
+
+def test_heartbeat_names_the_waiting_agent_and_its_time_in_state(tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger=LOGGER)
+    sb = Sandbox(tmp_path)
+    cfg = make_config(["agent-a"], progress_every_sec=0.2, idle_event_timeout_sec=5)
+    scenario = {"turns": [{"on_prompt": work_ready, "events": ["busy", "idle"], "delay": 1.0}]}
+    with _BenchFake(scenario) as fake:
+        state = _round(sb, fake, cfg)
+    assert state.agents[0].state is AgentState.READY
+    beats = _lines(caplog, f"round {ROUND} ")
+    assert beats, caplog.text
+    assert any("agent-a WAITING" in b and "1 live" in b for b in beats)
+    assert all(b.endswith(" live") for b in beats)
+    assert not [t for t in threading.enumerate() if t.name.startswith("contest-progress")]
+
+
+def test_progress_every_sec_zero_logs_transitions_but_no_heartbeat(tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger=LOGGER)
+    sb = Sandbox(tmp_path)
+    cfg = make_config(["agent-a"], progress_every_sec=0)
+    scenario = {"turns": [{"on_prompt": work_ready, "events": ["busy", "idle"], "delay": 0.5}]}
+    with _BenchFake(scenario) as fake:
+        _round(sb, fake, cfg)
+    assert _lines(caplog, "agent-a: READY")
+    assert not _lines(caplog, f"round {ROUND} ")
+    assert not [t for t in threading.enumerate() if t.name.startswith("contest-progress")]

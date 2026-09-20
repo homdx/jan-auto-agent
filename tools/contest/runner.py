@@ -31,6 +31,13 @@ back as `IdleResult.status == "timeout"`; `elapsed` tells them apart. The
 third-question edge is the runner's own, still: `stall()` aborts and closes
 the tap, and the wait wakes on `tap.closed`.
 
+The round narrates itself (KC-18, round 57): every `transition` is one INFO
+line on `tools.contest.runner` — `<agent>: <STATE> …` with the attempt, the
+harvest's codes, the error or the commit — and `run_round` keeps a heartbeat
+thread that logs, every `progress_every_sec` seconds (`[contest]`, 0 = off),
+the round's age and each agent's state and time in it. `cli.main` routes the
+logger to stderr; a caller that never configured logging hears nothing.
+
 The harvest's tests: `run_round(..., run_tests=True)` (KC-16, round 55) makes
 the four pytest roots the round's judge — a tree that breaks `tests/` is
 REWORK with the pytest tail in the rework prompt, instead of READY. The roots
@@ -357,10 +364,12 @@ def run_agent(run: AgentRun, *, client: KiloClient, tap: EventTap, policy: Polic
     except OSError:
         ticket_files = ()
 
-    def transition(state: AgentState, error: str | None = None) -> None:
+    def transition(state: AgentState, error: str | None = None, *, note: str | None = None) -> None:
         run.state = state
         if error is not None:
             run.last_error = error
+        detail = error if error is not None else note
+        _log.info("%s: %s%s", spec.name, state.value, f" — {detail}" if detail else "")
         on_transition(run)
 
     def stall(reason: str) -> None:
@@ -407,8 +416,8 @@ def run_agent(run: AgentRun, *, client: KiloClient, tap: EventTap, policy: Polic
         if questions_this_turn[0] >= int(config.max_questions_per_turn):
             stall(f"{questions_this_turn[0]} questions in one turn")
 
-    def finish(state: AgentState, error: str | None = None) -> AgentRun:
-        transition(state, error)
+    def finish(state: AgentState, error: str | None = None, *, note: str | None = None) -> AgentRun:
+        transition(state, error, note=note)
         return run
 
     try:
@@ -428,7 +437,7 @@ def run_agent(run: AgentRun, *, client: KiloClient, tap: EventTap, policy: Polic
             text = rework_text if rework_text is not None else round_prompt(
                 spec.name, ticket_path, ws.base_sha)
             turn = {"kind": kind, "attempt": run.attempt, "sent_at": time.time()}
-            transition(AgentState.PROMPTED)
+            transition(AgentState.PROMPTED, note=f"attempt {run.attempt} ({kind})")
             try:
                 client.prompt(session, text)
             except KiloHttpError as exc:
@@ -468,19 +477,20 @@ def run_agent(run: AgentRun, *, client: KiloClient, tap: EventTap, policy: Polic
                 return finish(state, error)
 
             # ── HARVESTING ─────────────────────────────────────────────────
-            transition(AgentState.HARVESTING)
+            transition(AgentState.HARVESTING, note="tests on" if run_tests else "tests off")
             verdict = _harvest(ws, ticket_path, run_tests)
             turn["harvest"] = {"verdict": verdict.verdict, "reasons": [r.code for r in verdict.reasons]}
             run.turns.append(turn)
             _append_jsonl(agent_dir / "turns.jsonl", {"agent": spec.name, **turn})
             run.commit = verdict.commit
             if verdict.verdict == "READY":
-                return finish(AgentState.READY)
+                return finish(AgentState.READY, note=(run.commit or "")[:12])
             if run.attempt >= int(config.max_rework):
                 return finish(AgentState.GAVE_UP, "REWORK after the last attempt: "
                               + ", ".join(r.code for r in verdict.reasons if r.blocking))
             run.attempt += 1
-            transition(AgentState.REWORK)
+            transition(AgentState.REWORK, note=f"attempt {run.attempt} — "
+                       + ", ".join(r.code for r in verdict.reasons))
             rework_text = rework_message(verdict, run.attempt, int(config.max_rework))
     finally:
         if session is not None and run.terminal:
@@ -561,6 +571,7 @@ def run_round(config: ContestConfig, round_no: int, ticket_path: Path, workspace
                        agents=runs)
     lock = threading.Lock()
     stop = threading.Event()
+    since: dict = {run.agent.name: time.monotonic() for run in runs}   # state entered at
 
     def save() -> None:
         with lock:
@@ -569,7 +580,10 @@ def run_round(config: ContestConfig, round_no: int, ticket_path: Path, workspace
     def on_transition(run: AgentRun) -> None:
         if stop.is_set():
             raise _Stopped()
+        since[run.agent.name] = time.monotonic()
         save()
+
+    heartbeat = _Heartbeat(state, since, float(config.progress_every_sec or 0))
 
     policy = Policy(config)
     live: list = []                     # (run, client, tap) of every agent in the pool
@@ -596,6 +610,7 @@ def run_round(config: ContestConfig, round_no: int, ticket_path: Path, workspace
 
     pool = ThreadPoolExecutor(max_workers=max(1, int(config.max_parallel)),
                               thread_name_prefix="contest")
+    heartbeat.start()
     try:
         futures = {pool.submit(work, *item): item[0] for item in live}
         for future in as_completed(futures):
@@ -617,9 +632,56 @@ def run_round(config: ContestConfig, round_no: int, ticket_path: Path, workspace
             tap.stop()  # wakes the worker's wait
         raise
     finally:
+        heartbeat.stop()
         pool.shutdown(wait=False, cancel_futures=True)
     save()
     return state
+
+
+class _Heartbeat:
+    """The once-a-minute line: the round's age and every agent's state and time
+    in it — `round 52 12m: mistral WAITING 3m (attempt 1) · laguna ERROR · hy3 ERROR — 1 live`.
+
+    A daemon thread waiting on an `Event`, so `stop()` returns at once and the
+    thread never outlives `run_round`. `every <= 0` starts nothing.
+    """
+
+    def __init__(self, state: RoundState, since: dict, every: float):
+        self.state, self.since, self.every = state, since, every
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._loop, name="contest-progress", daemon=True)
+
+    def start(self) -> None:
+        if self.every > 0:
+            self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(2.0)
+
+    def line(self) -> str:
+        now = time.monotonic()
+        parts = []
+        for run in self.state.agents:
+            part = f"{run.agent.name} {run.state.value}"
+            if not run.terminal:
+                part += f" {_age(now - self.since.get(run.agent.name, now))}"
+                if run.attempt:
+                    part += f" (attempt {run.attempt})"
+            parts.append(part)
+        live = sum(1 for run in self.state.agents if not run.terminal)
+        age = _age(time.time() - self.state.started_at)
+        return f"round {self.state.round_no} {age}: " + " · ".join(parts) + f" — {live} live"
+
+    def _loop(self) -> None:
+        while not self._stop.wait(self.every):
+            _log.info("%s", self.line())
+
+
+def _age(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    return f"{seconds}s" if seconds < 90 else f"{seconds // 60}m"
 
 
 def _wait_for_stream(tap: EventTap, timeout: float = 5.0) -> None:

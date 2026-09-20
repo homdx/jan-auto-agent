@@ -154,7 +154,7 @@ def test_committed_limits_are_ints(gate_key):
     cfg = load_roster(COMMITTED)
     for key in ("max_parallel", "max_rework", "turn_timeout_sec",
                 "idle_event_timeout_sec", "max_questions_per_turn",
-                "gate_max_calls_per_session"):
+                "progress_every_sec", "gate_max_calls_per_session"):
         assert isinstance(getattr(cfg, key), int), key
 
 
@@ -295,6 +295,7 @@ model = kenary/hy3:free
     assert cfg.turn_timeout_sec == 1800
     assert cfg.idle_event_timeout_sec == 300
     assert cfg.max_questions_per_turn == 3
+    assert cfg.progress_every_sec == 60
     assert cfg.tmp_roots == ()
     assert cfg.deny_commands == ()
     assert cfg.gate_max_calls_per_session == 20
@@ -305,6 +306,20 @@ model = kenary/hy3:free
     assert cfg.gate_settings.response_format is True
     assert cfg.agents[0].kilo_agent is None
     assert cfg.agents[0].variant is None
+
+
+def test_progress_every_sec_parses_from_contest_and_zero_is_off(tmp_path):
+    """KC-18: the heartbeat's period; 0 disables it."""
+    base = """
+[contest]
+progress_every_sec = %s
+
+[contest.agent.alpha]
+model = kenary/hy3:free
+"""
+    assert load_roster(write_ini(tmp_path, base % "15")).progress_every_sec == 15
+    assert load_roster(write_ini(tmp_path, base % "0")).progress_every_sec == 0
+    assert "progress_every_sec" in CONTEST_KEYS
 
 
 def test_malformed_limit_falls_back_to_the_default(tmp_path):
