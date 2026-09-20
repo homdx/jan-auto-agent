@@ -1,0 +1,11 @@
+{
+  "base": "c27bc32",
+  "ticket": "epic-tasks/58-kc19-a-retryable-session-error-is-re-prompted-into-the-same-session-not-error.md",
+  "note": "round 58, 2026-09-20, the third manager-run round (`python3 -m tools.contest run --ticket 58 --models … --max-parallel 8`, base c27bc32 = d0d8a45 + KC-15 parked). Eight kenary free slots: three ids do not exist (`agnes-3-0-flash:free`, `north-mini-code:free`, `nex-n2-5-pro:free` — ERROR at t+17 s, KC-25) and `muse-spark-1-3` died at t+225 s on `the model's provider interrupted the response stream` — the very error this ticket retries. One harvest: mimo-v2-5 READY at 21:36 (7929e4e, kc19/kc19-mimo-v2-5.patch). agnes-2-5-flash, step-3-7-flash and hy3 were STALLED at `turn_timeout_sec = 1800` with the whole change edited but uncommitted — each was inside its self-check `python3 -m pytest tests -q` (four full suites in parallel on one machine) when the clock ran out; their worktree diffs are the `.STALLED.diff` entries (KC-21's shape, one step earlier: no commit yet).",
+  "entries": {
+    "mimo":  {"model": "mimo-v2-5:free",        "file": "kc19/kc19-mimo-v2-5.patch",           "harvest": "READY"},
+    "agnes": {"model": "agnes-2-5-flash:free",  "file": "kc19/kc19-agnes-2-5-flash.STALLED.diff", "harvest": "STALLED, uncommitted"},
+    "step":  {"model": "step-3-7-flash:free",   "file": "kc19/kc19-step-3-7-flash.STALLED.diff",  "harvest": "STALLED, uncommitted"},
+    "hy3":   {"model": "hy3:free",              "file": "kc19/kc19-hy3.STALLED.diff",             "harvest": "STALLED, uncommitted"}
+  }
+}
