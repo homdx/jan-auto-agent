@@ -254,6 +254,68 @@ def test_declared_files_raises_for_a_missing_ticket(tmp_path):
         declared_files(tmp_path / "nope.md")
 
 
+def _ticket(tmp_path, file_line, also_line=None):
+    p = tmp_path / "03-y.md"
+    lines = ["# Y", "", f"**File:** {file_line}"]
+    if also_line is not None:
+        lines += ["", f"**Also touches:** {also_line}"]
+    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return p
+
+
+def test_declared_files_reads_every_backticked_path_on_the_file_line(tmp_path):
+    """KC-17: KC-6's verbatim lines — `(new)` after the span is not a path."""
+    p = _ticket(tmp_path, "`tools/contest/runner.py` (new)",
+                "`tests/test_contest_runner.py` (new), `tests/_kilo_fake.py`")
+    assert declared_files(p) == ("tools/contest/runner.py",
+                                 "tests/test_contest_runner.py", "tests/_kilo_fake.py")
+
+
+def test_declared_files_drops_symbols_on_the_file_line(tmp_path):
+    """KC-14's line: the symbols in the brackets are backticked but not paths."""
+    p = _ticket(tmp_path, "`tools/contest/harvest.py` (`_is_ancestor`, `harvest`)")
+    assert declared_files(p) == ("tools/contest/harvest.py",)
+
+
+def test_declared_files_keeps_three_file_paths_in_order(tmp_path):
+    """KC-5's line names three paths; all three, in the line's order."""
+    p = _ticket(tmp_path, "`tools/contest/gates.py` (new), `tools/contest/harvest.py` "
+                          "(new), `scripts/judge_epic_round.py`")
+    assert declared_files(p) == ("tools/contest/gates.py", "tools/contest/harvest.py",
+                                 "scripts/judge_epic_round.py")
+
+
+def test_declared_files_bare_file_line_is_one_path(tmp_path):
+    assert declared_files(_ticket(tmp_path, "tools/x.py")) == ("tools/x.py",)
+    assert declared_files(_ticket(tmp_path, "—")) == ()
+
+
+def test_declared_files_drops_config_keys_on_also_touches(tmp_path):
+    """KC-10's line: a `key = value` span is backticked but not a path."""
+    p = _ticket(tmp_path, "`tools/contest/runner.py`",
+                "`contest.ini` (`compact_at_percent = 80`), `tests/_kilo_fake.py`")
+    assert declared_files(p) == ("tools/contest/runner.py", "contest.ini",
+                                 "tests/_kilo_fake.py")
+
+
+def test_harvest_does_not_call_the_file_line_path_off_ticket(round_, tmp_path):
+    """The live case: a ticket written the epic way declares its primary file."""
+    repo, base, _ = round_
+    ticket = repo / "epic-tasks" / "04-z.md"
+    ticket.write_text("# Z\n\n**File:** `tools/auto/probe.py` (`probe`)\n\n"
+                      "**Also touches:** `tests/test_probe.py` (new)\n", encoding="utf-8")
+    wt = _worktree(repo, base, tmp_path)
+    _record(wt, ticket.name, outcome="DONE", commit=_accepting(wt))
+    assert "off_ticket_files" not in _codes(harvest(wt, ticket))
+
+    _edit(wt, "tools/auto/other.py", "OTHER = 1\n")
+    _git(wt.path, "add", "tools/auto/other.py")
+    _git(wt.path, "commit", "-q", "--amend", "--no-edit")
+    _record(wt, ticket.name, outcome="DONE", commit=_git(wt.path, "rev-parse", "HEAD"))
+    h = harvest(wt, ticket)
+    assert _reason(h, "off_ticket_files").text.endswith("declared list: tools/auto/other.py")
+
+
 def test_ticket_for_round_still_finds_and_titles(round_):
     repo, base, ticket = round_
     name, title, declared = ticket_for_round(str(ticket.parent), 1)

@@ -81,14 +81,35 @@ def extract_shrink(cwd, rev):
     return "\n".join(body).rstrip()
 
 
+#: What a backticked span on a `**File:**` / `**Also touches:**` line must
+#: look like to count as a path — the lines also carry symbols
+#: (`` (`_is_ancestor`, `harvest`) ``) and config keys, which are not.
+_PATH_ENDINGS = (".py", ".md", ".ini", ".sh", ".json", ".txt", ".gitignore", "/")
+
+
+def _looks_like_path(span: str) -> bool:
+    return "/" in span or span.endswith(_PATH_ENDINGS)
+
+
 def _declared_paths(body: str) -> tuple[str, ...]:
-    """The paths a ticket declares: the `**File:**` line plus `**Also touches:**`."""
-    f = re.search(r"^\*\*File:\*\*\s*`?([^`\n]+?)`?\s*$", body, re.M)
-    also = re.search(r"^\*\*Also touches:\*\*\s*(.+?)\s*$", body, re.M)
-    declared = [f.group(1)] if f else []
-    if also:
-        declared += re.findall(r"`([^`]+)`", also.group(1))
-    return tuple(d for d in declared if d != "—")
+    """The paths a ticket declares: the `**File:**` line plus `**Also touches:**`.
+
+    Both lines are read the same way (KC-17): every backticked span that looks
+    like a path, in order, `**File:**` first. A `**File:**` line without any
+    backtick is one path, the whole value; a `—` placeholder declares nothing.
+    """
+    declared: list[str] = []
+    for label in ("File", "Also touches"):
+        m = re.search(rf"^\*\*{label}:\*\*\s*(.+?)\s*$", body, re.M)
+        if not m:
+            continue
+        value = m.group(1)
+        spans = re.findall(r"`([^`]+)`", value)
+        if spans:
+            declared += [s for s in spans if _looks_like_path(s)]
+        elif label == "File" and value != "—":
+            declared.append(value)
+    return tuple(declared)
 
 
 def declared_files(ticket_path) -> tuple[str, ...]:
