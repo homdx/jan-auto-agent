@@ -1,6 +1,6 @@
 # KC-17 — `gates._declared_paths`: the `**File:**` line is read like `**Also touches:**` — every backticked path — instead of not at all
 
-**Status:** open — round 56 of EPIC KC (`docs/kilo-contest/EPIC-KC.md`); found on 2026-09-19 while writing KC-16. Independent of KC-12, KC-13, KC-14 and KC-16 (different file); can run in parallel with any of them.
+**Status:** landed `6d038f9` — by hand, no contest, on 2026-09-20: round 53's rework prompts carried `touched 1 file(s) outside the ticket's declared list: tools/contest/harvest.py` for KC-14's own file, and the judge had to be right before round 53 could be scored (with KC-26). Round 56 of EPIC KC (`docs/kilo-contest/EPIC-KC.md`); found on 2026-09-19 while writing KC-16. Independent of KC-12, KC-13, KC-14 and KC-16 (different file); can run in parallel with any of them.
 **Severity:** MEDIUM
 **File:** `tools/contest/gates.py` (`_declared_paths`, `declared_files`)
 **Symbol:** `_declared_paths`, `declared_files`
