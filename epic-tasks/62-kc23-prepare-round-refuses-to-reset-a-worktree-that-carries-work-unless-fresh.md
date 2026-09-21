@@ -45,8 +45,12 @@
       a commit → `intake:` line on stderr with `--fresh`, exit `EXIT_FAILED`,
       no `kilo serve` spawned (the `spawn_holder` fixture saw nothing);
       `run --fresh` on the same sandbox → proceeds (worktree reset).
-- [ ] Every existing test in both files unmodified and green —
-      `remove_round` and `ensure_clone` are untouched.
+- [ ] Every existing test in both files stays green, and only
+      `test_prepare_round_is_idempotent_after_progress_and_commits` changes —
+      its rerun now passes `force=True`, because a silent reset over a stray
+      commit and `PROGRESS.csv` is exactly the behaviour this ticket removes;
+      asserting the old silent reset would contradict the fix. `remove_round`
+      and `ensure_clone` are untouched.
 - [ ] `python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180` green (sequentially).
 
 ## Out of scope
