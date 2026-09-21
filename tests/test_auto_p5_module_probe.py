@@ -43,7 +43,12 @@ import pytest
 import analyze_logs
 from tools.agent_trace import tracer
 from tools.auto import arch_probe
-from tools.auto.arch_probe import ArchProbe, ProbeOp, extract_probe_request
+from tools.auto.arch_probe import (
+    ArchProbe,
+    ProbeOp,
+    ProbeOpTally,
+    extract_probe_request,
+)
 from tools.auto.architect import ClusterReviewer
 from tools.auto.collect_bridge import CollectBridge
 from tools.auto.repo_ingest import RepoCluster
@@ -246,7 +251,10 @@ class TestArchProbeModuleOp:
         assert "module: tools/backoff.py" in out
         assert "(not found)" in out
         assert p.last_hits == 2 and p.last_misses == 1
-        assert p.last_by_op == {"facts": [1, 0], "module": [1, 1]}
+        assert p.last_by_op == (
+            ProbeOpTally("facts", 1, 0),
+            ProbeOpTally("module", 1, 1),
+        )
         assert p.last_by_op_str() == "facts=1/0 module=1/1"
 
     def test_module_respects_the_per_op_cap(self, monkeypatch) -> None:
@@ -264,7 +272,7 @@ class TestArchProbeModuleOp:
         b = _bridge({"tools/x.py": [_sym("tools/x.py", "f")]}, monkeypatch)
         p = ArchProbe(b)
         assert p.execute([ProbeOp("module", "tools/nope.py")]) == ""
-        assert p.last_by_op == {"module": [0, 1]}
+        assert p.last_by_op == (ProbeOpTally("module", 0, 1),)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
