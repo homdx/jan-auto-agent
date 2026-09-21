@@ -741,6 +741,12 @@ Available commands
   /help, /?            Show this help
   /auto <goal>         Run autonomous improvement mode (AUTO-A1).
                        e.g. /auto improve current code
+  /contest run --ticket NN   Run one contest round — prompt, wait, harvest,
+                              rework — for the agents on the roster (or
+                              --models a:free,b:free to override it).
+                              Passes every flag straight to
+                              `python3 -m tools.contest run`.
+                              /contest --help for the full flag list.
   /collect             Bring the structural project model in [collect] dir
                         (default .collect/) up to date. Read-only to the
                         source tree. Freshness-gated: a no-op (no writes) if
@@ -817,6 +823,7 @@ def _parse_args():
               python main.py --faq "question" --base /path/to/project
               python main.py --auto "harden error handling" --dry-run
               python main.py --validate-plan --base /path/to/project
+              python main.py --contest "run --ticket 63 --models hy3:free"
         """),
     )
     parser.add_argument("base_dir_positional", nargs="?", default=None, metavar="base_dir",
@@ -853,6 +860,14 @@ def _parse_args():
                              "--auto \"<goal>\" --dry-run (or a full run); does not "
                              "build one and does not execute any tasks itself. "
                              "e.g. --validate-plan --base /srv/app")
+    # KC-33: contest one-shot flag — same shape as --auto, but the value is a
+    # whole argument string handed to tools.contest.cli.main.
+    parser.add_argument(
+        "--contest", metavar="ARGS", default=None,
+        help="One-shot contest round: pass the rest of the argument string to "
+             "`tools.contest.cli.main`, then exit.  "
+             "e.g. --contest \"run --ticket 63 --models hy3:free\"",
+    )
     # FAQ one-shot flag
     parser.add_argument("--faq", metavar="QUESTION", default=None,
                         help="One-shot FAQ lookup against the knowledge folder, then exit. "
@@ -1318,6 +1333,17 @@ def main():
                 print(f"\n✅ Answer:\n{result}")
                 sys.exit(0)
 
+    # ── CONTEST ONE-SHOT MODE (KC-33) ─────────────────────────────────
+    # Same shape as --auto: the value is a whole argument string, split with
+    # shlex so quotes round-trip, and forwarded to tools.contest.cli.main.
+    # Placed before the Orchestrator is constructed — a contest round never
+    # needs the agents — and before the checkpoint block, so a saved
+    # backoff checkpoint never prompts on a one-shot invocation.
+    if args.contest is not None:
+        import shlex
+        from tools.contest.cli import main as _contest_main
+        sys.exit(_contest_main(shlex.split(args.contest)))
+
     orchestrator = Orchestrator(config_path=args.config)
 
     # ── Issue 7: Resume interrupted backoff session ──────────────────────
@@ -1493,8 +1519,39 @@ def main():
                 print()
                 continue
 
+            # KC-33: /contest — run one contest round from the interactive shell.
+            # Everything after "/contest" is forwarded verbatim to
+            # tools.contest.cli.main, so `/contest run --ticket 63 --no-tests`
+            # behaves exactly like `python3 -m tools.contest run --ticket 63
+            # --no-tests`. Bare /contest passes ["--help"].
+            if user_input.startswith("/contest"):
+                body = user_input[len("/contest"):].strip()
+                argv = body.split() if body else ["--help"]
+                from tools.contest.cli import main as _contest_main
+                try:
+                    _rc = _contest_main(argv)
+                except SystemExit as exc:
+                    # CORRECTION (review pass): argparse's OWN --help action and
+                    # its own usage-error path (e.g. a bare `/contest run`
+                    # missing the required --ticket) call sys.exit() directly —
+                    # they do not return an int. That raises SystemExit, which
+                    # is NOT an Exception subclass and is NOT caught by the
+                    # REPL's own `except (KeyboardInterrupt, EOFError):` further
+                    # down. Left unguarded, a bare `/contest` (or any malformed
+                    # one) would propagate out of `while True:` and kill the
+                    # whole main.py process — exactly the failure mode
+                    # /collect's own dispatch was built to avoid (see
+                    # parse_collect_args's docstring: "Kept separate from
+                    # stdlib argparse so main.py can add ... and just forward
+                    # here"). Catch it here and normalize to the same int
+                    # contract every other dispatch uses.
+                    _rc = exc.code if isinstance(exc.code, int) else (0 if exc.code is None else 1)
+                if _rc:
+                    print(f"[{_ts()}] ⚠️  contest finished with exit code {_rc}.")
+                continue
+
             # Guard: unrecognized slash-commands should NOT be sent to the model.
-            if user_input.startswith("/") and not user_input.startswith(("/edit", "/search")):
+            if user_input.startswith("/") and not user_input.startswith(("/edit", "/search", "/contest")):
                 print(f"Unknown command: {user_input.split()[0]}  —  type /help for the command list.")
                 continue
 
