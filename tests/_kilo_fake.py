@@ -12,6 +12,8 @@ Everything here is scripted by one scenario dict, per session:
     {
         "session": {...},            # merged into GET /session/{id} (cost, tokens)
         "diff": [...],               # default GET /session/{id}/diff
+        "providers": {...},          # the GET /provider body; DEFAULT_OFFER when absent
+        "providers_status": 500,     # GET /provider answers this instead of 200
         "turns": [                   # one entry per prompt the client sends
             {
                 "events": ["busy", "file.edited", "idle"],
@@ -56,6 +58,14 @@ all sit under a ``properties`` dict next to a ``type``. ``session.created`` and
 ``session.error`` payloads were never printed by the probe, so they use the
 envelope every other recorded event uses and nothing more.
 
+The two offer keys are per round, not per session: ``providers`` replaces
+the whole ``GET /provider`` body (the ticket's ``{"all", "default",
+"connected", "failed"}`` shape, each provider carrying its ``models`` map), and
+``providers_status`` answers it with something other than 200, so the client's
+``KiloHttpError`` path is reachable. Without either, the default body is one
+provider ``kenary`` named ``kenari`` offering the model ids the contest's own
+test rosters use, so a roster built on them is on offer with no override.
+
 Every request is recorded as ``{method, path, query, body}`` in ``requests``
 (``path`` without its query string) and every emitted event in ``events``, so
 an assertion can read what the client actually sent and what the server
@@ -80,6 +90,7 @@ __all__ = ["FakeKiloServer"]
 
 _RE_HEALTH = re.compile(r"^/global/health$")
 _RE_EVENT = re.compile(r"^/event$")
+_RE_PROVIDER = re.compile(r"^/provider$")
 _RE_SESSION = re.compile(r"^/session$")
 _RE_SESSION_GET = re.compile(r"^/session/([^/]+)/((?:message|diff)(?:/.*)?)$")
 _RE_SESSION_BY_ID = re.compile(r"^/session/([^/]+)$")
@@ -102,6 +113,49 @@ _EVENTS = {
 }
 #: emitted only after session.idle — PROBE.md's sequence ends with it
 _POST_IDLE = "session.turn.close"
+
+
+def _offered_model(model_id: str, provider_id: str = "kenary") -> dict:
+    """One entry of a provider's ``models`` dict, as ``GET /provider`` sends it.
+
+    ``status`` is ``active`` and the capabilities are the ones the live server
+    sent in 7.6.2; nothing here reads them, but a scenario that copies the
+    shape does.
+    """
+    return {
+        "id": model_id,
+        "providerID": provider_id,
+        "name": model_id,
+        "status": "active",
+        "capabilities": {"reasoning": False, "toolcall": True},
+        "variants": {},
+    }
+
+
+def _offered(provider_id: str, name: str, model_ids) -> dict:
+    """One entry of ``GET /provider``'s ``all`` list, keyed by model id."""
+    return {
+        "id": provider_id,
+        "name": name,
+        "source": "static",
+        "models": {model_id: _offered_model(model_id, provider_id) for model_id in model_ids},
+    }
+
+
+#: The offer the fake answers ``GET /provider`` with when a scenario names
+#: none: one provider whose ``id`` is ``kenary`` and whose ``name`` is the
+#: display string ``kenari`` — so a roster that spells the display name is
+#: refused the way the live server's would be — carrying the model ids the
+#: contest suites roster by default (`tests/test_contest_cli.py`'s
+#: ``kenary/agent-a:free``, ``kenary/agent-b:free``, and ``--models
+#: x:free,y:free``).
+DEFAULT_OFFER = {
+    "all": [_offered("kenary", "kenari", ("hy3:free", "agent-a:free", "agent-b:free",
+                                          "x:free", "y:free"))],
+    "default": {"kenary": "hy3:free"},
+    "connected": ["kenary"],
+    "failed": [],
+}
 
 
 def _tool_part(part: dict) -> dict:
@@ -282,6 +336,12 @@ class FakeKiloServer:
 
     def sessions(self) -> list:
         return list(self._sessions.values())
+
+    @property
+    def offer(self) -> dict:
+        """The ``GET /provider`` body this fake answers with — the scenario's
+        ``providers`` when one is given, else :data:`DEFAULT_OFFER`."""
+        return self.scenario.get("providers", DEFAULT_OFFER)
 
     @property
     def subscribers(self) -> int:
@@ -546,6 +606,12 @@ class _Handler(BaseHTTPRequestHandler):
 
         if _RE_EVENT.fullmatch(path):
             return self._stream_events()
+
+        if _RE_PROVIDER.fullmatch(path):
+            # the offer: `providers` replaces it wholesale, `providers_status`
+            # makes the route answer an error instead (KC-25's intake line)
+            return self._json(int(self.fake.scenario.get("providers_status", 200)),
+                              self.fake.scenario.get("providers", DEFAULT_OFFER))
 
         if _RE_SESSION_BY_ID.fullmatch(path):
             m = _RE_SESSION_BY_ID.fullmatch(path)

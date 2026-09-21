@@ -22,6 +22,16 @@ only when the base is HEAD (KC-24); the refusal names the ticket the sessions
 would get and prints the two ways past it. Nothing is edited here: a ticket in
 the way is reported, never flipped — `epic-tasks/` is the orchestrator's.
 
+When the server answers, `intake` asks it what it offers
+(`KiloClient.providers`, KC-25) and runs the roster's `provider/model` pairs
+through `roster_on_offer`: the display name spelled as the id, a provider with
+no credentials, a model that is not there — each a refusal naming the id or the
+model to use, instead of half the round's slots dying on the first turn with
+`Model not found`. With `server = spawn` that costs a throwaway server of its
+own; a server that cannot be started is not a failure here, the round's own
+`server:` line says the same thing. `--provider` is the default provider behind
+a bare `--models` id.
+
 `main(argv)` takes subcommands so KC-7 (round 46) adds `status` and `--dry-run`
 without moving anything. Exit codes: 0 when at least one agent is READY, 2
 when none is, 1 on an intake or a server failure; a bare `python3 -m
@@ -31,22 +41,31 @@ tools.contest` is argparse's usage, exit 2.
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
 import logging
 import os
 import re
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, replace
 from pathlib import Path
 
 from tools.contest import gates
-from tools.contest.kilo_client import KiloServer, KiloServerError, find_kilo_binary
+from tools.contest.kilo_client import (
+    KiloClient,
+    KiloHttpError,
+    KiloServerError,
+    KiloServer,
+    find_kilo_binary,
+)
 from tools.contest.roster import AgentSpec, ContestConfig, RosterError, load_roster
 from tools.contest.runner import AgentState, RoundState, run_round
 from tools.contest.workspace import WorkspaceError, prepare_round
 
 __all__ = [
+    "DEFAULT_PROVIDER",
     "DEFAULT_ROSTER",
     "TASKS_DIR",
     "Intake",
@@ -55,6 +74,7 @@ __all__ = [
     "export_patches",
     "intake",
     "main",
+    "roster_on_offer",
 ]
 
 #: The ticket folder the round reads; `scripts/next_task.py` hands it out.
@@ -63,6 +83,10 @@ TASKS_DIR = "epic-tasks"
 #: The committed roster at the repo root; a `contest.local.ini` next to it
 #: overrides it, `load_roster`'s own rule (KC-2).
 DEFAULT_ROSTER = "contest.ini"
+
+#: The provider id behind a `--models` id that does not name its own. The id
+#: `POST /session` wants — not the display name the id may have been read from.
+DEFAULT_PROVIDER = "kenary"
 
 #: The status this command runs, exactly: the first word of `**Status:**`.
 OPEN = "open"
@@ -162,7 +186,7 @@ def _label(body: str, name: str, number: int) -> str:
 # the roster's flags
 # ─────────────────────────────────────────────────────────────────────────────
 
-def agents_from_models(models: str, provider: str = "kenary") -> tuple:
+def agents_from_models(models: str, provider: str = DEFAULT_PROVIDER) -> tuple:
     """`--models a:free,b:free` → a roster of `AgentSpec`s.
 
     Copied from `contest-bench/kc6/live_smoke.py`: the name is the model id
@@ -175,6 +199,66 @@ def agents_from_models(models: str, provider: str = "kenary") -> tuple:
         name = "".join(c if c.isalnum() or c in "_-" else "-" for c in model_id.split(":")[0].lower())
         specs.append(AgentSpec(name=name.lstrip("_-"), provider_id=prov or provider, model_id=model_id))
     return tuple(specs)
+
+
+def roster_on_offer(providers: dict, agents: tuple) -> list:
+    """One failure line per roster agent that is not on offer, in roster order.
+
+    *providers* is `GET /provider` as `KiloClient.providers` hands it over,
+    decoded as is. A provider's `id` is what `POST /session` wants and its
+    `name` is the display string from `kilo.jsonc`, so a roster that spells the
+    display name is refused with the id to use instead — the one-word error that
+    used to surface as the first turn's `Model not found` on one agent of the
+    round, minutes in. Pure: no server, no roster, one line per bad agent.
+
+    A model whose `status` is not `active` is not a failure — that field's other
+    values are unverified — and nothing is inferred from `capabilities`.
+    """
+    by_id = {}
+    by_name = {}
+    for provider in providers.get("all") or []:
+        if not isinstance(provider, dict):
+            continue
+        provider_id = provider.get("id")
+        if not isinstance(provider_id, str) or not provider_id:
+            continue
+        by_id[provider_id] = provider
+        name = provider.get("name")
+        if isinstance(name, str) and name.lower() not in by_name:
+            by_name[name.lower()] = provider_id
+    connected = [item for item in (providers.get("connected") or []) if isinstance(item, str)]
+
+    failures = []
+    for agent in agents:
+        pair = agent.model
+        if agent.provider_id not in by_id:
+            display = by_name.get(agent.provider_id.lower())
+            if display:
+                use = display + "/" + agent.model_id
+                failures.append(
+                    f"[{agent.name}] {pair}: no provider '{agent.provider_id}' — "
+                    f"that is the display name of provider '{display}'; use {use}")
+            else:
+                failures.append(
+                    f"[{agent.name}] {pair}: no provider '{agent.provider_id}' — "
+                    f"connected: {', '.join(sorted(connected))}")
+            continue
+        if agent.provider_id not in connected:
+            failures.append(
+                f"[{agent.name}] {pair}: provider '{agent.provider_id}' "
+                "has no credentials (not connected)")
+            continue
+        models = by_id[agent.provider_id].get("models") or {}
+        if agent.model_id in models:
+            continue
+        ids = sorted(str(model) for model in models)
+        line = (f"[{agent.name}] {pair}: no model '{agent.model_id}' "
+                f"under '{agent.provider_id}' — on offer: {', '.join(ids)}")
+        close = difflib.get_close_matches(agent.model_id, ids, n=1)
+        if close:
+            line += " (did you mean " + close[0] + "?)"
+        failures.append(line)
+    return failures
 
 
 def _roster_path(repo, roster: str) -> Path:
@@ -270,6 +354,48 @@ class Intake:
     out_dir: Path
 
 
+def _offer_failures(repo, config: ContestConfig, attached) -> list:
+    """The roster's `provider/model` pairs, checked against `GET /provider`.
+
+    With `server = spawn` no server is attached yet, so a throwaway one is
+    started for the call alone and removed with its log — `cmd_run` starts its
+    own afterwards, and leaving that order alone is the point, so the second
+    spawn is the price. Whatever stops that throwaway from starting is caught
+    wide on purpose and not reported here: the check asks one question, and it
+    must not fail louder than the round it guards — the round's own `server:`
+    line reports the same word. With a URL the attached server answers and
+    nothing is spawned. A failure of the call itself is one line, so the check
+    never crashes intake.
+    """
+    log_path = None
+    own_server = None
+    server = attached
+    try:
+        if server is None and config.server == "spawn":
+            fd, log_path = tempfile.mkstemp(prefix="kilo-offer-", text=True)
+            os.close(fd)
+            try:
+                server = KiloServer.spawn(find_kilo_binary(config.kilo_bin),
+                                          log_path=log_path)
+                own_server = server
+            except Exception:
+                return []
+        if server is None:
+            return []
+        providers = KiloClient(server, str(repo)).providers()
+        return roster_on_offer(providers, config.agents)
+    except (KiloHttpError, KiloServerError, ValueError) as exc:
+        return [f"GET /provider failed: {exc}"]
+    finally:
+        if own_server is not None:
+            own_server.close()
+        if log_path:
+            try:
+                os.unlink(log_path)
+            except OSError:
+                pass
+
+
 def intake(repo, tasks_dir, round_no, base_ref, config, argv=None):
     """Run every pre-round check; return the `Intake`, or `None` with the failures printed.
 
@@ -280,8 +406,12 @@ def intake(repo, tasks_dir, round_no, base_ref, config, argv=None):
     first word is `open`; no lower-numbered ticket is still on offer, and each
     of those is named with the two ways past it, because the runner's prompt
     does not name a ticket and `scripts/next_task.py` would hand that one to
-    the session; and the server answers — the `kilo` binary resolves when the
-    roster says `spawn`, else `KiloServer.attach` reaches the URL.
+    the session; the server answers — the `kilo` binary resolves when the
+    roster says `spawn`, else `KiloServer.attach` reaches the URL; and the
+    roster's `provider/model` pairs are on offer — `KiloClient.providers`
+    against `roster_on_offer`, so a display name spelled as an id, a provider
+    with no credentials, and a model that is not there are all refused here
+    instead of on the first turn (KC-25).
     `Intake.out_dir` is the default `<out_dir>/<NN>`; `--out` replaces it in
     `cmd_run`.
 
@@ -337,6 +467,7 @@ def intake(repo, tasks_dir, round_no, base_ref, config, argv=None):
                           base_ref, base_is_head)
             )
 
+    attached = None
     if config.server == "spawn":
         try:
             find_kilo_binary(config.kilo_bin)
@@ -344,9 +475,13 @@ def intake(repo, tasks_dir, round_no, base_ref, config, argv=None):
             failures.append(str(exc))
     else:
         try:
-            KiloServer.attach(config.server)
+            attached = KiloServer.attach(config.server)
         except KiloServerError as exc:
             failures.append(str(exc))
+
+    # the roster the round would run, against what the server offers: the
+    # refusal that used to arrive as one agent's first-turn `session.error`
+    failures.extend(_offer_failures(repo, config, attached))
 
     if failures:
         for line in failures:
@@ -421,9 +556,11 @@ def _start_server(config: ContestConfig, out_dir: Path):
 
 
 def _apply_flags(config: ContestConfig, args: argparse.Namespace) -> ContestConfig:
-    """`--models`, `--max-parallel` and `--no-gate` on top of the roster."""
+    """`--models` (with `--provider` behind its bare ids), `--max-parallel` and
+    `--no-gate` on top of the roster."""
     if args.models:
-        config = replace(config, agents=agents_from_models(args.models))
+        config = replace(config, agents=agents_from_models(args.models,
+                                                           provider=args.provider))
     if args.max_parallel is not None:
         config = replace(config, max_parallel=int(args.max_parallel))
     if args.no_gate:
@@ -556,7 +693,11 @@ def _parser() -> argparse.ArgumentParser:
                      help="the base ref the worktrees start from (default HEAD)")
     run.add_argument("--models", default="",
                      help="comma-separated model ids run INSTEAD of the roster's agents "
-                          "(a:free,b:free → provider kenary unless the id says its own)")
+                          "(a:free,b:free → --provider unless the id names its own)")
+    run.add_argument("--provider", default=DEFAULT_PROVIDER, metavar="ID",
+                     help="the provider id behind a --models id that names no provider of "
+                          "its own (default kenary; the roster spells a model provider/model, "
+                          "and --roster's agents are unaffected)")
     run.add_argument("--max-parallel", type=int, default=None, metavar="N",
                      help="override the roster's max_parallel")
     run.add_argument("--no-tests", action="store_true",

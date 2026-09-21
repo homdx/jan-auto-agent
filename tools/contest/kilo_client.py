@@ -23,6 +23,10 @@ Two things the probe learned live are behaviour here, not comments:
     (KC-12), every other event carrying this session's ``sessionID`` — a
     ``session.status busy``, a ``file.edited`` — resets that clock and
     nothing else.
+  * ``providers`` is ``GET /provider`` decoded as is (KC-25) — nothing is
+    reshaped, because the caller compares the roster's ``provider/model``
+    pairs against it, and a provider's ``name`` there is the display string
+    from ``kilo.jsonc``, not the ``id`` ``POST /session`` wants.
 
 Nothing here decides a permission: ``KiloClient.wait_idle`` hands the event
 to a callback and sends back what the callback says. Reporting is by value
@@ -674,6 +678,27 @@ class KiloClient:
     def _check(status: int, body, method: str, path: str) -> None:
         if not 200 <= status < 300:
             raise KiloHttpError(status, body, method, path)
+
+    # ── the offer ───────────────────────────────────────────────────────────
+
+    def providers(self) -> dict:
+        """``GET /provider`` — the server's view of what is on offer, decoded as is.
+
+        ``{"all": [provider…], "default": {providerID: modelID}, "connected":
+        [providerID…], "failed": […]}``, each provider carrying an ``id``, a
+        ``name``, ``source`` and a ``models`` dict keyed by model id — the
+        model ids are what ``POST /session`` wants, and a provider's ``name``
+        is the display string from ``kilo.jsonc``, which is not its ``id``.
+        Nothing is reshaped here: the caller compares the roster's
+        ``provider/model`` pairs against the body. A non-dict body is a
+        :class:`ValueError`, like :meth:`create_session`'s.
+        """
+        status, resp = self._request("GET", "/provider")
+        self._check(status, resp, "GET", "/provider")
+        if not isinstance(resp, dict):
+            raise ValueError(
+                f"GET /provider returned {type(resp).__name__}, expected a dict")
+        return resp
 
     # ── the session ────────────────────────────────────────────────────────
 

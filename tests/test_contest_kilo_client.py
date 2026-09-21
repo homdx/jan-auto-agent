@@ -23,6 +23,11 @@ session that goes silent for longer than it, long before the overall
 resets that clock, across several windows; a neighbour session on the same
 tap does not count at all; and the clock runs from the start of the wait, so
 a turn that never emits anything is cut at the window too.
+
+KC-25 (round 64) adds the sixth primitive: `providers()` is `GET /provider`,
+the offer decoded as is, so intake can check a roster's `provider/model` pairs
+before the round; a non-2xx is a `KiloHttpError` and a non-dict body is a
+`ValueError`.
 """
 
 from __future__ import annotations
@@ -846,3 +851,88 @@ def test_a_turn_hook_that_raises_becomes_a_recorded_error(tmp_path):
     assert res.status == "idle"
     assert h.fake.turn_errors == ["on_prompt: RuntimeError: the hook is broken"]
     assert assistant == "done"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 9 — GET /provider: the offer, as the server sees it
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _offered(provider_id: str, name: str, model_ids) -> dict:
+    """One entry of a `GET /provider` body, in the shape the live server sends."""
+    return {
+        "id": provider_id,
+        "name": name,
+        "source": "static",
+        "models": {
+            model_id: {"id": model_id, "providerID": provider_id, "name": model_id,
+                       "status": "active",
+                       "capabilities": {"reasoning": True, "toolcall": True},
+                       "variants": {}}
+            for model_id in model_ids
+        },
+    }
+
+
+def _offer(providers, connected=None):
+    """A whole `GET /provider` body around the providers named."""
+    return {
+        "all": list(providers),
+        "default": {"kenary": "hy3:free"},
+        "connected": list(connected if connected is not None else ["kenary"]),
+        "failed": [],
+    }
+
+
+def test_providers_returns_the_offer_decoded_as_is(tmp_path):
+    """`providers()` is the body `GET /provider` sent, reshaped by nothing: intake
+    compares the roster's `provider/model` pairs against it, and a provider's
+    `name` there is the display string, not the id `POST /session` wants."""
+    offer = _offer((_offered("sensenova123", "sensenova",
+                             ("sensenova-6.8-flash-lite", "hy3:free")),
+                    _offered("kenary", "kenari", ("agnes-2-5-flash:free",))),
+                   connected=["sensenova123", "kenary"])
+    scenario = {"providers": offer,
+                "turns": [{"events": ["busy", "idle"], "assistant": "done"}]}
+    with _probe(tmp_path, scenario) as h:
+        providers = h.client.providers()
+
+    assert providers == offer
+    (sensenova, kenary) = providers["all"]
+    assert sensenova["id"] == "sensenova123" and sensenova["name"] == "sensenova"
+    assert kenary["id"] == "kenary" and kenary["name"] == "kenari"
+    assert set(providers) == {"all", "default", "connected", "failed"}
+    request = h.fake.calls(method="GET", path="/provider")[0]
+    assert request["query"]["directory"] == h.directory
+
+
+def test_providers_defaults_to_the_fake_offer(tmp_path):
+    """A scenario that names no `providers` gets the default offer, whose one
+    provider is `kenary`, named `kenari`."""
+    with _probe(tmp_path, {"turns": [{"events": ["busy", "idle"], "assistant": "done"}]}) as h:
+        providers = h.client.providers()
+        (provider,) = h.fake.offer["all"]
+        assert provider["id"] != provider["name"]
+    assert providers == h.fake.offer
+    (provider,) = providers["all"]
+    assert provider["id"] == "kenary" and provider["name"] == "kenari"
+    assert providers["connected"] == ["kenary"]
+    assert "hy3:free" in provider["models"]
+
+
+def test_providers_of_a_500_is_a_kilo_http_error(tmp_path):
+    with _probe(tmp_path, {"providers_status": 500,
+                           "turns": [{"events": ["busy", "idle"], "assistant": "done"}]}) as h:
+        with pytest.raises(KiloHttpError) as exc:
+            h.client.providers()
+    assert exc.value.status == 500
+    assert exc.value.method == "GET"
+    assert exc.value.path == "/provider"
+    assert isinstance(exc.value.body, dict)
+
+
+def test_providers_of_a_non_dict_body_is_a_value_error(tmp_path):
+    """Like `create_session`'s, a body that is not a dict is a `ValueError`."""
+    with _probe(tmp_path, {"providers": ["not", "a", "dict"],
+                           "turns": [{"events": ["busy", "idle"], "assistant": "done"}]}) as h:
+        with pytest.raises(ValueError, match="GET /provider"):
+            h.client.providers()

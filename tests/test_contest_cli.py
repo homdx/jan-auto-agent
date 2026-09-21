@@ -630,6 +630,234 @@ def test_intake_refuses_a_park_that_is_not_committed(tmp_path, monkeypatch, caps
     assert "epic-tasks/ has uncommitted or untracked changes" in captured.err
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# KC-25: the roster's provider/model pairs against GET /provider
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _provider(provider_id, name, model_ids):
+    """One entry of a `GET /provider` body, for `roster_on_offer` alone."""
+    return {"id": provider_id, "name": name, "source": "static",
+            "models": {model_id: {"id": model_id, "providerID": provider_id,
+                                  "name": model_id, "status": "active"}
+                       for model_id in model_ids}}
+
+
+def _offer(providers, connected=("kenary",)):
+    """A whole `GET /provider` body around the providers named."""
+    return {"all": list(providers), "default": {}, "connected": list(connected),
+            "failed": []}
+
+
+#: The offer those tests read: one provider whose `id` is `kenary` and whose
+#: `name` is the display string `kenari` — the pair `kenari/hy3:free` is the
+#: mistake the round lost four slots to.
+KC25_OFFER = _offer((_provider("kenary", "kenari",
+                               ("hy3:free", "agnes-2-5-flash:free",
+                                "agnes-2-0-flash:free")),))
+
+
+def test_roster_on_offer_names_the_id_to_use_when_the_display_name_is_spelled():
+    """`kenari` is the display name, not the id: the refusal names the id to use."""
+    (agent,) = cli.agents_from_models("kenari/hy3:free")
+    (line,) = cli.roster_on_offer(KC25_OFFER, (agent,))
+    assert line == ("[hy3] kenari/hy3:free: no provider 'kenari' — that is the display name "
+                    "of provider 'kenary'; use kenary/hy3:free")
+
+
+def test_roster_on_offer_names_the_connected_providers_when_no_name_matches():
+    (agent,) = cli.agents_from_models("sensenova123/sensenova-6.8-flash-lite")
+    (line,) = cli.roster_on_offer(KC25_OFFER, (agent,))
+    assert line == ("[sensenova-6-8-flash-lite] sensenova123/sensenova-6.8-flash-lite: "
+                    "no provider 'sensenova123' — connected: kenary")
+
+
+def test_roster_on_offer_names_a_provider_without_credentials():
+    (agent,) = cli.agents_from_models("hy3:free")
+    (line,) = cli.roster_on_offer(_offer((_provider("kenary", "kenari", ("hy3:free",)),),
+                                         connected=()), (agent,))
+    assert line == ("[hy3] kenary/hy3:free: provider 'kenary' has no credentials "
+                    "(not connected)")
+
+
+def test_roster_on_offer_lists_the_models_on_offer_and_a_close_one():
+    """`hy3` gets no suggestion: `difflib.get_close_matches`' 0.6 cutoff keeps a
+    model from its own `:free` variant, so that pair gets the bare line."""
+    agents = cli.agents_from_models("agnes-2-5-flash,hy3")
+    assert cli.roster_on_offer(KC25_OFFER, agents) == [
+        "[agnes-2-5-flash] kenary/agnes-2-5-flash: no model 'agnes-2-5-flash' under 'kenary' — "
+        "on offer: agnes-2-0-flash:free, agnes-2-5-flash:free, hy3:free "
+        "(did you mean agnes-2-5-flash:free?)",
+        "[hy3] kenary/hy3: no model 'hy3' under 'kenary' — on offer: agnes-2-0-flash:free, "
+        "agnes-2-5-flash:free, hy3:free",
+    ]
+
+
+def test_roster_on_offer_is_one_line_per_bad_agent_in_roster_order():
+    """A good agent in the middle is skipped and the bad ones keep the roster order."""
+    agents = cli.agents_from_models("kenari/hy3:free,hy3:free,agnes-2-5-flash")
+    lines = cli.roster_on_offer(KC25_OFFER, agents)
+    assert len(lines) == 2
+    assert lines[0].startswith("[hy3] kenari/hy3:free: no provider 'kenari'")
+    assert lines[1].startswith("[agnes-2-5-flash] kenary/agnes-2-5-flash: no model")
+
+
+def test_roster_on_offer_is_empty_for_a_roster_entirely_on_offer():
+    assert cli.roster_on_offer(KC25_OFFER,
+                               cli.agents_from_models("hy3:free,kenary/agnes-2-0-flash:free")) == []
+
+
+def test_roster_on_offer_ignores_a_model_whose_status_is_not_active():
+    """`active` is the only status the server documents here; the others are not
+    refusals, and nothing is inferred from `capabilities`."""
+    models = dict(KC25_OFFER["all"][0]["models"])
+    models["hy3:free"]["status"] = "unknown"
+    offer = _offer((_provider("kenary", "kenari", models),))
+    assert cli.roster_on_offer(offer, cli.agents_from_models("hy3:free")) == []
+
+
+def test_agents_from_models_takes_its_default_provider_from_the_flag():
+    """`--provider sensenova123 --models sensenova-6.8-flash-lite`."""
+    (spec,) = cli.agents_from_models("sensenova-6.8-flash-lite", provider="sensenova123")
+    assert spec == AgentSpec(provider_id="sensenova123", model_id="sensenova-6.8-flash-lite",
+                             name="sensenova-6-8-flash-lite")
+
+
+def test_a_models_id_with_its_own_prefix_wins_over_the_provider_flag():
+    (spec,) = cli.agents_from_models("kenary/hy3:free", provider="sensenova123")
+    assert (spec.provider_id, spec.model_id) == ("kenary", "hy3:free")
+
+
+def test_agents_from_models_defaults_to_the_kenary_provider():
+    assert cli.agents_from_models("hy3:free")[0].provider_id == cli.DEFAULT_PROVIDER == "kenary"
+
+
+KC25_SCENARIO = {"providers": KC25_OFFER,
+                 "turns": [{"on_prompt": work_ready, "events": ["busy", "idle"]}]}
+
+
+def test_run_refuses_a_model_id_spelled_as_a_display_name(sandbox, capsys, spawn_holder):
+    """`--models kenari/hy3:free` is refused at intake with the id to use — before
+    a worktree, an output directory or a session exists."""
+    code, fake = run_fake(sandbox, KC25_SCENARIO,
+                          ["--ticket", "1", "--models", "kenari/hy3:free",
+                           "--no-gate", "--no-tests"], spawn_holder)
+    captured = capsys.readouterr()
+    lines = [line for line in captured.err.splitlines() if line.startswith("intake:")]
+
+    assert code == cli.EXIT_FAILED
+    assert lines == ["intake: [hy3] kenari/hy3:free: no provider 'kenari' — that is the display "
+                     "name of provider 'kenary'; use kenary/hy3:free"]
+    assert not (sandbox.rounds / f"{ROUND:02d}-hy3").exists()
+    assert not sandbox.out().exists()
+    assert _sessions(fake) == [], "no session may be created before intake passes"
+
+
+def test_run_passes_the_same_roster_with_the_provider_id(sandbox, capsys, spawn_holder):
+    """`kenary/hy3:free`: intake passes and the plan shows the pair it checked."""
+    code, fake = run_fake(sandbox, KC25_SCENARIO,
+                          ["--ticket", "1", "--models", "kenary/hy3:free",
+                           "--no-gate", "--no-tests"], spawn_holder)
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert "intake:" not in captured.err
+    assert _plan(captured.out)["agents"] == "1: kenary/hy3:free"
+    assert sorted(entry.name for entry in sandbox.rounds.iterdir()) == [f"{ROUND:02d}-hy3"]
+    assert len(_sessions(fake)) == 1
+    assert _sessions(fake)[0]["body"]["model"] == {"providerID": "kenary", "id": "hy3:free"}
+
+
+def test_run_checks_the_provider_flag_against_the_offer(sandbox, capsys, spawn_holder):
+    """`--provider sensenova123` is the default behind a bare id, and that pair is
+    checked too: the offer has no such provider."""
+    code, fake = run_fake(sandbox, KC25_SCENARIO,
+                          ["--ticket", "1", "--provider", "sensenova123",
+                           "--models", "sensenova-6.8-flash-lite",
+                           "--no-gate", "--no-tests"], spawn_holder)
+    captured = capsys.readouterr()
+    lines = [line for line in captured.err.splitlines() if line.startswith("intake:")]
+
+    assert code == cli.EXIT_FAILED
+    assert lines == ["intake: [sensenova-6-8-flash-lite] sensenova123/sensenova-6.8-flash-lite: "
+                     "no provider 'sensenova123' — connected: kenary"]
+    assert not sandbox.out().exists()
+    assert _sessions(fake) == []
+
+
+def test_run_reports_a_failed_get_provider_as_one_intake_line(sandbox, capsys, spawn_holder):
+    """`GET /provider` answering 500 is one line and never crashes intake."""
+    scenario = dict(KC25_SCENARIO, providers_status=500)
+    code, fake = run_fake(sandbox, scenario, ["--ticket", "1", "--no-gate", "--no-tests"],
+                          spawn_holder)
+    captured = capsys.readouterr()
+    lines = [line for line in captured.err.splitlines() if line.startswith("intake:")]
+
+    assert code == cli.EXIT_FAILED
+    assert len(lines) == 1
+    assert lines[0].startswith("intake: GET /provider failed: ")
+    assert "500" in lines[0] and "/provider" in lines[0]
+    assert "server:" not in captured.err
+    assert not sandbox.out().exists()
+    assert _sessions(fake) == []
+
+
+def test_intake_checks_the_offer_against_the_attached_server(sandbox, capsys, spawn_holder):
+    """`server = <url>`: the attached server answers the offer check and nothing
+    is spawned for it — the throwaway is only the price of `server = spawn`."""
+    with FakeKiloServer({"providers": KC25_OFFER}) as fake:
+        config = sandbox.config(server=fake.url, agents=cli.agents_from_models("kenari/hy3:free"))
+        result = cli.intake(sandbox.repo, sandbox.repo / "epic-tasks", ROUND, "HEAD", config)
+
+    captured = capsys.readouterr()
+    assert result is None
+    lines = [line for line in captured.err.splitlines() if line.startswith("intake:")]
+    assert lines == ["intake: [hy3] kenari/hy3:free: no provider 'kenari' — that is the display "
+                     "name of provider 'kenary'; use kenary/hy3:free"]
+    assert not spawn_holder, "an attached server must not start a second one"
+    assert fake.calls(method="GET", path="/provider")
+
+
+def test_the_offer_check_closes_its_throwaway_server(tmp_path, monkeypatch, capsys):
+    """`server = spawn` starts a throwaway for the offer call alone: it is closed
+    and its log removed, because `cmd_run` starts its own afterwards."""
+    sb = Sandbox(tmp_path)
+    monkeypatch.chdir(sb.repo)
+    closed, logs = [], []
+
+    class Throwaway:
+        @property
+        def base_url(self) -> str:
+            return fake.url
+
+        def close(self) -> None:
+            closed.append(True)
+
+    def spawn_server(binary, *, log_path):
+        logs.append(log_path)
+        return Throwaway()
+
+    monkeypatch.setattr(cli.KiloServer, "spawn", staticmethod(spawn_server))
+    with FakeKiloServer({"providers": KC25_OFFER}) as fake:
+        config = sb.config(agents=cli.agents_from_models("kenari/hy3:free"))
+        result = cli.intake(sb.repo, sb.repo / "epic-tasks", ROUND, "HEAD", config)
+
+    captured = capsys.readouterr()
+    assert result is None
+    lines = [line for line in captured.err.splitlines() if line.startswith("intake:")]
+    assert lines == ["intake: [hy3] kenari/hy3:free: no provider 'kenari' — that is the display "
+                     "name of provider 'kenary'; use kenary/hy3:free"]
+    assert closed == [True], "the check closes the server it started for the offer"
+    assert len(logs) == 1 and not Path(logs[0]).exists(), "its log goes with it"
+
+
+def test_run_help_names_the_provider_flag():
+    help_out = subprocess.run([sys.executable, "-m", "tools.contest", "run", "--help"],
+                              capture_output=True, text=True, cwd=REPO_ROOT)
+    assert help_out.returncode == 0
+    assert "--provider" in help_out.stdout
+    assert "provider/model" in help_out.stdout
+
+
 def test_agents_from_models_squeezes_the_name_and_keeps_its_own_provider():
     specs = cli.agents_from_models("x:free,y:free")
     assert [spec.model for spec in specs] == ["kenary/x:free", "kenary/y:free"]
