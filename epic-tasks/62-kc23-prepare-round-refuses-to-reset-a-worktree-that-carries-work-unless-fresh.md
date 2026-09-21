@@ -1,6 +1,6 @@
 # KC-23 — `prepare_round` refuses to reset a round worktree that carries work unless `--fresh`; the message names `--resume`
 
-**Status:** open — round 62 of EPIC KC (`docs/kilo-contest/EPIC-KC.md`); found 2026-09-20 reading `workspace.reset_worktree` after round 52's three manager runs, each of which started by resetting `../rounds/52-*` — twice over trees that held a finished commit (`hy3 e71f221`, `mistral 9f05e3c`) the operator had exported by hand first. Independent of KC-19/21/22 (different file).
+**Status:** landed `2a7e899` (round 62, 4 live entries) — round 62 of EPIC KC (`docs/kilo-contest/EPIC-KC.md`); found 2026-09-20 reading `workspace.reset_worktree` after round 52's three manager runs, each of which started by resetting `../rounds/52-*` — twice over trees that held a finished commit (`hy3 e71f221`, `mistral 9f05e3c`) the operator had exported by hand first. Independent of KC-19/21/22 (different file).
 **Severity:** MEDIUM
 **File:** `tools/contest/workspace.py` (`reset_worktree`, `prepare_round`), `tools/contest/cli.py` (`run` — the `--fresh` flag)
 **Symbol:** `prepare_round`, `reset_worktree`, `WorkspaceError`
