@@ -12,13 +12,15 @@ the only judge here — `run_round(..., run_tests=True)` runs the pytest roots i
 every harvest, one worktree at a time.
 
 `intake` runs every pre-round check and reports every failure, one line each,
-before anything is created: the ticket exists and is `open`; it is the
-lowest-numbered `open` ticket, because the runner's prompt does not name a
-ticket and `scripts/next_task.py` would hand the session that one; the base
-resolves and `epic-tasks/` is clean at it — KC-4's own check through its
-`WorkspaceError`, not a copy of it; and the server answers. Nothing is edited
-here: an `open` ticket in the way is reported, never flipped — `epic-tasks/`
-is the orchestrator's.
+before anything is created: the base resolves and `epic-tasks/` is clean at it
+— KC-4's own check through its `WorkspaceError`, not a copy of it; the ticket
+exists and is `open`; no lower-numbered ticket is still on offer, because the
+runner's prompt does not name a ticket and `scripts/next_task.py` would hand the
+session that one; and the server answers. The ticket statuses are read from the
+base tree the sessions read, not from this checkout, so the two agree on a word
+only when the base is HEAD (KC-24); the refusal names the ticket the sessions
+would get and prints the two ways past it. Nothing is edited here: a ticket in
+the way is reported, never flipped — `epic-tasks/` is the orchestrator's.
 
 `main(argv)` takes subcommands so KC-7 (round 46) adds `status` and `--dry-run`
 without moving anything. Exit codes: 0 when at least one agent is READY, 2
@@ -65,6 +67,14 @@ DEFAULT_ROSTER = "contest.ini"
 #: The status this command runs, exactly: the first word of `**Status:**`.
 OPEN = "open"
 
+#: The words that take a lower ticket off the offer — exactly
+#: `scripts/next_task.py`'s `SKIP_STATUS`, duplicated the way `_STATUS_RE`
+#: already duplicates that script's status regex: the runner does not read
+#: `scripts/`. Anything else is still on offer — `open`, but also `running` or
+#: `wip` when a round runs on another machine, and a ticket with no status line
+#: at all — and a session prompted without a ticket would get it.
+PARKED = ("landed", "queued")
+
 #: Exit codes.
 EXIT_OK, EXIT_NO_READY, EXIT_FAILED = 0, 2, 1
 
@@ -84,35 +94,68 @@ _TICKET_RE = re.compile(r"^0*(\d+)-.*\.md$")
 # tickets
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _status(ticket_path) -> str:
-    """The ticket's `**Status:**` first word, lower-cased; `''` when absent."""
-    try:
-        body = Path(ticket_path).read_text(encoding="utf-8")
-    except OSError:
-        return ""
+def _status_of(body: str) -> str:
+    """The body's `**Status:**` first word, lower-cased; `""` when absent."""
     match = _STATUS_RE.search(body)
     return match.group(1).strip("`*").lower() if match else ""
 
 
-def _tickets(tasks_dir) -> list:
-    """`(number, path, status)` per `NN-*.md` in *tasks_dir*, numeric order."""
+def _ticket_body(tasks_dir, name, at=None) -> str:
+    """One ticket's body: from the commit *at* when it is set, else from disk.
+
+    `git show <at>:epic-tasks/<name>` is the copy the sessions read — their
+    worktrees are built at *at*, not at this checkout. A name that is not in
+    that tree reads as `""`, the same as an unreadable file below.
+    """
+    if at:
+        # `tasks_dir` is one level under the repo root, so its own name is the
+        # repo-root-relative path `git ls-tree` / `git show` want
+        return gates.git(str(Path(tasks_dir).parent), "show",
+                         f"{at}:{Path(tasks_dir).name}/{name}")
+    try:
+        return Path(tasks_dir).joinpath(name).read_text(encoding="utf-8")
+    except OSError:
+        return ""
+
+
+def _tickets(tasks_dir, at=None) -> list:
+    """`(number, path, status, body)` per `NN-*.md`, in numeric order.
+
+    Without *at* the names and the statuses come from *tasks_dir* as checked
+    out. With *at* they come from that commit's tree instead —
+    `git ls-tree -r --name-only <at> epic-tasks/` for the names,
+    `git show <at>:epic-tasks/<name>` for each body — because the sessions read
+    the folder from the worktree built at the base, not from this checkout. The
+    `path` entries stay checkout paths: only `.name` is used, and their files
+    may be absent on disk then. `-r`: without it `ls-tree` lists the tree
+    itself and nothing under it.
+    """
+    tasks_dir = Path(tasks_dir)
+    if at:
+        rel_dir = Path(tasks_dir).name
+        listed = gates.git(str(tasks_dir.parent), "ls-tree", "-r", "--name-only",
+                           str(at), rel_dir)
+        names = [line.rsplit("/", 1)[-1] for line in listed.splitlines() if line.strip()]
+    else:
+        names = [path.name for path in tasks_dir.glob("*.md")]
     found = []
-    for path in Path(tasks_dir).glob("*.md"):
-        match = _TICKET_RE.match(path.name)
+    for name in names:
+        match = _TICKET_RE.match(name)
         if match:
-            found.append((int(match.group(1)), path, _status(path)))
+            body = _ticket_body(tasks_dir, name, at)
+            found.append((int(match.group(1)), tasks_dir / name, _status_of(body), body))
     return sorted(found, key=lambda item: item[0])
 
 
-def _label(ticket_path, number: int) -> str:
-    """`KC-7 (46)` — the id the ticket announces in its H1, plus its number."""
-    try:
-        body = Path(ticket_path).read_text(encoding="utf-8")
-    except OSError:
-        return Path(ticket_path).name
+def _title_id(body: str, name: str) -> str:
+    """`KC-7` — the id the ticket announces in its H1, or its file name."""
     match = _TITLE_RE.search(body)
-    title = match.group(1) if match else Path(ticket_path).name
-    return f"{title} ({number})"
+    return match.group(1) if match else name
+
+
+def _label(body: str, name: str, number: int) -> str:
+    """`KC-7 (46)` — the id the ticket announces in its H1, plus its number."""
+    return _title_id(body, name) + f" ({number})"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -150,6 +193,73 @@ def _round_out_dir(repo, config: ContestConfig, round_no: int) -> Path:
 # intake
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _run_line(argv, number: int) -> str:
+    """`python3 -m tools.contest` + this invocation's argv with the `--ticket`
+    value replaced by *number* — nothing else is re-derived."""
+    words: list = []
+    i = 0
+    while i < len(argv):
+        word = argv[i]
+        if word == "--ticket" and i + 1 < len(argv):
+            words += ["--ticket", str(number)]
+            i += 2
+        elif word.startswith("--ticket="):
+            words.append("--ticket=" + str(number))
+            i += 1
+        else:
+            words.append(word)
+            i += 1
+    return "python3 -m tools.contest " + " ".join(words)
+
+
+def _park_line(body, name, number: int, rel_dir) -> str:
+    r"""The `sed` and the `git commit` that park one ticket in this checkout.
+
+    An uncommitted `epic-tasks/` is refused by `prepare_round` and an
+    uncommitted edit is invisible to the sessions, so the park is a `sed` and a
+    commit of that one file. The `**Status:**` line is addressed by its number
+    in *body*, not by a hard-coded 3. Built by concatenation: a 3.10 f-string
+    cannot hold the `\*` the sed expression needs.
+    """
+    file_ref = rel_dir + "/" + name
+    word = _status_of(body)
+    match = _STATUS_RE.search(body)
+    line_no = body[:match.start()].count("\n") + 1 if match else 0
+    if line_no:
+        sed = "'" + str(line_no) + "s/^\\*\\*Status:\\*\\* " + word + "/**Status:** queued/'"
+    else:
+        sed = "'1s/^/**Status:** queued\\n/'"
+    message = rel_dir + ": " + _title_id(body, name) + " queued — round " \
+        + str(number) + " runs elsewhere"
+    return "sed -i " + sed + " " + file_ref + " && git commit -m '" + message + "' -- " + file_ref
+
+
+def _on_offer(body, rel_dir, name, number, wanted, argv, base_ref, base_is_head) -> list:
+    """The four `intake:` lines for one lower ticket that is still on offer.
+
+    The first names the ticket the sessions would get and why; the next two are
+    the two ways out, each indented two spaces so every line still lands under
+    the one `intake:` prefix `intake` prints.
+    """
+    file_ref = rel_dir + "/" + name
+    label = _label(body, name, number)
+    status = _status_of(body)
+    lines = [
+        label + " is on offer ahead of " + wanted + " — the session prompt names no ticket; "
+        + "scripts/next_task.py would hand the sessions " + label,
+        "  " + "planned for the sessions:".ljust(26) + file_ref
+        + " (**Status:** " + (status or "missing") + ")",
+        "  " + "run that one instead:".ljust(26) + _run_line(argv, number),
+    ]
+    if base_is_head:
+        lines.append("  " + "or park it, then re-run:".ljust(26) +
+                     _park_line(body, name, number, rel_dir))
+    else:
+        lines.append("  or park it in a commit reachable from --base " + str(base_ref)
+                     + " (the sessions read " + rel_dir + "/ from there, not from this checkout)")
+    return lines
+
+
 @dataclass(frozen=True)
 class Intake:
     """The round, once `intake` has checked it: what `cmd_run` runs it from."""
@@ -160,41 +270,32 @@ class Intake:
     out_dir: Path
 
 
-def intake(repo, tasks_dir, round_no, base_ref, config):
+def intake(repo, tasks_dir, round_no, base_ref, config, argv=None):
     """Run every pre-round check; return the `Intake`, or `None` with the failures printed.
 
     All checks run and every failure goes to stderr on its own line before
-    anything is created, in this order: the ticket exists and its `**Status:**`
-    first word is `open`; every lower-numbered `open` ticket is named, because
-    the runner's prompt does not name a ticket and `scripts/next_task.py` would
-    hand that one to the session; the base resolves and `epic-tasks/` is clean
-    at it — `workspace.prepare_round` with an empty roster runs exactly KC-4's
-    check and builds nothing; and the server answers — the `kilo` binary
-    resolves when the roster says `spawn`, else `KiloServer.attach` reaches
-    the URL. `Intake.out_dir` is the default `<out_dir>/<NN>`; `--out` replaces
-    it in `cmd_run`.
+    anything is created, in this order: the base resolves and `epic-tasks/` is
+    clean at it — `workspace.prepare_round` with an empty roster runs exactly
+    KC-4's check and builds nothing; the ticket exists and its `**Status:**`
+    first word is `open`; no lower-numbered ticket is still on offer, and each
+    of those is named with the two ways past it, because the runner's prompt
+    does not name a ticket and `scripts/next_task.py` would hand that one to
+    the session; and the server answers — the `kilo` binary resolves when the
+    roster says `spawn`, else `KiloServer.attach` reaches the URL.
+    `Intake.out_dir` is the default `<out_dir>/<NN>`; `--out` replaces it in
+    `cmd_run`.
+
+    Every status read is from the base tree, not from this checkout: the
+    sessions read `epic-tasks/` from the worktree built at the base, so the two
+    only agree on a word when the base is HEAD. A base that does not resolve
+    yields no tree to read, so the checkout stands in for the ticket checks and
+    the `WorkspaceError` line is the base's own failure. *argv* is this
+    invocation's, for the printed `run` line; `None` means `sys.argv[1:]`.
     """
     repo, tasks_dir = Path(repo), Path(tasks_dir)
     failures: list = []
-
-    found = gates.ticket_for_round(tasks_dir, round_no)
-    ticket_path = tasks_dir / found[0] if found[0] else None
-    title = ""
-    if ticket_path is None or not ticket_path.is_file():
-        failures.append(f"no ticket numbered {round_no} in {tasks_dir}")
-    else:
-        title = found[1]
-        status = _status(ticket_path)
-        if status != OPEN:
-            failures.append(
-                f"{ticket_path.name} is not open (**Status:** {status or 'missing'}) — "
-                "only an open ticket is on offer"
-            )
-        for number, path, state in _tickets(tasks_dir):
-            if state == OPEN and number < round_no:
-                failures.append(
-                    f"{_label(path, number)} is open too — set it to queued or run it first"
-                )
+    argv = list(argv) if argv else list(sys.argv[1:])
+    rel_dir = tasks_dir.name
 
     base_sha = ""
     try:
@@ -202,6 +303,39 @@ def intake(repo, tasks_dir, round_no, base_ref, config):
         base_sha = gates.git(str(repo), "rev-parse", "--verify", f"{base_ref}^{{commit}}")
     except WorkspaceError as exc:
         failures.append(str(exc))
+    # the sessions read `epic-tasks/` from the base's tree; without a base to
+    # read from the checkout stands in for those reads, and the line above says
+    # why the base is unusable
+    at = base_sha or None
+
+    found = gates.ticket_for_round(tasks_dir, round_no)
+    name = found[0]
+    ticket_path = tasks_dir / name if name else None
+    title = ""
+    if ticket_path is None or not ticket_path.is_file():
+        failures.append(f"no ticket numbered {round_no} in {tasks_dir}")
+    else:
+        title = found[1]
+        body = _ticket_body(tasks_dir, name, at)
+        if at and not body:
+            # not in the base tree: the checkout copy stands in for its status
+            body = _ticket_body(tasks_dir, name, None)
+        status = _status_of(body)
+        if status != OPEN:
+            failures.append(
+                f"{name} is not open (**Status:** {status or 'missing'}) — "
+                "only an open ticket is on offer"
+            )
+        wanted = _label(body, name, round_no)
+        head_sha = gates.git(str(repo), "rev-parse", "HEAD") if base_sha else ""
+        base_is_head = bool(base_sha) and base_sha == head_sha
+        for number, path, state, lower_body in _tickets(tasks_dir, at):
+            if state.startswith(PARKED) or number >= round_no:
+                continue
+            failures.extend(
+                _on_offer(lower_body, rel_dir, path.name, number, wanted, argv,
+                          base_ref, base_is_head)
+            )
 
     if config.server == "spawn":
         try:
@@ -350,7 +484,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     config = _apply_flags(config, args)
     run_tests = not args.no_tests
 
-    result = intake(repo, tasks_dir, args.ticket, args.base, config)
+    result = intake(repo, tasks_dir, args.ticket, args.base, config,
+                    argv=getattr(args, "argv", None))
     if result is None:
         return EXIT_FAILED
     out_dir = Path(args.out).resolve() if args.out else result.out_dir
@@ -450,4 +585,7 @@ def main(argv=None) -> int:
     # view of a live round: `live_smoke.py` configures the same
     logging.basicConfig(level=logging.INFO, stream=sys.stderr,
                         format="%(asctime)s %(name)s %(message)s")
+    # this invocation's argv, so intake can print the `run` line with the
+    # blocked ticket's number in it instead of re-deriving the command
+    args.argv = list(argv) if argv else list(sys.argv[1:])
     return args.func(args)

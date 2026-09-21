@@ -9,9 +9,9 @@ them: `run_tests` is the `tools/contest/runner.py` thread covered in
 `tests/test_contest_runner.py`, and the one test that leaves the roots on runs
 them in a temp worktree, not in this repo's own `tests/`.
 
-The ticket's H1 here is `# 01 — first`, so `intake`'s "in the way" line reads
-`01 (1) is open too — …`; a real ticket with `# KC-7 — …` reads
-`KC-7 (46) is open too — …`, the same line either way.
+The ticket's H1 here is `# 01 — first`, so `intake`'s "on offer ahead" line
+reads `01 (1) is on offer ahead of 02 (2) — …`; a real ticket with `# KC-7 — …`
+reads `KC-7 (46) is on offer ahead of …`, the same four lines either way.
 """
 
 from __future__ import annotations
@@ -94,7 +94,7 @@ class Sandbox:
     """A repo with a base commit, a committed `epic-tasks/` of two open tickets
     and a roster of two agents, whose worktrees go outside it."""
 
-    def __init__(self, tmp_path, agents=("agent-a", "agent-b")):
+    def __init__(self, tmp_path, agents=("agent-a", "agent-b"), tickets=None):
         self.tmp = tmp_path
         self.repo = tmp_path / "repo"
         self.rounds = tmp_path / "rounds"
@@ -107,10 +107,12 @@ class Sandbox:
         _write(self.repo / "pkg" / "__init__.py", "")
         _write(self.repo / "pkg" / "thing.py", "def thing():\n    return 1\n")
         _write(self.repo / "tests" / "test_base.py", "def test_base():\n    assert True\n")
-        _write(self.repo / ".gitignore", "contest-out/\nruns/\n__pycache__/\n")
-        _write(self.repo / "epic-tasks" / TICKET_01, _ticket("01", "first"))
-        _write(self.repo / "epic-tasks" / TICKET_02, _ticket("02", "second"))
+        _write(self.repo / ".gitignore", "contest-out/\nruns/\n__pycache__/")
+        for name, body in tickets or ((TICKET_01, _ticket("01", "first")),
+                                      (TICKET_02, _ticket("02", "second"))):
+            _write(self.repo / "epic-tasks" / name, body)
         _write(self.repo / "contest.ini", self._roster(agents))
+
 
         _git(self.repo, "init", "-q", "-b", "main")
         _git(self.repo, "config", "user.email", "cli@example.invalid")
@@ -305,11 +307,20 @@ def _patches(stdout: str) -> list:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def test_intake_rejects_a_ticket_that_is_not_the_lowest_open_one(sandbox, capsys):
-    """`--ticket 2` with `01` still open: in the way, named, nothing created."""
+    """`--ticket 2` with `01` still on offer: four lines, the two ways out,
+    nothing created."""
     code = cli.main(["run", "--ticket", "2", "--no-tests", "--no-gate"])
     captured = capsys.readouterr()
+    lines = [line for line in captured.err.splitlines() if line.startswith("intake:")]
     assert code == 1
-    assert "01 (1) is open too — set it to queued or run it first" in captured.err
+    assert len(lines) == 4
+    assert lines[0] == ("intake: 01 (1) is on offer ahead of 02 (2) — the session prompt names no "
+                        "ticket; scripts/next_task.py would hand the sessions 01 (1)")
+    assert lines[1] == "intake:   planned for the sessions: epic-tasks/01-first.md " \
+                       "(**Status:** open)"
+    assert "--ticket 1 --no-tests --no-gate" in lines[2]
+    assert lines[3].startswith("intake:   or park it, then re-run:  sed -i")
+    assert lines[3].rstrip().endswith("epic-tasks/01-first.md")
     assert not (sandbox.rounds / f"{ROUND:02d}-agent-a").exists()
     assert not sandbox.out().exists()
 
@@ -361,7 +372,7 @@ def test_intake_reports_every_failure_at_once(sandbox, capsys):
     code = cli.main(["run", "--ticket", "2", "--base", "no-such-ref", "--no-tests", "--no-gate"])
     captured = capsys.readouterr()
     assert code == 1
-    assert "01 (1) is open too" in captured.err
+    assert "01 (1) is on offer ahead of 02 (2)" in captured.err
     assert "does not resolve" in captured.err
 
 
@@ -372,6 +383,251 @@ def test_intake_names_a_server_that_does_not_answer(sandbox, capsys):
     captured = capsys.readouterr()
     assert result is None
     assert "not healthy" in captured.err
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KC-24: the ticket on offer ahead, and the two ways out
+# ─────────────────────────────────────────────────────────────────────────────
+
+KC24_ROUND = 54
+KC53 = "53-kc14-harvest-accepts-only-a-hex-sha.md"
+KC54 = "54-kc15-a-bash-redirect-outside-the-worktree.md"
+KC53_TITLE = "harvest accepts only a hex sha"
+KC54_TITLE = "a bash redirect outside the worktree"
+
+KC_TICKET = """# KC-{tag} — {title}
+
+**Status:** {status} — round {num} of the KC-24 intake test.
+**Severity:** LOW
+**File:** `pkg/thing.py`
+**Symbol:** `thing`
+**Round:** {num}
+**Size:** S
+**Also touches:** `tests/test_thing.py` (new)
+
+body
+"""
+
+
+def _kc_ticket(tag, title, num, status="open") -> str:
+    return KC_TICKET.format(tag=tag, title=title, num=num, status=status)
+
+
+def _kc_sandbox(tmp_path, status_53="open", status_54="open") -> Sandbox:
+    """The ticket's Acceptance sandbox: 53 ahead of 54, both on offer at HEAD."""
+    return Sandbox(tmp_path, tickets=[
+        (KC53, _kc_ticket("14", KC53_TITLE, "53", status_53)),
+        (KC54, _kc_ticket("15", KC54_TITLE, "54", status_54)),
+    ])
+
+
+def _park_line(captured) -> str:
+    """The printed park command, the `intake:` prefix and the label cut off."""
+    (line,) = [line for line in captured.err.splitlines() if line.startswith("intake:   or park it")]
+    return line.split("re-run:", 1)[1].strip()
+
+
+def test_intake_names_the_ticket_the_sessions_would_get_and_both_ways_out(
+        tmp_path, monkeypatch, capsys, spawn_holder):
+    """53 on offer ahead of 54: four `intake:` lines, a `run` line naming 53,
+    a `sed` on 53's own status line number, and no `kilo serve` spawned."""
+    sb = _kc_sandbox(tmp_path)
+    monkeypatch.chdir(sb.repo)
+
+    code = cli.main(["run", "--ticket", "54", "--models", "x", "--max-parallel", "2"])
+
+    captured = capsys.readouterr()
+    lines = [line for line in captured.err.splitlines() if line.startswith("intake:")]
+    assert code == cli.EXIT_FAILED
+    assert len(lines) == 4
+    assert lines[0] == ("intake: KC-14 (53) is on offer ahead of KC-15 (54) — the session prompt "
+                        "names no ticket; scripts/next_task.py would hand the sessions KC-14 (53)")
+    assert lines[1] == ("intake:   planned for the sessions: epic-tasks/" + KC53
+                        + " (**Status:** open)")
+    label, _, run_cmd = lines[2].partition("python3 -m tools.contest ")
+    assert " ".join(label.split()) == "intake: run that one instead:"
+    assert run_cmd.strip() == "run --ticket 53 --models x --max-parallel 2"
+    park = _park_line(captured)
+    assert park == ("sed -i '3s/^\\*\\*Status:\\*\\* open/**Status:** queued/' epic-tasks/" + KC53
+                    + " && git commit -m 'epic-tasks: KC-14 queued — round 53 runs elsewhere' "
+                      "-- epic-tasks/" + KC53)
+    assert lines[3] == "intake:   or park it, then re-run:  " + park
+    assert not spawn_holder, "no kilo serve may be started"
+    assert not (sb.rounds / f"{KC24_ROUND:02d}-x").exists()
+    assert not (sb.repo / "contest-out" / f"{KC24_ROUND:02d}").exists()
+
+
+def test_intake_prints_one_block_per_ticket_on_offer_lowest_first(tmp_path, monkeypatch, capsys):
+    sb = Sandbox(tmp_path, tickets=[
+        ("52-kc12-stall-detection.md", _kc_ticket("12", "stall detection", "52")),
+        (KC53, _kc_ticket("14", KC53_TITLE, "53")),
+        (KC54, _kc_ticket("15", KC54_TITLE, "54")),
+    ])
+    monkeypatch.chdir(sb.repo)
+
+    code = cli.main(["run", "--ticket", "54", "--no-tests", "--no-gate"])
+
+    captured = capsys.readouterr()
+    lines = [line for line in captured.err.splitlines() if line.startswith("intake:")]
+    assert code == cli.EXIT_FAILED
+    assert len(lines) == 8
+    assert lines[0] == ("intake: KC-12 (52) is on offer ahead of KC-15 (54) — the session prompt "
+                        "names no ticket; scripts/next_task.py would hand the sessions KC-12 (52)")
+    assert lines[4] == ("intake: KC-14 (53) is on offer ahead of KC-15 (54) — the session prompt "
+                        "names no ticket; scripts/next_task.py would hand the sessions KC-14 (53)")
+    assert "--ticket 52 --no-tests --no-gate" in lines[2]
+    assert "--ticket 53 --no-tests --no-gate" in lines[6]
+
+
+def test_intake_refuses_a_ticket_on_offer_that_is_not_open(tmp_path, monkeypatch, capsys):
+    """`running` is not in `PARKED`, so it blocks exactly as `open` does."""
+    sb = _kc_sandbox(tmp_path, status_53="running")
+    monkeypatch.chdir(sb.repo)
+
+    code = cli.main(["run", "--ticket", "54", "--no-tests", "--no-gate"])
+
+    captured = capsys.readouterr()
+    assert code == cli.EXIT_FAILED
+    assert "KC-14 (53) is on offer ahead of KC-15 (54)" in captured.err
+    assert "epic-tasks/" + KC53 + " (**Status:** running)" in captured.err
+
+
+def test_intake_passes_once_the_ticket_ahead_is_queued(tmp_path, monkeypatch, capsys):
+    """`queued` is in `PARKED`: the pre-KC-24 behaviour, unchanged."""
+    sb = _kc_sandbox(tmp_path, status_53="queued")
+    monkeypatch.chdir(sb.repo)
+
+    result = cli.intake(sb.repo, sb.repo / "epic-tasks", KC24_ROUND, "HEAD", sb.config())
+
+    captured = capsys.readouterr()
+    assert result is not None
+    assert captured.err == ""
+    assert result.ticket_path.name == KC54
+    assert result.title == "KC-15 — " + KC54_TITLE
+
+
+def test_intake_replaces_the_ticket_of_the_equal_spelling(tmp_path, monkeypatch, capsys):
+    """`--ticket=54` → the printed `run` line carries `--ticket=53`."""
+    sb = _kc_sandbox(tmp_path)
+    monkeypatch.chdir(sb.repo)
+
+    code = cli.main(["run", "--ticket=54", "--no-tests", "--no-gate"])
+
+    captured = capsys.readouterr()
+    assert code == cli.EXIT_FAILED
+    line = next(line for line in captured.err.splitlines() if "tools.contest run" in line)
+    assert "python3 -m tools.contest run --ticket=53 --no-tests --no-gate" in line
+
+
+def test_intake_reads_the_status_from_the_base_not_the_checkout(tmp_path, monkeypatch, capsys):
+    """HEAD has 53 open and `parked` parks it: `--base parked` passes intake and
+    the bare `run` refuses — the checkout's word is not the sessions'."""
+    sb = _kc_sandbox(tmp_path)
+    monkeypatch.chdir(sb.repo)
+    _git(sb.repo, "checkout", "-q", "-b", "parked")
+    sb.commit_ticket(KC53, _kc_ticket("14", KC53_TITLE, "53", "queued"))
+    _git(sb.repo, "checkout", "-q", "main")
+
+    result = cli.intake(sb.repo, sb.repo / "epic-tasks", KC24_ROUND, "parked", sb.config())
+    assert result is not None
+    assert capsys.readouterr().err == ""
+
+    code = cli.main(["run", "--ticket", "54", "--no-tests", "--no-gate"])
+    captured = capsys.readouterr()
+    assert code == cli.EXIT_FAILED
+    assert "KC-14 (53) is on offer ahead of KC-15 (54)" in captured.err
+    assert "sed -i" in captured.err, "the base is HEAD: the park is the sed"
+
+
+def test_intake_refuses_when_the_base_has_the_ticket_on_offer(tmp_path, monkeypatch, capsys):
+    """The reverse layout: 53 parked at HEAD, open on `parked`. The bare `run`
+    passes and `--base parked` refuses — with the park line in the one-sentence
+    form, since a `sed` in this checkout would not reach the sessions."""
+    sb = _kc_sandbox(tmp_path, status_53="queued")
+    monkeypatch.chdir(sb.repo)
+    _git(sb.repo, "checkout", "-q", "-b", "parked")
+    sb.commit_ticket(KC53, _kc_ticket("14", KC53_TITLE, "53", "open"))
+    _git(sb.repo, "checkout", "-q", "main")
+
+    result = cli.intake(sb.repo, sb.repo / "epic-tasks", KC24_ROUND, "HEAD", sb.config())
+    assert result is not None
+    assert capsys.readouterr().err == ""
+
+    code = cli.main(["run", "--ticket", "54", "--base", "parked", "--no-tests", "--no-gate"])
+    captured = capsys.readouterr()
+    assert code == cli.EXIT_FAILED
+    assert "KC-14 (53) is on offer ahead of KC-15 (54)" in captured.err
+    assert "epic-tasks/" + KC53 + " (**Status:** open)" in captured.err
+    parked = [line for line in captured.err.splitlines() if "reachable from --base" in line]
+    assert len(parked) == 1
+    assert parked[0] == ("intake:   or park it in a commit reachable from --base parked "
+                         "(the sessions read epic-tasks/ from there, not from this checkout)")
+    assert "sed -i" not in captured.err
+
+
+def test_intake_reads_the_rounds_ticket_from_the_base(tmp_path, monkeypatch, capsys):
+    """The requested ticket's own status is the base's word too: `parked` has 54
+    as `queued`, so `--base parked` refuses it though this checkout says `open`."""
+    sb = _kc_sandbox(tmp_path, status_53="queued")
+    monkeypatch.chdir(sb.repo)
+    _git(sb.repo, "checkout", "-q", "-b", "parked")
+    sb.commit_ticket(KC54, _kc_ticket("15", KC54_TITLE, "54", "queued"))
+    _git(sb.repo, "checkout", "-q", "main")
+
+    result = cli.intake(sb.repo, sb.repo / "epic-tasks", KC24_ROUND, "HEAD", sb.config())
+    assert result is not None
+    assert capsys.readouterr().err == ""
+
+    code = cli.main(["run", "--ticket", "54", "--base", "parked", "--no-tests", "--no-gate"])
+    captured = capsys.readouterr()
+    assert code == cli.EXIT_FAILED
+    assert "intake: " + KC54 + " is not open (**Status:** queued)" in captured.err
+    assert "on offer ahead of" not in captured.err
+
+
+def test_the_printed_park_line_parks_the_ticket(tmp_path, monkeypatch, capsys):
+    """The `sed && git commit` intake prints is a real command: run it and the
+    round starts — the park needs the commit, not just the edit."""
+    sb = _kc_sandbox(tmp_path)
+    monkeypatch.chdir(sb.repo)
+
+    code = cli.main(["run", "--ticket", "54", "--no-tests", "--no-gate"])
+    captured = capsys.readouterr()
+    assert code == cli.EXIT_FAILED
+    park = _park_line(captured)
+    assert park.endswith("&& git commit -m 'epic-tasks: KC-14 queued — round 53 runs elsewhere' "
+                         "-- epic-tasks/" + KC53)
+
+    proc = subprocess.run(["bash", "-c", park], cwd=str(sb.repo), capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+
+    body = (sb.repo / "epic-tasks" / KC53).read_text(encoding="utf-8")
+    assert "**Status:** queued" in body and "**Status:** open" not in body
+    result = cli.intake(sb.repo, sb.repo / "epic-tasks", KC24_ROUND, "HEAD", sb.config())
+    captured = capsys.readouterr()
+    assert result is not None
+    assert captured.err == ""
+
+
+def test_intake_refuses_a_park_that_is_not_committed(tmp_path, monkeypatch, capsys):
+    """A `sed` without its commit is refused as a dirty `epic-tasks/`: that is
+    why the printed park line carries the commit."""
+    sb = _kc_sandbox(tmp_path)
+    monkeypatch.chdir(sb.repo)
+
+    code = cli.main(["run", "--ticket", "54", "--no-tests", "--no-gate"])
+    captured = capsys.readouterr()
+    assert code == cli.EXIT_FAILED
+    sed_only = _park_line(captured).split(" && ")[0]
+
+    proc = subprocess.run(["bash", "-c", sed_only], cwd=str(sb.repo),
+                          capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr
+
+    code = cli.main(["run", "--ticket", "54", "--no-tests", "--no-gate"])
+    captured = capsys.readouterr()
+    assert code == cli.EXIT_FAILED
+    assert "epic-tasks/ has uncommitted or untracked changes" in captured.err
 
 
 def test_agents_from_models_squeezes_the_name_and_keeps_its_own_provider():
