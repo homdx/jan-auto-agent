@@ -1,10 +1,8 @@
-# KC-34 — `tools/contest/backend.py`: abstract `KiloClient` behind a `ContestBackend` protocol so non-kilo providers (OpenRouter, plain OpenAI-compatible) can run in the same round
+# KC-34 — `tools/contest/backend.py`: abstract `KiloClient` behind a `ContestBackend` protocol so non-kilo providers (OpenRouter, plain OpenAI-compatible) can run in the same round; and a model listed twice in `--models` runs as `<name>-var1`, `<name>-var2`
 
 **Status:** open  
 **Severity:** HIGH  
-**File:** `tools/contest/backend.py` (new), `tools/contest/kilo_client.py`,
-`tools/contest/runner.py`, `tools/contest/roster.py`, `tools/contest/cli.py`,
-`contest.ini`  
+**File:** `tools/contest/backend.py` (new), `tools/contest/kilo_client.py`, `tools/contest/runner.py`, `tools/contest/roster.py`, `tools/contest/cli.py`, `contest.ini`  
 **Symbol:** `ContestBackend`, `KiloBackend`, `OpenRouterBackend`,
 `ContestConfig.backend`, `run_round`, `run_agent`, `agents_from_models`  
 **Round:** 73  
@@ -20,12 +18,16 @@ There is no path to run an agent against OpenRouter, a direct OpenAI-compatible
 endpoint, or any other non-kilo backend — even though `tools.llm_stream`
 already handles an OpenAI-compatible endpoint (which covers OpenRouter) and
 Ollama via `api_format`.
-Operators with openrouter keys and no kilo binary cannot run a round at all.  
+Operators with openrouter keys and no kilo binary cannot run a round at all.
+A second gap in the same function (§7): `--models a:free,hy3:free,hy3:free`
+builds two `AgentSpec`s both named `hy3` — the name is the id without its
+`:tag` — and the name is the branch, the worktree folder, `runs/<name>/` and
+`<name>.patch`, so both agents share one checkout and one branch and the
+round still exits 0. `contest.ini` rejects a duplicate agent name
+(`roster.py:300-301`); the `--models` path has no such check.  
 **Depends on:** KC-6 (`run_agent`, `run_round`, landed `e8c6ad3`),
 KC-16 (`cli.py` `cmd_run` / `agents_from_models`, landed `1304950`).  
-**Also touches:** `tests/test_contest_backend.py` (new),
-`tests/test_contest_runner.py` (extend), `tests/_kilo_fake.py` (extend with
-a minimal OpenRouter fake)
+**Also touches:** `tests/test_contest_backend.py` (new), `tests/test_contest_runner.py` (extend), `tests/test_contest_roster.py` (extend), `tests/test_contest_cli.py` (extend, §7), `tests/_kilo_fake.py` (extend with a minimal OpenRouter fake)
 
 ---
 
@@ -311,6 +313,82 @@ model    =                      ; unused here — OpenRouterBackend gets its
                                  ; from this section
 ```
 
+### 7. `cli.py` — a model listed twice runs as `<name>-var1`, `<name>-var2`
+
+Today (checked on `kc` at `9912b78`: `--models x:free,x:free` through the
+KC-16 test fake): `agents_from_models` returns two specs both named `x`;
+`prepare_round` builds **one** worktree (`rounds/01-x`) and one branch
+(`contest/01/x`); `run_round` opens two Kilo sessions in that one directory
+under the same title; the result table prints two `x` rows carrying the same
+commit; one `x.patch` is written; the exit code is 0 and nothing warns that
+two agents shared a checkout. The agent name is the only key the contest
+uses — `contest/<NN>/<name>`, `<NN>-<name>`, `runs/<name>/PROGRESS.csv`,
+`<name>.patch`, the `{name}` in the runner's prompt — and none of it assumes
+the name is the model's slug, so the fix belongs in one place: the function
+that makes the names. `_apply_flags` stays as §5 sketches it.
+
+The rule, in `agents_from_models`:
+
+- a name that appears **once** in `--models` stays as it is (`hy3`) —
+  today's behaviour, folders included;
+- a name that appears **more than once** becomes `<name>-var1`,
+  `<name>-var2`, … in list order. "Same name" means the squeezed name, i.e.
+  the id without its `:tag`: `hy3:free,hy3:pro` are variants too, and so are
+  `kenary/hy3:free,openrouter/hy3:free` (each keeps its own provider);
+- a variant never lands on a name the list already holds:
+  `hy3-var1:free,hy3:free,hy3:free` → `hy3-var1`, `hy3-var2`, `hy3-var3`;
+- the names are a pure function of the `--models` string, so `--resume` with
+  the same string finds the same agents in `state.json`.
+
+The operator's own command line:
+
+```
+python3 -m tools.contest run --ticket 63 --max-parallel 8 \
+  --models agnes-2-5-flash:free,mimo-v2-5:free,step-3-7-flash:free,hy3:free,hy3:free
+```
+
+runs five agents in `<rounds_dir>/63-agnes-2-5-flash`, `63-mimo-v2-5`,
+`63-step-3-7-flash`, `63-hy3-var1` and `63-hy3-var2`, on the branches
+`contest/63/hy3-var1` and `contest/63/hy3-var2` (and one per other agent),
+and exports `hy3-var1.patch` and `hy3-var2.patch`. With `hy3:free` listed
+once it is `63-hy3` and `hy3.patch`, exactly as now.
+
+A reference shape — checked against the KC-16 sandbox, red on the base and
+green with it; use it or an equivalent:
+
+```python
+from collections import Counter
+
+def agents_from_models(models: str, provider: str = "kenary") -> tuple:
+    parsed = []
+    for item in filter(None, (m.strip() for m in models.split(","))):
+        prov, _, model_id = item.rpartition("/")
+        name = "".join(c if c.isalnum() or c in "_-" else "-"
+                       for c in model_id.split(":")[0].lower())
+        parsed.append((name.lstrip("_-"), prov or provider, model_id))
+
+    counts = Counter(name for name, _, _ in parsed)
+    taken = {name for name, count in counts.items() if count == 1}
+    last: dict = {}
+    specs = []
+    for name, prov, model_id in parsed:
+        if counts[name] > 1:
+            number = last.get(name, 0)
+            while True:
+                number += 1
+                candidate = f"{name}-var{number}"
+                if candidate not in taken:
+                    break
+            last[name] = number
+            taken.add(candidate)
+            name = candidate
+        specs.append(AgentSpec(name=name, provider_id=prov, model_id=model_id))
+    return tuple(specs)
+```
+
+The docstring says the function is "copied from
+`contest-bench/kc6/live_smoke.py`"; say what it now does beyond the copy.
+
 ## Open question — needs a decision before implementation
 
 `on_permission`/`on_question` (see the corrected protocol in §1) are how
@@ -369,7 +447,33 @@ Acceptance list below doesn't yet test either path.
 - [ ] `tests/test_contest_cli.py` — extend:
   - `--backend openrouter` sets `config.backend == "openrouter"`;
   - `agents_from_models("agnes-2-5-flash:free", provider="openrouter")`
-    produces `provider_id="openrouter"`.
+    produces `provider_id="openrouter"`;
+  - §7, guards (green on the base by design — they pin today's behaviour):
+    `agents_from_models("hy3:free")` → name `hy3`; `"x:free,y:free"` →
+    `x`, `y`; and `--models x:free` through `cli.main` still gives the one
+    folder `01-x` and `x.patch`;
+  - §7, `agents_from_models("hy3:free,hy3:free")` → names `hy3-var1`,
+    `hy3-var2`, both `kenary/hy3:free`;
+  - §7, only the repeated name is suffixed and list order holds: the
+    five-model `--models` value of the example above → `agnes-2-5-flash`,
+    `mimo-v2-5`, `step-3-7-flash`, `hy3-var1`, `hy3-var2`; and
+    `"hy3:free,x:free,hy3:free,hy3:free"` → `hy3-var1`, `x`, `hy3-var2`,
+    `hy3-var3`;
+  - §7, the name drops the tag: `"hy3:free,hy3:pro"` → `hy3-var1`,
+    `hy3-var2`, with `model_id` `hy3:free` and `hy3:pro`;
+  - §7, a variant skips a name the list already holds:
+    `"hy3-var1:free,hy3:free,hy3:free"` → `hy3-var1`, `hy3-var2`, `hy3-var3`;
+  - §7, providers: `"kenary/hy3:free,openrouter/hy3:free"` → `hy3-var1` on
+    kenary, `hy3-var2` on openrouter; `provider="openrouter"` applies to
+    every variant of `"hy3:free,hy3:free"`;
+  - §7, end to end, `cli.main(["run", "--ticket", "1", "--models",
+    "x:free,x:free", "--max-parallel", "2", "--no-gate", "--no-tests"])`
+    against the fake: exit 0; exactly the folders `01-x-var1` and
+    `01-x-var2` under the rounds dir; exactly the branches
+    `contest/01/x-var1` and `contest/01/x-var2`; two Kilo sessions; two
+    `state.table_rows()` lines named `x-var1` and `x-var2`; and
+    `x-var1.patch` and `x-var2.patch` in the out dir. Red on the base, where
+    the one folder is `01-x`.
 - [ ] Every existing test unmodified and green.
 - [ ] `python3 -m pytest tests -n 4 -q --timeout=180 && python3 -m pytest tests_bugfix -n 4 -q --timeout=180` green.
 - [ ] `python3 -m tools.contest run --ticket NN --backend openrouter --models agnes-2-5-flash:free` is a valid invocation (intake passes, `OpenRouterBackend` is constructed).
@@ -390,11 +494,20 @@ Acceptance list below doesn't yet test either path.
   see the Open Question above. Leave `policy.py`'s own code untouched, but
   don't read "no change needed" as "no decision needed" for how
   `OpenRouterBackend` feeds it.
+- §7 is `agents_from_models` only. `_print_plan` keeps printing
+  `provider/model` per agent (`tests/test_contest_cli.py` pins that line for
+  a roster without repeats); the variant names show in the folders, the
+  result rows and `<name>.patch`. The roster's INI path still rejects a
+  duplicate `[contest.agent.<name>]` section (`roster.py:300-301`) — the same
+  model twice from `contest.ini` means two named sections. The bench
+  script's own copy in `contest-bench/kc6/live_smoke.py` is left as it is.
 
 ## Self-check before `append_task.py`
 
 - [ ] `python3 --version` on the judge is **3.10.12**;
       `python3 -c "from tools.contest.backend import ContestBackend, KiloBackend, OpenRouterBackend"` clean.
+- [ ] `python3 -c "from tools.contest.cli import agents_from_models as f; print([a.name for a in f('hy3:free,hy3:free')])"`
+      prints `['hy3-var1', 'hy3-var2']`.
 - [ ] Exactly **one** commit; only the files listed in `**File:**` and the test files touched.
 - [ ] `git diff --stat <base>..HEAD` names only `tools/contest/backend.py` (new),
       `tools/contest/kilo_client.py`, `tools/contest/runner.py`,
@@ -403,7 +516,8 @@ Acceptance list below doesn't yet test either path.
       `tests/test_contest_roster.py`, `tests/test_contest_cli.py`
       (plus `.smoke_tests/` links). Never `epic-tasks/`.
 - [ ] `python3 scripts/sync_test_tiers.py --check` clean.
-- [ ] New tests red without the change.
+- [ ] New tests red without the change — except the §7 single-model guards,
+      which pin today's behaviour and are green on the base by design.
 - [ ] `python3 -m pytest tests -n 4 -q --timeout=180` then
       `python3 -m pytest tests_bugfix -n 4 -q --timeout=180`, sequentially, both green.
 - [ ] `CollectBridge._shrink` byte-identical.
