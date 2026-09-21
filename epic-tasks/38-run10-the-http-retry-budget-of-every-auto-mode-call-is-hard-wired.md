@@ -112,7 +112,7 @@ with a malformed-value warning and the library default as fallback.
       `LLM retry budget [loop]:` line with the resolved numbers.
 - [ ] `agents.ini` and `agents_128k.ini` (committed version) carry the
       three `[loop]` keys; `[collect]`'s comment says "Pass B only".
-- [ ] `python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180` green (run sequentially).
+- [ ] `python3 -m pytest tests -n 4 -q --timeout=180 && python3 -m pytest tests_bugfix -n 4 -q --timeout=180` green (run sequentially).
 
 ## Out of scope
 

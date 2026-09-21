@@ -82,7 +82,7 @@ roster.
 - [ ] `tests/test_contest_kilo_client.py` gains `delete_session` (200 →
       `None`; 404 → `KiloHttpError`) and `create_session(variant=)`;
       no existing line removed.
-- [ ] `python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180` green.
+- [ ] `python3 -m pytest tests -n 4 -q --timeout=180 && python3 -m pytest tests_bugfix -n 4 -q --timeout=180` green.
 
 ## Out of scope
 

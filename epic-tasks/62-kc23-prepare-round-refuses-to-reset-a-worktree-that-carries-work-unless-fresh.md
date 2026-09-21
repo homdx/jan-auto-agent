@@ -51,7 +51,7 @@
       commit and `PROGRESS.csv` is exactly the behaviour this ticket removes;
       asserting the old silent reset would contradict the fix. `remove_round`
       and `ensure_clone` are untouched.
-- [ ] `python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180` green (sequentially).
+- [ ] `python3 -m pytest tests -n 4 -q --timeout=180 && python3 -m pytest tests_bugfix -n 4 -q --timeout=180` green (sequentially).
 
 ## Out of scope
 
@@ -73,8 +73,8 @@
       links). Never `epic-tasks/`.
 - [ ] `python3 scripts/sync_test_tiers.py --check` is clean.
 - [ ] The new tests are red without the change.
-- [ ] `python3 -m pytest tests -q --timeout=180` then
-      `python3 -m pytest tests_bugfix -q --timeout=180`, **sequentially**,
+- [ ] `python3 -m pytest tests -n 4 -q --timeout=180` then
+      `python3 -m pytest tests_bugfix -n 4 -q --timeout=180`, **sequentially**,
       both green.
 - [ ] `CollectBridge._shrink` byte-identical.
 - [ ] `scripts/append_task.py` from the worktree with the **sha** of the

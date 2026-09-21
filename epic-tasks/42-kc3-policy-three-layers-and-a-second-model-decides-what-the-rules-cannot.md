@@ -119,7 +119,7 @@ events by geometry alone; the rest need a reader.
 - [ ] `grep -c '"always"' tools/contest/policy.py` counts only the
       docstring mention (assert in a test).
 - [ ] `record()` writes one line per decision with the listed keys.
-- [ ] `python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180` green.
+- [ ] `python3 -m pytest tests -n 4 -q --timeout=180 && python3 -m pytest tests_bugfix -n 4 -q --timeout=180` green.
 
 ## Out of scope
 

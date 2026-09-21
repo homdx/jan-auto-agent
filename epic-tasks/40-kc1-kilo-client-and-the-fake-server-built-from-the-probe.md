@@ -131,7 +131,7 @@ not from `/event`.
 - [ ] `tests/test_contest_kilo_client.py` covers the eight cases above;
       all carry the `port_bound_http_servers` group.
 - [ ] `scripts/kilo_hello.py` is untouched (matches the version referenced by `docs/kilo-contest/PROBE.md`, no diff).
-- [ ] `python3 scripts/sync_test_tiers.py` run; `python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180` green (sequentially).
+- [ ] `python3 scripts/sync_test_tiers.py` run; `python3 -m pytest tests -n 4 -q --timeout=180 && python3 -m pytest tests_bugfix -n 4 -q --timeout=180` green (sequentially).
 
 ## Out of scope
 

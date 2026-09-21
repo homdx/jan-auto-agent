@@ -73,7 +73,7 @@ the plan's membership is decided by provider silence.
       `trace_round_snapshot.py` prints it.
 - [ ] `presence_workers > 1` path (GATE1-PAR-1) carries the third outcome
       in order.
-- [ ] `python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180` green (run sequentially).
+- [ ] `python3 -m pytest tests -n 4 -q --timeout=180 && python3 -m pytest tests_bugfix -n 4 -q --timeout=180` green (run sequentially).
 
 ## Out of scope
 

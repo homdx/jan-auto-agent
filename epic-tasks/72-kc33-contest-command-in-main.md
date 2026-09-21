@@ -157,7 +157,7 @@ if user_input.startswith("/") and not user_input.startswith(
       - `/contest` does **not** match the unrecognized-slash guard.
 - [ ] `HELP_TEXT` contains the string `/contest run --ticket`.
 - [ ] Every existing test unmodified and green.
-- [ ] `python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180` green.
+- [ ] `python3 -m pytest tests -n 4 -q --timeout=180 && python3 -m pytest tests_bugfix -n 4 -q --timeout=180` green.
 
 ## Out of scope
 
@@ -175,8 +175,8 @@ if user_input.startswith("/") and not user_input.startswith(
       Never `epic-tasks/`.
 - [ ] `python3 scripts/sync_test_tiers.py --check` clean.
 - [ ] New tests red without the change.
-- [ ] `python3 -m pytest tests -q --timeout=180` then
-      `python3 -m pytest tests_bugfix -q --timeout=180`, sequentially, both green.
+- [ ] `python3 -m pytest tests -n 4 -q --timeout=180` then
+      `python3 -m pytest tests_bugfix -n 4 -q --timeout=180`, sequentially, both green.
 - [ ] `CollectBridge._shrink` byte-identical.
 - [ ] `scripts/append_task.py` with the sha of the one commit.
 

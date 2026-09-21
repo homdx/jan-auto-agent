@@ -48,7 +48,7 @@ price of one call out of the session's twenty.
       - `command: "echo x > /dev/shm/leak"` → still the gate (`/dev/shm` is
         a place; only the four devices are dropped).
 - [ ] Every existing test in `tests/test_contest_policy.py` unmodified and green.
-- [ ] `python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180` green.
+- [ ] `python3 -m pytest tests -n 4 -q --timeout=180 && python3 -m pytest tests_bugfix -n 4 -q --timeout=180` green.
 
 ## Out of scope
 
@@ -66,8 +66,8 @@ price of one call out of the session's twenty.
       and `tests/test_contest_policy.py` (plus `.smoke_tests/` links). Never `epic-tasks/`.
 - [ ] `python3 scripts/sync_test_tiers.py --check` is clean.
 - [ ] The new tests are red without the change.
-- [ ] `python3 -m pytest tests -q --timeout=180` then
-      `python3 -m pytest tests_bugfix -q --timeout=180`, **sequentially**,
+- [ ] `python3 -m pytest tests -n 4 -q --timeout=180` then
+      `python3 -m pytest tests_bugfix -n 4 -q --timeout=180`, **sequentially**,
       both green.
 - [ ] `CollectBridge._shrink` byte-identical.
 - [ ] `scripts/append_task.py` from the worktree with the **sha** of the

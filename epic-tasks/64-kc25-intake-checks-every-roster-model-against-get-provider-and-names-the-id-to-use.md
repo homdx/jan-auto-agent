@@ -83,7 +83,7 @@ provider four times.
 - [ ] Every existing intake test unmodified and green (the default fake
       answers `/provider` with the roster those tests use — adjust the
       fake's default, not the tests).
-- [ ] `python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180` green (sequentially).
+- [ ] `python3 -m pytest tests -n 4 -q --timeout=180 && python3 -m pytest tests_bugfix -n 4 -q --timeout=180` green (sequentially).
 
 ## Out of scope
 
@@ -109,8 +109,8 @@ provider four times.
       is 0 — KC-1's tests gain, never lose, lines.
 - [ ] `python3 scripts/sync_test_tiers.py --check` is clean.
 - [ ] The new tests are red without the change.
-- [ ] `python3 -m pytest tests -q --timeout=180` then
-      `python3 -m pytest tests_bugfix -q --timeout=180`, **sequentially**,
+- [ ] `python3 -m pytest tests -n 4 -q --timeout=180` then
+      `python3 -m pytest tests_bugfix -n 4 -q --timeout=180`, **sequentially**,
       both green.
 - [ ] `CollectBridge._shrink` byte-identical.
 - [ ] `scripts/append_task.py` from the worktree with the **sha** of the

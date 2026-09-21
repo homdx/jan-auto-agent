@@ -103,7 +103,7 @@ what the safety gate must use so that `api_key`, `base_url`, `api_format`,
 - [ ] `gate_settings` comes from `resolve_llm_profile` (assert by
       monkeypatching it) with `response_format` true by default.
 - [ ] `.gitignore` has `contest.local.ini` and `contest-out/`.
-- [ ] `python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180` green.
+- [ ] `python3 -m pytest tests -n 4 -q --timeout=180 && python3 -m pytest tests_bugfix -n 4 -q --timeout=180` green.
 
 ## Out of scope
 

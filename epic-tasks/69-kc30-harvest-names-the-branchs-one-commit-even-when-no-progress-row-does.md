@@ -33,7 +33,7 @@
 - [ ] `tests/test_contest_runner.py`: the KC-21 stall-on-a-rejected-commit test
       passes with `run.commit = verdict.commit` and no `rev-parse` in
       `runner.py`.
-- [ ] `python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180` green (sequentially).
+- [ ] `python3 -m pytest tests -n 4 -q --timeout=180 && python3 -m pytest tests_bugfix -n 4 -q --timeout=180` green (sequentially).
 
 ## Out of scope
 

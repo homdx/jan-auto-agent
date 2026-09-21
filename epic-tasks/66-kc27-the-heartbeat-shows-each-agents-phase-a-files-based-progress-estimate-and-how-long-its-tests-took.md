@@ -102,7 +102,7 @@ for the lock — is computed and dropped; `turn["harvest"]` keeps only
       and every other existing `tests/test_contest_runner.py` test
       unmodified and green: `from_dict` on a `state.json` **without**
       `elapsed` still loads.
-- [ ] `python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180` green.
+- [ ] `python3 -m pytest tests -n 4 -q --timeout=180 && python3 -m pytest tests_bugfix -n 4 -q --timeout=180` green.
 
 ## Out of scope
 
@@ -128,6 +128,6 @@ for the lock — is computed and dropped; `turn["harvest"]` keeps only
       byte-identical (not in this file — do not touch `tools/collect_bridge.py`).
 - [ ] `python3 scripts/sync_test_tiers.py --check` is clean.
 - [ ] The new tests are red without the change.
-- [ ] `python3 -m pytest tests -q --timeout=180` then
-      `python3 -m pytest tests_bugfix -q --timeout=180`, **sequentially**,
+- [ ] `python3 -m pytest tests -n 4 -q --timeout=180` then
+      `python3 -m pytest tests_bugfix -n 4 -q --timeout=180`, **sequentially**,
       both green.

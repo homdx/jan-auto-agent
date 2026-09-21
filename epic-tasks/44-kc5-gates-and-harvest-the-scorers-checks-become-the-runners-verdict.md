@@ -85,7 +85,7 @@ done; nothing today combines the claim with the facts.
       with a failing test → `tests_failed` and the tail in the text.
 - [ ] `rework_message` on a two-reason harvest contains both sentences,
       the attempt counter, and the word `append_task.py`.
-- [ ] `python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180` green.
+- [ ] `python3 -m pytest tests -n 4 -q --timeout=180 && python3 -m pytest tests_bugfix -n 4 -q --timeout=180` green.
 
 ## Out of scope
 

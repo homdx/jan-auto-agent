@@ -84,7 +84,7 @@ path at all falls through to layer 2 — one gate call per command.
         still beats the no-path rule);
       - `external_directory` with no paths still goes to the gate (existing
         behaviour, one test).
-- [ ] `python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180` green.
+- [ ] `python3 -m pytest tests -n 4 -q --timeout=180 && python3 -m pytest tests_bugfix -n 4 -q --timeout=180` green.
 
 ## Out of scope
 
@@ -121,8 +121,8 @@ the scorer checks all of them mechanically, so check them yourself first.
 - [ ] `python3 scripts/sync_test_tiers.py --check` is clean.
 - [ ] The new tests are red without the change: check the test files alone
       out onto the base, run them, see them fail; restore.
-- [ ] `python3 -m pytest tests -q --timeout=180` then
-      `python3 -m pytest tests_bugfix -q --timeout=180`, **sequentially**,
+- [ ] `python3 -m pytest tests -n 4 -q --timeout=180` then
+      `python3 -m pytest tests_bugfix -n 4 -q --timeout=180`, **sequentially**,
       both green.
 - [ ] `CollectBridge._shrink` byte-identical:
       `git diff <base> HEAD -- tools/auto/collect_bridge.py` is empty.

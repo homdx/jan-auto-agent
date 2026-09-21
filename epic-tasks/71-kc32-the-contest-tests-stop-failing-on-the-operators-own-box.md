@@ -35,7 +35,7 @@
       without one, it is green too.
 - [ ] The three timing tests pass with a `nice -n 19` CPU hog on every core
       (run them once under load and once quiet).
-- [ ] `python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180` green (sequentially).
+- [ ] `python3 -m pytest tests -n 4 -q --timeout=180 && python3 -m pytest tests_bugfix -n 4 -q --timeout=180` green (sequentially).
 
 ## Out of scope
 

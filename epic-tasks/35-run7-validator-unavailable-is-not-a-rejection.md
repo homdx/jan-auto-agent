@@ -90,7 +90,7 @@ path never adopted it.
       score is unchanged by it.
 - [ ] `_prior_validator_critique` after an unavailable call equals what it
       was before.
-- [ ] `python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180` green (run sequentially).
+- [ ] `python3 -m pytest tests -n 4 -q --timeout=180 && python3 -m pytest tests_bugfix -n 4 -q --timeout=180` green (run sequentially).
 
 ## Out of scope
 

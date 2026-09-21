@@ -57,7 +57,7 @@ After KC-21 the terminal branch reads (shape, not text):
 - [ ] `tests/test_contest_cli.py`: a round whose only agent is an aborted
       stall with a valid commit writes `<agent>.STALLED.patch` and exits
       non-zero.
-- [ ] `python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180` green (sequentially).
+- [ ] `python3 -m pytest tests -n 4 -q --timeout=180 && python3 -m pytest tests_bugfix -n 4 -q --timeout=180` green (sequentially).
 
 ## Out of scope
 

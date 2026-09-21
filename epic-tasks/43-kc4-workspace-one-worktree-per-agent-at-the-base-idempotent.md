@@ -90,7 +90,7 @@ means removing everything by hand first.
       and `git status` unchanged in every test).
 - [ ] `scripts/contest_reset.sh 40` on this repo (manual, in the PR text)
       prints three lines for the default roster.
-- [ ] `python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180` green.
+- [ ] `python3 -m pytest tests -n 4 -q --timeout=180 && python3 -m pytest tests_bugfix -n 4 -q --timeout=180` green.
 
 ## Out of scope
 

@@ -100,7 +100,7 @@ seen".
 - [x] `clear_task_deadline` tests (`tests_bugfix/test_bugfix_*deadline*.py`,
       5 files) still pass unchanged or with the minimal edit for the new
       file content.
-- [x] `python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180` green (run sequentially).
+- [x] `python3 -m pytest tests -n 4 -q --timeout=180 && python3 -m pytest tests_bugfix -n 4 -q --timeout=180` green (run sequentially).
 
 ## Out of scope
 

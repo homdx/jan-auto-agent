@@ -75,7 +75,7 @@ warning does not name it, and nothing in `--auto`'s startup output says
 - [x] `collect_refresh` event present in the trace with `modules` and `ok`.
 - [x] Existing `tests_bugfix/test_collect_bridge_stale_after_task_commit.py`
       unchanged and green.
-- [x] `python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180` green (run sequentially).
+- [x] `python3 -m pytest tests -n 4 -q --timeout=180 && python3 -m pytest tests_bugfix -n 4 -q --timeout=180` green (run sequentially).
 
 ## Out of scope
 

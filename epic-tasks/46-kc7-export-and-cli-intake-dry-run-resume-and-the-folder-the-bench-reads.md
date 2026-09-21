@@ -85,7 +85,7 @@ would still hand-write `entrants.json` and `format-patch` each branch.
 - [ ] `git am` of `laguna.patch` onto the base in a fresh temp worktree
       applies cleanly and reproduces the branch's tree.
 - [ ] `status` after the run prints the same table as `SUMMARY.md`'s.
-- [ ] `python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180` green.
+- [ ] `python3 -m pytest tests -n 4 -q --timeout=180 && python3 -m pytest tests_bugfix -n 4 -q --timeout=180` green.
 
 ## Out of scope
 

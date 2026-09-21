@@ -128,6 +128,6 @@ Two rules of thumb that paid off in RUN-9:
 
 * It does not run the entries' own test files, and it does not run the
   project suite — do that separately for the shortlist
-  (`python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180`,
+  (`python3 -m pytest tests -n 4 -q --timeout=180 && python3 -m pytest tests_bugfix -n 4 -q --timeout=180`,
   sequentially, inside the entry's worktree).
 * It does not read code. Part 2 (the ideal patch) does.

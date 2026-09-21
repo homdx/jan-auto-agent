@@ -127,7 +127,7 @@ the first module lands — up to 27 minutes into a 429 storm.
       `KeyboardInterrupt` from `action_refresh` propagates out of
       `_refresh_on_entry` (no `pack OFF` line, no `collect_refresh` event).
 - [ ] `agents.ini` `[collect]` names the checkpoint file.
-- [ ] `python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180` green (run sequentially).
+- [ ] `python3 -m pytest tests -n 4 -q --timeout=180 && python3 -m pytest tests_bugfix -n 4 -q --timeout=180` green (run sequentially).
 
 ## Out of scope
 

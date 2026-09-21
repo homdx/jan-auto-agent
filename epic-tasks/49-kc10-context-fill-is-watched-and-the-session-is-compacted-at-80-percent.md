@@ -70,7 +70,7 @@ only.
       same prompt again → `READY`; the same error twice → `ERROR`.
 - [ ] `turns.jsonl` lines carry `fill` and `compacted`; `SUMMARY.md` (KC-7)
       shows `fill%` at the last turn and the number of compactions.
-- [ ] `python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180` green.
+- [ ] `python3 -m pytest tests -n 4 -q --timeout=180 && python3 -m pytest tests_bugfix -n 4 -q --timeout=180` green.
 
 ## Out of scope
 

@@ -225,7 +225,7 @@ agent is actually better, accumulated over 24 rounds instead of guessed.
 ```bash
 git checkout competition
 git cherry-pick <winning sha>
-python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180
+python3 -m pytest tests -n 4 -q --timeout=180 && python3 -m pytest tests_bugfix -n 4 -q --timeout=180
 git worktree remove ../round-opus   # …and the rest
 ```
 

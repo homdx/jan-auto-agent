@@ -19,7 +19,7 @@ backlog) and executes tasks with a Coder, gates and validators. `--dry-run` and
 - `pip install -r requirements.txt` — optional Java parsing backend.
 - `python3 -m pytest .smoke_tests/` — fast pre-commit gate.
 - `python3 -m pytest .smoke_tests/ .regression_tests/` — full suite, each file once.
-- `python3 -m pytest tests_bugfix -q` — regression guards for fixed bugs.
+- `python3 -m pytest tests_bugfix -n 4 -q` — regression guards for fixed bugs.
 - `python3 scripts/sync_test_tiers.py` — regenerate tier symlinks (never by hand); `--check` verifies them.
 - `git config core.hooksPath githooks` — enable the pre-commit tier/stray-file hook.
 - `python3 -m tools.contest run --ticket NN` — the round; patches in `contest-out/NN/`.

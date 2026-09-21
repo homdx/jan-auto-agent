@@ -108,7 +108,7 @@ unrelated was touched, so there is nothing to reject.
       does not contain `coder failed`.
 - [x] Nothing in the SAFETY guard's *blocking* semantics changes: the file
       outside `target_files` is never written, not even partially.
-- [x] `python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180` green (run sequentially).
+- [x] `python3 -m pytest tests -n 4 -q --timeout=180 && python3 -m pytest tests_bugfix -n 4 -q --timeout=180` green (run sequentially).
 
 ## Ground rules (same as every round)
 

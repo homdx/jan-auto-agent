@@ -371,7 +371,7 @@ Acceptance list below doesn't yet test either path.
   - `agents_from_models("agnes-2-5-flash:free", provider="openrouter")`
     produces `provider_id="openrouter"`.
 - [ ] Every existing test unmodified and green.
-- [ ] `python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180` green.
+- [ ] `python3 -m pytest tests -n 4 -q --timeout=180 && python3 -m pytest tests_bugfix -n 4 -q --timeout=180` green.
 - [ ] `python3 -m tools.contest run --ticket NN --backend openrouter --models agnes-2-5-flash:free` is a valid invocation (intake passes, `OpenRouterBackend` is constructed).
 
 ## Out of scope
@@ -404,8 +404,8 @@ Acceptance list below doesn't yet test either path.
       (plus `.smoke_tests/` links). Never `epic-tasks/`.
 - [ ] `python3 scripts/sync_test_tiers.py --check` clean.
 - [ ] New tests red without the change.
-- [ ] `python3 -m pytest tests -q --timeout=180` then
-      `python3 -m pytest tests_bugfix -q --timeout=180`, sequentially, both green.
+- [ ] `python3 -m pytest tests -n 4 -q --timeout=180` then
+      `python3 -m pytest tests_bugfix -n 4 -q --timeout=180`, sequentially, both green.
 - [ ] `CollectBridge._shrink` byte-identical.
 - [ ] `scripts/append_task.py` with the sha of the one commit.
 

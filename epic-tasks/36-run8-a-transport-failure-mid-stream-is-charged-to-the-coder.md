@@ -72,7 +72,7 @@ when the *run* is stopped), so a single hung stream can end the task.
 - [ ] A NO-JSON reply is still `error_kind == "parse"`, still consumes the attempt, still climbs the RUN-4 ladder — the ladder tests in `tests/test_run4_coder_budget_ladder.py` are unchanged.
 - [ ] Deadline credit: with `max_task_seconds` = 10 and a patched clock that advances 8 s inside the failing call, the next attempt is still allowed (the deadline moved by 8 s); with the same 8 s inside a *parsed* reply it is charged.
 - [ ] Outer loop: `unavailable` result → task `todo`, no `feedback_round_1.md`, no `knowledge.md`, no ticket.
-- [ ] `python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180` green (run sequentially).
+- [ ] `python3 -m pytest tests -n 4 -q --timeout=180 && python3 -m pytest tests_bugfix -n 4 -q --timeout=180` green (run sequentially).
 
 ## Out of scope
 

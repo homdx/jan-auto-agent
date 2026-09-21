@@ -68,7 +68,7 @@ permission asked is silent from the plan until the JSON rows at the end.
       "every key" tests pick it up unmodified.
 - [ ] Every existing `tests/test_contest_runner.py` test unmodified and
       green; `test_contest_cli.py` unmodified and green.
-- [ ] `python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180` green.
+- [ ] `python3 -m pytest tests -n 4 -q --timeout=180 && python3 -m pytest tests_bugfix -n 4 -q --timeout=180` green.
 
 ## Out of scope
 

@@ -116,7 +116,7 @@ The operator still pastes the prompt into N UIs and watches.
         agent is skipped, the other restarts and reaches `READY`.
 - [ ] `round_prompt` contains the runbook's `next_task.py` and
       `append_task.py` command lines and the agent name.
-- [ ] `python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180` green.
+- [ ] `python3 -m pytest tests -n 4 -q --timeout=180 && python3 -m pytest tests_bugfix -n 4 -q --timeout=180` green.
 
 ## Out of scope
 
@@ -150,8 +150,8 @@ the scorer checks all of them mechanically, so check them yourself first.
 - [ ] The new test is red without the change: check the test file alone
       out onto the base (`git stash` / `git checkout <base> -- <src>`),
       run it, see it fail; restore.
-- [ ] `python3 -m pytest tests -q --timeout=180` then
-      `python3 -m pytest tests_bugfix -q --timeout=180`, **sequentially**,
+- [ ] `python3 -m pytest tests -n 4 -q --timeout=180` then
+      `python3 -m pytest tests_bugfix -n 4 -q --timeout=180`, **sequentially**,
       both green.
 - [ ] `CollectBridge._shrink` byte-identical:
       `git diff <base> HEAD -- tools/auto/collect_bridge.py` is empty.

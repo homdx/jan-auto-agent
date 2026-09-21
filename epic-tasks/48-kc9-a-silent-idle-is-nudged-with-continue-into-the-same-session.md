@@ -65,7 +65,7 @@ No look at *how* the turn ended.
       session export (`GET /session/{id}/message` of a probe run; commit
       the fixture under `tests/fixtures/kilo/`), including one with
       `info.error` set.
-- [ ] `python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180` green.
+- [ ] `python3 -m pytest tests -n 4 -q --timeout=180 && python3 -m pytest tests_bugfix -n 4 -q --timeout=180` green.
 
 ## Out of scope
 

@@ -110,7 +110,7 @@ the literal sleep the test suite should perform.)
       matched) within `idle_event_timeout` of each other is never stalled
       out early, even if it runs past several `idle_event_timeout`
       windows before finishing.
-- [ ] `python3 scripts/sync_test_tiers.py` run; `python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180` green (sequentially).
+- [ ] `python3 scripts/sync_test_tiers.py` run; `python3 -m pytest tests -n 4 -q --timeout=180 && python3 -m pytest tests_bugfix -n 4 -q --timeout=180` green (sequentially).
 
 ## Out of scope
 
@@ -148,8 +148,8 @@ the scorer checks all of them mechanically, so check them yourself first.
 - [ ] The new test is red without the change: check the test file alone
       out onto the base (`git stash` / `git checkout <base> -- <src>`),
       run it, see it fail; restore.
-- [ ] `python3 -m pytest tests -q --timeout=180` then
-      `python3 -m pytest tests_bugfix -q --timeout=180`, **sequentially**,
+- [ ] `python3 -m pytest tests -n 4 -q --timeout=180` then
+      `python3 -m pytest tests_bugfix -n 4 -q --timeout=180`, **sequentially**,
       both green.
 - [ ] `CollectBridge._shrink` byte-identical:
       `git diff <base> HEAD -- tools/auto/collect_bridge.py` is empty.

@@ -70,7 +70,7 @@ passes alone is a failure of the tree, and the agent is told to fix it.
 - [x] `git diff --stat <base>..HEAD` names only `tools/contest/gates.py` and `tests/test_contest_harvest.py`. Never `epic-tasks/`.
 - [x] `python3 scripts/sync_test_tiers.py --check` is clean.
 - [x] The new tests are red without the change (all four).
-- [x] `python3 -m pytest tests -q --timeout=180` then `python3 -m pytest tests_bugfix -q --timeout=180`, sequentially, both green.
+- [x] `python3 -m pytest tests -n 4 -q --timeout=180` then `python3 -m pytest tests_bugfix -n 4 -q --timeout=180`, sequentially, both green.
 - [x] `CollectBridge._shrink` byte-identical; `scripts/judge_epic_round.py` untouched.
 
 ## Ground rules (same as every round)

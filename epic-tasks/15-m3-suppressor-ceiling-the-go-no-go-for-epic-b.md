@@ -106,7 +106,7 @@ methods in the index                        0
    and run nothing extra; combining roots in one `pytest` call produces ~362
    false errors from a conftest collision:
    ```bash
-   python3 -m pytest tests -q --timeout=180 && python3 -m pytest tests_bugfix -q --timeout=180
+   python3 -m pytest tests -n 4 -q --timeout=180 && python3 -m pytest tests_bugfix -n 4 -q --timeout=180
    ```
    `python` is not on PATH — use `python3`. One suite at a time — the machine
    is shared with the other round entrants.
