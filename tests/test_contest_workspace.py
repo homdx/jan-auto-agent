@@ -21,6 +21,7 @@ Knowledge label: KC-4 regression test.
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -378,3 +379,28 @@ def test_repo_checkout_is_never_modified(repo, config):
     remove_round(repo, config, 40)
     assert _git(repo, "rev-parse", "HEAD").strip() == head_before
     assert _git(repo, "status", "--porcelain").strip() == status_before
+
+
+def test_reset_worktree_prunes_a_registration_whose_folder_was_removed(repo, config):
+    """Round 64 on the operator's machine: the eight ``rounds/64-*`` folders were
+    deleted by hand between two attempts, so ``git worktree list`` still carried
+    them (marked ``prunable``) and every slot died in intake with
+
+        fatal: '.../rounds/64-agnes-2-5-flash' is a missing but already
+        registered worktree; use 'add -f' to override, or 'prune' or 'remove'
+
+    ``git worktree remove`` deregisters, a plain ``rm -rf`` does not — so the
+    stale-branch path above is not reached and ``add`` fails outright. The reset
+    must prune the missing registration and rebuild the worktree.
+    """
+    base = _base_sha(repo)
+    ws1 = reset_worktree(repo, config.rounds_dir, 64, "agnes-2-5-flash", base)
+    shutil.rmtree(ws1.path)  # the folder only — git is not told
+    assert "prunable" in _git(repo, "worktree", "list")
+
+    ws2 = reset_worktree(repo, config.rounds_dir, 64, "agnes-2-5-flash", base)
+    assert ws2.path == ws1.path
+    assert ws2.branch == ws1.branch
+    assert _git(ws2.path, "rev-parse", "HEAD").strip() == base
+    assert _git(ws2.path, "status", "--porcelain").strip() == ""
+    assert "prunable" not in _git(repo, "worktree", "list")

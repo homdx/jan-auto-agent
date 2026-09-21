@@ -282,7 +282,8 @@ def reset_worktree(
     """A fresh, idempotent worktree for *agent* at *base_sha*.
 
     Path ``<rounds_dir>/<NN>-<agent>``, branch ``contest/<NN>/<agent>``. Creates it
-    when absent (reusing a stale branch with ``-B``); when present and a worktree of
+    when absent (pruning a registration whose folder was removed by hand, and
+    reusing a stale branch with ``-B``); when present and a worktree of
     *repo*, refuses a reset that would drop work — commits above *base_sha* or
     uncommitted edits outside ``runs/`` — unless *force* (KC-23, the operator's
     ``--fresh``); when present but not ours, raises rather than delete it.
@@ -295,6 +296,14 @@ def reset_worktree(
     owned = _worktree_paths(repo)
 
     if not path.exists():
+        if path.resolve() in owned:
+            # The folder went away without git being told (``rm -rf`` of a round
+            # directory, a wiped scratch disk): the worktree stays registered and
+            # ``git worktree add`` refuses with "is a missing but already
+            # registered worktree". Prune drops exactly those missing
+            # registrations and touches no worktree that still has its folder.
+            _git(repo, ["worktree", "prune"])
+            owned = _worktree_paths(repo)
         if _rev_parse(repo, branch) is not None:
             # A stale branch without its worktree: recreate the worktree, then move
             # the branch onto the base.
