@@ -1045,6 +1045,25 @@ def test_retry_does_not_increment_attempt(tmp_path):
     assert run.turns[1]["attempt"] == 0
 
 
+@pytest.fixture
+def sigint_raises_keyboardinterrupt():
+    """Make SIGINT raise KeyboardInterrupt for the length of a test that sends one to itself.
+
+    A process started with SIGINT ignored — a background job (`cmd &`), `nohup`, a CI
+    runner — passes that on to Python, which then never installs its own handler: the
+    signal is swallowed and `pytest.raises(KeyboardInterrupt)` fails with "DID NOT
+    RAISE" though nothing is wrong with the code under test. xdist workers inherit the
+    controller's setting, so `-n` does not help. The previous handler is put back.
+    """
+    previous = signal.getsignal(signal.SIGINT)
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGINT, previous if previous is not None else signal.SIG_DFL)
+
+
+@pytest.mark.usefixtures("sigint_raises_keyboardinterrupt")
 def test_ctrl_c_during_retry_backoff_ends_the_round(tmp_path):
     """SIGINT during the backoff wait ends the round well before the backoff
     itself would (a 60 s wait, cut short by the interrupt)."""
@@ -1214,6 +1233,32 @@ def test_a_silent_agent_stalls_next_to_a_chatty_one(tmp_path):
     assert abort_at - started < 4.0
 
 
+def _interrupt_once_agent_a_is_saved_ready(sb, pid, timeout=10.0):
+    """An `on_prompt` that sends SIGINT to *pid* — after state.json says agent-a is READY.
+
+    agent-a's harvest and agent-b's second prompt run on different threads. Sending the
+    signal the moment b is prompted races a's READY, and the state.json the interrupt
+    saves is the one the test asserts on: on a loaded machine a was still HARVESTING
+    about half the time. state.json is rewritten after every transition, so READY on
+    disk means READY in memory. If it never shows up the signal goes out anyway after
+    *timeout*, and the test's own assertion reports what it found.
+    """
+    def on_prompt(directory, text):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                agents = _state_json(sb)["agents"]
+            except (OSError, ValueError):
+                agents = []
+            if any(a["agent"]["name"] == "agent-a" and a["state"] == "READY" for a in agents):
+                break
+            time.sleep(0.02)
+        os.kill(pid, signal.SIGINT)
+
+    return on_prompt
+
+
+@pytest.mark.usefixtures("sigint_raises_keyboardinterrupt")
 def test_ctrl_c_aborts_writes_state_and_propagates_then_resume_finishes(tmp_path):
     """agent-a lands in one turn; agent-b's rework prompt is where Ctrl-C
     arrives (SIGINT to this process). Then b was aborted, state.json says
@@ -1227,7 +1272,7 @@ def test_ctrl_c_aborts_writes_state_and_propagates_then_resume_finishes(tmp_path
         (work_ready if _agent_of(directory) == "agent-a" else work_no_test)(directory, text)
 
     scenario = {"turns": [{"on_prompt": turn1, "events": ["busy", "idle"]},
-                          {"on_prompt": lambda d, t: os.kill(pid, signal.SIGINT),
+                          {"on_prompt": _interrupt_once_agent_a_is_saved_ready(sb, pid),
                            "events": ["busy"], "idle": False}]}
     with _BenchFake(scenario) as fake:
         with pytest.raises(KeyboardInterrupt):
@@ -1485,3 +1530,159 @@ def test_progress_every_sec_zero_logs_transitions_but_no_heartbeat(tmp_path, cap
     assert _lines(caplog, "agent-a: READY")
     assert not _lines(caplog, f"round {ROUND} ")
     assert not [t for t in threading.enumerate() if t.name.startswith("contest-progress")]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KC-22 follow-up: what the landed tests leave open — the off switch on --resume,
+# the porcelain lines as git prints them, a bounded listing, and the behaviours
+# the implementation has but nothing pins down
+# ─────────────────────────────────────────────────────────────────────────────
+
+import tools.contest.runner as _runner_module  # noqa: E402
+from tools.contest.runner import continue_message  # noqa: E402
+
+
+def work_commit_and_leave_a_stray_file(directory, text):
+    """One commit (no test, so REWORK) and one file left over in the tree."""
+    work_no_test(directory, text)
+    _write(Path(directory) / "pkg" / "stray.py", "x = 1\n")
+
+
+def _watch_tree_reads(monkeypatch) -> list:
+    """Record every `git status` the runner takes of a worktree; the real one still runs."""
+    real, calls = _runner_module._dirty_tree, []
+
+    def watching(ws):
+        calls.append(str(ws.path))
+        return real(ws)
+
+    monkeypatch.setattr(_runner_module, "_dirty_tree", watching)
+    return calls
+
+
+def _mid_flight_prior(sb, cfg, agent="agent-a") -> RoundState:
+    """A round that died with *agent* mid-flight: its session is gone, its worktree is not."""
+    spec = next(s for s in cfg.agents if s.name == agent)
+    return RoundState(round_no=ROUND, ticket=TICKET, base_sha=sb.base_sha, started_at=1.0, agents=[
+        AgentRun(agent=spec, workspace=sb.ws(agent), state=AgentState.WAITING, session_id="ses_gone"),
+    ])
+
+
+def _resumed_first_prompt(sb, cfg) -> str:
+    """Resume *sb*'s only agent into whatever its worktree holds; the fresh session's first prompt."""
+    with _BenchFake({"turns": [{"on_prompt": work_ready, "events": ["busy", "idle"]}]}) as fake:
+        _round(sb, fake, cfg, resume=_mid_flight_prior(sb, cfg))
+        (_sid, first), = _prompts(fake)
+    return first
+
+
+def test_resume_with_max_continues_zero_sends_the_plain_prompt(tmp_path, monkeypatch):
+    """0 disables the whole mechanism, today's behaviour byte for byte — a `--resume`
+    into a dirty worktree included: no paragraph, and the tree is not even read."""
+    tree_reads = _watch_tree_reads(monkeypatch)
+    sb = Sandbox(tmp_path)
+    cfg = make_config(["agent-a"], max_continues_per_attempt=0)
+    work_edit_no_commit(str(sb.ws("agent-a").path), "")
+    first = _resumed_first_prompt(sb, cfg)
+    assert first == round_prompt("agent-a", sb.ticket_path, sb.base_sha)
+    assert tree_reads == []
+
+
+def test_resume_into_a_clean_worktree_keeps_the_prompt_exactly(tmp_path):
+    sb = Sandbox(tmp_path)
+    cfg = make_config(["agent-a"])
+    _work(str(sb.ws("agent-a").path), test=False)       # committed, no test: REWORK, tree clean
+    assert _resumed_first_prompt(sb, cfg) == round_prompt("agent-a", sb.ticket_path, sb.base_sha)
+
+
+def test_resume_with_a_commit_under_the_dirty_tree_keeps_the_plain_prompt(tmp_path):
+    """The paragraph says nothing was committed, so it is only sent when that is true."""
+    sb = Sandbox(tmp_path)
+    cfg = make_config(["agent-a"])
+    work_commit_and_leave_a_stray_file(str(sb.ws("agent-a").path), "")
+    assert _resumed_first_prompt(sb, cfg) == round_prompt("agent-a", sb.ticket_path, sb.base_sha)
+
+
+def test_a_dirty_tree_above_a_commit_is_harvested_not_continued(tmp_path, monkeypatch):
+    """Something is handed in: the harvest has a commit to score, so it scores it."""
+    harvests = _harvest_calls(monkeypatch)
+    scenario = {"turns": [{"on_prompt": work_commit_and_leave_a_stray_file, "events": ["busy", "idle"]},
+                          {"on_prompt": work_ready, "events": ["busy", "idle"]}]}
+    _sb, fake, _h, run, _ = _run_one(tmp_path, scenario)
+    assert [t["kind"] for t in run.turns][:2] == ["initial", "rework"]
+    assert run.turns[0]["harvest"]["verdict"] == "REWORK"
+    assert len(harvests) >= 1
+    assert "uncommitted" not in _prompts(fake)[1][1]
+
+
+def test_a_fresh_round_reads_no_tree_and_its_prompt_is_exactly_round_prompt(tmp_path, monkeypatch):
+    """The nudge is looked for on a `--resume` and after an idle turn with no commit; a
+    fresh run that commits on its first turn costs no `git status` at all."""
+    tree_reads = _watch_tree_reads(monkeypatch)
+    scenario = {"turns": [{"on_prompt": work_ready, "events": ["busy", "idle"]}]}
+    sb, fake, _h, _run, _ = _run_one(tmp_path, scenario)
+    (_sid, text), = _prompts(fake)
+    assert text == round_prompt("agent-a", sb.ticket_path, sb.base_sha)
+    assert tree_reads == []
+
+
+def test_continue_turns_and_the_resume_nudge_leave_the_json_shape_alone(tmp_path):
+    sb = Sandbox(tmp_path)
+    cfg = make_config(["agent-a"])
+    work_edit_no_commit(str(sb.ws("agent-a").path), "")
+    with _BenchFake({"turns": [{"on_prompt": work_edit_no_commit, "events": ["busy", "idle"]},
+                               {"on_prompt": work_ready, "events": ["busy", "idle"]}]}) as fake:
+        state = _round(sb, fake, cfg, resume=_mid_flight_prior(sb, cfg))
+    saved = _state_json(sb)
+    (agent,) = saved["agents"]
+    assert set(agent) == {"agent", "workspace", "session_id", "state", "attempt", "turns",
+                          "permissions", "questions", "last_error", "commit", "cost", "tokens"}
+    assert [t["kind"] for t in agent["turns"]] == ["initial", "continue"]
+    assert RoundState.from_dict(saved) == state
+
+
+def test_dirty_tree_names_each_file_and_leaves_runs_out(tmp_path):
+    """`runs/` is the runner's ground even where a repo does not gitignore it, and the
+    first line is as git prints it — its leading space is part of the status."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "user.email", "t@example.invalid")
+    _git(repo, "config", "user.name", "t")
+    _write(repo / "pkg" / "a.py", "a\n")
+    _write(repo / "pkg" / "b.py", "b\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "base")
+    ws = Workspace(agent="agent-a", path=repo.resolve(), branch="main",
+                   base_sha=_git(repo, "rev-parse", "HEAD"), kind="worktree")
+
+    assert _runner_module._dirty_tree(ws) == ""
+    _write(repo / "runs" / "agent-a" / "PROGRESS.csv", "row\n")
+    assert _runner_module._dirty_tree(ws) == ""                     # not the work
+    _write(repo / "pkg" / "a.py", "changed\n")
+    _write(repo / "pkg" / "b.py", "changed\n")
+    _write(repo / "tests" / "new" / "test_x.py", "x\n")
+    assert _runner_module._dirty_tree(ws).splitlines() == [
+        " M pkg/a.py", " M pkg/b.py", "?? tests/new/test_x.py"]
+
+
+def test_dirty_tree_of_a_path_git_cannot_read_is_empty(tmp_path):
+    ws = Workspace(agent="agent-a", path=tmp_path / "gone", branch="main", base_sha="0" * 40,
+                   kind="worktree")
+    assert _runner_module._dirty_tree(ws) == ""
+
+
+def test_continue_message_lists_every_line_of_a_short_tree():
+    text = continue_message(" M pkg/thing.py\n?? tests/test_thing.py")
+    assert "uncommitted" in text and "Do not start over" in text
+    assert " M pkg/thing.py" in text and "?? tests/test_thing.py" in text
+    assert "more" not in text
+
+
+def test_continue_message_is_bounded_for_a_huge_tree():
+    """The message is a prompt: a tree with thousands of untracked files is not a list."""
+    text = continue_message("\n".join(f"?? gen/f{i}.py" for i in range(5000)))
+    assert "gen/f0.py" in text and "gen/f39.py" in text
+    assert "gen/f40.py" not in text
+    assert "... and 4960 more" in text
+    assert len(text.splitlines()) < 60

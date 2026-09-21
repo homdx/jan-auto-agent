@@ -60,6 +60,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -365,6 +366,11 @@ def round_prompt(agent_name: str, ticket_path: Path, base_sha: str, *, dirty: st
     return text
 
 
+#: How many `git status` lines `continue_message` lists before it says "and N more":
+#: a tree with thousands of untracked files must not turn a nudge into a megabyte prompt.
+_DIRTY_LINES_SHOWN = 40
+
+
 def continue_message(dirty: str) -> str:
     """The nudge sent when a turn ends `idle` with uncommitted work (KC-22).
 
@@ -373,7 +379,10 @@ def continue_message(dirty: str) -> str:
     the instruction to finish in this same worktree. *dirty* is the porcelain
     output (KC-22's `git status` lines) — already excluding `runs/`.
     """
-    indented = "\n".join("  " + ln for ln in dirty.splitlines())
+    lines = dirty.splitlines()
+    indented = "\n".join("  " + ln for ln in lines[:_DIRTY_LINES_SHOWN])
+    if len(lines) > _DIRTY_LINES_SHOWN:
+        indented += f"\n  ... and {len(lines) - _DIRTY_LINES_SHOWN} more"
     return (
         "Your turn ended before anything was committed. The worktree still "
         "holds your uncommitted work:\n"
@@ -392,11 +401,16 @@ def _dirty_tree(ws: Workspace) -> str:
     the agent's work. Empty string when the tree is clean or when git cannot
     answer, so an unreadable worktree degrades to "no collect data" and the
     runner harvests as it always did, never raising.
+
+    Not `gates.git`: that strips its output, and the first porcelain line of a
+    tree with unstaged edits starts with a space that is part of the status.
     """
     try:
-        out = git(ws.path, "status", "--porcelain", "--untracked-files=all")
-    except Exception:  # noqa: BLE001 — a status that cannot be read is a clean one
+        r = subprocess.run(["git", "status", "--porcelain", "--untracked-files=all"],
+                           cwd=ws.path, capture_output=True, text=True)
+    except OSError:  # a status that cannot be read is a clean one
         return ""
+    out = r.stdout if r.returncode == 0 else ""
     lines = []
     for ln in out.splitlines():
         if not ln.strip():
@@ -783,7 +797,9 @@ def _plan(config: ContestConfig, workspaces: list, ticket_path: Path,
                 # prompt. A clean tree (or one with a commit under it) carries no
                 # `dirty_on_resume`, so the prompt is unchanged and the agent
                 # may not start over or discard the files.
-                if _commits_above(ws) == 0:
+                # `max_continues_per_attempt = 0` turns the whole mechanism off — this
+                # half included: no tree read, no paragraph, today's prompt.
+                if int(config.max_continues_per_attempt) > 0 and _commits_above(ws) == 0:
                     dirty = _dirty_tree(ws)
                     if dirty:
                         run.dirty_on_resume = dirty
