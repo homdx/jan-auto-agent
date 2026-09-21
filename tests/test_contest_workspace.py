@@ -11,7 +11,10 @@ nothing because its stale ``PROGRESS.csv`` was still there).
 
 This test pins ``prepare_round``, ``reset_worktree``, ``attach_clone`` and
 ``remove_round`` against temp repos only (never this checkout), per KC-4's acceptance
-list. It also asserts the repo's own checkout is never modified by any call.
+list. It also asserts the repo's own checkout is never modified by any call. KC-23
+adds the refusal: a worktree holding commits above the base or edits outside
+``runs/`` is not reset unless ``force=True``, and the message names ``--fresh`` and
+``--resume``.
 
 Knowledge label: KC-4 regression test.
 """
@@ -126,8 +129,9 @@ def test_prepare_round_is_idempotent_after_progress_and_commits(repo, config):
     _git(laguna.path, "commit", "-q", "-m", "stray")
     laguna.path.joinpath("runs", "laguna", "PROGRESS.csv").write_text("done\n")
 
-    # rerun
-    wss2 = prepare_round(repo, config, 40, base)
+    # rerun — KC-23: a rerun over commits needs force=True (the operator's
+    # --fresh) on purpose; without it the refusal is the whole point
+    wss2 = prepare_round(repo, config, 40, base, force=True)
     laguna2 = next(ws for ws in wss2 if ws.agent == "laguna")
 
     assert _git(laguna2.path, "rev-parse", "HEAD").strip() == base
@@ -137,6 +141,111 @@ def test_prepare_round_is_idempotent_after_progress_and_commits(repo, config):
     assert not laguna2.progress_csv.exists()
     assert (laguna2.path / "runs" / "laguna").is_dir()
     assert not list((laguna2.path / "runs" / "laguna").iterdir())
+
+
+def test_prepare_round_refuses_a_worktree_with_a_commit_above_the_base(repo, config):
+    """KC-23: a rerun must not wipe a branch that holds a commit. The message
+    names the worktree, the count and both ways out — ``--fresh`` to discard
+    the work, ``--resume`` to keep it — and leaves the worktree untouched."""
+    base = _base_sha(repo)
+    laguna = next(ws for ws in prepare_round(repo, config, 40, base)
+                  if ws.agent == "laguna")
+
+    (laguna.path / "thing.py").write_text("42\n")
+    _git(laguna.path, "add", "thing.py")
+    _git(laguna.path, "commit", "-q", "-m", "KC-23: thing")
+    assert _git(laguna.path, "rev-list", "--count", f"{base}..HEAD").strip() == "1"
+
+    with pytest.raises(WorkspaceError) as excinfo:
+        prepare_round(repo, config, 40, base)
+
+    message = str(excinfo.value)
+    assert str(laguna.path) in message
+    assert "1 commit" in message
+    assert "--fresh" in message
+    assert "--resume" in message
+    assert "contest-out/40/state.json" in message
+    # the refusal must not have touched the worktree
+    assert _git(laguna.path, "rev-parse", "HEAD").strip() != base
+    assert (laguna.path / "thing.py").exists()
+
+
+def test_prepare_round_refuses_a_worktree_with_uncommitted_edits(repo, config):
+    """No commit, only an edit: refused too, and the edit is named."""
+    base = _base_sha(repo)
+    laguna = next(ws for ws in prepare_round(repo, config, 40, base)
+                  if ws.agent == "laguna")
+
+    (laguna.path / "thing.py").write_text("42\n")
+
+    with pytest.raises(WorkspaceError) as excinfo:
+        prepare_round(repo, config, 40, base)
+
+    message = str(excinfo.value)
+    assert str(laguna.path) in message
+    assert "thing.py" in message
+    assert "--fresh" in message
+    assert "--resume" in message
+    assert _git(laguna.path, "rev-parse", "HEAD").strip() == base
+
+
+def test_prepare_round_force_resets_a_worktree_that_carries_work(repo, config):
+    """``force=True`` is the operator's ``--fresh``: the work is discarded, the
+    branch lands back on the base, the scratch goes with it."""
+    base = _base_sha(repo)
+    laguna = next(ws for ws in prepare_round(repo, config, 40, base)
+                  if ws.agent == "laguna")
+
+    (laguna.path / "thing.py").write_text("42\n")
+    _git(laguna.path, "add", "thing.py")
+    _git(laguna.path, "commit", "-q", "-m", "KC-23: thing")
+    laguna.progress_csv.parent.mkdir(parents=True, exist_ok=True)
+    laguna.progress_csv.write_text("task1,done\n")
+
+    wss = prepare_round(repo, config, 40, base, force=True)
+    laguna2 = next(ws for ws in wss if ws.agent == "laguna")
+
+    assert _git(laguna2.path, "rev-parse", "HEAD").strip() == base
+    assert not (laguna2.path / "thing.py").exists()
+    assert _git(laguna2.path, "status", "--porcelain").strip() == ""
+    assert not laguna2.progress_csv.exists()
+
+
+def test_prepare_round_resets_a_clean_worktree_at_the_base(repo, config):
+    """Nothing on the branch, only the round's own ``runs/`` scratch: the
+    idempotent rerun resets as before — the scratch is not work to refuse over,
+    so ``next_task.py`` still gets the queue emptied."""
+    base = _base_sha(repo)
+    prepare_round(repo, config, 40, base)
+    laguna = next(ws for ws in prepare_round(repo, config, 40, base)
+                  if ws.agent == "laguna")
+    laguna.progress_csv.parent.mkdir(parents=True, exist_ok=True)
+    laguna.progress_csv.write_text("task1,done\n")
+
+    wss = prepare_round(repo, config, 40, base)
+    laguna2 = next(ws for ws in wss if ws.agent == "laguna")
+
+    assert _git(laguna2.path, "rev-parse", "HEAD").strip() == base
+    assert not laguna2.progress_csv.exists()
+    assert _git(laguna2.path, "status", "--porcelain").strip() == ""
+
+
+def test_prepare_round_resets_a_worktree_from_a_previous_base(repo, config):
+    """A base that moved on: the worktree's branch sits behind the new base with
+    no commits above it, so it is not carrying work and resets silently."""
+    base = _base_sha(repo)
+    prepare_round(repo, config, 40, base)
+
+    (repo / "readme.txt").write_text("r2\n")
+    _git(repo, "add", "readme.txt")
+    _git(repo, "commit", "-q", "-m", "r2")
+    new_base = _git(repo, "rev-parse", "HEAD").strip()
+    assert new_base != base
+
+    wss = prepare_round(repo, config, 40, new_base)
+    for ws in wss:
+        assert _git(ws.path, "rev-parse", "HEAD").strip() == new_base
+        assert _git(ws.path, "status", "--porcelain").strip() == ""
 
 
 def test_reset_worktree_recreates_stale_branch_without_its_worktree(repo, config):

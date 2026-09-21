@@ -14,7 +14,10 @@ the per-agent checkouts by hand and warn, three times, about what must hold:
 This module is the operator-facing replacement for that shell loop: it resolves the
 base, refuses to reuse a previous round's worktree, empties ``runs/<agent>/`` so a
 stale ``PROGRESS.csv`` never makes ``next_task.py`` hand out nothing, and never
-touches the repo's own checkout. The runbook's stage-5 cleanup is :func:`remove_round`.
+touches the repo's own checkout. Since KC-23 it also refuses a reset that would drop
+the work a worktree carries — commits above the base, or edits outside
+``runs/`` — unless ``--fresh`` says to discard it; the message names ``--resume``
+for the other way out. The runbook's stage-5 cleanup is :func:`remove_round`.
 
 Standard library only (``subprocess``, ``pathlib``, ``shutil``); it shells out to
 ``git`` exactly the way the runbook does.
@@ -52,14 +55,20 @@ _EPIC_TASKS_DIRTY_REASON = (
 _KIND_WORKTREE: Literal["worktree", "clone"] = "worktree"
 _KIND_CLONE: Literal["worktree", "clone"] = "clone"
 
+#: How many dirty paths a refusal names before it says there are more — a
+#: worktree can hold a whole round of edits, and the operator only needs enough
+#: to see that the reset is not safe.
+_DIRTY_NAMED = 5
+
 
 class WorkspaceError(RuntimeError):
     """A worktree or clone could not be prepared or removed.
 
     Raised for an unresolvable base, a dirty ``epic-tasks/`` at the base, a folder
     at a worktree path that is not ours to delete, a clone that lacks the base sha,
-    a dirty clone without ``--force``, and any ``git`` failure in between. Always
-    says what was attempted.
+    a dirty clone without ``--force``, a worktree that holds commits or edits
+    without ``--fresh`` (KC-23), and any ``git`` failure in between. Always says
+    what was attempted.
     """
 
 
@@ -200,15 +209,85 @@ def _check_base_and_epic_tasks(repo: Path, base_ref: str) -> str:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def _commits_above(worktree: Path, base_sha: str) -> int:
+    """The commits on the worktree's branch above *base_sha*.
+
+    ``git rev-list --count <base>..HEAD`` is 0 when the branch is at the base or
+    behind it — a worktree left by a previous base, after the base moved on — so a
+    clean tree on an old base is not carrying work. On a base with no history in
+    common it would count the branch's whole length instead, a non-zero number,
+    which is the safe way to be wrong here: refusing loses nothing.
+    """
+    proc = _git(worktree, ["rev-list", "--count", f"{base_sha}..HEAD"], check=False)
+    if proc.returncode != 0:
+        return 0
+    text = proc.stdout.strip()
+    return int(text) if text.isdigit() else 0
+
+
+def _is_runs_scratch(line: str) -> bool:
+    """Whether a ``--porcelain`` line is the round's own ``runs/`` scratch.
+
+    The status occupies ``line[:2]``, the path starts at ``line[3:]``; a rename
+    names its destination after the arrow, and that destination is what matters.
+    """
+    path = line[3:].strip()
+    if " -> " in path:
+        path = path.rsplit(" -> ", 1)[-1]
+    return path == "runs" or path.startswith("runs/")
+
+
+def _dirty_outside_runs(worktree: Path) -> list[str]:
+    """The worktree's dirty ``--porcelain`` lines, minus the ``runs/`` scratch.
+
+    ``runs/<agent>/PROGRESS.csv`` is the round's queue file — KC-4 empties it and
+    the ``clean`` below excludes it — so a worktree holding nothing but that is
+    clean: the idempotent rerun must not refuse over a file the round writes.
+    """
+    proc = _git(worktree, ["status", "--porcelain", "--untracked-files=all"], check=False)
+    return [line for line in proc.stdout.splitlines() if not _is_runs_scratch(line)]
+
+
+def _refuse_to_reset(
+    path: Path, branch: str, round_no: int, commits: int, dirty: list[str]
+) -> WorkspaceError:
+    """The :class:`WorkspaceError` for a worktree a reset would wipe out.
+
+    Names the worktree, the commits above the base, the first few dirty files, and
+    both ways out — ``--fresh`` to discard the work, ``--resume`` to keep it and
+    continue the round. The work is the operator's, not ours to throw away
+    silently; ``contest-out/<NN>/state.json`` is where ``--resume`` reads it from.
+    """
+    bits: list[str] = []
+    if commits:
+        plural = "" if commits == 1 else "s"
+        bits.append(f"{commits} commit{plural} on {branch} above the base")
+    if dirty:
+        plural = "" if len(dirty) == 1 else "s"
+        named = "\n".join("  " + line for line in dirty[:_DIRTY_NAMED])
+        hidden = len(dirty) - _DIRTY_NAMED
+        if hidden > 0:
+            named += f"\n  ... and {hidden} more"
+        bits.append(f"{len(dirty)} uncommitted change{plural}:\n{named}")
+    return WorkspaceError(
+        f"{path} holds work a reset would discard — " + "; ".join(bits)
+        + "\npass --fresh to discard it, or --resume to continue the round from "
+        + f"contest-out/{round_no:02d}/state.json"
+    )
+
+
 def reset_worktree(
-    repo: Path, rounds_dir, round_no: int, agent: str, base_sha: str
+    repo: Path, rounds_dir, round_no: int, agent: str, base_sha: str, *, force: bool = False
 ) -> Workspace:
     """A fresh, idempotent worktree for *agent* at *base_sha*.
 
     Path ``<rounds_dir>/<NN>-<agent>``, branch ``contest/<NN>/<agent>``. Creates it
     when absent (reusing a stale branch with ``-B``); when present and a worktree of
-    *repo*, resets the branch to the base and ``clean -fdx -e runs/``; when present
-    but not ours, raises rather than delete it. ``runs/<agent>/`` is always emptied.
+    *repo*, refuses a reset that would drop work — commits above *base_sha* or
+    uncommitted edits outside ``runs/`` — unless *force* (KC-23, the operator's
+    ``--fresh``); when present but not ours, raises rather than delete it.
+    ``runs/<agent>/`` is always emptied. A clean worktree at the base, and a clean
+    one left behind by a moved base, reset as before.
     """
     root = _resolve_rounds_dir(repo, str(rounds_dir))
     path = _worktree_path(root, round_no, agent)
@@ -229,6 +308,10 @@ def reset_worktree(
                 f"{path} exists but is not a worktree of {repo} — refusing to "
                 f"delete a folder this module did not create"
             )
+        commits = _commits_above(path, base_sha)
+        dirty = _dirty_outside_runs(path)
+        if (commits or dirty) and not force:
+            raise _refuse_to_reset(path.resolve(), branch, round_no, commits, dirty)
         _git(path, ["checkout", "-B", branch, base_sha])
 
     _git(path, ["clean", "-fdx", "-e", "runs/"])
@@ -288,13 +371,16 @@ def prepare_round(
     *,
     clones: dict[str, Path] | None = None,
     force_clone: bool = False,
+    force: bool = False,
 ) -> list[Workspace]:
     """Prepare one checkout per roster agent at *base_ref*; return the workspaces.
 
     Resolves and validates the base (unresolvable or a dirty ``epic-tasks/`` raise),
     then for each agent in roster order attaches its ``clones`` entry or builds a
-    worktree. The repo's own checkout is never touched (no ``checkout``/``reset`` in
-    *repo* itself).
+    worktree. A worktree that holds commits above the base or edits outside
+    ``runs/`` is refused unless *force* (KC-23's ``--fresh``); *force_clone* still
+    governs the clones alone. The repo's own checkout is never touched (no
+    ``checkout``/``reset`` in *repo* itself).
     """
     repo_path = Path(repo).resolve()
     base_sha = _check_base_and_epic_tasks(repo_path, base_ref)
@@ -315,7 +401,8 @@ def prepare_round(
             )
         else:
             workspaces.append(
-                reset_worktree(repo_path, root, round_no, agent.name, base_sha)
+                reset_worktree(repo_path, root, round_no, agent.name, base_sha,
+                               force=force)
             )
     return workspaces
 
@@ -356,6 +443,8 @@ def _main(argv: list[str] | None = None) -> int:
     p_prep.add_argument("--clone", action="append", default=[],
                         metavar="name=path", help="use an existing clone for <name>")
     p_prep.add_argument("--force-clone", action="store_true")
+    p_prep.add_argument("--fresh", action="store_true",
+                        help="reset a worktree even when it holds commits or edits")
 
     p_rem = sub.add_parser("remove", help="remove a round's worktrees and branches")
     p_rem.add_argument("--repo", default=".")
@@ -386,7 +475,7 @@ def _main(argv: list[str] | None = None) -> int:
 
     workspaces = prepare_round(
         repo_path, cfg, args.round, args.base_ref,
-        clones=clone_map, force_clone=args.force_clone,
+        clones=clone_map, force_clone=args.force_clone, force=args.fresh,
     )
     for ws in workspaces:
         if ws.kind == _KIND_CLONE:

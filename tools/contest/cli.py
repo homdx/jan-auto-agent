@@ -326,6 +326,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     `state.table_rows()`. `server.close()` in `finally`: on Ctrl-C `run_round`
     has already saved `state.json` and re-raised, so the KeyboardInterrupt
     propagates after the close. 0 with a READY, 2 with none.
+
+    A worktree left by a crashed attempt is not reset silently (KC-23): the
+    refusal is the same `intake:` line as every other `WorkspaceError`, exit 1,
+    no server started — `--fresh` discards the work, `--resume` continues it.
     """
     # `contest-bench/kc6/live_smoke.py` sets the same default: the committed
     # roster's ${CONTEST_GATE_API_KEY} reference must resolve for `load_roster`
@@ -366,7 +370,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         workspaces = [run.workspace for run in resume.agents]
     else:
         try:
-            workspaces = prepare_round(repo, config, args.ticket, args.base)
+            workspaces = prepare_round(repo, config, args.ticket, args.base,
+                                       force=args.fresh)
         except WorkspaceError as exc:
             print(f"intake: {exc}", file=sys.stderr)
             return EXIT_FAILED
@@ -425,6 +430,9 @@ def _parser() -> argparse.ArgumentParser:
                      help="no gate model: the mechanical layer decides, the rest is gate-failed")
     run.add_argument("--resume", action="store_true",
                      help="resume from <out>/state.json — only the mid-flight agents restart")
+    run.add_argument("--fresh", action="store_true",
+                     help="reset the round's worktrees even when they hold uncommitted "
+                          "work or commits")
     run.add_argument("--out", default=None, metavar="DIR",
                      help="the round's output directory (default <out_dir>/<NN>)")
     run.set_defaults(func=cmd_run)

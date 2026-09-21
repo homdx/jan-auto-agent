@@ -565,6 +565,52 @@ def test_resume_without_a_state_file_is_an_intake_failure(sandbox, capsys):
     assert "state.json" in captured.err and "nothing to resume" in captured.err
 
 
+def _worktree_with_a_commit(sb, agent: str = "agent-a") -> tuple:
+    """The round prepared, then that worktree holding one committed change — the
+    crashed attempt an operator reruns the command into (KC-23)."""
+    prepared = {ws.agent: ws for ws in prepare_round(sb.repo, sb.config(), ROUND, "HEAD")}
+    worktree = prepared[agent].path
+    _write(worktree / "leftover.txt", "mid-run garbage\n")
+    _git(worktree, "add", "-A")
+    _git(worktree, "commit", "-q", "-m", "KC-16: thing")
+    return worktree, _git(worktree, "rev-parse", "HEAD")
+
+
+def test_run_refuses_to_reset_a_worktree_that_carries_a_commit(sandbox, capsys, spawn_holder):
+    """A rerun over a branch with a commit is an intake failure naming
+    ``--fresh``: exit 1, no server started, the work left exactly where it was."""
+    worktree, commit = _worktree_with_a_commit(sandbox)
+
+    code = cli.main(["run", "--ticket", "1", "--no-gate", "--no-tests"])
+    captured = capsys.readouterr()
+
+    assert code == 1
+    assert captured.err.strip().startswith("intake: ")
+    assert "--fresh" in captured.err
+    assert "--resume" in captured.err
+    assert str(worktree) in captured.err
+    assert not spawn_holder, "no kilo serve may be started"
+    assert _git(worktree, "rev-parse", "HEAD") == commit
+    assert (worktree / "leftover.txt").exists()
+    assert not sandbox.out().exists()
+
+
+def test_run_fresh_resets_the_worktree_and_proceeds(sandbox, capsys, spawn_holder):
+    """The same sandbox with ``--fresh``: the work is discarded, the branch lands
+    back on the base, and the round runs to READY."""
+    worktree, commit = _worktree_with_a_commit(sandbox)
+
+    code, fake = run_fake(sandbox, {"turns": [{"on_prompt": work_ready, "events": ["busy", "idle"]}]},
+                          ["--ticket", "1", "--no-gate", "--no-tests", "--fresh"], spawn_holder)
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert "intake:" not in captured.err
+    assert not (worktree / "leftover.txt").exists()
+    assert _git(worktree, "rev-parse", "HEAD") != commit
+    assert [row["state"] for row in _table(captured.out)] == ["READY", "READY"]
+
+
 def test_models_and_max_parallel_replace_the_roster(sandbox, capsys, spawn_holder):
     """`--models x:free,y:free --max-parallel 1`: the plan names only those two
     models, and the worktrees are theirs alone."""
@@ -648,7 +694,8 @@ def test_tests_flag_toggles_the_roots_in_the_plan(sandbox, capsys, spawn_holder)
                           spawn_holder)
     assert code == 0 and _plan(capsys.readouterr().out)["tests"] == "off"
 
-    code, fake = run_fake(sandbox, one_turn, ["--ticket", "1", "--no-gate"], spawn_holder)
+    # the first run left a commit in the worktree: KC-23 makes the rerun say so
+    code, fake = run_fake(sandbox, one_turn, ["--ticket", "1", "--no-gate", "--fresh"], spawn_holder)
     assert code == 0 and _plan(capsys.readouterr().out)["tests"] == "on"
     turns = _jsonl(sandbox.out() / "agent-a" / "turns.jsonl")
     assert turns[0]["harvest"]["verdict"] == "READY"
