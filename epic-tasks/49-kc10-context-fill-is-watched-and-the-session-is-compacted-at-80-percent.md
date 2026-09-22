@@ -1,6 +1,6 @@
 # KC-10 — Context fill is measured after every turn; at 80 % the session is compacted, not abandoned
 
-**Status:** queued — after KC-9 (round 48). Written against `docs/kilo-contest/PROBE.md`.  
+**Status:** queued — after KC-9 (round 48). Written against `docs/kilo-contest/PROBE.md`. Note added 2026-09-22: `compact` here is a session-internal call (`POST /session/{id}/summarize`) that returns no text to the caller — it shrinks the session's own history, it does not preserve the model's account of an in-progress diff anywhere outside the session. KC-40 (queued, depends on this ticket) covers the case this one does not: fill is high **and** a diff already exists, where a plain compact risks discarding the only explanation of unfinished work — KC-40 asks the model for a summary first and copies it out to a file before compacting or falling back to a fresh session.  
 **Severity:** HIGH  
 **File:** `tools/contest/runner.py`, `tools/contest/kilo_client.py`  
 **Symbol:** `KiloClient.model_limit`, `KiloClient.session_tokens`, `KiloClient.compact`, `runner.context_fill`, `runner.maybe_compact`  

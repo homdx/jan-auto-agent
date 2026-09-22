@@ -1,6 +1,6 @@
 # KC-9 — A session that stopped without finishing — idle-but-cut or silent past `idle_event_timeout_sec` — is nudged with `continue`, same session, bounded
 
-**Status:** queued — after KC-6 (round 45); lands before KC-7 is run live. Written against `docs/kilo-contest/PROBE.md`.  
+**Status:** queued — after KC-6 (round 45); lands before KC-7 is run live. Written against `docs/kilo-contest/PROBE.md`. Note added 2026-09-22: KC-22 (round 61) landed the base continue-on-idle-with-a-dirty-tree mechanism ahead of this ticket, including `max_continues_per_attempt` — so "no край gives the cut turn another `continue`" below is no longer accurate on its own; this ticket's remaining scope is `classify_idle`'s FINISHED/CUT/SILENT split layered on what KC-22 shipped, not the whole edge. KC-39 (queued) extends the same edge further, on top of whichever of this ticket and KC-22 is current when it lands: a continue whose diff does not change starts a fresh session instead of exhausting the budget in place.  
 **Severity:** HIGH  
 **File:** `tools/contest/runner.py`  
 **Symbol:** `run_agent` (the `WAITING → HARVESTING` edge and the silence-`stall`/`timeout` → `STALLED` edge), `classify_idle`, `CONTINUE_PROMPT`, `IdleKind`  

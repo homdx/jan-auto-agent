@@ -1,6 +1,6 @@
 # KC-31 — a STALLED worktree with uncommitted work is exported as `<agent>.STALLED.diff`
 
-**Status:** queued — after KC-30, last in the queue; found 2026-09-20 in round 60 (KC-21) — the third round in a row to show it.
+**Status:** queued — after KC-30, last in the queue; found 2026-09-20 in round 60 (KC-21) — the third round in a row to show it. Note added 2026-09-22: round 64 showed it a fourth time, on five agents at once, and made the limit of this ticket plain — a `.diff` on disk is readable by a human but is not an entry, so a round can still report zero while holding work that passes every test root. KC-41 (queued) covers that half: the same worktrees get a deadline commit, a `PROGRESS.csv` row written by the runner, and a real harvest. This ticket keeps the case KC-41 cannot help — a terminal turn whose worktree is genuinely clean — and its `Out of scope` below is superseded accordingly.
 **Severity:** MEDIUM (the agent's whole turn is lost when it stalls before `git commit`)
 **File:** `tools/contest/cli.py` (`export_patches`), `tools/contest/runner.py` (the terminal branch, for the state)
 **Symbol:** `export_patches`
@@ -35,5 +35,9 @@
 
 ## Out of scope
 
-- Committing on the agent's behalf, or harvesting a diff — KC-22 is the ticket
-  for a turn that stops with uncommitted work while the session is still alive.
+- Committing on the agent's behalf, or harvesting a diff — KC-22 (landed) is the
+  ticket for a turn that stops with uncommitted work while the session is still
+  alive, and **KC-41** (queued) is the ticket for the same tree once the session
+  is gone and the clock has run out. Superseded note, 2026-09-22: after KC-41
+  lands, an agent with a deadline commit exports a `.patch`, and this ticket's
+  `.diff` is written only for a terminal turn with a clean worktree.
