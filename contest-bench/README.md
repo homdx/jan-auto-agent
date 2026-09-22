@@ -39,6 +39,7 @@ contest-bench/
     REPORT.md               hand-written: findings, nominations, decisions for the ideal patch
   kc4/ kc5/ kc6/             KC rounds: self-contained (run_one_kcN.py + run_all_kcN.py, no harness/ dependency)
     kc6/RUNBOOK.md          the full procedure, and how to reuse KC-6 as the benchmark ticket for a live multi-agent run
+  fl1/RUNBOOK.md            FL-1 (round 84): no scenarios — the suite is the test data and a 64-worker stress run is the input; six layered causes, base 6471230, reference e500d40. Nobody has closed it in one pass
 ```
 
 The submissions themselves (`run9/*.patch`, `run9/sonets/*.zip`) are **not**
