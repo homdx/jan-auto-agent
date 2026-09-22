@@ -1,13 +1,13 @@
 # KC-39 — A continue whose diff repeats the previous one starts a fresh session, not a same-session harvest
 
-**Status:** queued — after KC-38, last in the queue; asked by the operator on 2026-09-22, not from a live round: KC-22's continue mechanism grants the full `max_continues_per_attempt` budget to any turn that still shows a dirty tree, with no check that the dirty tree is any *different* from the one at the last continue. Sequenced with KC-9 (queued, same edge — `classify_idle`'s FINISHED/CUT/SILENT split decides whether a continue is sent at all; this ticket decides, once one is being sent for the third-plus time, whether it goes to the same session or a new one). Whichever of KC-9 and KC-39 lands second rebases onto the first.
+**Status:** queued — after KC-9, KC-34 and KC-36 (see the sequencing below), not merely last in the queue; asked by the operator on 2026-09-22, not from a live round: KC-22's continue mechanism grants the full `max_continues_per_attempt` budget to any turn that still shows a dirty tree, with no check that the dirty tree is any *different* from the one at the last continue. Sequenced with KC-9 (queued, same edge — `classify_idle`'s FINISHED/CUT/SILENT split decides whether a continue is sent at all; this ticket decides, once one is being sent for the third-plus time, whether it goes to the same session or a new one) — land KC-9 first, this ticket is strictly downstream of that decision. Also sequenced after two more tickets that touch the same code, found live 2026-09-21 in round 64: KC-34 (landed `3bc10b8` — the `ContestBackend` protocol — `client.create_session`/`client.abort` calls in `run_agent` move behind it; write this ticket's session-reset against whichever interface is current when it starts) and KC-36 (`_churn` — files/lines changed in the worktree, introduced there to extend `turn_timeout_sec`; if it has landed, `_diff_signature` below should reuse or wrap `_churn` rather than duplicate a second "how much changed" helper measuring the same worktree). Whichever of KC-9/KC-36 lands last relative to this ticket, this one rebases onto it, not the reverse — it is the newest and smallest of the four.
 **Severity:** MEDIUM (no work is lost — a commit under the branch is still harvested either way, KC-21 — but a model that repeats itself burns the whole continue budget for nothing and then gets a `HARVESTING`/`REWORK` critique inside the very session that produced the loop, which is the session least likely to break out of it)
 **File:** `tools/contest/runner.py` (`run_agent` — the `idle.status == "idle"` branch, KC-22's `continue_used`/`budget` block), `contest.ini`
 **Symbol:** `run_agent`, `continue_message`, `_dirty_tree`, `_diff_signature` (new), `ContestConfig.max_sessions_per_attempt` (new)
 **Round:** 78
 **Size:** M
 **Source:** paraphrased from the operator: "extend the continue criterion — right now three continues are granted by default (`max_continues_per_attempt` in `contest.ini`); if the third one still adds nothing, a new session should start instead." Confirmed against the code: `run_agent`'s continue branch (`tools/contest/runner.py`, the `idle.status == "idle"` case) reads `_dirty_tree(ws)` — `git status --porcelain` file names and status letters only, never the diff's content — and treats any non-empty result as "still working", with no comparison to the previous continue's tree. `max_continues_per_attempt` is 2 in `contest.ini` today (three prompts total counting the initial one), not three; the operator's "three" is presumably a local override and is not itself a bug.
-**Depends on:** KC-22 (landed `286cff9` — the continue loop, `continue_message`, `round_prompt(dirty=...)` this ticket extends).
+**Depends on:** KC-22 (landed `286cff9` — the continue loop, `continue_message`, `round_prompt(dirty=...)` this ticket extends). Sequenced after — not a hard code dependency, but land these first to avoid rebasing this ticket's own diff onto theirs: KC-9 (queued — reshapes the decision that this ticket sits downstream of), KC-34 (landed `3bc10b8` — `ContestBackend`; `client.create_session`/`client.abort` below should target whatever this lands as), KC-36 (open — `_churn`; reuse it for `_diff_signature` if it has landed by the time this starts).
 **Also touches:** `tests/test_contest_runner.py`, `tests/_kilo_fake.py`, `contest-bench/kc39/` (new — the live probe below)
 
 ---
@@ -131,9 +131,11 @@ shown it cannot act on, spending one of `max_rework`'s attempts on it.
 
 - Any change to what makes the *first* continue of an attempt fire — still
   just "the tree is dirty", exactly as KC-22 left it.
-- Detecting "no progress" any other way than the worktree's own diff
-  content — token counts, elapsed time, tool-call counts are KC-36's
-  concern (a different edge, inside one turn) and are not reused here.
+- Inventing a second "how much changed in the worktree" measurement if
+  KC-36's `_churn` has already landed by the time this ticket starts —
+  `_diff_signature` should wrap or reuse `_churn` rather than duplicate it
+  (see Depends on). Only build a standalone `_diff_signature` from scratch
+  if KC-36 is genuinely not in the tree yet.
 - Writing or capturing a summary of the stuck work before the reset — the
   reset's prompt carries only the raw `git status` lines, same as KC-22's
   `--resume` path. A model-authored summary is KC-40, which depends on

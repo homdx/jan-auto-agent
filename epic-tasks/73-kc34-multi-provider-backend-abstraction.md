@@ -1,6 +1,6 @@
 # KC-34 — `tools/contest/backend.py`: abstract `KiloClient` behind a `ContestBackend` protocol so non-kilo providers (OpenRouter, plain OpenAI-compatible) can run in the same round; and a model listed twice in `--models` runs as `<name>-var1`, `<name>-var2`
 
-**Status:** landed — ideal patch of the KC-34 round (73), winner SenSenova-6-8; applied `c25f165`  
+**Status:** landed — ideal patch of the KC-34 round (73), winner SenSenova-6-8; applied `3bc10b8`  
 **Severity:** HIGH  
 **File:** `tools/contest/backend.py` (new), `tools/contest/kilo_client.py`, `tools/contest/runner.py`, `tools/contest/roster.py`, `tools/contest/cli.py`, `contest.ini`  
 **Symbol:** `ContestBackend`, `KiloBackend`, `OpenRouterBackend`,

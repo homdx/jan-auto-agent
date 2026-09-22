@@ -1,6 +1,6 @@
 # KC-33 — `/contest` command in `main.py` REPL and `--contest` one-shot flag
 
-**Status:** open  
+**Status:** landed `6b7978c` — round 72, ideal commit chosen black-box over all 10 candidate patches (3 round-72 agents + 7 SenSenova variants): all 10 agreed on the core dispatch, the one discriminating test was `test_main_skips_the_orchestrator` (`--contest` must short-circuit before `Orchestrator(config_path=...)` is built) — 7/10 got it right; SenSenova-6-8-var10 won on the fullest green suite (20 tests) and clean hygiene. Note added 2026-09-22: this ticket's own Status line and the INDEX row were still `open` after the commit landed — a bookkeeping lag, not a code gap; fixed now.  
 **Severity:** MEDIUM  
 **File:** `main.py` (`HELP_TEXT`, `_parse_args`, `main`)  
 **Symbol:** `main`, `_parse_args`, `HELP_TEXT`  
