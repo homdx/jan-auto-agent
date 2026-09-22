@@ -26,11 +26,11 @@ written is a warning, never an exception into a round.
 Stall detection: KC-12 (round 51) gives `wait_idle` an `idle_event_timeout=`,
 so this module only passes the round's `idle_event_timeout_sec` (KC-2's
 `[contest]` key) and reads the result. The primitive owns the clock — the last
-event *of this session* on the tap, in `time.monotonic()` — and sends the
+event *of this session* on its stream, in `time.monotonic()` — and sends the
 `abort` itself. A silence stall and the overall `turn_timeout_sec` both come
 back as `IdleResult.status == "timeout"`; `elapsed` tells them apart. The
-third-question edge is the runner's own, still: `stall()` aborts and closes
-the tap, and the wait wakes on `tap.closed`.
+third-question edge is the runner's own, still: `stall()` aborts and interrupts
+the backend, and the wait wakes on the closed stream.
 
 The round narrates itself (KC-18, round 57): every `transition` is one INFO
 line on `tools.contest.runner` — `<agent>: <STATE> …` with the attempt, the
@@ -70,9 +70,10 @@ from pathlib import Path
 from typing import Callable
 
 from tools.backoff import save_state
+from tools.contest.backend import ContestBackend, ContestBackendError
 from tools.contest.gates import declared_files, git
 from tools.contest.harvest import harvest, rework_message
-from tools.contest.kilo_client import EventTap, KiloClient, KiloHttpError, SessionRef
+from tools.contest.kilo_client import SessionRef
 from tools.contest.policy import HARD_DENYLIST, Policy, PolicyContext
 from tools.contest.roster import AgentSpec, ContestConfig
 from tools.contest.workspace import Workspace
@@ -449,9 +450,9 @@ def _brief(value) -> str:
     return " ".join(text.split())[:300]
 
 
-def _abort_quietly(client: KiloClient, session: SessionRef) -> None:
+def _abort_quietly(backend: ContestBackend, session: SessionRef) -> None:
     try:
-        client.abort(session)
+        backend.abort(session)
     except Exception as exc:  # noqa: BLE001 — the session may already be gone
         _log.warning("abort(%s) failed: %s: %s", session.id, type(exc).__name__, exc)
 
@@ -460,32 +461,37 @@ def _abort_quietly(client: KiloClient, session: SessionRef) -> None:
 # the wait, with the round's stall edge
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _wait_turn(client: KiloClient, tap: EventTap, session: SessionRef, config: ContestConfig,
+def _wait_turn(backend: ContestBackend, session: SessionRef, config: ContestConfig,
                *, on_permission, on_question):
-    """`client.wait_idle` for one turn, with the round's stall edge wired in.
+    """`backend.wait_idle` for one turn, with the round's stall edge wired in.
 
     Returns the `IdleResult`. `idle_event_timeout` is the round's
     `idle_event_timeout_sec`: a session silent for that long is aborted by the
-    primitive and comes back as `status="timeout"`, at an `elapsed` well under
+    backend and comes back as `status="timeout"`, at an `elapsed` well under
     `turn_timeout_sec` — which is how the runner names it a silence stall
     rather than a turn timeout. Zero or unset disables the clock, which is
     `wait_idle`'s behaviour without the argument.
     """
     silence = float(config.idle_event_timeout_sec or 0)
-    return client.wait_idle(tap, session, float(config.turn_timeout_sec),
-                            idle_event_timeout=silence or None,
-                            on_permission=on_permission, on_question=on_question)
+    return backend.wait_idle(session, float(config.turn_timeout_sec),
+                             idle_event_timeout=silence or None,
+                             on_permission=on_permission, on_question=on_question)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # one agent
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_agent(run: AgentRun, *, client: KiloClient, tap: EventTap, policy: Policy,
+def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
               config: ContestConfig, ticket_path: Path, out_dir: Path,
               on_transition: Callable[[AgentRun], None],
               run_tests: bool = False) -> AgentRun:
     """Drive *run* to a terminal state — single-threaded, one session for every turn.
+
+    *backend* is a `ContestBackend` (KC-34): everything this function needs of the
+    session — create, prompt, wait, abort, tool history, close — goes through
+    it, so a Kilo server and an OpenRouter subprocess are the same round. This
+    function never touches a client or a tap.
 
     `on_transition(run)` is called after every state change. In `finally`, on a
     terminal state, the session's `cost` and `tokens` are read and its messages
@@ -516,18 +522,18 @@ def run_agent(run: AgentRun, *, client: KiloClient, tap: EventTap, policy: Polic
         on_transition(run)
 
     def stall(reason: str) -> None:
-        """Abort the session and close the tap; the wait wakes on `tap.closed`."""
+        """Abort the session and end the wait; it wakes on the closed stream."""
         if stalled:
             return
         stalled.append(reason)
-        _abort_quietly(client, session)
-        tap.stop()
+        _abort_quietly(backend, session)
+        backend.interrupt(session)
 
     def on_permission(event: dict) -> tuple:
         props = event.get("properties") or {}
         run.permissions["asked"] += 1
         try:
-            recent = tuple(client.tool_parts(session)[-RECENT_TOOLS:])
+            recent = tuple(backend.tool_parts(session)[-RECENT_TOOLS:])
         except Exception:  # noqa: BLE001 — a history that cannot be read is an empty one
             recent = ()
         spent = run.permissions["gated"] + run.permissions["gate_failed"]
@@ -566,10 +572,10 @@ def run_agent(run: AgentRun, *, client: KiloClient, tap: EventTap, policy: Polic
     try:
         # ── CREATED: one session, kept for every turn ─────────────────────
         try:
-            session = client.create_session(
+            session = backend.create_session(
                 spec.provider_id, spec.model_id, rules=config.session_rules(),
                 title=ws.branch, agent=spec.kilo_agent)
-        except (KiloHttpError, ValueError) as exc:
+        except (ContestBackendError, ValueError) as exc:
             return finish(AgentState.ERROR, f"POST /session failed: {_brief(str(exc))}")
         run.session_id = session.id
 
@@ -607,14 +613,14 @@ def run_agent(run: AgentRun, *, client: KiloClient, tap: EventTap, policy: Polic
                 note = f"attempt {run.attempt} ({kind})"
             transition(AgentState.PROMPTED, note=note)
             try:
-                client.prompt(session, text)
-            except KiloHttpError as exc:
+                backend.prompt(session, text)
+            except ContestBackendError as exc:
                 return finish(AgentState.ERROR, f"prompt failed: {_brief(str(exc))}")
 
             # ── WAITING ────────────────────────────────────────────────────
             transition(AgentState.WAITING)
             questions_this_turn[0] = 0
-            idle = _wait_turn(client, tap, session, config,
+            idle = _wait_turn(backend, session, config,
                               on_permission=on_permission, on_question=on_question)
             turn["idle_at"] = time.time()
             turn["idle_status"] = idle.status
@@ -650,7 +656,7 @@ def run_agent(run: AgentRun, *, client: KiloClient, tap: EventTap, policy: Polic
                         try:
                             while not _backoff_event.is_set():
                                 _backoff_event.wait(timeout=0.2)
-                                if stalled or tap._stop.is_set():
+                                if stalled or backend.interrupted():
                                     break
                         finally:
                             _timer.cancel()
@@ -745,19 +751,19 @@ def run_agent(run: AgentRun, *, client: KiloClient, tap: EventTap, policy: Polic
             rework_text = rework_message(verdict, run.attempt, int(config.max_rework))
     finally:
         if session is not None and run.terminal:
-            _record_session(run, client, session, out_dir)
+            _record_session(run, backend, session, out_dir)
 
 
-def _record_session(run: AgentRun, client: KiloClient, session: SessionRef, out_dir: Path) -> None:
+def _record_session(run: AgentRun, backend: ContestBackend, session: SessionRef, out_dir: Path) -> None:
     """Cost, tokens and the transcript of a finished session. Fail-open."""
     try:
-        info = client.session_info(session)
+        info = backend.session_info(session)
         run.cost = info.get("cost")
         run.tokens = info.get("tokens")
     except Exception as exc:  # noqa: BLE001 — the server may be gone
         _log.warning("session_info(%s) failed: %s: %s", session.id, type(exc).__name__, exc)
     try:
-        _write_json(out_dir / f"{run.agent.name}.session.json", client.messages(session))
+        _write_json(out_dir / f"{run.agent.name}.session.json", backend.messages(session))
     except Exception as exc:  # noqa: BLE001
         _log.warning("messages(%s) failed: %s: %s", session.id, type(exc).__name__, exc)
 
@@ -808,11 +814,18 @@ def _plan(config: ContestConfig, workspaces: list, ticket_path: Path,
 
 
 def run_round(config: ContestConfig, round_no: int, ticket_path: Path, workspaces: list, *,
-              server, out_dir: Path, resume: RoundState | None = None,
+              make_backend: Callable[[Workspace], ContestBackend], out_dir: Path,
+              resume: RoundState | None = None,
               run_tests: bool = False) -> RoundState:
     """One round: a `run_agent` per workspace in a pool of `config.max_parallel`.
 
-    Each agent gets its own `KiloClient` and `EventTap` for its directory.
+    Each agent gets its own `ContestBackend` for its directory: `make_backend`
+    is called once per non-terminal agent and decides which backend that is
+    (KC-34) — a `KiloBackend` over `kilo serve`, or an `OpenRouterBackend`
+    subprocess agent. `run_round` never touches a client, a tap or a server:
+    `backend.wait_ready()` before the first prompt, `backend.close()` after the
+    last, are the only two calls it makes besides `run_agent`.
+
     `state.json` is rewritten atomically after every transition of any agent.
     With *resume*, terminal agents are skipped and mid-flight agents restart in
     their worktree (a tree that already scores READY needs no session). Ctrl-C
@@ -848,27 +861,23 @@ def run_round(config: ContestConfig, round_no: int, ticket_path: Path, workspace
     heartbeat = _Heartbeat(state, since, float(config.progress_every_sec or 0))
 
     policy = Policy(config)
-    live: list = []                     # (run, client, tap) of every agent in the pool
+    live: list = []                     # (run, backend) of every agent in the pool
     for run in runs:
         if run.terminal:
             continue
-        client = KiloClient(server, str(run.workspace.path))
-        tap = EventTap(server.base_url, str(run.workspace.path),
-                       str(out_dir / run.agent.name / "events.jsonl")).start()
-        live.append((run, client, tap))
+        live.append((run, make_backend(run.workspace)))
     save()
 
-    def work(run: AgentRun, client: KiloClient, tap: EventTap) -> None:
-        _wait_for_stream(tap)
+    def work(run: AgentRun, backend: ContestBackend) -> None:
+        backend.wait_ready()
         try:
-            run_agent(run, client=client, tap=tap, policy=policy, config=config,
+            run_agent(run, backend=backend, policy=policy, config=config,
                       ticket_path=ticket_path, out_dir=out_dir, on_transition=on_transition,
                       run_tests=run_tests)
         except _Stopped:
             pass
         finally:
-            tap.stop()
-            tap.join(2.0)
+            backend.close()
 
     pool = ThreadPoolExecutor(max_workers=max(1, int(config.max_parallel)),
                               thread_name_prefix="contest")
@@ -886,12 +895,14 @@ def run_round(config: ContestConfig, round_no: int, ticket_path: Path, workspace
     except KeyboardInterrupt:
         stop.set()  # from here on a worker's transition raises instead of saving
         save()      # the round as it stood: mid-flight agents stay mid-flight for --resume
-        for run, client, tap in live:
+        for run, backend in live:
+            session = None
             if not run.terminal and run.session_id:
-                _abort_quietly(client, SessionRef(run.session_id, run.agent.provider_id,
-                                                  run.agent.model_id, str(run.workspace.path),
-                                                  run.agent.kilo_agent))
-            tap.stop()  # wakes the worker's wait
+                session = SessionRef(run.session_id, run.agent.provider_id,
+                                     run.agent.model_id, str(run.workspace.path),
+                                     run.agent.kilo_agent)
+                _abort_quietly(backend, session)
+            backend.interrupt(session)  # wakes the worker's wait
         raise
     finally:
         heartbeat.stop()
@@ -944,12 +955,3 @@ class _Heartbeat:
 def _age(seconds: float) -> str:
     seconds = max(0, int(seconds))
     return f"{seconds}s" if seconds < 90 else f"{seconds // 60}m"
-
-
-def _wait_for_stream(tap: EventTap, timeout: float = 5.0) -> None:
-    """Give the tap's reader a moment to connect: an event published before the
-    stream is open is lost, and the first one is the session's own."""
-    deadline = time.monotonic() + timeout
-    while getattr(tap, "_socket", None) is None and time.monotonic() < deadline:
-        if tap.join(0.02):
-            return  # the reader already ended: the wait will see tap.closed

@@ -32,6 +32,15 @@ own; a server that cannot be started is not a failure here, the round's own
 `server:` line says the same thing. `--provider` is the default provider behind
 a bare `--models` id.
 
+`backend = openrouter` runs the same command on a non-Kilo backend:
+`--backend openrouter` skips the `kilo serve` start, the `KiloServer.attach`
+health check and the `GET /provider` offer check alike, gives each agent an
+`OpenRouterBackend` subprocess instead of a `KiloClient` session, and makes
+`openrouter` the provider behind a bare `--models` id — an operator with a
+gateway key and no `kilo` binary can run the round. That credential is
+`[contest] openrouter_llm_profile`, resolved at load time for that backend
+only, and it is not the gate profile.
+
 `main(argv)` takes subcommands so KC-7 (round 46) adds `status` and `--dry-run`
 without moving anything. Exit codes: 0 when at least one agent is READY, 2
 when none is, 1 on an intake or a server failure; a bare `python3 -m
@@ -42,6 +51,7 @@ from __future__ import annotations
 
 import argparse
 import difflib
+from collections import Counter
 import json
 import logging
 import os
@@ -53,6 +63,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from tools.contest import gates
+from tools.contest.backend import KiloBackend, OpenRouterBackend
 from tools.contest.kilo_client import (
     KiloClient,
     KiloHttpError,
@@ -189,15 +200,46 @@ def _label(body: str, name: str, number: int) -> str:
 def agents_from_models(models: str, provider: str = DEFAULT_PROVIDER) -> tuple:
     """`--models a:free,b:free` → a roster of `AgentSpec`s.
 
-    Copied from `contest-bench/kc6/live_smoke.py`: the name is the model id
-    without its `:tag`, squeezed to the `[a-z0-9][a-z0-9_-]*` a branch name
-    needs, and the provider is *provider* unless the id says its own.
+    The name is the model id without its `:tag`, squeezed to the
+    `[a-z0-9][a-z0-9_-]*` a branch name needs, and the provider is *provider*
+    unless the id says its own — copied from `contest-bench/kc6/live_smoke.py`.
+
+    Beyond the copy, a name that appears more than once in *models* is
+    suffixed: `<name>-var1`, `<name>-var2`, … in list order. The name is the
+    branch, the worktree folder, `runs/<name>/` and `<name>.patch`, so two
+    agents with one name share one checkout and one branch and the round still
+    exits 0; the roster path already refuses a duplicate agent name, the
+    `--models` path did not. "Same name" means the squeezed name, so
+    `hy3:free,hy3:pro` are variants too and so are `kenary/hy3:free` and
+    `openrouter/hy3:free`, each keeping its own provider. A name that appears
+    once is untouched, and a variant skips a name the list already holds
+    (`hy3-var1:free,hy3:free,hy3:free` → `hy3-var1`, `hy3-var2`, `hy3-var3`).
+    The names are a pure function of the *models* string, so `--resume` with
+    the same string finds the same agents in `state.json`.
     """
-    specs = []
+    parsed = []
     for item in filter(None, (m.strip() for m in models.split(","))):
         prov, _, model_id = item.rpartition("/")
-        name = "".join(c if c.isalnum() or c in "_-" else "-" for c in model_id.split(":")[0].lower())
-        specs.append(AgentSpec(name=name.lstrip("_-"), provider_id=prov or provider, model_id=model_id))
+        name = "".join(c if c.isalnum() or c in "_-" else "-"
+                       for c in model_id.split(":")[0].lower())
+        parsed.append((name.lstrip("_-"), prov or provider, model_id))
+
+    counts = Counter(name for name, _, _ in parsed)
+    taken = {name for name, count in counts.items() if count == 1}
+    last: dict = {}
+    specs = []
+    for name, prov, model_id in parsed:
+        if counts[name] > 1:
+            number = last.get(name, 0)
+            while True:
+                number += 1
+                candidate = f"{name}-var{number}"
+                if candidate not in taken:
+                    break
+            last[name] = number
+            taken.add(candidate)
+            name = candidate
+        specs.append(AgentSpec(name=name, provider_id=prov, model_id=model_id))
     return tuple(specs)
 
 
@@ -468,20 +510,23 @@ def intake(repo, tasks_dir, round_no, base_ref, config, argv=None):
             )
 
     attached = None
-    if config.server == "spawn":
-        try:
-            find_kilo_binary(config.kilo_bin)
-        except (FileNotFoundError, OSError) as exc:
-            failures.append(str(exc))
-    else:
-        try:
-            attached = KiloServer.attach(config.server)
-        except KiloServerError as exc:
-            failures.append(str(exc))
+    if config.backend == "kilo":
+        # an openrouter round has no Kilo server at all: nothing to resolve,
+        # nothing to attach to, and no offer to check the roster against
+        if config.server == "spawn":
+            try:
+                find_kilo_binary(config.kilo_bin)
+            except (FileNotFoundError, OSError) as exc:
+                failures.append(str(exc))
+        else:
+            try:
+                attached = KiloServer.attach(config.server)
+            except KiloServerError as exc:
+                failures.append(str(exc))
 
-    # the roster the round would run, against what the server offers: the
-    # refusal that used to arrive as one agent's first-turn `session.error`
-    failures.extend(_offer_failures(repo, config, attached))
+        # the roster the round would run, against what the server offers: the
+        # refusal that used to arrive as one agent's first-turn `session.error`
+        failures.extend(_offer_failures(repo, config, attached))
 
     if failures:
         for line in failures:
@@ -555,12 +600,50 @@ def _start_server(config: ContestConfig, out_dir: Path):
     return KiloServer.attach(config.server)
 
 
+def _make_backends(config: ContestConfig, out_dir: Path):
+    """``(server, make_backend)`` for ``run_round``: one ``ContestBackend`` per worktree.
+
+    ``backend = kilo`` starts (or attaches to) the ``kilo serve`` process the
+    whole round shares and hands each agent a ``KiloBackend`` over it; the
+    server outlives every agent, so it is returned for ``cmd_run`` to close.
+    ``backend = openrouter`` starts no server at all — one ``OpenRouterBackend``
+    subprocess per agent, and nothing else left open — so it returns
+    ``server=None`` and closes with the round.
+    """
+    if config.backend == "openrouter":
+        settings = config.openrouter_settings
+        if settings is None:
+            raise KiloServerError(
+                "[contest] backend = openrouter needs openrouter_llm_profile — "
+                "the agents' own base_url and api_key")
+        def make_backend(workspace):
+            return OpenRouterBackend(settings.api_key, settings.base_url,
+                                     str(workspace.path))
+        return None, make_backend
+
+    server = _start_server(config, out_dir)
+
+    def make_backend(workspace):
+        return KiloBackend(server, str(workspace.path),
+                           events_log=str(out_dir / workspace.agent / "events.jsonl"))
+    return server, make_backend
+
+
 def _apply_flags(config: ContestConfig, args: argparse.Namespace) -> ContestConfig:
     """`--models` (with `--provider` behind its bare ids), `--max-parallel` and
-    `--no-gate` on top of the roster."""
+    `--no-gate` on top of the roster.
+
+    `--backend` is deliberately not here: it is applied by `load_roster`
+    (`cmd_run` passes `args.backend`), because the backend decides whether the
+    OpenRouter profile is expanded and resolved.
+    """
     if args.models:
-        config = replace(config, agents=agents_from_models(args.models,
-                                                           provider=args.provider))
+        # the roster's backend picks the provider behind a bare id: an
+        # openrouter round has no Kilo to route through, so the default there
+        # is the gateway, not `kenary`
+        provider = args.provider or ("openrouter" if config.backend == "openrouter"
+                                     else DEFAULT_PROVIDER)
+        config = replace(config, agents=agents_from_models(args.models, provider=provider))
     if args.max_parallel is not None:
         config = replace(config, max_parallel=int(args.max_parallel))
     if args.no_gate:
@@ -592,11 +675,13 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     `intake` first (exit 1 with one line per failure); then `prepare_round` at
     the base, or `<out>/state.json` under `--resume` with the workspaces taken
-    from it; then `KiloServer.spawn` or `.attach`; then `run_round(...,
-    run_tests=…)`; then `export_patches` and one JSON line per agent from
-    `state.table_rows()`. `server.close()` in `finally`: on Ctrl-C `run_round`
-    has already saved `state.json` and re-raised, so the KeyboardInterrupt
-    propagates after the close. 0 with a READY, 2 with none.
+    from it; then one `ContestBackend` per agent — a shared `kilo serve`
+    process for `backend = kilo`, an `OpenRouterBackend` subprocess with no
+    server at all for `backend = openrouter` (KC-34); then `run_round(...,
+    make_backend=…, run_tests=…)`; then `export_patches` and one JSON line per
+    agent from `state.table_rows()`. `server.close()` in `finally`: on Ctrl-C
+    `run_round` has already saved `state.json` and re-raised, so the
+    KeyboardInterrupt propagates after the close. 0 with a READY, 2 with none.
 
     A worktree left by a crashed attempt is not reset silently (KC-23): the
     refusal is the same `intake:` line as every other `WorkspaceError`, exit 1,
@@ -613,7 +698,11 @@ def cmd_run(args: argparse.Namespace) -> int:
     tasks_dir = repo / TASKS_DIR
 
     try:
-        config = load_roster(_roster_path(repo, args.roster))
+        # `--backend` goes into `load_roster`, not into `_apply_flags`: the
+        # backend decides whether the OpenRouter profile is expanded and
+        # resolved, so the flag has to be in place before the roster is read —
+        # applied afterwards, `config.openrouter_settings` would still be None.
+        config = load_roster(_roster_path(repo, args.roster), backend=args.backend)
     except RosterError as exc:
         print(f"intake: {exc}", file=sys.stderr)
         return EXIT_FAILED
@@ -650,17 +739,18 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     out_dir.mkdir(parents=True, exist_ok=True)
     try:
-        server = _start_server(config, out_dir)
+        server, make_backend = _make_backends(config, out_dir)
     except (KiloServerError, FileNotFoundError, OSError) as exc:
         print(f"server: {exc}", file=sys.stderr)
         return EXIT_FAILED
 
     try:
         state = run_round(config, args.ticket, result.ticket_path, workspaces,
-                          server=server, out_dir=out_dir, resume=resume,
+                          make_backend=make_backend, out_dir=out_dir, resume=resume,
                           run_tests=run_tests)
     finally:
-        server.close()
+        if server is not None:
+            server.close()
 
     patches = export_patches(state, workspaces, out_dir)
     for row in state.table_rows():
@@ -694,9 +784,12 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--models", default="",
                      help="comma-separated model ids run INSTEAD of the roster's agents "
                           "(a:free,b:free → --provider unless the id names its own)")
-    run.add_argument("--provider", default=DEFAULT_PROVIDER, metavar="ID",
+    run.add_argument("--backend", default=None, choices=["kilo", "openrouter"],
+                     help="override the roster's backend (kilo | openrouter)")
+    run.add_argument("--provider", default=None, metavar="ID",
                      help="the provider id behind a --models id that names no provider of "
-                          "its own (default kenary; the roster spells a model provider/model, "
+                          "its own (default kenary for backend = kilo, openrouter for "
+                          "backend = openrouter; the roster spells a model provider/model, "
                           "and --roster's agents are unaffected)")
     run.add_argument("--max-parallel", type=int, default=None, metavar="N",
                      help="override the roster's max_parallel")

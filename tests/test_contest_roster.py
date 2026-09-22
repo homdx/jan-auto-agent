@@ -629,6 +629,164 @@ def test_gate_profile_expands_an_env_reference(tmp_path, monkeypatch):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# the round's backend — KC-34
+# ─────────────────────────────────────────────────────────────────────────────
+
+#: The agents' own profile when `backend = openrouter`: the gate's section with
+#: the OpenRouter endpoint and a key that is not the gate's.
+OPENROUTER_PROFILE = """
+[openrouter]
+base_url = https://openrouter.ai/api/v1
+api_key = test-openrouter-key
+model =
+api_format = openai
+"""
+
+
+def with_backend(text: str, backend: str, profile: bool = True) -> str:
+    """*text* with a `[contest] backend =` key, plus its OpenRouter profile."""
+    line = f"[contest]\nbackend = {backend}\n"
+    if profile:
+        line += "openrouter_llm_profile = openrouter\n"
+    text = text.replace("[contest]\n", line)
+    return text + (OPENROUTER_PROFILE if profile else "")
+
+
+def test_the_committed_backend_is_kilo_without_an_openrouter_key(gate_key):
+    """The committed roster carries a ${CONTEST_OPENROUTER_API_KEY} reference
+    but never resolves it: `backend = kilo` needs no OpenRouter key at all, so
+    the committed file loads on a machine that has no such key exported."""
+    cfg = load_roster(COMMITTED)
+
+    assert cfg.backend == "kilo"
+    assert cfg.openrouter_llm_profile == "contest_openrouter_llm"
+    assert cfg.openrouter_settings is None
+
+
+def test_backend_defaults_to_kilo(tmp_path):
+    text = MINIMAL.split("[contest.agent.alpha]")[0] + "[contest.agent.alpha]\nmodel = kenary/hy3:free\n"
+    cfg = load_roster(write_ini(tmp_path, text))
+
+    assert cfg.backend == "kilo"
+    assert cfg.openrouter_settings is None
+
+
+def test_backend_openrouter_parses_and_resolves_its_own_profile(tmp_path):
+    cfg = load_roster(write_ini(tmp_path, with_backend(MINIMAL, "openrouter")))
+
+    assert cfg.backend == "openrouter"
+    assert cfg.openrouter_llm_profile == "openrouter"
+    assert cfg.openrouter_settings.base_url == "https://openrouter.ai/api/v1"
+    assert cfg.openrouter_settings.api_key == "test-openrouter-key"
+    assert cfg.openrouter_settings.model == ""
+    assert cfg.openrouter_settings.api_format == "openai"
+    # the gate keeps its own profile: the backend never borrows its credential
+    assert cfg.gate_settings.api_key == "test-key"
+    assert cfg.openrouter_settings is not cfg.gate_settings
+
+
+def test_backend_openrouter_without_a_profile_names_the_key(tmp_path):
+    text = MINIMAL.replace("[contest]\n", "[contest]\nbackend = openrouter\n") + OPENROUTER_PROFILE
+    with pytest.raises(RosterError, match="openrouter_llm_profile"):
+        load_roster(write_ini(tmp_path, text))
+
+
+def test_backend_openrouter_without_its_section_names_it(tmp_path):
+    text = MINIMAL.replace("[contest]\n", "[contest]\nbackend = openrouter\nopenrouter_llm_profile = openrouter\n")
+    with pytest.raises(RosterError, match=r"\[openrouter\]"):
+        load_roster(write_ini(tmp_path, text))
+
+
+def test_backend_openrouter_missing_a_required_field_names_it(tmp_path):
+    text = with_backend(MINIMAL, "openrouter").replace("api_key = test-openrouter-key\n", "")
+    with pytest.raises(RosterError, match="required option"):
+        load_roster(write_ini(tmp_path, text))
+
+
+def test_backend_expands_its_own_env_reference(tmp_path, monkeypatch):
+    """The real key goes in `contest.local.ini`; the committed reference is
+    expanded from the environment the same way the gate's is."""
+    monkeypatch.setenv("ROSTER_OPENROUTER_TEST_KEY", "expanded-openrouter-key")
+    text = with_backend(MINIMAL, "openrouter").replace(
+        "api_key = test-openrouter-key", "api_key = ${ROSTER_OPENROUTER_TEST_KEY}")
+    assert load_roster(write_ini(tmp_path, text)).openrouter_settings.api_key == "expanded-openrouter-key"
+
+
+def test_backend_openrouter_falls_back_to_its_own_defaults(tmp_path):
+    """The gate's and the OpenRouter profile's defaults differ (temperature,
+    max_tokens, response_format); the OpenRouter profile must fall back to
+    its own, not to the gate's."""
+    section = "[openrouter]\nbase_url = https://openrouter.ai/api/v1\napi_key = test-openrouter-key\nmodel = \n"
+    text = MINIMAL.replace("[contest]\n", "[contest]\nbackend = openrouter\nopenrouter_llm_profile = openrouter\n") + section
+    settings = load_roster(write_ini(tmp_path, text)).openrouter_settings
+
+    assert settings is not roster.DEFAULTS_GATE
+    assert settings.temperature == roster.DEFAULTS_OPENROUTER.temperature == 0.2
+    assert settings.max_tokens == roster.DEFAULTS_OPENROUTER.max_tokens == 4096
+    assert settings.response_format is roster.DEFAULTS_OPENROUTER.response_format is False
+    assert settings.base_url == "https://openrouter.ai/api/v1"
+
+
+def test_load_roster_accepts_a_backend_override(tmp_path):
+    """`--backend` is applied while the roster is read, not after: a file that
+    says `backend = kilo` still resolves its OpenRouter profile when the
+    command asks for `openrouter`, because the override is in place before the
+    ${ENV} expansion and the profile resolution."""
+    text = with_backend(MINIMAL, "kilo")
+    assert load_roster(write_ini(tmp_path, text)).backend == "kilo"
+    assert load_roster(write_ini(tmp_path, text)).openrouter_settings is None
+
+    cfg = load_roster(write_ini(tmp_path, text), backend="openrouter")
+    assert cfg.backend == "openrouter"
+    assert cfg.openrouter_settings.api_key == "test-openrouter-key"
+    assert cfg.gate_settings.api_key == "test-key"
+
+
+def test_backend_override_without_a_profile_in_the_file_names_the_key(tmp_path):
+    text = MINIMAL.replace("[contest]\n", "[contest]\nbackend = kilo\n")
+    with pytest.raises(RosterError, match="openrouter_llm_profile"):
+        load_roster(write_ini(tmp_path, text), backend="openrouter")
+
+
+def test_backend_override_does_not_mask_a_bad_backend_in_the_file(tmp_path):
+    """The override replaces the file's value, but the file's own value is still
+    validated: a typo there is reported as a typo, not silently ignored."""
+    text = MINIMAL.replace("[contest]\n", "[contest]\nbackend = ollama\n") + OPENROUTER_PROFILE
+    with pytest.raises(RosterError, match=r"got 'ollama'"):
+        load_roster(write_ini(tmp_path, text), backend="openrouter")
+
+
+def test_backend_of_an_unknown_value_names_it(tmp_path):
+    text = with_backend(MINIMAL, "ollama", profile=False)
+    with pytest.raises(RosterError, match=r"backend must be one of kilo \| openrouter, got 'ollama'"):
+        load_roster(write_ini(tmp_path, text))
+
+
+def test_backend_values_are_listed_in_backends_and_contest_keys():
+    assert roster.BACKENDS == ("kilo", "openrouter")
+    assert "backend" in CONTEST_KEYS
+    assert "openrouter_llm_profile" in CONTEST_KEYS
+    assert "backend" in ContestConfig.__dataclass_fields__
+    assert "openrouter_settings" in ContestConfig.__dataclass_fields__
+
+
+def test_backend_case_and_whitespace_are_squeezed(tmp_path):
+    cfg = load_roster(write_ini(tmp_path, with_backend(MINIMAL, "  openrouter  ")))
+    assert cfg.backend == "openrouter"
+
+
+def test_kilo_needs_no_openrouter_key_even_when_the_section_says_an_env_ref(tmp_path, monkeypatch):
+    """The committed roster's shape: the section exists with an env reference,
+    the backend is `kilo`, the variable is unset, and the load still succeeds."""
+    monkeypatch.delenv(GATE_KEY_ENV, raising=False)
+    text = MINIMAL.replace("[contest]\n", "[contest]\nbackend = kilo\nopenrouter_llm_profile = openrouter\n")
+    text += OPENROUTER_PROFILE.replace("api_key = test-openrouter-key", "api_key = ${UNSET_OPENROUTER_KEY}")
+    cfg = load_roster(write_ini(tmp_path, text))
+
+    assert cfg.openrouter_settings is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # the shape of what this module exports
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -655,7 +813,7 @@ model = kenary/laguna-s-2-1:free
 
 def test_exported_key_sets_match_the_dataclass():
     assert set(CONTEST_KEYS) == set(ContestConfig.__dataclass_fields__) - {
-        "agents", "gate_settings",
+        "agents", "gate_settings", "openrouter_settings",
     }
     assert set(AGENT_KEYS) == {"model", "kilo_agent", "variant"}
     assert AGENT_SECTION_PREFIX == "contest.agent."

@@ -732,3 +732,144 @@ class _Handler(BaseHTTPRequestHandler):
         finally:
             self.fake._bus.unsubscribe(q)
             self.close_connection = True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# a minimal OpenAI-compatible endpoint, for KC-34's OpenRouterBackend
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _openai_reply(content=None, calls=(), usage=(10, 20), *, role="assistant"):
+    """One ``/chat/completions`` reply in the shape the endpoint returns.
+
+    ``content`` is the assistant text (``None`` for a tool-only turn) and
+    ``calls`` is a list of ``{"id", "function": {"name", "arguments"}}`` where
+    ``arguments`` is the JSON *string* the endpoint sends.
+    """
+    message = {"role": role, "content": content}
+    if calls:
+        message["tool_calls"] = list(calls)
+    return {"choices": [{"finish_reason": "stop", "message": message}],
+            "usage": {"prompt_tokens": usage[0], "completion_tokens": usage[1]}}
+
+
+def _openai_tool(name, arguments, call_id="call_1"):
+    """One tool call, with ``arguments`` as the JSON string the endpoint sends."""
+    payload = json.dumps(arguments, ensure_ascii=False) if not isinstance(arguments, str) else arguments
+    return {"id": call_id, "function": {"name": name, "arguments": payload}}
+
+
+class _OpenRouterHandler(BaseHTTPRequestHandler):
+    """One POST per reply, threaded across connections, like the Kilo fake."""
+
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):  # silence; requests are recorded instead
+        pass
+
+    @property
+    def fake(self):
+        return self.server._fake
+
+    def _body(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(length) if length > 0 else b""
+        if not raw:
+            return None
+        try:
+            return json.loads(raw)
+        except ValueError:
+            return raw.decode("utf-8", "replace")
+
+    def _json(self, status: int, payload) -> None:
+        body = json.dumps(payload, ensure_ascii=False).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self) -> None:
+        path = urlparse(self.path).path
+        body = self._body()
+        with self.fake._lock:
+            self.fake.requests.append({"path": path, "body": body,
+                                       "authorization": self.headers.get("Authorization")})
+        if not path.endswith("/chat/completions"):
+            return self._json(404, {"error": f"no such route: {path}"})
+        with self.fake._lock:
+            index = self.fake._index
+            self.fake._index += 1
+            spec = self.fake.responses[index] if index < len(self.fake.responses) else {}
+        if isinstance(spec, dict) and "status" in spec:
+            status, payload = int(spec["status"]), spec.get("body")
+        else:
+            status, payload = 200, spec
+        if status >= 400:
+            # the client turns this into an error turn, not a crash
+            return self._json(status, payload if isinstance(payload, dict) else {"error": str(payload)})
+        return self._json(200, payload)
+
+
+class FakeOpenRouter:
+    """A scripted OpenAI-compatible ``/chat/completions`` on 127.0.0.1.
+
+    The other half of KC-34's test double: ``OpenRouterBackend`` speaks this
+    endpoint straight, with no ``kilo`` in the path, so the fake is one route
+    and nothing else. Each entry of *responses* is one reply, in call order —
+    a dict body returned as 200, or ``{"status": N, "body": …}`` for an error
+    answer. A reply beyond the end answers an empty body, which the agent loop
+    reads as ``error`` rather than a crash. ``requests`` records every call as
+    ``{path, body, authorization}``, so an assertion can read what the backend
+    actually sent. The real provider is never called.
+    """
+
+    def __init__(self, responses=None, *, host: str = "127.0.0.1", port: int = 0,
+                 base_path: str = "/v1") -> None:
+        self.responses = list(responses or [])
+        self.requests: list = []
+        self.host = host
+        self._port = port
+        self._base_path = base_path.rstrip("/")
+        self._lock = threading.Lock()
+        self._index = 0
+        self._httpd = None
+        self._thread = None
+        self._base = None
+
+    @property
+    def url(self) -> str:
+        """The base URL, e.g. ``http://127.0.0.1:53211/v1``. ``None`` before start."""
+        return self._base
+
+    def start(self) -> "FakeOpenRouter":
+        if self._httpd is not None:
+            return self
+        httpd = ThreadingHTTPServer((self.host, self._port), _OpenRouterHandler)
+        httpd._fake = self
+        httpd.daemon_threads = True
+        self._httpd = httpd
+        self._base = f"http://{self.host}:{httpd.server_address[1]}" + self._base_path
+        thread = threading.Thread(target=httpd.serve_forever,
+                                  kwargs={"poll_interval": 0.1}, daemon=True)
+        self._thread = thread
+        thread.start()
+        return self
+
+    def stop(self) -> None:
+        httpd, self._httpd = self._httpd, None
+        if httpd is not None:
+            try:
+                httpd.shutdown()
+            finally:
+                httpd.server_close()
+        thread, self._thread = self._thread, None
+        if thread is not None:
+            thread.join(5)
+
+    def __enter__(self) -> "FakeOpenRouter":
+        return self.start()
+
+    def __exit__(self, *exc) -> bool:
+        self.stop()
+        return False

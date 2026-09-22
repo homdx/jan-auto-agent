@@ -10,6 +10,11 @@ neighbour, three agents reworking at once, Ctrl-C mid-turn).
 
 ``_BenchFake`` adds the two knobs the scenarios need and the fake does not have:
 ``bad_models`` (``POST /session`` answers 400) and a turn's ``"questions": N``.
+
+KC-34 moved the session behind a protocol: every ``run_agent`` and ``run_round``
+here takes a ``KiloBackend`` instead of a ``KiloClient`` and a ``EventTap``, and
+nothing in this file touches a tap — the backend owns it and ``close()`` stops it.
+The kilo round is otherwise byte-for-byte what it was.
 """
 
 from __future__ import annotations
@@ -37,7 +42,8 @@ for _p in (str(REPO_ROOT), str(TESTS_DIR)):
 import _kilo_fake  # noqa: E402
 from _kilo_fake import FakeKiloServer  # noqa: E402
 from tools.auto.llm_profile import LlmSettings  # noqa: E402
-from tools.contest.kilo_client import EventTap, KiloClient, KiloServer  # noqa: E402
+from tools.contest.backend import KiloBackend  # noqa: E402
+from tools.contest.kilo_client import KiloServer  # noqa: E402
 from tools.contest.policy import Policy  # noqa: E402
 from tools.contest.roster import AgentSpec, ContestConfig  # noqa: E402
 from tools.contest.runner import (  # noqa: E402
@@ -299,8 +305,9 @@ class Harness:
         self.ws = sb.ws(agent)
         spec = next(s for s in config.agents if s.name == agent)
         self.server = KiloServer.attach(fake.url)
-        self.client = KiloClient(self.server, str(self.ws.path))
-        self.tap = EventTap(fake.url, str(self.ws.path), str(sb.out_dir / agent / "events.jsonl")).start()
+        self.backend = KiloBackend(
+            self.server, str(self.ws.path),
+            events_log=str(sb.out_dir / agent / "events.jsonl"))
         deadline = time.monotonic() + 5
         while fake.subscribers < 1 and time.monotonic() < deadline:
             time.sleep(0.01)
@@ -312,12 +319,11 @@ class Harness:
         def record(run):
             self.transitions.append(run.state)
         try:
-            return run_agent(self.run, client=self.client, tap=self.tap, policy=self.policy,
+            return run_agent(self.run, backend=self.backend, policy=self.policy,
                              config=self.config, ticket_path=self.sb.ticket_path,
                              out_dir=self.sb.out_dir, on_transition=record)
         finally:
-            self.tap.stop()
-            self.tap.join(2)
+            self.backend.close()
 
 
 def _run_one(tmp_path, scenario, config=None, policy=None):
@@ -330,9 +336,20 @@ def _run_one(tmp_path, scenario, config=None, policy=None):
     return sb, fake, h, run, aborted
 
 
+def _make_backend(fake, out_dir):
+    """`make_backend` over the fake: one `KiloBackend` per workspace, as `cmd_run` builds."""
+    server = KiloServer.attach(fake.url)
+
+    def make_backend(ws):
+        return KiloBackend(server, str(ws.path),
+                           events_log=str(out_dir / ws.agent / "events.jsonl"))
+    return make_backend
+
+
 def _round(sb, fake, config, resume=None) -> RoundState:
     return run_round(config, ROUND, sb.ticket_path, list(sb.workspaces),
-                     server=KiloServer.attach(fake.url), out_dir=sb.out_dir, resume=resume)
+                     make_backend=_make_backend(fake, sb.out_dir), out_dir=sb.out_dir,
+                     resume=resume)
 
 
 def _by_name(state: RoundState) -> dict:
@@ -770,7 +787,7 @@ def test_a_terminal_harvest_runs_the_roots_under_the_rounds_lock(tmp_path, monke
     scenario = {"turns": [{"on_prompt": work_ready, "events": [], "idle": False}]}
     with _BenchFake(scenario) as fake:
         state = run_round(_stall_config(), ROUND, sb.ticket_path, list(sb.workspaces),
-                          server=KiloServer.attach(fake.url), out_dir=sb.out_dir,
+                          make_backend=_make_backend(fake, sb.out_dir), out_dir=sb.out_dir,
                           run_tests=True)
     (run,) = state.agents
     assert run.state is AgentState.READY, (run.state, run.last_error)
@@ -1082,7 +1099,7 @@ def test_ctrl_c_during_retry_backoff_ends_the_round(tmp_path):
     with _BenchFake(scenario) as fake:
         with pytest.raises(KeyboardInterrupt):
             run_round(cfg, ROUND, sb.ticket_path, list(sb.workspaces),
-                      server=KiloServer.attach(fake.url), out_dir=sb.out_dir)
+                      make_backend=_make_backend(fake, sb.out_dir), out_dir=sb.out_dir)
         elapsed = time.monotonic() - started
     # the interrupt cut the 60 s backoff short; any loaded box still lands well
     # under the full wait, and a regression that ignored SIGINT would sit here
@@ -1354,8 +1371,8 @@ def test_run_round_run_tests_is_keyword_only_with_a_false_default():
 
     params = inspect.signature(run_round).parameters
     assert list(params) == ["config", "round_no", "ticket_path", "workspaces",
-                            "server", "out_dir", "resume", "run_tests"]
-    for name in ("server", "out_dir", "resume", "run_tests"):
+                            "make_backend", "out_dir", "resume", "run_tests"]
+    for name in ("make_backend", "out_dir", "resume", "run_tests"):
         assert params[name].kind is inspect.Parameter.KEYWORD_ONLY, name
     assert params["resume"].default is None
     assert params["run_tests"].default is False
@@ -1372,7 +1389,7 @@ def test_run_tests_true_makes_the_failed_suite_a_rework_with_the_pytest_tail(tmp
     sb = Sandbox(tmp_path)
     with _BenchFake(scenario) as fake:
         state = run_round(cfg, ROUND, sb.ticket_path, list(sb.workspaces),
-                          server=KiloServer.attach(fake.url), out_dir=sb.out_dir,
+                          make_backend=_make_backend(fake, sb.out_dir), out_dir=sb.out_dir,
                           run_tests=True)
     (run,) = state.agents
     assert run.state is AgentState.READY
@@ -1393,7 +1410,7 @@ def test_run_tests_false_is_ready_after_one_turn_on_the_same_tree(tmp_path):
     sb = Sandbox(tmp_path)
     with _BenchFake(scenario) as fake:
         state = run_round(cfg, ROUND, sb.ticket_path, list(sb.workspaces),
-                          server=KiloServer.attach(fake.url), out_dir=sb.out_dir)
+                          make_backend=_make_backend(fake, sb.out_dir), out_dir=sb.out_dir)
     (run,) = state.agents
     _assert_ready(run, sb.ws("agent-a"))
     assert len(run.turns) == 1 and run.turns[0]["harvest"] == {"verdict": "READY", "reasons": []}
@@ -1427,7 +1444,7 @@ def test_run_tests_true_never_runs_the_roots_twice_at_once(tmp_path, monkeypatch
                           {"on_prompt": work_ready, "events": ["busy", "idle"]}]}
     with _BenchFake(scenario) as fake:
         state = run_round(cfg, ROUND, sb.ticket_path, list(sb.workspaces),
-                          server=KiloServer.attach(fake.url), out_dir=sb.out_dir,
+                          make_backend=_make_backend(fake, sb.out_dir), out_dir=sb.out_dir,
                           run_tests=True)
     for name in agents:
         _assert_ready(_by_name(state)[name], sb.ws(name))
@@ -1455,7 +1472,7 @@ def test_resume_harvests_the_mid_flight_worktree_with_the_roots(tmp_path, monkey
     monkeypatch.setattr(harvest_module, "run_tests_detail", roots)
     with _BenchFake({"turns": []}) as fake:
         state = run_round(cfg, ROUND, sb.ticket_path, list(sb.workspaces),
-                          server=KiloServer.attach(fake.url), out_dir=sb.out_dir,
+                          make_backend=_make_backend(fake, sb.out_dir), out_dir=sb.out_dir,
                           resume=prior, run_tests=True)
     runs = _by_name(state)
     assert runs["agent-b"].state is AgentState.READY

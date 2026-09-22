@@ -16,9 +16,11 @@ reads `KC-7 (46) is on offer ahead of …`, the same four lines either way.
 
 from __future__ import annotations
 
+import argparse
 import json
 import subprocess
 import sys
+import time
 from dataclasses import replace
 from pathlib import Path
 
@@ -697,7 +699,9 @@ def test_roster_on_offer_is_one_line_per_bad_agent_in_roster_order():
     agents = cli.agents_from_models("kenari/hy3:free,hy3:free,agnes-2-5-flash")
     lines = cli.roster_on_offer(KC25_OFFER, agents)
     assert len(lines) == 2
-    assert lines[0].startswith("[hy3] kenari/hy3:free: no provider 'kenari'")
+    # both hy3 ids are the same name, so KC-34's variant rule suffixes them:
+    # the names differ, the provider and model do not
+    assert lines[0].startswith("[hy3-var1] kenari/hy3:free: no provider 'kenari'")
     assert lines[1].startswith("[agnes-2-5-flash] kenary/agnes-2-5-flash: no model")
 
 
@@ -1190,11 +1194,290 @@ def test_module_entry_point_help_and_usage():
     help_out = subprocess.run([sys.executable, "-m", "tools.contest", "run", "--help"],
                               capture_output=True, text=True, cwd=REPO_ROOT)
     assert help_out.returncode == 0
-    for flag in ("--ticket", "--roster", "--base", "--models", "--max-parallel",
-                 "--no-tests", "--no-gate", "--resume", "--out"):
+    for flag in ("--ticket", "--roster", "--base", "--models", "--backend", "--provider",
+                 "--max-parallel", "--no-tests", "--no-gate", "--resume", "--out"):
         assert flag in help_out.stdout
 
     bare = subprocess.run([sys.executable, "-m", "tools.contest"],
                           capture_output=True, text=True, cwd=REPO_ROOT)
     assert bare.returncode == 2
     assert "usage: tools.contest" in bare.stderr
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KC-34 §7 — a model listed twice runs as <name>-var1, <name>-var2
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_agents_from_models_leaves_a_single_name_untouched():
+    """§7 guard, green on the base: a name that appears once is today's name."""
+    (spec,) = cli.agents_from_models("hy3:free")
+    assert (spec.name, spec.provider_id, spec.model_id) == ("hy3", "kenary", "hy3:free")
+    assert [agent.name for agent in cli.agents_from_models("x:free,y:free")] == ["x", "y"]
+
+
+def test_agents_from_models_suffixes_a_repeated_name():
+    """Two identical ids are two variants: one worktree, branch and patch each."""
+    specs = cli.agents_from_models("hy3:free,hy3:free")
+    assert [spec.name for spec in specs] == ["hy3-var1", "hy3-var2"]
+    assert [spec.model_id for spec in specs] == ["hy3:free", "hy3:free"]
+    assert [spec.provider_id for spec in specs] == ["kenary", "kenary"]
+
+
+def test_agents_from_models_suffixes_only_the_repeated_name_in_list_order():
+    """The operator's own command line: three singles keep their names, the two
+    `hy3` ids get the suffixes in the order they were listed."""
+    models = "agnes-2-5-flash:free,mimo-v2-5:free,step-3-7-flash:free,hy3:free,hy3:free"
+    names = [spec.name for spec in cli.agents_from_models(models)]
+    assert names == ["agnes-2-5-flash", "mimo-v2-5", "step-3-7-flash",
+                     "hy3-var1", "hy3-var2"]
+    assert sorted(names) != names, "the roster order is the list order, not alphabetical"
+
+
+def test_agents_from_models_numbering_runs_across_the_list():
+    """Interleaved repeats keep counting: the second and third `hy3` are var2
+    and var3, the single `x` between them is untouched."""
+    names = [spec.name for spec in cli.agents_from_models("hy3:free,x:free,hy3:free,hy3:free")]
+    assert names == ["hy3-var1", "x", "hy3-var2", "hy3-var3"]
+
+
+def test_agents_from_models_treats_the_same_name_at_two_tags_as_variants():
+    """Same name, different `:tag`: two ids, two variants, the tags survive."""
+    specs = cli.agents_from_models("hy3:free,hy3:pro")
+    assert [spec.name for spec in specs] == ["hy3-var1", "hy3-var2"]
+    assert [spec.model_id for spec in specs] == ["hy3:free", "hy3:pro"]
+
+
+def test_agents_from_models_skips_a_variant_name_the_list_already_holds():
+    """`hy3-var1:free` is a name on its own; the first variant of `hy3` has to
+    skip it rather than land on a name two agents would share."""
+    names = [spec.name for spec in cli.agents_from_models("hy3-var1:free,hy3:free,hy3:free")]
+    assert names == ["hy3-var1", "hy3-var2", "hy3-var3"]
+
+
+def test_agents_from_models_keeps_each_variant_on_its_own_provider():
+    """`kenary/hy3:free,openrouter/hy3:free` are two variants of one name, each
+    keeping the provider its own id said."""
+    specs = cli.agents_from_models("kenary/hy3:free,openrouter/hy3:free")
+    assert [(spec.name, spec.provider_id) for spec in specs] == [
+        ("hy3-var1", "kenary"), ("hy3-var2", "openrouter")]
+
+
+def test_agents_from_models_applies_the_provider_flag_to_every_variant():
+    specs = cli.agents_from_models("hy3:free,hy3:free", provider="openrouter")
+    assert [(spec.name, spec.provider_id) for spec in specs] == [
+        ("hy3-var1", "openrouter"), ("hy3-var2", "openrouter")]
+
+
+def test_agents_from_models_is_a_pure_function_of_the_models_string():
+    """`--resume` re-runs the same string and has to find the same agents in
+    state.json: the names come from the string alone, not from the live roster."""
+    models = "hy3:free,x:free,hy3:free"
+    first = [spec.name for spec in cli.agents_from_models(models)]
+    second = [spec.name for spec in cli.agents_from_models(models)]
+    assert first == second == ["hy3-var1", "x", "hy3-var2"]
+
+
+def test_run_with_a_single_model_keeps_its_name_and_patch(sandbox, capsys, spawn_holder):
+    """§7 guard, green on the base: one `x:free` is the one folder `01-x` and
+    one `x.patch`, exactly as today."""
+    code, fake = run_fake(sandbox, {"turns": [{"on_prompt": work_ready, "events": ["busy", "idle"]}]},
+                          ["--ticket", "1", "--models", "x:free", "--max-parallel", "1",
+                           "--no-gate", "--no-tests"], spawn_holder)
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert sorted(entry.name for entry in sandbox.rounds.iterdir()) == ["01-x"]
+    assert sorted(_git(sandbox.rounds / "01-x", "branch", "--show-current").splitlines()) == [
+        "contest/01/x"]
+    assert len(_sessions(fake)) == 1
+    assert (sandbox.out() / "x.patch").is_file()
+    assert [row["name"] for row in _table(captured.out)] == ["x"]
+
+
+def test_run_with_a_twice_listed_model_gives_each_variant_its_own_everything(
+        sandbox, capsys, spawn_holder):
+    """§7, red on the base, where both agents share the one folder `01-x` and
+    the one branch `contest/01/x`: two folders, two branches, two sessions,
+    two rows and two patches, one per variant name."""
+    scenario = {"turns": [{"on_prompt": work_ready, "events": ["busy", "idle"]}]}
+    code, fake = run_fake(sandbox, scenario,
+                          ["--ticket", "1", "--models", "x:free,x:free", "--max-parallel", "2",
+                           "--no-gate", "--no-tests"], spawn_holder)
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert sorted(entry.name for entry in sandbox.rounds.iterdir()) == ["01-x-var1", "01-x-var2"]
+    assert sorted(_git(sandbox.rounds / "01-x-var1", "branch", "--show-current").splitlines()) == [
+        "contest/01/x-var1"]
+    assert sorted(_git(sandbox.rounds / "01-x-var2", "branch", "--show-current").splitlines()) == [
+        "contest/01/x-var2"]
+
+    creates = _sessions(fake)
+    assert len(creates) == 2
+    assert len({record["query"]["directory"] for record in creates}) == 2
+    assert all("01-x-var" in record["query"]["directory"] for record in creates)
+
+    rows = _table(captured.out)
+    assert [row["name"] for row in rows] == ["x-var1", "x-var2"]
+    assert [row["state"] for row in rows] == ["READY", "READY"]
+
+    out = sandbox.out()
+    assert (out / "x-var1.patch").is_file()
+    assert (out / "x-var2.patch").is_file()
+    assert not (out / "x.patch").exists()
+    assert _patches(captured.out) == [str(out / "x-var1.patch"), str(out / "x-var2.patch")]
+
+    # two separate worktrees, so two separate claims as well as two patches
+    assert (sandbox.rounds / "01-x-var1" / "runs" / "x-var1" / "PROGRESS.csv").is_file()
+    assert (sandbox.rounds / "01-x-var2" / "runs" / "x-var2" / "PROGRESS.csv").is_file()
+    assert (out / "x-var1.patch").read_text(encoding="utf-8").strip().startswith("From ")
+    assert (out / "x-var2.patch").read_text(encoding="utf-8").strip().startswith("From ")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KC-34 §4-§6 — `--backend openrouter`
+# ─────────────────────────────────────────────────────────────────────────────
+
+OPENROUTER_ROSTER = """
+[contest]
+kilo_bin = /no/such/kilo
+backend = kilo
+openrouter_llm_profile = contest_openrouter_llm
+max_parallel = 2
+gate_llm_profile = contest_gate_llm
+out_dir = contest-out
+rounds_dir = {rounds}
+
+[contest_gate_llm]
+base_url = http://127.0.0.1:1/v1
+api_key = ${{CONTEST_GATE_API_KEY}}
+model = test/gate
+api_format = openai
+response_format = true
+
+[contest_openrouter_llm]
+base_url = http://127.0.0.1:9/v1
+api_key = test-openrouter-key
+model =
+api_format = openai
+response_format = false
+
+[contest.agent.alpha]
+model = kenary/hy3:free
+"""
+
+
+def _write_openrouter_roster(sb) -> None:
+    """The sandbox's roster, with the profile an openrouter round reads.
+
+    `backend = kilo` in the file and `kilo_bin` pointed at nothing: the flag is
+    what makes the round openrouter, and the round must not need a kilo binary
+    or a server to be valid.
+    """
+    (sb.repo / "contest.ini").write_text(
+        OPENROUTER_ROSTER.format(rounds=sb.rounds), encoding="utf-8")
+
+
+def _args(*argv: str) -> argparse.Namespace:
+    """`cli._parser().parse_args` for the `run` command — the flag surface."""
+    return cli._parser().parse_args(["run", "--ticket", "1", *argv])
+
+
+def test_the_parser_refuses_a_backend_it_does_not_know(capsys):
+    with pytest.raises(SystemExit) as raised:
+        _args("--backend", "ollama")
+    assert raised.value.code == 2
+
+
+def test_models_under_an_openrouter_backend_default_to_the_gateway_provider(sandbox):
+    """A bare id has no Kilo to route through, so the default provider there is
+    the gateway, not `kenary` — and the variant names come along with it."""
+    config = cli._apply_flags(sandbox.config(backend="openrouter"),
+                              _args("--models", "hy3:free,hy3:free"))
+
+    assert [(spec.name, spec.provider_id) for spec in config.agents] == [
+        ("hy3-var1", "openrouter"), ("hy3-var2", "openrouter")]
+
+
+def test_models_under_a_kilo_backend_default_to_kenary(sandbox):
+    config = cli._apply_flags(sandbox.config(), _args("--models", "hy3:free,hy3:free"))
+
+    assert [(spec.name, spec.provider_id) for spec in config.agents] == [
+        ("hy3-var1", "kenary"), ("hy3-var2", "kenary")]
+
+
+def test_the_provider_flag_wins_over_the_backend_default(sandbox):
+    (spec,) = cli._apply_flags(sandbox.config(backend="openrouter"),
+                               _args("--provider", "kenary", "--models", "hy3:free")).agents
+    assert spec.provider_id == "kenary"
+
+
+def test_a_models_id_naming_its_own_provider_wins_over_the_backend_default(sandbox):
+    (spec,) = cli._apply_flags(sandbox.config(backend="openrouter"),
+                               _args("--models", "kenary/hy3:free")).agents
+    assert spec.provider_id == "kenary"
+
+
+def test_backend_flag_builds_an_openrouter_backend_without_a_kilo_server(
+        sandbox, capsys, monkeypatch):
+    """`--backend openrouter --models agnes-2-5-flash:free` is a valid
+    invocation: intake passes with no kilo binary to find and no offer to check,
+    the roster's own profile is resolved on demand (the file declares
+    `backend = kilo`, so `load_roster` never read it), and the round builds one
+    `OpenRouterBackend` in the agent's worktree."""
+    _write_openrouter_roster(sandbox)
+    built: list = []
+    backends: list = []
+
+    def make_backend_record(api_key, base_url, directory, **kwargs):
+        built.append((api_key, base_url, directory, kwargs))
+        return type("Backend", (), {})()
+
+    def fake_run_round(config, ticket, ticket_path, workspaces, *, make_backend,
+                       out_dir, resume=None, run_tests=True):
+        backends.extend(make_backend(workspace) for workspace in workspaces)
+        specs = {spec.name: spec for spec in config.agents}
+        return RoundState(
+            round_no=ROUND, ticket=ticket, base_sha=sandbox.base, started_at=time.time(),
+            agents=[AgentRun(agent=specs.get(ws.agent) or AgentSpec(ws.agent, "", ""),
+                             workspace=ws, state=AgentState.READY) for ws in workspaces])
+
+    def never_start_server(*args, **kwargs):
+        raise AssertionError("backend = openrouter must not start a Kilo server")
+
+    monkeypatch.setattr(cli, "OpenRouterBackend", make_backend_record)
+    monkeypatch.setattr(cli, "run_round", fake_run_round)
+    monkeypatch.setattr(cli, "_start_server", never_start_server)
+
+    code = cli.main(["run", "--ticket", "1", "--backend", "openrouter",
+                     "--models", "agnes-2-5-flash:free", "--max-parallel", "1",
+                     "--no-gate", "--no-tests"])
+    captured = capsys.readouterr()
+
+    assert code == 0, captured.err
+    assert "intake:" not in captured.err
+    assert "server:" not in captured.err
+    assert _plan(captured.out)["agents"] == "1: openrouter/agnes-2-5-flash:free"
+    assert len(backends) == 1
+
+    (api_key, base_url, directory, kwargs) = built[0]
+    assert (api_key, base_url) == ("test-openrouter-key", "http://127.0.0.1:9/v1")
+    assert kwargs == {}
+    assert directory.rstrip("/").endswith(f"01-agnes-2-5-flash")
+    assert [row["name"] for row in _table(captured.out)] == ["agnes-2-5-flash"]
+
+
+def test_backend_flag_without_a_profile_in_the_roster_is_a_server_line(
+        sandbox, capsys, spawn_holder):
+    """The roster names no `openrouter_llm_profile`: the agents have no
+    credential of their own, so the roster fails to load and the round never
+    starts — exit 1, no worktree, no server."""
+    code = cli.main(["run", "--ticket", "1", "--backend", "openrouter",
+                     "--models", "agnes-2-5-flash:free", "--max-parallel", "1",
+                     "--no-gate", "--no-tests"])
+    captured = capsys.readouterr()
+
+    assert code == cli.EXIT_FAILED
+    assert captured.err.startswith("intake: [contest] backend = openrouter")
+    assert "openrouter_llm_profile" in captured.err
+    assert list(sandbox.rounds.iterdir()) == [], "no worktree before the roster is valid"

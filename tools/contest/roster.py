@@ -15,6 +15,12 @@ in the shape the runner (KC-6) and the policy (KC-3) read it:
     presence_llm_profile = gate1_llm`` does, so ``api_key``, ``base_url``,
     ``api_format``, ``response_format`` and ``think`` behave here as they do
     in ``agents.ini``'s ``[gate1_llm]``;
+  * the round's backend — ``backend = kilo`` (default) or ``backend =
+    openrouter``, one value for the whole round. ``openrouter`` needs a second
+    named profile, ``openrouter_llm_profile = contest_openrouter_llm``, resolved
+    through the same ``resolve_llm_profile`` call: that is the competing
+    agents' own credential, and it is not the gate's profile — the gate is a
+    different model called on a risky command;
   * the session rules KC-1's ``KiloClient.create_session`` sends — the probe's
     three fixed rules, then one ``bash`` deny per ``deny_commands`` entry.
     :meth:`ContestConfig.session_rules` is the single source of truth for that
@@ -51,8 +57,10 @@ __all__ = [
     "AGENT_SECTION_PREFIX",
     "BASE_RULES",
     "CONTEST_KEYS",
+    "BACKENDS",
     "DEFAULTS",
     "DEFAULTS_GATE",
+    "DEFAULTS_OPENROUTER",
     "LOCAL_FILENAME",
     "AgentSpec",
     "ContestConfig",
@@ -71,6 +79,7 @@ AGENT_SECTION_PREFIX = "contest.agent."
 CONTEST_KEYS = (
     "kilo_bin",
     "server",
+    "backend",
     "max_parallel",
     "max_rework",
     "max_continues_per_attempt",
@@ -84,6 +93,7 @@ CONTEST_KEYS = (
     "deny_commands",
     "ask_commands",
     "gate_llm_profile",
+    "openrouter_llm_profile",
     "gate_max_calls_per_session",
     "out_dir",
     "rounds_dir",
@@ -119,6 +129,25 @@ DEFAULTS_GATE = LlmSettings(
 #: ``DEFAULTS_GATE`` under the name the ticket uses for the symbol.
 DEFAULTS = DEFAULTS_GATE
 
+#: The OpenRouter agents' own profile defaults, resolved the same way the gate'
+#: profile is: ``[contest] openrouter_llm_profile`` names an LlmSettings section in
+#: this file. Same shape as ``[contest_gate_llm]``, different taste — a coding
+#: agent wants a wide token budget and free-form output, not the gate's 256-token
+#: JSON verdict. ``model`` is empty on purpose: ``OpenRouterBackend`` gets its
+#: model id per agent from ``AgentSpec``, not from this section.
+DEFAULTS_OPENROUTER = LlmSettings(
+    base_url="",
+    api_key="",
+    model="",
+    api_format="openai",
+    temperature=0.2,
+    max_tokens=4096,
+    response_format=False,
+)
+
+#: The values ``[contest] backend =`` accepts, in the order ``contest.ini`` lists them.
+BACKENDS = ("kilo", "openrouter")
+
 #: ``[a-z0-9][a-z0-9_-]*`` — an agent name becomes a branch and a folder.
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
 
@@ -131,9 +160,12 @@ class RosterError(ValueError):
 
     Raised for a missing roster file, an unreadable source, a ``${ENV}``
     reference to an unset variable, a duplicate section or option, an unknown
-    key in ``[contest]`` or an agent section, an agent name that cannot become
-    a branch, a ``model`` with no ``/``, and an empty roster. Always says which
-    section and key is at fault — the operator has to be able to find the typo.
+    key in ``[contest]`` or an agent section, a ``backend`` that is not
+    ``kilo`` or ``openrouter``, a ``backend = openrouter`` whose
+    ``openrouter_llm_profile`` does not resolve, an agent name that cannot
+    become a branch, a ``model`` with no ``/``, and an empty roster. Always
+    says which section and key is at fault — the operator has to be able to
+    find the typo.
     Subclasses :class:`ValueError`, which is what every other config problem in
     this repo is.
     """
@@ -190,6 +222,17 @@ class ContestConfig:
     rounds_dir: str = "../rounds"
     agents: tuple[AgentSpec, ...] = ()
     gate_settings: LlmSettings = field(default_factory=lambda: DEFAULTS_GATE)
+    #: The backend the round runs on: one of ``BACKENDS``, one value per round.
+    backend: str = "kilo"
+    #: The OpenRouter agents' own credential, resolved from
+    #: ``[contest] openrouter_llm_profile``. ``None`` unless ``backend ==
+    #: "openrouter"``, where a profile that does not resolve is a
+    #: ``RosterError`` at load time — the gate profile above is the safety
+    #: gate's model, never the competing agents' credential, so the two are
+    #: read separately.
+    openrouter_settings: LlmSettings | None = None
+    #: The profile name that ``openrouter_settings`` was resolved from.
+    openrouter_llm_profile: str = ""
 
     def session_rules(self) -> list[dict]:
         """The rule list ``KiloClient.create_session`` sends, per session.
@@ -328,8 +371,15 @@ def _parse_agents(parser: configparser.ConfigParser) -> tuple[AgentSpec, ...]:
     return tuple(agents)
 
 
-def _build(parser: configparser.ConfigParser) -> ContestConfig:
-    """The config, from a parsed and merged roster."""
+def _build(parser: configparser.ConfigParser, backend: str | None = None) -> ContestConfig:
+    """The config, from a parsed and merged roster.
+
+    *backend* overrides the file's own ``[contest] backend =`` — ``--backend``
+    is exactly such an override, so it is applied here, before the OpenRouter
+    profile is expanded and resolved, not after: a roster that says ``kilo``
+    still resolves the profile its ``openrouter_llm_profile`` names when the
+    command asks for ``openrouter``.
+    """
     unknown = _unknown_keys(parser, "contest", CONTEST_KEYS)
     if unknown:
         raise RosterError(
@@ -337,8 +387,25 @@ def _build(parser: configparser.ConfigParser) -> ContestConfig:
             f"known keys: {', '.join(CONTEST_KEYS)}"
         )
 
+    if backend is not None:
+        file_backend = parser.get("contest", "backend", fallback="kilo").strip()
+        if file_backend not in BACKENDS:
+            raise RosterError(
+                f"[contest] backend must be one of {' | '.join(BACKENDS)}, "
+                f"got {file_backend!r}")
+        backend = backend.strip()
+    else:
+        backend = parser.get("contest", "backend", fallback="kilo").strip()
     gate_profile = parser.get("contest", "gate_llm_profile", fallback="").strip()
-    _expand(parser, ("contest", *_agent_sections(parser), gate_profile))
+    openrouter_profile = parser.get("contest", "openrouter_llm_profile", fallback="").strip()
+    # The OpenRouter profile's own ${ENV} references are expanded only when the
+    # backend needs them: a kilo round must not fail to load the roster because
+    # an OpenRouter key is not exported, and the committed contest.ini carries
+    # the ${CONTEST_OPENROUTER_API_KEY} reference for a machine that has one.
+    profiles = [gate_profile]
+    if backend == "openrouter":
+        profiles.append(openrouter_profile)
+    _expand(parser, ("contest", *_agent_sections(parser), *profiles))
 
     def scalar(key: str, default: str) -> str:
         return parser.get("contest", key, fallback=default).strip()
@@ -349,6 +416,10 @@ def _build(parser: configparser.ConfigParser) -> ContestConfig:
     def list_(key: str) -> tuple[str, ...]:
         return _split_list(parser.get("contest", key, fallback=""))
 
+    if backend not in BACKENDS:
+        raise RosterError(
+            f"[contest] backend must be one of {' | '.join(BACKENDS)}, got {backend!r}")
+
     agents = _parse_agents(parser)
 
     try:
@@ -357,6 +428,23 @@ def _build(parser: configparser.ConfigParser) -> ContestConfig:
         )
     except ValueError as exc:
         raise RosterError(f"[contest] gate_llm_profile: {exc}") from exc
+
+    openrouter_settings = None
+    if backend == "openrouter":
+        # the agents' own credential: required only for that backend, resolved
+        # the same way the gate's is and only then, so a kilo round never needs
+        # an OpenRouter key to load the roster
+        if not openrouter_profile:
+            raise RosterError(
+                "[contest] backend = openrouter needs openrouter_llm_profile — "
+                "the agents' own base_url and api_key, as [contest_gate_llm] is "
+                "for the gate")
+        try:
+            openrouter_settings, _ = resolve_llm_profile(
+                parser, "contest", "openrouter_llm_profile", defaults=DEFAULTS_OPENROUTER
+            )
+        except ValueError as exc:
+            raise RosterError(f"[contest] openrouter_llm_profile: {exc}") from exc
 
     return ContestConfig(
         kilo_bin=scalar("kilo_bin", "auto"),
@@ -379,19 +467,24 @@ def _build(parser: configparser.ConfigParser) -> ContestConfig:
         rounds_dir=scalar("rounds_dir", "../rounds"),
         agents=agents,
         gate_settings=settings,
+        backend=backend,
+        openrouter_settings=openrouter_settings,
+        openrouter_llm_profile=openrouter_profile,
     )
 
 
-def load_roster(path, *, overlay=None) -> ContestConfig:
+def load_roster(path, *, overlay=None, backend=None) -> ContestConfig:
     """Load *path*, then ``contest.local.ini`` next to it, then *overlay*.
 
     Later sources override earlier ones key by key, which is where a real
     ``api_key`` overrides the committed ``${CONTEST_GATE_API_KEY}`` reference.
     Raises :class:`RosterError` — naming the section and key — on a missing or
     unreadable source, an unset ``${ENV}`` reference, a duplicate section or
-    option, an unknown key in ``[contest]`` or an agent section, an agent name
-    that cannot become a branch, a ``model`` without a ``/`` or an empty
-    roster. Unknown sections are ignored, so an overlay may be ``agents.ini``.
+    option, an unknown key in ``[contest]`` or an agent section, a ``backend``
+    that is neither ``kilo`` nor ``openrouter``, a ``backend = openrouter``
+    whose ``openrouter_llm_profile`` does not resolve, an agent name that
+    cannot become a branch, a ``model`` without a ``/`` or an empty roster.
+    Unknown sections are ignored, so an overlay may be ``agents.ini``.
     """
     roster = Path(path)
     if not roster.is_file():
@@ -413,4 +506,4 @@ def load_roster(path, *, overlay=None) -> ContestConfig:
     if unread:
         raise RosterError(f"roster source could not be read: {', '.join(unread)}")
 
-    return _build(parser)
+    return _build(parser, backend)
