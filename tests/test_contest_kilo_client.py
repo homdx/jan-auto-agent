@@ -120,10 +120,14 @@ def _probe(tmp_path, scenario, *, reply_timeout: float = 20.0, agent=None):
     client = KiloClient(server, directory)
     tap = EventTap(fake.url, directory, str(tmp_path / "events.jsonl")).start()
     # a tap only receives events after its /event connection is open, on the
-    # fake as on a real server — wait for it so session.created is not lost
-    for _ in range(100):
-        if fake.subscribers:
-            break
+    # fake as on a real server — wait for it so session.created is not lost.
+    # FL-1 (round 84): this used to poll for a fixed 2 s. That is a deadline,
+    # and on the operator's 64-worker box a thread opening an HTTP connection
+    # can need longer; missing the handshake loses every event the turn
+    # emits, which surfaces as a bewildering `status == "timeout"` somewhere
+    # far from here. 30 s, and it still fails loudly if the tap never comes.
+    deadline = time.monotonic() + 30
+    while not fake.subscribers and time.monotonic() < deadline:
         time.sleep(0.02)
     assert fake.subscribers, "the tap never connected"
     session = client.create_session("kenary", "hy3:free", rules=RULES,
@@ -166,11 +170,14 @@ def test_turn_one_idle_is_not_turn_two_idle(tmp_path):
     ]}
     with _probe(tmp_path, scenario) as h:
         h.client.prompt(h.session, "create hello.txt with Hello world")
-        res1 = h.client.wait_idle(h.tap, h.session, 5.0, on_permission=_reject,
+        res1 = h.client.wait_idle(h.tap, h.session, 60.0, on_permission=_reject,
                                   on_question=lambda event: None)
         assert res1.status == "idle"
         assert res1.permissions == []
-        assert 0.0 <= res1.elapsed < 3.0
+        # FL-1 (round 84): the deadline is far away and the bound is in the
+        # middle of the gap, so a loaded box cannot blur "idled" into "hit
+        # the deadline" the way a 5 s deadline under a 3 s bound could.
+        assert 0.0 <= res1.elapsed < 30.0
 
         # turn 1's idle is consumed, not just matched: a fresh wait with the
         # same predicate finds nothing, and turn 2 has not gone idle yet.
@@ -180,7 +187,7 @@ def test_turn_one_idle_is_not_turn_two_idle(tmp_path):
 
         h.client.prompt(h.session, "append the model id as a second line")
         started = time.monotonic()
-        res2 = h.client.wait_idle(h.tap, h.session, 5.0, on_permission=_reject,
+        res2 = h.client.wait_idle(h.tap, h.session, 60.0, on_permission=_reject,
                                   on_question=lambda event: None)
         assert res2.status == "idle"
         # turn 2's idle was held back by 0.6 s, so returning faster proves the
@@ -203,7 +210,7 @@ def test_wait_idle_sees_only_its_own_session(tmp_path):
                                         title="the other one")
         h.client.prompt(h.session, "first")
         h.client.prompt(other, "also first")
-        res = h.client.wait_idle(h.tap, h.session, 5.0, on_permission=_reject,
+        res = h.client.wait_idle(h.tap, h.session, 60.0, on_permission=_reject,
                                  on_question=lambda event: None)
         assert res.status == "idle"
         assert h.client.last_assistant_text(h.session) == "one"
@@ -217,7 +224,7 @@ def test_tap_closed_wakes_a_waiting_caller(tmp_path):
     scenario = {"turns": [{"events": ["busy"], "idle": False}]}
     with _probe(tmp_path, scenario) as h:
         h.fake.stop()          # wakes the stream with the sentinel
-        res = h.client.wait_idle(h.tap, h.session, 5.0, on_permission=_reject,
+        res = h.client.wait_idle(h.tap, h.session, 60.0, on_permission=_reject,
                                  on_question=lambda event: None)
     assert res.status == "closed"
     assert isinstance(res.error, str) and res.error
@@ -247,7 +254,7 @@ def test_permission_in_the_middle_is_answered_and_idle_is_reached(tmp_path, vari
 
     with _probe(tmp_path, scenario) as h:
         h.client.prompt(h.session, "delete /tmp/testfile")
-        res = h.client.wait_idle(h.tap, h.session, 5.0, on_permission=on_permission,
+        res = h.client.wait_idle(h.tap, h.session, 60.0, on_permission=on_permission,
                                  on_question=lambda event: None)
 
     assert res.status == "idle"
@@ -295,7 +302,7 @@ def test_reply_permission_falls_back_to_the_legacy_route(tmp_path):
                  "permission_endpoint_404": True}
     with _probe(tmp_path, scenario) as h:
         h.client.prompt(h.session, "delete /tmp/testfile")
-        res = h.client.wait_idle(h.tap, h.session, 5.0, on_permission=_reject,
+        res = h.client.wait_idle(h.tap, h.session, 60.0, on_permission=_reject,
                                  on_question=lambda event: None)
     assert res.status == "idle"
     primary = h.fake.calls(method="POST", prefix="/permission/")
@@ -332,7 +339,7 @@ def test_session_error_yields_error_status_with_the_payload(tmp_path):
     scenario = {"turns": [{"events": ["busy"], "error": error}]}
     with _probe(tmp_path, scenario) as h:
         h.client.prompt(h.session, "summarise the module")
-        res = h.client.wait_idle(h.tap, h.session, 5.0, on_permission=_reject,
+        res = h.client.wait_idle(h.tap, h.session, 60.0, on_permission=_reject,
                                  on_question=lambda event: None)
         # a turn that errors never sends an assistant message
         assistant = h.client.last_assistant_text(h.session)
@@ -358,8 +365,10 @@ def test_timeout_aborts_the_session(tmp_path):
         elapsed = time.monotonic() - started
     assert res.status == "timeout"
     assert res.error is None
-    assert 0.0 <= res.elapsed < 3.0
-    assert elapsed < 3.0
+    # FL-1 (round 84): a bound that only says "it did not hang" — the 0.5 s
+    # deadline is what is under test and `status` already reports it.
+    assert 0.0 <= res.elapsed < 30.0
+    assert elapsed < 30.0
 
     aborts = h.fake.calls(method="POST", path="/abort")
     assert len(aborts) == 1
@@ -376,21 +385,28 @@ def test_timeout_aborts_the_session(tmp_path):
 def test_wait_idle_aborts_on_stall(tmp_path):
     """A session silent for longer than ``idle_event_timeout`` is aborted
     well before the overall ``timeout`` elapses. The fake emits one
-    ``session.status busy`` and then goes silent for 2 s without ever
+    ``session.status busy`` and then goes silent for 60 s without ever
     idling, so the wait must be bounded by the 0.5 s silence window — not by
-    the 2 s pause it would have waited out, and not by the 10 s deadline."""
-    scenario = {"turns": [{"pause_before_idle_sec": 2, "assistant": "still running"}]}
+    the 60 s pause it would have waited out, and not by the 120 s deadline.
+
+    FL-1 (round 84): the pause was 2 s under a 1.5 s bound, i.e. 1 s of
+    slack between "took the window" and "took the pause", and the operator's
+    64-worker stress run does not honour 1 s. Widening the *slow* path is
+    free — a green run still returns at ~0.5 s — and it buys 19.5 s of
+    slack. (`FakeKiloServer._sleep` wakes on `stop()`, so the 60 s pause
+    costs nothing at teardown.)"""
+    scenario = {"turns": [{"pause_before_idle_sec": 60, "assistant": "still running"}]}
     with _probe(tmp_path, scenario) as h:
         h.client.prompt(h.session, "run the slow command")
         started = time.monotonic()
-        res = h.client.wait_idle(h.tap, h.session, 10.0, idle_event_timeout=0.5,
+        res = h.client.wait_idle(h.tap, h.session, 120.0, idle_event_timeout=0.5,
                                  on_permission=_reject, on_question=lambda event: None)
         elapsed = time.monotonic() - started
     assert res.status == "timeout"
     assert res.error is None
     assert res.permissions == [] and res.questions == []
-    assert res.elapsed < 1.5, res.elapsed      # the 0.5 s window, not the 2 s pause
-    assert elapsed < 1.5
+    assert res.elapsed < 20.0, res.elapsed     # the 0.5 s window, not the 60 s pause
+    assert elapsed < 20.0
     # the shape's heartbeat went out, no idle ever did, and one abort was sent
     assert h.fake.events_of("session.status")
     assert h.fake.events_of("session.idle") == []
@@ -399,30 +415,59 @@ def test_wait_idle_aborts_on_stall(tmp_path):
 
 def test_events_of_the_session_keep_wait_idle_alive(tmp_path):
     """The silence clock counts every event of the session, not only the ones
-    ``wait_idle`` acts on: a ``session.status busy`` every 0.15 s is eight
-    0.3 s windows, and the turn still reaches idle — several windows past
-    the first one. No abort, no early cut-off."""
-    scenario = {"turns": [{"events": ["busy"], "delay": 1.0, "assistant": "done"}]}
+    ``wait_idle`` acts on: a ``session.status busy`` every ``BEAT`` carries the
+    turn well past the silence window, and it still reaches idle. No abort, no
+    early cut-off.
+
+    FL-1 (round 84). The sibling of
+    ``test_contest_runner.py::test_events_of_the_session_keep_a_turn_alive``,
+    and it obeys the same arithmetic — see that test for the full reasoning.
+    In short: a regression (``wait_idle`` not counting ``session.status``)
+    cuts the turn at ``window``, so the only way to prove the opposite is to
+    *survive* longer than ``window``, and the turn survives only if no gap
+    between two delivered events exceeds it. Window, runtime and tolerance
+    for a starved box are therefore one number, and there is no margin to
+    widen. Narrowing the beat does not substitute: the runner-side twin
+    failed the operator's stress run while emitting every 0.1 s, because
+    what starved was the *delivery* — a fake HTTP server, an SSE stream and
+    a tap thread — not the emitting thread. So this test buys its
+    robustness with wall time: an 8 s window and 12 s of beats.
+
+    The heartbeat thread emits the idle itself after a fixed number of
+    beats, rather than the turn idling on a wall-clock ``delay``. A starved
+    box can then only make the turn longer, never end it before the beats
+    do.
+    """
+    window, beat, beats = 8.0, 0.2, 60
+    scenario = {"turns": [{"events": ["busy"], "idle": False, "assistant": "done"}]}
     with _probe(tmp_path, scenario) as h:
         def heartbeat():
-            for _ in range(8):
-                time.sleep(0.15)
+            for _ in range(beats):
+                if h.fake._stop.is_set():
+                    return
+                time.sleep(beat)
                 h.fake._emit({"type": "session.status",
                               "properties": {"sessionID": h.session.id,
                                              "status": "busy"}})
+            h.fake._emit({"type": "session.idle",
+                          "properties": {"sessionID": h.session.id}})
 
         threading.Thread(target=heartbeat, daemon=True).start()
         started = time.monotonic()
         h.client.prompt(h.session, "slow turn")
-        res = h.client.wait_idle(h.tap, h.session, 5.0, idle_event_timeout=0.3,
+        # the overall deadline is deliberately far away: it is not what this
+        # test is about, and a loaded box must not hit it by accident
+        res = h.client.wait_idle(h.tap, h.session, 300.0, idle_event_timeout=window,
                                  on_permission=_reject, on_question=lambda event: None)
         elapsed = time.monotonic() - started
     assert res.status == "idle"
-    assert res.elapsed > 0.9, res.elapsed      # it really waited out the heartbeats
-    assert elapsed > 0.9
+    # it really waited out the heartbeats — past a full silence window, which
+    # is the whole claim. A lower bound only ever gets safer under load.
+    assert res.elapsed > window, res.elapsed
+    assert elapsed > window
     assert not h.fake.recorded_abort_for(h.session.id)
-    # busy plus at least two beats: with idle_event_timeout=0.3 and no
-    # heartbeat counted, this wait would have stalled out at ~0.3 s
+    # with no heartbeat counted, this wait would have stalled out at the
+    # window, seconds before the turn idled
     assert len(h.fake.events_of("session.status")) >= 3
 
 
@@ -430,15 +475,21 @@ def test_a_neighbours_events_do_not_keep_a_silent_session_alive(tmp_path):
     """The clock is the session's own: the tap reads every session of the
     directory, so a chatty neighbour must not push a silent one past its
     silence window. The silent session is aborted at 0.5 s while the other
-    keeps emitting."""
-    scenario = {"turns": [{"pause_before_idle_sec": 2}]}
+    keeps emitting.
+
+    FL-1 (round 84): same widening as the sibling stall test above — the
+    pause and the deadline move out, the bound sits in the middle, and the
+    neighbour chatters until teardown rather than for a counted 1 s, so a
+    loaded box cannot run it out of beats before the silent session is
+    cut."""
+    scenario = {"turns": [{"pause_before_idle_sec": 60}]}
     with _probe(tmp_path, scenario) as h:
         neighbour = h.client.create_session("kenary", "hy3:free", rules=RULES,
                                             title="the chatty one")
         h.client.prompt(h.session, "go quiet")
 
         def chat():
-            for _ in range(10):
+            while not h.fake._stop.is_set():
                 time.sleep(0.1)
                 h.fake._emit({"type": "session.status",
                               "properties": {"sessionID": neighbour.id,
@@ -446,12 +497,12 @@ def test_a_neighbours_events_do_not_keep_a_silent_session_alive(tmp_path):
 
         threading.Thread(target=chat, daemon=True).start()
         started = time.monotonic()
-        res = h.client.wait_idle(h.tap, h.session, 10.0, idle_event_timeout=0.5,
+        res = h.client.wait_idle(h.tap, h.session, 120.0, idle_event_timeout=0.5,
                                  on_permission=_reject, on_question=lambda event: None)
         elapsed = time.monotonic() - started
     assert res.status == "timeout"
-    assert res.elapsed < 1.5, res.elapsed
-    assert elapsed < 1.5
+    assert res.elapsed < 20.0, res.elapsed
+    assert elapsed < 20.0
     assert h.fake.recorded_abort_for(h.session.id)
     assert not h.fake.recorded_abort_for(neighbour.id)
 
@@ -461,22 +512,28 @@ def test_a_turn_with_no_event_at_all_is_cut_at_the_window(tmp_path):
     turn whose prompt is accepted and then answered with nothing — no busy,
     no idle — is a stall at 0.5 s, not a turn that waits out the 10 s
     deadline. (A first turn always has ``session.created`` on the tap ahead
-    of it, which is why this needs a second one.)"""
+    of it, which is why this needs a second one.)
+
+    FL-1 (round 84): the deadline moves out to 120 s and the bound to 20 s —
+    the two paths this test tells apart are 0.5 s and 120 s, so nothing is
+    lost and a loaded box has 19.5 s of room. The first turn's own window
+    moves out too: it is scaffolding here, not the claim, and it must not be
+    able to stall the turn it is only setting up."""
     scenario = {"turns": [{"events": ["busy", "idle"], "assistant": "one"},
                           {"events": [], "idle": False}]}
     with _probe(tmp_path, scenario) as h:
         h.client.prompt(h.session, "first")
-        res = h.client.wait_idle(h.tap, h.session, 10.0, idle_event_timeout=1.0,
+        res = h.client.wait_idle(h.tap, h.session, 120.0, idle_event_timeout=30.0,
                                  on_permission=_reject, on_question=lambda event: None)
         assert res.status == "idle"
         h.client.prompt(h.session, "second")
         started = time.monotonic()
-        res = h.client.wait_idle(h.tap, h.session, 10.0, idle_event_timeout=0.5,
+        res = h.client.wait_idle(h.tap, h.session, 120.0, idle_event_timeout=0.5,
                                  on_permission=_reject, on_question=lambda event: None)
         elapsed = time.monotonic() - started
     assert res.status == "timeout"
-    assert res.elapsed < 1.5, res.elapsed
-    assert elapsed < 1.5
+    assert res.elapsed < 20.0, res.elapsed
+    assert elapsed < 20.0
     assert h.fake.recorded_abort_for(h.session.id)
 
 
@@ -506,7 +563,7 @@ def test_tool_parts_and_last_assistant_text(tmp_path):
     }]}
     with _probe(tmp_path, scenario) as h:
         h.client.prompt(h.session, "write hello.txt")
-        res = h.client.wait_idle(h.tap, h.session, 5.0, on_permission=_reject,
+        res = h.client.wait_idle(h.tap, h.session, 60.0, on_permission=_reject,
                                  on_question=lambda event: None)
         assert res.status == "idle"
 
@@ -550,7 +607,7 @@ def test_on_prompt_mutates_the_session_directory(tmp_path):
                            "assistant": "done"}]}
     with _probe(tmp_path, scenario) as h:
         h.client.prompt(h.session, "create hello.txt")
-        res = h.client.wait_idle(h.tap, h.session, 5.0, on_permission=_reject,
+        res = h.client.wait_idle(h.tap, h.session, 60.0, on_permission=_reject,
                                  on_question=lambda event: None)
     assert res.status == "idle"
     assert seen == [(h.directory, "create hello.txt")]
@@ -604,8 +661,11 @@ def test_spawn_waits_for_health_and_close_kills_the_child(tmp_path):
     binary = _write_executable(tmp_path / "kilo", STUB_KILO)
     log = tmp_path / "serve.log"
     started = time.monotonic()
-    server = KiloServer.spawn(str(binary), log_path=str(log), health_timeout=10.0)
-    assert time.monotonic() - started < 10.0
+    # FL-1 (round 84): the gate is generous and the bound is in the middle —
+    # spawn returning at all is the claim, and a health poll that needs 12 s
+    # on a 64-worker box is still a pass, not a failure.
+    server = KiloServer.spawn(str(binary), log_path=str(log), health_timeout=60.0)
+    assert time.monotonic() - started < 60.0
     try:
         assert server.base_url.startswith("http://127.0.0.1:")
         assert server.pid is not None
@@ -633,8 +693,11 @@ def test_spawn_of_a_binary_that_exits_raises_with_the_log_tail(tmp_path):
     log = tmp_path / "serve.log"
     started = time.monotonic()
     with pytest.raises(KiloServerError) as exc:
-        KiloServer.spawn(str(binary), log_path=str(log), health_timeout=5.0)
-    assert time.monotonic() - started < 5.0
+        KiloServer.spawn(str(binary), log_path=str(log), health_timeout=60.0)
+    # FL-1 (round 84): "must not wait out the whole timeout" is the claim, so
+    # the timeout moves out to 60 s and the bound sits at 30 s — the child
+    # exits at once and spawn notices at once, on any box.
+    assert time.monotonic() - started < 30.0
     message = str(exc.value)
     assert "exited with code 3" in message
     assert "provider config not found: kenary" in exc.value.log_tail
@@ -680,10 +743,10 @@ def test_prompt_sends_the_model_in_prompt_async_shape(tmp_path):
     with _probe(tmp_path, {"turns": [{"events": ["busy", "idle"], "assistant": "done"},
                                      {"events": ["busy", "idle"], "assistant": "again"}]}) as h:
         h.client.prompt(h.session, "first")
-        h.client.wait_idle(h.tap, h.session, 5.0, on_permission=_reject,
+        h.client.wait_idle(h.tap, h.session, 60.0, on_permission=_reject,
                            on_question=lambda event: None)
         h.client.prompt(h.session, "second")
-        h.client.wait_idle(h.tap, h.session, 5.0, on_permission=_reject,
+        h.client.wait_idle(h.tap, h.session, 60.0, on_permission=_reject,
                            on_question=lambda event: None)
         h.client.abort(h.session)
 
@@ -724,14 +787,14 @@ def test_tap_writes_the_probe_event_log_format(tmp_path):
     fake = FakeKiloServer(scenario, directory=str(tmp_path)).start()
     try:
         tap = EventTap(fake.url, str(tmp_path), str(log_path)).start()
-        for _ in range(100):          # see _probe: a tap only sees events after
-            if fake.subscribers:      # its /event connection is open
-                break
-            time.sleep(0.02)
+        deadline = time.monotonic() + 30   # see _probe: a tap only sees events
+        while not fake.subscribers and time.monotonic() < deadline:
+            time.sleep(0.02)               # after its /event connection is open
+        assert fake.subscribers, "the tap never connected"
         client = KiloClient(KiloServer.attach(fake.url), str(tmp_path))
         session = client.create_session("kenary", "hy3:free", rules=RULES, title="log")
         client.prompt(session, "go")
-        res = client.wait_idle(tap, session, 5.0, on_permission=_reject,
+        res = client.wait_idle(tap, session, 60.0, on_permission=_reject,
                                on_question=lambda event: None)
         assert res.status == "idle"
         tap.stop()
@@ -758,7 +821,7 @@ def test_tap_keeps_every_event_for_its_whole_life(tmp_path):
     with _probe(tmp_path, scenario) as h:
         for text in ("first", "second"):
             h.client.prompt(h.session, text)
-            assert h.client.wait_idle(h.tap, h.session, 5.0, on_permission=_reject,
+            assert h.client.wait_idle(h.tap, h.session, 60.0, on_permission=_reject,
                                       on_question=lambda event: None).status == "idle"
         assert len(h.tap.events) == len(h.fake.events)
         assert h.tap.cursor == len(h.fake.events)
@@ -828,10 +891,10 @@ def test_an_unscripted_prompt_goes_idle_and_leaves_a_trace(tmp_path):
     scenario = {"turns": [{"events": ["busy", "idle"], "assistant": "one"}]}
     with _probe(tmp_path, scenario) as h:
         h.client.prompt(h.session, "one")
-        assert h.client.wait_idle(h.tap, h.session, 5.0, on_permission=_reject,
+        assert h.client.wait_idle(h.tap, h.session, 60.0, on_permission=_reject,
                                   on_question=lambda event: None).status == "idle"
         h.client.prompt(h.session, "two — nothing scripted for this one")
-        res = h.client.wait_idle(h.tap, h.session, 5.0, on_permission=_reject,
+        res = h.client.wait_idle(h.tap, h.session, 60.0, on_permission=_reject,
                                  on_question=lambda event: None)
     assert res.status == "idle"
     assert any("has no scripted turn" in note for note in h.fake.turn_errors)
@@ -845,7 +908,7 @@ def test_a_turn_hook_that_raises_becomes_a_recorded_error(tmp_path):
                            "assistant": "done"}]}
     with _probe(tmp_path, scenario) as h:
         h.client.prompt(h.session, "go")
-        res = h.client.wait_idle(h.tap, h.session, 5.0, on_permission=_reject,
+        res = h.client.wait_idle(h.tap, h.session, 60.0, on_permission=_reject,
                                  on_question=lambda event: None)
         assistant = h.client.last_assistant_text(h.session)
     assert res.status == "idle"

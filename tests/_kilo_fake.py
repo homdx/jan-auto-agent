@@ -445,6 +445,11 @@ class FakeKiloServer:
         with self._lock:
             return self._sessions.get(sid)
 
+    # FL-1 (round 84): the interval of the heartbeat that covers a scenario
+    # hook's real work — see _run_turn. Far inside the shortest silence window
+    # any caller configures.
+    HOOK_BEAT_S = 0.1
+
     def _run_turn(self, session: _Session, turn: dict, text: str) -> None:
         """Replay one prompt. Runs on its own thread: idle must wait for the
         permission reply, and the reply arrives on a different connection."""
@@ -454,10 +459,42 @@ class FakeKiloServer:
 
         on_prompt = turn.get("on_prompt")
         if callable(on_prompt):
+            # FL-1 (round 84): heartbeat for as long as the hook runs.
+            #
+            # A scenario hook does real work — usually a `git` commit in a
+            # worktree, which is hundreds of ms on an idle box and seconds on
+            # a loaded one. The caller's silence clock (`idle_event_timeout`)
+            # is already running by then: it started when `wait_idle` did,
+            # right after `prompt_async` returned, and this method runs on its
+            # own thread. So without this a turn whose hook commits could have
+            # the stall fire *while the commit was being written* — the
+            # harvest then read an empty branch, or the stall beat a scripted
+            # `session.error` to the tap and the turn came back STALLED.
+            #
+            # A real agent emits while it works, so the fake does too. The
+            # beats stop the moment the hook returns, so the silence still
+            # starts exactly where the agent stopped and no stall test is
+            # weakened — the silence has to arrive after the beats for those
+            # tests to pass at all.
+            hook_done = threading.Event()
+
+            def _beat() -> None:
+                while not hook_done.wait(self.HOOK_BEAT_S):
+                    self._emit({"type": "session.status",
+                                "properties": {"sessionID": session.id,
+                                               "status": "busy"}})
+
+            self._emit({"type": "session.status",
+                        "properties": {"sessionID": session.id, "status": "busy"}})
+            beating = threading.Thread(target=_beat, daemon=True)
+            beating.start()
             try:
                 on_prompt(session.directory, text)
             except Exception as e:
                 self.turn_errors.append(f"on_prompt: {type(e).__name__}: {e}")
+            finally:
+                hook_done.set()
+                beating.join(5)
 
         session.messages.append({
             "info": {"role": "user", "sessionID": session.id, "time": time.time()},

@@ -211,6 +211,12 @@ class _BenchHandler(_kilo_fake._Handler):
 class _BenchFake(FakeKiloServer):
     """``bad_models`` → 400 on ``POST /session``; ``"questions": N`` in a turn."""
 
+    # FL-1 (round 84): the interval of the heartbeat that covers a scenario
+    # hook's real git work — see _run_turn. Far inside the shortest silence
+    # window any test here configures (`_stall_config`'s 3 s), because what a
+    # loaded box drifts past is the absolute margin, not the ratio.
+    HOOK_BEAT_S = 0.1
+
     def __init__(self, scenario=None, **kw):
         super().__init__(scenario, **kw)
         self.bad_models = set(self.scenario.get("bad_models") or ())
@@ -236,16 +242,42 @@ class _BenchFake(FakeKiloServer):
             if box is None or not box["event"].wait(self.reply_timeout):
                 self.unanswered.append(qid)
                 return
-        return super()._run_turn(session, {k: v for k, v in turn.items() if k != "questions"}, text)
+        plain = {k: v for k, v in turn.items() if k != "questions"}
+        # FL-1 (round 84): the hook heartbeat that used to live here moved to
+        # FakeKiloServer._run_turn — every consumer of the fake needs it, not
+        # just this file (tests/test_contest_cli.py runs a real `git` commit
+        # from a hook under a silence window too). What stays here is the
+        # *completion* beat for a turn that scripts no idle: it puts "no
+        # event for N s" at the end of the turn's work rather than at the
+        # start of it.
+        super()._run_turn(session, plain, text)
+        if plain.get("idle") is False:
+            self._emit({"type": "session.status",
+                        "properties": {"sessionID": session.id, "status": "busy"}})
 
-    def pulse(self, session_id: str, every: float, times: int, then_idle: bool = False) -> None:
-        """Emit a ``session.status busy`` every *every* seconds, on a thread."""
+    def pulse(self, session_id: str, every: float, times: int | None,
+              then_idle: bool = False) -> None:
+        """Emit a ``session.status busy`` every *every* seconds, on a thread.
+
+        ``times=None`` beats until the fake is stopped, which is what a test
+        wants whenever the heartbeat has to outlast something it does not
+        control the length of — FL-1 (round 84): a counted heartbeat next to
+        a turn whose ``on_prompt`` does real git work is a race on the *total*
+        length of the beats, not just on the interval between them. Under the
+        operator's 64-worker stress run the hook's commit pushed the turn's
+        idle out past the end of a 6 s pulse, the silence window opened after
+        the last beat, and a turn that reached READY was aborted on the way.
+        Either the beats outlive the turn by construction, or the test is
+        betting on how long a git commit takes.
+        """
         def run():
-            for _ in range(times):
+            beats = 0
+            while not self._stop.is_set() and (times is None or beats < times):
                 time.sleep(every)
+                beats += 1
                 self._emit({"type": "session.status",
                             "properties": {"sessionID": session_id, "status": "busy"}})
-            if then_idle:
+            if then_idle and not self._stop.is_set():
                 self._emit({"type": "session.idle", "properties": {"sessionID": session_id}})
         threading.Thread(target=run, daemon=True).start()
 
@@ -326,8 +358,25 @@ class Harness:
             self.backend.close()
 
 
-def _run_one(tmp_path, scenario, config=None, policy=None):
+def _run_one(tmp_path, scenario, config=None, policy=None, prepare=None):
+    """Run one agent against *scenario*.
+
+    ``prepare(worktree_path)`` runs on agent-a's worktree *before* the round
+    starts. FL-1 (round 84): the stall/error harvest tests used to do their
+    git work from the turn's own ``on_prompt`` hook, so a real ``git commit``
+    ran while the runner's wall-clock silence clock was already ticking. That
+    is a race no margin closes — the hook's work is unbounded and the window
+    is not — and it survived both a wider window and a heartbeat through the
+    hook, because a beat that is emitted still has to be *delivered* through
+    a fake HTTP server, an SSE stream and a tap thread, none of which a
+    loaded box schedules on demand. The runner cannot tell when a commit was
+    made (``_commits_above`` reads the branch at harvest time), so moving the
+    work in front of the run loses no coverage and removes the clock from the
+    question entirely.
+    """
     sb = Sandbox(tmp_path)
+    if prepare is not None:
+        prepare(str(sb.ws("agent-a").path))
     config = config or make_config(["agent-a"])
     with _BenchFake(scenario) as fake:
         h = Harness(sb, fake, config, policy=policy)
@@ -337,12 +386,33 @@ def _run_one(tmp_path, scenario, config=None, policy=None):
 
 
 def _make_backend(fake, out_dir):
-    """`make_backend` over the fake: one `KiloBackend` per workspace, as `cmd_run` builds."""
+    """`make_backend` over the fake: one `KiloBackend` per workspace, as `cmd_run` builds.
+
+    FL-1 (round 84): each backend waits for *its own* tap to appear on the
+    fake before it is handed back, which is what `Harness` has always done
+    and `run_round` never did. A `KiloBackend` opens its event stream on a
+    thread, and the fake — like a real server — drops any event emitted
+    before that stream is connected. So on a loaded box the round could
+    prompt, the fake could start the turn and beat through the scenario
+    hook, and every one of those beats could land on nobody: the silence
+    clock then ran from `wait_idle` with no events at all and declared the
+    stall while the hook was still committing, which is
+    `test_a_terminal_harvest_runs_the_roots_under_the_rounds_lock` coming
+    back `(STALLED, commit=None)`. Waiting on the count *rising* — not on
+    it being non-zero — is what makes this right for a multi-agent round,
+    where another agent's tap may already be up.
+    """
     server = KiloServer.attach(fake.url)
 
     def make_backend(ws):
-        return KiloBackend(server, str(ws.path),
-                           events_log=str(out_dir / ws.agent / "events.jsonl"))
+        before = fake.subscribers
+        backend = KiloBackend(server, str(ws.path),
+                              events_log=str(out_dir / ws.agent / "events.jsonl"))
+        deadline = time.monotonic() + 30
+        while fake.subscribers <= before and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert fake.subscribers > before, f"{ws.agent}: the tap never connected"
+        return backend
     return make_backend
 
 
@@ -538,12 +608,10 @@ def test_a_sibling_worktree_is_forbidden_ground(tmp_path):
 
 def test_three_questions_in_one_turn_stall_and_abort(tmp_path):
     scenario = {"turns": [{"on_prompt": work_ready, "events": ["busy"], "questions": 3, "delay": 0.5}]}
-    started = time.monotonic()
     sb, fake, _h, run, aborted = _run_one(tmp_path, scenario)
     assert run.state is AgentState.STALLED and aborted
     assert run.questions == 3 and "questions" in run.last_error
     assert len(fake.calls(prefix="/question/")) >= 2
-    assert time.monotonic() - started < 10
     (turn,) = run.turns
     assert turn["idle_status"] == "stalled"
     assert len(_jsonl(sb.out_dir / "agent-a" / "turns.jsonl")) == 1
@@ -577,29 +645,62 @@ def test_unknown_model_is_error_with_the_body(tmp_path):
 
 def test_idle_event_timeout_stalls_a_silent_session(tmp_path):
     cfg = make_config(["agent-a"], turn_timeout_sec=30, idle_event_timeout_sec=1)
-    started = time.monotonic()
     _sb, _fake, _h, run, aborted = _run_one(tmp_path, {"turns": [{"events": [], "idle": False}]}, cfg)
-    elapsed = time.monotonic() - started
     assert run.state is AgentState.STALLED and aborted
-    # took the idle-event path (1 s), not the turn_timeout path (30 s); the
-    # margin absorbs a loaded box without letting the two paths blur.
-    assert elapsed < cfg.idle_event_timeout_sec + 10
+    # took the idle-event path (last_error/idle_status below), not the
+    # turn_timeout path — a load-independent way to tell the two apart, since
+    # a wall-clock bound on top is exactly what FL-1 (round 84) found flaky.
     assert run.last_error == "no event for 1s"
     assert run.turns[0]["idle_status"] == "stalled"
 
 
 def test_events_of_the_session_keep_a_turn_alive(tmp_path):
-    """idle_event_timeout_sec=1, a status event every 0.4 s for 2.4 s, then idle:
-    silence is measured from the last event, so no abort."""
+    """A status event every `BEAT` for `KEEPALIVE_BEATS` beats, then idle:
+    silence is measured from the last event, so no abort — and the turn
+    outlives the silence window, which is the point.
+
+    FL-1 (round 84). This test cost three rounds of stress runs to get
+    right, and the arithmetic that finally settled it is worth stating,
+    because it is not the "wider margin" every other test here wanted.
+
+    A regression — `wait_idle` not counting `session.status` as an event of
+    the session — shows up as the turn being cut at `window` after it
+    starts. So the test can only prove the opposite by *surviving longer
+    than the window*. And it survives only if no gap between two consecutive
+    events exceeds the window. That makes the two numbers the same number:
+
+        tolerance for a stalled box == window == how long this test runs
+
+    There is no margin to widen. Narrowing the beat does not help either:
+    the last failure emitted a beat every 0.1 s and the runner still saw
+    more than 3 s of silence, because what starved was not the emitting
+    thread but the *delivery* of what it emitted — a fake HTTP server, an
+    SSE stream and a tap thread that also writes every event to disk, none
+    of which a box running four `pytest -n 8` invocations schedules on
+    demand. Emission is not delivery, and the fixture cannot observe the
+    difference.
+
+    So this test buys its robustness with wall time, deliberately: an 8 s
+    window and 12 s of beats. It is one of the slowest tests in the file
+    and that is the price of the claim.
+
+    The span comes from the beat *count*, not from a `delay` — the pulse
+    emits the idle itself. Starvation can then only make the turn longer,
+    never shorter, so there is no second race about the beats running out
+    before the turn ends (which is how this test failed two rounds ago)."""
     sb = Sandbox(tmp_path)
-    cfg = make_config(["agent-a"], turn_timeout_sec=30, idle_event_timeout_sec=1)
-    scenario = {"turns": [{"events": ["busy"], "delay": 2.6}]}
+    cfg = make_config(["agent-a"], turn_timeout_sec=120,
+                      idle_event_timeout_sec=KEEPALIVE_WINDOW_S)
+    scenario = {"turns": [{"events": ["busy"], "idle": False}]}
     with _BenchFake(scenario) as fake:
-        scenario["turns"][0]["on_prompt"] = lambda d, t: (fake.pulse(fake.sessions()[-1].id, 0.4, 6),
-                                                          work_ready(d, t))
+        scenario["turns"][0]["on_prompt"] = lambda d, t: (
+            fake.pulse(fake.sessions()[-1].id, KEEPALIVE_BEAT_S,
+                       KEEPALIVE_BEATS, then_idle=True),
+            work_ready(d, t))
         run = Harness(sb, fake, cfg).go()
         aborted = _aborted(fake)
     _assert_ready(run, sb.ws("agent-a"))
+    assert run.turns[0]["idle_status"] == "idle"
     assert not aborted
 
 
@@ -609,13 +710,12 @@ def test_turn_timeout_stalls_a_session_that_never_idles(tmp_path):
     scenario = {"turns": [{"events": ["busy"], "idle": False}]}
     with _BenchFake(scenario) as fake:
         scenario["turns"][0]["on_prompt"] = lambda d, t: fake.pulse(fake.sessions()[-1].id, 0.3, 20)
-        started = time.monotonic()
         run = Harness(sb, fake, cfg).go()
-        elapsed = time.monotonic() - started
         aborted = _aborted(fake)
-    # fired on turn_timeout (1 s) with a generous margin, not a bare box number
+    # fired on turn_timeout, not the (60 s) idle-event path — idle_status/
+    # last_error say so directly and load-independently; FL-1 (round 84)
+    # found the wall-clock bound this used to carry on top flaky.
     assert run.state is AgentState.STALLED and aborted
-    assert elapsed < cfg.turn_timeout_sec + 10
     assert run.turns[0]["idle_status"] == "timeout"
     assert run.last_error == "no idle after 1s"
 
@@ -641,10 +741,24 @@ def test_server_going_away_mid_turn_is_error(tmp_path):
 # KC-21: a STALLED / ERROR turn with a commit on its branch is harvested
 # ─────────────────────────────────────────────────────────────────────────────
 
+# FL-1 (round 84): the two tests that must *survive* a silence window rather
+# than trip it — see test_events_of_the_session_keep_a_turn_alive for why the
+# window, the runtime and the tolerance for a starved box are all one number.
+KEEPALIVE_WINDOW_S = 8
+KEEPALIVE_BEAT_S = 0.2
+KEEPALIVE_BEATS = 60          # 12 s of beats, comfortably past the window
+
+
 def _stall_config(**over) -> ContestConfig:
     """A silence stall inside the turn deadline, so the turn is `stalled`, not a
     turn timeout."""
-    kw = dict(turn_timeout_sec=30, idle_event_timeout_sec=1)
+    # FL-1 (round 84): 3 s, not 1 s. These tests want the stall to fire, so
+    # the window is their *slow* path and widening it costs a green run only
+    # the two extra seconds it spends proving the stall. What it buys is
+    # 2.9 s of margin over the 0.1 s hook heartbeat above, where a 1 s window
+    # left 0.9 s — and 0.9 s is inside what the operator's 64-worker stress
+    # run drifts by.
+    kw = dict(turn_timeout_sec=30, idle_event_timeout_sec=3)
     kw.update(over)
     return make_config(["agent-a"], **kw)
 
@@ -662,38 +776,46 @@ def _branch_sha(ws) -> str:
 
 
 def test_a_stalled_turn_with_a_valid_commit_is_harvested_to_ready(tmp_path, caplog):
-    """The work is committed and claimed, then the session goes silent: READY,
-    `run.commit` is that sha, the single turn carries `idle_status == "stalled"`
-    and the READY harvest, and the KC-18 line reads
-    `<agent>: READY — <sha12> after no event for 1s`."""
+    """The work is committed and claimed, then the session goes silent:
+    READY, `run.commit` is that sha, the single turn carries
+    `idle_status == "stalled"` and the READY harvest, and the KC-18 line
+    reads `<agent>: READY — <sha12> after no event for 3s`.
+
+    FL-1 (round 84): the commit is made by `prepare`, before the run — see
+    `_run_one`. Doing it from the turn's hook put a real `git commit` inside
+    a wall-clock silence window, which is a race no margin closes."""
     caplog.set_level(logging.INFO, logger="tools.contest.runner")
     cfg = _stall_config()
-    scenario = {"turns": [{"on_prompt": work_ready, "events": [], "idle": False}]}
-    started = time.monotonic()
-    sb, fake, _h, run, aborted = _run_one(tmp_path, scenario, cfg)
+    scenario = {"turns": [{"events": [], "idle": False}]}
+    sb, fake, _h, run, aborted = _run_one(tmp_path, scenario, cfg,
+                                          prepare=lambda d: work_ready(d, ""))
     ws = sb.ws("agent-a")
     assert run.state is AgentState.READY, (run.state, run.last_error)
     assert run.commit == _branch_sha(ws)
-    assert aborted and time.monotonic() - started < 5
+    assert aborted
     assert run.last_error is None and run.attempt == 0
     (turn,) = run.turns
     assert turn["idle_status"] == "stalled"
     assert turn["harvest"] == {"verdict": "READY", "reasons": []}
-    assert _runner_has(caplog, f"agent-a: READY — {run.commit[:12]} after no event for 1s")
+    assert _runner_has(caplog, f"agent-a: READY — {run.commit[:12]} after no event for 3s")
     (line,) = _jsonl(sb.out_dir / "agent-a" / "turns.jsonl")
     assert line["idle_status"] == "stalled" and line["harvest"]["verdict"] == "READY"
 
 
 def test_a_stalled_turn_with_a_rejected_commit_stays_stalled_without_a_reprompt(tmp_path):
-    """One commit with no `PROGRESS.csv` row: STALLED, `run.commit` is that sha,
-    the turn's harvest is REWORK, `last_error` is the stall text, `attempt` is
-    unchanged, and no second prompt went to the fake."""
+    """One commit with no `PROGRESS.csv` row: STALLED, `run.commit` is that
+    sha, the turn's harvest is REWORK, `last_error` is the stall text,
+    `attempt` is unchanged, and no second prompt went to the fake.
+
+    FL-1 (round 84): the commit is made by `prepare`, before the run — see
+    `_run_one` and the sibling READY test above."""
     sb, fake, _h, run, _ = _run_one(tmp_path,
-        {"turns": [{"on_prompt": work_no_claim, "events": [], "idle": False}]}, _stall_config())
+        {"turns": [{"events": [], "idle": False}]}, _stall_config(),
+        prepare=lambda d: work_no_claim(d, ""))
     ws = sb.ws("agent-a")
     assert run.state is AgentState.STALLED, run.last_error
     assert run.commit == _branch_sha(ws)
-    assert run.last_error == "no event for 1s"
+    assert run.last_error == "no event for 3s"
     assert run.attempt == 0
     (turn,) = run.turns
     assert turn["idle_status"] == "stalled"
@@ -705,9 +827,10 @@ def test_an_error_turn_with_a_valid_commit_is_harvested_to_ready(tmp_path, caplo
     """`session.error` after the commit and the claim: the same harvest as the
     stall, ERROR standing in for STALLED."""
     caplog.set_level(logging.INFO, logger="tools.contest.runner")
-    scenario = {"turns": [{"on_prompt": work_ready, "events": ["busy"],
+    scenario = {"turns": [{"events": ["busy"],
                            "error": {"name": "ProviderError", "message": "boom-42"}}]}
-    sb, _fake, _h, run, _ = _run_one(tmp_path, scenario, _stall_config())
+    sb, _fake, _h, run, _ = _run_one(tmp_path, scenario, _stall_config(),
+                                     prepare=lambda d: work_ready(d, ""))
     ws = sb.ws("agent-a")
     assert run.state is AgentState.READY, (run.state, run.last_error)
     assert run.commit == _branch_sha(ws)
@@ -720,9 +843,9 @@ def test_an_error_turn_with_a_valid_commit_is_harvested_to_ready(tmp_path, caplo
 
 def test_an_error_turn_with_a_rejected_commit_stays_error_without_a_reprompt(tmp_path):
     sb, fake, _h, run, _ = _run_one(tmp_path,
-        {"turns": [{"on_prompt": work_no_claim, "events": ["busy"],
+        {"turns": [{"events": ["busy"],
                     "error": {"name": "ProviderError", "message": "boom-42"}}]},
-        _stall_config())
+        _stall_config(), prepare=lambda d: work_no_claim(d, ""))
     ws = sb.ws("agent-a")
     assert run.state is AgentState.ERROR, run.last_error
     assert run.commit == _branch_sha(ws)
@@ -744,7 +867,7 @@ def test_a_stall_with_no_commit_is_not_harvested(tmp_path, monkeypatch):
     sb, fake, _h, run, aborted = _run_one(tmp_path, {"turns": [{"events": [], "idle": False}]},
                                           _stall_config())
     assert run.state is AgentState.STALLED and aborted
-    assert run.last_error == "no event for 1s"
+    assert run.last_error == "no event for 3s"
     assert run.commit is None
     (turn,) = run.turns
     assert turn["idle_status"] == "stalled" and "harvest" not in turn
@@ -755,12 +878,13 @@ def test_a_stall_with_no_commit_is_not_harvested(tmp_path, monkeypatch):
 def test_a_terminal_harvest_skips_the_commit_when_the_branch_has_two(tmp_path):
     """Two commits, the claim naming the older of the two: the verdict is REWORK
     and there is no single commit to point at, so `run.commit` stays None."""
-    def two_commits(directory, text):
-        work_ready(directory, text)
+    def two_commits(directory):
+        work_ready(directory, "")
         _git(directory, "commit", "-q", "--allow-empty", "-m", "KC-21: second")
 
     sb, fake, _h, run, _ = _run_one(tmp_path,
-        {"turns": [{"on_prompt": two_commits, "events": [], "idle": False}]}, _stall_config())
+        {"turns": [{"events": [], "idle": False}]}, _stall_config(),
+        prepare=two_commits)
     ws = sb.ws("agent-a")
     assert run.state is AgentState.STALLED
     assert run.commit is None
@@ -784,7 +908,10 @@ def test_a_terminal_harvest_runs_the_roots_under_the_rounds_lock(tmp_path, monke
         return ALL_ROOTS_PASS, []
 
     monkeypatch.setattr(harvest_module, "run_tests_detail", roots)
-    scenario = {"turns": [{"on_prompt": work_ready, "events": [], "idle": False}]}
+    # FL-1 (round 84): committed before the round, not from the turn's hook —
+    # see `_run_one`. This one goes through `run_round`, so it does it by hand.
+    work_ready(str(sb.ws("agent-a").path), "")
+    scenario = {"turns": [{"events": [], "idle": False}]}
     with _BenchFake(scenario) as fake:
         state = run_round(_stall_config(), ROUND, sb.ticket_path, list(sb.workspaces),
                           make_backend=_make_backend(fake, sb.out_dir), out_dir=sb.out_dir,
@@ -964,8 +1091,15 @@ def test_retryable_error_reprompts_same_session_and_recovers(tmp_path, caplog):
 
 
 def test_retry_backoff_is_observed(tmp_path):
-    """error_retry_backoff_sec=1: the second prompt arrives >= 1 s after the
-    error event, and the run still finishes in < 5 s."""
+    """error_retry_backoff_sec=1: the retry prompt goes out >= 1 s after the
+    error event, read off the run's own turn timestamps.
+
+    FL-1 (round 84): the old upper bound was `backoff + 10` measured around
+    the whole of `_run_one` — which includes building the sandbox (real git
+    worktrees) and two full turns. On the operator's 64-worker box that
+    setup alone can eat the 10 s, so the bound was a box number, not a
+    deadline. The backoff itself is what this test is about, and the turns
+    record exactly when it started and ended."""
     scenario = {"turns": [
         {"events": ["busy"], "error": _ECONNRESET},
         {"on_prompt": work_ready, "events": ["busy", "idle"]},
@@ -975,10 +1109,13 @@ def test_retry_backoff_is_observed(tmp_path):
     sb, fake, h, run, _ = _run_one(tmp_path, scenario, cfg)
     elapsed = time.monotonic() - started
     assert run.state is AgentState.READY
-    # the backoff was observed (>= its 1 s), and the run did not stall waiting
-    # far past it; the upper bound tracks the config, not the box.
-    assert elapsed >= cfg.error_retry_backoff_sec
-    assert elapsed < cfg.error_retry_backoff_sec + 10
+    # the backoff was observed, measured where it actually happened: from the
+    # errored turn going idle to the retry prompt going out.
+    error_turn, retry_turn = run.turns
+    assert retry_turn["sent_at"] - error_turn["idle_at"] >= cfg.error_retry_backoff_sec
+    # and the run did not sit somewhere else instead: both turns' deadlines
+    # plus the backoff, which is a deadline and not a box number.
+    assert elapsed < cfg.error_retry_backoff_sec + 2 * cfg.turn_timeout_sec
 
 
 def test_retries_exhausted_then_error(tmp_path):
@@ -1222,7 +1359,27 @@ def test_three_agents_rework_in_parallel_and_state_json_is_always_whole(tmp_path
 def test_a_silent_agent_stalls_next_to_a_chatty_one(tmp_path):
     """agent-a goes silent while agent-b keeps emitting on the same server;
     the fake broadcasts every event to every tap, so a's clock must count
-    only a's session — a is aborted within seconds, not after b is done."""
+    only a's session — a takes the idle-event silence path (not the 30 s
+    turn_timeout), regardless of what agent-b is doing at the same time.
+
+    FL-1 (round 84), two independent fixes:
+    * agent-b has to *survive* the silence window while agent-a trips it, so
+      it is governed by the same arithmetic as
+      test_events_of_the_session_keep_a_turn_alive — see that test: the
+      window, this test's runtime and its tolerance for a starved box are
+      all one number, and no beat interval substitutes for it, because what
+      starves is the delivery of a beat and not its emission. b beats for
+      12 s under an 8 s window; a emits nothing at all and still stalls,
+      just at 8 s instead of 1 s.
+    * the classification check (idle_status/last_error) is what proves a's
+      clock ran independently of b's traffic, not a wall-clock bound: a
+      KC-12 regression (a's clock counting b's events) would show up as
+      agent-a taking the turn_timeout path instead of the idle-event one,
+      not as a slow abort — and the abort check looks only at agent-a's own
+      session instead of unpacking "the one abort" from a list that a
+      genuine second abort (of either agent) can make hold more than one
+      entry.
+    """
     sb = Sandbox(tmp_path, ["agent-a", "agent-b"])
     stamps: list = []
 
@@ -1231,8 +1388,16 @@ def test_a_silent_agent_stalls_next_to_a_chatty_one(tmp_path):
 
         def run_turn(session, turn, text):
             if session.directory.endswith("agent-b"):
+                # FL-1 (round 84): the beats start *before* the git work, not
+                # after it. b's silence clock is already running when this
+                # hook is entered, so a commit that takes longer than the
+                # window on a loaded box would stall the agent this test
+                # needs to stay chatty. The count is finite because the last
+                # beat is what ends b's turn — it only has to outlast a's
+                # stall at 3 s, and 60 beats is 6 s before any drift.
+                fake.pulse(session.id, KEEPALIVE_BEAT_S, KEEPALIVE_BEATS,
+                           then_idle=True)
                 work_ready(session.directory, text)
-                fake.pulse(session.id, 0.3, 20, then_idle=True)
             return orig_turn(session, turn, text)
 
         def record(method, path, query, body):
@@ -1240,14 +1405,16 @@ def test_a_silent_agent_stalls_next_to_a_chatty_one(tmp_path):
             orig_record(method, path, query, body)
 
         fake._run_turn, fake._record_request = run_turn, record
-        started = time.monotonic()
-        state = _round(sb, fake, make_config(["agent-a", "agent-b"], max_parallel=2,
-                                             turn_timeout_sec=30, idle_event_timeout_sec=1))
+        state = _round(sb, fake, make_config(
+            ["agent-a", "agent-b"], max_parallel=2, turn_timeout_sec=120,
+            idle_event_timeout_sec=KEEPALIVE_WINDOW_S))
     runs = _by_name(state)
     assert runs["agent-a"].state is AgentState.STALLED
+    assert runs["agent-a"].last_error == f"no event for {KEEPALIVE_WINDOW_S}s"
+    assert runs["agent-a"].turns[-1]["idle_status"] == "stalled"
     _assert_ready(runs["agent-b"], sb.ws("agent-b"))
-    (abort_at, _), = [s for s in stamps if s[1].endswith("/abort")]
-    assert abort_at - started < 4.0
+    a_abort_path = f"/session/{runs['agent-a'].session_id}/abort"
+    assert any(s[1] == a_abort_path for s in stamps), "agent-a's session was never aborted"
 
 
 def _interrupt_once_agent_a_is_saved_ready(sb, pid, timeout=10.0):
@@ -1436,7 +1603,10 @@ def test_run_tests_true_never_runs_the_roots_twice_at_once(tmp_path, monkeypatch
         return ALL_ROOTS_PASS, []
 
     def on_prompt(directory, text):
-        barrier.wait(2)
+        # FL-1 (round 84): a rendezvous between two agent threads, not a
+        # deadline — 2 s was short enough for a loaded box to break the
+        # barrier and turn a scheduling delay into a test failure.
+        barrier.wait(60)
         work_ready(directory, text)
 
     monkeypatch.setattr(harvest_module, "run_tests_detail", roots)
@@ -1525,7 +1695,10 @@ def test_rework_and_error_lines_carry_the_codes_and_the_payload(tmp_path, caplog
 def test_heartbeat_names_the_waiting_agent_and_its_time_in_state(tmp_path, caplog):
     caplog.set_level(logging.INFO, logger=LOGGER)
     sb = Sandbox(tmp_path)
-    cfg = make_config(["agent-a"], progress_every_sec=0.2, idle_event_timeout_sec=5)
+    # FL-1 (round 84): the silence window is incidental here — this test is
+    # about the heartbeat *log line*, and the turn only has to reach READY.
+    # A 5 s window was one more thing for a loaded box to trip over.
+    cfg = make_config(["agent-a"], progress_every_sec=0.2, idle_event_timeout_sec=120)
     scenario = {"turns": [{"on_prompt": work_ready, "events": ["busy", "idle"], "delay": 1.0}]}
     with _BenchFake(scenario) as fake:
         state = _round(sb, fake, cfg)

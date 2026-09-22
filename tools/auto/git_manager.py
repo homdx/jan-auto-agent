@@ -34,7 +34,9 @@ from __future__ import annotations
 
 import configparser
 import logging
+import re
 import subprocess
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -414,8 +416,47 @@ class GitManager:
 
     # ── Private ──────────────────────────────────────────────────────────────
 
+    # FL-1 (round 84): git takes `.git/index.lock` for the whole of any
+    # command that writes the index — `add`, `commit`, and `status` when it
+    # refreshes — and fails outright, code 128, if another git already holds
+    # it. That is a *transient*: the holder is a moment from releasing it.
+    # This repo's own error text has always named it as a likely cause
+    # (see `has_uncommitted_changes` and the generic handler below), but
+    # nothing ever waited for it, so one collision cost a task its commit.
+    # The operator's 64-worker stress run turned that into a red suite —
+    # `CommitOnSuccess: git error for task T1 — git add -u failed` — and
+    # in a real autonomous run it loses the agent's work outright.
+    #
+    # A stale lock left by a crashed git never clears, so this is bounded
+    # and short: it buys the contended case and costs the stale case two
+    # seconds before the same error, which already explains stale locks.
+    _LOCK_CONTENTION_RE = re.compile(
+        r"Unable to create '.*\.lock': File exists", re.IGNORECASE)
+    _LOCK_RETRIES = 8
+    _LOCK_BACKOFF_S = 0.25
+
     def _run(self, cmd: list[str], error_msg: str) -> str:
-        """Run *cmd* inside *repo_dir*, capture output, raise on failure."""
+        """Run *cmd* inside *repo_dir*, capture output, raise on failure.
+
+        A `.lock: File exists` failure is retried briefly — see
+        `_LOCK_CONTENTION_RE` above.
+        """
+        for attempt in range(self._LOCK_RETRIES):
+            try:
+                return self._run_once(cmd, error_msg)
+            except GitError as exc:
+                if attempt == self._LOCK_RETRIES - 1 or not self._LOCK_CONTENTION_RE.search(str(exc)):
+                    raise
+                logger.debug(
+                    "GitManager: %s held by another git — retry %d/%d in %.2fs",
+                    " ".join(cmd), attempt + 1, self._LOCK_RETRIES - 1,
+                    self._LOCK_BACKOFF_S,
+                )
+                time.sleep(self._LOCK_BACKOFF_S)
+        raise AssertionError("unreachable")   # pragma: no cover
+
+    def _run_once(self, cmd: list[str], error_msg: str) -> str:
+        """One attempt at *cmd*; `_run` is what decides whether to repeat it."""
         try:
             result = subprocess.run(
                 cmd,

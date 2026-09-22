@@ -654,13 +654,27 @@ class OuterLoop:
     def _task_budget_seconds(self) -> float:
         """This task's wall-clock budget in seconds (0 disables the guard).
 
-        Wrapped: a malformed ``max_task_seconds`` must mean "no guard", not an
-        exception at the resume point.
+        A malformed ``max_task_seconds`` must mean "no guard", not an
+        exception at the resume point — but FL-1 (round 84): "malformed"
+        must also cover a value that ``float()`` *accepts*, not just one
+        that raises.  ``float(MagicMock())`` is ``1.0`` (MagicMock implements
+        ``__float__``), and ``float(True)`` is ``1.0`` too (``bool`` is an
+        ``int`` subclass) — the old ``float(getattr(...) or 0)`` silently
+        turned either one into a real 1-second budget nobody configured.
+        Only a real, finite, positive ``int``/``float`` is accepted; a
+        ``bool``, a ``MagicMock``, a string that happens to parse, an enum,
+        or a missing/``None`` attribute all mean "no guard".
         """
+        value = getattr(self.inner_loop, "max_task_seconds", 0)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return 0.0
         try:
-            return float(getattr(self.inner_loop, "max_task_seconds", 0) or 0)
+            seconds = float(value)
         except (TypeError, ValueError):
             return 0.0
+        if not math.isfinite(seconds) or seconds <= 0:
+            return 0.0
+        return seconds
 
     def _begin_task_budget(self, task_id: str) -> _TaskBudget:
         """Open this task's budget ledger and start this session's clock.

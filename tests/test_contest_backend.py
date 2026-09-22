@@ -414,7 +414,7 @@ def test_openrouter_wait_idle_returns_idle_on_the_sentinel():
     pipe.push(json.dumps({"type": "usage", "input": 12, "output": 34}))
     pipe.push(json.dumps({"type": "idle"}))
     questions = []
-    result = backend.wait_idle(session, 5.0, on_permission=lambda e: ("once", ""),
+    result = backend.wait_idle(session, 60.0, on_permission=lambda e: ("once", ""),
                                on_question=lambda e: questions.append(e))
     assert result.status == "idle"
     assert result.error is None and result.permissions == [] and result.questions == []
@@ -432,8 +432,11 @@ def test_openrouter_wait_idle_times_out_on_a_silent_agent():
                                on_question=lambda e: None)
     elapsed = time.monotonic() - started
     assert result.status == "timeout"
-    assert 0.25 < elapsed < 2.0, elapsed
-    assert 0.25 < result.elapsed < 2.0
+    # FL-1 (round 84): the lower bound is the claim (it waited out the 0.3 s
+    # deadline rather than returning early) and only gets safer under load.
+    # The upper bound is a "did not hang" guard, so it is generous.
+    assert 0.25 < elapsed < 30.0, elapsed
+    assert 0.25 < result.elapsed < 30.0
     backend.close()
 
 
@@ -464,7 +467,7 @@ def test_openrouter_records_a_permission_event_and_replies_on_stdin():
         asked.append(candidate)
         return "reject", "the reviewer refused this command"
 
-    result = backend.wait_idle(session, 5.0, on_permission=on_permission,
+    result = backend.wait_idle(session, 60.0, on_permission=on_permission,
                                on_question=lambda e: None)
     assert result.status == "idle"
     assert asked == [event] and len(result.permissions) == 1
@@ -485,7 +488,7 @@ def test_openrouter_a_broken_policy_answers_reject_not_a_crash():
     def explode(event):
         raise RuntimeError("a policy that raises")
 
-    result = backend.wait_idle(session, 5.0, on_permission=explode,
+    result = backend.wait_idle(session, 60.0, on_permission=explode,
                                on_question=lambda e: None)
     assert result.status == "idle"
     replies = [record for record in pipe.sent() if record.get("type") == "permission.reply"]
@@ -500,7 +503,7 @@ def test_openrouter_a_provider_error_is_a_retryable_idle_result():
     pipe.push(json.dumps({"type": "error", "data": {"name": "AgentError", "message": "429",
                                                     "isRetryable": True,
                                                     "metadata": {"code": "429", "status": "429"}}}))
-    result = backend.wait_idle(session, 5.0, on_permission=lambda e: ("once", ""),
+    result = backend.wait_idle(session, 60.0, on_permission=lambda e: ("once", ""),
                                on_question=lambda e: None)
     assert result.status == "error"
     assert result.error["isRetryable"] is True and result.error["message"] == "429"
@@ -513,7 +516,7 @@ def test_openrouter_a_dead_agent_is_a_closed_stream():
     session = backend.create_session("openrouter", "hy3:free", rules=[], title="t")
     backend.abort(session)          # EOF on the pipe
     pipe.push("   ")                # a blank line is not an event, not an EOF
-    result = backend.wait_idle(session, 5.0, on_permission=lambda e: ("once", ""),
+    result = backend.wait_idle(session, 60.0, on_permission=lambda e: ("once", ""),
                                on_question=lambda e: None)
     assert result.status == "closed"
     assert "exit" in result.error
@@ -531,7 +534,7 @@ def test_openrouter_tool_parts_returns_the_agents_own_calls():
     pipe.push(json.dumps(first))
     pipe.push(json.dumps(second))
     pipe.push(json.dumps({"type": "idle"}))
-    backend.wait_idle(session, 5.0, on_permission=lambda e: ("once", ""),
+    backend.wait_idle(session, 60.0, on_permission=lambda e: ("once", ""),
                       on_question=lambda e: None)
     assert backend.tool_parts(session) == [first, second]
     backend.close()

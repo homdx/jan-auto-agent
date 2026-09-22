@@ -3,6 +3,8 @@ import logging
 import os
 import re
 import tempfile
+import threading
+import time
 from collections import Counter
 from dataclasses import dataclass, asdict, fields
 from pathlib import Path
@@ -11,6 +13,17 @@ from typing import List, Dict, Any, Optional
 logger = logging.getLogger(__name__)
 
 METRICS_PATH = Path("metrics.json")
+
+# FL-1 (round 84): fsync is a disk barrier — a real round trip to the
+# storage layer, not microseconds. Calling it on every single record()
+# turns N back-to-back writers (e.g. AutoMetricsStream's concurrent
+# Gate-2 callers) into N sequential disk round trips with zero overlap,
+# which is enough on a loaded box to exceed a bounded test's --timeout
+# even though nothing is actually deadlocked (see epic-tasks/84). Sync at
+# most once per this many seconds instead — the file on disk is correct
+# (atomically replaced) after every record() call regardless; only the
+# crash-durability window widens from "one record" to this bound.
+_FSYNC_INTERVAL_S = 0.5
 
 
 @dataclass
@@ -41,6 +54,14 @@ class MetricsCollector:
         # when we already know the in-memory copy matches disk.
         self._cache: Optional[list] = None
         self._cache_mtime: Optional[float] = None
+        # FL-1: record() is now thread-safe on its own — this lock is a
+        # MetricsCollector-owned implementation detail (not a caller's lock,
+        # like AutoMetricsStream._lock used to be) that serialises the
+        # read-modify-write cycle so concurrent callers produce a
+        # consistent record count. It is held across the disk write, but
+        # never across a blocking fsync — see _FSYNC_INTERVAL_S above.
+        self._write_lock = threading.Lock()
+        self._last_fsync_monotonic: Optional[float] = None
 
     def _load_all_cached(self) -> list:
         try:
@@ -57,42 +78,88 @@ class MetricsCollector:
     def record(self, run: RunRecord) -> None:
         """Append a RunRecord to metrics.json, creating the file if needed.
 
+        Thread-safe on its own (FL-1, round 84): the full read-modify-write
+        cycle is serialised under an internal lock, so concurrent callers —
+        not just ones that add their own external locking, like
+        AutoMetricsStream used to — get a consistent record count with no
+        lost writes.
+
         The write is atomic: data is serialised to a sibling temp file first,
         then renamed over the target with os.replace().  A crash mid-write
         therefore leaves the previous metrics.json intact rather than producing
         a truncated file that would silence the prompt optimizer on the next run.
+
+        fsync is called on a bounded cadence (_FSYNC_INTERVAL_S) rather than
+        on every call — see the module comment. The file on disk is always
+        current after this call returns (os.replace has happened); only the
+        durability guarantee against an unclean shutdown is bounded to that
+        interval instead of "every single record".  ``flush()`` forces an
+        immediate fsync when a caller needs a stronger guarantee.
         """
-        records = self._load_all_cached()
-        records = list(records)  # don't mutate the cached list in place
-        records.append(asdict(run))
-        try:
-            dir_ = self.metrics_path.parent
-            dir_.mkdir(parents=True, exist_ok=True)
-            fd, tmp_path = tempfile.mkstemp(
-                dir=dir_, prefix=".metrics_tmp_", suffix=".json"
-            )
+        with self._write_lock:
+            records = self._load_all_cached()
+            records = list(records)  # don't mutate the cached list in place
+            records.append(asdict(run))
             try:
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    json.dump(records, f, indent=2)
-                    # BUGFIX: same missing-fsync bug as PromptStore._save —
-                    # without flush+fsync here, a crash between the write and
-                    # os.replace can lose metrics history on an unclean
-                    # shutdown, which the operator sees as metrics silently
-                    # "resetting to zero" with no explanation.
-                    f.flush()
-                    os.fsync(f.fileno())
-            except Exception:
-                os.unlink(tmp_path)
-                raise
-            os.replace(tmp_path, self.metrics_path)
-            self._cache = records
+                dir_ = self.metrics_path.parent
+                dir_.mkdir(parents=True, exist_ok=True)
+                fd, tmp_path = tempfile.mkstemp(
+                    dir=dir_, prefix=".metrics_tmp_", suffix=".json"
+                )
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as f:
+                        json.dump(records, f, indent=2)
+                        # BUGFIX: same missing-fsync bug as PromptStore._save —
+                        # without flush+fsync here, a crash between the write and
+                        # os.replace can lose metrics history on an unclean
+                        # shutdown, which the operator sees as metrics silently
+                        # "resetting to zero" with no explanation.
+                        f.flush()
+                        now = time.monotonic()
+                        fsync_due = (
+                            self._last_fsync_monotonic is None
+                            or (now - self._last_fsync_monotonic) >= _FSYNC_INTERVAL_S
+                        )
+                        if fsync_due:
+                            os.fsync(f.fileno())
+                            self._last_fsync_monotonic = now
+                except Exception:
+                    os.unlink(tmp_path)
+                    raise
+                os.replace(tmp_path, self.metrics_path)
+                self._cache = records
+                try:
+                    self._cache_mtime = self.metrics_path.stat().st_mtime
+                except OSError:
+                    self._cache = None
+                    self._cache_mtime = None
+            except Exception as e:
+                logger.error(f"MetricsCollector failed to write metrics: {e}")
+
+    def flush(self) -> None:
+        """Force the current on-disk metrics file durable right now.
+
+        record()'s fsync is bounded-cadence (see _FSYNC_INTERVAL_S), so the
+        most recent write or two may not have hit disk yet.  This opens the
+        already-replaced target file and fsyncs it directly — safe to call
+        at any time, including when metrics_path does not exist yet (a
+        no-op then).  Never raises.
+        """
+        with self._write_lock:
             try:
-                self._cache_mtime = self.metrics_path.stat().st_mtime
+                fd = os.open(self.metrics_path, os.O_RDONLY)
             except OSError:
-                self._cache = None
-                self._cache_mtime = None
-        except Exception as e:
-            logger.error(f"MetricsCollector failed to write metrics: {e}")
+                return
+            try:
+                os.fsync(fd)
+            except OSError as exc:
+                logger.warning(
+                    "MetricsCollector.flush: fsync of %s failed: %s",
+                    self.metrics_path, exc,
+                )
+            finally:
+                os.close(fd)
+            self._last_fsync_monotonic = time.monotonic()
 
     def load_recent(self, n: int) -> List[RunRecord]:
         """Return the last N RunRecord entries.

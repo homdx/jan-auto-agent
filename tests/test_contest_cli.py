@@ -928,8 +928,14 @@ def test_a_stall_with_a_valid_commit_counts_as_ready_and_exits_zero(sandbox, cap
     so the run exports `agent-a.patch` and exits 0, while agent-b stalled with an
     empty branch stays STALLED with no patch and no harvest."""
     ini = sandbox.repo / "contest.ini"
+    # FL-1 (round 84): 5 s, not 1 s. The window only has to be short enough
+    # that the silent agent stalls inside the turn deadline — its exact value
+    # is not the claim — and agent-a commits from its hook, so a 1 s window
+    # was a real `git` commit racing a wall clock. FakeKiloServer heartbeats
+    # through the hook now, but a 1 s window leaves no room for that beat to
+    # be *delivered* late on a loaded box.
     ini.write_text(ini.read_text(encoding="utf-8").replace("idle_event_timeout_sec = 30",
-                                                           "idle_event_timeout_sec = 1"),
+                                                           "idle_event_timeout_sec = 5"),
                    encoding="utf-8")
     scenario = {"turns": [{"on_prompt": lambda directory, text: work_ready(directory, text)
                                           if Path(directory).name.endswith("agent-a") else None,
