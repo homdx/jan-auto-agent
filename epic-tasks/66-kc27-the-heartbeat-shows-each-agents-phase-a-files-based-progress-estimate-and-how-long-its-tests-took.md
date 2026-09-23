@@ -59,24 +59,20 @@ for the lock — is computed and dropped; `turn["harvest"]` keeps only
    - `WAITING`, `REWORK` (the agent is working) →
      `min(60, round(60 * files / max(median, 1)))`, where `median` is the
      median of `files` over the agents currently working (floor 1) — an
-     agent at or above the pack's median is at 60 %; when its branch carries
-     a **new** commit (`committed`, below) → `70`;
+     agent at or above the pack's median is at 60 %; when its branch already
+     carries a commit above `base_sha` on the first attempt (`committed`) → `70`;
    - `HARVESTING` → `80`;
    - `READY` → `100`; `GAVE_UP`, `STALLED`, `ERROR` → `None`.
    The heuristic is stated in the docstring as what it is: a files-count
    against the pack, not a measure of the work — good enough to see the
    field converging and one agent stuck at 1 file for 20 minutes.
 
-   **A rework rolls the bar back** (added 2026-09-23, asked by the operator
-   during round 86). The harvest records the HEAD it judged:
-   `turn["harvest"]["head"]` is the full sha of the worktree's HEAD at the
-   harvest, or `None` when it cannot be read. `committed` is true only when
-   HEAD is above `base_sha` **and** differs from the last harvested `head` of
-   this run. So the bar moves `HARVESTING 80 %` → `REWORK`/`WAITING` back to
-   the files-based ≤ 60 %: the commit the judge refused no longer counts as
-   progress. It climbs back to `70` when the agent amends (a new HEAD), and to
-   `80` at the next harvest. A continue (KC-22) is not a harvest, so it leaves
-   `head` and the bar alone.
+   **A rework rolls the bar back** (added 2026-09-23, asked by the operator).
+   The caller passes `committed = <commit above base> and run.attempt == 0`.
+   On a rework the commit the judge refused is still on the branch, but it
+   does not count: the bar drops from `HARVESTING 80 %` to the files-based
+   ≤ 60 % and stays there until the next harvest (`80`). Nothing is
+   remembered between ticks; `attempt` is already on `AgentRun`.
 
 4. **The line.** `_Heartbeat.line()` renders per agent
    `<name> <STATE> <age> <bar> <pct>% <files>f[ ↺N][ (tests 4m)]`,
@@ -107,13 +103,9 @@ for the lock — is computed and dropped; `turn["harvest"]` keeps only
         `(WAITING, 3, 2, False) == 60` (capped), `(WAITING, 0, 1, False) == 0`,
         `(WAITING, 1, 2, True) == 70`, `(HARVESTING, *, *, *) == 80`,
         `(READY, …) == 100`, `(STALLED, …) is None`, `(PROMPTED, …) == 0`;
-      - the rollback, through the fake round with `max_rework ≥ 1` and a
-        first harvest that is `REWORK`: the recorded `turn["harvest"]["head"]`
-        is the worktree's HEAD at that harvest; while the agent's branch still
-        sits on that same HEAD, the line shows ≤ 60 % and `↺1`, never 70 or
-        80; after a new commit (amend) it shows `70`; a `state.json` whose
-        `harvest` has no `head` loads and counts any commit as new (today's
-        behaviour);
+      - the rollback: `_Heartbeat.line()` on an agent in `WAITING` with
+        `attempt == 1` and a commit above `base_sha` shows ≤ 60 % and `↺1`,
+        never 70; the same agent with `attempt == 0` shows `70`;
       - `_Heartbeat.line()` on a `RoundState` with two working agents whose
         worktrees have 1 and 3 files touched shows `30%`/`60%`, `1f`/`3f`, a
         ten-cell bar each, and a READY agent as `READY (tests 4m)` when its
