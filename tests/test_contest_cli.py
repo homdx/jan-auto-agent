@@ -1487,3 +1487,114 @@ def test_backend_flag_without_a_profile_in_the_roster_is_a_server_line(
     assert captured.err.startswith("intake: [contest] backend = openrouter")
     assert "openrouter_llm_profile" in captured.err
     assert list(sandbox.rounds.iterdir()) == [], "no worktree before the roster is valid"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KC-49 — the reasoning variant, named or `highest`, through `run`
+# ─────────────────────────────────────────────────────────────────────────────
+
+KC49_REJECTED = {"name": "APIError",
+                 "data": {"message": "the model's provider rejected the request. check "
+                                     "the model id, request fields, and context length",
+                          "statusCode": 400, "isRetryable": False}}
+
+KC49_OFFER = _offer(({
+    "id": "kenary", "name": "kenari", "source": "static",
+    "models": {"glm-4-7-flash:free": {
+        "id": "glm-4-7-flash:free", "providerID": "kenary", "name": "glm-4-7-flash:free",
+        "status": "active", "capabilities": {"reasoning": True, "toolcall": True},
+        "variants": {name: {"reasoningEffort": name}
+                     for name in ("none", "low", "medium", "high", "xhigh", "max")}}},
+},))
+
+
+def _work_unless_probe(directory, text):
+    """The round's agent does the work; the intake's `say: hello` only answers."""
+    if text.strip() == "say: hello":
+        return
+    work_ready(directory, text)
+
+
+KC49_SCENARIO = {"providers": KC49_OFFER,
+                 "reject_variants": {"max": KC49_REJECTED, "xhigh": KC49_REJECTED},
+                 "turns": [{"on_prompt": _work_unless_probe, "events": ["busy", "idle"],
+                            "assistant": "hello"}]}
+
+
+def test_run_resolves_highest_to_the_top_variant_that_answers(sandbox, capsys, spawn_holder):
+    """`@highest` on glm-4-7-flash:free: `max` and `xhigh` are rejected by the
+    provider, `high` answers — the round runs at `high`, and says so."""
+    code, fake = run_fake(sandbox, KC49_SCENARIO,
+                          ["--ticket", "1", "--models", "glm-4-7-flash:free@highest",
+                           "--no-gate", "--no-tests"], spawn_holder)
+    captured = capsys.readouterr()
+
+    assert code == 0, captured.err
+    assert ("variant: kenary/glm-4-7-flash:free@highest → high (failed: max: "
+            "the model's provider rejected the request.") in captured.out
+    assert _plan(captured.out)["agents"] == "1: kenary/glm-4-7-flash:free@high"
+    sessions = _sessions(fake)
+    assert [s["body"]["model"].get("variant") for s in sessions] == ["max", "xhigh", "high",
+                                                                     "high"]
+    round_session = sessions[-1]
+    assert round_session["body"]["title"] == f"contest/{ROUND:02d}/glm-4-7-flash"
+    round_prompts = [r for r in fake.calls("POST")
+                     if r["path"] == f"/session/{fake.sessions()[-1].id}/prompt_async"]
+    assert round_prompts and all(r["body"]["variant"] == "high" for r in round_prompts)
+    assert len(fake.calls(method="DELETE")) == 3, "every probe session is deleted"
+
+
+def test_run_with_no_variant_flag_runs_at_highest(sandbox, capsys, spawn_holder):
+    """`highest` is the default: the same glm case with nothing on the command line."""
+    code, fake = run_fake(sandbox, KC49_SCENARIO,
+                          ["--ticket", "1", "--models", "glm-4-7-flash:free",
+                           "--no-gate", "--no-tests"], spawn_holder)
+    captured = capsys.readouterr()
+
+    assert code == 0, captured.err
+    assert "variant: kenary/glm-4-7-flash:free@highest → high" in captured.out
+    assert _plan(captured.out)["agents"] == "1: kenary/glm-4-7-flash:free@high"
+    assert [s["body"]["model"].get("variant") for s in _sessions(fake)] == [
+        "max", "xhigh", "high", "high"]
+
+
+def test_run_variant_default_sends_no_variant_and_probes_nothing(sandbox, capsys,
+                                                                  spawn_holder):
+    code, fake = run_fake(sandbox, KC49_SCENARIO,
+                          ["--ticket", "1", "--models", "glm-4-7-flash:free",
+                           "--variant", "default", "--no-gate", "--no-tests"], spawn_holder)
+    captured = capsys.readouterr()
+
+    assert code == 0, captured.err
+    assert "variant:" not in captured.out
+    assert _plan(captured.out)["agents"] == "1: kenary/glm-4-7-flash:free"
+    (session,) = _sessions(fake)
+    assert "variant" not in session["body"]["model"]
+
+
+def test_run_refuses_a_variant_the_model_does_not_list(sandbox, capsys, spawn_holder):
+    code, fake = run_fake(sandbox, KC49_SCENARIO,
+                          ["--ticket", "1", "--models", "glm-4-7-flash:free@turbo",
+                           "--no-gate", "--no-tests"], spawn_holder)
+    lines = [line for line in capsys.readouterr().err.splitlines()
+             if line.startswith("intake:")]
+
+    assert code == cli.EXIT_FAILED
+    assert lines == ["intake: [glm-4-7-flash] kenary/glm-4-7-flash:free: no variant 'turbo' "
+                     "— listed: none, low, medium, high, xhigh, max"]
+    assert _sessions(fake) == [], "no session, probe or round, before intake passes"
+    assert not sandbox.out().exists()
+
+
+def test_run_variant_flag_sends_a_named_variant_without_probing(sandbox, capsys, spawn_holder):
+    code, fake = run_fake(sandbox, KC49_SCENARIO,
+                          ["--ticket", "1", "--models", "glm-4-7-flash:free",
+                           "--variant", "medium", "--no-gate", "--no-tests"], spawn_holder)
+    captured = capsys.readouterr()
+
+    assert code == 0, captured.err
+    assert "variant:" not in captured.out
+    assert _plan(captured.out)["agents"] == "1: kenary/glm-4-7-flash:free@medium"
+    (session,) = _sessions(fake)
+    assert session["body"]["model"]["variant"] == "medium"
+    assert fake.calls(method="DELETE") == []

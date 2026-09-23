@@ -152,7 +152,8 @@ class ContestBackend(Protocol):
 
     def create_session(self, provider_id: str, model_id: str, *,
                        rules: list, title: str,
-                       agent: str | None = None) -> SessionRef: ...
+                       agent: str | None = None,
+                       variant: str | None = None) -> SessionRef: ...
 
     def prompt(self, session: SessionRef, text: str) -> None: ...
 
@@ -264,10 +265,11 @@ class KiloBackend:
 
     def create_session(self, provider_id: str, model_id: str, *,
                        rules: list, title: str,
-                       agent: str | None = None) -> SessionRef:
+                       agent: str | None = None,
+                       variant: str | None = None) -> SessionRef:
         try:
             return self._client.create_session(provider_id, model_id, rules=rules,
-                                               title=title, agent=agent)
+                                               title=title, agent=agent, variant=variant)
         except KiloHttpError as exc:
             raise ContestBackendError(str(exc)) from exc
 
@@ -414,12 +416,16 @@ class OpenRouterBackend:
 
     def create_session(self, provider_id: str, model_id: str, *,
                        rules: list, title: str,
-                       agent: str | None = None) -> SessionRef:
+                       agent: str | None = None,
+                       variant: str | None = None) -> SessionRef:
+        # the subprocess agent loop has no reasoning-variant knob: the variant
+        # is kept on the ref, so the round's record says what was asked, and
+        # nothing else changes
         sid = f"openrouter-{model_id or title or 'agent'}"
         record = self._spawn_one(sid, provider_id, model_id, agent)
         self._records[sid] = record
         return SessionRef(id=sid, provider_id=provider_id, model_id=model_id,
-                          directory=self._directory, agent=agent)
+                          directory=self._directory, agent=agent, variant=variant or None)
 
     def prompt(self, session: SessionRef, text: str) -> None:
         record = self._record(session)

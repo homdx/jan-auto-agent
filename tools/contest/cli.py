@@ -72,6 +72,14 @@ from tools.contest.kilo_client import (
 )
 from tools.contest.roster import AgentSpec, ContestConfig, RosterError, load_roster
 from tools.contest.runner import AgentState, RoundState, run_round
+from tools.contest.variant import (
+    DEFAULT,
+    HIGHEST,
+    hello_probe,
+    ladder,
+    listed_variants,
+    pick_variant,
+)
 from tools.contest.workspace import WorkspaceError, prepare_round
 from tools.git_run import run_git
 
@@ -85,6 +93,7 @@ __all__ = [
     "export_patches",
     "intake",
     "main",
+    "resolve_variants",
     "roster_on_offer",
 ]
 
@@ -216,19 +225,25 @@ def agents_from_models(models: str, provider: str = DEFAULT_PROVIDER) -> tuple:
     (`hy3-var1:free,hy3:free,hy3:free` → `hy3-var1`, `hy3-var2`, `hy3-var3`).
     The names are a pure function of the *models* string, so `--resume` with
     the same string finds the same agents in `state.json`.
+
+    KC-49: an item may end in `@<variant>` — `sensenova123/sensenova-6.8-flash-lite@high`,
+    `glm-4-7-flash:free@highest` — the reasoning variant that agent runs at.
+    The variant is not part of the name: `m@high,m@low` are two variants of one
+    name, suffixed like any repeat.
     """
     parsed = []
     for item in filter(None, (m.strip() for m in models.split(","))):
+        item, _, variant = item.partition("@")
         prov, _, model_id = item.rpartition("/")
         name = "".join(c if c.isalnum() or c in "_-" else "-"
                        for c in model_id.split(":")[0].lower())
-        parsed.append((name.lstrip("_-"), prov or provider, model_id))
+        parsed.append((name.lstrip("_-"), prov or provider, model_id, variant.strip() or None))
 
-    counts = Counter(name for name, _, _ in parsed)
+    counts = Counter(name for name, _, _, _ in parsed)
     taken = {name for name, count in counts.items() if count == 1}
     last: dict = {}
     specs = []
-    for name, prov, model_id in parsed:
+    for name, prov, model_id, variant in parsed:
         if counts[name] > 1:
             number = last.get(name, 0)
             while True:
@@ -239,8 +254,63 @@ def agents_from_models(models: str, provider: str = DEFAULT_PROVIDER) -> tuple:
             last[name] = number
             taken.add(candidate)
             name = candidate
-        specs.append(AgentSpec(name=name, provider_id=prov, model_id=model_id))
+        specs.append(AgentSpec(name=name, provider_id=prov, model_id=model_id,
+                               variant=variant))
     return tuple(specs)
+
+
+def resolve_variants(providers: dict, agents: tuple, probe_for=None) -> tuple:
+    """KC-49: `(agents, failures, notes)` — every agent's variant made real.
+
+    *providers* is `GET /provider`. An agent with no variant is untouched. A
+    named variant must be one the model lists, or it is one failure line with
+    the list. `highest` walks `variant.ladder` of the listed variants with
+    `probe_for(agent)` — a `try_one` for `variant.pick_variant` — and the agent
+    gets the first rung that answers (`None` when only the plain request did);
+    nothing answering is a failure line naming every rung and why. A model that
+    lists no variants is not probed: `highest` of nothing is no variant. The
+    same `provider/model` is probed once however many agents ask for it.
+    *notes* is one line per probed model for the operator. Without
+    *probe_for*, `highest` on a model that lists variants is a failure: there
+    is nothing to ask.
+    """
+    resolved = []
+    failures: list = []
+    notes: list = []
+    picks: dict = {}
+    for agent in agents:
+        wanted = agent.variant
+        if not wanted:
+            resolved.append(agent)
+            continue
+        listed = listed_variants(providers, agent.provider_id, agent.model_id)
+        if wanted != HIGHEST:
+            if wanted not in listed:
+                failures.append(
+                    f"[{agent.name}] {agent.model}: no variant '{wanted}' — listed: "
+                    f"{', '.join(listed) if listed else '(none)'}")
+            resolved.append(agent)
+            continue
+        if not listed:
+            resolved.append(replace(agent, variant=None))
+            continue
+        if probe_for is None:
+            failures.append(f"[{agent.name}] {agent.model}: variant '{HIGHEST}' needs "
+                            "GET /provider and a server to ask — neither is attached")
+            resolved.append(agent)
+            continue
+        if agent.model not in picks:
+            pick = pick_variant(ladder(listed), probe_for(agent))
+            picks[agent.model] = pick
+            notes.append(f"{agent.model}@{HIGHEST} → {pick.describe()}")
+        pick = picks[agent.model]
+        if not pick.usable:
+            failures.append(f"[{agent.name}] {agent.model}: no variant answered "
+                            f"'say: hello' — {pick.describe()}")
+            resolved.append(agent)
+            continue
+        resolved.append(replace(agent, variant=pick.variant))
+    return tuple(resolved), failures, notes
 
 
 def roster_on_offer(providers: dict, agents: tuple) -> list:
@@ -394,10 +464,32 @@ class Intake:
     title: str
     base_sha: str
     out_dir: Path
+    #: the roster with every `highest` resolved (KC-49); empty = the config's as is
+    agents: tuple = ()
+
+
+def _without_highest(agents: tuple) -> tuple:
+    """*agents* with every unresolved `highest` sent as no variant."""
+    return tuple(replace(agent, variant=None) if agent.variant == HIGHEST else agent
+                 for agent in agents)
 
 
 def _offer_failures(repo, config: ContestConfig, attached) -> list:
-    """The roster's `provider/model` pairs, checked against `GET /provider`.
+    """`_check_offer`'s failures alone — its first KC-25 shape, kept for callers."""
+    return _check_offer(repo, config, attached)[0]
+
+
+def _check_offer(repo, config: ContestConfig, attached, *, resolve: bool = True) -> tuple:
+    """`(failures, agents, notes)`: the roster's `provider/model` pairs, checked
+    against `GET /provider`, then its variants resolved there (KC-49).
+
+    *agents* is the roster with every `highest` replaced by the variant that
+    answered, or `config.agents` as is when nothing was resolved; *notes* is
+    one line per probed model. With no offer to read, `highest` becomes no
+    variant: it is the round's default, and a server that did not start is
+    reported by the round itself. `resolve=False` stops after the pair check:
+    intake passes it when the round is already refused, so a refused round
+    spends no model call.
 
     With `server = spawn` no server is attached yet, so a throwaway one is
     started for the call alone and removed with its log — `cmd_run` starts its
@@ -409,6 +501,10 @@ def _offer_failures(repo, config: ContestConfig, attached) -> list:
     nothing is spawned. A failure of the call itself is one line, so the check
     never crashes intake.
     """
+    agents = config.agents
+    # no offer to read: `highest` — the round's default — quietly becomes no
+    # variant, and the round's own `server:` line reports why there was none
+    unresolved = _without_highest(agents)
     log_path = None
     own_server = None
     server = attached
@@ -421,13 +517,19 @@ def _offer_failures(repo, config: ContestConfig, attached) -> list:
                                           log_path=log_path)
                 own_server = server
             except Exception:
-                return []
+                return [], unresolved, []
         if server is None:
-            return []
+            return [], unresolved, []
         providers = KiloClient(server, str(repo)).providers()
-        return roster_on_offer(providers, config.agents)
+        failures = roster_on_offer(providers, agents)
+        if failures or not resolve:
+            return failures, unresolved, []
+        def probe_for(agent):
+            return hello_probe(server, agent.provider_id, agent.model_id)
+        resolved, failures, notes = resolve_variants(providers, agents, probe_for)
+        return failures, resolved, notes
     except (KiloHttpError, KiloServerError, ValueError) as exc:
-        return [f"GET /provider failed: {exc}"]
+        return [f"GET /provider failed: {exc}"], unresolved, []
     finally:
         if own_server is not None:
             own_server.close()
@@ -509,6 +611,8 @@ def intake(repo, tasks_dir, round_no, base_ref, config, argv=None):
                           base_ref, base_is_head)
             )
 
+    # an openrouter round has no offer to probe: `highest` is no variant there
+    agents = _without_highest(config.agents)
     attached = None
     if config.backend == "kilo":
         # an openrouter round has no Kilo server at all: nothing to resolve,
@@ -526,7 +630,13 @@ def intake(repo, tasks_dir, round_no, base_ref, config, argv=None):
 
         # the roster the round would run, against what the server offers: the
         # refusal that used to arrive as one agent's first-turn `session.error`
-        failures.extend(_offer_failures(repo, config, attached))
+        # the variant probe spends model calls, so it only runs for a round
+        # that has passed every other check
+        offer_failures, agents, notes = _check_offer(repo, config, attached,
+                                                     resolve=not failures)
+        failures.extend(offer_failures)
+        for note in notes:
+            print(f"variant: {note}")
 
     if failures:
         for line in failures:
@@ -538,6 +648,7 @@ def intake(repo, tasks_dir, round_no, base_ref, config, argv=None):
         title=title,
         base_sha=base_sha,
         out_dir=_round_out_dir(repo, config, round_no),
+        agents=agents,
     )
 
 
@@ -632,8 +743,8 @@ def _make_backends(config: ContestConfig, out_dir: Path):
 
 
 def _apply_flags(config: ContestConfig, args: argparse.Namespace) -> ContestConfig:
-    """`--models` (with `--provider` behind its bare ids), `--max-parallel` and
-    `--no-gate` on top of the roster.
+    """`--models` (with `--provider` behind its bare ids), `--variant`,
+    `--max-parallel` and `--no-gate` on top of the roster.
 
     `--backend` is deliberately not here: it is applied by `load_roster`
     (`cmd_run` passes `args.backend`), because the backend decides whether the
@@ -646,6 +757,14 @@ def _apply_flags(config: ContestConfig, args: argparse.Namespace) -> ContestConf
         provider = args.provider or ("openrouter" if config.backend == "openrouter"
                                      else DEFAULT_PROVIDER)
         config = replace(config, agents=agents_from_models(args.models, provider=provider))
+    # KC-49: every agent that names no variant of its own gets `--variant`,
+    # else `[contest] variant` (`highest` unless the roster says otherwise);
+    # `default` is no variant at all
+    variant = getattr(args, "variant", None) or config.variant or HIGHEST
+    config = replace(config, agents=tuple(
+        replace(agent, variant=None) if (agent.variant or variant) == DEFAULT
+        else agent if agent.variant else replace(agent, variant=variant)
+        for agent in config.agents))
     if args.max_parallel is not None:
         config = replace(config, max_parallel=int(args.max_parallel))
     if args.no_gate:
@@ -657,7 +776,8 @@ def _apply_flags(config: ContestConfig, args: argparse.Namespace) -> ContestConf
 
 def _print_plan(result: Intake, config: ContestConfig, out_dir: Path, *, run_tests: bool) -> None:
     """The plan, one line per fact: what the round will do, before it does it."""
-    models = ", ".join(agent.model for agent in config.agents)
+    models = ", ".join(agent.model + (f"@{agent.variant}" if agent.variant else "")
+                       for agent in config.agents)
     facts = (
         ("ticket", f"{result.ticket_path.name} — {result.title}"),
         ("base", result.base_sha[:12]),
@@ -716,6 +836,9 @@ def cmd_run(args: argparse.Namespace) -> int:
                     argv=getattr(args, "argv", None))
     if result is None:
         return EXIT_FAILED
+    if result.agents:
+        # `highest` resolved at intake (KC-49): the round runs what answered
+        config = replace(config, agents=result.agents)
     out_dir = Path(args.out).resolve() if args.out else result.out_dir
     _print_plan(result, config, out_dir, run_tests=run_tests)
 
@@ -793,6 +916,12 @@ def _parser() -> argparse.ArgumentParser:
                           "its own (default kenary for backend = kilo, openrouter for "
                           "backend = openrouter; the roster spells a model provider/model, "
                           "and --roster's agents are unaffected)")
+    run.add_argument("--variant", default=None, metavar="NAME",
+                     help="the reasoning variant of every agent that names none: "
+                          "high, max, … as GET /provider lists it; 'highest' (the default, "
+                          "[contest] variant) — the top one that answers 'say: hello', "
+                          "probed at intake; 'default' — send none. A --models item names "
+                          "its own as model@variant")
     run.add_argument("--max-parallel", type=int, default=None, metavar="N",
                      help="override the roster's max_parallel")
     run.add_argument("--no-tests", action="store_true",

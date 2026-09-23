@@ -670,6 +670,18 @@ class _Handler(BaseHTTPRequestHandler):
 
     # ── POST ───────────────────────────────────────────────────────────────
 
+    def do_DELETE(self) -> None:
+        # KC-49: the variant probe removes each throwaway session
+        path, _query = self._record(None)
+        m = _RE_SESSION_BY_ID.fullmatch(path)
+        if m:
+            with self.fake._lock:
+                gone = self.fake._sessions.pop(m.group(1), None)
+            if gone is None:
+                return self._not_found(path)
+            return self._json(200, True)
+        return self._not_found(path)
+
     def do_POST(self) -> None:
         body = self._body()
         path, query = self._record(body)
@@ -683,6 +695,14 @@ class _Handler(BaseHTTPRequestHandler):
             session = self.fake._session(m.group(1))
             if session is None:
                 return self._not_found(path)
+            # KC-49: `reject_variants` maps a variant to the `session.error`
+            # payload a provider answers it with (glm-4-7-flash:free's `max`)
+            rejected = (self.fake.scenario.get("reject_variants") or {}).get(
+                (session.model or {}).get("variant"))
+            if rejected is not None:
+                self.fake._emit({"type": "session.error",
+                                 "properties": {"sessionID": session.id, "error": rejected}})
+                return self._json(204)
             turns = self.fake.scenario.get("turns") or []
             if session.turn_index >= len(turns):
                 # no script for this prompt: go idle, and leave a trace

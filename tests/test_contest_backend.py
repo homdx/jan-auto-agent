@@ -210,8 +210,9 @@ class _RecordingClient:
         self.create_error = None
         self.tool_result = []
 
-    def create_session(self, provider_id, model_id, *, rules, title, agent=None):
-        self.calls.append(("create_session", provider_id, model_id, rules, title, agent))
+    def create_session(self, provider_id, model_id, *, rules, title, agent=None, variant=None):
+        call = ("create_session", provider_id, model_id, rules, title, agent)
+        self.calls.append(call + (variant,) if variant is not None else call)
         if self.create_error is not None:
             raise self.create_error
         return self.create_result

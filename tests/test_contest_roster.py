@@ -823,3 +823,15 @@ def test_gitignore_ignores_the_local_roster_and_the_out_dir():
     lines = (REPO_ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
     assert any(line.strip() == LOCAL for line in lines)
     assert any(line.strip() in ("contest-out", "contest-out/") for line in lines)
+
+
+def test_variant_key_defaults_to_highest_and_parses(tmp_path):
+    """KC-49: `[contest] variant` — `highest` when absent or empty, as written otherwise."""
+    assert "variant" in CONTEST_KEYS
+    assert ContestConfig().variant == "highest"
+    for text, want in (("", "highest"), ("variant =\n", "highest"),
+                       ("variant = high\n", "high"), ("variant = default\n", "default")):
+        ini = tmp_path / f"c{len(text)}.ini"
+        ini.write_text("[contest]\n" + text
+                       + "[contest.agent.a]\nmodel = kenary/a:free\n", encoding="utf-8")
+        assert load_roster(ini).variant == want

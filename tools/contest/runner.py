@@ -596,7 +596,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         try:
             session = backend.create_session(
                 spec.provider_id, spec.model_id, rules=config.session_rules(),
-                title=ws.branch, agent=spec.kilo_agent)
+                title=ws.branch, agent=spec.kilo_agent, variant=spec.variant)
         except (ContestBackendError, ValueError) as exc:
             return finish(AgentState.ERROR, f"POST /session failed: {_brief(str(exc))}")
         run.session_id = session.id

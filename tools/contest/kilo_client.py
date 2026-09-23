@@ -159,6 +159,7 @@ class SessionRef:
     model_id: str
     directory: str
     agent: str | None = None
+    variant: str | None = None
 
 
 @dataclass(frozen=True)
@@ -746,11 +747,21 @@ class KiloClient:
     # ── the session ────────────────────────────────────────────────────────
 
     def create_session(self, provider_id: str, model_id: str, *, rules: list,
-                       title: str, agent: str | None = None) -> SessionRef:
-        """``POST /session`` — the probe's body, ``model`` as ``{"providerID", "id"}``."""
+                       title: str, agent: str | None = None,
+                       variant: str | None = None) -> SessionRef:
+        """``POST /session`` — the probe's body, ``model`` as ``{"providerID", "id"}``.
+
+        *variant* (KC-49) is the model's reasoning variant as ``GET /provider``
+        lists it (``high``, ``max``, …): it goes into ``model.variant``, and the
+        returned ref carries it so every ``prompt`` repeats it. ``None`` sends
+        no key — the body is byte-for-byte what it was without it.
+        """
+        model = {"providerID": provider_id, "id": model_id}
+        if variant:
+            model["variant"] = variant
         body = {
             "title": title,
-            "model": {"providerID": provider_id, "id": model_id},
+            "model": model,
             "permission": list(rules),
         }
         if agent:
@@ -760,21 +771,36 @@ class KiloClient:
         if not isinstance(resp, dict) or not isinstance(resp.get("id"), str):
             raise ValueError(f"POST /session returned no session id: {resp!r}")
         return SessionRef(id=resp["id"], provider_id=provider_id, model_id=model_id,
-                          agent=agent, directory=self.directory)
+                          agent=agent, directory=self.directory, variant=variant or None)
 
     def prompt(self, session: SessionRef, text: str) -> None:
         """``prompt_async`` into an existing session; 200 and 204 both succeed.
 
         The model is ``{"providerID", "modelID"}`` here — a different shape
-        than ``create_session``, which is how the live server wants it.
+        than ``create_session``, which is how the live server wants it. The
+        session's variant, when it has one, is sent again as the top-level
+        ``variant`` (7.6.2's ``prompt_async`` schema): each prompt names its
+        model afresh, so the variant is named with it rather than trusted to
+        survive on the session.
         """
         path = f"/session/{session.id}/prompt_async"
         body = {
             "parts": [{"type": "text", "text": text}],
             "model": {"providerID": session.provider_id, "modelID": session.model_id},
         }
+        variant = getattr(session, "variant", None)
+        if variant:
+            body["variant"] = variant
         status, resp = self._request("POST", path, body)
         self._check(status, resp, "POST", path)
+        return None
+
+    def delete_session(self, session: SessionRef) -> None:
+        """``DELETE /session/{id}`` — 200 on 7.6.2; KC-49's variant probe
+        removes each throwaway session with it."""
+        path = f"/session/{session.id}"
+        status, resp = self._request("DELETE", path)
+        self._check(status, resp, "DELETE", path)
         return None
 
     def abort(self, session: SessionRef) -> None:

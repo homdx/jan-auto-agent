@@ -97,6 +97,7 @@ CONTEST_KEYS = (
     "gate_max_calls_per_session",
     "out_dir",
     "rounds_dir",
+    "variant",
 )
 
 #: Every key an agent section may carry.
@@ -220,6 +221,10 @@ class ContestConfig:
     gate_max_calls_per_session: int = 20
     out_dir: str = "contest-out"
     rounds_dir: str = "../rounds"
+    #: KC-49: the reasoning variant of every agent that names none — a name
+    #: (``high``, ``max``), ``highest`` (the top one that answers, probed at
+    #: intake) or ``default`` (no variant sent: the provider's own default).
+    variant: str = "highest"
     agents: tuple[AgentSpec, ...] = ()
     gate_settings: LlmSettings = field(default_factory=lambda: DEFAULTS_GATE)
     #: The backend the round runs on: one of ``BACKENDS``, one value per round.
@@ -465,6 +470,7 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
         gate_max_calls_per_session=limit("gate_max_calls_per_session", 20),
         out_dir=scalar("out_dir", "contest-out"),
         rounds_dir=scalar("rounds_dir", "../rounds"),
+        variant=scalar("variant", "highest") or "highest",
         agents=agents,
         gate_settings=settings,
         backend=backend,
