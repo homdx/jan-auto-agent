@@ -315,14 +315,46 @@ class KiloBackend:
         self._tap.join(2.0)
 
 
-def _wait_for_stream(tap: EventTap, timeout: float = 5.0) -> None:
-    """Give the tap's reader a moment to connect: an event published before the
-    stream is open is lost, and the first one is the session's own."""
+#: How long `_wait_for_stream` waits for a tap's reader to open its stream.
+#:
+#: FL-1 (round 84) family C4: an event published before the stream is open is
+#: *lost*, and the first one is the session's own. A round that prompts and
+#: then emits into a tap nobody is reading gets a silence clock that has seen
+#: nothing at all — which is indistinguishable from a session that went quiet.
+#:
+#: 5 s was a wall-clock bet on how fast a thread opens an HTTP connection, and
+#: the operator's 32-worker stress run walks through bets that size. The
+#: equivalent handshake in the contest tests is 30 s for that reason.
+STREAM_CONNECT_TIMEOUT_S = 30.0
+
+
+def _wait_for_stream(tap: EventTap, timeout: float = STREAM_CONNECT_TIMEOUT_S) -> bool:
+    """Give the tap's reader time to connect; True when the stream is open.
+
+    Returns False when the wait ran out — the caller is then about to publish
+    into a stream nobody is reading, which is worth saying out loud. It used to
+    return `None` either way, so a tap that never connected looked exactly like
+    one that connected instantly, and the loss surfaced much later as "the
+    model never answered".
+
+    `hello_probe` is the sharpest case: a probe whose events are dropped reads
+    as "this variant did not answer", so an agent silently runs at a lower
+    reasoning variant than it could. Nothing raises here — a tap that is slow
+    to connect is not a reason to fail a round — but it no longer passes
+    unremarked.
+    """
     deadline = time.monotonic() + timeout
     while getattr(tap, "_socket", None) is None and time.monotonic() < deadline:
         if tap.join(0.02):
-            return  # the reader already ended: the wait will see tap.closed
-    return None
+            return False  # the reader already ended: the wait will see tap.closed
+    connected = getattr(tap, "_socket", None) is not None
+    if not connected:
+        _LOG.warning(
+            "event stream for %s did not open within %.0fs — events published "
+            "now are lost, and a turn that emits into it reads as silent",
+            getattr(tap, "directory", "?"), timeout,
+        )
+    return connected
 
 
 # ─────────────────────────────────────────────────────────────────────────────
