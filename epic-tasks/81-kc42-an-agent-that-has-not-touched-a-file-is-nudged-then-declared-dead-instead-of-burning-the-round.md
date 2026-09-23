@@ -24,6 +24,17 @@ itself — this ticket covers the turn that never starts.
 **Depends on:** KC-9 (queued — `classify_idle`; this ticket's nudge reuses its `CONTINUE_PROMPT` shape but fires on a different signal), KC-39 (queued — `max_sessions_per_attempt` and the live session-reset path, reused for the nudge's escalation).
 **Also touches:** `tests/test_contest_runner.py`, `tests/_kilo_fake.py`, `tools/contest/cli.py` (`SUMMARY.md` and the round table grow a `DEAD` row), `contest-bench/kc42/`
 
+
+**Seen again, and the cause is always the same (2026-09-23, round 86 run 4):**
+`nex-n2-5-pro`'s `task` sub-agent (`agent=explore mode=subagent`) was refused by
+its provider: "the model's provider rejected the request. check the model id,
+request fields, and context length". The same error appears once per round in
+`kilo-serve.log` of rounds 64, 74 (qwen26), 85 and 86. This ticket's nudge and
+`DEAD` answer the slot it wastes. Why the sub-agent's request is refused
+(context length or a request field the provider rejects) is not established.
+Worth checking before this lands: whether a contest session should be allowed
+to spawn `task` sub-agents at all.
+
 ---
 
 ## What happens today
