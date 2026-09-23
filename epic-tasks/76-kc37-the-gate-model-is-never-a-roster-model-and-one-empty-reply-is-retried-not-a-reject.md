@@ -31,6 +31,14 @@ a decision, it is a dropped call.
 **Depends on:** KC-6 (the policy layers, landed `e8c6ad3`), KC-16 (`intake`, `_apply_flags`, landed `1304950`).
 **Also touches:** `tests/test_contest_policy.py`, `tests/test_contest_cli.py`, `contest.ini`
 
+
+**Seen again, round 86 (run 3, 2026-09-23, base `4634507`):** the gate was
+`hy3:free` again, and `hy3:free` was again in `--models`. 12 of 13 gate calls
+failed (11 `empty reply`, 1 `RuntimeError`) in 3–5 s each; one parsed. All
+13 were `2>/dev/null` reads that should never have reached the gate (KC-28).
+A retry (§1) would not have saved these: the endpoint was saturated by the
+same round. §2's intake refusal would have.
+
 ---
 
 ## What must change

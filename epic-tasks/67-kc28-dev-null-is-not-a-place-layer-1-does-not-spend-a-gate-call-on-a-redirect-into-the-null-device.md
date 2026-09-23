@@ -1,7 +1,7 @@
 # KC-28 — `/dev/null` is not a place: layer 1 does not spend a gate call (and the budget) on a redirect into the null device
 
 **Status:** queued — after KC-27, last in the queue; found 2026-09-20 landing KC-15 (round 54): with `*>*` asked, a `> /dev/null 2>&1` goes to the gate. Same file as KC-15 (landed) and KC-13 (landed); disjoint from every open ticket.
-**Severity:** LOW (a gate call per `> /dev/null`; `reject`/`budget` once the session's twenty are spent — fail-closed by design, KC-3)
+**Severity:** HIGH, raised from LOW on 2026-09-23 after round 86 (see *Seen live* below). It costs a gate call per `> /dev/null`, and `reject`/`budget` once the session's twenty are spent (fail-closed by design, KC-3). With a free gate that answers empty, every such call is a `reject`, and a reject can end the agent's turn.
 **File:** `tools/contest/policy.py` (`_extract_paths` or `_inside_worktree_or_tmp`)
 **Symbol:** `_extract_paths`, `NULL_DEVICES`
 **Round:** 67
@@ -9,6 +9,22 @@
 **Source:** the KC-15 ideal on `kc`, probed by hand before landing: `python3 -m pytest tests -q > /dev/null 2>&1` → `once`/`gate`, one gate call, reason `gate: scratch path under tmp_roots`; `sort x | tee out.txt` and `cp a.py b.py` → `once`/`mechanical`, no call. `/dev/null` is a path token of the command (KC-13's scan), it resolves outside the worktree and outside `tmp_roots`, so layer 1 cannot settle it and layer 2 answers a question nobody asked. `gate_max_calls_per_session = 20` in `contest.ini`; a model that habitually silences commands with `> /dev/null` burns the budget on nothing and then meets `reject`/`budget` on the first command that matters. `/dev/stdout`, `/dev/stderr` and `/dev/tty` are the same kind of token.
 **Depends on:** KC-13 (`_extract_paths` scans `metadata.command`, landed `3e4b41b`), KC-15 (`*>*` asked, landed).
 **Also touches:** `tests/test_contest_policy.py`
+
+
+**Seen live, round 86 (run 3, 2026-09-23, base `4634507`, 12 agents, gate `hy3:free`):**
+in the first five minutes, **all 13** gate calls were for a command whose only
+outside path was `/dev/null` (`ls tests/ | head; ls .smoke_tests/ 2>/dev/null`,
+`pip list 2>/dev/null | grep …`, `git diff --stat HEAD~1..HEAD 2>/dev/null`,
+`cat tools/auto/collect_bridge.py 2>/dev/null | head -50`). 12 of the 13 came
+back `gate-failed` (11 `empty reply`, 1 `RuntimeError`, 3–5 s each; KC-37),
+so each became a `reject` on a harmless read inside the worktree. The losses:
+
+- `agnes-2-5-flash`: 3 of 4 reads refused, then its turn ended `idle` at +92 s with a clean tree → `HARVESTING` on nothing (KC-50).
+- `mimo-v2-5` 3, `sensenova-6-7-flash-lite-var1` 2, `agnes-3-0-flash` 2 and `sensenova-6-8-flash-lite-var1` 2 refused reads.
+
+`2>/dev/null` is the most common suffix models add to a probing command. Until
+this ticket lands, every one of them goes through the gate, and the gate is
+the weakest link in the round.
 
 ---
 
