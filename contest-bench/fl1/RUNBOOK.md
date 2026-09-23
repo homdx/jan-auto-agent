@@ -12,16 +12,18 @@ residuals were disjoint — they were each other's missing half. It took
 Opus 5 over three hours and five full stress rounds to close.
 
 And that was still not the end. `e500d40` — the patch this runbook first
-called the reference — went 48 consecutive stress runs green and was *still
-incomplete*: a sixth round on a harder-loaded box found four more failures,
-one of them the production bug that had been underneath the whole family
-(C5, below). The full account is **`POSTMORTEM-FL-1.md`** (repo root; copy
+called the reference — went **12 consecutive stress runs green** (three full
+passes) and was *still incomplete*: the fourth pass, and then a sixth round
+on a harder-loaded box, found four more failures, one of them the production
+bug that had been underneath the whole family (C5, below). The full account is **`POSTMORTEM-FL-1.md`** (repo root; copy
 in `docs/kilo-contest/`) — ten causes, six rounds, the taxonomy in §8 and
 the diagnostic toolkit in Appendix B. Read it before scoring a rerun.
 
-That is the measure of the ticket: two green stress passes in a row are not
-evidence of a finished fix, and the strongest single attempt on record
-needed twelve further stress runs after it looked done.
+That is the measure of the ticket: **three** green stress passes in a row
+are not evidence of a finished fix — that is exactly what `e500d40` had — and
+the strongest attempt on record needed twelve further passes after it looked
+done. And a seventh round, run while validating *this runbook*, found an
+eleventh cause that 48 green runs had missed (§9).
 
 That failure pattern is why this folder exists. FL-1 is the best
 intelligence test in the repo: it cannot be faked, it cannot be pattern
@@ -36,11 +38,12 @@ The tree every agent starts from is commit **`6471230`**
 of its named causes are live, and the three further families below are live
 and undocumented.
 
-The reference solution is **`e500d40`** (13 files, +717/−194) **plus the
-follow-up commit immediately after it on `kc`** — the one that adds
-`POSTMORTEM-FL-1.md` and rewrites `EventTap._record` / `EventTap.wait` in
-`tools/contest/kilo_client.py`. `e500d40` alone is *not* a complete fix; it
-is round 0–5 of six. Do not read either before scoring a round — read the
+The reference solution is **`e500d40`** (13 files, +717/−194) **plus
+`f105522`** — the follow-up that adds `POSTMORTEM-FL-1.md` and rewrites
+`EventTap._record` / `EventTap.wait` in `tools/contest/kilo_client.py` —
+**plus the round-7 commit after it** (§9). `e500d40` alone is *not* a
+complete fix: it does not touch `tools/contest/kilo_client.py` at all, which
+is where C5 lives, and it is rounds 0–5 of seven. Do not read either before scoring a round — read the
 candidates first, rank them by the stress run, then read `e500d40`'s commit
 message (families A–C6) and `POSTMORTEM-FL-1.md` (all ten causes, plus G
 and S).
@@ -150,7 +153,8 @@ The bar moved once already, and this is where it now sits:
 
 - **48 consecutive green suite runs is the passing evidence**, not two or
   three — 186 072 test executions, 1 h 40 min of wall clock, on a box under
-  other load. `e500d40` looked finished long before that and was not.
+  other load. `e500d40` looked finished at **12** and was not. And 48 is a
+  floor, not a proof: §9 is a cause that 48 green runs did not surface.
 - **A 38 % spread in suite runtime** between the fastest and slowest of
   those runs is the scale of noise every surviving margin has to absorb.
   Any margin narrower than that is a future red run.
@@ -236,8 +240,9 @@ the candidate, not a flake.
 
 ## 8. What the first pass still missed — read this before calling a rerun done
 
-`e500d40` was 48 stress runs green when it was committed. Round 6, on a box
-under heavier load, produced four more failures. Every one of them is a
+`e500d40` was **12** stress runs green — three full passes — when it was
+committed. The fourth pass, and then round 6 on a box under heavier load,
+produced four more failures between them. Every one of them is a
 pattern a rerun can hit, and three of the four are *not* in the ticket:
 
 | what fired | what it actually was | shape |
@@ -256,13 +261,58 @@ Two lessons for the scorer:
    that the number is. Four consecutive "widen it" passes on one test is
    the signature of a misclassified shape-4.
 
-## 9. Standing record
+## 9. Round 7 — the cause that 48 green runs did not surface
+
+Found while running §4 against the merged tree to validate *this runbook*.
+One failure in the first pass:
+
+```
+FAILED tests/test_contest_runner.py::test_retry_backoff_is_observed
+AssertionError: assert <AgentState.STALLED> is <AgentState.READY>
+                last_error = 'no idle after 30s'
+```
+
+Not the silence clock — the **turn deadline**. `turn_timeout_sec` is a
+wall-clock bound the *runner* puts over a whole turn, and 58 turns in
+`test_contest_runner.py` run a real `git commit` from their `on_prompt` hook
+underneath it. At the default of 30 s that is a bound around unbounded work,
+and a loaded box walks through it exactly like every other one in this
+ticket.
+
+It is textbook **Shape 2** (§2): a hang guard wearing an assertion's
+clothes. No test in the file asserts that the default fires, and the one
+test that *is* about the turn deadline sets `turn_timeout_sec=1` explicitly.
+The default is now 300 s, along with the four other scaffolding copies of
+it; the deliberately short ones are untouched.
+
+Three things make this the most instructive entry in the runbook:
+
+1. **48 consecutive green runs did not surface it.** The bar in §3 is a
+   floor, not a proof. Treat a clean stress run as "no evidence of a
+   problem", never as "evidence of no problem".
+2. **The taxonomy found it, not the stress run.** The stress run produced
+   one line; §2's table said which of four fixes that line called for, and
+   the fix was a one-line default plus four copies — located by grep, not by
+   another 8-minute pass.
+3. **It was in the same file, of the same shape, as causes already fixed** —
+   and the round-6 audit missed it because `turn_timeout_sec` reads as a
+   *config value for the production runner*, not as a test bound. It is
+   both. Anything a test sets that can end a turn is a deadline over that
+   test's work, whoever enforces it.
+
+For scoring: a candidate is not penalised for missing this — it was invisible
+to every attempt including the reference's first two sittings. But a
+candidate that reports it, or that raises `turn_timeout_sec` on the right
+grounds, has read the shape and not the symptom.
+
+## 10. Standing record
 
 | round | date | entries | finished | reference |
 |---|---|---|---|---|
 | 84 | 2026-09-22 | 5 (`Sonet5-FL-1-84`, `kc37-Dots3-note`, `kc37-SenSenova-6-7-var1`, `kc37-SenSenova-6-7-var2`, `kc37-SenSenova-6-8-var1`) | 0 | — |
 | 84 (hand) | 2026-09-22 | Opus 5, >3 h, 5 stress rounds | partially — 4 causes left | `e500d40` |
-| 84 (hand, follow-up) | 2026-09-23 | Opus 5, round 6 + 12 further stress runs | yes — 48 consecutive green | `e500d40` + the follow-up commit, `POSTMORTEM-FL-1.md` |
+| 84 (hand, follow-up) | 2026-09-23 | Opus 5, round 6 + 12 further stress **passes** (48 runs) | yes — 48 consecutive green | `e500d40` + `f105522`, `POSTMORTEM-FL-1.md` |
+| 84 (runbook validation) | 2026-09-23 | round 7, found while running §4 against the merged tree | an 11th cause (§9) | the commit after `f105522` |
 
 `Sonet5-FL-1-84` owns families A and B in the reference patch unchanged, and
 had C1 half-right (it shrank the beat where the answer was to widen the

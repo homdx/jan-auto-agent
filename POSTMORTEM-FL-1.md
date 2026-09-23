@@ -1,4 +1,4 @@
-# FL-1 — postmortem: ten causes behind one flaky suite
+# FL-1 — postmortem: eleven causes behind one flaky suite
 
 **Ticket:** `epic-tasks/84-fl-1-full-tests-suite-is-not-reproducible-green-under-n-4-three-independent-root-causes.md`
 **Round:** 84
@@ -102,6 +102,7 @@ regression it exists to catch*, not merely by going green.
 | C6 | A real `git commit` inside a wall-clock silence window — unfixable in that shape | contest tests | test design |
 | G | `.git/index.lock` contention treated as a hard failure instead of a transient | `tools/auto/git_manager.py` | **production** |
 | S | A 10 s client timeout against a stub server whose `serve_forever` had not been scheduled | `tests/test_collect_ab_harness.py` | test |
+| T | A 30 s **turn deadline** over 58 turns that each run a real `git commit` | `tests/test_contest_runner.py` | test |
 
 ---
 
@@ -1379,6 +1380,62 @@ byte-identical.
 
 ---
 
+## 9.1 Round 7 — the one that 48 green runs did not find
+
+Written after the fact, and it is the most useful entry in this document.
+
+The stress command in §9 was re-run against the merged tree, to validate the
+benchmark runbook rather than to find anything. The first pass came back with:
+
+```
+FAILED tests/test_contest_runner.py::test_retry_backoff_is_observed
+AssertionError: assert <AgentState.STALLED> is <AgentState.READY>
+                last_error = 'no idle after 30s'
+```
+
+Not the silence clock this time — the **turn deadline**. `turn_timeout_sec`
+is a wall-clock bound the *runner* puts over an entire turn, and 58 turns in
+that file run a real `git commit` from their `on_prompt` hook underneath it.
+At the default of 30 s it is a bound around unbounded work, which is
+precisely Shape 2 from §8 — a hang guard wearing an assertion's clothes.
+
+```python
+# BEFORE — tests/test_contest_runner.py, make_config()
+kw = dict(agents=specs, max_parallel=1, max_rework=2, turn_timeout_sec=30, ...)
+
+# AFTER
+kw = dict(agents=specs, max_parallel=1, max_rework=2, turn_timeout_sec=300, ...)
+```
+
+Plus four scaffolding copies of the same number. The one test that is
+actually *about* the turn deadline sets `turn_timeout_sec=1` explicitly and
+is untouched; nothing in the file asserts that the default fires.
+
+Three things this settles, and they are worth more than the fix:
+
+1. **48 consecutive green runs is a floor, not a proof.** This document's own
+   verification section says the streak is what makes the claim credible.
+   It does — and it still missed a cause of a shape the document itself
+   names. A clean stress run means *no evidence of a problem*, never
+   *evidence of no problem*.
+
+2. **The taxonomy earned its keep.** The stress run produced one line. §8's
+   table said which of four fixes that line called for, `grep` found every
+   other copy of the number, and it was closed in minutes instead of another
+   8-minute pass per instance. That is the difference between a postmortem
+   that records what happened and one that is usable.
+
+3. **The audit missed it for a readable reason.** `turn_timeout_sec` looks
+   like a *config value for the production runner*, not a test bound — so
+   the shape greps in Appendix B.3, which hunt `elapsed <`, `timeout=` and
+   short rendezvous, walk straight past it. The corrected rule:
+
+   > Anything a test sets that can **end** the work it is measuring is a
+   > deadline over that work, whoever enforces it — the test, the runner, or
+   > the config.
+
+---
+
 ## 10. What I would do differently
 
 1. **Read the failure logs before the candidate code.** The distribution of failures across
@@ -1401,6 +1458,12 @@ byte-identical.
 5. **When a fixture "should" be fast and isn't, suspect the plumbing, not the box.** Three
    rounds were spent padding margins around a `flush()` that was blocking the reader thread.
    "The box is slow" is a hypothesis that explains everything and predicts nothing.
+
+6. **Grep for the *concept*, not the syntax.** Appendix B.3's greps find `elapsed <`,
+   `timeout=` and short rendezvous. They do not find `turn_timeout_sec=30`, because it
+   reads as production config — and that is how cause T survived 48 green runs (§9.1). The
+   question to grep for is not "what looks like a deadline" but "what can end the work this
+   test is measuring".
 
 ### The one that is worth keeping
 

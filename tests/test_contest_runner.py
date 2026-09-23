@@ -308,7 +308,16 @@ def make_config(agents, **over) -> ContestConfig:
     specs = tuple(AgentSpec(name=a, provider_id="kenary", model_id=f"{a}:free") for a in agents)
     gate = LlmSettings(base_url="https://gate-test/v1", api_key="k", model="test/gate",
                        api_format="openai", response_format=True, temperature=0.0, max_tokens=256)
-    kw = dict(agents=specs, max_parallel=1, max_rework=2, turn_timeout_sec=30,
+    # FL-1 (round 84, round 7): `turn_timeout_sec` is a wall-clock deadline the
+    # *runner* puts over the whole turn — and 58 turns in this file run a real
+    # `git commit` from their `on_prompt` hook under it. That makes the default
+    # a Shape-2 hang guard (postmortem §8), not an assertion: no test here
+    # asserts that the default fires, and the four that are *about* the turn
+    # deadline set a short one explicitly. At 30 s it was a bound around
+    # unbounded work, and the operator's stress run walked through it —
+    # `test_retry_backoff_is_observed` came back STALLED with
+    # `no idle after 30s`. 300 s, so only a genuine hang reaches it.
+    kw = dict(agents=specs, max_parallel=1, max_rework=2, turn_timeout_sec=300,
               idle_event_timeout_sec=60, max_questions_per_turn=3, tmp_roots=("/tmp/*",),
               gate_max_calls_per_session=20, gate_settings=gate)
     kw.update(over)
@@ -644,7 +653,8 @@ def test_unknown_model_is_error_with_the_body(tmp_path):
 
 
 def test_idle_event_timeout_stalls_a_silent_session(tmp_path):
-    cfg = make_config(["agent-a"], turn_timeout_sec=30, idle_event_timeout_sec=1)
+    # 300 s vs 1 s: the two paths this test tells apart, as far apart as they go
+    cfg = make_config(["agent-a"], turn_timeout_sec=300, idle_event_timeout_sec=1)
     _sb, _fake, _h, run, aborted = _run_one(tmp_path, {"turns": [{"events": [], "idle": False}]}, cfg)
     assert run.state is AgentState.STALLED and aborted
     # took the idle-event path (last_error/idle_status below), not the
@@ -722,7 +732,7 @@ def test_turn_timeout_stalls_a_session_that_never_idles(tmp_path):
 
 def test_server_going_away_mid_turn_is_error(tmp_path):
     sb = Sandbox(tmp_path)
-    cfg = make_config(["agent-a"], turn_timeout_sec=30, idle_event_timeout_sec=60)
+    cfg = make_config(["agent-a"], turn_timeout_sec=300, idle_event_timeout_sec=60)
     fake = _BenchFake({"turns": [{"events": ["busy"], "idle": False}]}).start()
     try:
         threading.Timer(0.8, fake.stop).start()
@@ -764,7 +774,7 @@ def _stall_config(**over) -> ContestConfig:
     # 2.9 s of margin over the 0.1 s hook heartbeat above, where a 1 s window
     # left 0.9 s — and 0.9 s is inside what the operator's 32-worker stress
     # run drifts by.
-    kw = dict(turn_timeout_sec=30, idle_event_timeout_sec=3)
+    kw = dict(turn_timeout_sec=300, idle_event_timeout_sec=3)
     kw.update(over)
     return make_config(["agent-a"], **kw)
 
@@ -1060,8 +1070,10 @@ _ECONNRESET = {"name": "APIError", "data": {"message": "Connection reset by serv
 
 
 def _make_retry_config(**over) -> ContestConfig:
+    # FL-1 (round 84, round 7): 300 s, not 30. These turns commit for real and
+    # none of these tests is about the turn deadline — see make_config.
     kw = dict(max_error_retries=2, error_retry_backoff_sec=0,
-              turn_timeout_sec=30, idle_event_timeout_sec=60)
+              turn_timeout_sec=300, idle_event_timeout_sec=60)
     kw.update(over)
     return make_config(["agent-a"], **kw)
 
@@ -1458,7 +1470,7 @@ def test_ctrl_c_aborts_writes_state_and_propagates_then_resume_finishes(tmp_path
     a=READY and b mid-flight, KeyboardInterrupt propagated. Resuming from
     that state.json skips a (no new session) and restarts b in its worktree."""
     sb = Sandbox(tmp_path, ["agent-a", "agent-b"])
-    cfg = make_config(["agent-a", "agent-b"], max_parallel=2, turn_timeout_sec=20)
+    cfg = make_config(["agent-a", "agent-b"], max_parallel=2, turn_timeout_sec=300)
     pid = os.getpid()
 
     def turn1(directory, text):
