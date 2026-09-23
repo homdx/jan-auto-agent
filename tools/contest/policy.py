@@ -66,6 +66,7 @@ __all__ = [
     "HARD_DENYLIST",
     "LAYERS",
     "MAX_REASON_CHARS",
+    "NULL_DEVICES",
     "REPLIES",
     "Decision",
     "Policy",
@@ -142,6 +143,14 @@ def _hard_denylist() -> tuple:
 
 
 HARD_DENYLIST: tuple = _hard_denylist()
+
+#: The devices a command writes to or reads from without touching a place
+#: (KC-28): ``2>/dev/null`` is the commonest suffix a model puts on a probe,
+#: and a gate call to ask whether writing nothing to nowhere is safe is a call
+#: the gate can lose. Matched against the token as written and as resolved
+#: (``/dev/stdout`` is a symlink into ``/proc``). Only these four: ``/dev/shm``
+#: and the block devices are places the gate should see.
+NULL_DEVICES: frozenset = frozenset({"/dev/null", "/dev/stdout", "/dev/stderr", "/dev/tty"})
 
 
 def _exact_only(path: Path) -> bool:
@@ -343,6 +352,7 @@ def _extract_paths(props: dict) -> list:
     touches two outside places is judged by both, not by the one Kilo chose
     to report. A leading ``~`` is expanded for every source, so ``~/.ssh/x``
     meets the hard denylist instead of resolving under the caller's cwd.
+    A token naming one of ``NULL_DEVICES`` is dropped (KC-28).
     """
     meta = _metadata(props)
     raw = list(_as_list(props.get("patterns")))
@@ -363,6 +373,10 @@ def _extract_paths(props: dict) -> list:
             target = os.path.expanduser(target)
         resolved = _resolve(target)
         if resolved is None:
+            continue
+        if target in NULL_DEVICES or str(resolved) in NULL_DEVICES:
+            # KC-28: a null device is not a place — a command whose only
+            # path is ``/dev/null`` is a no-path ask, settled by layer 1
             continue
         if resolved not in originals:
             originals[resolved] = []

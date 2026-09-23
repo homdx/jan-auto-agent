@@ -53,6 +53,7 @@ from tools.contest.policy import (
     HARD_DENYLIST,
     LAYERS,
     MAX_REASON_CHARS,
+    NULL_DEVICES,
     REPLIES,
     Decision,
     Policy,
@@ -1190,3 +1191,75 @@ def test_tilde_in_patterns_meets_the_home_denylist(tmp_path):
     assert (decision.reply, decision.layer) == ("reject", "mechanical")
     assert "forbidden" in decision.reason
     assert gate.calls == []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KC-28: a null device is not a place — no gate call for `2>/dev/null`
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_redirect_into_dev_null_is_mechanical(tmp_path):
+    """`pytest -q > /dev/null 2>&1` has no path outside the worktree."""
+    event = make_event(permission="bash", patterns=[],
+                       command="python3 -m pytest tests -q > /dev/null 2>&1")
+    gate = StubGate(json.dumps(ALLOW))
+    policy = Policy(make_config(tmp_roots=("/tmp/contest/*",)),
+                    completion_fn=gate, clock=FakeClock())
+
+    decision = decide(policy, event, tmp_path, tmp_roots=("/tmp/contest/*",))
+
+    assert (decision.reply, decision.layer) == ("once", "mechanical")
+    assert "no path outside" in decision.reason
+    assert gate.calls == []
+
+
+@pytest.mark.parametrize("command", [
+    # the round 86 shapes, all of which the gate was asked about
+    "ls tests/ | head -60; ls .smoke_tests/ 2>/dev/null | head -60",
+    "pip list 2>/dev/null | grep -i -E \"pytest|timeout|xdist\"",
+    "git diff --stat HEAD~1..HEAD 2>/dev/null || echo \"only one commit\"",
+    "cat tools/auto/collect_bridge.py 2>/dev/null | head -50",
+    "echo done >/dev/stderr; cat x < /dev/tty; echo y > /dev/stdout",
+])
+def test_probe_commands_with_null_devices_do_not_reach_the_gate(tmp_path, command):
+    event = make_event(permission="bash", patterns=[], command=command)
+    gate = StubGate(json.dumps(REJECT))
+    policy = Policy(make_config(), completion_fn=gate, clock=FakeClock())
+
+    decision = decide(policy, event, tmp_path)
+
+    assert (decision.reply, decision.layer) == ("once", "mechanical")
+    assert gate.calls == []
+
+
+def test_dev_null_beside_an_outside_path_still_asks_for_the_outside_path(tmp_path):
+    """Only the null device is dropped: the other path still goes to the gate."""
+    event = make_event(permission="bash", patterns=[],
+                       command="cat x > /dev/null; cp y /tmp/elsewhere/z")
+    gate = StubGate(json.dumps(ALLOW))
+    policy = Policy(make_config(), completion_fn=gate, clock=FakeClock())
+
+    assert [originals for _, originals in policy_mod._extract_paths(event["properties"])] \
+        == [("/tmp/elsewhere/z",)]
+    decision = decide(policy, event, tmp_path)
+
+    assert decision.layer == "gate"
+    assert len(gate.calls) == 1
+    assert "/tmp/elsewhere/z" in gate.user_message()
+
+
+def test_dev_null_in_patterns_yields_no_path():
+    event = make_event(permission="external_directory", patterns=["/dev/null"],
+                       directories=["/dev/null"])
+    assert policy_mod._extract_paths(event["properties"]) == []
+
+
+def test_dev_shm_is_a_place_and_still_goes_to_the_gate(tmp_path):
+    event = make_event(permission="bash", patterns=[], command="echo x > /dev/shm/leak")
+    gate = StubGate(json.dumps(REJECT))
+    policy = Policy(make_config(), completion_fn=gate, clock=FakeClock())
+
+    decision = decide(policy, event, tmp_path)
+
+    assert decision.layer == "gate"
+    assert len(gate.calls) == 1
+    assert "/dev/shm" not in NULL_DEVICES
