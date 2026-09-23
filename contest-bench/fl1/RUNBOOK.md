@@ -169,14 +169,27 @@ The bar moved once already, and this is where it now sits:
 
 ## 4. The stress run
 
-The operator's own command — four suites, **32** worker processes
-(4 × `-n 8`) on 8 cores, a ~4× oversubscription ratio, which is what every
-margin in this ticket had to survive:
+`scripts/stress_suite.py` is the bench — it runs the command and prints the
+flake table, so neither the command nor the repetition count is a shell line
+the operator retypes and reads off the terminal anymore:
 
 ```bash
-pytest tests -n 8 & pytest tests_bugfix -n 8 & \
-pytest tests -n 8 & pytest tests_bugfix -n 8 &
+python3 scripts/stress_suite.py                    # 12 passes, the e500d40 shape
+python3 scripts/stress_suite.py --shape serial     # FL-1's -n 4 loop over both roots
+python3 scripts/stress_suite.py --passes 20 --keep-logs /tmp/fl
 ```
+
+`--shape stress` is the operator's own shape — `pytest tests -n 8`,
+`pytest tests_bugfix -n 8`, each twice: four suites at once, **32** worker
+processes on 8 cores, a ~4× oversubscription ratio, which is what every margin
+in this ticket had to survive. `--shape serial` is the `-n 4` loop. Worker
+count and root list are flags with those defaults, so a different box says so
+on the command line instead of editing the script. Exit 0 only when every pass
+was green; otherwise it exits non-zero with the table — per test, how many
+passes it failed in out of how many, and a test that fails in *every* pass
+labelled as a plain failure so nobody hunts a race that is not there — and the
+log paths. `--timeout` defaults to 180, is printed, and a pass killed by
+`pytest-timeout` is reported as killed, with the stack dump kept in the log.
 
 This is the whole bench. It needs no fake provider, no `kilo` binary and no
 scenario file — the suite *is* the test data, and the load is the input.
@@ -184,7 +197,16 @@ Run it on `6471230` first: it must be red, on a different test each time.
 
 One run is not a result. FL-1's own Diagnosis was 19 runs of `pytest tests -n 4`,
 8 red, a different victim every time — so a candidate needs several clean
-stress runs before it counts, and a single red run anywhere is a fail.
+stress runs before it counts, and a single red run anywhere is a fail. A run
+below the 12-pass bar says so on one line, green or not.
+
+[^stress-command]: The raw command, kept so the script is never the only way to
+run this bench. The two rules that make it valid — never combine the two roots
+into one pytest invocation, never run two passes at once — are enforced by
+`scripts/stress_suite.py`, not documented here:
+
+    pytest tests -n 8 & pytest tests_bugfix -n 8 & \
+    pytest tests -n 8 & pytest tests_bugfix -n 8 &
 
 Per candidate:
 
@@ -194,7 +216,8 @@ git worktree add $S/<entry> <entry-sha>
 ( cd $S/<entry> && git diff --stat 6471230..HEAD && \
   git diff 6471230 HEAD -- tools/auto/collect_bridge.py | wc -l && \
   python3 scripts/sync_test_tiers.py --check | tail -1 )
-# then the stress command above, from inside $S/<entry>, several times
+# then, from inside $S/<entry>:
+python3 scripts/stress_suite.py --keep-logs $S/<entry>-logs      # 12 passes
 ```
 
 **Never run two candidates' stress runs at once** — the whole point of the
