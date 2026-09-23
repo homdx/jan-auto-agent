@@ -162,6 +162,10 @@ def _run_git(root: Path, *args: str) -> Optional[str]:
             timeout=10,
             encoding="utf-8",
         )
+    except subprocess.TimeoutExpired:
+        # still "nothing to report", but not silently: the git was killed
+        logger.warning("git %s in %s timed out after 10s", " ".join(args), root)
+        return None
     except (OSError, subprocess.SubprocessError):
         return None
     if proc.returncode != 0:
@@ -200,7 +204,12 @@ def is_dirty(root: Path, exclude_dir: Optional[Path] = None) -> bool:
     `capture_provenance`, which callers should use instead of calling
     `get_git_sha`/`is_dirty` directly, to make this ordering hard to get
     wrong."""
-    status = _run_git(root, "status", "--porcelain")
+    # --no-optional-locks: a plain `status` takes .git/index.lock to write back
+    # refreshed stat data, and the 10 s timeout above ends it with SIGKILL — no
+    # cleanup, so the lock stays and every later `git add` in the repo exits
+    # 128 (a 32-worker stress run: all four task commits of one controller test
+    # lost). With the flag, status never writes the index, so it never locks it.
+    status = _run_git(root, "--no-optional-locks", "status", "--porcelain")
     if not status:
         return False
     if exclude_dir is None:

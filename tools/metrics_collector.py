@@ -26,6 +26,22 @@ METRICS_PATH = Path("metrics.json")
 _FSYNC_INTERVAL_S = 0.5
 
 
+def _encode_item(record: dict) -> str:
+    """One element of the top-level array, exactly as ``json.dump(records,
+    f, indent=2)`` writes it: the element's own ``indent=2`` text, every line
+    after the first indented one more level. JSON strings escape ``\n``, so
+    each newline in the text is a line break of the layout, never data."""
+    return json.dumps(record, indent=2).replace("\n", "\n  ")
+
+
+def _encode_array(items: list) -> str:
+    """The whole file from encoded elements — byte-identical to
+    ``json.dump(records, f, indent=2)``."""
+    if not items:
+        return "[]"
+    return "[\n  " + ",\n  ".join(items) + "\n]"
+
+
 @dataclass
 class RunRecord:
     timestamp: str
@@ -54,6 +70,14 @@ class MetricsCollector:
         # when we already know the in-memory copy matches disk.
         self._cache: Optional[list] = None
         self._cache_mtime: Optional[float] = None
+        # FL-1 follow-up: each cached record's encoded text, index for index
+        # with _cache. json.dump with indent= runs Python 3.12's pure-Python
+        # encoder and one write() per token, so re-encoding the whole list on
+        # every record() was 96% of its time — 18M writes for 1000 records,
+        # 19 s unloaded, past pytest-timeout at 32 workers on 8 cores. Now a
+        # record is encoded once and the file goes out in one write(). None
+        # whenever _cache was (re)loaded from disk; rebuilt from it then.
+        self._cache_items: Optional[list] = None
         # FL-1: record() is now thread-safe on its own — this lock is a
         # MetricsCollector-owned implementation detail (not a caller's lock,
         # like AutoMetricsStream._lock used to be) that serialises the
@@ -73,6 +97,7 @@ class MetricsCollector:
         records = self._load_all()
         self._cache = records
         self._cache_mtime = mtime
+        self._cache_items = None
         return records
 
     def record(self, run: RunRecord) -> None:
@@ -99,7 +124,12 @@ class MetricsCollector:
         with self._write_lock:
             records = self._load_all_cached()
             records = list(records)  # don't mutate the cached list in place
-            records.append(asdict(run))
+            items = self._cache_items
+            if items is None or len(items) != len(records):
+                items = [_encode_item(r) for r in records]
+            new = asdict(run)
+            records.append(new)
+            items = items + [_encode_item(new)]
             try:
                 dir_ = self.metrics_path.parent
                 dir_.mkdir(parents=True, exist_ok=True)
@@ -108,7 +138,7 @@ class MetricsCollector:
                 )
                 try:
                     with os.fdopen(fd, "w", encoding="utf-8") as f:
-                        json.dump(records, f, indent=2)
+                        f.write(_encode_array(items))
                         # BUGFIX: same missing-fsync bug as PromptStore._save —
                         # without flush+fsync here, a crash between the write and
                         # os.replace can lose metrics history on an unclean
@@ -128,11 +158,13 @@ class MetricsCollector:
                     raise
                 os.replace(tmp_path, self.metrics_path)
                 self._cache = records
+                self._cache_items = items
                 try:
                     self._cache_mtime = self.metrics_path.stat().st_mtime
                 except OSError:
                     self._cache = None
                     self._cache_mtime = None
+                    self._cache_items = None
             except Exception as e:
                 logger.error(f"MetricsCollector failed to write metrics: {e}")
 

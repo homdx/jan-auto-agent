@@ -425,8 +425,10 @@ def _dirty_tree(ws: Workspace) -> str:
     tree with unstaged edits starts with a space that is part of the status.
     """
     try:
-        r = run_git(["git", "status", "--porcelain", "--untracked-files=all"],
-                    cwd=ws.path)
+        # --no-optional-locks: status only reads, so it never takes the index
+        # lock an agent's own `git add` in this worktree may need at that moment
+        r = run_git(["git", "--no-optional-locks", "status", "--porcelain",
+                     "--untracked-files=all"], cwd=ws.path)
     except (OSError, subprocess.SubprocessError) as exc:
         raise TreeReadError(f"git status in {ws.path} did not run: {exc}") from exc
     if r.returncode != 0:

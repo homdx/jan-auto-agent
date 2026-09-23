@@ -316,7 +316,10 @@ def test_hello_probe_walks_down_past_the_variants_the_provider_rejects(tmp_path)
 
     assert pick.variant == "high" and pick.usable
     assert [rung for rung, _ in pick.tried] == ["max", "xhigh"]
-    assert all("rejected the request" in reason for _, reason in pick.tried)
+    # the reasons in the message: a stress-run red here once showed only
+    # `all(<generator>)`, which cannot say whether the error event was lost
+    # (`no answer (timeout)`) or the HTTP call failed (`HTTP …`)
+    assert all("rejected the request" in reason for _, reason in pick.tried), pick.tried
     created = fake.calls(method="POST", path="/session")
     assert [c["body"]["model"].get("variant") for c in created] == ["max", "xhigh", "high"]
     assert all(c["body"]["permission"] == [{"permission": "*", "pattern": "*",

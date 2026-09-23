@@ -4,6 +4,8 @@
 * `is_fresh` is False when a tracked file is modified, a new file is added,
   or a tracked file is removed.
 * `is_fresh` is True for a clean/unchanged tree, even at the same git SHA.
+* `is_dirty` never writes (so never locks) the index; a git that timed out
+  is logged, not silent.
 """
 
 import subprocess
@@ -121,6 +123,42 @@ def test_capture_provenance_matches_get_git_sha_and_is_dirty(mini_repo: Path):
     assert sha == get_git_sha(mini_repo)
     assert dirty is False
 
+
+
+def _stale_stat(root: Path) -> bytes:
+    """Age a tracked file's mtime without touching its content — the index's
+    cached stat data no longer matches, so a plain `git status` refreshes it
+    and writes the index back. Returns the index bytes before any status."""
+    import os
+    os.utime(root / "pkg" / "a.py", (1_577_836_800, 1_577_836_800))  # 2020-01-01
+    return (root / ".git" / "index").read_bytes()
+
+
+def test_is_dirty_never_writes_or_locks_the_index(mini_repo: Path):
+    """A plain `status` takes `.git/index.lock` to write refreshed stat data,
+    and `_run_git`'s timeout ends it with SIGKILL, which leaves that lock
+    behind for every later `git add`. `is_dirty` must not write the index at
+    all. The control below shows a plain status would have."""
+    before = _stale_stat(mini_repo)
+    assert is_dirty(mini_repo) is False
+    assert (mini_repo / ".git" / "index").read_bytes() == before
+    assert not (mini_repo / ".git" / "index.lock").exists()
+
+    _git(mini_repo, "status", "--porcelain")          # the control
+    assert (mini_repo / ".git" / "index").read_bytes() != before
+
+
+def test_a_timed_out_git_is_logged_not_silent(mini_repo: Path, monkeypatch, caplog):
+    import tools.collect.manifest as manifest_mod
+
+    def _hang(cmd, **kwargs):
+        raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout"))
+
+    monkeypatch.setattr(manifest_mod, "run_git", _hang)
+    with caplog.at_level("WARNING", logger="tools.collect.manifest"):
+        assert is_dirty(mini_repo) is False
+    assert any("timed out" in r.getMessage() and "status" in r.getMessage()
+               for r in caplog.records)
 
 def test_build_manifest_uses_precomputed_provenance_when_given(mini_repo: Path):
     """`build_manifest(..., provenance=...)` must trust the passed-in
