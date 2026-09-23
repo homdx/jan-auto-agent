@@ -731,17 +731,37 @@ def test_turn_timeout_stalls_a_session_that_never_idles(tmp_path):
 
 
 def test_server_going_away_mid_turn_is_error(tmp_path):
+    """The server disappears while a turn is in flight: ERROR with
+    `idle_status == "closed"`, detected off the closed stream rather than by
+    waiting out the turn deadline.
+
+    FL-1 (round 84, round 7): the server used to be taken away by a
+    `threading.Timer(0.8, fake.stop)` armed *before* the harness was built —
+    a wall-clock bet that the setup (a backend, a tap handshake, a session,
+    a prompt) finishes inside 0.8 s. On a loaded box it does not: the fake
+    was already gone when the prompt went out, the run came back ERROR with
+    **no turns at all**, and the assertion below died on `run.turns[0]` with
+    an IndexError instead of on anything it means to check.
+
+    The stop is now triggered *by the turn itself*, so "mid-turn" is a fact
+    rather than a hope. `on_prompt` runs inside the fake's own turn thread,
+    which is underneath `serve_forever` — so the stop, which joins that
+    loop, has to happen on a thread of its own."""
     sb = Sandbox(tmp_path)
     cfg = make_config(["agent-a"], turn_timeout_sec=300, idle_event_timeout_sec=60)
-    fake = _BenchFake({"turns": [{"events": ["busy"], "idle": False}]}).start()
+
+    def take_the_server_away(directory, text):
+        threading.Thread(target=fake.stop, daemon=True).start()
+
+    fake = _BenchFake({"turns": [{"on_prompt": take_the_server_away,
+                                  "events": ["busy"], "idle": False}]}).start()
     try:
-        threading.Timer(0.8, fake.stop).start()
         started = time.monotonic()
         run = Harness(sb, fake, cfg).go()
         elapsed = time.monotonic() - started
     finally:
         fake.stop()
-    # detected the closed connection rather than waiting out turn_timeout (30 s)
+    # detected the closed connection rather than waiting out turn_timeout
     assert run.state is AgentState.ERROR
     assert elapsed < cfg.turn_timeout_sec
     assert run.turns[0]["idle_status"] == "closed"

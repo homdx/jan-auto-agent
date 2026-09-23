@@ -67,6 +67,8 @@ round, in this order:
 | C5 | **emission is not delivery — `EventTap` starved the clock it feeds** | `_record` did a `flush()` **per event on the reader thread**, so the next SSE line was not read until that `write(2)` returned — seconds, under dirty-page writeback. `wait` added a 200 ms poll on top. The silence clock is measured from when the caller *sees* an event, so a turn that never stopped emitting was declared stalled: **the agent's own event log starved the agent**. Not observable from a fixture, and not fixable with margin |
 | C6 | the harvest tests | a `git commit` inside a wall-clock silence window cannot be made to work: the hook's work is unbounded, the window is not |
 | G | `.git/index.lock` is a transient, not a failure | **production.** One collision costs a task its commit — a red suite here, lost agent work in a real run (§6) |
+| T | **a turn deadline over a real `git commit`** | `turn_timeout_sec=30` over 58 turns whose hook commits for real. Reads as production config, is also a test bound. 48 green runs did not find it (§9) |
+| U | **a `threading.Timer` racing the harness build** | `Timer(0.8, fake.stop)` armed before the backend, tap handshake, session and prompt exist. On a loaded box the server was gone before the turn began, so a test about a server vanishing *mid-turn* never reached a turn (§9) |
 | S | a client timeout against a server that had not been scheduled | `StubServer.start()` binds in `__init__` and hands `serve_forever` to a daemon thread, so the socket queues a connection before anything serves it. The reply is not slow — nobody has run yet |
 
 Three of these are traps that punish the *correct-looking* reflex:
@@ -300,10 +302,32 @@ Three things make this the most instructive entry in the runbook:
    both. Anything a test sets that can end a turn is a deadline over that
    test's work, whoever enforces it.
 
-For scoring: a candidate is not penalised for missing this — it was invisible
-to every attempt including the reference's first two sittings. But a
-candidate that reports it, or that raises `turn_timeout_sec` on the right
-grounds, has read the shape and not the symptom.
+And fixing T surfaced **U** in the test immediately above it: a
+`threading.Timer(0.8, fake.stop)` armed *before* the harness was built —
+a bet that a backend, a tap handshake, a session and a prompt all finish
+inside 0.8 s. They do not, under load. The fake was gone before the prompt
+went out, so there was no turn, and the assertion died on `run.turns[0]`
+with an `IndexError` rather than on anything it meant to check.
+
+The fix is the move that keeps recurring in this ticket: **stop guessing
+when the moment arrives, and let the thing itself say so.** The turn now
+triggers its own takedown from `on_prompt`, so "mid-turn" is a fact. Note
+the contrast twenty lines below: `Timer(0.5, os.kill, ...)` is armed *from
+inside a hook*, against a 60 s backoff, and is fine. Same primitive, forty
+times the margin, triggered by the work rather than racing it.
+
+For scoring: a candidate is not penalised for missing T or U — both were
+invisible to every attempt including the reference's first two sittings. But
+a candidate that reports either, or that raises `turn_timeout_sec` on the
+right grounds, has read the shape and not the symptom.
+
+**A methodological note for whoever runs §4.** These two were found while
+two stress batches were accidentally running at once — suite runtimes went
+from ~8 min to ~17 min. That is a violation of §4's own rule and the results
+are not comparable across it. It is also, unhelpfully, how the last two
+causes surfaced: double load finds what single load does not. If you do it
+deliberately, say so in the record; if you do it by accident, rerun clean
+before scoring anything.
 
 ## 10. Standing record
 

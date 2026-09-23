@@ -1,4 +1,4 @@
-# FL-1 — postmortem: eleven causes behind one flaky suite
+# FL-1 — postmortem: twelve causes behind one flaky suite
 
 **Ticket:** `epic-tasks/84-fl-1-full-tests-suite-is-not-reproducible-green-under-n-4-three-independent-root-causes.md`
 **Round:** 84
@@ -103,6 +103,7 @@ regression it exists to catch*, not merely by going green.
 | G | `.git/index.lock` contention treated as a hard failure instead of a transient | `tools/auto/git_manager.py` | **production** |
 | S | A 10 s client timeout against a stub server whose `serve_forever` had not been scheduled | `tests/test_collect_ab_harness.py` | test |
 | T | A 30 s **turn deadline** over 58 turns that each run a real `git commit` | `tests/test_contest_runner.py` | test |
+| U | A `threading.Timer` armed *before* the harness was built, racing its setup | `tests/test_contest_runner.py` | test |
 
 ---
 
@@ -1433,6 +1434,51 @@ Three things this settles, and they are worth more than the fix:
    > Anything a test sets that can **end** the work it is measuring is a
    > deadline over that work, whoever enforces it — the test, the runner, or
    > the config.
+
+### And one more, in the same pass
+
+Re-running §9's stress command after fixing T surfaced cause **U**, in the
+test immediately above it:
+
+```
+FAILED test_server_going_away_mid_turn_is_error
+IndexError: list index out of range      # run.turns[0] — there were no turns
+```
+
+```python
+# BEFORE
+fake = _BenchFake(...).start()
+threading.Timer(0.8, fake.stop).start()   # armed before the harness exists
+run = Harness(sb, fake, cfg).go()         # backend + tap handshake + session + prompt
+```
+
+The timer is a bet that building the harness — a backend, a tap handshake, a
+session and a prompt — finishes inside 0.8 s. On a loaded box it does not:
+the fake was gone before the prompt went out, so there was no turn at all,
+and the assertion died on `run.turns[0]` rather than on anything it means to
+check. A test about a server vanishing *mid-turn* was not reaching a turn.
+
+The fix is the same move as C6 and as the `index.lock` tests: **stop guessing
+when the moment arrives, and let the thing itself say so.**
+
+```python
+# AFTER — the turn triggers its own takedown
+def take_the_server_away(directory, text):
+    threading.Thread(target=fake.stop, daemon=True).start()
+
+fake = _BenchFake({"turns": [{"on_prompt": take_the_server_away, ...}]}).start()
+```
+
+`on_prompt` runs inside the fake's turn thread, so by the time it fires the
+prompt has been accepted and `wait_idle` is running — "mid-turn" is now a
+fact rather than a hope. (The stop runs on a thread of its own because it
+joins the `serve_forever` loop this hook is running underneath.)
+
+The sibling `threading.Timer(0.5, os.kill, ...)` twenty lines below is
+**fine** and stays: it is armed from inside a hook, so the turn has already
+started, and it delays a SIGINT by 0.5 s against a 60 s backoff. Same
+primitive, forty times the margin, and triggered by the work rather than
+racing it.
 
 ---
 
