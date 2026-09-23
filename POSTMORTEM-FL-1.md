@@ -1,4 +1,4 @@
-# FL-1 — postmortem: twelve causes behind one flaky suite
+# FL-1 — postmortem: thirteen causes behind one flaky suite
 
 **Ticket:** `epic-tasks/84-fl-1-full-tests-suite-is-not-reproducible-green-under-n-4-three-independent-root-causes.md`
 **Round:** 84
@@ -104,6 +104,7 @@ regression it exists to catch*, not merely by going green.
 | S | A 10 s client timeout against a stub server whose `serve_forever` had not been scheduled | `tests/test_collect_ab_harness.py` | test |
 | T | A 30 s **turn deadline** over 58 turns that each run a real `git commit` | `tests/test_contest_runner.py` | test |
 | U | A `threading.Timer` armed *before* the harness was built, racing its setup | `tests/test_contest_runner.py` | test |
+| V | An integration test still required a *neighbour* to survive a window it was not tripping | `tests/test_contest_runner.py` | test design |
 
 ---
 
@@ -1479,6 +1480,41 @@ The sibling `threading.Timer(0.5, os.kill, ...)` twenty lines below is
 started, and it delays a SIGINT by 0.5 s against a 60 s backoff. Same
 primitive, forty times the margin, and triggered by the work rather than
 racing it.
+
+### And the shape I had already named, still left in one place — V
+
+The clean re-run after U came back 23 of 24 green, with
+`test_a_silent_agent_stalls_next_to_a_chatty_one` losing **agent-b**:
+
+```
+AssertionError: (<AgentState.STALLED: 'STALLED'>, 'no event for 8s')
+```
+
+b is the *chatty* one. It was emitting five times a second and was declared
+silent anyway — a delivery gap over eight seconds, which is C5's mechanism
+surviving in a place C5's fix cannot reach.
+
+The uncomfortable part: this is **Shape 4, in a test I had already
+classified as Shape 4 and then left as integration anyway.** Its window went
+1 s → 3 s → 8 s across three rounds — the exact reflex §8 says is useless
+here — because the other two tests of that shape had been moved onto a fake
+clock and this one *felt* different. It was not different. b had to survive
+a window it was not tripping, which is the definition.
+
+The rule, applied properly this time: the sharp claim already had an exact
+home — the fake-clock test
+`test_a_beat_the_wait_does_not_count_lets_the_silence_clock_run_out`,
+written in round 6 and covering precisely "a neighbour's events do not reset
+this session's clock". The integration test keeps only the half that cannot
+be starved: a silent agent stalls on its own clock, and a working neighbour
+is not taken down with it. b stays chatty, but its turn now ends **inside**
+a's window instead of spanning it, so starvation can delay a's stall and
+never invert the outcome.
+
+> **Lesson.** Naming a shape is not the same as acting on it. When the rule
+> says "move this out of real time", it applies to *every* instance —
+> including the one that still looks manageable. That is the one that comes
+> back.
 
 ---
 

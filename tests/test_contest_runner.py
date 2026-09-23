@@ -778,6 +778,11 @@ KEEPALIVE_WINDOW_S = 8
 KEEPALIVE_BEAT_S = 0.2
 KEEPALIVE_BEATS = 60          # 12 s of beats, comfortably past the window
 
+# The chatty *neighbour* does not have to outlive anything: its turn ends on
+# its own, well inside the window the silent agent is tripping. See
+# test_a_silent_agent_stalls_next_to_a_chatty_one.
+NEIGHBOUR_BEATS = 10          # 2 s of chatter under an 8 s window
+
 # The keep-alive turn does not have to outrun its own window any more — the
 # semantics are settled deterministically in test_contest_kilo_client.py — so
 # it runs for a quarter as long under a window nothing plausibly starves past.
@@ -1403,15 +1408,29 @@ def test_a_silent_agent_stalls_next_to_a_chatty_one(tmp_path):
     only a's session — a takes the idle-event silence path (not the 30 s
     turn_timeout), regardless of what agent-b is doing at the same time.
 
-    FL-1 (round 84), two independent fixes:
-    * agent-b has to *survive* the silence window while agent-a trips it, so
-      it is governed by the same arithmetic as
-      test_events_of_the_session_keep_a_turn_alive — see that test: the
-      window, this test's runtime and its tolerance for a starved box are
-      all one number, and no beat interval substitutes for it, because what
-      starves is the delivery of a beat and not its emission. b beats for
-      12 s under an 8 s window; a emits nothing at all and still stalls,
-      just at 8 s instead of 1 s.
+    FL-1 (round 84, round 7): what this test keeps is the half that cannot
+    be starved.
+
+    It used to make agent-b beat for 12 s *across* agent-a's 8 s window, so
+    b had to survive a window it was not tripping — Shape 4 (postmortem §8),
+    where the window, the runtime and the tolerance for a starved box are
+    one number and there is no margin to widen. It failed exactly that way:
+    b came back `(STALLED, 'no event for 8s')` while emitting five times a
+    second, because what starves is the *delivery* of a beat, not its
+    emission.
+
+    So the sharp claim — a neighbour's events do not reset this session's
+    silence clock — moved to where it can be settled exactly, on a fake
+    clock with no transport at all: `test_contest_kilo_client.py::
+    test_a_beat_the_wait_does_not_count_lets_the_silence_clock_run_out`.
+    A KC-12 regression fails there deterministically.
+
+    What is left here is the integration half, and all of it is load-proof:
+    in a real two-agent round, on one broadcast stream, the silent agent
+    stalls on its own clock and the working neighbour is not taken down with
+    it. b is still chatty — it just finishes its turn well inside a's window
+    instead of racing it, so starvation can only delay a's stall, never
+    invert the outcome.
     * the classification check (idle_status/last_error) is what proves a's
       clock ran independently of b's traffic, not a wall-clock bound: a
       KC-12 regression (a's clock counting b's events) would show up as
@@ -1429,14 +1448,12 @@ def test_a_silent_agent_stalls_next_to_a_chatty_one(tmp_path):
 
         def run_turn(session, turn, text):
             if session.directory.endswith("agent-b"):
-                # FL-1 (round 84): the beats start *before* the git work, not
-                # after it. b's silence clock is already running when this
-                # hook is entered, so a commit that takes longer than the
-                # window on a loaded box would stall the agent this test
-                # needs to stay chatty. The count is finite because the last
-                # beat is what ends b's turn — it only has to outlast a's
-                # stall at 3 s, and 60 beats is 6 s before any drift.
-                fake.pulse(session.id, KEEPALIVE_BEAT_S, KEEPALIVE_BEATS,
+                # The beats start *before* the git work, not after it: b's
+                # silence clock is already running when this hook is entered.
+                # b chats for ~2 s and then idles, comfortably inside a's 8 s
+                # window — what matters here is the neighbour's *traffic*,
+                # not how long the neighbour lasts.
+                fake.pulse(session.id, KEEPALIVE_BEAT_S, NEIGHBOUR_BEATS,
                            then_idle=True)
                 work_ready(session.directory, text)
             return orig_turn(session, turn, text)
