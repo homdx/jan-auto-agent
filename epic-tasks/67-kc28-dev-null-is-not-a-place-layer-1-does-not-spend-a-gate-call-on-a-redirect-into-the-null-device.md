@@ -1,6 +1,6 @@
 # KC-28 — `/dev/null` is not a place: layer 1 does not spend a gate call (and the budget) on a redirect into the null device
 
-**Status:** queued — after KC-27, last in the queue; found 2026-09-20 landing KC-15 (round 54): with `*>*` asked, a `> /dev/null 2>&1` goes to the gate. Same file as KC-15 (landed) and KC-13 (landed); disjoint from every open ticket.
+**Status:** landed `fc824f2` (2026-09-23, by hand, after round 86 run 3) — queued — after KC-27, last in the queue; found 2026-09-20 landing KC-15 (round 54): with `*>*` asked, a `> /dev/null 2>&1` goes to the gate. Same file as KC-15 (landed) and KC-13 (landed); disjoint from every open ticket.
 **Severity:** HIGH, raised from LOW on 2026-09-23 after round 86 (see *Seen live* below). It costs a gate call per `> /dev/null`, and `reject`/`budget` once the session's twenty are spent (fail-closed by design, KC-3). With a free gate that answers empty, every such call is a `reject`, and a reject can end the agent's turn.
 **File:** `tools/contest/policy.py` (`_extract_paths` or `_inside_worktree_or_tmp`)
 **Symbol:** `_extract_paths`, `NULL_DEVICES`
