@@ -68,6 +68,7 @@ round, in this order:
 | C6 | the harvest tests | a `git commit` inside a wall-clock silence window cannot be made to work: the hook's work is unbounded, the window is not |
 | G | `.git/index.lock` is a transient, not a failure | **production.** One collision costs a task its commit — a red suite here, lost agent work in a real run (§6) |
 | T | **a turn deadline over a real `git commit`** | `turn_timeout_sec=30` over 58 turns whose hook commits for real. Reads as production config, is also a test bound. 48 green runs did not find it (§9) |
+| Y | **not a clock at all: a shared scratch file** | `test_story_2_3.py` wrote one fixed `prompts.json` in the repo root. §4 runs `pytest tests -n 8` *twice at once*, so two copies collided over it. Reproduced 34/40 under 8-way concurrency, on a different assertion each time (§9) |
 | X | **a 30 s executor guard over a nested pytest** | the `Executor` under test runs an acceptance check under a timeout; the shared helper used 30 s. Most of those checks are `python -c "pass"`; one spawns `python -m pytest`, loading the whole plugin stack and this repo's conftest first. Found in a part of the suite the ticket never mentions (§9) |
 | W | **the fixture's own rendezvous was a 20 s bet** | the fake waits for the client to answer a `permission.asked` before emitting `permission.replied` — a round trip across the SSE stream, the reader thread, the callback and an HTTP POST. It gave up at 20 s; the reply arrived to nobody, and the failure pointed at a client that had done everything right (§9) |
 | V | **a neighbour required to survive a window it was not tripping** | the chatty agent in `test_a_silent_agent_stalls_next_to_a_chatty_one` beat *across* the silent one's window, so it had to survive C5's delivery gap. Shape 4 in a test already *classified* as Shape 4 and left as integration anyway — its window went 1 s → 3 s → 8 s across three rounds before the reflex was dropped (§9) |
@@ -362,6 +363,27 @@ looks like a deadline**:
 The scoring question is therefore not "did the candidate find the flakes"
 but **"did it ask who owns each clock?"** A patch that only touches
 `assert elapsed <` bounds has searched one of five layers.
+
+### And one that is not a clock — why §4 runs the suite *twice*
+
+Cause **Y** is worth its own note, because it explains a property of the
+stress command that is easy to mistake for redundancy.
+
+`test_story_2_3.py` wrote one fixed scratch file in the repo root. §4 runs
+`pytest tests -n 8` **twice concurrently**, so two copies of that script ran
+against that one file and deleted it under each other. No timeout, no
+margin, no window — two processes sharing mutable state.
+
+> Running the same suite twice at once is not only load. It is a
+> **concurrency test of the suite against itself**, and any test writing a
+> fixed path outside a per-process directory fails it. `-n 16` in a single
+> invocation would never find this, because xdist runs each test once.
+
+Reproduced directly rather than argued: eight concurrent copies of the old
+script, five rounds — **34 of 40 failed, on a different assertion each
+time**. The same rotating-cast fingerprint as the whole ticket, inside one
+file. A scorer can use that trick on any candidate: take a suspect test,
+run N copies of it at once, and see whether the victim moves.
 
 For scoring: a candidate is not penalised for missing T, U, V, W or X — both were
 invisible to every attempt including the reference's first two sittings. But

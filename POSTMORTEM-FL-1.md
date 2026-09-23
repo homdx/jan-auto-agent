@@ -1,4 +1,4 @@
-# FL-1 — postmortem: fifteen causes behind one flaky suite
+# FL-1 — postmortem: sixteen causes behind one flaky suite
 
 **Ticket:** `epic-tasks/84-fl-1-full-tests-suite-is-not-reproducible-green-under-n-4-three-independent-root-causes.md`
 **Round:** 84
@@ -107,6 +107,7 @@ regression it exists to catch*, not merely by going green.
 | V | An integration test still required a *neighbour* to survive a window it was not tripping | `tests/test_contest_runner.py` | test design |
 | W | A 20 s fixture rendezvous on a permission round trip that crosses the whole transport | `tests/_kilo_fake.py` | fixture |
 | X | A 30 s executor guard over an acceptance check that spawns a **nested pytest** | `tests/test_auto_c1.py` and four siblings | test |
+| Y | **Not a clock at all** — two concurrent pytest invocations sharing one scratch file in the repo root | `tests/test_story_2_3.py` | test |
 
 ---
 
@@ -1610,6 +1611,58 @@ is that **only the first looks like a deadline**:
 > It is **"what can end the work this test is measuring, and who owns that
 > clock?"** Appendix B.3's greps answer the first question. Only reading the
 > call path answers the second.
+
+### Y — and the last one is not a clock at all
+
+31 of 32, and the loser was a *script-style* test the ticket never mentions:
+
+```
+FAILED tests/test_story_2_3.py::test_story_2_3
+  FAIL: After 2nd push -> v2
+```
+
+`PromptStore.push` numbers versions from what it reads off disk. Push twice,
+get v1 then v2. The script got v1 twice — and there is no timeout, no
+margin and no window anywhere near it.
+
+```python
+# BEFORE
+TMP = _root / "test_story_2_3_prompts.json"     # ONE fixed path, in the repo root
+
+def fresh_store(**kw):
+    if TMP.exists(): TMP.unlink()               # ← and it deletes it
+    return PromptStore(store_path=TMP, **kw)
+```
+
+The operator's stress command runs `pytest tests -n 8` **twice at once**. Two
+copies of this script therefore run concurrently against that one file.
+Interleave one process's `fresh_store()` unlink with another's second
+`push()`, and the second push reloads an empty store, numbers itself v1, and
+the assertion dies.
+
+That is not a timing bug that load makes likely. It is **two processes
+sharing mutable state**, and load only widens the window.
+
+Reproduced, because reasoning is not evidence. Eight concurrent copies of
+the old script, five rounds:
+
+```
+OLD:   failed runs: 34 / 40      ← and on a DIFFERENT assertion each time:
+                                    'After push -> v1'
+                                    'After rollback: improvement back to hardcoded'
+                                    'get_current returns custom validator'
+FIXED: failed runs:  0 / 40      ← scratch file in a per-process tempdir
+```
+
+The rotating cast of victims, in miniature, inside one script — the same
+fingerprint §1 opens with.
+
+> **Lesson.** Running the same suite twice at once is not only *load*. It is
+> a **concurrency test of the suite against itself**, and any test that
+> writes a fixed path outside a per-process directory fails it. That is a
+> property of the operator's command worth knowing deliberately: it tests
+> something `-n 16` in a single invocation never would, because xdist runs
+> each test once.
 
 ---
 
