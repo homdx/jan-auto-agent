@@ -326,7 +326,10 @@ def reset_worktree(
         dirty = _dirty_outside_runs(path)
         if (commits or dirty) and not force:
             raise _refuse_to_reset(path.resolve(), branch, round_no, commits, dirty)
-        _git(path, ["checkout", "-B", branch, base_sha])
+        # ``--fresh`` has already agreed to drop the edits; without
+        # ``-f`` a plain checkout keeps them and refuses outright when the new
+        # base changes the same file ("would be overwritten by checkout").
+        _git(path, ["checkout", *(["-f"] if force else []), "-B", branch, base_sha])
 
     _git(path, ["clean", "-fdx", "-e", "runs/"])
     _empty_runs_dir(path, agent)
@@ -364,7 +367,7 @@ def attach_clone(clone_path, agent: str, base_sha: str, branch: str, *, force: b
             f"clone {clone} is dirty (pass --force-clone to reset it):\n  {files}"
         )
 
-    _git(clone, ["checkout", "-B", branch, base_sha])
+    _git(clone, ["checkout", *(["-f"] if force else []), "-B", branch, base_sha])
     _git(clone, ["clean", "-fdx", "-e", "runs/"])
     _empty_runs_dir(clone, agent)
 

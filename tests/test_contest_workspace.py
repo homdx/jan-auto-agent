@@ -212,6 +212,48 @@ def test_prepare_round_force_resets_a_worktree_that_carries_work(repo, config):
     assert not laguna2.progress_csv.exists()
 
 
+def test_prepare_round_force_resets_an_edit_the_new_base_also_changes(repo, config):
+    """Round 86: ``--fresh`` over a worktree whose uncommitted edit is to
+    a file the *new* base changes too. A plain ``checkout -B`` refuses ("would
+    be overwritten by checkout") and the whole round stops at intake."""
+    old_base = _base_sha(repo)
+    new_base = _git(repo, "rev-parse", "HEAD").strip()  # changes readme.txt
+    laguna = next(ws for ws in prepare_round(repo, config, 40, old_base)
+                  if ws.agent == "laguna")
+    (laguna.path / "readme.txt").write_text("the agent's edit\n")
+
+    wss = prepare_round(repo, config, 40, new_base, force=True)
+    laguna2 = next(ws for ws in wss if ws.agent == "laguna")
+
+    assert _git(laguna2.path, "rev-parse", "HEAD").strip() == new_base
+    assert (laguna2.path / "readme.txt").read_text() == "r1\n"
+    assert _git(laguna2.path, "status", "--porcelain").strip() == ""
+
+
+def test_prepare_round_without_force_still_refuses_that_edit(repo, config):
+    old_base = _base_sha(repo)
+    new_base = _git(repo, "rev-parse", "HEAD").strip()
+    laguna = next(ws for ws in prepare_round(repo, config, 40, old_base)
+                  if ws.agent == "laguna")
+    (laguna.path / "readme.txt").write_text("the agent's edit\n")
+
+    with pytest.raises(WorkspaceError, match="--fresh"):
+        prepare_round(repo, config, 40, new_base)
+    assert (laguna.path / "readme.txt").read_text() == "the agent's edit\n"
+
+
+def test_attach_clone_force_resets_an_edit_the_base_also_changes(repo, tmp_path):
+    base = _base_sha(repo)
+    clone = tmp_path / "clone-hy3"
+    _git(repo, "clone", "-q", str(repo), str(clone))
+    (clone / "readme.txt").write_text("uncommitted\n")  # HEAD r1, base r0
+
+    attach_clone(clone, "hy3", base, "contest/40/hy3", force=True)
+
+    assert _git(clone, "rev-parse", "HEAD").strip() == base
+    assert (clone / "readme.txt").read_text() == "r0\n"
+
+
 def test_prepare_round_resets_a_clean_worktree_at_the_base(repo, config):
     """Nothing on the branch, only the round's own ``runs/`` scratch: the
     idempotent rerun resets as before — the scratch is not work to refuse over,
