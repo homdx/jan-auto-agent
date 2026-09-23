@@ -47,6 +47,14 @@ part in `running` is on the stream, with the timeout the agent asked for.
 **Depends on:** KC-12 (the silence clock, landed `183de9b`), FL-1 (`e500d40`, the tap's silence accounting).
 **Also touches:** `tools/contest/backend.py` (the three `wait_idle` adapters pass it through unchanged), `tests/test_contest_kilo_client.py`, `tests/_kilo_fake.py`
 
+
+**Stopgap landed 2026-09-23 (by hand, `contest.ini` only):** `idle_event_timeout_sec`
+300 → 900 and `turn_timeout_sec` 1800 → 3600, so an agent's own `pytest` run of
+10–15 minutes on a loaded box is not killed as silence. The price is that a dead
+stream is noticed 10 minutes later than before. This ticket stays queued: the
+proper fix below (the silence bound follows the running `bash` call's own
+`timeout`) lets the idle bound go back to 300 s.
+
 ---
 
 ## What must change

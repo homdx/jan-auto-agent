@@ -141,8 +141,8 @@ def test_committed_contest_ini_loads(gate_key):
     assert cfg.server == "spawn"
     assert cfg.max_parallel == 3
     assert cfg.max_rework == 2
-    assert cfg.turn_timeout_sec == 1800
-    assert cfg.idle_event_timeout_sec == 300
+    assert cfg.turn_timeout_sec == 3600
+    assert cfg.idle_event_timeout_sec == 900
     assert cfg.max_questions_per_turn == 3
     assert cfg.tmp_roots == ("/tmp/kilo/*", "/tmp/contest/*")
     assert cfg.ask_commands == (
