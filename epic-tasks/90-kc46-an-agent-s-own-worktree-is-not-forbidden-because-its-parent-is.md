@@ -1,6 +1,6 @@
 # KC-46 — an agent's own worktree is not forbidden ground just because the rounds folder that holds it is
 
-**Status:** landed `adbbfd1` (2026-09-23, by hand, during round 86 run 4) — queued — found live 2026-09-23 in round 86: `step-3-7-flash` was refused `ls` and `head` on files in its own worktree, by absolute path, twice.
+**Status:** landed `adbbfd1` (2026-09-23, by hand, during round 86 run 4). Found live 2026-09-23 in round 86: `step-3-7-flash` was refused `ls` and `head` on files in its own worktree, by absolute path, twice.
 **Severity:** MEDIUM (a mechanical, gate-free reject of the most harmless command there is — reading your own file — — 14 of the 17 `forbidden: …/rounds/…` rejects on this box, in six rounds)
 **File:** `tools/contest/runner.py`, `tools/contest/policy.py`
 **Symbol:** `run_agent` (the `PolicyContext(...)` built per permission), `Policy._mechanical`, `_forbidden_match`

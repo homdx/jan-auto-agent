@@ -1355,3 +1355,23 @@ def test_forbidden_match_without_a_worktree_is_unchanged(tmp_path):
     assert policy_mod._forbidden_match(own / "x.py", (rounds,)) == rounds
     assert policy_mod._forbidden_match(own / "x.py", (rounds,), own) is None
     assert policy_mod._forbidden_match(rounds / "86-b" / "x.py", (rounds,), own) == rounds
+
+
+@pytest.mark.parametrize("spelling", ["dotdot", "symlink"])
+def test_an_own_worktree_spelling_that_lands_on_a_sibling_stays_forbidden(tmp_path, spelling):
+    """The exemption is judged on the resolved path: ``<own>/../86-b`` and a
+    symlink in the own worktree that points at a sibling are the sibling."""
+    rounds, own, ctx = _rounds(tmp_path)
+    if spelling == "dotdot":
+        path = f"{own}/../86-b/x.py"
+    else:
+        (own / "peek").symlink_to(rounds / "86-b")
+        path = f"{own}/peek/x.py"
+    gate = StubGate(json.dumps(ALLOW))
+    policy = Policy(make_config(), completion_fn=gate, clock=FakeClock())
+
+    decision = decide(policy, _bash(f"cat {path}"), own, **ctx)
+
+    assert (decision.reply, decision.layer) == ("reject", "mechanical")
+    assert decision.reason.startswith("forbidden: ")
+    assert gate.calls == []
