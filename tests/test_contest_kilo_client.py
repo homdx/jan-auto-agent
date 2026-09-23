@@ -49,6 +49,7 @@ for _p in (str(REPO_ROOT), str(TESTS_DIR)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import _kilo_fake  # noqa: E402
 from _kilo_fake import FakeKiloServer  # noqa: E402
 
 import tools.contest.kilo_client as kilo_client_module  # noqa: E402
@@ -112,7 +113,8 @@ def _reject(event):
 
 
 @contextmanager
-def _probe(tmp_path, scenario, *, reply_timeout: float = 20.0, agent=None):
+def _probe(tmp_path, scenario, *, reply_timeout: float = _kilo_fake.REPLY_TIMEOUT_S,
+           agent=None):
     """A fake server, an attached KiloServer, a client, a tap and a session."""
     directory = str(tmp_path)
     fake = FakeKiloServer(scenario, directory=directory,
@@ -894,7 +896,9 @@ def test_tap_writes_the_probe_event_log_format(tmp_path):
                                on_question=lambda event: None)
         assert res.status == "idle"
         tap.stop()
-        assert tap.join(5) is True
+        # a hang guard on the reader unwinding, not a claim about how fast
+        # it does (FL-1, round 84, round 7)
+        assert tap.join(60) is True
     finally:
         fake.stop()
 

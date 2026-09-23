@@ -220,6 +220,19 @@ class _Session:
         self.aborted = False
 
 
+# FL-1 (round 84, round 7): how long a scripted turn waits for the client to
+# answer a permission or a question before giving up and recording it in
+# `unanswered`. A hang guard, not an assertion — nothing in either test root
+# asserts that it fires, and one test asserts the opposite (`not
+# fake.unanswered`). At 20 s it was a wall-clock bound on a round trip that
+# has to cross an SSE stream, a reader thread, the client's callback and an
+# HTTP POST; the operator's stress run walked through it, and
+# `test_permission_in_the_middle_is_answered_and_idle_is_reached` came back
+# with the reply delivered over HTTP but `permission.replied` never emitted,
+# because the turn thread had already stopped waiting for it.
+REPLY_TIMEOUT_S = 300.0
+
+
 class FakeKiloServer:
     """A scripted ``kilo serve`` on an ephemeral port of 127.0.0.1.
 
@@ -230,7 +243,7 @@ class FakeKiloServer:
 
     def __init__(self, scenario: dict | None = None, directory: str | None = None,
                  *, host: str = "127.0.0.1", port: int = 0,
-                 reply_timeout: float = 20.0) -> None:
+                 reply_timeout: float = REPLY_TIMEOUT_S) -> None:
         self.scenario = dict(scenario or {})
         self.directory = directory or os.getcwd()
         self.host = host

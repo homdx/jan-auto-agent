@@ -68,6 +68,7 @@ round, in this order:
 | C6 | the harvest tests | a `git commit` inside a wall-clock silence window cannot be made to work: the hook's work is unbounded, the window is not |
 | G | `.git/index.lock` is a transient, not a failure | **production.** One collision costs a task its commit — a red suite here, lost agent work in a real run (§6) |
 | T | **a turn deadline over a real `git commit`** | `turn_timeout_sec=30` over 58 turns whose hook commits for real. Reads as production config, is also a test bound. 48 green runs did not find it (§9) |
+| W | **the fixture's own rendezvous was a 20 s bet** | the fake waits for the client to answer a `permission.asked` before emitting `permission.replied` — a round trip across the SSE stream, the reader thread, the callback and an HTTP POST. It gave up at 20 s; the reply arrived to nobody, and the failure pointed at a client that had done everything right (§9) |
 | V | **a neighbour required to survive a window it was not tripping** | the chatty agent in `test_a_silent_agent_stalls_next_to_a_chatty_one` beat *across* the silent one's window, so it had to survive C5's delivery gap. Shape 4 in a test already *classified* as Shape 4 and left as integration anyway — its window went 1 s → 3 s → 8 s across three rounds before the reflex was dropped (§9) |
 | U | **a `threading.Timer` racing the harness build** | `Timer(0.8, fake.stop)` armed before the backend, tap handshake, session and prompt exist. On a loaded box the server was gone before the turn began, so a test about a server vanishing *mid-turn* never reached a turn (§9) |
 | S | a client timeout against a server that had not been scheduled | `StubServer.start()` binds in `__init__` and hands `serve_forever` to a daemon thread, so the socket queues a connection before anything serves it. The reply is not slow — nobody has run yet |
@@ -329,7 +330,18 @@ reference's own: naming a shape is not the same as acting on it.** When
 scoring, look for a candidate that applies its own stated rule to every
 instance, not only the convenient ones.
 
-For scoring: a candidate is not penalised for missing T, U or V — both were
+And then **W**, 31 of 32 green: the *fake's own* `reply_timeout` giving up
+on a permission round trip at 20 s. Note where that failure points — the
+client's HTTP POST is in the log with the right body, and the assertion that
+dies is about an event the *fixture* failed to emit. A scorer reading that
+traceback cold would start debugging the client.
+
+**The audit that keeps paying: whose clock is it?** Six rounds looked at
+deadlines the runner enforces and bounds the assertions carry. T was config,
+U was fixture setup, W was the fake's own rendezvous. All three are
+deadlines over the work, and none of them looks like one.
+
+For scoring: a candidate is not penalised for missing T, U, V or W — both were
 invisible to every attempt including the reference's first two sittings. But
 a candidate that reports either, or that raises `turn_timeout_sec` on the
 right grounds, has read the shape and not the symptom.

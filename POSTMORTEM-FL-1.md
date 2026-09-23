@@ -1,4 +1,4 @@
-# FL-1 — postmortem: thirteen causes behind one flaky suite
+# FL-1 — postmortem: fourteen causes behind one flaky suite
 
 **Ticket:** `epic-tasks/84-fl-1-full-tests-suite-is-not-reproducible-green-under-n-4-three-independent-root-causes.md`
 **Round:** 84
@@ -105,6 +105,7 @@ regression it exists to catch*, not merely by going green.
 | T | A 30 s **turn deadline** over 58 turns that each run a real `git commit` | `tests/test_contest_runner.py` | test |
 | U | A `threading.Timer` armed *before* the harness was built, racing its setup | `tests/test_contest_runner.py` | test |
 | V | An integration test still required a *neighbour* to survive a window it was not tripping | `tests/test_contest_runner.py` | test design |
+| W | A 20 s fixture rendezvous on a permission round trip that crosses the whole transport | `tests/_kilo_fake.py` | fixture |
 
 ---
 
@@ -1515,6 +1516,54 @@ never invert the outcome.
 > says "move this out of real time", it applies to *every* instance —
 > including the one that still looks manageable. That is the one that comes
 > back.
+
+### W — and the *fixture's own* rendezvous was a 20 s bet
+
+31 of 32 green, and the one loss was a shape that had not appeared yet:
+
+```
+FAILED test_permission_in_the_middle_is_answered_and_idle_is_reached[external_directory]
+assert len(answered) == 1
+assert 0 == 1
+```
+
+Read what passed before it. `replies` — the HTTP POST the client sent to
+`/permission/<id>` — was there, with exactly the right body. The client did
+everything right. What was missing was the fake's own
+`permission.replied` event.
+
+The fake's scripted turn emits `permission.asked` and then **waits** for the
+client to answer:
+
+```python
+# tests/_kilo_fake.py, inside _run_turn
+pid, event = self._permission_event(session, permission)
+self._emit(event)
+box = self._pending.get(pid)
+if box is None or not box["event"].wait(self.reply_timeout):   # ← 20 s
+    self.unanswered.append(pid)
+else:
+    ... emit permission.replied ...
+```
+
+That round trip crosses the SSE stream, the reader thread, the client's
+callback and an HTTP POST — the same transport C5 showed can stall for
+seconds. Twenty seconds of it is a wall-clock bet, and the box took it: the
+turn thread gave up, recorded the request as unanswered, and the reply
+arrived to nobody.
+
+Shape 2 again, and the giveaway is the same one as always — **nothing
+asserts that this timeout fires.** One test asserts the opposite
+(`assert not fake.unanswered`). It is a hang guard, so it is now
+`REPLY_TIMEOUT_S = 300.0`, named at module level with the reason attached.
+`assert tap.join(5) is True` went the same way, for the same reason: it
+guards the reader unwinding, it does not claim a speed.
+
+> **Lesson.** Audit the *fixture's* waits with the same eye as the code
+> under test. Six rounds of this ticket looked at deadlines the runner
+> enforces and at bounds the assertions carry. This one was in the fake —
+> and a fake that gives up waiting produces a failure that points at the
+> client, which did nothing wrong.
 
 ---
 
