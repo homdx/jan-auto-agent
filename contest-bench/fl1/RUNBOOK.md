@@ -68,6 +68,7 @@ round, in this order:
 | C6 | the harvest tests | a `git commit` inside a wall-clock silence window cannot be made to work: the hook's work is unbounded, the window is not |
 | G | `.git/index.lock` is a transient, not a failure | **production.** One collision costs a task its commit — a red suite here, lost agent work in a real run (§6) |
 | T | **a turn deadline over a real `git commit`** | `turn_timeout_sec=30` over 58 turns whose hook commits for real. Reads as production config, is also a test bound. 48 green runs did not find it (§9) |
+| X | **a 30 s executor guard over a nested pytest** | the `Executor` under test runs an acceptance check under a timeout; the shared helper used 30 s. Most of those checks are `python -c "pass"`; one spawns `python -m pytest`, loading the whole plugin stack and this repo's conftest first. Found in a part of the suite the ticket never mentions (§9) |
 | W | **the fixture's own rendezvous was a 20 s bet** | the fake waits for the client to answer a `permission.asked` before emitting `permission.replied` — a round trip across the SSE stream, the reader thread, the callback and an HTTP POST. It gave up at 20 s; the reply arrived to nobody, and the failure pointed at a client that had done everything right (§9) |
 | V | **a neighbour required to survive a window it was not tripping** | the chatty agent in `test_a_silent_agent_stalls_next_to_a_chatty_one` beat *across* the silent one's window, so it had to survive C5's delivery gap. Shape 4 in a test already *classified* as Shape 4 and left as integration anyway — its window went 1 s → 3 s → 8 s across three rounds before the reflex was dropped (§9) |
 | U | **a `threading.Timer` racing the harness build** | `Timer(0.8, fake.stop)` armed before the backend, tap handshake, session and prompt exist. On a loaded box the server was gone before the turn began, so a test about a server vanishing *mid-turn* never reached a turn (§9) |
@@ -341,7 +342,28 @@ deadlines the runner enforces and bounds the assertions carry. T was config,
 U was fixture setup, W was the fake's own rendezvous. All three are
 deadlines over the work, and none of them looks like one.
 
-For scoring: a candidate is not penalised for missing T, U, V or W — both were
+Then **X**, 31 of 32 again, in a part of the suite this ticket never
+mentions: a 30 s `Executor` guard over an acceptance check that spawns a
+*nested pytest*.
+
+### The five places a deadline hid — the most useful table here
+
+Rounds 7–7e found one cause in each of five layers, and **only the first
+looks like a deadline**:
+
+| cause | where it lived | what it reads as |
+|---|---|---|
+| C1 & co | `assert elapsed < N` in the test | a deadline |
+| T | `turn_timeout_sec` in a config helper | production config |
+| U | `threading.Timer` before the harness exists | fixture setup |
+| W | `reply_timeout` inside the fake | a rendezvous |
+| X | `timeout_sec` on the Executor under test | a parameter of the thing being tested |
+
+The scoring question is therefore not "did the candidate find the flakes"
+but **"did it ask who owns each clock?"** A patch that only touches
+`assert elapsed <` bounds has searched one of five layers.
+
+For scoring: a candidate is not penalised for missing T, U, V, W or X — both were
 invisible to every attempt including the reference's first two sittings. But
 a candidate that reports either, or that raises `turn_timeout_sec` on the
 right grounds, has read the shape and not the symptom.

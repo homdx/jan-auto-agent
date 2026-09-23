@@ -1,4 +1,4 @@
-# FL-1 — postmortem: fourteen causes behind one flaky suite
+# FL-1 — postmortem: fifteen causes behind one flaky suite
 
 **Ticket:** `epic-tasks/84-fl-1-full-tests-suite-is-not-reproducible-green-under-n-4-three-independent-root-causes.md`
 **Round:** 84
@@ -106,6 +106,7 @@ regression it exists to catch*, not merely by going green.
 | U | A `threading.Timer` armed *before* the harness was built, racing its setup | `tests/test_contest_runner.py` | test |
 | V | An integration test still required a *neighbour* to survive a window it was not tripping | `tests/test_contest_runner.py` | test design |
 | W | A 20 s fixture rendezvous on a permission round trip that crosses the whole transport | `tests/_kilo_fake.py` | fixture |
+| X | A 30 s executor guard over an acceptance check that spawns a **nested pytest** | `tests/test_auto_c1.py` and four siblings | test |
 
 ---
 
@@ -1564,6 +1565,51 @@ guards the reader unwinding, it does not claim a speed.
 > enforces and at bounds the assertions carry. This one was in the fake —
 > and a fake that gives up waiting produces a failure that points at the
 > client, which did nothing wrong.
+
+### X — and once more, in a fifth place a deadline can hide
+
+31 of 32 again, in a part of the suite this ticket had never touched:
+
+```
+FAILED tests/test_auto_c1.py::TestIntegration::test_pytest_acceptance_check
+ExecutionResult(exit_code=-1, timed_out=True, ...)
+WARNING tools.auto.executor: _execute: TIMEOUT task=PYTEST-TASK timeout=30.0s
+```
+
+The `Executor` runs a task's `acceptance_check` under a configurable
+timeout, and the shared test helper built it with 30 s. For most of those
+tests the command is `python -c "pass"` — a bare interpreter start. For this
+one it is `python -m pytest test_sample.py`, a **nested pytest** that loads
+the whole plugin stack and this repo's `conftest.py` before it runs a line.
+Thirty seconds of that on a saturated box is not a margin.
+
+Shape 2 once more, and once more the tell is structural: the tests that are
+*about* the timeout build their own `Executor(timeout_sec=0.5)`. The shared
+helper only ever needed the command to finish.
+
+This time the shape was enumerated rather than waited for. One grep for
+`timeout_sec=` across both test roots found every executor guard over a real
+subprocess — five files, nine sites, none of them asserted on — and they all
+moved to 300 s in the same pass. The alternative is one 10-minute stress
+round per site.
+
+### The five places a deadline hid
+
+Rounds 7–7e found one cause in each of five different layers, and the point
+is that **only the first looks like a deadline**:
+
+| cause | where it lived | what it reads as |
+|---|---|---|
+| C1 & co | `assert elapsed < N` in the test | a deadline |
+| T | `turn_timeout_sec` in a config helper | production config |
+| U | `threading.Timer` before the harness exists | fixture setup |
+| W | `reply_timeout` inside the fake | a rendezvous |
+| X | `timeout_sec` on the Executor under test | a parameter of the thing being tested |
+
+> **Lesson, final form.** The question is not "what looks like a deadline".
+> It is **"what can end the work this test is measuring, and who owns that
+> clock?"** Appendix B.3's greps answer the first question. Only reading the
+> call path answers the second.
 
 ---
 

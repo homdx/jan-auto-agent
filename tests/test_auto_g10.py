@@ -121,7 +121,7 @@ git_user = agent
 git_email = agent@test
 max_rounds_per_task = 10
 max_attempts_per_task = 5
-exec_timeout_sec = 30
+exec_timeout_sec = 300
 max_tasks_per_run = {max_tasks}
 max_runtime_min = {max_runtime_min}
 
@@ -289,7 +289,7 @@ class TestExecutorBlocklist:
 
     @pytest.fixture()
     def executor(self, tmp_path):
-        return Executor(base_dir=tmp_path, timeout_sec=10)
+        return Executor(base_dir=tmp_path, timeout_sec=300)
 
     @pytest.mark.parametrize("dangerous_cmd", [
         "rm -rf /",
@@ -346,7 +346,7 @@ class TestExecutorBlocklist:
         always fails ('false'), not bare 'pytest' (which can spuriously pass
         on an unrelated pre-existing test suite mirrored into the workspace)
         and not the blocked command itself."""
-        executor = Executor(base_dir=tmp_path, timeout_sec=10)
+        executor = Executor(base_dir=tmp_path, timeout_sec=300)
         # Access the internal resolver directly to confirm fallback path.
         cmd = executor._resolve_command("rm -rf /", [], tmp_path)
         assert "rm" not in cmd, (
@@ -389,7 +389,7 @@ class TestPathTraversalGuard:
         executor = Executor(
             base_dir=tmp_path,
             workspace_root=workspace_root,
-            timeout_sec=10,
+            timeout_sec=300,
         )
         task = {
             "id": "../../evil",
@@ -412,7 +412,7 @@ class TestPathTraversalGuard:
         executor = Executor(
             base_dir=tmp_path,
             workspace_root=workspace_root,
-            timeout_sec=10,
+            timeout_sec=300,
         )
         task = {
             "id": "../../evil",

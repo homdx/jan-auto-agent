@@ -248,7 +248,7 @@ max_attempts     = 3
 timeout_seconds  = 30
 
 [auto]
-exec_timeout_sec = 30
+exec_timeout_sec = 300
 canon_check_every = 0
 
 [coder]
