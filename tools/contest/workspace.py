@@ -19,8 +19,9 @@ the work a worktree carries — commits above the base, or edits outside
 ``runs/`` — unless ``--fresh`` says to discard it; the message names ``--resume``
 for the other way out. The runbook's stage-5 cleanup is :func:`remove_round`.
 
-Standard library only (``subprocess``, ``pathlib``, ``shutil``); it shells out to
-``git`` exactly the way the runbook does.
+Standard library only (``subprocess``, ``pathlib``, ``shutil``), plus this
+repo's own ``tools.git_run`` for the git calls; it shells out to ``git`` exactly
+the way the runbook does.
 """
 
 from __future__ import annotations
@@ -32,6 +33,7 @@ from pathlib import Path
 from typing import Literal
 
 from tools.contest.roster import ContestConfig
+from tools.git_run import run_git
 
 __all__ = [
     "Workspace",
@@ -107,12 +109,15 @@ def _resolve_rounds_dir(repo: Path, rounds_dir: str) -> Path:
 
 
 def _git(cwd: Path, args: list[str], *, check: bool = True) -> subprocess.CompletedProcess:
-    """Run ``git`` in *cwd*; raise :class:`WorkspaceError` on a non-zero exit."""
-    proc = subprocess.run(
-        ["git", "-C", str(cwd), *args],
-        capture_output=True,
-        text=True,
-    )
+    """Run ``git`` in *cwd*; raise :class:`WorkspaceError` on a non-zero exit.
+
+    Through ``tools.git_run.run_git``: a ``worktree add`` / ``checkout -B`` /
+    ``clean -fdx`` that finds the index held by another git waits
+    for it instead of taking the first 128 as final (FL-2) — in a round of N
+    agents against one repository a collision here used to cost an agent its
+    workspace before the round even started.
+    """
+    proc = run_git(["git", "-C", str(cwd), *args])
     if check and proc.returncode != 0:
         raise WorkspaceError(
             f"git {' '.join(args)} in {cwd} failed ({proc.returncode}): "

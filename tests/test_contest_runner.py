@@ -1865,10 +1865,18 @@ def test_dirty_tree_names_each_file_and_leaves_runs_out(tmp_path):
         " M pkg/a.py", " M pkg/b.py", "?? tests/new/test_x.py"]
 
 
-def test_dirty_tree_of_a_path_git_cannot_read_is_empty(tmp_path):
+def test_dirty_tree_of_a_path_git_cannot_read_raises(tmp_path):
+    """FL-2: a `git status` that exits non-zero is a read error, not a clean tree.
+
+    The old behaviour returned `""` here, and the caller read that as "no
+    uncommitted work" — exactly the KC-31/KC-41 path where an unreadable tree
+    became zero harvested entries. `TreeReadError` is what lets a caller tell
+    the two apart; the runner catches it and degrades to "no nudge".
+    """
     ws = Workspace(agent="agent-a", path=tmp_path / "gone", branch="main", base_sha="0" * 40,
                    kind="worktree")
-    assert _runner_module._dirty_tree(ws) == ""
+    with pytest.raises(_runner_module.TreeReadError):
+        _runner_module._dirty_tree(ws)
 
 
 def test_continue_message_lists_every_line_of_a_short_tree():

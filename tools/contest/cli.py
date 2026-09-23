@@ -56,7 +56,6 @@ import json
 import logging
 import os
 import re
-import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass, replace
@@ -74,6 +73,7 @@ from tools.contest.kilo_client import (
 from tools.contest.roster import AgentSpec, ContestConfig, RosterError, load_roster
 from tools.contest.runner import AgentState, RoundState, run_round
 from tools.contest.workspace import WorkspaceError, prepare_round
+from tools.git_run import run_git
 
 __all__ = [
     "DEFAULT_PROVIDER",
@@ -557,6 +557,10 @@ def export_patches(state: RoundState, workspaces: list, out_dir) -> list:
     `<agent>.ERROR.patch`: the terminal state is the file name. An empty diff
     writes no file and says so: a READY without a commit cannot happen, the
     harvest sets it, so there is no fake sha to fall back on.
+
+    FL-2: the call goes through `tools.git_run.run_git`. `format-patch` never
+    takes the index, so the ladder is a no-op here — the point is that a caller
+    no longer has to remember which git writes the index.
     """
     out = Path(out_dir)
     by_agent = {ws.agent: ws for ws in workspaces}
@@ -572,10 +576,8 @@ def export_patches(state: RoundState, workspaces: list, out_dir) -> list:
             continue
         suffix = ".patch" if run.state is AgentState.READY else f".{run.state.value}.patch"
         target = out / f"{name}{suffix}"
-        proc = subprocess.run(
+        proc = run_git(
             ["git", "-C", str(ws.path), "format-patch", "--stdout", f"{ws.base_sha}..HEAD"],
-            capture_output=True,
-            text=True,
         )
         patch = proc.stdout.strip()
         if not patch:

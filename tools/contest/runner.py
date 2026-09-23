@@ -77,6 +77,7 @@ from tools.contest.kilo_client import SessionRef
 from tools.contest.policy import HARD_DENYLIST, Policy, PolicyContext
 from tools.contest.roster import AgentSpec, ContestConfig
 from tools.contest.workspace import Workspace
+from tools.git_run import run_git
 
 __all__ = ["AgentRun", "AgentState", "RoundState", "round_prompt", "run_agent", "run_round"]
 
@@ -394,26 +395,47 @@ def continue_message(dirty: str) -> str:
     )
 
 
+class TreeReadError(RuntimeError):
+    """`git status` could not be read for a worktree — a read error, not a tree.
+
+    FL-2: a status that exits non-zero (it lost the index lock, or the path is
+    not a repository at all) used to come back as ``""``, which every caller
+    read as "the tree is clean". Deciding "no uncommitted work" from a command
+    that did not run is what the KC-31/KC-41 path is built on: a turn scored
+    clean is a turn that is not harvested, and an agent's work becomes zero
+    entries.
+    """
+
+
 def _dirty_tree(ws: Workspace) -> str:
     """The uncommitted work of *ws* as `git status --porcelain
-    --untracked-files=all`, with `runs/` excluded — fail-open.
+    --untracked-files=all`, with `runs/` excluded — `""` only when the tree is
+    clean.
 
     `runs/<agent>/PROGRESS.csv` rows live under `runs/` and must not count as
-    the agent's work. Empty string when the tree is clean or when git cannot
-    answer, so an unreadable worktree degrades to "no collect data" and the
-    runner harvests as it always did, never raising.
+    the agent's work.
+
+    Raises :class:`TreeReadError` when git cannot answer (FL-2) — the callers
+    catch it, in `_plan` and in the KC-22 branch of `run_agent`, and degrade to
+    "no nudge" with a warning. The command still goes through
+    `tools.git_run.run_git`, so a transient held index is waited out first: only
+    a status that has genuinely failed is a read error.
 
     Not `gates.git`: that strips its output, and the first porcelain line of a
     tree with unstaged edits starts with a space that is part of the status.
     """
     try:
-        r = subprocess.run(["git", "status", "--porcelain", "--untracked-files=all"],
-                           cwd=ws.path, capture_output=True, text=True)
-    except OSError:  # a status that cannot be read is a clean one
-        return ""
-    out = r.stdout if r.returncode == 0 else ""
+        r = run_git(["git", "status", "--porcelain", "--untracked-files=all"],
+                    cwd=ws.path)
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise TreeReadError(f"git status in {ws.path} did not run: {exc}") from exc
+    if r.returncode != 0:
+        raise TreeReadError(
+            f"git status in {ws.path} exited {r.returncode}: "
+            f"{r.stderr.strip() or r.stdout.strip()}"
+        )
     lines = []
-    for ln in out.splitlines():
+    for ln in r.stdout.splitlines():
         if not ln.strip():
             continue
         body = ln[3:] if len(ln) > 3 else ln  # drop the two status chars + space
@@ -689,7 +711,16 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                 # still has no commit after the last nudge.
                 budget = int(config.max_continues_per_attempt)
                 if 0 < budget and continue_used < budget:
-                    dirty = _dirty_tree(ws) if _commits_above(ws) == 0 else ""
+                    dirty = ""
+                    if _commits_above(ws) == 0:
+                        try:
+                            dirty = _dirty_tree(ws)
+                        except TreeReadError as exc:
+                            # FL-2: a status that could not be read is not "no
+                            # uncommitted work" — say so, and let the turn fall
+                            # through to the harvest, which reads git itself.
+                            _log.warning("%s: tree unreadable — %s", spec.name,
+                                         _brief(str(exc)))
                     if dirty:
                         # the current turn keeps its own kind (initial/rework);
                         # the continue becomes the *next* PROMPTED turn, whose
@@ -806,7 +837,15 @@ def _plan(config: ContestConfig, workspaces: list, ticket_path: Path,
                 # `max_continues_per_attempt = 0` turns the whole mechanism off — this
                 # half included: no tree read, no paragraph, today's prompt.
                 if int(config.max_continues_per_attempt) > 0 and _commits_above(ws) == 0:
-                    dirty = _dirty_tree(ws)
+                    try:
+                        dirty = _dirty_tree(ws)
+                    except TreeReadError as exc:
+                        # FL-2: the tree is not clean, it is unreadable — no
+                        # paragraph, and a warning so nobody reads this as a
+                        # clean worktree.
+                        _log.warning("tree of %s unreadable — %s", ws.path,
+                                     _brief(str(exc)))
+                        dirty = ""
                     if dirty:
                         run.dirty_on_resume = dirty
         runs.append(run)

@@ -37,6 +37,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
+from tools.git_run import run_git
+
 logger = logging.getLogger(__name__)
 
 COLLECTOR_VERSION = "2"  # V10: real parameter lists in `signature` — forces one full rebuild
@@ -147,15 +149,18 @@ def _run_git(root: Path, *args: str) -> Optional[str]:
     harmless for the other subcommands this helper serves (``rev-parse``,
     ``log``) — it only affects how PATHS are quoted in output, and none of
     them emit paths.
+
+    FL-2: the call goes through ``tools.git_run.run_git``, so the "git is
+    unavailable" case above is reached only after the ladder has waited out a
+    transient held index — the one way a `status` fails while the tree itself
+    is perfectly fine.
     """
     try:
-        proc = subprocess.run(
+        proc = run_git(
             ["git", "-c", "core.quotepath=false", *args],
             cwd=str(root),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
             timeout=10,
+            encoding="utf-8",
         )
     except (OSError, subprocess.SubprocessError):
         return None

@@ -17,7 +17,8 @@ Hard gates (a `FAIL` here settles the round regardless of anything else):
 Everything else is a column, not a verdict. `tools/contest/harvest.py` turns a row
 into a `READY`/`REWORK` verdict with sentences an agent can act on.
 
-Standard library only.
+Standard library only; the git call below goes through this repo's own
+`tools.git_run` helper rather than a third-party dependency.
 """
 
 from __future__ import annotations
@@ -28,6 +29,8 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+
+from tools.git_run import run_git
 
 __all__ = [
     "BRIDGE",
@@ -52,8 +55,14 @@ FAIL_TAIL_LINES = 20
 
 
 def git(cwd, *args, check=False):
-    """`git <args>` in *cwd*, stdout stripped. Raise `RuntimeError` when *check*."""
-    r = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+    """`git <args>` in *cwd*, stdout stripped. Raise `RuntimeError` when *check*.
+
+    Through `tools.git_run.run_git`, so a transient held index is waited out
+    before the answer is read (FL-2). `check=False` callers still get `""` when
+    git cannot answer after the ladder — that is their contract, and
+    `judge_worktree` is written on it.
+    """
+    r = run_git(["git", *args], cwd=cwd)
     if check and r.returncode:
         raise RuntimeError(f"git {' '.join(args)} in {cwd}: {r.stderr.strip()}")
     return r.stdout.strip()
