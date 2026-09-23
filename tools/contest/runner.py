@@ -562,7 +562,8 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         ctx = PolicyContext(
             worktree=ws.path,
             tmp_roots=tuple(config.tmp_roots),
-            # the other agents' worktrees are this one's siblings: never theirs to read
+            # the rounds folder: this round's other worktrees and every earlier
+            # round's. The policy lets this agent's own worktree through (KC-46)
             forbidden=tuple(HARD_DENYLIST) + (ws.path.parent,),
             ticket_title=Path(ticket_path).name,
             ticket_files=tuple(ticket_files),

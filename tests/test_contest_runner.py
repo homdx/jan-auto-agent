@@ -615,6 +615,31 @@ def test_a_sibling_worktree_is_forbidden_ground(tmp_path):
     assert policy._completion_fn.calls == 0
 
 
+def test_own_worktree_by_absolute_path_is_not_forbidden_ground(tmp_path):
+    """KC-46: the rounds folder is forbidden, but the agent's own worktree is
+    in it. Reading its own file by absolute path is ``once`` from layer 1,
+    without the gate, while a sibling stays forbidden (the test above)."""
+    sb = Sandbox(tmp_path, ["agent-a", "agent-b"])
+    own = sb.ws("agent-a").path
+    command = f"head -3 {own}/pkg/thing.py"
+    cfg = make_config(["agent-a"])
+    policy = make_policy(cfg, "reject")
+    turn = {"on_prompt": work_ready, "events": ["busy", "idle"],
+            "permission": {"permission": "bash", "patterns": [command],
+                           "metadata": {"command": command}},
+            "tool_parts": [{"tool": "bash", "status": "completed",
+                            "input": {"command": "ls"}, "output": "ok"}]}
+    with _BenchFake({"turns": [turn]}) as fake:
+        run = Harness(sb, fake, cfg, policy=policy).go()
+        (replied,) = fake.events_of("permission.replied")
+    _assert_ready(run, sb.ws("agent-a"))
+    assert replied["properties"]["reply"] == "once"
+    (line,) = _jsonl(sb.out_dir / "agent-a" / "decisions.jsonl")
+    assert line["layer"] == "mechanical"
+    assert line["reason"] == "inside worktree/tmp_roots"
+    assert policy._completion_fn.calls == 0
+
+
 def test_three_questions_in_one_turn_stall_and_abort(tmp_path):
     scenario = {"turns": [{"on_prompt": work_ready, "events": ["busy"], "questions": 3, "delay": 0.5}]}
     sb, fake, _h, run, aborted = _run_one(tmp_path, scenario)

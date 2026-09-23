@@ -11,6 +11,8 @@ answered by silence:
   1. ``Policy._mechanical`` — geometry, free. Every path the event names is
      resolved (a symlink out of the worktree is judged by its target) and
      compared with ``forbidden``, then with the worktree and ``tmp_roots``.
+     A forbidden entry that holds the worktree (the rounds folder) does not
+     claim the worktree itself (KC-46).
      ``doom_loop`` is rejected outright, and a ``bash`` command that matches
      ``deny_commands`` is rejected too. No model is called on this branch.
   2. ``Policy._ask_gate`` — one call to the gate model, a *different* model
@@ -213,8 +215,10 @@ class PolicyContext:
     inside it is free and everything outside it is a permission event we
     answer (PROBE.md, §"The boundary is the session directory"). ``tmp_roots``
     are the scratch globs ``contest.ini`` allows outside it. ``forbidden`` is
-    the round's other worktrees, the repo's own ``.git`` and the hard
-    denylist. ``recent_tools`` are the last few ``tool`` parts of the session
+    the rounds folder (every other worktree, this round's and earlier ones'),
+    the repo's own ``.git`` and the hard denylist; an entry that is the
+    worktree or one of its ancestors never forbids a path inside the worktree
+    (KC-46). ``recent_tools`` are the last few ``tool`` parts of the session
     (KC-1's ``tool_parts``), so the gate can see what the agent has been
     doing rather than one call out of context. ``gate_budget_left`` is the
     runner's counter — the only state this policy carries.
@@ -391,10 +395,19 @@ def _inside(path: Path, root: Path) -> bool:
     return path == root or root in path.parents
 
 
-def _forbidden_match(path: Path, forbidden) -> "Path | None":
-    """The first forbidden entry *path* is equal to or under, or ``None``."""
+def _forbidden_match(path: Path, forbidden, worktree: "Path | None" = None) -> "Path | None":
+    """The first forbidden entry *path* is equal to or under, or ``None``.
+
+    KC-46: with *worktree*, a *path* inside it is not claimed by an entry that
+    is the worktree or one of its ancestors. The runner forbids the whole
+    rounds folder, and the agent's own worktree is in it. An entry *inside*
+    the worktree (a ``.git``, a ``.ssh``) still wins over the worktree.
+    """
+    own = worktree is not None and _inside(path, worktree)
     for entry in _as_list(forbidden):
         if not isinstance(entry, Path):
+            continue
+        if own and _inside(worktree, entry):
             continue
         if path == entry:
             return entry
@@ -611,15 +624,16 @@ class Policy:
             return Decision("reject", "mechanical", "doom loop")
 
         pairs = _extract_paths(props)
+        worktree = _resolve(ctx.worktree)
         for resolved, originals in pairs:
-            entry = _forbidden_match(resolved, ctx.forbidden)
+            entry = _forbidden_match(resolved, ctx.forbidden, worktree)
             if entry is not None:
                 return Decision(
                     "reject", "mechanical",
                     f"forbidden: {', '.join(originals)} is at or under {entry}",
                 )
 
-        if _inside_worktree_or_tmp(pairs, _resolve(ctx.worktree), self._tmp_roots(ctx)):
+        if _inside_worktree_or_tmp(pairs, worktree, self._tmp_roots(ctx)):
             return Decision("once", "mechanical", "inside worktree/tmp_roots")
 
         if permission == "bash":

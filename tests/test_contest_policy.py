@@ -1263,3 +1263,95 @@ def test_dev_shm_is_a_place_and_still_goes_to_the_gate(tmp_path):
     assert decision.layer == "gate"
     assert len(gate.calls) == 1
     assert "/dev/shm" not in NULL_DEVICES
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KC-46: the rounds folder is forbidden, the agent's own worktree in it is not
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _rounds(tmp_path):
+    """``<tmp>/rounds`` with this agent's ``86-a``, a sibling ``86-b`` and an
+    earlier round's ``85-a``; the context the runner builds for ``86-a``."""
+    rounds = (tmp_path / "rounds").resolve()
+    for name in ("86-a", "86-b", "85-a"):
+        (rounds / name / "scripts").mkdir(parents=True)
+    own = rounds / "86-a"
+    return rounds, own, {"forbidden": HARD_DENYLIST + (rounds,)}
+
+
+def _bash(command):
+    return make_event(permission="bash", patterns=[command], command=command)
+
+
+def test_own_worktree_by_absolute_path_is_mechanical_once(tmp_path):
+    rounds, own, ctx = _rounds(tmp_path)
+    gate = StubGate(json.dumps(REJECT))
+    policy = Policy(make_config(), completion_fn=gate, clock=FakeClock())
+
+    for command in (f"head -3 {own}/scripts/x.py",
+                    f"cd {own} && python3 --version",
+                    f"cat {own}/tests/SLOW_TESTS.txt"):
+        decision = decide(policy, _bash(command), own, **ctx)
+        assert (decision.reply, decision.layer) == ("once", "mechanical"), command
+        assert decision.reason == "inside worktree/tmp_roots"
+    assert gate.calls == []
+
+
+@pytest.mark.parametrize("other", ["86-b", "85-a"])
+def test_another_worktree_under_the_rounds_folder_stays_forbidden(tmp_path, other):
+    """A sibling of this round and an earlier round's worktree alike."""
+    rounds, own, ctx = _rounds(tmp_path)
+    gate = StubGate(json.dumps(ALLOW))
+    policy = Policy(make_config(), completion_fn=gate, clock=FakeClock())
+
+    decision = decide(policy, _bash(f"cat {rounds / other}/x.py"), own, **ctx)
+
+    assert (decision.reply, decision.layer) == ("reject", "mechanical")
+    assert "forbidden" in decision.reason and str(rounds) in decision.reason
+    assert gate.calls == []
+
+
+def test_own_file_beside_a_siblings_file_is_rejected(tmp_path):
+    rounds, own, ctx = _rounds(tmp_path)
+    gate = StubGate(json.dumps(ALLOW))
+    policy = Policy(make_config(), completion_fn=gate, clock=FakeClock())
+
+    decision = decide(policy, _bash(f"diff {own}/a.py {rounds}/86-b/a.py"), own, **ctx)
+
+    assert (decision.reply, decision.layer) == ("reject", "mechanical")
+    assert f"{rounds}/86-b/a.py" in decision.reason
+    assert gate.calls == []
+
+
+def test_the_rounds_folder_itself_stays_forbidden(tmp_path):
+    """Only the worktree is let through, not the folder that holds it."""
+    rounds, own, ctx = _rounds(tmp_path)
+    policy = Policy(make_config(), completion_fn=StubGate(json.dumps(ALLOW)),
+                    clock=FakeClock())
+
+    decision = decide(policy, _bash(f"ls {rounds}"), own, **ctx)
+
+    assert (decision.reply, decision.layer) == ("reject", "mechanical")
+
+
+def test_an_entry_inside_the_own_worktree_still_beats_it(tmp_path):
+    """The exemption covers the worktree's ancestors only: a forbidden
+    ``.git`` inside the worktree is still forbidden."""
+    rounds, own, ctx = _rounds(tmp_path)
+    dotgit = own / ".git"
+    dotgit.mkdir()
+    policy = Policy(make_config(), completion_fn=StubGate(json.dumps(ALLOW)),
+                    clock=FakeClock())
+
+    decision = decide(policy, _bash(f"cat {dotgit}/config"), own,
+                      forbidden=ctx["forbidden"] + (dotgit,))
+
+    assert (decision.reply, decision.layer) == ("reject", "mechanical")
+    assert str(dotgit) in decision.reason
+
+
+def test_forbidden_match_without_a_worktree_is_unchanged(tmp_path):
+    rounds, own, _ = _rounds(tmp_path)
+    assert policy_mod._forbidden_match(own / "x.py", (rounds,)) == rounds
+    assert policy_mod._forbidden_match(own / "x.py", (rounds,), own) is None
+    assert policy_mod._forbidden_match(rounds / "86-b" / "x.py", (rounds,), own) == rounds
