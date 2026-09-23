@@ -1,9 +1,9 @@
-# KC-49 — a roster model runs at a named reasoning variant, or at `highest`: the top variant that answers `say: hello`
+# KC-49 — a roster model runs at its highest reasoning variant that answers `say: hello` unless told otherwise; a named variant, or none, on request
 
-**Status:** queued — asked by the operator 2026-09-23 after round 86, where every agent (SenseNova included) ran at its provider's default reasoning effort because no variant ever reached Kilo. Split out of KC-11: this is the plumbing and the ladder; KC-11 keeps the cache.
+**Status:** landed `620518e` (2026-09-23, by hand on branch `kc49`, not a round). Asked by the operator 2026-09-23 after round 86, where every agent (SenseNova included) ran at its provider's default reasoning effort because no variant ever reached Kilo. Split out of KC-11: this is the plumbing and the ladder; KC-11 keeps the cache.
 **Severity:** MEDIUM (the strongest setting of the models the round depends on is unreachable from `run`)
-**File:** `tools/contest/kilo_client.py`, `tools/contest/backend.py`, `tools/contest/runner.py`, `tools/contest/cli.py`, `tools/contest/variant.py` (new)
-**Symbol:** `KiloClient.create_session`, `KiloClient.prompt`, `KiloClient.delete_session` (new), `SessionRef.variant`, `ContestBackend.create_session`, `run_agent`, `agents_from_models`, `resolve_variants` (new), `_check_offer`, `Intake.agents`, `_apply_flags`, `_print_plan`, `pick_variant`, `hello_probe`
+**File:** `tools/contest/kilo_client.py`, `tools/contest/backend.py`, `tools/contest/runner.py`, `tools/contest/cli.py`, `tools/contest/roster.py`, `tools/contest/variant.py` (new), `contest.ini`
+**Symbol:** `KiloClient.create_session`, `KiloClient.prompt`, `KiloClient.delete_session` (new), `SessionRef.variant`, `ContestBackend.create_session`, `run_agent`, `agents_from_models`, `resolve_variants` (new), `_check_offer`, `ContestConfig.variant`, `Intake.agents`, `_apply_flags`, `_print_plan`, `pick_variant`, `hello_probe`
 **Round:** 93
 **Size:** S
 **Source:** the code at `1852ee2` and a live Kilo 7.6.2.
@@ -28,7 +28,7 @@
   the list — it has to be asked.
 
 **Depends on:** KC-25 (`KiloClient.providers`, `roster_on_offer`, the fake's `GET /provider`, landed `215a740`), KC-16 (`intake`, `cmd_run`).
-**Also touches:** `tests/_kilo_fake.py` (`DELETE /session/{id}`; `reject_variants` answers a variant with a `session.error`), `tests/test_contest_variant.py` (new), `tests/test_contest_cli.py`, `tests/test_contest_backend.py`, `.smoke_tests/`
+**Also touches:** `tests/_kilo_fake.py` (`DELETE /session/{id}`; `reject_variants` answers a variant with a `session.error`), `tests/test_contest_variant.py` (new), `tests/test_contest_cli.py`, `tests/test_contest_backend.py`, `tests/test_contest_roster.py`, `.smoke_tests/`
 
 ---
 
@@ -46,13 +46,19 @@
 - `run_agent` passes `variant=spec.variant`.
 - `KiloClient.delete_session(session)` — `DELETE /session/{id}`.
 
-### 2. The operator names it
+### 2. The highest by default; the operator can name another
 
-- `--models` item `provider/model@variant`: the variant is not part of the
-  agent's name (`m@high,m@low` → `m-var1`, `m-var2`).
-- `--variant NAME` — the default for every agent (from `--models` or the
-  roster) that names none.
-- A roster section's `variant =` already exists and now works.
+- **Default: `highest`.** `[contest] variant` (new key, `contest.ini` ships
+  `variant = highest`; absent or empty is `highest`) is the variant of every
+  agent that names none. A round with no flag runs every model at the top
+  variant that answers.
+- `--variant NAME` overrides the key for this round.
+- An agent's own variant overrides both: a `--models` item
+  `provider/model@variant` (not part of the agent's name: `m@high,m@low` →
+  `m-var1`, `m-var2`), or a roster section's `variant =` (already read, now
+  used).
+- `default` — as the key, the flag or `@default` — sends no variant: the
+  provider's own default, today's behaviour.
 
 ### 3. Intake makes it real
 
@@ -68,7 +74,11 @@ passed (a refused round spends no model call):
   session after. The first rung with an idle turn, no `session.error` and a
   non-empty reply wins. One probe per `provider/model`, however many agents
   ask for it. Nothing answering is one failure line naming every rung and its
-  reason. `highest` with no offer to read is a failure, not a default.
+  reason. A model that lists no variants is not asked — `highest` of nothing
+  is no variant, so a roster of such models costs no probe. With no offer to
+  read (no server started, `GET /provider` failed, `backend = openrouter`)
+  `highest` becomes no variant: it is the default, and the round reports its
+  own server failure.
 - stdout: one `variant: provider/model@highest → high (failed: max: …; xhigh: …)`
   line per probed model; the plan's `agents` line shows `model@variant`.
 - `cmd_run` runs the resolved roster (`Intake.agents`).
@@ -88,5 +98,9 @@ named explicitly.
 - [ ] With the fake rejecting `max` and `xhigh` (glm's live payload), `--models glm-4-7-flash:free@highest` runs the round at `high`: three probe sessions (`max`, `xhigh`, `high`) all deleted, the round's session and prompts carry `high`, the plan reads `kenary/glm-4-7-flash:free@high`.
 - [ ] `@turbo` is refused at intake with the listed names, and no session — probe or round — is created.
 - [ ] `--variant medium` sends `medium` and probes nothing.
-- [ ] Live, once, by hand (not a test): `highest` on `kenary/glm-4-7-flash:free` → `high` with `max`/`xhigh` failed; on `sensenova123/sensenova-6.8-flash-lite` → `high`.
+- [ ] No flag at all: the glm case above runs at `high` — `highest` is the default.
+- [ ] `--variant default` (and `@default`) sends no `variant` key and probes nothing.
+- [ ] `[contest] variant` parses: absent or empty → `highest`; `high`, `default` as written; `--variant` overrides it; an agent's own variant overrides both.
+- [ ] `highest` on a model that lists no variants: no probe, no variant sent — every existing fake round (its models list none) is unchanged.
+- [ ] Every test runs offline: the fake server only, no provider, no internet.
 - [ ] `tests` and `tests_bugfix` green; `sync_test_tiers --check` clean; `CollectBridge._shrink` byte-identical.
