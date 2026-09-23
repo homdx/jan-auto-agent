@@ -360,10 +360,19 @@ def test_gate1_rows_must_be_equal_between_arms():
 
 # ── the stub ──────────────────────────────────────────────────────────────────
 
+# FL-1 (round 84): a hang guard against a stub server in this very process,
+# not a claim about how fast it answers. 10 s looked generous for a loopback
+# POST that normally returns in milliseconds, and the operator's 32-worker
+# stress run went through it anyway — a `TimeoutError: timed out` from deep
+# inside `http.client`, which says nothing about what broke. pytest-timeout
+# is the right thing to call a hang a hang, and it prints a stack dump.
+_STUB_TIMEOUT_S = 120
+
+
 def _post(url: str, body: dict) -> bytes:
     req = urllib.request.Request(url, data=json.dumps(body).encode("utf-8"),
                                  headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=10) as resp:
+    with urllib.request.urlopen(req, timeout=_STUB_TIMEOUT_S) as resp:
         return resp.read()
 
 

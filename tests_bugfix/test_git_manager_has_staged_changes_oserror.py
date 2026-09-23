@@ -100,7 +100,7 @@ def test_normal_operation_unaffected_with_staged_changes(tmp_path):
 # index, and a second git that finds it there exits 128 without waiting.
 # GitManager named stale locks in its error text but never waited for a held
 # one, so a single collision cost a task its commit: the operator's
-# 64-worker stress run surfaced it as `CommitOnSuccess: git error for task
+# 32-worker stress run surfaced it as `CommitOnSuccess: git error for task
 # T1 — git add -u failed` in
 # tests_bugfix/test_collect_bridge_stale_after_task_commit.py, and in a real
 # autonomous run the same collision loses the agent's work.
@@ -119,67 +119,79 @@ def _repo_with_a_commit(tmp_path: Path):
     return gm
 
 
-def test_a_held_index_lock_is_waited_out_not_raised(tmp_path):
+def test_a_held_index_lock_is_waited_out_not_raised(tmp_path, monkeypatch):
     """Another git holds the index and releases it: the command goes through.
 
     Without the retry this raises `GitError` on the first attempt — the lock
     is still held when `git add -u` starts, which is the whole point.
-    """
-    import threading
-    import time
 
+    The release happens *in* the retry's backoff rather than on a timer in
+    another thread (FL-1, round 84): a `time.sleep(0.5)` racing a bounded
+    ladder is the same wall-clock bet this whole ticket is about, and it
+    lost it on a loaded box. Standing in for the sleep makes the ordering —
+    first attempt fails, lock clears, second attempt succeeds — exact, and
+    costs the test no real time at all.
+    """
     gm = _repo_with_a_commit(tmp_path)
     lock = tmp_path / ".git" / "index.lock"
     lock.write_text("", encoding="utf-8")          # somebody else has the index
 
-    released = threading.Event()
+    backoffs: list = []
 
-    def release():
-        time.sleep(0.5)
-        lock.unlink()
-        released.set()
+    def release_instead_of_sleeping(seconds):
+        backoffs.append(seconds)
+        if lock.exists():
+            lock.unlink()
 
-    threading.Thread(target=release, daemon=True).start()
+    monkeypatch.setattr(gm, "_backoff", release_instead_of_sleeping)
     (tmp_path / "a.txt").write_text("2\n", encoding="utf-8")
 
     gm._run(["git", "add", "-u"], "git add -u failed")
 
-    assert released.is_set(), "the add went through before the lock was released"
+    assert backoffs == [gm._LOCK_BACKOFF_S], (
+        "expected exactly one backoff: the first attempt hits the lock, the "
+        f"second succeeds — got {backoffs}"
+    )
     assert gm.has_staged_changes() is True
 
 
-def test_a_stale_index_lock_still_raises_with_the_original_message(tmp_path):
+def test_a_stale_index_lock_still_raises_with_the_original_message(tmp_path, monkeypatch):
     """The retry is bounded: a lock nobody will ever release is still an
     error, and still the same one — the message already tells the operator
     that a stale `.git/index.lock` is a likely cause."""
-    import time
-
     from tools.auto.git_manager import GitError
 
     gm = _repo_with_a_commit(tmp_path)
     (tmp_path / ".git" / "index.lock").write_text("", encoding="utf-8")
     (tmp_path / "a.txt").write_text("2\n", encoding="utf-8")
 
-    started = time.monotonic()
+    backoffs: list = []
+    monkeypatch.setattr(gm, "_backoff", backoffs.append)
+
     with pytest.raises(GitError) as exc:
         gm._run(["git", "add", "-u"], "git add -u failed")
-    elapsed = time.monotonic() - started
 
     assert "git add -u failed" in str(exc.value)
     assert "index.lock" in str(exc.value)
-    # it gave up rather than hanging: the whole ladder is a couple of seconds
-    assert elapsed < 30, elapsed
+    # it gave up rather than hanging, and the ladder is counted rather than
+    # timed — the real sleeps are stood in for, so a loaded box changes
+    # nothing about what this asserts (FL-1, round 84)
+    assert len(backoffs) == gm._LOCK_RETRIES - 1
 
 
-def test_a_real_git_error_is_not_retried(tmp_path):
+def test_a_real_git_error_is_not_retried(tmp_path, monkeypatch):
     """Only lock contention repeats. An ordinary failure raises at once, so a
-    broken command does not pay the whole backoff ladder."""
-    import time
+    broken command does not pay the whole backoff ladder.
 
+    Counted, not timed (FL-1, round 84): "it did not back off" is the claim,
+    and a stopwatch around a subprocess is a bet on the box, not on that.
+    """
     from tools.auto.git_manager import GitError
 
     gm = _repo_with_a_commit(tmp_path)
-    started = time.monotonic()
+    backoffs: list = []
+    monkeypatch.setattr(gm, "_backoff", backoffs.append)
+
     with pytest.raises(GitError):
         gm._run(["git", "checkout", "no-such-branch-here"], "git checkout failed")
-    assert time.monotonic() - started < 1.0
+    assert backoffs == []

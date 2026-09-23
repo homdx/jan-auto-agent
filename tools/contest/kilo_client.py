@@ -96,6 +96,10 @@ _VERSION_RE = re.compile(r"(\d+)\.(\d+)(?:\.(\d+))?")
 #: stream is closed by `stop()` or by the server, not by a timeout.
 _STREAM_READ_TIMEOUT = 3600.0
 
+# FL-1 (round 84): how often EventTap forces its event log to disk. It used
+# to be every single event, on the reader thread — see EventTap._write_log.
+_LOG_FLUSH_INTERVAL_S = 0.5
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # errors
@@ -479,10 +483,14 @@ class EventTap:
         self.events: list[dict] = []
         self.cursor: int = 0
         self.lock = threading.Lock()
+        # FL-1 (round 84): waiters sleep on this instead of polling, so an
+        # event reaches wait() the moment the reader records it. See wait().
+        self._cond = threading.Condition(self.lock)
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._socket = None
         self._log = None
+        self._last_flush: float | None = None
 
     def start(self) -> "EventTap":
         """Start the reader thread (already running: no change)."""
@@ -550,20 +558,44 @@ class EventTap:
 
         A log that cannot be written (a full disk, a closed handle) does not
         stop the reader: the in-memory list is the copy a caller waits on.
+
+        The in-memory copy is published *first*, and waiters are woken before
+        the log is touched at all (FL-1, round 84) — what a caller's silence
+        clock measures must not include this tap's own bookkeeping.
         """
-        with self.lock:
+        with self._cond:
             self.events.append(event)
+            self._cond.notify_all()
         try:
             self._write_log({"t": time.time(), "event": event})
         except (OSError, ValueError, TypeError):
             pass
 
     def _write_log(self, entry: dict) -> None:
+        """Append one entry, flushing on a bounded cadence rather than per event.
+
+        FL-1 (round 84): this used to ``flush()`` on every single event, on
+        the reader thread, so the next line of the stream was not read until
+        that write returned. A ``write(2)`` is not free when the page cache
+        is full — under dirty-page writeback throttling it blocks, and on a
+        box running four ``pytest -n 8`` invocations it blocked for
+        *seconds*. The caller's silence clock counts that as the session
+        going quiet, so a turn that was emitting the whole time got declared
+        stalled and aborted: the agent's own event log starved the agent.
+
+        The same hazard family as the metrics lock spanning ``fsync`` — a
+        blocking disk operation on a path that a timing guard depends on.
+        Buffered writes still land in order and ``_close_log`` flushes, so
+        the on-disk format and completeness at ``stop()`` are unchanged.
+        """
         log = self._log
         if log is None:
             return
         log.write(json.dumps(entry) + "\n")
-        log.flush()
+        now = time.monotonic()
+        if self._last_flush is None or (now - self._last_flush) >= _LOG_FLUSH_INTERVAL_S:
+            log.flush()
+            self._last_flush = now
 
     def _close_with(self, reason: str) -> None:
         """Append the synthetic ``tap.closed`` event that wakes waiters."""
@@ -586,17 +618,28 @@ class EventTap:
         looked at, matching or not, and it persists across calls.
         """
         deadline = time.monotonic() + max(0.0, float(timeout))
-        while time.monotonic() < deadline:
-            while True:
-                with self.lock:
-                    if self.cursor >= len(self.events):
-                        break
+        while True:
+            event = None
+            with self._cond:
+                if self.cursor < len(self.events):
                     event = self.events[self.cursor]
                     self.cursor += 1
-                if pred(event):
-                    return event
-            time.sleep(0.2)
-        return None
+                else:
+                    left = deadline - time.monotonic()
+                    if left <= 0:
+                        return None
+                    # FL-1 (round 84): woken by _record, not by a 0.2 s poll.
+                    # The poll put up to 200 ms between an event arriving and
+                    # the caller seeing it, on top of whatever the box was
+                    # already charging — and a caller's silence clock is
+                    # measured from when it *sees* an event, so that latency
+                    # counted as the session being quiet.
+                    self._cond.wait(left)
+                    continue
+            # pred runs outside the lock: it is the caller's code, and the
+            # reader thread must not wait on it to record the next event.
+            if pred(event):
+                return event
 
     def stop(self) -> "EventTap":
         """Ask the reader to finish. Any number of times, even before start.

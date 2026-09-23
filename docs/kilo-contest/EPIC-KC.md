@@ -215,3 +215,24 @@ Order of implementation as requested: KC-9, then KC-10, then KC-11.
 | 69 | KC-30 | `harvest` names the branch's one commit when no `PROGRESS.csv` row does, so `export_patches` has a sha and no caller re-derives one | S |
 | 70 | KC-31 | a `STALLED`/`ERROR` worktree with edits and no commit is exported as `<agent>.STALLED.diff` | S |
 | 71 | KC-32 | the contest tests stop failing on the operator's own box: `contest.local.ini` is not the committed roster, and no test bounds wall-clock under a round's load | S |
+
+## 11. Added 2026-09-23 — FL-1 and its postmortem
+
+Round 84 (FL-1, `epic-tasks/84-…`) is the hardest ticket the epic has
+produced: the full test suite is not reproducibly green under load, and the
+causes are **layered**, so a candidate with real progress still sees an
+identical red suite. Five agents ran it and none finished; Opus 5 needed two
+sittings and twelve further stress runs after the first fix already looked
+done.
+
+| file | what it is |
+|---|---|
+| `POSTMORTEM-FL-1.md` (repo root; identical copy `docs/kilo-contest/POSTMORTEM-FL-1.md`) | the full account — ten causes, six rounds, the four-shape taxonomy of time-dependent test failure (§8), verification by regression injection (§9) and the diagnostic toolkit (Appendix B) |
+| `contest-bench/fl1/RUNBOOK.md` | how to rerun FL-1 as a benchmark: the base, the stress command, what the round is scoring, and the acceptance bar |
+
+Four of the ten causes are production bugs (a lock held across `fsync`;
+`float(MagicMock()) == 1.0`; `EventTap` flushing per event on the reader
+thread and starving the silence clock it feeds; `.git/index.lock` treated as
+a hard failure). Two of those were in code nobody suspected, inside tests
+that had already been written off as flaky — which is the reason the
+postmortem exists as a document rather than a commit message.

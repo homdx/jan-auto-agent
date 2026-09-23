@@ -51,6 +51,7 @@ for _p in (str(REPO_ROOT), str(TESTS_DIR)):
 
 from _kilo_fake import FakeKiloServer  # noqa: E402
 
+import tools.contest.kilo_client as kilo_client_module  # noqa: E402
 from tools.contest.kilo_client import (  # noqa: E402
     EventTap,
     KiloClient,
@@ -122,7 +123,7 @@ def _probe(tmp_path, scenario, *, reply_timeout: float = 20.0, agent=None):
     # a tap only receives events after its /event connection is open, on the
     # fake as on a real server — wait for it so session.created is not lost.
     # FL-1 (round 84): this used to poll for a fixed 2 s. That is a deadline,
-    # and on the operator's 64-worker box a thread opening an HTTP connection
+    # and on the operator's 32-worker box a thread opening an HTTP connection
     # can need longer; missing the handshake loses every event the turn
     # emits, which surfaces as a bewildering `status == "timeout"` somewhere
     # far from here. 30 s, and it still fails loudly if the tap never comes.
@@ -391,7 +392,7 @@ def test_wait_idle_aborts_on_stall(tmp_path):
 
     FL-1 (round 84): the pause was 2 s under a 1.5 s bound, i.e. 1 s of
     slack between "took the window" and "took the pause", and the operator's
-    64-worker stress run does not honour 1 s. Widening the *slow* path is
+    32-worker stress run does not honour 1 s. Widening the *slow* path is
     free — a green run still returns at ~0.5 s — and it buys 19.5 s of
     slack. (`FakeKiloServer._sleep` wakes on `stop()`, so the 60 s pause
     costs nothing at teardown.)"""
@@ -413,62 +414,157 @@ def test_wait_idle_aborts_on_stall(tmp_path):
     assert h.fake.recorded_abort_for(h.session.id)
 
 
-def test_events_of_the_session_keep_wait_idle_alive(tmp_path):
-    """The silence clock counts every event of the session, not only the ones
-    ``wait_idle`` acts on: a ``session.status busy`` every ``BEAT`` carries the
-    turn well past the silence window, and it still reaches idle. No abort, no
-    early cut-off.
+class _ScriptedTap:
+    """A tap that hands ``wait_idle`` a scripted stream on a fake clock.
 
-    FL-1 (round 84). The sibling of
-    ``test_contest_runner.py::test_events_of_the_session_keep_a_turn_alive``,
-    and it obeys the same arithmetic — see that test for the full reasoning.
-    In short: a regression (``wait_idle`` not counting ``session.status``)
-    cuts the turn at ``window``, so the only way to prove the opposite is to
-    *survive* longer than ``window``, and the turn survives only if no gap
-    between two delivered events exceeds it. Window, runtime and tolerance
-    for a starved box are therefore one number, and there is no margin to
-    widen. Narrowing the beat does not substitute: the runner-side twin
-    failed the operator's stress run while emitting every 0.1 s, because
-    what starved was the *delivery* — a fake HTTP server, an SSE stream and
-    a tap thread — not the emitting thread. So this test buys its
-    robustness with wall time: an 8 s window and 12 s of beats.
+    FL-1 (round 84). The integration version of this claim
+    (``test_events_of_the_session_keep_a_turn_alive`` and the one that used
+    to live here) has a shape that cannot be made load-proof:
 
-    The heartbeat thread emits the idle itself after a fixed number of
-    beats, rather than the turn idling on a wall-clock ``delay``. A starved
-    box can then only make the turn longer, never end it before the beats
-    do.
+      a regression cuts the turn at ``window``, so the only proof is
+      *surviving* longer than ``window``, and the turn survives only if no
+      gap between two **delivered** events exceeds it — so the window, the
+      test's runtime and its tolerance for a starved box are one number.
+
+    Widening it just makes the test slower, and it still failed the
+    operator's 32-worker stress run at eight seconds, because what starves
+    is the delivery path — a fake HTTP server, an SSE stream, a reader
+    thread — not the thread doing the emitting.
+
+    So the claim is settled here instead, with neither. There is no
+    transport: this stands in for ``EventTap`` and releases the next event
+    when ``wait_idle`` asks for one. And there is no wall clock: time only
+    moves when this object moves it, by exactly the amount ``wait_idle``
+    said it was willing to wait. A starved box cannot change the outcome
+    because nothing here is measured against real time.
+
+    Faithful to ``EventTap.wait`` in the two ways that matter: the cursor
+    advances past every event looked at, matching or not, and an event the
+    predicate rejects is *consumed without being returned* — the caller
+    keeps waiting. That second one is what makes a regression visible: a
+    ``wait_idle`` that did not count ``session.status`` as an event of the
+    session would consume the beats, see nothing, and let its silence clock
+    run out.
     """
-    window, beat, beats = 8.0, 0.2, 60
-    scenario = {"turns": [{"events": ["busy"], "idle": False, "assistant": "done"}]}
-    with _probe(tmp_path, scenario) as h:
-        def heartbeat():
-            for _ in range(beats):
-                if h.fake._stop.is_set():
-                    return
-                time.sleep(beat)
-                h.fake._emit({"type": "session.status",
-                              "properties": {"sessionID": h.session.id,
-                                             "status": "busy"}})
-            h.fake._emit({"type": "session.idle",
-                          "properties": {"sessionID": h.session.id}})
 
-        threading.Thread(target=heartbeat, daemon=True).start()
-        started = time.monotonic()
-        h.client.prompt(h.session, "slow turn")
-        # the overall deadline is deliberately far away: it is not what this
-        # test is about, and a loaded box must not hit it by accident
-        res = h.client.wait_idle(h.tap, h.session, 300.0, idle_event_timeout=window,
-                                 on_permission=_reject, on_question=lambda event: None)
-        elapsed = time.monotonic() - started
+    def __init__(self, events, *, every: float, clock):
+        self._events = list(events)
+        self._every = float(every)
+        self._clock = clock
+        self._next_at = clock.now + self._every
+
+    def wait(self, pred, timeout):
+        deadline = self._clock.now + max(0.0, float(timeout))
+        while True:
+            if not self._events or self._next_at > deadline:
+                # nothing more is due inside what the caller will wait for:
+                # the stream is silent for the whole of it
+                self._clock.now = deadline
+                return None
+            self._clock.now = self._next_at
+            self._next_at = self._clock.now + self._every
+            event = self._events.pop(0)
+            if pred(event):
+                return event
+            # consumed, not returned — exactly what EventTap does with an
+            # event its caller's predicate rejects
+
+
+class _FakeClock:
+    """``time.monotonic`` that only moves when a test moves it."""
+
+    def __init__(self, start: float = 1000.0):
+        self.now = float(start)
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+def _silence_clock_probe(monkeypatch, events, *, window, every, aborts=None):
+    """Run ``KiloClient.wait_idle`` over a scripted stream on a fake clock."""
+    clock = _FakeClock()
+    monkeypatch.setattr(kilo_client_module.time, "monotonic", clock.monotonic)
+
+    class _Client(KiloClient):
+        def __init__(self):
+            pass
+
+        def _abort_quietly(self, session):
+            (aborts if aborts is not None else []).append(session.id)
+
+    session = SessionRef(id="ses_probe", provider_id="p", model_id="m",
+                         directory="/nowhere")
+    tap = _ScriptedTap(events, every=every, clock=clock)
+    return _Client().wait_idle(tap, session, 10_000.0, idle_event_timeout=window,
+                               on_permission=_reject, on_question=lambda event: None)
+
+
+def _ev(etype, session_id="ses_probe", **props):
+    return {"type": etype, "properties": {"sessionID": session_id, **props}}
+
+
+def test_events_of_the_session_keep_wait_idle_alive(monkeypatch):
+    """The silence clock counts every event of the session, not only the ones
+    ``wait_idle`` acts on: a ``session.status busy`` every 0.4 s carries the
+    turn through eight 1 s windows, and it still reaches idle — many windows
+    past the first one. No abort, no early cut-off."""
+    window, every = 1.0, 0.4
+    beats = [_ev("session.status", status="busy") for _ in range(20)]
+    aborts: list = []
+
+    res = _silence_clock_probe(monkeypatch, beats + [_ev("session.idle")],
+                               window=window, every=every, aborts=aborts)
+
     assert res.status == "idle"
-    # it really waited out the heartbeats — past a full silence window, which
-    # is the whole claim. A lower bound only ever gets safer under load.
-    assert res.elapsed > window, res.elapsed
-    assert elapsed > window
-    assert not h.fake.recorded_abort_for(h.session.id)
-    # with no heartbeat counted, this wait would have stalled out at the
-    # window, seconds before the turn idled
-    assert len(h.fake.events_of("session.status")) >= 3
+    # it really waited the beats out — 21 events at 0.4 s is 8.4 s, more than
+    # eight times the window it would have been cut at without them
+    assert res.elapsed > window * 8, res.elapsed
+    assert aborts == []
+
+
+def test_a_beat_the_wait_does_not_count_lets_the_silence_clock_run_out(monkeypatch):
+    """The other side of the same claim, and the regression guard: an event
+    the predicate rejects is consumed without waking the wait, so a
+    ``wait_idle`` that stopped counting ``session.status`` would time out at
+    the window — which is exactly what this test sees when the beats belong
+    to *another* session."""
+    window, every = 1.0, 0.4
+    beats = [_ev("session.status", session_id="ses_someone_else", status="busy")
+             for _ in range(20)]
+    aborts: list = []
+
+    res = _silence_clock_probe(monkeypatch, beats + [_ev("session.idle")],
+                               window=window, every=every, aborts=aborts)
+
+    assert res.status == "timeout"
+    # cut at the window, not after the neighbour's 8 s of chatter
+    assert res.elapsed == window, res.elapsed
+    assert aborts == ["ses_probe"]
+
+
+def test_the_silence_clock_is_off_when_no_idle_event_timeout_is_given(monkeypatch):
+    """``idle_event_timeout=None`` is KC-1's wait, event for event: a silent
+    stream runs to the overall deadline instead of being cut at a window."""
+    clock = _FakeClock()
+    monkeypatch.setattr(kilo_client_module.time, "monotonic", clock.monotonic)
+    aborts: list = []
+
+    class _Client(KiloClient):
+        def __init__(self):
+            pass
+
+        def _abort_quietly(self, session):
+            aborts.append(session.id)
+
+    session = SessionRef(id="ses_probe", provider_id="p", model_id="m",
+                         directory="/nowhere")
+    tap = _ScriptedTap([], every=1.0, clock=clock)
+    res = _Client().wait_idle(tap, session, 42.0, idle_event_timeout=None,
+                              on_permission=_reject, on_question=lambda event: None)
+
+    assert res.status == "timeout"
+    assert res.elapsed == 42.0
+    assert aborts == ["ses_probe"]
 
 
 def test_a_neighbours_events_do_not_keep_a_silent_session_alive(tmp_path):
@@ -663,7 +759,7 @@ def test_spawn_waits_for_health_and_close_kills_the_child(tmp_path):
     started = time.monotonic()
     # FL-1 (round 84): the gate is generous and the bound is in the middle —
     # spawn returning at all is the claim, and a health poll that needs 12 s
-    # on a 64-worker box is still a pass, not a failure.
+    # on a 32-worker box is still a pass, not a failure.
     server = KiloServer.spawn(str(binary), log_path=str(log), health_timeout=60.0)
     assert time.monotonic() - started < 60.0
     try:

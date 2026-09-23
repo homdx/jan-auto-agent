@@ -264,7 +264,7 @@ class _BenchFake(FakeKiloServer):
         control the length of — FL-1 (round 84): a counted heartbeat next to
         a turn whose ``on_prompt`` does real git work is a race on the *total*
         length of the beats, not just on the interval between them. Under the
-        operator's 64-worker stress run the hook's commit pushed the turn's
+        operator's 32-worker stress run the hook's commit pushed the turn's
         idle out past the end of a 6 s pulse, the silence window opened after
         the last beat, and a turn that reached READY was aborted on the way.
         Either the beats outlive the turn by construction, or the test is
@@ -656,46 +656,46 @@ def test_idle_event_timeout_stalls_a_silent_session(tmp_path):
 
 def test_events_of_the_session_keep_a_turn_alive(tmp_path):
     """A status event every `BEAT` for `KEEPALIVE_BEATS` beats, then idle:
-    silence is measured from the last event, so no abort — and the turn
-    outlives the silence window, which is the point.
+    a turn that keeps emitting is not aborted, and the runner's
+    `idle_event_timeout_sec` reaches `wait_idle` intact.
 
-    FL-1 (round 84). This test cost three rounds of stress runs to get
-    right, and the arithmetic that finally settled it is worth stating,
-    because it is not the "wider margin" every other test here wanted.
+    FL-1 (round 84). This test cost four rounds of stress runs, and what
+    finally settled it was giving up on proving the *semantics* here.
 
     A regression — `wait_idle` not counting `session.status` as an event of
-    the session — shows up as the turn being cut at `window` after it
-    starts. So the test can only prove the opposite by *surviving longer
-    than the window*. And it survives only if no gap between two consecutive
-    events exceeds the window. That makes the two numbers the same number:
+    the session — cuts the turn at `window`. Proving the opposite therefore
+    means *surviving longer than the window*, and the turn survives only if
+    no gap between two consecutive **delivered** events exceeds it. That
+    makes three numbers one number: the window, this test's runtime, and its
+    tolerance for a starved box. There is no margin to widen, and narrowing
+    the beat does not substitute — a version of this emitted every 0.1 s and
+    the runner still saw three seconds of silence, because what starves is
+    the delivery path and not the emitting thread.
 
-        tolerance for a stalled box == window == how long this test runs
+    So the semantics moved to `tests/test_contest_kilo_client.py`, to
+    `test_events_of_the_session_keep_wait_idle_alive` and its two siblings,
+    which drive `wait_idle` over a scripted tap on a fake clock: no
+    transport to starve and no real time at all. A KC-12 regression fails
+    there deterministically — verified by injecting one.
 
-    There is no margin to widen. Narrowing the beat does not help either:
-    the last failure emitted a beat every 0.1 s and the runner still saw
-    more than 3 s of silence, because what starved was not the emitting
-    thread but the *delivery* of what it emitted — a fake HTTP server, an
-    SSE stream and a tap thread that also writes every event to disk, none
-    of which a box running four `pytest -n 8` invocations schedules on
-    demand. Emission is not delivery, and the fixture cannot observe the
-    difference.
+    What is left here is the integration half, and it is load-proof: a turn
+    that keeps emitting is not aborted. The window is far longer than the
+    beats, so nothing has to outrun anything;
+    `test_idle_event_timeout_stalls_a_silent_session` is what proves the
+    configured value reaches `wait_idle` at all, and it wants its stall, so
+    it is load-proof too.
 
-    So this test buys its robustness with wall time, deliberately: an 8 s
-    window and 12 s of beats. It is one of the slowest tests in the file
-    and that is the price of the claim.
-
-    The span comes from the beat *count*, not from a `delay` — the pulse
-    emits the idle itself. Starvation can then only make the turn longer,
-    never shorter, so there is no second race about the beats running out
-    before the turn ends (which is how this test failed two rounds ago)."""
+    The span still comes from the beat *count* rather than a `delay`, with
+    the pulse emitting the idle itself, so a starved box can only make the
+    turn longer, never end it before the beats do."""
     sb = Sandbox(tmp_path)
-    cfg = make_config(["agent-a"], turn_timeout_sec=120,
-                      idle_event_timeout_sec=KEEPALIVE_WINDOW_S)
+    cfg = make_config(["agent-a"], turn_timeout_sec=300,
+                      idle_event_timeout_sec=CHATTY_WINDOW_S)
     scenario = {"turns": [{"events": ["busy"], "idle": False}]}
     with _BenchFake(scenario) as fake:
         scenario["turns"][0]["on_prompt"] = lambda d, t: (
             fake.pulse(fake.sessions()[-1].id, KEEPALIVE_BEAT_S,
-                       KEEPALIVE_BEATS, then_idle=True),
+                       CHATTY_BEATS, then_idle=True),
             work_ready(d, t))
         run = Harness(sb, fake, cfg).go()
         aborted = _aborted(fake)
@@ -748,6 +748,12 @@ KEEPALIVE_WINDOW_S = 8
 KEEPALIVE_BEAT_S = 0.2
 KEEPALIVE_BEATS = 60          # 12 s of beats, comfortably past the window
 
+# The keep-alive turn does not have to outrun its own window any more — the
+# semantics are settled deterministically in test_contest_kilo_client.py — so
+# it runs for a quarter as long under a window nothing plausibly starves past.
+CHATTY_WINDOW_S = 60
+CHATTY_BEATS = 25             # 5 s of beats, a twelfth of the window
+
 
 def _stall_config(**over) -> ContestConfig:
     """A silence stall inside the turn deadline, so the turn is `stalled`, not a
@@ -756,7 +762,7 @@ def _stall_config(**over) -> ContestConfig:
     # the window is their *slow* path and widening it costs a green run only
     # the two extra seconds it spends proving the stall. What it buys is
     # 2.9 s of margin over the 0.1 s hook heartbeat above, where a 1 s window
-    # left 0.9 s — and 0.9 s is inside what the operator's 64-worker stress
+    # left 0.9 s — and 0.9 s is inside what the operator's 32-worker stress
     # run drifts by.
     kw = dict(turn_timeout_sec=30, idle_event_timeout_sec=3)
     kw.update(over)
@@ -1096,7 +1102,7 @@ def test_retry_backoff_is_observed(tmp_path):
 
     FL-1 (round 84): the old upper bound was `backoff + 10` measured around
     the whole of `_run_one` — which includes building the sandbox (real git
-    worktrees) and two full turns. On the operator's 64-worker box that
+    worktrees) and two full turns. On the operator's 32-worker box that
     setup alone can eat the 10 s, so the bound was a box number, not a
     deadline. The backoff itself is what this test is about, and the turns
     record exactly when it started and ended."""
@@ -1113,9 +1119,12 @@ def test_retry_backoff_is_observed(tmp_path):
     # errored turn going idle to the retry prompt going out.
     error_turn, retry_turn = run.turns
     assert retry_turn["sent_at"] - error_turn["idle_at"] >= cfg.error_retry_backoff_sec
-    # and the run did not sit somewhere else instead: both turns' deadlines
-    # plus the backoff, which is a deadline and not a box number.
-    assert elapsed < cfg.error_retry_backoff_sec + 2 * cfg.turn_timeout_sec
+    # No upper bound on `elapsed`. It measures the whole of `_run_one` —
+    # building the sandbox out of real git worktrees, two full turns, the
+    # harvest — and none of that is the backoff. The stress run measured 78 s
+    # for it on a doubly-loaded box while the assertion above, which is the
+    # actual claim, was true. `backoff + 2 * turn_timeout` looked like a
+    # deadline and was a box number in disguise.
 
 
 def test_retries_exhausted_then_error(tmp_path):

@@ -423,7 +423,7 @@ class GitManager:
     # This repo's own error text has always named it as a likely cause
     # (see `has_uncommitted_changes` and the generic handler below), but
     # nothing ever waited for it, so one collision cost a task its commit.
-    # The operator's 64-worker stress run turned that into a red suite —
+    # The operator's 32-worker stress run turned that into a red suite —
     # `CommitOnSuccess: git error for task T1 — git add -u failed` — and
     # in a real autonomous run it loses the agent's work outright.
     #
@@ -452,8 +452,18 @@ class GitManager:
                     " ".join(cmd), attempt + 1, self._LOCK_RETRIES - 1,
                     self._LOCK_BACKOFF_S,
                 )
-                time.sleep(self._LOCK_BACKOFF_S)
+                self._backoff(self._LOCK_BACKOFF_S)
         raise AssertionError("unreachable")   # pragma: no cover
+
+    def _backoff(self, seconds: float) -> None:
+        """Wait between two lock retries.
+
+        A named seam rather than a bare ``time.sleep`` so a test can stand in
+        for the wait without patching the ``time`` module for its whole
+        process — which is both too broad to be safe and, under ``pytest -n``,
+        a way to change behaviour a long way from the test doing it.
+        """
+        time.sleep(seconds)
 
     def _run_once(self, cmd: list[str], error_msg: str) -> str:
         """One attempt at *cmd*; `_run` is what decides whether to repeat it."""
