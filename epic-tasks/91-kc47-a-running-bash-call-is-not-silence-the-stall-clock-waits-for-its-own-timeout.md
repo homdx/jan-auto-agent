@@ -1,6 +1,6 @@
 # KC-47 — a `bash` call that is still running is not silence: the stall clock waits out the call's own `timeout` instead of aborting the agent's test run at 300 s
 
-**Status:** queued — found live 2026-09-23 in round 86: `sensenova-6-7-flash-lite-var1` was `STALLED — no event for 300s` in the middle of its own `pytest tests -n 4`, which the abort killed; twelve minutes later `mimo-v2-5` the same way.
+**Status:** landed `86c5f7f` (2026-09-24) — round 91, winner sensenova-6-7-flash-lite-var1 (27/28 in `contest-bench/kc47`), merged onto KC-36 with the bound run from the call's own `running` event. Found live 2026-09-23 in round 86: `sensenova-6-7-flash-lite-var1` was `STALLED — no event for 300s` in the middle of its own `pytest tests -n 4`, which the abort killed; twelve minutes later `mimo-v2-5` the same way.
 **Severity:** HIGH (the one thing every ticket asks an agent to do — run the suite before committing — is what the silence window kills; five of the six silence stalls on this box are it)
 **File:** `tools/contest/kilo_client.py`
 **Symbol:** `KiloClient.wait_idle` (the KC-12 silence clock, `last_seen`)
