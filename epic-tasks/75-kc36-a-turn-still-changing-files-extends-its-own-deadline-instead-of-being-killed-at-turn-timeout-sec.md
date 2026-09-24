@@ -1,6 +1,6 @@
 # KC-36 — a turn that is still changing files extends its own deadline instead of being killed at `turn_timeout_sec`
 
-**Status:** queued — found live on 2026-09-21 in round 64 (`contest-out/64/`), where the 1800 s turn clock killed the four agents that were working and let the one that was stuck run on.
+**Status:** landed `5840147` (2026-09-24) — round 75, winner `sensenova-6-7-flash-lite-var1` (its uncommitted tree, taken as is: STALLED at 3600 s with the work done — the ticket's own bug, live in its own round). 24/24 on `contest-bench/kc36/acceptance_kc36.py`, both roots green. Only 2 of 8 slots committed (`mimo-v2-5` 5495441, `sensenova-6-7-flash-lite-var2` 0a23ad9); five STALLED at 3600 s holding 339–866 uncommitted lines. Found live on 2026-09-21 in round 64 (`contest-out/64/`), where the 1800 s turn clock killed the four agents that were working and let the one that was stuck run on.
 **Severity:** HIGH (a round loses its best entries to a constant, and the operator reads `STALLED` for an agent that had 400 lines written)
 **File:** `tools/contest/kilo_client.py`, `tools/contest/runner.py`, `tools/contest/roster.py`, `contest.ini`
 **Symbol:** `KiloClient.wait_idle`, `_wait_turn`, `run_agent`, `_churn`, `_turn_deadline`, `ContestConfig.turn_extend_sec`, `ContestConfig.turn_max_sec`
