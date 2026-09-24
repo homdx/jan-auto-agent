@@ -1,6 +1,6 @@
 # KC-51 — a relative path in a command resolves against the agent's worktree, not the runner's cwd
 
-**Status:** queued — found live 2026-09-23 in round 86 (run 4, base `27adb12`).
+**Status:** landed `bfa74b9` (2026-09-24) — round 95, ideal patch (`95task.patch`, applied as is): `_extract_paths` joins a relative target to the agent's worktree, `_mechanical` passes `ctx.worktree`. Both roots green on `kc` after KC-36 (5155 / 2878). Found live 2026-09-23 in round 86 (run 4, base `27adb12`).
 **Severity:** HIGH (harmless commands go to a gate that fails, and a sibling's worktree reached by `../` is judged "outside" instead of "forbidden", so a gate `allow` lets an agent read another entry)
 **File:** `tools/contest/policy.py`
 **Symbol:** `_extract_paths`, `_resolve`
