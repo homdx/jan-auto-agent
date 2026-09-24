@@ -515,7 +515,9 @@ def test_happy_path_one_turn_ready_state_and_one_turns_line(tmp_path):
     turn = run.turns[0]
     assert turn["kind"] == "initial" and turn["idle_status"] == "idle"
     assert turn["sent_at"] <= turn["idle_at"]
-    assert turn["harvest"] == {"verdict": "READY", "reasons": []}
+    assert turn["harvest"]["verdict"] == "READY"
+    assert turn["harvest"]["reasons"] == []
+    assert isinstance(turn["harvest"]["elapsed"], float)
     assert run.session_id == fake.sessions()[0].id
     assert run.cost == 0.42 and run.tokens["total"] == 15
     assert len(_jsonl(sb.out_dir / "agent-a" / "turns.jsonl")) == 1
@@ -537,7 +539,9 @@ def test_rework_path_reprompts_the_same_session_with_the_reason_sentence(tmp_pat
     _assert_ready(run, sb.ws("agent-a"))
     assert run.attempt == 1
     assert [t["kind"] for t in run.turns] == ["initial", "rework"]
-    assert run.turns[0]["harvest"] == {"verdict": "REWORK", "reasons": ["no_test_file"]}
+    assert run.turns[0]["harvest"]["verdict"] == "REWORK"
+    assert run.turns[0]["harvest"]["reasons"] == ["no_test_file"]
+    assert isinstance(run.turns[0]["harvest"]["elapsed"], float)
     (sid1, _), (sid2, rework) = _prompts(fake)
     assert sid1 == sid2 and len(_session_posts(fake)) == 1
     assert "shipped no test file" in rework and "Attempt 1 of 2" in rework
@@ -862,7 +866,9 @@ def test_a_stalled_turn_with_a_valid_commit_is_harvested_to_ready(tmp_path, capl
     assert run.last_error is None and run.attempt == 0
     (turn,) = run.turns
     assert turn["idle_status"] == "stalled"
-    assert turn["harvest"] == {"verdict": "READY", "reasons": []}
+    assert turn["harvest"]["verdict"] == "READY"
+    assert turn["harvest"]["reasons"] == []
+    assert isinstance(turn["harvest"]["elapsed"], float)
     assert _runner_has(caplog, f"agent-a: READY — {run.commit[:12]} after no event for 3s")
     (line,) = _jsonl(sb.out_dir / "agent-a" / "turns.jsonl")
     assert line["idle_status"] == "stalled" and line["harvest"]["verdict"] == "READY"
@@ -885,7 +891,9 @@ def test_a_stalled_turn_with_a_rejected_commit_stays_stalled_without_a_reprompt(
     assert run.attempt == 0
     (turn,) = run.turns
     assert turn["idle_status"] == "stalled"
-    assert turn["harvest"] == {"verdict": "REWORK", "reasons": ["no_progress_row"]}
+    assert turn["harvest"]["verdict"] == "REWORK"
+    assert turn["harvest"]["reasons"] == ["no_progress_row"]
+    assert isinstance(turn["harvest"]["elapsed"], float)
     assert len(_prompts(fake)) == 1
 
 
@@ -903,7 +911,9 @@ def test_an_error_turn_with_a_valid_commit_is_harvested_to_ready(tmp_path, caplo
     assert run.last_error is None and run.attempt == 0
     (turn,) = run.turns
     assert turn["idle_status"] == "error"
-    assert turn["harvest"] == {"verdict": "READY", "reasons": []}
+    assert turn["harvest"]["verdict"] == "READY"
+    assert turn["harvest"]["reasons"] == []
+    assert isinstance(turn["harvest"]["elapsed"], float)
     assert _runner_has(caplog, f"agent-a: READY — {run.commit[:12]} after session.error:")
 
 
@@ -919,7 +929,9 @@ def test_an_error_turn_with_a_rejected_commit_stays_error_without_a_reprompt(tmp
     assert run.attempt == 0
     (turn,) = run.turns
     assert turn["idle_status"] == "error"
-    assert turn["harvest"] == {"verdict": "REWORK", "reasons": ["no_progress_row"]}
+    assert turn["harvest"]["verdict"] == "REWORK"
+    assert turn["harvest"]["reasons"] == ["no_progress_row"]
+    assert isinstance(turn["harvest"]["elapsed"], float)
     assert len(_prompts(fake)) == 1
 
 
@@ -986,7 +998,9 @@ def test_a_terminal_harvest_runs_the_roots_under_the_rounds_lock(tmp_path, monke
     assert run.state is AgentState.READY, (run.state, run.last_error)
     assert run.commit == _branch_sha(sb.ws("agent-a"))
     assert seen == [str(sb.ws("agent-a").path)]
-    assert run.turns[0]["harvest"] == {"verdict": "READY", "reasons": []}
+    assert run.turns[0]["harvest"]["verdict"] == "READY"
+    assert run.turns[0]["harvest"]["reasons"] == []
+    assert isinstance(run.turns[0]["harvest"]["elapsed"], float)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1644,8 +1658,12 @@ def test_run_tests_true_makes_the_failed_suite_a_rework_with_the_pytest_tail(tmp
     (run,) = state.agents
     assert run.state is AgentState.READY
     first, second = run.turns
-    assert first["harvest"] == {"verdict": "REWORK", "reasons": ["tests_failed"]}
-    assert second["harvest"] == {"verdict": "READY", "reasons": []}
+    assert first["harvest"]["verdict"] == "REWORK"
+    assert first["harvest"]["reasons"] == ["tests_failed"]
+    assert isinstance(first["harvest"]["elapsed"], float)
+    assert second["harvest"]["verdict"] == "READY"
+    assert second["harvest"]["reasons"] == []
+    assert isinstance(second["harvest"]["elapsed"], float)
     assert run.attempt == 1
     (sid, _), (_, rework) = _prompts(fake)
     assert "FAILED tests/test_thing.py::test_thing" in rework
@@ -1663,7 +1681,10 @@ def test_run_tests_false_is_ready_after_one_turn_on_the_same_tree(tmp_path):
                           make_backend=_make_backend(fake, sb.out_dir), out_dir=sb.out_dir)
     (run,) = state.agents
     _assert_ready(run, sb.ws("agent-a"))
-    assert len(run.turns) == 1 and run.turns[0]["harvest"] == {"verdict": "READY", "reasons": []}
+    assert len(run.turns) == 1
+    assert run.turns[0]["harvest"]["verdict"] == "READY"
+    assert run.turns[0]["harvest"]["reasons"] == []
+    assert isinstance(run.turns[0]["harvest"]["elapsed"], float)
 
 
 def test_run_tests_true_never_runs_the_roots_twice_at_once(tmp_path, monkeypatch):
@@ -1967,3 +1988,273 @@ def test_continue_message_is_bounded_for_a_huge_tree():
     assert "gen/f40.py" not in text
     assert "... and 4960 more" in text
     assert len(text.splitlines()) < 60
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KC-27: the heartbeat shows phase, files-based progress, and test duration
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _make_repo(tmp_path) -> Path:
+    """A bare repo with a base commit, like Sandbox but standalone."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "user.email", "t@example.invalid")
+    _git(repo, "config", "user.name", "t")
+    _write(repo / "pkg" / "a.py", "a\n")
+    _write(repo / "pkg" / "b.py", "b\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "base")
+    return repo
+
+
+def test_worktree_files_counts_tracked_and_untracked(tmp_path):
+    """`_worktree_files` on a tmp_path sandbox: clean → 0, tracked+untracked → 2,
+    committed+edited → 2, .smoke_tests/x not counted, non-git path → 0."""
+    repo = _make_repo(tmp_path)
+    ws = Workspace(agent="agent-a", path=repo.resolve(), branch="main",
+                   base_sha=_git(repo, "rev-parse", "HEAD"), kind="worktree")
+
+    assert _runner_module._worktree_files(ws) == 0
+
+    _write(repo / "pkg" / "a.py", "changed\n")
+    _write(repo / "pkg" / "c.py", "c\n")
+    assert _runner_module._worktree_files(ws) == 2
+
+    _git(repo, "add", "pkg/a.py")
+    _git(repo, "commit", "-q", "-m", "edit a")
+    _write(repo / "pkg" / "c.py", "c-edited\n")
+    assert _runner_module._worktree_files(ws) == 2
+
+    _write(repo / ".smoke_tests" / "x", "x\n")
+    assert _runner_module._worktree_files(ws) == 2
+
+    ws2 = Workspace(agent="agent-b", path=tmp_path / "not_a_repo", branch="main",
+                    base_sha="0" * 40, kind="worktree")
+    assert _runner_module._worktree_files(ws2) == 0
+
+
+def test_progress_table():
+    """The `_progress` table: files-count against the pack's median."""
+    S = AgentState
+    assert _runner_module._progress(S.WAITING, 1, 2, False) == 30
+    assert _runner_module._progress(S.WAITING, 3, 2, False) == 60
+    assert _runner_module._progress(S.WAITING, 0, 1, False) == 0
+    assert _runner_module._progress(S.WAITING, 1, 2, True) == 70
+    assert _runner_module._progress(S.HARVESTING, 5, 2, False) == 80
+    assert _runner_module._progress(S.READY, 5, 2, False) == 100
+    assert _runner_module._progress(S.STALLED, 5, 2, False) is None
+    assert _runner_module._progress(S.PROMPTED, 5, 2, False) == 0
+
+
+def _make_heartbeat(agents: list, files_by_name: dict):
+    """A `_Heartbeat` with *agents* and mocked `_worktree_files`/`_commits_above`.
+
+    Returns `(heartbeat, module, orig_files, orig_commits)` — restore the
+    originals with `rm._worktree_files, rm._commits_above = f, c` in a `finally`.
+    """
+    rm = _runner_module
+    orig_files, orig_commits = rm._worktree_files, rm._commits_above
+    rm._worktree_files = lambda ws: files_by_name.get(ws.agent, 0)
+    rm._commits_above = lambda ws: 0
+    state = RoundState(round_no=ROUND, ticket=TICKET, base_sha="0" * 40,
+                       started_at=time.time() - 120, agents=agents)
+    hb = rm._Heartbeat(state, {a.agent.name: time.monotonic() - 60 for a in agents}, 0)
+    return hb, rm, orig_files, orig_commits
+
+
+def test_heartbeat_rollback_on_rework(tmp_path, monkeypatch):
+    """WAITING with attempt=1 and a commit above base shows ≤60% and ↺1,
+    never 70; the same agent with attempt=0 shows 70."""
+    sb = Sandbox(tmp_path)
+    ws = sb.ws("agent-a")
+    spec = next(s for s in make_config(["agent-a"]).agents if s.name == "agent-a")
+
+    # attempt=0 with a commit: 70%
+    run0 = AgentRun(agent=spec, workspace=ws, state=AgentState.WAITING, attempt=0)
+    hb0, rm, f, c = _make_heartbeat([run0], {"agent-a": 3})
+    try:
+        rm._commits_above = lambda ws: 1
+        line = hb0.line()
+        assert "70%" in line
+        assert "↺" not in line
+    finally:
+        rm._worktree_files, rm._commits_above = f, c
+
+    # attempt=1 with a commit: ≤60%, ↺1
+    run1 = AgentRun(agent=spec, workspace=ws, state=AgentState.WAITING, attempt=1)
+    hb1, rm, f, c = _make_heartbeat([run1], {"agent-a": 3})
+    try:
+        rm._commits_above = lambda ws: 1
+        line = hb1.line()
+        assert "↺1" in line
+        assert "70%" not in line
+    finally:
+        rm._worktree_files, rm._commits_above = f, c
+
+
+def test_heartbeat_line_with_two_agents_and_ready(tmp_path):
+    """Two working agents (1 and 3 files) show 30%/60%, 1f/3f, ten-cell bars;
+    a READY agent shows `READY (tests 4m)` when its last harvest has elapsed."""
+    sb = Sandbox(tmp_path, ["agent-a", "agent-b", "agent-c"])
+    specs = make_config(["agent-a", "agent-b", "agent-c"]).agents
+    spec_a, spec_b, spec_c = specs[0], specs[1], specs[2]
+
+    run_a = AgentRun(agent=spec_a, workspace=sb.ws("agent-a"), state=AgentState.WAITING)
+    run_b = AgentRun(agent=spec_b, workspace=sb.ws("agent-b"), state=AgentState.WAITING)
+    run_c = AgentRun(agent=spec_c, workspace=sb.ws("agent-c"), state=AgentState.READY,
+                     commit="abc123456789",
+                     turns=[{"harvest": {"verdict": "READY", "reasons": [], "elapsed": 240.0}}])
+
+    hb, rm, f, c = _make_heartbeat([run_a, run_b, run_c],
+                                    {"agent-a": 1, "agent-b": 3})
+    try:
+        line = hb.line()
+        assert "agent-a WAITING" in line
+        assert "30%" in line
+        assert "1f" in line
+        assert "agent-b WAITING" in line
+        assert "60%" in line
+        assert "3f" in line
+        assert "[###......." in line  # 30% → 3 filled
+        assert "[######...." in line  # 60% → 6 filled
+        assert "agent-c READY (tests 4m)" in line
+    finally:
+        rm._worktree_files, rm._commits_above = f, c
+
+
+def test_harvest_elapsed_in_turns_jsonl_and_state_json(tmp_path, caplog, monkeypatch):
+    """With `run_tests=True`: the READY turn's harvest in turns.jsonl and
+    state.json has a float `elapsed`, and the INFO line for READY ends with
+    `(tests Ns)`.
+    """
+    caplog.set_level(logging.INFO, logger=LOGGER)
+    import tools.contest.harvest as harvest_module
+    monkeypatch.setattr(harvest_module, "run_tests_detail",
+                        lambda cwd: (ALL_ROOTS_PASS, []))
+
+    cfg = make_config(["agent-a"], max_parallel=1)
+    scenario = {"turns": [{"on_prompt": work_ready, "events": ["busy", "idle"]}]}
+    sb = Sandbox(tmp_path)
+    with _BenchFake(scenario) as fake:
+        state = run_round(cfg, ROUND, sb.ticket_path, list(sb.workspaces),
+                          make_backend=_make_backend(fake, sb.out_dir), out_dir=sb.out_dir,
+                          run_tests=True)
+
+    turns = _jsonl(sb.out_dir / "agent-a" / "turns.jsonl")
+    assert len(turns) == 1
+    assert "elapsed" in turns[0]["harvest"]
+    assert isinstance(turns[0]["harvest"]["elapsed"], float)
+
+    state_data = _state_json(sb)
+    agent = state_data["agents"][0]
+    assert "elapsed" in agent["turns"][0]["harvest"]
+    assert isinstance(agent["turns"][0]["harvest"]["elapsed"], float)
+
+    lines = _lines(caplog, "agent-a: READY")
+    assert len(lines) == 1
+    assert "(tests " in lines[0] and lines[0].rstrip().endswith(")")
+
+
+def test_run_tests_off_names_the_harvest_not_the_tests(tmp_path, caplog):
+    """KC-27 §1: with `run_tests` off the READY note says `(harvest Ns)` — the
+    harvest ran, the roots did not, and the note must not claim they did."""
+    caplog.set_level(logging.INFO, logger=LOGGER)
+    scenario = {"turns": [{"on_prompt": work_ready, "events": ["busy", "idle"]}]}
+    sb, _fake, _h, run, _ = _run_one(tmp_path, scenario)
+    _assert_ready(run, sb.ws("agent-a"))
+    (line,) = _lines(caplog, "agent-a: READY")
+    assert "(harvest " in line and "(tests " not in line
+    assert line.rstrip().endswith("s)")
+
+
+def test_a_state_json_without_elapsed_still_loads(tmp_path):
+    """KC-27 §5: `state.json`'s shape changes only by `elapsed`; one written
+    before it loads through `from_dict` and keeps its two old keys."""
+    data = {
+        "round_no": 1, "ticket": "t.md", "base_sha": "0" * 40, "started_at": 1.0,
+        "agents": [{
+            "agent": {"name": "a", "provider_id": "p", "model_id": "m"},
+            "workspace": {"agent": "a", "path": str(tmp_path), "branch": "b",
+                          "base_sha": "0" * 40, "kind": "worktree"},
+            "state": "READY", "attempt": 0,
+            "turns": [{"kind": "initial", "harvest": {"verdict": "READY", "reasons": []}}],
+            "permissions": {"asked": 0, "allowed": 0, "rejected": 0,
+                            "gated": 0, "gate_failed": 0},
+            "questions": 0,
+        }],
+    }
+    state = RoundState.from_dict(data)
+    assert state.agents[0].state is AgentState.READY
+    assert state.agents[0].turns[0]["harvest"] == {"verdict": "READY", "reasons": []}
+
+
+def _real_worktree(tmp_path, name: str, *, dirty: int = 0, committed: int = 0) -> Workspace:
+    """A git worktree with *committed* files changed in a commit above the base
+    and *dirty* more changed on disk — the heartbeat reads it through real git."""
+    root = tmp_path / name
+    root.mkdir()
+    for i in range(6):
+        _write(root / f"f{i}.py", "x = 0\n")
+    _git(root, "init", "-q")
+    _git(root, "config", "user.email", "t@t")
+    _git(root, "config", "user.name", "t")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-qm", "base")
+    base = _git(root, "rev-parse", "HEAD")
+    for i in range(committed):
+        _write(root / f"f{i}.py", "x = 1\n")
+    if committed:
+        _git(root, "commit", "-qam", "work")
+    for i in range(committed, committed + dirty):
+        _write(root / f"f{i}.py", "x = 2\n")
+    return Workspace(agent=name, path=root, branch=name, base_sha=base, kind="worktree")
+
+
+def _real_line(runs: list) -> str:
+    state = RoundState(round_no=ROUND, ticket=TICKET, base_sha="0" * 40,
+                       started_at=time.time() - 120, agents=runs)
+    return _runner_module._Heartbeat(
+        state, {r.agent.name: time.monotonic() - 60 for r in runs}, 0).line()
+
+
+def _real_run(ws: Workspace, state: AgentState, attempt: int = 0, turns=()) -> AgentRun:
+    run = AgentRun(agent=AgentSpec(name=ws.agent, provider_id="p", model_id=ws.agent),
+                   workspace=ws, state=state, attempt=attempt)
+    run.turns.extend(turns)
+    return run
+
+
+def _part(line: str, name: str) -> str:
+    return next(p for p in line.split(" · ") if p.split(": ")[-1].startswith(name + " "))
+
+
+def test_the_heartbeat_reads_real_worktrees_with_no_helper_mocked(tmp_path):
+    """KC-27 §3–§4 end to end: `_worktree_files` and `_commits_above` run
+    against real git — 1 and 3 files are 30 % and 60 % against a median of 2,
+    a READY agent names its tests' time, and a rework rolls a committed agent
+    back from 70 % to its files-count with `↺1` in place of `(attempt 1)`."""
+    a = _real_run(_real_worktree(tmp_path, "aa", dirty=1), AgentState.WAITING)
+    b = _real_run(_real_worktree(tmp_path, "bb", dirty=3), AgentState.WAITING)
+    c = _real_run(_real_worktree(tmp_path, "cc"), AgentState.READY, turns=[
+        {"harvest": {"verdict": "READY", "reasons": [], "elapsed": 240.0}}])
+    line = _real_line([a, b, c])
+    assert "aa WAITING 60s [###.......] 30% 1f" in _part(line, "aa"), line
+    assert "bb WAITING 60s [######....] 60% 3f" in _part(line, "bb"), line
+    assert _part(line, "cc").startswith("cc READY (tests 4m)"), line
+
+    ws = _real_worktree(tmp_path, "rr", committed=1, dirty=1)
+    first = _real_line([_real_run(ws, AgentState.WAITING, attempt=0)])
+    again = _real_line([_real_run(ws, AgentState.WAITING, attempt=1)])
+    assert "70% 2f" in first and "↺" not in first, first
+    assert "↺1" in again and "70%" not in again and "(attempt" not in again, again
+
+
+def test_the_packs_median_is_not_floored(tmp_path):
+    """Working agents at 1 and 2 files have a median of 1.5: the one at 1 file
+    is 40 %, not the 60 % an integer median of 1 would call "at the pack"."""
+    a = _real_run(_real_worktree(tmp_path, "aa", dirty=1), AgentState.WAITING)
+    b = _real_run(_real_worktree(tmp_path, "bb", dirty=2), AgentState.WAITING)
+    line = _real_line([a, b])
+    assert "40% 1f" in _part(line, "aa"), line
+    assert "60% 2f" in _part(line, "bb"), line

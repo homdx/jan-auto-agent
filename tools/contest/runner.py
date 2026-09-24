@@ -60,6 +60,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import statistics
 import subprocess
 import threading
 import time
@@ -92,6 +93,11 @@ RECENT_TOOLS = 8
 #: slow, so the lock is held for the whole `harvest` call — its mechanical part
 #: is a handful of `git` calls and costs nothing next to the roots.
 _TEST_RUNS_LOCK = threading.Lock()
+
+#: KC-27: the heartbeat's git calls per worktree — a short budget, because a
+#: tick that waits on a held index is late, not failed.
+_TICK_GIT_TIMEOUT_S = 5.0
+_TICK_GIT_RETRIES = 1
 
 
 #: The prompt sent after a retryable session error (KC-19).  The
@@ -167,6 +173,36 @@ def _commits_above(ws: Workspace) -> int:
 def _head_sha(ws: Workspace) -> str | None:
     """HEAD of *ws* as a full sha, or None when it cannot be read."""
     return git(ws.path, "rev-parse", "HEAD") or None
+
+
+def _worktree_files(ws: Workspace) -> int:
+    """The number of distinct paths changed in *ws*'s worktree (KC-27).
+
+    The union of `git status --porcelain --untracked-files=all` (tracked
+    changes and untracked files — the agent is editing) and
+    `git diff --name-only <base_sha>..HEAD` (what it already committed), minus
+    paths under `.smoke_tests/` (`sync_test_tiers.py` links).
+
+    Read-only and never raises: any git failure is `0`. Called from the
+    heartbeat thread only, once per tick per non-terminal agent —
+    `--no-optional-locks` so the tick never takes `index.lock` from under the
+    agent's own `git commit`, and one attempt with no lock ladder: a tick that
+    waits on a held index is a tick that is late, not a failure.
+    """
+    def names(*args: str) -> list:
+        r = run_git(["git", "--no-optional-locks", *args], cwd=ws.path,
+                    timeout=_TICK_GIT_TIMEOUT_S, retries=_TICK_GIT_RETRIES)
+        return r.stdout.splitlines() if r.returncode == 0 else []
+
+    try:
+        paths = {line[3:].rsplit(" -> ", 1)[-1]
+                 for line in names("status", "--porcelain", "--untracked-files=all")
+                 if len(line) > 3}
+        paths.update(line.strip() for line in names("diff", "--name-only",
+                                                     f"{ws.base_sha}..HEAD"))
+    except Exception:  # noqa: BLE001 — the heartbeat's estimate must never raise
+        return 0
+    return len({p for p in paths if p and not p.startswith(".smoke_tests/")})
 
 
 class AgentState(str, Enum):
@@ -751,6 +787,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                         turn["harvest"] = {
                             "verdict": verdict.verdict,
                             "reasons": [r.code for r in verdict.reasons],
+                            "elapsed": round(verdict.elapsed, 1),
                         }
                         run.commit = None
                         if above == 1:
@@ -769,18 +806,22 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
             # ── HARVESTING ─────────────────────────────────────────────────
             transition(AgentState.HARVESTING, note="tests on" if run_tests else "tests off")
             verdict = _harvest(ws, ticket_path, run_tests)
-            turn["harvest"] = {"verdict": verdict.verdict, "reasons": [r.code for r in verdict.reasons]}
+            turn["harvest"] = {"verdict": verdict.verdict,
+                               "reasons": [r.code for r in verdict.reasons],
+                               "elapsed": round(verdict.elapsed, 1)}
             run.turns.append(turn)
             _append_jsonl(agent_dir / "turns.jsonl", {"agent": spec.name, **turn})
             run.commit = verdict.commit
+            label = "tests" if run_tests else "harvest"
+            elapsed_str = f"({label} {_age(verdict.elapsed)})"
             if verdict.verdict == "READY":
-                return finish(AgentState.READY, note=(run.commit or "")[:12])
+                return finish(AgentState.READY, note=f"{(run.commit or '')[:12]} {elapsed_str}")
             if run.attempt >= int(config.max_rework):
                 return finish(AgentState.GAVE_UP, "REWORK after the last attempt: "
                               + ", ".join(r.code for r in verdict.reasons if r.blocking))
             run.attempt += 1
             continue_used = 0  # KC-22: a rework resets the per-attempt continue counter
-            transition(AgentState.REWORK, note=f"attempt {run.attempt} — "
+            transition(AgentState.REWORK, note=f"attempt {run.attempt} {elapsed_str} — "
                        + ", ".join(r.code for r in verdict.reasons))
             rework_text = rework_message(verdict, run.attempt, int(config.max_rework))
     finally:
@@ -954,8 +995,9 @@ def run_round(config: ContestConfig, round_no: int, ticket_path: Path, workspace
 
 
 class _Heartbeat:
-    """The once-a-minute line: the round's age and every agent's state and time
-    in it — `round 52 12m: mistral WAITING 3m (attempt 1) · laguna ERROR · hy3 ERROR — 1 live`.
+    """The once-a-minute line: the round's age and every agent's state, its
+    files-based progress bar, and how long its last tests took —
+    `round 66 14m: mimo WAITING 14m [######....] 60% 5f · ... — 3 live`.
 
     A daemon thread waiting on an `Event`, so `stop()` returns at once and the
     thread never outlives `run_round`. `every <= 0` starts nothing.
@@ -978,20 +1020,85 @@ class _Heartbeat:
     def line(self) -> str:
         now = time.monotonic()
         parts = []
+
+        # First pass: collect files for all non-terminal agents; the median
+        # is over the agents currently working (WAITING/REWORK), floor 1.
+        files_by_name = {}
+        working_files = []
+        for run in self.state.agents:
+            if not run.terminal:
+                f = _worktree_files(run.workspace)
+                files_by_name[run.agent.name] = f
+                if run.state in (AgentState.WAITING, AgentState.REWORK):
+                    working_files.append(f)
+        median = max(1.0, statistics.median(working_files)) if working_files else 1.0
+
         for run in self.state.agents:
             part = f"{run.agent.name} {run.state.value}"
             if not run.terminal:
                 part += f" {_age(now - self.since.get(run.agent.name, now))}"
+                files = files_by_name.get(run.agent.name, 0)
+                if run.state in (AgentState.WAITING, AgentState.REWORK):
+                    committed = _commits_above(run.workspace) > 0 and run.attempt == 0
+                else:
+                    committed = False
+                pct = _progress(run.state, files, median, committed)
+                if pct is not None:
+                    part += f" {_bar(pct)} {pct}% {files}f"
                 if run.attempt:
-                    part += f" (attempt {run.attempt})"
+                    part += f" ↺{run.attempt}"
+                elapsed = self._last_harvest_elapsed(run)
+                if elapsed is not None:
+                    part += f" (tests {_age(elapsed)})"
+            else:
+                elapsed = self._last_harvest_elapsed(run)
+                if elapsed is not None:
+                    part += f" (tests {_age(elapsed)})"
             parts.append(part)
+
         live = sum(1 for run in self.state.agents if not run.terminal)
         age = _age(time.time() - self.state.started_at)
         return f"round {self.state.round_no} {age}: " + " · ".join(parts) + f" — {live} live"
 
+    def _last_harvest_elapsed(self, run: AgentRun) -> float | None:
+        """The `elapsed` from the last turn's harvest, or None."""
+        for turn in reversed(run.turns):
+            h = turn.get("harvest")
+            if h and "elapsed" in h:
+                return h["elapsed"]
+        return None
+
     def _loop(self) -> None:
         while not self._stop.wait(self.every):
             _log.info("%s", self.line())
+
+
+def _bar(pct: int) -> str:
+    """A ten-cell progress bar: `[######....]` for 60 %."""
+    filled = max(0, min(10, round(pct / 10)))
+    return "[" + "#" * filled + "." * (10 - filled) + "]"
+
+
+def _progress(state: AgentState, files: int, median: float, committed: bool) -> int | None:
+    """A files-count progress estimate per cent, or None when no bar.
+
+    A files-count against the pack's median, not a measure of the work —
+    good enough to see the field converging and one agent stuck at 1 file
+    for 20 minutes. An agent at or above the pack's median is at 60 %;
+    one with a commit on its first attempt is at 70 %. HARVESTING is 80 %,
+    READY is 100 %. Terminal states other than READY are None.
+    """
+    if state in (AgentState.CREATED, AgentState.PROMPTED):
+        return 0
+    if state in (AgentState.WAITING, AgentState.REWORK):
+        if committed:
+            return 70
+        return min(60, round(60 * files / max(median, 1)))
+    if state is AgentState.HARVESTING:
+        return 80
+    if state is AgentState.READY:
+        return 100
+    return None
 
 
 def _age(seconds: float) -> str:
