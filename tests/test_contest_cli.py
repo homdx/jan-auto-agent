@@ -731,6 +731,23 @@ def test_a_models_id_with_its_own_prefix_wins_over_the_provider_flag():
     assert (spec.provider_id, spec.model_id) == ("kenary", "hy3:free")
 
 
+def test_a_models_id_splits_its_provider_at_the_first_slash_like_the_roster():
+    """`kilo/nex-agi/nex-n2.5-pro:free` is provider `kilo`; the last `/` made it
+    provider `kilo/nex-agi`, which no server has."""
+    (spec,) = cli.agents_from_models("kilo/nex-agi/nex-n2.5-pro:free")
+    assert spec == AgentSpec(provider_id="kilo", model_id="nex-agi/nex-n2.5-pro:free",
+                             name="nex-n2-5-pro")
+    assert spec.model == "kilo/nex-agi/nex-n2.5-pro:free"
+
+
+def test_a_provider_without_credentials_names_the_login_command():
+    (agent,) = cli.agents_from_models("hy3:free")
+    (line,) = cli.roster_on_offer(_offer((_provider("kenary", "kenari", ("hy3:free",)),),
+                                         connected=()), (agent,), kilo_bin="/x/kilo")
+    assert line == ("[hy3] kenary/hy3:free: provider 'kenary' has no credentials "
+                    "(not connected) — fix: /x/kilo auth login -p kenary")
+
+
 def test_agents_from_models_defaults_to_the_kenary_provider():
     assert cli.agents_from_models("hy3:free")[0].provider_id == cli.DEFAULT_PROVIDER == "kenary"
 

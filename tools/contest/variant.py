@@ -44,6 +44,7 @@ __all__ = [
     "hello_probe",
     "ladder",
     "listed_variants",
+    "needs_login",
     "pick_variant",
 ]
 
@@ -92,6 +93,21 @@ class VariantPick:
             return head
         rungs = "; ".join(f"{rung or '(none)'}: {reason}" for rung, reason in self.tried)
         return f"{head} (failed: {rungs})"
+
+
+#: The words a provider's refusal uses when the credentials are the problem —
+#: `bynara` says "A valid API key is required.", `kilo` "You need to sign in to
+#: use this model." Matched lower-cased, as substrings.
+LOGIN_MARKERS = ("api key", "api_key", "apikey", "sign in", "log in", "login",
+                 "unauthorized", "unauthenticated", "authentication", "401")
+
+
+def needs_login(pick: VariantPick) -> bool:
+    """True when every rung of an unusable *pick* was refused for credentials:
+    the fix is `kilo auth login`, not another model or variant."""
+    return (not pick.usable and bool(pick.tried)
+            and all(any(m in reason.lower() for m in LOGIN_MARKERS)
+                    for _, reason in pick.tried))
 
 
 def listed_variants(providers: dict, provider_id: str, model_id: str) -> list:

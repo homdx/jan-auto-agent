@@ -56,6 +56,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import sys
 import tempfile
 from dataclasses import dataclass, replace
@@ -78,6 +79,7 @@ from tools.contest.variant import (
     hello_probe,
     ladder,
     listed_variants,
+    needs_login,
     pick_variant,
 )
 from tools.contest.workspace import WorkspaceError, prepare_round
@@ -226,6 +228,11 @@ def agents_from_models(models: str, provider: str = DEFAULT_PROVIDER) -> tuple:
     The names are a pure function of the *models* string, so `--resume` with
     the same string finds the same agents in `state.json`.
 
+    The provider is split off at the first `/`, as the roster does, so a model
+    id with a `/` of its own keeps it: `kilo/nex-agi/nex-n2.5-pro:free` is
+    provider `kilo`, model `nex-agi/nex-n2.5-pro:free`, name `nex-n2-5-pro`
+    (the part after the model's own last `/`).
+
     KC-49: an item may end in `@<variant>` — `sensenova123/sensenova-6.8-flash-lite@high`,
     `glm-4-7-flash:free@highest` — the reasoning variant that agent runs at.
     The variant is not part of the name: `m@high,m@low` are two variants of one
@@ -234,9 +241,13 @@ def agents_from_models(models: str, provider: str = DEFAULT_PROVIDER) -> tuple:
     parsed = []
     for item in filter(None, (m.strip() for m in models.split(","))):
         item, _, variant = item.partition("@")
-        prov, _, model_id = item.rpartition("/")
+        # split at the FIRST "/", the roster's own rule: `kilo/nex-agi/nex-n2.5-pro:free`
+        # is provider `kilo`, model `nex-agi/nex-n2.5-pro:free`
+        prov, slash, model_id = item.partition("/")
+        if not slash:
+            prov, model_id = "", item
         name = "".join(c if c.isalnum() or c in "_-" else "-"
-                       for c in model_id.split(":")[0].lower())
+                       for c in model_id.rpartition("/")[2].split(":")[0].lower())
         parsed.append((name.lstrip("_-"), prov or provider, model_id, variant.strip() or None))
 
     counts = Counter(name for name, _, _, _ in parsed)
@@ -259,7 +270,16 @@ def agents_from_models(models: str, provider: str = DEFAULT_PROVIDER) -> tuple:
     return tuple(specs)
 
 
-def resolve_variants(providers: dict, agents: tuple, probe_for=None) -> tuple:
+def login_hint(kilo_bin: str | None, provider_id: str) -> str:
+    """` — fix: <kilo> auth login -p <provider>`, the binary this round resolved
+    (never a hard-coded path); `""` without one."""
+    if not kilo_bin:
+        return ""
+    return f" — fix: {shlex.quote(kilo_bin)} auth login -p {shlex.quote(provider_id)}"
+
+
+def resolve_variants(providers: dict, agents: tuple, probe_for=None, *,
+                     kilo_bin: str | None = None) -> tuple:
     """KC-49: `(agents, failures, notes)` — every agent's variant made real.
 
     *providers* is `GET /provider`. An agent with no variant is untouched. A
@@ -272,7 +292,8 @@ def resolve_variants(providers: dict, agents: tuple, probe_for=None) -> tuple:
     same `provider/model` is probed once however many agents ask for it.
     *notes* is one line per probed model for the operator. Without
     *probe_for*, `highest` on a model that lists variants is a failure: there
-    is nothing to ask.
+    is nothing to ask. A model refused for its credentials on every rung
+    (`needs_login`) gets `login_hint(kilo_bin, …)` on its failure line.
     """
     resolved = []
     failures: list = []
@@ -305,15 +326,16 @@ def resolve_variants(providers: dict, agents: tuple, probe_for=None) -> tuple:
             notes.append(f"{agent.model}@{HIGHEST} → {pick.describe()}")
         pick = picks[agent.model]
         if not pick.usable:
+            hint = login_hint(kilo_bin, agent.provider_id) if needs_login(pick) else ""
             failures.append(f"[{agent.name}] {agent.model}: no variant answered "
-                            f"'say: hello' — {pick.describe()}")
+                            f"'say: hello' — {pick.describe()}{hint}")
             resolved.append(agent)
             continue
         resolved.append(replace(agent, variant=pick.variant))
     return tuple(resolved), failures, notes
 
 
-def roster_on_offer(providers: dict, agents: tuple) -> list:
+def roster_on_offer(providers: dict, agents: tuple, *, kilo_bin: str | None = None) -> list:
     """One failure line per roster agent that is not on offer, in roster order.
 
     *providers* is `GET /provider` as `KiloClient.providers` hands it over,
@@ -358,7 +380,7 @@ def roster_on_offer(providers: dict, agents: tuple) -> list:
         if agent.provider_id not in connected:
             failures.append(
                 f"[{agent.name}] {pair}: provider '{agent.provider_id}' "
-                "has no credentials (not connected)")
+                "has no credentials (not connected)" + login_hint(kilo_bin, agent.provider_id))
             continue
         models = by_id[agent.provider_id].get("models") or {}
         if agent.model_id in models:
@@ -520,13 +542,18 @@ def _check_offer(repo, config: ContestConfig, attached, *, resolve: bool = True)
                 return [], unresolved, []
         if server is None:
             return [], unresolved, []
+        try:
+            kilo_bin = find_kilo_binary(config.kilo_bin)
+        except (FileNotFoundError, OSError):
+            kilo_bin = "kilo"
         providers = KiloClient(server, str(repo)).providers()
-        failures = roster_on_offer(providers, agents)
+        failures = roster_on_offer(providers, agents, kilo_bin=kilo_bin)
         if failures or not resolve:
             return failures, unresolved, []
         def probe_for(agent):
             return hello_probe(server, agent.provider_id, agent.model_id)
-        resolved, failures, notes = resolve_variants(providers, agents, probe_for)
+        resolved, failures, notes = resolve_variants(providers, agents, probe_for,
+                                                     kilo_bin=kilo_bin)
         return failures, resolved, notes
     except (KiloHttpError, KiloServerError, ValueError) as exc:
         return [f"GET /provider failed: {exc}"], unresolved, []

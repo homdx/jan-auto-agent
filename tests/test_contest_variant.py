@@ -31,6 +31,7 @@ from tools.contest.variant import (
     hello_probe,
     ladder,
     listed_variants,
+    needs_login,
     pick_variant,
 )
 
@@ -176,6 +177,28 @@ def test_resolve_variants_refuses_highest_when_nothing_answers_or_nothing_can_as
     _, failures, _ = cli.resolve_variants(OFFER, agents)
     assert failures == [("[hy3] kenary/hy3:free: variant 'highest' needs GET /provider and "
                          "a server to ask — neither is attached")]
+
+
+def test_a_model_refused_for_its_credentials_names_the_login_command():
+    """Every rung refused for the key: the line ends with the fix, the kilo
+    binary the round resolved — a path it is handed, never a hard-coded one."""
+    agents = cli.agents_from_models("hy3:free@highest")
+    refuse = lambda agent: (lambda rung: "A valid API key is required.")
+    _, failures, _ = cli.resolve_variants(OFFER, agents, refuse, kilo_bin="/opt/k 1/kilo")
+    (line,) = failures
+    assert line.endswith(" — fix: '/opt/k 1/kilo' auth login -p kenary")
+    _, failures, _ = cli.resolve_variants(OFFER, agents, refuse)
+    assert "fix:" not in failures[0]
+
+
+def test_a_model_down_for_another_reason_gets_no_login_hint():
+    agents = cli.agents_from_models("hy3:free@highest")
+    mixed = lambda agent: (lambda rung: "You need to sign in to use this model."
+                           if rung == "high" else "Not Found")
+    _, failures, _ = cli.resolve_variants(OFFER, agents, mixed, kilo_bin="kilo")
+    assert "fix:" not in failures[0]
+    assert needs_login(VariantPick(None, False, (("high", "You need to sign in"),)))
+    assert not needs_login(VariantPick("high", True, (("max", "api key"),)))
 
 
 def test_highest_on_a_model_that_lists_no_variants_asks_nothing_and_sends_none():
