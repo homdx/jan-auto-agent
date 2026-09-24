@@ -256,7 +256,8 @@ class _BenchFake(FakeKiloServer):
                         "properties": {"sessionID": session.id, "status": "busy"}})
 
     def pulse(self, session_id: str, every: float, times: int | None,
-              then_idle: bool = False) -> None:
+              then_idle: bool = False,
+              idle_after: "threading.Event | None" = None) -> None:
         """Emit a ``session.status busy`` every *every* seconds, on a thread.
 
         ``times=None`` beats until the fake is stopped, which is what a test
@@ -269,6 +270,16 @@ class _BenchFake(FakeKiloServer):
         the last beat, and a turn that reached READY was aborted on the way.
         Either the beats outlive the turn by construction, or the test is
         betting on how long a git commit takes.
+
+        ``idle_after`` is the same lesson for ``then_idle``: a counted pulse
+        that idles on its own thread idles when its count runs out, whether or
+        not the hook next to it has finished the work. On a loaded box the
+        hook's commit and ``PROGRESS.csv`` row came after that idle, the
+        harvest read no row, and a turn that did everything came back
+        ``GAVE_UP — no_progress_row``. With an event, the pulse keeps beating
+        past its count until the event is set, then idles: the count is the
+        least the session chats, and the idle is never before the work, as a
+        real agent's never is.
         """
         def run():
             beats = 0
@@ -277,6 +288,10 @@ class _BenchFake(FakeKiloServer):
                 beats += 1
                 self._emit({"type": "session.status",
                             "properties": {"sessionID": session_id, "status": "busy"}})
+            if idle_after is not None:
+                while not self._stop.is_set() and not idle_after.wait(every):
+                    self._emit({"type": "session.status",
+                                "properties": {"sessionID": session_id, "status": "busy"}})
             if then_idle and not self._stop.is_set():
                 self._emit({"type": "session.idle", "properties": {"sessionID": session_id}})
         threading.Thread(target=run, daemon=True).start()
@@ -726,21 +741,55 @@ def test_events_of_the_session_keep_a_turn_alive(tmp_path):
 
     The span still comes from the beat *count* rather than a `delay`, with
     the pulse emitting the idle itself, so a starved box can only make the
-    turn longer, never end it before the beats do."""
+    turn longer, never end it before the beats do — nor before the hook's
+    work: the pulse idles only once `work_ready` has returned (`idle_after`),
+    because a counted idle racing a loaded commit is the same bet on git's
+    speed, and it lost as `GAVE_UP — no_progress_row`."""
     sb = Sandbox(tmp_path)
     cfg = make_config(["agent-a"], turn_timeout_sec=300,
                       idle_event_timeout_sec=CHATTY_WINDOW_S)
     scenario = {"turns": [{"events": ["busy"], "idle": False}]}
     with _BenchFake(scenario) as fake:
-        scenario["turns"][0]["on_prompt"] = lambda d, t: (
-            fake.pulse(fake.sessions()[-1].id, KEEPALIVE_BEAT_S,
-                       CHATTY_BEATS, then_idle=True),
-            work_ready(d, t))
+        work_done = threading.Event()
+
+        def on_prompt(d, t):
+            fake.pulse(fake.sessions()[-1].id, KEEPALIVE_BEAT_S, CHATTY_BEATS,
+                       then_idle=True, idle_after=work_done)
+            try:
+                work_ready(d, t)
+            finally:
+                work_done.set()
+
+        scenario["turns"][0]["on_prompt"] = on_prompt
         run = Harness(sb, fake, cfg).go()
         aborted = _aborted(fake)
     _assert_ready(run, sb.ws("agent-a"))
     assert run.turns[0]["idle_status"] == "idle"
     assert not aborted
+
+
+def test_a_counted_pulse_idles_only_after_the_work_it_covers():
+    """The bench's own contract (`_BenchFake.pulse(..., idle_after=)`): the
+    count runs out first, the pulse keeps beating, and `session.idle` comes
+    only once the work is done — never on the count alone. Without it the two
+    keep-alive tests above idle before a loaded commit and its PROGRESS.csv
+    row, and a turn that did everything is `GAVE_UP — no_progress_row`."""
+    with _BenchFake({"turns": []}) as fake:
+        seen: list = []
+        fake._emit = lambda event: seen.append(event["type"])
+        work_done = threading.Event()
+        fake.pulse("ses_x", 0.02, 3, then_idle=True, idle_after=work_done)
+
+        deadline = time.monotonic() + 30
+        while seen.count("session.status") < 6 and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert seen.count("session.status") >= 6, seen   # past the count of 3
+        assert "session.idle" not in seen, seen          # and still no idle
+
+        work_done.set()
+        while "session.idle" not in seen and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert seen[-1] == "session.idle", seen
 
 
 def test_turn_timeout_stalls_a_session_that_never_idles(tmp_path):
@@ -1489,12 +1538,18 @@ def test_a_silent_agent_stalls_next_to_a_chatty_one(tmp_path):
             if session.directory.endswith("agent-b"):
                 # The beats start *before* the git work, not after it: b's
                 # silence clock is already running when this hook is entered.
-                # b chats for ~2 s and then idles, comfortably inside a's 8 s
-                # window — what matters here is the neighbour's *traffic*,
-                # not how long the neighbour lasts.
+                # b chats for at least ~2 s and idles once its work is
+                # committed (`idle_after`), inside a's 8 s window on an idle
+                # box — what matters here is the neighbour's *traffic*, not
+                # how long the neighbour lasts, and b must not idle before its
+                # own commit and PROGRESS.csv row exist, or it is not READY.
+                work_done = threading.Event()
                 fake.pulse(session.id, KEEPALIVE_BEAT_S, NEIGHBOUR_BEATS,
-                           then_idle=True)
-                work_ready(session.directory, text)
+                           then_idle=True, idle_after=work_done)
+                try:
+                    work_ready(session.directory, text)
+                finally:
+                    work_done.set()
             return orig_turn(session, turn, text)
 
         def record(method, path, query, body):
