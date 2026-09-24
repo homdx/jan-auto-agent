@@ -1,6 +1,6 @@
 # KC-27 — the heartbeat shows each agent's phase, a files-based progress estimate, and how long its tests took
 
-**Status:** queued — **last in the queue**: after every other open and queued KC ticket (59–64, then 50, 46–49); asked for on 2026-09-20 after round 58, where the operator watched eight `WAITING 14m` lines for half an hour with no way to tell an agent still editing from one inside its self-check `pytest`, and read how long the judge's tests took only afterwards from file mtimes in `contest-out/58/`. Same file as KC-21 and KC-22 (`tools/contest/runner.py`) — lands after both; disjoint from KC-19's retry loop.
+**Status:** landed (2026-09-24, the `KC-27:` commit right before this Status line) — round 66 (12 entries, base `01e7a40`): 2 commits, 1 READY, winner `sensenova-6-8-flash-lite-var1` (`640f9a9`) as the base; five entries solved it. The rest ran out of clock (8 STALLED on the 900 s silence window or the 3600 s turn — KC-47, KC-36), overflowed the context (laguna) or were cut by 503s (nex). The judge's merge adds real-git heartbeat tests, a float median and a short git budget. Was: queued, last in the queue; asked for on 2026-09-20 after round 58.
 **Severity:** LOW (operator comfort; nothing about the verdict changes)
 **File:** `tools/contest/runner.py` (`_Heartbeat.line`, `run_agent`'s HARVESTING step)
 **Symbol:** `_Heartbeat`, `_worktree_files`, `_progress`
@@ -115,7 +115,10 @@ for the lock — is computed and dropped; `turn["harvest"]` keeps only
         float `elapsed`, and the INFO line for READY ends with `(tests Ns)`.
 - [ ] `test_ctrl_c_aborts_writes_state_and_propagates_then_resume_finishes`
       and every other existing `tests/test_contest_runner.py` test
-      unmodified and green: `from_dict` on a `state.json` **without**
+      unmodified and green — except the nine that compare a turn's `harvest`
+      dict to `{"verdict", "reasons"}`: §1 adds `elapsed`, so they gain it
+      (found landing it: round 66's `glm-4-7-flash` was sent back twice for
+      keeping them, every other entry changed them): `from_dict` on a `state.json` **without**
       `elapsed` still loads.
 - [ ] `python3 -m pytest tests -n 4 -q --timeout=180 && python3 -m pytest tests_bugfix -n 4 -q --timeout=180` green.
 
