@@ -478,6 +478,18 @@ def _command_paths(command) -> list:
     word (``reboot``), ``2>&1``, ``$HOME/x`` and a URL are not paths and are
     dropped. String work only: no shell is started. Fail-open — a non-string
     command or one holding a NUL yields ``[]``.
+
+    KC-52: a token that is exactly ``/`` — quoted or not — is the division
+    operator, not the filesystem root, and is dropped. The scan tokenises the
+    whole command, heredoc body included, so ``x = tmp_path / "logs"``,
+    ``expr 6 / 3`` and ``a / b`` in ``awk`` or ``bc`` each produced a ``/``
+    token; ``_pathlike`` accepts it because it starts with ``/``, it resolves
+    to ``/``, and ``/`` is the exact-only entry of ``HARD_DENYLIST`` — a
+    mechanical, gate-free reject of a harmless inline script. Only the lone
+    slash goes: ``/etc``, ``/tmp/x``, ``//x`` and ``/*`` are still paths.
+    ``ls /`` is now a no-path ask; ``deny_commands`` is matched against the
+    raw command text, not this list, so it is unaffected; and an
+    ``external_directory`` pattern of ``/`` is never scanned here.
     """
     if not isinstance(command, str) or "\x00" in command:
         return []
@@ -485,7 +497,9 @@ def _command_paths(command) -> list:
     for token in _CMD_TOKEN.findall(command):
         if len(token) >= 2 and token[0] == token[-1] and token[0] in "\"'":
             token = token[1:-1]
-        if token and _pathlike(token):
+        if not token or token == "/":
+            continue
+        if _pathlike(token):
             paths.append(token)
     return paths
 

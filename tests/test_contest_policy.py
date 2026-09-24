@@ -651,6 +651,121 @@ def test_command_scan_deduplicates_paths(tmp_path):
     assert "/tmp/contest/out.txt" in originals
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# KC-52: a lone `/` in a command is an operator, not the filesystem root
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_heredoc_division_operator_is_not_the_root(tmp_path):
+    """KC-52: the round 86 reject — the heredoc body held ``x = tmp_path / "logs"``,
+    whose division operator was read as the filesystem root and rejected
+    mechanically, gate-free."""
+    event = make_event(
+        permission="bash",
+        patterns=[],
+        command='python3 - <<\'PY\'\nx = tmp_path / "logs"\nPY',
+        description="write the test",
+    )
+    gate = StubGate(json.dumps(ALLOW))
+    policy = Policy(make_config(), completion_fn=gate, clock=FakeClock())
+
+    assert policy_mod._command_paths(event["properties"]["metadata"]["command"]) == []
+
+    decision = decide(policy, event, tmp_path)
+
+    assert (decision.reply, decision.layer) == ("once", "mechanical")
+    assert "no path outside" in decision.reason
+    assert gate.calls == []
+
+
+@pytest.mark.parametrize("command", [
+    'python3 -c "print(6 / 3)"',
+    "python3 -c 'print(6 / 3)'",
+    "awk '{print $1 / 2}'",
+    "awk 'BEGIN{print 6 / 3}'",
+    "bc <<< \"6 / 3\"",
+    "expr 6 / 3",
+    "python3 - <<'PY'\nx = tmp_path / \"logs\"\nPY",
+])
+def test_lone_slash_tokens_are_not_paths(command):
+    """KC-52: a token that is exactly ``/`` is the division operator, whatever
+    the command kind — ``-c``, ``awk``, ``bc``, ``expr``, a heredoc body."""
+    assert policy_mod._command_paths(command) == []
+
+
+@pytest.mark.parametrize("command,expected", [
+    ("ls /etc", ["/etc"]),
+    ("cat /tmp/x", ["/tmp/x"]),
+    ("echo //x", ["//x"]),
+    ("cat /etc/passwd", ["/etc/passwd"]),
+])
+def test_paths_beside_a_lone_slash_are_unchanged(command, expected):
+    """KC-52: only the token that *is* ``/`` goes; every real path stays."""
+    assert policy_mod._command_paths(command) == expected
+
+
+@pytest.mark.parametrize("command", ["/", "'/'", '"/"', "cat '/'"])
+def test_a_quoted_lone_slash_is_dropped_too(command):
+    """KC-52: the drop happens after quote stripping, so a quoted ``/`` goes."""
+    assert policy_mod._command_paths(command) == []
+
+
+def test_lone_slash_beside_a_real_path_drops_only_the_slash():
+    """KC-52: one operator and one target on a line keep the target."""
+    assert policy_mod._command_paths("rm -rf /tmp/x && expr 6 / 3") == ["/tmp/x"]
+
+
+def test_ls_slash_is_a_no_path_ask(tmp_path):
+    """KC-52: ``ls /`` is a bash ask with no path outside the worktree — layer 1
+    answers ``once`` and no gate call is spent listing the root."""
+    event = make_event(permission="bash", patterns=[], command="ls /")
+    gate = StubGate(json.dumps(ALLOW))
+    policy = Policy(make_config(), completion_fn=gate, clock=FakeClock())
+
+    decision = decide(policy, event, tmp_path)
+
+    assert (decision.reply, decision.layer) == ("once", "mechanical")
+    assert "no path outside" in decision.reason
+    assert gate.calls == []
+
+
+def test_cat_etc_passwd_still_reaches_the_gate(tmp_path):
+    """KC-52: an ordinary absolute path outside the worktree still gates."""
+    event = make_event(permission="bash", patterns=[], command="cat /etc/passwd")
+    gate = StubGate(json.dumps(REJECT))
+    policy = Policy(make_config(), completion_fn=gate, clock=FakeClock())
+
+    decision = decide(policy, event, tmp_path)
+
+    assert decision.layer == "gate"
+    assert decision.reply == "reject"
+    assert "/etc/passwd" in gate.user_message()
+
+
+def test_rm_rf_slash_star_keeps_its_token_and_its_deny_match():
+    """KC-52: the fix must not touch a command that really targets the root.
+
+    ``/*`` is still a path token — only a token that *is* ``/`` goes — and
+    ``deny_commands`` is matched against the raw command text, never against
+    the scan output, so it is independent of the drop.
+    """
+    assert policy_mod._command_paths("rm -rf /*") == ["/*"]
+    assert policy_mod._deny_match("rm -rf /*", ("rm -rf /*",)) == "rm -rf /*"
+
+
+def test_external_directory_slash_pattern_stays_forbidden(tmp_path):
+    """KC-52: ``external_directory`` patterns are not scanned by
+    ``_command_paths``, so a ``/`` pattern there is still the hard denylist."""
+    event = make_event(permission="external_directory", patterns=["/"])
+    gate = StubGate(json.dumps(ALLOW))
+    policy = Policy(make_config(), completion_fn=gate, clock=FakeClock())
+
+    decision = decide(policy, event, tmp_path)
+
+    assert (decision.reply, decision.layer) == ("reject", "mechanical")
+    assert "forbidden" in decision.reason
+    assert gate.calls == []
+
+
 def test_root_and_home_match_on_identity_alone():
     """``/`` and ``$HOME`` are ancestors of every worktree, so they may only
     name themselves — otherwise every worktree path is forbidden."""
