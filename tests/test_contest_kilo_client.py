@@ -809,6 +809,80 @@ def test_spawn_of_a_missing_binary_is_a_file_not_found(tmp_path):
                          log_path=str(tmp_path / "serve.log"), health_timeout=1.0)
 
 
+# KC-35: the stub records the environment it was started with, so a spawn
+# without `env` and one with it can be compared.
+STUB_KILO_ENV = '''#!/usr/bin/env python3
+import http.server
+import os
+import sys
+
+args = sys.argv[1:]
+host = args[args.index("--hostname") + 1]
+port = int(args[args.index("--port") + 1])
+
+dump = os.environ.get("KC35_ENV_DUMP")
+if dump:
+    with open(dump, "w", encoding="utf-8") as handle:
+        for key in sorted(os.environ):
+            handle.write(key + "=" + os.environ[key] + "\\n")
+
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        body = b"ok" if self.path.startswith("/global/health") else b"[]"
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+http.server.HTTPServer((host, port), Handler).serve_forever()
+'''
+
+
+def test_spawn_env_is_added_to_the_inherited_environment(tmp_path, monkeypatch):
+    """`env` is an overlay on the operator's environment, not a replacement —
+    the child keeps its `PATH` and gains `KILO_CONFIG_CONTENT`."""
+    binary = _write_executable(tmp_path / "kilo", STUB_KILO_ENV)
+    dump = tmp_path / "child-env"
+    overlay = {"KILO_CONFIG_CONTENT": '{"provider": {"kenary": {}}}',
+               "KC35_ENV_DUMP": str(dump)}
+    monkeypatch.setenv("KC35_ALREADY_HERE", "inherited")
+    server = KiloServer.spawn(str(binary), log_path=str(tmp_path / "serve.log"),
+                              health_timeout=60.0, env=overlay)
+    try:
+        pairs = dict(line.split("=", 1) for line in dump.read_text(encoding="utf-8").splitlines())
+    finally:
+        server.close()
+
+    assert pairs["KILO_CONFIG_CONTENT"] == overlay["KILO_CONFIG_CONTENT"]
+    assert pairs["KC35_ENV_DUMP"] == str(dump)
+    # the inherited environment came along for the ride
+    assert pairs["PATH"] == os.environ["PATH"]
+    assert pairs["KC35_ALREADY_HERE"] == "inherited"
+
+
+def test_spawn_without_env_passes_nothing_extra(tmp_path, monkeypatch):
+    """No `env` → the child sees its parent's environment and nothing else."""
+    binary = _write_executable(tmp_path / "kilo", STUB_KILO_ENV)
+    dump = tmp_path / "child-env"
+    monkeypatch.setenv("KC35_ENV_DUMP", str(dump))
+    server = KiloServer.spawn(str(binary), log_path=str(tmp_path / "serve.log"),
+                              health_timeout=60.0)
+    try:
+        pairs = dict(line.split("=", 1) for line in dump.read_text(encoding="utf-8").splitlines())
+    finally:
+        server.close()
+
+    assert pairs["PATH"] == os.environ["PATH"]
+    assert pairs["KC35_ENV_DUMP"] == str(dump)
+    # the operator set no overlay: nothing was added on the way
+    assert pairs.get("KILO_CONFIG_CONTENT") == os.environ.get("KILO_CONFIG_CONTENT")
+
+
 def test_attach_checks_health_once_and_close_leaves_the_process_alone(tmp_path):
     """close() on a server we only attached to must not kill anything: the fake
     is still answering after the close."""

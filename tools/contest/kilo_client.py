@@ -352,8 +352,12 @@ class KiloServer:
 
     @classmethod
     def spawn(cls, binary: str, *, log_path: str, hostname: str = "127.0.0.1",
-              health_timeout: float = 30.0) -> "KiloServer":
+              health_timeout: float = 30.0, env: dict | None = None) -> "KiloServer":
         """Start ``kilo serve`` on a free port and wait until it is healthy.
+
+        ``env`` (KC-35) is added on top of this process's own environment for the
+        child, so ``KILO_CONFIG_CONTENT`` reaches the server it is meant to change;
+        ``None`` inherits the environment untouched, exactly as before the parameter.
 
         Raises :class:`KiloServerError` — with the tail of ``log_path`` — if
         the child exits before the health check passes or the timeout runs
@@ -366,12 +370,16 @@ class KiloServer:
         log_file = open(log_path, "a", encoding="utf-8")
         log_file.write(f"# {time.strftime('%Y-%m-%d %H:%M:%S')} kilo serve --port {port}\n")
         log_file.flush()
+        child_env = None
+        if env:
+            child_env = {**os.environ, **env}
         try:
             proc = subprocess.Popen(
                 [str(binary), "serve", "--port", str(port),
                  "--hostname", hostname, "--print-logs"],
                 stdout=log_file,
                 stderr=subprocess.STDOUT,
+                env=child_env,
             )
         except (OSError, ValueError):
             log_file.close()

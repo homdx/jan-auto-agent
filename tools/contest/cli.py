@@ -50,6 +50,7 @@ tools.contest` is argparse's usage, exit 2.
 from __future__ import annotations
 
 import argparse
+import copy
 import difflib
 from collections import Counter
 import json
@@ -112,6 +113,9 @@ __all__ = [
     "main",
     "resolve_variants",
     "roster_on_offer",
+    "roster_missing",
+    "registration_overlay",
+    "merge_config_content",
 ]
 
 #: The ticket folder the round reads; `scripts/next_task.py` hands it out.
@@ -414,6 +418,125 @@ def roster_on_offer(providers: dict, agents: tuple, *, kilo_bin: str | None = No
     return failures
 
 
+def roster_missing(providers: dict, agents) -> list:
+    """KC-35: the agents Kilo will refuse from its own model list, in roster order.
+
+    Exactly the third case of :func:`roster_on_offer`, split out so the remedy can
+    name it: the provider is *known* (it is in the offer's `all`) and *connected*
+    (it has credentials), but the model id is not in its `models`. An unknown
+    provider and a provider without credentials are **not** missing — registering
+    a model cannot create a provider or supply a key, so both stay
+    `roster_on_offer` lines. Nothing is inferred from `status` or `capabilities`,
+    and a provider's `name` is never treated as its id. Pure: no server, no roster.
+    """
+    by_id = {}
+    for provider in providers.get("all") or []:
+        if not isinstance(provider, dict):
+            continue
+        provider_id = provider.get("id")
+        if isinstance(provider_id, str) and provider_id:
+            by_id[provider_id] = provider
+    connected = [item for item in (providers.get("connected") or []) if isinstance(item, str)]
+
+    missing = []
+    for agent in agents:
+        provider = by_id.get(agent.provider_id)
+        if provider is None or agent.provider_id not in connected:
+            continue
+        if agent.model_id in (provider.get("models") or {}):
+            continue
+        missing.append(agent)
+    return missing
+
+
+def registration_overlay(agents) -> dict:
+    """KC-35: the `KILO_CONFIG_CONTENT` body that adds *agents*' models to Kilo's list.
+
+    ``{"provider": {<pid>: {"models": {<mid>: {"name": <mid>, "reasoning": True}}}}}``,
+    grouped by provider id, ids in roster order, ``{}`` for an empty list.
+    `reasoning: True` mirrors the existing `kenary` / `sensenova123` entries and is
+    what `kilo models` reported `capabilities.reasoning: true` for. The caller
+    merges it with the operator's own `KILO_CONFIG_CONTENT` — this function never
+    reads or writes `kilo.jsonc`.
+    """
+    models_by_provider: dict = {}
+    for agent in agents:
+        models_by_provider.setdefault(agent.provider_id, []).append(agent.model_id)
+    providers = {}
+    for provider_id, model_ids in models_by_provider.items():
+        models = {model_id: {"name": model_id, "reasoning": True} for model_id in model_ids}
+        providers[provider_id] = {"models": models}
+    return {} if not providers else {"provider": providers}
+
+
+def _additive_merge(base: dict, overlay: dict) -> dict:
+    """*base* with *overlay*'s keys added: dicts merge, a leaf is only ever added.
+
+    Additive rather than replacing, so an operator's own `name`, `options.baseURL`,
+    `apiKey` and already-listed models survive the merge untouched — the overlay
+    registers what is absent, and says nothing about what is there. Neither input
+    is mutated.
+    """
+    merged = {key: copy.deepcopy(value) for key, value in (base or {}).items()}
+    for key, value in (overlay or {}).items():
+        current = merged.get(key)
+        if isinstance(current, dict) and isinstance(value, dict):
+            merged[key] = _additive_merge(current, value)
+        elif key not in merged:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
+def merge_config_content(existing: str | None, overlay: dict) -> str:
+    """KC-35: the JSON string for `KILO_CONFIG_CONTENT`, *overlay* merged over *existing*.
+
+    An unset or empty *existing* gives the overlay alone; a JSON object is deep-merged
+    additively, so it keeps its own providers, `options.baseURL`, `apiKey` and models
+    and gains the overlay's models; anything else — a JSON array, a bare string, or
+    text that is not JSON at all — is a `ValueError` whose message intake prints as
+    `intake: KILO_CONFIG_CONTENT is not a JSON object: …`. A malformed value is a
+    refusal, never a crash: without it the round would run with no overlay and find
+    out ten seconds in, the way it did before this check.
+    """
+    if not existing:
+        return json.dumps(overlay)
+    try:
+        parsed = json.loads(existing)
+    except ValueError as exc:
+        raise ValueError(f"KILO_CONFIG_CONTENT is not a JSON object: {exc}") from exc
+    if not isinstance(parsed, dict):
+        raise ValueError(f"KILO_CONFIG_CONTENT is not a JSON object: "
+                         f"expected a JSON object, got {type(parsed).__name__}")
+    return json.dumps(_additive_merge(parsed, overlay))
+
+
+def _missing_hint_lines(missing) -> list:
+    """KC-35: one `hint:` line per provider whose models the roster wants but Kilo lacks.
+
+    Printed after `roster_on_offer`'s own lines, once per provider — `roster_missing`
+    groups by provider, and one line naming one `<pid>` is what an operator can act on.
+    It says the id is refused by Kilo, not by the provider, and that "did you mean"
+    compares spelling only, so the two remedies — the entry to add to `kilo.jsonc`, or
+    `--register-missing` — are both on the line.
+    """
+    counts: dict = {}
+    order: list = []
+    for agent in missing:
+        if agent.provider_id not in counts:
+            order.append(agent.provider_id)
+            counts[agent.provider_id] = 0
+        counts[agent.provider_id] += 1
+    lines = []
+    for provider_id in order:
+        lines.append(
+            f"hint: {counts[provider_id]} id(s) are not in Kilo's model list for provider "
+            f"'{provider_id}'. "
+            '"did you mean" compares spelling only — if the provider serves the id, add it '
+            f"under provider.{provider_id}.models in kilo.jsonc, or re-run with --register-missing."
+        )
+    return lines
+
+
 def _roster_path(repo, roster: str) -> Path:
     """`--roster` as a path: absolute as given, else relative to the repo."""
     path = Path(roster)
@@ -507,6 +630,13 @@ class Intake:
     out_dir: Path
     #: the roster with every `highest` resolved (KC-49); empty = the config's as is
     agents: tuple = ()
+
+    #: the `KILO_CONFIG_CONTENT` a `--register-missing` round runs on: the
+    #: operator's own value with the missing models merged in (KC-35)
+    config_content: str | None = None
+
+    #: the `provider/model` ids that registration put on offer this round
+    registered: tuple = ()
 
 
 def _without_highest(agents: tuple) -> tuple:
@@ -632,17 +762,60 @@ def _gate_probe(config) -> tuple:
 
 def _offer_failures(repo, config: ContestConfig, attached) -> list:
     """`_check_offer`'s failures alone — its first KC-25 shape, kept for callers."""
-    return _check_offer(repo, config, attached)[0]
+    return _check_offer(repo, config, attached).failures
 
 
-def _check_offer(repo, config: ContestConfig, attached, *, resolve: bool = True) -> tuple:
-    """`(failures, agents, notes, gate_warnings)`: the roster's `provider/model`
-    pairs checked against `GET /provider`, then its variants resolved there
-    (KC-49), then the gate's two intake checks (KC-55).
+@dataclass(frozen=True)
+class _Offer:
+    """What one `GET /provider` read is worth to intake.
+
+    *failures* are the printed `intake:` lines; *agents* the roster with its
+    `highest` resolved (KC-49); *notes* one line per probed variant; *warnings*
+    the `gate:` lines. KC-35 adds the two registration fields: *config_content*
+    is the `KILO_CONFIG_CONTENT` the round's own server must be spawned with, and
+    *registered* the `provider/model` ids that put it there — both empty when no
+    model needed registering.
+    """
+
+    failures: list
+    agents: tuple
+    notes: list
+    warnings: list
+    config_content: str | None = None
+    registered: tuple = ()
+
+
+def _offer_server(kilo_bin: str | None, env: dict | None = None) -> tuple:
+    """KC-35: one throwaway `kilo serve`, or `(None, log_path)` — never an error.
+
+    The check asks one question and must not fail louder than the round it
+    guards, so whatever stops the child from starting is swallowed here, the way
+    `_check_offer`'s old inline `except Exception` did. *env* goes to
+    `KiloServer.spawn`'s own `env=` and is added on top of `os.environ` for the
+    child; `None` spawns exactly as today — no `env=` at all, so a caller's own
+    keyword-only signature stays unchanged.
+    """
+    fd, log_path = tempfile.mkstemp(prefix="kilo-offer-", text=True)
+    os.close(fd)
+    kwargs = {}
+    if env:
+        kwargs["env"] = env
+    try:
+        server = KiloServer.spawn(find_kilo_binary(kilo_bin), log_path=log_path, **kwargs)
+    except Exception:
+        return None, log_path
+    return server, log_path
+
+
+def _check_offer(repo, config: ContestConfig, attached, *, resolve: bool = True,
+                 register_missing: bool = False) -> _Offer:
+    """The roster's `provider/model` pairs checked against `GET /provider`, then
+    its variants resolved there (KC-49), then the gate's two intake checks
+    (KC-55), returning an `_Offer`.
 
     *agents* is the roster with every `highest` replaced by the variant that
     answered, or `config.agents` as is when nothing was resolved; *notes* is
-    one line per probed model; *gate_warnings* are the `gate:` lines the round
+    one line per probed model; *warnings* are the `gate:` lines the round
     may warn on and still start — the gate sharing an endpoint with the roster,
     and a probe that hit a transient error. A probe that refuses the round goes
     into *failures* instead, so it is printed as every other refusal.
@@ -662,34 +835,96 @@ def _check_offer(repo, config: ContestConfig, attached, *, resolve: bool = True)
     line reports the same word. With a URL the attached server answers and
     nothing is spawned. A failure of the call itself is one line, so the check
     never crashes intake.
+
+    KC-35: when a model is missing from the provider's own list, the hint line
+    is printed after the KC-25 lines unless *register_missing* registered it
+    first. That flag needs a spawn: it builds `merge_config_content` over the
+    operator's own `KILO_CONFIG_CONTENT`, spawns a **second** throwaway with
+    `env={"KILO_CONFIG_CONTENT": …}`, and requires the models to be on offer
+    there — `registration did not take: <ids>` when they are not, with no
+    worktree created. The string is handed back on the `_Offer` so `cmd_run`
+    gives the round's real server the same one.
     """
     agents = config.agents
     # no offer to read: `highest` — the round's default — quietly becomes no
     # variant, and the round's own `server:` line reports why there was none
     unresolved = _without_highest(agents)
-    log_path = None
-    own_server = None
+    # KC-35: the overlay the registered round runs on, and the ids it got
+    content: str | None = None
+    registered: tuple = ()
+    spawned: list = []
+    logs: list = []
     server = attached
     try:
         if server is None and config.server == "spawn":
-            fd, log_path = tempfile.mkstemp(prefix="kilo-offer-", text=True)
-            os.close(fd)
-            try:
-                server = KiloServer.spawn(find_kilo_binary(config.kilo_bin),
-                                          log_path=log_path)
-                own_server = server
-            except Exception:
-                return [], unresolved, [], []
+            server, log_path = _offer_server(config.kilo_bin)
+            logs.append(log_path)
+            if server is not None:
+                spawned.append(server)
         if server is None:
-            return [], unresolved, [], []
+            return _Offer([], unresolved, [], [])
         try:
             kilo_bin = find_kilo_binary(config.kilo_bin)
         except (FileNotFoundError, OSError):
             kilo_bin = "kilo"
         providers = KiloClient(server, str(repo)).providers()
+        missing = roster_missing(providers, agents)
+
+        # the attached server reads the operator's own kilo.jsonc and this
+        # process cannot change it: the flag refuses, and the other agents still
+        # get their KC-25 check so the round is not refused twice
+        if missing and register_missing and attached is not None:
+            others = tuple(agent for agent in agents if agent not in missing)
+            return _Offer(
+                ["--register-missing needs server = spawn: an attached server reads its own "
+                 "kilo.jsonc"]
+                + roster_on_offer(providers, others, kilo_bin=kilo_bin),
+                unresolved, [], [])
+
+        if missing and register_missing and resolve:
+            try:
+                content = merge_config_content(os.environ.get("KILO_CONFIG_CONTENT"),
+                                               registration_overlay(missing))
+            except ValueError as exc:
+                return _Offer([str(exc)], unresolved, [], [])
+            second, second_log = _offer_server(config.kilo_bin,
+                                                env={"KILO_CONFIG_CONTENT": content})
+            logs.append(second_log)
+            if second is None:
+                # the overlay would not even start a server: no registration
+                # happened, and the hint's own advice — re-run with the flag —
+                # is what the operator just did, so the line says what failed
+                return _Offer([f"registration did not take: "
+                               f"{', '.join(agent.model for agent in missing)} — "
+                               "kilo serve with KILO_CONFIG_CONTENT did not start"],
+                              unresolved, [], [])
+            else:
+                server = second
+                spawned.append(second)
+                try:
+                    providers = KiloClient(server, str(repo)).providers()
+                except (KiloHttpError, KiloServerError, ValueError) as exc:
+                    return _Offer([f"GET /provider failed: {exc}"], unresolved, [], [])
+                still = roster_missing(providers, missing)
+                if still:
+                    return _Offer([f"registration did not take: "
+                                   f"{', '.join(agent.model for agent in still)}"],
+                                  unresolved, [], [])
+                registered = tuple(agent.model for agent in missing)
+                missing = ()
+        elif missing and register_missing:
+            # refused on other grounds already (`resolve=False`): nothing is
+            # registered, but the ids the flag would register are still not
+            # failures, and no hint tells the operator to pass a flag they passed
+            others = tuple(agent for agent in agents if agent not in missing)
+            return _Offer(roster_on_offer(providers, others, kilo_bin=kilo_bin),
+                          unresolved, [], [])
+
         failures = roster_on_offer(providers, agents, kilo_bin=kilo_bin)
+        if missing:
+            failures.extend(_missing_hint_lines(missing))
         if failures or not resolve:
-            return failures, unresolved, [], []
+            return _Offer(failures, unresolved, [], [])
 
         # KC-55 §5: the gate's two checks, both of them free of a session — the
         # share check off the offer just read, and one probe call of its own
@@ -700,26 +935,28 @@ def _check_offer(repo, config: ContestConfig, attached, *, resolve: bool = True)
         refusals, probe_warnings = _gate_probe(config)
         warnings.extend(probe_warnings)
         if refusals:
-            return list(refusals), unresolved, [], warnings
+            return _Offer(list(refusals), unresolved, [], warnings)
 
         def probe_for(agent):
             return hello_probe(server, agent.provider_id, agent.model_id)
         resolved, failures, notes = resolve_variants(providers, agents, probe_for,
                                                      kilo_bin=kilo_bin)
-        return failures, resolved, notes, warnings
+        return _Offer(failures, resolved, notes, warnings,
+                      config_content=content, registered=registered)
     except (KiloHttpError, KiloServerError, ValueError) as exc:
-        return [f"GET /provider failed: {exc}"], unresolved, [], []
+        return _Offer([f"GET /provider failed: {exc}"], unresolved, [], [])
     finally:
-        if own_server is not None:
+        for own_server in spawned:
             own_server.close()
-        if log_path:
+        for log_path in logs:
             try:
                 os.unlink(log_path)
             except OSError:
                 pass
 
 
-def intake(repo, tasks_dir, round_no, base_ref, config, argv=None):
+def intake(repo, tasks_dir, round_no, base_ref, config, argv=None,
+           register_missing: bool = False):
     """Run every pre-round check; return the `Intake`, or `None` with the failures printed.
 
     All checks run and every failure goes to stderr on its own line before
@@ -736,7 +973,11 @@ def intake(repo, tasks_dir, round_no, base_ref, config, argv=None):
     roster's `provider/model` pairs are on offer — `KiloClient.providers`
     against `roster_on_offer`, so a display name spelled as an id, a provider
     with no credentials, and a model that is not there are all refused here
-    instead of on the first turn (KC-25).
+    instead of on the first turn (KC-25). With `--register-missing`, a model
+    that is known, connected and simply not on the offer is registered for the
+    round alone through `KILO_CONFIG_CONTENT` instead of refused: the intake
+    proves it took in a second throwaway server and hands the string to
+    `cmd_run` as `Intake.config_content` (KC-35).
     `Intake.out_dir` is the default `<out_dir>/<NN>`; `--out` replaces it in
     `cmd_run`.
 
@@ -809,6 +1050,7 @@ def intake(repo, tasks_dir, round_no, base_ref, config, argv=None):
 
     # an openrouter round has no offer to probe: `highest` is no variant there
     agents = _without_highest(config.agents)
+    offer = None
     attached = None
     if config.backend == "kilo":
         # an openrouter round has no Kilo server at all: nothing to resolve,
@@ -828,13 +1070,18 @@ def intake(repo, tasks_dir, round_no, base_ref, config, argv=None):
         # refusal that used to arrive as one agent's first-turn `session.error`
         # the variant probe spends model calls, so it only runs for a round
         # that has passed every other check
-        offer_failures, agents, notes, gate_warnings = _check_offer(
-            repo, config, attached, resolve=not failures)
-        failures.extend(offer_failures)
-        for note in notes:
+        offer = _check_offer(repo, config, attached, resolve=not failures,
+                             register_missing=register_missing)
+        failures.extend(offer.failures)
+        for note in offer.notes:
             print(f"variant: {note}")
-        for line in gate_warnings:
+        for line in offer.warnings:
             print(line)
+
+    if offer is None:
+        # no offer was read: an openrouter round, or a backend that failed
+        # before the check — nothing was resolved and nothing was registered
+        offer = _Offer([], agents, [], [])
 
     if failures:
         for line in failures:
@@ -846,7 +1093,9 @@ def intake(repo, tasks_dir, round_no, base_ref, config, argv=None):
         title=title,
         base_sha=base_sha,
         out_dir=_round_out_dir(repo, config, round_no),
-        agents=agents,
+        agents=offer.agents,
+        config_content=offer.config_content,
+        registered=offer.registered,
     )
 
 
@@ -903,15 +1152,23 @@ def export_patches(state: RoundState, workspaces: list, out_dir) -> list:
 # the command
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _start_server(config: ContestConfig, out_dir: Path):
-    """`KiloServer.spawn` when `server = spawn`, else `.attach` to the URL."""
+def _start_server(config: ContestConfig, out_dir: Path, env: dict | None = None):
+    """`KiloServer.spawn` when `server = spawn`, else `.attach` to the URL.
+
+    KC-35: *env* is added on top of `os.environ` for the child, so the
+    round's own server gets the same `KILO_CONFIG_CONTENT` intake registered
+    with — `None` spawns exactly as before.
+    """
     if config.server == "spawn":
+        kwargs = {}
+        if env:
+            kwargs["env"] = env
         return KiloServer.spawn(find_kilo_binary(config.kilo_bin),
-                                log_path=str(out_dir / "kilo-serve.log"))
+                                log_path=str(out_dir / "kilo-serve.log"), **kwargs)
     return KiloServer.attach(config.server)
 
 
-def _make_backends(config: ContestConfig, out_dir: Path):
+def _make_backends(config: ContestConfig, out_dir: Path, env: dict | None = None):
     """``(server, make_backend)`` for ``run_round``: one ``ContestBackend`` per worktree.
 
     ``backend = kilo`` starts (or attaches to) the ``kilo serve`` process the
@@ -932,7 +1189,7 @@ def _make_backends(config: ContestConfig, out_dir: Path):
                                      str(workspace.path))
         return None, make_backend
 
-    server = _start_server(config, out_dir)
+    server = _start_server(config, out_dir, env=env)
 
     def make_backend(workspace):
         return KiloBackend(server, str(workspace.path),
@@ -1004,6 +1261,12 @@ def _print_plan(result: Intake, config: ContestConfig, out_dir: Path, *, run_tes
     width = max(len(key) for key, _ in facts)
     for key, value in facts:
         print(f"{key:<{width}} {value}")
+        if key == "agents" and result.registered:
+            # KC-35: what --register-missing added for this round alone — named
+            # here because kilo.jsonc was not touched, so the log is the only
+            # record that the ids were ever registered
+            print("registered for this round (kilo.jsonc untouched): "
+                  + ", ".join(result.registered))
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -1047,7 +1310,8 @@ def cmd_run(args: argparse.Namespace) -> int:
     run_tests = not args.no_tests
 
     result = intake(repo, tasks_dir, args.ticket, args.base, config,
-                    argv=getattr(args, "argv", None))
+                    argv=getattr(args, "argv", None),
+                    register_missing=args.register_missing)
     if result is None:
         return EXIT_FAILED
     if result.agents:
@@ -1055,6 +1319,12 @@ def cmd_run(args: argparse.Namespace) -> int:
         config = replace(config, agents=result.agents)
     out_dir = Path(args.out).resolve() if args.out else result.out_dir
     _print_plan(result, config, out_dir, run_tests=run_tests)
+    if result.config_content is not None:
+        # KC-35: the overlay intake proved in its throwaway goes to the round's
+        # own server too, or the round would run on an unregistered list
+        env = {"KILO_CONFIG_CONTENT": result.config_content}
+    else:
+        env = None
 
     resume = None
     if args.resume:
@@ -1078,7 +1348,7 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     out_dir.mkdir(parents=True, exist_ok=True)
     try:
-        server, make_backend = _make_backends(config, out_dir)
+        server, make_backend = _make_backends(config, out_dir, env=env)
     except (KiloServerError, FileNotFoundError, OSError) as exc:
         print(f"server: {exc}", file=sys.stderr)
         return EXIT_FAILED
@@ -1136,6 +1406,10 @@ def _parser() -> argparse.ArgumentParser:
                           "[contest] variant) — the top one that answers 'say: hello', "
                           "probed at intake; 'default' — send none. A --models item names "
                           "its own as model@variant")
+    run.add_argument("--register-missing", action="store_true",
+                     help="register a roster model that is not in Kilo's own model list "
+                          "for this round, through KILO_CONFIG_CONTENT (kilo.jsonc is not "
+                          "edited; needs server = spawn)")
     run.add_argument("--max-parallel", type=int, default=None, metavar="N",
                      help="override the roster's max_parallel")
     run.add_argument("--no-tests", action="store_true",

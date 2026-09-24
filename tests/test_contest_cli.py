@@ -35,6 +35,7 @@ for _p in (str(REPO_ROOT), str(TESTS_DIR)):
 from _kilo_fake import FakeKiloServer  # noqa: E402
 from tools.contest import cli  # noqa: E402
 from tools.contest.kilo_client import KiloServer  # noqa: E402
+from tools.contest.kilo_client import KiloServerError  # noqa: E402
 from tools.contest.roster import AgentSpec, load_roster  # noqa: E402
 from tools.contest.runner import AgentRun, AgentState, RoundState  # noqa: E402
 from tools.contest.workspace import Workspace, prepare_round  # noqa: E402
@@ -1796,3 +1797,493 @@ def test_a_silence_clock_shorter_than_the_gate_worst_case_refuses_the_round(
     assert calls == [], "a refused round spends no model call"
     assert _sessions(fake) == []
     assert not sandbox.out().exists()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KC-35: a roster model missing from Kilo's own model list
+# ─────────────────────────────────────────────────────────────────────────────
+
+#: The offer the round-64 logs were run against: `hy3:free` and the two
+#: `agnes-2-x` ids are listed, `agnes-3-0-flash:free` and `nex-n2-5-pro:free`
+#: are not, so the two agents that ended `ERROR` ten seconds in are missing.
+KC35_OFFER = _offer((_provider("kenary", "kenari",
+                               ("hy3:free", "agnes-2-5-flash:free",
+                                "agnes-2-0-flash:free")),))
+
+#: The same offer with the two ids added — what `kilo models` shows once
+#: `KILO_CONFIG_CONTENT` registers them (the ticket's live verification).
+KC35_REGISTERED_OFFER = _offer((_provider("kenary", "kenari",
+                                          ("hy3:free", "agnes-2-5-flash:free",
+                                           "agnes-2-0-flash:free",
+                                           "agnes-3-0-flash:free",
+                                           "nex-n2-5-pro:free")),))
+
+KC35_SCENARIO = {"providers": KC35_OFFER,
+                 "turns": [{"on_prompt": work_ready, "events": ["busy", "idle"]}]}
+KC35_REGISTERED_SCENARIO = {"providers": KC35_REGISTERED_OFFER,
+                            "turns": [{"on_prompt": work_ready, "events": ["busy", "idle"]}]}
+
+#: The `KILO_CONFIG_CONTENT` body registration writes for the ids named, under
+#: the `kenary` provider: `name` is the id, `reasoning` is on.
+def _kc35_overlay(*model_ids):
+    return {"provider": {"kenary": {"models": {
+        model_id: {"name": model_id, "reasoning": True} for model_id in model_ids}}}}
+
+
+KC35_ENTRY = _kc35_overlay("agnes-3-0-flash:free")
+KC35_TWO_ENTRIES = _kc35_overlay("agnes-3-0-flash:free", "nex-n2-5-pro:free")
+
+
+def test_roster_missing_names_only_a_known_connected_provider_missing_the_model():
+    """Unknown provider, no credentials, on offer — none of those are missing;
+    registering a model cannot create a provider or supply a key."""
+    offer = _offer((_provider("kenary", "kenari", ("hy3:free", "agnes-2-5-flash:free")),
+                    _provider("sensenova123", "sensenova", ("sensenova-6.8-flash-lite",))),
+                   connected=("kenary", "sensenova123"))
+    agents = (cli.agents_from_models("agnes-3-0-flash:free,nex-n2-5-pro:free")
+              + cli.agents_from_models("hy3:free")
+              + cli.agents_from_models("sensenova123/sensenova-6.8-flash-lite")
+              + cli.agents_from_models("kenari/hy3:free")
+              + cli.agents_from_models("mystery/gpt-4o"))
+
+    assert [agent.model for agent in cli.roster_missing(offer, agents)] == [
+        "kenary/agnes-3-0-flash:free", "kenary/nex-n2-5-pro:free"]
+
+
+def test_roster_missing_is_empty_for_a_roster_entirely_on_offer():
+    assert cli.roster_missing(KC25_OFFER,
+                              cli.agents_from_models("hy3:free,kenary/agnes-2-0-flash:free")) == []
+
+
+def test_roster_missing_ignores_a_provider_without_credentials():
+    offer = _offer((_provider("kenary", "kenari", ("hy3:free",)),), connected=())
+    assert cli.roster_missing(offer, cli.agents_from_models("agnes-3-0-flash:free")) == []
+
+
+def test_registration_overlay_groups_the_models_by_provider_in_roster_order():
+    agents = (cli.agents_from_models("agnes-3-0-flash:free,nex-n2-5-pro:free")
+              + cli.agents_from_models("sensenova123/sensenova-6.8-flash-lite"))
+
+    assert cli.registration_overlay(agents) == {
+        "provider": {
+            "kenary": {"models": {
+                "agnes-3-0-flash:free": {"name": "agnes-3-0-flash:free", "reasoning": True},
+                "nex-n2-5-pro:free": {"name": "nex-n2-5-pro:free", "reasoning": True}}},
+            "sensenova123": {"models": {
+                "sensenova-6.8-flash-lite": {"name": "sensenova-6.8-flash-lite",
+                                             "reasoning": True}}},
+        }}
+    # roster order, so the ids read back the way the roster did
+    assert list(cli.registration_overlay(agents)["provider"]["kenary"]["models"]) == [
+        "agnes-3-0-flash:free", "nex-n2-5-pro:free"]
+    assert cli.registration_overlay(()) == {}
+
+
+def test_merge_config_content_gives_the_overlay_when_nothing_is_set():
+    assert json.loads(cli.merge_config_content(None, KC35_ENTRY)) == KC35_ENTRY
+    assert json.loads(cli.merge_config_content("", KC35_ENTRY)) == KC35_ENTRY
+
+
+def test_merge_config_content_keeps_the_operator_s_own_models_and_options():
+    existing = json.dumps({
+        "options": {"baseURL": "https://kenari.id/v1"},
+        "provider": {"kenary": {"apiKey": "sk-operator",
+                                "models": {"hy3:free": {"name": "hy3:free",
+                                                         "reasoning": True}}}}})
+    merged = json.loads(cli.merge_config_content(existing, KC35_ENTRY))
+
+    assert merged["options"]["baseURL"] == "https://kenari.id/v1"
+    assert merged["provider"]["kenary"]["apiKey"] == "sk-operator"
+    assert merged["provider"]["kenary"]["models"]["hy3:free"] == {"name": "hy3:free",
+                                                                  "reasoning": True}
+    assert merged["provider"]["kenary"]["models"]["agnes-3-0-flash:free"] == {
+        "name": "agnes-3-0-flash:free", "reasoning": True}
+    # neither input is rewritten: the operator's string is what it was
+    assert json.loads(existing)["provider"]["kenary"]["models"] == {"hy3:free":
+        {"name": "hy3:free", "reasoning": True}}
+
+
+@pytest.mark.parametrize("bad", ('[1, 2]', '"a string"', "123", "not json", "true"))
+def test_merge_config_content_refuses_a_value_that_is_not_an_object(bad):
+    with pytest.raises(ValueError, match="KILO_CONFIG_CONTENT is not a JSON object"):
+        cli.merge_config_content(bad, KC35_ENTRY)
+
+
+def _content_spawn_holder(monkeypatch):
+    """`KiloServer.spawn` → the next fake in line, each call's `env` recorded.
+
+    The order is the point of KC-35: the first throwaway is the operator's own
+    server, the second gets `KILO_CONFIG_CONTENT`, and the round's own server is
+    the last call. `fakes` is appended to by the test, in that order; one entry
+    stands in for every later call.
+    """
+    calls: list = []
+    fakes: list = []
+    # no operator overlay unless a test says so: the flag's own merge starts
+    # from nothing here
+    monkeypatch.delenv("KILO_CONFIG_CONTENT", raising=False)
+
+    def spawn_server(binary, *, log_path, **kwargs):
+        calls.append(dict(kwargs.get("env") or {}))
+        return KiloServer.attach(fakes[min(len(calls) - 1, len(fakes) - 1)].url)
+
+    monkeypatch.setattr(cli.KiloServer, "spawn", staticmethod(spawn_server))
+    return calls, fakes
+
+
+def _register_missing_flags(*models):
+    """The `run` flags for `--register-missing` on the model ids named."""
+    return ["--ticket", "1", "--models", ",".join(models), "--register-missing",
+            "--no-gate", "--no-tests"]
+
+
+def test_run_prints_the_kc25_line_and_one_hint_for_a_missing_model(sandbox, capsys, spawn_holder):
+    """The id Kilo refuses from its own list is named with the entry to add —
+    before a worktree, an output directory or a session exists."""
+    code, fake = run_fake(sandbox, KC35_SCENARIO,
+                          ["--ticket", "1", "--models", "hy3:free,agnes-3-0-flash:free",
+                           "--no-gate", "--no-tests"], spawn_holder)
+    captured = capsys.readouterr()
+    lines = [line for line in captured.err.splitlines() if line.startswith("intake:")]
+
+    assert code == cli.EXIT_FAILED
+    assert lines == [
+        "intake: [agnes-3-0-flash] kenary/agnes-3-0-flash:free: no model "
+        "'agnes-3-0-flash:free' under 'kenary' — on offer: agnes-2-0-flash:free, "
+        "agnes-2-5-flash:free, hy3:free (did you mean agnes-2-0-flash:free?)",
+        "intake: hint: 1 id(s) are not in Kilo's model list for provider 'kenary'. "
+        '"did you mean" compares spelling only — if the provider serves the id, add it '
+        "under provider.kenary.models in kilo.jsonc, or re-run with --register-missing.",
+    ]
+    assert not (sandbox.rounds / f"{ROUND:02d}-agnes-3-0-flash").exists()
+    assert not sandbox.out().exists()
+    assert _sessions(fake) == [], "no session may be created before intake passes"
+
+
+def test_run_prints_one_hint_for_both_ids_of_a_provider(sandbox, capsys, spawn_holder):
+    """Two ids of one provider are two failures and one hint, naming the count."""
+    code, fake = run_fake(sandbox, KC35_SCENARIO,
+                          ["--ticket", "1", "--models",
+                           "agnes-3-0-flash:free,nex-n2-5-pro:free",
+                           "--no-gate", "--no-tests"], spawn_holder)
+    captured = capsys.readouterr()
+    lines = [line for line in captured.err.splitlines() if line.startswith("intake:")]
+
+    assert code == cli.EXIT_FAILED
+    assert len(lines) == 3
+    assert lines[0].startswith("intake: [agnes-3-0-flash] kenary/agnes-3-0-flash:free: no model")
+    assert lines[1].startswith("intake: [nex-n2-5-pro] kenary/nex-n2-5-pro:free: no model")
+    assert lines[2] == ("intake: hint: 2 id(s) are not in Kilo's model list for provider "
+                        "'kenary'. \"did you mean\" compares spelling only — if the provider "
+                        "serves the id, add it under provider.kenary.models in kilo.jsonc, or "
+                        "re-run with --register-missing.")
+
+
+def test_run_prints_no_hint_for_a_roster_entirely_on_offer(sandbox, capsys, spawn_holder):
+    code, fake = run_fake(sandbox, KC35_SCENARIO,
+                          ["--ticket", "1", "--models", "hy3:free",
+                           "--no-gate", "--no-tests"], spawn_holder)
+    captured = capsys.readouterr()
+
+    assert code == 0
+    assert not [line for line in captured.err.splitlines() if line.startswith("intake:")]
+    assert not [line for line in (captured.out + captured.err).splitlines()
+                if "hint:" in line]
+
+
+def test_register_missing_registers_the_models_and_runs_the_round(
+        sandbox, capsys, monkeypatch):
+    """`--register-missing` proves the ids are on offer in a second throwaway and
+    gives the round's own server the same overlay, so no first turn can fail with
+    `Model not found`."""
+    calls, fakes = _content_spawn_holder(monkeypatch)
+    plain = FakeKiloServer(KC35_SCENARIO).start()
+    registered = FakeKiloServer(KC35_REGISTERED_SCENARIO).start()
+    try:
+        fakes.extend((plain, registered))
+        code = cli.main(["run", *_register_missing_flags("hy3:free",
+                                                          "agnes-3-0-flash:free",
+                                                          "nex-n2-5-pro:free")])
+    finally:
+        registered.stop()
+        plain.stop()
+    captured = capsys.readouterr()
+
+    assert code == 0, captured.err
+    # the first throwaway is the operator's own server; the overlay goes to the
+    # second and to the round's own server, the same string both times
+    assert not calls[0]
+    assert len(calls) == 3
+    assert calls[1] == calls[2] == {"KILO_CONFIG_CONTENT": json.dumps(KC35_TWO_ENTRIES)}
+    models = json.loads(calls[1]["KILO_CONFIG_CONTENT"])["provider"]["kenary"]["models"]
+    assert list(models) == ["agnes-3-0-flash:free", "nex-n2-5-pro:free"], "roster order"
+    assert all(entry["reasoning"] is True and entry["name"] == model_id
+               for model_id, entry in models.items())
+    # the intake saw the missing ids, so no hint and no refusal
+    assert not [line for line in captured.err.splitlines() if line.startswith("intake:")]
+    assert not [line for line in captured.err.splitlines() if "hint:" in line]
+
+    lines = captured.out.splitlines()
+    agent_line = next(line for line in lines if line.startswith("agents "))
+    assert lines[lines.index(agent_line) + 1] == (
+        "registered for this round (kilo.jsonc untouched): "
+        "kenary/agnes-3-0-flash:free, kenary/nex-n2-5-pro:free")
+    # the intake's first throwaway only read the offer; the sessions are the
+    # round's, on the server that carries the overlay
+    assert _sessions(plain) == []
+    assert len(_sessions(registered)) == 3
+
+
+def test_intake_carries_the_overlay_and_the_registered_ids(sandbox, monkeypatch):
+    """`Intake.config_content` and `Intake.registered` are what `cmd_run` prints
+    and passes to the round's server."""
+    calls, fakes = _content_spawn_holder(monkeypatch)
+    plain = FakeKiloServer(KC35_SCENARIO).start()
+    registered = FakeKiloServer(KC35_REGISTERED_SCENARIO).start()
+    try:
+        fakes.extend((plain, registered))
+        config = sandbox.config(agents=cli.agents_from_models("agnes-3-0-flash:free"),
+                                gate_settings=None)
+        result = cli.intake(sandbox.repo, sandbox.repo / "epic-tasks", ROUND, "HEAD", config,
+                            register_missing=True)
+    finally:
+        registered.stop()
+        plain.stop()
+
+    assert result is not None
+    assert result.config_content == json.dumps(KC35_ENTRY)
+    assert result.registered == ("kenary/agnes-3-0-flash:free",)
+    assert [agent.model for agent in result.agents] == ["kenary/agnes-3-0-flash:free"]
+
+
+def test_intake_without_the_flag_carries_no_overlay(sandbox, monkeypatch):
+    """Both fields default: nothing is registered, nothing is spawned twice."""
+    calls, fakes = _content_spawn_holder(monkeypatch)
+    plain = FakeKiloServer(KC35_REGISTERED_SCENARIO).start()
+    try:
+        fakes.append(plain)
+        config = sandbox.config(agents=cli.agents_from_models("hy3:free"),
+                                gate_settings=None)
+        result = cli.intake(sandbox.repo, sandbox.repo / "epic-tasks", ROUND, "HEAD", config)
+    finally:
+        plain.stop()
+
+    assert result is not None
+    assert result.config_content is None
+    assert result.registered == ()
+    assert len(calls) == 1 and not calls[0], "one throwaway, no overlay"
+
+
+def test_register_missing_fails_when_the_stub_ignores_the_variable(
+        sandbox, capsys, monkeypatch):
+    """The overlay did not reach a server that answers it: refuse here, before a
+    worktree — the same ids would otherwise die on their first turn."""
+    calls, fakes = _content_spawn_holder(monkeypatch)
+    plain = FakeKiloServer(KC35_SCENARIO).start()
+    try:
+        fakes.extend((plain, plain))
+        code = cli.main(["run", *_register_missing_flags("hy3:free",
+                                                              "agnes-3-0-flash:free")])
+    finally:
+        plain.stop()
+    captured = capsys.readouterr()
+    lines = [line for line in captured.err.splitlines() if line.startswith("intake:")]
+
+    assert code == cli.EXIT_FAILED
+    assert lines == ["intake: registration did not take: kenary/agnes-3-0-flash:free"]
+    # the overlay really was sent: the second throwaway got it and still answered
+    # without it
+    assert len(calls) == 2 and not calls[0]
+    assert "agnes-3-0-flash:free" in calls[1]["KILO_CONFIG_CONTENT"]
+    assert not sandbox.out().exists()
+    assert _sessions(plain) == []
+
+
+def test_register_missing_refuses_an_attached_server(sandbox, capsys, monkeypatch):
+    """With a URL the server reads its own `kilo.jsonc` and this process cannot
+    change it: one refusal, and the other agents still get their KC-25 check."""
+    ini = sandbox.repo / "contest.ini"
+    with FakeKiloServer(KC35_SCENARIO) as fake:
+        ini.write_text(ini.read_text(encoding="utf-8")
+                       .replace("server = spawn", f"server = {fake.url}"), encoding="utf-8")
+        code = cli.main(["run", *_register_missing_flags("agnes-3-0-flash:free",
+                                                              "sensenova123/sensenova-6.8-flash-lite")])
+    captured = capsys.readouterr()
+    lines = [line for line in captured.err.splitlines() if line.startswith("intake:")]
+
+    assert code == cli.EXIT_FAILED
+    assert lines == ["intake: --register-missing needs server = spawn: an attached server reads "
+                     "its own kilo.jsonc",
+                     "intake: [sensenova-6-8-flash-lite] "
+                     "sensenova123/sensenova-6.8-flash-lite: no provider 'sensenova123' — "
+                     "connected: kenary"]
+    assert "hint:" not in captured.err
+    assert not sandbox.out().exists()
+    assert _sessions(fake) == []
+
+
+def test_register_missing_still_refuses_a_provider_it_cannot_invent(
+        sandbox, capsys, spawn_holder):
+    """No provider, no display name, no credentials: registering a model does
+    none of those, so the KC-25 line stands and no hint is printed."""
+    code, fake = run_fake(sandbox, KC35_SCENARIO,
+                          _register_missing_flags("sensenova123/sensenova-6.8-flash-lite"),
+                          spawn_holder)
+    captured = capsys.readouterr()
+    lines = [line for line in captured.err.splitlines() if line.startswith("intake:")]
+
+    assert code == cli.EXIT_FAILED
+    assert lines == ["intake: [sensenova-6-8-flash-lite] "
+                     "sensenova123/sensenova-6.8-flash-lite: no provider 'sensenova123' — "
+                     "connected: kenary"]
+    assert "hint:" not in captured.err
+    assert not sandbox.out().exists()
+    assert _sessions(fake) == []
+
+
+def test_register_missing_still_refuses_a_provider_without_credentials(
+        sandbox, capsys, spawn_holder):
+    offer = _offer((_provider("kenary", "kenari", ("hy3:free",)),), connected=())
+    scenario = {"providers": offer,
+                "turns": [{"on_prompt": work_ready, "events": ["busy", "idle"]}]}
+    code, fake = run_fake(sandbox, scenario, _register_missing_flags("hy3:free"),
+                          spawn_holder)
+    captured = capsys.readouterr()
+    lines = [line for line in captured.err.splitlines() if line.startswith("intake:")]
+
+    assert code == cli.EXIT_FAILED
+    assert len(lines) == 1
+    assert lines[0].startswith("intake: [hy3] kenary/hy3:free: provider 'kenary' has no "
+                               "credentials (not connected)")
+    assert "hint:" not in captured.err
+
+
+def test_the_operator_s_own_kilo_config_content_survives_the_merge(
+        sandbox, capsys, monkeypatch):
+    """`KILO_CONFIG_CONTENT` already set is merged, not replaced: the operator's
+    options, key and models are still there, and the ids the roster wanted are
+    added to them."""
+    calls, fakes = _content_spawn_holder(monkeypatch)
+    operator = json.dumps({
+        "options": {"baseURL": "https://kenari.id/v1"},
+        "provider": {"kenary": {"apiKey": "sk-operator",
+                                "models": {"agnes-2-5-flash:free": {
+                                    "name": "agnes-2-5-flash:free", "reasoning": True}}}}})
+    monkeypatch.setenv("KILO_CONFIG_CONTENT", operator)
+    plain = FakeKiloServer(KC35_SCENARIO).start()
+    registered = FakeKiloServer(KC35_REGISTERED_SCENARIO).start()
+    try:
+        fakes.extend((plain, registered, registered))
+        code = cli.main(["run", *_register_missing_flags("hy3:free",
+                                                              "agnes-3-0-flash:free")])
+    finally:
+        registered.stop()
+        plain.stop()
+    captured = capsys.readouterr()
+
+    assert code == 0, captured.err
+    assert list(calls[1]) == ["KILO_CONFIG_CONTENT"]
+    merged = json.loads(calls[1]["KILO_CONFIG_CONTENT"])
+    assert merged == {
+        "options": {"baseURL": "https://kenari.id/v1"},
+        "provider": {"kenary": {"apiKey": "sk-operator",
+                                "models": {
+                                    "agnes-2-5-flash:free": {
+                                        "name": "agnes-2-5-flash:free", "reasoning": True},
+                                    "agnes-3-0-flash:free": {
+                                        "name": "agnes-3-0-flash:free", "reasoning": True}}}},
+    }
+    assert calls[2] == calls[1], "the round's own server gets the same overlay"
+    assert not [line for line in captured.err.splitlines() if line.startswith("intake:")]
+
+
+#: The registered offer as Kilo 7.7.5 reports a reasoning model it lists: the
+#: variants come with the entry, so they exist only on the server that carries
+#: the overlay — the first throwaway does not list the model at all.
+KC35_REGISTERED_VARIANTS_SCENARIO = {
+    "providers": _offer(({
+        "id": "kenary", "name": "kenari", "source": "static",
+        "models": {model_id: {
+            "id": model_id, "providerID": "kenary", "name": model_id, "status": "active",
+            "capabilities": {"reasoning": True, "toolcall": True},
+            "variants": {name: {"reasoningEffort": name} for name in ("low", "medium", "high")}}
+            for model_id in ("hy3:free", "agnes-3-0-flash:free")}},),),
+    "turns": [{"on_prompt": work_ready, "events": ["busy", "idle"]}]}
+
+
+def test_register_missing_checks_the_variant_on_the_registered_offer(
+        sandbox, capsys, monkeypatch):
+    """A registered model's variant is checked where the model is listed — the
+    server with the overlay — not against the first throwaway, which does not
+    list the model and so lists no variant for it either."""
+    calls, fakes = _content_spawn_holder(monkeypatch)
+    plain = FakeKiloServer(KC35_SCENARIO).start()
+    registered = FakeKiloServer(KC35_REGISTERED_VARIANTS_SCENARIO).start()
+    try:
+        fakes.extend((plain, registered))
+        code = cli.main(["run", "--ticket", "1", "--models", "agnes-3-0-flash:free",
+                         "--variant", "medium", "--register-missing",
+                         "--no-gate", "--no-tests"])
+    finally:
+        registered.stop()
+        plain.stop()
+    captured = capsys.readouterr()
+
+    assert code == 0, captured.err
+    assert not [line for line in captured.err.splitlines() if line.startswith("intake:")]
+    assert _plan(captured.out)["agents"] == "1: kenary/agnes-3-0-flash:free@medium"
+    (session,) = _sessions(registered)
+    assert session["body"]["model"]["variant"] == "medium"
+
+
+def test_register_missing_names_the_ids_when_the_overlay_server_does_not_start(
+        sandbox, capsys, monkeypatch):
+    """No server with the overlay, no registration: one line naming what failed —
+    not the KC-25 line with a hint to pass the flag the operator just passed."""
+    monkeypatch.delenv("KILO_CONFIG_CONTENT", raising=False)
+    calls: list = []
+    plain = FakeKiloServer(KC35_SCENARIO).start()
+
+    def spawn_server(binary, *, log_path, **kwargs):
+        calls.append(dict(kwargs.get("env") or {}))
+        if kwargs.get("env"):
+            raise KiloServerError("kilo serve exited before it was healthy")
+        return KiloServer.attach(plain.url)
+
+    monkeypatch.setattr(cli.KiloServer, "spawn", staticmethod(spawn_server))
+    try:
+        code = cli.main(["run", *_register_missing_flags("hy3:free",
+                                                              "agnes-3-0-flash:free")])
+    finally:
+        plain.stop()
+    captured = capsys.readouterr()
+    lines = [line for line in captured.err.splitlines() if line.startswith("intake:")]
+
+    assert code == cli.EXIT_FAILED
+    assert lines == ["intake: registration did not take: kenary/agnes-3-0-flash:free — "
+                     "kilo serve with KILO_CONFIG_CONTENT did not start"]
+    assert "hint:" not in captured.err
+    assert len(calls) == 2 and "KILO_CONFIG_CONTENT" in calls[1]
+    assert not sandbox.out().exists()
+
+
+def test_register_missing_is_no_refusal_when_the_round_is_refused_otherwise(
+        sandbox, capsys, monkeypatch):
+    """A round already refused spends nothing on registration, and the ids the
+    flag would register are neither refusals nor a hint — only the real reason
+    is printed."""
+    calls, fakes = _content_spawn_holder(monkeypatch)
+    plain = FakeKiloServer(KC35_SCENARIO).start()
+    try:
+        fakes.append(plain)
+        code = cli.main(["run", "--ticket", "9", "--models", "hy3:free,agnes-3-0-flash:free",
+                         "--register-missing", "--no-gate", "--no-tests"])
+    finally:
+        plain.stop()
+    captured = capsys.readouterr()
+    lines = [line for line in captured.err.splitlines() if line.startswith("intake:")]
+
+    assert code == cli.EXIT_FAILED
+    assert len(lines) == 1 and "no ticket numbered 9 in" in lines[0]
+    assert "hint:" not in captured.err
+    assert len(calls) == 1 and not calls[0], "no second throwaway for a refused round"
