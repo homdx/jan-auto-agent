@@ -514,6 +514,76 @@ def test_command_with_relative_and_absolute_path_is_once(tmp_path):
     assert gate.calls == []
 
 
+def test_relative_command_path_resolves_against_worktree_not_cwd(tmp_path, monkeypatch):
+    """KC-51: a ``./…`` or ``../…`` token in a command resolves against the
+    agent's worktree, the directory the command starts in, never the runner
+    process's cwd. The runner's cwd is chdir'd away from the worktree."""
+    rounds = (tmp_path / "rounds").resolve()
+    worktree = (rounds / "86-a").resolve()
+    worktree.mkdir(parents=True)
+    # the runner's cwd is an unrelated checkout, not the worktree
+    other = (tmp_path / "qwen25").resolve()
+    other.mkdir()
+    monkeypatch.chdir(other)
+
+    # ls ./a → <worktree>/a, mechanical once, no gate call
+    event = make_event(permission="bash", patterns=[], command="ls ./a")
+    gate = StubGate(json.dumps(ALLOW))
+    policy = Policy(make_config(), completion_fn=gate, clock=FakeClock())
+    decision = decide(policy, event, worktree)
+    assert (decision.reply, decision.layer) == ("once", "mechanical")
+    assert gate.calls == []
+
+    pairs = policy_mod._extract_paths(event["properties"], worktree)
+    assert pairs == [(worktree / "a", ("./a",))]
+
+    # cat ./scripts/x.py → <worktree>/scripts/x.py, mechanical once, no gate
+    event = make_event(permission="bash", patterns=[], command="cat ./scripts/x.py")
+    gate = StubGate(json.dumps(ALLOW))
+    policy = Policy(make_config(), completion_fn=gate, clock=FakeClock())
+    decision = decide(policy, event, worktree)
+    assert (decision.reply, decision.layer) == ("once", "mechanical")
+    assert gate.calls == []
+
+
+def test_relative_command_path_into_sibling_worktree_is_forbidden(tmp_path, monkeypatch):
+    """KC-51: ``cat ../86-b/x.py`` from rounds/86-a names the sibling
+    worktree rounds/86-b, which is forbidden by the rounds folder rule. If it
+    resolved against the runner's cwd it would become ``<cwd>/86-b/x.py`` and
+    slip past the forbidden rounds folder into the gate."""
+    rounds = (tmp_path / "rounds").resolve()
+    worktree = (rounds / "86-a").resolve()
+    worktree.mkdir(parents=True)
+    other = (tmp_path / "qwen25").resolve()
+    other.mkdir()
+    monkeypatch.chdir(other)
+
+    event = make_event(permission="bash", patterns=[], command="cat ../86-b/x.py")
+    gate = StubGate(json.dumps(ALLOW))
+    policy = Policy(make_config(),
+                    completion_fn=gate, clock=FakeClock())
+    decision = decide(policy, event, worktree,
+                      forbidden=HARD_DENYLIST + (rounds,))
+
+    assert (decision.reply, decision.layer) == ("reject", "mechanical")
+    assert "forbidden" in decision.reason
+    assert gate.calls == []
+
+    pairs = policy_mod._extract_paths(event["properties"], worktree)
+    assert pairs == [(rounds / "86-b" / "x.py", ("../86-b/x.py",))]
+
+
+def test_extract_paths_without_base_is_today_s_behaviour(tmp_path):
+    """KC-51: a direct ``_extract_paths`` call with no *base* resolves a
+    relative token against the caller's cwd, exactly as before the change."""
+    event = make_event(
+        permission="bash", patterns=[], command="cat ./scripts/x.py")
+    # no base passed; pairs are relative to the test's own cwd (tmp_path),
+    # matching the legacy (pre-KC-51) resolution against the caller.
+    pairs = policy_mod._extract_paths(event["properties"])
+    assert pairs == [(Path.cwd() / "scripts" / "x.py", ("./scripts/x.py",))]
+
+
 def test_command_bare_words_and_shell_syntax_are_not_paths(tmp_path):
     """A bare command word, 2>&1, $HOME/x, a URL, and a quoted path with
     spaces do not become paths or crash. With KC-15, a bash command that

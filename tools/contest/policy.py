@@ -490,7 +490,7 @@ def _command_paths(command) -> list:
     return paths
 
 
-def _extract_paths(props: dict) -> list:
+def _extract_paths(props: dict, base: "Path | None" = None) -> list:
     """The event's paths as ``(resolved, (original, ...))`` pairs.
 
     From ``properties.patterns`` and ``properties.metadata.directories`` /
@@ -506,7 +506,17 @@ def _extract_paths(props: dict) -> list:
     touches two outside places is judged by both, not by the one Kilo chose
     to report. A leading ``~`` is expanded for every source, so ``~/.ssh/x``
     meets the hard denylist instead of resolving under the caller's cwd.
-    A token naming one of ``NULL_DEVICES`` is dropped (KC-28).
+
+    KC-51: a target that is *not* absolute after ``~`` expansion — a ``./…``
+    or ``../…`` token from a command — is joined to *base* before it is
+    resolved, so it resolves against the agent's worktree, the directory the
+    command starts in, and not against the runner process's cwd. A ``cd`` on
+    the same line is not followed: the path is still judged against *base*,
+    and the ``cd`` target itself is a ``/…`` or ``~…`` token that is judged
+    on its own. ``external_directory`` patterns arrive absolute and are
+    unaffected. With no *base* (a direct caller, an old test) behaviour is
+    today's: the target resolves against the caller's cwd. A token naming one
+    of ``NULL_DEVICES`` is dropped (KC-28).
     """
     meta = _metadata(props)
     raw = list(_as_list(props.get("patterns")))
@@ -525,6 +535,10 @@ def _extract_paths(props: dict) -> list:
         if target.startswith("~"):
             # ``~/.ssh/x`` must land on the home denylist, not under the cwd
             target = os.path.expanduser(target)
+        if base is not None and not Path(target).is_absolute():
+            # KC-51: a relative command token resolves against the worktree,
+            # the directory the command starts in — never the runner's cwd.
+            target = str(Path(base) / target)
         resolved = _resolve(target)
         if resolved is None:
             continue
@@ -827,8 +841,8 @@ class Policy:
         if permission == "doom_loop":
             return Decision("reject", "mechanical", "doom loop")
 
-        pairs = _extract_paths(props)
         worktree = _resolve(ctx.worktree)
+        pairs = _extract_paths(props, worktree)
         for resolved, originals in pairs:
             entry = _forbidden_match(resolved, ctx.forbidden, worktree)
             if entry is not None:
