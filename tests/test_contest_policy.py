@@ -752,6 +752,36 @@ def test_rm_rf_slash_star_keeps_its_token_and_its_deny_match():
     assert policy_mod._deny_match("rm -rf /*", ("rm -rf /*",)) == "rm -rf /*"
 
 
+@pytest.mark.parametrize("command", ["rm -rf /*", "cat /*", "ls '/*'"])
+def test_root_glob_in_a_command_is_the_root_not_the_worktree(tmp_path, command):
+    """KC-52 follow-up: ``/*`` minus its ``/*`` suffix is the root. It was the
+    empty string, which KC-51 joins to the worktree, so ``rm -rf /*`` was
+    answered ``inside worktree/tmp_roots`` and ``deny_commands`` never ran."""
+    event = make_event(permission="bash", patterns=[], command=command)
+    gate = StubGate(json.dumps(ALLOW))
+    policy = Policy(make_config(deny_commands=("rm -rf /*",)),
+                    completion_fn=gate, clock=FakeClock())
+
+    decision = decide(policy, event, tmp_path)
+
+    assert (decision.reply, decision.layer) == ("reject", "mechanical")
+    assert "forbidden: /* is at or under /" in decision.reason
+    assert gate.calls == []
+
+
+def test_external_directory_root_glob_pattern_is_forbidden(tmp_path):
+    """KC-52 follow-up: a ``/*`` pattern names the root, never the worktree."""
+    event = make_event(permission="external_directory", patterns=["/*"])
+    gate = StubGate(json.dumps(ALLOW))
+    policy = Policy(make_config(), completion_fn=gate, clock=FakeClock())
+
+    decision = decide(policy, event, tmp_path)
+
+    assert (decision.reply, decision.layer) == ("reject", "mechanical")
+    assert "forbidden" in decision.reason
+    assert gate.calls == []
+
+
 def test_external_directory_slash_pattern_stays_forbidden(tmp_path):
     """KC-52: ``external_directory`` patterns are not scanned by
     ``_command_paths``, so a ``/`` pattern there is still the hard denylist."""

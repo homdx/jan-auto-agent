@@ -545,7 +545,11 @@ def _extract_paths(props: dict, base: "Path | None" = None) -> list:
         original = _as_str(item)
         if not original or not _pathlike(original):
             continue
-        target = original.removesuffix("/*")
+        # KC-52 follow-up: ``/*`` strips to the root, not to the empty
+        # string — "" is not absolute, so it was joined to *base* (KC-51)
+        # and ``rm -rf /*`` was judged "inside worktree", auto-approved
+        # before ``deny_commands`` was ever consulted.
+        target = original.removesuffix("/*") or "/"
         if target.startswith("~"):
             # ``~/.ssh/x`` must land on the home denylist, not under the cwd
             target = os.path.expanduser(target)
