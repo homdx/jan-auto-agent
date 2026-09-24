@@ -87,6 +87,21 @@ shares. The provider prefix is part of the match — `kenary/hy3:free` and
 whose model is still the placeholder — that case already has its own intake
 complaint and must not grow a second, confusing one.
 
+**Seen again in round 74 (addendum 2026-09-24, base `3017885`, KC-55 already
+landed).** The gate was `hy3:free` on `kenary`, `hy3` was one of the ten agents,
+and five of the agents shared that endpoint. Of 235 permission decisions, 231
+were mechanical allows and 1 a mechanical reject. **All 3** that reached the
+gate came back `gate-failed` → `reject`, each after 11-15 s with
+`gate unavailable: empty reply (2 attempts)`. KC-55's re-ask ran, and it could
+not help, because the second ask goes to the same busy free model. The round
+therefore had no reviewer: anything the mechanical layer did not allow was
+refused. That included `cd /tmp && python3 - <<PY … PY` (a stub check,
+`sensenova-6-8-flash-lite-var1`) and a heredoc test edit that wrote
+`/tmp/dbg.txt` (`-var2`); the second is KC-53's case of a scratch path the
+prompt never named. KC-55's shared-endpoint check only warns, and a warning is
+not enough when the gate is also a competitor, so this section is the one to
+land next.
+
 ### 3. The plan line says which model guards the round
 
 `_print_plan`'s `("gate", "on"|"off")` row becomes `("gate", "hy3:free")` /

@@ -79,6 +79,22 @@ shown it cannot act on, spending one of `max_rework`'s attempts on it.
    `state.json`/`SUMMARY.md` (KC-7) show the number of sessions used per
    agent.
 
+7. **A rework that would not fit goes to a fresh session too** (addendum
+   2026-09-24, round 74). `sensenova-6-7-flash-lite-var1` ended rework 1 on a
+   `finish: "length"` message at 244 410 input + 17 734 reasoning = 262 144,
+   exactly its `limit.context` (KC-56). The runner then sent rework 2 **into the
+   same session**, and it died 4 s later:
+   `ContextOverflowError … your prompt contains 262514 input tokens` → `ERROR`,
+   three turns and zero lines of work. Before a rework prompt is sent, the
+   runner reads the session's last assistant `tokens` (`KiloClient.messages`,
+   fail-open). When `input + cache.read + reasoning + output` is at or above
+   90 % of the model's `limit.context`, the rework goes to a fresh session
+   exactly as in point 3: `rework_message` plus
+   `round_prompt(..., dirty=_dirty_tree(ws))`. It is counted under
+   `max_sessions_per_attempt`, and `turns.jsonl` records `new_session` with
+   `reason: "context"`. Below 90 %, or with the limit unknown, today's
+   same-session rework stands.
+
 ## Acceptance
 
 - [ ] `_diff_signature` unit test: two worktrees with the same file list
@@ -126,6 +142,11 @@ shown it cannot act on, spending one of `max_rework`'s attempts on it.
       `state.json`/`turns.jsonl` under `contest-bench/kc39/`. A green fake
       suite alone does not close this ticket.
 - [ ] `python3 -m pytest tests -n 4 -q --timeout=180 && python3 -m pytest tests_bugfix -n 4 -q --timeout=180` green.
+
+- [ ] (§7) A rework whose session's last message used ≥ 90 % of
+  `limit.context` is sent to a new session, with `rework_message` and the dirty
+  paragraph, and `run.attempt` incremented as for any rework. At 50 % it is
+  sent into the same session, as today.
 
 ## Out of scope
 

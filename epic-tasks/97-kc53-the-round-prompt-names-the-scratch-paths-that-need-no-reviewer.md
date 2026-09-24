@@ -26,10 +26,28 @@
    literally `/tmp/contest/*`; otherwise only the list is printed.
 2. `run_agent` passes `tuple(config.tmp_roots)` in both calls.
 3. With no *tmp_roots*, the text is byte-identical to today's.
+4. **One git command at a time** (addendum 2026-09-24, round 74). The prompt
+   gains one sentence, with or without *tmp_roots*: `Run git commands one after
+   another, never as parallel tool calls: two of them at once collide on your
+   worktree's index.lock.` In round 74, `agnes-2-0-flash` issued `git add …` and
+   `git commit …` as two parallel calls (15:10:02). The commit failed with
+   `Unable to create '…/.git/worktrees/74-agnes-2-0-flash/index.lock': File
+   exists`. Sequential, 32 s later, it went through (`afff242`). The model then
+   asked to `rm -f` that lock, and the gate-failed reject was the right answer:
+   removing another git process's lock is not safe, and the lock was already
+   gone. No policy change, only the sentence. Point 3 now reads "byte-identical
+   except for this sentence", and the tests that compare the whole first prompt
+   gain it.
+
+   The same round shows the scratch-path case again: `sensenova-6-8-flash-lite-var2`
+   wrote debug output to `/tmp/dbg.txt` from a heredoc test edit, and it was
+   refused (`gate-failed`, KC-37). After that it moved its drafts to `/tmp/kilo/`
+   by itself. The paragraph in point 1 would have said so on the first turn.
 
 ## Acceptance
 
 - [ ] `round_prompt("zeta-9", …, tmp_roots=("/tmp/kilo/*", "/tmp/contest/*"))` contains both globs and `/tmp/contest/zeta-9/`.
 - [ ] `round_prompt(…)` without *tmp_roots* is unchanged (the existing `test_round_prompt…` pass untouched).
 - [ ] The tests that compare the first prompt to `round_prompt(...)` (`test_a_fresh_round_reads_no_tree_and_its_prompt_is_exactly_round_prompt` and the three resume tests) pass `tmp_roots=cfg.tmp_roots` in the expectation.
+- [ ] (§4) `round_prompt(…)` contains the one-git-command sentence, with and without *tmp_roots*.
 - [ ] `tests` and `tests_bugfix` green; `CollectBridge._shrink` byte-identical.

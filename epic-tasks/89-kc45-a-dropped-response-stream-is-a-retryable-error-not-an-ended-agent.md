@@ -70,6 +70,29 @@ this so a later, looser pattern (`provider`, `stream`) cannot swallow it.
 KC-19's list — `Model not found`, a context-length error, an unknown shape, a
 non-dict payload — is unchanged.
 
+### 2a. …unless the same session already had answers (addendum 2026-09-24, round 74)
+
+§2's reason holds only for the **first** call of a session: a request that is
+refused before any answer will be refused again. Round 74 shows the other case.
+`nemotron-3-super-120b-a12b` (`kenary`) finished five steps with
+`finish: tool-calls`, input 13 481 → 25 596 tokens. Two `session.status`
+`retry` events with `free-model rate limit reached; slow down and retry`
+followed, at 14:14:21 and 14:15:32. Then, at 14:16:09:
+`"the model's provider rejected the request. check the model id, request
+fields, and context length"` → `ERROR`. The model id and the fields had just
+worked five times, and 26 k is far below its context. This is the free tier
+refusing under load, the same class as the 429 two lines above it. The same
+payload ended `agnes-2-0-flash` (after 11 calls, 143 k) and `agnes-2-5-flash`
+(after 14 calls) in round 84.
+
+So the rule becomes: `provider rejected the request` is **not** retryable when
+the session has no assistant message with a `finish`, which is §2's
+first-request case, unchanged. It **is** retryable, under KC-19's same budget
+and backoff, once the session has at least one finished assistant message.
+`_retryable` gets the count from the caller (`run_agent` already has the
+session; `KiloClient.messages`, fail-open → `0`, which keeps §2's behaviour).
+The §2 pin test stays, and a second test pins the mid-session case.
+
 ### 3. `_retry_reason` names it
 
 The `RETRY_PROMPT` reason for this payload is the message with its extra
@@ -91,5 +114,7 @@ puts around it (checked on `a7bca10`).
 - [ ] `_retryable` on the round 86 `nex-n2-5-pro` payload (`the model's provider rejected the request. check the model id, request fields, and context length`) is `False`.
 - [ ] A runner test in the shape of `test_retryable_error_reprompts_same_session_and_recovers`: the first idle carries the interrupted-stream payload, the agent is re-prompted with `RETRY_PROMPT` in the **same** session and ends `READY`, not `ERROR`.
 - [ ] `_retry_reason` for the interrupted-stream payload neither starts nor ends with `"`.
+- [ ] (§2a) The same `rejected the request` payload in a session that already has one assistant message with `finish: "tool-calls"` is retried: `RETRY_PROMPT` in the same session, with KC-19's budget. On the first call, with no finished message, it is still `ERROR`, as in the test above.
+- [ ] (§2a) `messages()` raising while this is decided → treated as no finished message (not retried).
 - [ ] Every existing KC-19 test passes untouched (`test_non_retryable_error_is_not_retried`, `test_max_error_retries_zero_means_no_retry`, …).
 - [ ] `tests` and `tests_bugfix` green; `CollectBridge._shrink` byte-identical.
