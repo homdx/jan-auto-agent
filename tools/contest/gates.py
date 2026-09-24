@@ -50,6 +50,16 @@ BRIDGE = "tools/auto/collect_bridge.py"
 #: Four separate invocations — combining the roots collides in conftest.
 TEST_ROOTS = ["tests", "tests_bugfix", ".smoke_tests", ".regression_tests"]
 
+#: FL-8: the root a tier directory can be a pure symlink view onto. A tier root
+#: whose every entry links into it is the same files `tests` just ran — pytest
+#: is not run a second time, and the token says `links-to-tests`.
+_REAL_ROOT = "tests"
+
+#: FL-8: the tier-sync check a skipped tier root is traded for. When the tree
+#: carries it, `--check` proves every test in `tests/` has its one link, which
+#: is what running the tiers could never show (a missing link cannot fail).
+TIER_CHECK = os.path.join("scripts", "sync_test_tiers.py")
+
 #: How many lines of pytest output `run_tests_detail` keeps for a failure.
 FAIL_TAIL_LINES = 20
 
@@ -175,6 +185,26 @@ def _failures(lines: list[str]) -> tuple[int, list[str]]:
     return len(ids), ids
 
 
+def _links_into_tests(cwd, root) -> bool:
+    """True when *root* in *cwd* holds only symlinks that resolve under `tests/`.
+
+    `__pycache__` is pytest's own and does not count. An empty directory, a
+    real file, or a link that dangles or points elsewhere is `False`, and the
+    root runs as before.
+    """
+    real = os.path.realpath(os.path.join(cwd, _REAL_ROOT))
+    entries = [e for e in os.scandir(os.path.join(cwd, root)) if e.name != "__pycache__"]
+    if not entries:
+        return False
+    for e in entries:
+        if not e.is_symlink():
+            return False
+        target = os.path.realpath(e.path)
+        if not os.path.exists(target) or os.path.commonpath([real, target]) != real:
+            return False
+    return True
+
+
 def _pytest(cwd, *args) -> subprocess.CompletedProcess:
     return subprocess.run([sys.executable, "-m", "pytest", *args, "--timeout=180"],
                           cwd=cwd, capture_output=True, text=True)
@@ -195,6 +225,12 @@ def run_tests_detail(cwd) -> tuple[str, list[str]]:
     the last `FAIL_TAIL_LINES` lines of that root's output — the cause is at
     the tail, not the head, so that is what an agent gets — and, for a root
     that passed on rerun, one line naming the flaky tests.
+
+    FL-8: a root other than `tests` made only of links into `tests/` (the
+    `.smoke_tests` / `.regression_tests` tiers) is `links-to-tests` and is
+    not run — `tests` already ran every one of those files. When the tree
+    carries `TIER_CHECK`, its `--check` is one more token, `tiers:PASS` or
+    `tiers:✗` with its output in the tail.
     """
     out = []
     tail: list[str] = []
@@ -202,6 +238,9 @@ def run_tests_detail(cwd) -> tuple[str, list[str]]:
     for d in TEST_ROOTS:
         if not os.path.isdir(os.path.join(cwd, d)):
             out.append(f"{d}:absent")
+            continue
+        if d != _REAL_ROOT and _links_into_tests(cwd, d):
+            out.append(f"{d}:links-to-tests")
             continue
         r = _pytest(cwd, d)
         if r.returncode == 0:
@@ -217,6 +256,15 @@ def run_tests_detail(cwd) -> tuple[str, list[str]]:
         out.append(f"{d}:{bad}✗" if bad else f"{d}:rc{r.returncode}✗")
         tail.append(f"--- {d}")
         tail.extend(lines[-FAIL_TAIL_LINES:] or (r.stderr or "").strip().splitlines()[-FAIL_TAIL_LINES:])
+    if os.path.isfile(os.path.join(cwd, TIER_CHECK)):
+        r = subprocess.run([sys.executable, TIER_CHECK, "--check"],
+                           cwd=cwd, capture_output=True, text=True)
+        if r.returncode == 0:
+            out.append("tiers:PASS")
+        else:
+            out.append("tiers:✗")
+            tail.append("--- tiers")
+            tail.extend(((r.stdout or "") + (r.stderr or "")).strip().splitlines()[-FAIL_TAIL_LINES:])
     return " ".join(out), tail
 
 

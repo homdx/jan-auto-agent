@@ -446,6 +446,84 @@ def test_run_tests_reports_a_non_zero_exit_without_a_failed_test(round_, tmp_pat
     assert tail[0] == "--- tests"
 
 
+def _tier(ws: Workspace, root: str, *names: str, target: str = "tests") -> None:
+    """*root* as a symlink view: one relative link per name, into *target*."""
+    d = ws.path / root
+    d.mkdir(parents=True, exist_ok=True)
+    for name in names:
+        (d / name).symlink_to(Path("..") / target / name)
+
+
+def _roots_run(monkeypatch) -> list:
+    """Record the first argument of every `_pytest` call — the root it ran."""
+    import tools.contest.gates as gates
+    ran = []
+    real = gates._pytest
+
+    def spy(cwd, *args):
+        ran.append(args[0])
+        return real(cwd, *args)
+
+    monkeypatch.setattr(gates, "_pytest", spy)
+    return ran
+
+
+def test_run_tests_does_not_rerun_a_tier_of_links_into_tests(round_, tmp_path, monkeypatch):
+    """FL-8: `.smoke_tests` / `.regression_tests` made only of links into
+    `tests/` are the files `tests` just ran — no second pytest, one token each."""
+    repo, base, ticket = round_
+    wt = _worktree(repo, base, tmp_path)
+    _stage_probe(wt)
+    _tier(wt, ".smoke_tests", "test_base.py")
+    _tier(wt, ".regression_tests", "test_probe.py")
+    (wt.path / ".smoke_tests" / "__pycache__").mkdir()
+    _commit(wt, "probe, tiered")
+    ran = _roots_run(monkeypatch)
+    summary, tail = run_tests_detail(str(wt.path))
+    assert summary == ("tests:PASS tests_bugfix:absent "
+                       ".smoke_tests:links-to-tests .regression_tests:links-to-tests")
+    assert ran == ["tests"] and tail == []
+
+
+def test_run_tests_still_runs_a_tier_that_is_not_only_links_into_tests(round_, tmp_path, monkeypatch):
+    """FL-8: a real file in a tier, or a link out of `tests/`, keeps the old
+    run — only a pure view is skipped."""
+    repo, base, ticket = round_
+    wt = _worktree(repo, base, tmp_path)
+    _accepting(wt)
+    _tier(wt, ".smoke_tests", "test_base.py")
+    _edit(wt, ".smoke_tests/test_real.py", "def test_real():\n    assert False, 'real-file-3'\n")
+    _edit(wt, "tests_bugfix/test_b.py", "def test_b():\n    assert True\n")
+    _tier(wt, ".regression_tests", "test_b.py", target="tests_bugfix")
+    _commit(wt, "a tier with a real file, a tier linking elsewhere")
+    ran = _roots_run(monkeypatch)
+    summary, tail = run_tests_detail(str(wt.path))
+    assert [r for r in ran if "::" not in r] == [   # `::` — the flake rerun
+        "tests", "tests_bugfix", ".smoke_tests", ".regression_tests"]
+    assert ".smoke_tests:1✗" in summary and ".regression_tests:PASS" in summary
+    assert any("real-file-3" in line for line in tail)
+
+
+def test_run_tests_reports_the_tier_check_when_the_tree_has_one(round_, tmp_path):
+    """FL-8: the skipped tiers are traded for `sync_test_tiers.py --check` —
+    `tiers:PASS`, or `tiers:✗` with its output in the tail."""
+    repo, base, ticket = round_
+    wt = _worktree(repo, base, tmp_path)
+    _accepting(wt)
+    _edit(wt, "scripts/sync_test_tiers.py",
+          "import sys\nassert sys.argv[1:] == ['--check']\nsys.exit(0)\n")
+    _commit(wt, "a passing tier check")
+    summary, tail = run_tests_detail(str(wt.path))
+    assert summary.split()[-1] == "tiers:PASS" and tail == []
+
+    _edit(wt, "scripts/sync_test_tiers.py",
+          "import sys\nprint('.smoke_tests: missing link test_new.py')\nsys.exit(1)\n")
+    _commit(wt, "a failing tier check")
+    summary, tail = run_tests_detail(str(wt.path))
+    assert summary.split()[-1] == "tiers:✗"
+    assert tail[0] == "--- tiers" and any("missing link test_new.py" in l for l in tail)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 3. `harvest`: the claim and the facts become a verdict
 # ─────────────────────────────────────────────────────────────────────────────
