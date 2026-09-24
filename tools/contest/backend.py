@@ -74,6 +74,7 @@ from tools.contest.kilo_client import (
     KiloHttpError,
     KiloServer,
     SessionRef,
+    _deadline_grant,
 )
 
 __all__ = [
@@ -185,7 +186,8 @@ class ContestBackend(Protocol):
     def wait_idle(self, session: SessionRef, timeout: float, *,
                   idle_event_timeout: float | None = None,
                   on_permission: Callable[[dict], tuple],
-                  on_question: Callable[[dict], None]) -> IdleResult:
+                  on_question: Callable[[dict], None],
+                  on_deadline: Callable[[float], float | None] | None = None) -> IdleResult:
         """Block until this session goes idle, answering on the way.
 
         ``timeout`` bounds the whole wait, ``idle_event_timeout`` the silence.
@@ -194,6 +196,12 @@ class ContestBackend(Protocol):
         ``question.asked`` one. Both are required — the runner always passes
         them, even to a backend that never calls one of them
         (:class:`OpenRouterBackend` never calls ``on_question``).
+
+        ``on_deadline(elapsed) -> seconds | None`` (KC-36) is asked once at
+        ``timeout``, before the abort: a positive number extends the deadline
+        by that much, anything else aborts exactly as without it. ``None`` —
+        the default, and every pre-KC-36 caller — asks nothing and aborts at
+        ``timeout``.
         """
         ...
 
@@ -295,11 +303,15 @@ class KiloBackend:
     def wait_idle(self, session: SessionRef, timeout: float, *,
                   idle_event_timeout: float | None = None,
                   on_permission: Callable[[dict], tuple],
-                  on_question: Callable[[dict], None]) -> IdleResult:
-        return self._client.wait_idle(self._tap, session, timeout,
-                                      idle_event_timeout=idle_event_timeout,
-                                      on_permission=on_permission,
-                                      on_question=on_question)
+                  on_question: Callable[[dict], None],
+                  on_deadline: Callable[[float], float | None] | None = None) -> IdleResult:
+        # KC-36: the callback goes over only when it is armed — `None` keeps
+        # this call byte for byte what it was, for a client that predates it.
+        client_kwargs = {"idle_event_timeout": idle_event_timeout,
+                         "on_permission": on_permission, "on_question": on_question}
+        if on_deadline is not None:
+            client_kwargs["on_deadline"] = on_deadline
+        return self._client.wait_idle(self._tap, session, timeout, **client_kwargs)
 
     def tool_parts(self, session: SessionRef) -> list:
         return self._client.tool_parts(session)
@@ -484,7 +496,8 @@ class OpenRouterBackend:
     def wait_idle(self, session: SessionRef, timeout: float, *,
                   idle_event_timeout: float | None = None,
                   on_permission: Callable[[dict], tuple],
-                  on_question: Callable[[dict], None]) -> IdleResult:
+                  on_question: Callable[[dict], None],
+                  on_deadline: Callable[[float], float | None] | None = None) -> IdleResult:
         """Read the agent's stdout until ``idle``, the timeout, or the timeout's
         silence window.
 
@@ -493,6 +506,11 @@ class OpenRouterBackend:
         ``on_question`` is never called: a bare ``/chat/completions`` has no
         question event, so there is nothing to observe (the runner's
         ``max_questions_per_turn`` edge has no counterpart on this backend).
+
+        ``on_deadline`` (KC-36) is asked the same way on a Kilo session: at the
+        turn deadline, before ``abort``, with the elapsed seconds — a positive
+        return pushes it back, anything else aborts. The worktree churn that
+        earns the extension is the round's, and it is this backend's too.
 
         A provider error comes back as ``IdleResult(status="error")`` with the
         agent's payload, ``data.isRetryable`` set for a 429 or a 5xx, so the
@@ -511,10 +529,22 @@ class OpenRouterBackend:
 
         while True:
             now = time.monotonic()
-            left = deadline - now
+            overall_left = deadline - now
             if silence is not None:
-                left = min(left, silence - (now - last_seen))
+                left = min(overall_left, silence - (now - last_seen))
+            else:
+                left = overall_left
             if left <= 0:
+                # KC-36: the turn deadline asks first; the silence clock never
+                # does — the same race as on a Kilo session.
+                quiet = silence is not None and (silence - (now - last_seen)) <= 0
+                if not quiet and overall_left <= 0 and on_deadline is not None:
+                    grant = _deadline_grant(on_deadline, time.monotonic() - started)
+                    # a grant that leaves the deadline in the past would just
+                    # ask again in a hot loop of churn reads — abort instead
+                    if grant is not None and deadline + grant > time.monotonic():
+                        deadline += grant
+                        continue
                 self.abort(session)
                 return IdleResult(status="timeout", elapsed=time.monotonic() - started,
                                   permissions=permissions, questions=questions)

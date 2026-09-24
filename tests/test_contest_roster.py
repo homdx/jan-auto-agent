@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 
 import pytest
@@ -904,3 +904,76 @@ def test_a_malformed_gate_retries_falls_back_to_the_default(tmp_path):
     """The count is an int key, read with the same helper as every other limit."""
     text = add_to_contest(MINIMAL, "gate_retries = three")
     assert load_roster(write_ini(tmp_path, text)).gate_retries == 3
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KC-36: turn_extend_sec and turn_max_sec — the turn clock is a floor
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_turn_extend_sec_and_turn_max_sec_parse_and_default(tmp_path):
+    """KC-36: both keys parse, default 600 / 7200, and are in CONTEST_KEYS."""
+    assert "turn_extend_sec" in CONTEST_KEYS
+    assert "turn_max_sec" in CONTEST_KEYS
+    assert load_roster(write_ini(tmp_path, MINIMAL)).turn_extend_sec == 600
+    assert load_roster(write_ini(tmp_path, MINIMAL)).turn_max_sec == 7200
+
+    base = """
+[contest]
+turn_timeout_sec = %s
+turn_extend_sec  = %s
+turn_max_sec     = %s
+
+[contest.agent.alpha]
+model = kenary/hy3:free
+"""
+    cfg = load_roster(write_ini(tmp_path, base % ("1800", "300", "9000")))
+    assert (cfg.turn_timeout_sec, cfg.turn_extend_sec, cfg.turn_max_sec) == (1800, 300, 9000)
+    # 0 disables extension — today's clock — and a cap equal to the floor is legal
+    cfg0 = load_roster(write_ini(tmp_path, base % ("1800", "0", "1800")))
+    assert cfg0.turn_extend_sec == 0 and cfg0.turn_max_sec == cfg0.turn_timeout_sec
+    for key in ("turn_extend_sec", "turn_max_sec"):
+        assert isinstance(getattr(cfg, key), int)
+
+
+def test_committed_turn_extension_limits_are_a_floor_below_a_ceiling(gate_key):
+    """3600 s floor, 600 s per extension, 7200 s ceiling."""
+    cfg = load_roster(COMMITTED)
+    assert (cfg.turn_timeout_sec, cfg.turn_extend_sec, cfg.turn_max_sec) == (3600, 600, 7200)
+    assert cfg.turn_max_sec >= cfg.turn_timeout_sec
+    for key in ("turn_timeout_sec", "turn_extend_sec", "turn_max_sec"):
+        assert isinstance(getattr(cfg, key), int)
+
+
+def test_turn_max_sec_below_turn_timeout_sec_names_both_keys(tmp_path):
+    """A ceiling below the floor is unextendable: the error names both keys."""
+    text = add_to_contest(MINIMAL, "turn_timeout_sec = 1800\nturn_max_sec = 1200")
+    with pytest.raises(RosterError) as exc:
+        load_roster(write_ini(tmp_path, text))
+    for key in ("turn_timeout_sec", "turn_max_sec"):
+        assert key in str(exc.value)
+
+
+def test_a_negative_or_malformed_turn_limit(tmp_path):
+    """Both are read through `limit()`: a malformed value falls back, and a
+    negative one names its key instead of becoming a zero-second turn."""
+    assert load_roster(write_ini(tmp_path,
+                                 add_to_contest(MINIMAL, "turn_extend_sec = three"))
+                       ).turn_extend_sec == 600
+    assert load_roster(write_ini(tmp_path,
+                                 add_to_contest(MINIMAL, "turn_max_sec = three"))
+                       ).turn_max_sec == 7200
+    for key in ("turn_extend_sec", "turn_max_sec"):
+        with pytest.raises(RosterError, match=key):
+            load_roster(write_ini(tmp_path, add_to_contest(MINIMAL, f"{key} = -1")))
+
+
+def test_the_turn_limits_survive_a_models_override(tmp_path):
+    """KC-36 §6: `--models` replaces the roster and nothing else — the two
+    limits are round limits, read from the file like every other one."""
+    text = add_to_contest(MINIMAL, "turn_timeout_sec = 3600\nturn_extend_sec = 900\nturn_max_sec = 18000")
+    cfg = load_roster(write_ini(tmp_path, text))
+    models = replace(cfg, agents=tuple(
+        AgentSpec(name="hy3-var1", provider_id=a.provider_id, model_id=a.model_id)
+        for a in cfg.agents))
+    assert [agent.name for agent in models.agents] == ["hy3-var1"]
+    assert (models.turn_timeout_sec, models.turn_extend_sec, models.turn_max_sec) == (3600, 900, 18000)

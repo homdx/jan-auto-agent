@@ -84,6 +84,8 @@ CONTEST_KEYS = (
     "max_rework",
     "max_continues_per_attempt",
     "turn_timeout_sec",
+    "turn_extend_sec",
+    "turn_max_sec",
     "idle_event_timeout_sec",
     "max_questions_per_turn",
     "max_error_retries",
@@ -213,6 +215,14 @@ class ContestConfig:
     max_rework: int = 2
     max_continues_per_attempt: int = 2
     turn_timeout_sec: int = 1800
+    #: KC-36: seconds a turn's deadline is pushed, per extension, when the
+    #: worktree's churn has grown since the last deadline. 0 = the turn clock
+    #: is a hard kill again: today's behaviour, no callback asked.
+    turn_extend_sec: int = 600
+    #: KC-36: the hard ceiling for one turn, whatever the churn.
+    #: ``turn_timeout_sec`` plus every extension stops no later than this, so a
+    #: model in an infinite edit loop is bounded.
+    turn_max_sec: int = 7200
     idle_event_timeout_sec: int = 300
     max_questions_per_turn: int = 3
     max_error_retries: int = 2
@@ -464,6 +474,20 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
     if gate_retries < 0:
         raise RosterError(f"[contest] gate_retries must be >= 0, got {gate_retries}")
 
+    turn_timeout = limit("turn_timeout_sec", 1800)
+    turn_extend = limit("turn_extend_sec", 600)
+    turn_max = limit("turn_max_sec", 7200)
+    if turn_extend < 0:
+        raise RosterError(f"[contest] turn_extend_sec must be >= 0, got {turn_extend}")
+    if turn_max < 0:
+        raise RosterError(f"[contest] turn_max_sec must be >= 0, got {turn_max}")
+    # KC-36: the ceiling cannot sit below the floor — an unextendable turn
+    # would be killed before it had existed.
+    if turn_max < turn_timeout:
+        raise RosterError(
+            f"[contest] turn_max_sec must be >= turn_timeout_sec — got "
+            f"turn_max_sec={turn_max} and turn_timeout_sec={turn_timeout}")
+
     try:
         settings, _profile = resolve_llm_profile(
             parser, "contest", "gate_llm_profile", defaults=DEFAULTS_GATE
@@ -494,7 +518,9 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
         max_parallel=limit("max_parallel", 3),
         max_rework=limit("max_rework", 2),
         max_continues_per_attempt=limit("max_continues_per_attempt", 2),
-        turn_timeout_sec=limit("turn_timeout_sec", 1800),
+        turn_timeout_sec=turn_timeout,
+        turn_extend_sec=turn_extend,
+        turn_max_sec=turn_max,
         idle_event_timeout_sec=limit("idle_event_timeout_sec", 300),
         max_questions_per_turn=limit("max_questions_per_turn", 3),
         max_error_retries=limit("max_error_retries", 2),

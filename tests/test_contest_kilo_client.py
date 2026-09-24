@@ -33,6 +33,7 @@ before the round; a non-2xx is a `KiloHttpError` and a non-dict body is a
 from __future__ import annotations
 
 import json
+import logging
 import os
 import stat
 import sys
@@ -562,10 +563,128 @@ def test_the_silence_clock_is_off_when_no_idle_event_timeout_is_given(monkeypatc
                          directory="/nowhere")
     tap = _ScriptedTap([], every=1.0, clock=clock)
     res = _Client().wait_idle(tap, session, 42.0, idle_event_timeout=None,
-                              on_permission=_reject, on_question=lambda event: None)
+                               on_permission=_reject, on_question=lambda event: None)
 
     assert res.status == "timeout"
     assert res.elapsed == 42.0
+    assert aborts == ["ses_probe"]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3c — KC-36: the turn deadline asks before it kills
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _deadline_clock_probe(monkeypatch, events, *, timeout, every, on_deadline,
+                          idle_event_timeout=None, aborts=None):
+    """``wait_idle`` over a scripted stream on a fake clock, with the KC-36
+    deadline callback wired in. The probe of the silence clock above, with the
+    overall ``timeout`` and the callback both caller-chosen."""
+    clock = _FakeClock()
+    monkeypatch.setattr(kilo_client_module.time, "monotonic", clock.monotonic)
+
+    class _Client(KiloClient):
+        def __init__(self):
+            pass
+
+        def _abort_quietly(self, session):
+            (aborts if aborts is not None else []).append(session.id)
+
+    session = SessionRef(id="ses_probe", provider_id="p", model_id="m",
+                         directory="/nowhere")
+    tap = _ScriptedTap(events, every=every, clock=clock)
+    return _Client().wait_idle(tap, session, timeout,
+                               idle_event_timeout=idle_event_timeout,
+                               on_permission=_reject, on_question=lambda event: None,
+                               on_deadline=on_deadline)
+
+
+def test_on_deadline_moves_the_deadline_while_it_grants(monkeypatch):
+    """30 granted twice, then nothing: the wait outlives its own deadline and
+    ends at the last extended one, the callback is called at the deadline and
+    again 30 s past each grant, and one ``abort`` goes out at the end."""
+    grants = iter([30.0, 30.0, None])
+    calls: list = []
+    aborts: list = []
+
+    def on_deadline(elapsed):
+        calls.append(round(elapsed, 6))
+        return next(grants)
+
+    res = _deadline_clock_probe(monkeypatch, [], timeout=60.0, every=1.0,
+                                on_deadline=on_deadline, aborts=aborts)
+
+    assert res.status == "timeout"
+    # the elapsed seconds at each ask: the deadline, then 30 past each grant
+    assert calls == [60.0, 90.0, 120.0], calls
+    assert res.elapsed >= 60.0 + 30.0 + 30.0, res.elapsed
+    assert aborts == ["ses_probe"]
+
+
+@pytest.mark.parametrize("answer", [0, 0.0, -5, "30", [], {}, None])
+def test_a_deadline_answer_that_is_not_positive_aborts_at_once(monkeypatch, answer):
+    """``0``, a negative number, a non-number and ``None`` all abort exactly as
+    today: at the original deadline, with the callback asked exactly once."""
+    calls: list = []
+    aborts: list = []
+
+    def on_deadline(elapsed):
+        calls.append(elapsed)
+        return answer
+
+    res = _deadline_clock_probe(monkeypatch, [], timeout=60.0, every=1.0,
+                                on_deadline=on_deadline, aborts=aborts)
+
+    assert res.status == "timeout"
+    assert calls == [60.0], calls
+    assert res.elapsed == 60.0, res.elapsed
+    assert aborts == ["ses_probe"]
+
+
+def test_a_deadline_callback_that_raises_aborts_and_logs(monkeypatch, caplog):
+    """A callback that raises — a broken churn reader, a missing worktree — is
+    logged here and never raised into a round, and the wait aborts at the
+    original deadline as if the callback had never been given."""
+    caplog.set_level(logging.WARNING, logger="tools.contest.kilo_client")
+    aborts: list = []
+
+    def on_deadline(elapsed):
+        raise RuntimeError("worktree is gone")
+
+    res = _deadline_clock_probe(monkeypatch, [], timeout=60.0, every=1.0,
+                                on_deadline=on_deadline, aborts=aborts)
+
+    assert res.status == "timeout"
+    assert res.elapsed == 60.0, res.elapsed
+    assert aborts == ["ses_probe"]
+    assert any("worktree is gone" in record.getMessage() for record in caplog.records), \
+        caplog.text
+
+
+def test_an_extension_never_resurrects_a_session_that_went_quiet(monkeypatch):
+    """The silence clock keeps racing the extended deadline. Beats every 2 s
+    with a 10 s window carry the turn through the 60 s deadline, where 30 is
+    granted and the deadline moves to 90; the beats then stop at 70, and the
+    window — not the extension — ends the wait at 80."""
+    window, every = 10.0, 2.0
+    beats = [_ev("session.status", status="busy") for _ in range(35)]   # 2..70 s
+    calls: list = []
+    aborts: list = []
+
+    def on_deadline(elapsed):
+        calls.append(elapsed)
+        return 30.0
+
+    res = _deadline_clock_probe(monkeypatch, beats, timeout=60.0, every=every,
+                                on_deadline=on_deadline,
+                                idle_event_timeout=window, aborts=aborts)
+
+    assert res.status == "timeout"
+    # asked once, at the deadline — never again, at the extended one
+    assert calls == [60.0], calls
+    # the silence clock won: 70 s of beats plus the 10 s window, 10 s inside
+    # the deadline the grant had just moved to
+    assert res.elapsed == 80.0, res.elapsed
+    assert res.elapsed < 60.0 + 30.0, res.elapsed
     assert aborts == ["ses_probe"]
 
 

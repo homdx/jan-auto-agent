@@ -692,6 +692,26 @@ class EventTap:
 # the client
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _deadline_grant(on_deadline: Callable[[float], float | None],
+                    elapsed: float) -> float | None:
+    """The seconds a caller grants at its own deadline, or ``None``.
+
+    KC-36: ``wait_idle`` asks instead of killing, and the answer is whatever
+    this returns. ``None``, ``0``, a negative number and anything that is not
+    a number all mean "abort as today", and a callback that raises — a broken
+    churn reader, a missing worktree — is logged here and never raised into a
+    round. Only a positive number moves the deadline.
+    """
+    try:
+        value = on_deadline(elapsed)
+    except Exception as exc:  # noqa: BLE001 — a hook is a round, not the round
+        _log.warning("turn deadline asked, %s: %s", type(exc).__name__, exc)
+        return None
+    if not isinstance(value, (int, float)):
+        return None
+    return float(value) if float(value) > 0 else None
+
+
 class KiloClient:
     """One session directory on one server.
 
@@ -921,7 +941,8 @@ class KiloClient:
     def wait_idle(self, tap: EventTap, session: SessionRef, timeout: float, *,
                   idle_event_timeout: float | None = None,
                   on_permission: Callable[[dict], tuple],
-                  on_question: Callable[[dict], None]) -> IdleResult:
+                  on_question: Callable[[dict], None],
+                  on_deadline: Callable[[float], float | None] | None = None) -> IdleResult:
         """Block until this session goes idle, answering on the way.
 
         The probe's ``wait_idle`` with the decisions delegated:
@@ -945,6 +966,17 @@ class KiloClient:
         session's events — the tap reads every session of the directory, and
         a neighbour's traffic on the same stream does not keep this turn
         alive.
+
+        ``on_deadline`` (KC-36) is asked once, with the elapsed seconds, at
+        the moment the overall ``timeout`` is reached and before ``abort`` is
+        sent: the caller decides then whether the deadline moves. A positive
+        number is added to it and the wait keeps going; ``None``, ``0``, a
+        negative number, anything that is not a number, or an exception
+        (logged, never raised) aborts exactly as today. Omitted — which is
+        every existing caller — the loop is byte for byte what it was: the
+        callback is never called and ``abort`` goes at ``timeout``. The
+        silence clock is untouched and keeps racing it, so an extension never
+        resurrects a session that has gone quiet.
 
         Events that a permission or a question was *answered* for are
         collected in ``permissions`` / ``questions``, so a caller can audit
@@ -981,11 +1013,24 @@ class KiloClient:
 
         while True:
             now = time.monotonic()
-            left = deadline - now
+            overall_left = deadline - now
             if silence is not None:
                 # the two bounds race: whichever runs out first ends the wait
-                left = min(left, silence - (now - last_seen))
+                left = min(overall_left, silence - (now - last_seen))
+            else:
+                left = overall_left
             if left <= 0:
+                # KC-36: the turn deadline asks first. The silence clock never
+                # does — a session that went quiet is quiet whatever the
+                # worktree says, and no extension resurrects it.
+                quiet = silence is not None and (silence - (now - last_seen)) <= 0
+                if not quiet and overall_left <= 0 and on_deadline is not None:
+                    grant = _deadline_grant(on_deadline, time.monotonic() - started)
+                    # a grant that leaves the deadline in the past would just
+                    # ask again in a hot loop of churn reads — abort instead
+                    if grant is not None and deadline + grant > time.monotonic():
+                        deadline += grant
+                        continue
                 self._abort_quietly(session)
                 return IdleResult(status="timeout", elapsed=time.monotonic() - started,
                                   permissions=permissions, questions=questions)

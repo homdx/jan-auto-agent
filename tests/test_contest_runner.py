@@ -43,7 +43,7 @@ import _kilo_fake  # noqa: E402
 from _kilo_fake import FakeKiloServer  # noqa: E402
 from tools.auto.llm_profile import LlmSettings  # noqa: E402
 from tools.contest.backend import KiloBackend  # noqa: E402
-from tools.contest.kilo_client import KiloServer  # noqa: E402
+from tools.contest.kilo_client import IdleResult, KiloServer, SessionRef  # noqa: E402
 from tools.contest.policy import Policy  # noqa: E402
 from tools.contest.roster import AgentSpec, ContestConfig  # noqa: E402
 from tools.contest.runner import (  # noqa: E402
@@ -352,9 +352,13 @@ def make_config(agents, **over) -> ContestConfig:
     # unbounded work, and the operator's stress run walked through it —
     # `test_retry_backoff_is_observed` came back STALLED with
     # `no idle after 30s`. 300 s, so only a genuine hang reaches it.
+    # KC-36: `turn_extend_sec = 0` keeps the pre-KC-36 clock — the hard kill
+    # at `turn_timeout_sec`, `on_deadline` never passed, and the stall line the
+    # turns above compare byte for byte. The turn-deadline tests set it
+    # explicitly.
     kw = dict(agents=specs, max_parallel=1, max_rework=2, turn_timeout_sec=300,
-              idle_event_timeout_sec=60, max_questions_per_turn=3, tmp_roots=("/tmp/*",),
-              gate_max_calls_per_session=20, gate_settings=gate)
+              turn_extend_sec=0, idle_event_timeout_sec=60, max_questions_per_turn=3,
+              tmp_roots=("/tmp/*",), gate_max_calls_per_session=20, gate_settings=gate)
     kw.update(over)
     return ContestConfig(**kw)
 
@@ -2526,3 +2530,314 @@ def test_the_packs_median_is_not_floored(tmp_path):
     line = _real_line([a, b])
     assert "40% 1f" in _part(line, "aa"), line
     assert "60% 2f" in _part(line, "bb"), line
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KC-36: a turn that is still changing files extends its own deadline
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _churn_ws(tmp_path: Path, agent: str = "agent-a") -> Workspace:
+    """`_make_repo` as a `Workspace`: what `_churn` and the turn's clock read."""
+    repo = _make_repo(tmp_path)
+    return Workspace(agent=agent, path=repo.resolve(), branch="main",
+                     base_sha=_git(repo, "rev-parse", "HEAD"), kind="worktree")
+
+
+def _grow(directory: Path, seconds: float, every: float = 0.05) -> None:
+    """One line appended every *every* seconds for *seconds*: a worktree that
+    keeps moving while the turn clock runs. Line-buffered — a sample reads the
+    file off the disk, so the writes have to get there."""
+    path = directory / "pkg" / "growing.py"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8", buffering=1) as fh:
+        i = 0
+        stop = time.monotonic() + seconds
+        while time.monotonic() < stop:
+            fh.write(f"x{i} = {i}\n")
+            i += 1
+            time.sleep(every)
+
+
+class _RecordingBackend:
+    """A `ContestBackend` that records every `wait_idle` call and answers idle."""
+
+    def __init__(self):
+        self.calls = []
+
+    def wait_idle(self, session, timeout, **kwargs):
+        self.calls.append({"timeout": timeout, **kwargs})
+        return IdleResult(status="idle", elapsed=0.0)
+
+
+def test_churn_counts_files_and_lines_for_untracked_tracked_and_committed(tmp_path):
+    """`_churn` is the union of three reads: an untracked file's own lines come
+    off the disk, a tracked edit and a commit come off `--numstat`."""
+    ws = _churn_ws(tmp_path)
+    repo = ws.path
+    assert _runner_module._churn(ws) == (0, 0)
+
+    # untracked: the path from `git status`, the lines from the file itself
+    _write(repo / "pkg" / "new.py", "1\n2\n3\n")
+    assert _runner_module._churn(ws) == (1, 3)
+
+    # tracked: the edit lands on top of the untracked file
+    _write(repo / "pkg" / "a.py", "a\nb\nc\n")
+    assert _runner_module._churn(ws) == (2, 5)
+
+    # committed above the base: the same work, read off the branch instead
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "work")
+    assert _runner_module._churn(ws) == (2, 5)
+
+    # `.smoke_tests/` is a link `sync_test_tiers.py` makes, not a turn: both
+    # numbers ignore it, and so does the heartbeat's files count
+    _write(repo / ".smoke_tests" / "x", "1\n2\n3\n4\n5\n")
+    assert _runner_module._churn(ws) == (2, 5)
+    assert _runner_module._worktree_files(ws) == 2
+
+
+def test_churn_of_a_binary_edit_counts_the_file_not_its_lines(tmp_path):
+    """A `-` in a `--numstat` line is a binary file: the path counts, the lines do not."""
+    ws = _churn_ws(tmp_path)
+    (ws.path / "pkg" / "blob.bin").write_bytes(b"\x00" * 64)
+    _git(ws.path, "add", "-A")
+    _git(ws.path, "commit", "-q", "-m", "blob")
+    (ws.path / "pkg" / "blob.bin").write_bytes(b"\x00" * 128)
+    assert _runner_module._churn(ws) == (1, 0)
+
+
+def test_churn_of_a_missing_worktree_is_zero_without_raising(tmp_path):
+    ws = Workspace(agent="agent-a", path=tmp_path / "gone", branch="main",
+                   base_sha="0" * 40, kind="worktree")
+    assert _runner_module._churn(ws) == (0, 0)
+
+
+def test_churn_of_a_deleted_worktree_is_zero_without_raising(tmp_path):
+    """The directory is gone between the sample and the read: `(0, 0)`, not an error."""
+    import shutil
+    ws = _churn_ws(tmp_path)
+    shutil.rmtree(ws.path)
+    assert _runner_module._churn(ws) == (0, 0)
+
+
+def test_churn_when_git_fails_is_zero_without_raising(tmp_path, monkeypatch):
+    """Any git failure is a sample of nothing — never an exception into a round."""
+    ws = _churn_ws(tmp_path)
+    _write(ws.path / "pkg" / "a.py", "a\nb\n")
+
+    def boom(*args, **kwargs):
+        raise OSError("git is gone")
+
+    monkeypatch.setattr(_runner_module, "run_git", boom)
+    assert _runner_module._churn(ws) == (0, 0)
+    assert _runner_module._worktree_files(ws) == 0
+
+
+def test_the_turn_deadline_grows_with_the_worktree(tmp_path, caplog):
+    """Round 64 replayed at its own numbers: 1800 s nominal, 600 s per grant,
+    7200 s cap. A worktree that grew 2 files and 346 lines since the last
+    deadline is extended an hour; one flat since 11:56 with only heartbeats on
+    the wire is not. Either way the sample is keyed by the run's worktree, never
+    by a model id.
+    """
+    caplog.set_level(logging.INFO, logger=LOGGER)
+    ws = _churn_ws(tmp_path)
+    cfg = make_config(["agent-a"], turn_timeout_sec=1800, turn_extend_sec=600,
+                      turn_max_sec=7200, idle_event_timeout_sec=0)
+    spec = cfg.agents[0]
+
+    flat = _runner_module._turn_deadline(AgentRun(agent=spec, workspace=ws), cfg)
+    assert flat.on_deadline(1800.0) is None
+    assert flat.extensions == []
+    assert flat.granted == 0.0
+    assert flat.last_sample == (0, 0)
+
+    growing = _runner_module._turn_deadline(AgentRun(agent=spec, workspace=ws), cfg)
+    _write(ws.path / "pkg" / "more.py", "x\n" * 344)
+    _write(ws.path / "pkg" / "more2.py", "y\nz\n")
+    assert growing.on_deadline(1800.0) == 600
+    assert growing.extensions == [
+        {"at": 1800.0, "files": 2, "lines": 346, "granted": 600}]
+    assert growing.granted == 600.0
+    (line,) = [l for l in _lines(caplog, "agent-a: WAITING") if " +" in l]
+    assert line == "agent-a: WAITING — +10m at 30m (2 files, 346 lines)"
+
+
+def test_a_flat_sample_is_refused_and_named_in_the_stall(tmp_path):
+    """Flat churn is the old path: nothing is granted, and the stall line names
+    the sample the deadline refused."""
+    ws = _churn_ws(tmp_path)
+    cfg = make_config(["agent-a"], turn_timeout_sec=600, turn_extend_sec=600,
+                      turn_max_sec=7200, idle_event_timeout_sec=0)
+    clock = _runner_module._turn_deadline(AgentRun(agent=cfg.agents[0], workspace=ws), cfg)
+    assert clock.on_deadline(600.0) is None
+    assert clock.extensions == []
+    assert clock.last_sample == (0, 0)
+    assert _runner_module._no_idle_error(cfg, 600.0, clock) == \
+        "no idle after 10m (0 files, 0 lines, unchanged for 10m)"
+
+
+def test_growth_every_time_clips_the_last_grant_to_turn_max_sec(tmp_path):
+    """An edit loop is bounded: a 600 s floor, 900 s per grant and a 2400 s cap
+    gives 900 then 900, then nothing — and the total is exactly the cap."""
+    ws = _churn_ws(tmp_path)
+    cfg = make_config(["agent-a"], turn_timeout_sec=600, turn_extend_sec=900,
+                      turn_max_sec=2400, idle_event_timeout_sec=0)
+    clock = _runner_module._turn_deadline(AgentRun(agent=cfg.agents[0], workspace=ws), cfg)
+    for i in range(2):
+        _write(ws.path / "pkg" / f"loop{i}.py", f"i = {i}\n")
+        assert clock.on_deadline(float(cfg.turn_timeout_sec + clock.granted)) == 900
+    assert clock.extensions == [
+        {"at": 600.0, "files": 1, "lines": 1, "granted": 900},
+        {"at": 1500.0, "files": 2, "lines": 2, "granted": 900}]
+    # the cap is reached: the same growth grants nothing more
+    _write(ws.path / "pkg" / "loop2.py", "j = 2\n")
+    assert clock.on_deadline(float(cfg.turn_max_sec)) is None
+    assert clock.granted + cfg.turn_timeout_sec == cfg.turn_max_sec
+
+
+def test_wait_turn_passes_on_deadline_only_when_extension_is_armed(tmp_path):
+    """The seam the runner uses: `turn_extend_sec = 0` hands nothing over, and
+    an armed clock hands its callback over alongside the round's limits."""
+    backend = _RecordingBackend()
+    cfg0 = make_config(["agent-a"], turn_timeout_sec=600, turn_extend_sec=0,
+                       turn_max_sec=7200, idle_event_timeout_sec=0)
+    cfg1 = make_config(["agent-a"], turn_timeout_sec=600, turn_extend_sec=600,
+                       turn_max_sec=7200, idle_event_timeout_sec=0)
+    session = SessionRef(id="ses_one", provider_id="kenary", model_id="hy3:free",
+                         directory="/nowhere", agent="agent-a")
+    clock = _runner_module._TurnClock(on_deadline=lambda elapsed: 600.0)
+    common = dict(on_permission=lambda event: ("once", ""), on_question=lambda event: None)
+
+    _runner_module._wait_turn(backend, session, cfg0, **common)
+    _runner_module._wait_turn(backend, session, cfg1, on_deadline=clock.on_deadline, **common)
+    assert len(backend.calls) == 2
+    assert "on_deadline" not in backend.calls[0]
+    assert backend.calls[0]["timeout"] == 600.0
+    assert backend.calls[0]["idle_event_timeout"] is None
+    assert backend.calls[1]["on_deadline"] is clock.on_deadline
+
+
+def test_turn_extend_sec_zero_never_passes_on_deadline(tmp_path):
+    """End to end, `turn_extend_sec = 0` is today's path: `wait_idle` never
+    sees an `on_deadline` kwarg and the stall line is the one every earlier
+    turn compares byte for byte."""
+    calls = []
+    cfg = make_config(["agent-a"], turn_timeout_sec=1, turn_extend_sec=0,
+                      turn_max_sec=7200, idle_event_timeout_sec=0)
+    sb = Sandbox(tmp_path)
+    scenario = {"turns": [{"events": ["busy"], "idle": False}]}
+    with _BenchFake(scenario) as fake:
+        h = Harness(sb, fake, cfg)
+        real = h.backend.wait_idle
+
+        def spying(session, timeout, **kwargs):
+            calls.append({"timeout": timeout, **kwargs})
+            return real(session, timeout, **kwargs)
+
+        h.backend.wait_idle = spying
+        run = h.go()
+        aborted = _aborted(fake)
+    assert calls, "no turn was waited on"
+    assert all("on_deadline" not in call for call in calls), calls
+    assert all(call["timeout"] == 1.0 for call in calls), calls
+    assert run.state is AgentState.STALLED and aborted
+    assert run.turns[0]["idle_status"] == "timeout"
+    assert run.last_error == "no idle after 1s"
+    assert "extensions" not in run.turns[0]
+
+
+def test_a_flat_worktree_gets_no_extension_and_names_what_it_refused(tmp_path):
+    """A turn whose worktree never moves: no `extensions` key, `STALLED`, and the
+    sample in the error — round 64's glm-4-7-flash."""
+    cfg = make_config(["agent-a"], turn_timeout_sec=1, turn_extend_sec=60,
+                      turn_max_sec=720, idle_event_timeout_sec=0)
+    _sb, _fake, _h, run, aborted = _run_one(
+        tmp_path, {"turns": [{"events": ["busy"], "idle": False}]}, cfg)
+    assert run.state is AgentState.STALLED and aborted
+    assert run.turns[0]["idle_status"] == "timeout"
+    assert "extensions" not in run.turns[0]
+    assert run.last_error.startswith("no idle after ")
+    assert "(0 files, 0 lines, unchanged for" in run.last_error
+
+
+def test_a_growing_worktree_is_extended_once(tmp_path, caplog):
+    """A worktree whose line count grows between samples earns one extension,
+    which lands in the turn as `extensions` and on stderr as a KC-18 line."""
+    caplog.set_level(logging.INFO, logger=LOGGER)
+    cfg = make_config(["agent-a"], turn_timeout_sec=1, turn_extend_sec=1,
+                      turn_max_sec=2, idle_event_timeout_sec=0)
+    sb = Sandbox(tmp_path)
+    scenario = {"turns": [{"events": ["busy"], "idle": False}]}
+    scenario["turns"][0]["on_prompt"] = lambda d, t: _grow(Path(d), 3.0)
+    with _BenchFake(scenario) as fake:
+        run = Harness(sb, fake, cfg).go()
+        aborted = _aborted(fake)
+    assert run.state is AgentState.STALLED and aborted
+    assert run.turns[0]["idle_status"] == "timeout"
+    (ext,) = run.turns[0]["extensions"]
+    assert ext["files"] == 1 and ext["lines"] > 0 and ext["granted"] == 1, ext
+    assert ext["at"] == pytest.approx(1.0, abs=0.6)
+    # the stall line names the last sample the deadline refused: the same
+    # file, grown by the time the extended deadline came due
+    assert "(1 files," in run.last_error and "unchanged for" in run.last_error, \
+        run.last_error
+    (line,) = [l for l in _lines(caplog, "agent-a: WAITING") if " +" in l]
+    assert line.startswith("agent-a: WAITING — +1s at "), line
+    assert line.endswith(f"({ext['files']} files, {ext['lines']} lines)"), line
+
+
+def test_growth_every_time_stops_at_turn_max_sec(tmp_path):
+    """The last grant is clipped so the total is exactly `turn_max_sec`, and the
+    turn still ends STALLED rather than running on."""
+    cfg = make_config(["agent-a"], turn_timeout_sec=1, turn_extend_sec=2,
+                      turn_max_sec=4, idle_event_timeout_sec=0)
+    sb = Sandbox(tmp_path)
+    scenario = {"turns": [{"events": ["busy"], "idle": False}]}
+    scenario["turns"][0]["on_prompt"] = lambda d, t: _grow(Path(d), 5.0, every=0.01)
+    with _BenchFake(scenario) as fake:
+        run = Harness(sb, fake, cfg).go()
+        aborted = _aborted(fake)
+    assert run.state is AgentState.STALLED and aborted
+    ext = run.turns[0]["extensions"]
+    assert [e["granted"] for e in ext] == [2, 1], ext
+    assert cfg.turn_timeout_sec + sum(e["granted"] for e in ext) == cfg.turn_max_sec
+    assert (run.turns[0]["idle_at"] - run.turns[0]["sent_at"]) >= cfg.turn_max_sec - 0.5
+
+
+def test_two_runs_on_one_model_id_extend_on_their_own_churn(tmp_path):
+    """KC-36 §6: `hy3-var1` and `hy3-var2` share a model id and have their own
+    worktrees. The one still writing is extended and runs on; the one that went
+    flat stalls at the nominal clock."""
+    from dataclasses import replace
+    base = make_config(["hy3-var1", "hy3-var2"], max_parallel=2, turn_timeout_sec=1,
+                       turn_extend_sec=1, turn_max_sec=4, idle_event_timeout_sec=0)
+    cfg = replace(base, agents=tuple(
+        AgentSpec(name=a.name, provider_id="kenary", model_id="hy3:free")
+        for a in base.agents))
+    assert {a.model for a in cfg.agents} == {"kenary/hy3:free"}
+
+    sb = Sandbox(tmp_path, ["hy3-var1", "hy3-var2"])
+    scenario = {"turns": [{"events": ["busy"], "idle": False}]}
+
+    def on_prompt(directory, text):
+        if "hy3-var1" in directory:
+            _grow(Path(directory), 5.0, every=0.01)
+        else:
+            time.sleep(5)
+
+    scenario["turns"][0]["on_prompt"] = on_prompt
+    with _BenchFake(scenario) as fake:
+        state = run_round(cfg, ROUND, sb.ticket_path, list(sb.workspaces),
+                          make_backend=_make_backend(fake, sb.out_dir),
+                          out_dir=sb.out_dir)
+
+    flat, growing = _by_name(state)["hy3-var2"], _by_name(state)["hy3-var1"]
+    assert flat.state is AgentState.STALLED
+    assert "extensions" not in flat.turns[0]
+    assert growing.state is AgentState.STALLED
+    ext = growing.turns[0]["extensions"]
+    assert ext and all(e["granted"] == 1 for e in ext), ext
+    assert cfg.turn_timeout_sec + sum(e["granted"] for e in ext) == cfg.turn_max_sec
+    span = lambda run: run.turns[0]["idle_at"] - run.turns[0]["sent_at"]
+    assert span(growing) > span(flat) + 1.0

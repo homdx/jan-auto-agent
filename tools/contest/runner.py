@@ -223,34 +223,107 @@ def _head_sha(ws: Workspace) -> str | None:
     return git(ws.path, "rev-parse", "HEAD") or None
 
 
+def _split_numstat(line: str) -> tuple[int, int, str]:
+    """`(added, deleted, path)` of one `git diff --numstat` line.
+
+    `(0, 0, "")` for anything that is not a numstat line: a binary file is a
+    `-` where a number belongs, a rename arrives as `path => path`, and an
+    empty output has no lines at all.
+    """
+    parts = line.split("\t")
+    if len(parts) != 3:
+        return 0, 0, ""
+    # a binary file is `-` where a number belongs: the path still counts as a
+    # touched file, its lines do not
+    try:
+        added, deleted = int(parts[0]), int(parts[1])
+    except ValueError:
+        added, deleted = 0, 0
+    return added, deleted, parts[2].strip().rsplit(" => ", 1)[-1]
+
+
+def _line_count(path: Path) -> int:
+    """The lines of one file, `0` when it cannot be read.
+
+    `--numstat` has no view of an untracked file, so a sample counts one from
+    the disk itself.
+    """
+    try:
+        with Path(path).open("rb") as fh:
+            return sum(1 for _ in fh)
+    except OSError:
+        return 0
+
+
+def _churn(ws: Workspace) -> tuple[int, int]:
+    """`(files touched, lines changed)` in *ws*, committed and not. Never raises.
+
+    KC-36: the sample that decides whether a turn's deadline is extended. The
+    union of
+
+      * `git status --porcelain --untracked-files=all` — the paths, and for
+        each untracked file its own line count, which no `--numstat` can see;
+      * `git diff --numstat` — added plus deleted of the uncommitted edits;
+      * `git diff --numstat <base_sha>..HEAD` — what the agent already
+        committed on this branch;
+
+    minus everything under `.smoke_tests/` (`sync_test_tiers.py` links, not
+    work). `--no-optional-locks` so a sample never takes `index.lock` from the
+    agent's own `git commit`.
+
+    Read-only and never raises: any git failure, a missing worktree and a
+    binary `-` in a `--numstat` line all count `0` for that path, and a tree
+    that cannot be read at all is `(0, 0)` rather than an exception into a
+    round.
+    """
+    def out(*args: str) -> str:
+        try:
+            r = run_git(["git", "--no-optional-locks", *args], cwd=ws.path,
+                        timeout=_TICK_GIT_TIMEOUT_S, retries=_TICK_GIT_RETRIES)
+        except Exception:  # noqa: BLE001 — a sample must never raise
+            return ""
+        return r.stdout if r.returncode == 0 else ""
+
+    paths: set[str] = set()
+    lines = 0
+    try:
+        for raw in out("status", "--porcelain", "--untracked-files=all").splitlines():
+            if len(raw) <= 3:
+                continue
+            name = raw[3:].rsplit(" -> ", 1)[-1].strip()
+            if not name or name.startswith(".smoke_tests/"):
+                continue
+            paths.add(name)
+            if raw[:2] == "??":
+                lines += _line_count(Path(ws.path) / name)
+        for raw in out("diff", "--numstat").splitlines():
+            added, deleted, name = _split_numstat(raw)
+            if not name or name.startswith(".smoke_tests/"):
+                continue
+            paths.add(name)
+            lines += added + deleted
+        for raw in out("diff", "--numstat", f"{ws.base_sha}..HEAD").splitlines():
+            added, deleted, name = _split_numstat(raw)
+            if not name or name.startswith(".smoke_tests/"):
+                continue
+            paths.add(name)
+            lines += added + deleted
+    except Exception:  # noqa: BLE001 — see the docstring
+        return 0, 0
+    return len(paths), lines
+
+
 def _worktree_files(ws: Workspace) -> int:
     """The number of distinct paths changed in *ws*'s worktree (KC-27).
 
-    The union of `git status --porcelain --untracked-files=all` (tracked
-    changes and untracked files — the agent is editing) and
-    `git diff --name-only <base_sha>..HEAD` (what it already committed), minus
-    paths under `.smoke_tests/` (`sync_test_tiers.py` links).
-
-    Read-only and never raises: any git failure is `0`. Called from the
-    heartbeat thread only, once per tick per non-terminal agent —
-    `--no-optional-locks` so the tick never takes `index.lock` from under the
-    agent's own `git commit`, and one attempt with no lock ladder: a tick that
-    waits on a held index is a tick that is late, not a failure.
+    The files half of :func:`_churn`: one walker, shared with the turn's
+    deadline, instead of a second one for the heartbeat. Same contract as
+    KC-27 — the union of `git status --porcelain --untracked-files=all` and
+    `git diff <base_sha>..HEAD`, minus `.smoke_tests/`, read-only, never
+    raising, `--no-optional-locks` so it never takes `index.lock` from under
+    the agent's own `git commit`.
     """
-    def names(*args: str) -> list:
-        r = run_git(["git", "--no-optional-locks", *args], cwd=ws.path,
-                    timeout=_TICK_GIT_TIMEOUT_S, retries=_TICK_GIT_RETRIES)
-        return r.stdout.splitlines() if r.returncode == 0 else []
-
-    try:
-        paths = {line[3:].rsplit(" -> ", 1)[-1]
-                 for line in names("status", "--porcelain", "--untracked-files=all")
-                 if len(line) > 3}
-        paths.update(line.strip() for line in names("diff", "--name-only",
-                                                     f"{ws.base_sha}..HEAD"))
-    except Exception:  # noqa: BLE001 — the heartbeat's estimate must never raise
-        return 0
-    return len({p for p in paths if p and not p.startswith(".smoke_tests/")})
+    return _churn(ws)[0]
 
 
 class AgentState(str, Enum):
@@ -569,8 +642,103 @@ def _abort_quietly(backend: ContestBackend, session: SessionRef) -> None:
 # the wait, with the round's stall edge
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _no_idle_error(config: ContestConfig, elapsed: float,
+                   clock: "_TurnClock | None") -> str:
+    """`no idle after …` for the turn that never idled.
+
+    Today's string, unchanged, when no extension clock was armed — that is
+    `turn_extend_sec = 0` and every `state.json` written before KC-36. With
+    one, the same sentence names the sample the deadline refused: the files
+    and lines on disk when it gave up, and how long they had not moved.
+    """
+    if clock is None or clock.on_deadline is None:
+        return f"no idle after {config.turn_timeout_sec}s"
+    files, lines = clock.last_sample
+    quiet_for = max(0.0, elapsed - clock.last_change_at)
+    return (f"no idle after {_age(elapsed)} ({files} files, {lines} lines, "
+            f"unchanged for {_age(quiet_for)})")
+
+
+@dataclass
+class _TurnClock:
+    """One turn's deadline, and what the runner needs to tell about it.
+
+    KC-36: ``on_deadline`` is what ``wait_idle`` asks at the deadline,
+    ``extensions`` the grants it earned (one entry per grant, recorded in the
+    turn), ``last_sample`` the churn it refused, and ``granted`` the total the
+    deadline has already moved — both the cap the last extension is clipped to
+    and the heartbeat's ``+Nm``. ``prev_sample`` is the churn the last grant
+    was based on, the baseline the next sample grows against.
+    """
+
+    on_deadline: Callable[[float], float | None] | None
+    extensions: list = field(default_factory=list)
+    prev_sample: tuple[int, int] = (0, 0)
+    last_sample: tuple[int, int] = (0, 0)
+    last_change_at: float = 0.0
+    granted: float = 0.0
+
+
+def _turn_deadline(run: AgentRun, config: ContestConfig) -> _TurnClock:
+    """The clock for one turn: extend on churn, cap at `turn_max_sec`.
+
+    ``turn_extend_sec = 0`` returns a clock with ``on_deadline`` still
+    ``None`` — `wait_idle` is asked nothing and the turn is today's path byte
+    for byte. Otherwise every deadline asks for a fresh sample of the worktree
+    this *run* owns: `run.workspace.path`, keyed by `run.agent.name`, never by
+    `model_id`, so `hy3-var1` and `hy3-var2` on one model extend on their own
+    churn.
+
+    Progress is the sample growing strictly in either number — files alone is
+    too coarse, because an agent that writes a file in its first minute and
+    then loops shows the same count forever, so `lines` is what usually moves.
+    On progress the deadline is pushed by `turn_extend_sec`, clipped to
+    `turn_max_sec`, and the sample becomes the new previous; on no progress —
+    and at the cap, whatever the churn says — it aborts as today.
+    """
+    extend = float(getattr(config, "turn_extend_sec", 0) or 0)
+    clock = _TurnClock(on_deadline=None)
+    # `turn_extend_sec = 0` arms nothing and reads no git — today's path, for
+    # real, not just in the shape of the call.
+    if extend <= 0:
+        return clock
+    sample = _churn(run.workspace)
+    clock.prev_sample = sample
+    clock.last_sample = sample
+    ws, spec = run.workspace, run.agent
+    nominal = float(config.turn_timeout_sec or 0)
+    cap = float(getattr(config, "turn_max_sec", 0) or 0)
+    ceiling = cap if cap > 0 else nominal
+
+    def on_deadline(elapsed: float) -> float | None:
+        current = _churn(ws)
+        clock.last_sample = current
+        previous = clock.prev_sample
+        if not (current[0] > previous[0] or current[1] > previous[1]):
+            return None
+        grant = min(extend, ceiling - nominal - clock.granted)
+        if grant <= 0:
+            return None
+        clock.granted += grant
+        clock.prev_sample = current
+        clock.last_change_at = float(elapsed)
+        clock.extensions.append({"at": round(float(elapsed), 1), "files": current[0],
+                                 "lines": current[1], "granted": int(grant)})
+        try:
+            _log.info("%s: WAITING — +%s at %s (%d files, %d lines)",
+                      spec.name, _age(grant), _age(float(elapsed)),
+                      current[0], current[1])
+        except Exception:  # noqa: BLE001 — the grant stands, the line is not a round
+            pass
+        return grant
+
+    clock.on_deadline = on_deadline
+    return clock
+
+
 def _wait_turn(backend: ContestBackend, session: SessionRef, config: ContestConfig,
-               *, on_permission, on_question):
+               *, on_permission, on_question,
+               on_deadline: Callable[[float], float | None] | None = None):
     """`backend.wait_idle` for one turn, with the round's stall edge wired in.
 
     Returns the `IdleResult`. `idle_event_timeout` is the round's
@@ -579,11 +747,21 @@ def _wait_turn(backend: ContestBackend, session: SessionRef, config: ContestConf
     `turn_timeout_sec` — which is how the runner names it a silence stall
     rather than a turn timeout. Zero or unset disables the clock, which is
     `wait_idle`'s behaviour without the argument.
+
+    *on_deadline* (KC-36) is the turn's own churn clock, one per turn, built
+    by `run_agent`. When it is `None` — `turn_extend_sec = 0`, or a backend
+    with no worktree to read — the kwarg is not passed at all, and the call is
+    byte for byte today's.
     """
     silence = float(config.idle_event_timeout_sec or 0)
-    return backend.wait_idle(session, float(config.turn_timeout_sec),
-                             idle_event_timeout=silence or None,
-                             on_permission=on_permission, on_question=on_question)
+    wait_kwargs = {
+        "idle_event_timeout": silence or None,
+        "on_permission": on_permission,
+        "on_question": on_question,
+    }
+    if on_deadline is not None:
+        wait_kwargs["on_deadline"] = on_deadline
+    return backend.wait_idle(session, float(config.turn_timeout_sec), **wait_kwargs)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -731,10 +909,20 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
             # ── WAITING ────────────────────────────────────────────────────
             transition(AgentState.WAITING)
             questions_this_turn[0] = 0
-            idle = _wait_turn(backend, session, config,
-                              on_permission=on_permission, on_question=on_question)
+            # KC-36: this turn's own deadline, decided from its own worktree.
+            # It sits on the run only so the heartbeat can read it mid-wait.
+            clock = _turn_deadline(run, config)
+            run._turn_clock = clock
+            try:
+                idle = _wait_turn(backend, session, config,
+                                  on_permission=on_permission, on_question=on_question,
+                                  on_deadline=clock.on_deadline)
+            finally:
+                run._turn_clock = None
             turn["idle_at"] = time.time()
             turn["idle_status"] = idle.status
+            if clock.extensions:
+                turn["extensions"] = clock.extensions
             if stalled:
                 turn["idle_status"] = "stalled"
                 error, state = stalled[0], AgentState.STALLED
@@ -742,13 +930,15 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                 # KC-12 sends the silence stall back as "timeout" too, so the
                 # label comes from elapsed: under the overall deadline means
                 # the silence window fired, at it means the turn never idled.
+                # KC-36 moves that deadline when the churn earned it.
                 silence = float(config.idle_event_timeout_sec or 0)
-                quiet = 0 < silence and idle.elapsed < float(config.turn_timeout_sec)
+                limit = float(config.turn_timeout_sec) + clock.granted
+                quiet = 0 < silence and idle.elapsed < limit
                 if quiet:
                     turn["idle_status"] = "stalled"
                     error = f"no event for {silence:g}s"
                 else:
-                    error = f"no idle after {config.turn_timeout_sec}s"
+                    error = _no_idle_error(config, idle.elapsed, clock)
                 state = AgentState.STALLED
             elif idle.status == "error":
                 overflow = _is_overflow(idle.error)
@@ -1145,8 +1335,15 @@ class _Heartbeat:
                 pct = _progress(run.state, files, median, committed)
                 if pct is not None:
                     part += f" {_bar(pct)} {pct}% {files}f"
+                # KC-36: a turn running past its nominal clock says so, so an
+                # extended agent is not mistaken for a hung round. The suffix
+                # rides the attempt marker when there is one.
+                live_clock = getattr(run, "_turn_clock", None)
+                granted = float(live_clock.granted) if live_clock is not None else 0.0
                 if run.attempt:
                     part += f" ↺{run.attempt}"
+                if granted > 0:
+                    part += f"+{_age(granted)}" if run.attempt else f" +{_age(granted)}"
                 elapsed = self._last_harvest_elapsed(run)
                 if elapsed is not None:
                     part += f" (tests {_age(elapsed)})"
