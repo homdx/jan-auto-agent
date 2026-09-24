@@ -28,6 +28,13 @@ KC-25 (round 64) adds the sixth primitive: `providers()` is `GET /provider`,
 the offer decoded as is, so intake can check a roster's `provider/model` pairs
 before the round; a non-2xx is a `KiloHttpError` and a non-dict body is a
 `ValueError`.
+
+KC-47 (round 91) adds the silence clock's one exception: while this session
+still has a `bash` `tool` part in `state.status` `running`, the bound is the
+call's own `timeout` plus `idle_event_timeout` of grace, measured from the
+part's `running` event. Every case in §1–§4 of the ticket is settled here over
+a scripted tap on the fake clock, because they are all about the *gap* after a
+`running` event and there is no transport and no wall time to starve.
 """
 
 from __future__ import annotations
@@ -752,6 +759,314 @@ def test_a_turn_with_no_event_at_all_is_cut_at_the_window(tmp_path):
     assert res.elapsed < 20.0, res.elapsed
     assert elapsed < 20.0
     assert h.fake.recorded_abort_for(h.session.id)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3c — KC-47: a `bash` call that is still running is not silence
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _TimedScriptedTap:
+    """A scripted stream at absolute times, on the fake clock.
+
+    `_ScriptedTap` spaces its events an equal `every` apart, which cannot say
+    "one event, then nothing at all, then one event" — and KC-47's claim *is*
+    the gap after a `bash` part goes `running`. So the events are seconds
+    after the wait starts, and nothing here is measured against real time: a
+    starved box cannot change an outcome, because there is no transport and no
+    wall clock to drift.
+
+    Faithful to `EventTap.wait` in the two ways that matter: the cursor
+    advances past every event looked at, matching or not, and an event the
+    predicate rejects is consumed without being returned. That second one is
+    what makes §3's neighbour case visible.
+    """
+
+    def __init__(self, events, *, clock):
+        self._events = sorted((clock.now + float(at), event)
+                              for at, event in events)
+        self._clock = clock
+
+    def wait(self, pred, timeout):
+        deadline = self._clock.now + max(0.0, float(timeout))
+        while self._events and self._events[0][0] <= deadline:
+            at, event = self._events.pop(0)
+            self._clock.now = at
+            if pred(event):
+                return event
+        self._clock.now = deadline
+        return None
+
+
+def _kc47_probe(monkeypatch, events, *, window, timeout=10_000.0, aborts=None):
+    """`KiloClient.wait_idle` over a KC-47 stream on the fake clock.
+
+    `window` is the `idle_event_timeout`; `timeout` is the overall wait, the
+    runner's `turn_timeout_sec`. `aborts` records every session
+    `_abort_quietly` was sent for, so an assertion reads it rather than
+    re-deriving it.
+    """
+    clock = _FakeClock()
+    monkeypatch.setattr(kilo_client_module.time, "monotonic", clock.monotonic)
+
+    class _Client(KiloClient):
+        def __init__(self):
+            pass
+
+        def _abort_quietly(self, session):
+            (aborts if aborts is not None else []).append(session.id)
+
+    session = SessionRef(id="ses_probe", provider_id="p", model_id="m",
+                         directory="/nowhere")
+    return _Client().wait_idle(_TimedScriptedTap(events, clock=clock), session,
+                               timeout, idle_event_timeout=window,
+                               on_permission=_reject,
+                               on_question=lambda event: None)
+
+
+def _part_updated(part_id, *, tool="bash", status="running", timeout_ms=600000,
+                  command="python3 -m pytest tests -n 4", session_id="ses_probe",
+                  **state):
+    """One `message.part.updated` carrying a `tool` part, in the server's shape.
+
+    PROBE.md's part: an `id`, `type` `tool` and the tool's name, with a
+    `state` holding `status` and `input`. `timeout_ms=None` omits the key,
+    which is how a call that asked for no timeout arrives.
+    """
+    input_ = {"command": command}
+    if timeout_ms is not None:
+        input_["timeout"] = timeout_ms
+    part = {"id": part_id, "type": "tool", "tool": tool,
+            "messageID": f"msg_{part_id}", "callID": f"call_{part_id}",
+            "state": {"status": status, "input": input_, **state}}
+    return _ev("message.part.updated", session_id=session_id, part=part)
+
+
+def test_a_running_bash_part_holds_the_silence_clock_open(monkeypatch):
+    """The round 86 fix: a `bash` call with a 600 s `timeout` is allowed its
+    600 s plus the window of grace, so silence of `idle_event_timeout + 1`
+    inside it is the call running, not a stall. `session.idle` arrives and no
+    abort is sent — the behaviour before KC-47 cut this turn at the window."""
+    window = 1.0
+    aborts: list = []
+    events = [
+        (1.0, _part_updated("p1", timeout_ms=600000)),
+        (3.0, _part_updated("p1", status="completed", timeout_ms=600000)),
+        (3.1, _ev("session.idle")),
+    ]
+
+    res = _kc47_probe(monkeypatch, events, window=window, aborts=aborts)
+
+    assert res.status == "idle"
+    assert res.open_tool is None
+    assert aborts == []
+    assert res.elapsed == pytest.approx(3.1)
+
+
+def test_a_silence_past_a_bash_parts_own_timeout_stalls_with_the_call_named(monkeypatch):
+    """The same call, let run past its own `timeout` plus the grace: a stall,
+    one abort, and `open_tool` carrying the command so the next reader does
+    not have to dig in events.jsonl."""
+    window = 1.0
+    command = "python3 -m pytest tests -n 4"
+    aborts: list = []
+    events = [(1.0, _part_updated("p1", timeout_ms=600000, command=command))]
+
+    res = _kc47_probe(monkeypatch, events, window=window, aborts=aborts)
+
+    assert res.status == "timeout"
+    assert aborts == ["ses_probe"]
+    # past 600 + the window of grace, measured from the `running` event
+    assert res.elapsed == pytest.approx(1.0 + 600.0 + window)
+    assert res.open_tool["tool"] == "bash"
+    assert res.open_tool["command"] == command
+    assert res.open_tool["running_for"] == pytest.approx(601.0)
+
+
+def test_a_bash_part_with_no_timeout_uses_the_module_default_not_forever(monkeypatch):
+    """A call that names no `timeout` still ends, at Kilo's own `bash`
+    default. The constant is patched down so the claim is readable in numbers
+    and, more importantly, so "forever" cannot pass: an unbounded part would
+    run to the 10 000 s wait timeout instead of 2.5 s."""
+    monkeypatch.setattr(kilo_client_module, "_KILO_BASH_DEFAULT_TIMEOUT_MS", 500)
+    window = 1.0
+    aborts: list = []
+    events = [(1.0, _part_updated("p1", timeout_ms=None))]
+
+    res = _kc47_probe(monkeypatch, events, window=window, aborts=aborts)
+
+    assert res.status == "timeout"
+    assert aborts == ["ses_probe"]
+    assert res.elapsed == pytest.approx(1.0 + 0.5 + window)
+    assert res.open_tool is not None and res.open_tool["tool"] == "bash"
+
+
+@pytest.mark.parametrize("tool", ["task", "read", "edit", "write", "bash"])
+def test_a_non_bash_tool_part_is_not_a_suspension(monkeypatch, tool):
+    """§3: only `bash` holds the silence clock open. Round 64's `nex-n2-5-pro`
+    sat in a failed `task` — that is KC-42's — and an `edit` or a `read`
+    keeps KC-12's window, cut at it event for event.
+
+    `bash` is in the list because a part whose `state.status` is not
+    `running` or `pending` is not open either, and it must not widen anything.
+    """
+    if tool == "bash":
+        events = [(1.0, _part_updated("p1", status="completed", timeout_ms=600000))]
+    else:
+        events = [(1.0, _part_updated("p1", tool=tool, timeout_ms=600000))]
+    aborts: list = []
+
+    res = _kc47_probe(monkeypatch, events, window=1.0, aborts=aborts)
+
+    assert res.status == "timeout"
+    assert res.elapsed == pytest.approx(2.0)   # 1.0 to the part, 1.0 of silence
+    assert res.open_tool is None
+    assert aborts == ["ses_probe"]
+
+
+def test_two_bash_parts_only_the_still_running_one_sets_the_bound(monkeypatch):
+    """Two calls open: the widest one binds, and closing it drops the bound
+    to the survivor's own. Each call's bound runs from its own `running`
+    event, so after the closure it is p2's 1.1 + 1 + the window = 3.1 — below
+    KC-12's 2.5 + the window from the closing event, which is what binds: an
+    open call never leaves a turn less room than KC-12 would. With p1 never
+    closed the stall would land at 1.0 + 3 + the window = 5.0."""
+    window = 1.0
+    events = [
+        (1.0, _part_updated("p1", timeout_ms=3000, command="python3 -m pytest tests")),
+        (1.1, _part_updated("p2", timeout_ms=1000, command="python3 -m pytest .smoke_tests/")),
+        (2.5, _part_updated("p1", status="completed", timeout_ms=3000)),
+    ]
+    aborts: list = []
+
+    res = _kc47_probe(monkeypatch, events, window=window, aborts=aborts)
+
+    assert res.status == "timeout"
+    assert res.elapsed == pytest.approx(2.5 + window)
+    assert res.open_tool["tool"] == "bash"
+    assert res.open_tool["command"] == "python3 -m pytest .smoke_tests/"
+    assert res.open_tool["running_for"] == pytest.approx(2.4)
+
+
+def test_the_calls_bound_runs_from_its_running_event_not_from_later_updates(monkeypatch):
+    """A running call's later updates (its output streaming in) reset KC-12's
+    clock like any event, but not the call's own bound: that runs from the
+    first `running` — 1.0 + 3 + the window = 5.0, not 2.0 + 3 + the window."""
+    window = 1.0
+    events = [
+        (1.0, _part_updated("p1", timeout_ms=3000)),
+        (2.0, _part_updated("p1", timeout_ms=3000, metadata={"output": "...."})),
+    ]
+    aborts: list = []
+
+    res = _kc47_probe(monkeypatch, events, window=window, aborts=aborts)
+
+    assert res.status == "timeout"
+    assert res.elapsed == pytest.approx(1.0 + 3.0 + window)
+    assert res.open_tool["running_for"] == pytest.approx(4.0)
+    assert aborts == ["ses_probe"]
+
+
+def test_with_every_bash_part_closed_the_bound_is_kc12s_again(monkeypatch):
+    """Both calls finish: the wait is KC-12's again, event for event, and the
+    stall names nothing — an empty `open_tool`, exactly as a KC-12 silence
+    did before KC-47."""
+    window = 1.0
+    events = [
+        (1.0, _part_updated("p1", timeout_ms=600000)),
+        (1.2, _part_updated("p2", timeout_ms=600000)),
+        (1.4, _part_updated("p1", status="completed", timeout_ms=600000)),
+        (1.6, _part_updated("p2", status="completed", timeout_ms=600000)),
+    ]
+    aborts: list = []
+
+    res = _kc47_probe(monkeypatch, events, window=window, aborts=aborts)
+
+    assert res.status == "timeout"
+    assert res.elapsed == pytest.approx(1.6 + window)
+    assert res.open_tool is None
+    assert aborts == ["ses_probe"]
+
+
+def test_a_neighbour_sessions_bash_part_does_not_move_this_sessions_clock(monkeypatch):
+    """§3: the tap reads every session of the directory, and this session's
+    clock is its own. A neighbour's 600 s `bash` is consumed without waking
+    the wait, and the silence still runs out at the window."""
+    window = 1.0
+    events = [(1.0, _part_updated("p1", session_id="ses_someone_else", timeout_ms=600000))]
+    aborts: list = []
+
+    res = _kc47_probe(monkeypatch, events, window=window, aborts=aborts)
+
+    assert res.status == "timeout"
+    assert res.elapsed == pytest.approx(window)
+    assert res.open_tool is None
+    assert aborts == ["ses_probe"]
+
+
+def test_the_overall_timeout_still_bounds_a_wider_bash_call(monkeypatch):
+    """An agent that asks for a 40-minute `bash` on a 30-minute turn gets the
+    turn's end. The bound is widened only against the silence clock, and
+    `open_tool` stays empty: the turn deadline won, so the answer is "the turn
+    never idled", not "the call was slow"."""
+    window = 1.0
+    events = [(1.0, _part_updated("p1", timeout_ms=2_400_000))]
+    aborts: list = []
+
+    res = _kc47_probe(monkeypatch, events, window=window, timeout=10.0, aborts=aborts)
+
+    assert res.status == "timeout"
+    assert res.elapsed == pytest.approx(10.0)
+    assert res.open_tool is None
+    assert aborts == ["ses_probe"]
+
+
+def test_a_malformed_part_updates_the_map_without_raising(monkeypatch):
+    """Fail-open: a `message.part.updated` whose part is missing, not a dict,
+    without an id, or whose `state` is not a dict must not raise into a round
+    and must not widen anything — the silence clock stays KC-12's, which is
+    what any shape the server sends should degrade to."""
+    malformed = [
+        _ev("message.part.updated"),                                            # no part
+        _ev("message.part.updated", part=None),
+        _ev("message.part.updated", part=["not", "a", "dict"]),
+        _ev("message.part.updated", part={"type": "tool", "tool": "bash"}),     # no id
+        _ev("message.part.updated", part={"id": "p1", "type": "tool",
+                                          "tool": "bash", "state": "running"}),  # state not a dict
+        _ev("message.part.updated", part={"id": "p1", "type": "tool",
+                                          "tool": "bash",
+                                          "state": {"status": "idle"}}),        # not open
+    ]
+    events = [(1.0 + 0.1 * i, event) for i, event in enumerate(malformed)]
+    aborts: list = []
+
+    res = _kc47_probe(monkeypatch, events, window=1.0, aborts=aborts)
+
+    assert res.status == "timeout"
+    assert res.elapsed == pytest.approx(1.5 + 1.0)   # the last event, plus the window
+    assert res.open_tool is None
+    assert aborts == ["ses_probe"]
+
+
+def test_a_non_numeric_timeout_falls_back_to_the_module_default(monkeypatch):
+    """A `timeout` the model spelled as a word is not a number, so the call
+    takes Kilo's own default rather than raising — and rather than being
+    unbounded. The constant is patched down, as above, so the claim is a
+    number instead of "forever"."""
+    monkeypatch.setattr(kilo_client_module, "_KILO_BASH_DEFAULT_TIMEOUT_MS", 500)
+    part = {"id": "p1", "type": "tool", "tool": "bash",
+            "state": {"status": "running",
+                      "input": {"command": "python3 -m pytest tests",
+                                "timeout": "soon"}}}
+    aborts: list = []
+
+    res = _kc47_probe(monkeypatch, [(1.0, _ev("message.part.updated", part=part))],
+                      window=1.0, aborts=aborts)
+
+    assert res.status == "timeout"
+    assert res.elapsed == pytest.approx(1.0 + 0.5 + 1.0)
+    assert res.open_tool["tool"] == "bash"
+    assert res.open_tool["command"] == "python3 -m pytest tests"
+    assert res.open_tool["running_for"] == pytest.approx(1.5)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

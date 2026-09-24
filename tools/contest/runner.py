@@ -30,8 +30,12 @@ so this module only passes the round's `idle_event_timeout_sec` (KC-2's
 `[contest]` key) and reads the result. The primitive owns the clock — the last
 event *of this session* on its stream, in `time.monotonic()` — and sends the
 `abort` itself. A silence stall and the overall `turn_timeout_sec` both come
-back as `IdleResult.status == "timeout"`; `elapsed` tells them apart. The
-third-question edge is the runner's own, still: `stall()` aborts and interrupts
+back as `IdleResult.status == "timeout"`; `elapsed` tells them apart. KC-47
+(round 91) widens the silence window while the session still has a `bash` call
+in flight and puts that call in `IdleResult.open_tool`, which this module puts
+in `last_error` — `no event for Ns during bash: <command>` — so a stall report
+says the agent was running its tests. The third-question edge is the runner's
+own, still: `stall()` aborts and interrupts
 the backend, and the wait wakes on the closed stream.
 
 The round narrates itself (KC-18, round 57): every `transition` is one INFO
@@ -87,7 +91,7 @@ from tools.backoff import save_state
 from tools.contest.backend import ContestBackend, ContestBackendError
 from tools.contest.gates import declared_files, git
 from tools.contest.harvest import harvest, rework_message
-from tools.contest.kilo_client import SessionRef
+from tools.contest.kilo_client import AGENT_TEST_TIMEOUT_MS, SessionRef
 from tools.contest.policy import HARD_DENYLIST, Policy, PolicyContext
 from tools.contest.roster import AgentSpec, ContestConfig
 from tools.contest.workspace import Workspace
@@ -446,6 +450,12 @@ class RoundState:
 # the prompt
 # ─────────────────────────────────────────────────────────────────────────────
 
+# KC-47 §5: `AGENT_TEST_TIMEOUT_MS` is the figure `_PROMPT` tells the agent to
+# give its own test run. It is the `kilo_client` constant, so the number the
+# prompt asks for and the number the silence clock reasons about cannot drift
+# apart. It must stay below `turn_timeout_sec` — `tests/test_contest_runner.py`
+# asserts it does, against the committed `contest.ini`.
+
 #: `docs/collect-epics/RUN-THE-EPIC-COMPETITION.md` §Stage 1, "PROMPT STARTS …
 #: PROMPT ENDS", with the blockquote markers dropped and `<YOUR NAME>` as
 #: `{name}`. A module string on purpose: the runbook is documentation and may
@@ -496,6 +506,9 @@ Two more that are checked by reading your diff:
 Never point any command at a live provider config. If a step needs one, copy
 `agents_128k.ini` to a scratch path and stub every `base_url` first.
 
+Running the test suite on this machine can take up to 20 minutes under load:
+give that `bash` call a `timeout` of at least {test_timeout_ms} ms.
+
 When you are done, report: the commit sha, each Acceptance checkbox and
 whether you met it, and anything in the ticket you found to be wrong about the
 live code — each ticket names the commit it was written against in its
@@ -519,7 +532,8 @@ def round_prompt(agent_name: str, ticket_path: Path, base_sha: str, *, dirty: st
     passes no *dirty* and gets the unchanged text.
     """
     del ticket_path
-    text = _PROMPT.format(name=agent_name, base_sha=base_sha)
+    text = _PROMPT.format(name=agent_name, base_sha=base_sha,
+                          test_timeout_ms=AGENT_TEST_TIMEOUT_MS)
     if dirty:
         text = text + "\n\n" + continue_message(dirty)
     return text
@@ -931,12 +945,22 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                 # label comes from elapsed: under the overall deadline means
                 # the silence window fired, at it means the turn never idled.
                 # KC-36 moves that deadline when the churn earned it.
+                # KC-47 widens that window while a `bash` call is still
+                # running, and names the call in the stall when the widened
+                # bound is what fired, so the next reader does not have to dig
+                # in events.jsonl to learn the agent was running its tests.
                 silence = float(config.idle_event_timeout_sec or 0)
                 limit = float(config.turn_timeout_sec) + clock.granted
                 quiet = 0 < silence and idle.elapsed < limit
                 if quiet:
                     turn["idle_status"] = "stalled"
-                    error = f"no event for {silence:g}s"
+                    open_tool = getattr(idle, "open_tool", None) or {}
+                    if open_tool:
+                        error = (f"no event for {silence:g}s during "
+                                 f"{open_tool.get('tool', 'bash')}: "
+                                 f"{open_tool.get('command') or '(no command)'}")
+                    else:
+                        error = f"no event for {silence:g}s"
                 else:
                     error = _no_idle_error(config, idle.elapsed, clock)
                 state = AgentState.STALLED

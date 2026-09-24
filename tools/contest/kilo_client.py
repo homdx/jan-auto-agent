@@ -23,6 +23,11 @@ Two things the probe learned live are behaviour here, not comments:
     (KC-12), every other event carrying this session's ``sessionID`` — a
     ``session.status busy``, a ``file.edited`` — resets that clock and
     nothing else.
+  * with a ``bash`` ``tool`` part of this session still in
+    ``state.status`` `running` (KC-47), that silence bound is the call's own
+    ``state.input.timeout`` plus ``idle_event_timeout`` of grace, measured
+    from the part's ``running`` event — a full ``pytest`` run is not silence,
+    and a stall that fires anyway names the call in ``IdleResult.open_tool``.
   * ``providers`` is ``GET /provider`` decoded as is (KC-25) — nothing is
     reshaped, because the caller compares the roster's ``provider/model``
     pairs against it, and a provider's ``name`` there is the display string
@@ -60,6 +65,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Literal
 
 __all__ = [
+    "AGENT_TEST_TIMEOUT_MS",
     "EventTap",
     "IdleResult",
     "KiloClient",
@@ -99,6 +105,23 @@ _STREAM_READ_TIMEOUT = 3600.0
 # FL-1 (round 84): how often EventTap forces its event log to disk. It used
 # to be every single event, on the reader thread — see EventTap._write_log.
 _LOG_FLUSH_INTERVAL_S = 0.5
+
+# KC-47: how long Kilo's `bash` tool lets a command run when the model names
+# no `timeout` of its own. Read off the tool's schema in the build the contest
+# runs — Kilo 7.x: "Optional timeout in milliseconds. If not specified,
+# commands will time out after 120000ms." Kept as a constant rather than read
+# from a live session, so a `bash` part that omits the key is bounded instead
+# of "forever".
+_KILO_BASH_DEFAULT_TIMEOUT_MS = 120000
+
+# KC-47 §5: the `timeout` the round's prompt tells the agent to give its own
+# test run, in milliseconds — the number `runner._PROMPT` formats in. It must
+# stay below the round's `turn_timeout_sec`: the turn's deadline bounds every
+# `bash` call, whichever it asks for.
+AGENT_TEST_TIMEOUT_MS = 1_200_000
+
+# KC-47 §4: how much of a running command's text a silence stall reports.
+_OPEN_TOOL_COMMAND_CHARS = 120
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -177,6 +200,13 @@ class IdleResult:
     ``wait_idle`` does not invent a fourth status for it. A caller that needs
     to tell them apart reads ``elapsed``: a stall lands well under the
     overall deadline.
+
+    ``open_tool`` (KC-47) is set only when the silence bound fired while this
+    session still had a ``bash`` call in flight:
+    ``{"tool": "bash", "command": <120 chars>, "running_for": s}``, so a stall
+    report says what the agent was doing instead of "no event for 300s".
+    ``None`` for every other outcome, and for a stall with no ``bash`` part
+    open — KC-12's silence, byte for byte.
     """
 
     status: Literal["idle", "error", "timeout", "closed"]
@@ -184,6 +214,7 @@ class IdleResult:
     permissions: list = field(default_factory=list)
     questions: list = field(default_factory=list)
     elapsed: float = 0.0
+    open_tool: dict | None = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -689,6 +720,120 @@ class EventTap:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# KC-47 — the open `bash` parts the silence clock waits for
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _number(value) -> float | None:
+    """``value`` as a float when it is a number, else None. Never raises.
+
+    Kilo sends ``timeout`` as a number, and a malformed payload must not turn
+    a stall bookkeeping line into an exception into a round.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
+def _part_input(part: dict) -> dict:
+    """The arguments a ``tool`` part was called with; ``{}`` when it has none.
+
+    The live server nests them under ``state.input``; anything else is
+    treated as "no arguments", which is what a stalled stall report says
+    rather than guessing at a shape the build never sent.
+    """
+    state = part.get("state")
+    if not isinstance(state, dict):
+        return {}
+    input_ = state.get("input")
+    return input_ if isinstance(input_, dict) else {}
+
+
+def _part_command(part: dict) -> str:
+    """The command a ``tool`` part is running, trimmed and bounded."""
+    command = _part_input(part).get("command")
+    if not isinstance(command, str):
+        return ""
+    return command.strip()[:_OPEN_TOOL_COMMAND_CHARS]
+
+
+def _part_timeout_ms(part: dict) -> float:
+    """The milliseconds the part asked for, else Kilo's own `bash` default."""
+    timeout = _number(_part_input(part).get("timeout"))
+    if timeout is not None and timeout > 0:
+        return timeout
+    return float(_KILO_BASH_DEFAULT_TIMEOUT_MS)
+
+
+def _track_open_part(open_parts: dict, part: dict | None, at: float) -> None:
+    """One ``message.part.updated`` of this session, into the open-parts map.
+
+    A ``tool`` part with ``tool == "bash"`` and a ``state.status`` of
+    ``running`` or ``pending`` is *open*, keyed by its part id; that same id
+    in any other status closes it. Nothing else is tracked: a ``task``, an
+    ``edit``, a ``read`` keeps KC-12's clock exactly as today, and a part
+    without an id is skipped outright — one that could never be closed again
+    would hold the silence clock open for good.
+    """
+    if not isinstance(part, dict):
+        return
+    part_id = part.get("id")
+    if not isinstance(part_id, str) or not part_id:
+        return
+    state = part.get("state")
+    status = state.get("status") if isinstance(state, dict) else None
+    if part.get("type") == "tool" and part.get("tool") == "bash" \
+            and status in ("running", "pending"):
+        known = open_parts.get(part_id)
+        # the bound runs from the call's `running` event: a later update of
+        # the same running call (its output streaming in) does not restart it
+        if known is not None and known["status"] == "running":
+            at = known["at"]
+        open_parts[part_id] = {"tool": "bash", "command": _part_command(part),
+                               "timeout_ms": _part_timeout_ms(part), "at": at,
+                               "status": status}
+    else:
+        open_parts.pop(part_id, None)
+
+
+def _silence_left(silence: float, last_seen: float, open_parts: dict,
+                  now: float) -> float:
+    """Seconds the silence clock has left: KC-12's, widened by an open `bash` call.
+
+    With no part open this is KC-12's window from the last event, untouched.
+    With one it is the latest of that and each call's own timeout plus the
+    window as grace, measured from the call's ``running`` event: the call's
+    kill comes first, and its ``completed`` event is what resets the clock.
+    Never less than KC-12's, so opening a part can only ever give a turn more
+    room, and the session's own chatter never shortens the call's bound.
+    """
+    left = silence - (now - last_seen)
+    for info in open_parts.values():
+        left = max(left, info["at"] + float(info["timeout_ms"]) / 1000.0 + silence - now)
+    return left
+
+
+def _open_tool_report(open_parts: dict, now: float) -> dict | None:
+    """What was still running when the silence bound fired, or None.
+
+    The call whose own bound was the widest is the one the turn was waiting
+    on — the stall happened inside it.
+    """
+    if not open_parts:
+        return None
+    info = max(open_parts.values(),
+               key=lambda p: p["at"] + float(p["timeout_ms"]) / 1000.0)
+    return {"tool": info["tool"], "command": info["command"],
+            "running_for": now - info["at"]}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # the client
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -978,6 +1123,22 @@ class KiloClient:
         silence clock is untouched and keeps racing it, so an extension never
         resurrects a session that has gone quiet.
 
+        KC-47 widens that window while the session has a ``bash`` call in
+        flight. A ``message.part.updated`` of this session whose part is
+        ``type == "tool"``, ``tool == "bash"`` and in ``state.status``
+        ``running`` (or ``pending``) is *open*, keyed by part id; the same id
+        in any other status closes it. While one is open the silence bound is
+        the widest of ``idle_event_timeout`` and each call's own
+        ``state.input.timeout`` (milliseconds → seconds) plus
+        ``idle_event_timeout`` as grace, measured from that call's ``running``
+        event: Kilo kills the call first, and its ``completed`` event is what
+        resets the clock. A call that names no ``timeout`` uses
+        ``_KILO_BASH_DEFAULT_TIMEOUT_MS``, never "forever". Nothing else is
+        suspended — a ``task``, an ``edit``, a ``read`` keeps KC-12's clock —
+        and with no part open the loop is KC-12's, event for event. When the
+        bound fires with a part still open, ``IdleResult.open_tool`` carries
+        it; ``timeout`` still bounds everything above it.
+
         Events that a permission or a question was *answered* for are
         collected in ``permissions`` / ``questions``, so a caller can audit
         or persist the turn. A timeout sends ``abort`` first; a failure of
@@ -994,6 +1155,9 @@ class KiloClient:
         if silence is not None and silence <= 0:
             silence = None
         last_seen = started
+        # KC-47: this session's open `bash` parts, part id -> the call's own
+        # deadline. Empty, the loop below is KC-12's, event for event.
+        open_parts: dict = {}
         permissions: list = []
         questions: list = []
 
@@ -1014,16 +1178,19 @@ class KiloClient:
         while True:
             now = time.monotonic()
             overall_left = deadline - now
+            silence_left = None
             if silence is not None:
-                # the two bounds race: whichever runs out first ends the wait
-                left = min(overall_left, silence - (now - last_seen))
+                # the two bounds race: whichever runs out first ends the wait.
+                # An open `bash` call holds the silence one wider (KC-47).
+                silence_left = _silence_left(silence, last_seen, open_parts, now)
+                left = min(overall_left, silence_left)
             else:
                 left = overall_left
             if left <= 0:
                 # KC-36: the turn deadline asks first. The silence clock never
                 # does — a session that went quiet is quiet whatever the
                 # worktree says, and no extension resurrects it.
-                quiet = silence is not None and (silence - (now - last_seen)) <= 0
+                quiet = silence_left is not None and silence_left <= 0
                 if not quiet and overall_left <= 0 and on_deadline is not None:
                     grant = _deadline_grant(on_deadline, time.monotonic() - started)
                     # a grant that leaves the deadline in the past would just
@@ -1032,8 +1199,13 @@ class KiloClient:
                         deadline += grant
                         continue
                 self._abort_quietly(session)
+                # only the silence bound carries the tool: when the overall
+                # deadline won, the answer is "the turn never idled", not
+                # "the bash call was slow".
+                open_tool = _open_tool_report(open_parts, now) if quiet else None
                 return IdleResult(status="timeout", elapsed=time.monotonic() - started,
-                                  permissions=permissions, questions=questions)
+                                  permissions=permissions, questions=questions,
+                                  open_tool=open_tool)
             event = tap.wait(wanted, left)
             if event is None:
                 continue
@@ -1041,6 +1213,11 @@ class KiloClient:
 
             etype = event.get("type")
             props = event.get("properties") or {}
+
+            if etype == "message.part.updated":
+                # KC-47: an open `bash` part widens the silence bound, and the
+                # event that reset the clock is the one that opened the call.
+                _track_open_part(open_parts, props.get("part"), last_seen)
 
             if etype in ("permission.asked", "permission.v2.asked"):
                 try:

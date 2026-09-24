@@ -15,6 +15,11 @@ KC-34 moved the session behind a protocol: every ``run_agent`` and ``run_round``
 here takes a ``KiloBackend`` instead of a ``KiloClient`` and a ``EventTap``, and
 nothing in this file touches a tap — the backend owns it and ``close()`` stops it.
 The kilo round is otherwise byte-for-byte what it was.
+
+KC-47 (round 91) adds this module's own half: a silence stall that fires with a
+``bash`` call still running reads ``no event for 3s during bash: <command>`` in
+``last_error``, and ``round_prompt`` names the ``timeout`` the agent's own test
+run needs.
 """
 
 from __future__ import annotations
@@ -43,9 +48,10 @@ import _kilo_fake  # noqa: E402
 from _kilo_fake import FakeKiloServer  # noqa: E402
 from tools.auto.llm_profile import LlmSettings  # noqa: E402
 from tools.contest.backend import KiloBackend  # noqa: E402
-from tools.contest.kilo_client import IdleResult, KiloServer, SessionRef  # noqa: E402
+from tools.contest.kilo_client import (  # noqa: E402
+    AGENT_TEST_TIMEOUT_MS, IdleResult, KiloServer, SessionRef)
 from tools.contest.policy import Policy  # noqa: E402
-from tools.contest.roster import AgentSpec, ContestConfig  # noqa: E402
+from tools.contest.roster import AgentSpec, ContestConfig, load_roster  # noqa: E402
 from tools.contest.runner import (  # noqa: E402
     AgentRun,
     AgentState,
@@ -519,6 +525,38 @@ def test_round_prompt_carries_both_commands_the_name_the_base_and_the_rule(tmp_p
     assert round_prompt("eta", tmp_path / "45-x.md", "abc1234").replace("eta", "zeta-9") == text
 
 
+TEST_TIMEOUT_SENTENCE = (
+    "Running the test suite on this machine can take up to 20 minutes under load:\n"
+    "give that `bash` call a `timeout` of at least 1200000 ms."
+)
+
+RUNBOOK = REPO_ROOT / "docs" / "collect-epics" / "RUN-THE-EPIC-COMPETITION.md"
+
+
+def test_round_prompt_names_the_bash_timeout_for_the_agents_own_suite(monkeypatch):
+    """KC-47 §5: the runner no longer kills a `bash` that is still running, so
+    what can still kill it is the call's *own* `timeout` — Kilo's
+    "shell tool terminated command after exceeding timeout 300000 ms". The
+    prompt names the number to ask for, as `AGENT_TEST_TIMEOUT_MS`, and the
+    runbook's copy of the prompt carries the same sentence: the runbook is
+    documentation and may drift, but this line is the one an agent is scored
+    against and the one its own test run survives on.
+
+    The constant must stay below the round's turn deadline: a `bash` the
+    prompt tells the agent to ask for cannot outlive the turn that holds it.
+    """
+    assert AGENT_TEST_TIMEOUT_MS == 1_200_000
+    assert f"at least {AGENT_TEST_TIMEOUT_MS} ms" in TEST_TIMEOUT_SENTENCE
+    text = round_prompt("zeta-9", None, "abc1234")
+    assert TEST_TIMEOUT_SENTENCE in text
+    runbook = RUNBOOK.read_text(encoding="utf-8")
+    assert "> " + TEST_TIMEOUT_SENTENCE.replace("\n", "\n> ") in runbook
+
+    monkeypatch.setenv("CONTEST_GATE_API_KEY", "test")
+    turn_timeout = float(load_roster(str(REPO_ROOT / "contest.ini")).turn_timeout_sec)
+    assert AGENT_TEST_TIMEOUT_MS / 1000 < turn_timeout, (AGENT_TEST_TIMEOUT_MS, turn_timeout)
+
+
 def test_agent_run_and_round_state_round_trip_through_json(tmp_path):
     sb = Sandbox(tmp_path)
     run = AgentRun(agent=AgentSpec("agent-a", "kenary", "m:free", kilo_agent="code"),
@@ -730,6 +768,59 @@ def test_idle_event_timeout_stalls_a_silent_session(tmp_path):
     # a wall-clock bound on top is exactly what FL-1 (round 84) found flaky.
     assert run.last_error == "no event for 1s"
     assert run.turns[0]["idle_status"] == "stalled"
+
+
+#: The round 86 command: what five of the six silence stalls in contest-out
+#: were running when the window fired.
+TEST_SUITE_COMMAND = "python3 -m pytest tests -n 4"
+
+
+def _open_bash_part(command: str, timeout_ms: int) -> dict:
+    """One `message.part.updated` opening a `bash` call, the round 86 shape."""
+    return {"type": "message.part.updated",
+            "properties": {"sessionID": "fillme",
+                           "part": {"id": "part_test", "type": "tool",
+                                    "tool": "bash",
+                                    "state": {"status": "running",
+                                              "input": {"command": command,
+                                                        "timeout": timeout_ms}}}}}
+
+
+def test_a_stall_inside_a_running_bash_names_the_call(tmp_path):
+    """KC-47 §4: a silence stall that fires while the session still has a
+    `bash` call in flight says so in `last_error`, instead of a bare
+    "no event for 3s" that sends the next reader into events.jsonl.
+
+    The turn scripts no idle at all. The only thing that happens on the
+    stream after the turn starts is a `message.part.updated` opening a 400 ms
+    `bash` call, then nothing: the bound is the call's own timeout plus the
+    window of grace, so the stall lands at about 3.4 s — under the 300 s turn
+    deadline, which is what makes it the silence path rather than
+    "no idle after 300s".
+
+    The window stays at the repo's 3 s stall window: what has to be delivered
+    before the clock runs out is the part event itself, and 0.9 s of margin
+    is inside what the operator's 32-worker stress run drifts by (FL-1).
+    """
+    sb = Sandbox(tmp_path)
+    cfg = _stall_config()
+    scenario = {"turns": [{"events": [], "idle": False}]}
+    with _BenchFake(scenario) as fake:
+        def open_the_call():
+            part = _open_bash_part(TEST_SUITE_COMMAND, 400)
+            part["properties"]["sessionID"] = fake.sessions()[0].id
+            fake._emit(part)
+
+        scenario["turns"][0]["on_prompt"] = lambda d, t: threading.Thread(
+            target=open_the_call, daemon=True).start()
+        run = Harness(sb, fake, cfg).go()
+        aborted = _aborted(fake)
+
+    assert run.state is AgentState.STALLED and aborted
+    assert run.last_error == "no event for 3s during bash: " + TEST_SUITE_COMMAND
+    assert run.turns[0]["idle_status"] == "stalled"
+    (line,) = _jsonl(sb.out_dir / "agent-a" / "turns.jsonl")
+    assert line["idle_status"] == "stalled"
 
 
 def test_events_of_the_session_keep_a_turn_alive(tmp_path):

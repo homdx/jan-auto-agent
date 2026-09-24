@@ -146,6 +146,9 @@ wrong (see `INDEX.md` §"Numbers in this file … are hand-measured").
 > Never point any command at a live provider config. If a step needs one, copy
 > `agents_128k.ini` to a scratch path and stub every `base_url` first.
 >
+> Running the test suite on this machine can take up to 20 minutes under load:
+> give that `bash` call a `timeout` of at least 1200000 ms.
+>
 > When you are done, report: the commit sha, each Acceptance checkbox and
 > whether you met it, and anything in the ticket you found to be wrong about the
 > live code — each ticket names the commit it was written against in its
