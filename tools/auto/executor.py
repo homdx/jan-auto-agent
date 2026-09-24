@@ -102,7 +102,7 @@ _MAX_TRACEBACK_CHARS = 4_000
 # RUN-3: appended to a workspace pytest run when ``[executor] pytest_serial``
 # is on and the project's own pytest config asks for an xdist pool. A task
 # workspace holds one changed file, so xdist has nothing to distribute — yet
-# the workspace inherits the project's ``pytest.ini`` (``addopts = -n auto -q
+# the workspace inherits the project's ``pytest.ini`` (``addopts = -n auto
 # --dist=loadgroup`` in this repo) and every attempt spawned a worker per CPU,
 # paid the "bringing up nodes..." startup twice, and interleaved the output.
 # ``-n 0`` is xdist's own in-process switch and, given on the command line,

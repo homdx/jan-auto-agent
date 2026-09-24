@@ -330,8 +330,8 @@ def suite_argv(root: str, workers: int, timeout: int) -> list:
 
     ``--tb=long -rf`` per pass, so the traceback in each log is what tells the
     reader which family a failure belongs to — FL-1's own Diagnosis section is
-    entirely about reading those tracebacks. ``-q`` stays from ``pytest.ini``'s
-    addopts, and ``-n`` here overrides its ``-n auto``.
+    entirely about reading those tracebacks. No ``-q``: ``pytest.ini`` carries
+    none since FL-7, and ``-n`` here overrides its ``-n auto``.
     """
     if workers < 1:
         raise MalformedInvocation("--workers must be a positive integer, got %r" % workers)
