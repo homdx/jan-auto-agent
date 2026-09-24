@@ -45,7 +45,7 @@ long for a dead stream. But the session *says* which case it is in — a `tool`
 part in `running` is on the stream, with the timeout the agent asked for.
 
 **Depends on:** KC-12 (the silence clock, landed `183de9b`), FL-1 (`e500d40`, the tap's silence accounting).
-**Also touches:** `tools/contest/backend.py` (the three `wait_idle` adapters pass it through unchanged), `tests/test_contest_kilo_client.py`, `tests/_kilo_fake.py`
+**Also touches:** `tools/contest/runner.py` (`_PROMPT`, §5), `docs/collect-epics/RUN-THE-EPIC-COMPETITION.md`, `tools/contest/backend.py` (the three `wait_idle` adapters pass it through unchanged), `tests/test_contest_kilo_client.py`, `tests/_kilo_fake.py`
 
 
 **Stopgap landed 2026-09-23 (by hand, `contest.ini` only):** `idle_event_timeout_sec`
@@ -100,6 +100,23 @@ and the runner's `last_error` reads
 `no event for {n}s during bash: {command}` — so the next reader does not have
 to dig in `events.jsonl` to learn the agent was running its tests.
 
+### 5. The prompt tells the agent how long its own test run may take
+
+§1–§4 keep the *runner* from killing a running `bash`. They cannot stop
+*Kilo* from killing it: the kill in round 86's `mimo-v2-5` row came from the
+agent's own `timeout: 300000` ("shell tool terminated command after exceeding
+timeout 300000 ms"). `_PROMPT` in `tools/contest/runner.py` says nothing about
+how long the suite takes, so a model picks 5 min. One sentence goes into
+`_PROMPT` (and the runbook's copy in
+`docs/collect-epics/RUN-THE-EPIC-COMPETITION.md` §Stage 1, the same words):
+
+> Running the test suite on this machine can take up to 20 minutes under load:
+> give that `bash` call a `timeout` of at least 1200000 ms.
+
+The number is the module constant `AGENT_TEST_TIMEOUT_MS = 1_200_000`, the one
+the prompt formats in. It must stay below `turn_timeout_sec` (3600 s), and a
+test says so.
+
 ## Out of scope
 
 - Load on the box (`--max-parallel`, agents running stress suites) — operator's.
@@ -118,5 +135,6 @@ Through `_kilo_fake`, no real sleep longer than the fake's clock allows:
 - [ ] Another session's `bash` part in `running` does not change this session's clock.
 - [ ] `turn_timeout_sec` shorter than the `bash` timeout → the wait ends at `turn_timeout_sec`.
 - [ ] The runner's `last_error` for the round 86 shape is `no event for 300s during bash: python3 -m pytest tests -n 4 …`.
+- [ ] `_PROMPT` names `AGENT_TEST_TIMEOUT_MS` (1200000); the runbook's §Stage 1 prompt carries the same sentence; `AGENT_TEST_TIMEOUT_MS / 1000 < turn_timeout_sec` of the committed `contest.ini`.
 - [ ] Every existing KC-12 and FL-1 test passes untouched.
 - [ ] `tests` and `tests_bugfix` green; `CollectBridge._shrink` byte-identical.
