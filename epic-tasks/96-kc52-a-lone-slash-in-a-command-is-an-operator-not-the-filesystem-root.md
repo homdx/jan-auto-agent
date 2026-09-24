@@ -1,6 +1,6 @@
 # KC-52 — a lone `/` in a command is an operator, not the filesystem root
 
-**Status:** queued — found live 2026-09-23 in round 86 (run 4, base `27adb12`).
+**Status:** landed `7ac500c` (2026-09-24) — round 96, winner sensenova-6-7-flash-lite-var2; follow-up `5c61bc5`: `/*` strips to the root, so `rm -rf /*` is a mechanical reject instead of "inside worktree". Found live 2026-09-23 in round 86 (run 4, base `27adb12`).
 **Severity:** MEDIUM (a mechanical, gate-free reject of a harmless inline Python script)
 **File:** `tools/contest/policy.py`
 **Symbol:** `_command_paths`, `_pathlike`
