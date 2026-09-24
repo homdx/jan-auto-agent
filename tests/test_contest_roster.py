@@ -835,3 +835,72 @@ def test_variant_key_defaults_to_highest_and_parses(tmp_path):
         ini.write_text("[contest]\n" + text
                        + "[contest.agent.a]\nmodel = kenary/a:free\n", encoding="utf-8")
         assert load_roster(ini).variant == want
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KC-55: the gate's retry budget
+# ─────────────────────────────────────────────────────────────────────────────
+
+GATE_LIMIT_KEYS = ("gate_retries", "gate_retry_wait_sec",
+                   "gate_retry_max_wait_sec", "gate_deadline_sec")
+
+
+def test_gate_limit_keys_are_committed_with_their_defaults(gate_key):
+    """3 retries, 10 s between them, a 60 s cap on a Retry-After, a 600 s
+    deadline — a worst case of 660 s under the committed 900 s silence clock."""
+    config = load_roster(COMMITTED)
+
+    assert config.gate_retries == 3
+    assert config.gate_retry_wait_sec == 10.0
+    assert config.gate_retry_max_wait_sec == 60.0
+    assert config.gate_deadline_sec == 600.0
+    assert isinstance(config.gate_retries, int)
+    for key in GATE_LIMIT_KEYS:
+        assert key in CONTEST_KEYS
+
+
+def test_absent_gate_limit_keys_take_their_documented_defaults(tmp_path):
+    config = load_roster(write_ini(tmp_path, MINIMAL))
+
+    assert (config.gate_retries, config.gate_retry_wait_sec,
+            config.gate_retry_max_wait_sec, config.gate_deadline_sec) == (
+        3, 10.0, 60.0, 600.0)
+
+
+@pytest.mark.parametrize("key,value", [
+    ("gate_retries", "7"),
+    ("gate_retry_wait_sec", "2.5"),
+    ("gate_retry_max_wait_sec", "15"),
+    ("gate_deadline_sec", "120"),
+])
+def test_gate_limit_keys_parse_from_contest(tmp_path, key, value):
+    text = add_to_contest(MINIMAL, f"{key} = {value}")
+    assert getattr(load_roster(write_ini(tmp_path, text)), key) == float(value)
+
+
+@pytest.mark.parametrize("key,value", [
+    ("gate_retries", "-1"),
+    ("gate_retry_wait_sec", "-2.5"),
+    ("gate_retry_max_wait_sec", "-15"),
+    ("gate_deadline_sec", "-120"),
+])
+def test_a_negative_gate_limit_names_its_key(tmp_path, key, value):
+    text = add_to_contest(MINIMAL, f"{key} = {value}")
+    with pytest.raises(RosterError, match=key):
+        load_roster(write_ini(tmp_path, text))
+
+
+@pytest.mark.parametrize("key", ["gate_retry_wait_sec", "gate_retry_max_wait_sec",
+                                 "gate_deadline_sec"])
+def test_a_malformed_gate_time_names_its_key(tmp_path, key):
+    """Not a fallback: a typo in the wait budget must not silently become the
+    default, and a RosterError names the key so the operator finds it."""
+    text = add_to_contest(MINIMAL, f"{key} = soon")
+    with pytest.raises(RosterError, match=key):
+        load_roster(write_ini(tmp_path, text))
+
+
+def test_a_malformed_gate_retries_falls_back_to_the_default(tmp_path):
+    """The count is an int key, read with the same helper as every other limit."""
+    text = add_to_contest(MINIMAL, "gate_retries = three")
+    assert load_roster(write_ini(tmp_path, text)).gate_retries == 3

@@ -19,18 +19,30 @@ answered by silence:
      than the agent's (KC-2's ``[contest] gate_llm_profile``), which reads
      the command, the paths, the ticket and the recent tool calls and answers
      one JSON verdict.
-  3. Fail closed. An exhausted budget, an unparseable reply or an exception
-     from the transport becomes a ``reject`` whose ``reason`` the agent can
-     read — never an exception out of ``decide``, so a broken gate stops the
-     tool call and not the round.
+   3. KC-55: a transport failure is not a verdict. A 429, a 402, a 5xx, a
+      timeout and a dropped connection are retried by
+      ``tools.llm_stream.request_completion``'s own loop, with the wait budget
+      of ``[contest] gate_retries`` / ``gate_retry_wait_sec`` /
+      ``gate_retry_max_wait_sec``; a reply that carries no verdict is asked
+      once more after ``GATE_RETRY_WAIT``; and every wait stops no later than
+      ``gate_deadline_sec`` in, because the gate runs synchronously inside
+      ``KiloClient.wait_idle``'s loop and every second it spends counts against
+      the round's silence clock. A refusal the endpoint never retries — a 401,
+      a 403, a 404 — still fails at once.
+   4. Fail closed. An exhausted budget, an unparseable reply, a deadline, or an
+      exception from the transport becomes a ``reject`` whose ``reason`` the
+      agent can read — never an exception out of ``decide``, so a broken gate
+      stops the tool call and not the round.
 
 The default ``completion_fn`` is ``tools.llm_stream.request_completion`` with
 the URL, headers and payload that ``tools.llm_stream.build_chat_request``
 builds from ``ContestConfig.gate_settings``, exactly the way Gate 1's
 presence check builds its own call: ``response_format`` when the endpoint
 supports it, ``temperature`` and ``max_tokens`` from the settings,
-``stream=False``, a 60 s timeout and ``error_retries=0``. Nothing in this
-module opens a connection on its own; the tests stub ``completion_fn``.
+``stream=False`` and a 60 s timeout. KC-55 passes the retry budget, the
+deadline-checked sleep and an ``on_retry`` that keeps the last message with it.
+Nothing in this module opens a connection on its own; the tests stub
+``completion_fn``.
 
 Payload shapes are the ones PROBE.md recorded live on Kilo 7.6.2 — including
 the two places a ``bash`` event keeps command text instead of a path, which
@@ -63,6 +75,9 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "DECISION_KEYS",
+    "GATE_PROBE_MESSAGE",
+    "GATE_RETRIES",
+    "GATE_RETRY_WAIT",
     "GATE_SYSTEM_PROMPT",
     "GATE_TIMEOUT",
     "HARD_DENYLIST",
@@ -73,10 +88,36 @@ __all__ = [
     "Decision",
     "Policy",
     "PolicyContext",
+    "gate_error_name",
+    "gate_verdict",
+    "gate_worst_case_sec",
 ]
 
 #: The gate is the expensive second model; it gets one shot per permission.
 GATE_TIMEOUT = 60.0
+
+#: KC-55: a reply that carries neither ``allow`` nor ``reject`` — the empty body
+#: included — is asked once more, after ``GATE_RETRY_WAIT``. ``request_completion``
+#: already retried that call's own transport errors, so this is the one extra
+#: call the gate spends on a body it could not parse; the last attempt's verdict
+#: stands, and a clean verdict is never re-asked.
+GATE_RETRIES = 1
+GATE_RETRY_WAIT = 2.0
+
+#: KC-55 §5: the probe intake sends the gate once before the round starts — the
+#: same request shape as a real ask, with one attempt and no retries, so a dead
+#: key or a model that is not on offer is refused at intake instead of after 30
+#: minutes of ``gate-failed`` rejects.
+GATE_PROBE_MESSAGE = "permission: probe\ncommand: true"
+
+#: KC-55 §5: intake's probe spends one attempt only — a 429 is transient and is
+#: exactly what the real ask retries, so a probe that burned the budget would
+#: hide the very thing it is there to notice.
+_GATE_PROBE_RETRIES = 0
+
+#: KC-55 §1: the gate's transport budget. Absent or unreadable values degrade to
+#: these, so a policy built without a roster still fails fast like KC-3's gate.
+_GATE_RETRY_DEFAULTS = (3, 10.0, 60.0, 600.0)
 
 #: The only two replies a Decision may carry. ``Literal`` keeps the type
 #: narrow; ``Decision.__post_init__`` keeps it narrow at run time too.
@@ -104,6 +145,89 @@ DECISION_KEYS: tuple[str, ...] = (
 
 #: How much of the gate's reply a gate-failed reason may quote.
 _GATE_FAIL_QUOTE = 80
+
+#: KC-55: the sentence a gate-failed reason ends with after a 429 or a 5xx, for
+#: the agent that is about to read it — the reviewer is overloaded, and a
+#: command inside its own worktree never needed one in the first place.
+_GATE_OVERLOAD_HINT = (
+    " — the reviewer is overloaded; a command inside your worktree needs no reviewer"
+)
+
+#: KC-55: the status of ``HTTP 429 from https://…``, the RuntimeError
+#: ``request_completion`` raises. The reason names the status only: never the
+#: URL, never the body, never a key.
+_GATE_STATUS_RE = re.compile(r"\bHTTP (\d{3})\b")
+
+#: KC-55: the error name of ``TimeoutError calling https://…`` or
+#: ``ValueError reading response body from …`` — ``request_completion`` wraps a
+#: dropped connection or a garbled body in a RuntimeError, so the name comes
+#: out of the text rather than from ``type(exc).__name__``.
+_GATE_NETWORK_RE = re.compile(r"^(\w+Error) (?:calling|reading)\b")
+
+
+class _GateDeadline(Exception):
+    """KC-55: one whole gate decision has used up ``gate_deadline_sec``.
+
+    Subclasses ``Exception`` directly, not ``RuntimeError``, ``OSError`` or
+    ``ValueError`` — neither ``except`` clause in ``request_completion``
+    swallows it: ``_open`` catches ``HTTPError`` and the network errors, and the
+    read loop catches those plus ``ValueError``. It must reach ``_ask_gate``,
+    which turns it into a ``gate-failed`` reject instead of one more wait.
+    """
+
+
+def _gate_transport_name(text: str, fallback: str = "RuntimeError") -> str:
+    """``HTTP 429``, ``TimeoutError``, … out of one transport failure's text.
+
+    The status wins over the error class, because a 429 is the fact an operator
+    can act on and ``RuntimeError`` is the wrapper that hides it. ``fallback``
+    is the exception's own class name: what today's gate already puts in the
+    reason when neither pattern matches.
+    """
+    text = text or ""
+    match = _GATE_STATUS_RE.search(text)
+    if match:
+        return f"HTTP {match.group(1)}"
+    match = _GATE_NETWORK_RE.search(text)
+    if match:
+        return match.group(1)
+    return fallback
+
+
+def gate_error_name(exc: BaseException) -> str:
+    """KC-55: the name of a failed gate call, for a reason and for intake's probe."""
+    return _gate_transport_name(str(exc), type(exc).__name__)
+
+
+def gate_verdict(reply) -> str:
+    """KC-55: ``allow``, ``reject`` or ``""`` — the intake probe's only question.
+
+    The probe does not read the gate's reasoning; it only needs to know that the
+    endpoint answered something it could parse.
+    """
+    verdict, _reason = _extract_verdict(reply)
+    return verdict
+
+
+def _gate_failed_reason(name: str, attempts: int, elapsed: float,
+                        deadline: float = 0.0, deadline_hit: bool = False) -> str:
+    """The gate-failed reason: what failed, how hard the gate tried, how long it took.
+
+    One attempt reads exactly as today's reason, ``gate unavailable: <name>`` —
+    the status only. More attempts add the count and the total wall time, and a
+    decision that ran into its deadline names that too, after the error it was
+    last waiting on. A 429 or a 5xx ends with the overload hint.
+    """
+    reason = f"gate unavailable: {name}"
+    if attempts > 1:
+        detail = f" ({attempts} attempts, {elapsed:.1f} s"
+        if deadline_hit:
+            detail += f", deadline {deadline:.0f} s"
+        reason += detail + ")"
+    if name == "HTTP 429" or name.startswith("HTTP 5"):
+        reason += _GATE_OVERLOAD_HINT
+    return reason
+
 
 #: The paths no tool call may ever touch, from the ticket's denylist. The
 #: round's other worktrees and the repo's own ``.git`` are added by KC-4
@@ -249,6 +373,12 @@ class Decision:
     reason: str = ""
     gate_elapsed: "float | None" = None
     gate_raw: "str | None" = None
+    #: KC-55: the transport attempts and re-asks behind this decision — the
+    #: ``_sleep_fn`` calls plus one, since one of those counts the retry budget
+    #: and the other the re-ask of an unparsable reply. ``1`` is today's
+    #: fail-fast gate, and ``record`` then writes no ``gate_attempts`` key, so
+    #: the one-attempt records stay byte-identical.
+    gate_attempts: int = 1
 
     def __post_init__(self) -> None:
         one_line = " ".join(str(self.reason or "").split())
@@ -262,6 +392,26 @@ class Decision:
             raise ValueError(
                 f"Decision.layer must be one of {LAYERS}, got {self.layer!r}"
             )
+
+
+def gate_worst_case_sec(config: "ContestConfig | None") -> float:
+    """KC-55: the longest one gate decision may take, in seconds.
+
+    ``gate_deadline_sec`` bounds the waits, but the call in flight when the
+    deadline trips still gets its own ``GATE_TIMEOUT`` — that is the one sum a
+    formula over the retry counts cannot give: in ``request_completion`` the
+    read loop reopens the connection on every pass, and ``_open`` has its own
+    attempt counter, so one call can make up to ``(gate_retries + 1)**2``
+    requests. Intake compares this with ``idle_event_timeout_sec`` and the
+    tests read the same number; neither writes the sum itself.
+
+    Fail open: no config, or a deadline that is not a number, gives the roster's
+    own defaults rather than an exception.
+    """
+    deadline = getattr(config, "gate_deadline_sec", _GATE_RETRY_DEFAULTS[3])
+    if not isinstance(deadline, (int, float)) or isinstance(deadline, bool):
+        deadline = _GATE_RETRY_DEFAULTS[3]
+    return float(deadline) + GATE_TIMEOUT
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -499,6 +649,22 @@ def _extract_verdict(reply) -> "tuple[str, str]":
     return verdict, _as_str(data.get("reason"))
 
 
+def _reply_text(reply) -> str:
+    """The gate's reply as text: for ``gate_raw`` and the reason's quote.
+
+    Fail open — a reply that is neither a string nor something ``json.dumps``
+    can serialise is still a reply, not an exception out of the policy.
+    """
+    if isinstance(reply, str):
+        return reply
+    if reply is None:
+        return ""
+    try:
+        return json.dumps(reply, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        return str(reply)
+
+
 def _tool_lines(recent_tools) -> list:
     """The recent ``tool`` parts as ``name: input -> status`` lines."""
     lines: list = []
@@ -549,7 +715,8 @@ class Policy:
     ``deny_commands`` and the gate's own ``LlmSettings``. ``completion_fn``
     replaces the one HTTP call — tests pass a stub and never touch a
     provider; ``clock`` replaces ``time.monotonic`` so ``gate_elapsed`` is
-    deterministic under test.
+    deterministic under test, and ``sleep`` replaces ``time.sleep`` the same
+    way, so a test never waits the gate's retry backoff for real.
 
     :meth:`decide` never raises: any failure — a broken event, a malformed
     config, a dying transport — degrades to a ``reject`` the agent can read,
@@ -562,10 +729,12 @@ class Policy:
         *,
         completion_fn: "Callable | None" = None,
         clock: "Callable | None" = None,
+        sleep: "Callable | None" = None,
     ) -> None:
         self._config = config if isinstance(config, ContestConfig) else None
         self._completion_fn = completion_fn if completion_fn is not None else self._default_completion
         self._clock = clock if clock is not None else time.monotonic
+        self._sleep = sleep if sleep is not None else time.sleep
 
     # ── the one external call ──────────────────────────────────────────────
 
@@ -578,14 +747,49 @@ class Policy:
         settings = getattr(config, "gate_settings", None)
         return settings if isinstance(settings, LlmSettings) else None
 
-    def _default_completion(self, url, headers, payload, timeout, *,
-                            stream=False, api_format="openai",
-                            ssl_context=None, error_retries=0):
-        """The default ``completion_fn``: ``request_completion``, fail fast."""
+    def _gate_limits(self) -> tuple:
+        """KC-55: ``(retries, wait_sec, max_wait_sec, deadline_sec)``.
+
+        The four ``[contest] gate_*`` keys, each degrading to its own default
+        when absent, unreadable or negative — so a policy built on a config
+        that is not the roster's still fails fast instead of raising, and no
+        config can cap the gate's wait budget below zero.
+        """
+        config = self._config if isinstance(self._config, ContestConfig) else ContestConfig()
+
+        def value(key: str, default: float, whole: bool = False) -> float:
+            try:
+                number = int(getattr(config, key, default)) if whole else float(
+                    getattr(config, key, default))
+            except (TypeError, ValueError):
+                return default
+            return default if number < 0 else number
+
+        return (
+            value("gate_retries", _GATE_RETRY_DEFAULTS[0], whole=True),
+            value("gate_retry_wait_sec", _GATE_RETRY_DEFAULTS[1]),
+            value("gate_retry_max_wait_sec", _GATE_RETRY_DEFAULTS[2]),
+            value("gate_deadline_sec", _GATE_RETRY_DEFAULTS[3]),
+        )
+
+    def _default_completion(self, url, headers, payload, timeout, *, stream=False,
+                            api_format="openai", ssl_context=None,
+                            error_retries: int = 0, error_retry_wait_sec: float = 0.0,
+                            max_retry_after_sec: float = 0.0, _sleep_fn=None,
+                            on_retry=None):
+        """The default ``completion_fn``: ``request_completion``, unmodified.
+
+        KC-3's gate passed no retries — fail fast, so a rate limit cost one
+        second and a verdict. KC-55 lets it retry: the keyword defaults stay
+        fail-fast for a caller that names none, and ``_ask_gate`` names all
+        five, the deadline-checked sleep included.
+        """
         return request_completion(
             url, headers, payload, timeout,
-            stream=stream, api_format=api_format,
-            ssl_context=ssl_context, error_retries=error_retries,
+            stream=stream, api_format=api_format, ssl_context=ssl_context,
+            error_retries=error_retries, error_retry_wait_sec=error_retry_wait_sec,
+            max_retry_after_sec=max_retry_after_sec, _sleep_fn=_sleep_fn,
+            on_retry=on_retry,
         )
 
     def _tmp_roots(self, ctx: PolicyContext) -> tuple:
@@ -653,25 +857,24 @@ class Policy:
 
     # ── layer 2 ────────────────────────────────────────────────────────────
 
-    def _ask_gate(self, props: dict, ctx: PolicyContext) -> Decision:
-        """One call to the gate model, or a ``reject`` that names the budget."""
-        budget = ctx.gate_budget_left
-        budget = budget if isinstance(budget, (int, float)) else 0
-        if budget <= 0:
-            return Decision(
-                "reject", "budget",
-                f"gate budget exhausted ({int(budget)})",
-            )
-
+    def _ssl_context(self):
+        """The gate's ssl context: ``None`` unless its profile disables verify."""
         settings = self._settings
         if settings is None:
-            return Decision(
-                "reject", "gate-failed",
-                "gate unavailable: no gate model configured",
-            )
+            return None
+        return None if getattr(settings, "verify_ssl", True) else make_unverified_context()
 
+    def _gate_request(self, user_msg: str) -> "tuple | None":
+        """``(url, headers, payload, api_format)`` for one gate call.
+
+        ``None`` when the round has no gate model. One place both the real ask
+        and intake's probe build their call, so the two cannot drift: the same
+        ``build_chat_request`` arguments, the same prompt, the same timeout.
+        """
+        settings = self._settings
+        if settings is None:
+            return None
         api_format = _as_str(settings.api_format) or "openai"
-        user_msg = _gate_user_message(props, ctx, self._tmp_roots(ctx))
         url, headers, payload = build_chat_request(
             base_url=settings.base_url,
             api_key=settings.api_key,
@@ -689,42 +892,150 @@ class Policy:
                           else None),
             stream=False,
         )
+        return url, headers, payload, api_format
 
+    def probe_gate(self, user_msg: str = GATE_PROBE_MESSAGE) -> str:
+        """KC-55 §5: one call to the gate, one attempt, no retries.
+
+        Intake sends it before the round starts, so a refused key or a model
+        the endpoint does not offer fails there with a line naming
+        ``contest.local.ini`` instead of after minutes of ``gate-failed``
+        rejects. One attempt on purpose: a 429 is transient and is exactly
+        what a real ask retries, so a probe that burned the whole budget would
+        hide the thing it is there to notice. It is not one of any agent's
+        ``gate_max_calls_per_session`` calls — it happens before a session
+        exists.
+
+        Returns the reply text, which intake does not parse; raises whatever
+        the transport raises, since intake decides what a status means.
+        """
+        request = self._gate_request(user_msg)
+        if request is None:
+            return ""
+        url, headers, payload, api_format = request
+        return self._completion_fn(
+            url, headers, payload, GATE_TIMEOUT,
+            stream=False, api_format=api_format,
+            ssl_context=self._ssl_context(),
+            error_retries=_GATE_PROBE_RETRIES,
+            error_retry_wait_sec=0.0,
+            max_retry_after_sec=0.0,
+            _sleep_fn=None,
+            on_retry=None,
+        )
+
+    def _ask_gate(self, props: dict, ctx: PolicyContext) -> Decision:
+        """The gate model's verdict, or a ``reject`` that names the budget.
+
+        KC-55: the one call carries the gate's own transport retries — a 429 or
+        a dropped connection is retried rather than answered ``reject`` — and a
+        reply without a verdict is asked once more, after ``GATE_RETRY_WAIT``.
+        Every wait goes through one deadline check, because the gate runs
+        synchronously inside ``KiloClient.wait_idle``'s loop: while it waits
+        the session produces no events, so every second counts against the
+        round's silence clock. ``gate_elapsed`` is the total wall time across
+        all attempts and waits; ``gate_attempts`` is the ``_sleep_fn`` calls
+        plus one, never the ``on_retry`` calls, since the quota-reset path
+        reports without waiting.
+        """
+        budget = ctx.gate_budget_left
+        budget = budget if isinstance(budget, (int, float)) else 0
+        if budget <= 0:
+            return Decision(
+                "reject", "budget",
+                f"gate budget exhausted ({int(budget)})",
+            )
+
+        request = self._gate_request(_gate_user_message(props, ctx, self._tmp_roots(ctx)))
+        if request is None:
+            return Decision(
+                "reject", "gate-failed",
+                "gate unavailable: no gate model configured",
+            )
+        url, headers, payload, api_format = request
+
+        retries, retry_wait, max_wait, deadline = self._gate_limits()
         start = self._clock()
-        try:
-            reply = self._completion_fn(
+        waits: list = [0]
+        last: list = [None]
+        permission = _as_str(props.get("permission")) or "permission"
+
+        def wait(seconds: float) -> None:
+            """One wait, checked against the deadline before it is spent."""
+            if deadline > 0 and self._clock() - start + seconds > deadline:
+                raise _GateDeadline(f"{deadline:.0f} s")
+            waits[0] += 1
+            self._sleep(seconds)
+
+        def remember(message: str) -> None:
+            """The last transport message: what the reason names when it ends."""
+            last[0] = _gate_transport_name(message)
+
+        def call() -> str:
+            """The one call, with the gate's retry budget and this deadline."""
+            return self._completion_fn(
                 url, headers, payload, GATE_TIMEOUT,
                 stream=False, api_format=api_format,
-                ssl_context=None if getattr(settings, "verify_ssl", True)
-                else make_unverified_context(),
-                error_retries=0,
+                ssl_context=self._ssl_context(),
+                error_retries=retries,
+                error_retry_wait_sec=retry_wait,
+                max_retry_after_sec=max_wait,
+                _sleep_fn=wait,
+                on_retry=remember,
             )
-        except Exception as exc:  # noqa: BLE001 — the gate must not sink a round
+
+        attempts = 0
+        text = ""
+        try:
+            for ask in range(GATE_RETRIES + 1):
+                reply = call()
+                attempts = waits[0] + 1
+                text = _reply_text(reply)
+                verdict, reason = _extract_verdict(reply)
+                if verdict in ("allow", "reject"):
+                    # a clean verdict is never re-asked, in either direction
+                    elapsed = float(self._clock() - start)
+                    if verdict == "allow":
+                        return Decision("once", "gate",
+                                        f"gate: {reason or 'allowed'}", elapsed, text, attempts)
+                    return Decision("reject", "gate",
+                                    f"gate: {reason or 'rejected'}", elapsed, text, attempts)
+                if ask < GATE_RETRIES:
+                    # the same request once more; the last attempt's verdict stands
+                    wait(GATE_RETRY_WAIT)
+            elapsed = float(self._clock() - start)
+            quote = text.strip()[:_GATE_FAIL_QUOTE] or "empty reply"
+            return Decision(
+                "reject", "gate-failed",
+                f"gate unavailable: {quote} ({attempts} attempts)",
+                elapsed, text, attempts,
+            )
+        except _GateDeadline as exc:
+            attempts = waits[0] + 1
             elapsed = float(self._clock() - start)
             logger.warning(
-                "Policy._ask_gate [%s] failed closed: %s: %s",
-                _as_str(props.get("permission")) or "permission",
-                type(exc).__name__, exc,
+                "Policy._ask_gate [%s] failed closed: deadline %s (%d attempt(s))",
+                permission, exc, attempts,
             )
             return Decision(
                 "reject", "gate-failed",
-                f"gate unavailable: {type(exc).__name__}", elapsed, None,
+                _gate_failed_reason(last[0] or "deadline", attempts, elapsed,
+                                    deadline, True),
+                elapsed, None, attempts,
             )
-        elapsed = float(self._clock() - start)
-
-        text = reply if isinstance(reply, str) else ""
-        if not isinstance(reply, str) and reply is not None:
-            text = json.dumps(reply, ensure_ascii=False, default=str)
-        verdict, reason = _extract_verdict(reply)
-        if verdict == "allow":
-            return Decision("once", "gate", f"gate: {reason or 'allowed'}", elapsed, text)
-        if verdict == "reject":
-            return Decision("reject", "gate", f"gate: {reason or 'rejected'}", elapsed, text)
-        return Decision(
-            "reject", "gate-failed",
-            f"gate unavailable: {text.strip()[:_GATE_FAIL_QUOTE] or 'empty reply'}",
-            elapsed, text,
-        )
+        except Exception as exc:  # noqa: BLE001 — the gate must not sink a round
+            attempts = waits[0] + 1
+            elapsed = float(self._clock() - start)
+            logger.warning(
+                "Policy._ask_gate [%s] failed closed: %s: %s (%d attempt(s))",
+                permission, type(exc).__name__, exc, attempts,
+            )
+            return Decision(
+                "reject", "gate-failed",
+                _gate_failed_reason(_gate_transport_name(str(exc), type(exc).__name__),
+                                    attempts, elapsed),
+                elapsed, None, attempts,
+            )
 
     # ── the entry point ────────────────────────────────────────────────────
 
@@ -783,6 +1094,12 @@ class Policy:
                 "gate_elapsed": (decision.gate_elapsed if decision_ok else None),
                 "gate_model": settings.model if settings is not None else "",
             }
+            attempts = getattr(decision, "gate_attempts", 1) if decision_ok else 1
+            if isinstance(attempts, (int, float)) and not isinstance(attempts, bool) \
+                    and attempts > 1:
+                # KC-55: how hard the gate tried. Absent for one attempt, so a
+                # record of today's fail-fast gate stays byte-identical.
+                entry["gate_attempts"] = int(attempts)
             target = Path(path)
             target.parent.mkdir(parents=True, exist_ok=True)
             with target.open("a", encoding="utf-8") as handle:

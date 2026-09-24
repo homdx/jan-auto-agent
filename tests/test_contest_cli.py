@@ -133,7 +133,10 @@ server = spawn
 max_parallel = 2
 max_rework = 1
 turn_timeout_sec = 60
-idle_event_timeout_sec = 30
+# KC-55: 900, not 30 — the gate's worst case is gate_deadline_sec + GATE_TIMEOUT
+# = 660 s, and a 30 s silence clock refused every gate-on round at intake. The
+# stall test below rewrites it to 5 for itself; nothing else here reads it.
+idle_event_timeout_sec = 900
 max_questions_per_turn = 3
 tmp_roots = /nowhere/*
 gate_llm_profile = contest_gate_llm
@@ -951,8 +954,8 @@ def test_a_stall_with_a_valid_commit_counts_as_ready_and_exits_zero(sandbox, cap
     # was a real `git` commit racing a wall clock. FakeKiloServer heartbeats
     # through the hook now, but a 1 s window leaves no room for that beat to
     # be *delivered* late on a loaded box.
-    ini.write_text(ini.read_text(encoding="utf-8").replace("idle_event_timeout_sec = 30",
-                                                           "idle_event_timeout_sec = 5"),
+    ini.write_text(ini.read_text(encoding="utf-8").replace("idle_event_timeout_sec = 900",
+                                                            "idle_event_timeout_sec = 5"),
                    encoding="utf-8")
     scenario = {"turns": [{"on_prompt": lambda directory, text: work_ready(directory, text)
                                           if Path(directory).name.endswith("agent-a") else None,
@@ -1189,7 +1192,9 @@ def test_the_round_starts_without_a_resolvable_gate_key(sandbox, capsys, spawn_h
     code, fake = run_fake(sandbox, scenario, ["--ticket", "1", "--no-tests"], spawn_holder)
     captured = capsys.readouterr()
     assert code == 0
-    assert _plan(captured.out)["gate"] == "on"
+    # KC-37 §3 / KC-55 §6: the plan names the model and the host the gate sits
+    # on, not just `on` — the host is what round 66 lost to
+    assert _plan(captured.out)["gate"] == "test/gate @ 127.0.0.1"
     decisions = _jsonl(sandbox.out() / "agent-a" / "decisions.jsonl")
     (line,) = decisions
     assert line["layer"] == "gate-failed" and line["reply"] == "reject"
@@ -1609,9 +1614,185 @@ def test_run_variant_flag_sends_a_named_variant_without_probing(sandbox, capsys,
                            "--variant", "medium", "--no-gate", "--no-tests"], spawn_holder)
     captured = capsys.readouterr()
 
-    assert code == 0, captured.err
+    assert code == 0
     assert "variant:" not in captured.out
     assert _plan(captured.out)["agents"] == "1: kenary/glm-4-7-flash:free@medium"
     (session,) = _sessions(fake)
     assert session["body"]["model"]["variant"] == "medium"
     assert fake.calls(method="DELETE") == []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KC-55: the gate shares an endpoint with the roster, and intake asks it once
+# ─────────────────────────────────────────────────────────────────────────────
+
+GATE_HOST = "kenari.id"
+
+
+def _offer_with_base_url(base_url):
+    """The sandbox's two agents on offer, under a provider whose `options.baseURL`
+    the gate can share."""
+    return _offer((dict(_provider("kenary", "kenari", ("agent-a:free", "agent-b:free")),
+                        options={"baseURL": base_url}),))
+
+
+KC55_OFFER = _offer_with_base_url(f"https://{GATE_HOST}/v1")
+
+KC55_SCENARIO = {"providers": KC55_OFFER,
+                 "turns": [{"on_prompt": work_ready, "events": ["busy", "idle"]}]}
+
+
+def _aim_the_gate(sandbox, base_url, model):
+    """The sandbox's roster with its gate pointed at *base_url* / *model*."""
+    ini = sandbox.repo / "contest.ini"
+    ini.write_text(ini.read_text(encoding="utf-8")
+                   .replace("base_url = http://127.0.0.1:1/v1", f"base_url = {base_url}")
+                   .replace("model = test/gate", f"model = {model}"), encoding="utf-8")
+
+
+def _gate_allows(*args, **kwargs):
+    return json.dumps({"verdict": "allow", "reason": "scratch"})
+
+
+def _gate_raises(text):
+    def raise_it(*args, **kwargs):
+        raise RuntimeError(text)
+
+    return raise_it
+
+
+def test_the_gate_sharing_an_endpoint_with_the_roster_warns_and_runs(
+        sandbox, capsys, spawn_holder, monkeypatch):
+    """Round 66: a different model, the same key and endpoint as two of the
+    agents. One `gate:` line on stdout, and the round still starts."""
+    _aim_the_gate(sandbox, f"https://{GATE_HOST}/v1", "hy3:free")
+    monkeypatch.setattr("tools.contest.policy.request_completion", _gate_allows)
+
+    code, fake = run_fake(sandbox, KC55_SCENARIO, ["--ticket", "1", "--no-tests"],
+                          spawn_holder)
+    captured = capsys.readouterr()
+
+    assert code == 0, captured.err
+    shares = [line for line in captured.out.splitlines() if line.startswith("gate:")]
+    assert shares == [
+        f"gate: shares {GATE_HOST} with 2 agents (agent-a, agent-b) — a rate limit there "
+        "hits the gate too; point [contest_gate_llm] in contest.local.ini at another endpoint"]
+    assert _plan(captured.out)["gate"] == f"hy3:free @ {GATE_HOST}"
+    assert len(_sessions(fake)) == 2
+
+
+def test_a_gate_on_a_host_no_agent_uses_says_nothing(sandbox, capsys, spawn_holder, monkeypatch):
+    _aim_the_gate(sandbox, "https://another.host/v1", "hy3:free")
+    monkeypatch.setattr("tools.contest.policy.request_completion", _gate_allows)
+    scenario = dict(KC55_SCENARIO,
+                    providers=_offer((_provider("kenary", "kenari",
+                                                ("agent-a:free", "agent-b:free")),)))
+
+    code, fake = run_fake(sandbox, scenario, ["--ticket", "1", "--no-tests"], spawn_holder)
+
+    assert code == 0
+    out = capsys.readouterr().out
+    assert not [line for line in out.splitlines() if line.startswith("gate:")]
+
+
+def test_the_plan_label_is_the_model_and_the_host(sandbox):
+    """`hy3:free @ kenari.id` — the model id and the host, no key, no path."""
+    config = replace(sandbox.config(), gate_settings=replace(
+        sandbox.config().gate_settings, base_url=f"https://{GATE_HOST}/v1", model="hy3:free"))
+
+    assert cli._gate_plan_label(config) == f"hy3:free @ {GATE_HOST}"
+    assert cli._gate_plan_label(replace(config, gate_settings=None)) == "off"
+    assert cli._gate_plan_label(replace(config, gate_settings=replace(
+        config.gate_settings, base_url=""))) == "hy3:free"
+
+
+def test_an_intake_probe_that_refuses_the_key_refuses_the_round(
+        sandbox, capsys, spawn_holder, monkeypatch):
+    """A dead key used to surface as 48 `gate-failed` rejects; it is a line at
+    intake now, before a worktree or a session exists."""
+    _aim_the_gate(sandbox, f"https://{GATE_HOST}/v1", "hy3:free")
+    monkeypatch.setattr("tools.contest.policy.request_completion", _gate_raises(
+        f"HTTP 401 from https://{GATE_HOST}/v1/chat/completions: Unauthorized"))
+
+    code, fake = run_fake(sandbox, KC55_SCENARIO, ["--ticket", "1", "--no-tests"],
+                          spawn_holder)
+    captured = capsys.readouterr()
+
+    assert code == cli.EXIT_FAILED
+    lines = [line for line in captured.err.splitlines() if line.startswith("intake:")]
+    assert lines == ["intake: gate [contest_gate_llm] refused its key (HTTP 401) — set api_key "
+                     "in contest.local.ini"]
+    assert _sessions(fake) == [], "no session may exist before intake passes"
+    assert not sandbox.out().exists()
+
+
+def test_an_intake_probe_that_hits_a_rate_limit_warns_and_runs(
+        sandbox, capsys, spawn_holder, monkeypatch):
+    """A 429 is transient — the very thing the real ask retries — so it warns."""
+    _aim_the_gate(sandbox, f"https://{GATE_HOST}/v1", "hy3:free")
+    monkeypatch.setattr("tools.contest.policy.request_completion", _gate_raises(
+        f"HTTP 429 from https://{GATE_HOST}/v1/chat/completions: Too Many Requests"))
+
+    code, fake = run_fake(sandbox, KC55_SCENARIO, ["--ticket", "1", "--no-tests"],
+                          spawn_holder)
+    captured = capsys.readouterr()
+
+    assert code == 0, captured.err
+    warnings = [line for line in captured.out.splitlines() if line.startswith("gate:")]
+    assert warnings == [f"gate: shares {GATE_HOST} with 2 agents (agent-a, agent-b) — a rate "
+                        "limit there hits the gate too; point [contest_gate_llm] in "
+                        "contest.local.ini at another endpoint",
+                        "gate: HTTP 429 on the intake probe — the round starts anyway; "
+                        "the gate retries that itself"]
+    assert not [line for line in captured.err.splitlines() if line.startswith("intake:")]
+
+
+def test_no_gate_probes_nothing_and_shares_nothing(sandbox, capsys, spawn_holder, monkeypatch):
+    calls = []
+
+    def refuse(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("the gate must not be called with --no-gate")
+
+    _aim_the_gate(sandbox, f"https://{GATE_HOST}/v1", "hy3:free")
+    monkeypatch.setattr("tools.contest.policy.request_completion", refuse)
+
+    code, fake = run_fake(sandbox, KC55_SCENARIO,
+                          ["--ticket", "1", "--no-tests", "--no-gate"], spawn_holder)
+    captured = capsys.readouterr()
+
+    assert code == 0, captured.err
+    assert calls == []
+    assert not [line for line in captured.out.splitlines() if line.startswith("gate:")]
+    assert _plan(captured.out)["gate"] == "off"
+
+
+def test_a_silence_clock_shorter_than_the_gate_worst_case_refuses_the_round(
+        sandbox, capsys, spawn_holder, monkeypatch):
+    """The gate's worst case is gate_deadline_sec + GATE_TIMEOUT = 660 s. While it
+    waits the session is silent, so a 300 s clock would stall the agent the gate
+    is asking for — refuse it here instead."""
+    ini = sandbox.repo / "contest.ini"
+    ini.write_text(ini.read_text(encoding="utf-8")
+                   .replace("idle_event_timeout_sec = 900", "idle_event_timeout_sec = 300"),
+                   encoding="utf-8")
+    calls = []
+
+    def refuse(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("a refused round must not spend a model call")
+
+    monkeypatch.setattr("tools.contest.policy.request_completion", refuse)
+
+    code, fake = run_fake(sandbox, KC55_SCENARIO, ["--ticket", "1", "--no-tests"],
+                          spawn_holder)
+    captured = capsys.readouterr()
+
+    assert code == cli.EXIT_FAILED
+    lines = [line for line in captured.err.splitlines() if line.startswith("intake:")]
+    assert lines == ["intake: gate retries can outlast the silence clock: worst case 660 s ≥ "
+                     "idle_event_timeout_sec 300 — lower gate_deadline_sec in contest.ini, "
+                     "or raise idle_event_timeout_sec"]
+    assert calls == [], "a refused round spends no model call"
+    assert _sessions(fake) == []
+    assert not sandbox.out().exists()

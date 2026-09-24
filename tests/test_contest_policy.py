@@ -35,7 +35,8 @@ from __future__ import annotations
 
 import json
 import sys
-from dataclasses import FrozenInstanceError
+import urllib.error
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
 
 import pytest
@@ -48,6 +49,8 @@ from tools.auto.llm_profile import LlmSettings
 from tools.contest import policy as policy_mod
 from tools.contest.policy import (
     DECISION_KEYS,
+    GATE_RETRIES,
+    GATE_RETRY_WAIT,
     GATE_SYSTEM_PROMPT,
     GATE_TIMEOUT,
     HARD_DENYLIST,
@@ -58,8 +61,10 @@ from tools.contest.policy import (
     Decision,
     Policy,
     PolicyContext,
+    gate_worst_case_sec,
 )
 from tools.contest.roster import ContestConfig
+import tools.llm_stream as llm_stream_mod
 
 POLICY_FILE = REPO_ROOT / "tools" / "contest" / "policy.py"
 
@@ -189,6 +194,11 @@ class FakeClock:
         self.now += self.step
         self.ticks += 1
         return value
+
+
+def NO_SLEEP(seconds: float) -> None:
+    """The gate's re-ask wait, spent on nothing: no test sleeps wall time."""
+    return None
 
 
 def make_ctx(worktree: Path, **overrides) -> PolicyContext:
@@ -776,7 +786,7 @@ def test_gate_verdicts(tmp_path, reply, expected_reply, expected_reason_in):
 ])
 def test_gate_without_a_verdict_fails_closed(tmp_path, reply):
     gate = StubGate(reply)
-    policy = Policy(make_config(), completion_fn=gate, clock=FakeClock())
+    policy = Policy(make_config(), completion_fn=gate, clock=FakeClock(), sleep=NO_SLEEP)
 
     decision = decide(policy, EXTERNAL_DIRECTORY_EVENT, tmp_path,
                       tmp_roots=("/tmp/kilo/*",))
@@ -784,7 +794,9 @@ def test_gate_without_a_verdict_fails_closed(tmp_path, reply):
     assert decision.reply == "reject"
     assert decision.layer == "gate-failed"
     assert decision.reason.startswith("gate unavailable:")
-    assert len(gate.calls) == 1
+    # KC-55: a reply without a verdict is asked once more, after GATE_RETRY_WAIT
+    assert len(gate.calls) == 2
+    assert decision.gate_attempts == 2
 
 
 def test_gate_exception_fails_closed_and_names_the_class(tmp_path):
@@ -804,13 +816,14 @@ def test_gate_exception_fails_closed_and_names_the_class(tmp_path):
 
 def test_gate_empty_reply_quotes_what_came_back(tmp_path):
     gate = StubGate("thinking hard about the answer but not emitting any json at all")
-    policy = Policy(make_config(), completion_fn=gate, clock=FakeClock())
+    policy = Policy(make_config(), completion_fn=gate, clock=FakeClock(), sleep=NO_SLEEP)
 
     decision = decide(policy, EXTERNAL_DIRECTORY_EVENT, tmp_path,
                       tmp_roots=("/tmp/kilo/*",))
 
     assert decision.layer == "gate-failed"
     assert decision.reason.startswith("gate unavailable: thinking hard")
+    assert decision.reason.endswith("(2 attempts)")
     assert len(decision.reason) <= MAX_REASON_CHARS
 
 
@@ -907,7 +920,9 @@ def test_default_completion_builds_the_call_from_gate_settings(tmp_path, monkeyp
         num_ctx=4096,
         think=True,
     )
-    policy = Policy(make_config(settings=settings), clock=FakeClock())
+    slept: list = []
+    policy = Policy(make_config(settings=settings), clock=FakeClock(),
+                    sleep=lambda seconds: slept.append(seconds))
 
     decision = decide(policy, EXTERNAL_DIRECTORY_EVENT, tmp_path,
                       tmp_roots=("/tmp/kilo/*",))
@@ -926,9 +941,20 @@ def test_default_completion_builds_the_call_from_gate_settings(tmp_path, monkeyp
     assert seen["timeout"] == GATE_TIMEOUT == 60.0
     assert seen["stream"] is False
     assert seen["api_format"] == "openai"
-    assert seen["error_retries"] == 0
+    # KC-55: the gate retries its transport failures with the [contest] budget,
+    # so a 429 on kenari.id is a wait, not a reject
+    assert seen["error_retries"] == 3
+    assert seen["error_retry_wait_sec"] == 10.0
+    assert seen["max_retry_after_sec"] == 60.0
     assert seen["ssl_context"] is None
     assert seen["headers"]["Authorization"].startswith("Bearer ")
+    # and the sleep it waits on is the policy's own, checked against the
+    # deadline before it is spent — a test never waits it for real
+    assert callable(seen["_sleep_fn"])
+    assert callable(seen["on_retry"])
+    assert slept == [], "an allow on the first call spends no wait"
+    seen["_sleep_fn"](4.5)
+    assert slept == [4.5]
 
 
 def test_default_completion_builds_an_ollama_call(tmp_path, monkeypatch):
@@ -1375,3 +1401,354 @@ def test_an_own_worktree_spelling_that_lands_on_a_sibling_stays_forbidden(tmp_pa
     assert (decision.reply, decision.layer) == ("reject", "mechanical")
     assert decision.reason.startswith("forbidden: ")
     assert gate.calls == []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KC-55: the gate rides out a rate limit inside a bounded wait
+# ─────────────────────────────────────────────────────────────────────────────
+
+#: The body the fake opener returns when it answers: one allow verdict, the way
+#: the wire carries it.
+ALLOW_BODY = {"choices": [{"message": {"role": "assistant", "content": json.dumps(ALLOW)}}]}
+
+#: The sentence a gate-failed reason ends with after a 429 or a 5xx.
+OVERLOAD_TAIL = ("the reviewer is overloaded; a command inside your worktree "
+                 "needs no reviewer")
+
+GATE_URL = "https://policy-test/v1/chat/completions"
+
+
+def rate_limit(url: str = GATE_URL, retry_after: "str | None" = None
+               ) -> urllib.error.HTTPError:
+    """One 429, the way kenari.id sent it in round 66.
+
+    *retry_after* is the header the server sent. Absent, ``request_completion``
+    waits its own ``error_retry_wait_sec`` instead.
+    """
+    headers = {"Retry-After": retry_after} if retry_after else None
+    return urllib.error.HTTPError(url, 429, "Too Many Requests", headers, None)
+
+
+class FakeResponse:
+    """A response body as ``request_completion`` reads it: ``read``, as a context."""
+
+    def __init__(self, body: str):
+        self._body = body.encode("utf-8")
+
+    def read(self) -> bytes:
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class FakeOpener:
+    """``urllib.request.urlopen`` — the one call site ``request_completion`` has.
+
+    Each entry is an exception to raise or a body to return; the last entry is
+    held for as many calls as the retry loops make. Nothing here opens a socket,
+    which is why these tests run with the network down.
+    """
+
+    def __init__(self, *results):
+        self.results = list(results)
+        self.opens = 0
+
+    def __call__(self, request, timeout=None, context=None, **kwargs):
+        self.opens += 1
+        result = self.results[min(self.opens - 1, len(self.results) - 1)]
+        if isinstance(result, BaseException):
+            raise result
+        return FakeResponse(result if isinstance(result, str) else json.dumps(result))
+
+
+class FakeSleep:
+    """A sleep that spends its seconds on the fake clock — no wall time."""
+
+    def __init__(self, clock: FakeClock):
+        self.clock = clock
+        self.calls = []
+
+    def __call__(self, seconds: float):
+        self.calls.append(seconds)
+        self.clock.now += seconds
+        return None
+
+
+class TwiceGate:
+    """A ``completion_fn`` that answers *first*, then *second* — the re-ask."""
+
+    def __init__(self, first, second):
+        self.results = [first, second]
+        self.calls = []
+
+    def __call__(self, url, headers, payload, timeout, **kwargs):
+        self.calls.append(dict(kwargs))
+        return self.results[min(len(self.calls) - 1, len(self.results) - 1)]
+
+
+def retry_config(*, retries: int = 3, wait: float = 10.0, max_wait: float = 60.0,
+                 deadline: float = 600.0, settings=_UNSET) -> ContestConfig:
+    """The policy's config with the four ``[contest] gate_*`` keys named."""
+    config = make_config(settings=settings)
+    return replace(config, gate_retries=retries, gate_retry_wait_sec=wait,
+                   gate_retry_max_wait_sec=max_wait, gate_deadline_sec=deadline)
+
+
+def test_a_429_is_retried_and_the_gate_answers(tmp_path, monkeypatch):
+    """Round 66's 429: one wait of the server's own Retry-After, then a verdict."""
+    opener = FakeOpener(rate_limit(retry_after="7"), ALLOW_BODY)
+    monkeypatch.setattr(llm_stream_mod.urllib.request, "urlopen", opener)
+    clock = FakeClock(step=0.1)
+    slept = FakeSleep(clock)
+    policy = Policy(retry_config(), clock=clock, sleep=slept)
+
+    decision = decide(policy, EXTERNAL_DIRECTORY_EVENT, tmp_path,
+                      tmp_roots=("/tmp/kilo/*",))
+
+    assert (decision.reply, decision.layer) == ("once", "gate")
+    assert decision.gate_attempts == 2
+    assert opener.opens == 2
+    assert slept.calls == [7.0]
+    assert decision.gate_elapsed >= 7.0
+
+
+def test_a_429_every_time_names_the_status_the_attempts_and_the_overload(tmp_path,
+                                                                          monkeypatch):
+    opener = FakeOpener(rate_limit())
+    monkeypatch.setattr(llm_stream_mod.urllib.request, "urlopen", opener)
+    clock = FakeClock(step=0.1)
+    slept = FakeSleep(clock)
+    policy = Policy(retry_config(), clock=clock, sleep=slept)
+
+    decision = decide(policy, EXTERNAL_DIRECTORY_EVENT, tmp_path,
+                      tmp_roots=("/tmp/kilo/*",))
+
+    assert (decision.reply, decision.layer) == ("reject", "gate-failed")
+    assert decision.reason.startswith("gate unavailable: HTTP 429 (4 attempts")
+    assert decision.reason.endswith(OVERLOAD_TAIL)
+    assert decision.gate_attempts == 4
+    assert opener.opens == 4
+    assert slept.calls == [10.0, 10.0, 10.0]
+    # the reason is shown to the agent: never the URL, the body or a key
+    for forbidden in ("http://", "https://", "Bearer", "test-gate-key", "api_key"):
+        assert forbidden not in decision.reason
+
+
+def test_a_retry_after_longer_than_the_cap_fails_at_once(tmp_path, monkeypatch):
+    """A 3600 s Retry-After is a quota reset, not a blip: one call, no wait."""
+    opener = FakeOpener(rate_limit(retry_after="3600"))
+    monkeypatch.setattr(llm_stream_mod.urllib.request, "urlopen", opener)
+    clock = FakeClock(step=0.1)
+    slept = FakeSleep(clock)
+    policy = Policy(retry_config(), clock=clock, sleep=slept)
+
+    decision = decide(policy, EXTERNAL_DIRECTORY_EVENT, tmp_path,
+                      tmp_roots=("/tmp/kilo/*",))
+
+    assert (decision.reply, decision.layer) == ("reject", "gate-failed")
+    assert decision.reason.startswith("gate unavailable: HTTP 429")
+    assert decision.gate_attempts == 1
+    assert opener.opens == 1
+    assert slept.calls == []
+
+
+def test_a_refused_key_fails_at_once_without_the_overload_hint(tmp_path, monkeypatch):
+    """401 is neither a blip nor an overload: one call, the status, nothing else."""
+    opener = FakeOpener(urllib.error.HTTPError(GATE_URL, 401, "Unauthorized", {}, None))
+    monkeypatch.setattr(llm_stream_mod.urllib.request, "urlopen", opener)
+    clock = FakeClock(step=0.1)
+    slept = FakeSleep(clock)
+    policy = Policy(retry_config(), clock=clock, sleep=slept)
+
+    decision = decide(policy, EXTERNAL_DIRECTORY_EVENT, tmp_path,
+                      tmp_roots=("/tmp/kilo/*",))
+
+    assert (decision.reply, decision.layer) == ("reject", "gate-failed")
+    assert decision.reason == "gate unavailable: HTTP 401"
+    assert OVERLOAD_TAIL not in decision.reason
+    assert opener.opens == 1
+    assert slept.calls == []
+
+
+def test_zero_gate_retries_is_today_s_fail_fast_gate(tmp_path, monkeypatch):
+    """``gate_retries = 0``: one call, no wait — but the 429 is still named."""
+    opener = FakeOpener(rate_limit())
+    monkeypatch.setattr(llm_stream_mod.urllib.request, "urlopen", opener)
+    clock = FakeClock(step=0.1)
+    slept = FakeSleep(clock)
+    policy = Policy(retry_config(retries=0), clock=clock, sleep=slept)
+
+    decision = decide(policy, EXTERNAL_DIRECTORY_EVENT, tmp_path,
+                      tmp_roots=("/tmp/kilo/*",))
+
+    assert (decision.reply, decision.layer) == ("reject", "gate-failed")
+    assert decision.reason.startswith("gate unavailable: HTTP 429")
+    assert opener.opens == 1
+    assert slept.calls == []
+
+
+def test_an_unparsable_reply_is_asked_once_more(tmp_path):
+    """KC-37 §1: an empty body is the same ask again, after GATE_RETRY_WAIT."""
+    gate = TwiceGate("", json.dumps(ALLOW))
+    clock = FakeClock(step=0.1)
+    slept = FakeSleep(clock)
+    policy = Policy(retry_config(), completion_fn=gate, clock=clock, sleep=slept)
+
+    decision = decide(policy, EXTERNAL_DIRECTORY_EVENT, tmp_path,
+                      tmp_roots=("/tmp/kilo/*",))
+
+    assert (decision.reply, decision.layer) == ("once", "gate")
+    assert decision.gate_attempts == 2
+    assert len(gate.calls) == 2
+    assert slept.calls == [GATE_RETRY_WAIT]
+
+
+def test_an_unparsable_reply_twice_names_both_attempts(tmp_path):
+    gate = TwiceGate("", "")
+    clock = FakeClock(step=0.1)
+    policy = Policy(retry_config(), completion_fn=gate, clock=clock, sleep=FakeSleep(clock))
+
+    decision = decide(policy, EXTERNAL_DIRECTORY_EVENT, tmp_path,
+                      tmp_roots=("/tmp/kilo/*",))
+
+    assert (decision.reply, decision.layer) == ("reject", "gate-failed")
+    assert decision.reason == "gate unavailable: empty reply (2 attempts)"
+    assert decision.gate_attempts == 2
+    assert len(gate.calls) == 2
+
+
+def test_a_clean_reject_is_never_askaed(tmp_path):
+    """A clean reject is a verdict: one call, never re-asked."""
+    gate = StubGate(json.dumps(REJECT))
+    policy = Policy(retry_config(), completion_fn=gate, clock=FakeClock(), sleep=NO_SLEEP)
+
+    decision = decide(policy, EXTERNAL_DIRECTORY_EVENT, tmp_path,
+                      tmp_roots=("/tmp/kilo/*",))
+
+    assert (decision.reply, decision.layer) == ("reject", "gate")
+    assert decision.gate_attempts == 1
+    assert len(gate.calls) == 1
+
+
+def test_the_budget_counts_decisions_not_attempts(tmp_path, monkeypatch):
+    """One call left buys the whole decision: its retries are not budget units."""
+    opener = FakeOpener(rate_limit(retry_after="7"), ALLOW_BODY)
+    monkeypatch.setattr(llm_stream_mod.urllib.request, "urlopen", opener)
+    clock = FakeClock(step=0.1)
+    policy = Policy(retry_config(), clock=clock, sleep=FakeSleep(clock))
+
+    decision = decide(policy, EXTERNAL_DIRECTORY_EVENT, tmp_path,
+                      tmp_roots=("/tmp/kilo/*",), gate_budget_left=1)
+
+    assert (decision.reply, decision.layer) == ("once", "gate")
+    assert decision.gate_attempts == 2
+
+
+def test_the_record_only_names_the_attempts_when_there_were_two(tmp_path, monkeypatch):
+    """A one-attempt record is today's line, byte for byte; two gets the count."""
+    log = tmp_path / "out" / "decisions.jsonl"
+    # the first decision is a clean allow, the second a 429 then an allow
+    opener = FakeOpener(ALLOW_BODY, rate_limit(retry_after="7"), ALLOW_BODY)
+    monkeypatch.setattr(llm_stream_mod.urllib.request, "urlopen", opener)
+    clock = FakeClock(step=0.1)
+    policy = Policy(retry_config(), clock=clock, sleep=FakeSleep(clock))
+    worktree = tmp_path.resolve()
+
+    policy.record(decide(policy, EXTERNAL_DIRECTORY_EVENT, worktree,
+                         tmp_roots=("/tmp/kilo/*",)),
+                  EXTERNAL_DIRECTORY_EVENT, log)
+    policy.record(decide(policy, EXTERNAL_DIRECTORY_EVENT, worktree,
+                         tmp_roots=("/tmp/kilo/*",)),
+                  EXTERNAL_DIRECTORY_EVENT, log)
+
+    entries = [json.loads(line)
+               for line in log.read_text(encoding="utf-8").splitlines()]
+    assert len(entries) == 2
+    assert tuple(entries[0]) == DECISION_KEYS
+    assert "gate_attempts" not in entries[0]
+    assert entries[1]["gate_attempts"] == 2
+    assert entries[1]["layer"] == "gate"
+
+
+def test_the_gate_worst_case_is_the_deadline_plus_the_timeout():
+    """`gate_deadline_sec + GATE_TIMEOUT` — the one number intake and the tests read."""
+    assert gate_worst_case_sec(ContestConfig()) == 660.0
+    assert gate_worst_case_sec(retry_config(deadline=100)) == 160.0
+    # fail open: no config, or a deadline that is not a number
+    assert gate_worst_case_sec(None) == 660.0
+    bad = replace(ContestConfig(), gate_deadline_sec="six hundred")
+    assert gate_worst_case_sec(bad) == 660.0
+
+
+def test_malformed_gate_limits_degrade_to_their_defaults():
+    """Fail open: a config that names no gate_* values still fails fast, as today."""
+    config = replace(ContestConfig(), gate_retries="three", gate_retry_wait_sec="ten",
+                     gate_retry_max_wait_sec=-5, gate_deadline_sec=None)
+    policy = Policy(config, completion_fn=StubGate(json.dumps(ALLOW)),
+                    clock=FakeClock(), sleep=NO_SLEEP)
+
+    assert policy._gate_limits() == (3, 10.0, 60.0, 600.0)
+
+
+def test_the_deadline_stops_the_gate_before_a_wait_that_would_pass_it(tmp_path,
+                                                                        monkeypatch):
+    opener = FakeOpener(rate_limit(retry_after="10"))
+    monkeypatch.setattr(llm_stream_mod.urllib.request, "urlopen", opener)
+    clock = FakeClock(step=0.1)
+    slept = FakeSleep(clock)
+    policy = Policy(retry_config(retries=10, wait=10.0, deadline=30),
+                    clock=clock, sleep=slept)
+
+    decision = decide(policy, EXTERNAL_DIRECTORY_EVENT, tmp_path,
+                      tmp_roots=("/tmp/kilo/*",))
+
+    assert (decision.reply, decision.layer) == ("reject", "gate-failed")
+    assert decision.reason.startswith("gate unavailable: HTTP 429")
+    assert "deadline 30 s" in decision.reason
+    assert slept.calls == [10.0, 10.0]
+    assert sum(slept.calls) <= 30.0
+    assert opener.opens == 3
+
+
+def test_a_timeout_is_named_not_runtime_error(tmp_path, monkeypatch):
+    """``request_completion`` wraps a timeout in a RuntimeError: the reason
+    reads the network error out of the text instead."""
+    opener = FakeOpener(TimeoutError("timed out"))
+    monkeypatch.setattr(llm_stream_mod.urllib.request, "urlopen", opener)
+    clock = FakeClock(step=0.1)
+    slept = FakeSleep(clock)
+    policy = Policy(retry_config(), clock=clock, sleep=slept)
+
+    decision = decide(policy, EXTERNAL_DIRECTORY_EVENT, tmp_path,
+                      tmp_roots=("/tmp/kilo/*",))
+
+    assert (decision.reply, decision.layer) == ("reject", "gate-failed")
+    assert decision.reason.startswith("gate unavailable: TimeoutError (")
+    assert "RuntimeError" not in decision.reason
+    assert decision.gate_attempts == 4
+    assert opener.opens == 4
+
+
+def test_a_garbled_body_still_stops_at_the_deadline(tmp_path, monkeypatch):
+    """The read loop reopens on every pass, so one call could make
+    ``(gate_retries + 1) ** 2`` requests: the deadline bounds it instead."""
+    opener = FakeOpener("this is not json")
+    monkeypatch.setattr(llm_stream_mod.urllib.request, "urlopen", opener)
+    clock = FakeClock(step=0.1)
+    slept = FakeSleep(clock)
+    policy = Policy(retry_config(retries=3, wait=10.0, deadline=15),
+                    clock=clock, sleep=slept)
+
+    decision = decide(policy, EXTERNAL_DIRECTORY_EVENT, tmp_path,
+                      tmp_roots=("/tmp/kilo/*",))
+
+    assert (decision.reply, decision.layer) == ("reject", "gate-failed")
+    assert decision.reason.startswith("gate unavailable: JSONDecodeError (")
+    assert "deadline 15 s" in decision.reason
+    assert opener.opens == 2
+    assert opener.opens < (3 + 1) ** 2
+    assert sum(slept.calls) <= 15.0

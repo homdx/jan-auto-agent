@@ -61,6 +61,7 @@ import sys
 import tempfile
 from dataclasses import dataclass, replace
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from tools.contest import gates
 from tools.contest.backend import KiloBackend, OpenRouterBackend
@@ -71,7 +72,19 @@ from tools.contest.kilo_client import (
     KiloServer,
     find_kilo_binary,
 )
-from tools.contest.roster import AgentSpec, ContestConfig, RosterError, load_roster
+from tools.contest.policy import (
+    Policy,
+    gate_error_name,
+    gate_verdict,
+    gate_worst_case_sec,
+)
+from tools.contest.roster import (
+    AgentSpec,
+    ContestConfig,
+    LOCAL_FILENAME,
+    RosterError,
+    load_roster,
+)
 from tools.contest.runner import AgentState, RoundState, run_round
 from tools.contest.variant import (
     DEFAULT,
@@ -88,11 +101,13 @@ from tools.git_run import run_git
 __all__ = [
     "DEFAULT_PROVIDER",
     "DEFAULT_ROSTER",
+    "GATE_PLACEHOLDER_MODEL",
     "TASKS_DIR",
     "Intake",
     "agents_from_models",
     "cmd_run",
     "export_patches",
+    "gate_share_line",
     "intake",
     "main",
     "resolve_variants",
@@ -109,6 +124,10 @@ DEFAULT_ROSTER = "contest.ini"
 #: The provider id behind a `--models` id that does not name its own. The id
 #: `POST /session` wants — not the display name the id may have been read from.
 DEFAULT_PROVIDER = "kenary"
+
+#: The committed `contest.ini`'s gate model. It is not a model anyone can call,
+#: so a round that still runs on it has no gate to probe (KC-55 §5).
+GATE_PLACEHOLDER_MODEL = "some/model"
 
 #: The status this command runs, exactly: the first word of `**Status:**`.
 OPEN = "open"
@@ -496,22 +515,143 @@ def _without_highest(agents: tuple) -> tuple:
                  for agent in agents)
 
 
+def _host_of(url) -> str:
+    """The host of a base URL — the only part of it a round may print.
+
+    KC-55 compares the gate's `base_url` with a provider's `options.baseURL` by
+    host, not by path, so `https://kenari.id/v1` and `https://kenari.id/v1/chat`
+    are the same endpoint; a malformed or empty URL is no host, not an exception.
+    """
+    if not isinstance(url, str) or not url.strip():
+        return ""
+    try:
+        return urlsplit(url.strip()).hostname or ""
+    except ValueError:
+        return ""
+
+
+def _seconds(value) -> str:
+    """A number of seconds the way an operator reads it: `660`, not `660.0`."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    return str(int(number)) if number.is_integer() else f"{number:g}"
+
+
+def _gate_base_url(config) -> str:
+    """The gate's `base_url`, or `""` when the round has no gate."""
+    settings = config.gate_settings
+    if settings is None:
+        return ""
+    return str(getattr(settings, "base_url", "") or "")
+
+
+def gate_share_line(providers, agents, gate_base_url) -> str:
+    """KC-55 §5: the `gate: shares <host> with N agents (…) — …` warning.
+
+    The round 66 root cause, and the reason this compares hosts rather than
+    model ids: the gate was a different *model* from the agents but sat on the
+    same *key and endpoint* as eight of them, so one quota of 15 requests a
+    window was spent by eight agents plus the gate and the gate's 429 became a
+    `reject`. A provider's `options.baseURL` is read by host, so a gate on
+    `kenary/mistral-medium-3-5:free` next to eight other `kenary` agents is
+    caught where a `model_id` comparison would miss it.
+
+    ``""`` when nothing matches: a provider with no `options.baseURL` does not
+    match, nor does a gate with no host. Names at most four agents, then `…`,
+    and never the key. A warning, never a refusal — the operator may hold a
+    paid key on that host.
+    """
+    host = _host_of(gate_base_url)
+    if not host:
+        return ""
+    by_id = {}
+    for provider in (providers or {}).get("all") or []:
+        if isinstance(provider, dict) and isinstance(provider.get("id"), str):
+            by_id[provider["id"]] = provider
+    names = []
+    for agent in agents or ():
+        provider = by_id.get(getattr(agent, "provider_id", ""))
+        options = provider.get("options") if isinstance(provider, dict) else None
+        if not isinstance(options, dict):
+            continue
+        if _host_of(options.get("baseURL")) != host:
+            continue
+        name = str(getattr(agent, "name", "") or "").strip()
+        if name:
+            names.append(name)
+    if not names:
+        return ""
+    shown = ", ".join(names[:4]) + (" …" if len(names) > 4 else "")
+    word = "agent" if len(names) == 1 else "agents"
+    return ("gate: shares " + host + " with " + str(len(names)) + " " + word + " ("
+            + shown + ") — a rate limit there hits the gate too; point "
+            + "[contest_gate_llm] in " + LOCAL_FILENAME + " at another endpoint")
+
+
+def _gate_probe(config) -> tuple:
+    """KC-55 §5: `(refusals, warnings)` from one call to the gate before the round.
+
+    Nine recorded rounds learned the gate was unusable from `gate-failed`
+    rejects — 48 of them in five rounds, because the endpoint refused the key or
+    held no such model and the round found out one permission at a time. One
+    attempt, no retries, `GATE_TIMEOUT`, through `Policy`'s own
+    `completion_fn`, so a test stubs it the way it stubs the gate. It is not one
+    of any agent's `gate_max_calls_per_session` calls: no session exists yet.
+
+    A 401 or a 403 refuses the round and names `contest.local.ini`; a 404
+    refuses it naming the model and the host. Anything else only warns and the
+    round starts — a 429 or a 5xx is transient and is exactly what a real ask
+    retries, and so are a timeout, a dropped connection and an unparsable
+    reply. A reply that carries a verdict is a healthy gate and says nothing.
+    """
+    settings = config.gate_settings
+    model = getattr(settings, "model", "") if settings is not None else ""
+    model = model.strip() if isinstance(model, str) else ""
+    if not model or model == GATE_PLACEHOLDER_MODEL:
+        return (), ()
+    try:
+        reply = Policy(config).probe_gate()
+    except Exception as exc:
+        status = gate_error_name(exc)
+        if status in ("HTTP 401", "HTTP 403"):
+            return ([f"gate [contest_gate_llm] refused its key ({status}) — set api_key "
+                     f"in {LOCAL_FILENAME}"], ())
+        if status == "HTTP 404":
+            host = _host_of(_gate_base_url(config)) or "its endpoint"
+            return ([f"gate model '{model}' not found at {host} ({status}) — set model "
+                     f"in [contest_gate_llm]"], ())
+        return ((), (f"gate: {status} on the intake probe — the round starts anyway; "
+                     f"the gate retries that itself",))
+    if gate_verdict(reply):
+        return (), ()
+    return ((), ("gate: the intake probe came back unparsable — the round starts "
+                 "anyway; the gate asks it twice itself",))
+
+
 def _offer_failures(repo, config: ContestConfig, attached) -> list:
     """`_check_offer`'s failures alone — its first KC-25 shape, kept for callers."""
     return _check_offer(repo, config, attached)[0]
 
 
 def _check_offer(repo, config: ContestConfig, attached, *, resolve: bool = True) -> tuple:
-    """`(failures, agents, notes)`: the roster's `provider/model` pairs, checked
-    against `GET /provider`, then its variants resolved there (KC-49).
+    """`(failures, agents, notes, gate_warnings)`: the roster's `provider/model`
+    pairs checked against `GET /provider`, then its variants resolved there
+    (KC-49), then the gate's two intake checks (KC-55).
 
     *agents* is the roster with every `highest` replaced by the variant that
     answered, or `config.agents` as is when nothing was resolved; *notes* is
-    one line per probed model. With no offer to read, `highest` becomes no
-    variant: it is the round's default, and a server that did not start is
-    reported by the round itself. `resolve=False` stops after the pair check:
-    intake passes it when the round is already refused, so a refused round
-    spends no model call.
+    one line per probed model; *gate_warnings* are the `gate:` lines the round
+    may warn on and still start — the gate sharing an endpoint with the roster,
+    and a probe that hit a transient error. A probe that refuses the round goes
+    into *failures* instead, so it is printed as every other refusal.
+
+    With no offer to read, `highest` becomes no variant: it is the round's
+    default, and a server that did not start is reported by the round itself.
+    `resolve=False` stops after the pair check: intake passes it when the round
+    is already refused, so a refused round spends no model call — the variant
+    probes and the gate probe alike.
 
     With `server = spawn` no server is attached yet, so a throwaway one is
     started for the call alone and removed with its log — `cmd_run` starts its
@@ -539,9 +679,9 @@ def _check_offer(repo, config: ContestConfig, attached, *, resolve: bool = True)
                                           log_path=log_path)
                 own_server = server
             except Exception:
-                return [], unresolved, []
+                return [], unresolved, [], []
         if server is None:
-            return [], unresolved, []
+            return [], unresolved, [], []
         try:
             kilo_bin = find_kilo_binary(config.kilo_bin)
         except (FileNotFoundError, OSError):
@@ -549,14 +689,26 @@ def _check_offer(repo, config: ContestConfig, attached, *, resolve: bool = True)
         providers = KiloClient(server, str(repo)).providers()
         failures = roster_on_offer(providers, agents, kilo_bin=kilo_bin)
         if failures or not resolve:
-            return failures, unresolved, []
+            return failures, unresolved, [], []
+
+        # KC-55 §5: the gate's two checks, both of them free of a session — the
+        # share check off the offer just read, and one probe call of its own
+        warnings = []
+        share = gate_share_line(providers, agents, _gate_base_url(config))
+        if share:
+            warnings.append(share)
+        refusals, probe_warnings = _gate_probe(config)
+        warnings.extend(probe_warnings)
+        if refusals:
+            return list(refusals), unresolved, [], warnings
+
         def probe_for(agent):
             return hello_probe(server, agent.provider_id, agent.model_id)
         resolved, failures, notes = resolve_variants(providers, agents, probe_for,
                                                      kilo_bin=kilo_bin)
-        return failures, resolved, notes
+        return failures, resolved, notes, warnings
     except (KiloHttpError, KiloServerError, ValueError) as exc:
-        return [f"GET /provider failed: {exc}"], unresolved, []
+        return [f"GET /provider failed: {exc}"], unresolved, [], []
     finally:
         if own_server is not None:
             own_server.close()
@@ -577,7 +729,9 @@ def intake(repo, tasks_dir, round_no, base_ref, config, argv=None):
     first word is `open`; no lower-numbered ticket is still on offer, and each
     of those is named with the two ways past it, because the runner's prompt
     does not name a ticket and `scripts/next_task.py` would hand that one to
-    the session; the server answers — the `kilo` binary resolves when the
+    the session; the gate's worst case fits the silence clock it holds —
+    `policy.gate_worst_case_sec` against `idle_event_timeout_sec` (KC-55 §3);
+    the server answers — the `kilo` binary resolves when the
     roster says `spawn`, else `KiloServer.attach` reaches the URL; and the
     roster's `provider/model` pairs are on offer — `KiloClient.providers`
     against `roster_on_offer`, so a display name spelled as an id, a provider
@@ -638,6 +792,21 @@ def intake(repo, tasks_dir, round_no, base_ref, config, argv=None):
                           base_ref, base_is_head)
             )
 
+    # KC-55 §3: the gate's worst case must fit inside the silence clock it
+    # holds. The gate runs synchronously inside `wait_idle`'s loop, so while it
+    # waits the session produces no events and every second counts; a worst
+    # case at or over `idle_event_timeout_sec` makes the runner declare its own
+    # agent `STALLED`. `gate_worst_case_sec` is the one place the number comes
+    # from, so the intake line and the tests read the same value.
+    worst_case = gate_worst_case_sec(config)
+    idle = config.idle_event_timeout_sec
+    if config.gate_settings is not None and isinstance(idle, (int, float)) \
+            and not isinstance(idle, bool) and idle > 0 and worst_case >= idle:
+        failures.append(
+            f"gate retries can outlast the silence clock: worst case "
+            f"{_seconds(worst_case)} s ≥ idle_event_timeout_sec {_seconds(idle)} — "
+            f"lower gate_deadline_sec in contest.ini, or raise idle_event_timeout_sec")
+
     # an openrouter round has no offer to probe: `highest` is no variant there
     agents = _without_highest(config.agents)
     attached = None
@@ -659,11 +828,13 @@ def intake(repo, tasks_dir, round_no, base_ref, config, argv=None):
         # refusal that used to arrive as one agent's first-turn `session.error`
         # the variant probe spends model calls, so it only runs for a round
         # that has passed every other check
-        offer_failures, agents, notes = _check_offer(repo, config, attached,
-                                                     resolve=not failures)
+        offer_failures, agents, notes, gate_warnings = _check_offer(
+            repo, config, attached, resolve=not failures)
         failures.extend(offer_failures)
         for note in notes:
             print(f"variant: {note}")
+        for line in gate_warnings:
+            print(line)
 
     if failures:
         for line in failures:
@@ -801,6 +972,22 @@ def _apply_flags(config: ContestConfig, args: argparse.Namespace) -> ContestConf
     return config
 
 
+def _gate_plan_label(config) -> str:
+    """The plan's gate line: `hy3:free @ kenari.id`, or `off`.
+
+    KC-37 §3 / KC-55 §6: the model id and the host, and nothing else — no key,
+    no path. The host is there because a gate on a different *model* can still
+    share a *key and endpoint* with the roster, which is the round 66 loss.
+    """
+    if config.gate_settings is None:
+        return "off"
+    model = str(getattr(config.gate_settings, "model", "") or "").strip()
+    host = _host_of(_gate_base_url(config))
+    if not model and not host:
+        return "off"
+    return f"{model} @ {host}" if host else model
+
+
 def _print_plan(result: Intake, config: ContestConfig, out_dir: Path, *, run_tests: bool) -> None:
     """The plan, one line per fact: what the round will do, before it does it."""
     models = ", ".join(agent.model + (f"@{agent.variant}" if agent.variant else "")
@@ -811,7 +998,7 @@ def _print_plan(result: Intake, config: ContestConfig, out_dir: Path, *, run_tes
         ("agents", f"{len(config.agents)}: {models}"),
         ("parallel", str(config.max_parallel)),
         ("tests", "on" if run_tests else "off"),
-        ("gate", "on" if config.gate_settings is not None else "off"),
+        ("gate", _gate_plan_label(config)),
         ("out", str(out_dir)),
     )
     width = max(len(key) for key, _ in facts)

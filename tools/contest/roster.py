@@ -95,6 +95,10 @@ CONTEST_KEYS = (
     "gate_llm_profile",
     "openrouter_llm_profile",
     "gate_max_calls_per_session",
+    "gate_retries",
+    "gate_retry_wait_sec",
+    "gate_retry_max_wait_sec",
+    "gate_deadline_sec",
     "out_dir",
     "rounds_dir",
     "variant",
@@ -219,6 +223,21 @@ class ContestConfig:
     ask_commands: tuple[str, ...] = ()
     gate_llm_profile: str = ""
     gate_max_calls_per_session: int = 20
+    #: KC-55: how many times a gate call that hit a rate limit or a dropped
+    #: connection is retried by ``tools.llm_stream.request_completion``'s own
+    #: loop. 0 is today's fail-fast gate.
+    gate_retries: int = 3
+    #: KC-55: the wait between two of those retries when the server names no
+    #: ``Retry-After``.
+    gate_retry_wait_sec: float = 10.0
+    #: KC-55: a ``Retry-After`` longer than this is a quota reset, not a blip:
+    #: the call fails at once rather than waiting it out.
+    gate_retry_max_wait_sec: float = 60.0
+    #: KC-55: one whole gate decision, every retry and re-ask, stops no later
+    #: than this many seconds in. ``policy.gate_worst_case_sec`` adds
+    #: ``GATE_TIMEOUT`` to it and intake compares that with
+    #: ``idle_event_timeout_sec``.
+    gate_deadline_sec: float = 600.0
     out_dir: str = "contest-out"
     rounds_dir: str = "../rounds"
     #: KC-49: the reasoning variant of every agent that names none — a name
@@ -418,6 +437,20 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
     def limit(key: str, default: int) -> int:
         return safe_getint(parser, "contest", key, fallback=default)
 
+    def seconds(key: str, default: float) -> float:
+        """KC-55: a time in seconds. Unlike ``limit``, a malformed value is a
+        ``RosterError`` naming the key rather than a fallback: the gate's wait
+        budget is exactly what a typo must not silently reset, and a negative
+        one would cap a whole decision at zero seconds."""
+        raw = parser.get("contest", key, fallback=str(default)).strip()
+        try:
+            value = float(raw)
+        except ValueError:
+            raise RosterError(f"[contest] {key} is not a number of seconds: {raw}") from None
+        if value < 0:
+            raise RosterError(f"[contest] {key} must be >= 0 seconds, got {raw}")
+        return value
+
     def list_(key: str) -> tuple[str, ...]:
         return _split_list(parser.get("contest", key, fallback=""))
 
@@ -426,6 +459,10 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
             f"[contest] backend must be one of {' | '.join(BACKENDS)}, got {backend!r}")
 
     agents = _parse_agents(parser)
+
+    gate_retries = limit("gate_retries", 3)
+    if gate_retries < 0:
+        raise RosterError(f"[contest] gate_retries must be >= 0, got {gate_retries}")
 
     try:
         settings, _profile = resolve_llm_profile(
@@ -468,6 +505,10 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
         ask_commands=list_("ask_commands"),
         gate_llm_profile=gate_profile,
         gate_max_calls_per_session=limit("gate_max_calls_per_session", 20),
+        gate_retries=gate_retries,
+        gate_retry_wait_sec=seconds("gate_retry_wait_sec", 10.0),
+        gate_retry_max_wait_sec=seconds("gate_retry_max_wait_sec", 60.0),
+        gate_deadline_sec=seconds("gate_deadline_sec", 600.0),
         out_dir=scalar("out_dir", "contest-out"),
         rounds_dir=scalar("rounds_dir", "../rounds"),
         variant=scalar("variant", "highest") or "highest",
