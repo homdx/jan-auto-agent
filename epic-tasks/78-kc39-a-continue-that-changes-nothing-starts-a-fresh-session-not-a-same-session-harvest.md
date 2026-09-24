@@ -94,6 +94,9 @@ shown it cannot act on, spending one of `max_rework`'s attempts on it.
    `max_sessions_per_attempt`, and `turns.jsonl` records `new_session` with
    `reason: "context"`. Below 90 %, or with the limit unknown, today's
    same-session rework stands.
+   The 90 % is one module constant shared with KC-56's `_cut_off`, and the
+   session swap is KC-54's (landed `f383335`), factored into one helper
+   rather than copied a third time.
 
 ## Acceptance
 
