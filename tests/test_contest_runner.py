@@ -32,6 +32,7 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import replace
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -47,7 +48,7 @@ for _p in (str(REPO_ROOT), str(TESTS_DIR)):
 import _kilo_fake  # noqa: E402
 from _kilo_fake import FakeKiloServer  # noqa: E402
 from tools.auto.llm_profile import LlmSettings  # noqa: E402
-from tools.contest.backend import KiloBackend  # noqa: E402
+from tools.contest.backend import ContestBackendError, KiloBackend  # noqa: E402
 from tools.contest.kilo_client import (  # noqa: E402
     AGENT_TEST_TIMEOUT_MS, IdleResult, KiloServer, SessionRef)
 from tools.contest.policy import Policy  # noqa: E402
@@ -56,7 +57,10 @@ from tools.contest.runner import (  # noqa: E402
     AgentRun,
     AgentState,
     RoundState,
+    CONTEXT_FULL_SHARE,
+    CUT_OFF_MESSAGE,
     TreeReadError,
+    _cut_off,
     _is_overflow,
     round_prompt,
     run_agent,
@@ -1684,6 +1688,337 @@ def test_a_non_overflow_session_error_is_error_as_before(tmp_path):
     assert not run.last_error.startswith("after ")
     assert len(_session_posts(fake)) == 1 and len(_prompts(fake)) == 1
     assert run.turns[0]["idle_status"] == "error"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KC-56: a turn cut off at `finish: "length"` goes on, it is not harvested
+# ─────────────────────────────────────────────────────────────────────────────
+
+#: round 74's sensenova window: `limit.context` of the model that was cut off at
+#: 244 410 + 17 734 = 262 144
+_LIMIT = 262_144
+
+
+def _length(**tokens) -> dict:
+    """An assistant message's `info` for a reply cut off at a token limit."""
+    tokens.setdefault("input", 0)
+    tokens.setdefault("output", 0)
+    tokens.setdefault("reasoning", 0)
+    tokens.setdefault("cache", {"read": 0, "write": 0})
+    return {"finish": "length", "tokens": tokens}
+
+
+#: the first row of round 74: the output budget, all of it reasoning, no text
+_OUTPUT_CUT = _length(input=23_352, reasoning=32_000, cache={"read": 0, "write": 0})
+#: a full window: 91 % of `_LIMIT` in `input` alone
+_CONTEXT_CUT = _length(input=int(0.91 * _LIMIT))
+
+
+def _cut_config(context_limit=_LIMIT, **over) -> ContestConfig:
+    """`make_config` whose agent-a carries *context_limit*, as intake puts it there."""
+    config = make_config(["agent-a"], **over)
+    return replace(config, agents=tuple(replace(spec, context_limit=context_limit or None)
+                                        for spec in config.agents))
+
+
+def _run_cut_one(tmp_path, scenario, *, config=None):
+    """`_run_one` against :class:`_OverflowFake`, so a scenario may script the
+    fresh session a context cut-off opens; the agent's limit is `_LIMIT`."""
+    sb = Sandbox(tmp_path)
+    config = config or _cut_config()
+    with _OverflowFake(scenario) as fake:
+        h = Harness(sb, fake, config)
+        run = h.go()
+    return sb, fake, h, run
+
+
+class _Messages:
+    """A backend stand-in for `_cut_off`: `messages()` returns or raises."""
+
+    def __init__(self, messages=None, error=None):
+        self._messages, self._error = messages, error
+
+    def messages(self, session):
+        if self._error is not None:
+            raise self._error
+        return self._messages
+
+
+def _assistant(info) -> dict:
+    return {"info": {"role": "assistant", **info}, "parts": []}
+
+
+def test_cut_off_reads_the_last_assistant_message():
+    """`"output"` below 90 % of the window, `"context"` at or above it, `None`
+    for any other finish — and only the *last* assistant message counts."""
+    user = {"info": {"role": "user"}, "parts": [{"type": "text", "text": "go"}]}
+    assert _cut_off(_Messages([user, _assistant(_OUTPUT_CUT)]), None, _LIMIT) == "output"
+    assert _cut_off(_Messages([_assistant(_CONTEXT_CUT), user]), None, _LIMIT) == "context"
+    # round 74's third row: input + reasoning is exactly the window
+    full = _length(input=244_410, reasoning=17_734)
+    assert _cut_off(_Messages([_assistant(full)]), None, _LIMIT) == "context"
+    # cache.read counts toward the window; exactly at the threshold is "context"
+    at = _length(input=0, cache={"read": int(CONTEXT_FULL_SHARE * 1000)})
+    assert _cut_off(_Messages([_assistant(at)]), None, 1000) == "context"
+    below = _length(input=int(CONTEXT_FULL_SHARE * 1000) - 1)
+    assert _cut_off(_Messages([_assistant(below)]), None, 1000) == "output"
+    stopped = {"finish": "stop", "tokens": _CONTEXT_CUT["tokens"]}
+    assert _cut_off(_Messages([_assistant(_OUTPUT_CUT), _assistant(stopped)]), None,
+                    _LIMIT) is None
+
+
+def test_cut_off_is_output_when_the_limit_is_unknown():
+    """No `limit.context` for the model: a full window cannot be told from a
+    spent output budget, so every cut-off is an output one."""
+    for limit in (None, 0):
+        assert _cut_off(_Messages([_assistant(_CONTEXT_CUT)]), None, limit) == "output"
+
+
+def test_cut_off_fails_open():
+    """A transcript that cannot be read, is not a list, holds no assistant
+    message, or a message whose tokens are junk — never an exception."""
+    assert _cut_off(_Messages(error=RuntimeError("GET /message: 500")), None, _LIMIT) is None
+    assert _cut_off(_Messages({"not": "a list"}), None, _LIMIT) is None
+    assert _cut_off(_Messages([]), None, _LIMIT) is None
+    assert _cut_off(_Messages([{"info": {"role": "user"}}, "junk", None]), None, _LIMIT) is None
+    junk = {"finish": "length", "tokens": {"input": "many", "cache": 7, "output": True}}
+    assert _cut_off(_Messages([_assistant(junk)]), None, _LIMIT) == "output"
+    assert _cut_off(_Messages([_assistant({"finish": "length"})]), None, _LIMIT) == "output"
+
+
+def test_an_output_cut_off_on_a_clean_tree_continues_in_the_same_session(tmp_path, monkeypatch):
+    """Acceptance 1: `finish: "length"`, reasoning = the whole output budget, no
+    text, a clean tree — a continue into the *same* session with the cut-off
+    message, no harvest of the cut-off turn, `cut_off: "output"` in
+    turns.jsonl, and the next turn's work is READY."""
+    counts = _harvest_calls(monkeypatch)
+    scenario = {"turns": [
+        {"events": ["busy", "idle"], "message_info": _OUTPUT_CUT},
+        {"on_prompt": work_ready, "events": ["busy", "idle"]},
+    ]}
+    sb, fake, h, run = _run_cut_one(tmp_path, scenario)
+    _assert_ready(run, sb.ws("agent-a"))
+    assert run.attempt == 0
+    assert [t["kind"] for t in run.turns] == ["initial", "continue"]
+    assert len(_session_posts(fake)) == 1
+    (sid0, _first), (sid1, second) = _prompts(fake)
+    assert sid0 == sid1 and second == CUT_OFF_MESSAGE
+    assert len(counts) == 1
+    (t0, t1) = _jsonl(sb.out_dir / "agent-a" / "turns.jsonl")
+    assert t0["cut_off"] == "output" and "harvest" not in t0
+    assert "new_session" not in t0 and "cut_off" not in t1
+    # the cut-off turn went straight back to PROMPTED, never HARVESTING
+    first_harvest = h.transitions.index(AgentState.HARVESTING)
+    assert h.transitions[:first_harvest].count(AgentState.PROMPTED) == 2
+
+
+def test_a_context_cut_off_on_a_clean_tree_opens_a_fresh_session(tmp_path, monkeypatch):
+    """Acceptance 2: `input` at 91 % of `limit.context`, a clean tree — a second
+    `POST /session`, whose first prompt is the bare `round_prompt` (no dirty
+    paragraph); `run.attempt` stays 0 and the swap spends a continue."""
+    counts = _harvest_calls(monkeypatch)
+    scenario = {
+        "turns": [{"events": ["busy", "idle"], "message_info": _CONTEXT_CUT}],
+        "turns_after": [{"on_prompt": work_ready, "events": ["busy", "idle"]}],
+    }
+    sb, fake, _h, run = _run_cut_one(tmp_path, scenario)
+    ws = sb.ws("agent-a")
+    _assert_ready(run, ws)
+    assert run.attempt == 0
+    assert [t["kind"] for t in run.turns] == ["initial", "continue"]
+    assert len(_session_posts(fake)) == 2
+    (old_session, fresh_session) = fake.sessions()
+    assert run.session_id == fresh_session.id
+    (sid1, _first), (sid2, second) = _prompts(fake)
+    assert sid1 == old_session.id and sid2 == fresh_session.id
+    assert second == round_prompt("agent-a", sb.ticket_path, ws.base_sha)
+    assert len(counts) == 1
+    (t0, t1) = _jsonl(sb.out_dir / "agent-a" / "turns.jsonl")
+    assert t0["cut_off"] == "context" and "harvest" not in t0
+    assert t0["session_id"] == old_session.id and t0["new_session"] == fresh_session.id
+    assert "session_id" not in t1
+
+
+def test_a_context_cut_off_on_a_dirty_tree_carries_the_dirty_paragraph(tmp_path):
+    """Acceptance 3: the same cut-off with uncommitted work — the new session's
+    first prompt is `round_prompt` *with* the dirty paragraph."""
+    scenario = {
+        "turns": [{"on_prompt": work_edit_no_commit, "events": ["busy", "idle"],
+                   "message_info": _CONTEXT_CUT}],
+        "turns_after": [{"on_prompt": work_ready, "events": ["busy", "idle"]}],
+    }
+    sb, fake, _h, run = _run_cut_one(tmp_path, scenario)
+    ws = sb.ws("agent-a")
+    _assert_ready(run, ws)
+    (sid1, _first), (sid2, second) = _prompts(fake)
+    assert sid1 != sid2
+    assert second.startswith(round_prompt("agent-a", sb.ticket_path, ws.base_sha))
+    assert "pkg/thing.py" in second and "uncommitted" in second
+    assert run.turns[0]["cut_off"] == "context"
+
+
+def test_a_cut_off_at_85_percent_of_the_window_is_an_output_one(tmp_path):
+    """Acceptance 4: 85 % of `limit.context` is under the threshold — the
+    same session, the cut-off message, no second `POST /session`."""
+    scenario = {"turns": [
+        {"events": ["busy", "idle"], "message_info": _length(input=int(0.85 * _LIMIT))},
+        {"on_prompt": work_ready, "events": ["busy", "idle"]},
+    ]}
+    sb, fake, _h, run = _run_cut_one(tmp_path, scenario)
+    _assert_ready(run, sb.ws("agent-a"))
+    assert len(_session_posts(fake)) == 1
+    assert _prompts(fake)[1][1] == CUT_OFF_MESSAGE
+    assert run.turns[0]["cut_off"] == "output"
+
+
+def test_a_stopped_reply_on_a_clean_tree_is_harvested_as_before(tmp_path):
+    """Acceptance 5: `finish: "stop"` on a clean tree is today's path — harvested
+    at once, no continue, no `cut_off`."""
+    cfg = _cut_config(max_rework=0)
+    stopped = {"finish": "stop", "tokens": _CONTEXT_CUT["tokens"]}
+    scenario = {"turns": [{"events": ["busy", "idle"], "message_info": stopped}]}
+    sb, fake, _h, run = _run_cut_one(tmp_path, scenario, config=cfg)
+    assert run.state is AgentState.GAVE_UP
+    (turn,) = run.turns
+    assert turn["kind"] == "initial" and turn["harvest"]["verdict"] == "REWORK"
+    assert "cut_off" not in turn
+    assert len(_session_posts(fake)) == 1 and len(_prompts(fake)) == 1
+
+
+def test_a_transcript_that_cannot_be_read_is_harvested_as_before(tmp_path, monkeypatch):
+    """Acceptance 6: `messages()` raising — fail-open, today's path."""
+    def boom(self, session):
+        raise RuntimeError("GET /session/x/message: 500")
+
+    monkeypatch.setattr(KiloBackend, "messages", boom)
+    cfg = _cut_config(max_rework=0)
+    scenario = {"turns": [{"events": ["busy", "idle"], "message_info": _OUTPUT_CUT}]}
+    sb, fake, _h, run = _run_cut_one(tmp_path, scenario, config=cfg)
+    assert run.state is AgentState.GAVE_UP
+    (turn,) = run.turns
+    assert turn["harvest"]["verdict"] == "REWORK" and "cut_off" not in turn
+    assert len(_prompts(fake)) == 1
+
+
+def test_an_output_cut_off_with_the_budget_spent_is_harvested(tmp_path, monkeypatch):
+    """Acceptance 7: `max_continues_per_attempt = 1`, two output cut-offs in a
+    row — the first continues, the second falls through to the harvest."""
+    counts = _harvest_calls(monkeypatch)
+    cfg = _cut_config(max_continues_per_attempt=1, max_rework=0)
+    scenario = {"turns": [{"events": ["busy", "idle"], "message_info": _OUTPUT_CUT}] * 2}
+    sb, fake, _h, run = _run_cut_one(tmp_path, scenario, config=cfg)
+    assert run.state is AgentState.GAVE_UP
+    assert [t["kind"] for t in run.turns] == ["initial", "continue"]
+    assert run.turns[0]["cut_off"] == "output"
+    assert "cut_off" not in run.turns[1] and run.turns[1]["harvest"]["verdict"] == "REWORK"
+    assert len(counts) == 1 and len(_session_posts(fake)) == 1
+
+
+def test_a_context_cut_off_spends_the_same_budget_as_a_continue(tmp_path, monkeypatch):
+    """The swap counts in `max_continues_per_attempt`: with a budget of 1, the
+    fresh session's own cut-off is harvested — two sessions, never three."""
+    counts = _harvest_calls(monkeypatch)
+    cfg = _cut_config(max_continues_per_attempt=1, max_rework=0)
+    scenario = {"turns": [{"events": ["busy", "idle"], "message_info": _CONTEXT_CUT}]}
+    sb, fake, _h, run = _run_cut_one(tmp_path, scenario, config=cfg)
+    assert run.state is AgentState.GAVE_UP
+    assert len(_session_posts(fake)) == 2 and len(counts) == 1
+    assert run.turns[0]["cut_off"] == "context" and "harvest" in run.turns[1]
+
+
+def test_zero_continues_turns_the_cut_off_check_off(tmp_path, monkeypatch):
+    """`max_continues_per_attempt = 0`: no transcript is read, the cut-off turn
+    is harvested at once."""
+    def never(self, session):
+        raise AssertionError("messages() must not be read with no continue budget")
+
+    monkeypatch.setattr(KiloBackend, "messages", never)
+    cfg = _cut_config(max_continues_per_attempt=0, max_rework=0)
+    scenario = {"turns": [{"events": ["busy", "idle"], "message_info": _CONTEXT_CUT}]}
+    sb, fake, _h, run = _run_cut_one(tmp_path, scenario, config=cfg)
+    assert run.state is AgentState.GAVE_UP
+    assert len(_session_posts(fake)) == 1 and "cut_off" not in run.turns[0]
+
+
+def test_an_unknown_limit_makes_a_full_window_an_output_cut_off(tmp_path):
+    """No `context_limit` on the spec — a roster read without an offer: the
+    same session and the cut-off message, never a second `POST /session`."""
+    scenario = {"turns": [
+        {"events": ["busy", "idle"], "message_info": _CONTEXT_CUT},
+        {"on_prompt": work_ready, "events": ["busy", "idle"]},
+    ]}
+    sb, fake, _h, run = _run_cut_one(tmp_path, scenario, config=_cut_config(None))
+    _assert_ready(run, sb.ws("agent-a"))
+    assert len(_session_posts(fake)) == 1
+    assert run.turns[0]["cut_off"] == "output"
+
+
+def test_a_failed_post_session_on_a_context_cut_off_is_error(tmp_path, monkeypatch):
+    """The fresh session is refused: ERROR with the `POST /session` line, the
+    cut-off turn is still in turns.jsonl with its old session, and that old
+    session is still the one `finally` writes to `<agent>.session.json`."""
+    real = KiloBackend.create_session
+    calls = []
+
+    def once(self, *args, **kwargs):
+        calls.append(1)
+        if len(calls) > 1:
+            raise ContestBackendError("POST /session -> 503")
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(KiloBackend, "create_session", once)
+    scenario = {"turns": [{"events": ["busy", "idle"], "message_info": _CONTEXT_CUT}]}
+    sb, fake, _h, run = _run_cut_one(tmp_path, scenario)
+    assert run.state is AgentState.ERROR
+    assert run.last_error.startswith("POST /session failed:")
+    (t0,) = _jsonl(sb.out_dir / "agent-a" / "turns.jsonl")
+    assert t0["cut_off"] == "context" and t0["session_id"] == fake.sessions()[0].id
+    assert "new_session" not in t0
+    assert (sb.out_dir / "agent-a.session.json").is_file()
+
+
+def test_a_refused_overflow_swap_still_records_the_turn_and_the_session(tmp_path, monkeypatch):
+    """Guard for the swap KC-56 factored out of KC-54: a dirty overflow whose
+    fresh `POST /session` is refused ends ERROR exactly as before — the turn
+    that overflowed in turns.jsonl, and the old session's messages in
+    `<agent>.session.json` (a swap helper that hands back `None` for the
+    session on a refusal loses the second)."""
+    real = KiloBackend.create_session
+    calls = []
+
+    def once(self, *args, **kwargs):
+        calls.append(1)
+        if len(calls) > 1:
+            raise ContestBackendError("POST /session -> 503")
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(KiloBackend, "create_session", once)
+    scenario = {"turns": [{"on_prompt": work_edit_no_commit, "events": ["busy"],
+                           "error": _OVERFLOW}]}
+    sb, fake, _h, run, _ = _run_overflow_one(tmp_path, scenario)
+    assert run.state is AgentState.ERROR
+    assert run.last_error.startswith("POST /session failed:")
+    (t0,) = _jsonl(sb.out_dir / "agent-a" / "turns.jsonl")
+    assert t0["session_id"] == fake.sessions()[0].id and t0["idle_status"] == "error"
+    assert (sb.out_dir / "agent-a.session.json").is_file()
+
+
+def test_run_round_hands_each_agent_its_models_context_limit(tmp_path):
+    """`run_round` reads the limit off each agent's spec: agent-a's cut-off at
+    91 % of its own window opens a fresh session."""
+    sb = Sandbox(tmp_path)
+    config = _cut_config()
+    scenario = {
+        "turns": [{"events": ["busy", "idle"], "message_info": _CONTEXT_CUT}],
+        "turns_after": [{"on_prompt": work_ready, "events": ["busy", "idle"]}],
+    }
+    with _OverflowFake(scenario) as fake:
+        state = run_round(config, ROUND, sb.ticket_path, list(sb.workspaces),
+                          make_backend=_make_backend(fake, sb.out_dir), out_dir=sb.out_dir)
+    run = _by_name(state)["agent-a"]
+    _assert_ready(run, sb.ws("agent-a"))
+    assert run.turns[0]["cut_off"] == "context"
+    assert len(_session_posts(fake)) == 2
 
 
 # ─────────────────────────────────────────────────────────────────────────────

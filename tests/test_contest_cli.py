@@ -17,6 +17,7 @@ reads `KC-7 (46) is on offer ahead of …`, the same four lines either way.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import subprocess
 import sys
@@ -840,6 +841,61 @@ def test_intake_checks_the_offer_against_the_attached_server(sandbox, capsys, sp
                      "name of provider 'kenary'; use kenary/hy3:free"]
     assert not spawn_holder, "an attached server must not start a second one"
     assert fake.calls(method="GET", path="/provider")
+
+
+def test_run_puts_the_offers_context_limit_on_the_agents_spec(sandbox, capsys, spawn_holder,
+                                                       monkeypatch):
+    """KC-56: `limit.context` from the `GET /provider` read intake makes lands
+    on the agent's spec the round runs — no second read of the offer."""
+    offer = copy.deepcopy(KC25_OFFER)
+    offer["all"][0]["models"]["hy3:free"]["limit"] = {"context": 262_144, "output": 32_000}
+    seen: dict = {}
+    real = cli.run_round
+
+    def spy(config, *args, **kwargs):
+        seen["config"] = config
+        return real(config, *args, **kwargs)
+
+    monkeypatch.setattr(cli, "run_round", spy)
+    code, fake = run_fake(sandbox, dict(KC25_SCENARIO, providers=offer),
+                          ["--ticket", "1", "--models", "kenary/hy3:free",
+                           "--no-gate", "--no-tests"], spawn_holder)
+    capsys.readouterr()
+    assert code == 0
+    (spec,) = seen["config"].agents
+    assert spec.model == "kenary/hy3:free" and spec.context_limit == 262_144
+
+
+def test_context_limits_reads_limit_context_per_provider_model():
+    """`GET /provider` → `provider/model: limit.context`; a model with no
+    positive integer limit is left out, and junk is an empty dict."""
+    offer = {"all": [
+        {"id": "kenary", "models": {
+            "a:free": {"id": "a:free", "limit": {"context": 262_144, "output": 32_000}},
+            "b:free": {"id": "b:free", "limit": {"context": 0}},
+            "c:free": {"id": "c:free"},
+            "d:free": {"id": "d:free", "limit": {"context": "big"}},
+            "e:free": {"id": "e:free", "limit": {"context": True}},
+            # the `models` key is what a roster names, whatever `id` says
+            "f:free": {"id": "other-name", "limit": {"context": 64_000}},
+        }},
+        {"id": "other", "models": {"x": {"limit": {"context": 1000}}}},
+        {"name": "no id", "models": {"y": {"limit": {"context": 5}}}},
+        "junk",
+    ]}
+    assert cli._context_limits(offer) == {"kenary/a:free": 262_144, "kenary/f:free": 64_000,
+                                          "other/x": 1000}
+    assert cli._context_limits(None) == {} and cli._context_limits({"all": None}) == {}
+
+
+def test_with_context_limits_puts_the_limit_on_the_matching_spec():
+    """Only the agent whose `provider/model` has an entry changes; the rest keep
+    `None`, and nothing else about a spec moves."""
+    a = AgentSpec("a", "kenary", "a:free", variant="high")
+    b = AgentSpec("b", "kenary", "b:free")
+    (a2, b2) = cli._with_context_limits((a, b), {"kenary/a:free": 262_144})
+    assert a2 == replace(a, context_limit=262_144) and a2.variant == "high"
+    assert b2 is b and b2.context_limit is None
 
 
 def test_the_offer_check_closes_its_throwaway_server(tmp_path, monkeypatch, capsys):

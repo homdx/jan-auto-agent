@@ -192,6 +192,11 @@ class AgentSpec:
     model_id: str
     kilo_agent: str | None = None
     variant: str | None = None
+    #: KC-56: the model's ``limit.context`` from ``GET /provider``, put here at
+    #: intake (never read from ``contest.ini``); ``None`` = unknown. The runner
+    #: tells a reply cut off by a full context window from one cut off by its
+    #: output budget with it.
+    context_limit: int | None = None
 
     @property
     def model(self) -> str:

@@ -140,6 +140,21 @@ _OVERFLOW_RE = re.compile(
     r"ContextOverflowError|maximum context length|context_length_exceeded", re.IGNORECASE
 )
 
+#: KC-56: a reply cut off at ``finish: "length"`` whose tokens reach this share
+#: of the model's ``limit.context`` filled the context window rather than the
+#: output budget. One constant for the runner: KC-39 §7's check before a rework
+#: into a full session is the same 90 %, and reads it from here.
+CONTEXT_FULL_SHARE = 0.9
+
+#: KC-56: the continue sent into the same session when the last reply hit the
+#: *output* limit before any text or tool call — not `continue_message`, which
+#: is about uncommitted files, and the tree may well be clean.
+CUT_OFF_MESSAGE = (
+    "Your last reply hit the output limit before any text or tool call. Think "
+    "less, and make the next step a tool call. Your worktree and this "
+    "conversation are intact — continue from where you were; do not start over."
+)
+
 
 def _retryable(error) -> bool:
     """True when *error* is a retryable provider error (KC-19).
@@ -192,6 +207,49 @@ def _is_overflow(error) -> bool:
         if isinstance(error.get("message"), str):
             parts.append(error["message"])
     return _OVERFLOW_RE.search(" ".join(parts)) is not None
+
+
+def _tokens_used(tokens: dict) -> int:
+    """``input + cache.read + reasoning + output`` of one message's ``tokens``."""
+    def num(value) -> int:
+        return value if isinstance(value, (int, float)) and not isinstance(value, bool) else 0
+    cache = tokens.get("cache")
+    read = num(cache.get("read")) if isinstance(cache, dict) else 0
+    return int(num(tokens.get("input")) + read + num(tokens.get("reasoning"))
+               + num(tokens.get("output")))
+
+
+def _cut_off(backend: ContestBackend, session: SessionRef,
+             context_limit: int | None = None) -> str | None:
+    """KC-56: why the turn that just went idle was cut off, or ``None``.
+
+    Reads the session's last assistant message. ``finish == "length"`` is a
+    reply the provider stopped at a token limit, not a model that decided it
+    was done: ``"context"`` when its tokens (`_tokens_used`) are at or above
+    `CONTEXT_FULL_SHARE` of *context_limit* — the window is full and a prompt
+    into this session overflows — else ``"output"``, the reply's own budget. An
+    unknown *context_limit* (``None``, 0) is ``"output"``. Any other finish, no
+    assistant message, or a ``messages()`` that raises is ``None``: fail-open,
+    today's path.
+    """
+    try:
+        messages = backend.messages(session)
+    except Exception:  # noqa: BLE001 — a transcript that cannot be read cuts nothing off
+        return None
+    if not isinstance(messages, list):
+        return None
+    for message in reversed(messages):
+        info = message.get("info") if isinstance(message, dict) else None
+        if not isinstance(info, dict) or info.get("role") != "assistant":
+            continue
+        if info.get("finish") != "length":
+            return None
+        tokens = info.get("tokens")
+        used = _tokens_used(tokens) if isinstance(tokens, dict) else 0
+        if context_limit and used >= CONTEXT_FULL_SHARE * context_limit:
+            return "context"
+        return "output"
+    return None
 
 
 def _retry_reason(error) -> str:
@@ -787,8 +845,9 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
               on_transition: Callable[[AgentRun], None],
               run_tests: bool = False) -> AgentRun:
     """Drive *run* to a terminal state — single-threaded, one session for every
-    turn; a context overflow opens a fresh one (KC-54), which is the only second
-    ``POST /session`` this function makes.
+    turn; a context overflow (KC-54) or a reply cut off by a full context window
+    (KC-56) opens a fresh one, which are the only second ``POST /session`` this
+    function makes.
 
     *backend* is a `ContestBackend` (KC-34): everything this function needs of the
     session — create, prompt, wait, abort, tool history, close — goes through
@@ -803,6 +862,11 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
     the four pytest roots are then the round's judge (KC-16) and run one
     worktree at a time, instead of the ticket's own self-check being the only
     evidence. Off by default, so every earlier call of this function is unchanged.
+
+    ``run.agent.context_limit`` — the model's ``limit.context``, which intake
+    puts on the spec from ``GET /provider`` (KC-56) — tells a reply cut off by
+    a full context window from one cut off by its output budget. ``None`` is an
+    unknown limit: every cut-off is then an output one.
     """
     out_dir = Path(out_dir)
     ws, spec = run.workspace, run.agent
@@ -871,6 +935,36 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
     def finish(state: AgentState, error: str | None = None, *, note: str | None = None) -> AgentRun:
         transition(state, error, note=note)
         return run
+
+    def fresh_session(turn: dict, dirty: str) -> str | None:
+        """Go on in a new session: the error line if ``POST /session`` failed.
+
+        KC-54's swap, shared by KC-56's context cut-off. The full session is
+        replaced, never prompted again; the new one has never seen the ticket
+        or the round prompt, so its first prompt is `round_prompt(dirty=)`
+        (KC-22's `--resume` shape), without the paragraph when *dirty* is
+        empty. *turn* — the one that filled the old session — is recorded with
+        that session's id, because `finally` records only the last session,
+        and with ``new_session`` once there is one. `run.attempt` is left
+        alone; the swap spends one of `max_continues_per_attempt`.
+        """
+        nonlocal session, continue_text, continue_used
+        turn["session_id"] = run.session_id
+        try:
+            session = backend.create_session(
+                spec.provider_id, spec.model_id, rules=config.session_rules(),
+                title=ws.branch, agent=spec.kilo_agent, variant=spec.variant)
+        except (ContestBackendError, ValueError) as exc:
+            run.turns.append(turn)
+            _append_jsonl(agent_dir / "turns.jsonl", {"agent": spec.name, **turn})
+            return f"POST /session failed: {_brief(str(exc))}"
+        turn["new_session"] = session.id
+        run.turns.append(turn)
+        _append_jsonl(agent_dir / "turns.jsonl", {"agent": spec.name, **turn})
+        run.session_id = session.id
+        continue_text = round_prompt(spec.name, ticket_path, ws.base_sha, dirty=dirty)
+        continue_used += 1
+        return None
 
     try:
         # ── CREATED: one session, kept for every turn ─────────────────────
@@ -987,23 +1081,9 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                             _log.warning("%s: tree unreadable — %s", spec.name,
                                          _brief(str(exc)))
                     if dirty and 0 < budget and continue_used < budget:
-                        # the session that overflowed, before it is replaced:
-                        # `finally` records only the last one, so the old id
-                        # stays findable in turns.jsonl
-                        turn["session_id"] = run.session_id
-                        run.turns.append(turn)
-                        _append_jsonl(agent_dir / "turns.jsonl", {"agent": spec.name, **turn})
-                        try:
-                            session = backend.create_session(
-                                spec.provider_id, spec.model_id, rules=config.session_rules(),
-                                title=ws.branch, agent=spec.kilo_agent, variant=spec.variant)
-                        except (ContestBackendError, ValueError) as exc:
-                            return finish(AgentState.ERROR,
-                                          f"POST /session failed: {_brief(str(exc))}")
-                        run.session_id = session.id
-                        continue_text = round_prompt(spec.name, ticket_path, ws.base_sha,
-                                                    dirty=dirty)
-                        continue_used += 1
+                        failed = fresh_session(turn, dirty)
+                        if failed:
+                            return finish(AgentState.ERROR, failed)
                         continue
                     # A clean overflow is a model that spent its whole context
                     # reading and produced nothing — a stall, not a crash. Do
@@ -1059,7 +1139,8 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                 # construction and burn the pytest roots on an unfinished tree.
                 # A clean tree (the model did nothing) is *not* a continue: it
                 # falls through to today's path (HARVESTING → REWORK/GAVE_UP),
-                # which is the right answer for "you did nothing". A rework
+                # which is the right answer for "you did nothing" — unless the
+                # last reply was cut off at a token limit (KC-56). A rework
                 # resets the counter; it is exhausted here only when the branch
                 # still has no commit after the last nudge.
                 budget = int(config.max_continues_per_attempt)
@@ -1074,12 +1155,27 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                             # through to the harvest, which reads git itself.
                             _log.warning("%s: tree unreadable — %s", spec.name,
                                          _brief(str(exc)))
-                    if dirty:
+                    # KC-56: a reply cut off at `finish: "length"` is a model
+                    # stopped mid-thought, not one that did nothing — clean
+                    # tree or not, it goes on instead of being harvested.
+                    cut = _cut_off(backend, session, spec.context_limit)
+                    if cut is not None:
+                        turn["cut_off"] = cut
+                    if cut == "context":
+                        # The window is full, so a continue here is the 4-second
+                        # `ContextOverflowError` of round 74. A deliberate
+                        # exception to KC-54's clean-overflow stall: the provider
+                        # cut a reply off, it did not reject a prompt.
+                        failed = fresh_session(turn, dirty)
+                        if failed:
+                            return finish(AgentState.ERROR, failed)
+                        continue
+                    if cut == "output" or dirty:
                         # the current turn keeps its own kind (initial/rework);
                         # the continue becomes the *next* PROMPTED turn, whose
                         # PROMPTED transition (with "(continue N of M)") runs at
                         # the top of the loop. Record this idle turn as it stands.
-                        continue_text = continue_message(dirty)
+                        continue_text = CUT_OFF_MESSAGE if cut else continue_message(dirty)
                         continue_used += 1
                         run.turns.append(turn)
                         _append_jsonl(agent_dir / "turns.jsonl", {"agent": spec.name, **turn})

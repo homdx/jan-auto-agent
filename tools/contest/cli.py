@@ -765,6 +765,46 @@ def _offer_failures(repo, config: ContestConfig, attached) -> list:
     return _check_offer(repo, config, attached).failures
 
 
+def _context_limits(providers) -> dict:
+    """KC-56: ``{"provider/model": limit.context}`` for every model *providers* offers.
+
+    *providers* is ``GET /provider`` as ``KiloClient.providers`` hands it over
+    — the read intake already makes; `_with_context_limits` then puts each
+    agent's entry on its ``AgentSpec.context_limit``. A model with no positive
+    integer ``limit.context`` is left out, so its limit is unknown, never 0: an
+    unknown limit makes every cut-off an output one (`runner._cut_off`). Pure and
+    total — a malformed offer is an empty dict, not an error.
+    """
+    limits: dict = {}
+    if not isinstance(providers, dict):
+        return limits
+    for provider in providers.get("all") or []:
+        if not isinstance(provider, dict) or not isinstance(provider.get("id"), str):
+            continue
+        models = provider.get("models")
+        if not isinstance(models, dict):
+            continue
+        for model_id, model in models.items():
+            # keyed like `roster_missing` reads the offer: by the `models` key,
+            # which is what `AgentSpec.model_id` names
+            limit = model.get("limit") if isinstance(model, dict) else None
+            context = limit.get("context") if isinstance(limit, dict) else None
+            if isinstance(context, int) and not isinstance(context, bool) and context > 0:
+                limits[f"{provider['id']}/{model_id}"] = context
+    return limits
+
+
+def _with_context_limits(agents: tuple, limits: dict) -> tuple:
+    """KC-56: *agents* with each one's ``context_limit`` from *limits*.
+
+    *limits* is `_context_limits`. An agent whose ``provider/model`` has no
+    entry keeps the limit it has (``None`` from the roster), so a model the
+    offer gives no ``limit.context`` stays unknown.
+    """
+    return tuple(replace(agent, context_limit=limits[agent.model])
+                 if agent.model in limits else agent for agent in agents)
+
+
 @dataclass(frozen=True)
 class _Offer:
     """What one `GET /provider` read is worth to intake.
@@ -941,6 +981,9 @@ def _check_offer(repo, config: ContestConfig, attached, *, resolve: bool = True,
             return hello_probe(server, agent.provider_id, agent.model_id)
         resolved, failures, notes = resolve_variants(providers, agents, probe_for,
                                                      kilo_bin=kilo_bin)
+        # KC-56: the same read's `limit.context`, so the runner can tell a full
+        # context window from a spent output budget without asking again
+        resolved = _with_context_limits(resolved, _context_limits(providers))
         return _Offer(failures, resolved, notes, warnings,
                       config_content=content, registered=registered)
     except (KiloHttpError, KiloServerError, ValueError) as exc:

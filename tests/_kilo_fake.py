@@ -34,6 +34,8 @@ Everything here is scripted by one scenario dict, per session:
                                      # nothing — a stalled turn (KC-12)
                 "idle": false,       # never go idle (a stalled turn)
                 "error": {...},      # session.error instead of idle
+                "message_info": {...},  # merged into the assistant message's info
+                                     # (KC-56: `finish`, `tokens`)
             },
         ],
         "permission_endpoint_404": true,   # /permission/{id}/reply answers 404,
@@ -576,10 +578,11 @@ class FakeKiloServer:
         parts = [_tool_part(p) for p in (turn.get("tool_parts") or [])]
         if turn.get("assistant"):
             parts.append({"type": "text", "text": turn["assistant"]})
-        session.messages.append({
-            "info": {"role": "assistant", "sessionID": session.id, "time": time.time()},
-            "parts": parts,
-        })
+        # KC-56: `message_info` goes onto the assistant message's `info` —
+        # `finish` and `tokens` the way Kilo reports a reply cut off at a limit
+        info = {"role": "assistant", "sessionID": session.id, "time": time.time()}
+        info.update(turn.get("message_info") or {})
+        session.messages.append({"info": info, "parts": parts})
 
         if turn.get("idle", True):
             delay = turn.get("delay")
