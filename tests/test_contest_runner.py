@@ -50,6 +50,8 @@ from tools.contest.runner import (  # noqa: E402
     AgentRun,
     AgentState,
     RoundState,
+    TreeReadError,
+    _is_overflow,
     round_prompt,
     run_agent,
     run_round,
@@ -295,6 +297,24 @@ class _BenchFake(FakeKiloServer):
             if then_idle and not self._stop.is_set():
                 self._emit({"type": "session.idle", "properties": {"sessionID": session_id}})
         threading.Thread(target=run, daemon=True).start()
+
+
+class _OverflowFake(_BenchFake):
+    """The scenario's `turns_after` replaces `turns` the moment a *second*
+    session is created (KC-54).
+
+    `turns` is indexed per session, so the fresh session the runner opens for
+    an overflow's uncommitted work replays `turns[0]` — the turn that just
+    overflowed — unless the script is swapped. `turns_after` is the script for
+    the replacement: the work that finishes the ticket in the new session. A
+    scenario without `turns_after` behaves exactly like `_BenchFake`.
+    """
+
+    def _create_session(self, body, directory):
+        session = super()._create_session(body, directory)
+        if len(self.sessions()) > 1 and self.scenario.get("turns_after") is not None:
+            self.scenario["turns"] = self.scenario.pop("turns_after")
+        return session
 
 
 def _prompts(fake) -> list:
@@ -1376,6 +1396,199 @@ def test_ctrl_c_during_retry_backoff_ends_the_round(tmp_path):
     # under the full wait, and a regression that ignored SIGINT would sit here
     # for the whole backoff.
     assert elapsed < cfg.error_retry_backoff_sec
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KC-54: a context overflow — the work goes on in a fresh session
+# ─────────────────────────────────────────────────────────────────────────────
+
+#: The payload round 91's five agents sent back: the provider's `name`, the
+#: message under `data`. `_is_overflow` must read it before the KC-19 retry
+#: path sees it.
+_OVERFLOW = {"name": "ContextOverflowError",
+             "data": {"message": "the request exceeds the model's maximum context length"}}
+#: The same overflow with the provider's retry flag set. The overflow check
+#: still wins, because a prompt into the full session overflows again.
+_RETRYABLE_OVERFLOW = {"name": "ContextOverflowError",
+                       "data": {"message": "the request exceeds the model's maximum context length",
+                                "isRetryable": True, "metadata": {"code": "ECONNRESET"}}}
+
+
+def test_is_overflow_matches_the_name_and_both_message_spellings():
+    assert _is_overflow({"name": "ContextOverflowError", "data": {"message": "..."}})
+    assert _is_overflow({"name": "Other",
+                         "data": {"message": "the request exceeds the model's maximum context length"}})
+    assert _is_overflow("ContextOverflowError")
+    assert _is_overflow({"name": "Other", "message": "context_length_exceeded"})
+    # a `data.message` that says something else does not hide the top-level one
+    assert _is_overflow({"name": "Other", "data": {"message": "bad request"},
+                         "message": "context_length_exceeded"})
+
+
+def test_is_overflow_is_false_for_none_empty_and_a_retryable_network_error():
+    assert not _is_overflow(None)
+    assert not _is_overflow({})
+    assert not _is_overflow(_ECONNRESET)
+    assert not _is_overflow("ECONNRESET")
+    assert not _is_overflow({"name": "ProviderError", "message": "boom-42"})
+    assert not _is_overflow(42)
+
+
+def _run_overflow_one(tmp_path, scenario, config=None, prepare=None):
+    """`_run_one` against :class:`_OverflowFake`, so a scenario may script the
+    fresh session the overflow's uncommitted work continues in."""
+    sb = Sandbox(tmp_path)
+    if prepare is not None:
+        prepare(str(sb.ws("agent-a").path))
+    config = config or make_config(["agent-a"])
+    with _OverflowFake(scenario) as fake:
+        h = Harness(sb, fake, config)
+        run = h.go()
+    return sb, fake, h, run, _aborted(fake)
+
+
+def test_an_overflow_turn_with_uncommitted_work_continues_in_a_fresh_session(tmp_path):
+    """`session.error` names `ContextOverflowError` and the worktree holds an
+    uncommitted file: a second `POST /session`, the next prompt goes to the
+    *new* session and carries the round prompt plus the dirty lines, the
+    overflowed turn keeps the old `session_id`, and `run.session_id` is the
+    new one."""
+    scenario = {
+        "turns": [{"on_prompt": work_edit_no_commit, "events": ["busy"], "error": _OVERFLOW}],
+        "turns_after": [{"on_prompt": work_ready, "events": ["busy", "idle"]}],
+    }
+    sb, fake, _h, run, _ = _run_overflow_one(tmp_path, scenario)
+    _assert_ready(run, sb.ws("agent-a"))
+    assert run.attempt == 0
+    assert [t["kind"] for t in run.turns] == ["initial", "continue"]
+    assert len(_session_posts(fake)) == 2
+    (old_session, fresh_session) = fake.sessions()
+    assert run.session_id == fresh_session.id
+    (sid1, first), (sid2, second) = _prompts(fake)
+    assert sid1 == old_session.id and sid2 == fresh_session.id
+    assert "pkg/thing.py" not in first
+    assert "pkg/thing.py" in second and "uncommitted" in second
+    assert "runs/agent-a/PROGRESS.csv" in second
+    assert run.turns[0]["session_id"] == old_session.id
+    assert "session_id" not in run.turns[1]
+    (t0, t1) = _jsonl(sb.out_dir / "agent-a" / "turns.jsonl")
+    assert t0["session_id"] == old_session.id and t0["idle_status"] == "error"
+    assert "session_id" not in t1
+
+
+def test_an_overflow_turn_with_a_retryable_flag_still_uses_a_fresh_session(tmp_path):
+    """The provider flags the overflow retryable: the overflow check comes
+    first, so the KC-19 retry path never fires — the second prompt is the round
+    prompt into a *new* session, not `RETRY_PROMPT` into the full one."""
+    cfg = _make_retry_config(max_continues_per_attempt=1)
+    scenario = {
+        "turns": [{"on_prompt": work_edit_no_commit, "events": ["busy"],
+                   "error": _RETRYABLE_OVERFLOW}],
+        "turns_after": [{"on_prompt": work_ready, "events": ["busy", "idle"]}],
+    }
+    sb, fake, _h, run, _ = _run_overflow_one(tmp_path, scenario, cfg)
+    _assert_ready(run, sb.ws("agent-a"))
+    assert [t["kind"] for t in run.turns] == ["initial", "continue"]
+    (sid1, _first), (sid2, second) = _prompts(fake)
+    assert sid1 != sid2 and len(_session_posts(fake)) == 2
+    assert "dropped the connection" not in second and "uncommitted" in second
+
+
+def test_an_overflow_turn_with_a_clean_tree_is_a_stall_not_a_crash(tmp_path, monkeypatch):
+    """Nothing uncommitted, nothing committed: the model spent its whole context
+    reading and produced nothing — STALLED, not ERROR, with one `POST /session`
+    and no harvest."""
+    def boom(*args, **kwargs):
+        raise AssertionError("_harvest must not run for an overflow with no commit")
+
+    monkeypatch.setattr("tools.contest.runner._harvest", boom)
+    scenario = {"turns": [{"events": ["busy"], "error": _OVERFLOW}]}
+    sb, fake, _h, run, _ = _run_one(tmp_path, scenario, _stall_config())
+    assert run.state is AgentState.STALLED
+    assert run.last_error == "context overflow with no uncommitted work"
+    assert run.commit is None and run.attempt == 0
+    assert len(_session_posts(fake)) == 1 and len(_prompts(fake)) == 1
+    (turn,) = run.turns
+    assert turn["idle_status"] == "error" and "harvest" not in turn
+    assert "session_id" not in turn
+
+
+def test_an_overflow_turn_with_a_valid_commit_is_harvested_to_ready(tmp_path):
+    """The model committed and claimed, then overflowed: the KC-21 harvest runs
+    in place of a retry — READY, not STALLED, and no second session."""
+    scenario = {"turns": [{"events": ["busy"], "error": _OVERFLOW}]}
+    sb, fake, _h, run, _ = _run_one(tmp_path, scenario, _stall_config(),
+                                    prepare=lambda d: work_ready(d, ""))
+    _assert_ready(run, sb.ws("agent-a"))
+    assert run.last_error is None
+    assert len(_session_posts(fake)) == 1 and len(_prompts(fake)) == 1
+    (turn,) = run.turns
+    assert turn["idle_status"] == "error"
+    assert turn["harvest"]["verdict"] == "READY"
+
+
+def test_an_overflow_turn_exhausts_the_continue_budget_then_stalls(tmp_path):
+    """`max_continues_per_attempt = 1`, two overflows with work still on disk:
+    the first opens a fresh session, the second is a STALLED turn, and there
+    are exactly two `POST /session` in total — the loop cannot run forever."""
+    scenario = {"turns": [{"on_prompt": work_edit_no_commit, "events": ["busy"],
+                           "error": _OVERFLOW}]}
+    cfg = make_config(["agent-a"], max_continues_per_attempt=1)
+    sb, fake, _h, run, _ = _run_one(tmp_path, scenario, cfg)
+    assert run.state is AgentState.STALLED
+    assert run.last_error == "context overflow"
+    assert len(_session_posts(fake)) == 2
+    assert len(_prompts(fake)) == 2
+    assert [t["kind"] for t in run.turns] == ["initial", "continue"]
+    (old_session, fresh_session) = fake.sessions()
+    assert run.session_id == fresh_session.id
+    (t0, t1) = _jsonl(sb.out_dir / "agent-a" / "turns.jsonl")
+    assert t0["session_id"] == old_session.id and t1["idle_status"] == "error"
+
+
+def test_an_overflow_with_zero_continues_is_a_stall_without_a_new_session(tmp_path):
+    """`max_continues_per_attempt = 0` turns the mechanism off: a dirty overflow
+    is STALLED, not a fresh session."""
+    cfg = make_config(["agent-a"], max_continues_per_attempt=0)
+    scenario = {"turns": [{"on_prompt": work_edit_no_commit, "events": ["busy"],
+                           "error": _OVERFLOW}]}
+    sb, fake, _h, run, _ = _run_one(tmp_path, scenario, cfg)
+    assert run.state is AgentState.STALLED
+    assert run.last_error == "context overflow"
+    assert len(_session_posts(fake)) == 1 and len(_prompts(fake)) == 1
+
+
+def test_an_overflow_with_an_unreadable_tree_is_a_clean_stall(tmp_path, monkeypatch, caplog):
+    """`_dirty_tree` raising `TreeReadError`: the read error does not raise into
+    the run — no fresh session, the "no work" stall, and the reason on the log."""
+    caplog.set_level(logging.WARNING, logger="tools.contest.runner")
+
+    def unreadable(ws):
+        raise TreeReadError("git status in /wt/agent-a exited 128: not a git repository")
+
+    monkeypatch.setattr("tools.contest.runner._dirty_tree", unreadable)
+    scenario = {"turns": [{"events": ["busy"], "error": _OVERFLOW}]}
+    sb, fake, _h, run, _ = _run_one(tmp_path, scenario, _stall_config())
+    assert run.state is AgentState.STALLED
+    assert run.last_error == "context overflow with no uncommitted work"
+    assert run.commit is None
+    assert len(_session_posts(fake)) == 1
+    assert _runner_has(caplog, "tree unreadable")
+
+
+def test_a_non_overflow_session_error_is_error_as_before(tmp_path):
+    """`name: "SomeOtherError"`: today's path byte for byte — ERROR with the
+    payload, one session, one prompt, no retry even though retries are
+    configured (it is not retryable)."""
+    cfg = _make_retry_config()
+    scenario = {"turns": [{"events": ["busy"],
+                           "error": {"name": "SomeOtherError", "message": "boom-98"}}]}
+    sb, fake, _h, run, _ = _run_one(tmp_path, scenario, cfg)
+    assert run.state is AgentState.ERROR
+    assert "boom-98" in run.last_error
+    assert not run.last_error.startswith("after ")
+    assert len(_session_posts(fake)) == 1 and len(_prompts(fake)) == 1
+    assert run.turns[0]["idle_status"] == "error"
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -17,6 +17,8 @@ Per agent, `run_agent` walks the states in order:
     WAITING → STALLED  (turn timeout, silence, a third question — abort sent)
     WAITING → ERROR    (session.error, the stream closed, retries exhausted)
     CREATED → ERROR    (POST /session refused)
+    WAITING → PROMPTED (context overflow with uncommitted work: a fresh session, KC-54)
+    WAITING → STALLED  (context overflow with nothing left to carry on — KC-54)
 
 After every transition `on_transition(run)` fires — `run_round` writes
 `state.json` there — and one line per turn goes to `out_dir/<agent>/turns.jsonl`.
@@ -53,6 +55,17 @@ run as READY with the note `<sha12> after <the turn's error>`, and a REWORK
 verdict keeps the state the turn earned — no rework prompt, the session is gone.
 A branch with no commit above the base keeps today's path byte for byte: no
 harvest, no pytest, `commit: null`.
+
+A `session.error` that is a context overflow (KC-54, round 98) is neither
+retried nor scored as-is: a prompt into a full session overflows again, so the
+worktree's uncommitted edits are carried into a *fresh* session with
+`round_prompt(dirty=)` — KC-22's `--resume` prompt, which is what a session
+that has never seen the ticket needs — inside the attempt's continue budget.
+The turn that overflowed is recorded with the old `session_id` before the
+replacement is made. A clean overflow, or one that has spent the budget, is a
+`STALLED` turn rather than an `ERROR` and still falls through to KC-21: a
+commit above the base is harvested there and can still end `READY`. Every
+non-overflow `session.error` keeps today's path byte for byte.
 """
 
 from __future__ import annotations
@@ -115,6 +128,14 @@ _RETRYABLE_MSG_RE = re.compile(
     r"429|502|503|504|overloaded|rate limit|timeout", re.IGNORECASE
 )
 
+#: KC-54: a context overflow's payload — the provider's name for it, or either
+#: spelling of the message it carries. The name is in the pattern as well as
+#: the messages, so a payload that is just the string
+#: ``"ContextOverflowError"`` matches too.
+_OVERFLOW_RE = re.compile(
+    r"ContextOverflowError|maximum context length|context_length_exceeded", re.IGNORECASE
+)
+
 
 def _retryable(error) -> bool:
     """True when *error* is a retryable provider error (KC-19).
@@ -140,6 +161,33 @@ def _retryable(error) -> bool:
     if _RETRYABLE_MSG_RE.search(msg):
         return True
     return False
+
+
+def _is_overflow(error) -> bool:
+    """True when *error* is a context overflow (KC-54).
+
+    An overflow has filled the session's context, so a prompt into the *same*
+    session overflows again: the runner opens a fresh session for the work
+    instead of retrying, and a clean tree is a stall rather than a crash.
+    True when ``name`` is ``"ContextOverflowError"``, or when ``data.message``
+    (or a top-level ``message``) carries ``"maximum context length"`` or
+    ``"context_length_exceeded"``. A plain string matches on any of those
+    three. A payload that is not a dict, or carries none of them, is not an
+    overflow — ``None`` and ``{}`` are False.
+    """
+    parts = []
+    if isinstance(error, str):
+        parts.append(error)
+    elif isinstance(error, dict):
+        name = error.get("name")
+        if isinstance(name, str):
+            parts.append(name)
+        data = error.get("data")
+        if isinstance(data, dict) and isinstance(data.get("message"), str):
+            parts.append(data["message"])
+        if isinstance(error.get("message"), str):
+            parts.append(error["message"])
+    return _OVERFLOW_RE.search(" ".join(parts)) is not None
 
 
 def _retry_reason(error) -> str:
@@ -546,7 +594,9 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
               config: ContestConfig, ticket_path: Path, out_dir: Path,
               on_transition: Callable[[AgentRun], None],
               run_tests: bool = False) -> AgentRun:
-    """Drive *run* to a terminal state — single-threaded, one session for every turn.
+    """Drive *run* to a terminal state — single-threaded, one session for every
+    turn; a context overflow opens a fresh one (KC-54), which is the only second
+    ``POST /session`` this function makes.
 
     *backend* is a `ContestBackend` (KC-34): everything this function needs of the
     session — create, prompt, wait, abort, tool history, close — goes through
@@ -701,7 +751,54 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                     error = f"no idle after {config.turn_timeout_sec}s"
                 state = AgentState.STALLED
             elif idle.status == "error":
-                if _retryable(idle.error) and retries_used < int(config.max_error_retries):
+                overflow = _is_overflow(idle.error)
+                if overflow:
+                    # KC-54: the overflow has filled this session's context, so
+                    # a prompt into it overflows again — never RETRY_PROMPT here,
+                    # even when the provider flags the error retryable. The work
+                    # is not lost, though: uncommitted edits go on in a *fresh*
+                    # session, which has never seen the ticket or the round
+                    # prompt, so it gets `round_prompt(dirty=)` (KC-22's
+                    # `--resume` shape) rather than `continue_message`.
+                    budget = int(config.max_continues_per_attempt)
+                    dirty = ""
+                    if _commits_above(ws) == 0:
+                        try:
+                            dirty = _dirty_tree(ws)
+                        except TreeReadError as exc:
+                            # FL-2: a status that could not be read is not "no
+                            # uncommitted work" — say so, and let the stall
+                            # below carry the "no work" reason rather than
+                            # raising into the round.
+                            _log.warning("%s: tree unreadable — %s", spec.name,
+                                         _brief(str(exc)))
+                    if dirty and 0 < budget and continue_used < budget:
+                        # the session that overflowed, before it is replaced:
+                        # `finally` records only the last one, so the old id
+                        # stays findable in turns.jsonl
+                        turn["session_id"] = run.session_id
+                        run.turns.append(turn)
+                        _append_jsonl(agent_dir / "turns.jsonl", {"agent": spec.name, **turn})
+                        try:
+                            session = backend.create_session(
+                                spec.provider_id, spec.model_id, rules=config.session_rules(),
+                                title=ws.branch, agent=spec.kilo_agent, variant=spec.variant)
+                        except (ContestBackendError, ValueError) as exc:
+                            return finish(AgentState.ERROR,
+                                          f"POST /session failed: {_brief(str(exc))}")
+                        run.session_id = session.id
+                        continue_text = round_prompt(spec.name, ticket_path, ws.base_sha,
+                                                    dirty=dirty)
+                        continue_used += 1
+                        continue
+                    # A clean overflow is a model that spent its whole context
+                    # reading and produced nothing — a stall, not a crash. Do
+                    # not `return`: fall through to the KC-21 harvest below,
+                    # which scores a commit the model made and then overflowed
+                    # and can still end READY.
+                    error = "context overflow" + ("" if dirty else " with no uncommitted work")
+                    state = AgentState.STALLED
+                if not overflow and _retryable(idle.error) and retries_used < int(config.max_error_retries):
                     run.turns.append(turn)
                     _append_jsonl(agent_dir / "turns.jsonl", {"agent": spec.name, **turn})
                     retries_used += 1
@@ -731,10 +828,13 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                         return finish(AgentState.STALLED, stalled[0])
                     retry_text = RETRY_PROMPT.format(reason=_retry_reason(idle.error))
                     continue
-                error = f"session.error: {_brief(idle.error)}"
-                if retries_used:
-                    error = f"after {retries_used} retries: {error}"
-                state = AgentState.ERROR
+                if not overflow:
+                    # an overflow already set its own `error` and `state` above;
+                    # this is the fallback for every other `session.error`
+                    error = f"session.error: {_brief(idle.error)}"
+                    if retries_used:
+                        error = f"after {retries_used} retries: {error}"
+                    state = AgentState.ERROR
             elif idle.status == "closed":
                 error, state = f"event stream closed: {_brief(idle.error)}", AgentState.ERROR
             elif idle.status == "idle":
