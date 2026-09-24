@@ -1,126 +1,143 @@
 # KC-54 — A context overflow with uncommitted work continues in a fresh session; a clean overflow is a stall
 
-**Status:** open — found live 2026-09-24 in round 91: `step-3-7-flash` filled its context on the rework attempt (`ContextOverflowError`), leaving 356 lines of uncommitted changes in `kilo_client.py`, `runner.py` and `tests/test_contest_kilo_client.py`. The runner marked it `ERROR` and stopped. The work was not lost but was also not recovered. A `ContextOverflowError` on a clean worktree means the model spent the whole context reading without producing anything — that is a stall, not a crash.
-**Severity:** HIGH — a model that fills context mid-rework loses all its work with no recovery path.
+**Status:** queued — found live 2026-09-24 in round 91 (base `58e20e5`). Five of the round's twelve agents ended in `ContextOverflowError`, and the runner marked each one `ERROR` and stopped. Three still had uncommitted work: `step-3-7-flash` with 356 lines on its rework attempt (`kilo_client.py`, `runner.py`, `tests/test_contest_kilo_client.py`), `glm-4-7-flash` with 31 lines and `hy3` with 18. Two of them, `laguna-s-2-1` and `nex-n2-5-pro`, had clean worktrees. The work was not lost, but it was not recovered either. A `ContextOverflowError` on a clean worktree means the model spent its whole context reading and produced nothing. That is a stall, not a crash.
+**Severity:** HIGH (a model that fills its context mid-turn loses all its work, with no recovery path; five of twelve entries in round 91)
 **File:** `tools/contest/runner.py`
-**Symbol:** the `session.error` branch (~line 698), `_overflow_continue_message` (new), `_is_overflow` (new)
+**Symbol:** `run_agent` (the `idle.status == "error"` branch, ~line 667), `_is_overflow` (new)
 **Round:** 98
 **Size:** S
-**Source:** round 91 live observation (base `58e20e5`, `step-3-7-flash`, `ContextOverflowError` on rework attempt 1).
-**Depends on:** nothing — `_dirty_tree`, `_commits_above`, `_brief` are already present.
+**Source:** round 91, `contest-out/91/state.json` (`last_error` of the five agents) and `git status` in `rounds/91-*`.
+**Depends on:** KC-22 (`continue_message`, `round_prompt(..., dirty=)`, `max_continues_per_attempt`), KC-21 (the harvest of a commit under a dead turn). `_dirty_tree`, `_commits_above`, `_brief` and `TreeReadError` are already in the tree.
 **Also touches:** `tests/test_contest_runner.py`
 
 ---
 
 ## What happens today
 
-In `run_agent`, when `wait_idle` returns `status == "error"` and `_retryable`
-returns `False`, the runner does:
+`run_agent` opens **one** session at `CREATED` and sends every later turn
+(`retry`, `rework`, `continue`) into that same session with
+`backend.prompt(session, text)`. When `wait_idle` returns
+`status == "error"` and `_retryable` returns `False`, the runner does this:
 
 ```python
 error = f"session.error: {_brief(idle.error)}"
 state = AgentState.ERROR
 ```
 
-A `ContextOverflowError` reaches this branch — it is not retryable, it is not
-a stall, it is not a closed stream. The agent is marked `ERROR` and the loop
-exits. Any uncommitted changes in the worktree are ignored (the KC-21 harvest
-below only runs when there is a commit above the base).
+A `ContextOverflowError` reaches this branch. It is not retryable, not a stall
+and not a closed stream. The agent is marked `ERROR`. The KC-21 block below it
+harvests only a commit above the base, so uncommitted changes are ignored.
+
+A `continue` sent into the **same** session cannot help. That session's context
+is already full, so the next prompt overflows again.
 
 ## What must change
 
-Add one guard before the generic `session.error` assignment, still inside the
-`status == "error"` branch:
+### 1. `_is_overflow(error) -> bool`
 
-1. **`_is_overflow(error) -> bool`** — returns `True` when the error payload's
-   `name` is `"ContextOverflowError"` or its `data.message` / `message` field
-   contains `"context length"` or `"context_length_exceeded"`. Mirrors the
-   shape of `_retryable`.
+This is a module-level function, shaped like `_retryable`. It returns `True`
+when either of these holds:
+- the payload's `name` is `"ContextOverflowError"`;
+- its `data.message` (or top-level `message`) contains `"maximum context length"`
+  or `"context_length_exceeded"`.
 
-2. **`_overflow_continue_message(dirty: str) -> str`** — a module-level string
-   function parallel to `continue_message`. Text:
+A plain string matches when it contains any of those three. `None`, `{}` and
+other shapes are `False`.
 
-   > Your session ran out of context before you could commit. Your changes are
-   > still in the worktree:
-   > `<indented dirty lines, same cap as continue_message>`
-   > Start fresh: run the tests against what is already there, fix any
-   > failures, then `git add` and commit exactly one commit. Do not discard
-   > these files and do not start over from scratch.
+### 2. In the `status == "error"` branch, before the `_retryable` check
 
-3. **In the `status == "error"` branch**, before the generic assignment:
+The overflow check goes **first**. An overflow must never be sent to
+`RETRY_PROMPT` in the same full session, even when a provider flags it as
+retryable.
 
-   ```python
-   if _is_overflow(idle.error):
-       dirty = ""
-       if _commits_above(ws) == 0:
-           try:
-               dirty = _dirty_tree(ws)
-           except TreeReadError:
-               pass
-       if dirty:
-           # Real work exists — continue in a new session with the diff.
-           continue_text = _overflow_continue_message(dirty)
-           continue_used += 1
-           run.turns.append(turn)
-           _append_jsonl(agent_dir / "turns.jsonl",
-                         {"agent": spec.name, **turn})
-           continue  # top of loop: new session, carry continue_text
-       else:
-           # Nothing was produced — treat as a stall, not a crash.
-           run.turns.append(turn)
-           _append_jsonl(agent_dir / "turns.jsonl",
-                         {"agent": spec.name, **turn})
-           return finish(AgentState.STALLED,
-                         "context overflow with no uncommitted work")
-   ```
+```python
+if _is_overflow(idle.error):
+    budget = int(config.max_continues_per_attempt)
+    dirty = ""
+    if _commits_above(ws) == 0:
+        try:
+            dirty = _dirty_tree(ws)
+        except TreeReadError as exc:
+            _log.warning("%s: tree unreadable — %s", spec.name, _brief(str(exc)))
+    if dirty and 0 < budget and continue_used < budget:
+        run.turns.append(turn)
+        _append_jsonl(agent_dir / "turns.jsonl", {"agent": spec.name, **turn})
+        # a fresh session: the old one's context is full
+        try:
+            session = backend.create_session(
+                spec.provider_id, spec.model_id, rules=config.session_rules(),
+                title=ws.branch, agent=spec.kilo_agent, variant=spec.variant)
+        except (ContestBackendError, ValueError) as exc:
+            return finish(AgentState.ERROR, f"POST /session failed: {_brief(str(exc))}")
+        run.session_id = session.id
+        continue_text = round_prompt(spec.name, ticket_path, ws.base_sha, dirty=dirty)
+        continue_used += 1
+        continue
+    error = "context overflow" + ("" if dirty else " with no uncommitted work")
+    state = AgentState.STALLED
+```
 
-No other changes. The existing `session.error` path handles every non-overflow
-error exactly as before.
+The rules for this branch:
+- **The new session gets `round_prompt(..., dirty=dirty)`, not `continue_message`.**
+  A new session has not seen the ticket or the round prompt.
+  `round_prompt(dirty=)` already exists for exactly this case (KC-22,
+  `--resume`), and it appends the `continue_message` paragraph. Write no new
+  message function.
+- **Budget.** The continue budget of the attempt caps the fresh sessions, as
+  it caps the KC-22 continues. A model that overflows again after the budget
+  is spent ends as `STALLED`, and the loop cannot run forever.
+- **Do not `return` on the stall.** Set `error` and `state` and fall through to
+  the existing `if state is not None:` block. A commit above the base, where
+  the model committed and then overflowed, is harvested there by KC-21 and
+  can still end `READY`. A direct `return finish(...)` would skip that harvest.
+- **Record the old session.** The `finally` block records only the last
+  `session`. Before it is replaced, add `turn["session_id"] = run.session_id`,
+  the old id, to the turn that overflowed. That keeps the old session
+  findable in `turns.jsonl`.
+
+No other change. Every non-overflow `session.error` takes today's path
+unchanged.
 
 ## Acceptance
 
-- [ ] `tests/test_contest_runner.py` — use the existing fake infrastructure:
+- [ ] `tests/test_contest_runner.py`, on the existing fake backend:
+  - **overflow, dirty tree:** the fake emits `session.error` with `name: "ContextOverflowError"`, and the worktree holds an uncommitted file. Expect:
+    - `create_session` is called a **second** time;
+    - the next prompt goes to the **new** session and contains the dirty-tree lines;
+    - the overflowed turn in `turns.jsonl` carries the old `session_id`;
+    - `run.session_id` is the new one.
+  - **overflow, clean tree, no commit:** → `STALLED`, `error == "context overflow with no uncommitted work"`, one `create_session` call.
+  - **overflow with a commit above the base:** → the KC-21 harvest runs. A READY-shaped commit ends `READY`, not `STALLED`.
+  - **overflow, dirty tree, budget spent** (`max_continues_per_attempt = 1`, overflow twice) → `STALLED` after the second overflow, and `create_session` is called twice in total.
+  - **`max_continues_per_attempt = 0`**, dirty tree → `STALLED`, no second session.
+  - **non-overflow `session.error`** (`name: "SomeOtherError"`) → `ERROR`, as before.
+- [ ] `_is_overflow` returns `True` for each of these:
+  - `{"name": "ContextOverflowError", "data": {"message": "..."}}`;
+  - `{"name": "Other", "data": {"message": "the request exceeds the model's maximum context length"}}`;
+  - the string `"ContextOverflowError"`.
 
-  - **`test_overflow_with_dirty_tree`**: fake emits `session.error` with
-    `name: "ContextOverflowError"`, worktree has an uncommitted file → the
-    runner records the turn, increments `continue_used`, and loops (does not
-    return `ERROR` or `STALLED`); the next prompt contains the dirty-tree
-    lines from `_overflow_continue_message`.
-
-  - **`test_overflow_with_clean_tree`**: same error, worktree is clean (no
-    diff) → runner returns `AgentState.STALLED`, not `ERROR`.
-
-  - **`test_non_overflow_error_unchanged`**: a non-overflow `session.error`
-    (e.g. `name: "SomeOtherError"`) → runner returns `AgentState.ERROR` as
-    before (existing behaviour, confirm it is not broken).
-
-- [ ] `_is_overflow` returns `True` for:
-  - `{"name": "ContextOverflowError", "data": {"message": "..."}}`
-  - `{"name": "Other", "data": {"message": "the request exceeds the model's maximum context length"}}`
-  - a raw string `"ContextOverflowError"` (for forward compat with `_brief`-truncated payloads)
-
-  and `False` for `None`, `{}`, a retryable network error.
-
-- [ ] Every existing test in `tests/test_contest_runner.py` unmodified and green.
+  It returns `False` for `None`, `{}` and a retryable network error.
+- [ ] Every existing test in `tests/test_contest_runner.py` passes unmodified.
 - [ ] `python3 -m pytest tests -n 4 -q --timeout=180` then
-  `python3 -m pytest tests_bugfix -n 4 -q --timeout=180`, sequentially, both green.
+  `python3 -m pytest tests_bugfix -n 4 -q --timeout=180`, run one after the other; both green.
 - [ ] `python3 scripts/sync_test_tiers.py --check` is clean.
 
 ## Out of scope
 
 - KC-40's summary prompt (asking the model to describe its work before overflow).
   That fires *before* the overflow; this ticket handles *after*.
-- Any change to `_retryable`, `RETRY_PROMPT`, or the retry counter.
-- Harvesting a partial commit (already handled by KC-21).
+- Any change to `_retryable`, `RETRY_PROMPT` or the retry counter.
+- Carrying the rework reasons into the fresh session. The next harvest reports
+  them again.
 
 ## Self-check before `append_task.py`
 
-- [ ] `python3 --version` is **3.10.12**; `python3 -c "import tools.contest.runner"` clean.
-- [ ] Exactly **one** commit above the base; only this ticket's work.
+- [ ] `python3 --version` is **3.10.12**, and `python3 -c "import tools.contest.runner"` runs clean.
+- [ ] Exactly **one** commit above the base, holding only this ticket's work.
 - [ ] `git diff --stat <base>..HEAD` names only `tools/contest/runner.py` and
   `tests/test_contest_runner.py` (plus `.smoke_tests/` links). Never `epic-tasks/`.
 - [ ] `python3 scripts/sync_test_tiers.py --check` is clean.
-- [ ] New tests are red without the change.
+- [ ] The new tests are red without the change.
 - [ ] `CollectBridge._shrink` byte-identical.
 - [ ] `scripts/append_task.py` from the worktree with the sha of the one commit.
 
