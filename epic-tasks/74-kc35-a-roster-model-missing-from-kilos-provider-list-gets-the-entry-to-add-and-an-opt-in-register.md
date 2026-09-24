@@ -1,6 +1,6 @@
 # KC-35 — A roster model that is missing from Kilo's provider list is named with the entry to add, and `--register-missing` registers it for the round
 
-**Status:** open — found 2026-09-21 running round 64 (KC-25's own contest): `agnes-3-0-flash:free` and `nex-n2-5-pro:free` both ended `ERROR` 10 s after the prompt, 2 of 8 slots lost. Third time the same failure is recorded (RUNBOOK round 1, round 52/58 in KC-25's Source, now round 64).  
+**Status:** queued — found 2026-09-21 running round 64 (KC-25's own contest): `agnes-3-0-flash:free` and `nex-n2-5-pro:free` both ended `ERROR` 10 s after the prompt, 2 of 8 slots lost. Third time the same failure is recorded (RUNBOOK round 1, round 52/58 in KC-25's Source, now round 64).  
 **Severity:** MEDIUM  
 **File:** `tools/contest/cli.py` (`intake`, `_start_server`, `_parser`, `_print_plan`), `tools/contest/kilo_client.py` (`KiloServer.spawn`)  
 **Symbol:** `KiloServer.spawn(env=…)`, `roster_missing` (new), `registration_overlay` (new), `merge_config_content` (new), `--register-missing`  

@@ -1,6 +1,6 @@
 # KC-36 — a turn that is still changing files extends its own deadline instead of being killed at `turn_timeout_sec`
 
-**Status:** open — found live on 2026-09-21 in round 64 (`contest-out/64/`), where the 1800 s turn clock killed the four agents that were working and let the one that was stuck run on.
+**Status:** queued — found live on 2026-09-21 in round 64 (`contest-out/64/`), where the 1800 s turn clock killed the four agents that were working and let the one that was stuck run on.
 **Severity:** HIGH (a round loses its best entries to a constant, and the operator reads `STALLED` for an agent that had 400 lines written)
 **File:** `tools/contest/kilo_client.py`, `tools/contest/runner.py`, `tools/contest/roster.py`, `contest.ini`
 **Symbol:** `KiloClient.wait_idle`, `_wait_turn`, `run_agent`, `_churn`, `_turn_deadline`, `ContestConfig.turn_extend_sec`, `ContestConfig.turn_max_sec`

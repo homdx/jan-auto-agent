@@ -1,6 +1,6 @@
 # KC-55 — the gate rides out a rate limit: a 429 or a dropped call is retried inside a bounded wait, and intake says when the gate shares an endpoint with the roster
 
-**Status:** queued — found live 2026-09-24 in round 66 (base `01e7a40`, 12 agents, 8 of them on `kenary`); asked by the operator the same day. Takes over KC-37 §1 (see "KC-37" below).
+**Status:** open — found live 2026-09-24 in round 66 (base `01e7a40`, 12 agents, 8 of them on `kenary`); asked by the operator the same day. Takes over KC-37 §1 (see "KC-37" below).
 **Severity:** HIGH (in nine recorded rounds the gate answered 4 times out of 52 calls: 48 `gate-failed` rejects, 4 `gate` verdicts; see the table)
 **File:** `tools/contest/policy.py`, `tools/contest/roster.py`, `tools/contest/cli.py`, `contest.ini`
 **Symbol:** `Policy._ask_gate`, `Policy._default_completion`, `Policy.__init__`, `Policy.record`, `Decision`, `ContestConfig` (four new `gate_*` fields), `gate_worst_case_sec` (new), `_build`, `intake`, `_check_offer`, `_print_plan`

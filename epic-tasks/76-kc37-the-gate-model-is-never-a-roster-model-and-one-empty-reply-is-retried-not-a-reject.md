@@ -1,6 +1,6 @@
 # KC-37 — the safety gate never runs on a model the round is competing, and one empty reply is retried instead of becoming a `reject`
 
-**Status:** open — found live on 2026-09-21 in round 64, where the gate was `hy3:free` and `hy3` was agent 4 of 8.
+**Status:** queued — found live on 2026-09-21 in round 64, where the gate was `hy3:free` and `hy3` was agent 4 of 8.
 **Severity:** MEDIUM (a gate that answers nothing rejects the agent's work, and a gate sharing a model with the roster fails exactly when the round is busiest)
 **File:** `tools/contest/policy.py`, `tools/contest/cli.py`, `tools/contest/roster.py`
 **Symbol:** `Policy._ask_gate`, `GATE_RETRIES`, `intake`, `_apply_flags`, `ContestConfig.gate_settings`
