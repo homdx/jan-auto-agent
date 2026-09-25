@@ -180,7 +180,7 @@ def test_both_backends_satisfy_the_protocol_at_runtime(tmp_path):
 
 def test_the_protocol_names_every_method_a_backend_has_to_own():
     """A method dropped from a backend shows up here, not on the first round."""
-    required = {"wait_ready", "create_session", "prompt", "abort", "interrupt",
+    required = {"wait_ready", "create_session", "prompt", "mark", "abort", "interrupt",
                 "interrupted", "wait_idle", "tool_parts", "session_info",
                 "messages", "close"}
     protocol_methods = {name for name in dir(ContestBackend) if not name.startswith("_")}
@@ -236,7 +236,7 @@ class _RecordingClient:
         return []
 
     def wait_idle(self, tap, session, timeout, *, idle_event_timeout=None,
-                  on_permission, on_question):
+                  on_permission, on_question, since=None):
         self.calls.append(("wait_idle", tap, session, timeout, idle_event_timeout))
         return IdleResult(status="idle")
 

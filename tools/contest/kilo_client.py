@@ -95,6 +95,40 @@ _SESSION_EVENTS = (
     "question.v2.asked",
 )
 
+
+def _is_busy(event: dict) -> bool:
+    """KC-63: a sign the session started working on a prompt.
+
+    ``session.status`` busy in either shape (the fake sends
+    ``"busy"``, live Kilo ``{"type": "busy"}``) or a ``session.turn.open``.
+    """
+    etype = event.get("type")
+    if etype == "session.turn.open":
+        return True
+    if etype != "session.status":
+        return False
+    status = (event.get("properties") or {}).get("status")
+    if isinstance(status, dict):
+        status = status.get("type")
+    return status == "busy"
+
+
+def _skip_stale(tap: "EventTap", session_id: str, since: int) -> int:
+    """KC-63: move *tap* past *since*; how many skipped events could have
+    ended or steered this session's wait.
+
+    Only this session's :data:`_SESSION_EVENTS` count: the ``session.created``
+    or a neighbour's traffic that sits before every first prompt is skipped
+    too, but it is not an earlier turn's leftover. One wait reads a tap at a
+    time, and ``events`` only grows, so the slice is the skipped events.
+    """
+    start = tap.cursor
+    skipped = tap.skip_to(since)
+    return sum(1 for event in tap.events[start:start + skipped]
+               if event.get("type") in _SESSION_EVENTS
+               and (event.get("properties") or {}).get("sessionID") == session_id)
+
+
 _VERSION_RE = re.compile(r"(\d+)\.(\d+)(?:\.(\d+))?")
 
 #: How long one read of the event stream may block. The stream never ends on
@@ -215,6 +249,9 @@ class IdleResult:
     questions: list = field(default_factory=list)
     elapsed: float = 0.0
     open_tool: dict | None = None
+    #: KC-63: this session's idle/error/permission/question events that the
+    #: ``since`` mark skipped (0 without one)
+    stale_skipped: int = 0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -681,6 +718,29 @@ class EventTap:
             if pred(event):
                 return event
 
+    def mark(self) -> int:
+        """KC-63: how many events this tap holds right now.
+
+        Taken right *before* a prompt is sent: every event at an index below
+        it was recorded before the prompt existed, so it belongs to an
+        earlier turn.
+        """
+        with self._cond:
+            return len(self.events)
+
+    def skip_to(self, mark: int) -> int:
+        """KC-63: move the cursor forward to *mark*, never backward.
+
+        Returns how many unread events were skipped, so the caller can
+        record them. The skipped events stay in ``self.events`` and in
+        ``events.jsonl``; they are only never handed to ``wait`` again.
+        """
+        with self._cond:
+            target = max(self.cursor, min(int(mark), len(self.events)))
+            skipped = target - self.cursor
+            self.cursor = target
+            return skipped
+
     def stop(self) -> "EventTap":
         """Ask the reader to finish. Any number of times, even before start.
 
@@ -1087,7 +1147,8 @@ class KiloClient:
                   idle_event_timeout: float | None = None,
                   on_permission: Callable[[dict], tuple],
                   on_question: Callable[[dict], None],
-                  on_deadline: Callable[[float], float | None] | None = None) -> IdleResult:
+                  on_deadline: Callable[[float], float | None] | None = None,
+                  since: int | None = None) -> IdleResult:
         """Block until this session goes idle, answering on the way.
 
         The probe's ``wait_idle`` with the decisions delegated:
@@ -1145,7 +1206,21 @@ class KiloClient:
         that abort (the session is already gone) is logged, not raised. A
         failure of the reply itself is logged and skipped — the session then
         reaches the timeout like any other, which is the only honest outcome.
+
+        ``since`` (KC-63) is a :meth:`EventTap.mark` taken right before the
+        prompt this wait belongs to. Every unread event before it is skipped
+        and never examined: it is an earlier turn's. ``IdleResult.stale_skipped``
+        counts the skipped ones of this session that a wait acts on (an idle,
+        an error, a permission, a question). Omitted, nothing is skipped and
+        the wait is as before.
         """
+        # KC-63: events recorded before the prompt this wait belongs to are
+        # an earlier turn's. Kilo sends two session.idle after a
+        # session.error (round 106, mimo-v2-5), and the next turn read them
+        # as its own end.
+        stale = _skip_stale(tap, session.id, since) if since is not None else 0
+        # KC-63, diagnostic only: did this session go busy in this wait?
+        saw_busy = False
         started = time.monotonic()
         deadline = started + float(timeout)
         session_id = session.id
@@ -1162,6 +1237,7 @@ class KiloClient:
         questions: list = []
 
         def wanted(event: dict) -> bool:
+            nonlocal saw_busy
             etype = event.get("type")
             if etype == "tap.closed":
                 # a tap-level event: it has no sessionID, and it applies to
@@ -1169,6 +1245,10 @@ class KiloClient:
                 return True
             if (event.get("properties") or {}).get("sessionID") != session_id:
                 return False
+            if not saw_busy and _is_busy(event):
+                # KC-63: noted here, before the filter, so it is seen with the
+                # silence clock off too; it changes no result
+                saw_busy = True
             # with the silence clock on, every event of this session wakes the
             # wait: the ones acted on below are handled, the rest only reset
             # the clock — a `session.status busy` or a `file.edited` is the
@@ -1205,7 +1285,7 @@ class KiloClient:
                 open_tool = _open_tool_report(open_parts, now) if quiet else None
                 return IdleResult(status="timeout", elapsed=time.monotonic() - started,
                                   permissions=permissions, questions=questions,
-                                  open_tool=open_tool)
+                                  open_tool=open_tool, stale_skipped=stale)
             event = tap.wait(wanted, left)
             if event is None:
                 continue
@@ -1243,14 +1323,19 @@ class KiloClient:
             if etype == "session.error":
                 return IdleResult(status="error", error=props.get("error", props),
                                   elapsed=elapsed, permissions=permissions,
-                                  questions=questions)
+                                  questions=questions, stale_skipped=stale)
             if etype == "tap.closed":
                 return IdleResult(status="closed", error=props.get("error"),
                                   elapsed=elapsed, permissions=permissions,
-                                  questions=questions)
+                                  questions=questions, stale_skipped=stale)
             if etype != "session.idle":
                 # only with the silence clock on: an event of this session
                 # that reset it and asks for nothing
                 continue
+            if not saw_busy:
+                # KC-63, diagnostic only: how the next variant of a stale idle
+                # gets noticed. The result does not change.
+                _log.warning("%s: idle without busy after %.1fs", session_id, elapsed)
             return IdleResult(status="idle", elapsed=elapsed,
-                              permissions=permissions, questions=questions)
+                              permissions=permissions, questions=questions,
+                              stale_skipped=stale)

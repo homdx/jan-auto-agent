@@ -34,6 +34,8 @@ Everything here is scripted by one scenario dict, per session:
                                      # nothing — a stalled turn (KC-12)
                 "idle": false,       # never go idle (a stalled turn)
                 "error": {...},      # session.error instead of idle
+                "idles_after_error": 2,  # KC-63: that many session.idle after
+                                     # the session.error, as Kilo 7.6.2 sends
                 "message_info": {...},  # merged into the assistant message's info
                                      # (KC-56: `finish`, `tokens`)
             },
@@ -573,6 +575,11 @@ class FakeKiloServer:
             session.info["error"] = error
             self._emit({"type": "session.error",
                         "properties": {"sessionID": session.id, "error": error}})
+            # KC-63: Kilo 7.6.2 follows a session.error with session.idle
+            # events for the same session (two for mimo-v2-5 in round 106)
+            for _ in range(int(turn.get("idles_after_error") or 0)):
+                self._emit({"type": "session.idle",
+                            "properties": {"sessionID": session.id}})
             return
 
         parts = [_tool_part(p) for p in (turn.get("tool_parts") or [])]

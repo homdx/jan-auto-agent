@@ -1780,6 +1780,36 @@ def test_interrupted_stream_error_reprompts_same_session_and_recovers(tmp_path, 
     assert len(_jsonl(sb.out_dir / "agent-a" / "turns.jsonl")) == 2
 
 
+
+def _work_ready_late(directory, text):
+    """KC-63: the retry's work lands after the leftover idles are in the tap,
+    so a wait that read one of them as its own end would see no commit."""
+    time.sleep(0.5)
+    work_ready(directory, text)
+
+
+def test_a_retry_after_an_error_waits_for_its_own_idle(tmp_path):
+    """KC-63, round 106's mimo-v2-5: a `session.error` followed by two
+    `session.idle`. The retry ends on its own idle, records the two it
+    skipped, and no `continue` is sent in between. Without the mark the retry
+    ended in 0.15 s on the first leftover idle."""
+    scenario = {"turns": [
+        {"events": ["busy"], "error": dict(_INTERRUPTED_STREAM), "idles_after_error": 2},
+        {"on_prompt": _work_ready_late, "events": ["busy", "idle"]},
+    ]}
+    sb, fake, _h, run, _ = _run_one(tmp_path, scenario, _make_retry_config())
+    _assert_ready(run, sb.ws("agent-a"))
+    assert [t["kind"] for t in run.turns] == ["initial", "retry"]
+    assert run.turns[0]["idle_status"] == "error"
+    assert "stale_events" not in run.turns[0]
+    assert run.turns[1]["idle_status"] == "idle"
+    assert run.turns[1]["stale_events"] == 2
+    assert len(_prompts(fake)) == 2
+    turns = _jsonl(sb.out_dir / "agent-a" / "turns.jsonl")
+    assert [t.get("stale_events") for t in turns] == [None, 2]
+    assert sum(1 for t in turns if t.get("harvest")) == 1
+
+
 def test_upstream_unavailable_reprompts_same_session_and_recovers(tmp_path):
     """§1: Kilo's stream-log text is the same class once it reaches
     `session.error`, so it is retried too."""
@@ -3531,6 +3561,25 @@ def test_wait_turn_passes_on_deadline_only_when_extension_is_armed(tmp_path):
     assert backend.calls[0]["timeout"] == 600.0
     assert backend.calls[0]["idle_event_timeout"] is None
     assert backend.calls[1]["on_deadline"] is clock.on_deadline
+
+
+
+def test_mark_is_optional_on_a_backend(tmp_path):
+    """KC-63: a backend without `mark` (this one) still runs a turn, and
+    `since` goes over only when there is a mark to pass."""
+    backend = _RecordingBackend()
+    assert not hasattr(backend, "mark")
+    cfg = make_config(["agent-a"], turn_timeout_sec=600, idle_event_timeout_sec=0)
+    session = SessionRef(id="ses_one", provider_id="kenary", model_id="hy3:free",
+                         directory="/nowhere", agent="agent-a")
+    common = dict(on_permission=lambda event: ("once", ""), on_question=lambda event: None)
+
+    assert _runner_module._wait_turn(backend, session, cfg, **common).status == "idle"
+    _runner_module._wait_turn(backend, session, cfg, since=None, **common)
+    _runner_module._wait_turn(backend, session, cfg, since=7, **common)
+    assert "since" not in backend.calls[0]
+    assert "since" not in backend.calls[1]
+    assert backend.calls[2]["since"] == 7
 
 
 def test_turn_extend_sec_zero_never_passes_on_deadline(tmp_path):

@@ -210,6 +210,90 @@ def test_turn_one_idle_is_not_turn_two_idle(tmp_path):
         assert len(h.client.messages(h.session)) == 4  # user + assistant, twice
 
 
+
+# KC-63 (round 106, mimo-v2-5): Kilo follows a session.error with two
+# session.idle for the same session. The next turn's wait must not read them.
+_ERROR_THEN_TURN = {"turns": [
+    {"error": "UnknownError", "idles_after_error": 2},
+    {"events": ["busy", "file.edited", "idle"], "assistant": "done", "delay": 0.6},
+]}
+
+
+def _error_then_leftovers(h):
+    """Turn 1 errors; returns once both leftover idles sit in the tap."""
+    h.client.prompt(h.session, "first")
+    res1 = h.client.wait_idle(h.tap, h.session, 60.0, on_permission=_reject,
+                              on_question=lambda event: None)
+    assert res1.status == "error"
+    assert res1.stale_skipped == 0
+    deadline = time.monotonic() + 30
+    while len(h.fake.events_of("session.idle")) < 2 and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert len(h.fake.events_of("session.idle")) == 2
+    # the tap has to hold them too, not only the fake
+    while (sum(1 for e in list(h.tap.events) if e.get("type") == "session.idle") < 2
+           and time.monotonic() < deadline):
+        time.sleep(0.02)
+
+
+def test_a_turn_does_not_end_on_the_idles_left_after_an_error(tmp_path):
+    """With a mark taken before prompt 2, its wait skips the two leftover
+    idles and ends on turn 2's own idle, held back 0.6 s."""
+    with _probe(tmp_path, _ERROR_THEN_TURN) as h:
+        _error_then_leftovers(h)
+        since = h.tap.mark()
+        h.client.prompt(h.session, "retry")
+        res2 = h.client.wait_idle(h.tap, h.session, 60.0, on_permission=_reject,
+                                  on_question=lambda event: None, since=since)
+        assert res2.status == "idle"
+        assert res2.elapsed >= 0.55
+        assert res2.stale_skipped == 2
+        assert len(h.fake.events_of("session.idle")) == 3
+
+
+def test_without_since_the_leftover_idle_still_ends_the_wait(tmp_path):
+    """The default path is unchanged: no mark, the first leftover idle ends
+    the wait at once. This is also what makes the test above a real catch."""
+    with _probe(tmp_path, _ERROR_THEN_TURN) as h:
+        _error_then_leftovers(h)
+        h.client.prompt(h.session, "retry")
+        res2 = h.client.wait_idle(h.tap, h.session, 60.0, on_permission=_reject,
+                                  on_question=lambda event: None)
+        assert res2.status == "idle"
+        assert res2.elapsed < 0.55
+        assert res2.stale_skipped == 0
+
+
+def test_skip_to_never_moves_the_cursor_backward(tmp_path):
+    """A mark below the cursor is a no-op, never a replay; a mark past the
+    end stops at the end."""
+    tap = EventTap("http://127.0.0.1:9", str(tmp_path), str(tmp_path / "events.jsonl"))
+    tap.events.extend({"type": "session.idle", "properties": {}} for _ in range(3))
+    assert tap.mark() == 3
+    assert tap.wait(lambda e: True, 0) is not None
+    assert tap.cursor == 1
+    assert tap.skip_to(0) == 0
+    assert tap.cursor == 1
+    assert tap.skip_to(10**9) == 2
+    assert tap.cursor == 3
+    assert tap.skip_to(3) == 0
+
+
+def test_an_idle_without_busy_is_logged_and_not_changed(tmp_path, caplog):
+    """KC-63 diagnostic: a turn that idles without going busy logs one
+    warning, and its result is the plain idle it always was."""
+    scenario = {"turns": [{"events": ["idle"], "assistant": "done"}]}
+    caplog.set_level(logging.WARNING, logger="tools.contest.kilo_client")
+    with _probe(tmp_path, scenario) as h:
+        h.client.prompt(h.session, "first")
+        res = h.client.wait_idle(h.tap, h.session, 60.0, on_permission=_reject,
+                                 on_question=lambda event: None)
+    assert res.status == "idle"
+    assert res.stale_skipped == 0
+    lines = [r.getMessage() for r in caplog.records if "idle without busy" in r.getMessage()]
+    assert len(lines) == 1 and lines[0].startswith(h.session.id)
+
+
 def test_wait_idle_sees_only_its_own_session(tmp_path):
     """Events for a different session in the same directory are not ours."""
     scenario = {"turns": [

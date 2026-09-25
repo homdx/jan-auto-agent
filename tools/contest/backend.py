@@ -158,6 +158,11 @@ class ContestBackend(Protocol):
 
     def prompt(self, session: SessionRef, text: str) -> None: ...
 
+    def mark(self) -> int | None:
+        """KC-63: a position in this backend's event stream, taken before a
+        prompt; ``None`` when the backend has no shared stream."""
+        ...
+
     def abort(self, session: SessionRef) -> None:
         """Ask the session to stop its turn.
 
@@ -187,7 +192,8 @@ class ContestBackend(Protocol):
                   idle_event_timeout: float | None = None,
                   on_permission: Callable[[dict], tuple],
                   on_question: Callable[[dict], None],
-                  on_deadline: Callable[[float], float | None] | None = None) -> IdleResult:
+                  on_deadline: Callable[[float], float | None] | None = None,
+                  since: int | None = None) -> IdleResult:
         """Block until this session goes idle, answering on the way.
 
         ``timeout`` bounds the whole wait, ``idle_event_timeout`` the silence.
@@ -202,6 +208,9 @@ class ContestBackend(Protocol):
         by that much, anything else aborts exactly as without it. ``None`` —
         the default, and every pre-KC-36 caller — asks nothing and aborts at
         ``timeout``.
+
+        ``since`` (KC-63) is a :meth:`mark` taken right before the prompt:
+        events before it belong to an earlier turn and never end this wait.
         """
         ...
 
@@ -287,6 +296,9 @@ class KiloBackend:
         except KiloHttpError as exc:
             raise ContestBackendError(str(exc)) from exc
 
+    def mark(self) -> int | None:
+        return self._tap.mark()
+
     def abort(self, session: SessionRef) -> None:
         try:
             self._client.abort(session)
@@ -304,13 +316,16 @@ class KiloBackend:
                   idle_event_timeout: float | None = None,
                   on_permission: Callable[[dict], tuple],
                   on_question: Callable[[dict], None],
-                  on_deadline: Callable[[float], float | None] | None = None) -> IdleResult:
+                  on_deadline: Callable[[float], float | None] | None = None,
+                  since: int | None = None) -> IdleResult:
         # KC-36: the callback goes over only when it is armed — `None` keeps
         # this call byte for byte what it was, for a client that predates it.
         client_kwargs = {"idle_event_timeout": idle_event_timeout,
                          "on_permission": on_permission, "on_question": on_question}
         if on_deadline is not None:
             client_kwargs["on_deadline"] = on_deadline
+        if since is not None:
+            client_kwargs["since"] = since
         return self._client.wait_idle(self._tap, session, timeout, **client_kwargs)
 
     def tool_parts(self, session: SessionRef) -> list:
@@ -479,6 +494,11 @@ class OpenRouterBackend:
                                          "time": time.time()},
                                 "parts": [{"type": "text", "text": text}]})
 
+    def mark(self) -> int | None:
+        # KC-63: each session reads its own subprocess stdout, so no other
+        # turn's events can reach a wait; there is nothing to mark
+        return None
+
     def abort(self, session: SessionRef) -> None:
         self._terminate(self._record(session))
 
@@ -497,7 +517,8 @@ class OpenRouterBackend:
                   idle_event_timeout: float | None = None,
                   on_permission: Callable[[dict], tuple],
                   on_question: Callable[[dict], None],
-                  on_deadline: Callable[[float], float | None] | None = None) -> IdleResult:
+                  on_deadline: Callable[[float], float | None] | None = None,
+                  since: int | None = None) -> IdleResult:
         """Read the agent's stdout until ``idle``, the timeout, or the timeout's
         silence window.
 
@@ -511,6 +532,7 @@ class OpenRouterBackend:
         turn deadline, before ``abort``, with the elapsed seconds — a positive
         return pushes it back, anything else aborts. The worktree churn that
         earns the extension is the round's, and it is this backend's too.
+        ``since`` (KC-63) is accepted and ignored: :meth:`mark` is ``None``.
 
         A provider error comes back as ``IdleResult(status="error")`` with the
         agent's payload, ``data.isRetryable`` set for a 429 or a 5xx, so the

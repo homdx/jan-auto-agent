@@ -569,7 +569,8 @@ class AgentRun:
 
     `attempt` is 0 for the first turn and grows by one per rework. `turns` holds
     one dict per turn: `kind` (`initial`/`continue`/`rework`/`retry`), `attempt`,
-    `sent_at`, `idle_at`, `idle_status`, and `harvest` = `{"verdict", "reasons": [codes]}`
+    `sent_at`, `idle_at`, `idle_status`, `stale_events` (KC-63, only when a
+    wait skipped an earlier turn's events), and `harvest` = `{"verdict", "reasons": [codes]}`
     once the turn was scored. `permissions` counts what the policy was asked
     and how it answered; `questions` counts the questions over the whole run.
     `reaped` (KC-48) is what the worktree was still running when the run ended.
@@ -985,7 +986,8 @@ def _turn_deadline(run: AgentRun, config: ContestConfig) -> _TurnClock:
 
 def _wait_turn(backend: ContestBackend, session: SessionRef, config: ContestConfig,
                *, on_permission, on_question,
-               on_deadline: Callable[[float], float | None] | None = None):
+               on_deadline: Callable[[float], float | None] | None = None,
+               since: int | None = None):
     """`backend.wait_idle` for one turn, with the round's stall edge wired in.
 
     Returns the `IdleResult`. `idle_event_timeout` is the round's
@@ -999,6 +1001,9 @@ def _wait_turn(backend: ContestBackend, session: SessionRef, config: ContestConf
     by `run_agent`. When it is `None` — `turn_extend_sec = 0`, or a backend
     with no worktree to read — the kwarg is not passed at all, and the call is
     byte for byte today's.
+
+    *since* (KC-63) is the backend's mark taken right before this turn's
+    prompt; `None` (a backend without one) is not passed at all.
     """
     silence = float(config.idle_event_timeout_sec or 0)
     wait_kwargs = {
@@ -1008,6 +1013,8 @@ def _wait_turn(backend: ContestBackend, session: SessionRef, config: ContestConf
     }
     if on_deadline is not None:
         wait_kwargs["on_deadline"] = on_deadline
+    if since is not None:
+        wait_kwargs["since"] = since
     return backend.wait_idle(session, float(config.turn_timeout_sec), **wait_kwargs)
 
 
@@ -1501,6 +1508,10 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
             else:
                 note = f"attempt {run.attempt} ({kind})"
             transition(AgentState.PROMPTED, note=note)
+            # KC-63: the mark goes right before the POST, so no event of this
+            # turn can come before it and every event of an earlier one does
+            mark_fn = getattr(backend, "mark", None)
+            since = mark_fn() if callable(mark_fn) else None
             try:
                 backend.prompt(session, text)
             except ContestBackendError as exc:
@@ -1516,11 +1527,15 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
             try:
                 idle = _wait_turn(backend, session, config,
                                   on_permission=on_permission, on_question=on_question,
-                                  on_deadline=clock.on_deadline)
+                                  on_deadline=clock.on_deadline, since=since)
             finally:
                 run._turn_clock = None
             turn["idle_at"] = time.time()
             turn["idle_status"] = idle.status
+            stale = int(getattr(idle, "stale_skipped", 0) or 0)
+            if stale:
+                # KC-63: events of an earlier turn this wait did not read as its own
+                turn["stale_events"] = stale
             if clock.extensions:
                 turn["extensions"] = clock.extensions
             if stalled:
