@@ -75,7 +75,10 @@ KC-45 (round 89) makes the provider's own name for a dropped stream
 retryable: ``interrupted the response stream`` and ``upstream unavailable``
 match the message pattern, so the round 86 payload goes to a
 ``RETRY_PROMPT`` re-prompt instead of an ``ERROR`` after one turn, and
-``_retry_reason`` drops the pair of quotes Kilo wraps it in. A `provider
+``_retry_reason`` drops the pair of quotes Kilo wraps it in. Round 92's
+agnes-3-0-flash ended ERROR on the same drop in other words — `interrupted the
+response before it finished. send the request again as a new request` — so the
+pattern is the stem, ``interrupted the response``, not the round 86 wording. A `provider
 rejected the request` is still permanent on the session's *first* call —
 refused once, refused again — but retryable once the session has had an
 assistant reply that finished, where it is the free tier refusing under load.
@@ -184,7 +187,7 @@ _RETRYABLE_CODES = frozenset({
 })
 _RETRYABLE_MSG_RE = re.compile(
     r"429|502|503|504|overloaded|rate limit|timeout"
-    r"|interrupted the response stream|upstream unavailable", re.IGNORECASE
+    r"|interrupted the response|upstream unavailable", re.IGNORECASE
 )
 
 #: KC-45 §2/§2a: the provider's refusal of the request itself — no status code,
@@ -244,8 +247,9 @@ def _retryable(error, finished: int = 0) -> bool:
     Retryable when ``data.isRetryable`` is truthy, or ``data.metadata.code``
     is one of the known transient socket codes, or the message matches a
     status-code, overload or dropped-stream pattern — the two KC-45 additions
-    being ``interrupted the response stream``, the provider's own name for the
-    connection it cut mid-turn, and ``upstream unavailable``, Kilo's text for
+    being ``interrupted the response`` (``… stream`` in round 86, ``… before it
+    finished`` in round 92), the provider's own name for the connection it cut
+    mid-turn, and ``upstream unavailable``, Kilo's text for
     the same class on the stream log.
 
     ``provider rejected the request`` needs *finished*, the count of the

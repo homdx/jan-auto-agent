@@ -1527,6 +1527,12 @@ def test_ctrl_c_during_retry_backoff_ends_the_round(tmp_path):
 #: a literal pair of quotes, and it carries no `isRetryable` and no `metadata`.
 _INTERRUPTED_STREAM = {"name": "UnknownError",
                        "data": {"message": "\"the model's provider interrupted the response stream\""}}
+#: The round 92 `agnes-3-0-flash` payload: the same drop in other words, which
+#: the round 86 wording did not match — it ended the agent ERROR after one turn.
+_INTERRUPTED_BEFORE_FINISH = {
+    "name": "UnknownError",
+    "data": {"message": "\"the model's provider interrupted the response before it finished. "
+                        "send the request again as a new request\""}}
 #: Kilo's text for the same class on the stream log, which never reached
 #: `session.error` in round 86.
 _UPSTREAM_UNAVAILABLE = {"name": "UnknownError",
@@ -1538,9 +1544,10 @@ _REJECTED_REQUEST = {"name": "UnknownError",
                                           "check the model id, request fields, and context length"}}
 
 
-@pytest.mark.parametrize("payload", [_INTERRUPTED_STREAM, _UPSTREAM_UNAVAILABLE])
+@pytest.mark.parametrize("payload", [_INTERRUPTED_STREAM, _INTERRUPTED_BEFORE_FINISH,
+                                     _UPSTREAM_UNAVAILABLE])
 def test_a_dropped_response_stream_is_retryable(payload):
-    """§1: both dropped-connection messages are retryable from the message
+    """§1: every dropped-connection message is retryable from the message
     alone — no status code, no `isRetryable`, no `metadata`."""
     assert _retryable(payload) is True, payload
 
