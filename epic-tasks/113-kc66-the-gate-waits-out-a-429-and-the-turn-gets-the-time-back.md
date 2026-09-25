@@ -1,6 +1,6 @@
 # KC-66 — the gate waits out a 429, and the turn gets the time back
 
-**Status:** queued — asked by the operator 2026-09-25.
+**Status:** landed `82fbea2` (2026-09-25) — round 113, winner sensenova-6-8-flash-lite-var1 (28/28 on the round's acceptance bench; one fix on top: the silence-vs-deadline label counts the gate's time too). The code went in under the subject of the `py_model_test.py` commit it was staged next to; asked by the operator 2026-09-25.
 **Severity:** MEDIUM
 **Round:** 113
 **Size:** S
