@@ -1,6 +1,6 @@
 # FL-5 — `test_gate1_corpus_precision` grades the *live* source of `MetricsCollector.record`: one word in that docstring turns an unrelated test red
 
-**Status:** queued — after FL-1 (84, landed `e500d40`), which rewrote the very function this corpus reads. Found while scoring round 84: one candidate lost two tests to it, and that was a real regression in the candidate rather than a flake — but the trap is in the test's design, not in the candidate.
+**Status:** landed `01977ed` (2026-09-25) — round 88. Was queued after FL-1 (84, landed `e500d40`), which rewrote the very function this corpus reads. Found while scoring round 84: one candidate lost two tests to it, and that was a real regression in the candidate rather than a flake — but the trap is in the test's design, not in the candidate.
 
 **Severity:** LOW — no failure on the current tree; a landmine under whoever next edits `tools/metrics_collector.py`.
 **File:** `tests/test_gate1_corpus_precision.py`.
