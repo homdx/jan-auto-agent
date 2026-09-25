@@ -17,6 +17,18 @@
 | `glm-4-7-flash` | `86046dc` | REWORK | `tests:34✗` | 3 | +290/−10 |
 
 All five: `shrink: same`, `off_ticket: 0`, `gate: ok`, one commit. Both READY entries had independently written the same two symbols as the ideal patch that had already landed as `215a740` (`roster_on_offer`, `KiloClient.providers`) — they were finished work that never said so.
+**Seen again (2026-09-25, round 92, base `fb2054c`, ticket KC-48):**
+`laguna-s-2-1` worked the whole turn and never committed. KC-36 extended the
+turn three times, because the tree kept changing: at 3600 s (2 files, 495
+lines), 4200 s (507) and 4800 s (510). At 5401 s the tree had been flat for
+10 minutes, so the turn ended `STALLED` with
+"no idle after 90m (2 files, 482 lines, unchanged for 10m)". The worktree
+`rounds/92-laguna-s-2-1` holds `tools/contest/runner.py` +228/−3 and
+`tests/test_contest_runner.py` +254, uncommitted. `contest-out/92/laguna-s-2-1/`
+has no `.diff` (KC-31), and there was no harvest. So KC-36 buys the turn the
+time it asks for, and then the round drops what that time produced. Whether
+this diff passes the four roots is not checked here.
+
 **Depends on:** KC-21 (landed — the terminal branch harvests a turn that *has* a commit; this ticket removes the "has a commit" precondition), KC-22 (landed — the continue loop that runs before the deadline is reached), KC-31 (queued — same evidence, the file-export half).
 **Also touches:** `tests/test_contest_runner.py`, `tests/_kilo_fake.py`, `tools/contest/harvest.py` (one new fact key, no new reason code), `tools/contest/cli.py` (`export_patches` — a deadline commit exports as a patch, not a `.diff`)
 
