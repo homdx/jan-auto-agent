@@ -74,6 +74,7 @@ __all__ = [
     "KiloServer",
     "SessionRef",
     "find_kilo_binary",
+    "kilo_neighbours",
 ]
 
 _log = logging.getLogger(__name__)
@@ -516,6 +517,130 @@ class KiloServer:
     def __exit__(self, *exc) -> bool:
         self.close()
         return False
+
+
+def kilo_data_dir(environ: dict) -> str:
+    """The Kilo store one environment writes to, as a path.
+
+    ``$XDG_DATA_HOME/kilo`` when the var is set, else ``$HOME/.local/share/kilo``
+    — Kilo's own default. ``""`` when neither can be read, which is the
+    "no data dir" answer the callers compare against rather than a raise.
+    """
+    root = str(environ.get("XDG_DATA_HOME") or "").strip()
+    if root:
+        return root.rstrip("/") + "/kilo"
+    home = str(environ.get("HOME") or "").strip()
+    if not home:
+        return ""
+    return home.rstrip("/") + "/.local/share/kilo"
+
+
+def _proc_env(root: str, pid: int) -> dict:
+    """The `KEY=VALUE` pairs of `/proc/<pid>/environ`, `{}` when unreadable.
+
+    Every read that cannot happen is a missing pair, never an exception: the
+    process may have exited between the scan and the read.
+    """
+    try:
+        with open(f"{root}/{pid}/environ", "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        return {}
+    pairs: dict[str, str] = {}
+    for item in raw.split(b"\0"):
+        if b"=" not in item:
+            continue
+        key, _sep, value = item.partition(b"=")
+        pairs[key.decode("utf-8", "replace")] = value.decode("utf-8", "replace")
+    return pairs
+
+
+def _proc_argv0(root: str, pid: int) -> str:
+    """The command of `/proc/<pid>/cmdline`, `""` when it has none.
+
+    A kernel thread has no cmdline at all, and so does a process that exited
+    between the scan and the read — `""` is skipped by the caller, not raised.
+    """
+    try:
+        with open(f"{root}/{pid}/cmdline", "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        return ""
+    return raw.split(b"\0", 1)[0].decode("utf-8", "replace")
+
+
+def _proc_ppid(root: str, pid: int):
+    """The parent pid off `/proc/<pid>/stat`, `None` when it cannot be read.
+
+    The comm (field two) may itself hold `)` and spaces, so the walk starts
+    after the last `)`: the state is first, the ppid second.
+    """
+    try:
+        with open(f"{root}/{pid}/stat", encoding="utf-8") as fh:
+            raw = fh.read()
+    except OSError:
+        return None
+    tail = raw.rsplit(")", 1)
+    if len(tail) != 2:
+        return None
+    fields = tail[1].split()
+    if len(fields) < 2 or not fields[1].isdigit():
+        return None
+    return int(fields[1])
+
+
+def kilo_neighbours(server_pid: int, *, proc_root: str = "/proc") -> tuple[int, str]:
+    """KC-62: ``(count, data_dir)`` of the other Kilo processes that write the
+    same store as *server_pid*.
+
+    ``data_dir`` comes from that server's own ``/proc/<pid>/environ`` —
+    ``XDG_DATA_HOME``, else ``HOME + "/.local/share"``, plus ``/kilo`` — so the
+    box decides where the store is and no path is hard-coded. A process counts
+    when its ``argv[0]`` basename is ``kilo``, it is not *server_pid* nor part of
+    its tree, and its own environ resolves to that same ``data_dir``. The tree
+    matters because a ``kilo run`` check boots a server of its own, and this
+    round's server and its children are this round, not a neighbour.
+
+    Everything is read through ``/proc`` — no ``ps``, no hard-coded paths.
+    Fail-open: ``(0, "")`` when the pid is not usable, the server's environ
+    resolves to no store, or ``/proc`` is not readable at all (not Linux, no
+    perms). A scan that sees a store but cannot count counts zero, which is the
+    "no neighbours" line, never a raise into a round.
+    """
+    if not isinstance(server_pid, int) or isinstance(server_pid, bool) or server_pid <= 0:
+        return 0, ""
+    root = str(proc_root)
+    data_dir = kilo_data_dir(_proc_env(root, server_pid))
+    if not data_dir:
+        return 0, ""
+    try:
+        entries = os.listdir(root)
+    except OSError:
+        return 0, ""
+    pids = sorted(int(entry) for entry in entries if entry.isdigit())
+    children: dict[int, list[int]] = {}
+    for pid in pids:
+        ppid = _proc_ppid(root, pid)
+        if ppid is not None:
+            children.setdefault(ppid, []).append(pid)
+    own = {server_pid}
+    queue = list(children.get(server_pid, []))
+    while queue:
+        child = queue.pop()
+        if child in own:
+            continue
+        own.add(child)
+        queue.extend(children.get(child, []))
+    count = 0
+    for pid in pids:
+        if pid in own:
+            continue
+        if os.path.basename(_proc_argv0(root, pid)) != "kilo":
+            continue
+        if kilo_data_dir(_proc_env(root, pid)) != data_dir:
+            continue
+        count += 1
+    return count, data_dir
 
 
 # ─────────────────────────────────────────────────────────────────────────────

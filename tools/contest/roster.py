@@ -93,6 +93,9 @@ CONTEST_KEYS = (
     "error_retry_backoff_sec",
     "error_retry_max_backoff_sec",
     "agent_max_sec",
+    "max_local_store_retries",
+    "local_store_retry_backoff_sec",
+    "neighbour_kilo_warn",
     "provider_retry_max_attempts",
     "provider_retry_max_wait_sec",
     "quota_patterns",
@@ -257,6 +260,15 @@ class ContestConfig:
     #: one agent's hard limit from its start, whatever the turns add up to; the
     #: session is aborted as a stall and the tree is scored as it stands. 0 = off
     agent_max_sec: int = 0
+    #: KC-62: Kilo's own store errors ("Failed to execute statement"): retried in
+    #: the same session on this budget, which the provider's does not touch.
+    #: 0 turns it off — the pre-KC-62 path.
+    max_local_store_retries: int = 5
+    #: KC-62: base backoff for those retries, doubled per retry and jittered ±30 %.
+    local_store_retry_backoff_sec: int = 10
+    #: KC-62: intake warns, and the heartbeat names them, when more than this many
+    #: other Kilo processes of the same user share the server's store.
+    neighbour_kilo_warn: int = 4
     #: KC-64: Kilo retries in a row with no model output before the agent
     #: ends ERROR provider_unavailable; 0 = off (wait for the turn deadline)
     provider_retry_max_attempts: int = 10
@@ -621,6 +633,9 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
         error_retry_backoff_sec=limit("error_retry_backoff_sec", 15),
         error_retry_max_backoff_sec=limit("error_retry_max_backoff_sec", 60),
         agent_max_sec=limit("agent_max_sec", 0),
+        max_local_store_retries=limit("max_local_store_retries", 5),
+        local_store_retry_backoff_sec=limit("local_store_retry_backoff_sec", 10),
+        neighbour_kilo_warn=limit("neighbour_kilo_warn", 4),
         provider_retry_max_attempts=limit("provider_retry_max_attempts", 10),
         provider_retry_max_wait_sec=seconds("provider_retry_max_wait_sec", 300.0),
         quota_patterns=scalar("quota_patterns", ""),

@@ -73,6 +73,7 @@ from tools.contest.kilo_client import (
     KiloServerError,
     KiloServer,
     find_kilo_binary,
+    kilo_neighbours,
 )
 from tools.contest.policy import (
     Policy,
@@ -152,6 +153,10 @@ GATE_PLACEHOLDER_MODEL = "some/model"
 #: goes on PYTHONPATH; the module name is what PYTEST_PLUGINS carries.
 PYTEST_WORKERS_PLUGIN = "contest_pytest_workers"
 PYTEST_WORKERS_PLUGIN_DIR = Path(__file__).resolve().parent / "pytest_plugin"
+
+#: KC-62: the box intake scans for the neighbours that share the server's store.
+#: A test points it at a fake `/proc` to rehearse a box it cannot read.
+_PROC_ROOT = "/proc"
 
 #: The status this command runs, exactly: the first word of `**Status:**`.
 OPEN = "open"
@@ -1378,6 +1383,37 @@ def _make_backends(config: ContestConfig, out_dir: Path, env: dict | None = None
     return server, make_backend
 
 
+def _kilo_neighbour_note(config: ContestConfig, server, *,
+                         proc_root: str = "/proc") -> str | None:
+    """KC-62: intake's one line about the box, or `None` to stay silent.
+
+    Above `neighbour_kilo_warn` other Kilo processes share the server's store,
+    so `Failed to execute statement` is likely: the line names the count and the
+    store, and it is a warning, not a refusal. The data dir comes off the
+    server's own environment — `kilo_neighbours` reads it from `/proc/<pid>/
+    environ` — never off a constant here. No server (an openrouter round), no
+    pid (an attached server), no threshold, or an unreadable `/proc` all print
+    nothing: the round starts either way.
+    """
+    pid = getattr(server, "pid", None) if server is not None else None
+    try:
+        warn = int(getattr(config, "neighbour_kilo_warn", 4) or 0)
+    except (TypeError, ValueError):
+        return None
+    if not pid or warn < 0:
+        return None
+    try:
+        count, data_dir = kilo_neighbours(pid, proc_root=proc_root)
+    except OSError:
+        # a scan that cannot read `/proc` at all is no line, and never a reason
+        # to refuse the round: intake would otherwise die over a bookkeeping line
+        return None
+    if count <= warn or not data_dir:
+        return None
+    return (f"kilo: {count} other Kilo processes share {data_dir} — "
+            "database errors likely")
+
+
 def _apply_flags(config: ContestConfig, args: argparse.Namespace) -> ContestConfig:
     """`--models` (with `--provider` behind its bare ids), `--variant`,
     `--max-parallel` and `--no-gate` on top of the roster.
@@ -1621,10 +1657,17 @@ def cmd_run(args: argparse.Namespace) -> int:
             shutil.rmtree(agent_tmp, ignore_errors=True)
         return EXIT_FAILED
 
+    # KC-62: the box decides what the round is likely to lose. One line at
+    # intake, so the operator knows before the first prompt that the store is
+    # shared — the agents' own retries are the recovery, not the notice.
+    note = _kilo_neighbour_note(config, server, proc_root=_PROC_ROOT)
+    if note:
+        print(note, file=sys.stderr)
+
     try:
         state = run_round(config, args.ticket, result.ticket_path, workspaces,
                           make_backend=make_backend, out_dir=out_dir, resume=resume,
-                          run_tests=run_tests)
+                          run_tests=run_tests, server_pid=server.pid if server else None)
     finally:
         if server is not None:
             server.close()

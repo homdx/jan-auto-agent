@@ -7,7 +7,12 @@
 Reads no keys: the request goes through kilo with kilo's own config.
 The model's code runs in a separate process with a timeout, in a temp dir,
 with no stdin. When there is no answer, the reason is printed: timeout, kilo's
-exit code and the tail of its stderr (401, 404, "Database is busy", ...).
+exit code and the tail of its stderr (401, 404, "Database is busy",
+"Failed to execute statement", "Failed query:", ...).
+
+Every `kilo run` writes the user's own Kilo store, so a check next to a live
+round (`kilo serve`) can be what makes the round's writes fail: `-j` above four
+is capped to four with a warning, and `--force` keeps the count.
 
 Exit: 0 — every model gave code and got a score; 1 — at least one has no
 score (no answer, no code, code crashed).
@@ -123,6 +128,125 @@ def find_kilo(explicit: str | None) -> str:
     if hits:
         return hits[-1]
     sys.exit("kilo not found: pass --kilo /path/to/kilo")
+
+
+#: KC-62: the parallelism this check is capped to next to a live round. Twelve
+#: `kilo run`s against the store a round is writing is what emptied round 107.
+JOBS_NEXT_TO_A_ROUND = 4
+
+#: The box the process scan runs on. A test points it at a fake `/proc`.
+_PROC_ROOT = "/proc"
+
+#: KC-62: the line the cap prints, in the box's own language.
+LIVE_ROUND_NOTE = (
+    "живой раунд (kilo serve pid {pid}): -j снижен до {jobs}, --force чтобы оставить"
+)
+
+
+def _proc_cmdline(proc_root: str, pid: str) -> list:
+    """The argv of one `/proc/<pid>`, `[]` when it has none or cannot be read.
+
+    A kernel thread has no cmdline at all, and so does a process that exited
+    between the scan and the read: both are an empty argv, not an error.
+    """
+    try:
+        with open(f"{proc_root}/{pid}/cmdline", "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        return []
+    return [part.decode("utf-8", "replace") for part in raw.split(b"\0") if part]
+
+
+def _proc_uid(proc_root: str, pid: str):
+    """The `Uid:` of `/proc/<pid>/status`, `None` when it cannot be read."""
+    try:
+        with open(f"{proc_root}/{pid}/status", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("Uid:"):
+                    field = line.split(None, 1)[1].split()
+                    return int(field[0]) if field and field[0].isdigit() else None
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def _kilo_procs(proc_root: str = "/proc") -> list:
+    """`[(pid, argv)]` of this user's `kilo` processes, `[]` when there are none.
+
+    KC-62: a process counts when `argv[0]`'s basename is `kilo` and its `Uid:`
+    is ours — another user's Kilo writes another store. `[]` when there is
+    nothing to count, or when `/proc` is not readable at all (not Linux, no
+    perms): an unreadable tree is an empty one, never an error.
+    """
+    try:
+        entries = os.listdir(proc_root)
+        ours = os.getuid()
+    except (OSError, AttributeError):
+        return []
+    procs = []
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        cmdline = _proc_cmdline(proc_root, entry)
+        if not cmdline or os.path.basename(cmdline[0]) != "kilo":
+            continue
+        uid = _proc_uid(proc_root, entry)
+        if uid is not None and uid != ours:
+            continue
+        procs.append((int(entry), cmdline))
+    return procs
+
+
+def live_kilo_serve(proc_root: str = "/proc") -> int | None:
+    """The pid of a live `kilo serve` of this user, or `None`.
+
+    KC-62: a model check that outruns a round makes the round's own store
+    refuse writes. `serve` among a Kilo process's args is the round's server.
+    `None` when nothing is running, or when `/proc` is not readable at all.
+    """
+    for pid, cmdline in _kilo_procs(proc_root):
+        if "serve" in cmdline:
+            return pid
+    return None
+
+
+def store_note(proc_root: str = "/proc") -> str | None:
+    """KC-62: the one line about the store, or `None` when there is nothing to say.
+
+    Every `kilo run` — and `--find-free`'s own second pass — writes this user's
+    own Kilo store, so a check next to a live round can be what makes the
+    round's writes fail. The count is the Kilo processes of this user and the
+    pid is the `kilo serve` when there is one; nothing is counted and nothing
+    is printed when there is none.
+    """
+    procs = _kilo_procs(proc_root)
+    if not procs:
+        return None
+    if len(procs) == 1:
+        note = "kilo: 1 Kilo process of this user writes the same store"
+    else:
+        note = f"kilo: {len(procs)} Kilo processes of this user write the same store"
+    serve = live_kilo_serve(proc_root)
+    if serve is not None:
+        note += f" (kilo serve pid {serve})"
+    return note
+
+
+def cap_jobs(args, proc_root: str = "/proc") -> None:
+    """KC-62: hold `-j` to four next to a live round, unless `--force`.
+
+    Warns and caps when this user already has a `kilo serve` alive and the
+    caller asked for more than `JOBS_NEXT_TO_A_ROUND` models in parallel;
+    `--force` leaves the count alone. *args* is changed in place and nothing is
+    returned, so `main` keeps one parse and one place where the number is set.
+    """
+    if args.force or args.parallel <= JOBS_NEXT_TO_A_ROUND:
+        return
+    pid = live_kilo_serve(proc_root)
+    if pid is None:
+        return
+    print(LIVE_ROUND_NOTE.format(pid=pid, jobs=JOBS_NEXT_TO_A_ROUND), file=sys.stderr)
+    args.parallel = JOBS_NEXT_TO_A_ROUND
 
 
 def run(cmd: list, cwd: str, timeout: int) -> tuple[str, str, int | None]:
@@ -444,7 +568,11 @@ def main() -> int:
                     help="add a direct-API provider for --find-free (repeatable)")
     ap.add_argument("--parallel", "-j", metavar="N", type=int, default=1,
                     help="run N models in parallel (default: 1 = sequential)")
+    ap.add_argument("--force", action="store_true",
+                    help=f"ignore a live round: do not cap -j to {JOBS_NEXT_TO_A_ROUND} "
+                         "next to a running kilo serve")
     args = ap.parse_args()
+    cap_jobs(args, _PROC_ROOT)
 
     if args.find_free:
         # Build unified (name, url, key) spec list
@@ -460,6 +588,11 @@ def main() -> int:
             ap.error("--find-free requires provider names or --provider NAME URL KEY")
         # need kilo only if any non-direct providers
         kilo = find_kilo(args.kilo) if any(u is None for _, u, _ in provider_specs) else ""
+        # KC-62: find-free sends nothing to a model, but it is the step right
+        # before the parallel second pass: name the store before it is crowded.
+        note = store_note(_PROC_ROOT)
+        if note:
+            print(note, file=sys.stderr)
         return find_free(kilo, provider_specs)
 
     if not args.models:
@@ -467,6 +600,8 @@ def main() -> int:
     direct = bool(args.base_url and not args.find_free)
     if direct and not args.api_key:
         sys.exit("--api-key is required with --base-url")
+    # the second pass runs `kilo run` unless it asks the API directly
+    kilo = "" if direct else find_kilo(args.kilo)
 
     import threading
     print_lock = threading.Lock()

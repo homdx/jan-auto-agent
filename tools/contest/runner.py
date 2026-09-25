@@ -109,6 +109,28 @@ start by `workspace.ensure_agent_tmp_dirs` and named in its prompt. The other
 agents' dirs are on this agent's `forbidden`, so a write into one of them is a
 mechanical reject rather than a gate call — the same geometry rule that keeps a
 sibling worktree forbidden (KC-46).
+
+KC-62 (round 107) makes Kilo's own store a retryable error. Four of the five
+live agents ended `ERROR` within two minutes on `Failed to execute statement` —
+the round's `kilo serve` refusing a write in the SQLite every Kilo process of
+the user shares, not a provider and not a model. `_LOCAL_STORE_RE` matches the
+store's texts, `run_agent` retries them in the *same* session with
+`RETRY_PROMPT(reason="kilo store error")` on their own budget
+(`max_local_store_retries`, `local_store_retry_backoff_sec`, doubled per retry
+and jittered ±30 % so four agents that hit the lock in the same second retry at
+different times), and the provider's `max_error_retries` is not touched — a 429
+and a store error in one turn each spend their own counter. The texts are not
+added to `_RETRYABLE_MSG_RE`, because that rule is also the gate's, and the
+provider's transients keep their own budget.
+
+The work of a spent budget is kept rather than dropped (until KC-41 lands the
+deadline commit): an `ERROR` on a store error whose tree is still dirty is
+written to `state.json` with `resumable: true`, and `_plan` restarts such an
+agent on `--resume` the way it restarts a mid-flight one — harvest when there is
+a commit to score, otherwise a fresh session in the same worktree with
+`dirty_on_resume`. A plain `ERROR` and an old `state.json` that has no key both
+read `False`, so nothing that ended for a reason outside the store is restarted
+on a resume that did not mean to.
 """
 
 from __future__ import annotations
@@ -116,6 +138,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
 import re
 import signal
 import statistics
@@ -132,7 +155,11 @@ from tools.backoff import save_state
 from tools.contest.backend import ContestBackend, ContestBackendError
 from tools.contest.gates import declared_files, git
 from tools.contest.harvest import harvest, rework_message
-from tools.contest.kilo_client import AGENT_TEST_TIMEOUT_MS, SessionRef
+from tools.contest.kilo_client import (
+    AGENT_TEST_TIMEOUT_MS,
+    SessionRef,
+    kilo_neighbours,
+)
 from tools.contest.policy import HARD_DENYLIST, Policy, PolicyContext
 from tools.contest.roster import AgentSpec, ContestConfig
 from tools.contest.workspace import (
@@ -466,6 +493,16 @@ _RETRYABLE_MSG_RE = re.compile(
     r"|interrupted the response|upstream unavailable", re.IGNORECASE
 )
 
+#: KC-62: Kilo's own store refusing a write — the round server's SQLite, shared
+#: with every other Kilo process of the same user. Not the provider, not the
+#: model: the session is intact and the same turn can go on. These texts are
+#: deliberately not in `_RETRYABLE_MSG_RE`: they need their own budget, and
+#: `_retryable` is also the gate-side rule for the provider's transients.
+_LOCAL_STORE_RE = re.compile(
+    r"Failed to execute statement|Failed query:|database is locked|database is busy"
+    r"|SQLITE_BUSY|SQLITE_LOCKED|disk I/O error", re.IGNORECASE
+)
+
 
 def _quota_re(config) -> "re.Pattern | None":
     """KC-61: ``[contest] quota_patterns``, ``|``-separated, as one
@@ -557,6 +594,17 @@ def _error_message(error) -> str:
     if isinstance(error.get("message"), str):
         return error["message"]
     return ""
+
+
+def _is_local_store(error) -> bool:
+    """KC-62: True when *error*'s message is a Kilo-local store failure.
+
+    Round 107's four `Failed to execute statement` payloads carry the text in
+    `data.message`, which is where `_error_message` reads it. A payload that is
+    not a dict, or a message that matches none of the phrases, is not one —
+    every `_retryable` failure keeps today's path.
+    """
+    return bool(_LOCAL_STORE_RE.search(_error_message(error)))
 
 
 def _rejected_request(error) -> bool:
@@ -950,6 +998,12 @@ class AgentRun:
     permissions: dict = field(default_factory=_counters)
     questions: int = 0
     last_error: str | None = None
+    #: KC-62: the run ended `ERROR` on Kilo's own store and its worktree still
+    #: holds uncommitted work, so `--resume` may restart it. `False` for every
+    #: other terminal state, and for a `state.json` written before the key.
+    #: KC-41 supersedes: the deadline commit replaces this with work committed
+    #: on the spot, and the flag goes away with it.
+    resumable: bool = False
     commit: str | None = None
     cost: float | None = None
     tokens: dict | None = None
@@ -976,7 +1030,7 @@ class AgentRun:
         ws["path"] = Path(ws["path"])
         run = cls(agent=AgentSpec(**data["agent"]), workspace=Workspace(**ws))
         for name in ("session_id", "attempt", "turns", "permissions", "questions",
-                     "last_error", "commit", "cost", "tokens", "reaped"):
+                     "last_error", "resumable", "commit", "cost", "tokens", "reaped"):
             if name in data:
                 setattr(run, name, data[name])
         run.state = AgentState(data.get("state", "CREATED"))
@@ -1917,6 +1971,33 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         continue_used += 1
         return None
 
+    def _wait_backoff(seconds: float) -> bool:
+        """Sleep *seconds* between two retries into the same session.
+
+        The wait the provider's own retry had inline: a `Timer` sets an `Event`
+        after *seconds*, and the loop checks it every 200 ms, so a stall that
+        fires inside the wait — or a `backend.interrupted()` from Ctrl-C —
+        wakes it at once. KC-62's local-store branch shares it, so the two
+        budgets stand down on the same signal. Returns False when such a wake
+        happened, True when the whole backoff ran or when *seconds* is 0 or
+        less — nothing was waited, nothing was cut short.
+        """
+        seconds = float(seconds)
+        if seconds <= 0:
+            return not stalled and not backend.interrupted()
+        event = threading.Event()
+        timer = threading.Timer(seconds, event.set)
+        timer.daemon = True
+        timer.start()
+        try:
+            while not event.is_set():
+                event.wait(timeout=0.2)
+                if stalled or backend.interrupted():
+                    break
+        finally:
+            timer.cancel()
+        return not stalled and not backend.interrupted()
+
     try:
         # ── CREATED: one session, kept for every turn ─────────────────────
         try:
@@ -1942,6 +2023,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         continue_text = None
         continue_used = 0
         retries_used = 0
+        local_retries = 0
         while True:
             if stalled:
                 # the hard limit fired between two turns: no new prompt
@@ -2095,17 +2177,49 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                     error = f"provider_quota: {reason}".rstrip()
                     state = AgentState.ERROR
                 else:
+                    # KC-64: never retried. `_RETRYABLE_MSG_RE` matches the provider's
+                    # "upstream unavailable" and "503" texts, so without this the
+                    # spent provider gets `max_error_retries` more rounds on top of
+                    # the `provider_retry_max_attempts` Kilo already spent.
+                    down = _is_provider_unavailable(idle.error)
+                    # KC-62: Kilo's own store refusing a write is neither the provider
+                    # nor the model: the session is intact and the same turn goes on.
+                    # It keeps its own budget and its own backoff — the provider's
+                    # `retries_used` is not touched, so a 429 and a store error in one
+                    # turn each spend their own counter. `max_local_store_retries = 0`
+                    # turns it off, exactly as `max_error_retries = 0` does.
+                    local_budget = int(getattr(config, "max_local_store_retries", 5) or 0)
+                    if (not overflow and not down and _is_local_store(idle.error)
+                            and local_retries < local_budget):
+                        run.turns.append(turn)
+                        _append_jsonl(agent_dir / "turns.jsonl",
+                                      {"agent": spec.name, **turn, "cause": "local_store"})
+                        local_retries += 1
+                        # doubled per retry, then jittered ±30 %: four agents that hit
+                        # the locked database in the same second must not retry in the
+                        # same second again, and lock it back.
+                        base = (float(getattr(config, "local_store_retry_backoff_sec", 10))
+                                * (2 ** (local_retries - 1)))
+                        backoff = base * random.uniform(0.7, 1.3)
+                        _log.info("%s: kilo store error — retry %d/%d in %.0fs", spec.name,
+                                  local_retries, local_budget, backoff)
+                        if not _wait_backoff(backoff):
+                            if stalled:
+                                turn_r = {"kind": "retry", "attempt": run.attempt,
+                                          "sent_at": time.time(), "idle_at": time.time(),
+                                          "idle_status": "stalled"}
+                                run.turns.append(turn_r)
+                                _append_jsonl(agent_dir / "turns.jsonl",
+                                              {"agent": spec.name, **turn_r})
+                                return finish(AgentState.STALLED, stalled[0])
+                        retry_text = RETRY_PROMPT.format(reason="kilo store error")
+                        continue
                     # KC-45 §2a: KC-19's rules decide most `session.error`s. A
                     # mid-session `provider rejected the request` needs the count of
                     # the replies that already finished, so the transcript is read
                     # for that payload only — fail-open to 0, which is §2's answer.
                     # An overflow, a spent budget or any other error never reads it.
                     retryable = False
-                    # KC-64: never retried. `_RETRYABLE_MSG_RE` matches the provider's
-                    # "upstream unavailable" and "503" texts, so without this the
-                    # spent provider gets `max_error_retries` more rounds on top of
-                    # the `provider_retry_max_attempts` Kilo already spent.
-                    down = _is_provider_unavailable(idle.error)
                     if not overflow and not down and retries_used < int(config.max_error_retries):
                         retryable = _retryable(idle.error)
                         if not retryable and _rejected_request(idle.error):
@@ -2120,26 +2234,15 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                         _log.info("%s: retry %d/%d in %ds — %s", spec.name,
                                   retries_used, int(config.max_error_retries),
                                   backoff, _retry_reason(idle.error))
-                        if backoff > 0:
-                            _backoff_event = threading.Event()
-                            _timer = threading.Timer(backoff, _backoff_event.set)
-                            _timer.daemon = True
-                            _timer.start()
-                            try:
-                                while not _backoff_event.is_set():
-                                    _backoff_event.wait(timeout=0.2)
-                                    if stalled or backend.interrupted():
-                                        break
-                            finally:
-                                _timer.cancel()
-                        if stalled:
-                            turn_r = {"kind": "retry", "attempt": run.attempt,
-                                      "sent_at": time.time(), "idle_at": time.time(),
-                                      "idle_status": "stalled"}
-                            run.turns.append(turn_r)
-                            _append_jsonl(agent_dir / "turns.jsonl",
-                                          {"agent": spec.name, **turn_r})
-                            return finish(AgentState.STALLED, stalled[0])
+                        if not _wait_backoff(backoff):
+                            if stalled:
+                                turn_r = {"kind": "retry", "attempt": run.attempt,
+                                          "sent_at": time.time(), "idle_at": time.time(),
+                                          "idle_status": "stalled"}
+                                run.turns.append(turn_r)
+                                _append_jsonl(agent_dir / "turns.jsonl",
+                                              {"agent": spec.name, **turn_r})
+                                return finish(AgentState.STALLED, stalled[0])
                         retry_text = RETRY_PROMPT.format(reason=_retry_reason(idle.error))
                         continue
                     if down:
@@ -2158,13 +2261,19 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                         error = f"session.error: {_brief(idle.error)}"
                         if retries_used:
                             error = f"after {retries_used} retries: {error}"
+                        # KC-62: the budget is spent — say how hard the runner tried
+                        # the store, so the next reader does not read it as a model.
+                        if local_retries and _is_local_store(idle.error):
+                            error = f"after {local_retries} kilo store retries: {error}"
                         state = AgentState.ERROR
             elif idle.status == "closed":
                 error, state = f"event stream closed: {_brief(idle.error)}", AgentState.ERROR
             elif idle.status == "idle":
                 # A turn that ended idle is a good answer: the error budget
-                # counts refusals in a row, so it starts over here.
+                # counts refusals in a row, so it starts over here — KC-62's
+                # store budget too.
                 retries_used = 0
+                local_retries = 0
                 # KC-22: a turn that ended idle with edits in the tree but no
                 # commit is a model that has not handed in yet, not one that
                 # handed in a wrong entry. Nudge it on in this same session —
@@ -2248,6 +2357,21 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                             note = f"{(run.commit or '')[:12]} after {error}"
                             state = AgentState.READY
                             error = None
+                if state is AgentState.ERROR and _is_local_store(idle.error):
+                    # KC-62: the session is gone, the worktree is not — and with no
+                    # commit under it, no commit for `_plan` to restart from either.
+                    # The flag is what makes `--resume` start the agent again in this
+                    # tree instead of leaving the turn dropped.
+                    try:
+                        if _dirty_tree(ws):
+                            # KC-41 supersedes: the deadline commit lands the work
+                            # here on the spot, and the flag goes away with it.
+                            run.resumable = True
+                    except TreeReadError as exc:
+                        # FL-2: a status that could not be read is not a clean tree —
+                        # no flag, and a warning so nobody reads it as one.
+                        _log.warning("%s: tree unreadable — %s", spec.name,
+                                     _brief(str(exc)))
                 run.turns.append(turn)
                 _append_jsonl(agent_dir / "turns.jsonl", {"agent": spec.name, **turn})
                 return finish(state, error, note=note)
@@ -2270,7 +2394,10 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                 return finish(AgentState.GAVE_UP, "REWORK after the last attempt: "
                               + ", ".join(r.code for r in verdict.reasons if r.blocking))
             run.attempt += 1
-            continue_used = 0  # KC-22: a rework resets the per-attempt continue counter
+            # KC-22: a rework resets the per-attempt continue counter; KC-62's local
+            # store budget is per turn, not per attempt, so it resets there too.
+            continue_used = 0
+            local_retries = 0
             transition(AgentState.REWORK, note=f"attempt {run.attempt} {elapsed_str} — "
                        + ", ".join(r.code for r in verdict.reasons))
             rework_text = rework_message(verdict, run.attempt, int(config.max_rework))
@@ -2323,8 +2450,10 @@ def _plan(config: ContestConfig, workspaces: list, ticket_path: Path,
         run = prior.get(ws.agent)
         if run is None:
             run = AgentRun(agent=specs.get(ws.agent) or AgentSpec(ws.agent, "", ""), workspace=ws)
-        elif not run.terminal:
-            # mid-flight when the round died: the session is gone, the worktree is not
+        elif not run.terminal or run.resumable:
+            # mid-flight when the round died — or `ERROR` on Kilo's own store with a
+            # dirty tree (KC-62): the session is gone, the worktree is not
+            run.resumable = False      # spent on this restart, so a later plain ERROR is not
             run.workspace = ws
             verdict = _harvest(ws, ticket_path, run_tests, config)
             if verdict.verdict == "READY":
@@ -2357,7 +2486,8 @@ def _plan(config: ContestConfig, workspaces: list, ticket_path: Path,
 def run_round(config: ContestConfig, round_no: int, ticket_path: Path, workspaces: list, *,
               make_backend: Callable[[Workspace], ContestBackend], out_dir: Path,
               resume: RoundState | None = None,
-              run_tests: bool = False) -> RoundState:
+              run_tests: bool = False,
+              server_pid: int | None = None) -> RoundState:
     """One round: a `run_agent` per workspace in a pool of `config.max_parallel`.
 
     Each agent gets its own `ContestBackend` for its directory: `make_backend`
@@ -2377,6 +2507,10 @@ def run_round(config: ContestConfig, round_no: int, ticket_path: Path, workspace
     after every turn and to the resume's mid-flight harvest, so the four pytest
     roots become the round's judge instead of the ticket's self-check. Off by
     default, and keyword-only — every earlier call of this function is untouched.
+
+    *server_pid* (KC-62) is the round server's pid, so the heartbeat can count the
+    other Kilo processes that share its store and say so on the line. `None` is
+    every earlier caller: no check, no suffix.
     """
     out_dir, ticket_path = Path(out_dir), Path(ticket_path)
     workspaces = list(workspaces)
@@ -2409,7 +2543,9 @@ def run_round(config: ContestConfig, round_no: int, ticket_path: Path, workspace
         since[run.agent.name] = time.monotonic()
         save()
 
-    heartbeat = _Heartbeat(state, since, float(config.progress_every_sec or 0))
+    heartbeat = _Heartbeat(state, since, float(config.progress_every_sec or 0),
+                           server_pid=server_pid,
+                           neighbour_warn=int(getattr(config, "neighbour_kilo_warn", 4) or 0))
 
     policy = Policy(config)
     live: list = []                     # (run, backend) of every agent in the pool
@@ -2497,8 +2633,10 @@ class _Heartbeat:
     thread never outlives `run_round`. `every <= 0` starts nothing.
     """
 
-    def __init__(self, state: RoundState, since: dict, every: float):
+    def __init__(self, state: RoundState, since: dict, every: float,
+                 server_pid: int | None = None, neighbour_warn: int | None = None):
         self.state, self.since, self.every = state, since, every
+        self.server_pid, self.neighbour_warn = server_pid, neighbour_warn
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, name="contest-progress", daemon=True)
 
@@ -2575,7 +2713,30 @@ class _Heartbeat:
 
         live = sum(1 for run in self.state.agents if not run.terminal)
         age = _age(time.time() - self.state.started_at)
-        return f"round {self.state.round_no} {age}: " + " · ".join(parts) + f" — {live} live"
+        text = f"round {self.state.round_no} {age}: " + " · ".join(parts) + f" — {live} live"
+        count = self._kilo_neighbours()
+        if count is not None:
+            # KC-62: a store this busy is what ends agents on `Failed to execute
+            # statement` — the operator needs to see the crowd, not just the states.
+            text += f" · kilo neighbours {count}"
+        return text
+
+    def _kilo_neighbours(self) -> int | None:
+        """KC-62: how many other Kilo processes share the round server's store,
+        `None` when the line must not name a number.
+
+        `None` when there is no server pid, no threshold to compare against, or a
+        threshold that is not a number — every earlier caller, and every failure
+        of `kilo_neighbours`, ends here rather than in a broken heartbeat line.
+        """
+        if self.server_pid is None or self.neighbour_warn is None:
+            return None
+        try:
+            warn = int(self.neighbour_warn)
+        except (TypeError, ValueError):
+            return None
+        count, _dir = kilo_neighbours(self.server_pid)
+        return count if count > warn else None
 
     def _last_harvest_elapsed(self, run: AgentRun) -> float | None:
         """The `elapsed` from the last turn's harvest, or None."""

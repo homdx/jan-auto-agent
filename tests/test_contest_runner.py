@@ -3012,16 +3012,19 @@ def work_passing_test(directory, text):
 
 
 def test_run_round_run_tests_is_keyword_only_with_a_false_default():
-    """KC-16 adds one keyword to `run_round`; nothing else about it moves."""
+    """KC-16 adds one keyword to `run_round` and KC-62 another (`server_pid`, for
+    the heartbeat's neighbour count); nothing else about it moves."""
     import inspect
 
     params = inspect.signature(run_round).parameters
     assert list(params) == ["config", "round_no", "ticket_path", "workspaces",
-                            "make_backend", "out_dir", "resume", "run_tests"]
-    for name in ("make_backend", "out_dir", "resume", "run_tests"):
+                            "make_backend", "out_dir", "resume", "run_tests",
+                            "server_pid"]
+    for name in ("make_backend", "out_dir", "resume", "run_tests", "server_pid"):
         assert params[name].kind is inspect.Parameter.KEYWORD_ONLY, name
     assert params["resume"].default is None
     assert params["run_tests"].default is False
+    assert params["server_pid"].default is None
     assert inspect.signature(run_agent).parameters["run_tests"].default is False
 
 
@@ -3326,7 +3329,8 @@ def test_continue_turns_and_the_resume_nudge_leave_the_json_shape_alone(tmp_path
     saved = _state_json(sb)
     (agent,) = saved["agents"]
     assert set(agent) == {"agent", "workspace", "session_id", "state", "attempt", "turns",
-                          "permissions", "questions", "last_error", "commit", "cost", "tokens"}
+                          "permissions", "questions", "last_error", "resumable", "commit",
+                          "cost", "tokens"}
     assert [t["kind"] for t in agent["turns"]] == ["initial", "continue"]
     assert RoundState.from_dict(saved) == state
 

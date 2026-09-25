@@ -1526,7 +1526,7 @@ def test_backend_flag_builds_an_openrouter_backend_without_a_kilo_server(
         return type("Backend", (), {})()
 
     def fake_run_round(config, ticket, ticket_path, workspaces, *, make_backend,
-                       out_dir, resume=None, run_tests=True):
+                       out_dir, resume=None, run_tests=True, server_pid=None):
         backends.extend(make_backend(workspace) for workspace in workspaces)
         specs = {spec.name: spec for spec in config.agents}
         return RoundState(
@@ -1549,6 +1549,8 @@ def test_backend_flag_builds_an_openrouter_backend_without_a_kilo_server(
     assert code == 0, captured.err
     assert "intake:" not in captured.err
     assert "server:" not in captured.err
+    # KC-62: no server, so no neighbour check — the `kilo:` line is a kilo thing
+    assert "kilo:" not in captured.err
     assert _plan(captured.out)["agents"] == "1: openrouter/agnes-2-5-flash:free"
     assert len(backends) == 1
 
@@ -1561,6 +1563,99 @@ def test_backend_flag_builds_an_openrouter_backend_without_a_kilo_server(
     assert Path(kwargs["extra_env"]["CONTEST_PYTEST_WORKERS_FILE"]).name == "pytest-workers"
     assert directory.rstrip("/").endswith(f"01-agnes-2-5-flash")
     assert [row["name"] for row in _table(captured.out)] == ["agnes-2-5-flash"]
+
+
+class _ServedServer:
+    """The two facts intake needs of a `kilo serve` that never really started."""
+
+    pid = 4321
+
+    def close(self):
+        pass
+
+
+def _neighbour_proc(root: Path, pid: int = 4321, *, neighbours: int = 5,
+                    home: str = "/home/op") -> Path:
+    """A fake `/proc`: the round's server plus *neighbours* sibling `kilo run`s
+    on the same store, so the scan has something to count. The store is read off
+    the server's own `environ`, never off a constant in the test."""
+    entry = root / str(pid)
+    entry.mkdir(parents=True, exist_ok=True)
+    argv = ("/bin/kilo", "serve", "--port", "8123")
+    (entry / "cmdline").write_bytes(b"\0".join(a.encode() for a in argv) + b"\0")
+    (entry / "environ").write_bytes(f"HOME={home}\0".encode())
+    (entry / "stat").write_text(f"{pid} (kilo) S 1\n", encoding="utf-8")
+    for i in range(neighbours):
+        other = 5000 + i
+        other_dir = root / str(other)
+        other_dir.mkdir(parents=True, exist_ok=True)
+        argv = ("/bin/kilo", "run", "-m", "kenary/hy3:free")
+        (other_dir / "cmdline").write_bytes(b"\0".join(a.encode() for a in argv) + b"\0")
+        (other_dir / "environ").write_bytes(f"HOME={home}\0".encode())
+        (other_dir / "stat").write_text(f"{other} (kilo) S 1\n", encoding="utf-8")
+    return root
+
+
+def _kc62_round(base_sha):
+    """`run_round`'s stand-in: one READY agent per worktree, nothing to export."""
+
+    def fake_round(config, ticket, ticket_path, workspaces, **kw):
+        return RoundState(
+            round_no=ROUND, ticket=ticket, base_sha=base_sha, started_at=time.time(),
+            agents=[AgentRun(agent=spec, workspace=ws, state=AgentState.READY)
+                    for spec, ws in zip(config.agents, workspaces)])
+
+    return fake_round
+
+
+def test_intake_prints_the_neighbour_line_above_the_threshold(
+        sandbox, capsys, monkeypatch, spawn_holder):
+    """KC-62 acceptance: five Kilo processes on the round's store print one line
+    to stderr at intake, with the store read off the server's environment; three
+    print nothing. A warning, not a refusal — either way the round runs."""
+    five = _neighbour_proc(sandbox.tmp / "proc5")
+    monkeypatch.setattr(cli, "_start_server", lambda *a, **kw: _ServedServer())
+    monkeypatch.setattr(cli, "_PROC_ROOT", str(five))
+    monkeypatch.setattr(cli, "run_round", _kc62_round(sandbox.base))
+    monkeypatch.setattr(cli, "export_patches", lambda *a, **kw: [])
+
+    code = cli.main(["run", "--ticket", "1", "--max-parallel", "1",
+                     "--no-gate", "--no-tests"])
+    captured = capsys.readouterr()
+
+    assert code == 0, captured.err
+    assert "intake:" not in captured.err
+    assert "server:" not in captured.err
+    line = next((l for l in captured.err.splitlines() if l.startswith("kilo:")), "")
+    assert line == "kilo: 5 other Kilo processes share /home/op/.local/share/kilo " \
+                   "— database errors likely", captured.err
+
+
+def test_a_proc_the_scan_cannot_read_still_starts_the_round(
+        sandbox, capsys, monkeypatch, spawn_holder):
+    """KC-62 acceptance: intake scans for the neighbours that share the server's
+    store, and a box it cannot read gives no line — the round runs anyway, no
+    `intake:` error, no raised OSError. The store check is a notice, not a gate."""
+    monkeypatch.setattr(cli, "_start_server", lambda *a, **kw: _ServedServer())
+    monkeypatch.setattr(cli, "_PROC_ROOT", str(sandbox.tmp / "no-such-proc"))
+
+    def fake_round(config, ticket, ticket_path, workspaces, **kw):
+        return RoundState(
+            round_no=ROUND, ticket=ticket, base_sha=sandbox.base,
+            started_at=time.time(),
+            agents=[AgentRun(agent=spec, workspace=ws, state=AgentState.READY)
+                    for spec, ws in zip(config.agents, workspaces)])
+
+    monkeypatch.setattr(cli, "run_round", fake_round)
+    monkeypatch.setattr(cli, "export_patches", lambda *a, **kw: [])
+
+    code = cli.main(["run", "--ticket", "1", "--max-parallel", "1",
+                     "--no-gate", "--no-tests"])
+    captured = capsys.readouterr()
+
+    assert code == 0, captured.err
+    assert "intake:" not in captured.err
+    assert "kilo:" not in captured.err
 
 
 def test_backend_flag_without_a_profile_in_the_roster_is_a_server_line(
