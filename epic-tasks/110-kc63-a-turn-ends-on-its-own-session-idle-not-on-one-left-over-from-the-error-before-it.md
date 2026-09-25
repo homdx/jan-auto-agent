@@ -1,6 +1,6 @@
 # KC-63 — a turn ends on its own `session.idle`, not on one left over from the error before it
 
-**Status:** queued — found 2026-09-25 reading round 106 (KC-59): `mimo-v2-5` went `GAVE_UP` after three `REWORK`s in 14 min while it was working the whole time. Every turn after its first `session.error` "ended" 0.1 s after its prompt, and the harvest ran while the agent was still editing.
+**Status:** landed `8b9cc85` (2026-09-25) — round 110 ideal patch. Was queued: found 2026-09-25 reading round 106 (KC-59): `mimo-v2-5` went `GAVE_UP` after three `REWORK`s in 14 min while it was working the whole time. Every turn after its first `session.error` "ended" 0.1 s after its prompt, and the harvest ran while the agent was still editing.
 **Severity:** HIGH (a model that recovers from one dropped stream is scored three times on a half-written tree and given up; its prompts pile up in Kilo's queue, so from then on the runner is always one turn behind the agent)
 **File:** `tools/contest/kilo_client.py`, `tools/contest/backend.py`, `tools/contest/runner.py`, `tests/_kilo_fake.py`
 **Symbol:** `EventTap`, `KiloClient.wait_idle`, `ContestBackend.mark` / `wait_idle`, the runner's `PROMPTED → WAITING` step
