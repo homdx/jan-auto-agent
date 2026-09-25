@@ -12,6 +12,10 @@ exit code and the tail of its stderr (401, 404, "Database is busy", ...).
 Exit: 0 — every model gave code and got a score; 1 — at least one has no
 score (no answer, no code, code crashed).
 
+Direct mode — bypass kilo, hit any OpenAI-compatible endpoint:
+
+    python3 scripts/py_model_test.py --base-url https://api.zyloai.net/v1 --api-key zk_... deepseek-v4
+
 First pass — find a provider's free models (sends nothing to any model):
 
     python3 scripts/py_model_test.py --find-free vercel_8080 openrouter2 kilo
@@ -299,6 +303,25 @@ def find_free(kilo: str, providers: list) -> int:
     return 0
 
 
+def ask_direct(base_url: str, api_key: str, model: str, prompt: str, timeout: int) -> str:
+    """Send one chat completion request directly to an OpenAI-compatible API.
+    Returns the assistant's text content, or raises on HTTP error."""
+    payload = json.dumps({
+        "model": model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": 2048,
+    }).encode()
+    req = urllib.request.Request(
+        f"{base_url.rstrip('/')}/chat/completions",
+        data=payload,
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        data = json.loads(r.read())
+    return data["choices"][0]["message"]["content"] or ""
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("models", nargs="+",
@@ -309,7 +332,69 @@ def main() -> int:
                     help="keep answers and stderr in ./py_model_test_out/")
     ap.add_argument("--find-free", action="store_true",
                     help="first pass: find the providers' free models, no test")
+    ap.add_argument("--base-url", metavar="URL",
+                    help="direct mode: OpenAI-compatible base URL (e.g. https://api.zyloai.net/v1)")
+    ap.add_argument("--api-key", metavar="KEY",
+                    help="direct mode: API key for --base-url")
     args = ap.parse_args()
+
+    if args.base_url:
+        # Direct mode: no kilo, plain HTTP requests
+        if not args.api_key:
+            sys.exit("--api-key is required with --base-url")
+        results = []
+        with tempfile.TemporaryDirectory(prefix="pymodeltest-") as work:
+            checker = os.path.join(work, "checker.py")
+            with open(checker, "w", encoding="utf-8") as f:
+                f.write(CHECKER)
+            for model in args.models:
+                print(f"== {model}", flush=True)
+                mdir = tempfile.mkdtemp(prefix="m-", dir=work)
+                start = time.time()
+                try:
+                    raw = ask_direct(args.base_url, args.api_key, model, PROMPT, args.timeout)
+                    err_msg = ""
+                except urllib.error.HTTPError as e:
+                    body = e.read()[:300].decode(errors="replace")
+                    raw, err_msg = "", f"HTTP {e.code}: {body}"
+                except Exception as e:  # noqa: BLE001
+                    raw, err_msg = "", str(e)[:200]
+                took = time.time() - start
+                if args.keep:
+                    os.makedirs("py_model_test_out", exist_ok=True)
+                    safe = model.replace("/", "_").replace(":", "_")
+                    with open(f"py_model_test_out/{safe}.txt", "w", encoding="utf-8") as f:
+                        f.write(raw)
+                code = pick_code(raw)
+                if not code:
+                    why = err_msg or ("empty answer" if not raw.strip() else "no ```python block")
+                    print(f"  {why} ({took:.0f}s)")
+                    if raw.strip() and not err_msg:
+                        print(f"  stdout: {raw.strip()[:200]!r}")
+                    results.append((model, "-", took, why))
+                    continue
+                src = os.path.join(mdir, "answer.py")
+                with open(src, "w", encoding="utf-8") as f:
+                    f.write(code)
+                cout, cerr, crc = run([sys.executable, checker, src], mdir, 30)
+                check = cout + cerr
+                score = re.search(r"SCORE (\d+/\d+)", check)
+                if crc is None:
+                    print("  FAIL timeout (model code hung)")
+                    results.append((model, "crash", took, "code hung"))
+                    continue
+                if score:
+                    print(check.replace(score.group(0), "").rstrip() or "  all checks passed")
+                    results.append((model, score.group(1), took, ""))
+                else:
+                    print(f"  code crashed: {tail(check, 4)}")
+                    results.append((model, "crash", took, "code crashed"))
+        print()
+        print("model".ljust(44), "score", " time", " reason")
+        for model, score, took, why in results:
+            print(model.ljust(44), score.ljust(5), f"{took:4.0f}s", "", why)
+        return 0 if all(s not in ("-", "crash") for _, s, _, _ in results) else 1
+
     kilo = find_kilo(args.kilo)
     if args.find_free:
         return find_free(kilo, args.models)
