@@ -1,6 +1,6 @@
 # KC-65 — a round sizes its agents' pytest to the box, not eight workers each
 
-**Status:** queued — found 2026-09-25 in round 107 (`--fresh` re-run): load average 68 on an 8-core box while the CPU sat 36–64 % idle. The box was not attacked and no log was flooding: the agents' own test runs had put 55 processes in uninterruptible disk wait.
+**Status:** landed `23db0b3` (2026-09-25) — round 112, ideal patch from the second machine; found 2026-09-25 in round 107 (`--fresh` re-run): load average 68 on an 8-core box while the CPU sat 36–64 % idle. The box was not attacked and no log was flooding: the agents' own test runs had put 55 processes in uninterruptible disk wait.
 **Severity:** MEDIUM (every agent's test run slows to a crawl; `--timeout=300` fails fire on healthy code and an agent "fixes" what is not broken; the operator's box is unusable for the round)
 **File:** `tools/contest/cli.py`, `tools/contest/runner.py`, `tools/contest/backend.py`, `tools/contest/roster.py`, `contest.ini`, new `tools/contest/pytest_plugin/contest_pytest_workers.py`
 **Symbol:** `cmd_run` (the `env` it hands `_make_backends`), `run_round.save`, `OpenRouterBackend` agent spawn, `CONTEST_KEYS`
