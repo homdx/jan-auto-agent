@@ -1,6 +1,6 @@
 # KC-60 — the harvest tests the commit it scores, not the working tree around it
 
-**Status:** queued — found 2026-09-25 judging round 103 (FL-9): `agnes-2-0-flash` and `step-3-7-flash` were harvested `READY` with every root green, and their handed-in patches fail 4 tests on `kc`.
+**Status:** landed `9edfec1` (2026-09-25) — round 107 winner sensenova-6-8-flash-lite-var2 (uncommitted entry), plus a fail-closed checkout, an index-safe `git status` and the runner's queue file left out of `uncommitted_files`. Was queued: found 2026-09-25 judging round 103 (FL-9): `agnes-2-0-flash` and `step-3-7-flash` were harvested `READY` with every root green, and their handed-in patches fail 4 tests on `kc`.
 **Severity:** HIGH (a `READY` verdict and a green heartbeat for a patch that is red as handed in; the operator finds out only when landing it)
 **File:** `tools/contest/harvest.py`, `tools/contest/gates.py`
 **Symbol:** `harvest` (the `run_tests` block), `gates.run_tests_detail`
