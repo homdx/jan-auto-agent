@@ -1,6 +1,6 @@
 # KC-62 — Kilo's own database error is a retry, not the end of an agent
 
-**Status:** queued — found 2026-09-25 in round 107 (KC-60): 4 of the round's 5 live agents went `ERROR` within 2 minutes on `Failed to execute statement`. That is Kilo's local SQLite refusing a write, not the model or the provider. All four had uncommitted work, and the round exports none of it.
+**Status:** landed `0436f86` (2026-09-26) — round 109 winner sensenova-6-8-flash-lite-var1; found 2026-09-25 in round 107 (KC-60): 4 of the round's 5 live agents went `ERROR` within 2 minutes on `Failed to execute statement`. That is Kilo's local SQLite refusing a write, not the model or the provider. All four had uncommitted work, and the round exports none of it.
 **Severity:** HIGH (a local, transient error ends an agent for good and throws away its work; one noisy neighbour on the box can empty a round)
 **File:** `tools/contest/runner.py`, `tools/contest/cli.py`, `scripts/py_model_test.py`
 **Symbol:** `_retryable`, `_RETRYABLE_MSG_RE`, the runner's `session.error` block, intake
