@@ -1,6 +1,6 @@
 # KC-59 — each agent works in its own clone and its own tmp dir: a `git stash` in one worktree pops another agent's work
 
-**Status:** queued — found 2026-09-25 judging round 103 (FL-9) in `/mnt-fs/jan-auto-agent`: `hy3`'s worktree holds, byte for byte, `sensenova-6-7-flash-lite-var1`'s `gate1_grounding.py`, and hy3's own implementation exists only as an unreachable stash commit.
+**Status:** landed `06104f1` + `98fc1bc` (2026-09-25) — round 106 winner sensenova-6-8-flash-lite-var2 (21/21 on the shared bench, the only full score; 8 entries, 5 of them uncommitted). Was queued: found 2026-09-25 judging round 103 (FL-9) in `/mnt-fs/jan-auto-agent`: `hy3`'s worktree holds, byte for byte, `sensenova-6-7-flash-lite-var1`'s `gate1_grounding.py`, and hy3's own implementation exists only as an unreachable stash commit.
 **Severity:** HIGH (one agent's code silently lands in another's tree; the round scores the wrong author, and the real author's work is lost unless someone runs `git fsck`)
 **File:** `tools/contest/workspace.py`, `tools/contest/runner.py`
 **Symbol:** `prepare_round`, `_KIND_CLONE`, `attach_clone`, `PolicyContext.tmp_roots`
