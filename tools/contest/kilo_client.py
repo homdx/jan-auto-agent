@@ -1150,7 +1150,8 @@ class KiloClient:
                   on_deadline: Callable[[float], float | None] | None = None,
                   since: int | None = None,
                   max_retry_wait: float | None = None,
-                  quota_re: "re.Pattern | None" = None) -> IdleResult:
+                  quota_re: "re.Pattern | None" = None,
+                  max_retry_attempts: int | None = None) -> IdleResult:
         """Block until this session goes idle, answering on the way.
 
         The probe's ``wait_idle`` with the decisions delegated:
@@ -1231,6 +1232,26 @@ class KiloClient:
         provider's text. Both omitted — every pre-KC-61 caller — a
         ``session.status`` is never acted on and the loop is byte for byte what
         it was, silence clock or not.
+
+        ``max_retry_attempts`` (KC-64) is the other end of the same
+        ``session.status``: a Kilo retry *nearby in time*, over and over. Counted
+        are this session's ``type == "retry"``, and the count resets on any
+        assistant-side ``message.part.updated`` of this session — a
+        ``step-start``, ``reasoning``, ``tool`` or ``step-finish`` part, which is
+        the model answering. A ``text`` part does not reset it: the runner's own
+        prompt comes back as ``text`` parts (round 106's laguna: nine of them,
+        zero tokens out), and on this provider that is the *whole* of the turn.
+        When both Kilo's own ``attempt`` and that local count reach the limit, the
+        wait ends as ``status="error"`` with ``error["name"] ==
+        "ProviderUnavailable"`` — the provider's text in ``data.message`` and the
+        count in ``data.attempts`` — and the session is aborted first, so Kilo
+        never keeps its own retry loop running past the round's decision. Kilo
+        resets ``attempt`` after every success, so a provider that answers now and
+        then never reaches the limit: the count and the limit have to be crossed
+        in one go, with no output between. Omitted or ``0`` — every pre-KC-64
+        caller — nothing is counted and the loop is byte for byte KC-61's,
+        silence clock or not. The KC-61 quota check runs first: a daily quota must
+        end at ``attempt: 1``, not at ``attempt: 10``.
         """
         # KC-63: events recorded before the prompt this wait belongs to are
         # an earlier turn's. Kilo sends two session.idle after a
@@ -1239,6 +1260,8 @@ class KiloClient:
         stale = _skip_stale(tap, session.id, since) if since is not None else 0
         # KC-63, diagnostic only: did this session go busy in this wait?
         saw_busy = False
+        # KC-64: retries Kilo reported since this session last produced output
+        retries_without_output = 0
         started = time.monotonic()
         deadline = started + float(timeout)
         session_id = session.id
@@ -1251,6 +1274,15 @@ class KiloClient:
         # KC-47: this session's open `bash` parts, part id -> the call's own
         # deadline. Empty, the loop below is KC-12's, event for event.
         open_parts: dict = {}
+        # KC-64: a limit that is not a positive count is no limit — the caller
+        # arms it from a config value, and a value that is not a number
+        # turns the rule off rather than raising a TypeError out of a wait.
+        try:
+            retries_limit = int(max_retry_attempts)
+        except (TypeError, ValueError):
+            retries_limit = 0
+        if retries_limit <= 0:
+            retries_limit = None
         permissions: list = []
         questions: list = []
 
@@ -1271,13 +1303,16 @@ class KiloClient:
             # wait: the ones acted on below are handled, the rest only reset
             # the clock — a `session.status busy` or a `file.edited` is the
             # session working, not stalled
-            if silence is not None or etype in _SESSION_EVENTS:
-                return True
             # KC-61: a `retry` status is acted on below when `max_retry_wait`
             # is armed, so it must reach the loop even with the silence clock
             # off — the probe has no clock, and it must not spend its timeout
             # on a quota that resets in fourteen hours.
-            return etype == "session.status" and max_retry_wait is not None
+            if (silence is not None or etype in _SESSION_EVENTS
+                    or (max_retry_wait is not None and etype == "session.status")
+                    or (retries_limit and etype in ("session.status",
+                                                     "message.part.updated"))):
+                return True
+            return False
 
         while True:
             now = time.monotonic()
@@ -1322,6 +1357,14 @@ class KiloClient:
                 # KC-47: an open `bash` part widens the silence bound, and the
                 # event that reset the clock is the one that opened the call.
                 _track_open_part(open_parts, props.get("part"), last_seen)
+                # KC-64: any assistant-side part (a step-start, reasoning, a tool,
+                # a step-finish) is the model answering. A `text` part does not
+                # reset it: our own prompt comes back as `text` parts, and round
+                # 106's laguna had nine of them with zero tokens out.
+                part = props.get("part")
+                if isinstance(part, dict) and \
+                        part.get("type") in ("step-start", "reasoning", "tool", "step-finish"):
+                    retries_without_output = 0
 
             if etype in ("permission.asked", "permission.v2.asked"):
                 try:
@@ -1367,6 +1410,29 @@ class KiloClient:
                                    "data": {"message": message, "retryAt": nxt}},
                             elapsed=elapsed, permissions=permissions,
                             questions=questions, stale_skipped=stale)
+            if etype == "session.status" and retries_limit:
+                # KC-64: a retry *nearby* in time, as often as the provider lets
+                # it. KC-61's quota check above ran first: a retry scheduled
+                # fourteen hours out ends at attempt 1, never at attempt 10.
+                status = props.get("status")
+                if isinstance(status, dict) and status.get("type") == "retry":
+                    retries_without_output += 1
+                    attempt = status.get("attempt")
+                    count = (attempt if isinstance(attempt, int)
+                             and not isinstance(attempt, bool)
+                             else retries_without_output)
+                    if min(count, retries_without_output) >= retries_limit:
+                        # stop Kilo's endless retry: its `session.status busy`
+                        # beats would otherwise reset the silence clock forever
+                        self._abort_quietly(session)
+                        return IdleResult(
+                            status="error",
+                            error={"name": "ProviderUnavailable",
+                                   "data": {"message": str(status.get("message") or ""),
+                                            "attempts": count}},
+                            elapsed=elapsed, permissions=permissions,
+                            questions=questions, stale_skipped=stale)
+                continue
             if etype == "session.error":
                 return IdleResult(status="error", error=props.get("error", props),
                                   elapsed=elapsed, permissions=permissions,

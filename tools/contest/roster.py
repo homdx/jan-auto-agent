@@ -91,6 +91,7 @@ CONTEST_KEYS = (
     "max_questions_per_turn",
     "max_error_retries",
     "error_retry_backoff_sec",
+    "provider_retry_max_attempts",
     "provider_retry_max_wait_sec",
     "quota_patterns",
     "progress_every_sec",
@@ -248,6 +249,9 @@ class ContestConfig:
     max_questions_per_turn: int = 3
     max_error_retries: int = 2
     error_retry_backoff_sec: int = 15
+    #: KC-64: Kilo retries in a row with no model output before the agent
+    #: ends ERROR provider_unavailable; 0 = off (wait for the turn deadline)
+    provider_retry_max_attempts: int = 10
     #: KC-61: a ``session.status`` retry scheduled further out than this many
     #: seconds is a quota reset, not a blip: the agent ends
     #: ``ERROR provider_quota`` at once instead of sitting out the silence
@@ -603,6 +607,7 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
         max_questions_per_turn=limit("max_questions_per_turn", 3),
         max_error_retries=limit("max_error_retries", 2),
         error_retry_backoff_sec=limit("error_retry_backoff_sec", 15),
+        provider_retry_max_attempts=limit("provider_retry_max_attempts", 10),
         provider_retry_max_wait_sec=seconds("provider_retry_max_wait_sec", 300.0),
         quota_patterns=scalar("quota_patterns", ""),
         progress_every_sec=limit("progress_every_sec", 60),

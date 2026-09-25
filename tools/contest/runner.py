@@ -539,6 +539,24 @@ def _is_overflow(error) -> bool:
     return _OVERFLOW_RE.search(" ".join(parts)) is not None
 
 
+def _is_provider_unavailable(error) -> bool:
+    """KC-64: wait_idle ended the turn after too many provider retries.
+
+    Never retried by the runner: Kilo already tried ``provider_retry_max_attempts``
+    times, and the runner's ``max_error_retries`` would spend two more full
+    rounds of the same against a provider that is not answering. True only for
+    the payload ``wait_idle`` builds itself — ``name == "ProviderUnavailable"``;
+    anything else, including a string or a payload that is not a dict, is False.
+    """
+    return isinstance(error, dict) and error.get("name") == "ProviderUnavailable"
+
+
+#: KC-64: bynara answers an exhausted plan with the same "temporarily
+#: unavailable" 503 as a real outage (KC-61, 2026-09-25), so the end says
+#: where to look instead of guessing which one it was.
+_PLAN_HINT = " (can be an exhausted plan — check the provider's site)"
+
+
 def _tokens_used(tokens: dict) -> int:
     """``input + cache.read + reasoning + output`` of one message's ``tokens``."""
     def num(value) -> int:
@@ -1243,6 +1261,13 @@ def _wait_turn(backend: ContestBackend, session: SessionRef, config: ContestConf
     quota_re = _quota_re(config)
     if quota_re is not None:
         wait_kwargs["quota_re"] = quota_re
+    # KC-64: N retries in a row, with no model output between them, end the
+    # turn instead of Kilo's own retry loop resetting the silence clock for an
+    # hour. 0, a missing key or a negative value arms nothing — today's
+    # behaviour, bounded only by the turn deadline.
+    attempts = int(getattr(config, "provider_retry_max_attempts", 0) or 0)
+    if attempts > 0:
+        wait_kwargs["max_retry_attempts"] = attempts
     return backend.wait_idle(session, float(config.turn_timeout_sec), **wait_kwargs)
 
 
@@ -1869,7 +1894,12 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                     # for that payload only — fail-open to 0, which is §2's answer.
                     # An overflow, a spent budget or any other error never reads it.
                     retryable = False
-                    if not overflow and retries_used < int(config.max_error_retries):
+                    # KC-64: never retried. `_RETRYABLE_MSG_RE` matches the provider's
+                    # "upstream unavailable" and "503" texts, so without this the
+                    # spent provider gets `max_error_retries` more rounds on top of
+                    # the `provider_retry_max_attempts` Kilo already spent.
+                    down = _is_provider_unavailable(idle.error)
+                    if not overflow and not down and retries_used < int(config.max_error_retries):
                         retryable = _retryable(idle.error)
                         if not retryable and _rejected_request(idle.error):
                             retryable = _retryable(
@@ -1904,7 +1934,17 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                             return finish(AgentState.STALLED, stalled[0])
                         retry_text = RETRY_PROMPT.format(reason=_retry_reason(idle.error))
                         continue
-                    if not overflow:
+                    if down:
+                        # KC-64: the provider's text is the reason, and the hint
+                        # sits after `_brief`'s cut, never inside it — an exhausted
+                        # plan reads the same as an outage, so the next reader has
+                        # to look at the provider's site.
+                        data = (idle.error or {}).get("data") or {}
+                        error = (f"provider_unavailable after {data.get('attempts')} retries: "
+                                 f"{_brief(data.get('message') or '')}"
+                                 f"{_PLAN_HINT}")
+                        state = AgentState.ERROR
+                    elif not overflow:
                         # an overflow already set its own `error` and `state` above;
                         # this is the fallback for every other `session.error`
                         error = f"session.error: {_brief(idle.error)}"

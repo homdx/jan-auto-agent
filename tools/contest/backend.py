@@ -196,7 +196,8 @@ class ContestBackend(Protocol):
                   on_deadline: Callable[[float], float | None] | None = None,
                   since: int | None = None,
                   max_retry_wait: float | None = None,
-                  quota_re: "re.Pattern | None" = None) -> IdleResult:
+                  quota_re: "re.Pattern | None" = None,
+                  max_retry_attempts: int | None = None) -> IdleResult:
         """Block until this session goes idle, answering on the way.
 
         ``timeout`` bounds the whole wait, ``idle_event_timeout`` the silence.
@@ -222,6 +223,13 @@ class ContestBackend(Protocol):
         waiting the silence clock out. :class:`OpenRouterBackend` takes both and
         ignores them — a bare ``/chat/completions`` has no retry status, so its
         wait is unchanged with either set.
+
+        ``max_retry_attempts`` (KC-64) is passed to :meth:`KiloClient.wait_idle`
+        when it is truthy: ``status="error"`` with
+        ``error["name"] == "ProviderUnavailable"`` once the provider has failed
+        that many retries in a row with no assistant output in between.
+        :class:`OpenRouterBackend` takes it and ignores it too — its provider
+        errors reach the runner as a plain ``session.error``.
         """
         ...
 
@@ -330,7 +338,8 @@ class KiloBackend:
                   on_deadline: Callable[[float], float | None] | None = None,
                   since: int | None = None,
                   max_retry_wait: float | None = None,
-                  quota_re: "re.Pattern | None" = None) -> IdleResult:
+                  quota_re: "re.Pattern | None" = None,
+                  max_retry_attempts: int | None = None) -> IdleResult:
         # KC-36: the callback goes over only when it is armed — `None` keeps
         # this call byte for byte what it was, for a client that predates it.
         client_kwargs = {"idle_event_timeout": idle_event_timeout,
@@ -345,6 +354,10 @@ class KiloBackend:
             client_kwargs["max_retry_wait"] = max_retry_wait
         if quota_re is not None:
             client_kwargs["quota_re"] = quota_re
+        # KC-64: the same way — a limit of 0 is off and goes over as no limit
+        # at all, so a client that predates it gets today's call.
+        if max_retry_attempts:
+            client_kwargs["max_retry_attempts"] = max_retry_attempts
         return self._client.wait_idle(self._tap, session, timeout, **client_kwargs)
 
     def tool_parts(self, session: SessionRef) -> list:
@@ -543,7 +556,8 @@ class OpenRouterBackend:
                   on_deadline: Callable[[float], float | None] | None = None,
                   since: int | None = None,
                   max_retry_wait: float | None = None,
-                  quota_re: "re.Pattern | None" = None) -> IdleResult:
+                  quota_re: "re.Pattern | None" = None,
+                  max_retry_attempts: int | None = None) -> IdleResult:
         """Read the agent's stdout until ``idle``, the timeout, or the timeout's
         silence window.
 
@@ -561,6 +575,9 @@ class OpenRouterBackend:
         ``max_retry_wait`` and ``quota_re`` (KC-61) are accepted and ignored too:
         this backend has no Kilo retry status to judge, and a provider 429
         reaches the runner as a plain ``session.error``.
+        ``max_retry_attempts`` (KC-64) is ignored for the same reason: this
+        backend has no Kilo retry counter, so a provider that keeps failing
+        reaches the runner as a ``session.error`` and keeps KC-19's retry path.
 
         A provider error comes back as ``IdleResult(status="error")`` with the
         agent's payload, ``data.isRetryable`` set for a 429 or a 5xx, so the

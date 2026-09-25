@@ -32,6 +32,10 @@ Everything here is scripted by one scenario dict, per session:
                 "pause_before_idle_sec": 2,  # session.status busy, then that many
                                      # seconds of silence: no idle, no error,
                                      # nothing — a stalled turn (KC-12)
+                "retries": 10,       # KC-64: Kilo's own retry loop, `attempt` 1
+                                      # and up, with no assistant output in
+                                      # between — the round-106 bynara shape
+                "retry_message": "...",  # KC-64: the provider's text on each retry
                 "idle": false,       # never go idle (a stalled turn)
                 "error": {...},      # session.error instead of idle
                 "idles_after_error": 2,  # KC-63: that many session.idle after
@@ -526,6 +530,18 @@ class FakeKiloServer:
             self._emit(self._event_for(session, "busy"))
             self._sleep(float(pause))
             return
+
+        # KC-64: the provider keeps failing — Kilo's own retry loop, as round
+        # 106 showed it for bynara: busy, then retry with attempt n
+        for n in range(1, int(turn.get("retries") or 0) + 1):
+            self._emit({"type": "session.status",
+                        "properties": {"sessionID": session.id,
+                                       "status": {"type": "busy"}}})
+            self._emit({"type": "session.status",
+                        "properties": {"sessionID": session.id,
+                                       "status": {"type": "retry", "attempt": n,
+                                                  "message": turn.get("retry_message", "Upstream temporarily unavailable"),
+                                                  "next": int((time.time() + 10) * 1000)}}})
 
         names = list(turn.get("events") or [])
         for name in names:
