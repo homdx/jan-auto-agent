@@ -118,6 +118,7 @@ class GateEntry:
     config_default: str
     provenance: str = Provenance.STATIC
 
+    # Gate 1 corpus AUTO-T13 grades `__post_init__` live: tests/test_gate1_corpus_precision.py
     def __post_init__(self) -> None:
         if self.fail_mode not in FAIL_MODES:
             raise ValueError(

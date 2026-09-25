@@ -6,7 +6,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-
+# Gate 1 corpus AUTO-T8 grades `read_optional` live: tests/test_gate1_corpus_precision.py
 def read_optional(d, key):
     """`except: pass` — fail-open: silently falls through and returns None."""
     try:

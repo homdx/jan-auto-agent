@@ -100,6 +100,7 @@ class MetricsCollector:
         self._cache_items = None
         return records
 
+    # Gate 1 corpus AUTO-T7 grades `record` live: tests/test_gate1_corpus_precision.py
     def record(self, run: RunRecord) -> None:
         """Append a RunRecord to metrics.json, creating the file if needed.
 

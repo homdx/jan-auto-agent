@@ -23,6 +23,7 @@ def resolve_path(path: str, base_dir: str | None = None) -> str:
     return str(p)
 
 
+# Gate 1 corpus AUTO-T4 grades `read_file` live: tests/test_gate1_corpus_precision.py
 def read_file(path: str) -> str:
     """
     Read a local file safely.
@@ -59,6 +60,7 @@ def read_file(path: str) -> str:
         raise OSError(f"Cannot read {resolved}: {exc}") from exc
 
 
+# Gate 1 corpus AUTO-T5 grades `list_py_files` live: tests/test_gate1_corpus_precision.py
 def list_py_files(base_dir: str, skip_dirs: list) -> list[str]:
     """
     Walk a directory recursively and return all Python source files,

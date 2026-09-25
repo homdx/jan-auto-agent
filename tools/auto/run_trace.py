@@ -233,6 +233,7 @@ class RunTrace:
 # Factory
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Gate 1 corpus AUTO-T2 grades `setup_run_trace` live: tests/test_gate1_corpus_precision.py
 def setup_run_trace(
     state,
     config: configparser.ConfigParser,

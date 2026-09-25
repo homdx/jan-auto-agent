@@ -33,6 +33,7 @@ class OutputFormatter:
         mins, secs = divmod(int(max(0.0, seconds)), 60)
         return f"{mins:02d}:{secs:02d}"
 
+    # Gate 1 corpus AUTO-T6 grades `render` live: tests/test_gate1_corpus_precision.py
     @classmethod
     def render(
         cls,
