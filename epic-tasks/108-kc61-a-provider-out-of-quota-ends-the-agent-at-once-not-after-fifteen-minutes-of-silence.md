@@ -1,6 +1,6 @@
 # KC-61 — a provider out of quota ends the agent at once, not after fifteen minutes of silence
 
-**Status:** queued — found 2026-09-25 in round 107 (KC-60): all five `kenary` agents hit the provider's free daily limit on their first request and sat in `WAITING` for 15 min before the round called them `STALLED`.
+**Status:** landed `d81124a` (2026-09-25) — round 108 winner sensenova-6-8-flash-lite-var1; at intake a quota leaves the agent out with one console line and the round runs one short (not a failure that refuses the round). Was queued: found 2026-09-25 in round 107 (KC-60): all five `kenary` agents hit the provider's free daily limit on their first request and sat in `WAITING` for 15 min before the round called them `STALLED`.
 **Severity:** LOW (the round loses no work: these agents never got to do any. The cost is that the operator's view is wrong for 15 minutes, and the right reason is missing: the report says "no event for 900s" instead of "out of quota until 00:00 UTC")
 **File:** `tools/contest/kilo_client.py`, `tools/contest/backend.py`, `tools/contest/runner.py`, `tools/contest/roster.py`, `contest.ini`, `tools/contest/cli.py`, `tools/contest/variant.py`
 **Symbol:** `KiloClient.wait_idle`, the runner's per-agent loop (the `session.error` / retry block), intake's `resolve_variants` / `hello_probe`

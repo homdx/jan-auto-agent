@@ -395,7 +395,9 @@ def harvest(ws: Workspace, ticket_path: Path, *, run_tests: bool = False) -> Har
                 blocking=False,
             ))
 
-    if run_tests:
+    # No commit above the base: `commits_ne_1` already makes this REWORK, and the
+    # roots would only run the base itself — so they are not run at all.
+    if run_tests and facts.get("commits") != 0:
         # KC-60: the roots run on the commit this harvest scores, not on this
         # tree. An untracked file must not make a red commit score `READY`, and
         # an uncommitted fix must not make a green one score `REWORK`. This tree

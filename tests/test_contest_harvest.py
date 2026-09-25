@@ -868,6 +868,25 @@ def test_harvest_run_tests_reports_the_failure_tail(round_, tmp_path):
     assert "the tests do not pass" in failed.text
 
 
+def test_harvest_run_tests_skips_the_roots_with_no_commit(round_, tmp_path, monkeypatch):
+    """Nothing committed above the base: REWORK on `commits_ne_1`, and the roots
+    are not run on the base for nothing."""
+    repo, base, ticket = round_
+    wt = _worktree(repo, base, tmp_path)
+    _stage_probe(wt)
+
+    def no_roots(cwd):
+        raise AssertionError(f"no commit, yet the roots ran in {cwd}")
+
+    monkeypatch.setattr(harvest_mod, "run_tests_detail", no_roots)
+
+    h = harvest(wt, ticket, run_tests=True)
+    assert h.verdict == "REWORK"
+    assert "commits_ne_1" in _codes(h)
+    assert "tests_failed" not in _codes(h)
+    assert h.facts["tests_run"] == "—"
+
+
 def test_harvest_last_row_wins(round_, tmp_path):
     """The claim is the last row for the ticket, not the first."""
     repo, base, ticket = round_
