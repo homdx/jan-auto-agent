@@ -135,7 +135,7 @@ one puts it in `contest.local.ini`.
 
 - `CONTEST_PYTEST_WORKERS_FILE` = `<out_dir>/pytest-workers` (absolute).
   Write the file **before** the server spawns, with the start value
-  `workers(min(max_parallel, non-terminal workspaces))`, so the first
+  `workers(min(max_parallel, live agents))` (the count below), so the first
   prompts already read a sane number.
 - `PYTEST_PLUGINS` = `contest_pytest_workers` (§3) and `PYTHONPATH` =
   `<runner>/tools/contest/pytest_plugin` **prepended** to the inherited
@@ -145,11 +145,20 @@ one puts it in `contest.local.ini`.
   instead of the code in its own clone.
 - `PYTEST_XDIST_AUTO_NUM_WORKERS` = the same start value, as the fallback
   xdist ≥ 3.2 reads by itself (installed: 3.8.0) if the plugin cannot load.
-- Count the **workspaces**, not `config.agents`: on `--resume` the agents
-  come from `state.json` and may be more than the command line names
-  (round 110 resumed 10 agents, two of them not on the command line). So
-  this is computed after the `if args.resume: … else: prepare_round(…)`
-  block, not where `env` is built today.
+- Count the **round's agents**, not `config.agents`: on `--resume` the
+  agents come from `state.json` and may be more than the command line names
+  (round 110 resumed 10 agents, two of them not on the command line). A
+  `Workspace` carries no state, so the count is taken from the runs:
+  `resume.agents` minus those whose `state` is terminal (a resumed round
+  whose 8 agents already ended has 2 live, not 10); without `--resume`
+  it is `len(config.agents)`, one workspace per agent.
+- Order in `cmd_run`: today `_print_plan` (≈ line 1364) runs **before** the
+  `if args.resume:` block (≈ line 1373), so the plan cannot know the count.
+  Move the `state.json` read (the `if args.resume:` half only — it only
+  reads a file) above `_print_plan`; `prepare_round` stays where it is,
+  after the plan. A `--resume` whose `state.json` is missing or unreadable
+  then fails before the plan is printed, as it already fails before any
+  server starts.
 
 An explicit `-n 4` typed by an agent still wins — that is fine; `-n auto`
 from `pytest.ini` is what multiplies.
@@ -290,6 +299,20 @@ round's other records.
 
 `tests/test_contest_roster.py`: the keys parse, reject negatives (and `pytest_workers_min = 0`, `pytest_workers_few = 0`), and
 `${VAR}` expands in `agent_tmpdir`.
+
+**Every new test is hermetic against the round's own env.** Agents run this
+suite *inside* a round, where `CONTEST_PYTEST_WORKERS_FILE`,
+`PYTEST_PLUGINS`, `PYTEST_XDIST_AUTO_NUM_WORKERS`, the plugin's
+`PYTHONPATH` entry and (with `agent_tmpdir`) `TMPDIR` are already set. A
+test that checks "file missing → xdist's own answer", "no `TMPDIR` key" or
+"`PYTHONPATH` starts with the plugin dir" must `monkeypatch.delenv` /
+`setenv` each of those first, or it passes on the operator's box and fails
+in every agent's run (or the reverse). Add one test that runs the plugin
+tests with those variables set to junk and expects them green.
+
+- `--resume` with a `state.json` of 10 agents, 8 of them terminal,
+  `max_parallel = 8`, 8 cores → `4` (2 live), not `2`.
+- `--resume` with no `state.json` → exit 1, and the plan is not printed.
 
 Tier with `python3 scripts/sync_test_tiers.py`.
 
