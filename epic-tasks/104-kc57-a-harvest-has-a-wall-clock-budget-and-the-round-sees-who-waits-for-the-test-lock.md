@@ -1,6 +1,6 @@
 # KC-57 — a harvest has a wall-clock budget, and the round sees who waits for the test lock
 
-**Status:** queued — found 2026-09-25 judging round 92 and reading round 103 (both with `run_tests` on).
+**Status:** landed `3af979c` (2026-09-26) — round 104, winner sensenova-6-8-flash-lite-var1 (23/23 on the round's acceptance bench `contest-bench/kc57`, tied with sensenova-6-8-flash-lite-var2; var1 names the test the budget ended in); the key documented in `contest.ini`; found 2026-09-25 judging round 92 and reading round 103 (both with `run_tests` on).
 **Severity:** MEDIUM (one entry's slow suite holds `_TEST_RUNS_LOCK` for 20+ minutes; every other finished entry waits behind it in `HARVESTING`, and the round's last half hour is a queue nobody can see)
 **File:** `tools/contest/runner.py`, `tools/contest/harvest.py`, `tools/contest/gates.py`
 **Symbol:** `_harvest`, `_TEST_RUNS_LOCK`, `harvest` (`run_tests` block), `gates.run_tests_detail`
