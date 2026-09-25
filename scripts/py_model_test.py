@@ -20,8 +20,14 @@ First pass — find a provider's free models (sends nothing to any model):
 
     python3 scripts/py_model_test.py --find-free vercel_8080 openrouter2 kilo
 
-    # zyloai: pass --base-url and --api-key, use the provider name as a label
+    # single direct provider via --base-url/--api-key
     python3 scripts/py_model_test.py --find-free --base-url https://api.zyloai.net/v1 --api-key zk_... zyloai
+
+    # multiple direct providers in one run via --provider NAME URL KEY (repeatable)
+    python3 scripts/py_model_test.py --find-free \\
+        --provider teamorouter https://api.teamorouter.com/v1 sk-teamo-... \\
+        --provider orca https://api.orcarouter.ai/v1 sk-orca-... \\
+        --provider pollinations https://gen.pollinations.ai sk_LL...
 
 Prints the text models with tools and price 0, marks which ones kilo already
 has under that provider, and the model list for the second pass (a normal run).
@@ -260,10 +266,13 @@ def free_from_openrouter() -> list:
 def free_from_direct_api(base_url: str, api_key: str) -> list:
     """(id, status, context, note) from an OpenAI-compatible /models endpoint.
 
-    Expects the zyloai shape: {"text": [{id, pricing, capabilities, context_window,
-    min_plan, ...}]}. Falls back to the standard {"data": [...]} shape.
-    Marks models with all-zero pricing and 'tool-use' capability as FREE when
-    min_plan is absent/BASIC, else MAYBE.
+    Handles several response shapes:
+      - zyloai: {"text": [{id, pricing, capabilities, context_window, min_plan}]}
+      - standard: {"data": [{id, ...}]}
+      - bare list: [{id, ...}] or ["model-id", ...]
+    When capabilities are listed and neither 'tool-use' nor 'tools' appears, the
+    model is skipped. When capabilities are absent, the model is included (unknown).
+    Models with non-zero pricing are excluded; no pricing info → MAYBE.
     """
     req = urllib.request.Request(
         f"{base_url.rstrip('/')}/models",
@@ -271,19 +280,33 @@ def free_from_direct_api(base_url: str, api_key: str) -> list:
     )
     with urllib.request.urlopen(req, timeout=30) as r:
         data = json.loads(r.read())
-    models = data.get("text") or data.get("data") or []
+    if isinstance(data, list):
+        models = data
+    else:
+        models = data.get("text") or data.get("data") or data.get("models") or []
     rows = []
     for m in models:
-        if "tool-use" not in (m.get("capabilities") or []):
+        if isinstance(m, str):
+            m = {"id": m}
+        mid = m.get("id") or m.get("name") or ""
+        if not mid:
+            continue
+        caps = m.get("capabilities") or []
+        # If capabilities are present and neither tool-use nor tools is listed, skip
+        if caps and "tool-use" not in caps and "tools" not in caps:
             continue
         pricing = m.get("pricing") or {}
         if paid_fields(pricing):
             continue
-        ctx = m.get("context_window") or 0
+        ctx = m.get("context_window") or m.get("context_length") or 0
         plan = (m.get("min_plan") or "").upper()
-        note = f"min_plan={plan}" if plan and plan not in ("BASIC", "FREE", "") else ""
-        status = FREE if plan in ("BASIC", "FREE", "") else MAYBE
-        rows.append((m["id"], status, ctx, note))
+        if not pricing:
+            status, note = MAYBE, "no pricing info"
+        elif plan and plan not in ("BASIC", "FREE", ""):
+            status, note = MAYBE, f"min_plan={plan}"
+        else:
+            status, note = FREE, ""
+        rows.append((mid, status, ctx, note))
     print(f"  direct api: checked {len(models)} models")
     return rows
 
@@ -306,19 +329,20 @@ def free_from_kilo(meta: dict) -> list:
     return rows
 
 
-def find_free(kilo: str, providers: list, base_url: str | None = None,
-              api_key: str | None = None) -> int:
-    for provider in providers:
+def find_free(kilo: str, provider_specs: list) -> int:
+    """provider_specs: list of (name, url_or_None, key_or_None).
+    url/key are set for direct-API providers; None for vercel/openrouter/kilo."""
+    for provider, purl, pkey in provider_specs:
         print(f"== {provider}", flush=True)
         low = provider.lower()
-        direct = base_url and api_key
+        direct = bool(purl and pkey)
         try:
             if direct or low.startswith("zyloai"):
-                url = base_url or f"https://api.{low}.net/v1"
-                if not api_key:
+                url = purl or f"https://api.{low}.net/v1"
+                if not pkey:
                     print("  --api-key required for direct API provider")
                     continue
-                rows, source = free_from_direct_api(url, api_key), f"direct api {url}"
+                rows, source = free_from_direct_api(url, pkey), f"direct api {url}"
             elif low.startswith("vercel"):
                 rows, source = free_from_vercel(), "api vercel"
             elif low.startswith("openrouter"):
@@ -339,10 +363,12 @@ def find_free(kilo: str, providers: list, base_url: str | None = None,
             print("model".ljust(w), "status".ljust(12), " context", " note")
             for mid, status, ctx, note in rows:
                 print(mid.ljust(w), status.ljust(12), f"{ctx // 1000:>7}k", f"  {note}")
-            cmd = (f"python3 scripts/py_model_test.py"
-                   f" --base-url {base_url} --api-key {api_key}"
-                   f" " + " ".join(r[0] for r in rows))
-            print(f"\n  second pass:\n  {cmd}")
+            free_ids = [r[0] for r in rows if r[1] == FREE]
+            if free_ids:
+                cmd = (f"python3 scripts/py_model_test.py"
+                       f" --base-url {purl} --api-key {pkey}"
+                       f" " + " ".join(free_ids))
+                print(f"\n  second pass (free only):\n  {cmd}")
         else:
             in_kilo = kilo_models(kilo, provider, False)
             print("model".ljust(w), "status".ljust(12), " context", " in kilo", " note")
@@ -401,7 +427,7 @@ def ask_direct(base_url: str, api_key: str, model: str, prompt: str, timeout: in
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("models", nargs="+",
+    ap.add_argument("models", nargs="*",
                     help="provider/model as in kilo; with --find-free, provider names")
     ap.add_argument("--kilo", help="path to the kilo binary")
     ap.add_argument("--timeout", type=int, default=240, help="seconds for the model to answer")
@@ -413,14 +439,31 @@ def main() -> int:
                     help="direct mode: OpenAI-compatible base URL (e.g. https://api.zyloai.net/v1)")
     ap.add_argument("--api-key", metavar="KEY",
                     help="direct mode: API key for --base-url")
+    ap.add_argument("--provider", nargs=3, action="append",
+                    metavar=("NAME", "URL", "KEY"),
+                    help="add a direct-API provider for --find-free (repeatable)")
     ap.add_argument("--parallel", "-j", metavar="N", type=int, default=1,
                     help="run N models in parallel (default: 1 = sequential)")
     args = ap.parse_args()
 
-    kilo = find_kilo(args.kilo) if not (args.base_url and args.find_free) else ""
     if args.find_free:
-        return find_free(kilo, args.models, base_url=args.base_url, api_key=args.api_key)
+        # Build unified (name, url, key) spec list
+        provider_specs: list[tuple[str, str | None, str | None]] = []
+        for name in (args.models or []):
+            if args.base_url and args.api_key:
+                provider_specs.append((name, args.base_url, args.api_key))
+            else:
+                provider_specs.append((name, None, None))
+        for name, url, key in (args.provider or []):
+            provider_specs.append((name, url, key))
+        if not provider_specs:
+            ap.error("--find-free requires provider names or --provider NAME URL KEY")
+        # need kilo only if any non-direct providers
+        kilo = find_kilo(args.kilo) if any(u is None for _, u, _ in provider_specs) else ""
+        return find_free(kilo, provider_specs)
 
+    if not args.models:
+        ap.error("at least one model is required")
     direct = bool(args.base_url and not args.find_free)
     if direct and not args.api_key:
         sys.exit("--api-key is required with --base-url")
