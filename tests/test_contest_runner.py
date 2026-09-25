@@ -61,7 +61,10 @@ from tools.contest.runner import (  # noqa: E402
     CUT_OFF_MESSAGE,
     TreeReadError,
     _cut_off,
+    _finished_replies,
     _is_overflow,
+    _retry_reason,
+    _retryable,
     round_prompt,
     run_agent,
     run_round,
@@ -324,6 +327,23 @@ class _OverflowFake(_BenchFake):
         session = super()._create_session(body, directory)
         if len(self.sessions()) > 1 and self.scenario.get("turns_after") is not None:
             self.scenario["turns"] = self.scenario.pop("turns_after")
+        return session
+
+
+class _FinishedFake(_BenchFake):
+    """The session opens with one assistant reply that already `finish`ed
+    (`finish: "tool-calls"`): the round 74 shape, five steps done before the
+    provider turned the request off.
+
+    `turns` is unchanged — the seed is only what the transcript looks like when
+    the runner reads it, not another scripted turn."""
+
+    SEED = {"info": {"role": "assistant", "finish": "tool-calls"},
+            "parts": [{"type": "text", "text": "five steps done"}]}
+
+    def _create_session(self, body, directory):
+        session = super()._create_session(body, directory)
+        self._sessions[session["id"]].messages.append(dict(self.SEED))
         return session
 
 
@@ -1495,6 +1515,255 @@ def test_ctrl_c_during_retry_backoff_ends_the_round(tmp_path):
     # under the full wait, and a regression that ignored SIGINT would sit here
     # for the whole backoff.
     assert elapsed < cfg.error_retry_backoff_sec
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KC-45: a dropped response stream is a retryable error, not an ended agent
+# ─────────────────────────────────────────────────────────────────────────────
+
+#: The round 86 payload, quoting included — Kilo wraps the provider's message in
+#: a literal pair of quotes, and it carries no `isRetryable` and no `metadata`.
+_INTERRUPTED_STREAM = {"name": "UnknownError",
+                       "data": {"message": "\"the model's provider interrupted the response stream\""}}
+#: Kilo's text for the same class on the stream log, which never reached
+#: `session.error` in round 86.
+_UPSTREAM_UNAVAILABLE = {"name": "UnknownError",
+                         "data": {"message": "upstream unavailable for model x"}}
+#: The round 86 `nex-n2-5-pro` payload: refused on its very first request,
+#: before any tool call.
+_REJECTED_REQUEST = {"name": "UnknownError",
+                     "data": {"message": "the model's provider rejected the request. "
+                                          "check the model id, request fields, and context length"}}
+
+
+@pytest.mark.parametrize("payload", [_INTERRUPTED_STREAM, _UPSTREAM_UNAVAILABLE])
+def test_a_dropped_response_stream_is_retryable(payload):
+    """§1: both dropped-connection messages are retryable from the message
+    alone — no status code, no `isRetryable`, no `metadata`."""
+    assert _retryable(payload) is True, payload
+
+
+@pytest.mark.parametrize("payload", [
+    {"name": "UnknownError", "data": {"message": "Model not found: kenary/x"}},
+    {"name": "APIError", "data": {"message": "This model's maximum context length is 128000 tokens"}},
+    {"name": "ProviderError", "message": "boom-42"},
+    {"name": "APIError", "data": {"message": "x", "isRetryable": False}},
+    {},
+    "Connection reset by server",
+    None,
+    42,
+    ["ECONNRESET"],
+])
+def test_the_kc19_not_retryable_shapes_stay_not_retryable(payload):
+    """KC-19's list is unchanged, so a later looser pattern (`provider`,
+    `stream`) cannot swallow them."""
+    assert _retryable(payload) is False, payload
+
+
+def test_provider_rejected_request_is_not_retryable_without_a_finished_reply():
+    """§2: the pin. A refusal on the session's first call is refused again when
+    resent, and a count that is not a count fails open to that answer."""
+    assert _retryable(_REJECTED_REQUEST) is False
+    for junk in (None, "1", [], {}, True, 1.5):
+        assert _retryable(_REJECTED_REQUEST, junk) is False, junk
+
+
+def test_provider_rejected_request_is_retryable_after_a_finished_reply():
+    """§2a: the same payload once the session has had an answer is the free tier
+    refusing under load — the 429 class, retryable under KC-19's budget."""
+    assert _retryable(_REJECTED_REQUEST, 1) is True
+    assert _retryable(_REJECTED_REQUEST, 5) is True
+
+
+class _Transcript:
+    """A backend stand-in for `_finished_replies`: `messages()` returns or
+    raises."""
+
+    def __init__(self, messages=None, error=None):
+        self._messages, self._error = messages, error
+
+    def messages(self, session):
+        if self._error is not None:
+            raise self._error
+        return self._messages
+
+
+def test_finished_replies_counts_the_answers_that_finished():
+    """§2a: one per assistant message with a `finish` — any finish, not only
+    `stop`. A transcript that cannot be read, is not a list, or holds no
+    assistant reply is 0."""
+    tool_calls = {"info": {"role": "assistant", "finish": "tool-calls"}, "parts": []}
+    length = {"info": {"role": "assistant", "finish": "length"}, "parts": []}
+    open_reply = {"info": {"role": "assistant"}, "parts": []}
+    # the reply Kilo writes for the refused call itself (round 88,
+    # nemotron-3-super-120b-a12b): an error and no `finish` — not an answer
+    refused = {"info": {"role": "assistant", "error": {"name": "UnknownError"}}, "parts": []}
+    user = {"info": {"role": "user"}, "parts": []}
+    assert _finished_replies(_Transcript([user, tool_calls]), None) == 1
+    assert _finished_replies(_Transcript([tool_calls, length]), None) == 2
+    assert _finished_replies(_Transcript([open_reply]), None) == 0
+    assert _finished_replies(_Transcript([refused]), None) == 0
+    assert _finished_replies(_Transcript([tool_calls, refused]), None) == 1
+    assert _finished_replies(_Transcript([user]), None) == 0
+    assert _finished_replies(_Transcript([]), None) == 0
+    assert _finished_replies(_Transcript({"not": "a list"}), None) == 0
+    assert _finished_replies(_Transcript(error=RuntimeError("GET /message: 500")), None) == 0
+    assert _finished_replies(_Transcript([None, "junk", {"info": "junk"}]), None) == 0
+
+
+def test_retry_reason_drops_the_surrounding_quotes():
+    """§3: the reason is the message without Kilo's extra `"…"`, so
+    `RETRY_PROMPT` reads as a sentence instead of a sentence inside a quote."""
+    reason = _retry_reason(_INTERRUPTED_STREAM)
+    assert not reason.startswith('"') and not reason.endswith('"')
+    assert reason == "the model's provider interrupted the response stream"
+    # one layer only, and only when both ends are the same quote
+    assert _retry_reason({"name": "APIError", "data": {"message": "502 Bad Gateway"}}) == "502 Bad Gateway"
+    assert _retry_reason({"name": "APIError", "data": {"message": "'502 Bad Gateway'"}}) == "502 Bad Gateway"
+    assert _retry_reason("Connection reset by server") == "Connection reset by server"
+    assert _retry_reason({"name": "APIError", "data": {"message": 'a "quoted" word'}}) == 'a "quoted" word'
+
+
+def _run_finished_one(tmp_path, scenario, config=None):
+    """`_run_one` against :class:`_FinishedFake`, so the session opens with one
+    assistant reply that already finished (KC-45 §2a)."""
+    sb = Sandbox(tmp_path)
+    config = config or _make_retry_config()
+    with _FinishedFake(scenario) as fake:
+        h = Harness(sb, fake, config)
+        run = h.go()
+    return sb, fake, h, run, _aborted(fake)
+
+
+def _assert_retried_in_the_same_session(run, fake, reason):
+    """KC-45's runner contract: one session, one prompt on it, and a retry whose
+    text is `RETRY_PROMPT` naming *reason* — never an `ERROR` after one turn."""
+    assert run.state is AgentState.READY, (run.state, run.last_error)
+    assert run.attempt == 0
+    assert [t["kind"] for t in run.turns] == ["initial", "retry"]
+    assert run.turns[0]["idle_status"] == "error"
+    assert len(_session_posts(fake)) == 1
+    prompts = _prompts(fake)
+    assert len(prompts) == 2
+    (sid1, _), (sid2, retry_text) = prompts
+    assert sid1 == sid2
+    assert "dropped the connection" in retry_text and reason in retry_text
+    return retry_text
+
+
+def test_interrupted_stream_error_reprompts_same_session_and_recovers(tmp_path, caplog):
+    """Acceptance 4: the round 86 payload on the first turn — no `isRetryable`,
+    no `metadata`, the message wrapped in quotes. The agent is re-prompted with
+    `RETRY_PROMPT` in the same session and ends READY, not ERROR after one turn."""
+    caplog.set_level(logging.INFO, logger="tools.contest.runner")
+    scenario = {"turns": [
+        {"events": ["busy"], "error": _INTERRUPTED_STREAM},
+        {"on_prompt": work_ready, "events": ["busy", "idle"]},
+    ]}
+    sb, fake, _h, run, _ = _run_one(tmp_path, scenario, _make_retry_config())
+    retry_text = _assert_retried_in_the_same_session(
+        run, fake, "the model's provider interrupted the response stream")
+    # §3: the retry prompt carries the reason without Kilo's wrapping quotes
+    assert '"the model' not in retry_text and 'stream"' not in retry_text
+    assert "agent-a: retry 1/2 in 0s — the model's provider interrupted the response stream" in [
+        r.getMessage() for r in caplog.records if r.name == "tools.contest.runner"]
+    assert len(_jsonl(sb.out_dir / "agent-a" / "turns.jsonl")) == 2
+
+
+def test_upstream_unavailable_reprompts_same_session_and_recovers(tmp_path):
+    """§1: Kilo's stream-log text is the same class once it reaches
+    `session.error`, so it is retried too."""
+    scenario = {"turns": [
+        {"events": ["busy"], "error": _UPSTREAM_UNAVAILABLE},
+        {"on_prompt": work_ready, "events": ["busy", "idle"]},
+    ]}
+    sb, fake, _h, run, _ = _run_one(tmp_path, scenario, _make_retry_config())
+    _assert_retried_in_the_same_session(run, fake, "upstream unavailable for model x")
+
+
+def test_rejected_request_is_retried_after_a_finished_reply(tmp_path, caplog):
+    """Acceptance §2a: the session has already had an assistant reply with
+    `finish: "tool-calls"` — five steps done before the provider turned the
+    request off. Retried with `RETRY_PROMPT` in the same session."""
+    caplog.set_level(logging.INFO, logger="tools.contest.runner")
+    scenario = {"turns": [
+        {"events": ["busy"], "error": _REJECTED_REQUEST},
+        {"on_prompt": work_ready, "events": ["busy", "idle"]},
+    ]}
+    sb, fake, _h, run, _ = _run_finished_one(tmp_path, scenario)
+    _assert_retried_in_the_same_session(run, fake, "the model's provider rejected the request")
+    logs = [r.getMessage() for r in caplog.records if r.name == "tools.contest.runner"]
+    assert any(l.startswith("agent-a: retry 1/2 in 0s — the model's provider rejected the request")
+               for l in logs), logs
+
+
+def test_rejected_request_is_not_retried_on_the_first_call(tmp_path):
+    """Acceptance §2: the same payload in a session with no finished reply is
+    still ERROR after one turn — no second prompt, even with retries left."""
+    scenario = {"turns": [{"events": ["busy"], "error": _REJECTED_REQUEST}]}
+    sb, fake, _h, run, _ = _run_one(tmp_path, scenario, _make_retry_config())
+    assert run.state is AgentState.ERROR
+    assert len(_prompts(fake)) == 1
+    assert len(run.turns) == 1
+    assert "provider rejected the request" in run.last_error
+
+
+def test_rejected_request_uses_the_kc19_retry_budget(tmp_path):
+    """Acceptance §2a: the mid-session refusal spends KC-19's budget, it gets
+    none of its own — two refusals with `max_error_retries=1` end ERROR with
+    the `after 1 retries:` line."""
+    scenario = {"turns": [
+        {"events": ["busy"], "error": _REJECTED_REQUEST},
+        {"events": ["busy"], "error": _REJECTED_REQUEST},
+    ]}
+    sb, fake, _h, run, _ = _run_finished_one(tmp_path, scenario,
+                                             _make_retry_config(max_error_retries=1))
+    assert run.state is AgentState.ERROR
+    assert run.last_error.startswith("after 1 retries: session.error:")
+    assert [t["kind"] for t in run.turns] == ["initial", "retry"]
+    assert len(_prompts(fake)) == 2 and len(_session_posts(fake)) == 1
+
+
+def test_rejected_request_is_not_retried_when_the_transcript_is_unreadable(tmp_path, monkeypatch):
+    """Acceptance §2a: `messages()` raising while the count is decided is no
+    finished reply — the refusal is treated as a first-call one, so the run
+    ends ERROR instead of raising into the round."""
+    def unreadable(self, session):
+        raise RuntimeError("GET /message: 500")
+    monkeypatch.setattr(KiloBackend, "messages", unreadable)
+    scenario = {"turns": [{"events": ["busy"], "error": _REJECTED_REQUEST}]}
+    sb, fake, _h, run, _ = _run_finished_one(tmp_path, scenario)
+    assert run.state is AgentState.ERROR
+    assert len(_prompts(fake)) == 1
+    assert len(run.turns) == 1
+
+
+def test_the_transcript_is_read_for_a_rejected_request_only(tmp_path, monkeypatch):
+    """§2a costs a `GET /message` only where the answer depends on it: a
+    rejected request. Any other error — permanent or already retryable — is
+    decided without reading the transcript."""
+    reads = []
+    real = _runner_module._finished_replies
+
+    def counting(backend, session):
+        reads.append(session)
+        return real(backend, session)
+    monkeypatch.setattr(_runner_module, "_finished_replies", counting)
+
+    not_found = {"name": "APIError", "data": {"message": "Model not found: agent-a:free"}}
+    _, _, _, run, _ = _run_finished_one(tmp_path / "a", {"turns": [
+        {"events": ["busy"], "error": not_found}]})
+    assert run.state is AgentState.ERROR and reads == []
+
+    _, _, _, run, _ = _run_finished_one(tmp_path / "b", {"turns": [
+        {"events": ["busy"], "error": _INTERRUPTED_STREAM},
+        {"on_prompt": work_ready, "events": ["busy", "idle"]}]})
+    assert run.state is AgentState.READY and reads == []
+
+    _, _, _, run, _ = _run_finished_one(tmp_path / "c", {"turns": [
+        {"events": ["busy"], "error": _REJECTED_REQUEST},
+        {"on_prompt": work_ready, "events": ["busy", "idle"]}]})
+    assert run.state is AgentState.READY and len(reads) == 1
 
 
 # ─────────────────────────────────────────────────────────────────────────────

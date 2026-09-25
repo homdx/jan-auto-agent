@@ -70,6 +70,15 @@ replacement is made. A clean overflow, or one that has spent the budget, is a
 `STALLED` turn rather than an `ERROR` and still falls through to KC-21: a
 commit above the base is harvested there and can still end `READY`. Every
 non-overflow `session.error` keeps today's path byte for byte.
+
+KC-45 (round 89) makes the provider's own name for a dropped stream
+retryable: ``interrupted the response stream`` and ``upstream unavailable``
+match the message pattern, so the round 86 payload goes to a
+``RETRY_PROMPT`` re-prompt instead of an ``ERROR`` after one turn, and
+``_retry_reason`` drops the pair of quotes Kilo wraps it in. A `provider
+rejected the request` is still permanent on the session's *first* call —
+refused once, refused again — but retryable once the session has had an
+assistant reply that finished, where it is the free tier refusing under load.
 """
 
 from __future__ import annotations
@@ -129,8 +138,17 @@ _RETRYABLE_CODES = frozenset({
     "ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "EPIPE", "UND_ERR_SOCKET",
 })
 _RETRYABLE_MSG_RE = re.compile(
-    r"429|502|503|504|overloaded|rate limit|timeout", re.IGNORECASE
+    r"429|502|503|504|overloaded|rate limit|timeout"
+    r"|interrupted the response stream|upstream unavailable", re.IGNORECASE
 )
+
+#: KC-45 §2/§2a: the provider's refusal of the request itself — no status code,
+#: no retry flag, no socket error. Refused on the session's *first* call, it is
+#: refused again when resent (§2). Once the session has had an assistant reply
+#: that finished, the model id and the request fields have just worked, and the
+#: refusal is the free tier refusing under load — the same class as the 429 two
+#: lines above it (§2a).
+_PROVIDER_REJECTED_RE = re.compile(r"provider rejected the request", re.IGNORECASE)
 
 #: KC-54: a context overflow's payload — the provider's name for it, or either
 #: spelling of the message it carries. The name is in the pattern as well as
@@ -156,13 +174,45 @@ CUT_OFF_MESSAGE = (
 )
 
 
-def _retryable(error) -> bool:
-    """True when *error* is a retryable provider error (KC-19).
+def _error_message(error) -> str:
+    """The message of a ``session.error`` payload: ``data.message``, else a
+    top-level ``message``, else ``""``."""
+    if not isinstance(error, dict):
+        return ""
+    data = error.get("data")
+    if isinstance(data, dict) and isinstance(data.get("message"), str):
+        return data["message"]
+    if isinstance(error.get("message"), str):
+        return error["message"]
+    return ""
+
+
+def _rejected_request(error) -> bool:
+    """KC-45 §2a: *error* is the provider refusing the request itself — the
+    one payload whose retry depends on the session's transcript."""
+    return _PROVIDER_REJECTED_RE.search(_error_message(error)) is not None
+
+
+def _retryable(error, finished: int = 0) -> bool:
+    """True when *error* is a retryable provider error (KC-19, KC-45).
 
     Retryable when ``data.isRetryable`` is truthy, or ``data.metadata.code``
     is one of the known transient socket codes, or the message matches a
-    status-code or overload pattern.  A payload that is not a dict, or has
-    no recognizable retryable signal, is not retryable.
+    status-code, overload or dropped-stream pattern — the two KC-45 additions
+    being ``interrupted the response stream``, the provider's own name for the
+    connection it cut mid-turn, and ``upstream unavailable``, Kilo's text for
+    the same class on the stream log.
+
+    ``provider rejected the request`` needs *finished*, the count of the
+    session's assistant messages that carry a ``finish`` (KC-45 §2a, the caller
+    counts them off ``KiloClient.messages``): zero means the refusal happened
+    before any answer, so the request is refused again when resent (§2); one or
+    more means the model id and the request fields have just worked, and the
+    refusal is the free tier refusing under load (§2a). *finished* is ``0`` by
+    default, which is §2's behaviour for every caller that supplies nothing.
+
+    A payload that is not a dict, or has no recognizable retryable signal, is
+    not retryable.
     """
     if not isinstance(error, dict):
         return False
@@ -172,13 +222,13 @@ def _retryable(error) -> bool:
     metadata = data.get("metadata") if isinstance(data, dict) else None
     if isinstance(metadata, dict) and metadata.get("code") in _RETRYABLE_CODES:
         return True
-    msg = ""
-    if isinstance(data, dict) and isinstance(data.get("message"), str):
-        msg = data["message"]
-    elif isinstance(error.get("message"), str):
-        msg = error["message"]
+    msg = _error_message(error)
     if _RETRYABLE_MSG_RE.search(msg):
         return True
+    if _PROVIDER_REJECTED_RE.search(msg):
+        # fail-open: a count that cannot be trusted is no count, which is §2's
+        # answer — an unreadable transcript cannot prove the session answered
+        return isinstance(finished, int) and not isinstance(finished, bool) and finished > 0
     return False
 
 
@@ -252,12 +302,54 @@ def _cut_off(backend: ContestBackend, session: SessionRef,
     return None
 
 
+def _finished_replies(backend: ContestBackend, session: SessionRef) -> int:
+    """KC-45 §2a: how many of *session*'s assistant messages carry a ``finish``.
+
+    ``0`` for every failure — a transcript that cannot be read, or one that is
+    not a list, is treated as one with no finished reply, which is §2's
+    first-call behaviour: the refusal is not retried. Any ``finish`` counts,
+    not only ``"stop"``: a reply cut off at a token limit still answered the
+    request the provider now calls bad.
+    """
+    try:
+        messages = backend.messages(session)
+    except Exception:  # noqa: BLE001 — a transcript that cannot be read has no replies
+        return 0
+    if not isinstance(messages, list):
+        return 0
+    finished = 0
+    for message in messages:
+        info = message.get("info") if isinstance(message, dict) else None
+        if isinstance(info, dict) and info.get("role") == "assistant" and info.get("finish"):
+            finished += 1
+    return finished
+
+
+def _unquote(text: str) -> str:
+    """*text* with one layer of matching surrounding quotes removed (KC-45 §3).
+
+    Kilo wraps some provider messages in a literal pair of quotes — the round 86
+    dropped-stream payload arrives as ``"the model's provider interrupted the
+    response stream"`` — and ``RETRY_PROMPT`` puts the reason in a sentence of
+    its own, so the extra layer only reads as noise. One layer only, and only
+    when both ends are the same quote: an unbalanced message is unchanged.
+    """
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in ('"', "'"):
+        return text[1:-1].strip()
+    return text
+
+
 def _retry_reason(error) -> str:
-    """The brief reason string for ``RETRY_PROMPT`` from a retryable payload."""
+    """The brief reason string for ``RETRY_PROMPT`` from a retryable payload.
+
+    ``data.message`` first, then the payload itself. The message has one layer
+    of surrounding quotes removed (KC-45 §3): ``RETRY_PROMPT`` already puts the
+    reason in its own sentence, so Kilo's extra ``"…"`` only reads as noise.
+    """
     if isinstance(error, dict):
         data = error.get("data") or {}
         if isinstance(data, dict) and isinstance(data.get("message"), str):
-            return _brief(data["message"])
+            return _brief(_unquote(data["message"]))
     return _brief(error)
 
 
@@ -1092,7 +1184,18 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                     # and can still end READY.
                     error = "context overflow" + ("" if dirty else " with no uncommitted work")
                     state = AgentState.STALLED
-                if not overflow and _retryable(idle.error) and retries_used < int(config.max_error_retries):
+                # KC-45 §2a: KC-19's rules decide most `session.error`s. A
+                # mid-session `provider rejected the request` needs the count of
+                # the replies that already finished, so the transcript is read
+                # for that payload only — fail-open to 0, which is §2's answer.
+                # An overflow, a spent budget or any other error never reads it.
+                retryable = False
+                if not overflow and retries_used < int(config.max_error_retries):
+                    retryable = _retryable(idle.error)
+                    if not retryable and _rejected_request(idle.error):
+                        retryable = _retryable(
+                            idle.error, finished=_finished_replies(backend, session))
+                if retryable:
                     run.turns.append(turn)
                     _append_jsonl(agent_dir / "turns.jsonl", {"agent": spec.name, **turn})
                     retries_used += 1
