@@ -289,10 +289,11 @@ class ContestConfig:
     #: KC-55: how many times a gate call that hit a rate limit or a dropped
     #: connection is retried by ``tools.llm_stream.request_completion``'s own
     #: loop. 0 is today's fail-fast gate.
-    gate_retries: int = 3
+    gate_retries: int = 4
     #: KC-55: the wait between two of those retries when the server names no
-    #: ``Retry-After``.
-    gate_retry_wait_sec: float = 10.0
+    #: ``Retry-After``. KC-66: 30 s, 5 tries in all — a free gate key shared
+    #: with eight agents needs more than 10 s to cool.
+    gate_retry_wait_sec: float = 30.0
     #: KC-55: a ``Retry-After`` longer than this is a quota reset, not a blip:
     #: the call fails at once rather than waiting it out.
     gate_retry_max_wait_sec: float = 60.0
@@ -533,7 +534,7 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
 
     agents = _parse_agents(parser)
 
-    gate_retries = limit("gate_retries", 3)
+    gate_retries = limit("gate_retries", 4)
     if gate_retries < 0:
         raise RosterError(f"[contest] gate_retries must be >= 0, got {gate_retries}")
 
@@ -622,7 +623,7 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
         gate_llm_profile=gate_profile,
         gate_max_calls_per_session=limit("gate_max_calls_per_session", 20),
         gate_retries=gate_retries,
-        gate_retry_wait_sec=seconds("gate_retry_wait_sec", 10.0),
+        gate_retry_wait_sec=seconds("gate_retry_wait_sec", 30.0),
         gate_retry_max_wait_sec=seconds("gate_retry_max_wait_sec", 60.0),
         gate_deadline_sec=seconds("gate_deadline_sec", 600.0),
         out_dir=scalar("out_dir", "contest-out"),

@@ -917,6 +917,36 @@ def _deadline_grant(on_deadline: Callable[[float], float | None],
     return float(value) if float(value) > 0 else None
 
 
+def _gate_back_sec(value) -> float:
+    """The seconds a handler grants the turn back, or ``0.0``.
+
+    KC-66: a bool is not a number of seconds, a string is not either, and a
+    negative number is not a grant. Anything that is not a positive int or
+    float is ``0.0`` — never an exception out of a permission reply.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0.0
+    return float(value) if float(value) > 0 else 0.0
+
+
+def _permission_answer(answer) -> "tuple[str, str, float]":
+    """KC-66: ``(reply, message, gate_sec)`` out of an ``on_permission`` answer.
+
+    Two elements is today's contract and it is unchanged: a handler that spent
+    no gate time answers ``("once", "")`` exactly as before and ``gate_sec`` is
+    ``0.0``. A third element is the seconds the handler asks back for the gate's
+    own waits — the gate runs inside this loop, so every second of its 429
+    would otherwise come out of the agent's turn. Anything that is not a
+    sequence of at least two is a ``TypeError``, the failure ``on_permission``
+    has always had: the permission is not answered. A third element that is not
+    a positive number of seconds is ``0.0``.
+    """
+    if isinstance(answer, (tuple, list)) and len(answer) >= 2:
+        granted = _gate_back_sec(answer[2]) if len(answer) > 2 else 0.0
+        return answer[0], answer[1], granted
+    raise TypeError(f"on_permission returned {answer!r}, not (reply, message)")
+
+
 class KiloClient:
     """One session directory on one server.
 
@@ -1155,7 +1185,7 @@ class KiloClient:
         """Block until this session goes idle, answering on the way.
 
         The probe's ``wait_idle`` with the decisions delegated:
-        ``on_permission(event) -> (reply, message)`` decides a
+        ``on_permission(event) -> (reply, message[, gate_sec])`` decides a
         ``permission.*.asked`` event (the reply and the reason the model will
         read) and ``on_question(event) -> None`` observes a
         ``question.*.asked`` event, which is rejected regardless. Only events
@@ -1368,8 +1398,15 @@ class KiloClient:
 
             if etype in ("permission.asked", "permission.v2.asked"):
                 try:
-                    reply, message = on_permission(event)
+                    reply, message, granted = _permission_answer(on_permission(event))
                     self.reply_permission(session, props.get("id"), reply, message)
+                    # KC-66: the gate's own waits are the agent's time, not the
+                    # gate's — grant them back before the loop re-measures the
+                    # deadline on the pass that follows.
+                    if granted > 0:
+                        deadline += granted
+                        _log.info("%s: gate waits granted +%gs to the turn",
+                                  session_id, granted)
                 except (KiloHttpError, ValueError, TypeError) as e:
                     _log.warning("permission %s not answered: %s", props.get("id"), e)
                 permissions.append(event)

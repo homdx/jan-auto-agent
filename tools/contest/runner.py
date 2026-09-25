@@ -1150,10 +1150,15 @@ class _TurnClock:
 
     KC-36: ``on_deadline`` is what ``wait_idle`` asks at the deadline,
     ``extensions`` the grants it earned (one entry per grant, recorded in the
-    turn), ``last_sample`` the churn it refused, and ``granted`` the total the
-    deadline has already moved — both the cap the last extension is clipped to
+    turn), ``last_sample`` the churn it refused, and ``granted`` the churn the
+    deadline has already moved — both the cap the next extension is clipped to
     and the heartbeat's ``+Nm``. ``prev_sample`` is the churn the last grant
     was based on, the baseline the next sample grows against.
+
+    KC-66: ``gate_added`` and ``gate_attempts`` are the gate's half, kept out
+    of ``granted`` on purpose. The gate's waits are recovery, not progress, so
+    a turn that hit a busy gate key still has its full churn room left, and the
+    two are added up when the turn is recorded.
     """
 
     on_deadline: Callable[[float], float | None] | None
@@ -1162,6 +1167,31 @@ class _TurnClock:
     last_sample: tuple[int, int] = (0, 0)
     last_change_at: float = 0.0
     granted: float = 0.0
+    #: KC-66: the seconds this turn got back for the gate's own waits, and the
+    #: tries those waits cost.
+    gate_added: float = 0.0
+    gate_attempts: int = 0
+
+    def grant_gate(self, seconds: float, tries: int) -> float:
+        """KC-66: the seconds a gate's waits are granted back to this turn.
+
+        The gate runs inside ``wait_idle``'s loop, so its 429 would otherwise
+        come straight out of the agent's turn. Whatever it asks is granted, and
+        it is kept out of ``granted`` — see the class docstring — so a turn
+        that spent time on the gate's rate limit still earns its churn
+        extensions. Returns the same seconds, which is what the deadline moves
+        by and what the turn records. Fail open: a malformed amount is 0.0.
+        """
+        try:
+            asked = max(0.0, float(seconds))
+            count = int(tries)
+        except (TypeError, ValueError):
+            return 0.0
+        if asked <= 0 or count <= 0:
+            return 0.0
+        self.gate_added += asked
+        self.gate_attempts += count
+        return asked
 
 
 def _turn_deadline(run: AgentRun, config: ContestConfig) -> _TurnClock:
@@ -1685,7 +1715,19 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
             run.permissions["gate_failed"] += 1
         _log.info("%s: permission %s -> %s (%s)", spec.name, props.get("permission"),
                   decision.reply, decision.layer)
-        return decision.reply, decision.reason
+        # KC-66: the gate waited inside this wait_idle loop, so the seconds it
+        # spent are granted back to this turn's deadline and counted on its
+        # clock — the agent never pays for the gate's 429. `back` is what the
+        # deadline moves by, so the turn records exactly what it was given.
+        back = 0.0
+        tries = int(getattr(decision, "gate_attempts", 1) or 1)
+        turn_clock = getattr(run, "_turn_clock", None)
+        if turn_clock is not None:
+            back = turn_clock.grant_gate(
+                float(getattr(decision, "gate_added_sec", 0.0) or 0.0), tries)
+        if back > 0:
+            _log.info("%s: gate %d tries, +%gs to the turn", spec.name, tries, back)
+        return decision.reply, decision.reason, back
 
     def on_question(event: dict) -> None:
         del event  # rejected by wait_idle regardless; only the count matters here
@@ -1808,6 +1850,10 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                 turn["stale_events"] = stale
             if clock.extensions:
                 turn["extensions"] = clock.extensions
+            if clock.gate_added > 0:
+                # KC-66: what the gate's 429 cost this turn, and how hard it tried
+                turn["gate_added_sec"] = int(clock.gate_added)
+                turn["gate_attempts"] = int(clock.gate_attempts)
             if stalled:
                 turn["idle_status"] = "stalled"
                 error, state = stalled[0], AgentState.STALLED
@@ -1820,8 +1866,10 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                 # running, and names the call in the stall when the widened
                 # bound is what fired, so the next reader does not have to dig
                 # in events.jsonl to learn the agent was running its tests.
+                # KC-66: the gate's waits moved the deadline too, so a silence
+                # inside that time is still a silence stall.
                 silence = float(config.idle_event_timeout_sec or 0)
-                limit = float(config.turn_timeout_sec) + clock.granted
+                limit = float(config.turn_timeout_sec) + clock.granted + clock.gate_added
                 quiet = 0 < silence and idle.elapsed < limit
                 if quiet:
                     turn["idle_status"] = "stalled"

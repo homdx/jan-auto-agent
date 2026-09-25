@@ -4294,3 +4294,135 @@ def test_the_agents_tmpdir_is_scratch_the_policy_allows(tmp_path):
     _assert_ready(run, sb.ws("agent-a"))
     assert replied["properties"]["reply"] == "reject"
     assert denied._completion_fn.calls == 1, "no dir, so the gate answers"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KC-66: the gate's 429 is the agent's time, granted back to the turn
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _RateLimitedGate:
+    """A gate transport that 429s, waiting between its tries.
+
+    It runs the transport's own loop — ``error_retries`` tries, ``_sleep_fn``
+    between them — so ``gate_attempts`` stays the sleeps plus one, exactly as on
+    the wire. *limited* is how many 429s the limiter sends before it lifts.
+    """
+
+    def __init__(self, verdict, limited):
+        self.verdict = verdict
+        self.limited = limited
+        self.calls = 0
+
+    def __call__(self, url, headers, payload, timeout, **kw):
+        retries = kw.get("error_retries", 0)
+        wait = kw.get("error_retry_wait_sec", 0.0)
+        sleep_fn = kw.get("_sleep_fn")
+        for attempt in range(retries + 1):
+            self.calls += 1
+            if self.calls > self.limited:
+                return json.dumps({"verdict": self.verdict, "reason": "stub"})
+            if attempt == retries:
+                break
+            if sleep_fn is not None:
+                sleep_fn(wait)
+        raise RuntimeError(f"HTTP 429 from {url}: free-model rate limit reached")
+
+
+def test_a_gate_that_waits_gets_its_seconds_back_into_the_turn(tmp_path):
+    """Two 429s of 30 s, then an allow: the action goes through, the turn is
+    longer by the two minutes the gate waited, and the tries and the added time
+    are in the decision log and in the turn."""
+    cfg = make_config(["agent-a"], tmp_roots=("/nowhere/*",),
+                      gate_retries=4, gate_retry_wait_sec=30.0)
+    gate = _RateLimitedGate("allow", 2)
+    slept: list = []
+    policy = Policy(cfg, completion_fn=gate, clock=time.monotonic,
+                    sleep=lambda seconds: slept.append(seconds))
+    sb, fake, _h, run, _ = _run_one(
+        tmp_path, {"turns": [_permission_turn(work_ready, ["/var/lib/*"])]},
+        cfg, policy)
+
+    _assert_ready(run, sb.ws("agent-a"))
+    (replied,) = fake.events_of("permission.replied")
+    assert replied["properties"]["reply"] == "once"
+    assert gate.calls == 3
+    assert slept == [30.0, 30.0]
+    (line,) = _jsonl(sb.out_dir / "agent-a" / "decisions.jsonl")
+    assert line["gate_attempts"] == 3
+    assert line["gate_added_sec"] == 120
+    assert run.turns[0]["gate_attempts"] == 3
+    assert run.turns[0]["gate_added_sec"] == 120
+    (turn,) = _jsonl(sb.out_dir / "agent-a" / "turns.jsonl")
+    assert turn["gate_added_sec"] == 120 and turn["gate_attempts"] == 3
+
+
+def test_a_gate_that_429s_every_try_is_rejected_after_five_tries(tmp_path):
+    """The KC-66 budget runs out: five tries, four 30 s waits, a gate-failed
+    reject — and the turn is still longer by the three minutes the gate spent
+    waiting."""
+    cfg = make_config(["agent-a"], tmp_roots=("/nowhere/*",),
+                      gate_retries=4, gate_retry_wait_sec=30.0)
+    slept: list = []
+    policy = Policy(cfg, completion_fn=_RateLimitedGate("allow", 99),
+                    clock=time.monotonic,
+                    sleep=lambda seconds: slept.append(seconds))
+    sb, fake, _h, run, _ = _run_one(
+        tmp_path, {"turns": [_permission_turn(work_ready, ["/var/lib/*"])]},
+        cfg, policy)
+
+    _assert_ready(run, sb.ws("agent-a"))
+    (replied,) = fake.events_of("permission.replied")
+    assert replied["properties"]["reply"] == "reject"
+    assert policy._completion_fn.calls == 5
+    assert slept == [30.0] * 4
+    (line,) = _jsonl(sb.out_dir / "agent-a" / "decisions.jsonl")
+    assert line["layer"] == "gate-failed"
+    assert line["gate_attempts"] == 5
+    assert line["gate_added_sec"] == 180
+    assert run.turns[0]["gate_added_sec"] == 180
+    assert run.turns[0]["gate_attempts"] == 5
+
+
+def test_a_gate_that_never_429s_adds_nothing_to_the_turn(tmp_path):
+    """No wait, no tries, no time back — and no `gate_*` keys on the turn."""
+    cfg = make_config(["agent-a"], tmp_roots=("/nowhere/*",),
+                      gate_retries=4, gate_retry_wait_sec=30.0)
+    policy = make_policy(cfg, "allow")
+    sb, fake, _h, run, _ = _run_one(
+        tmp_path, {"turns": [_permission_turn(work_ready, ["/var/lib/*"])]},
+        cfg, policy)
+
+    _assert_ready(run, sb.ws("agent-a"))
+    assert policy._completion_fn.calls == 1
+    (line,) = _jsonl(sb.out_dir / "agent-a" / "decisions.jsonl")
+    assert "gate_attempts" not in line and "gate_added_sec" not in line
+    assert "gate_added_sec" not in run.turns[0]
+    assert "gate_attempts" not in run.turns[0]
+
+
+def test_the_gate_grant_leaves_the_churn_room_alone(tmp_path):
+    """The gate's recovery is not progress: a turn that spent three minutes on a
+    busy gate key still has its whole churn budget left, and the two halves sit
+    side by side on the clock instead of one eating the other."""
+    ws = _churn_ws(tmp_path)
+    cfg = make_config(["agent-a"], turn_timeout_sec=600, turn_extend_sec=600,
+                      turn_max_sec=900, idle_event_timeout_sec=0)
+    clock = _runner_module._turn_deadline(
+        AgentRun(agent=cfg.agents[0], workspace=ws), cfg)
+
+    assert clock.grant_gate(180.0, 5) == 180.0
+    assert clock.gate_added == 180.0 and clock.gate_attempts == 5
+    assert clock.granted == 0.0, "recovery is not progress"
+
+    # the churn still finds the whole 300 s the cap leaves over the floor
+    _write(ws.path / "pkg" / "grew.py", "x\n")
+    assert clock.on_deadline(float(cfg.turn_timeout_sec + 1.0)) == 300.0
+    assert clock.granted == 300.0
+    # the cap is reached: the same growth grants nothing more
+    _write(ws.path / "pkg" / "grew2.py", "y\n")
+    assert clock.on_deadline(float(cfg.turn_max_sec + 1.0)) is None
+
+    # and nothing malformed buys time
+    for seconds, tries in (("a lot", 3), (0.0, 3), (60.0, 0), (60.0, "five")):
+        assert clock.grant_gate(seconds, tries) == 0.0
+    assert clock.gate_added == 180.0 and clock.gate_attempts == 5

@@ -872,12 +872,13 @@ GATE_LIMIT_KEYS = ("gate_retries", "gate_retry_wait_sec",
 
 
 def test_gate_limit_keys_are_committed_with_their_defaults(gate_key):
-    """3 retries, 10 s between them, a 60 s cap on a Retry-After, a 600 s
-    deadline — a worst case of 660 s under the committed 900 s silence clock."""
+    """KC-66: 4 retries (5 tries in all), 30 s between them, a 60 s cap on a
+    Retry-After, a 600 s deadline — a worst case of 660 s under the committed
+    900 s silence clock."""
     config = load_roster(COMMITTED)
 
-    assert config.gate_retries == 3
-    assert config.gate_retry_wait_sec == 10.0
+    assert config.gate_retries == 4
+    assert config.gate_retry_wait_sec == 30.0
     assert config.gate_retry_max_wait_sec == 60.0
     assert config.gate_deadline_sec == 600.0
     assert isinstance(config.gate_retries, int)
@@ -890,7 +891,7 @@ def test_absent_gate_limit_keys_take_their_documented_defaults(tmp_path):
 
     assert (config.gate_retries, config.gate_retry_wait_sec,
             config.gate_retry_max_wait_sec, config.gate_deadline_sec) == (
-        3, 10.0, 60.0, 600.0)
+        4, 30.0, 60.0, 600.0)
 
 
 @pytest.mark.parametrize("key,value", [
@@ -929,7 +930,7 @@ def test_a_malformed_gate_time_names_its_key(tmp_path, key):
 def test_a_malformed_gate_retries_falls_back_to_the_default(tmp_path):
     """The count is an int key, read with the same helper as every other limit."""
     text = add_to_contest(MINIMAL, "gate_retries = three")
-    assert load_roster(write_ini(tmp_path, text)).gate_retries == 3
+    assert load_roster(write_ini(tmp_path, text)).gate_retries == 4
 
 
 # ─────────────────────────────────────────────────────────────────────────────

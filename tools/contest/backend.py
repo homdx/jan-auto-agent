@@ -76,6 +76,7 @@ from tools.contest.kilo_client import (
     KiloServer,
     SessionRef,
     _deadline_grant,
+    _permission_answer,
 )
 
 __all__ = [
@@ -206,6 +207,12 @@ class ContestBackend(Protocol):
         ``question.asked`` one. Both are required — the runner always passes
         them, even to a backend that never calls one of them
         (:class:`OpenRouterBackend` never calls ``on_question``).
+
+        A third element of an ``on_permission`` answer (KC-66) is the seconds
+        the handler asks back for the gate's own waits, which run inside the
+        loop and would otherwise come out of the agent's turn: the deadline
+        moves by that much. Omitted, as by every pre-KC-66 handler, nothing
+        moves and the wait is byte for byte what it was.
 
         ``on_deadline(elapsed) -> seconds | None`` (KC-36) is asked once at
         ``timeout``, before the abort: a positive number extends the deadline
@@ -636,9 +643,13 @@ class OpenRouterBackend:
             kind = event.get("type")
             if kind == "permission.asked":
                 try:
-                    reply, message = on_permission(event)
+                    reply, message, granted = _permission_answer(on_permission(event))
                 except Exception as exc:  # noqa: BLE001 — a broken policy is a reject
                     reply, message = "reject", f"policy failed: {type(exc).__name__}"
+                    granted = 0.0
+                if granted > 0:
+                    # KC-66: the gate's own waits are the agent's time back
+                    deadline += granted
                 props = event.get("properties") or {}
                 self._write(record, {"type": "permission.reply", "id": props.get("id"),
                                      "reply": reply, "message": message})

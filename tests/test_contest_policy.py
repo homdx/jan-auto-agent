@@ -61,6 +61,7 @@ from tools.contest.policy import (
     Decision,
     Policy,
     PolicyContext,
+    gate_time_back_sec,
     gate_worst_case_sec,
 )
 from tools.contest.roster import ContestConfig
@@ -1158,8 +1159,8 @@ def test_default_completion_builds_the_call_from_gate_settings(tmp_path, monkeyp
     assert seen["api_format"] == "openai"
     # KC-55: the gate retries its transport failures with the [contest] budget,
     # so a 429 on kenari.id is a wait, not a reject
-    assert seen["error_retries"] == 3
-    assert seen["error_retry_wait_sec"] == 10.0
+    assert seen["error_retries"] == 4
+    assert seen["error_retry_wait_sec"] == 30.0
     assert seen["max_retry_after_sec"] == 60.0
     assert seen["ssl_context"] is None
     assert seen["headers"]["Authorization"].startswith("Bearer ")
@@ -1906,7 +1907,7 @@ def test_malformed_gate_limits_degrade_to_their_defaults():
     policy = Policy(config, completion_fn=StubGate(json.dumps(ALLOW)),
                     clock=FakeClock(), sleep=NO_SLEEP)
 
-    assert policy._gate_limits() == (3, 10.0, 60.0, 600.0)
+    assert policy._gate_limits() == (4, 30.0, 60.0, 600.0)
 
 
 def test_the_deadline_stops_the_gate_before_a_wait_that_would_pass_it(tmp_path,
@@ -1967,3 +1968,141 @@ def test_a_garbled_body_still_stops_at_the_deadline(tmp_path, monkeypatch):
     assert opener.opens == 2
     assert opener.opens < (3 + 1) ** 2
     assert sum(slept.calls) <= 15.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KC-66: the gate waits out a 429, and the turn gets the time back
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_gate_time_back_is_one_minute_per_two_tries():
+    """1-2 tries buy a minute, 3-4 buy two, and so on — one try buys nothing.
+
+    The one-try case is today's fail-fast gate: a clean verdict is still
+    today's decision and today's turn, with no time added to it.
+    """
+    assert gate_time_back_sec(0) == 0.0
+    assert gate_time_back_sec(1) == 0.0
+    assert gate_time_back_sec(2) == 60.0
+    assert gate_time_back_sec(3) == 120.0
+    assert gate_time_back_sec(4) == 120.0
+    assert gate_time_back_sec(5) == 180.0
+    assert gate_time_back_sec(6) == 180.0
+    # fail open: nothing that is not a number of tries buys anything
+    for bad in (None, "five", True, False, -2):
+        assert gate_time_back_sec(bad) == 0.0
+
+
+def test_a_decision_derives_its_time_back_from_its_tries():
+    """The number is computed, not carried: the log and the turn cannot diverge."""
+    clean = Decision("once", "gate", "gate: allowed", 0.5, "{}", 1)
+    waited = Decision("once", "gate", "gate: allowed", 65.0, "{}", 3)
+    assert clean.gate_added_sec == 0.0
+    assert waited.gate_added_sec == 120.0
+    # a caller that tries to set it is overwritten by the same derivation
+    assert Decision("once", "gate", "gate: allowed", 65.0, "{}", 5, 999.0).gate_added_sec == 180.0
+
+
+def test_a_429_a_few_times_then_an_answer_is_granted_the_time_back(tmp_path, monkeypatch):
+    """Two 429s of 30 s, then a verdict: the action goes through and the turn
+    gets the two minutes back — they were the gate's, never the agent's."""
+    opener = FakeOpener(rate_limit(), rate_limit(), ALLOW_BODY)
+    monkeypatch.setattr(llm_stream_mod.urllib.request, "urlopen", opener)
+    clock = FakeClock(step=0.1)
+    slept = FakeSleep(clock)
+    policy = Policy(retry_config(retries=4, wait=30.0), clock=clock, sleep=slept)
+
+    decision = decide(policy, EXTERNAL_DIRECTORY_EVENT, tmp_path,
+                      tmp_roots=("/tmp/kilo/*",))
+
+    assert (decision.reply, decision.layer) == ("once", "gate")
+    assert opener.opens == 3
+    assert slept.calls == [30.0, 30.0]
+    assert decision.gate_attempts == 3
+    assert decision.gate_added_sec == 120.0
+
+
+def test_a_429_every_time_is_rejected_after_five_tries_with_time_back(tmp_path, monkeypatch):
+    """The KC-66 budget runs out: five tries, four 30 s waits, a reject that
+    names the status — and the turn still gets the three minutes back."""
+    opener = FakeOpener(rate_limit())
+    monkeypatch.setattr(llm_stream_mod.urllib.request, "urlopen", opener)
+    clock = FakeClock(step=0.1)
+    slept = FakeSleep(clock)
+    policy = Policy(retry_config(retries=4, wait=30.0), clock=clock, sleep=slept)
+
+    decision = decide(policy, EXTERNAL_DIRECTORY_EVENT, tmp_path,
+                      tmp_roots=("/tmp/kilo/*",))
+
+    assert (decision.reply, decision.layer) == ("reject", "gate-failed")
+    assert decision.reason.startswith("gate unavailable: HTTP 429 (5 attempts")
+    assert decision.reason.endswith(OVERLOAD_TAIL)
+    assert opener.opens == 5
+    assert slept.calls == [30.0, 30.0, 30.0, 30.0]
+    assert decision.gate_attempts == 5
+    assert decision.gate_added_sec == 180.0
+
+
+def test_a_retry_after_still_wins_over_the_new_wait(tmp_path, monkeypatch):
+    """The server's own 7 s beats the 30 s default: KC-55's rules are untouched
+    by the bigger budget, only its size changed."""
+    opener = FakeOpener(rate_limit(retry_after="7"), ALLOW_BODY)
+    monkeypatch.setattr(llm_stream_mod.urllib.request, "urlopen", opener)
+    clock = FakeClock(step=0.1)
+    slept = FakeSleep(clock)
+    policy = Policy(retry_config(retries=4, wait=30.0), clock=clock, sleep=slept)
+
+    decision = decide(policy, EXTERNAL_DIRECTORY_EVENT, tmp_path,
+                      tmp_roots=("/tmp/kilo/*",))
+
+    assert (decision.reply, decision.layer) == ("once", "gate")
+    assert slept.calls == [7.0]
+    assert decision.gate_attempts == 2
+    assert decision.gate_added_sec == 60.0
+
+
+def test_no_429_waits_nothing_and_grants_the_turn_nothing(tmp_path):
+    """A clean verdict: no wait, no tries, no time added to the turn."""
+    gate = StubGate(json.dumps(ALLOW))
+    clock = FakeClock(step=0.1)
+    slept = FakeSleep(clock)
+    policy = Policy(retry_config(retries=4, wait=30.0), completion_fn=gate,
+                    clock=clock, sleep=slept)
+
+    decision = decide(policy, EXTERNAL_DIRECTORY_EVENT, tmp_path,
+                      tmp_roots=("/tmp/kilo/*",))
+
+    assert (decision.reply, decision.layer) == ("once", "gate")
+    assert len(gate.calls) == 1
+    assert slept.calls == []
+    assert decision.gate_attempts == 1
+    assert decision.gate_added_sec == 0.0
+
+
+def test_the_decision_log_names_the_tries_and_the_time_back(tmp_path, monkeypatch):
+    """Two lines: a clean verdict with neither key, a 429 with both — the tries
+    and the minutes the turn was granted for them."""
+    log = tmp_path / "out" / "decisions.jsonl"
+    opener = FakeOpener(ALLOW_BODY, rate_limit(), rate_limit(), ALLOW_BODY)
+    monkeypatch.setattr(llm_stream_mod.urllib.request, "urlopen", opener)
+    clock = FakeClock(step=0.1)
+    policy = Policy(retry_config(retries=4, wait=30.0), clock=clock,
+                    sleep=FakeSleep(clock))
+    worktree = tmp_path.resolve()
+
+    policy.record(decide(policy, EXTERNAL_DIRECTORY_EVENT, worktree,
+                         tmp_roots=("/tmp/kilo/*",)),
+                  EXTERNAL_DIRECTORY_EVENT, log)
+    policy.record(decide(policy, EXTERNAL_DIRECTORY_EVENT, worktree,
+                         tmp_roots=("/tmp/kilo/*",)),
+                  EXTERNAL_DIRECTORY_EVENT, log)
+
+    entries = [json.loads(line)
+               for line in log.read_text(encoding="utf-8").splitlines()]
+    assert len(entries) == 2
+    assert tuple(entries[0]) == DECISION_KEYS
+    assert "gate_attempts" not in entries[0]
+    assert "gate_added_sec" not in entries[0]
+    assert entries[1]["layer"] == "gate"
+    assert entries[1]["gate_attempts"] == 3
+    assert entries[1]["gate_added_sec"] == 120
+    assert tuple(entries[1]) == tuple(DECISION_KEYS) + ("gate_attempts", "gate_added_sec")

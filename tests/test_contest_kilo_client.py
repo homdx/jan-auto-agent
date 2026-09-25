@@ -779,6 +779,79 @@ def test_an_extension_never_resurrects_a_session_that_went_quiet(monkeypatch):
     assert aborts == ["ses_probe"]
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# KC-66: the gate's 429 is the agent's time, granted back to the turn
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _gate_back_probe(monkeypatch, on_permission, *, timeout=60.0, every=1.0):
+    """`wait_idle` over one scripted `permission.asked`, on a fake clock, no idle.
+
+    The session never goes idle, so the wait ends at its own deadline — which is
+    exactly what KC-66 moves. Nothing here touches wall time: the clock only
+    moves when the scripted stream moves it, which is why no test waits a gate
+    out for real.
+    """
+    clock = _FakeClock()
+    monkeypatch.setattr(kilo_client_module.time, "monotonic", clock.monotonic)
+    aborts: list = []
+    answered: list = []
+
+    class _Client(KiloClient):
+        def __init__(self):
+            pass
+
+        def reply_permission(self, session, permission_id, reply, message):
+            answered.append((permission_id, reply, message))
+
+        def _abort_quietly(self, session):
+            aborts.append(session.id)
+
+    session = SessionRef(id="ses_probe", provider_id="p", model_id="m",
+                         directory="/nowhere")
+    tap = _ScriptedTap([_ev("permission.asked", id="per_one",
+                            permission="external_directory",
+                            patterns=["/var/lib/*"])], every=every, clock=clock)
+    res = _Client().wait_idle(tap, session, timeout, on_permission=on_permission,
+                              on_question=lambda event: None)
+    return res, answered, aborts
+
+
+def test_a_permission_answer_that_asks_time_back_moves_the_deadline(monkeypatch):
+    """180 s back for the gate's waits pushes the deadline out by 180 s, and the
+    reply itself goes out unchanged."""
+    res, answered, aborts = _gate_back_probe(
+        monkeypatch, lambda event: ("once", "the reviewer said yes", 180.0))
+
+    assert res.status == "timeout"
+    assert res.elapsed == 240.0, res.elapsed
+    assert answered == [("per_one", "once", "the reviewer said yes")]
+    assert len(res.permissions) == 1
+    assert aborts == ["ses_probe"]
+
+
+def test_a_two_element_answer_is_the_old_wait(monkeypatch):
+    """No third element, no time back: the wait ends at its own deadline, and so
+    does an answer whose third element is not a number of seconds."""
+    res, answered, _ = _gate_back_probe(monkeypatch, lambda event: ("once", ""))
+
+    assert res.elapsed == 60.0, res.elapsed
+    assert answered == [("per_one", "once", "")]
+
+    for bad in ("a lot", None, -1, True):
+        again, _, _ = _gate_back_probe(monkeypatch,
+                                       lambda event: ("once", "", bad))
+        assert again.elapsed == 60.0, (bad, again.elapsed)
+
+
+def test_an_answer_that_is_not_a_pair_is_not_answered(monkeypatch):
+    """A handler that returns one value, or nothing, is a broken handler: the
+    permission is not answered and the wait is exactly what it was."""
+    res, answered, _ = _gate_back_probe(monkeypatch, lambda event: "once")
+
+    assert res.elapsed == 60.0, res.elapsed
+    assert answered == []
+
+
 def test_a_neighbours_events_do_not_keep_a_silent_session_alive(tmp_path):
     """The clock is the session's own: the tap reads every session of the
     directory, so a chatty neighbour must not push a silent one past its

@@ -89,6 +89,7 @@ __all__ = [
     "Policy",
     "PolicyContext",
     "gate_error_name",
+    "gate_time_back_sec",
     "gate_verdict",
     "gate_worst_case_sec",
 ]
@@ -117,7 +118,35 @@ _GATE_PROBE_RETRIES = 0
 
 #: KC-55 §1: the gate's transport budget. Absent or unreadable values degrade to
 #: these, so a policy built without a roster still fails fast like KC-3's gate.
-_GATE_RETRY_DEFAULTS = (3, 10.0, 60.0, 600.0)
+#: KC-66: 4 retries of 30 s — 5 tries in all. Three waits of 10 s was a budget
+#: that ran out while a key shared with eight agents was still cooling, so the
+#: action was rejected rather than retried.
+_GATE_RETRY_DEFAULTS = (4, 30.0, 60.0, 600.0)
+
+#: KC-66: the minutes one gate decision asks back per two tries. The gate waits
+#: inside `KiloClient.wait_idle`'s loop, so every second of a 429 is the
+#: agent's turn, not the gate's: two tries buy a minute, three or four buy two.
+GATE_TIME_BACK_MIN = 60.0
+
+
+def gate_time_back_sec(tries) -> float:
+    """KC-66: the seconds a turn gets back for a gate decision that spent *tries*.
+
+    One try — a clean verdict, no 429, no wait — buys nothing, so today's
+    fail-fast gate is still today's decision and today's turn. Two tries buy a
+    minute, three or four buy two, and so on: ``ceil(tries / 2)`` minutes.
+
+    Fail open: ``None``, a malformed value and a bool buy nothing rather than
+    raising into a round, and ``0`` reads as "the gate never ran".
+    """
+    try:
+        count = int(tries)
+    except (TypeError, ValueError):
+        return 0.0
+    if isinstance(tries, bool) or count <= 1:
+        return 0.0
+    return float((count + 1) // 2) * GATE_TIME_BACK_MIN
+
 
 #: The only two replies a Decision may carry. ``Literal`` keeps the type
 #: narrow; ``Decision.__post_init__`` keeps it narrow at run time too.
@@ -379,10 +408,16 @@ class Decision:
     #: fail-fast gate, and ``record`` then writes no ``gate_attempts`` key, so
     #: the one-attempt records stay byte-identical.
     gate_attempts: int = 1
+    #: KC-66: the seconds this decision asks the turn back for the gate's own
+    #: waits. Derived from ``gate_attempts`` in ``__post_init__`` and never set
+    #: by a caller, so the decision, decisions.jsonl and the turn cannot disagree
+    #: about the number. ``0.0`` for a gate that never waited.
+    gate_added_sec: float = 0.0
 
     def __post_init__(self) -> None:
         one_line = " ".join(str(self.reason or "").split())
         object.__setattr__(self, "reason", one_line[:MAX_REASON_CHARS])
+        object.__setattr__(self, "gate_added_sec", gate_time_back_sec(self.gate_attempts))
         if self.reply not in REPLIES:
             raise ValueError(
                 f"Decision.reply must be one of {REPLIES}, got {self.reply!r} — "
@@ -1130,8 +1165,12 @@ class Policy:
             if isinstance(attempts, (int, float)) and not isinstance(attempts, bool) \
                     and attempts > 1:
                 # KC-55: how hard the gate tried. Absent for one attempt, so a
-                # record of today's fail-fast gate stays byte-identical.
+                # record of today's fail-fast gate stays byte-identical. KC-66:
+                # the time that cost the turn rides in the same two keys, which
+                # is exactly the same condition.
                 entry["gate_attempts"] = int(attempts)
+                entry["gate_added_sec"] = int(
+                    getattr(decision, "gate_added_sec", 0.0) or 0.0)
             target = Path(path)
             target.parent.mkdir(parents=True, exist_ok=True)
             with target.open("a", encoding="utf-8") as handle:

@@ -20,13 +20,18 @@ First pass — find a provider's free models (sends nothing to any model):
 
     python3 scripts/py_model_test.py --find-free vercel_8080 openrouter2 kilo
 
+    # zyloai: pass --base-url and --api-key, use the provider name as a label
+    python3 scripts/py_model_test.py --find-free --base-url https://api.zyloai.net/v1 --api-key zk_... zyloai
+
 Prints the text models with tools and price 0, marks which ones kilo already
 has under that provider, and the model list for the second pass (a normal run).
 Prices come from the provider's public API, no key needed: a provider named
 vercel* — ai-gateway.vercel.sh, every endpoint of every model; openrouter* —
-openrouter.ai/api/v1/models. Anything else — `kilo models <p> --verbose`,
-where 0 can also mean an unknown price: such models are printed as
-"maybe paid", as are models that have a paid endpoint next to the free one.
+openrouter.ai/api/v1/models. A provider named zyloai* (or any name when
+--base-url is given) — hits that base URL's /models endpoint directly (needs
+--api-key). Anything else — `kilo models <p> --verbose`, where 0 can also
+mean an unknown price: such models are printed as "maybe paid", as are models
+that have a paid endpoint next to the free one.
 """
 from __future__ import annotations
 
@@ -252,6 +257,37 @@ def free_from_openrouter() -> list:
     return rows
 
 
+def free_from_direct_api(base_url: str, api_key: str) -> list:
+    """(id, status, context, note) from an OpenAI-compatible /models endpoint.
+
+    Expects the zyloai shape: {"text": [{id, pricing, capabilities, context_window,
+    min_plan, ...}]}. Falls back to the standard {"data": [...]} shape.
+    Marks models with all-zero pricing and 'tool-use' capability as FREE when
+    min_plan is absent/BASIC, else MAYBE.
+    """
+    req = urllib.request.Request(
+        f"{base_url.rstrip('/')}/models",
+        headers={"Authorization": f"Bearer {api_key}", "User-Agent": "py_model_test"},
+    )
+    with urllib.request.urlopen(req, timeout=30) as r:
+        data = json.loads(r.read())
+    models = data.get("text") or data.get("data") or []
+    rows = []
+    for m in models:
+        if "tool-use" not in (m.get("capabilities") or []):
+            continue
+        pricing = m.get("pricing") or {}
+        if paid_fields(pricing):
+            continue
+        ctx = m.get("context_window") or 0
+        plan = (m.get("min_plan") or "").upper()
+        note = f"min_plan={plan}" if plan and plan not in ("BASIC", "FREE", "") else ""
+        status = FREE if plan in ("BASIC", "FREE", "") else MAYBE
+        rows.append((m["id"], status, ctx, note))
+    print(f"  direct api: checked {len(models)} models")
+    return rows
+
+
 def free_from_kilo(meta: dict) -> list:
     rows = []
     for mid, d in meta.items():
@@ -270,12 +306,20 @@ def free_from_kilo(meta: dict) -> list:
     return rows
 
 
-def find_free(kilo: str, providers: list) -> int:
+def find_free(kilo: str, providers: list, base_url: str | None = None,
+              api_key: str | None = None) -> int:
     for provider in providers:
         print(f"== {provider}", flush=True)
         low = provider.lower()
+        direct = base_url and api_key
         try:
-            if low.startswith("vercel"):
+            if direct or low.startswith("zyloai"):
+                url = base_url or f"https://api.{low}.net/v1"
+                if not api_key:
+                    print("  --api-key required for direct API provider")
+                    continue
+                rows, source = free_from_direct_api(url, api_key), f"direct api {url}"
+            elif low.startswith("vercel"):
                 rows, source = free_from_vercel(), "api vercel"
             elif low.startswith("openrouter"):
                 rows, source = free_from_openrouter(), "api openrouter"
@@ -284,21 +328,34 @@ def find_free(kilo: str, providers: list) -> int:
         except Exception as e:  # noqa: BLE001
             print(f"  could not get the list: {e}")
             continue
-        in_kilo = kilo_models(kilo, provider, False)
         rows.sort(key=lambda r: (r[1] != FREE, r[0]))
         print(f"  price source: {source}; found {len(rows)}\n")
+        if not rows:
+            print()
+            continue
         w = max([len(r[0]) for r in rows] + [6]) + 2
-        print("model".ljust(w), "status".ljust(12), " context", " in kilo", " note")
-        for mid, status, ctx, note in rows:
-            mark = "yes" if mid in in_kilo else "no"
-            print(mid.ljust(w), status.ljust(12), f"{ctx // 1000:>7}k", f" {mark:<7}", note)
-        ready = [f"{provider}/{r[0]}" for r in rows if r[0] in in_kilo]
-        missing = [r[0] for r in rows if r[0] not in in_kilo]
-        if ready:
-            print("\n  second pass:\n  python3 scripts/py_model_test.py " + " ".join(ready))
-        if missing:
-            print(f"\n  not in kilo under {provider} (add to kilo.jsonc to test them): "
-                  + ", ".join(missing))
+        if direct or low.startswith("zyloai"):
+            # no kilo cross-check in direct mode — just list models + second-pass command
+            print("model".ljust(w), "status".ljust(12), " context", " note")
+            for mid, status, ctx, note in rows:
+                print(mid.ljust(w), status.ljust(12), f"{ctx // 1000:>7}k", f"  {note}")
+            cmd = (f"python3 scripts/py_model_test.py"
+                   f" --base-url {base_url} --api-key {api_key}"
+                   f" " + " ".join(r[0] for r in rows))
+            print(f"\n  second pass:\n  {cmd}")
+        else:
+            in_kilo = kilo_models(kilo, provider, False)
+            print("model".ljust(w), "status".ljust(12), " context", " in kilo", " note")
+            for mid, status, ctx, note in rows:
+                mark = "yes" if mid in in_kilo else "no"
+                print(mid.ljust(w), status.ljust(12), f"{ctx // 1000:>7}k", f" {mark:<7}", note)
+            ready = [f"{provider}/{r[0]}" for r in rows if r[0] in in_kilo]
+            missing = [r[0] for r in rows if r[0] not in in_kilo]
+            if ready:
+                print("\n  second pass:\n  python3 scripts/py_model_test.py " + " ".join(ready))
+            if missing:
+                print(f"\n  not in kilo under {provider} (add to kilo.jsonc to test them): "
+                      + ", ".join(missing))
         print()
     return 0
 
@@ -338,7 +395,7 @@ def main() -> int:
                     help="direct mode: API key for --base-url")
     args = ap.parse_args()
 
-    if args.base_url:
+    if args.base_url and not args.find_free:
         # Direct mode: no kilo, plain HTTP requests
         if not args.api_key:
             sys.exit("--api-key is required with --base-url")
@@ -395,9 +452,9 @@ def main() -> int:
             print(model.ljust(44), score.ljust(5), f"{took:4.0f}s", "", why)
         return 0 if all(s not in ("-", "crash") for _, s, _, _ in results) else 1
 
-    kilo = find_kilo(args.kilo)
+    kilo = find_kilo(args.kilo) if not (args.base_url and args.find_free) else ""
     if args.find_free:
-        return find_free(kilo, args.models)
+        return find_free(kilo, args.models, base_url=args.base_url, api_key=args.api_key)
 
     results = []
     with tempfile.TemporaryDirectory(prefix="pymodeltest-") as work:
