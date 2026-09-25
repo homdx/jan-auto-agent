@@ -360,6 +360,26 @@ def find_free(kilo: str, providers: list, base_url: str | None = None,
     return 0
 
 
+def _score_raw(raw: str, checker: str, mdir: str) -> tuple[str, str]:
+    """Run the checker on extracted code. Returns (score_str, why_fail)."""
+    code = pick_code(raw)
+    if not code:
+        why = "empty answer" if not raw.strip() else "no ```python block"
+        return "-", why
+    src = os.path.join(mdir, "answer.py")
+    with open(src, "w", encoding="utf-8") as f:
+        f.write(code)
+    cout, cerr, crc = run([sys.executable, checker, src], mdir, 30)
+    check = cout + cerr
+    score_m = re.search(r"SCORE (\d+/\d+)", check)
+    if crc is None:
+        return "crash", "code hung"
+    if score_m:
+        detail = check.replace(score_m.group(0), "").rstrip()
+        return score_m.group(1), detail
+    return "crash", f"code crashed: {tail(check, 4)}"
+
+
 def ask_direct(base_url: str, api_key: str, model: str, prompt: str, timeout: int) -> str:
     """Send one chat completion request directly to an OpenAI-compatible API.
     Returns the assistant's text content, or raises on HTTP error."""
@@ -393,80 +413,49 @@ def main() -> int:
                     help="direct mode: OpenAI-compatible base URL (e.g. https://api.zyloai.net/v1)")
     ap.add_argument("--api-key", metavar="KEY",
                     help="direct mode: API key for --base-url")
+    ap.add_argument("--parallel", "-j", metavar="N", type=int, default=1,
+                    help="run N models in parallel (default: 1 = sequential)")
     args = ap.parse_args()
-
-    if args.base_url and not args.find_free:
-        # Direct mode: no kilo, plain HTTP requests
-        if not args.api_key:
-            sys.exit("--api-key is required with --base-url")
-        results = []
-        with tempfile.TemporaryDirectory(prefix="pymodeltest-") as work:
-            checker = os.path.join(work, "checker.py")
-            with open(checker, "w", encoding="utf-8") as f:
-                f.write(CHECKER)
-            for model in args.models:
-                print(f"== {model}", flush=True)
-                mdir = tempfile.mkdtemp(prefix="m-", dir=work)
-                start = time.time()
-                try:
-                    raw = ask_direct(args.base_url, args.api_key, model, PROMPT, args.timeout)
-                    err_msg = ""
-                except urllib.error.HTTPError as e:
-                    body = e.read()[:300].decode(errors="replace")
-                    raw, err_msg = "", f"HTTP {e.code}: {body}"
-                except Exception as e:  # noqa: BLE001
-                    raw, err_msg = "", str(e)[:200]
-                took = time.time() - start
-                if args.keep:
-                    os.makedirs("py_model_test_out", exist_ok=True)
-                    safe = model.replace("/", "_").replace(":", "_")
-                    with open(f"py_model_test_out/{safe}.txt", "w", encoding="utf-8") as f:
-                        f.write(raw)
-                code = pick_code(raw)
-                if not code:
-                    why = err_msg or ("empty answer" if not raw.strip() else "no ```python block")
-                    print(f"  {why} ({took:.0f}s)")
-                    if raw.strip() and not err_msg:
-                        print(f"  stdout: {raw.strip()[:200]!r}")
-                    results.append((model, "-", took, why))
-                    continue
-                src = os.path.join(mdir, "answer.py")
-                with open(src, "w", encoding="utf-8") as f:
-                    f.write(code)
-                cout, cerr, crc = run([sys.executable, checker, src], mdir, 30)
-                check = cout + cerr
-                score = re.search(r"SCORE (\d+/\d+)", check)
-                if crc is None:
-                    print("  FAIL timeout (model code hung)")
-                    results.append((model, "crash", took, "code hung"))
-                    continue
-                if score:
-                    print(check.replace(score.group(0), "").rstrip() or "  all checks passed")
-                    results.append((model, score.group(1), took, ""))
-                else:
-                    print(f"  code crashed: {tail(check, 4)}")
-                    results.append((model, "crash", took, "code crashed"))
-        print()
-        print("model".ljust(44), "score", " time", " reason")
-        for model, score, took, why in results:
-            print(model.ljust(44), score.ljust(5), f"{took:4.0f}s", "", why)
-        return 0 if all(s not in ("-", "crash") for _, s, _, _ in results) else 1
 
     kilo = find_kilo(args.kilo) if not (args.base_url and args.find_free) else ""
     if args.find_free:
         return find_free(kilo, args.models, base_url=args.base_url, api_key=args.api_key)
 
-    results = []
-    with tempfile.TemporaryDirectory(prefix="pymodeltest-") as work:
-        checker = os.path.join(work, "checker.py")
-        with open(checker, "w", encoding="utf-8") as f:
-            f.write(CHECKER)
-        for model in args.models:
-            print(f"== {model}", flush=True)
-            # a separate empty dir per model: files the model creates anyway reach
-            # neither the next model nor the current directory
-            mdir = tempfile.mkdtemp(prefix="m-", dir=work)
-            start = time.time()
+    direct = bool(args.base_url and not args.find_free)
+    if direct and not args.api_key:
+        sys.exit("--api-key is required with --base-url")
+
+    import threading
+    print_lock = threading.Lock()
+
+    def run_one(model: str, work: str, checker: str) -> tuple[str, str, float, str]:
+        """Run one model; return (model, score, took, why). Thread-safe stdout."""
+        mdir = tempfile.mkdtemp(prefix="m-", dir=work)
+        start = time.time()
+        lines: list[str] = []
+
+        if direct:
+            try:
+                raw = ask_direct(args.base_url, args.api_key, model, PROMPT, args.timeout)
+                err_msg = ""
+            except urllib.error.HTTPError as e:
+                body = e.read()[:300].decode(errors="replace")
+                raw, err_msg = "", f"HTTP {e.code}: {body}"
+            except Exception as e:  # noqa: BLE001
+                raw, err_msg = "", str(e)[:200]
+            took = time.time() - start
+            if args.keep:
+                os.makedirs("py_model_test_out", exist_ok=True)
+                safe = model.replace("/", "_").replace(":", "_")
+                with open(f"py_model_test_out/{safe}.txt", "w", encoding="utf-8") as f:
+                    f.write(raw)
+            if err_msg:
+                lines.append(f"  {err_msg} ({took:.0f}s)")
+                with print_lock:
+                    print(f"== {model}", flush=True)
+                    print("\n".join(lines), flush=True)
+                return model, "-", took, err_msg
+        else:
             out, err, rc = run([kilo, "run", "--pure", "-m", model, PROMPT], mdir, args.timeout)
             took = time.time() - start
             raw = ANSI_RE.sub("", out)
@@ -477,39 +466,61 @@ def main() -> int:
                     f.write(raw)
                 with open(f"py_model_test_out/{safe}.stderr.txt", "w", encoding="utf-8") as f:
                     f.write(err)
-            code = pick_code(raw)
-            if not code:
+            err_msg = ""
+            if not pick_code(raw):
                 if rc is None:
-                    why = f"timeout {args.timeout}s"
+                    err_msg = f"timeout {args.timeout}s"
                 elif rc != 0:
-                    why = f"kilo exit {rc}"
+                    err_msg = f"kilo exit {rc}"
                 elif not raw.strip():
-                    why = "empty answer"
+                    err_msg = "empty answer"
                 else:
-                    why = "no ```python block"
-                print(f"  {why} ({took:.0f}s)")
+                    err_msg = "no ```python block"
+            if err_msg:
+                lines.append(f"  {err_msg} ({took:.0f}s)")
                 if raw.strip():
-                    print(f"  stdout: {raw.strip()[:200]!r}")
+                    lines.append(f"  stdout: {raw.strip()[:200]!r}")
                 if tail(err):
-                    print(f"  stderr: {tail(err)}")
-                results.append((model, "-", took, why))
-                continue
-            src = os.path.join(mdir, "answer.py")
-            with open(src, "w", encoding="utf-8") as f:
-                f.write(code)
-            cout, cerr, crc = run([sys.executable, checker, src], mdir, 30)
-            check = cout + cerr
-            score = re.search(r"SCORE (\d+/\d+)", check)
-            if crc is None:
-                print("  FAIL timeout (model code hung)")
-                results.append((model, "crash", took, "code hung"))
-                continue
-            if score:
-                print(check.replace(score.group(0), "").rstrip() or "  all checks passed")
-                results.append((model, score.group(1), took, ""))
-            else:
-                print(f"  code crashed: {tail(check, 4)}")
-                results.append((model, "crash", took, "code crashed"))
+                    lines.append(f"  stderr: {tail(err)}")
+                with print_lock:
+                    print(f"== {model}", flush=True)
+                    print("\n".join(lines), flush=True)
+                return model, "-", took, err_msg
+
+        score, detail = _score_raw(raw, checker, mdir)
+        if score == "crash" and detail == "code hung":
+            lines.append("  FAIL timeout (model code hung)")
+        elif score == "-":
+            lines.append(f"  {detail} ({took:.0f}s)")
+            if raw.strip() and not err_msg:
+                lines.append(f"  stdout: {raw.strip()[:200]!r}")
+        elif score.startswith("crash"):
+            lines.append(f"  {detail}")
+        else:
+            lines.append(detail or "  all checks passed")
+        with print_lock:
+            print(f"== {model}", flush=True)
+            print("\n".join(lines), flush=True)
+        why = detail if score in ("-", "crash") else ""
+        return model, score, took, why
+
+    results: list[tuple[str, str, float, str]] = []
+    with tempfile.TemporaryDirectory(prefix="pymodeltest-") as work:
+        checker = os.path.join(work, "checker.py")
+        with open(checker, "w", encoding="utf-8") as f:
+            f.write(CHECKER)
+        workers = max(1, args.parallel)
+        if workers == 1:
+            for model in args.models:
+                results.append(run_one(model, work, checker))
+        else:
+            with concurrent.futures.ThreadPoolExecutor(workers) as ex:
+                futs = {ex.submit(run_one, m, work, checker): m for m in args.models}
+                for fut in concurrent.futures.as_completed(futs):
+                    results.append(fut.result())
+            # restore input order for the summary
+            order = {m: i for i, m in enumerate(args.models)}
+            results.sort(key=lambda r: order.get(r[0], 0))
 
     print()
     print("model".ljust(44), "score", " time", " reason")
