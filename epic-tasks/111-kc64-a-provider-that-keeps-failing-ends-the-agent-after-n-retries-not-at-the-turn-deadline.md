@@ -1,6 +1,6 @@
 # KC-64 — a provider that keeps failing ends the agent after N retries, not at the turn deadline
 
-**Status:** queued — found 2026-09-25 reading round 106 (KC-59): `laguna-s-2-1` and `nex-n2-5-pro` (both `bynara`) never produced one token. Kilo retried the model 51 and 50 times over 60 min, and each retry's `session.status busy` reset the runner's silence clock. So both agents sat `WAITING` until `turn_timeout_sec` and ended `STALLED: no idle after 60m (0 files, 0 lines, unchanged for 60m)`. The real reason, "The model service is temporarily unavailable", is in no field of `state.json`.
+**Status:** open — found 2026-09-25 reading round 106 (KC-59): `laguna-s-2-1` and `nex-n2-5-pro` (both `bynara`) never produced one token. Kilo retried the model 51 and 50 times over 60 min, and each retry's `session.status busy` reset the runner's silence clock. So both agents sat `WAITING` until `turn_timeout_sec` and ended `STALLED: no idle after 60m (0 files, 0 lines, unchanged for 60m)`. The real reason, "The model service is temporarily unavailable", is in no field of `state.json`.
 **Severity:** MEDIUM (no work is lost, since the model never answered, but the agent holds a round slot for the full hour, the round's end waits for it, and the report names the wrong cause)
 **File:** `tools/contest/kilo_client.py`, `tools/contest/backend.py`, `tools/contest/runner.py`, `tools/contest/roster.py`, `contest.ini`, `tests/_kilo_fake.py`
 **Symbol:** `KiloClient.wait_idle`, `IdleResult`, the runner's `idle.status == "error"` block, `ContestConfig`
