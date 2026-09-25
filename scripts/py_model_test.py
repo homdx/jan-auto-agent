@@ -1,21 +1,35 @@
 #!/usr/bin/env python3
-"""Быстрый тест модели на Python: одна задача через `kilo run`, 15 проверок ответа.
+"""Quick Python model test: one task through `kilo run`, 15 checks on the answer.
 
     python3 scripts/py_model_test.py bynara/ling-3.0-flash-fin-free bynara/ling-3.0-flash-sante-free
     python3 scripts/py_model_test.py --kilo /path/to/kilo --timeout 300 kenary/hy3:free
 
-Ключи не читает: запрос идёт через kilo с его собственным конфигом.
-Код модели выполняется в отдельном процессе с таймаутом, во временной папке,
-без stdin. Когда ответа нет, печатается причина: таймаут, код возврата kilo и
-хвост его stderr (401, 404, "Database is busy" и т.п.).
+Reads no keys: the request goes through kilo with kilo's own config.
+The model's code runs in a separate process with a timeout, in a temp dir,
+with no stdin. When there is no answer, the reason is printed: timeout, kilo's
+exit code and the tail of its stderr (401, 404, "Database is busy", ...).
 
-Выход: 0 — каждая модель дала код и получила балл; 1 — хотя бы у одной нет
-балла (нет ответа, нет кода, код упал).
+Exit: 0 — every model gave code and got a score; 1 — at least one has no
+score (no answer, no code, code crashed).
+
+First pass — find a provider's free models (sends nothing to any model):
+
+    python3 scripts/py_model_test.py --find-free vercel_8080 openrouter2 kilo
+
+Prints the text models with tools and price 0, marks which ones kilo already
+has under that provider, and the model list for the second pass (a normal run).
+Prices come from the provider's public API, no key needed: a provider named
+vercel* — ai-gateway.vercel.sh, every endpoint of every model; openrouter* —
+openrouter.ai/api/v1/models. Anything else — `kilo models <p> --verbose`,
+where 0 can also mean an unknown price: such models are printed as
+"maybe paid", as are models that have a paid endpoint next to the free one.
 """
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import glob
+import json
 import os
 import re
 import shutil
@@ -24,6 +38,8 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
+import urllib.request
 
 PROMPT = (
     "Write a Python 3 function `merge_intervals(intervals: list[tuple[int,int]]) -> "
@@ -36,7 +52,7 @@ PROMPT = (
     "no explanation, do not create files."
 )
 
-# Запускается в отдельном процессе: argv[1] — файл с кодом модели.
+# Runs in a separate process: argv[1] is the file with the model's code.
 CHECKER = r'''
 import sys
 ns = {}
@@ -76,7 +92,7 @@ for bad in ["", "1x", "h", "abc", "1h1h"]:
 print(f"SCORE {ok}/{tot}")
 '''
 
-# ```python, ```py, ```python3 или голые ```; \r\n тоже.
+# ```python, ```py, ```python3 or a bare ```; \r\n too.
 FENCE_RE = re.compile(r"```[ \t]*(?:python3?|py)?[ \t]*\r?\n(.*?)```", re.S | re.I)
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
@@ -91,12 +107,12 @@ def find_kilo(explicit: str | None) -> str:
         "~/.vscode/extensions/kilocode.kilo-code-*/bin/kilo")))
     if hits:
         return hits[-1]
-    sys.exit("kilo не найден: укажи --kilo /path/to/kilo")
+    sys.exit("kilo not found: pass --kilo /path/to/kilo")
 
 
 def run(cmd: list, cwd: str, timeout: int) -> tuple[str, str, int | None]:
-    """stdout, stderr, код возврата (None — таймаут). По таймауту убивается вся
-    группа процессов: `kilo run` поднимает свой сервер, он не должен остаться."""
+    """stdout, stderr, exit code (None = timeout). On timeout the whole process
+    group is killed: `kilo run` starts its own server, which must not be left behind."""
     p = subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                          stderr=subprocess.PIPE, text=True, start_new_session=True)
     try:
@@ -112,7 +128,7 @@ def run(cmd: list, cwd: str, timeout: int) -> tuple[str, str, int | None]:
 
 
 def pick_code(raw: str) -> str:
-    """Блок с обеими функциями, иначе первый блок, иначе пусто."""
+    """The block with both functions, else the first block, else empty."""
     blocks = FENCE_RE.findall(raw)
     for b in blocks:
         if "def merge_intervals" in b and "def parse_duration" in b:
@@ -125,15 +141,178 @@ def tail(text: str, n: int = 3) -> str:
     return " | ".join(lines[-n:])[:300]
 
 
+# --- first pass: --find-free --------------------------------------------
+
+FREE = "free"
+MAYBE = "maybe paid"
+VERCEL_API = "https://ai-gateway.vercel.sh/v1/models"
+OPENROUTER_API = "https://openrouter.ai/api/v1/models"
+# in the model name: ":free", "-free", "/free" — the provider itself calls it free
+FREE_NAME_RE = re.compile(r"[:/-]free\b", re.I)
+
+
+def get_json(url: str, timeout: int = 30):
+    req = urllib.request.Request(url, headers={"User-Agent": "py_model_test"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.load(r)
+
+
+def is_zero(v) -> bool:
+    """Price 0. A nested structure (video tiers etc.) is not zero."""
+    if v is None or v == "":
+        return True
+    if isinstance(v, (list, dict)):
+        return not v
+    try:
+        return float(v) == 0
+    except (TypeError, ValueError):
+        return False
+
+
+def paid_fields(pricing: dict) -> dict:
+    return {k: v for k, v in (pricing or {}).items()
+            if k not in ("discount", "varies_by_provider") and not is_zero(v)}
+
+
+def kilo_models(kilo: str, provider: str, verbose: bool) -> dict:
+    """{model id without provider: metadata or {}} from `kilo models <p>`."""
+    cmd = [kilo, "models", provider, "--pure"] + (["--verbose"] if verbose else [])
+    out, err, rc = run(cmd, os.getcwd(), 120)
+    if rc != 0:
+        print(f"  kilo models {provider}: exit {rc} {tail(err)}", file=sys.stderr)
+        return {}
+    out = ANSI_RE.sub("", out)
+    found = {}
+    if verbose:
+        for m in re.finditer(r"^(\S+?)/(\S+)\n(\{.*?\n\})", out, re.M | re.S):
+            try:
+                found[m.group(2)] = json.loads(m.group(3))
+            except ValueError:
+                pass
+    else:
+        for line in out.splitlines():
+            if line.startswith(provider + "/"):
+                found[line[len(provider) + 1:].strip()] = {}
+    return found
+
+
+def free_from_vercel() -> list:
+    """(id, status, context, note). Every endpoint of every text model."""
+    models = [m["id"] for m in get_json(VERCEL_API)["data"] if m.get("type") == "language"]
+
+    def endpoints(mid):
+        try:
+            url = f"{VERCEL_API}/{urllib.parse.quote(mid)}/endpoints"
+            return mid, get_json(url)["data"].get("endpoints") or [], None
+        except Exception as e:  # noqa: BLE001 — one model does not fail the search
+            return mid, [], str(e)[:80]
+
+    rows, errors = [], []
+    with concurrent.futures.ThreadPoolExecutor(8) as ex:
+        for mid, eps, err in ex.map(endpoints, models):
+            if err:
+                errors.append(f"{mid}: {err}")
+                continue
+            free = [e for e in eps if e.get("pricing") and not paid_fields(e["pricing"])
+                    and "tools" in (e.get("supported_parameters") or [])]
+            if not free:
+                continue
+            paid = [e["provider_name"] for e in eps if e not in free
+                    and paid_fields(e.get("pricing"))]
+            ctx = max(e.get("context_length") or 0 for e in free)
+            if paid:
+                rows.append((mid, MAYBE, ctx, "has a paid endpoint: " + ", ".join(paid)))
+            else:
+                rows.append((mid, FREE, ctx, ""))
+    for e in errors:
+        print(f"  vercel: could not read {e}", file=sys.stderr)
+    print(f"  vercel: checked {len(models)} text models, {len(errors)} errors")
+    return rows
+
+
+def free_from_openrouter() -> list:
+    rows = []
+    data = get_json(OPENROUTER_API)["data"]
+    for m in data:
+        arch = m.get("architecture") or {}
+        if "text" not in (arch.get("output_modalities") or ["text"]):
+            continue
+        if "tools" not in (m.get("supported_parameters") or []):
+            continue
+        if paid_fields(m.get("pricing")):
+            continue
+        ok = bool(m.get("pricing")) and (FREE_NAME_RE.search(m["id"]) or m["id"].endswith(":free"))
+        rows.append((m["id"], FREE if ok else MAYBE, m.get("context_length") or 0,
+                     "" if ok else "price 0 but no :free in the name (a router?)"))
+    print(f"  openrouter: checked {len(data)} models")
+    return rows
+
+
+def free_from_kilo(meta: dict) -> list:
+    rows = []
+    for mid, d in meta.items():
+        cost = d.get("cost") or {}
+        caps = d.get("capabilities") or {}
+        if not caps.get("toolcall"):
+            continue
+        if not ((caps.get("input") or {}).get("text") and (caps.get("output") or {}).get("text")):
+            continue
+        if not (is_zero(cost.get("input")) and is_zero(cost.get("output"))
+                and all(is_zero(v) for v in (cost.get("cache") or {}).values())):
+            continue
+        named = bool(FREE_NAME_RE.search(mid))
+        rows.append((mid, FREE if named else MAYBE, (d.get("limit") or {}).get("context") or 0,
+                     "per kilo" if named else "kilo also shows 0 for an unknown price"))
+    return rows
+
+
+def find_free(kilo: str, providers: list) -> int:
+    for provider in providers:
+        print(f"== {provider}", flush=True)
+        low = provider.lower()
+        try:
+            if low.startswith("vercel"):
+                rows, source = free_from_vercel(), "api vercel"
+            elif low.startswith("openrouter"):
+                rows, source = free_from_openrouter(), "api openrouter"
+            else:
+                rows, source = free_from_kilo(kilo_models(kilo, provider, True)), "kilo models"
+        except Exception as e:  # noqa: BLE001
+            print(f"  could not get the list: {e}")
+            continue
+        in_kilo = kilo_models(kilo, provider, False)
+        rows.sort(key=lambda r: (r[1] != FREE, r[0]))
+        print(f"  price source: {source}; found {len(rows)}\n")
+        w = max([len(r[0]) for r in rows] + [6]) + 2
+        print("model".ljust(w), "status".ljust(12), " context", " in kilo", " note")
+        for mid, status, ctx, note in rows:
+            mark = "yes" if mid in in_kilo else "no"
+            print(mid.ljust(w), status.ljust(12), f"{ctx // 1000:>7}k", f" {mark:<7}", note)
+        ready = [f"{provider}/{r[0]}" for r in rows if r[0] in in_kilo]
+        missing = [r[0] for r in rows if r[0] not in in_kilo]
+        if ready:
+            print("\n  second pass:\n  python3 scripts/py_model_test.py " + " ".join(ready))
+        if missing:
+            print(f"\n  not in kilo under {provider} (add to kilo.jsonc to test them): "
+                  + ", ".join(missing))
+        print()
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("models", nargs="+", help="provider/model, как в kilo")
-    ap.add_argument("--kilo", help="путь к бинарнику kilo")
-    ap.add_argument("--timeout", type=int, default=240, help="секунд на ответ модели")
+    ap.add_argument("models", nargs="+",
+                    help="provider/model as in kilo; with --find-free, provider names")
+    ap.add_argument("--kilo", help="path to the kilo binary")
+    ap.add_argument("--timeout", type=int, default=240, help="seconds for the model to answer")
     ap.add_argument("--keep", action="store_true",
-                    help="сохранить ответы и stderr в ./py_model_test_out/")
+                    help="keep answers and stderr in ./py_model_test_out/")
+    ap.add_argument("--find-free", action="store_true",
+                    help="first pass: find the providers' free models, no test")
     args = ap.parse_args()
     kilo = find_kilo(args.kilo)
+    if args.find_free:
+        return find_free(kilo, args.models)
 
     results = []
     with tempfile.TemporaryDirectory(prefix="pymodeltest-") as work:
@@ -142,8 +321,8 @@ def main() -> int:
             f.write(CHECKER)
         for model in args.models:
             print(f"== {model}", flush=True)
-            # отдельная пустая папка на модель: файлы, которые модель всё же
-            # создаст, не попадут ни к следующей модели, ни в текущую папку
+            # a separate empty dir per model: files the model creates anyway reach
+            # neither the next model nor the current directory
             mdir = tempfile.mkdtemp(prefix="m-", dir=work)
             start = time.time()
             out, err, rc = run([kilo, "run", "--pure", "-m", model, PROMPT], mdir, args.timeout)
@@ -159,13 +338,13 @@ def main() -> int:
             code = pick_code(raw)
             if not code:
                 if rc is None:
-                    why = f"таймаут {args.timeout}s"
+                    why = f"timeout {args.timeout}s"
                 elif rc != 0:
                     why = f"kilo exit {rc}"
                 elif not raw.strip():
-                    why = "пустой ответ"
+                    why = "empty answer"
                 else:
-                    why = "нет блока ```python"
+                    why = "no ```python block"
                 print(f"  {why} ({took:.0f}s)")
                 if raw.strip():
                     print(f"  stdout: {raw.strip()[:200]!r}")
@@ -180,18 +359,18 @@ def main() -> int:
             check = cout + cerr
             score = re.search(r"SCORE (\d+/\d+)", check)
             if crc is None:
-                print("  FAIL timeout (код модели завис)")
-                results.append((model, "crash", took, "код завис"))
+                print("  FAIL timeout (model code hung)")
+                results.append((model, "crash", took, "code hung"))
                 continue
             if score:
-                print(check.replace(score.group(0), "").rstrip() or "  все проверки пройдены")
+                print(check.replace(score.group(0), "").rstrip() or "  all checks passed")
                 results.append((model, score.group(1), took, ""))
             else:
-                print(f"  код упал: {tail(check, 4)}")
-                results.append((model, "crash", took, "код упал"))
+                print(f"  code crashed: {tail(check, 4)}")
+                results.append((model, "crash", took, "code crashed"))
 
     print()
-    print("модель".ljust(44), "балл ", "время", " причина")
+    print("model".ljust(44), "score", " time", " reason")
     for model, score, took, why in results:
         print(model.ljust(44), score.ljust(5), f"{took:4.0f}s", "", why)
     return 0 if all(s not in ("-", "crash") for _, s, _, _ in results) else 1
