@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import select
 import signal
 import subprocess
 import sys
@@ -63,6 +64,7 @@ from tools.contest.runner import (  # noqa: E402
     _cut_off,
     _finished_replies,
     _is_overflow,
+    _reap_worktree,
     _retry_reason,
     _retryable,
     round_prompt,
@@ -3498,6 +3500,316 @@ def test_growth_every_time_stops_at_turn_max_sec(tmp_path):
     assert [e["granted"] for e in ext] == [2, 1], ext
     assert cfg.turn_timeout_sec + sum(e["granted"] for e in ext) == cfg.turn_max_sec
     assert (run.turns[0]["idle_at"] - run.turns[0]["sent_at"]) >= cfg.turn_max_sec - 0.5
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KC-48: an ended agent leaves no process in its worktree
+# ─────────────────────────────────────────────────────────────────────────────
+
+#: A grace far inside the 5 s default: a TERM that is honoured is honoured in
+#: milliseconds, so no test here waits out the grace.
+_GRACE_SEC = 0.2
+
+# Both payloads print READY *after* their handler is installed, so a test can
+# wait for the child to be armed before the reap under test fires. Without the
+# gate a TERM that lands during Python's own start-up is honoured, and a child
+# meant to ignore SIGTERM dies by it.
+_READY = "sys.stderr.write('READY\\n'); sys.stderr.flush()\n"
+_KILL = "import signal, sys, time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\n" \
+        + _READY + "time.sleep(600)\n"
+_TERM = "import sys, time\n" + _READY + "time.sleep(600)\n"
+
+
+#: The holder a stray runs under: it starts the payload with its cwd where the
+#: test wants it, relays READY with the payload's pid, and prints its exit code.
+#: The holder's own cwd is `/`, outside every tree, so it is never a candidate;
+#: the payload is this process's *grandchild* — the round 86 shape, where the
+#: suites were no child of the runner — because the reap spares the runner's own
+#: children (the backend's agent loop, the harvest's judge).
+_HOLDER = """
+import subprocess, sys
+p = subprocess.Popen([sys.executable, "-c", sys.argv[2]], cwd=sys.argv[1],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+if p.stderr.readline().strip() == "READY":
+    print("READY", p.pid, flush=True)
+print("RC", p.wait(), flush=True)
+"""
+
+
+class _Leaked:
+    """A stray the reap must clean up, and never one that leaks out.
+
+    `wait()` gives the stray's exit code for the TERM/KILL assertions; `kill()` in
+    a `finally` covers the paths where the reap under test did not reach it — a
+    failing test must not leave a sleeper on the box, which is the defect KC-48
+    is about."""
+
+    def __init__(self, cwd, code):
+        self.holder = subprocess.Popen([sys.executable, "-c", _HOLDER, str(cwd), code],
+                                       cwd="/", stdout=subprocess.PIPE, text=True)
+        self.pid = None
+        self.rc = None
+
+    def ready(self, timeout=10.0):
+        """Block until the stray has installed its handlers. Raises if it never did."""
+        end = time.monotonic() + timeout
+        while time.monotonic() < end:
+            hit, _, _ = select.select([self.holder.stdout], [], [],
+                                      max(0.0, end - time.monotonic()))
+            if hit:
+                word, _, pid = self.holder.stdout.readline().partition(" ")
+                if word == "READY":
+                    self.pid = int(pid)
+                    return
+        raise AssertionError("the stray never reported READY")
+
+    def wait(self, timeout=10.0):
+        end = time.monotonic() + timeout
+        while self.rc is None and time.monotonic() < end:
+            hit, _, _ = select.select([self.holder.stdout], [], [],
+                                      max(0.0, end - time.monotonic()))
+            if hit:
+                word, _, rc = self.holder.stdout.readline().partition(" ")
+                if word == "RC":
+                    self.rc = int(rc)
+        return self.rc
+
+    def alive(self):
+        """Whether the stray still runs — read off `/proc`, not the holder's
+        pipe, so a KILL a moment ago already reads as gone."""
+        try:
+            with open(f"/proc/{self.pid}/stat", encoding="utf-8") as fh:
+                return fh.read().rsplit(")", 1)[1].split()[0] not in ("Z", "X")
+        except (OSError, IndexError):
+            return False
+
+    def kill(self):
+        if self.pid is not None and self.rc is None:
+            try:
+                os.kill(self.pid, signal.SIGKILL)
+            except OSError:
+                pass
+        if self.pid is None:        # never armed: the holder is all there is to stop
+            self.holder.kill()
+        self.holder.wait(10)
+        self.holder.stdout.close()
+
+
+def _leaked(cwd, *, ignore_term=False):
+    return _Leaked(cwd, _KILL if ignore_term else _TERM)
+
+
+def test_a_stalled_agent_leaves_no_process_in_its_worktree(tmp_path, monkeypatch, caplog):
+    """KC-48 §1-2: a silence stall ends the run and clears its worktree — the
+    child that honours SIGTERM dies by TERM, the one that ignores it by KILL,
+    the one in `sub/dir` too, the siblings and outsiders untouched, and the
+    three killed children are on `reaped` in state.json. The test chdirs into
+    the tree first, so the runner's self-exclusion is what keeps it alive."""
+    monkeypatch.setattr("tools.contest.runner.REAP_GRACE_SEC", _GRACE_SEC)
+    sb = Sandbox(tmp_path)
+    ws = sb.ws("agent-a")
+    # a second worktree next to the first: the round's normal shape
+    sibling = ws.path.parent / "agent-b"
+    _git(sb.repo, "worktree", "add", "-q", "-b", f"contest/{ROUND}/agent-b",
+         str(sibling), sb.base_sha)
+    (ws.path / "sub" / "dir").mkdir(parents=True)
+    outside = tmp_path / "elsewhere"
+    outside.mkdir()
+    monkeypatch.chdir(ws.path)          # the test's own cwd is inside the tree
+    caplog.set_level(logging.INFO, logger="tools.contest.runner")
+
+    honours, ignores, nested = _leaked(ws.path), _leaked(ws.path, ignore_term=True), \
+        _leaked(ws.path / "sub" / "dir")
+    keep = [_leaked(outside, ignore_term=True), _leaked(sibling, ignore_term=True)]
+    for proc in [honours, ignores, nested, *keep]:
+        proc.ready()          # the handler is installed before the reap fires
+    try:
+        cfg = _stall_config(idle_event_timeout_sec=1)
+        with _BenchFake({"turns": [{"events": [], "idle": False}]}) as fake:
+            state = _round(sb, fake, cfg)
+        agent = _by_name(state)["agent-a"]
+        assert agent.state is AgentState.STALLED, agent.last_error
+        assert honours.wait() == -signal.SIGTERM
+        assert ignores.wait() == -signal.SIGKILL
+        assert nested.wait() == -signal.SIGTERM
+        # read before the `finally` below tidies `keep` up
+        kept_alive = [proc.alive() for proc in keep]
+    finally:
+        for proc in keep + [honours, ignores, nested]:
+            proc.kill()
+    assert all(kept_alive), kept_alive
+    reaped = agent.reaped or []
+    pids = [item["pid"] for item in reaped]
+    assert set(pids) == {honours.pid, ignores.pid, nested.pid}, reaped
+    cmds = {item["pid"]: item["cmd"] for item in reaped}
+    assert all(len(cmd) <= 120 for cmd in cmds.values())
+    assert "signal.SIG_IGN" in cmds[ignores.pid]
+    assert os.getpid() not in pids               # the runner is never a candidate
+    assert not any(p.pid in pids for p in keep), reaped
+
+    reaped_json = {a["agent"]["name"]: a.get("reaped") for a in _state_json(sb)["agents"]}
+    assert [i["pid"] for i in reaped_json["agent-a"]] == pids
+    assert "agent-b" not in reaped_json
+    assert _runner_has(caplog, "agent-a: reaped 3 processes left in the worktree")
+
+
+def test_an_unreadable_proc_root_is_one_warning_and_an_empty_reap(tmp_path, monkeypatch, caplog):
+    """KC-48 §3: no `/proc` is a best-effort miss, not an exception into a run —
+    one WARNING per reap, an empty result, and the tree's processes are never
+    signalled, so the agent still reaches its terminal state."""
+    caplog.set_level(logging.WARNING, logger="tools.contest.runner")
+    missing = str(tmp_path / "no-proc")
+    monkeypatch.setattr("tools.contest.runner._PROC_ROOT", missing)
+    bystander = _leaked(tmp_path, ignore_term=True)
+    try:
+        bystander.ready()
+        assert _reap_worktree(tmp_path, name="agent-a", grace=_GRACE_SEC) == []
+        assert bystander.alive()                  # nothing was signalled at all
+    finally:
+        bystander.kill()
+    warns = [r for r in caplog.records if r.name == "tools.contest.runner"
+             and r.levelno == logging.WARNING]
+    assert len(warns) == 1, [r.getMessage() for r in warns]
+    assert "no reap of" in warns[0].getMessage() and missing in warns[0].getMessage()
+
+    sb = Sandbox(tmp_path)
+    cfg = _stall_config(idle_event_timeout_sec=1)
+    with _BenchFake({"turns": [{"events": [], "idle": False}]}) as fake:
+        state = _round(sb, fake, cfg)
+    agent = _by_name(state)["agent-a"]
+    assert agent.state is AgentState.STALLED, agent.last_error
+    assert agent.reaped is None
+    assert "reaped" not in _state_json(sb)["agents"][0]
+
+
+@pytest.mark.usefixtures("sigint_raises_keyboardinterrupt")
+def test_the_rounds_end_reaps_every_worktree_on_ctrl_c(tmp_path, monkeypatch):
+    """KC-48 §3: the round's own sweep runs on Ctrl-C too, in the main thread,
+    over every worktree — the agent that has already ENDED and the one still
+    mid-flight, which stays mid-flight in state.json for --resume.
+
+    agent-b's second prompt is where Ctrl-C lands. It first waits for
+    agent-a's `session.json`, which `run_agent` writes in the same `finally`
+    right after agent-a's own reap, so the sleeper the hook then leaves in
+    agent-a's tree can only be reached by the round's sweep; the one it leaves
+    in its own tree is what a mid-flight agent's suite looks like at Ctrl-C."""
+    monkeypatch.setattr("tools.contest.runner.REAP_GRACE_SEC", _GRACE_SEC)
+    sb = Sandbox(tmp_path, ["agent-a", "agent-b"])
+    ws_a, ws_b = sb.ws("agent-a"), sb.ws("agent-b")
+    cfg = make_config(["agent-a", "agent-b"], max_parallel=2, turn_timeout_sec=300)
+    pid = os.getpid()
+    calls, leaked = [], []
+    real, main = _reap_worktree, threading.main_thread()
+
+    def recording(worktree, *, name, grace=None):
+        out = real(worktree, name=name, grace=grace)
+        calls.append((name, str(worktree), threading.current_thread(), out))
+        return out
+
+    def leak_and_interrupt(directory, text):
+        # agent-a's own reap is done: its session.json is written in the same
+        # `finally`, right after it, so it is out before this hook runs on
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline and not (sb.out_dir / "agent-a.session.json").is_file():
+            time.sleep(0.02)
+        assert (sb.out_dir / "agent-a.session.json").is_file(), \
+            "agent-a never finished, so there is nothing left for the sweep to reap"
+        for tree in (ws_a.path, ws_b.path):
+            stray = _leaked(tree, ignore_term=True)
+            leaked.append(stray)
+            stray.ready()     # armed before Ctrl-C, so only the grace can kill it
+        os.kill(pid, signal.SIGINT)
+
+    scenario = {"turns": [
+        {"on_prompt": lambda d, t: work_ready(d, t) if _agent_of(d) == "agent-a"
+                               else work_no_test(d, t),
+         "events": ["busy", "idle"]},
+        {"on_prompt": leak_and_interrupt, "events": ["busy"], "idle": False},
+    ]}
+    monkeypatch.setattr("tools.contest.runner._reap_worktree", recording)
+    try:
+        with _BenchFake(scenario) as fake:
+            with pytest.raises(KeyboardInterrupt):
+                _round(sb, fake, cfg)
+        rcs = [proc.wait() for proc in leaked]
+    finally:
+        for proc in leaked:
+            proc.kill()
+
+    assert rcs == [-signal.SIGKILL, -signal.SIGKILL], rcs
+    stray_a, stray_b = leaked
+    # the sweep ran in the main thread over both trees: agent-a's own reap had
+    # already returned, and agent-b never reached one of its own, so the round's
+    # exit is the only reap that could still reach either sleeper.
+    for tree, stray in ((ws_a, stray_a), (ws_b, stray_b)):
+        sweeps = [c for c in calls if c[2] is main and c[1] == str(tree.path)]
+        assert sweeps, calls
+        assert any(stray.pid in [i["pid"] for i in c[3]] for c in sweeps), calls
+    # agent-b stays mid-flight for --resume, and carries what it left running
+    saved = {a["agent"]["name"]: a for a in _state_json(sb)["agents"]}
+    assert not AgentState(saved["agent-b"]["state"]).terminal
+    assert stray_b.pid in [i["pid"] for i in saved["agent-b"]["reaped"]]
+
+
+def test_a_stalled_turn_with_a_commit_is_reaped_before_its_harvest(tmp_path, monkeypatch):
+    """KC-48 §1: a STALLED turn with a commit under it is harvested (KC-21) —
+    and the harvest reads the tree and runs its suites only after the stray is
+    gone, not next to it. The run still lands READY on its commit.
+
+    The commit and the stray are made in `prepare`, before the round (FL-1): a
+    hook that commits while the silence clock runs is a race on the box's load."""
+    monkeypatch.setattr("tools.contest.runner.REAP_GRACE_SEC", _GRACE_SEC)
+    leaked, seen = [], []
+    real = _runner_module._harvest
+
+    def harvest(*args, **kwargs):
+        seen.append(leaked[0].alive())
+        return real(*args, **kwargs)
+
+    def commit_and_leak(worktree):
+        _work(worktree, test=True)
+        stray = _leaked(worktree, ignore_term=True)
+        leaked.append(stray)
+        stray.ready()
+
+    monkeypatch.setattr(_runner_module, "_harvest", harvest)
+    try:
+        _sb, _fake, _h, run, _ = _run_one(tmp_path, {"turns": [{"events": [], "idle": False}]},
+                                          _stall_config(), prepare=commit_and_leak)
+        rc = leaked[0].wait()
+    finally:
+        for proc in leaked:
+            proc.kill()
+    assert run.state is AgentState.READY, run.last_error
+    assert seen == [False]
+    assert rc == -signal.SIGKILL
+    assert [i["pid"] for i in run.reaped] == [leaked[0].pid]
+
+
+def test_the_runners_own_child_in_the_worktree_is_not_the_agents_leftover(tmp_path, monkeypatch):
+    """KC-48: `OpenRouterBackend` runs its agent loop as this process's child with
+    `cwd=` the worktree, and `close()` ends it after the reap. It is not work the
+    agent left running, so the reap neither signals nor records it — only a
+    stray one level further down is."""
+    monkeypatch.setattr("tools.contest.runner.REAP_GRACE_SEC", _GRACE_SEC)
+    sb = Sandbox(tmp_path)
+    ws = sb.ws("agent-a")
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"],
+                             cwd=str(ws.path))
+    stray = _leaked(ws.path)
+    try:
+        stray.ready()
+        with _BenchFake({"turns": [{"events": [], "idle": False}]}) as fake:
+            state = _round(sb, fake, _stall_config())
+        rc = stray.wait()
+        child_alive = child.poll() is None
+    finally:
+        stray.kill()
+        child.kill()
+        child.wait()
+    assert child_alive
+    assert rc == -signal.SIGTERM
+    assert [i["pid"] for i in _by_name(state)["agent-a"].reaped] == [stray.pid]
 
 
 def test_two_runs_on_one_model_id_extend_on_their_own_churn(tmp_path):

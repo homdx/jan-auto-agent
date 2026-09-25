@@ -79,13 +79,35 @@ match the message pattern, so the round 86 payload goes to a
 rejected the request` is still permanent on the session's *first* call —
 refused once, refused again — but retryable once the session has had an
 assistant reply that finished, where it is the free tier refusing under load.
+
+KC-48 (round 92) closes the gap that left 36 python processes in round 86: a
+`bash` call that returned had started four `pytest -n=8` suites with thirty-two
+xdist workers, and the runner put the agent in `STALLED` while the suites ran
+on, reparented to `systemd --user`, until the box ran out of cores. Nothing
+looked at processes before — `finish()` transitioned and returned. Now every
+terminal state reaps the worktree: every process whose `/proc/<pid>/cwd` is the
+worktree or under it, and whose uid is ours, gets `SIGTERM`, and whatever is
+still running after `REAP_GRACE_SEC` gets `SIGKILL`. The runner and its
+ancestors are never candidates, however their cwd reads. The reap is recorded on
+the agent as `reaped: [{pid, cmd}]` — absent when nothing was left behind — and
+logged as one line. A STALLED or ERROR turn with a commit is reaped before
+its salvage harvest reads the tree. The round's end runs the same sweep over
+every worktree once more, Ctrl-C included, so a process started by a tool call
+that returned after the agent's own reap is not left behind either. The
+runner's own children — OpenRouter's agent loop, the harvest's judge — are the
+runner's to end, and are never recorded as the agent's leftovers. The reap is
+fail-open: a `/proc` entry that vanishes mid-scan is skipped, and a `/proc` that
+is not there at all is one `WARNING` and an empty reap, never an exception into
+a round.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
 import re
+import signal
 import statistics
 import subprocess
 import threading
@@ -124,6 +146,29 @@ _TEST_RUNS_LOCK = threading.Lock()
 #: tick that waits on a held index is late, not failed.
 _TICK_GIT_TIMEOUT_S = 5.0
 _TICK_GIT_RETRIES = 1
+
+#: KC-48: how long a process in a finished worktree gets between the TERM and
+#: the KILL. Five seconds is enough for a suite's own cleanup to run, and
+#: pointless to wait out if it will not — the round 86 suites ran for about a
+#: minute past their agent's own STALLED. A module constant, patched in tests,
+#: because no test wants to spend five seconds on the grace.
+REAP_GRACE_SEC = 5.0
+
+#: KC-48: the proc root the reap scans. A constant, not a literal inside the
+#: walkers, so a test can point the reap at a directory that is not there.
+_PROC_ROOT = "/proc"
+
+#: KC-48: how long the reap waits for a SIGKILLed process to be gone. KILL is
+#: not ignorable, so only a process in uninterruptible sleep gets near it.
+_REAP_KILL_WAIT_SEC = 2.0
+
+#: KC-48: how much of a reaped process's command line `state.json` keeps.
+_REAP_CMD_CHARS = 120
+
+# KC-48: guards the read-modify-write on `run.reaped`. An agent's own reap runs
+# in its pool worker while the round's end sweep runs in the main thread, so the
+# record must not be rebuilt from a torn read by two threads at once.
+_REAPED_LOCK = threading.Lock()
 
 
 #: The prompt sent after a retryable session error (KC-19).  The
@@ -511,6 +556,7 @@ class AgentRun:
     `sent_at`, `idle_at`, `idle_status`, and `harvest` = `{"verdict", "reasons": [codes]}`
     once the turn was scored. `permissions` counts what the policy was asked
     and how it answered; `questions` counts the questions over the whole run.
+    `reaped` (KC-48) is what the worktree was still running when the run ended.
     """
 
     agent: AgentSpec
@@ -525,6 +571,10 @@ class AgentRun:
     commit: str | None = None
     cost: float | None = None
     tokens: dict | None = None
+    #: KC-48: `[{"pid": int, "cmd": str}]` of what the reap found in the
+    #: worktree at the terminal state, absent from `state.json` when the agent
+    #: left nothing running.
+    reaped: list | None = None
 
     @property
     def terminal(self) -> bool:
@@ -534,6 +584,8 @@ class AgentRun:
         data = asdict(self)
         data["workspace"]["path"] = str(self.workspace.path)
         data["state"] = self.state.value
+        if not data.get("reaped"):
+            data.pop("reaped", None)
         return data
 
     @classmethod
@@ -542,7 +594,7 @@ class AgentRun:
         ws["path"] = Path(ws["path"])
         run = cls(agent=AgentSpec(**data["agent"]), workspace=Workspace(**ws))
         for name in ("session_id", "attempt", "turns", "permissions", "questions",
-                     "last_error", "commit", "cost", "tokens"):
+                     "last_error", "commit", "cost", "tokens", "reaped"):
             if name in data:
                 setattr(run, name, data[name])
         run.state = AgentState(data.get("state", "CREATED"))
@@ -929,6 +981,306 @@ def _wait_turn(backend: ContestBackend, session: SessionRef, config: ContestConf
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# KC-48: the reap — an ended agent leaves no process in its worktree
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _stat_fields(proc_root: str, pid: int):
+    """`(state, ppid)` off `/proc/<pid>/stat`, or `None` when it cannot be read.
+
+    The comm (field two) may itself hold `)` and spaces, so the walk starts
+    after the last `)`: `state` is first, `ppid` second.
+    """
+    try:
+        with open(f"{proc_root}/{pid}/stat", encoding="utf-8") as fh:
+            raw = fh.read()
+    except OSError:
+        return None
+    tail = raw.rsplit(")", 1)
+    if len(tail) != 2:
+        return None
+    fields = tail[1].split()
+    if len(fields) < 2 or not fields[1].isdigit():
+        return None
+    return fields[0], int(fields[1])
+
+
+def _ancestor_pids(proc_root: str) -> set:
+    """Our pid and every pid above it in the parent chain — never candidates.
+
+    Read off `/proc`, so a chain that has already been reaped simply stops
+    short. This is what keeps a round started from inside a worktree from
+    signalling itself, and it costs one `stat` read per level of a chain that is
+    a dozen long at most.
+    """
+    own = os.getpid()
+    chain = {own}
+    pid = own
+    for _ in range(128):   # a cycle, not a chain, if we ever come back to ourselves
+        info = _stat_fields(proc_root, pid)
+        if info is None or info[1] in chain:
+            break
+        chain.add(info[1])
+        pid = info[1]
+    return chain
+
+
+def _proc_uid(proc_root: str, pid: int):
+    """The real uid that owns *pid*, or `None` when it cannot be read.
+
+    Three sources, in order, because no single one exists everywhere: the owner
+    of the `/proc/<pid>` directory itself — one `stat`, and it holds the real uid
+    even on a stripped-down `/proc` that ships no `uid` file, which is this box
+    (57 entries per pid, none of them `uid`) — then the dedicated
+    `/proc/<pid>/uid`, then the `Uid:` line of `/proc/<pid>/status`. Every branch
+    falls through rather than returning `None`, so one missing file does not skip
+    the sources that are still there. Reading the uid off `/proc` at all is what
+    keeps the reap from signalling a process the runner does not own: a `None`
+    here means *skip this pid*, never *assume it is ours*.
+    """
+    try:
+        return int(os.stat(f"{proc_root}/{pid}").st_uid)
+    except OSError:
+        pass
+    try:
+        with open(f"{proc_root}/{pid}/uid", encoding="utf-8") as fh:
+            field = fh.read().split()
+        if field and field[0].isdigit():
+            return int(field[0])
+    except OSError:
+        pass
+    try:
+        with open(f"{proc_root}/{pid}/status", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("Uid:"):
+                    field = line.split(None, 1)[1].split()
+                    if field and field[0].isdigit():
+                        return int(field[0])
+    except OSError:
+        pass
+    return None
+
+
+def _proc_cwd(proc_root: str, pid: int) -> Path | None:
+    """The resolved cwd of *pid*, or `None` when the entry is gone or unreadable.
+
+    Gone covers the entry vanishing between `os.listdir` and this read, and a
+    cwd whose directory was already deleted: `/proc` keeps the link, reading it
+    still works, and `resolve(strict=False)` returns the vanished path instead of
+    raising.
+    """
+    try:
+        link = os.readlink(f"{proc_root}/{pid}/cwd")
+    except OSError:
+        return None
+    return Path(link).resolve(strict=False)
+
+
+def _proc_cmd(proc_root: str, pid: int) -> str:
+    """The process's command line, NULs and newlines as spaces, `""` when unreadable.
+
+    A kernel thread has no cmdline at all; `""` is what the record then holds,
+    and the log line says `(no command)` for it. Newlines are folded to spaces
+    because a `python3 -c` payload carries them and the record has to stay on
+    one log line and one `state.json` field.
+    """
+    try:
+        with open(f"{proc_root}/{pid}/cmdline", "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        return ""
+    text = raw.replace(b"\0", b" ").decode("utf-8", "replace")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _alive(proc_root: str, pid: int) -> bool:
+    """Whether *pid* still has a live task behind it — a zombie does not.
+
+    A zombie is already dead: its parent only has to wait on it, and a KILL
+    would reach nothing.
+    """
+    info = _stat_fields(proc_root, pid)
+    return info is not None and info[0] not in ("Z", "X")
+
+
+def _wait_for_exit(proc_root: str, pids: list, grace: float) -> list:
+    """The pids of *pids* still running *grace* seconds after their TERM.
+
+    Polls instead of sleeping the grace out, so a TERM that is honoured is not
+    followed by a pointless wait for the rest of it. A grace of 0 returns at
+    once — how a test reaches the KILL half of the reap without spending five
+    seconds on the grace.
+    """
+    deadline = time.monotonic() + grace
+    alive = [pid for pid in pids if _alive(proc_root, pid)]
+    while alive and time.monotonic() < deadline:
+        time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+        alive = [pid for pid in alive if _alive(proc_root, pid)]
+    return alive
+
+
+def _signal_pid(pid: int, sig: int) -> None:
+    """`os.kill` with the races of a concurrent scan folded away.
+
+    `ESRCH` — the process exited between the scan and the signal — is the
+    expected answer here, not a failure. Anything else is a WARNING and the reap
+    goes on: one stubborn process must not keep the rest of the tree running.
+    """
+    try:
+        os.kill(pid, sig)
+    except ProcessLookupError:
+        pass
+    except OSError as exc:
+        _log.warning("could not signal %d with %d: %s: %s", pid, sig, type(exc).__name__, exc)
+
+
+def _reap_summary(reaped: list) -> str:
+    """`(pytest -n=8 … ×4, …)` — the distinct commands, counted when repeated.
+
+    The round 86 shape was four identical suites with thirty-two workers each, so
+    the line names the shape of what was left behind rather than forty identical
+    clauses, and caps itself so one agent cannot turn the log into a wall.
+    """
+    counts: dict = {}
+    for item in reaped:
+        cmd = item.get("cmd") or "(no command)"
+        counts[cmd] = counts.get(cmd, 0) + 1
+    parts = [f"{cmd} ×{n}" if n > 1 else cmd for cmd, n in counts.items()]
+    text = ", ".join(parts)
+    return text if len(text) <= 200 else text[:200] + "…"
+
+
+def _grace(grace: float | None) -> float:
+    """The grace to wait: *grace*, else `REAP_GRACE_SEC` read at the call.
+
+    Read at the call, not bound as a default, so patching `REAP_GRACE_SEC` is
+    enough to shorten the grace — which is how a test reaches the KILL half of
+    the reap without spending five seconds on it.
+    """
+    return float(REAP_GRACE_SEC) if grace is None else float(grace)
+
+
+def _reap_worktree(worktree, *, name: str, grace: float | None = None) -> list:
+    """KC-48: TERM, then KILL, whatever is still standing in *worktree*.
+
+    Candidates are the processes whose resolved `/proc/<pid>/cwd` is *worktree*
+    or under it, and whose uid is ours; the runner, its ancestors and its own
+    children are never candidates, however their cwd reads. A child of the
+    runner is the runner's to end, not the agent's leftover: `OpenRouterBackend`
+    spawns its agent loop with `cwd=` the worktree and `close()` ends it after
+    this reap, and the harvest's judge runs there too. What the agent's own
+    calls started is one level further down, or reparented to `systemd --user`. Everything is read through `/proc`, and
+    everything that cannot be read is skipped rather than raised: a pid that
+    exits between `os.listdir` and the read is already reaped, and a `/proc`
+    that is not there at all is one WARNING and an empty reap.
+
+    Returns `[{"pid": int, "cmd": first 120 chars}]`, `[]` when nothing was left
+    behind. Never raises into a round.
+    """
+    proc_root = _PROC_ROOT
+    try:
+        entries = os.listdir(proc_root)
+    except OSError as exc:
+        _log.warning("%s: no reap of %s — %s is not readable (%s: %s)",
+                     name, worktree, proc_root, type(exc).__name__, exc)
+        return []
+    try:
+        ours = os.getuid()
+    except (AttributeError, OSError):
+        _log.warning("%s: no reap of %s — the runner's uid could not be read", name, worktree)
+        return []
+    try:
+        root = Path(worktree).resolve(strict=False)
+        excluded = _ancestor_pids(proc_root)
+        me = os.getpid()
+        found = []
+        for entry in entries:
+            if not entry.isdigit():
+                continue
+            pid = int(entry)
+            if pid in excluded:
+                continue
+            info = _stat_fields(proc_root, pid)
+            if info is None or info[1] == me:
+                continue
+            cwd = _proc_cwd(proc_root, pid)
+            if cwd is None or not cwd.is_relative_to(root):
+                continue
+            if _proc_uid(proc_root, pid) != ours:
+                continue
+            # Already dead: its parent only has to wait on it, and signalling or
+            # recording it would say we reaped something we never touched.
+            if not _alive(proc_root, pid):
+                continue
+            found.append((pid, _proc_cmd(proc_root, pid)[:_REAP_CMD_CHARS]))
+    except OSError as exc:
+        _log.warning("%s: reap of %s could not be scanned — %s: %s",
+                     name, worktree, type(exc).__name__, exc)
+        return []
+    except Exception as exc:  # noqa: BLE001 — a reap is best effort, never a round-killing one
+        _log.warning("%s: reap of %s could not be scanned — %s: %s",
+                     name, worktree, type(exc).__name__, exc)
+        return []
+    if not found:
+        return []
+    for pid, _cmd in found:
+        _signal_pid(pid, signal.SIGTERM)
+    killed = _wait_for_exit(proc_root, [pid for pid, _ in found], _grace(grace))
+    for pid in killed:
+        _signal_pid(pid, signal.SIGKILL)
+    # `kill` returns before the process is gone — the KILL is delivered, not yet
+    # acted on — so the reap waits for it: whoever reads the tree next (the
+    # salvage harvest, the export) must not find the stray still running. KILL
+    # cannot be ignored, so this ends in milliseconds; the cap is for a process
+    # stuck in uninterruptible sleep, which is logged rather than waited out.
+    stuck = _wait_for_exit(proc_root, killed, _REAP_KILL_WAIT_SEC)
+    if stuck:
+        _log.warning("%s: %d reaped %s still running %gs after SIGKILL: %s", name,
+                     len(stuck), "process" if len(stuck) == 1 else "processes",
+                     _REAP_KILL_WAIT_SEC, stuck)
+    reaped = [{"pid": pid, "cmd": cmd} for pid, cmd in found]
+    _log.info("%s: reaped %d %s left in the worktree (%s)", name, len(reaped),
+              "process" if len(reaped) == 1 else "processes", _reap_summary(reaped))
+    return reaped
+
+
+def _record_reaped(run: AgentRun, name: str, worktree, grace: float | None = None) -> list:
+    """Reap *worktree* and put what came back on `run.reaped` for `state.json`.
+
+    Merges rather than replaces: a second sweep of a tree the first already
+    cleared finds nothing and leaves the record as it was, and a sweep that finds
+    something the first sweep missed adds it without repeating what is already
+    recorded. `state.json` then says what the agent left running.
+    """
+    reaped = _reap_worktree(worktree, name=name, grace=grace)
+    if not reaped:
+        return reaped
+    with _REAPED_LOCK:          # the round's sweep and a worker's own reap may race
+        have = {item.get("pid") for item in run.reaped or ()}
+        run.reaped = list(run.reaped or []) + [item for item in reaped if item["pid"] not in have]
+    return reaped
+
+
+def _reap_round_worktrees(runs: list, grace: float | None = None) -> int:
+    """The round's end sweep: every agent's worktree, once, in agent order.
+
+    An agent whose own reap already ran finds an empty tree here, which is the
+    common case — the sweep exists for the gap after it, the tool call that
+    returned after its agent had ended. Returns how many processes the round was
+    left with, so the caller knows whether `state.json` has changed.
+
+    On Ctrl-C this covers the agents still mid-flight too: their sessions are
+    being aborted and the round is exiting, so nothing in their trees is a live
+    tool call any more — a suite left running there would outlive the round
+    exactly as round 86's did. Their state is not touched: they stay mid-flight
+    for `--resume`, which starts them again in a tree with nothing running.
+    """
+    total = 0
+    for run in runs:
+        total += len(_record_reaped(run, run.agent.name, run.workspace.path, grace))
+    return total
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # one agent
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -947,8 +1299,10 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
     function never touches a client or a tap.
 
     `on_transition(run)` is called after every state change. In `finally`, on a
-    terminal state, the session's `cost` and `tokens` are read and its messages
-    are written to `out_dir/<agent>.session.json`.
+    terminal state, the worktree is reaped first (KC-48 — whatever the agent's
+    calls left standing is TERMed, then KILLed after the grace, and recorded on
+    `run.reaped`), then the session's `cost` and `tokens` are read and its
+    messages are written to `out_dir/<agent>.session.json`.
 
     *run_tests* passes the harvest's `run_tests` through to it after every turn:
     the four pytest roots are then the round's judge (KC-16) and run one
@@ -1296,6 +1650,11 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                 if state in (AgentState.STALLED, AgentState.ERROR):
                     above = _commits_above(ws)
                     if above:
+                        # KC-48: the session is gone, so what its calls left
+                        # running goes before the harvest reads the tree and runs
+                        # its suites next to it; `finally` reaps again, for what
+                        # came after.
+                        _record_reaped(run, spec.name, ws.path)
                         verdict = _harvest(ws, ticket_path, run_tests)
                         turn["harvest"] = {
                             "verdict": verdict.verdict,
@@ -1338,6 +1697,12 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                        + ", ".join(r.code for r in verdict.reasons))
             rework_text = rework_message(verdict, run.attempt, int(config.max_rework))
     finally:
+        if run.terminal:
+            # KC-48: the turn is over — the session aborted, the stream closed,
+            # or the state is whatever the run earned — so nothing the agent's
+            # calls left standing may keep running in the tree the harvest and
+            # the export are about to read.
+            _record_reaped(run, spec.name, ws.path)
         if session is not None and run.terminal:
             _record_session(run, backend, session, out_dir)
 
@@ -1478,6 +1843,7 @@ def run_round(config: ContestConfig, round_no: int, ticket_path: Path, workspace
     pool = ThreadPoolExecutor(max_workers=max(1, int(config.max_parallel)),
                               thread_name_prefix="contest")
     heartbeat.start()
+    interrupted = False
     try:
         futures = {pool.submit(work, *item): item[0] for item in live}
         for future in as_completed(futures):
@@ -1489,8 +1855,13 @@ def run_round(config: ContestConfig, round_no: int, ticket_path: Path, workspace
                 run.state, run.last_error = AgentState.ERROR, f"runner: {type(exc).__name__}: {exc}"
                 save()
     except KeyboardInterrupt:
+        interrupted = True
         stop.set()  # from here on a worker's transition raises instead of saving
-        save()      # the round as it stood: mid-flight agents stay mid-flight for --resume
+        # KC-48: the round's own sweep over every worktree, before the interrupt
+        # below wakes the workers — so the save right after carries `reaped`
+        # while the mid-flight agents are still saved mid-flight for --resume.
+        _reap_round_worktrees(state.agents)
+        save()      # the round as it stood, carrying the reap records
         for run, backend in live:
             session = None
             if not run.terminal and run.session_id:
@@ -1503,7 +1874,14 @@ def run_round(config: ContestConfig, round_no: int, ticket_path: Path, workspace
     finally:
         heartbeat.stop()
         pool.shutdown(wait=False, cancel_futures=True)
-    save()
+        # KC-48: the same sweep on a normal return, when every agent has ended and
+        # the round's exit is the last chance to close the gap after one of them.
+        # On Ctrl-C the handler already ran it and saved the round as it stood — a
+        # second `save()` here would write the states the just-woken workers are
+        # still dragging on, and turn a mid-flight agent into an ERROR for --resume.
+        if not interrupted:
+            _reap_round_worktrees(state.agents)
+            save()
     return state
 
 
