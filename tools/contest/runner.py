@@ -143,7 +143,23 @@ from tools.contest.workspace import (
 )
 from tools.git_run import run_git
 
-__all__ = ["AgentRun", "AgentState", "RoundState", "round_prompt", "run_agent", "run_round"]
+__all__ = [
+    "AgentRun",
+    "AgentState",
+    "RoundState",
+    "round_prompt",
+    "run_agent",
+    "run_round",
+    "WORKERS_FILE",
+    "agent_pytest_workers",
+    "agent_tmp_path",
+    "core_count",
+    "prompt_workers_note",
+    "read_pytest_workers",
+    "refresh_pytest_workers",
+    "round_live_agents",
+    "write_pytest_workers",
+]
 
 _log = logging.getLogger(__name__)
 
@@ -184,6 +200,177 @@ _REAP_CMD_CHARS = 120
 # in its pool worker while the round's end sweep runs in the main thread, so the
 # record must not be rebuilt from a torn read by two threads at once.
 _REAPED_LOCK = threading.Lock()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KC-65: the agents' pytest worker count
+# ─────────────────────────────────────────────────────────────────────────────
+
+#: KC-65: the round's record of the pytest-xdist workers its agents' `-n auto`
+#: should use. `cmd_run` writes it once with the start value, `run_round.save`
+#: rewrites it after every transition, and the plugin
+#: (`tools/contest/pytest_plugin/contest_pytest_workers.py`) reads it at each
+#: pytest start. This file is the source of the count — nothing else in the tree
+#: decides it, so the count the file holds and the count a prompt names cannot
+#: drift apart.
+WORKERS_FILE = "pytest-workers"
+
+#: KC-65: the last lines of every prompt the runner sends. `{n}` is the count
+#: the agents' `-n auto` reads at that moment. Last in the message on purpose:
+#: KC-22's "only the first prompt carries it" and every existing prompt test
+#: that checks the start of a message stay as they are.
+_WORKERS_NOTE = (
+    "\n\nThe box is shared: right now `-n auto` gives your pytest {n} workers.\n"
+    "Do not pass a larger `-n`; a run is slower when many agents test at once.\n"
+)
+
+
+def core_count() -> int:
+    """KC-65: the cores the box offers, as `os.cpu_count` reports them.
+
+    One function, because the count is capped at the cores in several places and
+    a test steers it by monkeypatching `os.cpu_count`. `None` or `0` is 1 — a
+    cap of zero would floor the whole round at no workers at all.
+    """
+    return max(1, int(os.cpu_count() or 1))
+
+
+def agent_pytest_workers(live: int, cores: int, config: ContestConfig) -> int:
+    """KC-65: the workers one agent's `-n auto` gets while *live* agents hold a
+    pool slot on *cores* cores.
+
+    A fixed `pytest_workers_per_agent` above 0 wins, and it is not capped: the
+    operator asked for that number. Otherwise the count follows the crowd — the
+    last agent left gets the whole box, up to `pytest_workers_few_agents` live
+    agents get `pytest_workers_few`, and above that `pytest_workers_min`. The
+    auto counts are capped at the cores and floored at 1, so ten agents ask for
+    no more than the box has, and nobody gets one worker, where a full suite
+    runs for over half an hour and an agent's own `--timeout` fires on healthy
+    code.
+    """
+    cores = max(1, int(cores or 1))
+    per_agent = int(getattr(config, "pytest_workers_per_agent", 0) or 0)
+    if per_agent > 0:
+        return max(1, per_agent)
+    few_agents = max(1, int(getattr(config, "pytest_workers_few_agents", 0) or 0))
+    if live <= 1:
+        count = cores
+    elif live <= few_agents:
+        count = int(getattr(config, "pytest_workers_few", 4) or 4)
+    else:
+        count = int(getattr(config, "pytest_workers_min", 2) or 2)
+    return max(1, min(count, cores))
+
+
+def round_live_agents(config: ContestConfig, resume: "RoundState | None") -> int:
+    """KC-65: how many agents hold a pool slot when the round starts.
+
+    A `Workspace` carries no state, so the count comes from the runs: on
+    `--resume` they are the agents of `state.json` minus the ones already
+    terminal (a resumed round whose eight agents already ended has two live, not
+    eight), and they may outnumber the names on the command line. Without a
+    resume, `len(config.agents)` — one workspace per agent.
+    """
+    if resume is not None:
+        return sum(1 for run in resume.agents if not run.terminal)
+    return len(config.agents)
+
+
+def read_pytest_workers(path) -> "int | None":
+    """The count *path* holds, or ``None`` when it cannot be read.
+
+    ``None`` is the runner's "no guess": the prompt then carries no worker line,
+    and the agents' pytest falls back to xdist's own answer. An unreadable file
+    is not a round.
+    """
+    try:
+        raw = Path(path).read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value >= 1 else None
+
+
+def write_pytest_workers(path, value: int) -> None:
+    """Atomic: a temp file beside the target, then `os.replace`.
+
+    The file is read by a pytest that may start at any moment and rewritten
+    after every transition, so a torn write would hand a run a count that is not
+    a number. `os.replace` means the reader sees the old value or the new one,
+    never a half of either.
+    """
+    target = Path(path)
+    temp = target.with_name(target.name + ".tmp")
+    with temp.open("w", encoding="utf-8") as handle:
+        handle.write(f"{value}\n")
+    os.replace(temp, target)
+
+
+def refresh_pytest_workers(out_dir, config: ContestConfig, state: "RoundState",
+                           memo: dict) -> None:
+    """KC-65: follow the round with the worker file, after every transition.
+
+    `live` is the agents that hold a pool slot now — neither `CREATED` (queued,
+    it holds no slot) nor terminal (it gave the slot up). `HARVESTING` still
+    counts: it may go back to work, and a harvest is a pytest run.
+
+    A fixed `pytest_workers_per_agent` is written once by the CLI and never
+    touched here, so the round cannot move a number the operator pinned. The
+    write is atomic and only happens when the number changed — *memo* keeps the
+    last value written, so a save that sees the same count does no I/O. A write
+    that fails is one log line per round and never a stop: the agents' pytest
+    then falls back to xdist's own answer and the round goes on.
+    """
+    if int(getattr(config, "pytest_workers_per_agent", 0) or 0) > 0:
+        return
+    try:
+        live = sum(1 for run in state.agents
+                   if run.state is not AgentState.CREATED and not run.terminal)
+        value = agent_pytest_workers(live, core_count(), config)
+        if "value" not in memo:
+            memo["value"] = read_pytest_workers(out_dir / WORKERS_FILE)
+        if memo["value"] == value:
+            return
+        memo["value"] = value
+        write_pytest_workers(out_dir / WORKERS_FILE, value)
+    except OSError as exc:
+        if not memo.get("warned"):
+            memo["warned"] = True
+            _log.warning("could not write %s: %s: %s", out_dir / WORKERS_FILE,
+                         type(exc).__name__, exc)
+
+
+def prompt_workers_note(out_dir, config: ContestConfig) -> str:
+    """KC-65: the worker count of this moment, as the last lines of a prompt.
+
+    "" when the file cannot be read — no line, no guess — and "" when a fixed
+    `pytest_workers_per_agent` already equals every core the box has, where the
+    note would say nothing the agent does not already know.
+    """
+    per_agent = int(getattr(config, "pytest_workers_per_agent", 0) or 0)
+    if per_agent > 0 and per_agent == core_count():
+        return ""
+    value = read_pytest_workers(out_dir / WORKERS_FILE)
+    if value is None:
+        return ""
+    return _WORKERS_NOTE.format(n=value)
+
+
+def agent_tmp_path(config: ContestConfig, round_no: "str | int") -> "Path | None":
+    """KC-65: the round's own share of `[contest] agent_tmpdir`, or ``None``.
+
+    ``<agent_tmpdir>/contest-<NN>`` — one dir per round, so a round never
+    deletes another round's scratch and the parent is never touched. ``None``
+    when the key is unset or empty, which is the round's inherited ``$TMPDIR``
+    and needs no dir of its own.
+    """
+    root = str(getattr(config, "agent_tmpdir", "") or "").strip()
+    if not root:
+        return None
+    return Path(os.path.expanduser(root)).resolve() / f"contest-{round_no}"
 
 
 #: The prompt sent after a retryable session error (KC-19).  The
@@ -1366,7 +1553,7 @@ def _reap_round_worktrees(runs: list, grace: float | None = None) -> int:
 def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
               config: ContestConfig, ticket_path: Path, out_dir: Path,
               on_transition: Callable[[AgentRun], None],
-              run_tests: bool = False) -> AgentRun:
+              run_tests: bool = False, agent_tmp: Path | None = None) -> AgentRun:
     """Drive *run* to a terminal state — single-threaded, one session for every
     turn; a context overflow (KC-54) or a reply cut off by a full context window
     (KC-56) opens a fresh one, which are the only second ``POST /session`` this
@@ -1388,6 +1575,13 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
     worktree at a time, instead of the ticket's own self-check being the only
     evidence. Off by default, so every earlier call of this function is unchanged.
 
+    *agent_tmp* is the round's share of `[contest] agent_tmpdir` (KC-65) — the
+    dir the CLI pointed every agent's `$TMPDIR` at. Its `/*` glob joins the
+    policy's `tmp_roots`, because the round moved the agents' shell onto a dir
+    the policy has never seen, and without it an agent's first `tmp_path`
+    fixture is a gate call it did not cost under `/tmp`. `None` is today's
+    `/tmp` and adds nothing.
+
     ``run.agent.context_limit`` — the model's ``limit.context``, which intake
     puts on the spec from ``GET /provider`` (KC-56) — tells a reply cut off by
     a full context window from one cut off by its output budget. ``None`` is an
@@ -1407,6 +1601,9 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
     scratch_others = tuple(
         d for d in agent_tmp_dirs(tmp_roots, config.agents) if d.name != spec.name
     )
+    # KC-65: the round's own $TMPDIR is scratch for this agent too — the glob
+    # below, so a tmp_path fixture is not a gate call it did not cost under /tmp.
+    agent_tmp_glob = f"{agent_tmp}/*" if agent_tmp is not None else ""
     session: SessionRef | None = None
     stalled: list = []          # the reason, once the runner's stall edge fired
     questions_this_turn = [0]
@@ -1441,8 +1638,10 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         spent = run.permissions["gated"] + run.permissions["gate_failed"]
         ctx = PolicyContext(
             worktree=ws.path,
-            # the round's globs plus this agent's own scratch dir (KC-59)
-            tmp_roots=tuple(tmp_roots) + agent_tmp_globs(tmp_roots, spec.name),
+            # the round's globs, this agent's own scratch dir (KC-59), and the
+            # round's $TMPDIR (KC-65)
+            tmp_roots=tuple(tmp_roots) + agent_tmp_globs(tmp_roots, spec.name)
+                      + ((agent_tmp_glob,) if agent_tmp_glob else ()),
             # the rounds folder: this round's other worktrees and every earlier
             # round's, plus the other agents' scratch dirs. The policy lets this
             # agent's own worktree through (KC-46)
@@ -1554,7 +1753,12 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
             mark_fn = getattr(backend, "mark", None)
             since = mark_fn() if callable(mark_fn) else None
             try:
-                backend.prompt(session, text)
+                # KC-65: the worker count of this moment, as the last lines of
+                # the message. This one send carries the first prompt, a
+                # `continue`, a `REWORK` and a `--resume` prompt alike, so a
+                # nudged agent reads the count it starts with, not the count it
+                # had an hour ago.
+                backend.prompt(session, text + prompt_workers_note(out_dir, config))
             except ContestBackendError as exc:
                 return finish(AgentState.ERROR, f"prompt failed: {_brief(str(exc))}")
 
@@ -1930,9 +2134,19 @@ def run_round(config: ContestConfig, round_no: int, ticket_path: Path, workspace
     stop = threading.Event()
     since: dict = {run.agent.name: time.monotonic() for run in runs}   # state entered at
 
+    # KC-65: the last worker count `save` wrote, so a save that sees the same
+    # count does no I/O. `save` holds `lock`, so the memo needs none of its own.
+    _workers_memo: dict = {}
+    # KC-65: the round's share of `[contest] agent_tmpdir` — where the CLI
+    # pointed the agents' $TMPDIR — is scratch the policy lets through.
+    agent_tmp = agent_tmp_path(config, round_no)
+
     def save() -> None:
         with lock:
             _write_json(out_dir / "state.json", state.to_dict())
+            # KC-65: the worker file follows the round too — a slot that just
+            # freed is workers the next pytest can have.
+            refresh_pytest_workers(out_dir, config, state, _workers_memo)
 
     def on_transition(run: AgentRun) -> None:
         if stop.is_set():
@@ -1955,7 +2169,7 @@ def run_round(config: ContestConfig, round_no: int, ticket_path: Path, workspace
         try:
             run_agent(run, backend=backend, policy=policy, config=config,
                       ticket_path=ticket_path, out_dir=out_dir, on_transition=on_transition,
-                      run_tests=run_tests)
+                      run_tests=run_tests, agent_tmp=agent_tmp)
         except _Stopped:
             pass
         finally:

@@ -475,7 +475,7 @@ class OpenRouterBackend:
 
     def __init__(self, api_key: str, base_url: str, directory: str, *,
                  timeout: float = 300.0, max_steps: int = 24,
-                 spawn_agent=None) -> None:
+                 spawn_agent=None, extra_env: dict | None = None) -> None:
         if not isinstance(base_url, str) or not base_url.strip():
             raise ContestBackendError("OpenRouterBackend needs a base_url")
         self._api_key = api_key if isinstance(api_key, str) else ""
@@ -484,6 +484,10 @@ class OpenRouterBackend:
         self._timeout = float(timeout)
         self._max_steps = int(max_steps)
         self._spawn_agent = spawn_agent
+        #: KC-65: the round's env, applied after `dict(os.environ)` so the
+        #: agents' pytest reads the round's worker count too — without it the
+        #: rule is a Kilo-only rule, and this backend is the other half of it.
+        self._extra_env = dict(extra_env) if extra_env else None
         self._records: dict = {}
         self._interrupted = False
 
@@ -700,6 +704,8 @@ class OpenRouterBackend:
                 "--directory", self._directory, "--max-steps", str(self._max_steps),
                 "--request-timeout", f"{self._timeout:g}"]
         env = dict(os.environ)
+        if self._extra_env:
+            env.update(self._extra_env)
         env["CONTEST_AGENT_API_KEY"] = self._api_key
         env[_AGENT_BASH_TIMEOUT_ENV] = f"{self._timeout:g}"
         proc = subprocess.Popen(argv, cwd=self._directory, env=env,

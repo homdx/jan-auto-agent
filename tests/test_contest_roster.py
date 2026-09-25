@@ -1003,3 +1003,87 @@ def test_the_turn_limits_survive_a_models_override(tmp_path):
         for a in cfg.agents))
     assert [agent.name for agent in models.agents] == ["hy3-var1"]
     assert (models.turn_timeout_sec, models.turn_extend_sec, models.turn_max_sec) == (3600, 900, 18000)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KC-65: pytest_workers_* and agent_tmpdir — the agents' pytest sizes to the box
+# ─────────────────────────────────────────────────────────────────────────────
+
+KC65_KEYS = ("pytest_workers_per_agent", "pytest_workers_few_agents",
+             "pytest_workers_few", "pytest_workers_min")
+
+
+def test_pytest_workers_keys_parse_and_default(tmp_path):
+    """KC-65: the four keys parse, are in CONTEST_KEYS, and default to
+    0 / 4 / 4 / 2 — no override, `pytest_workers_few_agents` live, and 2."""
+    for key in KC65_KEYS:
+        assert key in CONTEST_KEYS
+    cfg = load_roster(write_ini(tmp_path, MINIMAL))
+    assert (cfg.pytest_workers_per_agent, cfg.pytest_workers_few_agents,
+            cfg.pytest_workers_few, cfg.pytest_workers_min) == (0, 4, 4, 2)
+
+    text = add_to_contest(MINIMAL, "pytest_workers_per_agent = 3\n"
+                                  "pytest_workers_few_agents = 8\n"
+                                  "pytest_workers_few = 6\n"
+                                  "pytest_workers_min = 1")
+    cfg = load_roster(write_ini(tmp_path, text))
+    assert (cfg.pytest_workers_per_agent, cfg.pytest_workers_few_agents,
+            cfg.pytest_workers_few, cfg.pytest_workers_min) == (3, 8, 6, 1)
+    for key in KC65_KEYS:
+        assert isinstance(getattr(cfg, key), int), key
+
+
+def test_committed_pytest_workers_keys_are_the_documented_defaults(gate_key):
+    """0 / 4 / 4 / 2 and no temp dir of their own: the committed roster is the
+    rule the ticket writes down."""
+    cfg = load_roster(COMMITTED)
+    assert (cfg.pytest_workers_per_agent, cfg.pytest_workers_few_agents,
+            cfg.pytest_workers_few, cfg.pytest_workers_min) == (0, 4, 4, 2)
+    assert cfg.agent_tmpdir == ""
+
+
+def test_a_negative_pytest_workers_key_names_it(tmp_path):
+    """A negative count would cap a whole agent at no workers: it names its key."""
+    for key in KC65_KEYS:
+        with pytest.raises(RosterError, match=key):
+            load_roster(write_ini(tmp_path, add_to_contest(MINIMAL, f"{key} = -1")))
+
+
+def test_pytest_workers_few_and_min_must_be_at_least_one(tmp_path):
+    """`pytest_workers_few` and `pytest_workers_min` feed a worker count, so 0
+    refuses them; `pytest_workers_min = 1` and `pytest_workers_per_agent = 0`
+    stay legal — one worker is slow but real, and 0 means the rule decides."""
+    for key in ("pytest_workers_few", "pytest_workers_min"):
+        with pytest.raises(RosterError, match=key):
+            load_roster(write_ini(tmp_path, add_to_contest(MINIMAL, f"{key} = 0")))
+    cfg = load_roster(write_ini(tmp_path, add_to_contest(
+        MINIMAL, "pytest_workers_per_agent = 0\npytest_workers_min = 1")))
+    assert cfg.pytest_workers_per_agent == 0 and cfg.pytest_workers_min == 1
+
+
+def test_a_malformed_pytest_workers_key_falls_back(tmp_path):
+    """Like every other limit: a typo is the default, not a refusal — the box
+    still gets sized."""
+    for key, default in (("pytest_workers_per_agent", 0), ("pytest_workers_few_agents", 4),
+                         ("pytest_workers_few", 4), ("pytest_workers_min", 2)):
+        cfg = load_roster(write_ini(tmp_path, add_to_contest(MINIMAL, f"{key} = three")))
+        assert getattr(cfg, key) == default, key
+
+
+def test_agent_tmpdir_defaults_to_empty_and_expands_its_env_reference(tmp_path, monkeypatch):
+    """`agent_tmpdir` unset means the round inherits TMPDIR, so it is `""`;
+    `${VAR}` expands like every other [contest] value, and an unset variable
+    names itself."""
+    assert "agent_tmpdir" in CONTEST_KEYS
+    assert ContestConfig().agent_tmpdir == ""
+    assert load_roster(write_ini(tmp_path, MINIMAL)).agent_tmpdir == ""
+
+    monkeypatch.setenv("KC65_TMP", str(tmp_path / "scratch"))
+    cfg = load_roster(write_ini(tmp_path, add_to_contest(MINIMAL, "agent_tmpdir = ${KC65_TMP}")))
+    assert cfg.agent_tmpdir == str(tmp_path / "scratch")
+    # a value with a trailing space is squeezed like every other scalar
+    cfg = load_roster(write_ini(tmp_path, add_to_contest(MINIMAL, "agent_tmpdir =   /kept   ")))
+    assert cfg.agent_tmpdir == "/kept"
+
+    with pytest.raises(RosterError, match="agent_tmpdir"):
+        load_roster(write_ini(tmp_path, add_to_contest(MINIMAL, "agent_tmpdir = ${KC65_UNSET}")))

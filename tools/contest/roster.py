@@ -94,6 +94,11 @@ CONTEST_KEYS = (
     "provider_retry_max_wait_sec",
     "quota_patterns",
     "progress_every_sec",
+    "pytest_workers_per_agent",
+    "pytest_workers_few_agents",
+    "pytest_workers_few",
+    "pytest_workers_min",
+    "agent_tmpdir",
     "tmp_roots",
     "deny_commands",
     "ask_commands",
@@ -255,6 +260,23 @@ class ContestConfig:
     #: not live here — they belong to KC-19's retry path.
     quota_patterns: str = ""
     progress_every_sec: int = 60
+    #: KC-65: pytest-xdist workers each agent gets. 0 = by the agents that are
+    #: live: one alone gets every core, up to `pytest_workers_few_agents` get
+    #: `pytest_workers_few`, more get `pytest_workers_min` — always at most
+    #: `cpu_count`. A value above 0 is fixed for the round.
+    pytest_workers_per_agent: int = 0
+    #: KC-65: up to this many live agents each get `pytest_workers_few`.
+    pytest_workers_few_agents: int = 4
+    #: KC-65: the workers each of those gets.
+    pytest_workers_few: int = 4
+    #: KC-65: the workers each gets above `pytest_workers_few_agents`; 1 is
+    #: allowed, 0 is rejected.
+    pytest_workers_min: int = 2
+    #: KC-65: temp dir for the agents' commands, `${VAR}` expanded; "" =
+    #: inherit TMPDIR. The round makes `<agent_tmpdir>/contest-<NN>` under it
+    #: mode 0700 before the server spawns, and removes that dir — never the
+    #: parent — when the round ends.
+    agent_tmpdir: str = ""
     tmp_roots: tuple[str, ...] = ()
     deny_commands: tuple[str, ...] = ()
     ask_commands: tuple[str, ...] = ()
@@ -532,6 +554,25 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
     except ValueError as exc:
         raise RosterError(f"[contest] gate_llm_profile: {exc}") from exc
 
+    # KC-65: a worker count that is zero would hand every agent's `-n auto` a
+    # number it cannot use, so the two bands that feed it refuse 0; `1` is
+    # allowed for `pytest_workers_min` (a crowded box beats a slow one) and
+    # negatives are refused for all four.
+    pytest_workers_per_agent = limit("pytest_workers_per_agent", 0)
+    pytest_workers_few_agents = limit("pytest_workers_few_agents", 4)
+    pytest_workers_few = limit("pytest_workers_few", 4)
+    pytest_workers_min = limit("pytest_workers_min", 2)
+    for key, value in (("pytest_workers_per_agent", pytest_workers_per_agent),
+                       ("pytest_workers_few_agents", pytest_workers_few_agents),
+                       ("pytest_workers_few", pytest_workers_few),
+                       ("pytest_workers_min", pytest_workers_min)):
+        if value < 0:
+            raise RosterError(f"[contest] {key} must be >= 0, got {value}")
+    if pytest_workers_few < 1:
+        raise RosterError(f"[contest] pytest_workers_few must be >= 1, got {pytest_workers_few}")
+    if pytest_workers_min < 1:
+        raise RosterError(f"[contest] pytest_workers_min must be >= 1, got {pytest_workers_min}")
+
     openrouter_settings = None
     if backend == "openrouter":
         # the agents' own credential: required only for that backend, resolved
@@ -565,6 +606,11 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
         provider_retry_max_wait_sec=seconds("provider_retry_max_wait_sec", 300.0),
         quota_patterns=scalar("quota_patterns", ""),
         progress_every_sec=limit("progress_every_sec", 60),
+        pytest_workers_per_agent=pytest_workers_per_agent,
+        pytest_workers_few_agents=pytest_workers_few_agents,
+        pytest_workers_few=pytest_workers_few,
+        pytest_workers_min=pytest_workers_min,
+        agent_tmpdir=scalar("agent_tmpdir", ""),
         tmp_roots=list_("tmp_roots"),
         deny_commands=list_("deny_commands"),
         ask_commands=list_("ask_commands"),

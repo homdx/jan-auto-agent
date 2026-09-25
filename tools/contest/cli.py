@@ -58,6 +58,7 @@ import logging
 import os
 import re
 import shlex
+import shutil
 import sys
 import tempfile
 from dataclasses import dataclass, replace
@@ -87,11 +88,17 @@ from tools.contest.roster import (
     load_roster,
 )
 from tools.contest.runner import (
+    WORKERS_FILE,
     AgentState,
     RoundState,
     _is_quota,
     _quota_re,
+    agent_pytest_workers,
+    agent_tmp_path,
+    core_count,
+    round_live_agents,
     run_round,
+    write_pytest_workers,
 )
 from tools.contest.variant import (
     DEFAULT,
@@ -138,6 +145,13 @@ DEFAULT_PROVIDER = "kenary"
 #: The committed `contest.ini`'s gate model. It is not a model anyone can call,
 #: so a round that still runs on it has no gate to probe (KC-55 §5).
 GATE_PLACEHOLDER_MODEL = "some/model"
+
+#: KC-65: the plugin the agents' pytest loads, and the directory it lives in.
+#: The directory — not the runner's repo root, which would make an agent's pytest
+#: import the runner's `tools` instead of the code in its own clone — is what
+#: goes on PYTHONPATH; the module name is what PYTEST_PLUGINS carries.
+PYTEST_WORKERS_PLUGIN = "contest_pytest_workers"
+PYTEST_WORKERS_PLUGIN_DIR = Path(__file__).resolve().parent / "pytest_plugin"
 
 #: The status this command runs, exactly: the first word of `**Status:**`.
 OPEN = "open"
@@ -1340,6 +1354,10 @@ def _make_backends(config: ContestConfig, out_dir: Path, env: dict | None = None
     ``backend = openrouter`` starts no server at all — one ``OpenRouterBackend``
     subprocess per agent, and nothing else left open — so it returns
     ``server=None`` and closes with the round.
+
+    *env* goes to both: the server for `KILO_CONFIG_CONTENT` (KC-35), and the
+    OpenRouter agents' subprocess for KC-65's worker count — without it the
+    sizing rule would be a Kilo-only rule.
     """
     if config.backend == "openrouter":
         settings = config.openrouter_settings
@@ -1349,7 +1367,7 @@ def _make_backends(config: ContestConfig, out_dir: Path, env: dict | None = None
                 "the agents' own base_url and api_key")
         def make_backend(workspace):
             return OpenRouterBackend(settings.api_key, settings.base_url,
-                                     str(workspace.path))
+                                     str(workspace.path), extra_env=env or None)
         return None, make_backend
 
     server = _start_server(config, out_dir, env=env)
@@ -1408,7 +1426,43 @@ def _gate_plan_label(config) -> str:
     return f"{model} @ {host}" if host else model
 
 
-def _print_plan(result: Intake, config: ContestConfig, out_dir: Path, *, run_tests: bool) -> None:
+def _worker_plan_label(workers, fixed: bool) -> str:
+    """KC-65: the plan's worker line — the count of the first prompts and the
+    rule behind it, so the operator sees the sizing before the round starts.
+
+    ``auto, min 2`` is the rule the runner rewrites as agents finish;
+    ``fixed N`` is an operator-pinned `pytest_workers_per_agent`.
+    """
+    if workers is None:
+        return "-"
+    rule = f"fixed {workers}" if fixed else "auto, min 2"
+    return f"{workers} each ({rule})"
+
+
+def _agent_env(workers: int) -> dict:
+    """KC-65: the env entries that size the agents' pytest, without the count.
+
+    The environment carries *where to read* the count, not the count: the runner
+    rewrites `<out_dir>/pytest-workers` after every transition, and a number
+    fixed when the server spawned would be wrong for most of the round.
+    `PYTEST_XDIST_AUTO_NUM_WORKERS` is the same start value, as the fallback
+    xdist >= 3.2 honours when the plugin cannot load — 3.8.0 here.
+
+    `PYTHONPATH` is the plugin's own directory plus the inherited value, in that
+    order: only that one directory, never the runner's repo root.
+    """
+    inherited = os.environ.get("PYTHONPATH", "")
+    parts = [part for part in inherited.split(os.pathsep) if part]
+    return {
+        "PYTEST_PLUGINS": PYTEST_WORKERS_PLUGIN,
+        "PYTHONPATH": os.pathsep.join((str(PYTEST_WORKERS_PLUGIN_DIR), *parts)),
+        "PYTEST_XDIST_AUTO_NUM_WORKERS": str(workers),
+    }
+
+
+def _print_plan(result: Intake, config: ContestConfig, out_dir: Path, *, run_tests: bool,
+                workers: int | None = None, workers_fixed: bool = False,
+                agent_tmp: Path | None = None) -> None:
     """The plan, one line per fact: what the round will do, before it does it."""
     models = ", ".join(agent.model + (f"@{agent.variant}" if agent.variant else "")
                        for agent in config.agents)
@@ -1417,6 +1471,8 @@ def _print_plan(result: Intake, config: ContestConfig, out_dir: Path, *, run_tes
         ("base", result.base_sha[:12]),
         ("agents", f"{len(config.agents)}: {models}"),
         ("parallel", str(config.max_parallel)),
+        ("workers", _worker_plan_label(workers, workers_fixed)),
+        ("tmpdir", str(agent_tmp) if agent_tmp is not None else "-"),
         ("tests", "on" if run_tests else "off"),
         ("gate", _gate_plan_label(config)),
         ("out", str(out_dir)),
@@ -1481,16 +1537,13 @@ def cmd_run(args: argparse.Namespace) -> int:
         # `highest` resolved at intake (KC-49): the round runs what answered
         config = replace(config, agents=result.agents)
     out_dir = Path(args.out).resolve() if args.out else result.out_dir
-    _print_plan(result, config, out_dir, run_tests=run_tests)
-    if result.config_content is not None:
-        # KC-35: the overlay intake proved in its throwaway goes to the round's
-        # own server too, or the round would run on an unregistered list
-        env = {"KILO_CONFIG_CONTENT": result.config_content}
-    else:
-        env = None
 
     resume = None
     if args.resume:
+        # KC-65: the read comes before the plan, because the plan names the
+        # worker count the resumed round holds. A `--resume` whose state.json
+        # is missing or unreadable then fails before the plan is printed, as it
+        # already fails before any server starts.
         state_path = out_dir / "state.json"
         if not state_path.is_file():
             print(f"intake: --resume: no {state_path} — nothing to resume", file=sys.stderr)
@@ -1500,6 +1553,36 @@ def cmd_run(args: argparse.Namespace) -> int:
         except (ValueError, KeyError, OSError) as exc:
             print(f"intake: --resume: {state_path} is unreadable: {exc}", file=sys.stderr)
             return EXIT_FAILED
+
+    # KC-65: the count the first prompts read, from the round's agents — on
+    # `--resume` from state.json, so it is the round's count and not the
+    # command line's. Capped at `max_parallel`: the pool holds that many slots,
+    # so ten agents with a pool of four do not size for ten. The runner keeps
+    # the rule itself; this is only the value it writes before the server spawns.
+    live = min(int(config.max_parallel), round_live_agents(config, resume))
+    workers = agent_pytest_workers(live, core_count(), config)
+    fixed = int(config.pytest_workers_per_agent) > 0
+
+    # KC-65: the agents' temp dir is the round's own, so a round does not leave
+    # the operator's /tmp holding every `tmp_path` fixture of every agent. It is
+    # made just before the server spawns, below, so a round that fails before
+    # that leaves nothing behind. The parent is the operator's.
+    agent_tmp = agent_tmp_path(config, args.ticket)
+    agent_tmp_created = False
+
+    env = _agent_env(workers)
+    if result.config_content is not None:
+        # KC-35: the overlay intake proved in its throwaway goes to the round's
+        # own server too, or the round would run on an unregistered list
+        env["KILO_CONFIG_CONTENT"] = result.config_content
+    if agent_tmp is not None:
+        for key in ("TMPDIR", "TEMP", "TMP"):
+            env[key] = str(agent_tmp)
+
+    _print_plan(result, config, out_dir, run_tests=run_tests, workers=workers,
+                workers_fixed=fixed, agent_tmp=agent_tmp)
+
+    if args.resume:
         workspaces = [run.workspace for run in resume.agents]
     else:
         try:
@@ -1510,10 +1593,32 @@ def cmd_run(args: argparse.Namespace) -> int:
             return EXIT_FAILED
 
     out_dir.mkdir(parents=True, exist_ok=True)
+    # KC-65: the file the agents' pytest reads, written before the server
+    # spawns, so the first prompts already read a sane number. A write that
+    # fails keeps the round going — the env then carries no
+    # CONTEST_PYTEST_WORKERS_FILE, the plugin answers None, and xdist takes its
+    # own answer from PYTEST_XDIST_AUTO_NUM_WORKERS.
+    workers_file = out_dir / WORKERS_FILE
     try:
-        server, make_backend = _make_backends(config, out_dir, env=env)
+        write_pytest_workers(workers_file, workers)
+        env["CONTEST_PYTEST_WORKERS_FILE"] = str(workers_file)
+    except OSError as exc:
+        print(f"warn: cannot write {workers_file}: {exc} — the agents' pytest "
+              "falls back to xdist's own worker count", file=sys.stderr)
+    if agent_tmp is not None:
+        try:
+            agent_tmp_created = not agent_tmp.exists()
+            agent_tmp.mkdir(parents=True, exist_ok=True)
+            os.chmod(agent_tmp, 0o700)
+        except OSError as exc:
+            print(f"intake: agent_tmpdir: cannot create {agent_tmp}: {exc}", file=sys.stderr)
+            return EXIT_FAILED
+    try:
+        server, make_backend = _make_backends(config, out_dir, env=env or None)
     except (KiloServerError, FileNotFoundError, OSError) as exc:
         print(f"server: {exc}", file=sys.stderr)
+        if agent_tmp_created:
+            shutil.rmtree(agent_tmp, ignore_errors=True)
         return EXIT_FAILED
 
     try:
@@ -1523,6 +1628,10 @@ def cmd_run(args: argparse.Namespace) -> int:
     finally:
         if server is not None:
             server.close()
+        # KC-65: the temp dir is the round's — removed here, with the server,
+        # and only when this round made it. Never the parent.
+        if agent_tmp_created:
+            shutil.rmtree(agent_tmp, ignore_errors=True)
 
     patches = export_patches(state, workspaces, out_dir)
     for row in state.table_rows():

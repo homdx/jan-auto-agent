@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import os
 import subprocess
 import sys
 import time
@@ -48,7 +49,13 @@ ROUND = 1
 TICKET_01 = "01-first.md"
 TICKET_02 = "02-second.md"
 OUT = Path("contest-out") / f"{ROUND:02d}"
-PLANNED = ("ticket", "base", "agents", "parallel", "tests", "gate", "out")
+PLANNED = ("ticket", "base", "agents", "parallel", "workers", "tmpdir", "tests", "gate", "out")
+
+#: KC-65: the env keys the round's server always gets besides
+#: `KILO_CONFIG_CONTENT` — the workers' file, the plugin that reads it, the
+#: plugin's one PYTHONPATH entry and xdist's own fallback for when it cannot load.
+KC65_ENV_KEYS = frozenset({"CONTEST_PYTEST_WORKERS_FILE", "PYTEST_PLUGINS",
+                           "PYTHONPATH", "PYTEST_XDIST_AUTO_NUM_WORKERS"})
 
 BRIDGE = '''"""stub for the round's ground rule"""
 
@@ -1547,7 +1554,11 @@ def test_backend_flag_builds_an_openrouter_backend_without_a_kilo_server(
 
     (api_key, base_url, directory, kwargs) = built[0]
     assert (api_key, base_url) == ("test-openrouter-key", "http://127.0.0.1:9/v1")
-    assert kwargs == {}
+    # KC-65: the OpenRouter agents get the same env as the ones a `kilo serve`
+    # hosts, or the sizing rule would be a Kilo-only rule.
+    assert set(kwargs) == {"extra_env"}
+    assert set(kwargs["extra_env"]) == KC65_ENV_KEYS
+    assert Path(kwargs["extra_env"]["CONTEST_PYTEST_WORKERS_FILE"]).name == "pytest-workers"
     assert directory.rstrip("/").endswith(f"01-agnes-2-5-flash")
     assert [row["name"] for row in _table(captured.out)] == ["agnes-2-5-flash"]
 
@@ -2121,7 +2132,11 @@ def test_register_missing_registers_the_models_and_runs_the_round(
     # second and to the round's own server, the same string both times
     assert not calls[0]
     assert len(calls) == 3
-    assert calls[1] == calls[2] == {"KILO_CONFIG_CONTENT": json.dumps(KC35_TWO_ENTRIES)}
+    assert calls[1] == {"KILO_CONFIG_CONTENT": json.dumps(KC35_TWO_ENTRIES)}
+    # the round's own server gets the same overlay, byte for byte, plus only
+    # KC-65's four entries on top of it
+    assert calls[2]["KILO_CONFIG_CONTENT"] == calls[1]["KILO_CONFIG_CONTENT"]
+    assert set(calls[2]) - {"KILO_CONFIG_CONTENT"} == KC65_ENV_KEYS
     models = json.loads(calls[1]["KILO_CONFIG_CONTENT"])["provider"]["kenary"]["models"]
     assert list(models) == ["agnes-3-0-flash:free", "nex-n2-5-pro:free"], "roster order"
     assert all(entry["reasoning"] is True and entry["name"] == model_id
@@ -2300,7 +2315,9 @@ def test_the_operator_s_own_kilo_config_content_survives_the_merge(
                                     "agnes-3-0-flash:free": {
                                         "name": "agnes-3-0-flash:free", "reasoning": True}}}},
     }
-    assert calls[2] == calls[1], "the round's own server gets the same overlay"
+    assert calls[2]["KILO_CONFIG_CONTENT"] == calls[1]["KILO_CONFIG_CONTENT"], (
+        "the round's own server gets the same overlay, byte for byte")
+    assert set(calls[2]) - {"KILO_CONFIG_CONTENT"} == KC65_ENV_KEYS
     assert not [line for line in captured.err.splitlines() if line.startswith("intake:")]
 
 
@@ -2401,3 +2418,320 @@ def test_register_missing_is_no_refusal_when_the_round_is_refused_otherwise(
     assert len(lines) == 1 and "no ticket numbered 9 in" in lines[0]
     assert "hint:" not in captured.err
     assert len(calls) == 1 and not calls[0], "no second throwaway for a refused round"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KC-65 — the agents' pytest worker count
+# ─────────────────────────────────────────────────────────────────────────────
+
+KC65_AGENTS = ("agent-a", "agent-b", "agent-c", "agent-d", "agent-e", "agent-f")
+
+def _kc65_offer(agents=KC65_AGENTS):
+    """The offer for a roster of *agents*: the intake checks the roster against it."""
+    return _offer((_provider("kenary", "kenari", tuple(f"{a}:free" for a in agents)),))
+
+
+def _kc65_roster(sb, agents, **extra):
+    """The sandbox's roster with the KC-65 keys the test sets and the agents named."""
+    extra_text = "".join(f"{key} = {value}\n" for key, value in extra.items())
+    return sb._roster(agents).replace("max_parallel = 2\n",
+                                      f"max_parallel = 2\n{extra_text}")
+
+
+def _kc65_state(sb, agents, states):
+    """A `state.json` with one run per agent in the state named — what `--resume` reads."""
+    runs = [
+        AgentRun(agent=AgentSpec(name=a, provider_id="kenary", model_id=f"{a}:free"),
+                 workspace=Workspace(agent=a, path=sb.rounds / f"{ROUND:02d}-{a}",
+                                     branch=f"contest/{ROUND:02d}/{a}", base_sha=sb.base,
+                                     kind="clone"),
+                 state=AgentState(st))
+        for a, st in zip(agents, states)
+    ]
+    return RoundState(round_no=ROUND, ticket=TICKET_01, base_sha=sb.base,
+                      started_at=time.time(), agents=runs)
+
+
+def _kc65_run(sb, monkeypatch, *, agents=KC65_AGENTS, extra=(), argv=(), unwritable=False):
+    """`cli.main(["run", ...])` with the round itself stubbed out.
+
+    `prepare_round`, `run_round` and `export_patches` are stubbed: the question here is the
+    env the round's server gets and the worker file it writes, not six worktrees. The intake
+    still checks the roster against the fake's offer, so a roster the server does not offer
+    is refused the way a real round's would be.
+    """
+    _write(sb.repo / "contest.ini", _kc65_roster(sb, agents, **dict(extra)))
+    monkeypatch.setattr(cli, "prepare_round", lambda *a, **k: [])
+    monkeypatch.setattr(cli, "run_round",
+                        lambda config, ticket, ticket_path, workspaces, **kw:
+                        RoundState(round_no=ROUND, ticket=TICKET_01, base_sha=sb.base,
+                                   started_at=time.time(),
+                                   agents=[AgentRun(
+                                       agent=spec,
+                                       workspace=Workspace(
+                                           agent=spec.name, path=sb.rounds / spec.name,
+                                           branch=f"contest/{ROUND:02d}/{spec.name}",
+                                           base_sha=sb.base, kind="clone"),
+                                       state=AgentState.READY)
+                                           for spec in config.agents]))
+    monkeypatch.setattr(cli, "export_patches", lambda *a, **k: [])
+    if unwritable:
+        def refusing(target, value):
+            raise OSError("permission denied")
+        monkeypatch.setattr(cli, "write_pytest_workers", refusing)
+    calls, fakes = _content_spawn_holder(monkeypatch)
+    fakes.append(FakeKiloServer({"providers": _kc65_offer(agents)}).start())
+    try:
+        code = cli.main(["run", "--ticket", "1", "--no-gate", "--no-tests", *argv])
+    finally:
+        fakes[-1].stop()
+    return code, calls, sb.out()
+
+
+def _kc65_env_free(monkeypatch):
+    """The four KC-65 vars cleared: the round's env must carry them, not inherit them."""
+    monkeypatch.delenv("CONTEST_PYTEST_WORKERS_FILE", raising=False)
+    monkeypatch.delenv("PYTEST_PLUGINS", raising=False)
+    monkeypatch.delenv("PYTEST_XDIST_AUTO_NUM_WORKERS", raising=False)
+    monkeypatch.delenv("TMPDIR", raising=False)
+    monkeypatch.delenv("TEMP", raising=False)
+    monkeypatch.delenv("TMP", raising=False)
+
+
+def test_the_start_worker_file_and_the_env_the_rounds_server_gets(sandbox, monkeypatch, capsys):
+    """Six live agents on 8 cores with a pool of 6: the file holds 2, the fallback the
+    same 2, the plugin the dir that reads the file, and `PYTHONPATH` the plugin's dir
+    first with the inherited value kept after it — never the runner's repo root."""
+    monkeypatch.setattr(os, "cpu_count", lambda: 8)
+    _kc65_env_free(monkeypatch)
+    inherited = f"{sandbox.tmp}/inherited-a{os.pathsep}{sandbox.tmp}/inherited-b"
+    monkeypatch.setenv("PYTHONPATH", inherited)
+
+    code, calls, out = _kc65_run(sandbox, monkeypatch, argv=("--max-parallel", "6"))
+    captured = capsys.readouterr()
+    assert code == 0
+
+    plugin_dir = str(cli.PYTEST_WORKERS_PLUGIN_DIR)
+    assert calls[0] == {}, "the offer check's throwaway gets none of the round's env"
+    assert calls[-1] == {
+        "PYTEST_PLUGINS": "contest_pytest_workers",
+        "PYTHONPATH": f"{plugin_dir}{os.pathsep}{inherited}",
+        "PYTEST_XDIST_AUTO_NUM_WORKERS": "2",
+        "CONTEST_PYTEST_WORKERS_FILE": str(out / "pytest-workers"),
+    }
+    entries = calls[-1]["PYTHONPATH"].split(os.pathsep)
+    assert entries[0] == plugin_dir
+    assert set(entries) == {plugin_dir,
+                            f"{sandbox.tmp}/inherited-a", f"{sandbox.tmp}/inherited-b"}
+    assert str(cli.PYTEST_WORKERS_PLUGIN_DIR.parents[2]) not in entries, (
+        "only the plugin's dir, not the runner's repo root")
+    assert (out / "pytest-workers").read_text(encoding="utf-8") == "2\n"
+    plan = _plan(captured.out)
+    assert plan["workers"] == "2 each (auto, min 2)"
+    assert plan["tmpdir"] == "-"
+
+
+def test_the_worker_count_is_the_agents_not_the_pool(sandbox, monkeypatch):
+    """Two agents with a pool of 5 count as two: 4 workers each, not the 2 the pool would
+    give — the round sizes the crowd it runs, not the slots it could have."""
+    monkeypatch.setattr(os, "cpu_count", lambda: 8)
+    _kc65_env_free(monkeypatch)
+    code, calls, out = _kc65_run(sandbox, monkeypatch,
+                                 agents=("agent-a", "agent-b"),
+                                 argv=("--max-parallel", "5"))
+    assert code == 0
+    assert (out / "pytest-workers").read_text(encoding="utf-8") == "4\n"
+    assert calls[-1]["PYTEST_XDIST_AUTO_NUM_WORKERS"] == "4"
+
+
+def test_the_worker_count_is_never_below_one_nor_above_the_cores(sandbox, monkeypatch):
+    """A pool of 16 sizes for six live agents, so the count is the floor; on a box with
+    one core it is capped there instead."""
+    _kc65_env_free(monkeypatch)
+    monkeypatch.setattr(os, "cpu_count", lambda: 1)
+    code, calls, out = _kc65_run(sandbox, monkeypatch, argv=("--max-parallel", "16"))
+    assert code == 0
+    assert (out / "pytest-workers").read_text(encoding="utf-8") == "1\n"
+
+    monkeypatch.setattr(os, "cpu_count", lambda: 8)
+    code, calls, out = _kc65_run(sandbox, monkeypatch, extra={"pytest_workers_min": 1},
+                                 argv=("--max-parallel", "16"))
+    assert code == 0
+    assert (out / "pytest-workers").read_text(encoding="utf-8") == "1\n"
+
+
+def test_a_fixed_worker_count_is_the_count_and_the_plan_says_so(sandbox, monkeypatch, capsys):
+    """`pytest_workers_per_agent = 3` is 3 whatever the cores, and the plan names it as
+    fixed rather than auto."""
+    monkeypatch.setattr(os, "cpu_count", lambda: 2)
+    _kc65_env_free(monkeypatch)
+    code, calls, out = _kc65_run(sandbox, monkeypatch,
+                                 extra={"pytest_workers_per_agent": 3},
+                                 argv=("--max-parallel", "6"))
+    captured = capsys.readouterr()
+    assert code == 0
+    assert (out / "pytest-workers").read_text(encoding="utf-8") == "3\n"
+    assert calls[-1]["PYTEST_XDIST_AUTO_NUM_WORKERS"] == "3"
+    assert _plan(captured.out)["workers"] == "3 each (fixed 3)"
+
+
+def test_resume_counts_the_rounds_agents_not_the_command_line(sandbox, monkeypatch):
+    """Six live agents in `state.json` and two names on the command line, a pool of 8: the
+    count is for the six — 2 workers each, not the 4 the two would get."""
+    monkeypatch.setattr(os, "cpu_count", lambda: 8)
+    _kc65_env_free(monkeypatch)
+    (sandbox.out() / "state.json").parent.mkdir(parents=True, exist_ok=True)
+    _write(sandbox.out() / "state.json",
+           json.dumps(_kc65_state(sandbox, KC65_AGENTS, ["WAITING"] * 6).to_dict()))
+    code, calls, out = _kc65_run(sandbox, monkeypatch,
+                                 agents=("agent-a", "agent-b"),
+                                 argv=("--resume", "--max-parallel", "8"))
+    assert code == 0
+    assert (out / "pytest-workers").read_text(encoding="utf-8") == "2\n"
+    assert calls[-1]["PYTEST_XDIST_AUTO_NUM_WORKERS"] == "2"
+
+
+def test_resume_counts_the_live_agents_not_the_rounds(sandbox, monkeypatch):
+    """A resumed round whose eight agents already ended has two live, so 4 workers each —
+    not the 2 the eight would get."""
+    monkeypatch.setattr(os, "cpu_count", lambda: 8)
+    _kc65_env_free(monkeypatch)
+    agents = tuple(f"agent-{i}" for i in range(1, 9))
+    (sandbox.out() / "state.json").parent.mkdir(parents=True, exist_ok=True)
+    _write(sandbox.out() / "state.json", json.dumps(
+        _kc65_state(sandbox, agents, ["READY"] * 6 + ["WAITING"] * 2).to_dict()))
+    code, calls, out = _kc65_run(sandbox, monkeypatch, agents=agents,
+                                 argv=("--resume", "--max-parallel", "8"))
+    assert code == 0
+    assert (out / "pytest-workers").read_text(encoding="utf-8") == "4\n"
+    assert calls[-1]["PYTEST_XDIST_AUTO_NUM_WORKERS"] == "4"
+
+
+def test_resume_without_a_state_json_fails_before_the_plan(sandbox, monkeypatch, capsys):
+    """`--resume` reads `state.json` before the plan is printed, because the plan names
+    the count that file holds — so a missing file is a refusal, not a plan."""
+    _kc65_env_free(monkeypatch)
+    code = cli.main(["run", "--ticket", "1", "--no-gate", "--no-tests", "--resume"])
+    captured = capsys.readouterr()
+    assert code == cli.EXIT_FAILED
+    lines = [line for line in captured.err.splitlines() if line.startswith("intake:")]
+    assert len(lines) == 1 and f"no {sandbox.out() / 'state.json'}" in lines[0]
+    assert not captured.out.strip(), "no plan is printed for a refused round"
+
+
+def test_an_unwritable_worker_file_is_a_warn_line_and_a_round_without_it(
+        sandbox, monkeypatch, capsys):
+    """A write that fails is one warn line: the env then carries no
+    `CONTEST_PYTEST_WORKERS_FILE`, the plugin answers `None`, and xdist's own fallback is
+    what the agents' pytest reads."""
+    monkeypatch.setattr(os, "cpu_count", lambda: 8)
+    _kc65_env_free(monkeypatch)
+    code, calls, out = _kc65_run(sandbox, monkeypatch, unwritable=True,
+                                 argv=("--max-parallel", "6"))
+    captured = capsys.readouterr()
+    assert code == 0
+    warns = [line for line in captured.err.splitlines() if line.startswith("warn:")]
+    assert len(warns) == 1 and str(out / "pytest-workers") in warns[0]
+    assert not (out / "pytest-workers").exists()
+    assert "CONTEST_PYTEST_WORKERS_FILE" not in calls[-1]
+    assert calls[-1]["PYTEST_XDIST_AUTO_NUM_WORKERS"] == "2", "the fallback still has a count"
+    assert set(calls[-1]) == KC65_ENV_KEYS - {"CONTEST_PYTEST_WORKERS_FILE"}
+
+
+def test_agent_tmpdir_is_the_rounds_env_the_dir_is_0700_and_it_is_removed(
+        sandbox, tmp_path, monkeypatch, capsys):
+    """`agent_tmpdir` is where the round puts its own scratch: the dir is made 0700 before
+    the server spawns, `TMPDIR`/`TEMP`/`TMP` point at it, the plan names it, and the round
+    removes it on the way out — never its parent."""
+    monkeypatch.setattr(os, "cpu_count", lambda: 8)
+    _kc65_env_free(monkeypatch)
+    scratch = tmp_path / "scratch"
+    monkeypatch.setenv("KC65_SCRATCH", str(scratch))
+    code, calls, out = _kc65_run(sandbox, monkeypatch, extra={"agent_tmpdir": "${KC65_SCRATCH}"})
+    captured = capsys.readouterr()
+    assert code == 0
+
+    agent_tmp = scratch / f"contest-{ROUND}"
+    assert not agent_tmp.exists(), "the round removes its own scratch"
+    assert scratch.exists(), "the parent is the operator's and stays"
+    assert calls[-1]["TMPDIR"] == str(agent_tmp)
+    assert calls[-1]["TEMP"] == calls[-1]["TMP"] == str(agent_tmp)
+    assert set(calls[-1]) == KC65_ENV_KEYS | {"TMPDIR", "TEMP", "TMP"}
+    assert _plan(captured.out)["tmpdir"] == str(agent_tmp)
+
+
+def test_agent_tmpdir_is_inherited_when_unset(sandbox, tmp_path, monkeypatch, capsys):
+    """No `agent_tmpdir` key: no `TMPDIR`/`TEMP`/`TMP` in the env at all, so the agents
+    inherit whatever the operator's box has."""
+    monkeypatch.setattr(os, "cpu_count", lambda: 8)
+    _kc65_env_free(monkeypatch)
+    code, calls, out = _kc65_run(sandbox, monkeypatch)
+    captured = capsys.readouterr()
+    assert code == 0
+    assert set(calls[-1]) == KC65_ENV_KEYS
+    assert not any(key in calls[-1] for key in ("TMPDIR", "TEMP", "TMP"))
+    assert _plan(captured.out)["tmpdir"] == "-"
+
+
+def test_an_existing_agent_tmpdir_is_left_in_place(sandbox, tmp_path, monkeypatch):
+    """The round removes only the dir it made: one that was there before it is the
+    operator's, and it stays with what it holds."""
+    monkeypatch.setattr(os, "cpu_count", lambda: 8)
+    _kc65_env_free(monkeypatch)
+    agent_tmp = tmp_path / "scratch" / f"contest-{ROUND}"
+    agent_tmp.mkdir(parents=True)
+    (agent_tmp / "kept").write_text("x", encoding="utf-8")
+    code, calls, out = _kc65_run(sandbox, monkeypatch,
+                                 extra={"agent_tmpdir": str(tmp_path / "scratch")})
+    assert code == 0
+    assert calls[-1]["TMPDIR"] == str(agent_tmp)
+    assert (agent_tmp / "kept").read_text(encoding="utf-8") == "x"
+
+
+def test_a_round_that_fails_before_its_server_leaves_no_agent_tmpdir(
+        sandbox, tmp_path, monkeypatch):
+    """A worktree refusal or a server that does not start ends the round early; the
+    round's own scratch is either not made yet or removed on the way out."""
+    monkeypatch.setattr(os, "cpu_count", lambda: 8)
+    _kc65_env_free(monkeypatch)
+    scratch = tmp_path / "scratch"
+    agent_tmp = scratch / f"contest-{ROUND}"
+
+    def refusing(*a, **k):
+        raise cli.WorkspaceError("worktree refused")
+    monkeypatch.setattr(cli, "prepare_round", refusing)
+    _write(sandbox.repo / "contest.ini",
+           _kc65_roster(sandbox, KC65_AGENTS, agent_tmpdir=str(scratch)))
+    calls, fakes = _content_spawn_holder(monkeypatch)
+    fakes.append(FakeKiloServer({"providers": _kc65_offer(KC65_AGENTS)}).start())
+    try:
+        code = cli.main(["run", "--ticket", "1", "--no-gate", "--no-tests"])
+    finally:
+        fakes[-1].stop()
+    assert code == cli.EXIT_FAILED
+    assert not agent_tmp.exists()
+
+    def no_server(*a, **k):
+        raise cli.KiloServerError("no server")
+    monkeypatch.setattr(cli, "_make_backends", no_server)
+    code, calls, out = _kc65_run(sandbox, monkeypatch,
+                                 extra={"agent_tmpdir": str(scratch)})
+    assert code == cli.EXIT_FAILED
+    assert not agent_tmp.exists()
+
+
+def test_an_uncreatable_agent_tmpdir_is_a_refusal_naming_the_path(
+        sandbox, monkeypatch, capsys):
+    """The parent is a file, so the round's own scratch cannot be made: intake fails
+    naming the path, rather than falling back to `/tmp` and telling nobody."""
+    monkeypatch.setattr(os, "cpu_count", lambda: 8)
+    _kc65_env_free(monkeypatch)
+    code, calls, out = _kc65_run(sandbox, monkeypatch,
+                                 extra={"agent_tmpdir": str(sandbox.repo / "pkg" / "thing.py")})
+    captured = capsys.readouterr()
+    assert code == cli.EXIT_FAILED
+    lines = [line for line in captured.err.splitlines() if line.startswith("intake:")]
+    assert len(lines) == 1
+    assert "cannot create" in lines[0]
+    assert str(sandbox.repo / "pkg" / "thing.py" / f"contest-{ROUND}") in lines[0]
+    assert calls == [{}], "only the offer check's throwaway; no round server of its own"

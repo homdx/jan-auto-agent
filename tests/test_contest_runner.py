@@ -422,8 +422,10 @@ def make_policy(config, verdict="reject") -> Policy:
 class Harness:
     """Everything ``run_agent`` needs for one agent against one fake."""
 
-    def __init__(self, sb: Sandbox, fake, config, agent="agent-a", policy=None):
+    def __init__(self, sb: Sandbox, fake, config, agent="agent-a", policy=None,
+                 agent_tmp=None):
         self.sb, self.fake, self.config = sb, fake, config
+        self.agent_tmp = agent_tmp
         self.ws = sb.ws(agent)
         spec = next(s for s in config.agents if s.name == agent)
         self.server = KiloServer.attach(fake.url)
@@ -443,7 +445,8 @@ class Harness:
         try:
             return run_agent(self.run, backend=self.backend, policy=self.policy,
                              config=self.config, ticket_path=self.sb.ticket_path,
-                             out_dir=self.sb.out_dir, on_transition=record)
+                             out_dir=self.sb.out_dir, on_transition=record,
+                             agent_tmp=self.agent_tmp)
         finally:
             self.backend.close()
 
@@ -2983,15 +2986,25 @@ def _resumed_first_prompt(sb, cfg) -> str:
     return first
 
 
+def _plain_prompt(sb, cfg) -> str:
+    """The plain `round_prompt` plus the KC-65 note the runner appends to every send.
+
+    "No paragraph" means exactly this: nothing between `round_prompt` and the
+    worker note, so a `continue_message` block would fail these equalities.
+    """
+    return (round_prompt("agent-a", sb.ticket_path, sb.base_sha, tmp_dir=_scratch_arg(cfg))
+            + _runner_module.prompt_workers_note(sb.out_dir, cfg))
+
+
 def test_resume_with_max_continues_zero_sends_the_plain_prompt(tmp_path, monkeypatch):
-    """0 disables the whole mechanism, today's behaviour byte for byte — a `--resume`
-    into a dirty worktree included: no paragraph, and the tree is not even read."""
+    """0 disables the whole mechanism: no paragraph, and the tree is not even read —
+    only the runner's KC-65 worker note sits behind `round_prompt`."""
     tree_reads = _watch_tree_reads(monkeypatch)
     sb = Sandbox(tmp_path)
     cfg = make_config(["agent-a"], max_continues_per_attempt=0)
     work_edit_no_commit(str(sb.ws("agent-a").path), "")
     first = _resumed_first_prompt(sb, cfg)
-    assert first == round_prompt("agent-a", sb.ticket_path, sb.base_sha, tmp_dir=_scratch_arg(cfg))
+    assert first == _plain_prompt(sb, cfg)
     assert tree_reads == []
 
 
@@ -2999,8 +3012,7 @@ def test_resume_into_a_clean_worktree_keeps_the_prompt_exactly(tmp_path):
     sb = Sandbox(tmp_path)
     cfg = make_config(["agent-a"])
     _work(str(sb.ws("agent-a").path), test=False)       # committed, no test: REWORK, tree clean
-    assert _resumed_first_prompt(sb, cfg) == round_prompt(
-        "agent-a", sb.ticket_path, sb.base_sha, tmp_dir=_scratch_arg(cfg))
+    assert _resumed_first_prompt(sb, cfg) == _plain_prompt(sb, cfg)
 
 
 def test_resume_with_a_commit_under_the_dirty_tree_keeps_the_plain_prompt(tmp_path):
@@ -3008,8 +3020,7 @@ def test_resume_with_a_commit_under_the_dirty_tree_keeps_the_plain_prompt(tmp_pa
     sb = Sandbox(tmp_path)
     cfg = make_config(["agent-a"])
     work_commit_and_leave_a_stray_file(str(sb.ws("agent-a").path), "")
-    assert _resumed_first_prompt(sb, cfg) == round_prompt(
-        "agent-a", sb.ticket_path, sb.base_sha, tmp_dir=_scratch_arg(cfg))
+    assert _resumed_first_prompt(sb, cfg) == _plain_prompt(sb, cfg)
 
 
 def test_a_dirty_tree_above_a_commit_is_harvested_not_continued(tmp_path, monkeypatch):
@@ -4015,3 +4026,271 @@ def test_two_runs_on_one_model_id_extend_on_their_own_churn(tmp_path):
     assert cfg.turn_timeout_sec + sum(e["granted"] for e in ext) == cfg.turn_max_sec
     span = lambda run: run.turns[0]["idle_at"] - run.turns[0]["sent_at"]
     assert span(growing) > span(flat) + 1.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KC-65 — the agents' pytest worker count
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _eight_cores(monkeypatch) -> None:
+    """`core_count` reads `os.cpu_count`; the rule is stated for an 8-core box."""
+    monkeypatch.setattr(os, "cpu_count", lambda: 8)
+
+
+def _worker_state(tmp_path, states, create=True, **over):
+    """One run per state at the state named: what `refresh` counts as live.
+
+    The workspaces are paths only — `refresh` counts states and writes one file,
+    so no git worktree stands behind them.
+    """
+    out = tmp_path / "out"
+    if create:
+        out.mkdir(parents=True, exist_ok=True)
+    names = [f"agent-{i}" for i in range(len(states))]
+    cfg = make_config(names, **over)
+    runs = [
+        AgentRun(agent=spec,
+                 workspace=Workspace(agent=spec.name, path=Path(f"/tmp/{spec.name}"),
+                                     branch=f"contest/{ROUND}/{spec.name}",
+                                     base_sha="b", kind="worktree"),
+                 state=AgentState(state))
+        for spec, state in zip(cfg.agents, states)
+    ]
+    return out, cfg, RoundState(round_no=ROUND, ticket=TICKET, base_sha="b",
+                                started_at=1.0, agents=runs)
+
+
+def _note(workers: int) -> str:
+    """The KC-65 lines the runner appends, as a test expects them."""
+    return ("\n\nThe box is shared: right now `-n auto` gives your pytest "
+            f"{workers} workers.\n"
+            "Do not pass a larger `-n`; a run is slower when many agents test at once.\n")
+
+
+def test_pytest_workers_follows_the_live_agents(monkeypatch):
+    """live 1 -> the whole box, 2..4 -> pytest_workers_few, 5+ -> pytest_workers_min,
+    always at most the cores."""
+    _eight_cores(monkeypatch)
+    cfg = make_config(["agent-a"])
+    for live, want in ((0, 8), (1, 8), (2, 4), (3, 4), (4, 4), (5, 2), (9, 2)):
+        assert _runner_module.agent_pytest_workers(live, 8, cfg) == want
+    assert _runner_module.agent_pytest_workers(3, 2, cfg) == 2, "capped at the cores"
+    assert _runner_module.agent_pytest_workers(1, 2, cfg) == 2, "two cores, not four"
+
+
+def test_a_fixed_pytest_workers_per_agent_is_not_capped(monkeypatch):
+    """`pytest_workers_per_agent = 3` -> 3 whatever the cores."""
+    _eight_cores(monkeypatch)
+    cfg = make_config(["agent-a"], pytest_workers_per_agent=3)
+    for live, cores in ((1, 8), (9, 8), (1, 2)):
+        assert _runner_module.agent_pytest_workers(live, cores, cfg) == 3
+
+
+def test_round_live_agents_counts_the_runs_not_the_command_line(tmp_path):
+    """On `--resume` the count is the round's agents minus the terminal ones, and it
+    may outnumber the names on the command line."""
+    _out, cfg, state = _worker_state(
+        tmp_path, ["WAITING", "READY", "READY", "CREATED", "READY", "GAVE_UP"])
+    assert _runner_module.round_live_agents(cfg, None) == 6
+    assert _runner_module.round_live_agents(cfg, state) == 2
+
+
+def test_the_worker_file_follows_the_round(tmp_path, monkeypatch):
+    """6 live -> 2, two go READY -> 4, three go READY -> 4, one left -> 8. A queued
+    CREATED agent holds no slot; a HARVESTING one does."""
+    _eight_cores(monkeypatch)
+    out, cfg, state = _worker_state(tmp_path, ["WAITING"] * 6)
+    path = out / _runner_module.WORKERS_FILE
+
+    def count(states) -> int:
+        for run, st in zip(state.agents, states):
+            run.state = AgentState(st)
+        _runner_module.refresh_pytest_workers(out, cfg, state, {})
+        return int(path.read_text(encoding="utf-8"))
+
+    assert count(["WAITING"] * 6) == 2
+    assert count(["READY", "READY"] + ["WAITING"] * 2 + ["CREATED"] * 2) == 4
+    assert count(["READY"] * 3 + ["WAITING"] * 3) == 4
+    assert count(["READY"] * 5 + ["WAITING"]) == 8
+    assert count(["CREATED"] * 6) == 8, "nothing holds a slot: the box is free"
+    assert count(["WAITING"] * 3 + ["CREATED"] * 3) == 4, "CREATED is not live"
+    assert count(["HARVESTING"] * 5 + ["WAITING"]) == 2, "HARVESTING holds a slot"
+
+
+def test_refresh_writes_only_when_the_count_moves(tmp_path, monkeypatch):
+    """A save that sees the same count does no I/O: the file already holds it,
+    so the next save leaves it alone even though it starts with no memo of its
+    own."""
+    _eight_cores(monkeypatch)
+    out, cfg, state = _worker_state(tmp_path, ["WAITING"] * 6)
+    writes = []
+
+    def writing(target, value):
+        writes.append(value)
+        Path(target).write_text(f"{value}\n", encoding="utf-8")
+
+    monkeypatch.setattr(_runner_module, "write_pytest_workers", writing)
+    _runner_module.refresh_pytest_workers(out, cfg, state, {})
+    _runner_module.refresh_pytest_workers(out, cfg, state, {})
+    assert writes == [2]
+
+
+def test_ten_agents_on_eight_cores_ask_for_two_and_never_more(tmp_path, monkeypatch):
+    _eight_cores(monkeypatch)
+    out, cfg, state = _worker_state(tmp_path, ["WAITING"] * 10)
+    _runner_module.refresh_pytest_workers(out, cfg, state, {})
+    assert (out / _runner_module.WORKERS_FILE).read_text(encoding="utf-8") == "2\n"
+
+
+def test_a_fixed_worker_count_is_written_once_and_the_round_never_moves_it(
+        tmp_path, monkeypatch):
+    """The CLI writes a fixed count; `run_round` must not touch it, so the operator's
+    number stays the number."""
+    _eight_cores(monkeypatch)
+    out, cfg, state = _worker_state(tmp_path, ["WAITING"] * 6,
+                                    pytest_workers_per_agent=3)
+    writes = []
+    monkeypatch.setattr(_runner_module, "write_pytest_workers",
+                        lambda target, value: writes.append(value))
+    _runner_module.refresh_pytest_workers(out, cfg, state, {})
+    assert writes == []
+    assert not (out / _runner_module.WORKERS_FILE).exists()
+
+
+def test_an_unwritable_worker_file_is_one_log_line(tmp_path, monkeypatch, caplog):
+    """No directory, no workers file, one warning: the agents' pytest then takes
+    xdist's own answer."""
+    _eight_cores(monkeypatch)
+    out, cfg, state = _worker_state(tmp_path, ["WAITING"] * 6, create=False)
+    with caplog.at_level(logging.WARNING, logger="tools.contest.runner"):
+        _runner_module.refresh_pytest_workers(out, cfg, state, {})
+    assert not out.exists()
+    lines = [m for m in caplog.messages if "pytest-workers" in m]
+    assert len(lines) == 1
+    assert lines[0].startswith("could not write")
+
+
+def test_a_round_whose_worker_file_will_not_write_still_runs(tmp_path, monkeypatch, caplog):
+    """A write that fails is one log line and one fewer env var, never a stopped round."""
+    _eight_cores(monkeypatch)
+
+    def refusing(target, value):
+        raise OSError("no such file or directory")
+
+    monkeypatch.setattr(_runner_module, "write_pytest_workers", refusing)
+    scenario = {"turns": [{"on_prompt": work_ready, "events": ["busy", "idle"]}]}
+    sb = Sandbox(tmp_path)
+    cfg = make_config(["agent-a"])
+    with _BenchFake(scenario) as fake:
+        with caplog.at_level(logging.WARNING, logger="tools.contest.runner"):
+            state = _round(sb, fake, cfg)
+        assert not fake.turn_errors
+    _assert_ready(_by_name(state)["agent-a"], sb.ws("agent-a"))
+    lines = [m for m in caplog.messages if "pytest-workers" in m]
+    assert len(lines) == 1, "one warning, and the round went on"
+    (_sid, text), = _prompts(fake)
+    assert "The box is shared" not in text, "no file, no guess"
+
+
+def test_every_prompt_names_the_count_of_that_moment(tmp_path, monkeypatch):
+    """The note is read from the file at send time, not cached when the round
+    starts: the first prompt names the crowd's count, the round rewrites the
+    file with the whole box before the `continue`, and the `continue` names the
+    whole box. The line is the last one, so a `continue_message` paragraph stays
+    where it is."""
+    _eight_cores(monkeypatch)
+    sb = Sandbox(tmp_path)
+    cfg = make_config(["agent-a"])
+
+    def count_for(live: int) -> int:
+        """The runner's own rule, through the runner's own writer."""
+        value = _runner_module.agent_pytest_workers(live, 8, cfg)
+        _runner_module.write_pytest_workers(sb.out_dir / _runner_module.WORKERS_FILE, value)
+        return value
+
+    few = count_for(2)                      # two live: pytest_workers_few
+    assert few == 4
+
+    seen: list = []
+    whole = [0]
+
+    def on_prompt(directory, text):
+        """The first prompt: edit and go idle dirty, so a `continue` follows;
+        the round rewrites the file with the whole box before it is sent."""
+        seen.append(text)
+        work_edit_no_commit(directory, text)
+        whole[0] = count_for(1)               # one live left: the whole box
+
+    def on_second(directory, text):
+        seen.append(text)
+        work_ready(directory, text)
+
+    scenario = {"turns": [{"on_prompt": on_prompt, "events": ["busy", "idle"]},
+                          {"on_prompt": on_second, "events": ["busy", "idle"]}]}
+    with _BenchFake(scenario) as fake:
+        run = Harness(sb, fake, cfg).go()
+        assert not fake.turn_errors
+    _assert_ready(run, sb.ws("agent-a"))
+    first, second = seen
+    assert first.endswith(_note(few))
+    assert second.endswith(_note(whole[0]))
+    assert whole[0] > few, "fewer agents: more workers each"
+    assert second.count("The box is shared") == 1, "the line is the last one"
+
+
+def test_no_worker_line_when_the_file_cannot_be_read(tmp_path):
+    """No `pytest-workers` file, no line and no guess: the prompt is byte-for-byte
+    `round_prompt`."""
+    sb = Sandbox(tmp_path)
+    cfg = make_config(["agent-a"])
+    scenario = {"turns": [{"on_prompt": work_ready, "events": ["busy", "idle"]}]}
+    with _BenchFake(scenario) as fake:
+        run = Harness(sb, fake, cfg).go()
+    _assert_ready(run, sb.ws("agent-a"))
+    (_sid, text), = _prompts(fake)
+    assert text == round_prompt("agent-a", sb.ticket_path, sb.base_sha,
+                                tmp_dir=_scratch_arg(cfg))
+
+
+def test_no_worker_line_when_a_fixed_count_equals_every_core(tmp_path, monkeypatch):
+    """`pytest_workers_per_agent` is the box itself: the note would only repeat the
+    operator's own number."""
+    _eight_cores(monkeypatch)
+    sb = Sandbox(tmp_path)
+    cfg = make_config(["agent-a"], pytest_workers_per_agent=8)
+    _runner_module.write_pytest_workers(sb.out_dir / _runner_module.WORKERS_FILE, 8)
+    scenario = {"turns": [{"on_prompt": work_ready, "events": ["busy", "idle"]}]}
+    with _BenchFake(scenario) as fake:
+        run = Harness(sb, fake, cfg).go()
+    _assert_ready(run, sb.ws("agent-a"))
+    (_sid, text), = _prompts(fake)
+    assert "The box is shared" not in text
+
+
+def test_the_agents_tmpdir_is_scratch_the_policy_allows(tmp_path):
+    """The round moved every agent's shell onto a dir the policy never saw, so its
+    `/*` glob joins `tmp_roots`: a `tmp_path` fixture is a mechanical `once`, not a gate
+    call. Without the dir the same path is the gate's to answer."""
+    sb = Sandbox(tmp_path)
+    cfg = make_config(["agent-a"], tmp_roots=())
+    agent_tmp = tmp_path / "scratch" / "contest-45"
+    scenario = {"turns": [_permission_turn(work_ready, [str(agent_tmp) + "/*"])]}
+
+    allowed = make_policy(cfg, "reject")
+    with _BenchFake(scenario) as fake:
+        run = Harness(sb, fake, cfg, policy=allowed, agent_tmp=agent_tmp).go()
+        (replied,) = fake.events_of("permission.replied")
+    _assert_ready(run, sb.ws("agent-a"))
+    assert replied["properties"]["reply"] == "once"
+    assert allowed._completion_fn.calls == 0, "geometry, not the gate"
+    line = _jsonl(sb.out_dir / "agent-a" / "decisions.jsonl")[-1]
+    assert line["layer"] == "mechanical"
+    assert line["reason"] == "inside worktree/tmp_roots"
+
+    denied = make_policy(cfg, "reject")
+    with _BenchFake(scenario) as fake:
+        run = Harness(sb, fake, cfg, policy=denied).go()
+        (replied,) = fake.events_of("permission.replied")
+    _assert_ready(run, sb.ws("agent-a"))
+    assert replied["properties"]["reply"] == "reject"
+    assert denied._completion_fn.calls == 1, "no dir, so the gate answers"
