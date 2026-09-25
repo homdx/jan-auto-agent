@@ -35,6 +35,22 @@ request fields, and context length". The same error appears once per round in
 Worth checking before this lands: whether a contest session should be allowed
 to spawn `task` sub-agents at all.
 
+**Seen again, without a sub-agent (2026-09-25, round 92, base `fb2054c`):**
+`nex-n2-5-pro` ran no `task` call this time. It made 29 read-only tool calls
+(bash 9, read 7, grep 7, `kilo_local_recall` 4, glob 1, todowrite 1). The
+last one was at 49.5 min, and it never wrote a file. From 13.6 min on, its
+provider answered with `session.status` `offline` "Request timed out", then
+`retry` "Reconnected", about every 5 minutes (13.6, 18.8, 24.0, 34.8, 41.8,
+54.5, 59.7 min), plus one `retry` "Upstream temporarily unavailable" at
+~25 min. The silence clock counts the session's last event of any type
+(`KiloClient.wait_idle`), so each of these status events restarted
+`idle_event_timeout_sec = 900`, and the silence edge never fired. The slot
+ended only at `turn_timeout_sec = 3600` as `STALLED`, with "no idle after 60m
+(0 files, 0 lines, unchanged for 60m)". This is the same "busy and useless"
+shape with a different engine. It is why the first-touch deadline has to be
+measured on the worktree, not on event traffic: a provider in an
+offline/retry loop looks exactly like an agent at work.
+
 ---
 
 ## What happens today
