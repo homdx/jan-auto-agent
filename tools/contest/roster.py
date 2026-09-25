@@ -97,6 +97,7 @@ CONTEST_KEYS = (
     "provider_retry_max_wait_sec",
     "quota_patterns",
     "progress_every_sec",
+    "harvest_budget_sec",
     "pytest_workers_per_agent",
     "pytest_workers_few_agents",
     "pytest_workers_few",
@@ -271,6 +272,9 @@ class ContestConfig:
     #: not live here — they belong to KC-19's retry path.
     quota_patterns: str = ""
     progress_every_sec: int = 60
+    #: KC-57: the wall-clock budget for one harvest's pytest roots.
+    #: 0 turns it off, which keeps today's unbounded behaviour.
+    harvest_budget_sec: int = 900
     #: KC-65: pytest-xdist workers each agent gets. 0 = by the agents that are
     #: live: one alone gets every core, up to `pytest_workers_few_agents` get
     #: `pytest_workers_few`, more get `pytest_workers_min` — always at most
@@ -621,6 +625,7 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
         provider_retry_max_wait_sec=seconds("provider_retry_max_wait_sec", 300.0),
         quota_patterns=scalar("quota_patterns", ""),
         progress_every_sec=limit("progress_every_sec", 60),
+        harvest_budget_sec=max(0, limit("harvest_budget_sec", 900)),
         pytest_workers_per_agent=pytest_workers_per_agent,
         pytest_workers_few_agents=pytest_workers_few_agents,
         pytest_workers_few=pytest_workers_few,

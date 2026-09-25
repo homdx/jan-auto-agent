@@ -24,6 +24,8 @@ import importlib.util
 import os
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -450,6 +452,191 @@ def test_run_tests_reports_a_non_zero_exit_without_a_failed_test(round_, tmp_pat
     assert tail[0] == "--- tests"
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# KC-57: the roots have a wall-clock budget
+# ─────────────────────────────────────────────────────────────────────────────
+
+#: A test that will outlive any budget the tests below give it.
+_SLOW = """\
+import time
+
+
+def test_slow_kc57():
+    time.sleep(90)
+"""
+
+
+def _live_pytest(cwd: Path) -> list:
+    """The pids of a live pytest still working inside *cwd* — `/proc`, fail-open.
+
+    The worktree is in the test's own temp dir, so this cannot name the round's
+    own suites: they run in the checkout that hosts this file, not here.
+    """
+    base = str(cwd)
+    pids = []
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return pids
+    for name in names:
+        if not name.isdigit():
+            continue
+        try:
+            here = os.path.realpath(f"/proc/{name}/cwd").replace(" (deleted)", "")
+            cmd = (Path("/proc") / name / "cmdline").read_bytes()
+        except OSError:
+            continue
+        if here.startswith(base) and b"pytest" in cmd:
+            pids.append(name)
+    return pids
+
+
+def test_run_tests_detail_ends_the_suite_at_the_harvest_budget(round_, tmp_path, monkeypatch):
+    """KC-57 §1: a root that outlives `budget_sec` is ended by its process group.
+    The summary says `budget✗` and not `PASS` or a failure of the tree, the tail
+    names where the budget hit, nothing of the suite is left running, and the
+    call returns at the budget rather than the suite's own runtime."""
+    repo, base, ticket = round_
+    wt = _worktree(repo, base, tmp_path)
+    _accepting(wt)
+    _edit(wt, "tests/test_slow_kc57.py", _SLOW)
+    _commit(wt, "a test that outlives the budget")
+
+    ended: list = []
+    real_end = gates_mod._end_process_group
+
+    def end_and_record(proc):
+        ended.append(proc.pid)
+        real_end(proc)
+
+    monkeypatch.setattr(gates_mod, "_end_process_group", end_and_record)
+
+    start = time.monotonic()
+    summary, tail = run_tests_detail(str(wt.path), budget_sec=3.0)
+    took = time.monotonic() - start
+
+    assert summary.startswith("tests:budget✗")
+    assert took < 15                                    # the budget, not the 90 s suite
+    assert len(ended) == 1                              # the group was ended, once
+    try:
+        os.killpg(ended[0], 0)
+    except ProcessLookupError:
+        pass                                           # every member of it is gone
+    else:
+        pytest.fail("the harvest's pytest process group is still alive")
+    time.sleep(0.5)
+    assert _live_pytest(wt.path) == []
+    assert any("the budget hit in:" in line and "test_slow_kc57.py::test_slow_kc57" in line
+               for line in tail)
+
+
+def test_run_tests_detail_without_a_budget_is_today_behaviour(round_, tmp_path, monkeypatch):
+    """KC-57 §2: `budget_sec = 0` runs the same command as before — no `-v`, no
+    `--durations`, no process group, no `budget✗` — so a slow suite runs out."""
+    repo, base, ticket = round_
+    wt = _worktree(repo, base, tmp_path)
+    _accepting(wt)
+    _edit(wt, "tests/test_probe.py",
+          "def test_probe():\n    assert False, 'boom-kc57'\n")
+    _commit(wt, "break a test")
+
+    calls: list = []
+    real = gates_mod._pytest
+
+    def spy(cwd, *args, budget=0.0):
+        calls.append((args, budget))
+        return real(cwd, *args, budget=budget)
+
+    monkeypatch.setattr(gates_mod, "_pytest", spy)
+
+    summary, tail = run_tests_detail(str(wt.path))
+    assert summary.startswith("tests:1✗")
+    assert "budget" not in summary
+    assert calls and calls[0] == (("tests",), 0.0)     # no `-v`, no `--durations`
+    assert all(budget == 0.0 for _, budget in calls)   # not the flake rerun either
+
+
+def test_harvest_budget_reworks_with_tests_slow(round_, tmp_path):
+    """KC-57 §1: the budget ends the roots, the verdict is REWORK on a blocking
+    `tests_slow` — not `tests_failed` — that says the suite is too slow, and the
+    rework prompt carries the budget instead of a red test."""
+    repo, base, ticket = round_
+    wt = _worktree(repo, base, tmp_path)
+    _accepting(wt)
+    _edit(wt, "tests/test_slow_kc57.py", _SLOW)
+    _record(wt, ticket.name, outcome="DONE", commit=_commit(wt, "a test that outlives the budget"))
+
+    h = harvest(wt, ticket, run_tests=True, budget_sec=3.0)
+
+    assert h.verdict == "REWORK"
+    assert "tests_slow" in _codes(h) and "tests_failed" not in _codes(h)
+    slow = _reason(h, "tests_slow")
+    assert slow.blocking
+    assert "3s harvest budget" in slow.text
+    assert "test_slow_kc57.py::test_slow_kc57" in slow.text
+    assert len(slow.text) <= TEXT_LIMIT
+    assert h.facts["tests_run"].startswith("tests:budget✗")
+
+    message = rework_message(h, 1, 2)
+    assert "harvest budget" in message
+    assert "the tests do not pass" not in message
+
+
+def test_tests_slow_names_the_slowest_tests_from_the_durations_table():
+    """The durations table wins over the `-v` progress, slowest first, and the
+    sentence never breaks `TEXT_LIMIT` no matter how long the node ids are."""
+    slow1 = "tests/test_a_very_long_filename_for_the_budget_case.py::test_a_very_long_name_that_must_still_fit_here"
+    slow2 = "tests/test_another_long_filename_for_the_budget_case.py::test_another_very_long_name_that_will_not_fit"
+
+    r = harvest_mod._tests_slow_reason(900.0, [f"60.01s call     {slow1}"])
+    assert r.code == "tests_slow" and r.blocking
+    assert "900s harvest budget" in r.text
+    assert "slowest tests: " + slow1 in r.text
+    assert len(r.text) <= TEXT_LIMIT
+
+    r2 = harvest_mod._tests_slow_reason(3.0, [f"1.00s call     {slow1}", f"0.50s call     {slow2}"])
+    assert "slowest tests: " + slow1 in r2.text    # the slowest is named first
+    assert slow2 not in r2.text                    # ... and it stops at the sentence budget
+    assert len(r2.text) <= TEXT_LIMIT
+
+
+def test_tests_slow_names_the_test_the_budget_hit_in():
+    """An ended suite never printed a durations table, so the `-v` line it was
+    still inside of is what the reason names — and nothing is invented when
+    pytest printed no node id at all."""
+    node = "tests/test_slow_kc57.py::test_slow_kc57"
+    r = harvest_mod._tests_slow_reason(3.0, [
+        "collecting ... collected 2 items",
+        f"tests/test_base.py::test_base PASSED          [ 50%]",
+        f"{node}",
+    ])
+    assert "the budget hit in: " + node in r.text
+    assert "slowest tests" not in r.text
+
+    r2 = harvest_mod._tests_slow_reason(3.0, ["collecting ... collected 2 items"])
+    assert r2.text == "the suite used more than the 3s harvest budget"
+    assert len(r2.text) <= TEXT_LIMIT
+
+
+def test_tests_slow_names_the_root_that_used_the_budget_not_the_one_before():
+    """The tail holds one section per root that did not pass, so a root that
+    finished in time can still carry its own durations table in the same list.
+    The budget's reason names the root that ran out of time."""
+    tail = [
+        "--- tests",
+        "E           AssertionError: boom-kc57",
+        "============================= slowest 10 durations =============================",
+        "1.00s call     tests/test_other.py::test_other",
+        "--- tests_bugfix: ended after the harvest budget",
+        "tests_bugfix/test_base.py::test_base PASSED      [ 50%]",
+        "tests_bugfix/test_slow_kc57.py::test_slow_kc57",
+    ]
+    r = harvest_mod._tests_slow_reason(3.0, tail)
+    assert "the budget hit in: tests_bugfix/test_slow_kc57.py::test_slow_kc57" in r.text
+    assert "test_other.py::test_other" not in r.text
+    assert "slowest tests" not in r.text
+
+
 def _tier(ws: Workspace, root: str, *names: str, target: str = "tests") -> None:
     """*root* as a symlink view: one relative link per name, into *target*."""
     d = ws.path / root
@@ -464,9 +651,9 @@ def _roots_run(monkeypatch) -> list:
     ran = []
     real = gates._pytest
 
-    def spy(cwd, *args):
+    def spy(cwd, *args, **kwargs):
         ran.append(args[0])
-        return real(cwd, *args)
+        return real(cwd, *args, **kwargs)
 
     monkeypatch.setattr(gates, "_pytest", spy)
     return ran
@@ -875,7 +1062,7 @@ def test_harvest_run_tests_skips_the_roots_with_no_commit(round_, tmp_path, monk
     wt = _worktree(repo, base, tmp_path)
     _stage_probe(wt)
 
-    def no_roots(cwd):
+    def no_roots(cwd, **kwargs):
         raise AssertionError(f"no commit, yet the roots ran in {cwd}")
 
     monkeypatch.setattr(harvest_mod, "run_tests_detail", no_roots)
@@ -929,7 +1116,7 @@ def test_reason_codes_are_the_tickets_list():
     assert set(REASON_CODES) == {
         "no_progress_row", "progress_not_done", "no_commit", "commit_not_on_branch",
         "commits_ne_1", "pushed", "no_test_file", "shrink_changed", "off_ticket_files",
-        "tests_failed", "uncommitted_files",
+        "tests_failed", "tests_slow", "uncommitted_files",
     }
 
 
@@ -1206,9 +1393,9 @@ def test_the_roots_run_in_a_throwaway_checkout_of_the_commit(tmp_path, monkeypat
     seen: list[tuple[str, str]] = []
     real = harvest_mod.run_tests_detail
 
-    def roots_on_the_commit(cwd):
+    def roots_on_the_commit(cwd, **kwargs):
         seen.append((cwd, _git(cwd, "rev-parse", "HEAD")))
-        return real(cwd)
+        return real(cwd, **kwargs)
 
     monkeypatch.setattr(harvest_mod, "run_tests_detail", roots_on_the_commit)
 
@@ -1231,7 +1418,7 @@ def test_the_throwaway_checkout_is_gone_when_the_roots_raise(tmp_path, monkeypat
 
     seen: list[str] = []
 
-    def roots_that_die(cwd):
+    def roots_that_die(cwd, **kwargs):
         seen.append(cwd)
         raise RuntimeError("boom-kc60")
 
@@ -1269,7 +1456,7 @@ def test_run_tests_false_checks_out_nothing_and_names_nothing(tmp_path, monkeypa
     _write(wt.path / "stray.py", "x = 1\n")
     before = _registered_worktrees(repo)
 
-    def no_roots(cwd):
+    def no_roots(cwd, **kwargs):
         raise AssertionError(f"run_tests=False must not run the roots in {cwd}")
 
     monkeypatch.setattr(harvest_mod, "run_tests_detail", no_roots)
@@ -1309,7 +1496,7 @@ def test_harvest_runs_no_roots_outside_a_git_worktree(tmp_path, round_, kind, mo
     ws = Workspace(agent="a", path=path, branch="contest/01/a", base_sha=base,
                    kind="worktree")
 
-    def no_roots(cwd):
+    def no_roots(cwd, **kwargs):
         raise AssertionError(f"no checkout, so no root may run (asked for {cwd})")
 
     monkeypatch.setattr(harvest_mod, "run_tests_detail", no_roots)
@@ -1343,7 +1530,7 @@ def test_a_checkout_that_cannot_be_made_is_not_a_pass(tmp_path, monkeypatch):
 
     ran: list[str] = []
     monkeypatch.setattr(harvest_mod, "run_tests_detail",
-                        lambda cwd: ran.append(cwd) or ("tests:PASS", []))
+                        lambda cwd, **kwargs: ran.append(cwd) or ("tests:PASS", []))
 
     h = harvest(wt, ticket, run_tests=True)
     assert ran == []                                 # not in the agent's tree, not anywhere

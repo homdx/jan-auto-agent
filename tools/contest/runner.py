@@ -166,12 +166,89 @@ _log = logging.getLogger(__name__)
 #: How many of the session's latest tool parts the gate sees.
 RECENT_TOOLS = 8
 
+class _TestRunsLock:
+    """The round's pytest lock, plus who is inside it and who is queued behind.
+
+    `_inner` is the mutual exclusion — one worktree's roots at a time. The
+    bookkeeping is a dict under its own guard, so `turn["harvest"]` can carry
+    `waited`, the heartbeat can say `HARVESTING (queued 12m, 2 ahead)` for a run
+    that is still waiting and `HARVESTING (tests 3m)` for the one that holds the
+    roots, and the round's table can total the wait per agent. `time.monotonic`
+    is what is read, so a test can patch the clock and see the wait without a
+    real sleep. Everything here is fail-open: an untracked agent is simply not
+    in the queue.
+    """
+
+    def __init__(self) -> None:
+        self._inner = threading.Lock()
+        self._guard = threading.Lock()
+        # agent -> {"waiting": t, "running": t}: when it asked for the lock and,
+        # once granted, when it got it. Absent once it has exited.
+        self._entries: dict = {}
+
+    def enter(self, agent: str = "") -> float:
+        """Ask for the lock; the returned value is how long the wait took."""
+        key = self._key(agent)
+        with self._guard:
+            self._entries.setdefault(key, {})["waiting"] = time.monotonic()
+        self._inner.acquire()
+        with self._guard:
+            asked = self._entries[key].get("waiting")
+            got = time.monotonic()
+            self._entries[key]["running"] = got
+        return max(0.0, got - (asked if asked is not None else got))
+
+    def exit(self, agent: str = "") -> None:
+        """Leave the queue and give the lock back."""
+        with self._guard:
+            self._entries.pop(self._key(agent), None)
+        self._inner.release()
+
+    def ahead(self, agent: str = "") -> int:
+        """How many are in front of *agent*: the holder plus who asked before it."""
+        with self._guard:
+            return self._in_front(agent)
+
+    def status(self, agent: str = "") -> tuple | None:
+        """`("queued", waited, ahead)` or `("running", elapsed)`, else None."""
+        with self._guard:
+            entry = self._entries.get(self._key(agent))
+            if not entry:
+                return None
+            now = time.monotonic()
+            if "running" in entry:
+                return ("running", max(0.0, now - entry["running"]), 0)
+            return ("queued", max(0.0, now - entry.get("waiting", now)), self._in_front(agent))
+
+    def _key(self, agent: str) -> str:
+        """The queue's name for this agent; an unnamed one is still ordered."""
+        return agent or "unnamed"
+
+    def _in_front(self, agent: str) -> int:
+        """The queue's depth ahead of *agent*; `self` is held, read under the guard."""
+        key = self._key(agent)
+        mine = self._entries.get(key)
+        if mine is None:
+            # Has not asked yet, so everyone in the queue asked before it will.
+            return len(self._entries)
+        my_since = mine.get("waiting") or 0.0
+        count = 0
+        for name, entry in self._entries.items():
+            if name == key:
+                continue
+            if "running" in entry:
+                count += 1                      # the one that holds the roots
+            elif (entry.get("waiting") or 0.0) <= my_since:
+                count += 1                      # asked before this one did
+        return count
+
+
 #: The four pytest roots run one worktree at a time. The judge machine takes
 #: about 20 minutes for eight parallel suites and about 105 s for one, so two
 #: agents harvesting at once must not fan the roots out; only the test run is
 #: slow, so the lock is held for the whole `harvest` call — its mechanical part
 #: is a handful of `git` calls and costs nothing next to the roots.
-_TEST_RUNS_LOCK = threading.Lock()
+_TEST_RUNS_LOCK = _TestRunsLock()
 
 #: KC-27: the heartbeat's git calls per worktree — a short budget, because a
 #: tick that waits on a held index is late, not failed.
@@ -667,12 +744,47 @@ def _retry_reason(error) -> str:
     return _brief(error)
 
 
-def _harvest(ws, ticket_path, run_tests):
-    """`harvest` for one worktree, with the pytest roots serialized round-wide."""
+def _budget_left(config) -> float:
+    """`harvest_budget_sec` as a non-negative float; missing or bad is no budget."""
+    try:
+        return max(0.0, float(getattr(config, "harvest_budget_sec", 0) or 0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _harvest(ws, ticket_path, run_tests, config=None):
+    """`harvest` for one worktree, with the pytest roots serialized round-wide.
+
+    KC-57: `config.harvest_budget_sec` bounds the roots' wall time, and the lock
+    is entered under the agent's name so the turn can carry how long it waited
+    and how many were ahead. Fail-open throughout: an absent or broken lock is
+    "no queue to stand in", so the roots still run and the harvest still ends.
+    """
+    budget = _budget_left(config)
     if not run_tests:
-        return harvest(ws, ticket_path)
-    with _TEST_RUNS_LOCK:
-        return harvest(ws, ticket_path, run_tests=True)
+        return harvest(ws, ticket_path, budget_sec=budget)
+    waiter = getattr(ws, "agent", "")
+    ahead = 0
+    waited = 0.0
+    try:
+        ahead = int(_TEST_RUNS_LOCK.ahead(waiter))
+    except (AttributeError, TypeError, ValueError):
+        ahead = 0
+    entered = False
+    try:
+        waited = float(_TEST_RUNS_LOCK.enter(waiter))
+        entered = True
+    except (AttributeError, TypeError, ValueError):
+        waited = 0.0
+    try:
+        return harvest(ws, ticket_path, run_tests=True,
+                       budget_sec=budget, waited=waited, ahead=ahead)
+    finally:
+        if entered:
+            try:
+                _TEST_RUNS_LOCK.exit(waiter)
+            except Exception:  # noqa: BLE001 — the harvest is over either way
+                pass
 
 
 def _commits_above(ws: Workspace) -> int:
@@ -880,6 +992,22 @@ class AgentRun:
                 return " ".join([h.get("verdict", "")] + [str(c) for c in h.get("reasons", [])]).strip()
         return ""
 
+    def test_wait(self) -> float:
+        """KC-57: the seconds this run spent queued for the round's pytest lock.
+
+        The sum of `waited` over its turns — one harvest per turn, each either
+        straight through the lock or behind the harvest before it. Turns that
+        carry no harvest, and rows written before `waited` existed, count as 0.
+        """
+        total = 0.0
+        for turn in self.turns:
+            h = turn.get("harvest") or {}
+            try:
+                total += max(0.0, float(h.get("waited") or 0))
+            except (TypeError, ValueError):
+                continue
+        return round(total, 1)
+
 
 @dataclass
 class RoundState:
@@ -915,6 +1043,7 @@ class RoundState:
             "tokens": run.tokens,
             "commit": run.commit,
             "last_reason": run.last_reason(),
+            "test_wait": run.test_wait(),
         } for run in self.agents]
 
 
@@ -2102,11 +2231,12 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                         # its suites next to it; `finally` reaps again, for what
                         # came after.
                         _record_reaped(run, spec.name, ws.path)
-                        verdict = _harvest(ws, ticket_path, run_tests)
+                        verdict = _harvest(ws, ticket_path, run_tests, config)
                         turn["harvest"] = {
                             "verdict": verdict.verdict,
                             "reasons": [r.code for r in verdict.reasons],
                             "elapsed": round(verdict.elapsed, 1),
+                            "waited": round(verdict.waited, 1),
                         }
                         run.commit = None
                         if above == 1:
@@ -2124,10 +2254,11 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
 
             # ── HARVESTING ─────────────────────────────────────────────────
             transition(AgentState.HARVESTING, note="tests on" if run_tests else "tests off")
-            verdict = _harvest(ws, ticket_path, run_tests)
+            verdict = _harvest(ws, ticket_path, run_tests, config)
             turn["harvest"] = {"verdict": verdict.verdict,
                                "reasons": [r.code for r in verdict.reasons],
-                               "elapsed": round(verdict.elapsed, 1)}
+                               "elapsed": round(verdict.elapsed, 1),
+                               "waited": round(verdict.waited, 1)}
             run.turns.append(turn)
             _append_jsonl(agent_dir / "turns.jsonl", {"agent": spec.name, **turn})
             run.commit = verdict.commit
@@ -2195,7 +2326,7 @@ def _plan(config: ContestConfig, workspaces: list, ticket_path: Path,
         elif not run.terminal:
             # mid-flight when the round died: the session is gone, the worktree is not
             run.workspace = ws
-            verdict = _harvest(ws, ticket_path, run_tests)
+            verdict = _harvest(ws, ticket_path, run_tests, config)
             if verdict.verdict == "READY":
                 run.state, run.commit = AgentState.READY, verdict.commit
             else:
@@ -2344,6 +2475,19 @@ def run_round(config: ContestConfig, round_no: int, ticket_path: Path, workspace
     return state
 
 
+def _lock_status(run: AgentRun) -> tuple | None:
+    """The round's pytest lock, as this run sees it — or None when there is none.
+
+    `("queued", waited, ahead)` while it waits for the one pytest slot,
+    `("running", elapsed, 0)` while it holds it. Fail-open: an absent lock is no
+    queue to report, and a resumed `state.json` cannot have had one.
+    """
+    try:
+        return _TEST_RUNS_LOCK.status(run.agent.name)
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
 class _Heartbeat:
     """The once-a-minute line: the round's age and every agent's state, its
     files-based progress bar, and how long its last tests took —
@@ -2366,6 +2510,26 @@ class _Heartbeat:
         self._stop.set()
         if self._thread.is_alive():
             self._thread.join(2.0)
+
+    def _harvest_note(self, run: AgentRun) -> str | None:
+        """What the line says about this run's roots, or None for no suffix.
+
+        KC-57: a run in `HARVESTING` is read live off the round's lock — `queued`
+        while it stands behind the one pytest slot, `tests` once it holds it, so
+        the queue that used to be invisible to the round is now on the line. Any
+        other state shows the last harvest that finished.
+        """
+        if run.state is AgentState.HARVESTING:
+            status = _lock_status(run)
+            if status and status[0] == "queued":
+                ahead = f", {status[2]} ahead" if status[2] else ""
+                return f"(queued {_age(status[1])}{ahead})"
+            if status and status[0] == "running":
+                return f"(tests {_age(status[1])})"
+        elapsed = self._last_harvest_elapsed(run)
+        if elapsed is not None:
+            return f"(tests {_age(elapsed)})"
+        return None
 
     def line(self) -> str:
         now = time.monotonic()
@@ -2404,13 +2568,9 @@ class _Heartbeat:
                     part += f" ↺{run.attempt}"
                 if granted > 0:
                     part += f"+{_age(granted)}" if run.attempt else f" +{_age(granted)}"
-                elapsed = self._last_harvest_elapsed(run)
-                if elapsed is not None:
-                    part += f" (tests {_age(elapsed)})"
-            else:
-                elapsed = self._last_harvest_elapsed(run)
-                if elapsed is not None:
-                    part += f" (tests {_age(elapsed)})"
+            note = self._harvest_note(run)
+            if note:
+                part += f" {note}"
             parts.append(part)
 
         live = sum(1 for run in self.state.agents if not run.terminal)

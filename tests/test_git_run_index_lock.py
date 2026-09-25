@@ -341,7 +341,7 @@ def test_the_runner_keeps_going_when_a_tree_cannot_be_read(tmp_path, monkeypatch
 
     monkeypatch.setattr(runner_mod, "_dirty_tree", unreadable)
     monkeypatch.setattr(runner_mod, "_harvest",
-                        lambda ws, ticket_path, run_tests=False: _Verdict())
+                        lambda ws, ticket_path, run_tests=False, config=None: _Verdict())
 
     repo = _make_repo(tmp_path)
     base = _git(repo, "rev-parse", "HEAD")

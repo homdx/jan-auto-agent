@@ -1274,7 +1274,7 @@ def test_a_terminal_harvest_runs_the_roots_under_the_rounds_lock(tmp_path, monke
     sb = Sandbox(tmp_path)
     seen: list[tuple[str, str]] = []
 
-    def roots(cwd):
+    def roots(cwd, **kwargs):
         # KC-60: the roots run in a detached checkout of the commit, not the tree.
         seen.append((cwd, _git(cwd, "rev-parse", "HEAD")))
         return ALL_ROOTS_PASS, []
@@ -1299,6 +1299,220 @@ def test_a_terminal_harvest_runs_the_roots_under_the_rounds_lock(tmp_path, monke
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# KC-57: a harvest has a wall-clock budget, and the queue is visible
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _FakeClock:
+    """`time.monotonic` on a clock the test advances; nothing else is touched.
+
+    `_TestRunsLock` is the only thing in `_harvest` that reads the clock, so the
+    wait is exact: no real sleep, no margin, no bet on a loaded box. `threading`
+    binds its own `monotonic` at import, so `Event.wait` and `join` keep the
+    real one.
+    """
+
+    def __init__(self):
+        self.now = 1000.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def test_the_test_runs_lock_reports_the_holder_and_clears_it(monkeypatch):
+    """`enter` reports the wait, `status` names the holder and its own time,
+    `ahead` sees the holder from an asker's side, and `exit` clears both."""
+    clock = _FakeClock()
+    monkeypatch.setattr(_runner_module, "time", clock)
+    lock = _runner_module._TestRunsLock()
+
+    assert lock.status("agent-a") is None and lock.ahead("agent-a") == 0
+    assert lock.enter("agent-a") == 0.0            # nothing was in front
+    assert lock.status("agent-a") == ("running", 0.0, 0)
+    assert lock.ahead("agent-b") == 1              # the holder is ahead of an asker
+
+    clock.advance(60.0)
+    assert lock.status("agent-a") == ("running", 60.0, 0)   # the holder's own time
+
+    lock.exit("agent-a")
+    assert lock.status("agent-a") is None
+    assert lock.ahead("agent-b") == 0
+    assert lock.status("") is None
+
+
+def _queue_state(lock, agent: str, deadline: float) -> tuple | None:
+    """`lock.status(agent)`, polled until it is not None — else None on the deadline.
+
+    The asker is not the one that can tell us it asked: it is inside `enter`.
+    """
+    end = time.monotonic() + deadline
+    while time.monotonic() < end:
+        status = lock.status(agent)
+        if status is not None:
+            return status
+        time.sleep(0.01)
+    return None
+
+
+def test_harvests_in_series_record_the_wait_and_who_is_ahead(tmp_path, monkeypatch):
+    """KC-57 §2 acceptance: three agents on the one pytest slot, patched clock, no
+    real sleep. The first one's `waited` is 0 and nobody is ahead of it; the
+    second one's `waited` is at least the first one's run time and one is ahead;
+    the third stands two ahead. All three see the config's budget."""
+    import tools.contest.harvest as harvest_module
+    import tools.contest.runner as runner_mod
+
+    names = ("agent-a", "agent-b", "agent-c")
+    sb = Sandbox(tmp_path, names)
+    cfg = make_config(names, harvest_budget_sec=900)
+    clock = _FakeClock()
+    monkeypatch.setattr(runner_mod, "time", clock)
+    lock = runner_mod._TEST_RUNS_LOCK
+
+    seen: dict = {}
+    results: dict = {}
+    first_inside = threading.Event()
+    released = threading.Event()
+
+    def slow(ws, ticket_path, *, run_tests=False, budget_sec=0.0, waited=0.0, ahead=0):
+        seen[ws.agent] = {"waited": waited, "ahead": ahead, "budget": budget_sec}
+        if ws.agent == names[0]:
+            first_inside.set()
+        released.wait(30.0)
+        return harvest_module.Harvest(verdict="REWORK", reasons=(), commit=None, facts={},
+                                      elapsed=0.01, waited=waited, ahead=ahead)
+
+    monkeypatch.setattr(runner_mod, "harvest", slow)
+
+    def run_harvest(name: str):
+        results[name] = runner_mod._harvest(sb.ws(name), sb.ticket_path, True, cfg)
+
+    threads = [threading.Thread(target=run_harvest, args=(name,), daemon=True) for name in names]
+    threads[0].start()
+    assert first_inside.wait(30.0), "the first harvest never got inside the lock"
+
+    threads[1].start()
+    queued = _queue_state(lock, names[1], 30.0)
+    assert queued and queued[0] == "queued" and queued[2] == 1     # the holder only
+
+    threads[2].start()
+    queued = _queue_state(lock, names[2], 30.0)
+    assert queued and queued[0] == "queued" and queued[2] == 2     # holder, plus the one before
+
+    clock.advance(300.0)                 # the first one's run time, on a patched clock
+    released.set()
+    for thread in threads:
+        thread.join(30.0)
+    assert not any(t.is_alive() for t in threads)
+
+    assert seen[names[0]] == {"waited": 0.0, "ahead": 0, "budget": 900.0}
+    assert seen[names[1]]["ahead"] == 1 and seen[names[1]]["waited"] >= 300.0
+    assert seen[names[2]]["ahead"] == 2 and seen[names[2]]["waited"] >= 300.0
+    for name in names:
+        assert seen[name]["budget"] == 900.0
+        assert results[name].waited == seen[name]["waited"]
+        assert results[name].ahead == seen[name]["ahead"]
+        assert lock.status(name) is None
+
+
+def test_a_missing_lock_is_no_queue_to_stand_in(tmp_path, monkeypatch):
+    """Fail-open: no `_TEST_RUNS_LOCK` at all is "no queue", so the roots still
+    run, the harvest ends, and `waited` is 0 rather than an exception in the run."""
+    import tools.contest.harvest as harvest_module
+    import tools.contest.runner as runner_mod
+
+    sb = Sandbox(tmp_path, ["agent-a"])
+    monkeypatch.setattr(runner_mod, "_TEST_RUNS_LOCK", None)
+    got: dict = {}
+
+    def roots(ws, ticket_path, *, run_tests=False, budget_sec=0.0, waited=0.0, ahead=0):
+        got.update(run_tests=run_tests, budget=budget_sec, waited=waited, ahead=ahead)
+        return harvest_module.Harvest(verdict="READY", reasons=(), commit=None, facts={},
+                                      elapsed=0.01, waited=waited, ahead=ahead)
+
+    monkeypatch.setattr(runner_mod, "harvest", roots)
+
+    runner_mod._harvest(sb.ws("agent-a"), sb.ticket_path, True, None)
+    assert got == {"run_tests": True, "budget": 0.0, "waited": 0.0, "ahead": 0}
+
+
+def test_the_budget_comes_from_the_config_and_gives_up():
+    """`_budget_left` reads `harvest_budget_sec`, defaults to 900, and gives up
+    to no budget on a missing, negative or malformed value rather than raising
+    into a run."""
+    assert _runner_module._budget_left(make_config(["agent-a"])) == 900.0
+    assert _runner_module._budget_left(make_config(["agent-a"], harvest_budget_sec=0)) == 0.0
+    assert _runner_module._budget_left(make_config(["agent-a"], harvest_budget_sec=-5)) == 0.0
+    assert _runner_module._budget_left(None) == 0.0
+    bad = type("Bad", (), {"harvest_budget_sec": "soon"})()
+    assert _runner_module._budget_left(bad) == 0.0
+
+
+class _FakeTestLock:
+    """`_TEST_RUNS_LOCK.status` off a table the test writes — no threads."""
+
+    def __init__(self, table: dict):
+        self.table = table
+
+    def status(self, agent: str = "") -> tuple | None:
+        return self.table.get(agent)
+
+
+def test_the_heartbeat_names_the_queue_and_the_runner(tmp_path, monkeypatch):
+    """KC-57 §2 acceptance: a HARVESTING agent standing behind the round's one
+    pytest slot reads `queued` with its wait and who is ahead of it; the one
+    inside reads `tests`."""
+    sb = Sandbox(tmp_path, ["agent-a", "agent-b"])
+    cfg = make_config(["agent-a", "agent-b"])
+    rm = _runner_module
+    runs = [
+        AgentRun(agent=cfg.agents[0], workspace=sb.ws("agent-a"), state=AgentState.HARVESTING),
+        AgentRun(agent=cfg.agents[1], workspace=sb.ws("agent-b"), state=AgentState.HARVESTING),
+    ]
+    hb, rm, files, commits = _make_heartbeat(runs, {"agent-a": 3, "agent-b": 3})
+    monkeypatch.setattr(rm, "_TEST_RUNS_LOCK", _FakeTestLock({
+        "agent-a": ("running", 180.0, 0),
+        "agent-b": ("queued", 720.0, 2),
+    }))
+    try:
+        line = hb.line()
+    finally:
+        rm._worktree_files, rm._commits_above = files, commits
+    a, b = _part(line, "agent-a"), _part(line, "agent-b")
+    assert "HARVESTING" in a and "(tests 3m)" in a
+    assert "HARVESTING" in b and "(queued 12m, 2 ahead)" in b
+
+
+def test_the_rounds_table_totals_each_agents_test_lock_wait(tmp_path):
+    """The round's final table carries the total lock wait per agent, summed
+    over its turns; a turn written before `waited` existed counts as 0."""
+    sb = Sandbox(tmp_path, ["agent-a", "agent-b"])
+    cfg = make_config(["agent-a", "agent-b"])
+    state = RoundState(round_no=ROUND, ticket=TICKET, base_sha=sb.base_sha,
+                       started_at=time.time() - 120, agents=[
+        AgentRun(agent=cfg.agents[0], workspace=sb.ws("agent-a"), state=AgentState.HARVESTING,
+                 turns=[
+                     {"kind": "initial",
+                      "harvest": {"verdict": "REWORK", "reasons": ["tests_slow"],
+                                  "elapsed": 900.0, "waited": 720.5}},
+                     {"kind": "rework",
+                      "harvest": {"verdict": "READY", "reasons": [],
+                                  "elapsed": 300.0, "waited": 60.0}},
+                 ]),
+        AgentRun(agent=cfg.agents[1], workspace=sb.ws("agent-b"), state=AgentState.READY,
+                 turns=[{"kind": "initial",
+                         "harvest": {"verdict": "READY", "reasons": [], "elapsed": 200.0}}]),
+    ])
+
+    rows = state.table_rows()
+    assert rows[0]["test_wait"] == 780.5
+    assert rows[1]["test_wait"] == 0.0
+    assert set(rows[0]) == set(rows[1])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # KC-22: a turn that ends idle with uncommitted work gets a continue, not a rework
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1309,9 +1523,9 @@ def _harvest_calls(monkeypatch):
     seen = []
     real = runner_mod._harvest
 
-    def wrap(ws, ticket_path, run_tests):
+    def wrap(ws, ticket_path, run_tests, config=None):
         seen.append(1)
-        return real(ws, ticket_path, run_tests)
+        return real(ws, ticket_path, run_tests, config=config)
 
     monkeypatch.setattr("tools.contest.runner._harvest", wrap)
     return seen
@@ -2867,7 +3081,7 @@ def test_run_tests_true_never_runs_the_roots_twice_at_once(tmp_path, monkeypatch
     counter = [0]
     peaks = []
 
-    def roots(cwd):
+    def roots(cwd, **kwargs):
         counter[0] += 1
         peaks.append(counter[0])
         time.sleep(0.2)
@@ -2903,7 +3117,7 @@ def test_resume_harvests_the_mid_flight_worktree_with_the_roots(tmp_path, monkey
     _work(str(sb.ws("agent-b").path), test=True)
     harvested: list[tuple[str, str]] = []
 
-    def roots(cwd):
+    def roots(cwd, **kwargs):
         # KC-60: the roots run in a detached checkout of the commit, not the tree.
         harvested.append((cwd, _git(cwd, "rev-parse", "HEAD")))
         return ALL_ROOTS_PASS, []
@@ -3313,7 +3527,7 @@ def test_harvest_elapsed_in_turns_jsonl_and_state_json(tmp_path, caplog, monkeyp
     caplog.set_level(logging.INFO, logger=LOGGER)
     import tools.contest.harvest as harvest_module
     monkeypatch.setattr(harvest_module, "run_tests_detail",
-                        lambda cwd: (ALL_ROOTS_PASS, []))
+                        lambda cwd, **kwargs: (ALL_ROOTS_PASS, []))
 
     cfg = make_config(["agent-a"], max_parallel=1)
     scenario = {"turns": [{"on_prompt": work_ready, "events": ["busy", "idle"]}]}
@@ -3327,11 +3541,17 @@ def test_harvest_elapsed_in_turns_jsonl_and_state_json(tmp_path, caplog, monkeyp
     assert len(turns) == 1
     assert "elapsed" in turns[0]["harvest"]
     assert isinstance(turns[0]["harvest"]["elapsed"], float)
+    # KC-57: `waited` rides next to `elapsed`, 0.0 here because this harvest
+    # took the round's pytest slot at once and waited for nobody.
+    assert isinstance(turns[0]["harvest"]["waited"], float)
+    assert turns[0]["harvest"]["waited"] == 0.0
 
     state_data = _state_json(sb)
     agent = state_data["agents"][0]
     assert "elapsed" in agent["turns"][0]["harvest"]
     assert isinstance(agent["turns"][0]["harvest"]["elapsed"], float)
+    assert "waited" in agent["turns"][0]["harvest"]
+    assert isinstance(agent["turns"][0]["harvest"]["waited"], float)
 
     lines = _lines(caplog, "agent-a: READY")
     assert len(lines) == 1

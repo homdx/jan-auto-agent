@@ -336,6 +336,30 @@ model = kenary/hy3:free
     assert "progress_every_sec" in CONTEST_KEYS
 
 
+def test_harvest_budget_sec_defaults_to_900_and_zero_turns_it_off(tmp_path):
+    """KC-57: the wall-clock budget for one harvest's pytest roots. 900 by
+    default, 0 keeps today's unbounded behaviour, a negative one is clamped, and
+    a malformed value falls back rather than failing the intake."""
+    assert "harvest_budget_sec" in CONTEST_KEYS
+    base = """
+[contest]
+harvest_budget_sec = %s
+
+[contest.agent.alpha]
+model = kenary/hy3:free
+"""
+    assert load_roster(write_ini(tmp_path, base % "900")).harvest_budget_sec == 900
+    assert load_roster(write_ini(tmp_path, base % "0")).harvest_budget_sec == 0
+    assert load_roster(write_ini(tmp_path, base % "-5")).harvest_budget_sec == 0
+    assert load_roster(write_ini(tmp_path, base % "soon")).harvest_budget_sec == 900
+    assert load_roster(write_ini(tmp_path, """
+[contest]
+
+[contest.agent.alpha]
+model = kenary/hy3:free
+""")).harvest_budget_sec == 900
+
+
 def test_max_error_retries_and_error_retry_backoff_sec_parse_and_default(tmp_path):
     """KC-19: both keys parse, default, and are in CONTEST_KEYS."""
     assert "max_error_retries" in CONTEST_KEYS

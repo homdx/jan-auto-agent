@@ -46,6 +46,7 @@ from tools.contest.gates import (
     git,
     judge_worktree,
     run_tests_detail,
+    _slow_tests,
 )
 from tools.contest.workspace import Workspace
 from tools.git_run import run_git
@@ -64,6 +65,7 @@ REASON_CODES = (
     "shrink_changed",
     "off_ticket_files",
     "tests_failed",
+    "tests_slow",
     "uncommitted_files",
 )
 
@@ -123,6 +125,11 @@ class Harvest:
     commit: str | None
     facts: dict
     elapsed: float
+    #: KC-57: seconds spent waiting for the round's pytest lock before the
+    #: roots ran. Always 0 unless the runner serialized this harvest.
+    waited: float = 0.0
+    #: KC-57: agents ahead in the pytest queue when this harvest waited.
+    ahead: int = 0
 
 
 def _progress_rows(progress_csv: Path) -> list[dict]:
@@ -260,6 +267,46 @@ def _drop_worktree(ws: Workspace, parent: str | None) -> None:
             pass
 
 
+def _last_tail_section(tail: list[str]) -> list[str]:
+    """The tail's last `--- ` section — the root that used the budget.
+
+    `run_tests_detail` keeps one section per root that did not pass, so a root
+    that finished in time can still carry its own durations table in the same
+    list. The budget's reason must name the root that ran out of time, not the
+    slowest test of the one that did not.
+    """
+    for i in range(len(tail) - 1, -1, -1):
+        if tail[i].startswith("--- "):
+            return tail[i:]
+    return tail
+
+
+def _tests_slow_reason(budget: float, tail: list[str]) -> Reason:
+    """`tests_slow`: the roots blew the harvest's wall-clock budget.
+
+    The reason names the budget, so the rework prompt tells the agent to make
+    the suite faster rather than to fix a red test — and names where the time
+    went, when pytest said so: the durations table when the suite reached its
+    own summary, the test it was still inside of when it was ended. Node ids
+    are added while they fit, so the sentence never breaks `TEXT_LIMIT`.
+    """
+    kind, ids = _slow_tests(_last_tail_section(tail))
+    text = f"the suite used more than the {budget:g}s harvest budget"
+    if kind == "running":
+        # The last node id is the test pytest had started and not finished.
+        ids = ids[-1:]
+    label = "slowest tests" if kind == "durations" else "the budget hit in"
+    picked: list[str] = []
+    for node in ids[:5]:
+        candidate = f"{text}; {label}: {' '.join(picked + [node])}"
+        if len(candidate) > TEXT_LIMIT:
+            break
+        picked.append(node)
+    if picked:
+        text = f"{text}; {label}: {' '.join(picked)}"
+    return Reason("tests_slow", text, blocking=True)
+
+
 def _uncommitted_reason(lines: list[str]) -> Reason:
     """`uncommitted_files`: the tree holds what the commit does not.
 
@@ -280,7 +327,8 @@ def _uncommitted_reason(lines: list[str]) -> Reason:
     return Reason("uncommitted_files", text, blocking=False)
 
 
-def harvest(ws: Workspace, ticket_path: Path, *, run_tests: bool = False) -> Harvest:
+def harvest(ws: Workspace, ticket_path: Path, *, run_tests: bool = False,
+            budget_sec: float = 0.0, waited: float = 0.0, ahead: int = 0) -> Harvest:
     """Score one worktree against its ticket and return the verdict.
 
     *ws* is the agent's checkout (`tools/contest/workspace.py`), *ticket_path*
@@ -291,9 +339,14 @@ def harvest(ws: Workspace, ticket_path: Path, *, run_tests: bool = False) -> Har
     checked out, and whatever it holds beyond the commit is reported as the
     non-blocking `uncommitted_files` reason instead of being judged.
 
+    `budget_sec > 0` bounds the roots together (KC-57): past it the suite is
+    `tests_slow`, not `tests_failed`, so the rework prompt says to make the
+    suite faster rather than fixing a red test. `0` keeps today's behaviour.
+
     Raises `FileNotFoundError` for an unreadable ticket; a runner holding a bad
     ticket path is a bug, not a harvest result.
     """
+    budget = max(0.0, float(budget_sec or 0))
     start = time.monotonic()
     ticket = Path(ticket_path).name
     declared = declared_files(ticket_path)
@@ -421,11 +474,13 @@ def harvest(ws: Workspace, ticket_path: Path, *, run_tests: bool = False) -> Har
             ))
         else:
             try:
-                summary, tail = run_tests_detail(target)
+                summary, tail = run_tests_detail(target, budget_sec=budget)
             finally:
                 _drop_worktree(ws, parent)
             facts["tests_run"] = summary
-            if "✗" in summary:
+            if "budget✗" in summary:
+                reasons.append(_tests_slow_reason(budget, tail))
+            elif "✗" in summary:
                 reasons.append(Reason(
                     "tests_failed",
                     f"the tests do not pass: {summary}\n" + "\n".join(tail),
@@ -440,6 +495,8 @@ def harvest(ws: Workspace, ticket_path: Path, *, run_tests: bool = False) -> Har
         commit=resolved,
         facts=facts,
         elapsed=time.monotonic() - start,
+        waited=max(0.0, float(waited or 0)),
+        ahead=max(0, int(ahead or 0)),
     )
 
 

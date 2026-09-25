@@ -26,8 +26,11 @@ from __future__ import annotations
 import importlib.util
 import os
 import re
+import signal
 import subprocess
 import sys
+import tempfile
+import time
 from pathlib import Path
 
 from tools.git_run import run_git
@@ -154,9 +157,9 @@ def ticket_for_round(tasks_dir, n):
     return None, None, []
 
 
-def run_tests(cwd):
+def run_tests(cwd, budget_sec: float = 0.0):
     """One summary token per pytest root: `tests:PASS` / `tests:2✗` / `tests:absent`."""
-    return run_tests_detail(cwd)[0]
+    return run_tests_detail(cwd, budget_sec=budget_sec)[0]
 
 
 #: A `FAILED` / `ERROR` line of pytest's short test summary: the node id, with
@@ -205,12 +208,118 @@ def _links_into_tests(cwd, root) -> bool:
     return True
 
 
-def _pytest(cwd, *args) -> subprocess.CompletedProcess:
-    return subprocess.run([sys.executable, "-m", "pytest", *args, "--timeout=180"],
-                          cwd=cwd, capture_output=True, text=True)
+def _pytest(cwd, *args, budget: float = 0.0) -> subprocess.CompletedProcess:
+    """Run one pytest root, optionally bounded by the harvest's wall-clock budget.
+
+    `budget <= 0` is today's direct `subprocess.run` — no session, no clock, the
+    suite runs as long as it takes. `budget > 0` starts pytest in its own session
+    so a harvest past the budget ends the suite and every xdist worker under it,
+    not just the parent process (KC-48: `killpg`, never `proc.kill`), and reports
+    rc 124 so `run_tests_detail` can tell an ended suite from a failing one.
+
+    A bounded run writes to files rather than pipes: `communicate(timeout=…)`
+    reads the partial output into a local and throws it away when the deadline
+    hits, so the `-v` line that names the test the budget hit in would be lost.
+    """
+    cmd = [sys.executable, "-m", "pytest", *args, "--timeout=180"]
+    if budget <= 0:
+        return subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+
+    outs = [tempfile.NamedTemporaryFile("w+", encoding="utf-8", errors="replace",
+                                        delete=False) for _ in (0, 1)]
+    try:
+        proc = subprocess.Popen(cmd, cwd=cwd, stdout=outs[0], stderr=outs[1],
+                                start_new_session=True)
+        try:
+            proc.wait(timeout=budget)
+        except subprocess.TimeoutExpired:
+            _end_process_group(proc)
+            return subprocess.CompletedProcess(cmd, 124, _file(outs[0]), _file(outs[1]))
+        return subprocess.CompletedProcess(cmd, proc.returncode,
+                                           _file(outs[0]), _file(outs[1]))
+    finally:
+        for fh in outs:
+            fh.close()
+            try:
+                os.unlink(fh.name)
+            except OSError:
+                pass
 
 
-def run_tests_detail(cwd) -> tuple[str, list[str]]:
+def _file(fh) -> str:
+    """A pytest output file, from the beginning; empty when it was not written."""
+    try:
+        fh.seek(0)
+        return fh.read()
+    except (OSError, ValueError):
+        return ""
+
+
+def _end_process_group(proc: subprocess.Popen) -> None:
+    """TERM, then KILL, the pytest process group; fail-open on every race.
+
+    TERM first, so a suite still inside its own cleanup runs it; the second pass
+    only reaches a group that ignored it. `pgid` is the parent's pid: `start_new_session`
+    put the whole suite in the group named by it.
+    """
+    pgid = proc.pid
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(pgid, sig)
+        except OSError:
+            # The group is already gone, or is not ours to signal.
+            pass
+        try:
+            proc.wait(timeout=2.0)
+        except (subprocess.TimeoutExpired, subprocess.SubprocessError):
+            continue
+        else:
+            break
+
+
+#: pytest's `--durations=10` row: `<time> <phase> <nodeid>`, printed last.
+_DURATIONS_ROW = re.compile(r"^\s*\d+(?:\.\d+)?[smh]?\s+(?:call|setup|teardown)\s+(\S+)")
+
+#: pytest's `-v` progress row: `<nodeid> <result> [ <pct>%]`, one per test, with
+#: an optional xdist worker prefix. The node id is printed *before* the test
+#: runs and the result only after, so a suite ended mid-test still names the
+#: test it was inside of — which is where the budget hit.
+_VERBOSE_ROW = re.compile(
+    r"^\s*(?:\[gw\d+\]\s*)?(\S+::\S+?)(?:\s+"
+    r"(?:PASSED|FAILED|ERROR|SKIPPED|XFAIL|XPASS(?:\(strict\))?|RERUN|UNDECIDED))?"
+    r"\s*(?:\[\s*\d+%])?\s*$")
+
+
+def _slow_tests(lines: list[str]) -> tuple[str, list[str]]:
+    """`(kind, nodeids)` out of one root's pytest output, in pytest's own order.
+
+    `("durations", …)` when the suite reached its own summary and printed a
+    durations table — the slowest tests, slowest first. `("running", …)` when
+    the budget ended it first: the node ids it printed, where the last one is
+    the test it was still inside of. Both de-duplicated, first occurrence
+    winning. Nothing pytest did not print is invented.
+    """
+    durations = []
+    for line in lines:
+        m = _DURATIONS_ROW.match(line)
+        if m:
+            durations.append(m.group(1))
+    if durations:
+        return "durations", list(dict.fromkeys(durations))
+    running = []
+    for line in lines:
+        m = _VERBOSE_ROW.match(line)
+        if m:
+            running.append(m.group(1))
+    return "running", list(dict.fromkeys(running))
+
+
+def _tail(text: str | None) -> list[str]:
+    """The last `FAIL_TAIL_LINES` of pytest's stderr; empty when there is none."""
+    return (text or "").strip().splitlines()[-FAIL_TAIL_LINES:]
+
+
+def run_tests_detail(cwd, budget_sec: float = 0.0) -> tuple[str, list[str]]:
     """Same four roots as `run_tests`, plus the tail of the failing output.
 
     Returns `(summary, tail_lines)`. The summary is one token per root:
@@ -231,10 +340,19 @@ def run_tests_detail(cwd) -> tuple[str, list[str]]:
     not run — `tests` already ran every one of those files. When the tree
     carries `TIER_CHECK`, its `--check` is one more token, `tiers:PASS` or
     `tiers:✗` with its output in the tail.
+
+    KC-57: `budget_sec > 0` bounds the roots together, and they run with `-v`
+    and `--durations=10` so the tail can name where the time went. Past the
+    budget the running pytest is ended by process group and its root is
+    `budget✗` — with the durations table in the tail when the suite reached its
+    own summary, else the test `-v` shows it was still inside of — and no root
+    after it runs.
     """
     out = []
     tail: list[str] = []
     serial = ["-n0"] if importlib.util.find_spec("xdist") else []
+    durations = ["-v", "--durations=10"] if budget_sec > 0 else []
+    start = time.monotonic()
     for d in TEST_ROOTS:
         if not os.path.isdir(os.path.join(cwd, d)):
             out.append(f"{d}:absent")
@@ -242,21 +360,42 @@ def run_tests_detail(cwd) -> tuple[str, list[str]]:
         if d != _REAL_ROOT and _links_into_tests(cwd, d):
             out.append(f"{d}:links-to-tests")
             continue
-        r = _pytest(cwd, d)
+        if budget_sec > 0:
+            remaining = max(0.0, budget_sec - (time.monotonic() - start))
+            if remaining <= 0:
+                out.append(f"{d}:budget✗")
+                tail.append(f"--- {d}: harvest budget exhausted")
+                continue
+        else:
+            remaining = 0.0
+        r = _pytest(cwd, d, *durations, budget=remaining)
         if r.returncode == 0:
             out.append(f"{d}:PASS")
             continue
         lines = (r.stdout or "").strip().splitlines()
+        if r.returncode == 124:
+            # The budget, not the tree: name where it hit and stop spending time
+            # on this root — no flake rerun, no more roots.
+            out.append(f"{d}:budget✗")
+            tail.append(f"--- {d}: ended after the harvest budget")
+            _kind, ids = _slow_tests(lines)
+            if ids:
+                tail.append(("slowest tests: " if _kind == "durations" else "the budget hit in: ")
+                            + " ".join(ids[:10]))
+            tail.extend(lines[-FAIL_TAIL_LINES:] or _tail(r.stderr))
+            continue
         bad, ids = _failures(lines)
-        if bad and ids and _pytest(cwd, *ids, *serial).returncode == 0:
+        if bad and ids and _pytest(cwd, *ids, *serial,
+                                   budget=max(0.0, budget_sec - (time.monotonic() - start))
+                                   if budget_sec > 0 else 0.0).returncode == 0:
             out.append(f"{d}:PASS*{bad}")
             tail.append(f"--- {d}: {bad} test(s) failed under the full run and passed "
                         f"alone on rerun (flaky, not counted): {' '.join(ids)}")
             continue
         out.append(f"{d}:{bad}✗" if bad else f"{d}:rc{r.returncode}✗")
         tail.append(f"--- {d}")
-        tail.extend(lines[-FAIL_TAIL_LINES:] or (r.stderr or "").strip().splitlines()[-FAIL_TAIL_LINES:])
-    if os.path.isfile(os.path.join(cwd, TIER_CHECK)):
+        tail.extend(lines[-FAIL_TAIL_LINES:] or _tail(r.stderr))
+    if os.path.isfile(os.path.join(cwd, TIER_CHECK)) and not any(t.endswith("budget✗") for t in out):
         r = subprocess.run([sys.executable, TIER_CHECK, "--check"],
                            cwd=cwd, capture_output=True, text=True)
         if r.returncode == 0:
