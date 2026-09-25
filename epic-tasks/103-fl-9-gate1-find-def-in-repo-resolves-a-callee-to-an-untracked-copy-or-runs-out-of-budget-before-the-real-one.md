@@ -1,6 +1,6 @@
 # FL-9 — `_find_def_in_repo` resolves a callee to whatever copy `rglob` meets first — an untracked round worktree, a pinned fixture — or to nothing once the 4000-file cap runs out in them
 
-**Status:** queued — found 2026-09-25 while judging round 88 (FL-5); kept out of FL-5, which forbids any change to Gate 1's behaviour.
+**Status:** landed `59b885c` (2026-09-25) — round 103 winner sensenova-6-8-flash-lite-var2. Was queued: found 2026-09-25 while judging round 88 (FL-5); kept out of FL-5, which forbids any change to Gate 1's behaviour.
 **Severity:** MEDIUM. Stage B is shown a foreign or stale definition as "one call-hop" context, or none at all. On this repo today, the real definition sits past the walk's cap. No test sees it, because the corpus mock ignores downstream context.
 **File:** `tools/auto/gate1_grounding.py`
 **Symbol:** `_find_def_in_repo` (:519, `max_files=4000`), called by `callee_context` (:554)
