@@ -71,7 +71,7 @@ from tools.contest.runner import (  # noqa: E402
     run_agent,
     run_round,
 )
-from tools.contest.workspace import Workspace  # noqa: E402
+from tools.contest.workspace import Workspace, agent_tmp_dir  # noqa: E402
 
 # every test binds an ephemeral-port HTTP server: one xdist worker for all of them
 pytestmark = pytest.mark.xdist_group(name="port_bound_http_servers")
@@ -393,6 +393,16 @@ def make_config(agents, **over) -> ContestConfig:
               tmp_roots=("/tmp/*",), gate_max_calls_per_session=20, gate_settings=gate)
     kw.update(over)
     return ContestConfig(**kw)
+
+
+def _scratch_arg(cfg: ContestConfig, agent: str = "agent-a") -> str:
+    """KC-59: the scratch dir the runner derives for *agent*, as `round_prompt` gets it.
+
+    `make_config` sets `tmp_roots = ("/tmp/*",)`, so every prompt expectation in
+    this file names `/tmp/<agent>` — the same derivation the runner runs, not a
+    copy of its result."""
+    path = agent_tmp_dir(cfg.tmp_roots, agent)
+    return str(path) if path is not None else ""
 
 
 class StubGate:
@@ -746,6 +756,77 @@ def test_own_worktree_by_absolute_path_is_not_forbidden_ground(tmp_path):
     assert line["reason"] == "inside worktree/tmp_roots"
     assert policy._completion_fn.calls == 0
 
+
+def test_own_scratch_dir_is_once_and_the_other_agents_are_forbidden(tmp_path):
+    """KC-59: the scratch dir is per agent. This agent's own ``<tmp_root>/<agent>/``
+    is a mechanical `once`; another agent's dir is a mechanical `forbidden` —
+    neither spends a gate call, so a write into a sibling's dir is settled by
+    geometry and cannot be approved by an exhausted reviewer."""
+    sb = Sandbox(tmp_path, ["agent-a", "agent-b"])
+    tmp_root = tmp_path / "tmp"
+    cfg = make_config(["agent-a", "agent-b"], tmp_roots=(str(tmp_root) + "/*",))
+
+    decisions = []
+    for target, want_reply in ((str(tmp_root / "agent-a") + "/*", "once"),
+                               (str(tmp_root / "agent-b") + "/*", "reject")):
+        policy = make_policy(cfg, "allow")
+        with _BenchFake({"turns": [_permission_turn(work_ready, [target])]}) as fake:
+            run = Harness(sb, fake, cfg, policy=policy).go()
+            (replied,) = fake.events_of("permission.replied")
+        _assert_ready(run, sb.ws("agent-a"))
+        assert replied["properties"]["reply"] == want_reply
+        decisions.append(_jsonl(sb.out_dir / "agent-a" / "decisions.jsonl")[-1])
+        assert policy._completion_fn.calls == 0
+
+    assert decisions[0]["layer"] == "mechanical"
+    assert decisions[0]["reason"] == "inside worktree/tmp_roots"
+    assert decisions[1]["layer"] == "mechanical"
+    assert "forbidden" in decisions[1]["reason"]
+    assert str(tmp_root / "agent-b") in decisions[1]["reason"]
+
+
+def test_the_prompt_sent_to_the_agent_names_its_own_scratch_dir(tmp_path):
+    """KC-59: the runner derives the dir from `tmp_roots` and the agent's name —
+    no path is named in the runner's code, and no other agent's dir is offered."""
+    tmp_root = tmp_path / "tmp"
+    cfg = make_config(["agent-a"], tmp_roots=(str(tmp_root) + "/*",))
+    scenario = {"turns": [{"on_prompt": work_ready, "events": ["busy", "idle"]}]}
+    sb, fake, _h, run, _ = _run_one(tmp_path, scenario, cfg)
+    _assert_ready(run, sb.ws("agent-a"))
+    (_sid, text), = _prompts(fake)
+    assert "scratch dir is " + str(tmp_root / "agent-a") in text
+    assert str(tmp_root / "agent-b") not in text
+
+
+def test_round_prompt_names_the_scratch_dir_and_stays_unchanged_without_one(tmp_path):
+    """KC-59: the sentence is appended when the round derived a dir, and the text
+    without one is byte-identical to today's — an absent `tmp_roots` key must not
+    change what the agent is told."""
+    base = round_prompt("zeta-9", tmp_path / "45-x.md", "abc1234")
+    named = round_prompt("zeta-9", tmp_path / "45-x.md", "abc1234", tmp_dir="/tmp/kilo/zeta-9")
+    assert named.startswith(base)
+    assert "scratch dir is /tmp/kilo/zeta-9" in named
+
+    a = round_prompt("agent-a", tmp_path / "45-x.md", "abc1234", tmp_dir="/tmp/kilo/agent-a")
+    b = round_prompt("agent-b", tmp_path / "45-x.md", "abc1234", tmp_dir="/tmp/kilo/agent-b")
+    assert "scratch dir is /tmp/kilo/agent-a" in a and "/tmp/kilo/agent-b" not in a
+    assert "scratch dir is /tmp/kilo/agent-b" in b and "/tmp/kilo/agent-a" not in b
+
+
+def test_a_round_without_tmp_roots_keeps_the_prompt_and_runs(tmp_path):
+    """KC-59 fail-open: no ``tmp_roots``, or only malformed values, degrades to "no
+    scratch dir" — the agent gets today's prompt byte for byte and nothing raises
+    into the round."""
+    scenario = {"turns": [{"on_prompt": work_ready, "events": ["busy", "idle"]}]}
+    cases = [("empty", {"tmp_roots": ()}),
+             ("malformed", {"tmp_roots": (None, "", "not-a-path", 42)})]
+    for label, over in cases:
+        cfg = make_config(["agent-a"], **over)
+        sb, fake, _h, run, _ = _run_one(tmp_path / label, scenario, cfg)
+        _assert_ready(run, sb.ws("agent-a"))
+        (_sid, text), = _prompts(fake)
+        assert text == round_prompt("agent-a", sb.ticket_path, sb.base_sha)
+        assert "scratch dir is" not in text
 
 def test_three_questions_in_one_turn_stall_and_abort(tmp_path):
     scenario = {"turns": [{"on_prompt": work_ready, "events": ["busy"], "questions": 3, "delay": 0.5}]}
@@ -2099,7 +2180,8 @@ def test_a_context_cut_off_on_a_clean_tree_opens_a_fresh_session(tmp_path, monke
         "turns": [{"events": ["busy", "idle"], "message_info": _CONTEXT_CUT}],
         "turns_after": [{"on_prompt": work_ready, "events": ["busy", "idle"]}],
     }
-    sb, fake, _h, run = _run_cut_one(tmp_path, scenario)
+    cfg = _cut_config()
+    sb, fake, _h, run = _run_cut_one(tmp_path, scenario, config=cfg)
     ws = sb.ws("agent-a")
     _assert_ready(run, ws)
     assert run.attempt == 0
@@ -2109,7 +2191,8 @@ def test_a_context_cut_off_on_a_clean_tree_opens_a_fresh_session(tmp_path, monke
     assert run.session_id == fresh_session.id
     (sid1, _first), (sid2, second) = _prompts(fake)
     assert sid1 == old_session.id and sid2 == fresh_session.id
-    assert second == round_prompt("agent-a", sb.ticket_path, ws.base_sha)
+    assert second == round_prompt("agent-a", sb.ticket_path, ws.base_sha,
+                                  tmp_dir=_scratch_arg(cfg))
     assert len(counts) == 1
     (t0, t1) = _jsonl(sb.out_dir / "agent-a" / "turns.jsonl")
     assert t0["cut_off"] == "context" and "harvest" not in t0
@@ -2125,12 +2208,14 @@ def test_a_context_cut_off_on_a_dirty_tree_carries_the_dirty_paragraph(tmp_path)
                    "message_info": _CONTEXT_CUT}],
         "turns_after": [{"on_prompt": work_ready, "events": ["busy", "idle"]}],
     }
-    sb, fake, _h, run = _run_cut_one(tmp_path, scenario)
+    cfg = _cut_config()
+    sb, fake, _h, run = _run_cut_one(tmp_path, scenario, config=cfg)
     ws = sb.ws("agent-a")
     _assert_ready(run, ws)
     (sid1, _first), (sid2, second) = _prompts(fake)
     assert sid1 != sid2
-    assert second.startswith(round_prompt("agent-a", sb.ticket_path, ws.base_sha))
+    assert second.startswith(round_prompt("agent-a", sb.ticket_path, ws.base_sha,
+                                          tmp_dir=_scratch_arg(cfg)))
     assert "pkg/thing.py" in second and "uncommitted" in second
     assert run.turns[0]["cut_off"] == "context"
 
@@ -2854,7 +2939,7 @@ def test_resume_with_max_continues_zero_sends_the_plain_prompt(tmp_path, monkeyp
     cfg = make_config(["agent-a"], max_continues_per_attempt=0)
     work_edit_no_commit(str(sb.ws("agent-a").path), "")
     first = _resumed_first_prompt(sb, cfg)
-    assert first == round_prompt("agent-a", sb.ticket_path, sb.base_sha)
+    assert first == round_prompt("agent-a", sb.ticket_path, sb.base_sha, tmp_dir=_scratch_arg(cfg))
     assert tree_reads == []
 
 
@@ -2862,7 +2947,8 @@ def test_resume_into_a_clean_worktree_keeps_the_prompt_exactly(tmp_path):
     sb = Sandbox(tmp_path)
     cfg = make_config(["agent-a"])
     _work(str(sb.ws("agent-a").path), test=False)       # committed, no test: REWORK, tree clean
-    assert _resumed_first_prompt(sb, cfg) == round_prompt("agent-a", sb.ticket_path, sb.base_sha)
+    assert _resumed_first_prompt(sb, cfg) == round_prompt(
+        "agent-a", sb.ticket_path, sb.base_sha, tmp_dir=_scratch_arg(cfg))
 
 
 def test_resume_with_a_commit_under_the_dirty_tree_keeps_the_plain_prompt(tmp_path):
@@ -2870,7 +2956,8 @@ def test_resume_with_a_commit_under_the_dirty_tree_keeps_the_plain_prompt(tmp_pa
     sb = Sandbox(tmp_path)
     cfg = make_config(["agent-a"])
     work_commit_and_leave_a_stray_file(str(sb.ws("agent-a").path), "")
-    assert _resumed_first_prompt(sb, cfg) == round_prompt("agent-a", sb.ticket_path, sb.base_sha)
+    assert _resumed_first_prompt(sb, cfg) == round_prompt(
+        "agent-a", sb.ticket_path, sb.base_sha, tmp_dir=_scratch_arg(cfg))
 
 
 def test_a_dirty_tree_above_a_commit_is_harvested_not_continued(tmp_path, monkeypatch):
@@ -2890,9 +2977,11 @@ def test_a_fresh_round_reads_no_tree_and_its_prompt_is_exactly_round_prompt(tmp_
     fresh run that commits on its first turn costs no `git status` at all."""
     tree_reads = _watch_tree_reads(monkeypatch)
     scenario = {"turns": [{"on_prompt": work_ready, "events": ["busy", "idle"]}]}
-    sb, fake, _h, _run, _ = _run_one(tmp_path, scenario)
+    cfg = make_config(["agent-a"])
+    sb, fake, _h, _run, _ = _run_one(tmp_path, scenario, cfg)
     (_sid, text), = _prompts(fake)
-    assert text == round_prompt("agent-a", sb.ticket_path, sb.base_sha)
+    assert text == round_prompt("agent-a", sb.ticket_path, sb.base_sha,
+                                tmp_dir=_scratch_arg(cfg))
     assert tree_reads == []
 
 

@@ -837,6 +837,32 @@ def test_variant_key_defaults_to_highest_and_parses(tmp_path):
         assert load_roster(ini).variant == want
 
 
+def test_workspace_kind_defaults_to_clone_and_parses(tmp_path):
+    """KC-59: `[contest] workspace_kind` — `clone` when absent or empty, as written
+    otherwise, and one of `WORKSPACE_KINDS` always."""
+    assert "workspace_kind" in CONTEST_KEYS
+    assert ContestConfig().workspace_kind == "clone"
+    for value, want in (("clone", "clone"), ("worktree", "worktree")):
+        ini = write_ini(tmp_path, add_to_contest(MINIMAL, f"workspace_kind = {value}"),
+                        f"wk_{value}.ini")
+        assert load_roster(ini).workspace_kind == want
+    # absent, and present but empty: the documented default
+    assert load_roster(write_ini(tmp_path, MINIMAL)).workspace_kind == "clone"
+    for i in range(2):
+        ini = write_ini(tmp_path,
+                        "[contest]\nworkspace_kind =\n[contest.agent.a]\nmodel = kenary/a:free\n",
+                        f"wk_empty_{i}.ini")
+        assert load_roster(ini).workspace_kind == "clone"
+
+
+def test_workspace_kind_refuses_a_value_that_is_not_a_kind(tmp_path):
+    """A typo is found at load time, naming the key — as `backend` does."""
+    ini = write_ini(tmp_path, add_to_contest(MINIMAL, "workspace_kind = clne"), "wk_bad.ini")
+    with pytest.raises(RosterError, match=r"\[contest\] workspace_kind must be one of "
+                                          r"clone \| worktree, got 'clne'"):
+        load_roster(ini)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # KC-55: the gate's retry budget
 # ─────────────────────────────────────────────────────────────────────────────

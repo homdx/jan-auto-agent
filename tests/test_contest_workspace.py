@@ -17,6 +17,14 @@ adds the refusal: a worktree holding commits above the base or edits outside
 ``--resume``.
 
 Knowledge label: KC-4 regression test.
+
+KC-59: the KC-4/KC-23 coverage below pins ``workspace_kind = worktree`` — the
+pre-KC-59 path — on purpose, and the last section of this file pins the new
+default: a fresh local clone per agent, with its own ``refs/stash`` (so one
+agent's ``git stash pop`` cannot take another agent's work), its push URL cut,
+KC-23's reuse rules, the round's cleanup, a ``<tmp_root>/<agent>/`` scratch dir,
+and the harvest and the ``format-patch`` of a clone matching those of a worktree
+at the same commit.
 """
 
 from __future__ import annotations
@@ -31,13 +39,20 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in __import__("sys").path:
     __import__("sys").path.insert(0, str(REPO_ROOT))
 
+from tools.contest.harvest import harvest
 from tools.contest.roster import ContestConfig
 from tools.contest.workspace import (
+    Workspace,
     WorkspaceError,
+    agent_tmp_dir,
+    agent_tmp_dirs,
+    agent_tmp_globs,
     attach_clone,
     prepare_round,
     remove_round,
+    reset_clone,
     reset_worktree,
+    tmp_root_dirs,
 )
 
 
@@ -79,21 +94,37 @@ def repo(tmp_path):
     return _make_repo(tmp_path)
 
 
-@pytest.fixture
-def config(tmp_path):
-    """Config whose rounds_dir is a fresh dir under tmp_path, two agents."""
-    rounds = tmp_path / "rounds"
-    rounds.mkdir()
-
+def _cfg(tmp_path: Path, **over) -> ContestConfig:
+    """Two agents against a fresh rounds_dir; KC-59's clone default unless overridden."""
     from tools.contest.roster import AgentSpec
 
-    return ContestConfig(
+    rounds = tmp_path / "rounds"
+    rounds.mkdir(exist_ok=True)
+    kw = dict(
         rounds_dir=str(rounds),
         agents=(
             AgentSpec(name="laguna", provider_id="kenary", model_id="hy3:free"),
             AgentSpec(name="hy3", provider_id="kenary", model_id="hy3:free"),
         ),
     )
+    kw.update(over)
+    return ContestConfig(**kw)
+
+
+@pytest.fixture
+def config(tmp_path):
+    """Config whose rounds_dir is a fresh dir under tmp_path, two agents.
+
+    KC-59: ``workspace_kind`` defaults to ``clone``, so the KC-4/KC-23 coverage
+    below names ``worktree`` — the pre-KC-59 path — on purpose; the clone path
+    is the tests at the end of this file."""
+    return _cfg(tmp_path, workspace_kind="worktree")
+
+
+@pytest.fixture
+def clone_config(tmp_path):
+    """The KC-59 default: a clone per agent, scratch dirs under ``tmp_path/tmp``."""
+    return _cfg(tmp_path, tmp_roots=(str(tmp_path / "tmp") + "/*",))
 
 
 def _base_sha(repo: Path) -> str:
@@ -446,3 +477,305 @@ def test_reset_worktree_prunes_a_registration_whose_folder_was_removed(repo, con
     assert _git(ws2.path, "rev-parse", "HEAD").strip() == base
     assert _git(ws2.path, "status", "--porcelain").strip() == ""
     assert "prunable" not in _git(repo, "worktree", "list")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KC-59: a clone per agent, and a scratch dir per agent
+# ─────────────────────────────────────────────────────────────────────────────
+
+_BRIDGE_SRC = (
+    "class CollectBridge:\n"
+    "    def _shrink(self, text):\n"
+    "        return text[:10]\n"
+)
+
+_TICKET = (
+    "# R1 — probe the bridge\n"
+    "\n"
+    "**File:** `tools/auto/probe.py`\n"
+    "\n"
+    "**Also touches:** `tests/test_probe.py`\n"
+)
+
+
+def _harvest_repo(tmp_path: Path) -> tuple[Path, str, Path]:
+    """A temp repo with the bridge, a probe module, a test and one open ticket."""
+    repo = tmp_path / "hrepo"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "kc59@example.invalid")
+    _git(repo, "config", "user.name", "KC59")
+    (repo / "tools" / "auto").mkdir(parents=True)
+    (repo / "tools" / "auto" / "collect_bridge.py").write_text(_BRIDGE_SRC, encoding="utf-8")
+    (repo / "tools" / "auto" / "probe.py").write_text("PROBE = 1\n", encoding="utf-8")
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_base.py").write_text(
+        "def test_base():\n    assert True\n", encoding="utf-8")
+    (repo / "epic-tasks").mkdir()
+    (repo / "epic-tasks" / "01-r1.md").write_text(_TICKET, encoding="utf-8")
+    (repo / ".gitignore").write_text("runs/\n", encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "base")
+    return repo, _git(repo, "rev-parse", "HEAD").strip(), repo / "epic-tasks" / "01-r1.md"
+
+
+def _record(ws, ticket: str, commit: str, outcome: str = "FIXED") -> None:
+    """Append one PROGRESS.csv row, the way `append_task.py` does."""
+    import csv
+
+    ws.progress_csv.parent.mkdir(parents=True, exist_ok=True)
+    with open(ws.progress_csv, "a", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=["ticket", "finding", "outcome", "commit", "note"])
+        if ws.progress_csv.stat().st_size == 0:
+            writer.writeheader()
+        writer.writerow({"ticket": ticket, "finding": "", "outcome": outcome,
+                         "commit": commit, "note": ""})
+
+
+def _format_patch(path: Path, base: str) -> str:
+    proc = subprocess.run(
+        ["git", "-C", str(path), "format-patch", "--stdout", f"{base}..HEAD"],
+        capture_output=True, text=True,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return proc.stdout.strip()
+
+
+def test_prepare_round_defaults_to_a_clone_per_agent(repo, clone_config):
+    """KC-59: the default is a fresh local clone, so the repo's worktree list and
+    the repo's own refs are untouched by the round."""
+    base = _base_sha(repo)
+    wss = prepare_round(repo, clone_config, 40, base)
+
+    assert len(wss) == 2
+    for ws in wss:
+        assert ws.kind == "clone"
+        assert (ws.path / ".git").is_dir()          # a real clone, not a worktree
+        assert _git(ws.path, "rev-parse", "HEAD").strip() == base
+        assert _git(ws.path, "rev-parse", "--abbrev-ref", "HEAD").strip() == ws.branch
+        assert ws.branch == f"contest/40/{ws.agent}"
+        assert _git(ws.path, "status", "--porcelain").strip() == ""
+        assert not list((ws.path / "runs" / ws.agent).iterdir())
+    # the repo holds no worktree of the round and no branch of it
+    assert _git(repo, "worktree", "list", "--porcelain").count("worktree ") == 1
+    assert _git(repo, "branch", "--list", "contest/40/*").strip() == ""
+
+
+def test_two_clones_have_independent_stash_stacks(repo, clone_config):
+    """KC-59, the round 103 failure. A worktree pair shares the repo's single
+    ``refs/stash``, so a ``git stash push`` in one and a ``git stash pop`` in the
+    other pop the first agent's work off into the second's tree. Two clones each
+    have their own stack, so the second clone has nothing to pop."""
+    base = _base_sha(repo)
+    laguna, hy3 = prepare_round(repo, clone_config, 40, base)
+
+    (laguna.path / "readme.txt").write_text("laguna's wip\n")
+    _git(laguna.path, "stash", "push", "-m", "laguna-wip", "--", "readme.txt")
+    laguna_stash = _git(laguna.path, "stash", "list")
+    assert "laguna-wip" in laguna_stash
+    assert _git(laguna.path, "status", "--porcelain").strip() == ""
+
+    pop = subprocess.run(["git", "-C", str(hy3.path), "stash", "pop"],
+                         capture_output=True, text=True)
+    assert pop.returncode != 0
+    assert "No stash entries found" in (pop.stdout + pop.stderr)
+    # laguna's entry is still on its own stack, and hy3's tree is untouched
+    assert "laguna-wip" in _git(laguna.path, "stash", "list")
+    assert _git(hy3.path, "status", "--porcelain").strip() == ""
+    assert _git(hy3.path, "rev-parse", "HEAD").strip() == base
+
+
+def test_clone_push_url_is_disabled_and_nothing_reaches_the_origin(repo, clone_config):
+    """KC-59: a push fails in git itself, whatever the policy answers, and the
+    operator's repo gains no ref. The fetch URL is untouched, so the operator
+    still lands with ``git fetch <clone> contest/<NN>/<agent>``."""
+    base = _base_sha(repo)
+    laguna, _ = prepare_round(repo, clone_config, 40, base)
+
+    assert _git(laguna.path, "config", "--get",
+                "remote.origin.pushurl").strip() == "DISABLED"
+    assert _git(laguna.path, "config", "--get", "remote.origin.url").strip() == str(repo.resolve())
+
+    (laguna.path / "thing.py").write_text("42\n")
+    _git(laguna.path, "add", "thing.py")
+    _git(laguna.path, "commit", "-q", "-m", "KC-59: thing")
+    branch_sha = _git(laguna.path, "rev-parse", "HEAD")
+
+    push = subprocess.run(["git", "-C", str(laguna.path), "push", "origin", "HEAD"],
+                          capture_output=True, text=True)
+    assert push.returncode != 0
+    assert "DISABLED" in (push.stdout + push.stderr)
+    # the operator's repo has no ref to the branch and no commit but its own
+    check = subprocess.run(["git", "-C", str(repo), "rev-parse", "--verify", "--quiet",
+                            "refs/heads/contest/40/laguna"],
+                           capture_output=True, text=True)
+    assert check.returncode != 0 and check.stdout.strip() == ""
+    assert branch_sha not in _git(repo, "rev-list", "--all")
+
+
+def test_workspace_kind_worktree_keeps_a_worktree(repo, clone_config):
+    """KC-59's escape hatch: ``workspace_kind = worktree`` is the pre-KC-59
+    path — a worktree registered with the repo, its branch in the repo."""
+    cfg = _cfg(Path(clone_config.rounds_dir).parent, workspace_kind="worktree")
+    base = _base_sha(repo)
+    wss = prepare_round(repo, cfg, 41, base)
+
+    for ws in wss:
+        assert ws.kind == "worktree"
+        assert not (ws.path / ".git").is_dir()
+    listed = _git(repo, "worktree", "list", "--porcelain")
+    assert listed.count("worktree ") == 3
+    assert _git(repo, "branch", "--list", "contest/41/*").strip() != ""
+    # a worktree keeps no push URL of its own — KC-59's clone is what cuts it
+    assert _git(repo, "branch", "-r", "--list").strip() == ""
+
+
+def test_prepare_round_refuses_a_clone_with_a_commit_above_the_base(repo, clone_config):
+    """KC-23's rules apply to a clone: a reset that would drop the commit is
+    refused without ``force`` and the operator's ``--fresh`` discards it."""
+    base = _base_sha(repo)
+    laguna = next(ws for ws in prepare_round(repo, clone_config, 40, base)
+                  if ws.agent == "laguna")
+    (laguna.path / "thing.py").write_text("42\n")
+    _git(laguna.path, "add", "thing.py")
+    _git(laguna.path, "commit", "-q", "-m", "KC-23: thing")
+    assert _git(laguna.path, "rev-list", "--count", f"{base}..HEAD").strip() == "1"
+
+    with pytest.raises(WorkspaceError) as excinfo:
+        prepare_round(repo, clone_config, 40, base)
+    message = str(excinfo.value)
+    assert str(laguna.path) in message
+    assert "1 commit" in message
+    assert "--fresh" in message and "--resume" in message
+    assert "contest-out/40/state.json" in message
+    assert _git(laguna.path, "rev-list", "--count", f"{base}..HEAD").strip() == "1"
+
+    wss = prepare_round(repo, clone_config, 40, base, force=True)
+    laguna2 = next(ws for ws in wss if ws.agent == "laguna")
+    assert laguna2.kind == "clone"
+    assert _git(laguna2.path, "rev-parse", "HEAD").strip() == base
+    assert not (laguna2.path / "thing.py").exists()
+    assert _git(laguna2.path, "status", "--porcelain").strip() == ""
+    assert _git(laguna2.path, "config", "--get",
+                "remote.origin.pushurl").strip() == "DISABLED"
+
+
+def test_prepare_round_resets_a_clone_from_a_previous_base(repo, clone_config):
+    """The base moved on after the clone was made: the clone's objects are a copy,
+    not a live link, so the reset fetches them and still lands back on the base."""
+    base = _base_sha(repo)
+    prepare_round(repo, clone_config, 40, base)
+
+    (repo / "readme.txt").write_text("r2\n")
+    _git(repo, "add", "readme.txt")
+    _git(repo, "commit", "-q", "-m", "r2")
+    new_base = _git(repo, "rev-parse", "HEAD").strip()
+
+    wss = prepare_round(repo, clone_config, 40, new_base)
+    for ws in wss:
+        assert _git(ws.path, "rev-parse", "HEAD").strip() == new_base
+        assert (ws.path / "readme.txt").read_text() == "r2\n"
+        assert _git(ws.path, "status", "--porcelain").strip() == ""
+
+
+def test_prepare_round_refuses_a_clone_it_does_not_own(repo, clone_config):
+    """A folder at the checkout path that is not ours is refused and left
+    untouched, and an empty folder a crashed clone left behind is replaced."""
+    base = _base_sha(repo)
+    foreign = Path(clone_config.rounds_dir) / "40-laguna"
+    foreign.mkdir(parents=True)
+    foreign.joinpath("i-was-here.txt").write_text("mine\n")
+
+    with pytest.raises(WorkspaceError, match="not a git clone"):
+        prepare_round(repo, clone_config, 40, base)
+    assert foreign.joinpath("i-was-here.txt").exists()
+
+    # the empty-folder half, straight on reset_clone: the folder goes, the clone comes back
+    shutil.rmtree(foreign)
+    foreign.mkdir()
+    ws = reset_clone(repo, clone_config.rounds_dir, 40, "laguna", base)
+    assert ws.kind == "clone"
+    assert _git(ws.path, "rev-parse", "HEAD").strip() == base
+
+
+def test_remove_round_removes_the_rounds_clones(repo, clone_config):
+    """KC-59: ``git worktree remove`` cannot see a clone, so the round's cleanup
+    takes the folder — a clone whose origin is not the repo would be left alone."""
+    base = _base_sha(repo)
+    wss = prepare_round(repo, clone_config, 40, base)
+    assert all(ws.path.is_dir() for ws in wss)
+
+    remove_round(repo, clone_config, 40)
+    for ws in wss:
+        assert not ws.path.exists()
+    assert _git(repo, "branch", "--list", "contest/40/*").strip() == ""
+
+
+def test_prepare_round_makes_a_scratch_dir_per_agent(repo, clone_config):
+    """KC-59: the scratch dir is ``<tmp_root>/<agent>/``, created at round start,
+    one per agent, and the policy's globs for one agent are its own only."""
+    base = _base_sha(repo)
+    prepare_round(repo, clone_config, 40, base)
+
+    laguna_dir = agent_tmp_dir(clone_config.tmp_roots, "laguna")
+    hy3_dir = agent_tmp_dir(clone_config.tmp_roots, "hy3")
+    assert laguna_dir != hy3_dir
+    assert laguna_dir.is_dir() and hy3_dir.is_dir()
+    assert str(laguna_dir.parent) in clone_config.tmp_roots[0]
+    assert agent_tmp_globs(clone_config.tmp_roots, "laguna") == (str(laguna_dir) + "/*",)
+
+
+def test_scratch_helpers_fail_open(tmp_path):
+    """No ``tmp_roots``, a malformed glob or a non-string agent degrades to "no
+    scratch dir" and never raises — an absent config key is not a round."""
+    assert tmp_root_dirs(()) == ()
+    assert tmp_root_dirs(None) == ()
+    assert tmp_root_dirs(("not-a-path", 42, None, "", "   ")) == ()
+    assert agent_tmp_dir((), "laguna") is None
+    assert agent_tmp_globs((), "laguna") == ()
+    assert agent_tmp_dirs((), ("laguna",)) == ()
+    assert agent_tmp_dir(("not-a-path",), "laguna") is None
+    assert agent_tmp_dir(("  ",), "") is None and agent_tmp_dir(("  ",), None) is None
+    roots = tmp_root_dirs((str(tmp_path / "tmp") + "/*",))
+    assert roots == (tmp_path / "tmp",)
+    # only an absolute or ~-absolute root derives a scratch dir: a relative one
+    # would make the agent's dir depend on the runner's cwd
+    assert tmp_root_dirs(("scratch/*", "./scratch/*", "../scratch/*")) == ()
+    assert agent_tmp_globs(("scratch/*",), "laguna") == ()
+    assert tmp_root_dirs(("~/scratch/*",)) == (Path.home() / "scratch",)
+    assert agent_tmp_dir(("~/scratch/*",), "laguna") == Path.home() / "scratch" / "laguna"
+
+
+def test_harvest_and_format_patch_of_a_clone_match_a_worktree_at_the_same_commit(tmp_path):
+    """KC-59: the harvest and the export read only the workspace path, so a clone
+    and a worktree at the same commit get the same verdict, the same reasons and
+    the same patch."""
+    repo, base, ticket = _harvest_repo(tmp_path)
+    rounds = tmp_path / "rounds"
+    branch = "contest/40/laguna"
+
+    # the round's own default: the commit is made in a clone
+    clone = prepare_round(repo, _cfg(tmp_path, rounds_dir=str(rounds)), 40, base)[0]
+    assert clone.kind == "clone"
+    (clone.path / "tools" / "auto" / "probe.py").write_text("PROBE = 2\n")
+    (clone.path / "tests" / "test_probe.py").write_text("def test_probe():\n    assert True\n")
+    _git(clone.path, "add", "-A")
+    _git(clone.path, "commit", "-q", "-m", "KC-59: probe")
+    sha = _git(clone.path, "rev-parse", "HEAD").strip()
+    _record(clone, "01-r1.md", sha)
+
+    # the same commit in a worktree, landed the way an operator fetches it
+    _git(repo, "fetch", "-q", str(clone.path), f"refs/heads/{branch}")
+    wt_dir = rounds / "wt-laguna"
+    _git(repo, "worktree", "add", "-q", "--detach", str(wt_dir), sha)
+    wt = Workspace(agent="laguna", path=wt_dir.resolve(), branch=branch,
+                   base_sha=base, kind="worktree")
+    _record(wt, "01-r1.md", sha)
+
+    h_clone = harvest(clone, ticket)
+    h_worktree = harvest(wt, ticket)
+    assert h_clone.verdict == "READY" == h_worktree.verdict
+    assert [r.code for r in h_clone.reasons] == [r.code for r in h_worktree.reasons]
+    assert h_clone.commit == sha
+    assert _format_patch(clone.path, base) == _format_patch(wt.path, base)
+    assert _format_patch(clone.path, base).startswith("From " + sha)

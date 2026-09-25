@@ -58,6 +58,7 @@ __all__ = [
     "BASE_RULES",
     "CONTEST_KEYS",
     "BACKENDS",
+    "WORKSPACE_KINDS",
     "DEFAULTS",
     "DEFAULTS_GATE",
     "DEFAULTS_OPENROUTER",
@@ -103,6 +104,7 @@ CONTEST_KEYS = (
     "gate_deadline_sec",
     "out_dir",
     "rounds_dir",
+    "workspace_kind",
     "variant",
 )
 
@@ -157,6 +159,13 @@ BACKENDS = ("kilo", "openrouter")
 
 #: ``[a-z0-9][a-z0-9_-]*`` — an agent name becomes a branch and a folder.
 _NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
+
+#: The values ``[contest] workspace_kind =`` accepts. ``clone`` is the default
+#: since KC-59: a local clone has its own ``refs/stash``, index, ``HEAD`` and
+#: branches, so one agent's ``git stash`` can never pop another agent's work
+#: off the stack the repo's worktrees share. ``worktree`` is the pre-KC-59
+#: behaviour, kept for anyone who needs it.
+WORKSPACE_KINDS = ("clone", "worktree")
 
 #: ``${NAME}`` in a value: expanded from the environment.
 _ENV_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
@@ -255,6 +264,10 @@ class ContestConfig:
     gate_deadline_sec: float = 600.0
     out_dir: str = "contest-out"
     rounds_dir: str = "../rounds"
+    #: KC-59: how ``prepare_round`` builds each agent's checkout — one of
+    #: ``WORKSPACE_KINDS``. ``clone`` (the default) makes a fresh local clone
+    #: per agent, ``worktree`` keeps the pre-KC-59 worktree per agent.
+    workspace_kind: str = "clone"
     #: KC-49: the reasoning variant of every agent that names none — a name
     #: (``high``, ``max``), ``highest`` (the top one that answers, probed at
     #: intake) or ``default`` (no variant sent: the provider's own default).
@@ -473,6 +486,12 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
         raise RosterError(
             f"[contest] backend must be one of {' | '.join(BACKENDS)}, got {backend!r}")
 
+    workspace_kind = scalar("workspace_kind", "clone") or "clone"
+    if workspace_kind not in WORKSPACE_KINDS:
+        raise RosterError(
+            f"[contest] workspace_kind must be one of {' | '.join(WORKSPACE_KINDS)}, "
+            f"got {workspace_kind!r}")
+
     agents = _parse_agents(parser)
 
     gate_retries = limit("gate_retries", 3)
@@ -542,6 +561,7 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
         gate_deadline_sec=seconds("gate_deadline_sec", 600.0),
         out_dir=scalar("out_dir", "contest-out"),
         rounds_dir=scalar("rounds_dir", "../rounds"),
+        workspace_kind=workspace_kind,
         variant=scalar("variant", "highest") or "highest",
         agents=agents,
         gate_settings=settings,

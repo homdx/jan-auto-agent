@@ -102,6 +102,13 @@ runner's to end, and are never recorded as the agent's leftovers. The reap is
 fail-open: a `/proc` entry that vanishes mid-scan is skipped, and a `/proc` that
 is not there at all is one `WARNING` and an empty reap, never an exception into
 a round.
+
+KC-59 makes the scratch dir per agent: the round's `tmp_roots` globs stay in
+force, and each agent additionally gets `<tmp_root>/<agent>/`, created at round
+start by `workspace.ensure_agent_tmp_dirs` and named in its prompt. The other
+agents' dirs are on this agent's `forbidden`, so a write into one of them is a
+mechanical reject rather than a gate call — the same geometry rule that keeps a
+sibling worktree forbidden (KC-46).
 """
 
 from __future__ import annotations
@@ -128,7 +135,12 @@ from tools.contest.harvest import harvest, rework_message
 from tools.contest.kilo_client import AGENT_TEST_TIMEOUT_MS, SessionRef
 from tools.contest.policy import HARD_DENYLIST, Policy, PolicyContext
 from tools.contest.roster import AgentSpec, ContestConfig
-from tools.contest.workspace import Workspace
+from tools.contest.workspace import (
+    Workspace,
+    agent_tmp_dir,
+    agent_tmp_dirs,
+    agent_tmp_globs,
+)
 from tools.git_run import run_git
 
 __all__ = ["AgentRun", "AgentState", "RoundState", "round_prompt", "run_agent", "run_round"]
@@ -727,19 +739,34 @@ rejection is final for that command — do not retry it.
 """
 
 
-def round_prompt(agent_name: str, ticket_path: Path, base_sha: str, *, dirty: str = "") -> str:
+#: KC-59: the sentence appended when the round derived a scratch dir for the
+#: agent — ``<tmp_root>/<agent>/``, the one place outside the worktree the
+#: policy lets it write and no other agent's. ``{tmp_dir}`` is that dir; an
+#: empty *tmp_dir* appends nothing, so a prompt without one is today's text.
+_SCRATCH_DIR_NOTE = (
+    "\n\nYour scratch dir is {tmp_dir} — put temporary files there. The policy "
+    "allows that dir and not the other agents'."
+)
+
+
+def round_prompt(agent_name: str, ticket_path: Path, base_sha: str, *, dirty: str = "",
+                 tmp_dir: str = "") -> str:
     """The runbook's prompt for *agent_name*, plus the base sha and the permission rule.
 
     The ticket is not repeated: the session reads it from its own worktree via
     `next_task.py`, so *ticket_path* is accepted for the caller's clarity only.
-    When *dirty* is non-empty (a `--resume` into a worktree that still holds
-    uncommitted work, KC-22), the `continue_message` paragraph is appended so the
-    fresh session learns of the work on its first prompt — every existing caller
-    passes no *dirty* and gets the unchanged text.
+    When *tmp_dir* is non-empty (KC-59), the sentence that names the agent's own
+    scratch dir is appended first; when *dirty* is non-empty (a `--resume` into a
+    worktree that still holds uncommitted work, KC-22), the `continue_message`
+    paragraph is appended after it so the fresh session learns of the work on its
+    first prompt — every existing caller passes neither and gets the unchanged
+    text.
     """
     del ticket_path
     text = _PROMPT.format(name=agent_name, base_sha=base_sha,
                           test_timeout_ms=AGENT_TEST_TIMEOUT_MS)
+    if tmp_dir:
+        text = text + _SCRATCH_DIR_NOTE.format(tmp_dir=tmp_dir)
     if dirty:
         text = text + "\n\n" + continue_message(dirty)
     return text
@@ -1321,6 +1348,17 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
     out_dir = Path(out_dir)
     ws, spec = run.workspace, run.agent
     agent_dir = out_dir / spec.name
+    # KC-59: the scratch dir is per agent. This agent's own dir is allowed and
+    # named in its prompt; the other agents' dirs are forbidden ground for it, so
+    # a write into one of them is a mechanical reject rather than a gate call.
+    # `getattr` for both: a config without a `tmp_roots` key degrades to "no
+    # scratch dir" instead of raising into a round.
+    tmp_roots = getattr(config, "tmp_roots", ()) or ()
+    scratch_dir = agent_tmp_dir(tmp_roots, spec.name)
+    scratch_arg = str(scratch_dir) if scratch_dir is not None else ""
+    scratch_others = tuple(
+        d for d in agent_tmp_dirs(tmp_roots, config.agents) if d.name != spec.name
+    )
     session: SessionRef | None = None
     stalled: list = []          # the reason, once the runner's stall edge fired
     questions_this_turn = [0]
@@ -1355,10 +1393,12 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         spent = run.permissions["gated"] + run.permissions["gate_failed"]
         ctx = PolicyContext(
             worktree=ws.path,
-            tmp_roots=tuple(config.tmp_roots),
+            # the round's globs plus this agent's own scratch dir (KC-59)
+            tmp_roots=tuple(tmp_roots) + agent_tmp_globs(tmp_roots, spec.name),
             # the rounds folder: this round's other worktrees and every earlier
-            # round's. The policy lets this agent's own worktree through (KC-46)
-            forbidden=tuple(HARD_DENYLIST) + (ws.path.parent,),
+            # round's, plus the other agents' scratch dirs. The policy lets this
+            # agent's own worktree through (KC-46)
+            forbidden=tuple(HARD_DENYLIST) + (ws.path.parent,) + scratch_others,
             ticket_title=Path(ticket_path).name,
             ticket_files=tuple(ticket_files),
             recent_tools=recent,
@@ -1412,7 +1452,8 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         run.turns.append(turn)
         _append_jsonl(agent_dir / "turns.jsonl", {"agent": spec.name, **turn})
         run.session_id = session.id
-        continue_text = round_prompt(spec.name, ticket_path, ws.base_sha, dirty=dirty)
+        continue_text = round_prompt(spec.name, ticket_path, ws.base_sha, dirty=dirty,
+                                     tmp_dir=scratch_arg)
         continue_used += 1
         return None
 
@@ -1448,10 +1489,11 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                 if dirty:
                     # KC-22, `--resume` into a worktree that still holds the
                     # work: the fresh session learns of it on its first prompt.
-                    text = round_prompt(spec.name, ticket_path, ws.base_sha, dirty=dirty)
+                    text = round_prompt(spec.name, ticket_path, ws.base_sha, dirty=dirty,
+                                        tmp_dir=scratch_arg)
                     run.dirty_on_resume = ""  # only the first prompt carries it
                 else:
-                    text = round_prompt(spec.name, ticket_path, ws.base_sha)
+                    text = round_prompt(spec.name, ticket_path, ws.base_sha, tmp_dir=scratch_arg)
             turn = {"kind": kind, "attempt": run.attempt, "sent_at": time.time()}
             if kind == "continue":
                 note = (f"attempt {run.attempt} (continue {continue_used} of "

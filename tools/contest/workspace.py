@@ -19,6 +19,24 @@ the work a worktree carries — commits above the base, or edits outside
 ``runs/`` — unless ``--fresh`` says to discard it; the message names ``--resume``
 for the other way out. The runbook's stage-5 cleanup is :func:`remove_round`.
 
+KC-59 makes the checkout a fresh local clone by default
+(``[contest] workspace_kind = clone``): a worktree is a second working tree of
+one repository, and every worktree shares that repository's single ``refs/stash``,
+so two agents that both ran "stash my change, run the tests, pop" popped each
+other's work (round 103: ``hy3``'s tree was, byte for byte, another agent's file,
+and ``hy3``'s own work survived only as an unreachable stash commit). A clone made
+by ``git clone --local`` costs about the same — the objects are hard links — and
+keeps its own ``refs/stash``, index, ``HEAD``, branches and config, so a ``git
+stash``, a ``git checkout`` and a ``git branch -D`` stay inside the agent. The
+clone's push URL is cut at the same time, so ``git push origin HEAD`` fails in git
+itself rather than in the LLM gate's prompt. The worktree path is unchanged and
+selectable with ``workspace_kind = worktree``.
+
+The round's scratch dir is per agent too: ``tmp_roots`` names the shared roots, and
+each agent gets ``<tmp_root>/<agent>/``, created at round start by
+:func:`ensure_agent_tmp_dirs`. Nothing in the runner names a path — the dir is
+derived here from the configured root and the agent's name.
+
 Standard library only (``subprocess``, ``pathlib``, ``shutil``), plus this
 repo's own ``tools.git_run`` for the git calls; it shells out to ``git`` exactly
 the way the runbook does.
@@ -26,6 +44,8 @@ the way the runbook does.
 
 from __future__ import annotations
 
+import logging
+import os
 import shutil
 import subprocess
 from dataclasses import dataclass
@@ -38,11 +58,19 @@ from tools.git_run import run_git
 __all__ = [
     "Workspace",
     "WorkspaceError",
+    "agent_tmp_dir",
+    "agent_tmp_dirs",
+    "agent_tmp_globs",
     "attach_clone",
+    "ensure_agent_tmp_dirs",
     "prepare_round",
     "remove_round",
+    "reset_clone",
     "reset_worktree",
+    "tmp_root_dirs",
 ]
+
+_log = logging.getLogger(__name__)
 
 #: The runbook's reason, repeated verbatim when ``epic-tasks/`` is not clean at
 #: the base — an untracked ``epic-tasks/`` is invisible inside a worktree.
@@ -169,8 +197,8 @@ def _branch_name(round_no: int, agent: str) -> str:
     return f"contest/{round_no:02d}/{agent}"
 
 
-def _worktree_path(rounds_dir: Path, round_no: int, agent: str) -> Path:
-    """``<rounds_dir>/<NN>-<agent>`` — the per-agent worktree path."""
+def _workspace_path(rounds_dir: Path, round_no: int, agent: str) -> Path:
+    """``<rounds_dir>/<NN>-<agent>`` — the per-agent checkout path, clone or worktree."""
     return rounds_dir / f"{round_no:02d}-{agent}"
 
 
@@ -296,7 +324,7 @@ def reset_worktree(
     one left behind by a moved base, reset as before.
     """
     root = _resolve_rounds_dir(repo, str(rounds_dir))
-    path = _worktree_path(root, round_no, agent)
+    path = _workspace_path(root, round_no, agent)
     branch = _branch_name(round_no, agent)
     owned = _worktree_paths(repo)
 
@@ -343,6 +371,230 @@ def reset_worktree(
     )
 
 
+def _clone_origin(clone: Path) -> str | None:
+    """The clone's ``origin`` URL, or ``None`` when the folder is not a clone.
+
+    ``None`` also for a folder that is not a git repository at all — a foreign
+    folder at the checkout path, or an empty one left by a crashed ``clone`` — and
+    for a *worktree* folder, whose ``.git`` is a file, not a directory: a worktree
+    would answer with its parent repo's ``origin`` and read as a clone.
+    """
+    if not (clone / ".git").is_dir():
+        return None
+    proc = _git(clone, ["config", "--get", "remote.origin.url"], check=False)
+    if proc.returncode != 0:
+        return None
+    origin = proc.stdout.strip()
+    return origin or None
+
+
+def _disable_push(clone: Path) -> None:
+    """Cut the clone's push URL, so ``git push origin …`` fails in git itself.
+
+    KC-59: today a push is refused only by the gate's prompt — a worktree pushing
+    writes the operator's own refs, and so would a clone with a live push URL.
+    ``remote.origin.pushurl = DISABLED`` makes the push fail in git itself,
+    whatever the policy answers, and leaves the fetch URL alone, so an operator's
+    ``git fetch <clone> contest/<NN>/<agent>`` and ``attach_clone``'s own
+    ``git fetch --all`` still work. Fail-open: a clone whose ``origin`` is gone
+    keeps its own settings rather than raising into a round.
+    """
+    try:
+        _git(clone, ["remote", "set-url", "--push", "origin", "DISABLED"], check=False)
+    except Exception as exc:  # noqa: BLE001 — the checkout is the round, not the push URL
+        _log.warning("could not disable pushing in %s: %s: %s", clone,
+                     type(exc).__name__, exc)
+
+
+def reset_clone(repo, rounds_dir, round_no: int, agent: str, base_sha: str,
+                *, force: bool = False) -> Workspace:
+    """A fresh, idempotent local clone for *agent* at *base_sha*.
+
+    Path ``<rounds_dir>/<NN>-<agent>``, branch ``contest/<NN>/<agent>``. Built
+    with ``git clone --local --no-checkout`` — the clone hard-links the repo's
+    objects, so it costs about what a worktree does — then checked out onto its
+    own branch at the base. KC-59: a clone has its own ``refs/stash``, index,
+    ``HEAD``, branches and config, so a ``git stash`` in this agent's checkout
+    can never pop another agent's work off the repo's shared worktree stack, and
+    its push URL is cut while the clone is ours to shape.
+
+    The reuse rules are KC-23's, exactly as for a worktree: a clone that holds
+    commits above *base_sha* or uncommitted edits outside ``runs/`` is refused
+    unless *force*; a clean clone at the base, and a clean one left behind by a
+    moved base, reset as before. ``runs/<agent>/`` is always emptied. A folder at
+    the path that is not a git clone, or a clone of a different repo, raises
+    rather than being deleted; an empty folder is removed and the clone rebuilt.
+    """
+    repo_path = Path(repo).resolve()
+    root = _resolve_rounds_dir(repo_path, str(rounds_dir))
+    path = _workspace_path(root, round_no, agent)
+    branch = _branch_name(round_no, agent)
+
+    if path.exists():
+        origin = _clone_origin(path)
+        if origin is None:
+            # not a clone: an empty folder a crashed clone left behind is ours to
+            # replace, anything else is refused rather than deleted
+            if any(path.iterdir()):
+                raise WorkspaceError(
+                    f"{path} exists but is not a git clone — refusing to delete a "
+                    f"folder this module did not create"
+                )
+            shutil.rmtree(path)
+        else:
+            try:
+                ours = Path(origin).resolve() == repo_path
+            except (OSError, RuntimeError):
+                ours = False
+            if not ours:
+                raise WorkspaceError(
+                    f"{path} is a clone of {origin}, not of {repo_path} — refusing "
+                    f"to reset a checkout this module did not create"
+                )
+            # the clone's objects are a copy, not a live link: a base the operator
+            # moved on to after the clone was made is not in it yet, so fetch
+            # before deciding what the clone carries — ``--local`` hard-links what
+            # is already there, so this is a handful of new objects at most
+            _git(path, ["fetch", "-q", "origin"])
+            if _rev_parse(path, f"{base_sha}^{{commit}}") is None:
+                raise WorkspaceError(
+                    f"clone {path} does not contain base sha {base_sha}, not even "
+                    f"after fetching origin — the base is not on any branch of "
+                    f"{repo_path}"
+                )
+            commits = _commits_above(path, base_sha)
+            dirty = _dirty_outside_runs(path)
+            if (commits or dirty) and not force:
+                raise _refuse_to_reset(path.resolve(), branch, round_no, commits, dirty)
+            # ``--fresh`` has already agreed to drop the edits; without ``-f`` a
+            # plain checkout keeps them and refuses outright when the new base
+            # changes the same file ("would be overwritten by checkout").
+            _git(path, ["checkout", *(["-f"] if force else []), "-B", branch, base_sha])
+    if not path.exists():
+        _git(repo_path, ["clone", "--local", "--no-checkout", "-q", str(repo_path),
+                         str(path)])
+        _git(path, ["checkout", "-q", "-B", branch, base_sha])
+
+    _disable_push(path)
+    _git(path, ["clean", "-fdx", "-e", "runs/"])
+    _empty_runs_dir(path, agent)
+
+    return Workspace(
+        agent=agent,
+        path=path.resolve(),
+        branch=branch,
+        base_sha=base_sha,
+        kind=_KIND_CLONE,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# the per-agent scratch dir
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def tmp_root_dirs(tmp_roots) -> tuple[Path, ...]:
+    """The directories the round's scratch globs name: ``/tmp/kilo/*`` -> ``/tmp/kilo``.
+
+    KC-59: the per-agent scratch dir is derived from these and the agent's name,
+    so no caller names a path. A trailing ``/*`` (or a bare ``/``) is stripped; a
+    value that is not an absolute or ``~``-absolute path is skipped, and
+    ``~`` is expanded the way the policy expands it. Fail-open throughout:
+    ``None``, an empty tuple or a set of malformed globs is ``()`` — the agents
+    then have no scratch dir, which is today's "no collect data" shape.
+    """
+    roots: list[Path] = []
+    for item in tmp_roots or ():
+        if not isinstance(item, str):
+            continue
+        raw = item.strip()
+        if not raw or not raw.startswith(("/", "~")):
+            continue
+        base = raw.removesuffix("/*").rstrip("/") or "/"
+        try:
+            root = Path(os.path.expanduser(base))
+        except (OSError, RuntimeError):
+            continue
+        if root not in roots:
+            roots.append(root)
+    return tuple(roots)
+
+
+def agent_tmp_dir(tmp_roots, agent) -> Path | None:
+    """``<tmp_root>/<agent>`` from the round's first scratch root, or ``None``.
+
+    *agent* is a roster name, so it matches ``[a-z0-9][a-z0-9_-]*`` and can hold
+    no glob metacharacter; anything else — ``None``, empty, not a string — is
+    ``None``, never an exception.
+    """
+    if not isinstance(agent, str) or not agent.strip():
+        return None
+    roots = tmp_root_dirs(tmp_roots)
+    if not roots:
+        return None
+    return roots[0] / agent.strip()
+
+
+def agent_tmp_globs(tmp_roots, agent) -> tuple[str, ...]:
+    """``<tmp_root>/<agent>/*`` for every scratch root — this agent's own dirs.
+
+    The policy's ``tmp_roots`` for one session (KC-59): the agent's own scratch
+    dir is allowed, and another agent's dir is not one of these globs, so it is
+    not settled by the mechanical layer and stays a permission event. Empty when
+    the round names no scratch root, so the policy falls back to ``contest.ini``
+    exactly as it does today.
+    """
+    globs: list[str] = []
+    if not isinstance(agent, str) or not agent.strip():
+        return ()
+    name = agent.strip()
+    for root in tmp_root_dirs(tmp_roots):
+        glob = f"{root}/{name}/*"
+        if glob not in globs:
+            globs.append(glob)
+    return tuple(globs)
+
+
+def agent_tmp_dirs(tmp_roots, agents) -> tuple[Path, ...]:
+    """Every roster agent's ``<tmp_root>/<agent>`` dir — the ones to forbid.
+
+    KC-59's half of the rule "the policy allows its own dir and not the other
+    agents'": each of these belongs to another agent and is forbidden ground for
+    this one. *agents* may hold ``AgentSpec`` or bare names.
+    """
+    dirs: list[Path] = []
+    for agent in agents or ():
+        name = getattr(agent, "name", agent)
+        path = agent_tmp_dir(tmp_roots, name)
+        if path is not None and path not in dirs:
+            dirs.append(path)
+    return tuple(dirs)
+
+
+def ensure_agent_tmp_dirs(config: ContestConfig) -> list[Path]:
+    """Create every roster agent's scratch dir at round start; the ones created.
+
+    Fail-open: no ``tmp_roots`` key, a malformed glob, or a directory that cannot
+    be made degrades to "no scratch dir" and never raises into a round — the
+    checkout is the round, the dir is a nicety the prompt names when it exists.
+    """
+    roots = tmp_root_dirs(getattr(config, "tmp_roots", ()))
+    if not roots:
+        return []
+    made: list[Path] = []
+    for agent in tuple(getattr(config, "agents", ()) or ()):
+        name = getattr(agent, "name", agent)
+        if not isinstance(name, str) or not name.strip():
+            continue
+        target = roots[0] / name.strip()
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+            made.append(target)
+        except OSError as exc:
+            _log.warning("could not create the scratch dir %s: %s", target, exc)
+    return made
+
+
 def attach_clone(clone_path, agent: str, base_sha: str, branch: str, *, force: bool = False) -> Workspace:
     """Use an existing *clone_path* as *agent*'s checkout at *base_sha*.
 
@@ -351,8 +603,14 @@ def attach_clone(clone_path, agent: str, base_sha: str, branch: str, *, force: b
     lists the dirty files. ``runs/<agent>/`` is emptied.
     """
     clone = Path(clone_path).resolve()
-    if not (clone / ".git").exists():
-        raise WorkspaceError(f"{clone} is not a git repository")
+    if not (clone / ".git").is_dir():
+        # a worktree's ``.git`` is a file, not a directory: attaching one would
+        # report ``kind == "clone"`` for a checkout that still shares its repo's
+        # single ``refs/stash`` — exactly what KC-59 is about
+        raise WorkspaceError(
+            f"{clone} is not a git repository (a worktree's .git is a file, and a "
+            f"worktree shares its repo's refs/stash — clone the repo instead)"
+        )
 
     _git(clone, ["fetch", "--all"])
     if _rev_parse(clone, f"{base_sha}^{{commit}}") is None:
@@ -380,6 +638,18 @@ def attach_clone(clone_path, agent: str, base_sha: str, branch: str, *, force: b
     )
 
 
+def _workspace_kind(config: ContestConfig) -> Literal["clone", "worktree"]:
+    """``config.workspace_kind`` as a kind, or ``"clone"`` for anything else.
+
+    KC-59's default is a clone per agent. ``load_roster`` already refuses a
+    value that is neither ``clone`` nor ``worktree``, so this is the fail-open
+    half for a config built by hand: an absent or malformed key degrades to the
+    default, never to an exception into a round.
+    """
+    kind = getattr(config, "workspace_kind", _KIND_CLONE)
+    return _KIND_WORKTREE if kind == _KIND_WORKTREE else _KIND_CLONE
+
+
 def prepare_round(
     repo,
     config: ContestConfig,
@@ -393,15 +663,20 @@ def prepare_round(
     """Prepare one checkout per roster agent at *base_ref*; return the workspaces.
 
     Resolves and validates the base (unresolvable or a dirty ``epic-tasks/`` raise),
-    then for each agent in roster order attaches its ``clones`` entry or builds a
-    worktree. A worktree that holds commits above the base or edits outside
-    ``runs/`` is refused unless *force* (KC-23's ``--fresh``); *force_clone* still
-    governs the clones alone. The repo's own checkout is never touched (no
-    ``checkout``/``reset`` in *repo* itself).
+    then for each agent in roster order attaches its ``clones`` entry or builds its
+    own checkout: a fresh local clone when ``[contest] workspace_kind`` is
+    ``clone`` (the KC-59 default — ``Workspace.kind == "clone"``, its own
+    ``refs/stash``, its push URL cut), a worktree when it is ``worktree``. Each
+    checkout that holds commits above the base or edits outside ``runs/`` is
+    refused unless *force* (KC-23's ``--fresh``); *force_clone* still governs the
+    attached clones alone. Every agent's scratch dir is created first. The repo's
+    own checkout is never touched (no ``checkout``/``reset`` in *repo* itself).
     """
     repo_path = Path(repo).resolve()
     base_sha = _check_base_and_epic_tasks(repo_path, base_ref)
     root = _resolve_rounds_dir(repo_path, config.rounds_dir)
+    use_worktrees = _workspace_kind(config) == _KIND_WORKTREE
+    ensure_agent_tmp_dirs(config)
 
     clone_map = {name: Path(p) for name, p in (clones or {}).items()}
     workspaces: list[Workspace] = []
@@ -416,19 +691,28 @@ def prepare_round(
                     force=force_clone,
                 )
             )
-        else:
+        elif use_worktrees:
             workspaces.append(
                 reset_worktree(repo_path, root, round_no, agent.name, base_sha,
                                force=force)
+            )
+        else:
+            workspaces.append(
+                reset_clone(repo_path, root, round_no, agent.name, base_sha,
+                            force=force)
             )
     return workspaces
 
 
 def remove_round(repo, config: ContestConfig, round_no: int) -> None:
-    """Remove every worktree (and branch) of *round_no*; leave clones alone.
+    """Remove every checkout (and branch) of *round_no*.
 
     The runbook's stage-5 cleanup, in one call: ``git worktree remove --force`` then
-    ``git branch -D`` for each ``contest/<NN>/<agent>`` worktree of the round.
+    ``git branch -D`` for each ``contest/<NN>/<agent>`` worktree of the round. KC-59's
+    default makes the checkouts clones, which ``git worktree list`` cannot see, so the
+    round's clone folders are removed whole too — only when their ``origin`` is *repo*,
+    so a folder this module did not create is never deleted. A clone's branches live
+    only inside the clone, so dropping the folder drops them.
     """
     repo_path = Path(repo).resolve()
     targets = {_branch_name(round_no, agent.name) for agent in config.agents}
@@ -436,6 +720,26 @@ def remove_round(repo, config: ContestConfig, round_no: int) -> None:
         if branch in targets:
             _git(repo_path, ["worktree", "remove", "--force", str(path)])
             _git(repo_path, ["branch", "-D", branch], check=False)
+
+    root = _resolve_rounds_dir(repo_path, config.rounds_dir)
+    for agent in config.agents:
+        path = _workspace_path(root, round_no, agent.name)
+        origin = _clone_origin(path)
+        if origin is None:
+            continue
+        try:
+            ours = Path(origin).resolve() == repo_path
+        except (OSError, RuntimeError):
+            ours = False
+        if not ours:
+            # a folder this module did not create — leave it for the operator
+            _log.warning("leaving %s: a clone of %s, not of %s", path, origin, repo_path)
+            continue
+        _git(repo_path, ["branch", "-D", _branch_name(round_no, agent.name)], check=False)
+        try:
+            shutil.rmtree(path)
+        except OSError as exc:
+            raise WorkspaceError(f"could not remove the clone {path}: {exc}") from exc
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -461,7 +765,7 @@ def _main(argv: list[str] | None = None) -> int:
                         metavar="name=path", help="use an existing clone for <name>")
     p_prep.add_argument("--force-clone", action="store_true")
     p_prep.add_argument("--fresh", action="store_true",
-                        help="reset a worktree even when it holds commits or edits")
+                        help="reset a checkout even when it holds commits or edits")
 
     p_rem = sub.add_parser("remove", help="remove a round's worktrees and branches")
     p_rem.add_argument("--repo", default=".")
@@ -485,7 +789,7 @@ def _main(argv: list[str] | None = None) -> int:
         clone_map[name] = Path(cpath)
     root = _resolve_rounds_dir(repo_path, cfg.rounds_dir)
     before = {
-        agent.name: _worktree_path(root, args.round, agent.name).exists()
+        agent.name: _workspace_path(root, args.round, agent.name).exists()
         for agent in cfg.agents
         if agent.name not in clone_map
     }
