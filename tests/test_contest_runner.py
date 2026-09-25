@@ -1268,10 +1268,11 @@ def test_a_terminal_harvest_runs_the_roots_under_the_rounds_lock(tmp_path, monke
     import tools.contest.harvest as harvest_module
 
     sb = Sandbox(tmp_path)
-    seen: list = []
+    seen: list[tuple[str, str]] = []
 
     def roots(cwd):
-        seen.append(cwd)
+        # KC-60: the roots run in a detached checkout of the commit, not the tree.
+        seen.append((cwd, _git(cwd, "rev-parse", "HEAD")))
         return ALL_ROOTS_PASS, []
 
     monkeypatch.setattr(harvest_module, "run_tests_detail", roots)
@@ -1286,7 +1287,8 @@ def test_a_terminal_harvest_runs_the_roots_under_the_rounds_lock(tmp_path, monke
     (run,) = state.agents
     assert run.state is AgentState.READY, (run.state, run.last_error)
     assert run.commit == _branch_sha(sb.ws("agent-a"))
-    assert seen == [str(sb.ws("agent-a").path)]
+    assert seen[0][0] != str(sb.ws("agent-a").path)      # not the agent's tree
+    assert seen[0][1] == _branch_sha(sb.ws("agent-a"))   # the commit it scores
     assert run.turns[0]["harvest"]["verdict"] == "READY"
     assert run.turns[0]["harvest"]["reasons"] == []
     assert isinstance(run.turns[0]["harvest"]["elapsed"], float)
@@ -2812,10 +2814,11 @@ def test_resume_harvests_the_mid_flight_worktree_with_the_roots(tmp_path, monkey
     sb = Sandbox(tmp_path, ["agent-a", "agent-b"])
     cfg = make_config(["agent-a", "agent-b"], max_parallel=2)
     _work(str(sb.ws("agent-b").path), test=True)
-    harvested = []
+    harvested: list[tuple[str, str]] = []
 
     def roots(cwd):
-        harvested.append(cwd)
+        # KC-60: the roots run in a detached checkout of the commit, not the tree.
+        harvested.append((cwd, _git(cwd, "rev-parse", "HEAD")))
         return ALL_ROOTS_PASS, []
 
     prior = RoundState(round_no=ROUND, ticket=TICKET, base_sha=sb.base_sha, started_at=1.0, agents=[
@@ -2831,7 +2834,8 @@ def test_resume_harvests_the_mid_flight_worktree_with_the_roots(tmp_path, monkey
     assert runs["agent-b"].state is AgentState.READY
     assert runs["agent-a"].commit == "0" * 40
     assert not _session_posts(fake)
-    assert harvested == [str(sb.ws("agent-b").path)]
+    assert harvested[0][0] != str(sb.ws("agent-b").path)      # not the agent's tree
+    assert harvested[0][1] == _branch_sha(sb.ws("agent-b"))   # the commit it scores
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import csv
 import importlib.util
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -30,6 +31,9 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
+
+import tools.contest.gates as gates_mod  # noqa: E402
+import tools.contest.harvest as harvest_mod  # noqa: E402
 
 from tools.contest.gates import (  # noqa: E402
     BRIDGE,
@@ -906,12 +910,14 @@ def test_reason_codes_are_the_tickets_list():
     assert set(REASON_CODES) == {
         "no_progress_row", "progress_not_done", "no_commit", "commit_not_on_branch",
         "commits_ne_1", "pushed", "no_test_file", "shrink_changed", "off_ticket_files",
-        "tests_failed",
+        "tests_failed", "uncommitted_files",
     }
 
 
 def test_blocking_reasons_stay_within_the_sentence_budget(round_, tmp_path):
-    """Every reason is one sentence ≤ TEXT_LIMIT chars, `tests_failed` excepted."""
+    """Every reason is one sentence ≤ TEXT_LIMIT chars, the two that carry a
+    payload excepted: `tests_failed` the pytest tail, `uncommitted_files` the
+    `git status` lines."""
     repo, base, ticket = round_
     wt = _worktree(repo, base, tmp_path)
     _stage_probe(wt)
@@ -922,7 +928,7 @@ def test_blocking_reasons_stay_within_the_sentence_budget(round_, tmp_path):
     h = harvest(wt, ticket)
     assert len(_codes(h)) >= 3
     for r in h.reasons:
-        if r.code == "tests_failed":
+        if r.code in ("tests_failed", "uncommitted_files"):
             continue
         assert len(r.text) <= TEXT_LIMIT, f"{r.code}: {len(r.text)} chars"
         assert r.text == r.text.strip()
@@ -999,3 +1005,333 @@ def test_rework_message_has_no_also_noted_without_a_note():
     assert "- 01-r1.md shipped no test file" in msg
     assert "Also noted" not in msg
     assert msg.index("Attempt 1 of 2") < msg.index("- 01-r1.md") < msg.index("Ground rules")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. KC-60: the roots run on the commit, and the tree is left exactly as it was
+# ─────────────────────────────────────────────────────────────────────────────
+
+#: The base repo's own noise filter. The harvest never carries a list of its
+#: own — `git status` applies this file and reports nothing it matches.
+IGNORED = "runs/\n__pycache__/\n.pytest_cache/\nscratch/\n"
+
+#: The committed check that makes a missing tier link a failing test. It reads
+#: the tree git has, so it passes in a tree that carries the link and fails in
+#: one that does not.
+TIER_LINKS = """\
+from pathlib import Path
+
+
+def test_every_test_file_has_a_link_in_the_tier():
+    root = Path(__file__).resolve().parent.parent
+    tier = root / ".smoke_fast"
+    missing = [p.name for p in sorted((root / "tests").glob("test_*.py"))
+               if not (tier / p.name).is_symlink()]
+    assert not missing, ".smoke_fast has no link for: " + ", ".join(missing)
+"""
+
+
+def _write(path: Path, text: str) -> None:
+    """One file with its parents, for a repo path rather than a `Workspace`."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+
+
+def _make_ignored_repo(tmp_path: Path) -> tuple[Path, str, Path]:
+    """A repo whose base carries a `.gitignore`, so `runs/` is the repo's own
+    scratch rather than an uncommitted file."""
+    repo, _base = _make_repo(tmp_path)
+    _write(repo / ".gitignore", IGNORED)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "ignore the round's scratch")
+    return repo, _git(repo, "rev-parse", "HEAD"), repo / "epic-tasks" / "01-r1.md"
+
+
+def _make_tier_repo(tmp_path: Path) -> tuple[Path, str, Path]:
+    """A repo whose base carries a `.smoke_fast` tier — a name that exists nowhere
+    in this repo — one committed relative link and one real coverage check. The
+    tier is not a pure link view, so it is a root that runs instead of a view
+    that is skipped."""
+    repo, _base, ticket = _make_ignored_repo(tmp_path)
+    _write(repo / ".smoke_fast" / "test_links.py", TIER_LINKS)
+    (repo / ".smoke_fast" / "test_base.py").symlink_to(
+        Path("..") / "tests" / "test_base.py")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "a .smoke_fast tier")
+    return repo, _git(repo, "rev-parse", "HEAD"), ticket
+
+
+def _tree_state(ws: Workspace) -> tuple[str, str, dict]:
+    """`(git status, git stash list, {path: mtime})` — what the harvest must leave."""
+    mtimes: dict[str, int] = {}
+    for p in sorted(ws.path.rglob("*")):
+        if ".git" in p.parts:      # git's own bookkeeping, not the tree's files
+            continue
+        mtimes[str(p.relative_to(ws.path))] = p.lstat().st_mtime_ns
+    return _git(ws.path, "status", "--porcelain"), _git(ws.path, "stash", "list"), mtimes
+
+
+def _registered_worktrees(repo: Path) -> set[Path]:
+    """The worktree paths git has registered, resolved: a throwaway is gone when
+    this set is unchanged."""
+    return {Path(line[len("worktree "):]).resolve()
+            for line in _git(repo, "worktree", "list", "--porcelain").splitlines()
+            if line.startswith("worktree ")}
+
+
+def test_harvest_runs_the_roots_on_the_commit_not_the_tree_around_it(tmp_path, monkeypatch):
+    """The commit lacks the tier link that only the untracked file makes pass. The
+    roots run on the commit, so the verdict is `tests_failed` and
+    `uncommitted_files` names the link — the green worktree is not what is scored."""
+    monkeypatch.setattr(gates_mod, "TEST_ROOTS", ["tests", ".smoke_fast"])
+    repo, base, ticket = _make_tier_repo(tmp_path)
+    wt = _worktree(repo, base, tmp_path)
+
+    _edit(wt, "tools/auto/probe.py", "PROBE = 1\n")
+    _edit(wt, "tests/test_probe.py", "def test_probe():\n    assert True\n")
+    _record(wt, ticket.name, outcome="DONE", commit=_commit(wt, "probe, plus a new test"))
+    _tier(wt, ".smoke_fast", "test_probe.py")      # never `git add`ed
+
+    green, _ = run_tests_detail(str(wt.path))      # the hole: the tree is green
+    assert "✗" not in green
+
+    h = harvest(wt, ticket, run_tests=True)
+    assert h.verdict == "REWORK"
+    assert h.facts["tests_run"].startswith("tests:PASS ")
+    assert ".smoke_fast:1✗" in h.facts["tests_run"]      # one failure: the link is missing
+    uncommitted = _reason(h, "uncommitted_files")
+    assert uncommitted.blocking is False
+    assert ".smoke_fast/test_probe.py" in uncommitted.text
+    assert _reason(h, "tests_failed").blocking is True
+    # The reason reaches the rework prompt, so the REWORK says why.
+    msg = rework_message(h, attempt=1, max_rework=2)
+    assert "- the tests do not pass:" in msg
+    assert "Also noted:" in msg
+    assert "- ?? .smoke_fast/test_probe.py is not in the commit you handed in" in msg
+
+
+def test_uncommitted_files_leaves_ignored_paths_out(tmp_path):
+    """The noise filter is the repo's own `.gitignore`: an ignored file is not
+    listed, and the non-blocking note keeps a green commit `READY`."""
+    repo, base, ticket = _make_ignored_repo(tmp_path)
+    wt = _worktree(repo, base, tmp_path)
+    _record(wt, ticket.name, outcome="DONE", commit=_accepting(wt))
+    _write(wt.path / "scratch" / "junk.txt", "noise\n")
+    _write(wt.path / "stray.py", "x = 1\n")
+
+    h = harvest(wt, ticket, run_tests=True)
+    text = _reason(h, "uncommitted_files").text
+    assert "stray.py" in text
+    assert "scratch" not in text and "junk.txt" not in text
+    assert h.verdict == "READY"          # the commit is green; the note is non-blocking
+
+
+def test_uncommitted_files_never_names_the_runners_own_queue_file(round_, tmp_path):
+    """A repo that does not ignore the runner's ground: the claim the harvest
+    reads (`ws.progress_csv`) is untracked there, and it is still not named —
+    telling the agent to commit the runner's file would be the wrong advice."""
+    repo, base, ticket = round_
+    wt = _worktree(repo, base, tmp_path)
+    _record(wt, ticket.name, outcome="DONE", commit=_accepting(wt))
+    assert "PROGRESS.csv" in _git(wt.path, "status", "--porcelain", "--untracked-files=all")
+    _write(wt.path / "stray.py", "x = 1\n")
+
+    h = harvest(wt, ticket, run_tests=True)
+    text = _reason(h, "uncommitted_files").text
+    assert text.startswith("?? stray.py is not in the commit you handed in")
+    assert "PROGRESS.csv" not in text
+
+
+def test_an_uncommitted_fix_does_not_turn_the_verdict_ready(tmp_path):
+    """The other way round: the commit has the failing test, the worktree has the
+    fix. The roots run on the commit, so it stays `REWORK`."""
+    repo, base, ticket = _make_ignored_repo(tmp_path)
+    wt = _worktree(repo, base, tmp_path)
+    _edit(wt, "tools/auto/probe.py", "PROBE = 1\n")
+    _edit(wt, "tests/test_probe.py", "def test_probe():\n    assert False, 'boom-kc60-42'\n")
+    _record(wt, ticket.name, outcome="DONE", commit=_commit(wt, "probe, with a broken test"))
+    _edit(wt, "tests/test_probe.py", "def test_probe():\n    assert True\n")   # not committed
+
+    green, _ = run_tests_detail(str(wt.path))      # the tree is green
+    assert "✗" not in green
+
+    h = harvest(wt, ticket, run_tests=True)
+    assert h.verdict == "REWORK"
+    assert _blocking(h) == ["tests_failed"]
+    assert "boom-kc60-42" in _reason(h, "tests_failed").text
+    assert "tests/test_probe.py" in _reason(h, "uncommitted_files").text
+
+
+def test_harvest_leaves_the_worktree_byte_for_byte_alone(tmp_path):
+    """No stash, no clean, no checkout: `git status`, `git stash list` and every
+    file's mtime are the same after the harvest as before it."""
+    repo, base, ticket = _make_ignored_repo(tmp_path)
+    wt = _worktree(repo, base, tmp_path)
+    _record(wt, ticket.name, outcome="DONE", commit=_accepting(wt))
+    _write(wt.path / "stray.py", "x = 1\n")
+
+    before = _tree_state(wt)
+    h = harvest(wt, ticket, run_tests=True)
+    assert _tree_state(wt) == before
+    assert h.verdict == "READY"          # the stray file is a note, not a change
+
+
+def test_the_roots_run_in_a_throwaway_checkout_of_the_commit(tmp_path, monkeypatch):
+    """Not in the agent's tree at all: a detached worktree at the claimed commit,
+    removed again, with neither git's registration nor its directory left."""
+    repo, base, ticket = _make_ignored_repo(tmp_path)
+    wt = _worktree(repo, base, tmp_path)
+    _record(wt, ticket.name, outcome="DONE", commit=_accepting(wt))
+    before = _registered_worktrees(repo)
+
+    seen: list[tuple[str, str]] = []
+    real = harvest_mod.run_tests_detail
+
+    def roots_on_the_commit(cwd):
+        seen.append((cwd, _git(cwd, "rev-parse", "HEAD")))
+        return real(cwd)
+
+    monkeypatch.setattr(harvest_mod, "run_tests_detail", roots_on_the_commit)
+
+    h = harvest(wt, ticket, run_tests=True)
+    assert h.verdict == "READY"
+    (target, head) = seen[0]
+    assert target != str(wt.path)                    # not the agent's tree
+    assert head == _git(wt.path, "rev-parse", "HEAD")  # the commit it scores
+    assert not Path(target).exists()                 # the checkout is gone
+    assert _registered_worktrees(repo) == before     # and git's record of it
+
+
+def test_the_throwaway_checkout_is_gone_when_the_roots_raise(tmp_path, monkeypatch):
+    """`finally`, not just the happy path: an exception out of the roots still
+    drops the checkout, and the exception still propagates."""
+    repo, base, ticket = _make_ignored_repo(tmp_path)
+    wt = _worktree(repo, base, tmp_path)
+    _record(wt, ticket.name, outcome="DONE", commit=_accepting(wt))
+    before = _registered_worktrees(repo)
+
+    seen: list[str] = []
+
+    def roots_that_die(cwd):
+        seen.append(cwd)
+        raise RuntimeError("boom-kc60")
+
+    monkeypatch.setattr(harvest_mod, "run_tests_detail", roots_that_die)
+
+    with pytest.raises(RuntimeError, match="boom-kc60"):
+        harvest(wt, ticket, run_tests=True)
+    assert seen and not Path(seen[0]).exists()
+    assert _registered_worktrees(repo) == before
+
+
+def test_uncommitted_files_names_at_most_ten_and_stays_non_blocking(tmp_path):
+    """A worktree with a pile of leftovers: ten paths are named, the rest is a
+    count, and the verdict is untouched."""
+    repo, base, ticket = _make_ignored_repo(tmp_path)
+    wt = _worktree(repo, base, tmp_path)
+    _record(wt, ticket.name, outcome="DONE", commit=_accepting(wt))
+    for i in range(15):
+        _write(wt.path / f"stray_{i:02d}.py", "x = 1\n")
+
+    h = harvest(wt, ticket, run_tests=True)
+    r = _reason(h, "uncommitted_files")
+    assert r.blocking is False and h.verdict == "READY"
+    assert r.text.count("?? stray_") == 10
+    assert "(+5 more)" in r.text
+    assert "15 worktree changes" in r.text
+
+
+def test_run_tests_false_checks_out_nothing_and_names_nothing(tmp_path, monkeypatch):
+    """The roots off: no checkout is made, no root is run, and `uncommitted_files`
+    is not reported — the old path does not move."""
+    repo, base, ticket = _make_ignored_repo(tmp_path)
+    wt = _worktree(repo, base, tmp_path)
+    _record(wt, ticket.name, outcome="DONE", commit=_accepting(wt))
+    _write(wt.path / "stray.py", "x = 1\n")
+    before = _registered_worktrees(repo)
+
+    def no_roots(cwd):
+        raise AssertionError(f"run_tests=False must not run the roots in {cwd}")
+
+    monkeypatch.setattr(harvest_mod, "run_tests_detail", no_roots)
+
+    h = harvest(wt, ticket)
+    assert h.verdict == "READY"
+    assert h.facts["tests_run"] == "—"
+    assert "uncommitted_files" not in _codes(h)
+    assert _registered_worktrees(repo) == before
+
+
+def test_harvest_reads_the_tree_without_rewriting_its_index(tmp_path):
+    """`git status` refreshes a stale index as a side effect; the harvest's read
+    of the tree must not. A tracked file whose mtime moved would make a plain
+    `git status` rewrite the index — `--no-optional-locks` leaves it as it was."""
+    repo, base, ticket = _make_ignored_repo(tmp_path)
+    wt = _worktree(repo, base, tmp_path)
+    _record(wt, ticket.name, outcome="DONE", commit=_accepting(wt))
+    index = Path(_git(wt.path, "rev-parse", "--path-format=absolute", "--git-path", "index"))
+    probe = wt.path / "tools" / "auto" / "probe.py"
+    os.utime(probe, ns=(probe.stat().st_atime_ns, probe.stat().st_mtime_ns + 5_000_000_000))
+    before = (index.read_bytes(), index.stat().st_mtime_ns)
+
+    harvest(wt, ticket, run_tests=True)
+    assert (index.read_bytes(), index.stat().st_mtime_ns) == before
+
+
+@pytest.mark.parametrize("kind", ["loose", "absent"])
+def test_harvest_runs_no_roots_outside_a_git_worktree(tmp_path, round_, kind, monkeypatch):
+    """No repo to check out from: no root runs anywhere — not in the loose folder
+    either — and the verdict says the tests could not run, rather than scoring
+    roots that never ran. Nothing is reported that was not learned, nothing raises."""
+    repo, base, ticket = round_
+    path = tmp_path / kind
+    if kind == "loose":
+        path.mkdir()
+    ws = Workspace(agent="a", path=path, branch="contest/01/a", base_sha=base,
+                   kind="worktree")
+
+    def no_roots(cwd):
+        raise AssertionError(f"no checkout, so no root may run (asked for {cwd})")
+
+    monkeypatch.setattr(harvest_mod, "run_tests_detail", no_roots)
+    h = harvest(ws, ticket, run_tests=True)
+    assert h.verdict == "REWORK"
+    assert "commits_ne_1" in _codes(h)
+    assert "not a git worktree" in _reason(h, "tests_failed").text
+    assert h.facts["tests_run"] == "checkout✗"
+    assert "uncommitted_files" not in _codes(h)
+
+
+def test_a_checkout_that_cannot_be_made_is_not_a_pass(tmp_path, monkeypatch):
+    """KC-60's hole must not reopen when git stumbles: if the commit cannot be
+    checked out, the roots do not fall back to the agent's tree (which is green
+    here only because of an untracked file) — the verdict is `tests_failed` with
+    git's own words, and no directory or registration is left behind."""
+    monkeypatch.setattr(gates_mod, "TEST_ROOTS", ["tests", ".smoke_fast"])
+    repo, base, ticket = _make_tier_repo(tmp_path)
+    wt = _worktree(repo, base, tmp_path)
+    _edit(wt, "tools/auto/probe.py", "PROBE = 1\n")
+    _edit(wt, "tests/test_probe.py", "def test_probe():\n    assert True\n")
+    _record(wt, ticket.name, outcome="DONE", commit=_commit(wt, "probe, plus a new test"))
+    _tier(wt, ".smoke_fast", "test_probe.py")      # the tree is green, the commit is not
+    before = _registered_worktrees(repo)
+
+    # `git worktree add` refuses a target that is already a non-empty folder.
+    scratch = tmp_path / "scratch-kc60"
+    (scratch / "commit").mkdir(parents=True)
+    (scratch / "commit" / "occupied").write_text("x\n", encoding="utf-8")
+    monkeypatch.setattr(harvest_mod.tempfile, "mkdtemp", lambda prefix="": str(scratch))
+
+    ran: list[str] = []
+    monkeypatch.setattr(harvest_mod, "run_tests_detail",
+                        lambda cwd: ran.append(cwd) or ("tests:PASS", []))
+
+    h = harvest(wt, ticket, run_tests=True)
+    assert ran == []                                 # not in the agent's tree, not anywhere
+    assert h.verdict == "REWORK"
+    text = _reason(h, "tests_failed").text
+    assert text.startswith(f"the tests could not run on commit {_git(wt.path, 'rev-parse', 'HEAD')[:12]}: ")
+    assert "already exists" in text
+    assert h.facts["tests_run"] == "checkout✗"
+    assert not scratch.exists()
+    assert _registered_worktrees(repo) == before

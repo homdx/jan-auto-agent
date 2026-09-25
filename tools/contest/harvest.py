@@ -15,14 +15,26 @@ Reasons are reported in a fixed order and `reasons` always lists everything
 found, so a `READY` verdict can still carry a non-blocking note — the note is
 information, not a stop.
 
+With `run_tests` the roots run on the claim's commit, not on the worktree they
+are read from: the commit is checked out into a throwaway worktree, the roots
+run there, and the worktree is removed again in `finally`. The agent's tree is
+read and left byte for byte as it was — no stash, no clean, no checkout — so an
+untracked file cannot make a red commit score `READY` and an uncommitted fix
+cannot make a green one score `REWORK`. What the tree holds beyond the commit is
+reported rather than hidden: the non-blocking `uncommitted_files` reason, whose
+noise filter is the repo's own `.gitignore`, never a list here.
+
 Standard library only.
 """
 
 from __future__ import annotations
 
 import csv
+import os
 import re
+import shutil
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -36,6 +48,7 @@ from tools.contest.gates import (
     run_tests_detail,
 )
 from tools.contest.workspace import Workspace
+from tools.git_run import run_git
 
 __all__ = ["Harvest", "Reason", "harvest", "rework_message"]
 
@@ -51,6 +64,7 @@ REASON_CODES = (
     "shrink_changed",
     "off_ticket_files",
     "tests_failed",
+    "uncommitted_files",
 )
 
 #: Outcomes that mean "the ticket is done". `append_task.py` upper-cases
@@ -59,10 +73,14 @@ REASON_CODES = (
 #: done; everything else — `SKIPPED`, `ALREADY-OK`, a typo — does not.
 _DONE_OUTCOMES = frozenset({"DONE", "FIXED"})
 
-#: A reason's `text` is one sentence for the agent. `tests_failed` is the one
-#: exception and carries the pytest tail on top of its sentence — the failure
-#: cause is at the tail, so that is what the agent needs.
+#: A reason's `text` is one sentence for the agent. Two reasons carry a payload
+#: on top of theirs and may run past it: `tests_failed` the pytest tail, because
+#: the failure cause is at the tail, and `uncommitted_files` the `git status`
+#: lines, because the paths are the whole point.
 TEXT_LIMIT = 200
+
+#: How many `git status` lines `uncommitted_files` names; the rest is counted.
+UNCOMMITTED_MAX = 10
 
 #: A claim is a commit only when it is written as a hex sha. `HEAD`, `@`, a
 #: branch and a tag all resolve in git, so `merge-base --is-ancestor` cannot
@@ -78,8 +96,9 @@ class Reason:
 
     `code` is one of `REASON_CODES`; `text` is one sentence for the agent, at
     most `TEXT_LIMIT` chars, naming the file or the number so nothing has to be
-    looked up; `blocking` is False only for `off_ticket_files`, which is
-    reported so the operator sees it without stopping the round.
+    looked up; `blocking` is False only for `off_ticket_files` and
+    `uncommitted_files`, which are reported so the operator sees them without
+    stopping the round.
     """
 
     code: str
@@ -146,12 +165,131 @@ def _resolve_claim(path: Path, claimed: str) -> str | None:
     return git(str(path), "rev-parse", "--verify", "--quiet", f"{claimed}^{{commit}}") or None
 
 
+def _status_lines(ws: Workspace) -> list[str]:
+    """The worktree's `git status --porcelain` lines: what the tree holds that
+    the commit does not.
+
+    `git` applies the repo's own `.gitignore` and never reports an ignored
+    path, so this carries no exclusion list of its own — nothing here knows a
+    tier directory or a test root. The one thing left out is the runner's own
+    ground: the directory `ws.progress_csv` lives in, as `Workspace` names it
+    (the harvest reads the claim from there). A repo that does not ignore it
+    would otherwise hear, every harvest, that its queue file is missing from the
+    commit — an invitation to commit the runner's file. `--no-optional-locks`
+    keeps the read a read: `git status` would otherwise refresh and rewrite
+    the tree's index. Empty when git cannot answer (not a worktree, an
+    unreadable index): a missing answer means nothing was learned, and is
+    never a raise.
+    """
+    try:
+        r = run_git(["git", "--no-optional-locks", "status", "--porcelain",
+                     "--untracked-files=all"], cwd=str(ws.path))
+    except OSError:
+        return []
+    if r.returncode:
+        return []
+    ground = ws.progress_csv.parent.relative_to(ws.path).as_posix() + "/"
+    lines = []
+    for line in r.stdout.splitlines():
+        if not line.strip():
+            continue
+        name = line[3:].rsplit(" -> ", 1)[-1].strip('"')
+        if (name + "/").startswith(ground):
+            continue
+        lines.append(line)
+    return lines
+
+
+def _commit_worktree(ws: Workspace, commit: str) -> tuple[str | None, str | None, str]:
+    """A throwaway detached worktree checked out at *commit*, for the roots.
+
+    Returns `(target, parent, error)`: *target* is where the roots run and
+    *parent* the temp directory to delete with it. `(None, None, error)` when
+    no checkout could be made — and then the roots do not run at all. They
+    never fall back to *ws*: a tree green only because of what the commit
+    lacks is exactly what this harvest must not score, and a silent fallback
+    would score it the moment git stumbles.
+
+    `git worktree add --detach` checks out exactly what git has at *commit*: a
+    committed relative symlink resolves inside the new worktree, and anything
+    the tree holds that is not committed is simply not there. Nothing here
+    knows this repo's layout — no tier name, no test root — because the
+    checkout is git's own and the roots are the caller's to name.
+    """
+    try:
+        parent = tempfile.mkdtemp(prefix="kc60-commit-")
+    except OSError as exc:
+        return None, None, f"no temp directory for the checkout: {exc}"
+    target = os.path.join(parent, "commit")
+    try:
+        r = run_git(["git", "worktree", "add", "-q", "--detach", target, commit],
+                    cwd=str(ws.path))
+        error = "" if r.returncode == 0 and os.path.isdir(target) else (
+            (r.stderr or r.stdout or "").strip() or f"exit {r.returncode}")
+    except OSError as exc:
+        error = str(exc)
+    if error:
+        _drop_worktree(ws, parent)
+        return None, None, error
+    return target, parent, ""
+
+
+def _drop_worktree(ws: Workspace, parent: str | None) -> None:
+    """Remove the throwaway checkout, on the success path and on an exception.
+
+    `git worktree remove --force` unregisters it (the roots may have left a
+    pytest cache in it, which is why the `--force`); the `rmtree` takes
+    whatever git did not. Only when git could not remove it does `worktree
+    prune` drop the registration the deleted folder left behind — never on
+    the ordinary path, where there is nothing stale to prune. None of it
+    touches *ws.path* — only the copy is dropped.
+    """
+    if parent is None:
+        return
+    removed = False
+    try:
+        removed = run_git(["git", "worktree", "remove", "--force",
+                           os.path.join(parent, "commit")], cwd=str(ws.path)).returncode == 0
+    except OSError:
+        pass
+    shutil.rmtree(parent, ignore_errors=True)
+    if not removed:
+        try:
+            run_git(["git", "worktree", "prune"], cwd=str(ws.path))
+        except OSError:
+            pass
+
+
+def _uncommitted_reason(lines: list[str]) -> Reason:
+    """`uncommitted_files`: the tree holds what the commit does not.
+
+    Non-blocking, because the commit is what is scored — but it is what tells
+    an agent why a green worktree scored red: the file is here, and it is not
+    in the commit they handed in. The lines are quoted as `git status` prints
+    them, so `??` is an untracked file and ` M` an edit left uncommitted.
+    """
+    extra = "" if len(lines) <= UNCOMMITTED_MAX else (
+        f" (+{len(lines) - UNCOMMITTED_MAX} more)")
+    if len(lines) == 1:
+        text = (f"{lines[0].strip()} is not in the commit you handed in — the tests "
+                "ran on the commit, not on your worktree")
+    else:
+        text = (f"{len(lines)} worktree changes are not in the commit you handed in — "
+                f"the tests ran on the commit, not on your worktree: "
+                f"{', '.join(line.strip() for line in lines[:UNCOMMITTED_MAX])}{extra}")
+    return Reason("uncommitted_files", text, blocking=False)
+
+
 def harvest(ws: Workspace, ticket_path: Path, *, run_tests: bool = False) -> Harvest:
     """Score one worktree against its ticket and return the verdict.
 
     *ws* is the agent's checkout (`tools/contest/workspace.py`), *ticket_path*
     its ticket file, and *run_tests* whether to run the four pytest roots —
-    kept off by default because it is the slow part of a round.
+    kept off by default because it is the slow part of a round. With the roots
+    on they run on the claim's commit, checked out into a throwaway worktree
+    that is removed again in `finally`: this tree is never stashed, cleaned or
+    checked out, and whatever it holds beyond the commit is reported as the
+    non-blocking `uncommitted_files` reason instead of being judged.
 
     Raises `FileNotFoundError` for an unreadable ticket; a runner holding a bad
     ticket path is a bug, not a harvest result.
@@ -258,13 +396,40 @@ def harvest(ws: Workspace, ticket_path: Path, *, run_tests: bool = False) -> Har
             ))
 
     if run_tests:
-        summary, tail = run_tests_detail(str(ws.path))
-        facts["tests_run"] = summary
-        if "✗" in summary:
+        # KC-60: the roots run on the commit this harvest scores, not on this
+        # tree. An untracked file must not make a red commit score `READY`, and
+        # an uncommitted fix must not make a green one score `REWORK`. This tree
+        # is only read, and is left byte for byte as it was — no stash, no
+        # clean, no checkout.
+        outside = _status_lines(ws)
+        if "commits" in facts:
+            # With no resolvable claim there is no scored commit; `HEAD` is the
+            # best commit git has, and a blocking claim reason is already on the
+            # list.
+            target, parent, error = _commit_worktree(ws, resolved or "HEAD")
+        else:
+            target, parent, error = None, None, f"{ws.path} is not a git worktree"
+        if target is None:
+            # Not run is not passed: the verdict cannot be READY on roots that
+            # never ran, and the reason says why they did not.
+            facts["tests_run"] = "checkout✗"
             reasons.append(Reason(
                 "tests_failed",
-                f"the tests do not pass: {summary}\n" + "\n".join(tail),
+                f"the tests could not run on commit {(resolved or 'HEAD')[:12]}: {error}",
             ))
+        else:
+            try:
+                summary, tail = run_tests_detail(target)
+            finally:
+                _drop_worktree(ws, parent)
+            facts["tests_run"] = summary
+            if "✗" in summary:
+                reasons.append(Reason(
+                    "tests_failed",
+                    f"the tests do not pass: {summary}\n" + "\n".join(tail),
+                ))
+        if outside:
+            reasons.append(_uncommitted_reason(outside))
 
     verdict = "REWORK" if any(r.blocking for r in reasons) else "READY"
     return Harvest(
