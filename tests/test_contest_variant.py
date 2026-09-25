@@ -143,14 +143,21 @@ def test_resolve_variants_refuses_a_name_the_model_does_not_list():
     assert resolved == agents and notes == []
 
 
-def test_resolve_variants_passes_a_listed_name_through_untouched_and_asks_nothing():
+def test_resolve_variants_passes_a_listed_name_through_untouched():
+    """KC-61: a listed named variant is asked about once, and a `hello` answer
+    leaves the agent exactly as it was named."""
     agents = cli.agents_from_models("hy3:free@high,plain:free")
+    asked = []
 
     def probe_for(agent):
-        raise AssertionError("a named variant is never probed")
+        def try_one(variant):
+            asked.append((agent.name, variant))
+            return None
+        return try_one
 
     resolved, failures, notes = cli.resolve_variants(OFFER, agents, probe_for)
     assert (resolved, failures, notes) == (agents, [], [])
+    assert asked == [("hy3", "high")]        # the one variant, asked once
 
 
 def test_resolve_variants_probes_highest_once_per_model():

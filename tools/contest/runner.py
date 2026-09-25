@@ -202,6 +202,38 @@ _RETRYABLE_MSG_RE = re.compile(
     r"|interrupted the response|upstream unavailable", re.IGNORECASE
 )
 
+
+def _quota_re(config) -> "re.Pattern | None":
+    """KC-61: ``[contest] quota_patterns``, ``|``-separated, as one
+    case-insensitive regex of literal phrases; ``None`` when the key is empty.
+
+    Every phrase is ``re.escape``d, so the join can never be a malformed
+    pattern: an absent or empty key is "no quota phrases", which is today's
+    behaviour, never a round-killing ``re.error``.
+    """
+    raw = getattr(config, "quota_patterns", "") or ""
+    phrases = [p.strip() for p in str(raw).split("|") if p.strip()]
+    return re.compile("|".join(map(re.escape, phrases)), re.IGNORECASE) if phrases else None
+
+
+def _is_quota(error, quota_re) -> bool:
+    """KC-61: a ``ProviderQuota`` from ``wait_idle``, or any ``session.error``
+    whose text is a quota.
+
+    The first is how a Kilo session ends when the provider names a retry
+    fourteen hours out; the second covers a provider that reports the same
+    thing as a plain error. *error* may already be a string — the intake probe
+    answers with the text it read, not a payload — in which case it is the text
+    itself. Anything without the phrases in ``quota_patterns`` is not a quota,
+    so a transient ``temporarily unavailable`` keeps KC-19's retry path.
+    """
+    if isinstance(error, dict) and error.get("name") == "ProviderQuota":
+        return True
+    if quota_re is None:
+        return False
+    text = error if isinstance(error, str) else _error_message(error)
+    return quota_re.search(text) is not None
+
 #: KC-45 §2/§2a: the provider's refusal of the request itself — no status code,
 #: no retry flag, no socket error. Refused on the session's *first* call, it is
 #: refused again when resent (§2). Once the session has had an assistant reply
@@ -1015,6 +1047,15 @@ def _wait_turn(backend: ContestBackend, session: SessionRef, config: ContestConf
         wait_kwargs["on_deadline"] = on_deadline
     if since is not None:
         wait_kwargs["since"] = since
+    # KC-61: a retry scheduled further out than the bound is a quota reset, not
+    # a blip — the agent ends `ERROR provider_quota` at once instead of waiting
+    # for the silence clock. 0 arms nothing, which is today's behaviour.
+    max_retry_wait = float(getattr(config, "provider_retry_max_wait_sec", 0) or 0)
+    if max_retry_wait > 0:
+        wait_kwargs["max_retry_wait"] = max_retry_wait
+    quota_re = _quota_re(config)
+    if quota_re is not None:
+        wait_kwargs["quota_re"] = quota_re
     return backend.wait_idle(session, float(config.turn_timeout_sec), **wait_kwargs)
 
 
@@ -1599,54 +1640,73 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                     # and can still end READY.
                     error = "context overflow" + ("" if dirty else " with no uncommitted work")
                     state = AgentState.STALLED
-                # KC-45 §2a: KC-19's rules decide most `session.error`s. A
-                # mid-session `provider rejected the request` needs the count of
-                # the replies that already finished, so the transcript is read
-                # for that payload only — fail-open to 0, which is §2's answer.
-                # An overflow, a spent budget or any other error never reads it.
-                retryable = False
-                if not overflow and retries_used < int(config.max_error_retries):
-                    retryable = _retryable(idle.error)
-                    if not retryable and _rejected_request(idle.error):
-                        retryable = _retryable(
-                            idle.error, finished=_finished_replies(backend, session))
-                if retryable:
-                    run.turns.append(turn)
-                    _append_jsonl(agent_dir / "turns.jsonl", {"agent": spec.name, **turn})
-                    retries_used += 1
-                    backoff = int(config.error_retry_backoff_sec) * (2 ** (retries_used - 1))
-                    _log.info("%s: retry %d/%d in %ds — %s", spec.name,
-                              retries_used, int(config.max_error_retries),
-                              backoff, _retry_reason(idle.error))
-                    if backoff > 0:
-                        _backoff_event = threading.Event()
-                        _timer = threading.Timer(backoff, _backoff_event.set)
-                        _timer.daemon = True
-                        _timer.start()
-                        try:
-                            while not _backoff_event.is_set():
-                                _backoff_event.wait(timeout=0.2)
-                                if stalled or backend.interrupted():
-                                    break
-                        finally:
-                            _timer.cancel()
-                    if stalled:
-                        turn_r = {"kind": "retry", "attempt": run.attempt,
-                                  "sent_at": time.time(), "idle_at": time.time(),
-                                  "idle_status": "stalled"}
-                        run.turns.append(turn_r)
-                        _append_jsonl(agent_dir / "turns.jsonl",
-                                      {"agent": spec.name, **turn_r})
-                        return finish(AgentState.STALLED, stalled[0])
-                    retry_text = RETRY_PROMPT.format(reason=_retry_reason(idle.error))
-                    continue
-                if not overflow:
-                    # an overflow already set its own `error` and `state` above;
-                    # this is the fallback for every other `session.error`
-                    error = f"session.error: {_brief(idle.error)}"
-                    if retries_used:
-                        error = f"after {retries_used} retries: {error}"
+                # KC-61: the quota check comes first. `_RETRYABLE_MSG_RE`
+                # matches `429`, so a daily limit that resets at midnight would
+                # otherwise spend `max_error_retries` against a key that is
+                # empty until then and end `after 2 retries: session.error:`
+                # instead of naming the reason. The KC-21 harvest below still
+                # runs, so an agent that committed before its key ran dry is
+                # scored.
+                if not overflow and _is_quota(idle.error, _quota_re(config)):
+                    data = (idle.error or {}).get("data") or {}
+                    at = data.get("retryAt")
+                    when = (time.strftime(" (retry at %Y-%m-%d %H:%M UTC)",
+                                          time.gmtime(float(at) / 1000))
+                            if isinstance(at, (int, float))
+                            and not isinstance(at, bool) else "")
+                    text = _brief(_error_message(idle.error))
+                    reason = text + when if text else when.strip()
+                    error = f"provider_quota: {reason}".rstrip()
                     state = AgentState.ERROR
+                else:
+                    # KC-45 §2a: KC-19's rules decide most `session.error`s. A
+                    # mid-session `provider rejected the request` needs the count of
+                    # the replies that already finished, so the transcript is read
+                    # for that payload only — fail-open to 0, which is §2's answer.
+                    # An overflow, a spent budget or any other error never reads it.
+                    retryable = False
+                    if not overflow and retries_used < int(config.max_error_retries):
+                        retryable = _retryable(idle.error)
+                        if not retryable and _rejected_request(idle.error):
+                            retryable = _retryable(
+                                idle.error, finished=_finished_replies(backend, session))
+                    if retryable:
+                        run.turns.append(turn)
+                        _append_jsonl(agent_dir / "turns.jsonl", {"agent": spec.name, **turn})
+                        retries_used += 1
+                        backoff = int(config.error_retry_backoff_sec) * (2 ** (retries_used - 1))
+                        _log.info("%s: retry %d/%d in %ds — %s", spec.name,
+                                  retries_used, int(config.max_error_retries),
+                                  backoff, _retry_reason(idle.error))
+                        if backoff > 0:
+                            _backoff_event = threading.Event()
+                            _timer = threading.Timer(backoff, _backoff_event.set)
+                            _timer.daemon = True
+                            _timer.start()
+                            try:
+                                while not _backoff_event.is_set():
+                                    _backoff_event.wait(timeout=0.2)
+                                    if stalled or backend.interrupted():
+                                        break
+                            finally:
+                                _timer.cancel()
+                        if stalled:
+                            turn_r = {"kind": "retry", "attempt": run.attempt,
+                                      "sent_at": time.time(), "idle_at": time.time(),
+                                      "idle_status": "stalled"}
+                            run.turns.append(turn_r)
+                            _append_jsonl(agent_dir / "turns.jsonl",
+                                          {"agent": spec.name, **turn_r})
+                            return finish(AgentState.STALLED, stalled[0])
+                        retry_text = RETRY_PROMPT.format(reason=_retry_reason(idle.error))
+                        continue
+                    if not overflow:
+                        # an overflow already set its own `error` and `state` above;
+                        # this is the fallback for every other `session.error`
+                        error = f"session.error: {_brief(idle.error)}"
+                        if retries_used:
+                            error = f"after {retries_used} retries: {error}"
+                        state = AgentState.ERROR
             elif idle.status == "closed":
                 error, state = f"event stream closed: {_brief(idle.error)}", AgentState.ERROR
             elif idle.status == "idle":

@@ -1148,7 +1148,9 @@ class KiloClient:
                   on_permission: Callable[[dict], tuple],
                   on_question: Callable[[dict], None],
                   on_deadline: Callable[[float], float | None] | None = None,
-                  since: int | None = None) -> IdleResult:
+                  since: int | None = None,
+                  max_retry_wait: float | None = None,
+                  quota_re: "re.Pattern | None" = None) -> IdleResult:
         """Block until this session goes idle, answering on the way.
 
         The probe's ``wait_idle`` with the decisions delegated:
@@ -1213,6 +1215,22 @@ class KiloClient:
         counts the skipped ones of this session that a wait acts on (an idle,
         an error, a permission, a question). Omitted, nothing is skipped and
         the wait is as before.
+
+        ``max_retry_wait`` and ``quota_re`` (KC-61) make a ``session.status`` of
+        this session whose ``status`` is ``{"type": "retry", "next": <ms>}`` a
+        terminal event instead of a beat. ``next`` is epoch milliseconds of the
+        time Kilo will retry on its own, so it is compared with the wall clock,
+        ``time.time()`` — the rest of the wait is ``time.monotonic()``. A retry
+        scheduled further out than ``max_retry_wait`` seconds ends the wait as
+        ``status="error"`` with ``error["name"] == "ProviderQuota"``, carrying
+        the provider's text in ``data.message`` and ``next`` in ``data.retryAt``,
+        and the session is aborted first: that is a quota reset until midnight,
+        not a blip, and the silence clock must not be the thing that names it.
+        A retry inside the bound is only a beat, and a ``next`` that is missing
+        or is not a number is judged by ``quota_re``, a compiled pattern over the
+        provider's text. Both omitted — every pre-KC-61 caller — a
+        ``session.status`` is never acted on and the loop is byte for byte what
+        it was, silence clock or not.
         """
         # KC-63: events recorded before the prompt this wait belongs to are
         # an earlier turn's. Kilo sends two session.idle after a
@@ -1253,7 +1271,13 @@ class KiloClient:
             # wait: the ones acted on below are handled, the rest only reset
             # the clock — a `session.status busy` or a `file.edited` is the
             # session working, not stalled
-            return silence is not None or etype in _SESSION_EVENTS
+            if silence is not None or etype in _SESSION_EVENTS:
+                return True
+            # KC-61: a `retry` status is acted on below when `max_retry_wait`
+            # is armed, so it must reach the loop even with the silence clock
+            # off — the probe has no clock, and it must not spend its timeout
+            # on a quota that resets in fourteen hours.
+            return etype == "session.status" and max_retry_wait is not None
 
         while True:
             now = time.monotonic()
@@ -1320,6 +1344,29 @@ class KiloClient:
                 continue
 
             elapsed = time.monotonic() - started
+            if etype == "session.status" and max_retry_wait is not None:
+                # KC-61: Kilo's own retry, and how long before it retries. `next`
+                # is epoch milliseconds, so it is the wall clock the wait is
+                # compared with — `time.time()`, never `time.monotonic()`.
+                status = props.get("status") or {}
+                if isinstance(status, dict) and status.get("type") == "retry":
+                    message = str(status.get("message") or "")
+                    nxt = status.get("next")
+                    wait = (float(nxt) / 1000.0 - time.time()
+                            if isinstance(nxt, (int, float))
+                            and not isinstance(nxt, bool) else None)
+                    if (wait is not None and wait > float(max_retry_wait)) or \
+                            (wait is None and quota_re is not None and quota_re.search(message)):
+                        # a quota reset, not a blip: stop Kilo's own
+                        # sleep-and-retry and hand the provider's text back, so
+                        # the round never waits for the silence clock to name it
+                        self._abort_quietly(session)
+                        return IdleResult(
+                            status="error",
+                            error={"name": "ProviderQuota",
+                                   "data": {"message": message, "retryAt": nxt}},
+                            elapsed=elapsed, permissions=permissions,
+                            questions=questions, stale_skipped=stale)
             if etype == "session.error":
                 return IdleResult(status="error", error=props.get("error", props),
                                   elapsed=elapsed, permissions=permissions,

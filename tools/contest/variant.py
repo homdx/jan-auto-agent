@@ -173,7 +173,9 @@ def _error_text(error) -> str:
 
 
 def hello_probe(server, provider_id: str, model_id: str, *,
-                timeout: float = HELLO_TIMEOUT_SEC) -> Callable[[str | None], str | None]:
+                timeout: float = HELLO_TIMEOUT_SEC,
+                max_retry_wait: float | None = None,
+                quota_re=None) -> Callable[[str | None], str | None]:
     """``try_one`` for :func:`pick_variant` against a live Kilo *server*.
 
     Each call opens a fresh session in a throwaway directory with every
@@ -181,10 +183,25 @@ def hello_probe(server, provider_id: str, model_id: str, *,
     idle, and deletes the session: a probe session never becomes anyone's
     context. The answer counts when the turn went idle with no
     ``session.error`` and a non-empty assistant text.
+
+    ``max_retry_wait`` and ``quota_re`` (KC-61) are handed to
+    :meth:`KiloClient.wait_idle` when they are not ``None``: a provider that is
+    out of quota answers in about a second — the probe's ``IdleResult`` is the
+    ``ProviderQuota``, whose text this returns as the rung's reason — instead of
+    burning :data:`HELLO_TIMEOUT_SEC` per model. Both ``None`` is every
+    pre-KC-61 caller, and the call is byte for byte what it was.
     """
     # imported here so the pure half of this module needs no server code
     from .backend import _wait_for_stream
     from .kilo_client import EventTap, KiloClient, KiloHttpError
+
+    # KC-61: armed only when given, so a caller that predates them gets today's
+    # wait_idle call, argument for argument.
+    probe_kwargs = {}
+    if max_retry_wait is not None:
+        probe_kwargs["max_retry_wait"] = max_retry_wait
+    if quota_re is not None:
+        probe_kwargs["quota_re"] = quota_re
 
     def try_one(variant):
         directory = tempfile.mkdtemp(prefix="kilo-variant-")
@@ -204,7 +221,8 @@ def hello_probe(server, provider_id: str, model_id: str, *,
                 return f"HTTP {exc}"
             idle = client.wait_idle(tap, session, timeout,
                                     on_permission=lambda event: ("reject", "probe"),
-                                    on_question=lambda event: None)
+                                    on_question=lambda event: None,
+                                    **probe_kwargs)
             if idle.status == "error":
                 return _error_text(idle.error)
             if idle.status != "idle":

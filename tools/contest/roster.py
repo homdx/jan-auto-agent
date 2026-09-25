@@ -91,6 +91,8 @@ CONTEST_KEYS = (
     "max_questions_per_turn",
     "max_error_retries",
     "error_retry_backoff_sec",
+    "provider_retry_max_wait_sec",
+    "quota_patterns",
     "progress_every_sec",
     "tmp_roots",
     "deny_commands",
@@ -241,6 +243,17 @@ class ContestConfig:
     max_questions_per_turn: int = 3
     max_error_retries: int = 2
     error_retry_backoff_sec: int = 15
+    #: KC-61: a ``session.status`` retry scheduled further out than this many
+    #: seconds is a quota reset, not a blip: the agent ends
+    #: ``ERROR provider_quota`` at once instead of sitting out the silence
+    #: clock. 0 turns it off — today's behaviour, for a provider that names no
+    #: reset time at all.
+    provider_retry_max_wait_sec: float = 300.0
+    #: KC-61: ``|``-separated quota phrases, case-insensitive literals, empty
+    #: when unset. Matched against a provider error's text when Kilo names no
+    #: retry time, and against every ``session.error``. Transient texts must
+    #: not live here — they belong to KC-19's retry path.
+    quota_patterns: str = ""
     progress_every_sec: int = 60
     tmp_roots: tuple[str, ...] = ()
     deny_commands: tuple[str, ...] = ()
@@ -549,6 +562,8 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
         max_questions_per_turn=limit("max_questions_per_turn", 3),
         max_error_retries=limit("max_error_retries", 2),
         error_retry_backoff_sec=limit("error_retry_backoff_sec", 15),
+        provider_retry_max_wait_sec=seconds("provider_retry_max_wait_sec", 300.0),
+        quota_patterns=scalar("quota_patterns", ""),
         progress_every_sec=limit("progress_every_sec", 60),
         tmp_roots=list_("tmp_roots"),
         deny_commands=list_("deny_commands"),

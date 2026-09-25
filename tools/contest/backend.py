@@ -61,6 +61,7 @@ import json
 import logging
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -193,7 +194,9 @@ class ContestBackend(Protocol):
                   on_permission: Callable[[dict], tuple],
                   on_question: Callable[[dict], None],
                   on_deadline: Callable[[float], float | None] | None = None,
-                  since: int | None = None) -> IdleResult:
+                  since: int | None = None,
+                  max_retry_wait: float | None = None,
+                  quota_re: "re.Pattern | None" = None) -> IdleResult:
         """Block until this session goes idle, answering on the way.
 
         ``timeout`` bounds the whole wait, ``idle_event_timeout`` the silence.
@@ -211,6 +214,14 @@ class ContestBackend(Protocol):
 
         ``since`` (KC-63) is a :meth:`mark` taken right before the prompt:
         events before it belong to an earlier turn and never end this wait.
+
+        ``max_retry_wait`` and ``quota_re`` (KC-61) are passed to
+        :meth:`KiloClient.wait_idle` when they are not ``None``: a ``session.status``
+        retry scheduled further out than the bound ends the wait as
+        ``status="error"`` with ``error["name"] == "ProviderQuota"`` instead of
+        waiting the silence clock out. :class:`OpenRouterBackend` takes both and
+        ignores them — a bare ``/chat/completions`` has no retry status, so its
+        wait is unchanged with either set.
         """
         ...
 
@@ -317,7 +328,9 @@ class KiloBackend:
                   on_permission: Callable[[dict], tuple],
                   on_question: Callable[[dict], None],
                   on_deadline: Callable[[float], float | None] | None = None,
-                  since: int | None = None) -> IdleResult:
+                  since: int | None = None,
+                  max_retry_wait: float | None = None,
+                  quota_re: "re.Pattern | None" = None) -> IdleResult:
         # KC-36: the callback goes over only when it is armed — `None` keeps
         # this call byte for byte what it was, for a client that predates it.
         client_kwargs = {"idle_event_timeout": idle_event_timeout,
@@ -326,6 +339,12 @@ class KiloBackend:
             client_kwargs["on_deadline"] = on_deadline
         if since is not None:
             client_kwargs["since"] = since
+        # KC-61: same — the retry bound and the quota phrases go over only when
+        # they are armed, so a client that predates them gets today's call.
+        if max_retry_wait is not None:
+            client_kwargs["max_retry_wait"] = max_retry_wait
+        if quota_re is not None:
+            client_kwargs["quota_re"] = quota_re
         return self._client.wait_idle(self._tap, session, timeout, **client_kwargs)
 
     def tool_parts(self, session: SessionRef) -> list:
@@ -518,7 +537,9 @@ class OpenRouterBackend:
                   on_permission: Callable[[dict], tuple],
                   on_question: Callable[[dict], None],
                   on_deadline: Callable[[float], float | None] | None = None,
-                  since: int | None = None) -> IdleResult:
+                  since: int | None = None,
+                  max_retry_wait: float | None = None,
+                  quota_re: "re.Pattern | None" = None) -> IdleResult:
         """Read the agent's stdout until ``idle``, the timeout, or the timeout's
         silence window.
 
@@ -533,6 +554,9 @@ class OpenRouterBackend:
         return pushes it back, anything else aborts. The worktree churn that
         earns the extension is the round's, and it is this backend's too.
         ``since`` (KC-63) is accepted and ignored: :meth:`mark` is ``None``.
+        ``max_retry_wait`` and ``quota_re`` (KC-61) are accepted and ignored too:
+        this backend has no Kilo retry status to judge, and a provider 429
+        reaches the runner as a plain ``session.error``.
 
         A provider error comes back as ``IdleResult(status="error")`` with the
         agent's payload, ``data.isRetryable`` set for a 429 or a 5xx, so the

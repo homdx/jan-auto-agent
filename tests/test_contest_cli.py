@@ -1665,7 +1665,10 @@ def test_run_refuses_a_variant_the_model_does_not_list(sandbox, capsys, spawn_ho
     assert not sandbox.out().exists()
 
 
-def test_run_variant_flag_sends_a_named_variant_without_probing(sandbox, capsys, spawn_holder):
+def test_run_variant_flag_probes_the_named_variant_once_and_sends_it(sandbox, capsys,
+                                                                    spawn_holder):
+    """KC-61: a named variant is asked about once at intake, then the round runs
+    at it — so a dry key is seen before the round, not fifteen minutes into it."""
     code, fake = run_fake(sandbox, KC49_SCENARIO,
                           ["--ticket", "1", "--models", "glm-4-7-flash:free",
                            "--variant", "medium", "--no-gate", "--no-tests"], spawn_holder)
@@ -1673,10 +1676,48 @@ def test_run_variant_flag_sends_a_named_variant_without_probing(sandbox, capsys,
 
     assert code == 0
     assert "variant:" not in captured.out
+    assert "provider_quota" not in captured.err
     assert _plan(captured.out)["agents"] == "1: kenary/glm-4-7-flash:free@medium"
+    sessions = _sessions(fake)
+    assert [s["body"]["model"].get("variant") for s in sessions] == ["medium", "medium"]
+    assert sessions[0]["body"]["title"] == "variant-probe/glm-4-7-flash:free/medium"
+    round_session = sessions[-1]
+    assert round_session["body"]["title"] == f"contest/{ROUND:02d}/glm-4-7-flash"
+    assert len(fake.calls(method="DELETE")) == 1, "the probe session is deleted"
+
+
+def test_run_variant_flag_answers_a_quota_at_intake_and_leaves_the_agent_out(sandbox, capsys,
+                                                                       spawn_holder):
+    """Acceptance 5: the intake's own probe answers the free-model daily limit —
+    one console line naming the agent and the reset, and the agent is left out.
+    It was the roster's only one, so nothing is left to start: no round, exit
+    failed. (With others on the roster they run one short — resolve_variants.)"""
+    scenario = {"providers": KC49_OFFER,
+                "turns": [{"error": {"name": "APIError",
+                                     "data": {"message": "Rate limit exceeded: "
+                                                        "free-models-per-day",
+                                              "statusCode": 429}}}]}
+    _quota_phrases(sandbox, "free-models-per-day")
+
+    code, fake = run_fake(sandbox, scenario,
+                          ["--ticket", "1", "--models", "glm-4-7-flash:free",
+                           "--variant", "medium", "--no-gate", "--no-tests"], spawn_holder)
+    captured = capsys.readouterr()
+    lines = [line for line in captured.err.splitlines() if line.startswith("intake:")]
+    skipped = [line for line in captured.out.splitlines() if "provider_quota" in line]
+
+    assert code == cli.EXIT_FAILED
+    assert len(skipped) == 1, captured.out
+    assert skipped[0].startswith("variant: [glm-4-7-flash] kenary/glm-4-7-flash:free: "
+                                 "provider_quota — ")
+    assert "free-models-per-day" in skipped[0] and skipped[0].endswith("not started")
+    assert lines == ["intake: every agent is out of quota — nothing to start "
+                     "(the variant: lines above name each one)"]
+    # the only session is the intake's own probe, and it was deleted: the agent
+    # never got a round of its own
     (session,) = _sessions(fake)
-    assert session["body"]["model"]["variant"] == "medium"
-    assert fake.calls(method="DELETE") == []
+    assert session["body"]["title"] == "variant-probe/glm-4-7-flash:free/medium"
+    assert len(fake.calls(method="DELETE")) == 1
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1705,6 +1746,16 @@ def _aim_the_gate(sandbox, base_url, model):
     ini.write_text(ini.read_text(encoding="utf-8")
                    .replace("base_url = http://127.0.0.1:1/v1", f"base_url = {base_url}")
                    .replace("model = test/gate", f"model = {model}"), encoding="utf-8")
+
+
+def _quota_phrases(sandbox, phrases):
+    """The sandbox's roster with `quota_patterns` set — the committed file's key is
+    not in it, so a quota would be invisible at intake without this."""
+    ini = sandbox.repo / "contest.ini"
+    ini.write_text(ini.read_text(encoding="utf-8")
+                   .replace("idle_event_timeout_sec = 900",
+                            f"idle_event_timeout_sec = 900\nquota_patterns = {phrases}"),
+                   encoding="utf-8")
 
 
 def _gate_allows(*args, **kwargs):
@@ -2288,8 +2339,15 @@ def test_register_missing_checks_the_variant_on_the_registered_offer(
     assert code == 0, captured.err
     assert not [line for line in captured.err.splitlines() if line.startswith("intake:")]
     assert _plan(captured.out)["agents"] == "1: kenary/agnes-3-0-flash:free@medium"
-    (session,) = _sessions(registered)
+    # KC-61: the named variant is asked about once, so there are two sessions on
+    # the registered server — the probe and the round's — and neither is on the
+    # plain throwaway, which lists no variant for the model at all.
+    sessions = _sessions(registered)
+    assert len(sessions) == 2
+    assert sessions[0]["body"]["title"] == "variant-probe/agnes-3-0-flash:free/medium"
+    (session,) = sessions[1:]
     assert session["body"]["model"]["variant"] == "medium"
+    assert _sessions(plain) == []
 
 
 def test_register_missing_names_the_ids_when_the_overlay_server_does_not_start(

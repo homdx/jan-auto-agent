@@ -86,7 +86,13 @@ from tools.contest.roster import (
     RosterError,
     load_roster,
 )
-from tools.contest.runner import AgentState, RoundState, run_round
+from tools.contest.runner import (
+    AgentState,
+    RoundState,
+    _is_quota,
+    _quota_re,
+    run_round,
+)
 from tools.contest.variant import (
     DEFAULT,
     HIGHEST,
@@ -302,17 +308,26 @@ def login_hint(kilo_bin: str | None, provider_id: str) -> str:
 
 
 def resolve_variants(providers: dict, agents: tuple, probe_for=None, *,
-                     kilo_bin: str | None = None) -> tuple:
+                     kilo_bin: str | None = None, quota_re=None) -> tuple:
     """KC-49: `(agents, failures, notes)` — every agent's variant made real.
 
     *providers* is `GET /provider`. An agent with no variant is untouched. A
     named variant must be one the model lists, or it is one failure line with
-    the list. `highest` walks `variant.ladder` of the listed variants with
-    `probe_for(agent)` — a `try_one` for `variant.pick_variant` — and the agent
-    gets the first rung that answers (`None` when only the plain request did);
-    nothing answering is a failure line naming every rung and why. A model that
-    lists no variants is not probed: `highest` of nothing is no variant. The
-    same `provider/model` is probed once however many agents ask for it.
+    the list, and it is probed once too when *probe_for* is attached (KC-61) —
+    a named variant used to be sent unasked, so an exhausted key reached the
+    round when the variant was named. The answer is `None` (hello came back)
+    and the agent is appended as today; a quota is a note naming the agent
+    and the reset text, and the agent is left out — the round runs one short;
+    anything else is a note, not a failure — today's
+    tolerance for a rung that refused for its own reason. Without *probe_for*
+    a named variant is still sent as it was. `highest` walks `variant.ladder`
+    of the listed variants with `probe_for(agent)` — a `try_one` for
+    `variant.pick_variant` — and the agent gets the first rung that answers
+    (`None` when only the plain request did); nothing answering is a failure
+    line naming every rung and why. A model that lists no variants is not
+    probed: `highest` of nothing is no variant. The same `provider/model` is
+    probed once however many agents ask for it, and so is the same
+    `provider/model@variant`.
     *notes* is one line per probed model for the operator. Without
     *probe_for*, `highest` on a model that lists variants is a failure: there
     is nothing to ask. A model refused for its credentials on every rung
@@ -322,6 +337,7 @@ def resolve_variants(providers: dict, agents: tuple, probe_for=None, *,
     failures: list = []
     notes: list = []
     picks: dict = {}
+    probed: dict = {}
     for agent in agents:
         wanted = agent.variant
         if not wanted:
@@ -330,10 +346,37 @@ def resolve_variants(providers: dict, agents: tuple, probe_for=None, *,
         listed = listed_variants(providers, agent.provider_id, agent.model_id)
         if wanted != HIGHEST:
             if wanted not in listed:
+                # the refusal is the list; nothing is asked, and the run does
+                # not start, so a probe here would only burn a request against
+                # the key that is about to be refused
                 failures.append(
                     f"[{agent.name}] {agent.model}: no variant '{wanted}' — listed: "
                     f"{', '.join(listed) if listed else '(none)'}")
-            resolved.append(agent)
+                resolved.append(agent)
+                continue
+            # KC-61: a named variant used to be sent unasked, so an exhausted
+            # key reached the round when the variant was named. One request per
+            # provider/model@variant is the whole cost — OpenRouter counts a
+            # failed request against the free quota too. Without a probe there
+            # is nothing to ask, and the named variant is sent as today.
+            if probe_for is not None:
+                key = (agent.provider_id, agent.model_id, wanted)
+                if key not in probed:
+                    probed[key] = _probe_answer(probe_for, agent, wanted)
+                answer = probed[key]
+                if answer is None:
+                    resolved.append(agent)      # hello came back, as today
+                elif _is_quota(answer, quota_re):
+                    # the key is out until its reset: one console line, and the
+                    # agent is left out — the round runs one agent short
+                    # instead of being refused for one dry key
+                    notes.append(_quota_skip_line(agent, answer))
+                else:
+                    # today's tolerance: a refusal for its own reason is a note
+                    notes.append(f"{agent.model}@{wanted}: the probe refused it — {answer}")
+                    resolved.append(agent)
+            else:
+                resolved.append(agent)
             continue
         if not listed:
             resolved.append(replace(agent, variant=None))
@@ -348,6 +391,12 @@ def resolve_variants(providers: dict, agents: tuple, probe_for=None, *,
             picks[agent.model] = pick
             notes.append(f"{agent.model}@{HIGHEST} → {pick.describe()}")
         pick = picks[agent.model]
+        if not pick.usable and pick.tried and all(
+                _is_quota(reason, quota_re) for _rung, reason in pick.tried):
+            # KC-61: every rung answered a quota — the same dry key, not a
+            # model that cannot talk: left out like a named variant's
+            notes.append(_quota_skip_line(agent, pick.tried[-1][1]))
+            continue
         if not pick.usable:
             hint = login_hint(kilo_bin, agent.provider_id) if needs_login(pick) else ""
             failures.append(f"[{agent.name}] {agent.model}: no variant answered "
@@ -356,6 +405,25 @@ def resolve_variants(providers: dict, agents: tuple, probe_for=None, *,
             continue
         resolved.append(replace(agent, variant=pick.variant))
     return tuple(resolved), failures, notes
+
+
+def _quota_skip_line(agent, answer) -> str:
+    """KC-61: the console line for an agent intake leaves out for its quota."""
+    return f"[{agent.name}] {agent.model}: provider_quota — {answer} — not started"
+
+
+def _probe_answer(probe_for, agent, wanted):
+    """One `say: hello` at *wanted* for one agent; its text, or `None`.
+
+    KC-61: the named-variant probe. A probe that raised answers `""` — which is
+    no quota, so the agent is started with a note, exactly as a rung that
+    refused for its own reason. Nothing here raises into intake.
+    """
+    try:
+        answer = probe_for(agent)(wanted)
+    except Exception:  # noqa: BLE001 — a broken probe is a refusal, not a round-killing one
+        return ""
+    return None if answer is None else str(answer)
 
 
 def roster_on_offer(providers: dict, agents: tuple, *, kilo_bin: str | None = None) -> list:
@@ -977,13 +1045,30 @@ def _check_offer(repo, config: ContestConfig, attached, *, resolve: bool = True,
         if refusals:
             return _Offer(list(refusals), unresolved, [], warnings)
 
+        # KC-61: the probe carries the round's own quota rule, so a dry key
+        # answers in about a second instead of burning HELLO_TIMEOUT_SEC per
+        # model — and its answer reads as a quota at intake, not at the runner
+        max_retry_wait = float(getattr(config, "provider_retry_max_wait_sec", 0) or 0)
+        quota_re = _quota_re(config)
+        probe_kwargs = {}
+        if max_retry_wait > 0:
+            probe_kwargs["max_retry_wait"] = max_retry_wait
+        if quota_re is not None:
+            probe_kwargs["quota_re"] = quota_re
+
         def probe_for(agent):
-            return hello_probe(server, agent.provider_id, agent.model_id)
+            return hello_probe(server, agent.provider_id, agent.model_id,
+                               **probe_kwargs)
         resolved, failures, notes = resolve_variants(providers, agents, probe_for,
-                                                     kilo_bin=kilo_bin)
+                                                     kilo_bin=kilo_bin,
+                                                     quota_re=quota_re)
         # KC-56: the same read's `limit.context`, so the runner can tell a full
         # context window from a spent output budget without asking again
         resolved = _with_context_limits(resolved, _context_limits(providers))
+        if agents and not resolved and not failures:
+            # KC-61: every agent was left out for its quota — nothing to start
+            failures.append("every agent is out of quota — nothing to start "
+                            "(the variant: lines above name each one)")
         return _Offer(failures, resolved, notes, warnings,
                       config_content=content, registered=registered)
     except (KiloHttpError, KiloServerError, ValueError) as exc:
@@ -1189,6 +1274,41 @@ def export_patches(state: RoundState, workspaces: list, out_dir) -> list:
         target.write_text(patch + "\n", encoding="utf-8")
         written.append(target)
     return written
+
+
+def _provider_quota_lines(state: RoundState) -> list:
+    """KC-61: one summary line per provider whose agents ended ``provider_quota``.
+
+    The reset time is the round's, read off the first such agent's own
+    ``last_reason`` — every agent of one provider was told the same midnight, so
+    naming it once per provider is the whole line. A line, not a refusal: the
+    round has already run, and the agents did their work around the others.
+    Nothing here is a provider name — the id comes off the agent's own spec.
+    """
+    groups: dict = {}
+    for run in state.agents:
+        try:
+            reason = run.last_reason()
+        except Exception:  # noqa: BLE001 — an unreadable run is not a summary failure
+            continue
+        if not isinstance(reason, str) or not reason.startswith("provider_quota:"):
+            continue
+        provider = getattr(run.agent, "provider_id", "") or "unknown"
+        groups.setdefault(provider, []).append(reason)
+    lines = []
+    for provider in sorted(groups):
+        reasons = groups[provider]
+        when = ""
+        for reason in reasons:
+            # the runner's reason ends `(retry at YYYY-MM-DD HH:MM UTC)`, so the
+            # group is the timestamp alone, its closing paren and all dropped
+            match = re.search(r"retry at (.+?)(?:\)\s*)?$", reason)
+            if match:
+                when = match.group(1)
+                break
+        lines.append(f"provider_quota: {provider} × {len(reasons)}"
+                     + (f" — retry at {when}" if when else ""))
+    return lines
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1407,6 +1527,11 @@ def cmd_run(args: argparse.Namespace) -> int:
     patches = export_patches(state, workspaces, out_dir)
     for row in state.table_rows():
         print(json.dumps(row, ensure_ascii=False))
+    # KC-61: one line per provider out of quota, with its reset time — the
+    # reason the agents ended is in each row's last_reason, and it is the same
+    # reason five times over, so the summary says it once per provider.
+    for line in _provider_quota_lines(state):
+        print(line)
     for patch in patches:
         print(f"patch: {patch}")
 
