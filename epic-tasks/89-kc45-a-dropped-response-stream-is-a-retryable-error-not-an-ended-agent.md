@@ -1,6 +1,6 @@
 # KC-45 — "the model's provider interrupted the response stream" is a dropped connection, so it is retried like one instead of ending the agent `ERROR`
 
-**Status:** queued — found live 2026-09-23 in round 86 (`laguna-s-2-1:free`, then `agnes-3-0-flash:free` twelve minutes later); the same payload ended an agent in round 58 (`muse-spark-1-3`) and round 59 (`mimo-v2-5:free`).
+**Status:** landed `fbfa62b` (2026-09-25) — round 89 winner sensenova-6-8-flash-lite-var1. Was queued: found live 2026-09-23 in round 86 (`laguna-s-2-1:free`, then `agnes-3-0-flash:free` twelve minutes later); the same payload ended an agent in round 58 (`muse-spark-1-3`) and round 59 (`mimo-v2-5:free`).
 **Severity:** MEDIUM (one slot of the round is lost to a transient provider fault KC-19 was written to absorb; three rounds out of the last dozen lost one, round 86 lost two)
 **File:** `tools/contest/runner.py`
 **Symbol:** `_RETRYABLE_MSG_RE`, `_retryable`
