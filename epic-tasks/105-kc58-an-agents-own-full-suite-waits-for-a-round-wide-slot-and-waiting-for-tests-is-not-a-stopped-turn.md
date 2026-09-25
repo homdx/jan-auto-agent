@@ -83,6 +83,33 @@ At a KC-36 deadline, an agent with a `bash` part `running`, a permission
 held for a slot, or a pytest process running in its worktree, is extended exactly as if its churn had grown. The extension
 is still bounded by `turn_max_sec`, which stays the hard ceiling.
 
+## Seen again in round 106
+
+`sensenova-6-8-flash-lite-var1` (round 106, KC-59) was working to the last
+second, and the turn was still aborted:
+
+- +3524 to +4097 s: it ran `pytest tests/test_contest_runner.py tests/test_contest_cli.py`,
+  `pytest tests/ -k contest`, `.smoke_tests/` and then the full `pytest tests/`.
+  Each took 2–3 min while 11 other agents ran their own suites.
+- At +3600 KC-36 granted one extension at 10 files / 1073 lines. At +4200
+  the sample was 10 files / **1072** lines: the agent had removed one line
+  while fixing a test. That is not "strictly growing", so no second
+  extension was granted. Its last `edit` was at +4196, 4 s before the
+  abort.
+- The report says `no idle after 70m (10 files, 1072 lines, unchanged for 10m)`.
+  "unchanged for 10m" is wrong: `_no_idle_error` measures from
+  `clock.last_change_at`, which only moves when an extension is **granted**,
+  not when the churn changes. Fix it here too: record the time of the last
+  sample that differed from the previous one (either number, up or down),
+  and print that as "unchanged for".
+- The 1072 lines are only in `../rounds/106-sensenova-6-8-flash-lite-var1`.
+  Nothing reached `contest-out/106/` (KC-41).
+
+For this ticket: count an edit (a `file.edited` event or a `tool` part
+`edit`/`write` completed during the turn's last `turn_extend_sec`) as
+progress at the deadline, in addition to a line count that grows. Churn that
+goes down is still work.
+
 ## Out of scope
 
 - Making the suite faster (FL-1, KC-38).
@@ -99,4 +126,5 @@ is still bounded by `turn_max_sec`, which stays the hard ceiling.
 - [ ] A holder past `agent_suite_max_sec` stops blocking: the next waiter is answered, and the holder's process is not signalled.
 - [ ] `agent_suite_slots = 0`: every reply is immediate, byte for byte as today.
 - [ ] A deadline reached with a `bash` part `running` extends the turn with unchanged churn. At `turn_max_sec` it does not.
+- [ ] Round 106 `sensenova-6-8-flash-lite-var1`: a sample of 1073 → 1072 lines with an `edit` in the last `turn_extend_sec` is extended, and `unchanged for` counts from the last sample that differed, not from the last grant.
 - [ ] `tests` and `tests_bugfix` green, sequentially; `CollectBridge._shrink` byte-identical.
