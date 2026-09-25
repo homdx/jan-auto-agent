@@ -307,6 +307,8 @@ model = kenary/hy3:free
     assert cfg.max_questions_per_turn == 3
     assert cfg.max_error_retries == 2
     assert cfg.error_retry_backoff_sec == 15
+    assert cfg.error_retry_max_backoff_sec == 60
+    assert cfg.agent_max_sec == 0
     assert cfg.progress_every_sec == 60
     assert cfg.tmp_roots == ()
     assert cfg.deny_commands == ()
@@ -354,6 +356,21 @@ model = kenary/hy3:free
     assert cfg0.error_retry_backoff_sec == 0
     for key in ("max_error_retries", "error_retry_backoff_sec"):
         assert isinstance(getattr(cfg, key), int)
+
+
+def test_error_retry_max_backoff_sec_parses_and_is_a_contest_key(tmp_path):
+    """The cap on the wait between retries; 0 = no cap."""
+    assert "error_retry_max_backoff_sec" in CONTEST_KEYS
+    assert "agent_max_sec" in CONTEST_KEYS
+    base = """
+[contest]
+error_retry_max_backoff_sec = %s
+
+[contest.agent.alpha]
+model = kenary/hy3:free
+"""
+    assert load_roster(write_ini(tmp_path, base % "90")).error_retry_max_backoff_sec == 90
+    assert load_roster(write_ini(tmp_path, base % "0")).error_retry_max_backoff_sec == 0
 
 
 def test_max_continues_per_attempt_defaults_to_two_and_parses(tmp_path):

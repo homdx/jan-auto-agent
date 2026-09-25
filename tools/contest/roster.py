@@ -91,6 +91,8 @@ CONTEST_KEYS = (
     "max_questions_per_turn",
     "max_error_retries",
     "error_retry_backoff_sec",
+    "error_retry_max_backoff_sec",
+    "agent_max_sec",
     "provider_retry_max_attempts",
     "provider_retry_max_wait_sec",
     "quota_patterns",
@@ -249,6 +251,11 @@ class ContestConfig:
     max_questions_per_turn: int = 3
     max_error_retries: int = 2
     error_retry_backoff_sec: int = 15
+    #: the longest wait between two retries; 0 = no cap (the wait keeps doubling)
+    error_retry_max_backoff_sec: int = 60
+    #: one agent's hard limit from its start, whatever the turns add up to; the
+    #: session is aborted as a stall and the tree is scored as it stands. 0 = off
+    agent_max_sec: int = 0
     #: KC-64: Kilo retries in a row with no model output before the agent
     #: ends ERROR provider_unavailable; 0 = off (wait for the turn deadline)
     provider_retry_max_attempts: int = 10
@@ -608,6 +615,8 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
         max_questions_per_turn=limit("max_questions_per_turn", 3),
         max_error_retries=limit("max_error_retries", 2),
         error_retry_backoff_sec=limit("error_retry_backoff_sec", 15),
+        error_retry_max_backoff_sec=limit("error_retry_max_backoff_sec", 60),
+        agent_max_sec=limit("agent_max_sec", 0),
         provider_retry_max_attempts=limit("provider_retry_max_attempts", 10),
         provider_retry_max_wait_sec=seconds("provider_retry_max_wait_sec", 300.0),
         quota_patterns=scalar("quota_patterns", ""),

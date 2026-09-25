@@ -427,7 +427,11 @@ def _is_quota(error, quota_re) -> bool:
 #: that finished, the model id and the request fields have just worked, and the
 #: refusal is the free tier refusing under load — the same class as the 429 two
 #: lines above it (§2a).
-_PROVIDER_REJECTED_RE = re.compile(r"provider rejected the request", re.IGNORECASE)
+#: A gateway's 403 ``request was blocked by a gateway or proxy`` is the same
+#: class (round 104: the three ``vercel_8080`` agents got it after ~30 min of
+#: work): retried only once the session has answered.
+_PROVIDER_REJECTED_RE = re.compile(
+    r"provider rejected the request|blocked by a gateway or proxy", re.IGNORECASE)
 
 #: KC-54: a context overflow's payload — the provider's name for it, or either
 #: spelling of the message it carries. The name is in the pattern as well as
@@ -451,6 +455,18 @@ CUT_OFF_MESSAGE = (
     "less, and make the next step a tool call. Your worktree and this "
     "conversation are intact — continue from where you were; do not start over."
 )
+
+
+def _retry_backoff(retry: int, base, cap) -> int:
+    """The wait before the *retry*-th retry: *base* doubled on each retry,
+    never longer than *cap* seconds (``0`` = no cap).
+
+    With 15 and 60: 15, 30, 60, 60, … — a long budget of retries stays a
+    minute apart instead of doubling into hours (round 104).
+    """
+    backoff = int(base) * (2 ** (int(retry) - 1))
+    cap = int(cap or 0)
+    return min(backoff, cap) if cap > 0 else backoff
 
 
 def _error_message(error) -> str:
@@ -1661,6 +1677,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
     agent_tmp_glob = f"{agent_tmp}/*" if agent_tmp is not None else ""
     session: SessionRef | None = None
     stalled: list = []          # the reason, once the runner's stall edge fired
+    time_up: "threading.Timer | None" = None   # the agent's hard limit, `agent_max_sec`
     questions_this_turn = [0]
     try:
         ticket_files = declared_files(ticket_path)
@@ -1780,6 +1797,16 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         except (ContestBackendError, ValueError) as exc:
             return finish(AgentState.ERROR, f"POST /session failed: {_brief(str(exc))}")
         run.session_id = session.id
+        # The agent's hard limit: `agent_max_sec` from here, whatever the turns,
+        # retries and extensions add up to. At the limit the session is aborted
+        # the way a stall is, and the tree is left as it stands for the scoring.
+        # 0 = no limit.
+        agent_max = float(getattr(config, "agent_max_sec", 0) or 0)
+        if agent_max > 0:
+            time_up = threading.Timer(
+                agent_max, stall, args=(f"time up: {_age(agent_max)} for the agent",))
+            time_up.daemon = True
+            time_up.start()
 
         rework_text = None
         retry_text = None
@@ -1787,6 +1814,9 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         continue_used = 0
         retries_used = 0
         while True:
+            if stalled:
+                # the hard limit fired between two turns: no new prompt
+                return finish(AgentState.STALLED, stalled[0])
             # ── PROMPTED ───────────────────────────────────────────────────
             if retry_text is not None:
                 kind, text = "retry", retry_text
@@ -1956,7 +1986,8 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                         run.turns.append(turn)
                         _append_jsonl(agent_dir / "turns.jsonl", {"agent": spec.name, **turn})
                         retries_used += 1
-                        backoff = int(config.error_retry_backoff_sec) * (2 ** (retries_used - 1))
+                        backoff = _retry_backoff(retries_used, config.error_retry_backoff_sec,
+                                                 getattr(config, "error_retry_max_backoff_sec", 0))
                         _log.info("%s: retry %d/%d in %ds — %s", spec.name,
                                   retries_used, int(config.max_error_retries),
                                   backoff, _retry_reason(idle.error))
@@ -2002,6 +2033,9 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
             elif idle.status == "closed":
                 error, state = f"event stream closed: {_brief(idle.error)}", AgentState.ERROR
             elif idle.status == "idle":
+                # A turn that ended idle is a good answer: the error budget
+                # counts refusals in a row, so it starts over here.
+                retries_used = 0
                 # KC-22: a turn that ended idle with edits in the tree but no
                 # commit is a model that has not handed in yet, not one that
                 # handed in a wrong entry. Nudge it on in this same session —
@@ -2110,6 +2144,8 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                        + ", ".join(r.code for r in verdict.reasons))
             rework_text = rework_message(verdict, run.attempt, int(config.max_rework))
     finally:
+        if time_up is not None:
+            time_up.cancel()
         if run.terminal:
             # KC-48: the turn is over — the session aborted, the stream closed,
             # or the state is whatever the run earned — so nothing the agent's

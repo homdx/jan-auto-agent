@@ -65,6 +65,7 @@ from tools.contest.runner import (  # noqa: E402
     _finished_replies,
     _is_overflow,
     _reap_worktree,
+    _retry_backoff,
     _retry_reason,
     _retryable,
     round_prompt,
@@ -1686,6 +1687,59 @@ def test_provider_rejected_request_is_retryable_after_a_finished_reply():
     refusing under load — the 429 class, retryable under KC-19's budget."""
     assert _retryable(_REJECTED_REQUEST, 1) is True
     assert _retryable(_REJECTED_REQUEST, 5) is True
+
+
+#: Round 104: the `vercel_8080` gateway's answer after ~30 min of work.
+_GATEWAY_403 = {"name": "APIError", "data": {
+    "message": "Forbidden: request was blocked by a gateway or proxy. You may not "
+               "have permission to access this resource — check your account and "
+               "provider settings.",
+    "statusCode": 403, "isRetryable": False}}
+
+
+def test_a_gateway_403_is_retried_only_after_a_finished_reply():
+    """Round 104: the gateway's 403 is §2/§2a's class — final on the first
+    call, the free tier under load once the session has answered."""
+    assert _retryable(_GATEWAY_403) is False
+    assert _retryable(_GATEWAY_403, 1) is True
+
+
+def test_retry_backoff_doubles_up_to_the_cap_then_stays():
+    """15, 30, then a minute apart; a cap of 0 keeps today's doubling."""
+    assert [_retry_backoff(n, 15, 60) for n in range(1, 7)] == [15, 30, 60, 60, 60, 60]
+    assert [_retry_backoff(n, 15, 0) for n in range(1, 5)] == [15, 30, 60, 120]
+    assert [_retry_backoff(n, 15, None) for n in range(1, 4)] == [15, 30, 60]
+    assert sum(_retry_backoff(n, 15, 60) for n in range(1, 31)) == 1725
+    assert _retry_backoff(3, 0, 60) == 0
+
+
+def test_a_good_turn_resets_the_retry_budget(tmp_path):
+    """The budget counts errors in a row: with a budget of 1, an error, a good
+    turn, then another error is retried again, not the end of the agent."""
+    scenario = {"turns": [
+        {"events": ["busy"], "error": _ECONNRESET},
+        {"events": ["busy", "idle"]},
+        {"events": ["busy"], "error": _ECONNRESET},
+        {"on_prompt": work_ready, "events": ["busy", "idle"]},
+    ]}
+    cfg = _make_retry_config(max_error_retries=1)
+    sb, fake, h, run, _ = _run_one(tmp_path, scenario, cfg)
+    assert run.state is AgentState.READY
+    assert [t["kind"] for t in run.turns].count("retry") == 2
+
+
+def test_agent_max_sec_ends_the_agent_between_turns(tmp_path):
+    """The agent's hard limit fires during a retry's backoff: no new prompt,
+    the agent ends STALLED "time up"."""
+    scenario = {"turns": [
+        {"events": ["busy"], "error": _ECONNRESET},
+        {"on_prompt": work_ready, "events": ["busy", "idle"]},
+    ]}
+    cfg = _make_retry_config(error_retry_backoff_sec=5, agent_max_sec=1)
+    sb, fake, h, run, _ = _run_one(tmp_path, scenario, cfg)
+    assert run.state is AgentState.STALLED
+    assert run.last_error.startswith("time up:")
+    assert len(_prompts(fake)) == 1
 
 
 class _Transcript:
