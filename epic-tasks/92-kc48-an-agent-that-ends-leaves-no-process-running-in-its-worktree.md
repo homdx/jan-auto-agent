@@ -1,6 +1,6 @@
 # KC-48 — an agent that has ended leaves no process running in its worktree: the runner reaps what the agent's commands left behind
 
-**Status:** queued — found live 2026-09-23 in round 86: 36 python processes (4 × `pytest -n=8 … tests` and their 32 xdist workers) ran on in `rounds/86-step-3-7-flash`, reparented to `systemd --user`, after the `bash` call that started them had returned, and past the agent's own `STALLED`.
+**Status:** landed `6c4fa3f` (2026-09-25) — round 92 winner sensenova-6-8-flash-lite-var2. Was queued: found live 2026-09-23 in round 86: 36 python processes (4 × `pytest -n=8 … tests` and their 32 xdist workers) ran on in `rounds/86-step-3-7-flash`, reparented to `systemd --user`, after the `bash` call that started them had returned, and past the agent's own `STALLED`.
 **Severity:** MEDIUM (a stray 32-worker suite on an 8-core box that is already carrying twelve agents — load average 72 at 19:01 — is what turns other agents' test runs into KC-47's silence stalls)
 **File:** `tools/contest/runner.py`
 **Symbol:** `run_agent` (`finally`, the terminal-state path), the round's end in `run_round`
