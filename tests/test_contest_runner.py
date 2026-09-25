@@ -785,6 +785,24 @@ def test_own_scratch_dir_is_once_and_the_other_agents_are_forbidden(tmp_path):
     assert str(tmp_root / "agent-b") in decisions[1]["reason"]
 
 
+def test_the_other_agents_dir_under_the_second_scratch_root_is_forbidden_too(tmp_path):
+    """KC-59 follow-up: with two scratch roots a sibling's dir under the second
+    one is a mechanical reject as well, not a `once` through the shared glob."""
+    sb = Sandbox(tmp_path, ["agent-a", "agent-b"])
+    kilo, contest = tmp_path / "kilo", tmp_path / "contest"
+    cfg = make_config(["agent-a", "agent-b"],
+                      tmp_roots=(str(kilo) + "/*", str(contest) + "/*"))
+    policy = make_policy(cfg, "allow")
+    with _BenchFake({"turns": [_permission_turn(work_ready, [str(contest / "agent-b") + "/*"])]}) as fake:
+        run = Harness(sb, fake, cfg, policy=policy).go()
+        (replied,) = fake.events_of("permission.replied")
+    _assert_ready(run, sb.ws("agent-a"))
+    assert replied["properties"]["reply"] == "reject"
+    line = _jsonl(sb.out_dir / "agent-a" / "decisions.jsonl")[-1]
+    assert line["layer"] == "mechanical" and str(contest / "agent-b") in line["reason"]
+    assert policy._completion_fn.calls == 0
+
+
 def test_the_prompt_sent_to_the_agent_names_its_own_scratch_dir(tmp_path):
     """KC-59: the runner derives the dir from `tmp_roots` and the agent's name —
     no path is named in the runner's code, and no other agent's dir is offered."""

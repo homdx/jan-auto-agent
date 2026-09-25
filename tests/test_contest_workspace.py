@@ -725,6 +725,52 @@ def test_prepare_round_makes_a_scratch_dir_per_agent(repo, clone_config):
     assert agent_tmp_globs(clone_config.tmp_roots, "laguna") == (str(laguna_dir) + "/*",)
 
 
+def test_a_clone_runs_the_repos_hooks(repo, clone_config):
+    """KC-59 follow-up: a worktree shares its repo's config, so the operator's
+    ``core.hooksPath githooks`` (the TIERS-1 pre-commit hook) ran on every
+    agent's commit; ``git clone`` copies no local config. The clone gets the
+    repo's value, and a commit in it runs the hook."""
+    hooks = repo / "githooks"
+    hooks.mkdir()
+    hook = hooks / "pre-commit"
+    hook.write_text("#!/bin/sh\necho refused by the repo hook >&2\nexit 1\n", encoding="utf-8")
+    hook.chmod(0o755)
+    _git(repo, "add", "githooks")
+    _git(repo, "commit", "-q", "-m", "hooks")
+    _git(repo, "config", "core.hooksPath", "githooks")
+
+    ws = prepare_round(repo, clone_config, 40, "HEAD")[0]
+    assert _git(ws.path, "config", "--get", "core.hooksPath").strip() == "githooks"
+    (ws.path / "new.txt").write_text("x\n", encoding="utf-8")
+    _git(ws.path, "add", "new.txt")
+    proc = subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit",
+                           "-q", "-m", "w"], cwd=ws.path, capture_output=True, text=True)
+    assert proc.returncode != 0 and "refused by the repo hook" in proc.stderr
+
+
+def test_a_clone_of_a_repo_without_hooks_sets_none(repo, clone_config):
+    """Nothing to copy: the clone's config gains no ``core.hooksPath``."""
+    ws = prepare_round(repo, clone_config, 40, "HEAD")[0]
+    proc = subprocess.run(["git", "config", "--local", "--get", "core.hooksPath"],
+                          cwd=ws.path, capture_output=True, text=True)
+    assert proc.returncode == 1 and proc.stdout == ""
+
+
+def test_the_other_agents_dirs_are_named_under_every_scratch_root(tmp_path):
+    """KC-59 follow-up: the agent's own dir is allowed under every root
+    (``agent_tmp_globs``), so a sibling's dir must be forbidden under every root
+    too — ``/tmp/contest/<other>`` would otherwise pass the shared
+    ``/tmp/contest/*`` glob as ``once``."""
+    roots = (str(tmp_path / "kilo") + "/*", str(tmp_path / "contest") + "/*")
+    assert agent_tmp_dirs(roots, ("laguna", "hy3")) == (
+        tmp_path / "kilo" / "laguna", tmp_path / "contest" / "laguna",
+        tmp_path / "kilo" / "hy3", tmp_path / "contest" / "hy3",
+    )
+    assert agent_tmp_dirs(roots, ("laguna", None, "", "laguna")) == (
+        tmp_path / "kilo" / "laguna", tmp_path / "contest" / "laguna",
+    )
+
+
 def test_scratch_helpers_fail_open(tmp_path):
     """No ``tmp_roots``, a malformed glob or a non-string agent degrades to "no
     scratch dir" and never raises — an absent config key is not a round."""

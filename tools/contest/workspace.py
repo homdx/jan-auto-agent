@@ -406,6 +406,27 @@ def _disable_push(clone: Path) -> None:
                      type(exc).__name__, exc)
 
 
+def _copy_hooks_path(repo: Path, clone: Path) -> None:
+    """Give the clone the repo's ``core.hooksPath``, so an agent's commit runs the same hooks.
+
+    A worktree shares its repo's config, so the operator's
+    ``git config core.hooksPath githooks`` (the TIERS-1 pre-commit hook: tier
+    symlinks and stray root files) ran on every agent's commit. ``git clone``
+    copies no local config, so without this a clone commits past the hook. The
+    value is copied as it is: a relative ``githooks`` resolves against the
+    clone's own tree, which holds the same tracked ``githooks/``. Nothing is
+    set when the repo sets nothing. Fail-open, like :func:`_disable_push`.
+    """
+    try:
+        proc = _git(repo, ["config", "--local", "--get", "core.hooksPath"], check=False)
+        value = proc.stdout.strip() if proc.returncode == 0 else ""
+        if value:
+            _git(clone, ["config", "core.hooksPath", value], check=False)
+    except Exception as exc:  # noqa: BLE001 — the checkout is the round, not the hook
+        _log.warning("could not copy core.hooksPath into %s: %s: %s", clone,
+                     type(exc).__name__, exc)
+
+
 def reset_clone(repo, rounds_dir, round_no: int, agent: str, base_sha: str,
                 *, force: bool = False) -> Workspace:
     """A fresh, idempotent local clone for *agent* at *base_sha*.
@@ -476,6 +497,7 @@ def reset_clone(repo, rounds_dir, round_no: int, agent: str, base_sha: str,
         _git(path, ["checkout", "-q", "-B", branch, base_sha])
 
     _disable_push(path)
+    _copy_hooks_path(repo_path, path)
     _git(path, ["clean", "-fdx", "-e", "runs/"])
     _empty_runs_dir(path, agent)
 
@@ -561,13 +583,22 @@ def agent_tmp_dirs(tmp_roots, agents) -> tuple[Path, ...]:
     KC-59's half of the rule "the policy allows its own dir and not the other
     agents'": each of these belongs to another agent and is forbidden ground for
     this one. *agents* may hold ``AgentSpec`` or bare names.
+
+    The dirs are taken under **every** scratch root, the way
+    :func:`agent_tmp_globs` allows the agent's own dir under every root: with
+    ``/tmp/kilo/*, /tmp/contest/*`` a sibling's ``/tmp/contest/<other>`` would
+    otherwise match the shared ``/tmp/contest/*`` glob and pass as ``once``.
     """
     dirs: list[Path] = []
+    roots = tmp_root_dirs(tmp_roots)
     for agent in agents or ():
         name = getattr(agent, "name", agent)
-        path = agent_tmp_dir(tmp_roots, name)
-        if path is not None and path not in dirs:
-            dirs.append(path)
+        if not isinstance(name, str) or not name.strip():
+            continue
+        for root in roots:
+            path = root / name.strip()
+            if path not in dirs:
+                dirs.append(path)
     return tuple(dirs)
 
 
