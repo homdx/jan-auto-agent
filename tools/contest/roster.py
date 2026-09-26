@@ -120,6 +120,7 @@ CONTEST_KEYS = (
     "rounds_dir",
     "workspace_kind",
     "variant",
+    "probe_ttl_days",
 )
 
 #: Every key an agent section may carry.
@@ -335,6 +336,8 @@ class ContestConfig:
     #: (``high``, ``max``), ``highest`` (the top one that answers, probed at
     #: intake) or ``default`` (no variant sent: the provider's own default).
     variant: str = "highest"
+    #: KC-11: how many days a probe result is trusted before re-probing. 0 = always re-probe.
+    probe_ttl_days: int = 7
     agents: tuple[AgentSpec, ...] = ()
     gate_settings: LlmSettings = field(default_factory=lambda: DEFAULTS_GATE)
     #: The backend the round runs on: one of ``BACKENDS``, one value per round.
@@ -659,6 +662,7 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
         rounds_dir=scalar("rounds_dir", "../rounds"),
         workspace_kind=workspace_kind,
         variant=scalar("variant", "highest") or "highest",
+        probe_ttl_days=int(scalar("probe_ttl_days", "7") or "7"),
         agents=agents,
         gate_settings=settings,
         backend=backend,

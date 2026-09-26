@@ -1764,3 +1764,45 @@ def test_providers_of_a_non_dict_body_is_a_value_error(tmp_path):
                            "turns": [{"events": ["busy", "idle"], "assistant": "done"}]}) as h:
         with pytest.raises(ValueError, match="GET /provider"):
             h.client.providers()
+
+
+# ── KC-11: delete_session and create_session(variant=) ──────────────────────
+
+def test_delete_session_200_returns_none(tmp_path):
+    """KC-11: `DELETE /session/{id}` with a 200 returns `None`."""
+    scenario = {"turns": [{"events": ["busy", "idle"], "assistant": "hello"}]}
+    with _probe(tmp_path, scenario) as h:
+        session = h.client.create_session("kenary", "hy3:free", rules=[], title="t")
+        result = h.client.delete_session(session)
+    assert result is None
+    deletes = h.fake.calls(method="DELETE")
+    assert any(f"/session/{session.id}" == r["path"] for r in deletes)
+
+
+def test_delete_session_404_raises_kilo_http_error(tmp_path):
+    """KC-11: deleting a session that does not exist raises `KiloHttpError`."""
+    scenario = {"turns": []}
+    with _probe(tmp_path, scenario) as h:
+        ghost = SessionRef(id="no-such-id", provider_id="kenary", model_id="hy3:free",
+                           directory=str(tmp_path), agent=None, variant=None)
+        with pytest.raises(KiloHttpError) as exc:
+            h.client.delete_session(ghost)
+    assert exc.value.status == 404
+
+
+def test_create_session_with_variant_sends_model_variant(tmp_path):
+    """KC-11 / KC-49: `create_session(..., variant="high")` puts `model.variant`
+    in the POST body; a `None` variant sends no variant key at all."""
+    scenario = {"turns": [{"events": ["busy", "idle"], "assistant": "hi"}]}
+    with _probe(tmp_path, scenario) as h:
+        s_high = h.client.create_session("kenary", "hy3:free", rules=[], title="t", variant="high")
+        s_none = h.client.create_session("kenary", "hy3:free", rules=[], title="t", variant=None)
+
+    # _probe creates one session with title "kilo-client-test"; skip it
+    posts = [p for p in h.fake.calls(method="POST", path="/session")
+             if (p["body"] or {}).get("title") == "t"]
+    assert len(posts) == 2
+    assert posts[0]["body"]["model"].get("variant") == "high"
+    assert "variant" not in posts[1]["body"]["model"]
+    assert s_high.variant == "high"
+    assert s_none.variant is None

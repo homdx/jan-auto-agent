@@ -110,6 +110,12 @@ from tools.contest.variant import (
     needs_login,
     pick_variant,
 )
+from tools.contest.think_probe import (
+    PROBE_CACHE_FILE,
+    load_probe_cache,
+    probe_model,
+    save_probe_cache,
+)
 from tools.contest.workspace import WorkspaceError, prepare_round
 from tools.git_run import run_git
 
@@ -970,7 +976,11 @@ def _offer_server(kilo_bin: str | None, env: dict | None = None) -> tuple:
 
 
 def _check_offer(repo, config: ContestConfig, attached, *, resolve: bool = True,
-                 register_missing: bool = False) -> _Offer:
+                 register_missing: bool = False,
+                 probe_cache: dict | None = None,
+                 probe_cache_path: str | None = None,
+                 reprobe: bool = False,
+                 allow_unprobed: bool = False) -> _Offer:
     """The roster's `provider/model` pairs checked against `GET /provider`, then
     its variants resolved there (KC-49), then the gate's two intake checks
     (KC-55), returning an `_Offer`.
@@ -1110,9 +1120,67 @@ def _check_offer(repo, config: ContestConfig, attached, *, resolve: bool = True,
         if quota_re is not None:
             probe_kwargs["quota_re"] = quota_re
 
+        # KC-11: wrap the existing probe_for with cache logic.
+        # For `highest` and a fresh cache entry: no session is opened — the
+        # try_one immediately returns success for the cached variant and a
+        # failure string for all others. After a live probe the result is saved.
+        # For a named variant: the existing KC-61 single-rung hello_probe runs
+        # as before; the cache is not consulted (the operator committed to the
+        # name, and the probe checks it works, not what the best variant is).
+        _cache = probe_cache if probe_cache is not None else {}
+        _ttl = int(getattr(config, "probe_ttl_days", 7) or 7)
+        import time as _time
+
         def probe_for(agent):
-            return hello_probe(server, agent.provider_id, agent.model_id,
-                               **probe_kwargs)
+            base_try_one = hello_probe(server, agent.provider_id, agent.model_id,
+                                       **probe_kwargs)
+            # Only cache-check for agents whose variant is `highest` — a named
+            # variant goes through the original single-rung path.
+            if agent.variant not in (HIGHEST, None):
+                return base_try_one
+
+            key = f"{agent.provider_id}/{agent.model_id}"
+            entry = _cache.get(key) if not reprobe else None
+            now = _time.time()
+            if isinstance(entry, dict):
+                age_days = (now - float(entry.get("probed_at", 0))) / 86400.0
+                cached_ver = entry.get("kilo_version", "")
+                version_ok = True  # no kilo_version available at this call site
+                if age_days < _ttl and version_ok:
+                    cached_variant = entry.get("variant")
+                    tried_map = {t[0]: t[1] for t in (entry.get("tried") or [])}
+
+                    def _cached(variant, _cv=cached_variant, _tm=tried_map):
+                        if variant == _cv:
+                            return None
+                        return _tm.get(variant, "probe failed (cached)")
+
+                    return _cached
+
+            # Live probe: wrap base_try_one to save the result on first success.
+            winner_box: list = []
+            tried_box: list = []
+
+            def _caching(variant):
+                reason = base_try_one(variant)
+                if reason is None:
+                    # first success → save the ladder result so far
+                    _cache[key] = {
+                        "variant": variant,
+                        "usable": True,
+                        "probed_at": _time.time(),
+                        "kilo_version": "",
+                        "tried": [[r, rs] for r, rs in tried_box],
+                        "reasoning_tokens": 0,
+                    }
+                    if probe_cache_path:
+                        save_probe_cache(probe_cache_path, _cache)
+                else:
+                    tried_box.append([variant, reason])
+                return reason
+
+            return _caching
+
         resolved, failures, notes = resolve_variants(providers, agents, probe_for,
                                                      kilo_bin=kilo_bin,
                                                      quota_re=quota_re)
@@ -1138,7 +1206,10 @@ def _check_offer(repo, config: ContestConfig, attached, *, resolve: bool = True,
 
 
 def intake(repo, tasks_dir, round_no, base_ref, config, argv=None,
-           register_missing: bool = False):
+           register_missing: bool = False,
+           reprobe: bool = False,
+           allow_unprobed: bool = False,
+           roster_path: str | None = None):
     """Run every pre-round check; return the `Intake`, or `None` with the failures printed.
 
     All checks run and every failure goes to stderr on its own line before
@@ -1258,8 +1329,18 @@ def intake(repo, tasks_dir, round_no, base_ref, config, argv=None,
         # refusal that used to arrive as one agent's first-turn `session.error`
         # the variant probe spends model calls, so it only runs for a round
         # that has passed every other check
+        # KC-11: load (or start) the probe cache from next to the roster ini.
+        _probe_cache_path: str | None = None
+        _probe_cache: dict | None = None
+        if roster_path:
+            _probe_cache_path = str(Path(roster_path).parent / PROBE_CACHE_FILE)
+            _probe_cache = load_probe_cache(_probe_cache_path)
         offer = _check_offer(repo, config, attached, resolve=not failures,
-                             register_missing=register_missing)
+                             register_missing=register_missing,
+                             probe_cache=_probe_cache,
+                             probe_cache_path=_probe_cache_path,
+                             reprobe=reprobe,
+                             allow_unprobed=allow_unprobed)
         failures.extend(offer.failures)
         for note in offer.notes:
             print(f"variant: {note}")
@@ -1605,9 +1686,13 @@ def cmd_run(args: argparse.Namespace) -> int:
     config = _apply_flags(config, args)
     run_tests = not args.no_tests
 
+    _roster_ini_path = str(_roster_path(repo, args.roster))
     result = intake(repo, tasks_dir, args.ticket, args.base, config,
                     argv=getattr(args, "argv", None),
-                    register_missing=args.register_missing)
+                    register_missing=args.register_missing,
+                    reprobe=getattr(args, "reprobe", False),
+                    allow_unprobed=getattr(args, "allow_unprobed", False),
+                    roster_path=_roster_ini_path)
     if result is None:
         return EXIT_FAILED
     if result.agents:
@@ -1771,6 +1856,12 @@ def _parser() -> argparse.ArgumentParser:
                      help="register a roster model that is not in Kilo's own model list "
                           "for this round, through KILO_CONFIG_CONTENT (kilo.jsonc is not "
                           "edited; needs server = spawn)")
+    run.add_argument("--reprobe", action="store_true",
+                     help="re-run the variant probe even when contest-probe.json holds a "
+                          "fresh entry for the same model and Kilo version (KC-11)")
+    run.add_argument("--allow-unprobed", action="store_true",
+                     help="start the round even when a model's variant probe failed or "
+                          "the cache has no entry for it (KC-11)")
     run.add_argument("--max-parallel", type=int, default=None, metavar="N",
                      help="override the roster's max_parallel")
     run.add_argument("--no-tests", action="store_true",

@@ -20,6 +20,9 @@ examples/task*/
 contest.local.ini
 contest-out/
 
+# KC-11: local variant probe cache — machine-specific, not committed.
+contest-probe.json
+
 # Benchmark run data — regenerated per run, not source.
 # The curated ground truth lives in GROUND-competition.md instead.
 validate*/*.csv
