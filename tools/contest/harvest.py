@@ -114,8 +114,12 @@ class Harvest:
 
     `verdict` is `READY` iff no reason is blocking. `reasons` lists everything
     found — a `READY` can still carry the non-blocking off-ticket note. `commit`
-    is the full 40-char sha the agent's claim in `PROGRESS.csv` resolves to, or
-    None when the row, its commit or its sha is missing or unresolvable.
+    is the full 40-char sha the agent's claim in `PROGRESS.csv` resolves to;
+    when there is no row at all, KC-30 names the branch's one commit instead —
+    the sha a patch is formatted from, so a stalled agent that never ran
+    `append_task.py` still hands the operator something. None when the claim
+    cannot be resolved, and always for a branch with two commits or none:
+    an ambiguous branch names no sha, whatever a row says.
     `facts` is the `judge_worktree` row (plus `tests_run` when tests ran);
     `elapsed` is the wall time of this harvest in seconds.
     """
@@ -265,6 +269,38 @@ def _drop_worktree(ws: Workspace, parent: str | None) -> None:
             run_git(["git", "worktree", "prune"], cwd=str(ws.path))
         except OSError:
             pass
+
+
+def _branch_commit(path: Path, facts: dict) -> str | None:
+    """KC-30: the full sha of the branch's one commit, from the scorecard row.
+
+    `facts["sha"]` is the short sha `judge_worktree` counted for the commit, so
+    it is resolved back here to the 40-char form `_resolve_claim` returns and
+    `Harvest.commit` keeps one shape. `git rev-parse HEAD` is the fallback, and
+    it is the same commit — with exactly one on the branch, the scorecard
+    counted the tip.
+
+    None when there is not exactly one commit to name — two (amend them into
+    one), none (nothing to export) — an ambiguous branch names no sha. None for
+    a `facts` row without `commits` (a path git will not read), and for a git
+    that cannot answer: a sha that cannot be resolved is no sha, never an
+    exception into the harvest.
+    """
+    if facts.get("commits") != 1:
+        return None
+    sha = facts.get("sha")
+    if isinstance(sha, str) and sha:
+        try:
+            full = git(str(path), "rev-parse", "--verify", "--quiet",
+                       f"{sha}^{{commit}}")
+        except (OSError, subprocess.TimeoutExpired):
+            full = ""
+        if full:
+            return full
+    try:
+        return git(str(path), "rev-parse", "HEAD") or None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
 
 
 def _last_tail_section(tail: list[str]) -> list[str]:
@@ -448,6 +484,16 @@ def harvest(ws: Workspace, ticket_path: Path, *, run_tests: bool = False,
                 blocking=False,
             ))
 
+    # KC-30: the commit the verdict points at. The claim's sha wins when the
+    # claim resolves; with no row at all the branch's one commit is named
+    # instead, so an agent that commits and stalls before `append_task.py` does
+    # not end with `commit: null` and no patch. A branch with two commits, or
+    # none, names nothing either way — there is no single sha to point at, and
+    # the fallback only reads a branch the scorecard counted one commit on.
+    commit = resolved if facts.get("commits") == 1 else None
+    if commit is None and claim is None:
+        commit = _branch_commit(ws.path, facts)
+
     # No commit above the base: `commits_ne_1` already makes this REWORK, and the
     # roots would only run the base itself — so they are not run at all.
     if run_tests and facts.get("commits") != 0:
@@ -492,7 +538,7 @@ def harvest(ws: Workspace, ticket_path: Path, *, run_tests: bool = False,
     return Harvest(
         verdict=verdict,
         reasons=tuple(reasons),
-        commit=resolved,
+        commit=commit,
         facts=facts,
         elapsed=time.monotonic() - start,
         waited=max(0.0, float(waited or 0)),

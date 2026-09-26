@@ -790,14 +790,127 @@ def test_run_tests_reports_the_tier_check_when_the_tree_has_one(round_, tmp_path
 def test_harvest_without_a_progress_row_reworks(round_, tmp_path):
     repo, base, ticket = round_
     wt = _worktree(repo, base, tmp_path)
-    _accepting(wt)
+    sha = _accepting(wt)
 
     h = harvest(wt, ticket)
     assert h.verdict == "REWORK"
     assert _codes(h) == ["no_progress_row"]
     assert _blocking(h) == ["no_progress_row"]
+    assert h.commit == sha  # KC-30: the branch's one commit, not None
     assert h.facts["commits"] == 1
     assert h.elapsed > 0
+
+
+def test_harvest_names_the_branchs_one_commit_when_no_row_does(round_, tmp_path):
+    """KC-30: the verdict does not move — `REWORK` with `no_progress_row` — but
+    `commit` names the commit on the branch, so `export_patches` has work to
+    format instead of a null. A row naming the same commit is unchanged, and an
+    ambiguous branch (two commits) or one at the base (none) still names nothing."""
+    repo, base, ticket = round_
+
+    one = _worktree(repo, base, tmp_path, agent="one")
+    head = _accepting(one)
+    h = harvest(one, ticket)
+    assert h.verdict == "REWORK"
+    assert _codes(h) == ["no_progress_row"]
+    assert _blocking(h) == ["no_progress_row"]
+    assert h.commit == head
+    assert len(h.commit) == 40
+
+    _record(one, ticket.name, outcome="DONE", commit=head)
+    h = harvest(one, ticket)
+    assert h.verdict == "READY"
+    assert _codes(h) == []
+    assert h.commit == head
+
+    two = _worktree(repo, base, tmp_path, agent="two")
+    _accepting(two)
+    _edit(two, "tools/auto/extra.py", "EXTRA = 1\n")
+    _commit(two, "second")
+    h = harvest(two, ticket)
+    assert h.verdict == "REWORK"
+    assert "no_progress_row" in _codes(h) and "commits_ne_1" in _codes(h)
+    assert h.commit is None
+
+    empty = _worktree(repo, base, tmp_path, agent="empty")
+    h = harvest(empty, ticket)
+    assert h.verdict == "REWORK"
+    assert h.commit is None
+    assert h.facts["commits"] == 0 and h.facts["sha"] == "—"
+
+
+def test_harvest_names_the_branch_commit_when_no_row_claims_it(round_, tmp_path):
+    """KC-30: no row is still REWORK with `no_progress_row`, but the verdict
+    names the branch's one commit — the sha `export_patches` formats a patch
+    from — instead of None.
+
+    Two commits and no commit both stay None: an ambiguous branch must not name
+    a sha, and a branch with nothing on it exports nothing.
+    """
+    repo, base, ticket = round_
+
+    one = _worktree(repo, base, tmp_path, agent="one")
+    sha = _accepting(one)
+    h = harvest(one, ticket)
+    assert h.verdict == "REWORK"
+    assert _codes(h) == ["no_progress_row"]
+    assert h.commit == _git(one.path, "rev-parse", "HEAD") == sha
+
+    # a row that names the same commit still resolves to it, unchanged
+    _record(one, ticket.name, outcome="DONE", commit=sha)
+    h = harvest(one, ticket)
+    assert h.verdict == "READY" and h.commit == sha
+
+    two = _worktree(repo, base, tmp_path, agent="two")
+    _accepting(two)
+    _git(two.path, "commit", "-q", "--allow-empty", "-m", "second")
+    assert harvest(two, ticket).commit is None
+
+    none = _worktree(repo, base, tmp_path, agent="none")
+    assert harvest(none, ticket).commit is None
+
+
+def test_harvest_names_no_commit_when_the_row_has_no_facts(round_, tmp_path, monkeypatch):
+    """Fail-open: a facts row without `commits` (a path git will not read) names
+    no commit and does not raise."""
+    repo, base, ticket = round_
+    wt = _worktree(repo, base, tmp_path)
+    _accepting(wt)
+
+    def row(*args, **kwargs):
+        return {"agent": "a", "path": str(wt.path), "gate": "FAIL",
+                "notes": "not a git worktree"}
+
+    monkeypatch.setattr("tools.contest.harvest.judge_worktree", row)
+    h = harvest(wt, ticket)
+    assert h.commit is None
+    assert _codes(h) == ["no_progress_row", "commits_ne_1"]
+
+
+def test_branch_commit_falls_back_to_head_when_the_short_sha_will_not_resolve(
+        round_, tmp_path, monkeypatch):
+    """Fail-open: `facts["sha"]` is a 7-char prefix, so it can fail `--verify`;
+    `rev-parse HEAD` is the same commit and names it instead."""
+    repo, base, ticket = round_
+    wt = _worktree(repo, base, tmp_path)
+    sha = _accepting(wt)
+
+    def no_verify(*args, **kwargs):
+        raise OSError("verify refused")
+
+    real_git = gates_mod.git
+    monkeypatch.setattr("tools.contest.harvest.git",
+                        lambda cwd, *args, **kwargs: "" if "verify" in " ".join(args)
+                        else real_git(cwd, *args, **kwargs))
+    assert harvest_mod._branch_commit(wt.path,
+                                      {"commits": 1, "sha": sha[:7]}) == sha
+
+    monkeypatch.setattr("tools.contest.harvest.git", no_verify)
+    assert harvest_mod._branch_commit(wt.path,
+                                      {"commits": 1, "sha": sha[:7]}) is None
+    assert harvest_mod._branch_commit(wt.path, {"commits": 1, "sha": "—"}) is None
+    assert harvest_mod._branch_commit(wt.path, {"commits": 2, "sha": sha[:7]}) is None
+    assert harvest_mod._branch_commit(wt.path, {"commits": 0}) is None
 
 
 def test_harvest_accepts_a_done_row_on_a_clean_commit(round_, tmp_path):

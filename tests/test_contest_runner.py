@@ -1190,6 +1190,40 @@ def test_a_stalled_turn_with_a_rejected_commit_stays_stalled_without_a_reprompt(
     assert len(_prompts(fake)) == 1
 
 
+def test_a_stalled_turn_reads_the_rejected_commit_from_the_harvest(tmp_path, monkeypatch):
+    """KC-30: the sha of a no-row stall comes from `Harvest.commit` — the harvest
+    names the branch's one commit itself — so the runner holds no `rev-parse` of
+    its own to drift out of step with it.
+
+    `_commits_above` still asks git for the count (`rev-list`), so the wrapper
+    refuses only `rev-parse`; the harvest's own `rev-parse` runs in another
+    module and is untouched."""
+    import tools.contest.gates as gates_mod
+    import tools.contest.runner as runner_mod
+
+    real_git = gates_mod.git
+
+    def no_rev_parse(cwd, *args, **kwargs):
+        if "rev-parse" in args:
+            raise AssertionError("KC-30: the runner must not rev-parse a commit itself")
+        return real_git(cwd, *args, **kwargs)
+
+    monkeypatch.setattr("tools.contest.runner.git", no_rev_parse)
+
+    sb, fake, _h, run, _ = _run_one(tmp_path,
+        {"turns": [{"events": [], "idle": False}]}, _stall_config(),
+        prepare=lambda d: work_no_claim(d, ""))
+    ws = sb.ws("agent-a")
+    assert run.state is AgentState.STALLED, run.last_error
+    assert run.commit == _branch_sha(ws)
+    (turn,) = run.turns
+    assert turn["harvest"]["verdict"] == "REWORK"
+    assert turn["harvest"]["reasons"] == ["no_progress_row"]
+    assert len(_prompts(fake)) == 1
+    # the fallback is gone for good, not just unused: no `rev-parse` in runner.py
+    assert "rev-parse" not in Path(runner_mod.__file__).read_text(encoding="utf-8")
+
+
 def test_an_error_turn_with_a_valid_commit_is_harvested_to_ready(tmp_path, caplog):
     """`session.error` after the commit and the claim: the same harvest as the
     stall, ERROR standing in for STALLED."""
@@ -1263,6 +1297,31 @@ def test_a_terminal_harvest_skips_the_commit_when_the_branch_has_two(tmp_path):
     assert turn["harvest"]["verdict"] == "REWORK"
     assert "commits_ne_1" in turn["harvest"]["reasons"]
     assert _git(ws.path, "rev-list", "--count", f"{ws.base_sha}..HEAD") == "2"
+
+
+def test_a_terminal_harvest_takes_its_commit_from_the_verdict(tmp_path, monkeypatch):
+    """KC-30: the runner derives no sha of its own — the branch's one commit is
+    the harvest's to set, so nothing here asks git for HEAD. That is the three
+    lines five round-60 entries each had to write beside the harvest call, and
+    the next caller was to forget them: `verdict.commit` is what reaches
+    `run.commit` and the patch the operator reads."""
+    import tools.contest.runner as runner_mod
+
+    asks: list[tuple[str, ...]] = []
+    real = runner_mod.git
+
+    def git_no_head(cwd, *args, **kwargs):
+        asks.append(args)
+        return real(cwd, *args, **kwargs)
+
+    monkeypatch.setattr(runner_mod, "git", git_no_head)
+    sb, fake, _h, run, _ = _run_one(tmp_path,
+        {"turns": [{"events": [], "idle": False}]}, _stall_config(),
+        prepare=lambda d: work_no_claim(d, ""))
+    ws = sb.ws("agent-a")
+    assert run.state is AgentState.STALLED, run.last_error
+    assert run.commit == _branch_sha(ws)
+    assert ("rev-parse", "HEAD") not in asks
 
 
 def test_a_terminal_harvest_runs_the_roots_under_the_rounds_lock(tmp_path, monkeypatch):

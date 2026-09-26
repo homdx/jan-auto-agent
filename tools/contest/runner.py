@@ -970,11 +970,6 @@ def _commits_above(ws: Workspace) -> int:
     return int(count) if count.isdigit() else 0
 
 
-def _head_sha(ws: Workspace) -> str | None:
-    """HEAD of *ws* as a full sha, or None when it cannot be read."""
-    return git(ws.path, "rev-parse", "HEAD") or None
-
-
 def _split_numstat(line: str) -> tuple[int, int, str]:
     """`(added, deleted, path)` of one `git diff --numstat` line.
 
@@ -3213,12 +3208,11 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                             "elapsed": round(verdict.elapsed, 1),
                             "waited": round(verdict.waited, 1),
                         }
-                        run.commit = None
-                        if above == 1:
-                            # the claim's sha once the harvest resolved it, else the
-                            # one commit on the branch — `None` when there are two
-                            # (amend them into one) or none (no harvest was run)
-                            run.commit = verdict.commit or _head_sha(ws)
+                        # KC-30: the harvest names the branch's one commit itself
+                        # when no row claims it, so there is no fallback to add
+                        # here — the sha comes from the verdict, one line as the
+                        # HARVESTING step does, so the two cannot drift apart.
+                        run.commit = verdict.commit
                         if verdict.verdict == "READY":
                             note = f"{(run.commit or '')[:12]} after {error}"
                             state = AgentState.READY
