@@ -122,6 +122,7 @@ __all__ = [
     "agents_from_models",
     "cmd_run",
     "export_patches",
+    "gate_model_refusals",
     "gate_share_line",
     "intake",
     "main",
@@ -807,6 +808,40 @@ def gate_share_line(providers, agents, gate_base_url) -> str:
             + "[contest_gate_llm] in " + LOCAL_FILENAME + " at another endpoint")
 
 
+def gate_model_refusals(config, agents) -> list:
+    """KC-37 §2: the intake lines refusing a gate model the roster runs, or `[]`.
+
+    Rounds 64, 74 and 86: the gate was `hy3:free` and `hy3` was an agent, so
+    every ask landed on an endpoint the round itself was saturating and came
+    back `gate-failed`. KC-55's shared-host line only warns; a gate that *is* a
+    competitor is refused.
+
+    Matched on the model, never the agent name, and every matching agent is
+    named (KC-34 §7 puts `hy3-var1` and `hy3-var2` on one model). The gate's
+    `model` is what its endpoint calls the model, so it matches an agent's
+    `model_id` — `nex-agi/nex-n2.5-pro:free` is `kilo/nex-agi/nex-n2.5-pro:free`
+    — or its whole `provider/model`; `openrouter/hy3:free` is neither for
+    `kenary/hy3:free`, so those two do not collide.
+
+    `[]` with no gate (`--no-gate`) and for the committed placeholder, which
+    has its own complaint.
+    """
+    settings = config.gate_settings
+    model = getattr(settings, "model", "") if settings is not None else ""
+    model = model.strip() if isinstance(model, str) else ""
+    if not model or model == GATE_PLACEHOLDER_MODEL:
+        return []
+    names = [agent.name for agent in agents if model in (agent.model_id, agent.model)]
+    if not names:
+        return []
+    shown = names[0] + (f" (and {', '.join(names[1:])})" if len(names) > 1 else "")
+    return [
+        f"gate model {model} is also agent {shown} in this round",
+        "  the gate must be a second, independent model: set [contest_gate_llm] model",
+        f"  in {LOCAL_FILENAME} to something the roster does not run, or pass --no-gate",
+    ]
+
+
 def _gate_probe(config) -> tuple:
     """KC-55 §5: `(refusals, warnings)` from one call to the gate before the round.
 
@@ -1115,6 +1150,7 @@ def intake(repo, tasks_dir, round_no, base_ref, config, argv=None,
     does not name a ticket and `scripts/next_task.py` would hand that one to
     the session; the gate's worst case fits the silence clock it holds —
     `policy.gate_worst_case_sec` against `idle_event_timeout_sec` (KC-55 §3);
+    the gate's model is not one the roster runs (KC-37 §2);
     the server answers — the `kilo` binary resolves when the
     roster says `spawn`, else `KiloServer.attach` reaches the URL; and the
     roster's `provider/model` pairs are on offer — `KiloClient.providers`
@@ -1194,6 +1230,11 @@ def intake(repo, tasks_dir, round_no, base_ref, config, argv=None,
             f"gate retries can outlast the silence clock: worst case "
             f"{_seconds(worst_case)} s ≥ idle_event_timeout_sec {_seconds(idle)} — "
             f"lower gate_deadline_sec in contest.ini, or raise idle_event_timeout_sec")
+
+    # KC-37 §2: the gate is not one of the round's own models. It reads no
+    # server, so it goes before the offer check and a refused round spends no
+    # model call, the gate probe included.
+    failures.extend(gate_model_refusals(config, config.agents))
 
     # an openrouter round has no offer to probe: `highest` is no variant there
     agents = _without_highest(config.agents)

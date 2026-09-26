@@ -2013,6 +2013,131 @@ def test_a_silence_clock_shorter_than_the_gate_worst_case_refuses_the_round(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# KC-37 §2: the gate is never a model the round is competing
+# ─────────────────────────────────────────────────────────────────────────────
+
+KC37_SCENARIO = {
+    "providers": _offer((_provider("kenary", "kenari", ("hy3:free", "x:free", "y:free")),
+                         _provider("kilo", "kilo", ("nex-agi/nex-n2.5-pro:free",))),
+                        connected=("kenary", "kilo")),
+    "turns": [{"on_prompt": work_ready, "events": ["busy", "idle"]}],
+}
+
+
+def _kc37_round(sandbox, capsys, spawn_holder, monkeypatch, gate, models, *extra):
+    """The round with the gate on *gate*: `(code, fake, captured, calls)`, where
+    *calls* counts every model call the gate made, the intake probe included."""
+    _aim_the_gate(sandbox, "https://another.host/v1", gate)
+    calls = []
+
+    def completion(*args, **kwargs):
+        calls.append(args)
+        return _gate_allows(*args, **kwargs)
+
+    monkeypatch.setattr("tools.contest.policy.request_completion", completion)
+    code, fake = run_fake(sandbox, KC37_SCENARIO,
+                          ["--ticket", "1", "--models", models, "--no-tests", *extra],
+                          spawn_holder)
+    return code, fake, capsys.readouterr(), calls
+
+
+def _intake_lines(err):
+    return [line for line in err.splitlines() if line.startswith("intake:")]
+
+
+def test_a_gate_model_the_roster_runs_refuses_the_round(sandbox, capsys, spawn_holder,
+                                                         monkeypatch):
+    """Round 64: the gate was `hy3:free` and `hy3` an agent. Refused at intake,
+    before a session and before any model call, the gate probe included."""
+    code, fake, captured, calls = _kc37_round(sandbox, capsys, spawn_holder, monkeypatch,
+                                              "hy3:free", "hy3:free,x:free")
+
+    assert code == cli.EXIT_FAILED
+    assert _intake_lines(captured.err) == [
+        "intake: gate model hy3:free is also agent hy3 in this round",
+        "intake:   the gate must be a second, independent model: set [contest_gate_llm] model",
+        "intake:   in contest.local.ini to something the roster does not run, "
+        "or pass --no-gate",
+    ]
+    assert calls == []
+    assert _sessions(fake) == []
+    assert not sandbox.out().exists()
+
+
+def test_no_gate_skips_the_gate_model_check(sandbox, capsys, spawn_holder, monkeypatch):
+    code, fake, captured, _ = _kc37_round(sandbox, capsys, spawn_holder, monkeypatch,
+                                          "hy3:free", "hy3:free,x:free", "--no-gate")
+
+    assert code == 0, captured.err
+    assert _intake_lines(captured.err) == []
+    assert _plan(captured.out)["gate"] == "off"
+    assert len(_sessions(fake)) == 2
+
+
+def test_a_gate_model_the_roster_does_not_run_starts_the_round(sandbox, capsys, spawn_holder,
+                                                               monkeypatch):
+    code, fake, captured, _ = _kc37_round(sandbox, capsys, spawn_holder, monkeypatch,
+                                          "hy3:free", "x:free,y:free")
+
+    assert code == 0, captured.err
+    assert _intake_lines(captured.err) == []
+    assert _plan(captured.out)["gate"].startswith("hy3:free")
+    assert len(_sessions(fake)) == 2
+
+
+def test_the_refusal_names_every_agent_on_the_gate_model(sandbox, capsys, spawn_holder,
+                                                         monkeypatch):
+    """KC-34 §7: two agents on one model, both named."""
+    code, fake, captured, _ = _kc37_round(sandbox, capsys, spawn_holder, monkeypatch,
+                                          "hy3:free", "hy3:free,hy3:free")
+
+    assert code == cli.EXIT_FAILED
+    assert _intake_lines(captured.err)[0] == (
+        "intake: gate model hy3:free is also agent hy3-var1 (and hy3-var2) in this round")
+    assert _sessions(fake) == []
+
+
+def test_a_gate_on_another_provider_does_not_collide(sandbox, capsys, spawn_holder,
+                                                     monkeypatch):
+    """`openrouter/hy3:free` and `kenary/hy3:free` are two models."""
+    code, fake, captured, _ = _kc37_round(sandbox, capsys, spawn_holder, monkeypatch,
+                                          "openrouter/hy3:free", "kenary/hy3:free")
+
+    assert code == 0, captured.err
+    assert _intake_lines(captured.err) == []
+    assert len(_sessions(fake)) == 1
+
+
+@pytest.mark.parametrize("gate, models, agent", [
+    # the gate spelled with the agent's own provider
+    ("kenary/hy3:free", "kenary/hy3:free,x:free", "hy3"),
+    # a model id with a `/` of its own: the gate's endpoint calls it that
+    ("nex-agi/nex-n2.5-pro:free", "kilo/nex-agi/nex-n2.5-pro:free,x:free", "nex-n2-5-pro"),
+])
+def test_a_gate_model_with_a_slash_still_collides(sandbox, capsys, spawn_holder, monkeypatch,
+                                                  gate, models, agent):
+    code, fake, captured, calls = _kc37_round(sandbox, capsys, spawn_holder, monkeypatch,
+                                              gate, models)
+
+    assert code == cli.EXIT_FAILED
+    assert _intake_lines(captured.err)[0] == (
+        f"intake: gate model {gate} is also agent {agent} in this round")
+    assert calls == []
+    assert _sessions(fake) == []
+
+
+def test_the_placeholder_gate_model_is_not_checked(sandbox):
+    """No gate, or the committed placeholder: nothing to refuse."""
+    config = replace(sandbox.config(),
+                     agents=cli.agents_from_models("some/model,hy3:free"))
+    gate = config.gate_settings
+    assert cli.gate_model_refusals(replace(config, gate_settings=None), config.agents) == []
+    assert cli.gate_model_refusals(
+        replace(config, gate_settings=replace(gate, model=cli.GATE_PLACEHOLDER_MODEL)),
+        config.agents) == []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # KC-35: a roster model missing from Kilo's own model list
 # ─────────────────────────────────────────────────────────────────────────────
 
