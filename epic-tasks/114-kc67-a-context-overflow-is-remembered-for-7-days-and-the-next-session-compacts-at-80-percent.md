@@ -1,6 +1,6 @@
 # KC-67 — a context overflow is remembered for 7 days, and the next session compacts at 80 % of it
 
-**Status:** queued — asked by the operator 2026-09-25 after round 113.
+**Status:** landed `dec2bb0` (2026-09-26), round 114 — winner sensenova-6-7-flash-lite-var1 (READY); at landing the last OK skips Kilo's all-zero message of the refused reply, and the console prints the fill, the compact's start and its end with the context before → after. mimo READY but off by default (no path = no memory), percent as 0.8, no wait for the compact; sn67-var2, step, ling-sante left uncommitted work (step: memory per round, not shared); the rest overflowed, timed out or lost the provider.
 **Severity:** HIGH
 **Round:** 114
 **Size:** S
