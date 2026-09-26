@@ -1358,6 +1358,94 @@ def test_a_terminal_harvest_runs_the_roots_under_the_rounds_lock(tmp_path, monke
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# KC-29: a stall the runner asked for keeps STALLED — the work is exported,
+# never promoted
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_a_runner_asked_stall_harvests_the_commit_but_never_promotes(tmp_path, caplog):
+    """The work is committed and claimed before the turn, and the turn asks
+    three questions: the runner's own stall edge, not the session's. The
+    harvest still runs — the work is exported, `run.commit` is the branch's
+    sha, the turn carries the READY verdict — but the run is not READY: it
+    keeps STALLED, `last_error` is the stall's reason alone, and the KC-18
+    line names both the stall and the verdict."""
+    caplog.set_level(logging.INFO, logger="tools.contest.runner")
+    scenario = {"turns": [{"events": ["busy"], "questions": 3}]}
+    sb, fake, _h, run, aborted = _run_one(tmp_path, scenario,
+                                          prepare=lambda d: work_ready(d, ""))
+    ws = sb.ws("agent-a")
+    assert run.state is AgentState.STALLED, (run.state, run.last_error)
+    assert run.last_error == "3 questions in one turn"
+    assert run.commit == _branch_sha(ws)
+    assert aborted
+    assert run.questions == 3
+    (turn,) = run.turns
+    assert turn["idle_status"] == "stalled"
+    assert turn["harvest"]["verdict"] == "READY"
+    assert turn["harvest"]["reasons"] == []
+    assert _runner_has(caplog, "agent-a: STALLED — 3 questions in one turn (harvest: READY)")
+    (line,) = _jsonl(sb.out_dir / "agent-a" / "turns.jsonl")
+    assert line["idle_status"] == "stalled" and line["harvest"]["verdict"] == "READY"
+
+
+def test_a_runner_asked_stall_with_no_commit_keeps_the_no_harvest_path(tmp_path, monkeypatch):
+    """The same turn, a branch with nothing under it: KC-21's byte-for-byte
+    path — STALLED, `commit` is None, no `harvest` key on the turn, and the
+    harvest is never called."""
+    def boom(*args, **kwargs):
+        raise AssertionError("_harvest must not run for a branch with no commit")
+
+    monkeypatch.setattr("tools.contest.runner._harvest", boom)
+    scenario = {"turns": [{"events": ["busy"], "questions": 3}]}
+    sb, fake, _h, run, aborted = _run_one(tmp_path, scenario)
+    assert run.state is AgentState.STALLED and aborted
+    assert run.last_error == "3 questions in one turn"
+    assert run.commit is None
+    (turn,) = run.turns
+    assert turn["idle_status"] == "stalled" and "harvest" not in turn
+    (line,) = _jsonl(sb.out_dir / "agent-a" / "turns.jsonl")
+    assert line["agent"] == "agent-a" and "harvest" not in line
+
+
+def test_a_runner_asked_stall_with_a_rejected_commit_keeps_stalled_and_its_reason(tmp_path, caplog):
+    """One commit the harvest rejects (no claim): STALLED, `last_error` is
+    the stall's reason unchanged by the verdict, `run.commit` is the branch's
+    sha, and the KC-18 line names the verdict after the reason."""
+    caplog.set_level(logging.INFO, logger="tools.contest.runner")
+    scenario = {"turns": [{"events": ["busy"], "questions": 3}]}
+    sb, fake, _h, run, _ = _run_one(tmp_path, scenario,
+                                     prepare=lambda d: work_no_claim(d, ""))
+    ws = sb.ws("agent-a")
+    assert run.state is AgentState.STALLED, run.last_error
+    assert run.last_error == "3 questions in one turn"
+    assert run.commit == _branch_sha(ws)
+    (turn,) = run.turns
+    assert turn["idle_status"] == "stalled"
+    assert turn["harvest"]["verdict"] == "REWORK"
+    assert turn["harvest"]["reasons"] == ["no_progress_row"]
+    assert _runner_has(caplog, "agent-a: STALLED — 3 questions in one turn (harvest: REWORK)")
+
+
+def test_a_session_that_ended_on_its_own_keeps_the_kc21_line_verbatim(tmp_path, caplog):
+    """KC-21, unchanged by KC-29: a turn that died on its own — the silence
+    window — with a READY harvest finishes READY, and its KC-18 line is the
+    KC-21 one verbatim: `<sha12> after <the error>`, no verdict suffix, no
+    stall named. Only a stall the runner asked for carries the suffix."""
+    caplog.set_level(logging.INFO, logger="tools.contest.runner")
+    cfg = _stall_config()
+    scenario = {"turns": [{"events": [], "idle": False}]}
+    sb, fake, _h, run, aborted = _run_one(tmp_path, scenario, cfg,
+                                          prepare=lambda d: work_ready(d, ""))
+    ws = sb.ws("agent-a")
+    assert run.state is AgentState.READY, (run.state, run.last_error)
+    assert run.commit == _branch_sha(ws)
+    assert run.last_error is None
+    lines = _runner_lines(caplog)
+    assert f"agent-a: READY — {run.commit[:12]} after no event for 3s" in lines
+    assert not any("(harvest:" in line for line in lines)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # KC-57: a harvest has a wall-clock budget, and the queue is visible
 # ─────────────────────────────────────────────────────────────────────────────
 

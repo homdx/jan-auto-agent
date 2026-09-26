@@ -60,6 +60,19 @@ verdict keeps the state the turn earned — no rework prompt, the session is gon
 A branch with no commit above the base keeps today's path byte for byte: no
 harvest, no pytest, `commit: null`.
 
+KC-29 (round 68) draws the line KC-21 left open: a stall the runner asked for
+is not a session that finished. `stall()` is the runner's own edge — the
+questions cap, the agent's hard limit — and its `STALLED` turns keep the state
+and `last_error` whatever the harvest's verdict: the harvest still runs,
+`turn["harvest"]` and `run.commit` are set, and `export_patches` still names
+the patch by the terminal state. What changes is the promotion — a READY
+verdict finishes the run as READY only when the session ended on its own: a
+silence, the turn clock, a `session.error`. An aborted turn stays STALLED,
+the KC-18 line names the verdict in place —
+`agent-a: STALLED — 3 questions in one turn (harvest: READY)` — and a round
+of nothing but aborted agents exits the way a round of stalls always has,
+because a READY is what `cmd_run` counts.
+
 A `session.error` that is a context overflow (KC-54, round 98) is neither
 retried nor scored as-is: a prompt into a full session overflows again, so the
 worktree's uncommitted edits are carried into a *fresh* session with
@@ -2535,6 +2548,12 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         if error is not None:
             run.last_error = error
         detail = error if error is not None else note
+        if error is not None and note:
+            # KC-29: a terminal turn the runner aborted carries the stall's
+            # reason as its error and the harvest's verdict as its note — the
+            # KC-18 line names both, and `last_error` keeps the reason alone,
+            # so nobody reads the verdict as the error or vice versa.
+            detail = f"{error} ({note})"
         _log.info("%s: %s%s", spec.name, state.value, f" — {detail}" if detail else "")
         on_transition(run)
 
@@ -3204,7 +3223,9 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                 # so it is scored once before the terminal state lands — exactly as
                 # the HARVESTING step and `_plan`'s resume branch score it. The
                 # session is gone, the worktree is not; the verdict decides whether
-                # the run counts as READY or stays in the state the turn earned.
+                # the run counts as READY or stays in the state the turn earned —
+                # and KC-29 qualifies who may be promoted: only a session that
+                # ended on its own, not one the runner asked to stop.
                 note = None
                 if state in (AgentState.STALLED, AgentState.ERROR):
                     above = _commits_above(ws)
@@ -3226,10 +3247,22 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                         # here — the sha comes from the verdict, one line as the
                         # HARVESTING step does, so the two cannot drift apart.
                         run.commit = verdict.commit
-                        if verdict.verdict == "READY":
+                        if verdict.verdict == "READY" and not stalled:
+                            # KC-21: the session ended on its own — a silence,
+                            # the turn clock, a `session.error` — with the work
+                            # committed and claimed: it counts as READY.
                             note = f"{(run.commit or '')[:12]} after {error}"
                             state = AgentState.READY
                             error = None
+                        elif stalled:
+                            # KC-29: the runner asked the stall itself — the
+                            # questions cap, the agent's hard limit — so the
+                            # agent did not finish: no promotion, whatever the
+                            # verdict. The harvest's verdict stays on the turn
+                            # and `run.commit` for the patch, the turn keeps
+                            # the state and the reason it earned, and the KC-18
+                            # line names the verdict after the reason.
+                            note = f"harvest: {verdict.verdict}"
                 if state is AgentState.ERROR and _is_local_store(idle.error):
                     # KC-62: the session is gone, the worktree is not — and with no
                     # commit under it, no commit for `_plan` to restart from either.

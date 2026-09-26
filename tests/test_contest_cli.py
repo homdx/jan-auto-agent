@@ -34,6 +34,7 @@ for _p in (str(REPO_ROOT), str(TESTS_DIR)):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
+import test_contest_runner as tr  # noqa: E402
 from _kilo_fake import FakeKiloServer  # noqa: E402
 from tools.contest import cli  # noqa: E402
 from tools.contest.kilo_client import KiloServer  # noqa: E402
@@ -1042,6 +1043,47 @@ def test_a_stall_with_a_valid_commit_counts_as_ready_and_exits_zero(sandbox, cap
     assert ready.turns[0]["harvest"]["verdict"] == "READY"
     assert stalled.commit is None and stalled.state is AgentState.STALLED
     assert "harvest" not in stalled.turns[0]
+
+
+def test_an_aborted_stall_with_a_valid_commit_writes_a_stalled_patch_and_exits_nonzero(
+        sandbox, capsys, spawn_holder, monkeypatch):
+    """KC-29: the round's only agent committed and claimed before its turn
+    (`prepare_round` does the git work, so it is on the branch before the
+    session exists — a hook commit would race the stall's harvest), and the
+    turn asked three questions: the runner's own stall edge, not the
+    session's. The terminal harvest still scores the commit READY — the work
+    is exported, `run.commit` is set — but the run is not READY: the patch
+    is `x.STALLED.patch`, and a round of nothing but such agents exits
+    non-zero, because KC-16's EXIT_OK needs a READY."""
+    real_prepare = cli.prepare_round
+
+    def prepare_and_ship(repo, config, round_no, base_ref, **kwargs):
+        workspaces = real_prepare(repo, config, round_no, base_ref, **kwargs)
+        for ws in workspaces:
+            work_ready(str(ws.path), "")
+        return workspaces
+
+    monkeypatch.setattr(cli, "prepare_round", prepare_and_ship)
+    scenario = {"turns": [{"events": ["busy"], "questions": 3}]}
+    with tr._BenchFake(scenario) as fake:
+        spawn_holder.append(fake)
+        code = cli.main(["run", "--ticket", "1", "--models", "x:free",
+                         "--no-gate", "--no-tests"])
+    captured = capsys.readouterr()
+    out = sandbox.out()
+
+    assert code == cli.EXIT_NO_READY
+    rows = _table(captured.out)
+    assert [row["state"] for row in rows] == ["STALLED"]
+    assert rows[0]["name"] == "x" and rows[0]["commit"]
+    assert (out / "x.STALLED.patch").is_file()
+    assert not (out / "x.patch").exists()
+
+    state = RoundState.from_dict(json.loads((out / "state.json").read_text(encoding="utf-8")))
+    (run,) = state.agents
+    assert run.state is AgentState.STALLED and run.commit
+    assert run.turns[0]["idle_status"] == "stalled"
+    assert run.turns[0]["harvest"]["verdict"] == "READY"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
