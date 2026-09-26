@@ -1,6 +1,6 @@
 # KC-30 — `harvest` names the branch's one commit even when no `PROGRESS.csv` row does, so every caller stops re-deriving it
 
-**Status:** open
+**Status:** landed `a26e37b` (2026-09-26) — round 69, all 8 entries READY; code sensenova-6-7-flash-lite-var2, tests + sensenova-6-8-flash-lite-var1
 **Severity:** MEDIUM (a finished worktree with no claim row exports no patch at all — the operator never sees the work)
 **File:** `tools/contest/harvest.py` (`harvest`, the `HarvestVerdict.commit` it returns)
 **Symbol:** `harvest`, `HarvestVerdict`
