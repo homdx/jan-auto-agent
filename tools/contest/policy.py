@@ -152,7 +152,9 @@ def gate_time_back_sec(tries) -> float:
 #: The only two replies a Decision may carry. ``Literal`` keeps the type
 #: narrow; ``Decision.__post_init__`` keeps it narrow at run time too.
 REPLIES: tuple[str, ...] = ("once", "reject")
-LAYERS: tuple[str, ...] = ("mechanical", "gate", "gate-failed", "budget")
+#: ``context`` (KC-69) is the runner's own refusal of an ask made in a session
+#: at or past ``compact_at_percent`` of its size — the policy never returns it.
+LAYERS: tuple[str, ...] = ("mechanical", "gate", "gate-failed", "budget", "context")
 
 #: A reason is sent to the agent as the tool error and written to
 #: decisions.jsonl — one line, so it stays readable in both places.
@@ -1304,8 +1306,14 @@ class Policy:
 
     # ── the audit trail ────────────────────────────────────────────────────
 
-    def record(self, decision: Decision, event: dict, path) -> None:
+    def record(self, decision: Decision, event: dict, path, *,
+               context: "dict | None" = None) -> None:
         """Append one JSON line per decision to *path* (decisions.jsonl).
+
+        *context* (KC-69) is the session's fill when the ask came — tokens,
+        size, its source, the percent and the compact threshold — written under
+        ``context`` so a later reader sees how full the session was at every
+        ask; absent when the runner passes none, so older lines keep their shape.
 
         Called by the runner (KC-6); the policy does not know about the
         runner. A broken artifact — a missing directory, a bad event, a
@@ -1340,6 +1348,8 @@ class Policy:
                 entry["gate_attempts"] = int(attempts)
                 entry["gate_added_sec"] = int(
                     getattr(decision, "gate_added_sec", 0.0) or 0.0)
+            if isinstance(context, dict) and context:
+                entry["context"] = dict(context)
             target = Path(path)
             target.parent.mkdir(parents=True, exist_ok=True)
             with target.open("a", encoding="utf-8") as handle:

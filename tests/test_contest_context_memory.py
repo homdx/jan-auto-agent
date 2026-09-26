@@ -46,6 +46,7 @@ for _p in (str(REPO_ROOT), str(TESTS_DIR)):
 import test_contest_runner as tr  # noqa: E402
 from tools.contest import cli as contest_cli  # noqa: E402
 from tools.contest import context_memory as cm  # noqa: E402
+from tools.contest import runner as runner_mod  # noqa: E402
 from tools.contest.roster import ContestConfig, load_roster  # noqa: E402
 
 # every runner test below binds an ephemeral-port HTTP server
@@ -110,6 +111,12 @@ def _posts(fake) -> list:
     return [(record["path"], record["body"]) for record in fake.calls("POST")]
 
 
+def _prompt_texts(fake) -> list:
+    """The text of every ``prompt_async`` the fake saw, in order."""
+    return ["".join(part.get("text", "") for part in (body or {}).get("parts", []))
+            for path, body in _posts(fake) if path.endswith("/prompt_async")]
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # the provider's words
 # ─────────────────────────────────────────────────────────────────────────────
@@ -144,7 +151,7 @@ def test_add_writes_one_record_atomically_and_load_reads_it_back(tmp_path):
     assert data[0] == {
         "at": pytest.approx(time.time(), abs=60), "round": "113", "agent": "agent-a",
         "provider": "kenary", "model": "agent-a:free",
-        "limit": SIZE, "last_ok": FULL_81, "prompt": 200_400,
+        "limit": SIZE, "last_ok": FULL_81, "prompt": 200_400, "output": None,
     }
 
     records = cm.load(path)
@@ -373,7 +380,9 @@ def test_an_overflow_that_names_the_limit_is_remembered_with_all_three_numbers(t
     assert (record.provider, record.model) == ("kenary", "agent-a:free")
     assert record.limit == 262_144 and record.prompt == 262_514
     assert record.last_ok == 260_000, "input + cache read + reasoning + output"
-    assert cm.smallest_size([record], "kenary", "agent-a:free") == 262_144
+    # KC-69: the 32 000 requested output is not the prompt's to use
+    assert record.output == 32_000
+    assert cm.smallest_size([record], "kenary", "agent-a:free") == 230_144
 
 
 def test_an_overflow_that_names_no_limit_is_remembered_with_only_the_last_ok(tmp_path):
@@ -495,12 +504,13 @@ def test_the_console_says_when_the_compact_finished_and_how_much_it_saved(tmp_pa
     tr._assert_ready(run, sb.ws("agent-a"))
 
     lines = [r.getMessage() for r in caplog.records if "compact" in r.getMessage()]
-    assert any("context 162,000 tokens = 81.0% of the 200,000 remembered, at 80% — "
+    assert any("context 162,000 tokens = 81.0% of 200,000 (remembered), at 80% — "
                "compacting before rework" in line for line in lines), lines
     assert any("compact finished in" in line
-               and "context 162,000 -> 12,000 tokens (-150,000, -93%)" in line
-               and "the round continues with the rework prompt" in line
-               for line in lines), lines
+               and "context 162,000 -> 12,000 tokens (-150,000, -93%) = 6.0% of 200,000"
+               in line for line in lines), lines
+    assert any("the round continues in the same session with the rework prompt"
+               in r.getMessage() for r in caplog.records)
     second = run.turns[1]
     assert (second["context_before"], second["context_after"]) == (162_000, 12_000)
 
@@ -519,7 +529,7 @@ def test_a_prompt_below_the_threshold_says_no_compact(tmp_path, caplog):
     memory = _memory(tmp_path, limit=SIZE, last_ok=None)
     _run(tmp_path, _rework_scenario(FULL_79), memory=memory)
     lines = [r.getMessage() for r in caplog.records]
-    assert any("= 79.0% of the 200,000 remembered, below 80% — no compact before rework"
+    assert any("= 79.0% of 200,000 (remembered), below 80% — no compact before rework"
                in line for line in lines), lines
 
 
@@ -535,22 +545,22 @@ def test_a_session_at_seventy_nine_percent_does_not_compact(tmp_path):
     assert second["fill"] == 79.0
 
 
-def test_the_runner_never_compacts_a_model_kilo_reports_a_limit_for(tmp_path):
-    """``spec.context_limit`` is set: Kilo compacts those sessions on its own, so
-    the runner records the size and its source and sends the prompt as today —
-    at the same 81 % a remembered size would have compacted."""
+def test_a_model_kilo_reports_a_limit_for_compacts_at_the_same_percent(tmp_path):
+    """KC-69: ``spec.context_limit`` is set — intake's, or the remembered size
+    KC-69 hands Kilo — and the runner compacts at the same 80 % a remembered
+    size does: Kilo's own compact comes only after the step that crossed it."""
     memory = _memory(tmp_path, limit=SIZE, last_ok=None)
     config = replace(_config(tmp_path, memory=memory),
                      agents=(replace(_config(tmp_path).agents[0], context_limit=SIZE),))
     sb, fake, _h, run, _ = tr._run_one(tmp_path, _rework_scenario(FULL_81), config)
     tr._assert_ready(run, sb.ws("agent-a"))
 
-    assert not any("/summarize" in path for path, _ in _posts(fake))
+    assert _summarize_path(run.session_id) in [path for path, _ in _posts(fake)]
     first, second = run.turns
     assert first["fill"] == 0.0 and second["fill"] == 81.0
     for turn in run.turns:
         assert turn["context_size"] == SIZE and turn["context_source"] == "kilo"
-        assert turn["compacted"] is False
+    assert first["compacted"] is False and second["compacted"] is True
     assert second["idle_status"] == "idle"
 
 
@@ -568,21 +578,55 @@ def test_a_last_ok_is_the_size_when_no_limit_was_named(tmp_path):
     assert second["compacted"] is True
 
 
-def test_a_refused_compact_leaves_the_prompt_alone(tmp_path):
-    """The server answers anything but 204 to ``summarize``: the prompt still
-    goes out as it stands, the turn says it did not compact, and no exception
-    reaches the round."""
+def _run_swapping(tmp_path, scenario, config):
+    """``run_agent`` on the fake that replays ``turns_after`` in a second session."""
+    sb = tr.Sandbox(tmp_path)
+    with tr._OverflowFake(scenario) as fake:
+        run = tr.Harness(sb, fake, config).go()
+    return sb, fake, run
+
+
+def test_a_refused_compact_goes_on_in_a_new_session_with_the_task(tmp_path, caplog):
+    """KC-69: the server answers anything but 204 to ``summarize``: the prompt
+    going out as it stands is the overflow the compact was for, so the work goes
+    on in a new session — the round prompt, the continue note, then the rework."""
+    caplog.set_level("INFO", logger="tools.contest.runner")
     memory = _memory(tmp_path, limit=SIZE, last_ok=None)
-    scenario = dict(_rework_scenario(FULL_81), summarize_status=500)
-    sb, fake, _h, run, _ = _run(tmp_path, scenario, memory=memory)
+    scenario = dict(_rework_scenario(FULL_81), summarize_status=500,
+                    turns_after=[{"on_prompt": tr.work_ready, "events": ["busy", "idle"]}])
+    sb, fake, run = _run_swapping(tmp_path, scenario, _config(tmp_path, memory=memory))
     tr._assert_ready(run, sb.ws("agent-a"))
 
+    first, second = fake.sessions()[:2]
     posts = [path for path, _ in _posts(fake)]
-    assert _summarize_path(run.session_id) in posts
-    assert posts[-1] == f"/session/{run.session_id}/prompt_async"
-    second = run.turns[1]
-    assert second["compacted"] is False and second["fill"] == 81.0
-    assert run.last_error is None
+    assert _summarize_path(first.id) in posts
+    assert posts[-1] == f"/session/{second.id}/prompt_async"
+    turn = run.turns[1]
+    assert turn["compacted"] is False and turn["fill"] == 81.0
+    assert turn["swapped_from"] == first.id and turn["new_session"] == second.id
+    text = _prompt_texts(fake)[-1]
+    assert "You are continuing unfinished work" in text
+    assert "(the previous session wrote no summary)" in text
+    lines = [r.getMessage() for r in caplog.records]
+    assert any("compact did not finish" in line and "new session" in line for line in lines)
+
+
+def test_a_compact_that_frees_too_little_goes_on_in_a_new_session(tmp_path, caplog):
+    """KC-69: the compact finished but its summary is still at or past the
+    threshold — a new session, carrying the summary text."""
+    caplog.set_level("INFO", logger="tools.contest.runner")
+    memory = _memory(tmp_path, limit=SIZE, last_ok=None)
+    scenario = dict(_rework_scenario(FULL_81), summary_tokens=170_000,
+                    summary_text="did steps 1-3 of the ticket",
+                    turns_after=[{"on_prompt": tr.work_ready, "events": ["busy", "idle"]}])
+    sb, fake, run = _run_swapping(tmp_path, scenario, _config(tmp_path, memory=memory))
+    tr._assert_ready(run, sb.ws("agent-a"))
+    turn = run.turns[1]
+    assert turn["compacted"] is True and turn["context_after"] == 170_000
+    assert turn["new_session"] == fake.sessions()[1].id
+    assert "did steps 1-3 of the ticket" in _prompt_texts(fake)[-1]
+    lines = [r.getMessage() for r in caplog.records]
+    assert any("the compact left 85.0% — still at or past 80%" in line for line in lines)
 
 
 def test_a_session_with_no_remembered_size_is_prompted_as_today(tmp_path):
@@ -652,16 +696,19 @@ def test_an_overflow_is_remembered_and_the_next_session_compacts_in_time(tmp_pat
     assert run.state is tr.AgentState.STALLED
     (record,) = cm.load(memory)
     assert record.limit == 262_144 and record.last_ok == 260_000
-    assert cm.smallest_size([record], "kenary", "agent-a:free") == 262_144
+    # KC-69: the 32 000 requested output is not the prompt's to use
+    assert record.output == 32_000
+    assert cm.smallest_size([record], "kenary", "agent-a:free") == 230_144
 
-    # 215 000 of a remembered 262 144 is 82 %: just past the 80 % the runner compacts at
+    # 215 000 of a remembered 230 144 budget (262 144 - 32 000) is 93.4 %:
+    # past the 80 % the runner compacts at
     sb, fake, _h, run, _ = _run(tmp_path / "round-2", _rework_scenario(215_000), memory=memory)
     tr._assert_ready(run, sb.ws("agent-a"))
     posts = [path for path, _ in _posts(fake)]
     assert _summarize_path(run.session_id) in posts
     second = run.turns[1]
     assert second["context_source"] == "remembered" and second["compacted"] is True
-    assert second["context_size"] == 262_144 and second["fill"] == 82.0
+    assert second["context_size"] == 230_144 and second["fill"] == 93.4
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -694,3 +741,233 @@ def test_the_start_plan_prints_one_line_per_model_with_a_remembered_size(tmp_pat
     broken = tmp_path / "broken.json"
     broken.write_text("{not json", encoding="utf-8")
     assert "context memory:" not in _plan(tmp_path, capsys, memory=broken)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KC-69: the remembered size reaches Kilo as `limit.context`
+# ─────────────────────────────────────────────────────────────────────────────
+
+#: kenary's overflow, word for word from laguna-s-2-1:free on 2026-09-26: no
+#: number in it, so only the last reply that went through is remembered
+KENARY_MESSAGE = ("the request exceeds the model's maximum context length. "
+                  "reduce the input or max_tokens")
+
+
+def _overlay(content) -> dict:
+    """The `limit` of every model in a `KILO_CONFIG_CONTENT` string."""
+    providers = json.loads(content)["provider"]
+    return {f"{pid}/{mid}": model.get("limit")
+            for pid, body in providers.items() for mid, model in body["models"].items()}
+
+
+def _threshold(content):
+    """The `compaction.threshold_percent` of a `KILO_CONFIG_CONTENT` string."""
+    return (json.loads(content).get("compaction") or {}).get("threshold_percent")
+
+
+
+def test_parse_output_reads_the_requested_output_and_nothing_else():
+    """sensenova names the output it reserved; kenary names nothing."""
+    assert cm.parse_output(SENSENOVA_OVERFLOW["data"]["message"]) == 32_000
+    assert cm.parse_output(KENARY_MESSAGE) is None
+    assert cm.parse_output(None) is None
+
+
+def test_a_record_before_kc69_keeps_its_size():
+    """No output in the record is today's size; a named output is subtracted."""
+    assert cm.size_of(_record(limit=262_144)) == 262_144
+    assert cm.size_of(_record(limit=262_144, output=32_000)) == 230_144
+    assert cm.size_of(_record(limit=10, output=32_000)) == 10, "a reserve that leaves nothing"
+    assert cm.OverflowRecord.from_dict({"at": 1.0, "provider": "p", "model": "m",
+                                        "limit": 5}).output is None
+
+
+def test_kilo_limit_is_the_real_window_and_input_is_the_compact_point():
+    """``context`` is the real window — a hard wall in Kilo; ``input`` is 80 % of
+    the budget plus Kilo's 20 000 reserve, where Kilo compacts after a step."""
+    assert cm.kilo_limit(230_144, 32_000) == {"context": 262_144, "input": 204_115,
+                                               "output": 32_000}
+    # no output named: Kilo's own 32 000 — a `limit` without `output` is a
+    # ConfigInvalidError that skips the whole KILO_CONFIG_CONTENT (live, 7.6.2)
+    assert cm.kilo_limit(149_359, None) == {"context": 181_359, "input": 139_487,
+                                             "output": 32_000}
+    # 0 % is the runner's compact off: Kilo's own at the full budget
+    assert cm.kilo_limit(230_144, 32_000, percent=0) == {"context": 262_144,
+                                                         "input": 230_144, "output": 32_000}
+    assert cm.kilo_limit(None, 32_000) is None
+
+
+def test_the_file_one_overflow_wrote_is_what_the_next_round_hands_kilo(tmp_path, monkeypatch):
+    """The whole ticket: an overflow that names the limit is written to the
+    shared file, and the next round's server gets that size as `limit.context`,
+    with the budget on the spec."""
+    monkeypatch.delenv("KILO_CONFIG_CONTENT", raising=False)
+    memory = tmp_path / "context-memory.json"
+    overflow = _overflow_scenario(SENSENOVA_OVERFLOW, 260_000)
+    _run(tmp_path / "round-1", overflow, memory=memory, max_continues_per_attempt=0)
+    assert json.loads(memory.read_text(encoding="utf-8"))[0]["output"] == 32_000
+
+    config = _config(tmp_path, memory=memory)
+    out, content = contest_cli._with_remembered_limits(config, tmp_path / "out" / "71", None)
+    (agent,) = out.agents
+    assert agent.context_limit == 230_144
+    assert _overlay(content) == {agent.model: {"context": 262_144, "input": 204_115,
+                                               "output": 32_000}}
+    assert _threshold(content) is None, "no global threshold: other models keep theirs"
+
+
+def test_a_provider_that_names_no_size_is_handed_its_last_ok(tmp_path, monkeypatch):
+    """kenary (laguna) says nothing but "exceeds": the last reply that went
+    through is the size, with no output in the overlay."""
+    monkeypatch.delenv("KILO_CONFIG_CONTENT", raising=False)
+    memory = _memory(tmp_path, limit=None, last_ok=215_042, output=None)
+    config = _config(tmp_path, memory=memory)
+    out, content = contest_cli._with_remembered_limits(config, tmp_path / "out" / "71", None)
+    assert out.agents[0].context_limit == 215_042
+    assert _overlay(content) == {out.agents[0].model: {"context": 247_042, "input": 192_033,
+                                                       "output": 32_000}}
+
+
+def test_intake_s_own_limit_wins_and_nothing_is_sent(tmp_path, monkeypatch):
+    """A model Kilo knows the size of keeps Kilo's number; no overlay at all."""
+    monkeypatch.delenv("KILO_CONFIG_CONTENT", raising=False)
+    config = _config(tmp_path, memory=_memory(tmp_path, limit=262_144, output=32_000))
+    config = replace(config, agents=tuple(replace(a, context_limit=128_000) for a in config.agents))
+    out, content = contest_cli._with_remembered_limits(config, tmp_path / "out" / "71", None)
+    assert out is config and content is None
+
+
+def test_the_overlay_merges_over_intake_s_registration(tmp_path, monkeypatch):
+    """KC-35's registered model keeps its entry and gains the limit."""
+    monkeypatch.delenv("KILO_CONFIG_CONTENT", raising=False)
+    config = _config(tmp_path, memory=_memory(tmp_path, limit=262_144, output=32_000))
+    agent = config.agents[0]
+    registered = json.dumps({"provider": {agent.provider_id: {"models": {
+        agent.model_id: {"name": agent.model_id, "reasoning": True}}}}})
+    _out, content = contest_cli._with_remembered_limits(config, tmp_path / "o" / "1", registered)
+    model = json.loads(content)["provider"][agent.provider_id]["models"][agent.model_id]
+    assert model == {"name": agent.model_id, "reasoning": True,
+                     "limit": {"context": 262_144, "input": 204_115, "output": 32_000}}
+
+
+def test_an_attached_server_gets_nothing(tmp_path, monkeypatch):
+    """An attached server never reads the overlay."""
+    monkeypatch.delenv("KILO_CONFIG_CONTENT", raising=False)
+    config = _config(tmp_path, memory=_memory(tmp_path, limit=262_144),
+                     server="http://127.0.0.1:4096")
+    out, content = contest_cli._with_remembered_limits(config, tmp_path / "out" / "71", None)
+    assert out is config and content is None
+
+
+def test_a_turned_off_compact_sends_the_window_at_the_full_budget(tmp_path, monkeypatch):
+    """0 % is the runner's compact off: Kilo still learns the window, and keeps
+    its own compact at the full size."""
+    monkeypatch.delenv("KILO_CONFIG_CONTENT", raising=False)
+    config = _config(tmp_path, memory=_memory(tmp_path, limit=262_144), compact_at_percent=0.0)
+    _out, content = contest_cli._with_remembered_limits(config, tmp_path / "out" / "71", None)
+    assert list(_overlay(content).values())[0]["input"] == 262_144
+
+
+def test_an_operator_s_own_compaction_is_left_alone(tmp_path, monkeypatch):
+    """The overlay adds, never replaces: the operator's `compaction` stays as is."""
+    monkeypatch.setenv("KILO_CONFIG_CONTENT", json.dumps({"compaction": {"threshold_percent": 60}}))
+    config = _config(tmp_path, memory=_memory(tmp_path, limit=262_144))
+    _out, content = contest_cli._with_remembered_limits(config, tmp_path / "out" / "71", None)
+    assert _threshold(content) == 60
+
+
+def test_a_broken_operator_value_is_the_round_unchanged(tmp_path, monkeypatch):
+    """Fail-open: a `KILO_CONFIG_CONTENT` that is not JSON is no overlay."""
+    monkeypatch.setenv("KILO_CONFIG_CONTENT", "not json")
+    config = _config(tmp_path, memory=_memory(tmp_path, limit=262_144))
+    out, content = contest_cli._with_remembered_limits(config, tmp_path / "out" / "71", None)
+    assert out is config and content is None
+
+
+class _FullFake(tr._BenchFake):
+    """Every session opens already holding a reply at 81 % of ``SIZE`` — a
+    permission asked in its first turn is asked in a full context."""
+
+    SEED = {"info": {"role": "assistant", "finish": "tool-calls",
+                     "tokens": {"input": FULL_81, "output": 0, "reasoning": 0,
+                                "cache": {"read": 0, "write": 0}}},
+            "parts": [{"type": "text", "text": "read the whole tree"}]}
+
+    def _create_session(self, body, directory):
+        session = super()._create_session(body, directory)
+        self._sessions[session["id"]].messages.append(dict(self.SEED))
+        return session
+
+
+def test_a_permission_in_a_full_context_is_refused_and_the_next_prompt_compacts(tmp_path, caplog):
+    """KC-69: the ask at 81 % is refused with the context reason, its line in
+    decisions.jsonl and on the console carries the fill, and the prompt after
+    the turn compacts first."""
+    caplog.set_level("INFO", logger="tools.contest.runner")
+    memory = _memory(tmp_path, limit=SIZE, last_ok=None)
+    # the turn holds 3 s after the ask, the way a model that goes on working does
+    scenario = {"summary_tokens": 12_000, "turns": [
+        dict(tr._permission_turn(tr.work_no_test, ["/var/lib/*"]), delay=3.0),
+        {"on_prompt": tr.work_ready, "events": ["busy", "idle"]},
+    ]}
+    sb = tr.Sandbox(tmp_path)
+    with _FullFake(scenario) as fake:
+        run = tr.Harness(sb, fake, _config(tmp_path, memory=memory)).go()
+    tr._assert_ready(run, sb.ws("agent-a"))
+
+    (replied,) = fake.events_of("permission.replied")
+    assert replied["properties"]["reply"] == "reject"
+    (line,) = tr._jsonl(sb.out_dir / "agent-a" / "decisions.jsonl")
+    assert line["layer"] == "context" and line["reason"] == runner_mod.CONTEXT_FULL_REJECT
+    assert line["context"] == {"tokens": FULL_81, "size": SIZE, "source": "remembered",
+                               "fill": 81.0, "compact_at": 80.0}
+    # the turn was stopped once after the refusal, so the compact comes now
+    assert [p for p, _ in _posts(fake)].count(f"/session/{run.session_id}/abort") == 1
+    turn = run.turns[1]
+    assert turn["context_refused"] is True and turn["compacted"] is True
+    assert _summarize_path(run.session_id) in [path for path, _ in _posts(fake)]
+    lines = [r.getMessage() for r in caplog.records]
+    assert any("permission" in l and "-> reject (context)" in l
+               and "context 162,000 tokens = 81.0% of 200,000 (remembered), compact at 80%" in l
+               for l in lines), lines
+
+
+def test_a_permission_below_the_threshold_is_decided_as_today_with_its_fill(tmp_path, caplog):
+    """KC-69: under the threshold the policy decides; the line still says the fill."""
+    caplog.set_level("INFO", logger="tools.contest.runner")
+    memory = _memory(tmp_path, limit=SIZE, last_ok=None)
+    cfg = _config(tmp_path, memory=memory, tmp_roots=("/tmp/*",))
+    sb, _fake, _h, run, _ = tr._run_one(
+        tmp_path, {"turns": [tr._permission_turn(tr.work_ready, ["/tmp/*"])]}, cfg,
+        tr.make_policy(cfg, "reject"))
+    tr._assert_ready(run, sb.ws("agent-a"))
+    (line,) = tr._jsonl(sb.out_dir / "agent-a" / "decisions.jsonl")
+    assert line["layer"] == "mechanical" and line["context"]["fill"] == 0.0
+    assert any("-> once (mechanical), context 0 tokens = 0.0% of 200,000" in r.getMessage()
+               for r in caplog.records)
+
+
+def test_a_chunked_summary_with_no_tokens_is_sized_by_its_text(tmp_path):
+    """KC-69: Kilo 7.6.2's chunked compact leaves the summary at 0 tokens — the
+    runner sizes it by its text, 4 characters a token, instead of nothing."""
+    backend = type("B", (), {"messages": lambda self, s: [
+        {"info": {"role": "assistant", "summary": True, "tokens": {"input": 0, "output": 0}},
+         "parts": [{"type": "text", "text": "x" * 4198}]}]})()
+    assert runner_mod._summary_tokens(backend, None) == 1050
+    empty = type("B", (), {"messages": lambda self, s: [
+        {"info": {"role": "assistant", "summary": True, "tokens": {}}, "parts": []}]})()
+    assert runner_mod._summary_tokens(empty, None) is None
+
+
+def test_the_fill_after_a_compact_is_the_summary_not_the_reply_before_it():
+    """KC-69: the summary starts the history — the reply before it is gone. Live
+    on laguna the old 64 894 was read again and refused every later ask."""
+    before = {"info": {"role": "assistant", "tokens": {"input": 64_000, "output": 894}},
+              "parts": []}
+    summary = {"info": {"role": "assistant", "summary": True, "tokens": {"input": 0, "output": 0}},
+               "parts": [{"type": "text", "text": "y" * 4000}]}
+    backend = type("B", (), {"messages": lambda self, s: [before, summary]})()
+    assert runner_mod._context_tokens(backend, None) == 1000
+    after = {"info": {"role": "assistant", "tokens": {"input": 11_000, "output": 50}}, "parts": []}
+    backend = type("B", (), {"messages": lambda self, s: [before, summary, after]})()
+    assert runner_mod._context_tokens(backend, None) == 11_050

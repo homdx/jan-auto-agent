@@ -658,6 +658,12 @@ def _response_socket(resp):
     return sock if hasattr(sock, "shutdown") else None
 
 
+#: KC-69: how long ``compact`` waits for ``POST /session/{id}/summarize`` to
+#: answer — the summary is written inside that call, over a context of up to
+#: the model's whole window.
+COMPACT_TIMEOUT_SEC = 900.0
+
+
 class EventTap:
     """The probe's SSE reader: a daemon thread over ``GET /event?directory=``.
 
@@ -1190,7 +1196,7 @@ class KiloClient:
 
         The model is ``{"providerID", "modelID"}``, the shape :meth:`prompt`
         sends rather than the ``{"providerID", "id"}`` of :meth:`create_session`,
-        and ``auto`` is the server's own flag for what to keep. The caller waits
+        and ``auto`` is ``False``: the summary alone, never the agent loop after it. The caller waits
         for the resulting ``session.idle`` through the normal tap — a
         ``session.compacted`` event precedes it and is recorded in the tap's log.
         """
@@ -1198,9 +1204,19 @@ class KiloClient:
         body = {
             "providerID": session.provider_id,
             "modelID": session.model_id,
-            "auto": True,
+            "auto": False,
         }
-        status, resp = self._request("POST", path, body)
+        # KC-69: `auto: true` is Kilo's own overflow compact — it goes on with
+        # the agent loop after the summary, so the model's next tool call asks
+        # a permission while this very call still waits for its answer, and
+        # nothing answers it: sensenova-6.7 asked `read all.py` right after its
+        # summary and the call hung for the whole timeout. `false` is the
+        # summary alone; the runner sends the next prompt itself.
+        # KC-69: 7.6.2 answers `summarize` only once the summary is written, so
+        # the call lasts as long as the model does — laguna 24 s, sensenova past
+        # the 30 s every other call gets, and the timeout turned a compact that
+        # was still running into a failed one
+        status, resp = self._request("POST", path, body, timeout=COMPACT_TIMEOUT_SEC)
         self._check(status, resp, "POST", path)
         return None
 

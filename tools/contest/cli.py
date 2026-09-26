@@ -1787,6 +1787,56 @@ def _context_memory_lines(config: ContestConfig, out_dir: Path) -> list[str]:
                                      percent=context_memory.compact_at_percent(config))
 
 
+def _with_remembered_limits(config: ContestConfig, out_dir: Path,
+                            content: str | None) -> tuple:
+    """KC-69: a remembered context size handed to Kilo as ``limit.context``.
+
+    ``(config, content)``: every agent intake found no ``limit.context`` for
+    (KC-56) and the KC-67 memory has a size for gets that size — the prompt
+    budget, ``limit - output`` — on its spec, and the model gets
+    `context_memory.kilo_limit` in the `KILO_CONFIG_CONTENT` the round's server
+    is spawned with, merged over *content* (intake's KC-35 overlay) or else the
+    operator's own value. Its ``input`` is ``compact_at_percent`` of the budget
+    plus Kilo's reserve, so Kilo compacts after the step that crosses that share,
+    inside a turn — the KC-67 gate between prompts only ever saw the turn's edges
+    (round 70: 263 159 input tokens in the first turn).
+
+    A model intake knows the size of keeps intake's number — the memory never
+    overrides Kilo. An attached server reads its own config and never sees the
+    overlay, so it gets nothing. ``compact_at_percent = 0`` sends the window
+    with ``input`` at the full budget: Kilo keeps its own compact there.
+    Fail-open like the rest of the memory: a memory or an operator value that
+    cannot be read is the config and *content* unchanged.
+    """
+    if config.server != "spawn":
+        return config, content
+    percent = context_memory.compact_at_percent(config)
+    try:
+        records = context_memory.load(context_memory.memory_path(config, out_dir),
+                                      days=context_memory.days_of(config))
+    except Exception:  # noqa: BLE001 — no memory is today's round, never a failed one
+        return config, content
+    agents, providers = [], {}
+    for agent in config.agents:
+        size, output = (None, None) if agent.context_limit else \
+            context_memory.remembered(records, agent.provider_id, agent.model_id)
+        limit = context_memory.kilo_limit(size, output, percent)
+        if limit is None:
+            agents.append(agent)
+            continue
+        agents.append(replace(agent, context_limit=size))
+        models = providers.setdefault(agent.provider_id, {"models": {}})["models"]
+        models[agent.model_id] = {"limit": limit}
+    if not providers:
+        return config, content
+    base = content if content is not None else os.environ.get("KILO_CONFIG_CONTENT")
+    try:
+        merged = merge_config_content(base, {"provider": providers})
+    except ValueError:
+        return config, content
+    return replace(config, agents=tuple(agents)), merged
+
+
 def _print_plan(result: Intake, config: ContestConfig, out_dir: Path, *, run_tests: bool,
                 workers: int | None = None, workers_fixed: bool = False,
                 agent_tmp: Path | None = None) -> None:
@@ -1874,6 +1924,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         # `highest` resolved at intake (KC-49): the round runs what answered
         config = replace(config, agents=result.agents)
     out_dir = Path(args.out).resolve() if args.out else result.out_dir
+    # KC-69: after `--out`, so the memory read is the one the runner writes to
+    config, config_content = _with_remembered_limits(config, out_dir, result.config_content)
 
     resume = None
     if args.resume:
@@ -1908,10 +1960,11 @@ def cmd_run(args: argparse.Namespace) -> int:
     agent_tmp_created = False
 
     env = _agent_env(workers)
-    if result.config_content is not None:
+    if config_content is not None:
         # KC-35: the overlay intake proved in its throwaway goes to the round's
-        # own server too, or the round would run on an unregistered list
-        env["KILO_CONFIG_CONTENT"] = result.config_content
+        # own server too, or the round would run on an unregistered list;
+        # KC-69 adds the remembered `limit.context` to it
+        env["KILO_CONFIG_CONTENT"] = config_content
     if agent_tmp is not None:
         for key in ("TMPDIR", "TEMP", "TMP"):
             env[key] = str(agent_tmp)

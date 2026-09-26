@@ -420,7 +420,8 @@ class FakeKiloServer:
 
         Nothing is sent back to the caller. Kilo writes the summary as an
         assistant message flagged ``summary``; ``summary_tokens`` in the
-        scenario is its ``output`` — the size the history shrank to. Without
+        scenario is its ``output`` — the size the history shrank to, and
+        ``summary_text`` (KC-69) its text, ``"summary"`` by default. Without
         the key no message is written, the way a server that reports nothing
         looks to the runner.
         """
@@ -431,7 +432,8 @@ class FakeKiloServer:
                          "time": time.time(), "summary": True,
                          "tokens": {"input": 0, "output": int(summary), "reasoning": 0,
                                     "cache": {"read": 0, "write": 0}}},
-                "parts": [{"type": "text", "text": "summary"}]})
+                "parts": [{"type": "text",
+                           "text": self.scenario.get("summary_text", "summary")}]})
         self._emit({"type": "session.compacted",
                     "properties": {"sessionID": session.id}})
         self._emit({"type": "session.idle",

@@ -1533,12 +1533,14 @@ def test_prompt_sends_the_model_in_prompt_async_shape(tmp_path):
 def test_compact_posts_to_summarize_with_the_prompt_async_model_shape(tmp_path):
     """KC-67's compact is ``POST /session/{id}/summarize`` — the ``{"providerID",
     "modelID"}`` shape prompt_async sends, not the ``{"providerID", "id"}`` of
-    create_session, and ``auto`` left on so the server keeps what it keeps."""
+    create_session, and ``auto`` off (KC-69): the summary alone — ``true`` goes on
+    with the agent loop, whose next permission nothing answers while the call
+    still waits (sensenova-6.7 live, 2026-09-26)."""
     with _probe(tmp_path, {"turns": [{"events": ["busy", "idle"], "assistant": "done"}]}) as h:
         h.client.compact(h.session)
         (call,) = h.fake.calls(method="POST", path="/summarize")
 
-    assert call["body"] == {"providerID": "kenary", "modelID": "hy3:free", "auto": True}
+    assert call["body"] == {"providerID": "kenary", "modelID": "hy3:free", "auto": False}
     assert call["query"]["directory"] == h.directory
     # nothing comes back to the caller: the session compacts, then goes idle
     assert h.fake.events_of("session.compacted")

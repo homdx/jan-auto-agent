@@ -1,10 +1,10 @@
 # KC-69 — a remembered context size reaches Kilo as `limit.context`, so a long turn compacts before the overflow
 
-**Status:** queued — found 2026-09-26 scoring round 70 on two machines
+**Status:** landed — by hand after a live bench on 8 models, 2026-09-27; found 2026-09-26 scoring round 70 on two machines
 **Severity:** MEDIUM
 **Round:** 115
 **Size:** S
-**File:** `tools/contest/cli.py` (`_with_context_limits`, the KC-35 `KILO_CONFIG_CONTENT` overlay), `tools/contest/context_memory.py` (`size_of`)
+**File:** `tools/contest/cli.py`, `tools/contest/context_memory.py`, `tools/contest/runner.py`, `tools/contest/kilo_client.py`, `tools/contest/policy.py`
 **Depends on:** KC-67 (landed `dec2bb0`), KC-56 (landed), KC-35 (landed).
 
 ## Problem
@@ -50,15 +50,64 @@ KC-35 already sends.
 
 ## Acceptance
 
-- [ ] A remembered 262 144 with output 32 000 for `provider/model` that intake
-      has no limit for puts `limit.context = 230144` (or 262 144 with
-      `limit.output = 32000`) into the overlay for that model, and `context_limit`
-      on its spec.
-- [ ] A model whose intake limit is known keeps intake's number. The memory never
-      overrides Kilo.
-- [ ] `parse_overflow` reads `requested 32000 output tokens`. An old record
-      without it keeps today's size.
-- [ ] `tests` then `tests_bugfix -n 4`, green, run sequentially.
+- [x] A remembered 262 144 with output 32 000 puts the model's real window into
+      the overlay — `limit {context: 262144, input: 204115, output: 32000}` —
+      and the budget 230 144 on `spec.context_limit`.
+- [x] A model whose intake limit is known keeps intake's number.
+- [x] `parse_overflow` / `parse_output` read `requested 32000 output tokens`;
+      an old record without it keeps today's size.
+- [x] `tests` then `tests_bugfix -n 4`, green, run sequentially.
+
+## What landed
+
+The live bench (below) turned the S ticket into the whole path, because each
+piece the ticket asked for failed on a real model in a way no fake showed:
+
+1. **The overlay.** `limit.context` is Kilo's hard wall, so it stays the real
+   window (`size + output`); a wall cut to the threshold ended turns in
+   `Compaction exhausted … after 3 attempts` (sensenova-6.7). Kilo compacts
+   inside a turn when a step reaches `limit.input - reserved` (20 000), and it
+   skips the preflight `compaction.threshold_percent` mid-turn (laguna: one
+   compact at a turn's start, then 53 % inside it) — so `input` is
+   `compact_at_percent` of the budget + 20 000. `limit.output` is always sent:
+   without it 7.6.2 rejects the `limit` as `ConfigInvalidError` and drops the
+   **whole** `KILO_CONFIG_CONTENT`, the KC-35 registration included (laguna).
+2. **The permission gate** (the operator's plan). Every permission asked logs
+   the fill — console and `decisions.jsonl` `context` — and at or past the
+   threshold it is refused (layer `context`), the turn is aborted once (the
+   model otherwise goes on with the tools that need no ask: glm, four refusals
+   at 60 %), and the next prompt compacts. A compact that fails or leaves the
+   session at or past the threshold goes on in a **new session**: the round
+   prompt, then `CONTEXT_CONTINUE_NOTE` with the old session's summary.
+3. **The compact itself.** `summarize` is `auto: false` — `true` runs the agent
+   loop after the summary, whose next permission nothing answers while the call
+   still waits (sensenova-6.7 hung). The call waits 900 s, not 30 (sensenova
+   writes a summary for longer). A chunked summary has 0 tokens, so its size is
+   its text / 4, and the fill after a compact is the summary, not the reply
+   before it — the old read refused every later ask (laguna).
+4. **A clean overflow goes on.** An overflow with nothing written and a
+   continue left is compacted and continued (`OVERFLOW_CONTINUE`), or moved to a
+   new session — no longer KC-54's stall. The runner's between-prompt gate works
+   for every known size, not only a remembered one.
+
+## Live bench, 2026-09-27
+
+A sandbox whose ticket makes the agent read ~170 k tokens of our own source,
+driven by the real `run_agent`, `compact_at_percent = 30`:
+
+| model | memory at start | result | what happened |
+|---|---|---|---|
+| sensenova-6.7-flash-lite | 230 144 | READY 572 s | Kilo compacted mid-turn |
+| sensenova-6.8-flash-lite | 230 144 | READY 346 s | Kilo compacted mid-turn |
+| laguna-s-2-1:free | 215 042 | READY 1120 s | |
+| glm-4-7-flash:free | none | READY 1133 s | |
+| glm-4-7-flash:free | 117 797 (its own overflow) | GAVE_UP `no_progress_row` | fill ≤ 21.6 %: Kilo compacted mid-turn; the sandbox has no `append_task.py` |
+| agnes-3-0-flash:free | none | READY 282 s | |
+| space-bunny-alpha-bynara | none | READY 1565 s | |
+| hy3:free | none | STALLED | overflow → compacted 189 145 → 12 330, went on; 2nd compact hit the free-model rate limit → new session; the ticket read the file again and overflowed a 3rd time. Size remembered for the next round |
+
+A model the memory does not know yet can still overflow inside the round that
+meets it: the overlay is built when the round's server starts.
 
 ## Out of scope
 

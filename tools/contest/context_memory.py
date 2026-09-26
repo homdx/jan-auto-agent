@@ -51,14 +51,19 @@ __all__ = [
     "DEFAULT_COMPACT_AT_PERCENT",
     "DEFAULT_DAYS",
     "DEFAULT_FILENAME",
+    "DEFAULT_OUTPUT_RESERVE",
+    "KILO_COMPACT_RESERVE",
     "OverflowRecord",
     "add",
     "compact_at_percent",
     "days_of",
+    "kilo_limit",
     "load",
     "memory_path",
+    "parse_output",
     "parse_overflow",
     "plan_lines",
+    "remembered",
     "size_of",
     "smallest_size",
 ]
@@ -69,6 +74,12 @@ _LOG = logging.getLogger(__name__)
 DEFAULT_DAYS = 7.0
 #: The default memory file, next to the rounds' output.
 DEFAULT_FILENAME = "context-memory.json"
+#: KC-69: the output Kilo reserves when the provider named none — Kilo's own
+#: default maximum output, and the 32 000 sensenova's overflow says was asked.
+DEFAULT_OUTPUT_RESERVE = 32000
+#: KC-69: the tokens Kilo 7.6.2 keeps free under ``limit.input`` when the config
+#: sets no ``compaction.reserved`` — ``min(20 000, the model's output)``.
+KILO_COMPACT_RESERVE = 20000
 #: The default fill, as a percent of the remembered size, at which the runner
 #: compacts a session that has no limit of its own. 0 turns the compact off.
 DEFAULT_COMPACT_AT_PERCENT = 80.0
@@ -87,6 +98,11 @@ _LIMIT_RE = re.compile(
 _PROMPT_RE = re.compile(
     r"prompt\s+contains(?:\s+at\s+least)?\s+(\d[\d,]*)\s*input\s*tokens?", re.IGNORECASE
 )
+
+
+#: KC-69: the output the provider reserved on top of the prompt — ``you requested
+#: 32000 output tokens`` — which the prompt budget does not get to use.
+_OUTPUT_RE = re.compile(r"requested\s+(\d[\d,]*)\s*output\s*tokens?", re.IGNORECASE)
 
 
 def _number(value) -> int | None:
@@ -133,6 +149,16 @@ def parse_overflow(message: object) -> tuple[int | None, int | None]:
     return limit, prompt
 
 
+def parse_output(message: object) -> int | None:
+    """KC-69: the output tokens the provider says were requested, else ``None``.
+
+    sensenova's ``you requested 32000 output tokens`` is the part of its named
+    limit the prompt never gets; kenary names nothing, so ``None`` there.
+    """
+    match = _OUTPUT_RE.search(message) if isinstance(message, str) else None
+    return _number(match.group(1)) if match is not None else None
+
+
 @dataclass(frozen=True)
 class OverflowRecord:
     """One overflow, one line of the shared file.
@@ -143,6 +169,9 @@ class OverflowRecord:
     same id. ``limit`` is the size the provider named, ``last_ok`` the context
     of the last reply that still went through, ``prompt`` the input the
     provider counted — any of the three ``None`` when it is not known.
+    ``output`` (KC-69) is the output the provider reserved on top of the
+    prompt, ``None`` for a record that did not name one — every record written
+    before KC-69.
     """
 
     at: float
@@ -153,6 +182,7 @@ class OverflowRecord:
     limit: int | None = None
     last_ok: int | None = None
     prompt: int | None = None
+    output: int | None = None
 
     def to_dict(self) -> dict:
         """The shape it has in the file, keys in order for a stable diff."""
@@ -165,6 +195,7 @@ class OverflowRecord:
             "limit": self.limit,
             "last_ok": self.last_ok,
             "prompt": self.prompt,
+            "output": self.output,
         }
 
     @classmethod
@@ -202,14 +233,75 @@ class OverflowRecord:
             limit=_number(data.get("limit")),
             last_ok=_number(data.get("last_ok")),
             prompt=_number(data.get("prompt")),
+            output=_number(data.get("output")),
         )
 
 
 def size_of(record: OverflowRecord) -> int | None:
     """The size one record remembers: the limit the provider named, else its
     ``last_ok`` — the last reply that still went through, which is the only
-    number a provider that names no limit ever gave."""
+    number a provider that names no limit ever gave.
+
+    KC-69: a limit named together with the output reserved on top of it is
+    ``limit - output`` — sensenova's 262 144 with 32 000 requested is a prompt
+    budget of 230 144, and a prompt past that overflows. A record without the
+    output, or with one that would leave nothing, keeps the limit as before.
+    """
+    if record.limit and record.output and record.limit > record.output:
+        return record.limit - record.output
     return record.limit or record.last_ok
+
+
+def remembered(records, provider: str, model: str) -> tuple[int | None, int | None]:
+    """KC-69: ``(size, output)`` of the record with the smallest size for
+    ``provider`` / ``model`` — :func:`smallest_size` plus the output that
+    record reserved, ``None`` when it named none. ``(None, None)`` for nothing
+    remembered.
+    """
+    best = None
+    if isinstance(records, (list, tuple)):
+        for entry in records:
+            record = entry if isinstance(entry, OverflowRecord) else OverflowRecord.from_dict(entry)
+            if record is None or record.provider != provider or record.model != model:
+                continue
+            size = size_of(record)
+            if size is not None and (best is None or size < best[0]):
+                best = (size, record.output)
+    return best if best is not None else (None, None)
+
+
+def kilo_limit(size, output, percent: float = DEFAULT_COMPACT_AT_PERCENT) -> dict | None:
+    """KC-69: the ``limit`` a remembered size becomes in Kilo's config, else ``None``.
+
+    *size* is the prompt budget (`size_of`). Kilo 7.6.2 compacts inside a turn
+    after every step whose context reaches ``limit.input - reserved`` —
+    ``reserved`` is ``min(20 000, output)`` unless the config sets it, and the
+    preflight ``compaction.threshold_percent`` is skipped mid-turn (live, laguna:
+    one compact at a turn's start, then 53 % inside the turn). So ``input`` is
+    *percent* of the budget plus Kilo's reserve: the step past *percent* of the
+    budget compacts, the same share the runner's own gate uses.
+
+    ``context`` stays the model's real window, ``size + output`` — Kilo treats it
+    as a hard wall, and a cut one ends turns in ``Compaction exhausted`` (live,
+    sensenova-6.7 at a wall cut to 30 %). ``output`` is always in the dict —
+    ``DEFAULT_OUTPUT_RESERVE`` when the provider named none: a ``limit`` without
+    it is ``ConfigInvalidError``, and Kilo skips the WHOLE ``KILO_CONFIG_CONTENT``
+    (live, laguna). *percent* 0 or out of range is ``input = size``, Kilo's own
+    compact at the full budget.
+    """
+    size = _number(size)
+    if size is None:
+        return None
+    reserve = _number(output) or DEFAULT_OUTPUT_RESERVE
+    try:
+        share = float(percent)
+    except (TypeError, ValueError):
+        share = 0.0
+    if math.isfinite(share) and 0 < share < 100:
+        at = min(size, int(size * share / 100) + min(KILO_COMPACT_RESERVE, reserve))
+    else:
+        at = size
+    return {"context": size + reserve, "input": at, "output": reserve}
 
 
 def smallest_size(records, provider: str, model: str) -> int | None:

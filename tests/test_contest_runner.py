@@ -2429,7 +2429,11 @@ def test_an_overflow_turn_with_a_clean_tree_is_a_stall_not_a_crash(tmp_path, mon
 
     monkeypatch.setattr("tools.contest.runner._harvest", boom)
     scenario = {"turns": [{"events": ["busy"], "error": _OVERFLOW}]}
-    sb, fake, _h, run, _ = _run_one(tmp_path, scenario, _stall_config())
+    # KC-69: with a continue left the overflow is compacted and goes on
+    # (`test_a_clean_overflow_is_compacted_and_the_work_goes_on`); none left is
+    # KC-54's stall
+    sb, fake, _h, run, _ = _run_one(tmp_path, scenario,
+                                    _stall_config(max_continues_per_attempt=0))
     assert run.state is AgentState.STALLED
     assert run.last_error == "context overflow with no uncommitted work"
     assert run.commit is None and run.attempt == 0
@@ -2482,6 +2486,26 @@ def test_an_overflow_with_zero_continues_is_a_stall_without_a_new_session(tmp_pa
     assert run.state is AgentState.STALLED
     assert run.last_error == "context overflow"
     assert len(_session_posts(fake)) == 1 and len(_prompts(fake)) == 1
+
+
+def test_a_clean_overflow_is_compacted_and_the_work_goes_on(tmp_path, caplog):
+    """KC-69: nothing written, nothing committed, a continue left: the session is
+    compacted and the work goes on in it with `OVERFLOW_CONTINUE` — READY."""
+    caplog.set_level(logging.INFO, logger="tools.contest.runner")
+    scenario = {"summary_tokens": 3_000, "turns": [
+        {"events": ["busy"], "error": _OVERFLOW},
+        {"on_prompt": work_ready, "events": ["busy", "idle"]},
+    ]}
+    sb, fake, _h, run, _ = _run_one(tmp_path, scenario, _stall_config())
+    _assert_ready(run, sb.ws("agent-a"))
+    assert len(_session_posts(fake)) == 1
+    posts = [r["path"] for r in fake.calls("POST")]
+    assert f"/session/{run.session_id}/summarize" in posts
+    from tools.contest.runner import OVERFLOW_CONTINUE
+    assert _prompts(fake)[-1] == (run.session_id, OVERFLOW_CONTINUE)
+    first = run.turns[0]
+    assert first["overflow_compacted"] is True and first["context_after"] == 3_000
+    assert _runner_has(caplog, "context overflow compacted in")
 
 
 def test_an_overflow_with_an_unreadable_tree_is_a_clean_stall(tmp_path, monkeypatch, caplog):
