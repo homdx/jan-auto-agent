@@ -1,6 +1,6 @@
 # KC-29 — a stall this runner asked for keeps its `STALLED`: the worktree is harvested and exported, never promoted to `READY`
 
-**Status:** queued — after KC-28, last in the queue; found 2026-09-20 scoring round 60 (KC-21), where nine entries split three ways on the same turn.
+**Status:** open
 **Severity:** MEDIUM (a round can exit 0 on an agent the runner aborted; or lose that agent's finished work entirely)
 **File:** `tools/contest/runner.py` (`run_agent` — the KC-21 terminal harvest)
 **Symbol:** `run_agent`, `stall`, `finish`
