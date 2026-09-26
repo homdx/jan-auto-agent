@@ -1,6 +1,6 @@
 # KC-29 — a stall this runner asked for keeps its `STALLED`: the worktree is harvested and exported, never promoted to `READY`
 
-**Status:** open
+**Status:** landed `a4021c2` (2026-09-26) — round 68, 7 READY + sensenova-6-7-flash-lite-var1 STALLED (context overflow, uncommitted, own test red); winner agnes-3-0-flash as-is — its code passes every entry's KC-29 tests, its tests are the strictest (catch four entries that drop the verdict on a rejected stall)
 **Severity:** MEDIUM (a round can exit 0 on an agent the runner aborted; or lose that agent's finished work entirely)
 **File:** `tools/contest/runner.py` (`run_agent` — the KC-21 terminal harvest)
 **Symbol:** `run_agent`, `stall`, `finish`
