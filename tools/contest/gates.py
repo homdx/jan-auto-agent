@@ -319,6 +319,20 @@ def _tail(text: str | None) -> list[str]:
     return (text or "").strip().splitlines()[-FAIL_TAIL_LINES:]
 
 
+def _budget_tail(header: str, r: subprocess.CompletedProcess) -> list[str]:
+    """The tail section of a root the budget ended: *header*, where the time
+    went (the durations table, else the test `-v` shows it was inside of), and
+    the end of pytest's own output."""
+    lines = (r.stdout or "").strip().splitlines()
+    section = [header]
+    kind, ids = _slow_tests(lines)
+    if ids:
+        section.append(("slowest tests: " if kind == "durations" else "the budget hit in: ")
+                       + " ".join(ids[:10]))
+    section.extend(lines[-FAIL_TAIL_LINES:] or _tail(r.stderr))
+    return section
+
+
 def run_tests_detail(cwd, budget_sec: float = 0.0) -> tuple[str, list[str]]:
     """Same four roots as `run_tests`, plus the tail of the failing output.
 
@@ -377,17 +391,27 @@ def run_tests_detail(cwd, budget_sec: float = 0.0) -> tuple[str, list[str]]:
             # The budget, not the tree: name where it hit and stop spending time
             # on this root — no flake rerun, no more roots.
             out.append(f"{d}:budget✗")
-            tail.append(f"--- {d}: ended after the harvest budget")
-            _kind, ids = _slow_tests(lines)
-            if ids:
-                tail.append(("slowest tests: " if _kind == "durations" else "the budget hit in: ")
-                            + " ".join(ids[:10]))
-            tail.extend(lines[-FAIL_TAIL_LINES:] or _tail(r.stderr))
+            tail.extend(_budget_tail(f"--- {d}: ended after the harvest budget", r))
             continue
         bad, ids = _failures(lines)
-        if bad and ids and _pytest(cwd, *ids, *serial,
-                                   budget=max(0.0, budget_sec - (time.monotonic() - start))
-                                   if budget_sec > 0 else 0.0).returncode == 0:
+        rerun = None
+        if bad and ids:
+            # The flake rerun spends the same budget. What is left of it is
+            # checked here, not handed over as-is: `budget=0` is "no bound",
+            # so a budget spent to the last millisecond would otherwise rerun
+            # unbounded. A rerun the budget ended is the budget, not a red tree.
+            left = max(0.0, budget_sec - (time.monotonic() - start)) if budget_sec > 0 else 0.0
+            if budget_sec > 0 and left <= 0:
+                out.append(f"{d}:budget✗")
+                tail.append(f"--- {d}: harvest budget exhausted before the flake rerun")
+                continue
+            rerun = _pytest(cwd, *ids, *serial, *durations, budget=left)
+            if rerun.returncode == 124:
+                out.append(f"{d}:budget✗")
+                tail.extend(_budget_tail(
+                    f"--- {d}: the flake rerun ended after the harvest budget", rerun))
+                continue
+        if rerun is not None and rerun.returncode == 0:
             out.append(f"{d}:PASS*{bad}")
             tail.append(f"--- {d}: {bad} test(s) failed under the full run and passed "
                         f"alone on rerun (flaky, not counted): {' '.join(ids)}")

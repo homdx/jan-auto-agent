@@ -556,6 +556,73 @@ def test_run_tests_detail_without_a_budget_is_today_behaviour(round_, tmp_path, 
     assert all(budget == 0.0 for _, budget in calls)   # not the flake rerun either
 
 
+#: Fails at once under the full run; its serial rerun outlives any budget.
+_SLOW_ON_RERUN = """\
+import pathlib
+import time
+FLAG = pathlib.Path(__file__).with_suffix(".flag")
+
+
+def test_slow_on_rerun_kc57():
+    if FLAG.exists():
+        time.sleep(90)
+    FLAG.write_text("seen")
+    assert False, "first run only"
+"""
+
+
+def test_the_flake_rerun_is_bounded_by_the_same_budget(round_, tmp_path):
+    """KC-57 §1: the serial rerun of a failed test spends what is left of the
+    budget. Past it the rerun is ended like the root itself: `budget✗`, the
+    test it hit in named — never `1✗`, which would send the agent to fix a
+    test that is not red."""
+    repo, base, ticket = round_
+    wt = _worktree(repo, base, tmp_path)
+    _accepting(wt)
+    _edit(wt, "tests/test_slow_on_rerun_kc57.py", _SLOW_ON_RERUN)
+    _commit(wt, "a test whose rerun outlives the budget")
+
+    start = time.monotonic()
+    summary, tail = run_tests_detail(str(wt.path), budget_sec=12.0)
+    took = time.monotonic() - start
+
+    assert summary.startswith("tests:budget✗"), summary
+    assert took < 30                                    # the budget, not the 90 s rerun
+    assert any("flake rerun ended" in line for line in tail)
+    assert any("the budget hit in:" in line and "test_slow_on_rerun_kc57" in line
+               for line in tail)
+    time.sleep(0.5)
+    assert _live_pytest(wt.path) == []
+
+
+def test_a_budget_spent_before_the_flake_rerun_skips_it(round_, tmp_path, monkeypatch):
+    """KC-57 §1: `budget=0` means "no bound" to `_pytest`, so a budget spent by
+    the time the root failed must not be passed on as 0 — the rerun is not run
+    at all and the root is `budget✗`."""
+    repo, base, ticket = round_
+    wt = _worktree(repo, base, tmp_path)
+    _accepting(wt)
+
+    clock = [1000.0]
+    monkeypatch.setattr(gates_mod.time, "monotonic", lambda: clock[0])
+    calls: list = []
+
+    def failing_root(cwd, *args, budget=0.0):
+        calls.append((args, budget))
+        clock[0] += 60.0                                 # the root used the whole budget
+        return subprocess.CompletedProcess(
+            ["pytest"], 1,
+            "FAILED tests/test_probe.py::test_probe - assert False\n1 failed in 60.00s\n", "")
+
+    monkeypatch.setattr(gates_mod, "_pytest", failing_root)
+    summary, tail = run_tests_detail(str(wt.path), budget_sec=30.0)
+
+    assert summary.startswith("tests:budget✗"), summary
+    assert len(calls) == 1                               # no rerun, bounded or not
+    assert all(budget > 0 for _, budget in calls)
+    assert any("exhausted before the flake rerun" in line for line in tail)
+
+
 def test_harvest_budget_reworks_with_tests_slow(round_, tmp_path):
     """KC-57 §1: the budget ends the roots, the verdict is REWORK on a blocking
     `tests_slow` — not `tests_failed` — that says the suite is too slow, and the
