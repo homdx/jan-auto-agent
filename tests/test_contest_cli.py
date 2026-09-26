@@ -1000,12 +1000,121 @@ def test_export_patches_names_a_stalled_or_error_patch_by_its_state(tmp_path):
     out = tmp_path / "out"
     written = cli.export_patches(state, list(workspaces.values()), out)
     assert [path.name for path in written] == ["agent-a.patch", "agent-b.GAVE_UP.patch",
-                                               "agent-c.STALLED.patch", "agent-d.ERROR.patch"]
+                                                "agent-c.STALLED.patch", "agent-d.ERROR.patch"]
     for name, patch in zip(("agent-a", "agent-b", "agent-c", "agent-d"), written):
         text = patch.read_text(encoding="utf-8")
         assert text.startswith(f"From {shas[name]}")
         assert "def thing():" in text
     assert not (out / "agent-c.patch").exists() and not (out / "agent-d.GAVE_UP.patch").exists()
+
+
+def test_export_patches_writes_a_worktree_diff_for_a_terminal_turn_with_no_commit(tmp_path):
+    """KC-31: a `STALLED` turn that died with edits and no commit exports
+    `<agent>.STALLED.diff` from `git diff <base_sha>` — both edited files'
+    `diff --git` hunks, no `From ` header; an `ERROR` one → `.ERROR.diff`; a clean
+    zero-commit tree writes nothing, and an agent with a commit keeps KC-21's
+    `.STALLED.patch` and gets no `.diff` at all."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write(repo / "pkg" / "__init__.py", "")
+    _write(repo / "pkg" / "thing.py", "def thing():\n    return 1\n")
+    _write(repo / "pkg" / "other.py", "OTHER = 1\n")
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "user.email", "patch@example.invalid")
+    _git(repo, "config", "user.name", "patch")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "base")
+    base = _git(repo, "rev-parse", "HEAD")
+
+    workspaces: list = []
+    runs: list = []
+    for name, state, commit_it in (
+        ("agent-a", AgentState.STALLED, False),
+        ("agent-b", AgentState.ERROR, False),
+        ("agent-c", AgentState.STALLED, False),
+        ("agent-d", AgentState.STALLED, True),
+    ):
+        path = tmp_path / "wt" / name
+        _git(repo, "worktree", "add", "-q", "-b", f"contest/{ROUND:02d}/{name}", str(path), base)
+        if name != "agent-c":                     # agent-c stays clean on purpose
+            _write(path / "pkg" / "thing.py", THING_CHANGED)
+            if name == "agent-a":
+                _write(path / "pkg" / "other.py", "OTHER = 42\n")
+        commit = None
+        if commit_it:
+            _git(path, "add", "-A")
+            _git(path, "commit", "-q", "-m", f"KC-21: {name}")
+            commit = _git(path, "rev-parse", "HEAD")
+        ws = Workspace(agent=name, path=path, branch=f"contest/{ROUND:02d}/{name}",
+                       base_sha=base, kind="worktree")
+        workspaces.append(ws)
+        runs.append(AgentRun(agent=AgentSpec(name, "kenary", f"{name}:free"), workspace=ws,
+                             state=state, commit=commit))
+    state = RoundState(round_no=ROUND, ticket=TICKET_01, base_sha=base,
+                       started_at=1.0, agents=runs)
+
+    out = tmp_path / "out"
+    written = cli.export_patches(state, workspaces, out)
+    # patches first (the loop the ticket keeps), the diffs after it
+    assert [path.name for path in written] == ["agent-d.STALLED.patch", "agent-a.STALLED.diff",
+                                               "agent-b.ERROR.diff"]
+    diff = (out / "agent-a.STALLED.diff").read_text(encoding="utf-8")
+    assert not diff.startswith("From "), "a worktree diff is not a format-patch"
+    assert diff.count("diff --git") == 2, "both edited files are in the one diff"
+    assert "pkg/thing.py" in diff and "pkg/other.py" in diff
+    assert "+    return 42" in diff and "+OTHER = 42" in diff
+    assert (out / "agent-b.ERROR.diff").read_text(encoding="utf-8").count("diff --git") == 1
+    assert (out / "agent-d.STALLED.patch").read_text(encoding="utf-8").startswith("From ")
+    assert not (out / "agent-a.patch").exists()
+    assert not (out / "agent-b.ERROR.patch").exists()
+    assert not (out / "agent-c.STALLED.diff").exists(), "a clean tree writes nothing"
+    assert not (out / "agent-d.STALLED.diff").exists(), "a commit owns its own patch"
+
+
+def test_export_patches_names_untracked_files_and_survives_a_missing_workspace(tmp_path):
+    """KC-31: the diff inlines only the tracked edits — the untracked paths go in
+    a trailing comment, and the orchestrator's own `runs/` rows open no file —
+    and a `STALLED` run with no workspace, or one whose worktree git cannot read,
+    writes nothing and raises nothing."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write(repo / "pkg" / "thing.py", "def thing():\n    return 1\n")
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "user.email", "patch@example.invalid")
+    _git(repo, "config", "user.name", "patch")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "base")
+    base = _git(repo, "rev-parse", "HEAD")
+
+    path = tmp_path / "wt" / "agent-a"
+    _git(repo, "worktree", "add", "-q", "-b", f"contest/{ROUND:02d}/agent-a", str(path), base)
+    _write(path / "pkg" / "thing.py", THING_CHANGED)
+    _write(path / "notes.txt", "not committed\n")
+    _write(path / "runs" / "agent-a" / "PROGRESS.csv", "round,status,ticket\n")
+    workspace = Workspace(agent="agent-a", path=path, branch=f"contest/{ROUND:02d}/agent-a",
+                          base_sha=base, kind="worktree")
+    broken = Workspace(agent="agent-b", path=tmp_path / "not-a-repo",
+                       branch="contest/01/agent-b", base_sha=base, kind="worktree")
+    agent_c = AgentSpec("agent-c", "kenary", "agent-c:free")
+    state = RoundState(
+        round_no=ROUND, ticket=TICKET_01, base_sha=base, started_at=1.0,
+        agents=[
+            AgentRun(agent=AgentSpec("agent-a", "kenary", "agent-a:free"),
+                     workspace=workspace, state=AgentState.STALLED),
+            AgentRun(agent=AgentSpec("agent-b", "kenary", "agent-b:free"),
+                     workspace=broken, state=AgentState.ERROR),
+            AgentRun(agent=agent_c, workspace=None, state=AgentState.ERROR),
+        ])
+
+    out = tmp_path / "out"
+    written = cli.export_patches(state, [workspace, broken], out)
+    assert [path.name for path in written] == ["agent-a.STALLED.diff"]
+    diff = (out / "agent-a.STALLED.diff").read_text(encoding="utf-8")
+    assert diff.count("diff --git") == 1
+    assert "def thing():" in diff
+    assert "not committed" not in diff, "the untracked file is not inlined"
+    assert diff.rstrip().endswith("# untracked (not inlined): notes.txt")
+    assert "runs/" not in diff, "the orchestrator's own rows are not the agent's work"
 
 
 def test_a_stall_with_a_valid_commit_counts_as_ready_and_exits_zero(sandbox, capsys, spawn_holder):

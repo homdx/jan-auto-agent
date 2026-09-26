@@ -1404,8 +1404,91 @@ def intake(repo, tasks_dir, round_no, base_ref, config, argv=None,
 # the patches
 # ─────────────────────────────────────────────────────────────────────────────
 
+#: KC-31: the terminal states whose tree is read for a `.diff` when the turn
+#: ended without a commit. `READY` is never here — the harvest always names its
+#: commit — and `GAVE_UP` is a scored REWORK after the last attempt, not work
+#: that died unclaimed.
+_DIFF_STATES = (AgentState.STALLED, AgentState.ERROR)
+
+#: KC-31: the one trailing comment the diff's untracked files go in — `git diff`
+#: has no view of a path that is not in the index, so those are named, not
+#: inlined.
+_UNTRACKED_NOTE = "# untracked (not inlined): "
+
+#: KC-31: the orchestrator's own rows in the worktree. `_dirty_tree`'s `runs/`
+#: rule, duplicated here for the same reason: `runs/<agent>/PROGRESS.csv` is not
+#: the agent's work, and it must not open a diff.
+_RUNS_PREFIX = "runs/"
+
+
+def _git_out(ws, *args: str) -> str | None:
+    """One read-only git call in *ws*'s worktree, or `None` when git did not run.
+
+    Read-only subcommands only — `--no-optional-locks` so a sample never takes
+    `index.lock` from under a neighbour agent's `git commit`. `None` is this
+    ticket's fail-open edge: an absent worktree, a path that is not a
+    repository, a held index that the ladder gave up on and a timeout all read
+    the same as "no collect data", never as an exception into a round.
+    """
+    try:
+        proc = run_git(["git", "--no-optional-locks", *args], cwd=str(ws.path))
+    except Exception:  # noqa: BLE001 — a tree that cannot be read is no data
+        return None
+    return proc.stdout if proc.returncode == 0 else None
+
+
+def _uncommitted_diff_body(ws) -> str | None:
+    """KC-31: the body of *ws*'s `.diff`, or `None` when there is no diff to write.
+
+    The work has to fail both of KC-21's gates to land here: `git rev-list
+    --count <base_sha>..HEAD` is `0`, so the branch holds nothing to format, and
+    `git status --porcelain --untracked-files=all` is not empty, so the turn left
+    something behind. The body is `git diff <base_sha>` — the worktree against
+    the base, tracked files only — with the untracked paths named in a trailing
+    comment instead of inlined, because a path that is not in the index has no
+    hunk. `runs/` paths are the orchestrator's, not the agent's, and are dropped
+    before the emptiness test so a stale `PROGRESS.csv` alone opens no file.
+
+    `None` in every other case: a branch with a commit under it (that is
+    KC-21's `.patch`, or KC-41's deadline commit), a clean tree (nothing to
+    read, as today), a worktree without a base to diff against, and a status
+    that git could not run. A worktree whose tracked diff is empty but which
+    holds untracked files still writes a body — the comment is the only view it
+    has.
+    """
+    base = str(getattr(ws, "base_sha", "") or "")
+    if not base:
+        return None
+    count = _git_out(ws, "rev-list", "--count", f"{base}..HEAD")
+    if count is None or count.strip() != "0":
+        return None
+    porcelain = _git_out(ws, "status", "--porcelain", "--untracked-files=all")
+    if porcelain is None or not porcelain.strip():
+        return None
+    untracked = []
+    for line in porcelain.splitlines():
+        if not line.strip() or len(line) <= 3:
+            continue
+        path = line[3:].rsplit(" -> ", 1)[-1].strip()
+        if not path or path.startswith(_RUNS_PREFIX):
+            continue
+        if line[:2] == "??":
+            untracked.append(path)
+    diff = (_git_out(ws, "diff", base) or "").strip()
+    if not diff and not untracked:
+        return None
+    body = diff
+    if untracked:
+        if body:
+            body += "\n"
+        else:
+            body = "\n"
+        body += _UNTRACKED_NOTE + " ".join(sorted(untracked))
+    return body
+
+
 def export_patches(state: RoundState, workspaces: list, out_dir) -> list:
-    """One `.patch` per agent whose `run.commit` is set, into *out_dir*.
+    """One `.patch` per agent whose `run.commit` is set, then the `.diff`s.
 
     `git format-patch --stdout <base_sha>..HEAD` per worktree — the patch the
     operator then applies by hand (`docs/collect-epics/
@@ -1417,7 +1500,16 @@ def export_patches(state: RoundState, workspaces: list, out_dir) -> list:
     writes no file and says so: a READY without a commit cannot happen, the
     harvest sets it, so there is no fake sha to fall back on.
 
-    FL-2: the call goes through `tools.git_run.run_git`. `format-patch` never
+    KC-31: a second loop over the agents the first one skipped for having no
+    `run.commit` — a `STALLED` or `ERROR` whose turn died with edits in the tree
+    and nothing committed writes `git diff <base_sha>` to `<agent>.STALLED.diff`
+    or `<agent>.ERROR.diff` instead of losing the turn to the round's end. A
+    clean tree still writes nothing, and an agent with a commit gets its patch
+    and no `.diff`: the file name says what happened to the work, and the diff
+    is not a `READY`, so the caller's exit code is untouched — a diff is one more
+    path in the list the run's summary line counts and prints.
+
+    FL-2: every call goes through `tools.git_run.run_git`. `format-patch` never
     takes the index, so the ladder is a no-op here — the point is that a caller
     no longer has to remember which git writes the index.
     """
@@ -1445,6 +1537,29 @@ def export_patches(state: RoundState, workspaces: list, out_dir) -> list:
             continue
         out.mkdir(parents=True, exist_ok=True)
         target.write_text(patch + "\n", encoding="utf-8")
+        written.append(target)
+
+    # KC-31: the agents the patch loop skipped — no commit to format, so the
+    # work is in the tree rather than on the branch.
+    for run in state.agents:
+        if run.commit or run.state not in _DIFF_STATES:
+            continue
+        name = run.agent.name
+        ws = by_agent.get(name)
+        if ws is None:
+            print(f"warning: {name} ended {run.state.value} with no workspace — no diff",
+                  file=sys.stderr)
+            continue
+        body = _uncommitted_diff_body(ws)
+        if body is None:
+            continue
+        target = out / f"{name}.{run.state.value}.diff"
+        try:
+            out.mkdir(parents=True, exist_ok=True)
+            target.write_text(body + "\n", encoding="utf-8")
+        except OSError as exc:
+            print(f"warning: {name}: could not write {target}: {exc}", file=sys.stderr)
+            continue
         written.append(target)
     return written
 

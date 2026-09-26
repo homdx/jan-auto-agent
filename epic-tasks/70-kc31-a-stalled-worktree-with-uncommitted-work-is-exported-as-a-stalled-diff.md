@@ -1,6 +1,6 @@
 # KC-31 — a STALLED worktree with uncommitted work is exported as `<agent>.STALLED.diff`
 
-**Status:** open
+**Status:** landed — round 70 (two machines, 16 entries), winner sensenova-6-8-flash-lite-var1 as-is
 **Severity:** MEDIUM (the agent's whole turn is lost when it stalls before `git commit`)
 **File:** `tools/contest/cli.py` (`export_patches`), `tools/contest/runner.py` (the terminal branch, for the state)
 **Symbol:** `export_patches`
