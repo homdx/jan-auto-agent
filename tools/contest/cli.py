@@ -1121,34 +1121,53 @@ def _check_offer(repo, config: ContestConfig, attached, *, resolve: bool = True,
             probe_kwargs["quota_re"] = quota_re
 
         # KC-11: wrap the existing probe_for with cache logic.
-        # For `highest` and a fresh cache entry: no session is opened — the
-        # try_one immediately returns success for the cached variant and a
-        # failure string for all others. After a live probe the result is saved.
+        # For `highest` and a fresh cache entry whose variant the model still
+        # lists: no session is opened — the try_one returns success for the
+        # cached variant and the recorded reason for the rungs above it. A
+        # cached variant the server no longer lists is stale, whatever its age:
+        # it would fail every rung and refuse the round, so it is probed live.
+        # After a live probe the result is saved; a live probe that found
+        # nothing drops the entry, so a later run cannot trust an old winner
+        # that `--reprobe` just saw fail.
         # For a named variant: the existing KC-61 single-rung hello_probe runs
         # as before; the cache is not consulted (the operator committed to the
         # name, and the probe checks it works, not what the best variant is).
         _cache = probe_cache if probe_cache is not None else {}
-        _ttl = int(getattr(config, "probe_ttl_days", 7) or 7)
+        # `probe_ttl_days = 0` means "always re-probe", so 0 is kept, not
+        # replaced by the default
+        try:
+            _ttl = float(getattr(config, "probe_ttl_days", 7))
+        except (TypeError, ValueError):
+            _ttl = 7.0
         import time as _time
+
+        def _save_cache():
+            if probe_cache_path:
+                save_probe_cache(probe_cache_path, _cache)
 
         def probe_for(agent):
             base_try_one = hello_probe(server, agent.provider_id, agent.model_id,
                                        **probe_kwargs)
             # Only cache-check for agents whose variant is `highest` — a named
             # variant goes through the original single-rung path.
-            if agent.variant not in (HIGHEST, None):
+            if agent.variant != HIGHEST:
                 return base_try_one
 
             key = f"{agent.provider_id}/{agent.model_id}"
+            rungs = ladder(listed_variants(providers, agent.provider_id, agent.model_id))
             entry = _cache.get(key) if not reprobe else None
-            now = _time.time()
-            if isinstance(entry, dict):
-                age_days = (now - float(entry.get("probed_at", 0))) / 86400.0
-                cached_ver = entry.get("kilo_version", "")
-                version_ok = True  # no kilo_version available at this call site
-                if age_days < _ttl and version_ok:
-                    cached_variant = entry.get("variant")
-                    tried_map = {t[0]: t[1] for t in (entry.get("tried") or [])}
+            if isinstance(entry, dict) and entry.get("usable", True):
+                try:
+                    probed_at = float(entry.get("probed_at", 0))
+                except (TypeError, ValueError):
+                    probed_at = 0.0
+                age_days = (_time.time() - probed_at) / 86400.0
+                cached_variant = entry.get("variant")
+                # kilo_version: no version is available at this call site yet,
+                # so only the age and the current variant list decide
+                if 0 <= age_days < _ttl and cached_variant in rungs:
+                    tried_map = {t[0]: t[1] for t in (entry.get("tried") or [])
+                                 if isinstance(t, (list, tuple)) and len(t) == 2}
 
                     def _cached(variant, _cv=cached_variant, _tm=tried_map):
                         if variant == _cv:
@@ -1157,14 +1176,13 @@ def _check_offer(repo, config: ContestConfig, attached, *, resolve: bool = True,
 
                     return _cached
 
-            # Live probe: wrap base_try_one to save the result on first success.
-            winner_box: list = []
+            # Live probe: wrap base_try_one to save the result on first
+            # success, and to drop the entry once the last rung has failed.
             tried_box: list = []
 
             def _caching(variant):
                 reason = base_try_one(variant)
                 if reason is None:
-                    # first success → save the ladder result so far
                     _cache[key] = {
                         "variant": variant,
                         "usable": True,
@@ -1173,10 +1191,11 @@ def _check_offer(repo, config: ContestConfig, attached, *, resolve: bool = True,
                         "tried": [[r, rs] for r, rs in tried_box],
                         "reasoning_tokens": 0,
                     }
-                    if probe_cache_path:
-                        save_probe_cache(probe_cache_path, _cache)
+                    _save_cache()
                 else:
                     tried_box.append([variant, reason])
+                    if variant == rungs[-1] and _cache.pop(key, None) is not None:
+                        _save_cache()
                 return reason
 
             return _caching
@@ -1186,6 +1205,19 @@ def _check_offer(repo, config: ContestConfig, attached, *, resolve: bool = True,
                                                      quota_re=quota_re)
         # KC-56: the same read's `limit.context`, so the runner can tell a full
         # context window from a spent output budget without asking again
+        if allow_unprobed:
+            # KC-11 `--allow-unprobed`: a `highest` agent no rung answered for
+            # is started with no variant instead of refusing the round; its
+            # failure line becomes a note so the operator still reads why
+            kept = []
+            for line in failures:
+                if ": no variant answered 'say: hello'" in line:
+                    notes.append(f"{line} — started with no variant (--allow-unprobed)")
+                else:
+                    kept.append(line)
+            failures = kept
+            resolved = tuple(replace(agent, variant=None) if agent.variant == HIGHEST
+                             else agent for agent in resolved)
         resolved = _with_context_limits(resolved, _context_limits(providers))
         if agents and not resolved and not failures:
             # KC-61: every agent was left out for its quota — nothing to start

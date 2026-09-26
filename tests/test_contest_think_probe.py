@@ -86,8 +86,9 @@ def test_save_probe_cache_is_atomic_tmp_is_not_left_behind(tmp_path):
 
 # ── probe_model without a server (no reasoning) ──────────────────────────────
 
-def test_probe_model_no_reasoning_returns_unusable_without_probing(tmp_path):
-    """A model with no listed variants skips the probe entirely."""
+def test_probe_model_no_reasoning_is_usable_without_probing(tmp_path):
+    """A model with no listed variants skips the probe entirely and runs with
+    no variant — usable, as the ticket's acceptance says."""
     called = []
 
     def client_factory(variant):
@@ -96,7 +97,7 @@ def test_probe_model_no_reasoning_returns_unusable_without_probing(tmp_path):
 
     result = probe_model(client_factory, "kenary", "plain:free", [],
                          cache={}, cache_path=None)
-    assert not result.usable
+    assert result.usable
     assert result.variant is None
     assert result.tried == []
     assert called == []  # no session opened
@@ -280,8 +281,8 @@ def test_probe_model_max_rejected_high_answers_two_sessions_created_winning_dele
     assert saved["kenary/glm:free"]["variant"] == "high"
 
 
-def test_probe_model_reasoning_false_returns_unusable_no_session(tmp_path):
-    """A model with `reasoning: false` (empty variants) → no session, `variant is None`."""
+def test_probe_model_reasoning_false_is_usable_no_session(tmp_path):
+    """A model with `reasoning: false` (empty variants) → no session, `variant is None`, usable."""
     scenario = {
         "turns": [{"events": ["busy", "idle"], "assistant": "hi"}],
     }
@@ -297,7 +298,7 @@ def test_probe_model_reasoning_false_returns_unusable_no_session(tmp_path):
         fake.stop()
 
     assert result.variant is None
-    assert not result.usable
+    assert result.usable
     # No session was created
     assert fake.calls(method="POST", path="/session") == []
 
@@ -370,3 +371,29 @@ def test_probe_model_roster_set_variant_low_is_checked_once_and_kept(tmp_path):
     assert result.usable
     assert ("high", "rejected") in result.tried
     assert ("medium", "rejected") in result.tried
+
+
+# ── cache entries that must not be trusted ───────────────────────────────────
+
+def _entry(variant, usable=True, age_days=1.0):
+    return {"kenary/hy3:free": {"variant": variant, "usable": usable,
+                                "probed_at": time.time() - age_days * 86400,
+                                "kilo_version": "", "tried": [], "reasoning_tokens": 0}}
+
+
+@pytest.mark.parametrize("cache, ttl_days", [
+    (_entry("turbo"), 7),                 # a variant the model no longer lists
+    (_entry(None, usable=False), 7),      # a failed probe is not a verdict for a week
+    (_entry("high", age_days=0.01), 0),   # ttl 0: always re-probe
+])
+def test_probe_model_does_not_trust_an_unusable_stale_or_unlisted_entry(cache, ttl_days):
+    called = []
+
+    def client_factory(variant):
+        called.append(variant)
+        return None if variant == "high" else "rejected"
+
+    result = probe_model(client_factory, "kenary", "hy3:free", ["max", "high"],
+                         cache=cache, ttl_days=ttl_days)
+    assert called == ["max", "high"]
+    assert result.variant == "high" and result.usable

@@ -1743,6 +1743,83 @@ def test_run_with_no_variant_flag_runs_at_highest(sandbox, capsys, spawn_holder)
         "max", "xhigh", "high", "high"]
 
 
+# KC-11: the probe cache, read and written next to the roster by `run`
+
+def _kc11_cache(sandbox, variant, age_days=1.0, usable=True):
+    """A `contest-probe.json` next to the sandbox roster with one glm entry."""
+    path = sandbox.repo / "contest-probe.json"
+    path.write_text(json.dumps({"kenary/glm-4-7-flash:free": {
+        "variant": variant, "usable": usable,
+        "probed_at": time.time() - age_days * 86400, "kilo_version": "",
+        "tried": [["max", "rejected"], ["xhigh", "rejected"]], "reasoning_tokens": 0}}))
+    return path
+
+
+def test_run_with_a_fresh_probe_cache_opens_no_probe_session(sandbox, capsys, spawn_holder):
+    _kc11_cache(sandbox, "high")
+    code, fake = run_fake(sandbox, KC49_SCENARIO,
+                          ["--ticket", "1", "--models", "glm-4-7-flash:free",
+                           "--no-gate", "--no-tests"], spawn_holder)
+    captured = capsys.readouterr()
+
+    assert code == 0, captured.err
+    assert _plan(captured.out)["agents"] == "1: kenary/glm-4-7-flash:free@high"
+    assert [s["body"]["model"].get("variant") for s in _sessions(fake)] == ["high"]
+
+
+def test_run_reprobes_a_cached_variant_the_model_no_longer_lists(sandbox, capsys,
+                                                                 spawn_holder):
+    """A fresh entry naming a variant `GET /provider` does not list would fail
+    every rung and refuse the round: it is stale, and the live ladder runs."""
+    path = _kc11_cache(sandbox, "turbo")
+    code, fake = run_fake(sandbox, KC49_SCENARIO,
+                          ["--ticket", "1", "--models", "glm-4-7-flash:free",
+                           "--no-gate", "--no-tests"], spawn_holder)
+    captured = capsys.readouterr()
+
+    assert code == 0, captured.err
+    assert [s["body"]["model"].get("variant") for s in _sessions(fake)] == [
+        "max", "xhigh", "high", "high"]
+    assert json.loads(path.read_text())["kenary/glm-4-7-flash:free"]["variant"] == "high"
+
+
+def test_run_with_probe_ttl_days_zero_always_reprobes(sandbox, capsys, spawn_holder):
+    """`probe_ttl_days = 0` is "always re-probe", not the 7-day default."""
+    roster = sandbox.repo / "contest.ini"
+    roster.write_text(roster.read_text().replace(
+        "out_dir = contest-out", "out_dir = contest-out\nprobe_ttl_days = 0", 1))
+    _kc11_cache(sandbox, "high", age_days=0.01)
+    code, fake = run_fake(sandbox, KC49_SCENARIO,
+                          ["--ticket", "1", "--models", "glm-4-7-flash:free",
+                           "--no-gate", "--no-tests"], spawn_holder)
+    captured = capsys.readouterr()
+
+    assert code == 0, captured.err
+    assert [s["body"]["model"].get("variant") for s in _sessions(fake)] == [
+        "max", "xhigh", "high", "high"]
+
+
+def test_allow_unprobed_starts_an_agent_no_rung_answered_for(sandbox, capsys, spawn_holder):
+    """Every rung, the plain request included, is refused: without the flag the
+    round is refused; with it the agent starts with no variant and a note."""
+    rejected = {name: KC49_REJECTED
+                for name in (None, "none", "low", "medium", "high", "xhigh", "max")}
+    scenario = dict(KC49_SCENARIO, reject_variants=rejected)
+    argv = ["--ticket", "1", "--models", "glm-4-7-flash:free", "--no-gate", "--no-tests"]
+
+    code, fake = run_fake(sandbox, scenario, argv, spawn_holder)
+    captured = capsys.readouterr()
+    assert code == cli.EXIT_FAILED
+    assert "no variant answered 'say: hello'" in captured.err
+
+    code, fake = run_fake(sandbox, scenario, [*argv, "--allow-unprobed"], spawn_holder)
+    captured = capsys.readouterr()
+    assert not [line for line in captured.err.splitlines() if line.startswith("intake:")]
+    assert "started with no variant (--allow-unprobed)" in captured.out
+    assert _plan(captured.out)["agents"] == "1: kenary/glm-4-7-flash:free"
+    assert "variant" not in _sessions(fake)[-1]["body"]["model"]
+
+
 def test_run_variant_default_sends_no_variant_and_probes_nothing(sandbox, capsys,
                                                                   spawn_holder):
     code, fake = run_fake(sandbox, KC49_SCENARIO,

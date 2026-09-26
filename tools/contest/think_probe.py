@@ -118,12 +118,16 @@ def probe_model(
     *listed* is the variant names ``GET /provider`` reports for the model
     (from :func:`variant.listed_variants`). When *listed* is empty the model
     has no reasoning capability: the result is ``ProbeResult(variant=None,
-    usable=False, tried=[])`` immediately and no session is created.
+    usable=True, tried=[])`` immediately and no session is created — the
+    model runs with no variant, exactly what ``highest`` of nothing means in
+    ``resolve_variants``.
 
-    When *cache* (a dict already loaded from *cache_path*) holds a fresh entry
-    (``probed_at`` within *ttl_days*, same *kilo_version* when non-empty) and
-    *reprobe* is ``False``, the cached result is returned and no session is
-    opened.
+    When *cache* (a dict already loaded from *cache_path*) holds a fresh,
+    usable entry (``probed_at`` within *ttl_days*, same *kilo_version* when
+    non-empty, and a variant the current ladder still holds) and *reprobe* is
+    ``False``, the cached result is returned and no session is opened. An
+    unusable entry is never trusted: one bad hour must not refuse the model
+    for ``ttl_days``. ``ttl_days = 0`` always probes.
 
     A cache hit returns ``elapsed=0.0`` and ``reasoning_tokens=0``; the cached
     ``tried`` list is restored as recorded. The cache is updated in-place when a
@@ -133,9 +137,12 @@ def probe_model(
 
     key = f"{provider_id}/{model_id}"
 
-    # No reasoning capability → nothing to probe.
+    # No reasoning capability → nothing to probe; the plain request is the
+    # model's only rung, and it is not asked here.
     if not listed:
-        return ProbeResult(variant=None, usable=False)
+        return ProbeResult(variant=None, usable=True)
+
+    rungs = build_ladder(listed)
 
     now = time.time()
 
@@ -146,19 +153,20 @@ def probe_model(
             age_days = (now - float(entry.get("probed_at", 0))) / 86400.0
             cached_version = entry.get("kilo_version", "")
             version_match = (not kilo_version) or (cached_version == kilo_version)
-            if age_days < ttl_days and version_match:
+            if (0 <= age_days < ttl_days and version_match
+                    and entry.get("usable", True)
+                    and entry.get("variant") in rungs):
                 _LOG.debug("probe cache hit for %s (age %.1fd)", key, age_days)
                 tried = [tuple(t) for t in (entry.get("tried") or [])]
                 return ProbeResult(
                     variant=entry.get("variant"),
-                    usable=entry.get("usable", entry.get("variant") is not None),
+                    usable=True,
                     tried=tried,
                     elapsed=0.0,
                     reasoning_tokens=0,
                 )
 
     # Live probe.
-    rungs = build_ladder(listed)
     t0 = time.monotonic()
     pick = pick_variant(rungs, client_factory)
     elapsed = time.monotonic() - t0
