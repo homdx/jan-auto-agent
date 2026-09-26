@@ -1,6 +1,6 @@
 # KC-38 — The full suite fails on a different test every run: three load flakes, one of them a 206 s I/O-bound hang
 
-**Status:** queued — found 2026-09-21 landing KC-25 (`tools/contest/cli.py`, one commit on the base). The acceptance gate is `python3 -m pytest tests -n 4 -q --timeout=180 && python3 -m pytest tests_bugfix -n 4 -q --timeout=180`. On this box, `tests_bugfix` is green, but `tests` fails once a run and never on the same test twice: four full runs gave four different victims. Each one is load-dependent, none is caused by KC-25 (evidence in §Evidence this is not the KC-25 commit). They are the third wave of the same class KC-32 fixed for the `elapsed <` bounds, so they are filed together as one ticket: two are test-only, one is a real ordering hazard in the runner that the fake makes visible.  
+**Status:** landed `e500d40` (2026-09-22) — closed without a round: FL-1 (84) fixed all three families in one commit — the metrics lock no longer spans the fsync (`TestThreadSafety`), the fake's turn waits on `on_prompt` (`tests/_kilo_fake.py`), and the kilo-client test lost its wall-clock lower bounds; follow-ups `708f7d0`, `215fe70`, `b5f9278` (FL-6). The original filing follows.  
 **Severity:** MEDIUM  
 **File:** `tests/_kilo_fake.py` (`FakeKiloServer._run_turn`), `tests/test_auto_e2.py` (`TestThreadSafety`), `tests/test_contest_kilo_client.py` (`test_events_of_the_session_keep_wait_idle_alive`)  
 **Symbol:** `FakeKiloServer._run_turn`, `TestThreadSafety`, `test_events_of_the_session_keep_wait_idle_alive`  
