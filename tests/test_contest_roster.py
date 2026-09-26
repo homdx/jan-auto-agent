@@ -1129,3 +1129,35 @@ def test_agent_tmpdir_defaults_to_empty_and_expands_its_env_reference(tmp_path, 
 
     with pytest.raises(RosterError, match="agent_tmpdir"):
         load_roster(write_ini(tmp_path, add_to_contest(MINIMAL, "agent_tmpdir = ${KC65_UNSET}")))
+
+
+def test_agent_suite_slots_and_agent_suite_max_sec_parse_and_default(tmp_path):
+    """KC-58: the round-wide suite slot count and the ceiling one holder may
+    block the queue. 1 and 900 by default, 0 slots turns the queue off for
+    real, a negative one is refused by name, and a typo is the default —
+    a round that cannot read a limit still gets one."""
+    assert "agent_suite_slots" in CONTEST_KEYS
+    assert "agent_suite_max_sec" in CONTEST_KEYS
+    assert ContestConfig().agent_suite_slots == 1
+    assert ContestConfig().agent_suite_max_sec == 900
+    assert load_roster(write_ini(tmp_path, MINIMAL)).agent_suite_slots == 1
+    assert load_roster(write_ini(tmp_path, MINIMAL)).agent_suite_max_sec == 900
+
+    cfg = load_roster(write_ini(tmp_path, add_to_contest(MINIMAL, "agent_suite_slots = 2")))
+    assert cfg.agent_suite_slots == 2
+    cfg = load_roster(write_ini(tmp_path, add_to_contest(MINIMAL, "agent_suite_max_sec = 300")))
+    assert cfg.agent_suite_max_sec == 300
+    # 0 slots is the ticket's off switch, not an error: every reply is immediate
+    assert load_roster(write_ini(tmp_path, add_to_contest(MINIMAL,
+                                                          "agent_suite_slots = 0"))).agent_suite_slots == 0
+    # 0 ceiling is a valid setting: one slow suite blocks the round for its run
+    assert load_roster(write_ini(tmp_path, add_to_contest(MINIMAL,
+                                                          "agent_suite_max_sec = 0"))).agent_suite_max_sec == 0
+
+    for bad in ("agent_suite_slots = -1", "agent_suite_max_sec = -5"):
+        with pytest.raises(RosterError, match=bad.split(" = ")[0]):
+            load_roster(write_ini(tmp_path, add_to_contest(MINIMAL, bad)))
+
+    for bad, default in (("agent_suite_slots = soon", 1), ("agent_suite_max_sec = soon", 900)):
+        key = bad.split(" = ")[0]
+        assert getattr(load_roster(write_ini(tmp_path, add_to_contest(MINIMAL, bad))), key) == default

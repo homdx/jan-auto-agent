@@ -173,7 +173,7 @@ from tools.contest.kilo_client import (
     SessionRef,
     kilo_neighbours,
 )
-from tools.contest.policy import HARD_DENYLIST, Policy, PolicyContext
+from tools.contest.policy import HARD_DENYLIST, Policy, PolicyContext, is_full_suite_command
 from tools.contest.roster import AgentSpec, ContestConfig
 from tools.contest.workspace import (
     Workspace,
@@ -905,6 +905,15 @@ def _harvest(ws, ticket_path, run_tests, config=None):
     is entered under the agent's name so the turn can carry how long it waited
     and how many were ahead. Fail-open throughout: an absent or broken lock is
     "no queue to stand in", so the roots still run and the harvest still ends.
+
+    KC-58 adds the round's suite slots: the judge's roots take one of them, so
+    an agent's own full-suite run never runs beside them. `agent_suite_slots = 0`
+    skips that queue for good — `_TEST_RUNS_LOCK` above stays the only
+    serialization and the call is today's for real. The ceiling here is this
+    harvest's own budget, so the judge is never cut short by an agent's clock,
+    and the slot is released on the way out rather than waited for the judge's
+    last process to exit. It is held under `<agent>:harvest`, scoped to this
+    call and never read off `/proc`.
     """
     budget = _budget_left(config)
     if not run_tests:
@@ -922,6 +931,18 @@ def _harvest(ws, ticket_path, run_tests, config=None):
         entered = True
     except (AttributeError, TypeError, ValueError):
         waited = 0.0
+    suite_held = False
+    # its own key: the agent may still hold (or be past the ceiling of) a slot
+    # for a background suite, and the judge must neither overwrite nor free it
+    harvest_key = f"{waiter}:harvest"
+    if _suite_slots_armed(config) > 0:
+        try:
+            held = _SUITE_SLOTS.acquire(harvest_key, ws.path, ceiling=budget, scoped=True)
+            suite_held = True
+            if held > 0:
+                _log.info("%s: HARVESTING — suite slot held %s", waiter, _age(held))
+        except Exception:  # noqa: BLE001 — the slots never hold up the judge
+            suite_held = False
     try:
         return harvest(ws, ticket_path, run_tests=True,
                        budget_sec=budget, waited=waited, ahead=ahead)
@@ -929,6 +950,11 @@ def _harvest(ws, ticket_path, run_tests, config=None):
         if entered:
             try:
                 _TEST_RUNS_LOCK.exit(waiter)
+            except Exception:  # noqa: BLE001 — the harvest is over either way
+                pass
+        if suite_held:
+            try:
+                _SUITE_SLOTS.release(harvest_key)
             except Exception:  # noqa: BLE001 — the harvest is over either way
                 pass
 
@@ -1456,6 +1482,13 @@ class _TurnClock:
     of ``granted`` on purpose. The gate's waits are recovery, not progress, so
     a turn that hit a busy gate key still has its full churn room left, and the
     two are added up when the turn is recorded.
+
+    KC-58: ``suite_waited`` is the same kind of time for the round's suite
+    queue — the seconds a whole-root ``pytest`` spent waiting for a slot while
+    its permission was held. That wait happens inside ``wait_idle``'s loop too,
+    where neither the deadline nor the silence clock can run, and it is the
+    round's queue, not the agent's work: given back in full, outside
+    ``granted``, never paid for out of the turn.
     """
 
     on_deadline: Callable[[float], float | None] | None
@@ -1468,6 +1501,21 @@ class _TurnClock:
     #: tries those waits cost.
     gate_added: float = 0.0
     gate_attempts: int = 0
+    #: KC-58: the seconds this turn got back for its suite-slot waits.
+    suite_waited: float = 0.0
+
+    def grant_suite(self, seconds: float) -> float:
+        """KC-58: the seconds a suite-slot wait is granted back to this turn.
+
+        Returns what the deadline moves by. Fail open: a malformed or
+        non-positive amount is 0.0.
+        """
+        try:
+            waited = max(0.0, float(seconds))
+        except (TypeError, ValueError):
+            return 0.0
+        self.suite_waited += waited
+        return waited
 
     def grant_gate(self, seconds: float, tries: int) -> float:
         """KC-66: the seconds a gate's waits are granted back to this turn.
@@ -1491,7 +1539,7 @@ class _TurnClock:
         return asked
 
 
-def _turn_deadline(run: AgentRun, config: ContestConfig) -> _TurnClock:
+def _turn_deadline(run: AgentRun, config: ContestConfig, working=None) -> _TurnClock:
     """The clock for one turn: extend on churn, cap at `turn_max_sec`.
 
     ``turn_extend_sec = 0`` returns a clock with ``on_deadline`` still
@@ -1504,9 +1552,19 @@ def _turn_deadline(run: AgentRun, config: ContestConfig) -> _TurnClock:
     Progress is the sample growing strictly in either number — files alone is
     too coarse, because an agent that writes a file in its first minute and
     then loops shows the same count forever, so `lines` is what usually moves.
-    On progress the deadline is pushed by `turn_extend_sec`, clipped to
-    `turn_max_sec`, and the sample becomes the new previous; on no progress —
-    and at the cap, whatever the churn says — it aborts as today.
+    KC-58 adds a second kind: *working*, a `bash` call still running, a suite
+    slot held or waited for, a `pytest` in the worktree, or an `edit`/`write`
+    part completed inside the last `turn_extend_sec` — a suite that takes an
+    hour changes nothing on disk, and churn that goes *down* is work too,
+    round 106's 1073 → 1072 with an edit 4 s before the abort. On progress the
+    deadline is pushed by `turn_extend_sec`, clipped to `turn_max_sec`, and
+    the sample becomes the new previous; on no progress — and at the cap,
+    whatever the churn says — it aborts as today.
+
+    ``last_change_at`` moves on every sample that differs from the one before
+    it, either number, up or down: that is what ``unchanged for`` measures,
+    and the old one moved only when an extension was *granted*, so a sample
+    the deadline refused still read as unchanged for the whole turn.
     """
     extend = float(getattr(config, "turn_extend_sec", 0) or 0)
     clock = _TurnClock(on_deadline=None)
@@ -1524,18 +1582,26 @@ def _turn_deadline(run: AgentRun, config: ContestConfig) -> _TurnClock:
 
     def on_deadline(elapsed: float) -> float | None:
         current = _churn(ws)
+        # against the *previous sample*, not the last granted one: a churn that
+        # stops after a refused read is what `unchanged for` has to show.
+        if current != clock.last_sample:
+            clock.last_change_at = float(elapsed)
         clock.last_sample = current
         previous = clock.prev_sample
-        if not (current[0] > previous[0] or current[1] > previous[1]):
+        grew = current[0] > previous[0] or current[1] > previous[1]
+        if not grew and not _is_working(working):
             return None
         grant = min(extend, ceiling - nominal - clock.granted)
         if grant <= 0:
             return None
         clock.granted += grant
         clock.prev_sample = current
-        clock.last_change_at = float(elapsed)
-        clock.extensions.append({"at": round(float(elapsed), 1), "files": current[0],
-                                 "lines": current[1], "granted": int(grant)})
+        extension = {"at": round(float(elapsed), 1), "files": current[0],
+                     "lines": current[1], "granted": int(grant)}
+        if not grew:
+            # KC-58: earned by work the churn cannot see, not by the churn
+            extension["working"] = True
+        clock.extensions.append(extension)
         try:
             _log.info("%s: WAITING — +%s at %s (%d files, %d lines)",
                       spec.name, _age(grant), _age(float(elapsed)),
@@ -1934,6 +2000,452 @@ def _reap_round_worktrees(runs: list, grace: float | None = None) -> int:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# KC-58: a whole pytest root takes one of the round's suite slots
+# ─────────────────────────────────────────────────────────────────────────────
+
+#: The poll that decides a holder's pytest is gone and moves a slow holder out
+#: of the queue. Read at the call, so a test shortens it by patching the name.
+_SUITE_POLL_SEC = 3.0
+
+#: The ceiling's default, in seconds — round 92's 33 minute suite is the reason
+#: there is a ceiling at all.
+_SUITE_CEILING_SEC = 900.0
+
+#: How long a fresh holder keeps its slot before the scan has seen its pytest.
+#: The slot is taken *before* the reply goes out, so the first poll can run
+#: before Kilo has even spawned the shell — without this, that poll reads "no
+#: pytest" and frees the slot a second after granting it. Once the scan has seen
+#: the process, only the process decides; a command that never starts one (it
+#: failed at once, or the "pytest" was an alias) gives the slot back after this.
+#: Read at the call, so a test can shorten it.
+_SUITE_START_GRACE_SEC = 30.0
+
+
+def _is_pytest_cmdline(cmd: str) -> bool:
+    """Whether a `/proc/<pid>/cmdline` is a pytest: a word that *is* pytest.
+
+    `pytest`, `/venv/bin/pytest`, `py.test`, or the `pytest` of
+    `python3 -m pytest`. A word that merely contains it — `grep -rn pytest_x`,
+    an editor on `test_pytest_ini.py` — is not a suite and holds no slot.
+    """
+    for word in str(cmd or "").split():
+        if word.rsplit("/", 1)[-1] in ("pytest", "py.test"):
+            return True
+    return False
+
+
+def _path_of(worktree) -> str:
+    """*worktree* as a resolved path string for the suite scan.
+
+    `""` when it cannot be read, which the scan reads as "no process", so a
+    broken worktree path never holds a slot against the rest of the round.
+    """
+    try:
+        return str(Path(worktree).resolve())
+    except Exception:  # noqa: BLE001 — see the docstring
+        return ""
+
+
+def _suite_pids(worktree, proc_root: str | None = None) -> set:
+    """The live `pytest` pids whose cwd is *worktree* or under it.
+
+    KC-58's hold: the tool part is the wrong signal twice over. A suite started
+    in the background (`background_process`, `… &`, `nohup`) completes its part
+    at once while pytest runs on — two agents did that in round 103 — and a
+    part cut by Kilo's own `bash` timeout ends two minutes into a four-minute
+    suite, two agents a dozen times apiece.
+
+    So the signal is the process, read the way KC-48's reap reads it:
+    `/proc/<pid>/cwd` resolved and compared with the worktree, `cmdline`
+    naming `pytest` as a word (`_is_pytest_cmdline`), the pid not a zombie, and
+    never the runner itself or one of its ancestors. Empty, and never raised, for a
+    worktree that cannot be read, a `/proc` that is not there at all, or a pid
+    that exits between the listing and the read.
+
+    *proc_root* defaults to `_PROC_ROOT` read at the call, not bound as a
+    default, so patching the module constant is enough — the same seam the reap
+    tests use for `REAP_GRACE_SEC`.
+    """
+    if proc_root is None:
+        proc_root = _PROC_ROOT
+    if not worktree:
+        return set()
+    try:
+        root = Path(worktree).resolve()
+    except Exception:  # noqa: BLE001 — a broken path is not a worktree
+        return set()
+    pids: set = set()
+    try:
+        excluded = _ancestor_pids(proc_root)
+        for entry in os.listdir(proc_root):
+            if not entry.isdigit():
+                continue
+            pid = int(entry)
+            if pid in excluded or not _alive(proc_root, pid):
+                continue
+            if not _is_pytest_cmdline(_proc_cmd(proc_root, pid)):
+                continue
+            cwd = _proc_cwd(proc_root, pid)
+            if cwd is None:
+                continue
+            try:
+                cwd.relative_to(root)
+            except ValueError:
+                continue
+            pids.add(pid)
+    except OSError:
+        return set()
+    return pids
+
+
+def _suite_slots_armed(config) -> int:
+    """`agent_suite_slots`: the round's slots for a whole pytest root.
+
+    0 is "no queue" — every reply immediate, `_TEST_RUNS_LOCK` the only
+    serialization. A config without the key, or one whose value is not a
+    number, arms the ticket's default of 1 rather than raising into a run.
+    """
+    try:
+        return max(0, int(getattr(config, "agent_suite_slots", 1) or 0))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _suite_ceiling(config) -> float:
+    """`agent_suite_max_sec`: how long one holder may block the next waiter."""
+    try:
+        return max(0.0, float(getattr(config, "agent_suite_max_sec", _SUITE_CEILING_SEC) or 0))
+    except (TypeError, ValueError):
+        return float(_SUITE_CEILING_SEC)
+
+
+def _is_full_suite_ask(props: dict) -> bool:
+    """Whether this permission ask runs a whole pytest root, and so holds a slot.
+
+    The `bash` permission whose command `is_full_suite_command` reads as a whole
+    root. `external_directory` and `doom_loop` never hold one: they are about
+    where a command reaches, not how long it runs.
+    """
+    try:
+        if props.get("permission") != "bash":
+            return False
+        metadata = props.get("metadata")
+        command = metadata.get("command") if isinstance(metadata, dict) else None
+    except AttributeError:
+        return False
+    return is_full_suite_command(command)
+
+
+class _SuiteSlots:
+    """The round's slots for a whole pytest root: the agents' own runs and the
+    runner's harvest, one queue for both.
+
+    KC-58. Round 103's four lost entries had finished their code half an hour
+    early and spent the rest of their hour on their own `pytest tests -n 4`,
+    which took 20–25 minutes because every other finished agent ran one too and
+    the judge's harvest ran alongside them. `_TEST_RUNS_LOCK` serialized only
+    the harvest; this is the queue the agents' own runs stand in, and the
+    harvest takes one of these slots as well, so nothing runs beside it.
+
+    A slot is held by a *process*, not by a tool part — see `_suite_pids`. So a
+    holder holds while its worktree still has a `pytest` running, and
+    `_grant` drops the hold when the last one is gone, polled every
+    `_SUITE_POLL_SEC` and on the exit of anyone who asked.
+
+    The ceiling is a queue rule, not a kill: past `agent_suite_max_sec` the
+    holder stops blocking, the free count grows by one and the next waiter goes
+    in beside it, while its pytest keeps running — the agent is still alive and
+    KC-48 leaves live agents' processes alone. Round 92's 33-minute suite then
+    costs the round one slot for 15 minutes instead of every agent's hour.
+
+    Everything here is fail-open. `limit = 0` is "no queue": every `acquire`
+    returns 0.0 at once, records nothing and `status` is `None` for everyone,
+    which is today's behaviour for real, not just in the shape of the call.
+    A holder with no worktree to read is not a hold, an unreadable `/proc` is
+    not a process, and no exception reaches the caller.
+    """
+
+    def __init__(self) -> None:
+        self._cond = threading.Condition(threading.Lock())
+        self._entries: dict = {}
+        self._limit = 1
+        self._watcher: "threading.Thread | None" = None
+        self._stop = threading.Event()
+
+    # ── the round's shape ────────────────────────────────────────────────
+
+    @property
+    def limit(self) -> int:
+        """The slots armed: 0 is "no queue", today's behaviour."""
+        with self._cond:
+            return int(self._limit)
+
+    def configure(self, slots) -> int:
+        """Arm the round's `agent_suite_slots`. A malformed value arms 1."""
+        try:
+            limit = int(slots)
+        except (TypeError, ValueError):
+            limit = 1
+        with self._cond:
+            self._limit = max(0, limit)
+            self._cond.notify_all()
+        return self._limit
+
+    def reset(self) -> None:
+        """Test seam: no holders, no waiters, one slot — the module's own start."""
+        self._stop.set()
+        with self._cond:
+            self._entries.clear()
+            self._limit = 1
+            self._cond.notify_all()
+        thread = self._watcher
+        self._watcher = None
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(2.0)
+        self._stop.clear()
+
+    # ── the queue ────────────────────────────────────────────────────────
+
+    def acquire(self, name, worktree, ceiling=None, stop=None, scoped=False) -> float:
+        """Wait for a slot for *name*, holding *worktree*; the return is the wait.
+
+        `limit = 0` returns 0.0 at once and records nothing. Otherwise the asker
+        is queued FIFO and enters when a holder becomes releasable — its pytest
+        gone or its ceiling past. A waiter whose *stop* fires (the agent stalled
+        or ended mid-wait) drops out of the queue for good, so a dead waiter
+        never blocks the one behind it.
+
+        *scoped* is the harvest's hold: the caller runs the roots itself and
+        calls `release` when they are done, so the scan never reads it — the
+        judge's pytest has not started when the slot is granted, and a poll in
+        that gap must not hand the slot on.
+        """
+        if self.limit <= 0:
+            return 0.0
+        asked = time.monotonic()
+        with self._cond:
+            entry = {"asked": asked, "held": None, "over": False, "done": False,
+                     "seen": False, "scoped": bool(scoped),
+                     "path": _path_of(worktree), "ceiling": ceiling}
+            self._entries[name] = entry
+            self._wake()
+            while entry["held"] is None:
+                if stop is not None and stop():
+                    self._entries.pop(name, None)
+                    return 0.0
+                self._grant()
+                if self._free() > 0:
+                    entry["held"] = time.monotonic()
+                else:
+                    self._cond.wait(_SUITE_POLL_SEC)
+            waited = max(0.0, time.monotonic() - asked)
+        return waited
+
+    def release(self, name) -> None:
+        """Give the slot back for good: the agent ended, or the harvest finished.
+
+        Called from `run_agent`'s `finally` and the harvest's own, so a slot
+        never outlives its owner and the next waiter is answered at once rather
+        than on the next poll.
+        """
+        with self._cond:
+            if self._entries.pop(name, None) is not None:
+                self._cond.notify_all()
+
+    def ahead(self, name) -> int:
+        """Who is in front of *name*: the holders that still block, the waiters
+        who asked first."""
+        with self._cond:
+            return self._ahead(name)
+
+    def status(self, name) -> tuple | None:
+        """`("queued", waited, ahead)`, `("running", held, 0)`, `("over", held, 0)` or
+        `("done", held, 0)` — `None` when nobody asked for a slot.
+
+        `done` is a holder whose pytest is gone: the slot is free, the entry is
+        what the heartbeat still reads until the agent releases it. The third
+        number is 0 outside `queued`, as in `_TestRunsLock.status`, so a
+        heartbeat can read both shapes.
+        """
+        with self._cond:
+            entry = self._entries.get(name)
+            if entry is None:
+                return None
+            now = time.monotonic()
+            if entry["held"] is None:
+                return ("queued", max(0.0, now - entry["asked"]), self._ahead(name))
+            if entry["done"]:
+                return ("done", max(0.0, now - entry["held"]), 0)
+            return ("over" if entry["over"] else "running",
+                    max(0.0, now - entry["held"]), 0)
+
+    # ── under the guard ──────────────────────────────────────────────────
+
+    def _free(self) -> int:
+        """The slots open: `limit` minus the holders that still block."""
+        blocking = sum(1 for entry in self._entries.values()
+                       if entry["held"] is not None and not entry["over"] and not entry["done"])
+        return max(0, int(self._limit) - blocking)
+
+    def _ahead(self, name) -> int:
+        mine = self._entries.get(name)
+        if mine is None:
+            return len(self._entries)
+        asked = mine["asked"]
+        count = 0
+        for other_name, other in self._entries.items():
+            if other_name == name:
+                continue
+            if other["held"] is not None:
+                if not other["over"] and not other["done"]:
+                    count += 1
+            elif other["asked"] <= asked:
+                count += 1
+        return count
+
+    def _grant(self) -> None:
+        """Re-read the holders: a pytest that is gone, or a ceiling that is past,
+        frees the slot for the next waiter. Neither is a kill.
+
+        Called under the guard by the watcher, by every waiter on its own poll,
+        and by `status` — so a hold is dropped within one poll of the process
+        exiting, whatever else in the round is awake.
+        """
+        moved = False
+        for entry in self._entries.values():
+            if entry["held"] is None or entry["over"] or entry["done"]:
+                continue
+            if not entry.get("scoped"):
+                try:
+                    if _suite_pids(entry["path"]):
+                        entry["seen"] = True
+                    elif entry["seen"] or \
+                            time.monotonic() - entry["held"] >= float(_SUITE_START_GRACE_SEC):
+                        # gone — or never came up within the grace
+                        entry["done"] = True
+                        moved = True
+                        continue
+                except Exception:  # noqa: BLE001 — a scan that fails is not a release
+                    pass
+            ceiling = entry["ceiling"] if entry["ceiling"] is not None else _SUITE_CEILING_SEC
+            if ceiling > 0 and time.monotonic() - entry["held"] >= ceiling:
+                entry["over"] = True
+                moved = True
+        if moved:
+            self._cond.notify_all()
+
+    def _wake(self) -> None:
+        """Make sure something is polling for the holders' pytest."""
+        if self._watcher is not None and self._watcher.is_alive():
+            return
+        try:
+            self._stop.clear()
+            self._watcher = threading.Thread(target=self._poll, name="contest-suite-slots",
+                                             daemon=True)
+            self._watcher.start()
+        except Exception:  # noqa: BLE001 — the waiters poll on their own too
+            pass
+
+    def _poll(self) -> None:
+        """The round's suite poll, and its own way out once nobody is queued."""
+        quiet = 0
+        while not self._stop.wait(_SUITE_POLL_SEC):
+            try:
+                with self._cond:
+                    self._grant()
+                    quiet = quiet + 1 if not self._entries else 0
+                    if quiet >= 4:      # a minute of nobody: no point in polling on
+                        self._watcher = None
+                        return
+            except Exception:  # noqa: BLE001 — a poll is a hint, not a round
+                pass
+
+
+#: The round's suite slots. `_harvest` takes one as well, so the judge's roots
+#: and an agent's own `pytest tests -n 4` never run beside each other.
+_SUITE_SLOTS = _SuiteSlots()
+
+
+def _suite_status(name) -> tuple | None:
+    """The round's suite slots, as one agent sees them — `None` on any failure."""
+    try:
+        return _SUITE_SLOTS.status(name)
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _session_tool_parts(backend: ContestBackend, session) -> list:
+    """The session's `tool` parts, `()` when the server cannot say.
+
+    KC-58 §2 reads these at the turn deadline: a `bash` still `running`, and an
+    `edit`/`write` completed inside the last `turn_extend_sec`, are both work
+    the churn sample cannot see. A session that has gone, a backend without
+    `tool_parts`, or a server that has is an empty history, never an exception
+    into a deadline.
+    """
+    try:
+        if session is None or not hasattr(backend, "tool_parts"):
+            return ()
+        parts = backend.tool_parts(session)
+        return parts if isinstance(parts, list) else ()
+    except Exception:  # noqa: BLE001 — see the docstring
+        return ()
+
+
+def _part_end(state: dict) -> float | None:
+    """A `tool` part's `state.time.end` as epoch seconds, `None` when absent."""
+    value = state.get("time")
+    try:
+        if isinstance(value, dict):
+            value = value.get("end")
+    except AttributeError:
+        value = None
+    try:
+        end = float(value)
+    except (TypeError, ValueError):
+        return None
+    return end if end > 0 else None
+
+
+def _parts_say_working(parts, window: float, now: float) -> bool:
+    """Whether *parts* show work the churn sample cannot see.
+
+    KC-47's open `bash` is a call that has not come back: `state.status` still
+    `running` or `pending`. Round 106's `edit` at 4 s before the abort is a
+    `tool` part `edit`/`write` that completed inside the last *window* seconds —
+    the churn went *down* there, 1073 → 1072, so a line count that grows is not
+    the only work a turn can have. `state.time.end` is epoch seconds, so the
+    window is measured against `time.time()` and never the runner's monotonic.
+    """
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        state = part.get("state")
+        if not isinstance(state, dict):
+            continue
+        tool = str(part.get("tool") or "")
+        if tool == "bash" and str(state.get("status") or "") in ("running", "pending"):
+            return True
+        if window <= 0 or tool not in ("edit", "write"):
+            continue
+        end = _part_end(state)
+        if end is None:
+            continue
+        if 0 <= now - end <= window:
+            return True
+    return False
+
+
+def _is_working(working) -> bool:
+    """KC-58 §2: is there work the churn sample cannot see? A `working` that
+    raises is `False` — a read failure is never a reason to extend a turn."""
+    try:
+        return bool(working()) if callable(working) else False
+    except Exception:  # noqa: BLE001 — see the docstring
+        return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # one agent
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1994,7 +2506,17 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
     session: SessionRef | None = None
     stalled: list = []          # the reason, once the runner's stall edge fired
     time_up: "threading.Timer | None" = None   # the agent's hard limit, `agent_max_sec`
+    # KC-58: `[seconds left, as of monotonic]` on that limit once armed — what a
+    # pause for the suite queue stops and a resume starts again from
+    time_left: list = []
     questions_this_turn = [0]
+    # KC-58: the round's suite slots, armed once per agent — the queue is shared
+    # round-wide, so every agent answers from one semaphore, and a config that
+    # names no key arms the ticket's default of one.
+    try:
+        _SUITE_SLOTS.configure(_suite_slots_armed(config))
+    except Exception:  # noqa: BLE001 — an unarmed queue answers every ask
+        pass
     try:
         ticket_files = declared_files(ticket_path)
     except OSError:
@@ -2015,6 +2537,65 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         stalled.append(reason)
         _abort_quietly(backend, session)
         backend.interrupt(session)
+
+    def arm_time_up(seconds: float) -> None:
+        """Start the agent's hard limit with *seconds* left on it."""
+        nonlocal time_up
+        time_left[:] = [float(seconds), time.monotonic()]
+        time_up = threading.Timer(
+            float(seconds), stall,
+            args=(f"time up: {_age(float(config.agent_max_sec))} for the agent",))
+        time_up.daemon = True
+        time_up.start()
+
+    def pause_time_up() -> bool:
+        """KC-58: stop the hard limit while a whole-root suite queues for a slot.
+
+        The queue is the round's, not the agent's: an agent stuck behind four
+        other suites must not reach `agent_max_sec` for it. True when it was
+        paused — nothing to pause (no limit, the agent already stopped, or the
+        limit is due this instant) is False, and the limit runs on as armed.
+        """
+        if time_up is None or not time_left or stalled:
+            return False
+        left = time_left[0] - (time.monotonic() - time_left[1])
+        if left <= 0:
+            return False
+        time_up.cancel()
+        time_left[:] = [left, time.monotonic()]
+        return True
+
+    def resume_time_up() -> None:
+        """Start the paused hard limit again with what it had left."""
+        if stalled or not time_left:
+            return
+        arm_time_up(time_left[0])
+
+    def working() -> bool:
+        """KC-58 §2: is this agent waiting on something the churn cannot see?
+
+        A `bash` call that has not come back, a suite slot it holds or waits
+        for, a `pytest` still running in its own worktree, or an `edit`/`write`
+        part completed inside the last `turn_extend_sec`. Round 103's four
+        lost entries were here for an hour, an hour after their code was done,
+        and round 106's was making an edit 4 s before the abort. Every read is
+        fail-open: nothing here may raise into a deadline.
+        """
+        try:
+            status = _suite_status(spec.name)
+            if status is not None and status[0] in ("queued", "running", "over"):
+                return True
+            if _suite_pids(ws.path):
+                return True
+        except Exception:  # noqa: BLE001 — the queue and the scan are hints
+            pass
+        try:
+            return _parts_say_working(
+                _session_tool_parts(backend, session),
+                float(getattr(config, "turn_extend_sec", 0) or 0),
+                time.time())
+        except Exception:  # noqa: BLE001 — a history that cannot be read is empty
+            return False
 
     def on_permission(event: dict) -> tuple:
         props = event.get("properties") or {}
@@ -2048,6 +2629,35 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
             run.permissions["gate_failed"] += 1
         _log.info("%s: permission %s -> %s (%s)", spec.name, props.get("permission"),
                   decision.reply, decision.layer)
+        # KC-58: a whole pytest root holds one of the round's suite slots before
+        # it is answered — a delay, never a refusal. The decision above is
+        # recorded first, so a reject never queues; `agent_suite_slots = 0`
+        # skips this for good, which is today's path. The slot is held by the
+        # `pytest` process, not by this part, so it is dropped when the
+        # worktree's last `pytest` is gone and released again when the agent
+        # ends. The wait is given back to the turn (`grant_suite` below): it
+        # blocked the very loop that runs the deadline and the silence clock,
+        # and it is the round's queue, not the agent's work — so is its hard
+        # limit, `agent_max_sec`, which is paused for the wait and resumed with
+        # what it had left. A waiter leaves the queue at once only when its
+        # agent was stopped by something else (the round was interrupted).
+        queued = 0.0
+        if decision.reply == "once":
+            try:
+                if _suite_slots_armed(config) > 0 and _is_full_suite_ask(props):
+                    paused = pause_time_up()
+                    try:
+                        queued = float(_SUITE_SLOTS.acquire(
+                            spec.name, ws.path, ceiling=_suite_ceiling(config),
+                            stop=lambda: bool(stalled) or bool(backend.interrupted())))
+                    finally:
+                        if paused:
+                            resume_time_up()
+                    if queued > 0:
+                        _log.info("%s: suite slot after %s in the queue",
+                                  spec.name, _age(queued))
+            except Exception:  # noqa: BLE001 — the reply is never held by the queue
+                queued = 0.0
         # KC-66: the gate waited inside this wait_idle loop, so the seconds it
         # spent are granted back to this turn's deadline and counted on its
         # clock — the agent never pays for the gate's 429. `back` is what the
@@ -2060,6 +2670,8 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                 float(getattr(decision, "gate_added_sec", 0.0) or 0.0), tries)
         if back > 0:
             _log.info("%s: gate %d tries, +%gs to the turn", spec.name, tries, back)
+        if turn_clock is not None and queued > 0:
+            back += turn_clock.grant_suite(queued)
         return decision.reply, decision.reason, back
 
     def on_question(event: dict) -> None:
@@ -2257,10 +2869,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         # 0 = no limit.
         agent_max = float(getattr(config, "agent_max_sec", 0) or 0)
         if agent_max > 0:
-            time_up = threading.Timer(
-                agent_max, stall, args=(f"time up: {_age(agent_max)} for the agent",))
-            time_up.daemon = True
-            time_up.start()
+            arm_time_up(agent_max)
 
         rework_text = None
         retry_text = None
@@ -2325,7 +2934,9 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
             questions_this_turn[0] = 0
             # KC-36: this turn's own deadline, decided from its own worktree.
             # It sits on the run only so the heartbeat can read it mid-wait.
-            clock = _turn_deadline(run, config)
+            # KC-58 hands it `working` too: a suite running beside an idle
+            # churn is progress, not a stopped turn.
+            clock = _turn_deadline(run, config, working)
             run._turn_clock = clock
             try:
                 idle = _wait_turn(backend, session, config,
@@ -2345,6 +2956,9 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                 # KC-66: what the gate's 429 cost this turn, and how hard it tried
                 turn["gate_added_sec"] = int(clock.gate_added)
                 turn["gate_attempts"] = int(clock.gate_attempts)
+            if clock.suite_waited > 0:
+                # KC-58: how long this turn's whole-root suites queued for a slot
+                turn["suite_wait_sec"] = int(clock.suite_waited)
             if stalled:
                 turn["idle_status"] = "stalled"
                 error, state = stalled[0], AgentState.STALLED
@@ -2360,7 +2974,8 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                 # KC-66: the gate's waits moved the deadline too, so a silence
                 # inside that time is still a silence stall.
                 silence = float(config.idle_event_timeout_sec or 0)
-                limit = float(config.turn_timeout_sec) + clock.granted + clock.gate_added
+                limit = (float(config.turn_timeout_sec) + clock.granted + clock.gate_added
+                         + clock.suite_waited)
                 quiet = 0 < silence and idle.elapsed < limit
                 if quiet:
                     turn["idle_status"] = "stalled"
@@ -2653,6 +3268,13 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                        + ", ".join(r.code for r in verdict.reasons))
             rework_text = rework_message(verdict, run.attempt, int(config.max_rework))
     finally:
+        # KC-58: a slot must not survive the agent that asked for it, whatever
+        # the agent left running. KC-48 reaps the processes a moment later; the
+        # next waiter is answered now, not on the next poll.
+        try:
+            _SUITE_SLOTS.release(spec.name)
+        except Exception:  # noqa: BLE001 — the round goes on without the slot
+            pass
         if time_up is not None:
             time_up.cancel()
         if run.terminal:
@@ -2920,6 +3542,35 @@ class _Heartbeat:
             return f"(tests {_age(elapsed)})"
         return None
 
+    def _suite_note(self, run: AgentRun) -> str | None:
+        """What the line says about this run's own suite, or None for no suffix.
+
+        KC-58: a `WAITING` agent is read live off the round's suite slots —
+        `queued` with its wait and how many are ahead of it, `suite` while it
+        holds one, and `over the ceiling` once it has passed
+        `agent_suite_max_sec` and stopped blocking the next waiter. `HARVESTING`
+        reads the same queue, but `_harvest_note` already names the roots there,
+        so this one only speaks for a run the harvest note cannot.
+        """
+        if run.state not in (AgentState.WAITING, AgentState.HARVESTING):
+            return None
+        try:
+            status = _suite_status(run.agent.name)
+        except (AttributeError, TypeError, ValueError):
+            return None
+        if not status:
+            return None
+        state = status[0]
+        if state == "queued":
+            ahead = status[2] if len(status) > 2 else 0
+            tail = f", {ahead} ahead" if ahead else ""
+            return f"(suite queued {_age(status[1])}{tail})"
+        if state == "over":
+            return f"(suite {_age(status[1])}, over the ceiling)"
+        if state != "running":
+            return None                 # `done`: the suite is over, nothing to say
+        return f"(suite {_age(status[1])})"
+
     def line(self) -> str:
         now = time.monotonic()
         parts = []
@@ -2957,7 +3608,7 @@ class _Heartbeat:
                     part += f" ↺{run.attempt}"
                 if granted > 0:
                     part += f"+{_age(granted)}" if run.attempt else f" +{_age(granted)}"
-            note = self._harvest_note(run)
+            note = self._harvest_note(run) or self._suite_note(run)
             if note:
                 part += f" {note}"
             parts.append(part)

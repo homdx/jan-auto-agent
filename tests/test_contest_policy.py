@@ -63,6 +63,7 @@ from tools.contest.policy import (
     PolicyContext,
     gate_time_back_sec,
     gate_worst_case_sec,
+    is_full_suite_command,
 )
 from tools.contest.roster import ContestConfig
 import tools.llm_stream as llm_stream_mod
@@ -1505,6 +1506,107 @@ def test_dev_shm_is_a_place_and_still_goes_to_the_gate(tmp_path):
     assert decision.layer == "gate"
     assert len(gate.calls) == 1
     assert "/dev/shm" not in NULL_DEVICES
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KC-58: a whole pytest root holds a round-wide suite slot
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.mark.parametrize("command", [
+    "pytest tests",
+    "python3 -m pytest tests -n 4",
+    "python -m pytest tests",
+    "pytest tests_bugfix",
+    "pytest .smoke_tests",
+    "pytest .smoke_tests/",
+    "pytest .smoke_fast -n 4",           # a tier that does not exist here
+    "pytest .smoke_fast/tests",          # ... and neither does its parent
+    "pytest -n 4",                       # no path argument at all
+    "pytest",
+    "./pytest tests",
+    "/opt/venv/bin/pytest tests",
+    "pytest tests -q -x --maxfail=1",
+    "pytest tests -n 4 --dist=loadscope",
+    "cd . && python3 -m pytest tests -n 4",
+    "pytest tests 2>&1 | tail -20",
+    # rounds 103-105: how the agents ran their suites most often
+    "timeout 1500 python3 -m pytest tests -n 4 -q 2>&1 | tail -20",
+    "timeout -k 5 900 python3 -m pytest tests_bugfix -n 4 -q",
+    "nohup python3 -m pytest tests -n 4 > /tmp/suite.log 2>&1 &",
+    "PYTHONPATH=. python3 -m pytest .smoke_tests/ -q",
+    "env PYTHONPATH=. nice -n 10 pytest tests",
+    "/usr/bin/python3.10 -m pytest tests",
+])
+def test_a_whole_pytest_root_is_a_suite_run(command):
+    """KC-58 acceptance: all-directory and no-path arguments are whole roots,
+    with nothing to update when a tier is added or renamed."""
+    assert is_full_suite_command(command) is True, command
+
+
+@pytest.mark.parametrize("command", [
+    "pytest tests/test_x.py -q",
+    "pytest -k foo",
+    "pytest tests/test_x.py::t",
+    "pytest tests/test_x.py::test_it -k foo",
+    "pytest -m integration",
+    "pytest --keywords=foo tests",
+    "pytest -k=foo tests",
+    "pytest tests/test_x.py",
+    "pytest tests/test_x.py::t -n 4",
+    "pytest --co tests/test_x.py",
+    "pytest --help",
+    "python3 -m pytest --help",
+    "python3 -m pytest tests/test_x.py -n 4",
+    "pytest --help tests",
+    "timeout 1500 python3 -m pytest \"tests/test_contest_runner.py::t\" -q",
+    "timeout 900 python3 -m pytest tests -k 'suite or slot' -q",
+    "python3 -m pytest --collect-only tests",
+])
+def test_a_targeted_pytest_run_is_answered_at_once(command):
+    """A `.py` file, a `::node` or a `-k`/`-m` selector names a subset, so it
+    does not take a round-wide slot — acceptance for KC-58 §1."""
+    assert is_full_suite_command(command) is False, command
+
+
+def test_non_suite_commands_are_not_suite_runs():
+    """Anything that is not a `pytest` invocation is not a suite run, and a
+    `pytest`-looking command that names a subset is not a whole root."""
+    assert is_full_suite_command("ls -la") is False
+    assert is_full_suite_command("python3 -m pip install -r requirements.txt") is False
+    assert is_full_suite_command("pytest_x tests") is False
+    assert is_full_suite_command("git push origin main") is False
+    assert is_full_suite_command("python3 -m pytestx tests") is False
+    assert is_full_suite_command("python3 -c \"import pytest\" tests") is False
+    # a shell wrapper is not a pytest invocation: the suite inside it runs
+    # beside the round, which is today's behaviour and not a whole root
+    assert is_full_suite_command("bash -lc 'pytest tests -n 4'") is False
+    assert is_full_suite_command("echo pytest tests") is False
+    assert is_full_suite_command("grep -rn pytest tests") is False
+    assert is_full_suite_command("timeout 60 grep -rn pytest tests") is False
+    # `python3 -m pytest` with nothing after it *is* a whole root: no path, no
+    # selector, so pytest's own default collection is what runs.
+    assert is_full_suite_command("python3 -m pytest") is True
+    # a flag with no value collects everything too
+    assert is_full_suite_command("pytest -n") is True
+
+
+@pytest.mark.parametrize("command", ["", None, 0, [], {}, "pytest\x00tests"])
+def test_a_malformed_command_is_not_a_suite_run(command):
+    """Fail-open: a non-string, an empty string or a NUL never raises."""
+    assert is_full_suite_command(command) is False, repr(command)
+
+
+def test_the_parser_reads_the_shape_not_the_filesystem(tmp_path):
+    """A directory name that exists nowhere in this repo is a whole root, and so
+    is one that does not exist at all. The parser never touches the disk, so a
+    tier renamed or added tomorrow needs no update here."""
+    (tmp_path / "real").mkdir()
+    assert is_full_suite_command("pytest real") is True
+    assert is_full_suite_command("pytest tests") is True
+    assert is_full_suite_command("pytest .smoke_fast") is True
+    assert is_full_suite_command("pytest .smoke_fast/tests") is True
+    assert is_full_suite_command("pytest /no/such/dir/at/all") is True
+    assert is_full_suite_command("pytest /no/such/dir/at/all/test_x.py") is False
 
 
 # ─────────────────────────────────────────────────────────────────────────────

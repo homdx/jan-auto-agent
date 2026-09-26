@@ -92,6 +92,7 @@ __all__ = [
     "gate_time_back_sec",
     "gate_verdict",
     "gate_worst_case_sec",
+    "is_full_suite_command",
 ]
 
 #: The gate is the expensive second model; it gets one shot per permission.
@@ -537,6 +538,174 @@ def _command_paths(command) -> list:
         if _pathlike(token):
             paths.append(token)
     return paths
+
+
+#: The options that name a subset of the tests rather than a directory: a
+#: `-k`/`-m` run is a targeted one whatever else it is given. `=` forms too, so
+#: `-k=foo` reads the same as `-k foo`.
+_SELECTOR_OPTIONS = frozenset({"-k", "--keywords", "-m", "--markers"})
+_SELECTOR_PREFIXES = ("-k=", "--keywords=", "-m=", "--markers=")
+
+#: An option that ends the invocation instead of running anything at all —
+#: `--collect-only` included: it imports the suite in seconds and runs none of it.
+_NO_RUN_OPTIONS = frozenset({"-h", "--help", "-V", "--version", "--co",
+                             "--collect-only", "--fixtures", "--markers"})
+
+#: The suffixes of a test *file*: a token that ends in one is a targeted run,
+#: never a whole root.
+_SUITE_FILE_SUFFIXES = (".py",)
+
+
+def _unquote_token(token: str) -> str:
+    """One `_CMD_TOKEN` match with its surrounding quotes removed."""
+    if len(token) >= 2 and token[0] == token[-1] and token[0] in "\"'":
+        return token[1:-1]
+    return token
+
+
+def _shell_pieces(command: str) -> list:
+    """*command* as its shell pieces: the runs of text a `&&`, `||`, `;`, `|` or
+    `&` joins outside quotes, so the suite piece of `cd /repo && pytest tests`
+    is what is measured and a `|` inside a quoted string stays in its token."""
+    pieces: list = []
+    current: list = []
+    quote = ""
+    for char in command:
+        if quote:
+            current.append(char)
+            if char == quote:
+                quote = ""
+            continue
+        if char in "\"'":
+            quote = char
+            current.append(char)
+            continue
+        if char in "|&;":
+            if current:
+                pieces.append("".join(current))
+                current = []
+            continue
+        current.append(char)
+    if current:
+        pieces.append("".join(current))
+    return [piece for piece in pieces if piece.strip()]
+
+
+def _pytest_argv_start(tokens: list) -> int | None:
+    """The index of the `pytest` token, or `None` when the command has no suite.
+
+    Only the command position counts: `echo pytest tests` and `ls pytest tests`
+    are not pytest runs, whatever token follows the tool. The position is past
+    `VAR=value` and the wrappers of `_WRAPPERS`, so `timeout 1500 python3 -m
+    pytest tests` is the suite it runs. Matched by basename,
+    so `/opt/venv/bin/pytest` is a suite too. `python -m pytest` counts as well,
+    with the argv starting after `pytest`: the two `-m` and `pytest` tokens have
+    to sit next to each other, so a `python -c "..."` that happens to name
+    `pytest` later on is not a suite.
+    """
+    start = _past_wrappers(tokens)
+    if start is None or start >= len(tokens):
+        return None
+    head = tokens[start].rsplit("/", 1)[-1]
+    if head in ("pytest", "py.test"):
+        return start
+    if _PYTHON_RE.fullmatch(head):
+        if tokens[start + 1:start + 3] == ["-m", "pytest"]:
+            return start + 2
+    return None
+
+
+#: `python`, `python3`, `python3.10` — the interpreters a `-m pytest` runs under.
+_PYTHON_RE = re.compile(r"python(\d+(\.\d+)?)?")
+
+#: A shell variable set for one command: `PYTHONPATH=. pytest tests`.
+_ENV_ASSIGN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=.*")
+
+#: Commands that run the rest of their line as the command: the suite behind
+#: them is still the suite. `timeout 1500 python3 -m pytest tests` is how the
+#: agents of rounds 103–105 ran theirs most often.
+_WRAPPERS = frozenset({"timeout", "nohup", "env", "nice", "time", "exec", "command",
+                       "stdbuf", "ionice"})
+
+
+def _past_wrappers(tokens: list) -> int | None:
+    """The index of the real command word of *tokens*, past its wrappers.
+
+    Skips `VAR=value` assignments and the wrappers of `_WRAPPERS` with their
+    own options; `timeout` also takes its duration and `nice -n` its niceness.
+    `None` for an empty piece.
+    """
+    i = 0
+    while i < len(tokens):
+        word = tokens[i]
+        if _ENV_ASSIGN_RE.fullmatch(word):
+            i += 1
+            continue
+        name = word.rsplit("/", 1)[-1]
+        if name not in _WRAPPERS:
+            return i
+        i += 1
+        while i < len(tokens) and tokens[i].startswith("-"):
+            flag = tokens[i]
+            i += 1
+            # the options of these wrappers that take a separate value
+            if flag in ("-n", "-s", "-k", "--signal", "--kill-after", "-o", "-e",
+                        "-i", "-c", "-u", "--unset") and i < len(tokens):
+                i += 1
+        if name == "timeout" and i < len(tokens):
+            i += 1                      # the duration
+    return None
+
+
+def _targeted_run(args: list) -> bool:
+    """Whether *args* names a subset of the tests, or runs nothing at all.
+
+    A token ending in `_SUITE_FILE_SUFFIXES` is a test file, one carrying a
+    `::` names a node, and a `-k`/`-m` selector names a subset by expression.
+    `--help` and friends run no suite. Every other `-…` token is an option —
+    `-n 4`, `-q`, `--rootdir`, `--maxfail` — and carries no information about
+    how much of the suite runs.
+    """
+    for token in args:
+        if token.startswith("-"):
+            if (token in _SELECTOR_OPTIONS or token in _NO_RUN_OPTIONS
+                    or token.startswith(_SELECTOR_PREFIXES)):
+                return True
+            continue
+        if "::" in token or token.endswith(_SUITE_FILE_SUFFIXES):
+            return True
+    return False
+
+
+def is_full_suite_command(command) -> bool:
+    """Whether *command* runs a whole pytest root, and so holds a suite slot.
+
+    KC-58. "Whole root" is the *shape* of the command, never a list of this
+    repo's directory names: a `pytest` — or a `python -m pytest` — whose
+    argument tokens are all options or all directories, or that names no
+    argument at all, is a whole root. `tests`, `tests_bugfix`, `.smoke_tests`,
+    a future `.smoke_fast`, and a bare `pytest -n 4` with no path argument are
+    all whole roots, and a tier that is added or renamed needs nothing to be
+    updated here. Anything that names a subset is a targeted run and is
+    answered at once: a `.py` file, a `path::node`, or a `-k`/`-m` selector.
+
+    String work only — no shell is started and no filesystem is read. `tests`
+    is judged a directory because it has no file suffix, not because it exists
+    in this repo, which is the whole point of the shape. Fail-open: a
+    non-string, a NUL, an unreadable shape, or a command that has no `pytest`
+    at all is not a whole root, and no exception ever reaches the caller.
+    """
+    if not isinstance(command, str) or not command or "\x00" in command:
+        return False
+    try:
+        for piece in _shell_pieces(command):
+            tokens = [_unquote_token(t) for t in _CMD_TOKEN.findall(piece)]
+            start = _pytest_argv_start(tokens)
+            if start is not None and not _targeted_run(tokens[start + 1:]):
+                return True
+        return False
+    except Exception:  # noqa: BLE001 — a read failure is not a suite
+        return False
 
 
 def _extract_paths(props: dict, base: "Path | None" = None) -> list:

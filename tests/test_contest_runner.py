@@ -4704,3 +4704,741 @@ def test_the_gate_grant_leaves_the_churn_room_alone(tmp_path):
     for seconds, tries in (("a lot", 3), (0.0, 3), (60.0, 0), (60.0, "five")):
         assert clock.grant_gate(seconds, tries) == 0.0
     assert clock.gate_added == 180.0 and clock.gate_attempts == 5
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KC-58: an agent's own full suite waits for a round-wide slot
+# ─────────────────────────────────────────────────────────────────────────────
+
+@pytest.fixture(autouse=True)
+def _suite_slots_are_clean():
+    """The round's suite slots are module state shared by every test here.
+
+    `reset` clears the queue and stops the poller thread, so a holder or a
+    waiter left behind by one test cannot bleed into the next through the
+    shared `_SUITE_SLOTS`. It runs before each test too, so a test that froze
+    the clock and left a poller behind cannot hand it to its neighbour.
+    """
+    _runner_module._SUITE_SLOTS.reset()
+    yield
+    _runner_module._SUITE_SLOTS.reset()
+
+
+def _wait_for(predicate, timeout: float = 30.0) -> bool:
+    """Poll *predicate* until it is true or the deadline passes — no event to wire."""
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
+
+
+class _SuiteSleeper:
+    """A process that reads to the scan as a `pytest` in its worktree, running nothing.
+
+    `[python, -c, "<sleep>", "pytest"]` — the trailing argument is `sys.argv[1]`
+    for a `-c` script, which python ignores — so `/proc` shows a live `pytest`
+    whose cwd is the worktree and no test suite runs. That trailing argument is
+    the whole point: it is what makes the process KC-58's signal.
+    """
+
+    CODE = "import time\ntime.sleep(600)\n"
+
+    def __init__(self, worktree):
+        self.proc = subprocess.Popen(
+            [sys.executable, "-c", self.CODE, "pytest"], cwd=str(worktree),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.pid = self.proc.pid
+
+    @property
+    def alive(self) -> bool:
+        return self.proc.poll() is None
+
+    def kill(self) -> None:
+        if self.proc.poll() is None:
+            self.proc.kill()
+        try:
+            self.proc.wait(5)
+        except OSError:
+            pass
+
+
+def _suite_scenario(command: str, *, delay: float = 0.0, idle: bool = True,
+                     on_prompt=None) -> dict:
+    """One turn that asks for a whole pytest root, as Kilo sends it.
+
+    `delay` keeps the turn alive after the reply, so the asker still holds its
+    slot while a test arranges the next one. `on_prompt` is the prompt hook —
+    the git work that makes the harvest accept the turn instead of reworking
+    it, which is what a READY assertion needs.
+    """
+    turn = {"events": ["busy"],
+            "permission": {"permission": "bash", "metadata": {"command": command}},
+            "idle": idle}
+    if on_prompt is not None:
+        turn["on_prompt"] = on_prompt
+    if delay:
+        turn["delay"] = delay
+    return {"turns": [turn]}
+
+
+def test_only_a_bash_ask_can_hold_a_suite_slot():
+    """`external_directory` and `doom_loop` are about where a command reaches, not
+    how long it runs: only a `bash` ask whose command is a whole root holds one.
+    A whole root waits for the slot; naming a subset is answered at once."""
+    for whole_root in ("pytest tests", "python3 -m pytest tests -n 4", "pytest -n 4",
+                       "cd . && python3 -m pytest tests -n 4"):
+        assert _runner_module._is_full_suite_ask(
+            {"permission": "bash", "metadata": {"command": whole_root}}), whole_root
+    for targeted in ("pytest tests/test_runner.py -q", "pytest tests/test_x.py::test_y",
+                     "pytest -k foo", "pytest tests -m slow"):
+        assert not _runner_module._is_full_suite_ask(
+            {"permission": "bash", "metadata": {"command": targeted}}), targeted
+    assert not _runner_module._is_full_suite_ask(
+        {"permission": "external_directory", "metadata": {"command": "pytest tests"}})
+    assert not _runner_module._is_full_suite_ask({"permission": "bash", "metadata": {}})
+    assert not _runner_module._is_full_suite_ask({})
+    assert not _runner_module._is_full_suite_ask(None)
+
+
+def test_the_suite_settings_degrade_to_their_defaults():
+    """A config without the key, or one that cannot be read, arms the ticket's
+    defaults rather than raising into a round."""
+    assert _runner_module._suite_slots_armed(None) == 1
+    assert _runner_module._suite_slots_armed(make_config(["agent-a"])) == 1
+    assert _runner_module._suite_slots_armed(
+        make_config(["agent-a"], agent_suite_slots=0)) == 0
+    assert _runner_module._suite_slots_armed(
+        make_config(["agent-a"], agent_suite_slots=3)) == 3
+
+    class BadSlots:
+        agent_suite_slots = "soon"
+
+    assert _runner_module._suite_slots_armed(BadSlots()) == 1
+
+    assert _runner_module._suite_ceiling(None) == 900.0
+    assert _runner_module._suite_ceiling(make_config(["agent-a"])) == 900.0
+    assert _runner_module._suite_ceiling(
+        make_config(["agent-a"], agent_suite_max_sec=150)) == 150.0
+    assert _runner_module._suite_ceiling(
+        make_config(["agent-a"], agent_suite_max_sec=0)) == 0.0
+
+
+def test_two_agents_share_one_suite_slot(tmp_path, monkeypatch):
+    """KC-58 acceptance: two agents each ask for `python3 -m pytest tests -n 4`
+    with `agent_suite_slots = 1`. The first answers at once and keeps the slot
+    while its pytest runs; the second's reply goes out only after the first
+    one's processes are gone. The `/proc` scan is patched and no suite runs.
+    """
+    names = ("agent-a", "agent-b")
+    sb = Sandbox(tmp_path, names)
+    cfg = make_config(names, agent_suite_slots=1, idle_event_timeout_sec=0)
+    path_a = _runner_module._path_of(sb.ws(names[0]).path)
+    holding = {path_a: {4242}}          # agent-a's suite is up in its worktree
+    monkeypatch.setattr(_runner_module, "_suite_pids",
+                        lambda worktree, proc_root=None:
+                        holding.get(_runner_module._path_of(worktree), set()))
+    monkeypatch.setattr(_runner_module, "_SUITE_POLL_SEC", 0.02)
+    slots = _runner_module._SUITE_SLOTS
+
+    with _BenchFake(_suite_scenario(TEST_SUITE_COMMAND, delay=20.0,
+                                     on_prompt=work_ready)) as fa, \
+         _BenchFake(_suite_scenario(TEST_SUITE_COMMAND, delay=20.0,
+                                     on_prompt=work_ready)) as fb:
+        ha = Harness(sb, fa, cfg, agent=names[0])
+        hb = Harness(sb, fb, cfg, agent=names[1])
+        results = {}
+
+        def go(agent, h):
+            results[agent] = h.go()
+
+        ta = threading.Thread(target=go, args=(names[0], ha), daemon=True)
+        ta.start()
+        assert _wait_for(lambda: fa.calls(method="POST", prefix="/permission/")), \
+            "the first agent never got its reply"
+        replied_a = time.monotonic()
+        assert slots.status(names[0])[0] == "running", slots.status(names[0])
+
+        tb = threading.Thread(target=go, args=(names[1], hb), daemon=True)
+        tb.start()
+        # the second stands behind the first one's suite, one ahead of it
+        assert _wait_for(lambda: slots.status(names[1]) is not None)
+        queued = slots.status(names[1])
+        assert queued[0] == "queued" and queued[2] == 1, queued
+        assert not fb.calls(method="POST", prefix="/permission/"), \
+            "the second reply went out while the first one's suite was still up"
+
+        holding[path_a] = set()          # the first one's processes are gone
+        cleared = time.monotonic()
+        assert _wait_for(lambda: fb.calls(method="POST", prefix="/permission/")), \
+            "the second reply never went out"
+        replied_b = time.monotonic()
+        for thread in (ta, tb):          # the fakes are still up: the streams end
+            thread.join(60)              # with them, and a stream gone is ERROR
+        assert not ta.is_alive() and not tb.is_alive()
+        assert replied_b >= cleared > replied_a
+        assert results[names[0]].state is AgentState.READY, results[names[0]].last_error
+        assert results[names[1]].state is AgentState.READY, results[names[1]].last_error
+
+
+def test_agent_suite_slots_zero_answers_every_ask_immediately(tmp_path, monkeypatch):
+    """KC-58 acceptance: `agent_suite_slots = 0` is today's path. No slot is
+    taken and nothing is queued — both replies go out at once, even while a
+    `pytest` is up in the worktree, where a queue would have held them.
+    """
+    names = ("agent-a", "agent-b")
+    sb = Sandbox(tmp_path, names)
+    cfg = make_config(names, agent_suite_slots=0, idle_event_timeout_sec=0)
+    monkeypatch.setattr(_runner_module, "_suite_pids", lambda worktree, proc_root=None: {4242})
+    asked = []
+    real_acquire = _runner_module._SuiteSlots.acquire
+
+    def refusing(name, worktree, ceiling=None, stop=None, scoped=False):
+        asked.append(name)
+        return real_acquire(name, worktree, ceiling=ceiling, stop=stop, scoped=scoped)
+
+    monkeypatch.setattr(_runner_module._SuiteSlots, "acquire", refusing)
+
+    with _BenchFake(_suite_scenario(TEST_SUITE_COMMAND, on_prompt=work_ready)) as fa, \
+         _BenchFake(_suite_scenario(TEST_SUITE_COMMAND, on_prompt=work_ready)) as fb:
+        ha, hb = Harness(sb, fa, cfg, agent=names[0]), Harness(sb, fb, cfg, agent=names[1])
+        ta = threading.Thread(target=ha.go, daemon=True)
+        tb = threading.Thread(target=hb.go, daemon=True)
+        ta.start()
+        tb.start()
+        assert _wait_for(lambda: fa.calls(method="POST", prefix="/permission/"))
+        assert _wait_for(lambda: fb.calls(method="POST", prefix="/permission/"))
+        ta.join(60)
+        tb.join(60)
+        assert ha.run.state is AgentState.READY, ha.run.last_error
+        assert hb.run.state is AgentState.READY, hb.run.last_error
+    assert not asked, "0 slots must not ask for one"
+    assert not _runner_module._SUITE_SLOTS._entries, "nothing may be queued"
+
+
+def test_a_stalled_holder_gives_its_slot_to_the_next_waiter(tmp_path, monkeypatch):
+    """KC-58 acceptance: a session that stalls while holding a slot releases it
+    and the next queued agent is answered. The scan keeps seeing the holder's
+    pytest, so only the agent ending can free the slot — the release on the way
+    out, not the poll.
+    """
+    names = ("agent-a", "agent-b")
+    sb = Sandbox(tmp_path, names)
+    cfg = make_config(names, agent_suite_slots=1, idle_event_timeout_sec=1)
+    path_a = _runner_module._path_of(sb.ws(names[0]).path)
+    monkeypatch.setattr(_runner_module, "_suite_pids",
+                        lambda worktree, proc_root=None:
+                        {4242} if _runner_module._path_of(worktree) == path_a else set())
+    monkeypatch.setattr(_runner_module, "_SUITE_POLL_SEC", 0.02)
+    slots = _runner_module._SUITE_SLOTS
+
+    with _BenchFake(_suite_scenario(TEST_SUITE_COMMAND, idle=False)) as fa, \
+         _BenchFake(_suite_scenario(TEST_SUITE_COMMAND, idle=False)) as fb:
+        ha, hb = Harness(sb, fa, cfg, agent=names[0]), Harness(sb, fb, cfg, agent=names[1])
+        results = {}
+
+        def go(agent, h):
+            results[agent] = h.go()
+
+        ta = threading.Thread(target=go, args=(names[0], ha), daemon=True)
+        ta.start()
+        assert _wait_for(lambda: slots.status(names[0]) is not None)
+        assert slots.status(names[0])[0] == "running"
+        tb = threading.Thread(target=go, args=(names[1], hb), daemon=True)
+        tb.start()
+        assert _wait_for(lambda: slots.status(names[1]) is not None)
+        assert slots.status(names[1])[0] == "queued"
+        assert not fb.calls(method="POST", prefix="/permission/")
+
+        assert _wait_for(lambda: not ta.is_alive(), 60)     # agent-a stalls
+        ta.join(60)
+        assert slots.status(names[0]) is None, "the slot must not survive its agent"
+        assert _wait_for(lambda: fb.calls(method="POST", prefix="/permission/"), 60), \
+            "the next queued agent was never answered"
+        tb.join(60)
+    assert results[names[0]].state is AgentState.STALLED, results[names[0]].last_error
+    assert results[names[1]].state is AgentState.STALLED, results[names[1]].last_error
+
+
+def test_a_background_suite_holds_its_slot_until_its_process_exits(tmp_path, monkeypatch):
+    """KC-58 acceptance: a suite started in the background holds the slot while
+    its pytest process runs in the worktree and releases it when the process
+    exits. No `release` is called — the poll is what finds the process gone.
+    """
+    clock = _FakeClock()
+    monkeypatch.setattr(_runner_module, "time", clock)
+    monkeypatch.setattr(_runner_module, "_SUITE_POLL_SEC", 0.02)
+    ws = _churn_ws(tmp_path)
+    sleeper = _SuiteSleeper(ws.path)
+    slots = _runner_module._SUITE_SLOTS
+    try:
+        assert _runner_module._suite_pids(ws.path) == {sleeper.pid}, "the scan must see it"
+        assert slots.acquire("agent-a", ws.path) == 0.0
+        entered = {}
+
+        def hold():
+            entered["waited"] = slots.acquire("agent-b", ws.path)
+
+        thread = threading.Thread(target=hold, daemon=True)
+        thread.start()
+        assert _wait_for(lambda: slots.status("agent-b") is not None)
+        assert slots.status("agent-b")[0] == "queued"
+        clock.advance(30.0)            # the background suite takes thirty seconds
+        assert thread.is_alive(), "the process is still up, so the slot must still be held"
+        sleeper.kill()                 # ... until the process exits
+        assert _wait_for(lambda: not thread.is_alive(), 60)
+        thread.join(60)
+        assert entered["waited"] == pytest.approx(30.0, abs=1.0)
+        # the hold is gone but the entry is not: only an explicit release drops it
+        assert slots.status("agent-a") == ("done", 30.0, 0)
+        # agent-b holds the slot now; whether the poll has already noticed that
+        # no pytest is left is a timing question, not something this test owns
+        second = slots.status("agent-b")
+        assert second[0] in ("running", "done") and second[2] == 0, second
+    finally:
+        sleeper.kill()
+        slots.release("agent-a")
+        slots.release("agent-b")
+
+
+def test_a_holder_past_its_ceiling_stops_blocking_without_a_kill(tmp_path, monkeypatch):
+    """KC-58 acceptance: past `agent_suite_max_sec` the holder stops blocking —
+    the next waiter goes in beside it — and the holder's process is not
+    signalled. The ceiling is a queue rule, not a kill.
+    """
+    clock = _FakeClock()
+    monkeypatch.setattr(_runner_module, "time", clock)
+    monkeypatch.setattr(_runner_module, "_SUITE_POLL_SEC", 0.02)
+    ws = _churn_ws(tmp_path)
+    sleeper = _SuiteSleeper(ws.path)
+    slots = _runner_module._SUITE_SLOTS
+    try:
+        assert slots.acquire("agent-a", ws.path, ceiling=100.0) == 0.0
+        entered = {}
+
+        def wait():
+            entered["waited"] = slots.acquire("agent-b", ws.path, ceiling=100.0)
+
+        thread = threading.Thread(target=wait, daemon=True)
+        thread.start()
+        assert _wait_for(lambda: slots.status("agent-b") is not None)
+        assert slots.status("agent-b")[0] == "queued"
+        clock.advance(90.0)
+        # one short of the ceiling: the queue still blocks
+        assert not _wait_for(lambda: slots.status("agent-b")[0] != "queued", 0.3)
+        assert slots.status("agent-a") == ("running", 90.0, 0)
+        # past it: the waiter goes in beside the holder, which keeps running
+        clock.advance(20.0)
+        assert _wait_for(lambda: not thread.is_alive(), 60)
+        thread.join(60)
+        assert entered["waited"] == pytest.approx(110.0, abs=1.0)
+        assert slots.status("agent-a")[0] == "over"
+        assert slots.status("agent-a")[1] == pytest.approx(110.0, abs=1.0)
+        assert sleeper.alive, "the ceiling must not signal the holder's pytest"
+    finally:
+        sleeper.kill()
+        slots.release("agent-a")
+        slots.release("agent-b")
+
+
+class _RecordingSuiteSlots:
+    """The round's slots, wrapped to count who asked for one."""
+
+    def __init__(self):
+        self.acquired: list = []
+        self.released: list = []
+        self.limit = 1
+        self.holders: dict = {}
+
+    def configure(self, slots):
+        self.limit = int(slots)
+        return self.limit
+
+    def acquire(self, name, worktree, ceiling=None, stop=None, scoped=False):
+        self.acquired.append((name, ceiling, scoped))
+        self.holders[name] = ("running", 0.0, 0)
+        return 0.0
+
+    def release(self, name):
+        self.released.append(name)
+        self.holders.pop(name, None)
+
+    def status(self, name):
+        return self.holders.get(name)
+
+    def ahead(self, name):
+        return 0
+
+
+def test_the_harvest_takes_a_suite_slot_too_and_gives_it_back(tmp_path, monkeypatch):
+    """KC-58: the judge's roots take one of the round's slots, so an agent's own
+    `pytest tests -n 4` never runs beside them, and the harvest's own budget is
+    its ceiling. `agent_suite_slots = 0` skips that queue for good."""
+    import tools.contest.harvest as harvest_module
+
+    sb = Sandbox(tmp_path, ["agent-a"])
+    holder = _RecordingSuiteSlots()
+    monkeypatch.setattr(_runner_module, "_SUITE_SLOTS", holder)
+    got = {}
+
+    def roots(ws, ticket_path, *, run_tests=False, budget_sec=0.0, waited=0.0, ahead=0):
+        got.update(run_tests=run_tests, budget=budget_sec, ahead=ahead)
+        return harvest_module.Harvest(verdict="READY", reasons=(), commit=None, facts={},
+                                      elapsed=1.0, waited=waited, ahead=ahead)
+
+    monkeypatch.setattr(_runner_module, "harvest", roots)
+
+    cfg = make_config(["agent-a"], agent_suite_slots=1, harvest_budget_sec=750)
+    assert _runner_module._harvest(
+        sb.ws("agent-a"), sb.ticket_path, True, cfg).verdict == "READY"
+    # its own key, scoped to the call: an agent's own slot is never touched
+    assert holder.acquired == [("agent-a:harvest", 750.0, True)], holder.acquired
+    assert holder.released == ["agent-a:harvest"], holder.released
+    assert got == {"run_tests": True, "budget": 750.0, "ahead": 0}
+
+    # 0 slots: no queue to stand in, and the roots still run — today's path
+    monkeypatch.setattr(_runner_module, "_SUITE_SLOTS", _runner_module._SuiteSlots())
+    _runner_module._SUITE_SLOTS.configure(0)
+    got.clear()
+    cfg0 = make_config(["agent-a"], agent_suite_slots=0, harvest_budget_sec=750)
+    assert _runner_module._harvest(
+        sb.ws("agent-a"), sb.ticket_path, True, cfg0).verdict == "READY"
+    assert got == {"run_tests": True, "budget": 750.0, "ahead": 0}
+
+
+def test_the_heartbeat_names_the_suite_queue_and_its_ceiling(tmp_path, monkeypatch):
+    """KC-58: a WAITING agent reads `queued` with its wait and how many are ahead
+    of it, the holder reads `suite`, and one past its ceiling says so — the queue
+    that was invisible to the round is on the line."""
+    names = ("agent-a", "agent-b", "agent-c")
+    sb = Sandbox(tmp_path, names)
+    cfg = make_config(names)
+    runs = [AgentRun(agent=cfg.agents[i], workspace=sb.ws(names[i]), state=AgentState.WAITING)
+            for i in range(3)]
+    hb, rm, files, commits = _make_heartbeat(runs, {n: 3 for n in names})
+    try:
+        monkeypatch.setattr(rm, "_SUITE_SLOTS", _RecordingSuiteSlots())
+        rm._SUITE_SLOTS.holders.update({
+            "agent-a": ("queued", 720.0, 2),
+            "agent-b": ("running", 600.0, 0),
+            "agent-c": ("over", 960.0, 0),
+        })
+        line = hb.line()
+    finally:
+        rm._worktree_files, rm._commits_above = files, commits
+    assert "agent-a WAITING" in line and "(suite queued 12m, 2 ahead)" in line, line
+    assert "(suite 10m)" in line, line
+    assert "(suite 16m, over the ceiling)" in line, line
+
+
+def test_parts_say_working_sees_a_running_bash_and_a_recent_edit():
+    """KC-58 §2: a `bash` part that has not come back is work, and so is an
+    `edit`/`write` completed inside the window — a `bash` that finished and an
+    `edit` older than the window are neither."""
+    now = time.time()
+    window = 600.0
+    parts = {
+        "running": {"type": "tool", "tool": "bash",
+                    "state": {"status": "running", "input": {"command": TEST_SUITE_COMMAND}}},
+        "pending": {"type": "tool", "tool": "bash", "state": {"status": "pending"}},
+        "done_bash": {"type": "tool", "tool": "bash",
+                      "state": {"status": "completed", "input": {"command": TEST_SUITE_COMMAND}}},
+        "recent_edit": {"type": "tool", "tool": "edit",
+                        "state": {"status": "completed", "time": {"end": now - 4}}},
+        "old_edit": {"type": "tool", "tool": "edit",
+                     "state": {"status": "completed", "time": {"end": now - 7200}}},
+        "read": {"type": "tool", "tool": "read",
+                 "state": {"status": "completed", "time": {"end": now - 1}}},
+    }
+    f = _runner_module._parts_say_working
+    assert f((parts["running"],), window, now)
+    assert f((parts["pending"],), window, now)
+    assert f((parts["recent_edit"],), window, now)
+    assert not f((parts["done_bash"],), window, now)
+    assert not f((parts["old_edit"],), window, now)
+    assert not f((parts["read"],), window, now)
+    assert not f((), window, now)
+    assert not f(("not a dict", None, {"tool": "bash"}), window, now)
+    # the window is measured, so a zero window admits no edit
+    assert not f((parts["recent_edit"],), 0.0, now)
+    # ... and a bash that is still running is work whatever the window is
+    assert f((parts["running"],), 0.0, now)
+
+
+def test_a_deadline_with_a_running_bash_is_extended_with_flat_churn(tmp_path):
+    """KC-58 §2 acceptance: a deadline reached with a `bash` part running extends
+    the turn with unchanged churn, and `turn_max_sec` stays the hard ceiling."""
+    ws = _churn_ws(tmp_path)
+    cfg = make_config(["agent-a"], turn_timeout_sec=1800, turn_extend_sec=600,
+                      turn_max_sec=3000, idle_event_timeout_sec=0)
+    run = AgentRun(agent=cfg.agents[0], workspace=ws)
+    open_bash = {"type": "tool", "tool": "bash",
+                 "state": {"status": "running", "input": {"command": TEST_SUITE_COMMAND}}}
+    working = lambda: _runner_module._parts_say_working(   # noqa: E731
+        (open_bash,), float(cfg.turn_extend_sec), time.time())
+
+    flat = _runner_module._turn_deadline(run, cfg)
+    assert flat.on_deadline(1800.0) is None, "flat churn with no work is still refused"
+
+    clock = _runner_module._turn_deadline(run, cfg, working)
+    assert clock.on_deadline(1800.0) == 600
+    assert clock.on_deadline(2400.0) == 600
+    assert clock.extensions == [
+        {"at": 1800.0, "files": 0, "lines": 0, "granted": 600, "working": True},
+        {"at": 2400.0, "files": 0, "lines": 0, "granted": 600, "working": True}]
+    assert clock.granted + cfg.turn_timeout_sec == cfg.turn_max_sec
+    assert clock.on_deadline(float(cfg.turn_max_sec)) is None, "the cap is the hard ceiling"
+
+
+def test_round_106_churn_down_with_an_edit_is_extended(tmp_path):
+    """Round 106: 10 files / 1073 lines at one deadline, 1072 at the next — the
+    agent removed one line while fixing a test — with an `edit` 4 s earlier.
+    Churn that goes down is work, and `unchanged for` counts from the sample
+    that differed, not from the last grant.
+    """
+    ws = _churn_ws(tmp_path)
+    cfg = make_config(["agent-a"], turn_timeout_sec=3600, turn_extend_sec=600,
+                      turn_max_sec=14400, idle_event_timeout_sec=0)
+    run = AgentRun(agent=cfg.agents[0], workspace=ws)
+    _write(ws.path / "pkg" / "big.py", "x = 1\n" * 1073)
+    working = lambda: _runner_module._parts_say_working(   # noqa: E731
+        ({"type": "tool", "tool": "edit",
+          "state": {"status": "completed", "time": {"end": time.time() - 4}}},),
+        float(cfg.turn_extend_sec), time.time())
+    clock = _runner_module._turn_deadline(run, cfg, working)
+
+    assert clock.on_deadline(3600.0) == 600          # 1 file / 1073 lines: growth
+    _write(ws.path / "pkg" / "big.py", "x = 1\n" * 1072)
+    assert clock.on_deadline(4200.0) == 600          # 1072: churn down, edit recent
+    assert [e["lines"] for e in clock.extensions] == [1073, 1072]
+    # "unchanged for" counts from 4200, the sample that differed, not from 3600
+    assert _runner_module._no_idle_error(cfg, 4800.0, clock) == \
+        "no idle after 80m (1 files, 1072 lines, unchanged for 10m)"
+
+    # and without the edit the same drop is refused
+    flat = _runner_module._turn_deadline(run, cfg)
+    assert flat.on_deadline(float(cfg.turn_max_sec)) is None
+
+
+def test_unchanged_for_counts_from_the_last_sample_that_differed(tmp_path):
+    """Round 106, the other half: `last_change_at` moves on a sample that differs
+    in either number, granted or not. A refused sample still resets it, so a turn
+    that stopped growing after ten minutes does not read as unchanged for
+    twenty-five."""
+    ws = _churn_ws(tmp_path)
+    cfg = make_config(["agent-a"], turn_timeout_sec=600, turn_extend_sec=600,
+                      turn_max_sec=14400, idle_event_timeout_sec=0)
+    clock = _runner_module._turn_deadline(AgentRun(agent=cfg.agents[0], workspace=ws), cfg)
+    _write(ws.path / "pkg" / "a.py", "x\n" * 100)
+    # the sample counts the diff against the base file, so 100 lines written
+    # is 101 changed: 100 added and the base line deleted. The numbers here are
+    # churn, not file sizes.
+    assert clock.on_deadline(600.0) == 600              # granted: 1 file / 101 lines
+    _write(ws.path / "pkg" / "a.py", "x\n" * 99)        # churn down to 100
+    assert clock.on_deadline(1200.0) is None            # refused: no growth, no edit
+    assert _runner_module._no_idle_error(cfg, 1800.0, clock) == \
+        "no idle after 30m (1 files, 100 lines, unchanged for 10m)"
+
+
+def test_a_fresh_holder_keeps_its_slot_until_its_pytest_comes_up(tmp_path, monkeypatch):
+    """The slot is granted before the reply goes out, so the first polls run
+    before Kilo has spawned the shell. They must not read "no pytest" as "done":
+    the holder keeps the slot until the scan has seen its process, and only the
+    process going away after that frees it."""
+    clock = _FakeClock()
+    monkeypatch.setattr(_runner_module, "time", clock)
+    monkeypatch.setattr(_runner_module, "_SUITE_POLL_SEC", 0.02)
+    ws = _churn_ws(tmp_path)
+    holding: set = set()
+    monkeypatch.setattr(_runner_module, "_suite_pids",
+                        lambda worktree, proc_root=None: set(holding))
+    slots = _runner_module._SUITE_SLOTS
+    try:
+        assert slots.acquire("agent-a", ws.path) == 0.0
+        thread = threading.Thread(target=slots.acquire, args=("agent-b", ws.path), daemon=True)
+        thread.start()
+        assert _wait_for(lambda: slots.status("agent-b") is not None)
+        # a dozen polls with nothing up yet, inside the grace: still held
+        assert not _wait_for(lambda: not thread.is_alive(), 0.3)
+        assert slots.status("agent-a")[0] == "running"
+        holding.add(4242)               # the suite comes up ...
+        assert not _wait_for(lambda: not thread.is_alive(), 0.3)
+        holding.clear()                 # ... and exits: now the slot moves on
+        assert _wait_for(lambda: not thread.is_alive(), 30)
+        assert slots.status("agent-a")[0] == "done"
+    finally:
+        slots.release("agent-a")
+        slots.release("agent-b")
+
+
+def test_a_holder_whose_pytest_never_comes_up_frees_after_the_grace(tmp_path, monkeypatch):
+    """A command that never starts a pytest (it failed at once) gives the slot
+    back once the start grace is over — it cannot sit on it until its ceiling."""
+    clock = _FakeClock()
+    monkeypatch.setattr(_runner_module, "time", clock)
+    monkeypatch.setattr(_runner_module, "_SUITE_POLL_SEC", 0.02)
+    monkeypatch.setattr(_runner_module, "_suite_pids", lambda worktree, proc_root=None: set())
+    ws = _churn_ws(tmp_path)
+    slots = _runner_module._SUITE_SLOTS
+    try:
+        assert slots.acquire("agent-a", ws.path, ceiling=900.0) == 0.0
+        got = {}
+        thread = threading.Thread(
+            target=lambda: got.update(waited=slots.acquire("agent-b", ws.path)), daemon=True)
+        thread.start()
+        assert _wait_for(lambda: slots.status("agent-b") is not None)
+        clock.advance(_runner_module._SUITE_START_GRACE_SEC - 1)
+        assert not _wait_for(lambda: not thread.is_alive(), 0.3)
+        clock.advance(2)
+        assert _wait_for(lambda: not thread.is_alive(), 30)
+        assert got["waited"] == pytest.approx(_runner_module._SUITE_START_GRACE_SEC + 1, abs=1)
+    finally:
+        slots.release("agent-a")
+        slots.release("agent-b")
+
+
+def test_a_waiter_whose_agent_stops_leaves_the_queue(tmp_path, monkeypatch):
+    """A waiter's `stop` (its agent stalled or the round was interrupted) takes
+    it out of the queue at once: no slot, no entry, and the holder untouched."""
+    monkeypatch.setattr(_runner_module, "_SUITE_POLL_SEC", 0.02)
+    monkeypatch.setattr(_runner_module, "_suite_pids",
+                        lambda worktree, proc_root=None: {4242})
+    ws = _churn_ws(tmp_path)
+    slots = _runner_module._SUITE_SLOTS
+    stopped: list = []
+    try:
+        slots.acquire("agent-a", ws.path)
+        got = {}
+        thread = threading.Thread(target=lambda: got.update(
+            waited=slots.acquire("agent-b", ws.path, stop=lambda: bool(stopped))), daemon=True)
+        thread.start()
+        assert _wait_for(lambda: slots.status("agent-b") is not None)
+        stopped.append("stalled")
+        assert _wait_for(lambda: not thread.is_alive(), 30)
+        assert got["waited"] == 0.0
+        assert slots.status("agent-b") is None
+        assert slots.status("agent-a")[0] == "running"
+    finally:
+        slots.release("agent-a")
+
+
+def test_the_harvest_hold_is_not_read_off_proc(tmp_path, monkeypatch):
+    """The harvest's slot is scoped to its call: the judge's pytest has not
+    started when the slot is granted, and a poll that sees none must not hand
+    the slot on — only the harvest's own `release` does."""
+    monkeypatch.setattr(_runner_module, "_SUITE_POLL_SEC", 0.02)
+    monkeypatch.setattr(_runner_module, "_suite_pids", lambda worktree, proc_root=None: set())
+    monkeypatch.setattr(_runner_module, "_SUITE_START_GRACE_SEC", 0.0)
+    ws = _churn_ws(tmp_path)
+    slots = _runner_module._SUITE_SLOTS
+    try:
+        slots.acquire("agent-a:harvest", ws.path, ceiling=900.0, scoped=True)
+        thread = threading.Thread(target=slots.acquire, args=("agent-b", ws.path), daemon=True)
+        thread.start()
+        assert _wait_for(lambda: slots.status("agent-b") is not None)
+        assert not _wait_for(lambda: not thread.is_alive(), 0.3)
+        assert slots.status("agent-a:harvest")[0] == "running"
+        slots.release("agent-a:harvest")
+        assert _wait_for(lambda: not thread.is_alive(), 30)
+    finally:
+        slots.release("agent-a:harvest")
+        slots.release("agent-b")
+
+
+@pytest.mark.parametrize("cmd, suite", [
+    ("/usr/bin/python3 -m pytest tests -n 4", True),
+    ("/venv/bin/pytest tests", True),
+    ("python3 -m py.test", True),
+    ("python3 -c import time pytest", True),
+    ("grep -rn pytest_ini tests", False),
+    ("vim tests/test_pytest_ini_quiet_summary.py", False),
+    ("", False),
+])
+def test_the_scan_reads_pytest_as_a_word(cmd, suite):
+    """A cmdline is a suite when a word *is* pytest, never when one only holds it."""
+    assert _runner_module._is_pytest_cmdline(cmd) is suite
+
+
+def test_the_suite_wait_is_granted_back_and_the_silence_clock_runs_from_the_reply(
+        tmp_path, monkeypatch):
+    """A whole-root ask that queues longer than the silence window: the wait
+    blocked the loop that runs both clocks, so the agent pays for neither. The
+    silence clock runs from the reply, not from the ask, and the turn records
+    the wait as `suite_wait_sec` — the seconds its deadline was moved by."""
+    names = ("agent-a",)
+    sb = Sandbox(tmp_path, names)
+    cfg = make_config(names, agent_suite_slots=1, idle_event_timeout_sec=1)
+    monkeypatch.setattr(_runner_module, "_SUITE_POLL_SEC", 0.02)
+    monkeypatch.setattr(_runner_module, "_suite_pids", lambda worktree, proc_root=None: set())
+    slots = _runner_module._SUITE_SLOTS
+    # someone else's suite holds the only slot, released by hand below
+    slots.acquire("other:harvest", tmp_path, scoped=True)
+    try:
+        with _BenchFake(_suite_scenario(TEST_SUITE_COMMAND, on_prompt=work_ready)) as fake:
+            h = Harness(sb, fake, cfg, agent=names[0])
+            result = {}
+            thread = threading.Thread(target=lambda: result.update(run=h.go()), daemon=True)
+            thread.start()
+            assert _wait_for(lambda: (slots.status(names[0]) or ("",))[0] == "queued")
+            time.sleep(2.2)             # twice the silence window, in the queue
+            assert not fake.calls(method="POST", prefix="/permission/")
+            slots.release("other:harvest")
+            thread.join(60)
+            assert not thread.is_alive()
+        run = result["run"]
+        assert run.state is AgentState.READY, run.last_error
+        turns = [json.loads(line) for line in
+                 (sb.out_dir / names[0] / "turns.jsonl").read_text().splitlines()]
+        # the turn idled on its own — not a silence stall that the harvest
+        # happened to rescue because the work was already committed
+        assert turns[0]["idle_status"] == "idle", turns[0]
+        assert turns[0]["suite_wait_sec"] >= 2, turns[0]
+    finally:
+        slots.release("other:harvest")
+
+
+def test_grant_suite_is_kept_out_of_the_churn_room():
+    """`grant_suite` moves the deadline by the wait and nothing else: the churn
+    room (`granted`) and the gate's half are untouched, and junk is 0.0."""
+    clock = _runner_module._TurnClock(on_deadline=None)
+    assert clock.grant_suite(120.5) == 120.5
+    assert clock.grant_suite("soon") == 0.0
+    assert clock.grant_suite(-3) == 0.0
+    assert clock.suite_waited == 120.5
+    assert clock.granted == 0.0 and clock.gate_added == 0.0
+
+
+def test_the_suite_queue_does_not_count_against_agent_max_sec(tmp_path, monkeypatch):
+    """An agent stuck in the suite queue is not at fault: `agent_max_sec` is
+    paused while its permission waits for a slot and resumed with what it had
+    left. Here the queue alone outlasts the whole limit, and the agent still
+    gets its reply, idles on its own and ends READY — not `time up`."""
+    names = ("agent-a",)
+    sb = Sandbox(tmp_path, names)
+    cfg = make_config(names, agent_suite_slots=1, agent_max_sec=2, idle_event_timeout_sec=0)
+    monkeypatch.setattr(_runner_module, "_SUITE_POLL_SEC", 0.02)
+    monkeypatch.setattr(_runner_module, "_suite_pids", lambda worktree, proc_root=None: set())
+    slots = _runner_module._SUITE_SLOTS
+    slots.acquire("other:harvest", tmp_path, scoped=True)
+    try:
+        with _BenchFake(_suite_scenario(TEST_SUITE_COMMAND, on_prompt=work_ready)) as fake:
+            h = Harness(sb, fake, cfg, agent=names[0])
+            result = {}
+            thread = threading.Thread(target=lambda: result.update(run=h.go()), daemon=True)
+            thread.start()
+            assert _wait_for(lambda: (slots.status(names[0]) or ("",))[0] == "queued")
+            time.sleep(3.0)             # longer than the agent's whole limit
+            assert thread.is_alive(), "the queue must not end the agent"
+            slots.release("other:harvest")
+            thread.join(60)
+            assert not thread.is_alive()
+        run = result["run"]
+        assert run.state is AgentState.READY, run.last_error
+        assert "time up" not in (run.last_error or "")
+        turns = [json.loads(line) for line in
+                 (sb.out_dir / names[0] / "turns.jsonl").read_text().splitlines()]
+        assert turns[0]["idle_status"] == "idle", turns[0]
+        assert turns[0]["suite_wait_sec"] >= 3, turns[0]
+    finally:
+        slots.release("other:harvest")

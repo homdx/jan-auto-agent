@@ -1548,13 +1548,18 @@ class KiloClient:
                     self.reply_permission(session, props.get("id"), reply, message)
                     # KC-66: the gate's own waits are the agent's time, not the
                     # gate's — grant them back before the loop re-measures the
-                    # deadline on the pass that follows.
+                    # deadline on the pass that follows. KC-58: so is a
+                    # whole-root suite's wait for its round-wide slot.
                     if granted > 0:
                         deadline += granted
-                        _log.info("%s: gate waits granted +%gs to the turn",
+                        _log.info("%s: gate/suite waits granted +%gs to the turn",
                                   session_id, granted)
                 except (KiloHttpError, ValueError, TypeError) as e:
                     _log.warning("permission %s not answered: %s", props.get("id"), e)
+                # KC-58: the session cannot have been silent while the runner
+                # held its permission — a suite slot can hold it for longer
+                # than the silence window — so the clock runs from the reply.
+                last_seen = time.monotonic()
                 permissions.append(event)
                 continue
 

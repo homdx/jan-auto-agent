@@ -102,6 +102,8 @@ CONTEST_KEYS = (
     "quota_patterns",
     "progress_every_sec",
     "harvest_budget_sec",
+    "agent_suite_slots",
+    "agent_suite_max_sec",
     "pytest_workers_per_agent",
     "pytest_workers_few_agents",
     "pytest_workers_few",
@@ -292,6 +294,16 @@ class ContestConfig:
     #: KC-57: the wall-clock budget for one harvest's pytest roots.
     #: 0 turns it off, which keeps today's unbounded behaviour.
     harvest_budget_sec: int = 900
+    #: KC-58: how many whole pytest roots run at once, round-wide — an agent's
+    #: own `pytest tests -n 4` and the runner's harvest alike. 0 turns the
+    #: queue off: every reply is immediate and `_TEST_RUNS_LOCK` is the only
+    #: serialization, which is today's behaviour byte for byte.
+    agent_suite_slots: int = 1
+    #: KC-58: how long one holder may keep the next waiter out. Past it the
+    #: holder stops blocking and the next waiter goes in beside it — its
+    #: pytest is not killed, because the agent is still running. 0 is no
+    #: ceiling, which is how one slow suite blocks the round for its whole run.
+    agent_suite_max_sec: int = 900
     #: KC-65: pytest-xdist workers each agent gets. 0 = by the agents that are
     #: live: one alone gets every core, up to `pytest_workers_few_agents` get
     #: `pytest_workers_few`, more get `pytest_workers_min` — always at most
@@ -640,6 +652,16 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
     context_memory_days = num("context_memory_days", 7.0)
     compact_at_percent = num("compact_at_percent", 80.0)
 
+    # KC-58: 0 slots is "the queue is off", so a negative count is refused
+    # rather than read as 0; a negative ceiling would unblock every holder at
+    # once, which is also a typo rather than a setting.
+    agent_suite_slots = limit("agent_suite_slots", 1)
+    agent_suite_max_sec = limit("agent_suite_max_sec", 900)
+    if agent_suite_slots < 0:
+        raise RosterError(f"[contest] agent_suite_slots must be >= 0, got {agent_suite_slots}")
+    if agent_suite_max_sec < 0:
+        raise RosterError(f"[contest] agent_suite_max_sec must be >= 0, got {agent_suite_max_sec}")
+
     openrouter_settings = None
     if backend == "openrouter":
         # the agents' own credential: required only for that backend, resolved
@@ -680,6 +702,8 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
         quota_patterns=scalar("quota_patterns", ""),
         progress_every_sec=limit("progress_every_sec", 60),
         harvest_budget_sec=max(0, limit("harvest_budget_sec", 900)),
+        agent_suite_slots=agent_suite_slots,
+        agent_suite_max_sec=agent_suite_max_sec,
         pytest_workers_per_agent=pytest_workers_per_agent,
         pytest_workers_few_agents=pytest_workers_few_agents,
         pytest_workers_few=pytest_workers_few,

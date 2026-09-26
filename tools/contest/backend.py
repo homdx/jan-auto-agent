@@ -674,8 +674,11 @@ class OpenRouterBackend:
                     reply, message = "reject", f"policy failed: {type(exc).__name__}"
                     granted = 0.0
                 if granted > 0:
-                    # KC-66: the gate's own waits are the agent's time back
+                    # KC-66: the gate's own waits are the agent's time back;
+                    # KC-58: so is a suite's wait for its round-wide slot
                     deadline += granted
+                # KC-58: never silent while the runner held the permission
+                last_seen = time.monotonic()
                 props = event.get("properties") or {}
                 self._write(record, {"type": "permission.reply", "id": props.get("id"),
                                      "reply": reply, "message": message})
