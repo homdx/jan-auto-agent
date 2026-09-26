@@ -1616,16 +1616,23 @@ def _gate_plan_label(config) -> str:
     return f"{model} @ {host}" if host else model
 
 
-def _worker_plan_label(workers, fixed: bool) -> str:
+def _worker_plan_label(workers, fixed: bool, slots: int = 0) -> str:
     """KC-65: the plan's worker line — the count of the first prompts and the
     rule behind it, so the operator sees the sizing before the round starts.
 
     ``auto, min 2`` is the rule the runner rewrites as agents finish;
-    ``fixed N`` is an operator-pinned `pytest_workers_per_agent`.
+    ``fixed N`` is an operator-pinned `pytest_workers_per_agent`. KC-68:
+    ``auto, N suite slots`` is the same rule split by the suites that can run
+    at once, when `agent_suite_slots` is armed.
     """
     if workers is None:
         return "-"
-    rule = f"fixed {workers}" if fixed else "auto, min 2"
+    if fixed:
+        rule = f"fixed {workers}"
+    elif slots > 0:
+        rule = f"auto, {slots} suite slot{'s' if slots != 1 else ''}"
+    else:
+        rule = "auto, min 2"
     return f"{workers} each ({rule})"
 
 
@@ -1676,7 +1683,8 @@ def _print_plan(result: Intake, config: ContestConfig, out_dir: Path, *, run_tes
         ("base", result.base_sha[:12]),
         ("agents", f"{len(config.agents)}: {models}"),
         ("parallel", str(config.max_parallel)),
-        ("workers", _worker_plan_label(workers, workers_fixed)),
+        ("workers", _worker_plan_label(workers, workers_fixed,
+                                       int(getattr(config, "agent_suite_slots", 0) or 0))),
         ("tmpdir", str(agent_tmp) if agent_tmp is not None else "-"),
         ("tests", "on" if run_tests else "off"),
         ("gate", _gate_plan_label(config)),

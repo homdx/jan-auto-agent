@@ -364,6 +364,14 @@ def agent_pytest_workers(live: int, cores: int, config: ContestConfig) -> int:
     no more than the box has, and nobody gets one worker, where a full suite
     runs for over half an hour and an agent's own `--timeout` fires on healthy
     code.
+
+    KC-68: with KC-58's suite slots armed, no more than `agent_suite_slots`
+    whole roots run at once, whatever the crowd — so the count is the cores
+    split between the suites that can run at once, never below the crowd's own
+    count. Round 69: eight live agents, two slots, 8 cores gave every root two
+    workers, so two roots used four cores and the judge's serialized harvests
+    ran one by one at `-n 2`. A targeted run holds no slot and reads the same
+    file; it is short, so the brief over-subscription is the cheaper side.
     """
     cores = max(1, int(cores or 1))
     per_agent = int(getattr(config, "pytest_workers_per_agent", 0) or 0)
@@ -376,6 +384,9 @@ def agent_pytest_workers(live: int, cores: int, config: ContestConfig) -> int:
         count = int(getattr(config, "pytest_workers_few", 4) or 4)
     else:
         count = int(getattr(config, "pytest_workers_min", 2) or 2)
+    slots = _suite_slots_armed(config)
+    if slots > 0:
+        count = max(count, cores // max(1, min(live, slots)))
     return max(1, min(count, cores))
 
 
@@ -939,8 +950,10 @@ def _harvest(ws, ticket_path, run_tests, config=None):
         try:
             held = _SUITE_SLOTS.acquire(harvest_key, ws.path, ceiling=budget, scoped=True)
             suite_held = True
-            if held > 0:
-                _log.info("%s: HARVESTING — suite slot held %s", waiter, _age(held))
+            # the wait for the slot, not how long it is held — and a wait under
+            # a second is no wait: round 69 printed "held 0s" for every harvest
+            if held >= 1:
+                _log.info("%s: HARVESTING — waited %s for a suite slot", waiter, _age(held))
         except Exception:  # noqa: BLE001 — the slots never hold up the judge
             suite_held = False
     try:

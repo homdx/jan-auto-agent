@@ -2757,7 +2757,9 @@ def _kc65_run(sb, monkeypatch, *, agents=KC65_AGENTS, extra=(), argv=(), unwrita
     still checks the roster against the fake's offer, so a roster the server does not offer
     is refused the way a real round's would be.
     """
-    _write(sb.repo / "contest.ini", _kc65_roster(sb, agents, **dict(extra)))
+    # KC-68: the crowd's rule alone unless a test arms the suite slots itself
+    extra = {"agent_suite_slots": 0, **dict(extra)}
+    _write(sb.repo / "contest.ini", _kc65_roster(sb, agents, **extra))
     monkeypatch.setattr(cli, "prepare_round", lambda *a, **k: [])
     monkeypatch.setattr(cli, "run_round",
                         lambda config, ticket, ticket_path, workspaces, **kw:
@@ -2826,6 +2828,20 @@ def test_the_start_worker_file_and_the_env_the_rounds_server_gets(sandbox, monke
     plan = _plan(captured.out)
     assert plan["workers"] == "2 each (auto, min 2)"
     assert plan["tmpdir"] == "-"
+
+
+def test_the_plan_names_the_suite_slots_the_count_is_split_by(sandbox, monkeypatch, capsys):
+    """KC-68: six live agents, two slots, 8 cores: the file holds 4 and the plan names the
+    slots as the rule — round 69 printed `2 each (auto, min 2)` and ran two roots at -n 2."""
+    monkeypatch.setattr(os, "cpu_count", lambda: 8)
+    _kc65_env_free(monkeypatch)
+    code, calls, out = _kc65_run(sandbox, monkeypatch, extra={"agent_suite_slots": 2},
+                                 argv=("--max-parallel", "6"))
+    captured = capsys.readouterr()
+    assert code == 0
+    assert (out / "pytest-workers").read_text(encoding="utf-8") == "4\n"
+    assert calls[-1]["PYTEST_XDIST_AUTO_NUM_WORKERS"] == "4"
+    assert _plan(captured.out)["workers"] == "4 each (auto, 2 suite slots)"
 
 
 def test_the_worker_count_is_the_agents_not_the_pool(sandbox, monkeypatch):

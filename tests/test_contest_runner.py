@@ -4384,6 +4384,8 @@ def _worker_state(tmp_path, states, create=True, **over):
     if create:
         out.mkdir(parents=True, exist_ok=True)
     names = [f"agent-{i}" for i in range(len(states))]
+    # KC-68: the crowd's rule alone — the suite slots split the box their own way
+    over.setdefault("agent_suite_slots", 0)
     cfg = make_config(names, **over)
     runs = [
         AgentRun(agent=spec,
@@ -4408,7 +4410,7 @@ def test_pytest_workers_follows_the_live_agents(monkeypatch):
     """live 1 -> the whole box, 2..4 -> pytest_workers_few, 5+ -> pytest_workers_min,
     always at most the cores."""
     _eight_cores(monkeypatch)
-    cfg = make_config(["agent-a"])
+    cfg = make_config(["agent-a"], agent_suite_slots=0)
     for live, want in ((0, 8), (1, 8), (2, 4), (3, 4), (4, 4), (5, 2), (9, 2)):
         assert _runner_module.agent_pytest_workers(live, 8, cfg) == want
     assert _runner_module.agent_pytest_workers(3, 2, cfg) == 2, "capped at the cores"
@@ -4421,6 +4423,35 @@ def test_a_fixed_pytest_workers_per_agent_is_not_capped(monkeypatch):
     cfg = make_config(["agent-a"], pytest_workers_per_agent=3)
     for live, cores in ((1, 8), (9, 8), (1, 2)):
         assert _runner_module.agent_pytest_workers(live, cores, cfg) == 3
+
+
+def test_suite_slots_split_the_box_between_the_roots_that_can_run(monkeypatch):
+    """KC-68: round 69 — eight live agents, two slots, 8 cores: 4 each, not the crowd's
+    2, so the two roots that can run at once fill the box. One slot is the whole box;
+    fewer live agents than slots split it by the agents; the crowd's count is a floor."""
+    _eight_cores(monkeypatch)
+    for slots, live, want in ((2, 8, 4), (1, 8, 8), (2, 1, 8), (4, 2, 4),
+                              (3, 8, 2), (4, 4, 4), (16, 9, 2)):
+        cfg = make_config(["agent-a"], agent_suite_slots=slots)
+        assert _runner_module.agent_pytest_workers(live, 8, cfg) == want, (slots, live)
+    cfg = make_config(["agent-a"], agent_suite_slots=1)
+    assert _runner_module.agent_pytest_workers(8, 2, cfg) == 2, "capped at the cores"
+    cfg = make_config(["agent-a"], agent_suite_slots=2, pytest_workers_per_agent=3)
+    assert _runner_module.agent_pytest_workers(8, 8, cfg) == 3, "a fixed count still wins"
+
+
+def test_the_worker_file_follows_the_slots_as_the_round_moves(tmp_path, monkeypatch):
+    """KC-68: with two slots the file holds 4 for eight live agents and the whole box
+    once one is left — the refresh reads the slots the same way the start does."""
+    _eight_cores(monkeypatch)
+    out, cfg, state = _worker_state(tmp_path, ["WAITING"] * 8, agent_suite_slots=2)
+    memo: dict = {}
+    _runner_module.refresh_pytest_workers(out, cfg, state, memo)
+    assert _runner_module.read_pytest_workers(out / _runner_module.WORKERS_FILE) == 4
+    for run in state.agents[1:]:
+        run.state = AgentState.READY
+    _runner_module.refresh_pytest_workers(out, cfg, state, memo)
+    assert _runner_module.read_pytest_workers(out / _runner_module.WORKERS_FILE) == 8
 
 
 def test_round_live_agents_counts_the_runs_not_the_command_line(tmp_path):
@@ -4537,7 +4568,7 @@ def test_every_prompt_names_the_count_of_that_moment(tmp_path, monkeypatch):
     where it is."""
     _eight_cores(monkeypatch)
     sb = Sandbox(tmp_path)
-    cfg = make_config(["agent-a"])
+    cfg = make_config(["agent-a"], agent_suite_slots=0)
 
     def count_for(live: int) -> int:
         """The runner's own rule, through the runner's own writer."""
