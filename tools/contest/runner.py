@@ -131,6 +131,18 @@ a commit to score, otherwise a fresh session in the same worktree with
 `dirty_on_resume`. A plain `ERROR` and an old `state.json` that has no key both
 read `False`, so nothing that ended for a reason outside the store is restarted
 on a resume that did not mean to.
+
+KC-67 keeps a context overflow for 7 days, in `context_memory.py`, because the
+provider's answer names the size Kilo does not know: round 113 overflowed the
+same model at the same 262 144 tokens three rounds in a row, and KC-54 still
+ends those STALLED. Before every prompt that goes into a session that already
+holds a conversation — a rework, a continue, a retry — this module asks for the
+model's size. Kilo's own `limit.context`, when intake has it, ends the question
+there, because Kilo compacts those on its own; otherwise the smallest size
+remembered for that provider and model is the number, and a session that holds
+`compact_at_percent` of it is compacted first — one `POST /session/{id}/summarize`,
+then the prompt. Every failure degrades to "no remembered size", which is today's
+prompt, and every overflow is recorded whether or not the round ends STALLED.
 """
 
 from __future__ import annotations
@@ -152,6 +164,7 @@ from pathlib import Path
 from typing import Callable
 
 from tools.backoff import save_state
+from tools.contest import context_memory
 from tools.contest.backend import ContestBackend, ContestBackendError
 from tools.contest.gates import declared_files, git
 from tools.contest.harvest import harvest, rework_message
@@ -561,6 +574,13 @@ _OVERFLOW_RE = re.compile(
 #: into a full session is the same 90 %, and reads it from here.
 CONTEXT_FULL_SHARE = 0.9
 
+#: KC-67: the prompt kinds that go into a session which already holds a
+#: conversation — the kinds the runner may compact first. The first prompt of a
+#: run and the first prompt of the fresh session an overflow's work continued in
+#: both start empty, so a fill for either would be a read of the new session,
+#: not the one that overflowed.
+_CONTEXT_GATE_KINDS = ("rework", "continue", "retry")
+
 #: KC-56: the continue sent into the same session when the last reply hit the
 #: *output* limit before any text or tool call — not `continue_message`, which
 #: is about uncommitted files, and the tree may well be clean.
@@ -738,6 +758,84 @@ def _cut_off(backend: ContestBackend, session: SessionRef,
         if context_limit and used >= CONTEXT_FULL_SHARE * context_limit:
             return "context"
         return "output"
+    return None
+
+
+def _context_budget(spec, records) -> tuple:
+    """KC-67: ``(size, source)`` for *spec*'s model, from Kilo's own limit first.
+
+    ``("N", "kilo")`` when intake put the model's own ``limit.context`` on the
+    spec: then Kilo compacts the session on its own and the runner does nothing
+    more with the number, which is why the two sources are told apart. Otherwise
+    the smallest size remembered for that provider and model, ``"remembered"`` —
+    the models the provider declares no limit for, the ones that overflowed.
+    ``("none", "none")`` when there is nothing at all, which is today's prompt
+    and today's overflow.
+    """
+    limit = getattr(spec, "context_limit", None)
+    if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0:
+        return int(limit), "kilo"
+    size = context_memory.smallest_size(records, spec.provider_id, spec.model_id)
+    if size is not None:
+        return int(size), "remembered"
+    return None, "none"
+
+
+def _context_tokens(backend: ContestBackend, session: SessionRef) -> int:
+    """KC-67: the context of the last reply that still went through, in tokens.
+
+    ``input + cache.read + reasoning + output`` of the session's last assistant
+    message that reports any — the same sum KC-56's cut-off reads, so the runner
+    and Kilo size the session the same way. A message that reports none is
+    skipped: Kilo keeps the message it opened for the reply an overflow refused,
+    all zeros (round 114, sn68-var1), and that is not the last reply that went
+    through. ``0`` for every failure: a transcript that cannot be read, or one
+    with no such message yet, is no fill, not an error, and no fill never
+    compacts anything.
+    """
+    try:
+        messages = backend.messages(session)
+    except Exception:  # noqa: BLE001 — a transcript that cannot be read is no fill
+        return 0
+    if not isinstance(messages, list):
+        return 0
+    for message in reversed(messages):
+        info = message.get("info") if isinstance(message, dict) else None
+        if not isinstance(info, dict) or info.get("role") != "assistant":
+            continue
+        tokens = info.get("tokens")
+        used = _tokens_used(tokens) if isinstance(tokens, dict) else 0
+        if used > 0:
+            return used
+    return 0
+
+
+def _summary_tokens(backend: ContestBackend, session: SessionRef) -> int | None:
+    """KC-67: the size of the summary a compact left, in tokens, else ``None``.
+
+    Kilo writes the compact as an assistant message flagged ``summary``; its
+    ``output`` is the summary the next prompt carries instead of the history,
+    so it is what the context shrank to — before the next prompt's own text.
+    ``None`` when there is no such message or it reports nothing: the console
+    then says the size is not known yet, and the next turn's fill shows it.
+    """
+    try:
+        messages = backend.messages(session)
+    except Exception:  # noqa: BLE001 — a transcript that cannot be read is no size
+        return None
+    if not isinstance(messages, list):
+        return None
+    for message in reversed(messages):
+        info = message.get("info") if isinstance(message, dict) else None
+        if not isinstance(info, dict) or info.get("role") != "assistant":
+            continue
+        if not info.get("summary"):
+            return None
+        tokens = info.get("tokens")
+        output = tokens.get("output") if isinstance(tokens, dict) else None
+        if isinstance(output, int) and not isinstance(output, bool) and output > 0:
+            return output
+        return None
     return None
 
 
@@ -1500,6 +1598,41 @@ def _wait_turn(backend: ContestBackend, session: SessionRef, config: ContestConf
     return backend.wait_idle(session, float(config.turn_timeout_sec), **wait_kwargs)
 
 
+def _compact_session(backend: ContestBackend, session: SessionRef, config: ContestConfig,
+                     on_permission, on_question) -> bool:
+    """KC-67: one `POST /session/{id}/summarize`, then the idle it ends in.
+
+    True only when the session went idle after the compact — the only answer
+    that means the history is smaller and the prompt that was coming is safe.
+    Every other outcome is False, and False is today's path: the prompt goes
+    out as it stands, and KC-54 still decides the overflow it may cause.
+
+    A backend without a compact (a subprocess agent, whose session has no
+    server-side history to shrink) returns False at once. A server that refuses
+    the call, a wait that ends in anything but `idle` — a refused compact, a
+    timeout on a session that will not answer, or a raise from either — is
+    False too, with a warning and nothing else: a compact that fails must never
+    end a round, and the caller re-reads no state from it.
+    """
+    compact = getattr(backend, "compact", None)
+    if not callable(compact):
+        return False
+    try:
+        mark_fn = getattr(backend, "mark", None)
+        since = mark_fn() if callable(mark_fn) else None
+        compact(session)
+        idle = _wait_turn(backend, session, config, on_permission=on_permission,
+                          on_question=on_question, since=since)
+        if getattr(idle, "status", None) != "idle":
+            _log.info("compact of %s ended %s, the prompt goes out as it stands",
+                      getattr(session, "id", session), getattr(idle, "status", ""))
+            return False
+        return True
+    except Exception as exc:  # noqa: BLE001 — a failed compact is the prompt as today
+        _log.warning("compact of %s: %s", getattr(session, "id", session), _brief(str(exc)))
+        return False
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # KC-48: the reap — an ended agent leaves no process in its worktree
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1998,6 +2131,117 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
             timer.cancel()
         return not stalled and not backend.interrupted()
 
+    def _memory() -> list:
+        """KC-67: the context overflows this round still remembers — read
+        fail-open, so a memory that is missing, unreadable or broken is no
+        memory and nothing else, never a failed round."""
+        try:
+            return context_memory.load(
+                context_memory.memory_path(config, out_dir),
+                days=context_memory.days_of(config))
+        except Exception as exc:  # noqa: BLE001 — no memory, never a raise
+            _log.warning("%s: context memory: %s", spec.name, _brief(str(exc)))
+            return []
+
+    def _context_gate(turn: dict, kind: str) -> bool:
+        """KC-67: what this session holds before the prompt, and the compact it
+        earns. ``True`` only when one happened, which is the only case where the
+        caller needs a fresh mark for its wait.
+
+        The size is Kilo's own ``limit.context`` when intake has it — then the
+        runner does nothing more with it, because Kilo compacts those models on
+        its own — else the smallest one remembered for this provider and model,
+        else nothing at all. The fill is the last reply that still went through
+        over that size, and a compact happens only for a remembered size and
+        only for a prompt that goes into a session which already holds a
+        conversation: a fresh session holds nothing to compact away.
+
+        The four fields are written whether or not there is a size, so a turn
+        always says what it knew: ``context_size``, ``context_source``,
+        ``fill`` and ``compacted``.
+        """
+        size, source, fill = None, "none", None
+        try:
+            size, source = _context_budget(spec, _memory())
+            tokens = _context_tokens(backend, session)
+            if size:
+                fill = tokens * 100.0 / float(size)
+        except Exception as exc:  # noqa: BLE001 — no size, the prompt as today
+            _log.warning("%s: context: %s", spec.name, _brief(str(exc)))
+            size, source, fill = None, "none", None
+        turn["context_size"] = size
+        turn["context_source"] = source
+        turn["fill"] = round(fill, 1) if isinstance(fill, float) else None
+        turn["compacted"] = False
+        if kind not in _CONTEXT_GATE_KINDS:
+            return False
+        percent = context_memory.compact_at_percent(config)
+        if source != "remembered" or not size or percent <= 0:
+            return False
+        if fill is None:
+            return False
+        if fill < percent:
+            # one console line per prompt of a model the memory sizes: the
+            # operator sees the fill grow towards the compact, not only the compact
+            _log.info("%s: context %s tokens = %.1f%% of the %s remembered, "
+                      "below %g%% — no compact before %s",
+                      spec.name, f"{tokens:,}", fill, f"{size:,}", percent, kind)
+            return False
+        _log.info("%s: context %s tokens = %.1f%% of the %s remembered, at %g%% — "
+                  "compacting before %s",
+                  spec.name, f"{tokens:,}", fill, f"{size:,}", percent, kind)
+        started = time.monotonic()
+        if not _compact_session(backend, session, config, on_permission, on_question):
+            _log.info("%s: compact did not finish — the %s prompt goes out as it stands",
+                      spec.name, kind)
+            return False
+        took = time.monotonic() - started
+        after = _summary_tokens(backend, session)
+        turn["compacted"] = True
+        turn["context_before"] = tokens
+        turn["context_after"] = after
+        if after is not None and after < tokens:
+            _log.info("%s: compact finished in %.0f s: context %s -> %s tokens "
+                      "(-%s, -%.0f%%) — the round continues with the %s prompt",
+                      spec.name, took, f"{tokens:,}", f"{after:,}",
+                      f"{tokens - after:,}", (tokens - after) * 100.0 / tokens, kind)
+        else:
+            _log.info("%s: compact finished in %.0f s: context %s tokens before, the "
+                      "size after is not reported yet — the round continues with the "
+                      "%s prompt; the next turn's fill shows it",
+                      spec.name, took, f"{tokens:,}", kind)
+        return True
+
+    def _remember_overflow(error) -> None:
+        """KC-67: one line in the shared memory, for the next round.
+
+        The provider's own numbers — the limit it named, the prompt it named,
+        the last reply that still went through — plus the round and the agent
+        that produced them, so a remembered size always says where it came from.
+        The record is added before the decision KC-54 makes of this overflow, so
+        it is remembered whether the round ends STALLED or READY. A write that
+        fails is a warning and nothing else: the overflow still ends the turn
+        the way it does today, and the line is for the next session, not this
+        one.
+        """
+        try:
+            limit, prompt = context_memory.parse_overflow(_error_message(error))
+            record = context_memory.OverflowRecord(
+                at=time.time(),
+                round=str(out_dir.name or ""),
+                agent=spec.name,
+                provider=spec.provider_id,
+                model=spec.model_id,
+                limit=limit,
+                last_ok=_context_tokens(backend, session),
+                prompt=prompt,
+            )
+            if not context_memory.add(context_memory.memory_path(config, out_dir),
+                                      record, days=context_memory.days_of(config)):
+                _log.warning("%s: context memory: not written", spec.name)
+        except Exception as exc:  # noqa: BLE001 — the overflow still ends the turn
+            _log.warning("%s: context memory: %s", spec.name, _brief(str(exc)))
+
     try:
         # ── CREATED: one session, kept for every turn ─────────────────────
         try:
@@ -2060,6 +2304,12 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
             # turn can come before it and every event of an earlier one does
             mark_fn = getattr(backend, "mark", None)
             since = mark_fn() if callable(mark_fn) else None
+            # KC-67: the session may already hold more than the model can take —
+            # the size came from the memory, not from Kilo, so Kilo will not
+            # compact it for us. A mark is re-taken when a compact did happen,
+            # so the compact's own idle is not this turn's idle.
+            if _context_gate(turn, kind):
+                since = mark_fn() if callable(mark_fn) else None
             try:
                 # KC-65: the worker count of this moment, as the last lines of
                 # the message. This one send carries the first prompt, a
@@ -2127,6 +2377,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
             elif idle.status == "error":
                 overflow = _is_overflow(idle.error)
                 if overflow:
+                    _remember_overflow(idle.error)
                     # KC-54: the overflow has filled this session's context, so
                     # a prompt into it overflows again — never RETRY_PROMPT here,
                     # even when the provider flags the error retryable. The work

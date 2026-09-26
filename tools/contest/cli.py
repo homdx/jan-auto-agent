@@ -65,7 +65,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from tools.contest import gates
+from tools.contest import context_memory, gates
 from tools.contest.backend import KiloBackend, OpenRouterBackend
 from tools.contest.kilo_client import (
     KiloClient,
@@ -1650,6 +1650,21 @@ def _agent_env(workers: int) -> dict:
     }
 
 
+def _context_memory_lines(config: ContestConfig, out_dir: Path) -> list[str]:
+    """KC-67: one plan line per model that has a remembered context size.
+
+    Read fail-open: a memory that is missing, unreadable or broken is no line,
+    and the plan prints what it already prints rather than refusing to print.
+    """
+    try:
+        records = context_memory.load(context_memory.memory_path(config, out_dir),
+                                      days=context_memory.days_of(config))
+    except Exception:  # noqa: BLE001 — no memory is no line, never a failed plan
+        return []
+    return context_memory.plan_lines(records, config.agents,
+                                     percent=context_memory.compact_at_percent(config))
+
+
 def _print_plan(result: Intake, config: ContestConfig, out_dir: Path, *, run_tests: bool,
                 workers: int | None = None, workers_fixed: bool = False,
                 agent_tmp: Path | None = None) -> None:
@@ -1676,6 +1691,11 @@ def _print_plan(result: Intake, config: ContestConfig, out_dir: Path, *, run_tes
             # record that the ids were ever registered
             print("registered for this round (kilo.jsonc untouched): "
                   + ", ".join(result.registered))
+        if key == "agents":
+            # KC-67: the models the round knows the size of from a past overflow
+            # — the only ones the runner will compact itself
+            for line in _context_memory_lines(config, out_dir):
+                print(line)
 
 
 def cmd_run(args: argparse.Namespace) -> int:

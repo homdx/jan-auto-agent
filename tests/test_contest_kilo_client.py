@@ -1530,6 +1530,28 @@ def test_prompt_sends_the_model_in_prompt_async_shape(tmp_path):
                for p in prompts)
 
 
+def test_compact_posts_to_summarize_with_the_prompt_async_model_shape(tmp_path):
+    """KC-67's compact is ``POST /session/{id}/summarize`` — the ``{"providerID",
+    "modelID"}`` shape prompt_async sends, not the ``{"providerID", "id"}`` of
+    create_session, and ``auto`` left on so the server keeps what it keeps."""
+    with _probe(tmp_path, {"turns": [{"events": ["busy", "idle"], "assistant": "done"}]}) as h:
+        h.client.compact(h.session)
+        (call,) = h.fake.calls(method="POST", path="/summarize")
+
+    assert call["body"] == {"providerID": "kenary", "modelID": "hy3:free", "auto": True}
+    assert call["query"]["directory"] == h.directory
+    # nothing comes back to the caller: the session compacts, then goes idle
+    assert h.fake.events_of("session.compacted")
+
+
+def test_compact_raises_when_the_server_refuses_it(tmp_path):
+    with _probe(tmp_path, {"turns": [{"events": ["busy", "idle"], "assistant": "done"}],
+                           "summarize_status": 500}) as h:
+        with pytest.raises(KiloHttpError):
+            h.client.compact(h.session)
+    assert not h.fake.events_of("session.compacted")
+
+
 def test_create_session_with_agent_sends_the_agent(tmp_path):
     with _probe(tmp_path, {"turns": [{"events": ["busy", "idle"], "assistant": "done"}]},
                 agent="build") as h:

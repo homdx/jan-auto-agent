@@ -182,7 +182,7 @@ def test_the_protocol_names_every_method_a_backend_has_to_own():
     """A method dropped from a backend shows up here, not on the first round."""
     required = {"wait_ready", "create_session", "prompt", "mark", "abort", "interrupt",
                 "interrupted", "wait_idle", "tool_parts", "session_info",
-                "messages", "close"}
+                "messages", "compact", "close"}
     protocol_methods = {name for name in dir(ContestBackend) if not name.startswith("_")}
     assert required == protocol_methods, protocol_methods ^ required
     for name in required:

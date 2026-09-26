@@ -44,13 +44,14 @@ opens a network connection.
 from __future__ import annotations
 
 import configparser
+import math
 import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from tools.auto.llm_profile import LlmSettings, resolve_llm_profile
-from tools.config_safe import safe_getint
+from tools.config_safe import safe_getfloat, safe_getint
 
 __all__ = [
     "AGENT_KEYS",
@@ -121,6 +122,9 @@ CONTEST_KEYS = (
     "workspace_kind",
     "variant",
     "probe_ttl_days",
+    "context_memory_file",
+    "context_memory_days",
+    "compact_at_percent",
 )
 
 #: Every key an agent section may carry.
@@ -328,6 +332,18 @@ class ContestConfig:
     gate_deadline_sec: float = 600.0
     out_dir: str = "contest-out"
     rounds_dir: str = "../rounds"
+    #: KC-67: the context overflow a model has already given, remembered for
+    #: ``context_memory_days`` so the next session of it compacts before it
+    #: overflows again. A path; ``""`` is the default next to the rounds' output
+    #: — ``<out_dir>/../context-memory.json``, shared by every round.
+    context_memory_file: str = ""
+    #: KC-67: how many days an overflow is remembered. 0 turns the memory off,
+    #: which is today's behaviour: every round overflows again the same way.
+    context_memory_days: float = 7.0
+    #: KC-67: the fill, as a percent of the remembered size, at which the runner
+    #: compacts a session whose model has no limit of its own. Kilo compacts
+    #: those on its own; 0 turns the runner's compact off.
+    compact_at_percent: float = 80.0
     #: KC-59: how ``prepare_round`` builds each agent's checkout — one of
     #: ``WORKSPACE_KINDS``. ``clone`` (the default) makes a fresh local clone
     #: per agent, ``worktree`` keeps the pre-KC-59 worktree per agent.
@@ -548,6 +564,20 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
     def list_(key: str) -> tuple[str, ...]:
         return _split_list(parser.get("contest", key, fallback=""))
 
+    def num(key: str, default: float) -> float:
+        """KC-67: the memory's numbers, read where a typo must not fail the
+        intake — the round would rather run with the default than refuse to
+        start because ``context_memory_days`` has letters in it. ``safe_getfloat``
+        already answers a malformed value with *default*, and 0 is what both
+        keys mean when they are set to it: no memory, no compact. A value below
+        zero or beyond it is 0 too, which is the mechanism off rather than a
+        nonsense number the runner has to defend against.
+        """
+        value = safe_getfloat(parser, "contest", key, fallback=default)
+        if not math.isfinite(value) or value <= 0:
+            return 0.0
+        return value
+
     if backend not in BACKENDS:
         raise RosterError(
             f"[contest] backend must be one of {' | '.join(BACKENDS)}, got {backend!r}")
@@ -603,6 +633,12 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
         raise RosterError(f"[contest] pytest_workers_few must be >= 1, got {pytest_workers_few}")
     if pytest_workers_min < 1:
         raise RosterError(f"[contest] pytest_workers_min must be >= 1, got {pytest_workers_min}")
+
+    # KC-67: the context memory — the two numbers a round reads before it prompts
+    # into a session it cannot size itself. Both fall back to the default, and 0
+    # is what either means when it is set to it: no memory, no compact.
+    context_memory_days = num("context_memory_days", 7.0)
+    compact_at_percent = num("compact_at_percent", 80.0)
 
     openrouter_settings = None
     if backend == "openrouter":
@@ -660,6 +696,9 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
         gate_deadline_sec=seconds("gate_deadline_sec", 600.0),
         out_dir=scalar("out_dir", "contest-out"),
         rounds_dir=scalar("rounds_dir", "../rounds"),
+        context_memory_file=scalar("context_memory_file", ""),
+        context_memory_days=context_memory_days,
+        compact_at_percent=compact_at_percent,
         workspace_kind=workspace_kind,
         variant=scalar("variant", "highest") or "highest",
         probe_ttl_days=int(scalar("probe_ttl_days", "7") or "7"),

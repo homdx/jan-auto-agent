@@ -103,6 +103,7 @@ _RE_SESSION = re.compile(r"^/session$")
 _RE_SESSION_GET = re.compile(r"^/session/([^/]+)/((?:message|diff)(?:/.*)?)$")
 _RE_SESSION_BY_ID = re.compile(r"^/session/([^/]+)$")
 _RE_PROMPT = re.compile(r"^/session/([^/]+)/prompt_async$")
+_RE_SUMMARIZE = re.compile(r"^/session/([^/]+)/summarize$")
 _RE_ABORT = re.compile(r"^/session/([^/]+)/abort$")
 _RE_PERMISSION_REPLY = re.compile(r"^/permission/([^/]+)/reply$")
 _RE_PERMISSION_LEGACY = re.compile(r"^/session/([^/]+)/permissions/([^/]+)$")
@@ -414,6 +415,28 @@ class FakeKiloServer:
                                    "model": model, "agent": agent}})
         return {"id": sid, "title": info.get("title"), "model": model, "agent": agent}
 
+    def _compact(self, session: _Session) -> None:
+        """KC-67: the server-side compact — one ``session.compacted``, then idle.
+
+        Nothing is sent back to the caller. Kilo writes the summary as an
+        assistant message flagged ``summary``; ``summary_tokens`` in the
+        scenario is its ``output`` — the size the history shrank to. Without
+        the key no message is written, the way a server that reports nothing
+        looks to the runner.
+        """
+        summary = self.scenario.get("summary_tokens")
+        if summary is not None:
+            session.messages.append({
+                "info": {"role": "assistant", "sessionID": session.id,
+                         "time": time.time(), "summary": True,
+                         "tokens": {"input": 0, "output": int(summary), "reasoning": 0,
+                                    "cache": {"read": 0, "write": 0}}},
+                "parts": [{"type": "text", "text": "summary"}]})
+        self._emit({"type": "session.compacted",
+                    "properties": {"sessionID": session.id}})
+        self._emit({"type": "session.idle",
+                    "properties": {"sessionID": session.id}})
+
     def _permission_event(self, session: _Session, spec: dict) -> tuple:
         pid = self._next_id("per")
         spec = dict(spec or {})
@@ -589,6 +612,12 @@ class FakeKiloServer:
             if isinstance(error, str):
                 error = {"name": error, "message": error}
             session.info["error"] = error
+            # KC-67: Kilo keeps the assistant message it opened for the refused
+            # reply — all-zero tokens, no finish (round 114, sn68-var1)
+            if turn.get("message_info") is not None:
+                info = {"role": "assistant", "sessionID": session.id, "time": time.time()}
+                info.update(turn["message_info"])
+                session.messages.append({"info": info, "parts": []})
             self._emit({"type": "session.error",
                         "properties": {"sessionID": session.id, "error": error}})
             # KC-63: Kilo 7.6.2 follows a session.error with session.idle
@@ -759,6 +788,20 @@ class _Handler(BaseHTTPRequestHandler):
                                if isinstance(p, dict) and p.get("type") == "text")
             threading.Thread(target=self.fake._run_turn, args=(session, turn, text),
                              daemon=True).start()
+            return self._json(204)
+
+        m = _RE_SUMMARIZE.fullmatch(path)
+        if m:
+            session = self.fake._session(m.group(1))
+            if session is None:
+                return self._not_found(path)
+            # KC-67: `summarize_status` makes the compact refused, so the runner's
+            # fail-open path — prompt anyway, no compact — is reachable
+            status = int(self.fake.scenario.get("summarize_status", 204))
+            if status != 204:
+                return self._json(status, {"error": {"name": "SummarizeError",
+                                                     "message": "compact refused"}})
+            self.fake._compact(session)
             return self._json(204)
 
         m = _RE_ABORT.fullmatch(path)

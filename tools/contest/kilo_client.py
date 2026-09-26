@@ -1183,6 +1183,27 @@ class KiloClient:
         self._check(status, resp, "POST", path)
         return None
 
+    def compact(self, session: SessionRef) -> None:
+        """``POST /session/{id}/summarize`` — the server-side compact (KC-10,
+        called by KC-67): the session's own history is shrunk and nothing comes
+        back to the caller.
+
+        The model is ``{"providerID", "modelID"}``, the shape :meth:`prompt`
+        sends rather than the ``{"providerID", "id"}`` of :meth:`create_session`,
+        and ``auto`` is the server's own flag for what to keep. The caller waits
+        for the resulting ``session.idle`` through the normal tap — a
+        ``session.compacted`` event precedes it and is recorded in the tap's log.
+        """
+        path = f"/session/{session.id}/summarize"
+        body = {
+            "providerID": session.provider_id,
+            "modelID": session.model_id,
+            "auto": True,
+        }
+        status, resp = self._request("POST", path, body)
+        self._check(status, resp, "POST", path)
+        return None
+
     def delete_session(self, session: SessionRef) -> None:
         """``DELETE /session/{id}`` — 200 on 7.6.2; KC-49's variant probe
         removes each throwaway session with it."""

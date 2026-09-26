@@ -160,6 +160,18 @@ class ContestBackend(Protocol):
 
     def prompt(self, session: SessionRef, text: str) -> None: ...
 
+    def compact(self, session: SessionRef) -> None:
+        """KC-67: shrink this session's own history server-side, before the next
+        prompt — ``POST /session/{id}/summarize``, KC-10's call.
+
+        A backend that has no session on a server to compact does not raise: it
+        returns without changing anything, and the runner sends the prompt that
+        was coming anyway. A server that refuses the call raises
+        :class:`ContestBackendError` like :meth:`prompt`; the runner treats both
+        as "no compact", never as a failed round.
+        """
+        ...
+
     def mark(self) -> int | None:
         """KC-63: a position in this backend's event stream, taken before a
         prompt; ``None`` when the backend has no shared stream."""
@@ -319,6 +331,12 @@ class KiloBackend:
     def prompt(self, session: SessionRef, text: str) -> None:
         try:
             self._client.prompt(session, text)
+        except KiloHttpError as exc:
+            raise ContestBackendError(str(exc)) from exc
+
+    def compact(self, session: SessionRef) -> None:
+        try:
+            self._client.compact(session)
         except KiloHttpError as exc:
             raise ContestBackendError(str(exc)) from exc
 
@@ -536,6 +554,14 @@ class OpenRouterBackend:
                                          "sessionID": session.id,
                                          "time": time.time()},
                                 "parts": [{"type": "text", "text": text}]})
+
+    def compact(self, session: SessionRef) -> None:
+        # The subprocess agent holds its own transcript and there is no session on a
+        # server to compact: it keeps every message it has ever had, so the runner's
+        # context fill (KC-67) never sees a size for it and never compacts it.
+        # Nothing changes, by design — the runner reads no fill out of a session
+        # that reports no tokens, which is "no collect data", not a failure.
+        return None
 
     def mark(self) -> int | None:
         # KC-63: each session reads its own subprocess stdout, so no other
