@@ -932,6 +932,58 @@ def test_a_permission_in_a_full_context_is_refused_and_the_next_prompt_compacts(
                for l in lines), lines
 
 
+class _AbortErrorFake(_FullFake):
+    """Kilo as round 49 saw it: the abort after the refusal lands while the next
+    step has already started, and the turn ends in `session.error:
+    MessageAbortedError` before its idle — not in a plain idle."""
+
+    def _run_turn(self, session, turn, text):
+        if not turn.get("abort_error"):
+            return super()._run_turn(session, turn, text)
+        plain = {k: v for k, v in turn.items() if k not in ("abort_error", "delay")}
+        super()._run_turn(session, dict(plain, idle=False), text)
+        until = time.monotonic() + 10
+        while not session.aborted and time.monotonic() < until:
+            time.sleep(0.05)
+        self._emit({"type": "session.error", "properties": {
+            "sessionID": session.id,
+            "error": {"name": "MessageAbortedError", "data": {"message": "Aborted"}}}})
+        self._emit({"type": "session.idle", "properties": {"sessionID": session.id}})
+
+
+def test_the_runner_s_own_abort_for_a_full_context_is_not_an_error(tmp_path, caplog):
+    """Round 49: the stop KC-69 sends after a refusal comes back as
+    `MessageAbortedError`; the turn is a plain idle and the next prompt
+    compacts — not ERROR, not Kilo's shutdown."""
+    caplog.set_level("INFO", logger="tools.contest.runner")
+    memory = _memory(tmp_path, limit=SIZE, last_ok=None)
+    scenario = {"summary_tokens": 12_000, "turns": [
+        dict(tr._permission_turn(tr.work_no_test, ["/var/lib/*"]), abort_error=True),
+        {"on_prompt": tr.work_ready, "events": ["busy", "idle"]},
+    ]}
+    sb = tr.Sandbox(tmp_path)
+    with _AbortErrorFake(scenario) as fake:
+        run = tr.Harness(sb, fake, _config(tmp_path, memory=memory)).go()
+    tr._assert_ready(run, sb.ws("agent-a"))
+
+    assert not run.resumable
+    first, second = run.turns[0], run.turns[1]
+    assert first["idle_status"] == "idle" and first["context_aborted"] is True
+    assert second["kind"] in runner_mod._CONTEXT_GATE_KINDS
+    assert second["context_refused"] is True and second["compacted"] is True
+    assert _summarize_path(run.session_id) in [path for path, _ in _posts(fake)]
+    assert not any("aborted by Kilo" in r.getMessage() for r in caplog.records)
+
+
+def test_a_message_aborted_error_with_no_context_stop_is_still_kilo_s(tmp_path):
+    """Round 87 unchanged: an abort the runner never sent is Kilo's shutdown —
+    ERROR, and `resumable` for `--resume`."""
+    err = {"name": "MessageAbortedError", "data": {"message": "Aborted"}}
+    sb, _fake, _h, run, _ = tr._run_one(tmp_path, {"turns": [{"error": err}]})
+    assert run.state is tr.AgentState.ERROR and run.resumable
+    assert "context_aborted" not in run.turns[0]
+
+
 def test_a_permission_below_the_threshold_is_decided_as_today_with_its_fill(tmp_path, caplog):
     """KC-69: under the threshold the policy decides; the line still says the fill."""
     caplog.set_level("INFO", logger="tools.contest.runner")

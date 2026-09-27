@@ -192,6 +192,7 @@ prompt, and every overflow is recorded whether or not the round ends STALLED.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import os
@@ -737,8 +738,10 @@ def _is_external_abort(error) -> bool:
     """Round 87: True when *error* is Kilo's `MessageAbortedError`.
 
     The runner never ends a turn this way itself. Its own stops come back as
-    `stalled`, or as its own `ProviderQuota` / `ProviderUnavailable`. So an
-    abort that reaches a turn was Kilo's: its server shut down (the Ctrl-C that
+    `stalled`, or as its own `ProviderQuota` / `ProviderUnavailable` — and
+    KC-69's stop for a full context, which `run_agent` reads as a plain idle
+    before this is asked (round 49). So any other abort that reaches a turn
+    was Kilo's: its server shut down (the Ctrl-C that
     stops the round reaches `kilo serve` in the same process group) and it
     aborted every session it held on the way out.
     """
@@ -3085,6 +3088,11 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
     # KC-69: the pending abort of a turn refused for a full context — cancelled
     # when the turn ends first, so it can never hit the compact that follows
     context_stopper: list = []
+    # round 49: set when that abort was actually sent in this turn — the
+    # `MessageAbortedError` it may bring back is the runner's own stop, not
+    # Kilo's shutdown, so the turn ends as a plain idle and the next prompt
+    # compacts
+    context_aborted = [False]
     # KC-58: the round's suite slots, armed once per agent — the queue is shared
     # round-wide, so every agent answers from one semaphore, and a config that
     # names no key arms the ticket's default of one.
@@ -3216,8 +3224,11 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                 # compacts first.
                 _log.info("%s: context full at a permission — stopping the turn to "
                           "compact before the next prompt", spec.name)
-                stopper = threading.Timer(CONTEXT_ABORT_DELAY_SEC, _abort_quietly,
-                                          args=(backend, session))
+                def _stop_for_context(target=session):
+                    context_aborted[0] = True
+                    _abort_quietly(backend, target)
+
+                stopper = threading.Timer(CONTEXT_ABORT_DELAY_SEC, _stop_for_context)
                 stopper.daemon = True
                 context_stopper.append(stopper)
                 stopper.start()
@@ -3695,6 +3706,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
             # churn is progress, not a stopped turn.
             clock = _turn_deadline(run, config, working)
             run._turn_clock = clock
+            context_aborted[0] = False
             try:
                 idle = _wait_turn(backend, session, config,
                                   on_permission=on_permission, on_question=on_question,
@@ -3703,6 +3715,21 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                 run._turn_clock = None
                 while context_stopper:
                     context_stopper.pop().cancel()
+            if (context_aborted[0] and idle.status == "error"
+                    and _is_external_abort(idle.error)):
+                # round 49 (sensenova-6-8-flash-lite-var1, at 82.5 %): the
+                # abort KC-69 sends after a refusal for a full context landed
+                # while Kilo had already started the next step, and Kilo
+                # answered it with `session.error: MessageAbortedError` before
+                # the idle — not the plain `session.idle` KC-69 saw live. That
+                # read as an ERROR (and as Kilo's own shutdown), and the agent
+                # ended there instead of compacting. It is the runner's own
+                # stop: the turn ended, and the next prompt compacts first.
+                _log.info("%s: the turn stopped for a full context ended in "
+                          "MessageAbortedError — the runner's own abort, a plain idle",
+                          spec.name)
+                turn["context_aborted"] = True
+                idle = dataclasses.replace(idle, status="idle", error=None)
             turn["idle_at"] = time.time()
             turn["idle_status"] = idle.status
             stale = int(getattr(idle, "stale_skipped", 0) or 0)
