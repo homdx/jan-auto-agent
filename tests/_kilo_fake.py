@@ -42,6 +42,12 @@ Everything here is scripted by one scenario dict, per session:
                                      # the session.error, as Kilo 7.6.2 sends
                 "message_info": {...},  # merged into the assistant message's info
                                      # (KC-56: `finish`, `tokens`)
+                "subagent": {        # KC-71: Kilo's `task` tool — a child session
+                    "permission": {...},  # asked by the child, not the session
+                    "question": {...},    # likewise
+                    "work_sec": 3,   # the child beats `busy` this long; the
+                                     # parent says nothing meanwhile
+                },
             },
         ],
         "permission_endpoint_404": true,   # /permission/{id}/reply answers 404,
@@ -568,6 +574,10 @@ class FakeKiloServer:
                                                   "message": turn.get("retry_message", "Upstream temporarily unavailable"),
                                                   "next": int((time.time() + 10) * 1000)}}})
 
+        subagent = turn.get("subagent")
+        if subagent is not None:
+            self._run_subagent(session, subagent)
+
         names = list(turn.get("events") or [])
         for name in names:
             if name in (_POST_IDLE, "idle"):
@@ -647,6 +657,53 @@ class FakeKiloServer:
         if _POST_IDLE in names:
             self._emit({"type": _EVENTS[_POST_IDLE][0],
                         "properties": {"sessionID": session.id}})
+
+    def _run_subagent(self, parent: _Session, spec: dict) -> None:
+        """KC-71: one ``task`` call, the way round 87's mimo-v2-5 made it.
+
+        Kilo runs a subagent in a session of its own: ``session.created`` with
+        ``info.parentID``, then the child's own traffic — its busy beats, its
+        permission and question asks (which block until the reply, like the
+        parent's), its ``session.idle`` and its ``session.turn.close`` with the
+        ``parentID``. The parent emits nothing while the child works. The ask
+        ids that never got a reply land in ``unanswered``, as the parent's do.
+        """
+        spec = dict(spec or {})
+        sid = self._next_id("ses")
+        child = _Session(sid, parent.directory, dict(parent.model), parent.agent,
+                         list(parent.rules), {"id": sid, "parentID": parent.id}, [])
+        with self._lock:
+            self._sessions[sid] = child
+        self._emit({"type": "session.created",
+                    "properties": {"sessionID": sid,
+                                   "info": {"id": sid, "parentID": parent.id,
+                                            "title": "subagent"}}})
+        work = float(spec.get("work_sec") or 0)
+        until = time.monotonic() + work
+        while time.monotonic() < until and not self._stop.is_set():
+            self._emit({"type": "session.status",
+                        "properties": {"sessionID": sid, "status": {"type": "busy"}}})
+            self._sleep(min(self.HOOK_BEAT_S * 5, max(0.0, until - time.monotonic())))
+        if spec.get("permission") is not None:
+            pid, event = self._permission_event(child, spec["permission"])
+            self._emit(event)
+            box = self._pending.get(pid)
+            if box is None or not box["event"].wait(self.reply_timeout):
+                self.unanswered.append(pid)
+            elif box["reply"] is not None:
+                self._emit({"type": "permission.replied",
+                            "properties": {"sessionID": sid, "requestID": pid,
+                                           "reply": box["reply"]}})
+        if spec.get("question") is not None:
+            qid, event = self._question_event(child, spec["question"])
+            self._emit(event)
+            box = self._pending.get(qid)
+            if box is None or not box["event"].wait(self.reply_timeout):
+                self.unanswered.append(qid)
+        self._emit({"type": "session.idle", "properties": {"sessionID": sid}})
+        self._emit({"type": "session.turn.close",
+                    "properties": {"sessionID": sid, "parentID": parent.id,
+                                   "reason": "completed"}})
 
     @staticmethod
     def _event_for(session: _Session, name: str) -> dict | None:

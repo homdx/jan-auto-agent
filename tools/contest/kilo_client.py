@@ -61,7 +61,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable, Literal
 
 __all__ = [
@@ -95,6 +95,36 @@ _SESSION_EVENTS = (
     "question.asked",
     "question.v2.asked",
 )
+
+
+#: KC-71: what a subagent's session asks that only the runner can answer. Its
+#: other events are the agent at work — they reset the silence clock — and its
+#: own `session.idle` / `session.error` are the subagent's, never the turn's.
+_CHILD_ASKS = (
+    "permission.asked",
+    "permission.v2.asked",
+    "question.asked",
+    "question.v2.asked",
+)
+
+
+def _child_session(event: dict, parents) -> str | None:
+    """KC-71: the id of a session *event* announces as a child of *parents*.
+
+    Kilo's ``task`` tool runs a subagent in a session of its own, and
+    ``session.created`` / ``session.updated`` carry it as ``info.id`` with
+    ``info.parentID`` naming the session that started it. ``None`` for every
+    other event, and for a session whose parent is not one of *parents*.
+    """
+    if event.get("type") not in ("session.created", "session.updated"):
+        return None
+    info = (event.get("properties") or {}).get("info")
+    if not isinstance(info, dict):
+        return None
+    child, parent = info.get("id"), info.get("parentID")
+    if isinstance(child, str) and child and parent in parents:
+        return child
+    return None
 
 
 def _is_busy(event: dict) -> bool:
@@ -1477,6 +1507,12 @@ class KiloClient:
             retries_limit = None
         permissions: list = []
         questions: list = []
+        # KC-71: the sessions this one started with Kilo's `task` tool, and
+        # theirs. Round 87: mimo-v2-5's subagent asked `external_directory` at
+        # 301 s, nobody answered a session that was not the agent's own, the
+        # subagent waited, the agent waited on it, and at 1010 s the silence
+        # clock called the agent STALLED — 0 files, 0 permissions counted.
+        children: set = set()
 
         def wanted(event: dict) -> bool:
             nonlocal saw_busy
@@ -1485,8 +1521,15 @@ class KiloClient:
                 # a tap-level event: it has no sessionID, and it applies to
                 # whatever stream this tap is reading
                 return True
-            if (event.get("properties") or {}).get("sessionID") != session_id:
-                return False
+            child = _child_session(event, children | {session_id})
+            if child is not None:
+                children.add(child)
+            event_session = (event.get("properties") or {}).get("sessionID")
+            if event_session != session_id:
+                # KC-71: a subagent's ask is answered as the agent's own, and
+                # with the silence clock on its work is the agent's work
+                return event_session in children and (
+                    etype in _CHILD_ASKS or silence is not None)
             if not saw_busy and _is_busy(event):
                 # KC-63: noted here, before the filter, so it is seen with the
                 # silence clock off too; it changes no result
@@ -1544,6 +1587,17 @@ class KiloClient:
 
             etype = event.get("type")
             props = event.get("properties") or {}
+            # KC-71: an event of a subagent's session — its asks are answered
+            # below like the agent's own, on the subagent's session
+            asker = session
+            if props.get("sessionID") in children:
+                if etype not in _CHILD_ASKS:
+                    # the subagent working: the clock was reset above, and a
+                    # `bash` it runs holds the clock open as the agent's would
+                    if etype == "message.part.updated":
+                        _track_open_part(open_parts, props.get("part"), last_seen)
+                    continue
+                asker = replace(session, id=props["sessionID"])
 
             if etype == "message.part.updated":
                 # KC-47: an open `bash` part widens the silence bound, and the
@@ -1561,7 +1615,7 @@ class KiloClient:
             if etype in ("permission.asked", "permission.v2.asked"):
                 try:
                     reply, message, granted = _permission_answer(on_permission(event))
-                    self.reply_permission(session, props.get("id"), reply, message)
+                    self.reply_permission(asker, props.get("id"), reply, message)
                     # KC-66: the gate's own waits are the agent's time, not the
                     # gate's — grant them back before the loop re-measures the
                     # deadline on the pass that follows. KC-58: so is a
