@@ -2718,7 +2718,13 @@ def test_a_retry_after_an_error_waits_for_its_own_idle(tmp_path):
         {"events": ["busy"], "error": dict(_INTERRUPTED_STREAM), "idles_after_error": 2},
         {"on_prompt": _work_ready_late, "events": ["busy", "idle"]},
     ]}
-    sb, fake, _h, run, _ = _run_one(tmp_path, scenario, _make_retry_config())
+    # A backoff of 1 s, not the 0 of `_make_retry_config`: at 0 the retry's
+    # mark could be taken before the tap had read the two leftover idles off
+    # the stream (1 in 48 under 16 parallel runs), so they landed after the
+    # mark and passed for the retry's own. Live the backoff is 15 s; what this
+    # pins is the mark, and the leftovers must be in the tap for it to matter.
+    sb, fake, _h, run, _ = _run_one(tmp_path, scenario,
+                                    _make_retry_config(error_retry_backoff_sec=1))
     _assert_ready(run, sb.ws("agent-a"))
     assert [t["kind"] for t in run.turns] == ["initial", "retry"]
     assert run.turns[0]["idle_status"] == "error"
