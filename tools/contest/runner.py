@@ -197,6 +197,7 @@ round ends STALLED.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import logging
 import os
@@ -1473,6 +1474,23 @@ class AgentRun:
     #: KC-9: the per-attempt counter of continues sent into the same session.
     #: Bounded by `max_continues_per_attempt`; reset on rework and resume.
     continues: int = 0
+    #: KC-39: how many sessions this run has opened in all — the first one
+    #: `run_agent` made and every replacement since. What `state.json` and
+    #: SUMMARY's `sessions` column print, so the operator sees which agent spent
+    #: a second session. `0` for a run that opened none, and for a `state.json`
+    #: written before the key.
+    sessions: int = 0
+    #: KC-39: how many of them the attempt that is running now has opened.
+    #: `max_sessions_per_attempt` is the ceiling on *this* count, not on
+    #: `sessions`: a rework starts a new attempt and reuses the session, so the
+    #: allowance comes back with it. Reset to 1 at a rework, `0` for a run that
+    #: opened no session yet.
+    sessions_this_attempt: int = 0
+    #: KC-39: `_diff_signature` of the worktree at the *previous* continue of
+    #: this attempt, so a continue may be told apart from the one before it by
+    #: the diff's content, not by its file list. Cleared on rework, on a KC-39
+    #: reset and on a resume, the way `continues` is; `""` for every other run.
+    last_diff_signature: str = ""
     #: KC-10: how many times this run's session was summarised — one per
     #: ``POST /session/{id}/summarize`` that went idle. ``0`` for every run that
     #: never filled a window, and for a `state.json` written before the key.
@@ -1503,7 +1521,9 @@ class AgentRun:
         run = cls(agent=AgentSpec(**data["agent"]), workspace=Workspace(**ws))
         for name in ("session_id", "attempt", "turns", "permissions", "questions",
                      "last_error", "resumable", "commit", "cost", "tokens", "reaped",
-                     "deadline_commit", "continues", "compactions"):
+                      "deadline_commit", "continues", "compactions", "sessions",
+                      "sessions_this_attempt",
+                      "last_diff_signature"):
             if name in data:
                 setattr(run, name, data[name])
         run.deadline_commit = bool(getattr(run, "deadline_commit", False))
@@ -1579,6 +1599,7 @@ class RoundState:
             "model": run.agent.model,
             "state": run.state.value,
             "attempts": run.attempt,
+            "sessions": run.sessions,
             "turns": len(run.turns),
             "permissions": dict(run.permissions),
             "questions": run.questions,
@@ -1853,6 +1874,45 @@ def _dirty_tree(ws: Workspace) -> str:
     return "\n".join(lines)
 
 
+def _diff_signature(ws: Workspace) -> str:
+    """KC-39: the uncommitted work of *ws* as one hash of its *content*.
+
+    ``git add -A -N`` marks every untracked file intent-to-add first — with no
+    pathspec: ``-- ':!runs'`` there makes git refuse the whole add (exit 1,
+    "paths are ignored") whenever the gitignored ``runs/`` exists, which is every
+    live worktree once the agent wrote its progress row — so a file
+    that git does not track yet is in the diff text too, and ``git diff HEAD``
+    then covers the worktree against the branch — staged edits and unstaged
+    ones alike, which bare ``git diff`` (worktree against index) misses once the
+    agent has staged anything. ``runs/`` is excluded, as in `_dirty_tree`: the
+    runner's own progress rows are not the agent's work.
+
+    A hash of the diff text, not of the file list: two continues that touch the
+    same file with different half-finished content must come back different, and
+    two that write the same bytes back must come back equal.
+
+    Returns ``""`` for a clean tree and for every failure — git that is not in a
+    repository yet, a held index, an exit of either command. The caller must read
+    ``""`` as "cannot compare", not "the diff is unchanged": a tree that could
+    not be read must never look like the repeat that opens a new session.
+    """
+    try:
+        staged = run_git(["git", "add", "-A", "-N"], cwd=ws.path)
+        if staged.returncode != 0:
+            # the untracked files would be missing from the diff, and a diff that
+            # can never see them is a constant that looks like a repeat
+            return ""
+        diff = run_git(["git", "diff", "HEAD", "--no-color", "--", ":!runs"], cwd=ws.path)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    if diff.returncode != 0:
+        return ""
+    text = diff.stdout
+    if not text.strip():
+        return ""
+    return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()
+
+
 #: KC-41: the progress columns `scripts/append_task.py` writes, in the same
 #: order. The deadline row is that script's row, written by the runner.
 _PROGRESS_COLUMNS = "ticket,finding,outcome,commit,note"
@@ -1935,6 +1995,28 @@ def _deadline_commit_enabled(config) -> bool:
     """
     value = getattr(config, "deadline_commit", True)
     return True if value is None else bool(value)
+
+
+def _sessions_ceiling(config) -> int:
+    """KC-39: `config.max_sessions_per_attempt`, read fail-open as a count.
+
+    A missing config, a config object without the key and a value that is not an
+    int at all all answer ``0``, which turns the ticket off — today's behaviour,
+    the continue is still granted and the exhausted budget is still harvested in
+    the same session. A ``bool`` is not a count (`True` is `1`, which would arm
+    a ceiling the round never asked for), and a negative one is refused the same
+    way: neither may open a session the round did not budget for. `roster`
+    already clamps a malformed ini value to 0, so this only guards a hand-built
+    config, which is what the tests hold.
+    """
+    value = getattr(config, "max_sessions_per_attempt", 0)
+    if isinstance(value, bool):
+        return 0
+    try:
+        count = int(str(value).strip() or 0)
+    except (TypeError, ValueError):
+        return 0
+    return count if count > 0 else 0
 
 
 def _deadline_reason(state, error, stalled) -> str:
@@ -3169,6 +3251,10 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
     # below, so a tmp_path fixture is not a gate call it did not cost under /tmp.
     agent_tmp_glob = f"{agent_tmp}/*" if agent_tmp is not None else ""
     session: SessionRef | None = None
+    # KC-39: the ids this run has already recorded with `_record_session`, so a
+    # session replaced mid-run is counted once and `finally` does not count the
+    # last one again
+    recorded_sessions: set = set()
     stalled: list = []          # the reason, once the runner's stall edge fired
     time_up: "threading.Timer | None" = None   # the agent's hard limit, `agent_max_sec`
     # KC-58: `[seconds left, as of monotonic]` on that limit once armed — what a
@@ -3392,6 +3478,59 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         transition(state, error, note=note)
         return run
 
+    def _record_once(session_ref: SessionRef | None) -> None:
+        """KC-39: record a session's cost, tokens and transcript — once.
+
+        `finally` records the last session the run held; a session replaced
+        mid-run must be recorded at the moment it is replaced, or its cost and
+        its messages are gone with it. A swap whose ``POST /session`` is refused
+        has already recorded the outgoing session and ``finally`` sees the same
+        one again, so the id is remembered and the second read is skipped —
+        otherwise one session's cost would be counted twice.
+        """
+        if session_ref is None or session_ref.id in recorded_sessions:
+            return
+        recorded_sessions.add(session_ref.id)
+        _record_session(run, backend, session_ref, out_dir)
+
+    def _replace_session(turn: dict, *, reason: str = "") -> str | None:
+        """KC-39: replace the session the work is going on in.
+
+        One helper for every swap: KC-54's overflow (`fresh_session` below),
+        KC-69's swap after a compact that freed nothing (`swap_session`) and
+        KC-39's reset for a continue that repeats its diff. The new session is
+        created with the same provider, model, rules, title and agent as the one
+        it replaces; `run.session_id` and `session` become it, `run.sessions`
+        and `run.sessions_this_attempt` both grow by one, and *turn* carries
+        `session_id` for the one that goes away and `new_session` for the one
+        that replaces it, with `reason` naming in `turns.jsonl` why the swap
+        happened.
+
+        The outgoing session is recorded first — its cost, tokens and messages
+        are added to the run's (§5), since `finally` only sees the last one —
+        then stopped (KC-73's `retire_session`). Returns ``None`` when the swap
+        happened, else the error line for `finish`.
+        """
+        nonlocal session
+        turn["session_id"] = run.session_id
+        if reason:
+            turn["session_reason"] = reason
+        _record_once(session)
+        retire_session(turn)
+        try:
+            session = backend.create_session(
+                spec.provider_id, spec.model_id, rules=config.session_rules(),
+                title=ws.branch, agent=spec.kilo_agent, variant=spec.variant)
+        except (ContestBackendError, ValueError) as exc:
+            return f"POST /session failed: {_brief(str(exc))}"
+        turn["new_session"] = session.id
+        run.session_id = session.id
+        run.sessions += 1
+        # KC-39: the ceiling is per attempt, so a replacement spends one of the
+        # attempt's allowance and is remembered for the one it goes on in.
+        run.sessions_this_attempt += 1
+        return None
+
     def fresh_session(turn: dict, dirty: str) -> str | None:
         """Go on in a new session: the error line if ``POST /session`` failed.
 
@@ -3404,21 +3543,14 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         and with ``new_session`` once there is one. `run.attempt` is left
         alone; the swap spends one of `max_continues_per_attempt`.
         """
-        nonlocal session, continue_text
-        turn["session_id"] = run.session_id
-        retire_session(turn)
-        try:
-            session = backend.create_session(
-                spec.provider_id, spec.model_id, rules=config.session_rules(),
-                title=ws.branch, agent=spec.kilo_agent, variant=spec.variant)
-        except (ContestBackendError, ValueError) as exc:
+        nonlocal continue_text
+        failed = _replace_session(turn)
+        if failed is not None:
             run.turns.append(turn)
             _append_jsonl(agent_dir / "turns.jsonl", {"agent": spec.name, **turn})
-            return f"POST /session failed: {_brief(str(exc))}"
-        turn["new_session"] = session.id
+            return failed
         run.turns.append(turn)
         _append_jsonl(agent_dir / "turns.jsonl", {"agent": spec.name, **turn})
-        run.session_id = session.id
         continue_text = round_prompt(spec.name, ticket_path, ws.base_sha, dirty=dirty,
                                      tmp_dir=scratch_arg, tmp_roots=tuple(tmp_roots))
         run.continues += 1
@@ -3645,16 +3777,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         nonlocal session
         turn["summary_text"] = _summary_text(backend, session)
         turn["swapped_from"] = run.session_id
-        retire_session(turn)
-        try:
-            session = backend.create_session(
-                spec.provider_id, spec.model_id, rules=config.session_rules(),
-                title=ws.branch, agent=spec.kilo_agent, variant=spec.variant)
-        except (ContestBackendError, ValueError) as exc:
-            return f"POST /session failed: {_brief(str(exc))}"
-        turn["new_session"] = session.id
-        run.session_id = session.id
-        return None
+        return _replace_session(turn)
 
     def _context_gate(turn: dict, kind: str) -> str:
         """KC-67 + KC-69: what this session holds before the prompt, and what it
@@ -3796,6 +3919,13 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         except (ContestBackendError, ValueError) as exc:
             return finish(AgentState.ERROR, f"POST /session failed: {_brief(str(exc))}")
         run.session_id = session.id
+        # KC-39: one more session for this run — `+=` because a `--resume` here
+        # is the run's next session, not its first, and the number printed in
+        # `state.json` is how many sessions the agent spent in all. The attempt
+        # this session opens in counts it as its own first, so the ceiling is
+        # compared against `sessions_this_attempt` from one.
+        run.sessions += 1
+        run.sessions_this_attempt = 1
         # The agent's hard limit: `agent_max_sec` from here, whatever the turns,
         # retries and extensions add up to. At the limit the session is aborted
         # the way a stall is, and the tree is left as it stands for the scoring.
@@ -4269,8 +4399,64 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                             # the continue becomes the *next* PROMPTED turn, whose
                             # PROMPTED transition (with "(continue N of M)") runs at
                             # the top of the loop. Record this idle turn as it stands.
+                            # KC-39: before the continue is granted, the diff's
+                            # content is hashed and compared with the previous
+                            # continue's — the file list alone cannot tell a model
+                            # that rewrote the same bytes from one that wrote new
+                            # ones. Only the *last* continue of the budget is
+                            # compared: that is the one whose grant would leave the
+                            # budget spent and the harvest inside this very
+                            # session. ``""`` is a tree that could not be read,
+                            # which is never a repeat.
+                            signature = ""
+                            repeat = False
+                            ceiling = _sessions_ceiling(config)
+                            if dirty and ceiling > 0:
+                                # `max_sessions_per_attempt = 0` turns the ticket
+                                # off: no diff is read and no signature written, so
+                                # `turns.jsonl` cannot be read as "this round was
+                                # comparing diffs"
+                                signature = _diff_signature(ws)
+                                turn["diff_signature"] = signature
+                                previous = getattr(run, "last_diff_signature", "") or ""
+                                repeat = (bool(signature) and signature == previous
+                                          and run.continues + 1 >= budget
+                                          and run.sessions_this_attempt < ceiling)
+                            if repeat:
+                                # KC-39: the budget would be spent on a continue that
+                                # adds nothing, so the work goes on in a session
+                                # that has never seen the loop — `round_prompt` with
+                                # the `git status` lines, KC-22's `--resume` shape,
+                                # triggered live instead of only after a restart.
+                                _log.info("%s: continue %d of %d would repeat the "
+                                          "previous diff (%s) — new session %d of %d",
+                                          spec.name, run.continues + 1, budget,
+                                          signature[:12], run.sessions_this_attempt + 1,
+                                          ceiling)
+                                failed = _replace_session(turn, reason="repeat")
+                                if failed is not None:
+                                    # the outgoing session is aborted and the
+                                    # replacement refused: the run ends here, and
+                                    # the worktree is left as it stands, so
+                                    # `--resume` restarts the agent in it
+                                    run.turns.append(turn)
+                                    _append_jsonl(agent_dir / "turns.jsonl",
+                                                  {"agent": spec.name, **turn})
+                                    run.resumable = True
+                                    return finish(AgentState.ERROR, failed)
+                                run.continues = 0
+                                run.last_diff_signature = ""
+                                run.turns.append(turn)
+                                _append_jsonl(agent_dir / "turns.jsonl",
+                                              {"agent": spec.name, **turn})
+                                continue_text = round_prompt(
+                                    spec.name, ticket_path, ws.base_sha, dirty=dirty,
+                                    tmp_dir=scratch_arg, tmp_roots=tuple(tmp_roots))
+                                continue
                             continue_text = CUT_OFF_MESSAGE if cut else continue_message(dirty)
                             run.continues += 1
+                            if signature:
+                                run.last_diff_signature = signature
                             run.turns.append(turn)
                             _append_jsonl(agent_dir / "turns.jsonl", {"agent": spec.name, **turn})
                             continue
@@ -4389,20 +4575,26 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                                "reasons": [r.code for r in verdict.reasons],
                                "elapsed": round(verdict.elapsed, 1),
                                "waited": round(verdict.waited, 1)}
-            run.turns.append(turn)
-            _append_jsonl(agent_dir / "turns.jsonl", {"agent": spec.name, **turn})
             run.commit = verdict.commit
             label = "tests" if run_tests else "harvest"
             elapsed_str = f"({label} {_age(verdict.elapsed)})"
+            run.turns.append(turn)
+            _append_jsonl(agent_dir / "turns.jsonl", {"agent": spec.name, **turn})
             if verdict.verdict == "READY":
                 return finish(AgentState.READY, note=f"{(run.commit or '')[:12]} {elapsed_str}")
             if run.attempt >= int(config.max_rework):
                 return finish(AgentState.GAVE_UP, "REWORK after the last attempt: "
                               + ", ".join(r.code for r in verdict.reasons if r.blocking))
             run.attempt += 1
-            # KC-22: a rework resets the per-attempt continue counter; KC-62's local
-            # store budget is per turn, not per attempt, so it resets there too.
+            # KC-22: a rework resets the per-attempt continue counter; KC-39's diff
+            # signature with it — the new attempt has nothing to compare a continue
+            # against. KC-62's local store budget is per turn, not per attempt, so
+            # it resets there too.
             run.continues = 0
+            run.last_diff_signature = ""
+            # KC-39: the attempt has just started, so the session it holds is its
+            # first.
+            run.sessions_this_attempt = 1
             local_retries = 0
             transition(AgentState.REWORK, note=f"attempt {run.attempt} {elapsed_str} — "
                        + ", ".join(r.code for r in verdict.reasons))
@@ -4424,19 +4616,73 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
             # the export are about to read.
             _record_reaped(run, spec.name, ws.path)
         if session is not None and run.terminal:
-            _record_session(run, backend, session, out_dir)
+            _record_once(session)
+
+
+def _add_tokens(total: dict | None, part: dict) -> dict:
+    """KC-39: two sessions' token dicts, added key by key.
+
+    The dict is the session's own shape — `input`, `output`, `reasoning`,
+    `total`, and the nested `cache` — so a value that is itself a dict is added
+    recursively, a number is summed, and anything else is replaced: a `None`
+    from the newer session wins, which is what "the session reported nothing
+    here" means, rather than a sum with it.
+    """
+    out = dict(total) if isinstance(total, dict) else {}
+    for key, value in part.items():
+        if isinstance(value, dict):
+            out[key] = _add_tokens(out.get(key), value)
+            continue
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            previous = out.get(key, 0)
+            if isinstance(previous, (int, float)) and not isinstance(previous, bool):
+                out[key] = previous + value
+            else:
+                out[key] = value
+        else:
+            out[key] = value
+    return out
 
 
 def _record_session(run: AgentRun, backend: ContestBackend, session: SessionRef, out_dir: Path) -> None:
-    """Cost, tokens and the transcript of a finished session. Fail-open."""
+    """KC-39: the cost, tokens and transcript of one session of an attempt.
+
+    An attempt may hold more than one session — KC-39 opens a new one when a
+    continue repeats the diff, or when a rework would not fit in the window the
+    session already fills — so nothing here overwrites what an earlier session
+    of the same attempt already put down: `run.cost` and `run.tokens` are sums
+    across the attempt's sessions, and this session's messages are appended to
+    the transcript the earlier ones wrote, so a replacement never erases the
+    session it replaced. One session is today's behaviour: the sum is its own
+    number and the file is its own message list.
+
+    Fail-open throughout, the way the call at the end of `run_agent` is: a
+    session recorded at the moment it is replaced may already be gone, and a
+    round must not die for that.
+    """
     try:
         info = backend.session_info(session)
-        run.cost = info.get("cost")
-        run.tokens = info.get("tokens")
+        cost = info.get("cost") if isinstance(info, dict) else None
+        if isinstance(cost, (int, float)) and not isinstance(cost, bool):
+            run.cost = round((run.cost or 0) + float(cost), 6)
+        tokens = info.get("tokens") if isinstance(info, dict) else None
+        if isinstance(tokens, dict):
+            run.tokens = _add_tokens(run.tokens, tokens)
     except Exception as exc:  # noqa: BLE001 — the server may be gone
         _log.warning("session_info(%s) failed: %s: %s", session.id, type(exc).__name__, exc)
     try:
-        _write_json(out_dir / f"{run.agent.name}.session.json", backend.messages(session))
+        messages = backend.messages(session)
+        path = out_dir / f"{run.agent.name}.session.json"
+        existing: list = []
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, list):
+                existing = loaded
+        except (OSError, ValueError):
+            existing = []   # no transcript yet, or one a reader cannot parse
+        if isinstance(messages, list):
+            existing.extend(messages)
+        _write_json(path, existing)
     except Exception as exc:  # noqa: BLE001
         _log.warning("messages(%s) failed: %s: %s", session.id, type(exc).__name__, exc)
 
@@ -4474,6 +4720,14 @@ def _plan(config: ContestConfig, workspaces: list, ticket_path: Path,
             else:
                 run.state, run.session_id, run.attempt = AgentState.CREATED, None, 0
                 run.continues = 0
+                # KC-39: the restart opens a new session in a new attempt, so the
+                # attempt's allowance comes back with it. The run's total is left
+                # as it is — those sessions were spent by this agent too — and
+                # the signature is cleared: a diff recorded before the round died
+                # must not be read as a repeat by the first continue of the
+                # restart, which would open a session the ticket did not ask for.
+                run.sessions_this_attempt = 0
+                run.last_diff_signature = ""
                 # KC-22, `--resume` into a worktree that still holds the agent's
                 # uncommitted work: the fresh session learns of it on its first
                 # prompt. A clean tree (or one with a commit under it) carries no

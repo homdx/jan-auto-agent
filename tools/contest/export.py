@@ -291,7 +291,7 @@ def write_entrants(out_dir, base_sha, state, paths, *, repo=None) -> Path | None
 
 #: The table's columns, in order: `state.table_rows()`'s keys, one per cell.
 _TABLE_COLUMNS = (
-    "name", "model", "state", "attempts", "turns", "asked", "allowed", "rejected",
+    "name", "model", "state", "attempts", "sessions", "turns", "asked", "allowed", "rejected",
     "gated", "gate-failed", "questions", "cost", "tokens in", "tokens out",
     "fill%", "compactions", "commit", "last reason", "file",
 )
@@ -401,6 +401,7 @@ def render_table(state, paths) -> list:
             row.get("model"),
             row.get("state"),
             row.get("attempts"),
+            _number(row.get("sessions")),
             row.get("turns"),
             _number(permissions.get("asked")),
             _number(permissions.get("allowed")),

@@ -66,6 +66,7 @@ from tools.contest.runner import (  # noqa: E402
     CONTEXT_FULL_SHARE,
     CUT_OFF_MESSAGE,
     TreeReadError,
+    _diff_signature,
     _cut_off,
     _finished_replies,
     _is_overflow,
@@ -208,6 +209,17 @@ def work_edit_no_commit(directory, text):
     with uncommitted work (KC-22)."""
     _write(Path(directory) / "pkg" / "thing.py",
            f"def thing():\n    return 7  # {time.time()}\n")
+
+
+#: KC-39: the bytes a stuck model writes back on every turn, unchanged.
+_REPEAT_BYTES = "def thing():\n    return 7\n"
+
+
+def work_edit_same(directory, text):
+    """Edit a file but commit nothing, writing the *same* bytes every time
+    (KC-39): the file list is unchanged from one continue to the next, and so is
+    the diff — which `_dirty_tree` cannot see but `_diff_signature` can."""
+    _write(Path(directory) / "pkg" / "thing.py", _REPEAT_BYTES)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2243,6 +2255,273 @@ def test_max_continues_zero_harvests_a_dirty_idle_turn_at_once(tmp_path):
     assert run.turns[0]["kind"] == "initial"
     assert run.turns[0]["harvest"]["verdict"] == "REWORK"
     assert [t["kind"] for t in run.turns if t["kind"] == "continue"] == []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KC-39: a continue whose diff repeats the previous one opens a new session
+
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_diff_signature_hashes_the_content_not_the_file_list(tmp_path):
+    """Same file list, different bytes → different signatures; an added
+    untracked file → a different one; a clean tree → ``""``."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "user.email", "t@example.invalid")
+    _git(repo, "config", "user.name", "t")
+    _write(repo / ".gitignore", "runs/\n")
+    _write(repo / "pkg" / "thing.py", "def thing():\n    return 1\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "base")
+    ws = Workspace(agent="agent-a", path=repo, branch="main",
+                   base_sha=_git(repo, "rev-parse", "HEAD"), kind="worktree")
+
+    assert _diff_signature(ws) == ""           # a clean tree
+    _write(repo / "pkg" / "thing.py", "def thing():\n    return 2\n")
+    first = _diff_signature(ws)
+    assert first and len(first) == 64
+    _write(repo / "pkg" / "thing.py", "def thing():\n    return 3\n")
+    second = _diff_signature(ws)               # the same file, other bytes
+    assert second and second != first
+    _write(repo / "tests" / "test_new.py", "def test_new():\n    assert True\n")
+    assert _diff_signature(ws) not in (first, second)   # an untracked file joins the diff
+
+
+def test_diff_signature_reads_a_tree_that_holds_the_progress_row(tmp_path):
+    """`runs/` is gitignored and holds the agent's `PROGRESS.csv` in every live
+    worktree. `git add -A -N -- ':!runs'` exits 1 on it ("paths are ignored"),
+    which blanked the signature for good and the reset never fired — the add
+    takes no pathspec; the diff alone leaves `runs/` out."""
+    sb = Sandbox(tmp_path)
+    ws = sb.ws("agent-a")
+    _write(ws.path / "pkg" / "thing.py", _REPEAT_BYTES)
+    before = _diff_signature(ws)
+    _write(ws.path / "runs" / "agent-a" / "PROGRESS.csv", "ticket\n")
+    assert _diff_signature(ws) == before != ""
+    _write(ws.path / "runs" / "agent-a" / "PROGRESS.csv", "ticket\nrow\n")
+    assert _diff_signature(ws) == before
+
+
+def test_diff_signature_is_empty_when_git_cannot_read_the_tree(tmp_path, monkeypatch):
+    """Fail-open: git that will not run, and git that exits non-zero, both give
+    ``""`` — never a signature a caller could read as "the diff is unchanged"
+    and turn into a reset."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "user.email", "t@example.invalid")
+    _git(repo, "config", "user.name", "t")
+    _write(repo / "pkg" / "thing.py", "def thing():\n    return 1\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "base")
+    _write(repo / "pkg" / "thing.py", "def thing():\n    return 2\n")
+    ws = Workspace(agent="agent-a", path=repo, branch="main", base_sha="abc", kind="worktree")
+
+    import tools.contest.runner as runner_mod
+    monkeypatch.setattr(runner_mod, "run_git",
+                        lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError("git")))
+    assert _diff_signature(ws) == ""
+    monkeypatch.setattr(runner_mod, "run_git",
+                        lambda *a, **k: subprocess.CompletedProcess(a[0], 128, stdout="",
+                                                                    stderr="index.lock"))
+    assert _diff_signature(ws) == ""
+    monkeypatch.setattr(runner_mod, "run_git",
+                        lambda *a, **k: subprocess.CompletedProcess(a[0], 0, stdout="x",
+                                                                    stderr=""))
+    assert _diff_signature(ws) == _diff_signature(ws)
+
+
+def test_a_repeated_diff_on_the_last_continue_opens_a_new_session(tmp_path):
+    """`max_continues_per_attempt = 2`, `max_sessions_per_attempt = 2`, a model
+    that writes the same bytes on every turn: the first continue is granted as
+    today, the second — whose signature equals the first's — aborts the session
+    and opens a second one with the same provider and model, whose first prompt
+    carries the round prompt and the `git status` lines. `continues` starts over
+    at 0, `attempt` is untouched, and the clean finish in the new session is
+    READY."""
+    scenario = {
+        "turns": [
+            {"on_prompt": work_edit_same, "events": ["busy", "idle"]},
+            {"on_prompt": work_edit_same, "events": ["busy", "idle"]},
+        ],
+        "turns_after": [{"on_prompt": work_ready, "events": ["busy", "idle"]}],
+    }
+    cfg = make_config(["agent-a"], max_continues_per_attempt=2,
+                      max_sessions_per_attempt=2)
+    sb, fake, _h, run, _ = _run_overflow_one(tmp_path, scenario, cfg)
+    _assert_ready(run, sb.ws("agent-a"))
+    assert run.attempt == 0
+    assert [t["kind"] for t in run.turns] == ["initial", "continue", "continue"]
+
+    (old, fresh) = fake.sessions()
+    assert run.session_id == fresh.id and run.sessions == 2
+    assert run.continues == 0 and run.last_diff_signature == ""
+
+    # the abort of the first session goes out after the run and before the
+    # POST /session that opens the replacement
+    log = [r["path"] for r in fake.requests]
+    opened = [i for i, path in enumerate(log) if path == "/session"]
+    aborted = log.index(f"/session/{old.id}/abort")
+    assert opened[0] < aborted < opened[-1]
+    assert len(_session_posts(fake)) == 2
+    (post_old, post_new) = _session_posts(fake)
+    assert post_old["body"]["model"] == post_new["body"]["model"] == \
+        {"providerID": "kenary", "id": "agent-a:free"}
+
+    # the new session's first prompt is the round prompt with the dirty lines
+    prompts = _prompts(fake)
+    assert [sid for sid, _ in prompts] == [old.id, old.id, fresh.id]
+    prompt_in_new = prompts[2][1]
+    assert "runs/agent-a/PROGRESS.csv" in prompt_in_new and sb.base_sha in prompt_in_new
+    assert "pkg/thing.py" in prompt_in_new and "uncommitted" in prompt_in_new
+
+    # the turn that triggered the reset says so, and carries the signature
+    reset_turn = run.turns[1]
+    assert reset_turn["session_id"] == old.id and reset_turn["new_session"] == fresh.id
+    assert reset_turn["session_reason"] == "repeat"
+    assert reset_turn["diff_signature"] == run.turns[0]["diff_signature"]
+    assert "new_session" not in run.turns[2]
+
+
+def test_a_repeated_diff_with_no_room_for_a_session_is_harvested_in_place(tmp_path):
+    """`max_sessions_per_attempt = 1`: the ceiling is spent by the first session,
+    so the repeating continue is still granted and the exhausted budget is still
+    harvested in the session that produced it — today's behaviour."""
+    scenario = {"turns": [
+        {"on_prompt": work_edit_same, "events": ["busy", "idle"]},
+        {"on_prompt": work_edit_same, "events": ["busy", "idle"]},
+        {"on_prompt": work_edit_same, "events": ["busy", "idle"]},
+    ]}
+    cfg = make_config(["agent-a"], max_continues_per_attempt=2,
+                      max_sessions_per_attempt=1, max_rework=1)
+    sb, fake, _h, run, _ = _run_one(tmp_path, scenario, cfg)
+    assert run.state is AgentState.GAVE_UP
+    assert len(fake.sessions()) == 1 and not _aborted(fake)
+    assert run.sessions == 1 and run.attempt == 1
+    assert not any(t.get("new_session") for t in run.turns)
+    assert [t["kind"] for t in run.turns] == [
+        "initial", "continue", "continue", "rework", "continue", "continue"]
+
+
+def test_a_repeated_diff_with_the_ceiling_off_is_harvested_in_place(tmp_path):
+    """`max_sessions_per_attempt = 0` turns the whole ticket off: no signature is
+    read at all, nothing is compared, and the exhausted budget is harvested in
+    the same session — the tree before this ticket."""
+    scenario = {"turns": [
+        {"on_prompt": work_edit_same, "events": ["busy", "idle"]},
+        {"on_prompt": work_edit_same, "events": ["busy", "idle"]},
+        {"on_prompt": work_edit_same, "events": ["busy", "idle"]},
+    ]}
+    cfg = make_config(["agent-a"], max_continues_per_attempt=2,
+                      max_sessions_per_attempt=0, max_rework=1)
+    sb, fake, _h, run, _ = _run_one(tmp_path, scenario, cfg)
+    assert run.state is AgentState.GAVE_UP
+    assert len(fake.sessions()) == 1 and not _aborted(fake)
+    assert run.sessions == 1
+    assert not any("diff_signature" in t for t in run.turns)
+    assert run.last_diff_signature == "" and run.continues == 2
+    assert [t["kind"] for t in run.turns] == [
+        "initial", "continue", "continue", "rework", "continue", "continue"]
+
+
+def test_a_continue_that_changes_the_diff_never_opens_a_new_session(tmp_path):
+    """Every continue adds genuinely new bytes, so every signature is new: no
+    reset is ever triggered, and the exhausted budget is harvested in the same
+    session, exactly as before this ticket."""
+    scenario = {"turns": [
+        {"on_prompt": work_edit_no_commit, "events": ["busy", "idle"]},
+        {"on_prompt": work_edit_no_commit, "events": ["busy", "idle"]},
+        {"on_prompt": work_edit_no_commit, "events": ["busy", "idle"]},
+    ]}
+    cfg = make_config(["agent-a"], max_continues_per_attempt=1,
+                      max_sessions_per_attempt=2, max_rework=1)
+    sb, fake, _h, run, _ = _run_one(tmp_path, scenario, cfg)
+    assert run.state is AgentState.GAVE_UP
+    assert len(fake.sessions()) == 1 and not _aborted(fake)
+    assert run.sessions == 1 and run.attempt == 1
+    assert not any(t.get("new_session") for t in run.turns)
+    assert [t["kind"] for t in run.turns] == ["initial", "continue", "rework", "continue"]
+
+
+def test_a_refused_reset_leaves_the_tree_to_resume(tmp_path, monkeypatch):
+    """The replacement is refused after the outgoing session was aborted: the
+    run ends ERROR, the turn that asked for it is on `turns.jsonl` with the old
+    `session_id`, and `resumable` is set so `--resume` restarts the agent in
+    the same worktree."""
+    real = KiloBackend.create_session
+    calls = []
+
+    def once(self, *args, **kwargs):
+        calls.append(1)
+        if len(calls) > 1:
+            raise ContestBackendError("POST /session -> 503")
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(KiloBackend, "create_session", once)
+    scenario = {
+        "turns": [
+            {"on_prompt": work_edit_same, "events": ["busy", "idle"]},
+            {"on_prompt": work_edit_same, "events": ["busy", "idle"]},
+        ],
+    }
+    cfg = make_config(["agent-a"], max_continues_per_attempt=2,
+                      max_sessions_per_attempt=2)
+    sb, fake, _h, run, _ = _run_overflow_one(tmp_path, scenario, cfg)
+    assert run.state is AgentState.ERROR
+    assert run.last_error.startswith("POST /session failed:")
+    assert run.resumable is True
+    (old,) = fake.sessions()
+    assert run.turns[-1]["session_id"] == old.id
+    assert "new_session" not in run.turns[-1]
+    assert (sb.out_dir / "agent-a" / "turns.jsonl").is_file()
+
+
+def test_the_cost_and_the_transcript_add_up_across_a_reset(tmp_path):
+    """One reset: `run.cost` and `run.tokens` are the sum of both sessions'
+    `GET /session/{id}` numbers, and the transcript holds both sessions'
+    messages in order rather than the second's alone."""
+    scenario = {
+        "session": {"cost": 0.42, "tokens": {"input": 10, "output": 5, "total": 15}},
+        "turns": [
+            {"on_prompt": work_edit_same, "events": ["busy", "idle"], "assistant": "first"},
+            {"on_prompt": work_edit_same, "events": ["busy", "idle"], "assistant": "second"},
+        ],
+        "turns_after": [{"on_prompt": work_ready, "events": ["busy", "idle"],
+                         "assistant": "third"}],
+    }
+    cfg = make_config(["agent-a"], max_continues_per_attempt=2,
+                      max_sessions_per_attempt=2)
+    sb, fake, _h, run, _ = _run_overflow_one(tmp_path, scenario, cfg)
+    _assert_ready(run, sb.ws("agent-a"))
+    assert run.cost == 0.84
+    assert run.tokens == {"total": 30, "input": 20, "output": 10}
+
+    transcript = json.loads((sb.out_dir / "agent-a.session.json").read_text())
+    assistant_texts = [p["text"] for m in transcript for p in m.get("parts") or []
+                       if p.get("type") == "text"]
+    assert "first" in assistant_texts and "second" in assistant_texts
+    assert "third" in assistant_texts
+
+
+def test_the_table_and_the_summary_show_the_sessions_used(tmp_path):
+    """`state.json` and `SUMMARY.md` carry the number of sessions a run used, so
+    the operator sees which agent spent a second session without reading
+    `turns.jsonl`."""
+    sb = Sandbox(tmp_path)
+    cfg = make_config(["agent-a"], max_continues_per_attempt=1, max_sessions_per_attempt=1)
+    with _BenchFake({"turns": [{"on_prompt": work_ready, "events": ["busy", "idle"]}]}) as fake:
+        state = _round(sb, fake, cfg)
+    (run,) = state.agents
+    assert run.sessions == 1
+    rows = state.table_rows()
+    assert rows[0]["sessions"] == 1
+
+    lines = render_table(state, [])
+    columns = [cell.strip() for cell in lines[0].strip("|").split("|")]
+    cells = [cell.strip() for cell in lines[2].strip("|").split("|")]
+    assert columns[columns.index("attempts") + 1] == "sessions"
+    assert cells[columns.index("sessions")] == "1"
 
 
 def test_resume_into_a_dirty_worktree_first_prompt_names_it(tmp_path):
@@ -4402,12 +4681,20 @@ def test_continue_turns_and_the_resume_nudge_leave_the_json_shape_alone(tmp_path
     (agent,) = saved["agents"]
     assert set(agent) == {"agent", "workspace", "session_id", "state", "attempt", "turns",
                           "permissions", "questions", "last_error", "resumable", "commit",
-                          "cost", "tokens", "deadline_commit", "continues", "compactions"}
+                          "cost", "tokens", "deadline_commit", "continues", "compactions",
+                          "sessions", "sessions_this_attempt", "last_diff_signature"}
     # KC-41: the key is present on a run that never used it, and reads `false` —
     # a consumer cannot tell "the model claimed this" from "the key was written
     # before the flag existed" by its presence alone
     assert agent["deadline_commit"] is False
     assert agent["compactions"] == 0
+    # KC-39: one session, which is also the attempt's own count — both keys, so
+    # a consumer can tell the run's total from the attempt's — and the signature
+    # of the diff the continue was granted against
+    assert agent["sessions"] == 1 and agent["sessions_this_attempt"] == 1
+    signatures = [t.get("diff_signature") for t in agent["turns"]]
+    assert signatures[0] == agent["last_diff_signature"] and len(signatures[0]) == 64
+    assert signatures[1:] == [None] * (len(agent["turns"]) - 1)
     assert [t["kind"] for t in agent["turns"]] == ["initial", "continue"]
     assert RoundState.from_dict(saved) == state
 
@@ -6729,3 +7016,84 @@ def test_the_summary_shows_a_dash_for_a_run_that_was_never_sized(tmp_path):
     cells = [cell.strip() for cell in lines[2].strip("|").split("|")]
     assert cells[columns.index("fill%")] == "-"
     assert cells[columns.index("compactions")] == "0"
+
+
+class _ScriptedFake(_BenchFake):
+    """One script per session: the session opened nth replays `scripts[n - 1]`.
+
+    `_BenchFake` indexes `turns` per session, so a session opened mid-run would
+    replay the first session's first turn. `_OverflowFake` fixes that with one
+    `turns_after` swap — one swap per run, one script on either side of it. This
+    is the same trick for a run that opens more than two sessions, which is what
+    KC-39 needs once the allowance comes back with a rework.
+    """
+
+    def __init__(self, scripts):
+        super().__init__(scripts[0])
+        self.scripts = list(scripts)
+
+    def _create_session(self, body, directory):
+        session = super()._create_session(body, directory)
+        n = len(self.sessions())
+        if n <= len(self.scripts):
+            self.scenario = self.scripts[n - 1]
+        return session
+
+
+def _same_script(n):
+    """*n* turns that write the same bytes back and commit nothing."""
+    return {"turns": [{"on_prompt": work_edit_same, "events": ["busy", "idle"]}] * n}
+
+
+def test_the_session_allowance_comes_back_with_the_rework(tmp_path):
+    """`max_sessions_per_attempt = 2`, `max_rework = 1`: attempt 0 repeats
+    itself, is reset once into a second session, repeats there too and — its
+    allowance spent — is harvested in place: REWORK. Attempt 1 goes on in that
+    second session, repeats again, and is reset into a third, because the
+    ceiling counts the attempt's own sessions, not the run's. `run.sessions`
+    counts the run, so the operator still sees the three."""
+    scripts = [_same_script(2), _same_script(5),
+               {"turns": [{"on_prompt": work_ready, "events": ["busy", "idle"]}]}]
+    sb = Sandbox(tmp_path)
+    cfg = make_config(["agent-a"], max_continues_per_attempt=2, max_rework=1,
+                      max_sessions_per_attempt=2)
+    with _ScriptedFake(scripts) as fake:
+        run = Harness(sb, fake, cfg).go()
+    _assert_ready(run, sb.ws("agent-a"))
+    assert run.attempt == 1
+    assert run.sessions == 3 and run.sessions_this_attempt == 2
+    (s1, s2, s3) = fake.sessions()
+    assert run.session_id == s3.id
+    aborted = [record["path"].split("/")[2] for record in fake.requests
+               if record["path"].endswith("/abort")]
+    assert aborted == [s1.id, s2.id]
+    rows = _jsonl(sb.out_dir / "agent-a" / "turns.jsonl")
+    assert [row["new_session"] for row in rows if row.get("new_session")] == [s2.id, s3.id]
+    assert [row["kind"] for row in rows].count("rework") == 1
+
+
+def test_the_state_shows_the_sessions_a_run_has_opened(tmp_path):
+    """A run reset once shows two sessions in `state.json` and in SUMMARY's
+    `sessions` column, so the operator sees it without reading `turns.jsonl`.
+    `sessions_this_attempt` is written too."""
+    scripts = [_same_script(2),
+               {"turns": [{"on_prompt": work_ready, "events": ["busy", "idle"]}]}]
+    sb = Sandbox(tmp_path)
+    cfg = make_config(["agent-a"], max_continues_per_attempt=2, max_sessions_per_attempt=2)
+    with _ScriptedFake(scripts) as fake:
+        state = _round(sb, fake, cfg)
+    (run,) = state.agents
+    _assert_ready(run, sb.ws("agent-a"))
+    assert len(fake.sessions()) == 2
+
+    saved = _state_json(sb)
+    (agent,) = saved["agents"]
+    assert agent["sessions"] == 2 and agent["sessions_this_attempt"] == 2
+
+    rows = RoundState.from_dict(saved).table_rows()
+    assert rows[0]["sessions"] == 2 and rows[0]["attempts"] == 0
+
+    lines = render_table(state, [])
+    columns = [cell.strip() for cell in lines[0].strip("|").split("|")]
+    cells = [cell.strip() for cell in lines[2].strip("|").split("|")]
+    assert cells[columns.index("sessions")] == "2"

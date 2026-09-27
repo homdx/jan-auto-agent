@@ -91,6 +91,7 @@ CONTEST_KEYS = (
     "max_parallel",
     "max_rework",
     "max_continues_per_attempt",
+    "max_sessions_per_attempt",
     "turn_timeout_sec",
     "turn_extend_sec",
     "turn_max_sec",
@@ -263,6 +264,11 @@ class ContestConfig:
     max_parallel: int = 3
     max_rework: int = 2
     max_continues_per_attempt: int = 2
+    #: KC-39: how many sessions one attempt may use in total — the first one and
+    #: every replacement (KC-39's reset for a repeated diff, KC-54's and KC-69's
+    #: swaps). The reset only fires below it; per attempt, not per run, so a
+    #: rework gets the allowance back. 0 turns the reset off, 1 means none.
+    max_sessions_per_attempt: int = 2
     turn_timeout_sec: int = 1800
     #: KC-36: seconds a turn's deadline is pushed, per extension, when the
     #: worktree's churn has grown since the last deadline. 0 = the turn clock
@@ -768,6 +774,7 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
         max_parallel=limit("max_parallel", 3),
         max_rework=limit("max_rework", 2),
         max_continues_per_attempt=limit("max_continues_per_attempt", 2),
+        max_sessions_per_attempt=max(0, limit("max_sessions_per_attempt", 2)),
         turn_timeout_sec=turn_timeout,
         turn_extend_sec=turn_extend,
         turn_max_sec=turn_max,
