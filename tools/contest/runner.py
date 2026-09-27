@@ -3634,26 +3634,37 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                     budget = int(config.max_continues_per_attempt)
                     dirty = ""
                     tree_read = False
-                    if _commits_above(ws) == 0:
-                        try:
-                            dirty = _dirty_tree(ws)
-                            tree_read = True
-                        except TreeReadError as exc:
-                            # FL-2: a status that could not be read is not "no
-                            # uncommitted work" — say so, and let the stall
-                            # below carry the "no work" reason rather than
-                            # raising into the round.
-                            _log.warning("%s: tree unreadable — %s", spec.name,
-                                         _brief(str(exc)))
-                    if dirty and 0 < budget and continue_used < budget:
+                    # round 80's glm-4-7-flash: an overflow on a branch that
+                    # already holds commits (a REWORK in progress) used to skip
+                    # the tree read and the recovery both, and stalled as "no
+                    # uncommitted work" with a modified file in the tree. The
+                    # tree is read either way now.
+                    above = _commits_above(ws)
+                    try:
+                        dirty = _dirty_tree(ws)
+                        tree_read = True
+                    except TreeReadError as exc:
+                        # FL-2: a status that could not be read is not "no
+                        # uncommitted work" — say so, and let the stall
+                        # below carry the "no work" reason rather than
+                        # raising into the round.
+                        _log.warning("%s: tree unreadable — %s", spec.name,
+                                     _brief(str(exc)))
+                    room = 0 < budget and continue_used < budget
+                    if not above and dirty and room:
                         failed = fresh_session(turn, dirty)
                         if failed:
                             return finish(AgentState.ERROR, failed)
                         continue
-                    if tree_read and not dirty and 0 < budget and continue_used < budget:
+                    if tree_read and room and bool(above) == bool(dirty):
                         # KC-69: nothing written yet — the model read past its
-                        # size (round 70's sn67-var2, live glm at 117 797). The
-                        # size is remembered above; compact and go on.
+                        # size (round 70's sn67-var2, live glm at 117 797) — or
+                        # the branch holds commits *and* more work on top, where
+                        # `round_prompt(dirty=)` would tell a new session nothing
+                        # was committed. Commits on a clean tree go to the KC-21
+                        # harvest below, which can end READY. The
+                        # size is remembered above; compact and go on: the
+                        # summary carries what the commits and the tree are.
                         failed = recover_overflow(turn)
                         if failed is None:
                             continue
@@ -3664,7 +3675,12 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                     # not `return`: fall through to the KC-21 harvest below,
                     # which scores a commit the model made and then overflowed
                     # and can still end READY.
-                    error = "context overflow" + ("" if dirty else " with no uncommitted work")
+                    if dirty:
+                        error = "context overflow"
+                    elif above:
+                        error = f"context overflow ({above} commit{'s' if above != 1 else ''}, clean tree)"
+                    else:
+                        error = "context overflow with no uncommitted work"
                     state = AgentState.STALLED
                 # KC-61: the quota check comes first. `_RETRYABLE_MSG_RE`
                 # matches `429`, so a daily limit that resets at midnight would

@@ -2982,6 +2982,43 @@ def test_a_clean_overflow_is_compacted_and_the_work_goes_on(tmp_path, caplog):
     assert _runner_has(caplog, "context overflow compacted in")
 
 
+def _committed_then_dirty(directory):
+    """Round 80's glm-4-7-flash: a commit on the branch (a REWORK in progress)
+    and more work on top of it, uncommitted."""
+    work_no_claim(directory, "")
+    work_edit_no_commit(directory, "")
+
+
+def test_an_overflow_over_commits_and_a_dirty_tree_is_compacted(tmp_path):
+    """Round 80's glm-4-7-flash: commits on the branch and a modified file on
+    top. The overflow used to skip the tree and the recovery and stall as
+    "no uncommitted work"; now the session is compacted and the work goes on
+    in it — no new session, whose round prompt would say nothing was committed."""
+    scenario = {"summary_tokens": 3_000, "turns": [
+        {"events": ["busy"], "error": _OVERFLOW},
+        {"on_prompt": work_ready, "events": ["busy", "idle"]},
+    ]}
+    sb, fake, _h, run, _ = _run_one(tmp_path, scenario, _stall_config(),
+                                    prepare=_committed_then_dirty)
+    _assert_ready(run, sb.ws("agent-a"))
+    assert len(_session_posts(fake)) == 1
+    from tools.contest.runner import OVERFLOW_CONTINUE
+    assert _prompts(fake)[-1] == (run.session_id, OVERFLOW_CONTINUE)
+    assert run.turns[0]["overflow_compacted"] is True
+
+
+def test_an_overflow_over_commits_and_a_dirty_tree_says_so_when_it_stalls(tmp_path):
+    """The same tree with no continue left: STALLED, and the reason no longer
+    claims the tree is clean."""
+    scenario = {"turns": [{"events": ["busy"], "error": _OVERFLOW}]}
+    sb, fake, _h, run, _ = _run_one(tmp_path, scenario,
+                                    _stall_config(max_continues_per_attempt=0),
+                                    prepare=_committed_then_dirty)
+    assert run.state is AgentState.STALLED
+    assert run.last_error == "context overflow"
+    assert len(_session_posts(fake)) == 1 and len(_prompts(fake)) == 1
+
+
 def test_an_overflow_with_an_unreadable_tree_is_a_clean_stall(tmp_path, monkeypatch, caplog):
     """`_dirty_tree` raising `TreeReadError`: the read error does not raise into
     the run — no fresh session, the "no work" stall, and the reason on the log."""
