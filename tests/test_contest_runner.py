@@ -5692,7 +5692,7 @@ def test_the_suite_wait_is_granted_back_and_the_silence_clock_runs_from_the_repl
             thread = threading.Thread(target=lambda: result.update(run=h.go()), daemon=True)
             thread.start()
             assert _wait_for(lambda: (slots.status(names[0]) or ("",))[0] == "queued")
-            time.sleep(2.2)             # twice the silence window, in the queue
+            time.sleep(2.2)             # clock: claim — C5: twice the silence window, in the queue
             assert not fake.calls(method="POST", prefix="/permission/")
             slots.release("other:harvest")
             thread.join(60)
