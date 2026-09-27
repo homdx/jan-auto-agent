@@ -1,6 +1,6 @@
 # KC-7 — `run --dry-run`, `status`, `entrants.json` and `SUMMARY.md`: the round's folder is the one `contest-bench` reads
 
-**Status:** open — rewritten 2026-09-27 against `kc` at `5d4d834`. KC-16 (round 55) and the tickets after it took this ticket's original core: `run --ticket NN`, `intake`, `--resume`, `--fresh`, `__main__.py`, `export_patches` (`<agent>.patch`, `<agent>.<STATE>.patch`, KC-31's `<agent>.<STATE>.diff`), `state.table_rows()`. What is left is below. Extend KC-16's `cli.py`; do not rewrite `cmd_run` or `intake`.
+**Status:** landed `3e9f5d5` — applied from patch 1-kc7-round46-winner + KC-72 62719ee
 **Severity:** HIGH
 **File:** `tools/contest/export.py` (new), `tools/contest/cli.py`
 **Symbol:** `write_entrants`, `write_summary`, `cmd_status`, `cmd_run`, `intake`, `_parser`
