@@ -15,7 +15,7 @@
 >
 > **Net effect:** the ticket's engineering content (What must change / Acceptance / Out of scope) needed no changes — nothing described has been built yet, partially or otherwise. Only the header's dependency bookkeeping was out of date. Corrections are inlined below; original wording is struck through, new wording follows.
 
-**Status:** queued — after KC-9 and KC-39, whose edges it completes from the other side.~~ **queued — KC-9 has landed (round 48, 2026-09-27); this ticket is now blocked on KC-39 alone.** Found live 2026-09-21 in round 64.
+**Status:** open — KC-39 landed `5f3de96` (round 78, 2026-09-28); KC-9 landed (round 48). Was: queued — after KC-9 and KC-39, whose edges it completes from the other side.~~ **queued — KC-9 has landed (round 48, 2026-09-27); this ticket is now blocked on KC-39 alone.** Found live 2026-09-21 in round 64.
 **Severity:** HIGH (three of eight slots in round 64 produced nothing and were only found out about after the round ended; a dead slot costs the same wall clock as a working one and silently shrinks the field the round is supposed to compare)
 **File:** `tools/contest/runner.py` (`run_agent` — the `WAITING` loop), `contest.ini`
 **Symbol:** `run_agent`, `_first_touch_deadline` (new), `_dirty_tree` (exists — `runner.py:1725`), `AgentState.DEAD` (new), `ContestConfig.first_touch_sec` ~~(existing)~~ **(new — corrected 2026-09-27; does not exist in `contest.ini` or `ContestConfig` today)**, `ContestConfig.first_touch_nudges` (new)
