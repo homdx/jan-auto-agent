@@ -266,6 +266,12 @@ class IdleResult:
     to tell them apart reads ``elapsed``: a stall lands well under the
     overall deadline.
 
+    ``"quiet"`` (KC-73) comes only from a wait armed with ``quiet_after``:
+    the session sent nothing at all in that window, so nothing is running in
+    it — and nothing is aborted. ``compacted`` is whether a
+    ``session.compacted`` of this session was read on the way: Kilo compacted
+    it by itself.
+
     ``open_tool`` (KC-47) is set only when the silence bound fired while this
     session still had a ``bash`` call in flight:
     ``{"tool": "bash", "command": <120 chars>, "running_for": s}``, so a stall
@@ -274,7 +280,7 @@ class IdleResult:
     open — KC-12's silence, byte for byte.
     """
 
-    status: Literal["idle", "error", "timeout", "closed"]
+    status: Literal["idle", "error", "timeout", "closed", "quiet"]
     error: object = None
     permissions: list = field(default_factory=list)
     questions: list = field(default_factory=list)
@@ -283,6 +289,8 @@ class IdleResult:
     #: KC-63: this session's idle/error/permission/question events that the
     #: ``since`` mark skipped (0 without one)
     stale_skipped: int = 0
+    #: KC-73: a ``session.compacted`` of this session was read in this wait
+    compacted: bool = False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1487,7 +1495,8 @@ class KiloClient:
                   since: int | None = None,
                   max_retry_wait: float | None = None,
                   quota_re: "re.Pattern | None" = None,
-                  max_retry_attempts: int | None = None) -> IdleResult:
+                  max_retry_attempts: int | None = None,
+                  quiet_after: float | None = None) -> IdleResult:
         """Block until this session goes idle, answering on the way.
 
         The probe's ``wait_idle`` with the decisions delegated:
@@ -1588,6 +1597,15 @@ class KiloClient:
         caller — nothing is counted and the loop is byte for byte KC-61's,
         silence clock or not. The KC-61 quota check runs first: a daily quota must
         end at ``attempt: 1``, not at ``attempt: 10``.
+
+        ``quiet_after`` (KC-73) is for a session whose turn has already ended in
+        a ``session.error``: is Kilo still working in it? Every event of this
+        session (and of its subagents) is read, as with the silence clock on.
+        When none has come ``quiet_after`` seconds into the wait, the wait ends
+        as ``status="quiet"`` — nothing is running, and nothing is aborted. Once
+        one has come, the wait is the ordinary one to the end, asks answered.
+        A ``session.compacted`` read on the way sets ``IdleResult.compacted``.
+        Omitted — every other caller — the loop is byte for byte KC-64's.
         """
         # KC-63: events recorded before the prompt this wait belongs to are
         # an earlier turn's. Kilo sends two session.idle after a
@@ -1621,6 +1639,10 @@ class KiloClient:
             retries_limit = None
         permissions: list = []
         questions: list = []
+        # KC-73: has this session sent anything yet, and did Kilo compact it
+        quiet_window = float(quiet_after) if quiet_after is not None else None
+        heard = False
+        compacted = False
         # KC-71: the sessions this one started with Kilo's `task` tool, and
         # theirs. Round 87: mimo-v2-5's subagent asked `external_directory` at
         # 301 s, nobody answered a session that was not the agent's own, the
@@ -1643,7 +1665,7 @@ class KiloClient:
                 # KC-71: a subagent's ask is answered as the agent's own, and
                 # with the silence clock on its work is the agent's work
                 return event_session in children and (
-                    etype in _CHILD_ASKS or silence is not None)
+                    etype in _CHILD_ASKS or silence is not None or quiet_window is not None)
             if not saw_busy and _is_busy(event):
                 # KC-63: noted here, before the filter, so it is seen with the
                 # silence clock off too; it changes no result
@@ -1656,7 +1678,7 @@ class KiloClient:
             # is armed, so it must reach the loop even with the silence clock
             # off — the probe has no clock, and it must not spend its timeout
             # on a quota that resets in fourteen hours.
-            if (silence is not None or etype in _SESSION_EVENTS
+            if (silence is not None or quiet_window is not None or etype in _SESSION_EVENTS
                     or (max_retry_wait is not None and etype == "session.status")
                     or (retries_limit and etype in ("session.status",
                                                      "message.part.updated"))):
@@ -1674,6 +1696,15 @@ class KiloClient:
                 left = min(overall_left, silence_left)
             else:
                 left = overall_left
+            if quiet_window is not None and not heard:
+                # KC-73: nothing from the session yet — Kilo is not working in
+                # it. Not a stall: the session is left as it is.
+                quiet_left = started + quiet_window - now
+                if quiet_left <= 0:
+                    return IdleResult(status="quiet", elapsed=now - started,
+                                      permissions=permissions, questions=questions,
+                                      stale_skipped=stale)
+                left = min(left, quiet_left)
             if left <= 0:
                 # KC-36: the turn deadline asks first. The silence clock never
                 # does — a session that went quiet is quiet whatever the
@@ -1698,6 +1729,8 @@ class KiloClient:
             if event is None:
                 continue
             last_seen = time.monotonic()
+            if event.get("type") != "tap.closed":
+                heard = True
 
             etype = event.get("type")
             props = event.get("properties") or {}
@@ -1805,10 +1838,14 @@ class KiloClient:
                             elapsed=elapsed, permissions=permissions,
                             questions=questions, stale_skipped=stale)
                 continue
+            if etype == "session.compacted":
+                compacted = True
+                continue
             if etype == "session.error":
                 return IdleResult(status="error", error=props.get("error", props),
                                   elapsed=elapsed, permissions=permissions,
-                                  questions=questions, stale_skipped=stale)
+                                  questions=questions, stale_skipped=stale,
+                                  compacted=compacted)
             if etype == "tap.closed":
                 return IdleResult(status="closed", error=props.get("error"),
                                   elapsed=elapsed, permissions=permissions,
@@ -1823,4 +1860,4 @@ class KiloClient:
                 _log.warning("%s: idle without busy after %.1fs", session_id, elapsed)
             return IdleResult(status="idle", elapsed=elapsed,
                               permissions=permissions, questions=questions,
-                              stale_skipped=stale)
+                              stale_skipped=stale, compacted=compacted)

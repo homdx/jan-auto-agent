@@ -692,6 +692,14 @@ OVERFLOW_CONTINUE = (
     "what you did so far. The task is not finished. Continue it from where you "
     "stopped; do not start over, and read only the parts of files you need now.")
 
+#: KC-73: how long a session whose turn ended in a context overflow may stay
+#: silent before the runner takes it that Kilo is not working in it. Kilo
+#: 7.6.2 compacts an overflowed session by itself and goes on with the agent
+#: loop — round 78's agnes-2-0-flash: `session.error` and the first `busy` of
+#: that compact in the same 160 ms. A session that sends nothing in this window
+#: is left to the runner's own recovery, as before.
+OVERFLOW_SETTLE_SEC = 3.0
+
 #: KC-56: the continue sent into the same session when the last reply hit the
 #: *output* limit before any text or tool call — not `continue_message`, which
 #: is about uncommitted files, and the tree may well be clean.
@@ -2268,7 +2276,7 @@ def _turn_deadline(run: AgentRun, config: ContestConfig, working=None) -> _TurnC
 def _wait_turn(backend: ContestBackend, session: SessionRef, config: ContestConfig,
                *, on_permission, on_question,
                on_deadline: Callable[[float], float | None] | None = None,
-               since: int | None = None):
+               since: int | None = None, quiet_after: float | None = None):
     """`backend.wait_idle` for one turn, with the round's stall edge wired in.
 
     Returns the `IdleResult`. `idle_event_timeout` is the round's
@@ -2285,6 +2293,10 @@ def _wait_turn(backend: ContestBackend, session: SessionRef, config: ContestConf
 
     *since* (KC-63) is the backend's mark taken right before this turn's
     prompt; `None` (a backend without one) is not passed at all.
+
+    *quiet_after* (KC-73) is armed only by `run_agent`'s overflow edge, to
+    wait out what Kilo still does in a session after its turn ended; `None`
+    is not passed at all.
     """
     silence = float(config.idle_event_timeout_sec or 0)
     wait_kwargs = {
@@ -2296,6 +2308,8 @@ def _wait_turn(backend: ContestBackend, session: SessionRef, config: ContestConf
         wait_kwargs["on_deadline"] = on_deadline
     if since is not None:
         wait_kwargs["since"] = since
+    if quiet_after is not None:
+        wait_kwargs["quiet_after"] = quiet_after
     # KC-61: a retry scheduled further out than the bound is a quota reset, not
     # a blip — the agent ends `ERROR provider_quota` at once instead of waiting
     # for the silence clock. 0 arms nothing, which is today's behaviour.
@@ -3392,6 +3406,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         """
         nonlocal session, continue_text
         turn["session_id"] = run.session_id
+        retire_session(turn)
         try:
             session = backend.create_session(
                 spec.provider_id, spec.model_id, rules=config.session_rules(),
@@ -3408,6 +3423,79 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                                      tmp_dir=scratch_arg, tmp_roots=tuple(tmp_roots))
         run.continues += 1
         return None
+
+    def retire_session(turn: dict) -> None:
+        """KC-73: stop the session a swap leaves behind.
+
+        The old session is never prompted again, but Kilo may still be working
+        in it: round 78's agnes-2-0-flash, whose session went on after Kilo's
+        own overflow compact and sat on an unanswered `external_directory` ask
+        for as long as the round ran — in the worktree the new session edits.
+        `abort` is quiet on a session that is already done; a failure is
+        logged and the swap goes on.
+        """
+        try:
+            backend.abort(session)
+            turn["old_session_aborted"] = True
+        except Exception as exc:  # noqa: BLE001 — a failed abort never ends a run
+            _log.warning("%s: abort of the old session %s: %s", spec.name,
+                         getattr(session, "id", session), _brief(str(exc)))
+            turn["old_session_aborted"] = False
+
+    def settle_overflow(turn: dict) -> bool:
+        """KC-73: wait out what Kilo still does in a session that overflowed.
+
+        On a context overflow Kilo 7.6.2 compacts the session by itself and goes
+        on with the agent loop, so the `session.error` that ended the turn is
+        not the session's last word. Round 78, agnes-2-0-flash: the runner POSTed
+        its own `summarize` into that busy session, Kilo's loop asked
+        `external_directory`, nothing read the ask while the POST was open, and
+        the POST ran its 900 s out — 15 of the agent's 90 minutes, then a swap
+        away from a session Kilo had already compacted.
+
+        So the session is waited on first, asks answered, the turn's budgets
+        and silence clock armed. A session silent for `OVERFLOW_SETTLE_SEC` has
+        nothing running (``quiet``); one that ends in anything but an idle is
+        left to the recovery as before. True only when Kilo compacted the
+        session itself, it went idle, and what it holds now is under
+        `compact_at_percent` (or its size is not known): the work goes on in it
+        with `OVERFLOW_CONTINUE`, and the caller spends the continue. A backend
+        with no shared event stream (`mark()` is `None`) has nothing to wait on.
+        """
+        mark_fn = getattr(backend, "mark", None)
+        if not callable(mark_fn) or mark_fn() is None:
+            return False
+        started = time.monotonic()
+        settled = _wait_turn(backend, session, config, on_permission=on_permission,
+                             on_question=on_question, quiet_after=OVERFLOW_SETTLE_SEC)
+        took = time.monotonic() - started
+        status = getattr(settled, "status", "")
+        if status == "quiet":
+            return False
+        turn["overflow_settle_sec"] = round(took, 1)
+        turn["overflow_settle_status"] = status
+        if status != "idle" or not getattr(settled, "compacted", False):
+            _log.info("%s: after the overflow Kilo worked on for %.0f s and ended %s%s — "
+                      "the runner recovers it", spec.name, took, status,
+                      "" if getattr(settled, "compacted", False) else ", no compact of its own")
+            return False
+        size, _source = _context_budget(spec, _memory(), config)
+        after = _context_tokens(backend, session)
+        percent = context_memory.compact_at_percent(config)
+        left = after * 100.0 / float(size) if size and after else None
+        if left is not None and percent > 0 and left >= percent:
+            _log.info("%s: Kilo compacted the overflow itself, but it holds %.1f%% of %s — "
+                      "the runner compacts it again", spec.name, left, f"{size:,}")
+            return False
+        turn["overflow_compacted"] = True
+        turn["compacted"] = True
+        turn["compacted_by"] = "kilo"
+        turn["context_after"] = after or None
+        run.compactions += 1
+        _log.info("%s: Kilo compacted the overflow itself and went idle in %.0f s%s — "
+                  "the work goes on in the same session", spec.name, took,
+                  f" at {left:.1f}% of {size:,}" if left is not None else "")
+        return True
 
     def recover_overflow(turn: dict) -> str | None:
         """KC-69: an overflow with nothing uncommitted goes on instead of stalling.
@@ -3436,7 +3524,8 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         turn["compacted"] = bool(done)
         if done:
             run.compactions += 1
-        turn["context_before"] = before
+        # KC-73: 0 is "the last message reports no tokens", not a size
+        turn["context_before"] = before or None
         turn["context_after"] = after
         turn["compact_sec"] = round(took, 1)
         left = after * 100.0 / float(size) if done and size and after else None
@@ -3546,6 +3635,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         nonlocal session
         turn["summary_text"] = _summary_text(backend, session)
         turn["swapped_from"] = run.session_id
+        retire_session(turn)
         try:
             session = backend.create_session(
                 spec.provider_id, spec.model_id, rules=config.session_rules(),
@@ -3895,6 +3985,22 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                     # prompt, so it gets `round_prompt(dirty=)` (KC-22's
                     # `--resume` shape) rather than `continue_message`.
                     budget = int(config.max_continues_per_attempt)
+                    room = 0 < budget and run.continues < budget
+                    # KC-73: before the tree is read and before anything is
+                    # compacted, whatever Kilo still does in the session is
+                    # waited out — it compacts an overflow itself and goes on
+                    # working, and that work lands in the tree
+                    if room and settle_overflow(turn):
+                        continue_text = OVERFLOW_CONTINUE
+                        run.continues += 1
+                        run.turns.append(turn)
+                        _append_jsonl(agent_dir / "turns.jsonl", {"agent": spec.name, **turn})
+                        continue
+                    if stalled:
+                        # KC-73: the agent's time ran out (or a stall fired)
+                        # while Kilo was still working — no compact, no new
+                        # session: the stall below, and the harvest after it
+                        room = False
                     dirty = ""
                     tree_read = False
                     # round 80's glm-4-7-flash: an overflow on a branch that
@@ -3913,7 +4019,6 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                         # raising into the round.
                         _log.warning("%s: tree unreadable — %s", spec.name,
                                      _brief(str(exc)))
-                    room = 0 < budget and run.continues < budget
                     if not above and dirty and room:
                         failed = fresh_session(turn, dirty)
                         if failed:
@@ -3945,6 +4050,9 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                     else:
                         error = "context overflow with no uncommitted work"
                     state = AgentState.STALLED
+                    if stalled:
+                        error = stalled[0]
+                        turn["idle_status"] = "stalled"
                 # KC-61: the quota check comes first. `_RETRYABLE_MSG_RE`
                 # matches `429`, so a daily limit that resets at midnight would
                 # otherwise spend `max_error_retries` against a key that is

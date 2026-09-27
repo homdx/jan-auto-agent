@@ -210,7 +210,8 @@ class ContestBackend(Protocol):
                   since: int | None = None,
                   max_retry_wait: float | None = None,
                   quota_re: "re.Pattern | None" = None,
-                  max_retry_attempts: int | None = None) -> IdleResult:
+                  max_retry_attempts: int | None = None,
+                  quiet_after: float | None = None) -> IdleResult:
         """Block until this session goes idle, answering on the way.
 
         ``timeout`` bounds the whole wait, ``idle_event_timeout`` the silence.
@@ -249,6 +250,12 @@ class ContestBackend(Protocol):
         that many retries in a row with no assistant output in between.
         :class:`OpenRouterBackend` takes it and ignores it too — its provider
         errors reach the runner as a plain ``session.error``.
+
+        ``quiet_after`` (KC-73) is passed to :meth:`KiloClient.wait_idle` when it
+        is not ``None``: a session that sends nothing in that many seconds ends
+        the wait as ``status="quiet"``, not aborted. The runner arms it only on a
+        backend whose :meth:`mark` is not ``None``; :class:`OpenRouterBackend`
+        takes it and ignores it.
         """
         ...
 
@@ -364,7 +371,8 @@ class KiloBackend:
                   since: int | None = None,
                   max_retry_wait: float | None = None,
                   quota_re: "re.Pattern | None" = None,
-                  max_retry_attempts: int | None = None) -> IdleResult:
+                  max_retry_attempts: int | None = None,
+                  quiet_after: float | None = None) -> IdleResult:
         # KC-36: the callback goes over only when it is armed — `None` keeps
         # this call byte for byte what it was, for a client that predates it.
         client_kwargs = {"idle_event_timeout": idle_event_timeout,
@@ -383,6 +391,9 @@ class KiloBackend:
         # at all, so a client that predates it gets today's call.
         if max_retry_attempts:
             client_kwargs["max_retry_attempts"] = max_retry_attempts
+        # KC-73: the same — armed only after an overflow, never on a turn
+        if quiet_after is not None:
+            client_kwargs["quiet_after"] = quiet_after
         return self._client.wait_idle(self._tap, session, timeout, **client_kwargs)
 
     def tool_parts(self, session: SessionRef) -> list:
@@ -590,7 +601,8 @@ class OpenRouterBackend:
                   since: int | None = None,
                   max_retry_wait: float | None = None,
                   quota_re: "re.Pattern | None" = None,
-                  max_retry_attempts: int | None = None) -> IdleResult:
+                  max_retry_attempts: int | None = None,
+                  quiet_after: float | None = None) -> IdleResult:
         """Read the agent's stdout until ``idle``, the timeout, or the timeout's
         silence window.
 
@@ -611,6 +623,9 @@ class OpenRouterBackend:
         ``max_retry_attempts`` (KC-64) is ignored for the same reason: this
         backend has no Kilo retry counter, so a provider that keeps failing
         reaches the runner as a ``session.error`` and keeps KC-19's retry path.
+        ``quiet_after`` (KC-73) is ignored: the runner never arms it here, since
+        :meth:`mark` is ``None`` and a finished subprocess turn has nothing left
+        running.
 
         A provider error comes back as ``IdleResult(status="error")`` with the
         agent's payload, ``data.isRetryable`` set for a 429 or a 5xx, so the

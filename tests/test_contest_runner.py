@@ -3072,6 +3072,115 @@ def test_an_overflow_with_an_unreadable_tree_is_a_clean_stall(tmp_path, monkeypa
     assert _runner_has(caplog, "tree unreadable")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# KC-73: Kilo's own overflow compact is waited out, its asks answered
+# ─────────────────────────────────────────────────────────────────────────────
+
+#: Round 78's agnes-2-0-flash asked this right after Kilo's own compact: a
+#: `cd` out of its worktree into the directory above it.
+_OUTSIDE_ASK = {"permission": "external_directory",
+                "patterns": ["/home/renat/Project/opensource/github/agent-offline/*"],
+                "metadata": {"command": "cd .. && git log --oneline -10",
+                             "directories": ["/home/renat/Project/opensource/github/agent-offline"]}}
+
+
+def test_kilo_s_own_overflow_compact_is_waited_out_and_its_ask_answered(tmp_path, caplog):
+    """KC-73, round 78's agnes-2-0-flash: after the overflow Kilo compacts the
+    session itself and goes on — busy, `session.compacted`, an
+    `external_directory` ask, idle. The runner used to POST its own
+    `summarize` into that busy session, nothing answered the ask while the POST
+    was open, and it ran 900 s out. Now the ask is answered, no `summarize` is
+    sent, and the work goes on in the same session with `OVERFLOW_CONTINUE`."""
+    caplog.set_level(logging.INFO, logger="tools.contest.runner")
+    scenario = {"summary_tokens": 3_000, "summarize_busy_timeout": 20, "turns": [
+        {"events": ["busy"], "error": _OVERFLOW,
+         "autocompact": {"compact_sec": 0.3, "permission": _OUTSIDE_ASK}},
+        {"on_prompt": work_ready, "events": ["busy", "idle"]},
+    ]}
+    started = time.monotonic()
+    sb, fake, _h, run, _ = _run_one(tmp_path, scenario, _stall_config(max_continues_per_attempt=2))
+    assert time.monotonic() - started < 60
+    _assert_ready(run, sb.ws("agent-a"))
+    assert not fake.unanswered
+    (replied,) = fake.events_of("permission.replied")
+    assert replied["properties"]["sessionID"] == run.session_id
+    assert run.permissions["asked"] == 1
+    assert len(_session_posts(fake)) == 1
+    assert not [r for r in fake.calls("POST") if r["path"].endswith("/summarize")]
+    from tools.contest.runner import OVERFLOW_CONTINUE
+    assert _prompts(fake)[-1] == (run.session_id, OVERFLOW_CONTINUE)
+    first = run.turns[0]
+    assert first["compacted_by"] == "kilo" and first["overflow_compacted"] is True
+    assert first["context_after"] == 3_000 and first["overflow_settle_status"] == "idle"
+    assert run.compactions == 1
+    assert _runner_has(caplog, "Kilo compacted the overflow itself")
+
+
+def test_kilo_s_loop_that_does_not_compact_is_compacted_by_the_runner_once_idle(tmp_path):
+    """KC-73: Kilo goes on after the overflow but writes no summary. The runner
+    waits for the idle first — its ask answered — and only then sends its own
+    `summarize`, into a session that is free, so the compact finishes at once."""
+    scenario = {"summary_tokens": 3_000, "summarize_busy_timeout": 20, "turns": [
+        {"events": ["busy"], "error": _OVERFLOW,
+         "autocompact": {"compact_sec": 0.3, "compacted": False, "permission": _OUTSIDE_ASK}},
+        {"on_prompt": work_ready, "events": ["busy", "idle"]},
+    ]}
+    sb, fake, _h, run, _ = _run_one(tmp_path, scenario, _stall_config(max_continues_per_attempt=2))
+    _assert_ready(run, sb.ws("agent-a"))
+    assert not fake.unanswered
+    assert [r for r in fake.calls("POST") if r["path"].endswith("/summarize")]
+    first = run.turns[0]
+    assert "compacted_by" not in first and first["overflow_compacted"] is True
+    assert first["compact_sec"] < 10
+
+
+def test_an_overflow_with_nothing_after_the_error_is_recovered_as_before(tmp_path):
+    """KC-73: a session that says nothing after its `session.error` is not
+    waited on past `OVERFLOW_SETTLE_SEC`: `quiet`, the runner's own compact, no
+    settle fields in the turn."""
+    scenario = {"summary_tokens": 3_000, "turns": [
+        {"events": ["busy"], "error": _OVERFLOW},
+        {"on_prompt": work_ready, "events": ["busy", "idle"]},
+    ]}
+    sb, _fake, _h, run, _ = _run_one(tmp_path, scenario, _stall_config(max_continues_per_attempt=2))
+    _assert_ready(run, sb.ws("agent-a"))
+    first = run.turns[0]
+    assert "overflow_settle_status" not in first and "compacted_by" not in first
+
+
+def test_time_up_while_kilo_still_works_after_an_overflow_is_a_stall_not_a_compact(tmp_path):
+    """KC-73: the agent's hard limit fires while Kilo is still compacting on its
+    own — STALLED `time up` at once, no `summarize` into the busy session, no
+    new session."""
+    scenario = {"summary_tokens": 3_000, "summarize_busy_timeout": 20, "turns": [
+        {"events": ["busy"], "error": _OVERFLOW, "autocompact": {"compact_sec": 15}},
+    ]}
+    started = time.monotonic()
+    _sb, fake, _h, run, _ = _run_one(
+        tmp_path, scenario, _stall_config(max_continues_per_attempt=2, agent_max_sec=2))
+    assert time.monotonic() - started < 12
+    assert run.state is AgentState.STALLED and run.last_error.startswith("time up"), run.last_error
+    assert not [r for r in fake.calls("POST") if r["path"].endswith("/summarize")]
+    assert len(_session_posts(fake)) == 1
+    assert run.turns[0]["idle_status"] == "stalled"
+
+
+def test_a_swap_after_an_overflow_aborts_the_old_session(tmp_path):
+    """KC-73: the session a swap leaves behind is aborted — round 78's old
+    session sat on an open ask in the worktree the new one edits."""
+    scenario = {
+        "turns": [{"on_prompt": work_edit_no_commit, "events": ["busy"], "error": _OVERFLOW}],
+        "turns_after": [{"on_prompt": work_ready, "events": ["busy", "idle"]}],
+    }
+    sb, fake, _h, run, _ = _run_overflow_one(tmp_path, scenario)
+    _assert_ready(run, sb.ws("agent-a"))
+    (old_session, fresh_session) = fake.sessions()
+    aborts = [r["path"] for r in fake.calls("POST") if r["path"].endswith("/abort")]
+    assert f"/session/{old_session.id}/abort" in aborts
+    assert f"/session/{fresh_session.id}/abort" not in aborts
+    assert run.turns[0]["old_session_aborted"] is True
+
+
 def test_a_non_overflow_session_error_is_error_as_before(tmp_path):
     """`name: "SomeOtherError"`: today's path byte for byte — ERROR with the
     payload, one session, one prompt, no retry even though retries are

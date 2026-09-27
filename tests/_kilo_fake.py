@@ -40,6 +40,15 @@ Everything here is scripted by one scenario dict, per session:
                 "error": {...},      # session.error instead of idle
                 "idles_after_error": 2,  # KC-63: that many session.idle after
                                      # the session.error, as Kilo 7.6.2 sends
+                "autocompact": {     # KC-73: after the session.error, Kilo's
+                                     # own overflow compact and its loop going
+                                     # on — round 78's agnes-2-0-flash
+                    "compact_sec": 0.5,   # busy beats before session.compacted
+                    "compacted": true,    # false: the loop goes on, no compact
+                    "permission": {...},  # asked after it, blocks until answered
+                    "on_work": callable(directory) -> None,  # the loop's work
+                    "end": "idle",   # or an error payload: how the loop ends
+                },
                 "message_info": {...},  # merged into the assistant message's info
                                      # (KC-56: `finish`, `tokens`)
                 "subagent": {        # KC-71: Kilo's `task` tool — a child session
@@ -233,6 +242,9 @@ class _Session:
         self.messages: list = []
         self.turn_index = 0
         self.aborted = False
+        # KC-73: Kilo's own loop is running in the session (an overflow's
+        # autocompact); `summarize` blocks until it is not, as Kilo's does
+        self.busy = threading.Event()
 
 
 # FL-1 (round 84, round 7): how long a scripted turn waits for the client to
@@ -637,6 +649,8 @@ class FakeKiloServer:
             for _ in range(int(turn.get("idles_after_error") or 0)):
                 self._emit({"type": "session.idle",
                             "properties": {"sessionID": session.id}})
+            if turn.get("autocompact") is not None:
+                self._autocompact(session, dict(turn["autocompact"]))
             return
 
         parts = [_tool_part(p) for p in (turn.get("tool_parts") or [])]
@@ -663,6 +677,68 @@ class FakeKiloServer:
         if _POST_IDLE in names:
             self._emit({"type": _EVENTS[_POST_IDLE][0],
                         "properties": {"sessionID": session.id}})
+
+    def _autocompact(self, session: _Session, spec: dict) -> None:
+        """KC-73: what Kilo 7.6.2 does after a ``ContextOverflowError`` on its own.
+
+        Round 78, agnes-2-0-flash: the ``session.error``, then — no idle — the
+        session stays ``busy`` while Kilo compacts it (``session.compacted``),
+        then its agent loop goes on: a permission asked, work, and only then
+        ``session.idle``. While this runs ``session.busy`` is set, and
+        ``summarize`` waits for it, the way Kilo answers a compact only when
+        the session is free. ``summary_tokens`` / ``summary_text`` of the
+        scenario are the summary's, as in :meth:`_compact`.
+        """
+        session.busy.set()
+        try:
+            until = time.monotonic() + float(spec.get("compact_sec", 0.5))
+            while time.monotonic() < until and not self._stop.is_set():
+                self._emit({"type": "session.status",
+                            "properties": {"sessionID": session.id,
+                                           "status": {"type": "busy"}}})
+                self._sleep(min(self.HOOK_BEAT_S, max(0.0, until - time.monotonic())))
+            if spec.get("compacted", True):
+                summary = self.scenario.get("summary_tokens")
+                if summary is not None:
+                    session.messages.append({
+                        "info": {"role": "assistant", "sessionID": session.id,
+                                 "time": time.time(), "summary": True,
+                                 "tokens": {"input": 0, "output": int(summary),
+                                            "reasoning": 0,
+                                            "cache": {"read": 0, "write": 0}}},
+                        "parts": [{"type": "text",
+                                   "text": self.scenario.get("summary_text", "summary")}]})
+                self._emit({"type": "session.compacted",
+                            "properties": {"sessionID": session.id}})
+            if spec.get("permission") is not None:
+                pid, event = self._permission_event(session, spec["permission"])
+                self._emit(event)
+                box = self._pending.get(pid)
+                if box is None or not box["event"].wait(self.reply_timeout):
+                    self.unanswered.append(pid)
+                elif box["reply"] is not None:
+                    self._emit({"type": "permission.replied",
+                                "properties": {"sessionID": session.id,
+                                               "requestID": pid, "reply": box["reply"]}})
+            on_work = spec.get("on_work")
+            if on_work is not None:
+                try:
+                    on_work(session.directory)
+                except Exception as e:
+                    self.turn_errors.append(f"on_work: {type(e).__name__}: {e}")
+            end = spec.get("end", "idle")
+            if end == "idle":
+                session.messages.append({
+                    "info": {"role": "assistant", "sessionID": session.id,
+                             "time": time.time()},
+                    "parts": [{"type": "text", "text": "done"}]})
+                self._emit({"type": "session.idle",
+                            "properties": {"sessionID": session.id}})
+            else:
+                self._emit({"type": "session.error",
+                            "properties": {"sessionID": session.id, "error": end}})
+        finally:
+            session.busy.clear()
 
     def _run_subagent(self, parent: _Session, spec: dict) -> None:
         """KC-71: one ``task`` call, the way round 87's mimo-v2-5 made it.
@@ -863,6 +939,14 @@ class _Handler(BaseHTTPRequestHandler):
             # KC-67: `summarize_status` makes the compact refused, so the runner's
             # fail-open path — prompt anyway, no compact — is reachable
             status = int(self.fake.scenario.get("summarize_status", 204))
+            # KC-73: Kilo answers a compact only once the session is free
+            deadline = time.monotonic() + float(
+                self.fake.scenario.get("summarize_busy_timeout", self.fake.reply_timeout))
+            while session.busy.is_set() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            if session.busy.is_set():
+                return self._json(504, {"error": {"name": "Timeout",
+                                                  "message": "session busy"}})
             if status != 204:
                 return self._json(status, {"error": {"name": "SummarizeError",
                                                      "message": "compact refused"}})
