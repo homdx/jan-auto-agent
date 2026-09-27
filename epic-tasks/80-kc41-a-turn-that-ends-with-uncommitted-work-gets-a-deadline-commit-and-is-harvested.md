@@ -1,6 +1,6 @@
 # KC-41 — A turn that ends with uncommitted work gets a deadline commit and is harvested like any other entry
 
-**Status:** queued — after KC-31, with which it shares `export_patches`' evidence and which it supersedes in effect (KC-31 writes the lost work to a file for a human; this ticket puts it back into the round). Found live 2026-09-21 in round 64 and proved by hand on 2026-09-22.
+**Status:** open — after KC-31, with which it shares `export_patches`' evidence and which it supersedes in effect (KC-31 writes the lost work to a file for a human; this ticket puts it back into the round). Found live 2026-09-21 in round 64 and proved by hand on 2026-09-22.
 **Severity:** HIGH (round 64 reported **zero** harvested entries while holding two entries that pass all four pytest roots; the loss is not a turn's time, it is the round's result)
 **File:** `tools/contest/runner.py` (`run_agent` — the terminal branch at the `if state is not None:` block, `_commits_above`/`_dirty_tree`), `contest.ini`
 **Symbol:** `run_agent`, `_deadline_commit` (new), `_dirty_tree`, `_commits_above`, `_harvest`, `ContestConfig.deadline_commit` (new)

@@ -1,6 +1,6 @@
 # FL-4 — the three test shapes FL-1 spent five stress rounds removing can be reintroduced by the next test anybody writes: `scripts/check_test_clocks.py` names them
 
-**Status:** queued — after FL-1 (84, landed `e500d40`) and ideally after FL-3 (86), which gives this check something to be checked against. FL-1's fix is a set of *rules* applied by hand to ~30 call sites; nothing in the repo records the rules or notices when a new test breaks them.
+**Status:** open — after FL-1 (84, landed `e500d40`) and ideally after FL-3 (86), which gives this check something to be checked against. FL-1's fix is a set of *rules* applied by hand to ~30 call sites; nothing in the repo records the rules or notices when a new test breaks them.
 
 **Severity:** MEDIUM — no bug today; a guarantee with no guard, on a suite that took three hours and five stress rounds to make green once.
 **File:** `scripts/check_test_clocks.py` (new); `docs/` or the script's own docstring for the three rules.

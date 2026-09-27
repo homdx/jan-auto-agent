@@ -1,6 +1,6 @@
 # FL-3 — the only thing that finds a flake in this suite is a hand-typed 32-worker stress run, repeated by eye: `scripts/stress_suite.py` runs it and prints the flake table
 
-**Status:** queued — after FL-1 (84, landed `e500d40`). Corrected 2026-09-23 before round 86: the stress shape is 32 workers (4 × `-n 8`), not 64; the default pass count is the bar POSTMORTEM-FL-1 set (12 passes = 48 suite runs), not 5; the timeout default and what "killed" means under xdist are now stated (requirement 6). FL-1 cost over three hours and five stress rounds, and every one of them was a shell line retyped by the operator with the results read off the terminal. Five agents failed the same ticket partly because they had no mechanical way to tell "green" from "green this time".
+**Status:** landed `21a81d5`; was queued — after FL-1 (84, landed `e500d40`). Corrected 2026-09-23 before round 86: the stress shape is 32 workers (4 × `-n 8`), not 64; the default pass count is the bar POSTMORTEM-FL-1 set (12 passes = 48 suite runs), not 5; the timeout default and what "killed" means under xdist are now stated (requirement 6). FL-1 cost over three hours and five stress rounds, and every one of them was a shell line retyped by the operator with the results read off the terminal. Five agents failed the same ticket partly because they had no mechanical way to tell "green" from "green this time".
 
 **Severity:** HIGH — not for a bug it fixes, but because without it FL-1 comes back and nobody notices until a round is already burning.
 **File:** `scripts/stress_suite.py` (new).
