@@ -22,7 +22,9 @@ backlog) and executes tasks with a Coder, gates and validators. `--dry-run` and
 - `python3 -m pytest tests_bugfix -n 4 -q` — regression guards for fixed bugs.
 - `python3 scripts/sync_test_tiers.py` — regenerate tier symlinks (never by hand); `--check` verifies them.
 - `git config core.hooksPath githooks` — enable the pre-commit tier/stray-file hook.
-- `python3 -m tools.contest run --ticket NN` — the round; patches in `contest-out/NN/`.
+- `python3 -m tools.contest run --ticket NN` — the round; patches, `entrants.json` and `SUMMARY.md` in `contest-out/NN/`.
+- `python3 -m tools.contest run --ticket NN --dry-run` — intake, the round's worktrees, the plan and the first agent's prompt, then stop: no `kilo serve`, no session, no gate call.
+- `python3 -m tools.contest status --ticket NN [--out DIR]` — the SUMMARY table off `contest-out/NN/state.json`; touches nothing, works mid-round, exits 1 with no `state.json`.
 
 ## Coding Style & Naming Conventions
 

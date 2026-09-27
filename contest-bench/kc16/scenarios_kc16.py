@@ -308,7 +308,7 @@ def test_s08_one_ready_one_gave_up_patches_plan_table_and_exit_zero(sb):
     state = json.loads((o / "state.json").read_text())
     assert {a["agent"]["name"] for a in state["agents"]} == {"laguna", "mistral"}
     names = {p.name for p in o.iterdir()}
-    assert not names & {"SUMMARY.md", "entrants.json"}, names
+    assert {"SUMMARY.md", "entrants.json"} <= names, names  # KC-7
     assert "kilo-serve.log" not in names, "attached server, nothing to spawn"
 
 

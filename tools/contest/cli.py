@@ -4,12 +4,13 @@
 sandbox: `load_roster` → `replace(config, …)` → `prepare_round` →
 `KiloServer.spawn` → `run_round` → `server.close()` → the table →
 `git log <base>..HEAD` per worktree. This module is that sequence on the real
-repo and the real ticket, plus `git format-patch` of every result — the patches
-then go through the same hands as every round before them
-(`docs/collect-epics/RUN-THE-EPIC-COMPETITION.md` stages 3–5, the ideal
-commit). No summary, no `entrants.json`, no scoring: the harvest's tests are
-the only judge here — `run_round(..., run_tests=True)` runs the pytest roots in
-every harvest, one worktree at a time.
+repo and the real ticket, plus `git format-patch` of every result, then
+`export.write_entrants` and `export.write_summary` — the round's folder is the
+one `contest-bench/harness/setup_worktrees.py` reads and the scorer scores, so
+the operator does not hand-write `entrants.json` or a summary after it. No
+scoring: the harvest's tests are the only judge here — `run_round(...,
+run_tests=True)` runs the pytest roots in every harvest, one worktree at a
+time.
 
 `intake` runs every pre-round check and reports every failure, one line each,
 before anything is created: the base resolves and `epic-tasks/` is clean at it
@@ -41,8 +42,14 @@ gateway key and no `kilo` binary can run the round. That credential is
 `[contest] openrouter_llm_profile`, resolved at load time for that backend
 only, and it is not the gate profile.
 
-`main(argv)` takes subcommands so KC-7 (round 46) adds `status` and `--dry-run`
-without moving anything. Exit codes: 0 when at least one agent is READY, 2
+`main(argv)` takes subcommands, so KC-7 (round 46) adds `status` and `--dry-run`
+without moving anything. `run --dry-run` runs `intake` and `prepare_round`,
+prints the plan and the exact prompt the first agent would get, and stops there:
+no `kilo serve` — not even intake's throwaway offer server — no session, no gate
+call, one `dry-run: skipped …` line per check that needed a server. `status
+--ticket NN` prints the SUMMARY table off `<out>/state.json` and touches
+nothing, mid-round as well as after it, and exits 1 with one line when there is
+no `state.json` to read. Exit codes: 0 when at least one agent is READY, 2
 when none is, 1 on an intake or a server failure; a bare `python3 -m
 tools.contest` is argparse's usage, exit 2.
 """
@@ -67,7 +74,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from tools.contest import context_memory, gates, probe_memory
+from tools.contest import context_memory, export, gates, probe_memory
 from tools.contest.backend import KiloBackend, OpenRouterBackend
 from tools.contest.kilo_client import (
     KiloClient,
@@ -100,6 +107,7 @@ from tools.contest.runner import (
     agent_tmp_path,
     core_count,
     round_live_agents,
+    round_prompt,
     run_round,
     write_pytest_workers,
 )
@@ -119,7 +127,7 @@ from tools.contest.think_probe import (
     probe_model,
     save_probe_cache,
 )
-from tools.contest.workspace import WorkspaceError, prepare_round
+from tools.contest.workspace import WorkspaceError, agent_tmp_dir, prepare_round
 from tools.git_run import run_git
 
 __all__ = [
@@ -130,6 +138,7 @@ __all__ = [
     "Intake",
     "agents_from_models",
     "cmd_run",
+    "cmd_status",
     "export_patches",
     "gate_model_refusals",
     "gate_share_line",
@@ -190,6 +199,15 @@ _STATUS_RE = re.compile(r"^\*\*Status:\*\*\s*(\S+)", re.MULTILINE)
 #: `# KC-16 — \`python3 -m tools.contest run …\`` → `KC-16`.
 _TITLE_RE = re.compile(r"^#\s*([A-Za-z0-9_.-]+)", re.MULTILINE)
 
+#: `**File:**` / `**Symbol:**` / `**Status:**` → the label alone. Every label a
+#: ticket declares, in one pass — `intake` needs to know the two it refuses
+#: without, and nothing else.
+_FIELD_LABEL_RE = re.compile(r"^\*\*([A-Za-z][A-Za-z0-9 _-]*):\*\*", re.MULTILINE)
+
+#: The labels `scripts/next_task.py` reads to name the code it hands the
+#: sessions: without one of them the sessions get no finding at all.
+_REQUIRED_LABELS = ("File", "Symbol")
+
 #: `NN-…md`, `next_task.py`'s `TICKET_RE` with its optional leading zeros.
 _TICKET_RE = re.compile(r"^0*(\d+)-.*\.md$")
 
@@ -202,6 +220,22 @@ def _status_of(body: str) -> str:
     """The body's `**Status:**` first word, lower-cased; `""` when absent."""
     match = _STATUS_RE.search(body)
     return match.group(1).strip("`*").lower() if match else ""
+
+
+def _missing_labels(body: str) -> list:
+    """The labels of `_REQUIRED_LABELS` *body* declares no line for, in order.
+
+    `scripts/next_task.py` reads `**File:**` and `**Symbol:**` to build the
+    finding it prints under `code to fix`, so a ticket without one of them hands
+    the sessions a ticket the runner cannot point them at. One label per
+    `intake:` line, the way every other intake refusal prints. `[]` when both
+    are there, and `[]` for an empty body — an unreadable ticket has already
+    printed the `no ticket numbered` line above.
+    """
+    labels = set()
+    for match in _FIELD_LABEL_RE.finditer(body):
+        labels.add(match.group(1).strip().lower())
+    return [label for label in _REQUIRED_LABELS if label.lower() not in labels]
 
 
 def _ticket_body(tasks_dir, name, at=None) -> str:
@@ -1364,7 +1398,8 @@ def intake(repo, tasks_dir, round_no, base_ref, config, argv=None,
            register_missing: bool = False,
            reprobe: bool = False,
            allow_unprobed: bool = False,
-           roster_path: str | None = None):
+           roster_path: str | None = None,
+           dry_run: bool = False):
     """Run every pre-round check; return the `Intake`, or `None` with the failures printed.
 
     All checks run and every failure goes to stderr on its own line before
@@ -1396,6 +1431,19 @@ def intake(repo, tasks_dir, round_no, base_ref, config, argv=None,
     yields no tree to read, so the checkout stands in for the ticket checks and
     the `WorkspaceError` line is the base's own failure. *argv* is this
     invocation's, for the printed `run` line; `None` means `sys.argv[1:]`.
+
+    KC-7: the ticket must also declare `**File:**` and `**Symbol:**` — one
+    `intake:` line per missing label, read from the base tree like the status.
+    `scripts/next_task.py` builds the finding it prints under `code to fix` from
+    those two, so a ticket without one would hand the sessions no code to fix.
+
+    With *dry_run* the checks that need a server are skipped instead of run — the
+    offer check, the variant probe and the gate probe, one `dry-run: skipped …`
+    line each, so the plan the caller prints does not read as fully checked. No
+    `kilo serve` is started then, intake's throwaway offer server included, and
+    nothing is asked of the gate. The pure checks still run: the base, the
+    tickets, the gate's worst case against the silence clock and the gate model
+    against the roster, so a round that would be refused is refused here too.
     """
     repo, tasks_dir = Path(repo), Path(tasks_dir)
     failures: list = []
@@ -1430,6 +1478,15 @@ def intake(repo, tasks_dir, round_no, base_ref, config, argv=None,
             failures.append(
                 f"{name} is not open (**Status:** {status or 'missing'}) — "
                 "only an open ticket is on offer"
+            )
+        # KC-7: `scripts/next_task.py` builds the finding it prints from
+        # `**File:**` and `**Symbol:**`, so a ticket without one would hand the
+        # sessions a ticket with no code to fix. Read from the base tree, like
+        # the status above.
+        for label in _missing_labels(body):
+            failures.append(
+                f"{name} has no **{label}:** line — scripts/next_task.py reads "
+                "**File:** and **Symbol:** to name the code the sessions fix"
             )
         wanted = _label(body, name, round_no)
         head_sha = gates.git(str(repo), "rev-parse", "HEAD") if base_sha else ""
@@ -1466,7 +1523,18 @@ def intake(repo, tasks_dir, round_no, base_ref, config, argv=None,
     agents = _without_highest(config.agents)
     offer = None
     attached = None
-    if config.backend == "kilo":
+    if dry_run:
+        # KC-7: the plan is the whole point. Every check that needs a server is
+        # skipped and announces itself, so the plan reads as unchecked instead of
+        # as checked: no `kilo serve` here at all, the throwaway offer server of
+        # the offer check included, no session opened, nothing asked of the gate.
+        # `resolve_variants` never runs, so a `highest` stays a `highest` — the
+        # plan shows what the roster says, which is what `--dry-run` is for.
+        print("dry-run: skipped the offer check — no server was started")
+        print("dry-run: skipped the variant probe — no session was opened")
+        print("dry-run: skipped the gate probe — the gate was not asked")
+        offer = _Offer([], agents, [], [])
+    elif config.backend == "kilo":
         # an openrouter round has no Kilo server at all: nothing to resolve,
         # nothing to attach to, and no offer to check the roster against
         if config.server == "spawn":
@@ -1998,6 +2066,55 @@ def _print_plan(result: Intake, config: ContestConfig, out_dir: Path, *, run_tes
                 print(line)
 
 
+def _first_prompt(config: ContestConfig, workspace, ticket_path) -> str:
+    """The prompt the runner would send *workspace*'s agent — `--dry-run` prints it.
+
+    The same call the runner makes for a first turn: `round_prompt` with the agent's
+    own scratch dir and the round's `tmp_roots`, and no `dirty` — the worktree is
+    the one `prepare_round` just built, clean. Without it a `--dry-run` would print
+    a prompt that is not the one the first agent gets.
+    """
+    tmp_roots = tuple(getattr(config, "tmp_roots", ()) or ())
+    scratch_dir = agent_tmp_dir(tmp_roots, workspace.agent)
+    return round_prompt(workspace.agent, ticket_path, workspace.base_sha,
+                        tmp_dir=str(scratch_dir) if scratch_dir is not None else "",
+                        tmp_roots=tmp_roots)
+
+
+def _dry_run(repo, result: Intake, config: ContestConfig, out_dir: Path, args, *,
+             run_tests: bool, workers: int, fixed: bool,
+             agent_tmp: Path | None) -> int:
+    """KC-7: `run --dry-run` — the plan and the first prompt, then exit 0.
+
+    `intake` has already run with its server checks skipped, so the only things
+    left that would touch the network are the worktrees, which are the round's
+    own, and the print. `prepare_round` runs with `force=args.fresh`, exactly as
+    the real path does, so a later `run` without `--fresh` meets these worktrees
+    as KC-23 does today and says so, and `--dry-run --fresh` discards them. The
+    plan prints after the worktrees exist, so it names a round the operator can
+    then `--resume` or `--fresh` into.
+
+    Exit 0 on the way out: the round has done what it set out to do — show the
+    plan and the prompt — and `EXIT_NO_READY` would claim an unmet expectation.
+    """
+    try:
+        workspaces = prepare_round(repo, config, args.ticket, args.base,
+                                   force=args.fresh)
+    except WorkspaceError as exc:
+        print(f"intake: {exc}", file=sys.stderr)
+        return EXIT_FAILED
+    _print_plan(result, config, out_dir, run_tests=run_tests, workers=workers,
+                workers_fixed=fixed, agent_tmp=agent_tmp)
+    if not workspaces:
+        print("dry-run: no agent to prompt", file=sys.stderr)
+        return EXIT_OK
+    first = workspaces[0]
+    text = _first_prompt(config, first, result.ticket_path)
+    print(f"prompt ({first.agent}):")
+    print(text)
+    return EXIT_OK
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     """`run --ticket NN …` — the round on the real repo, the patches in `<out>/`.
 
@@ -2011,9 +2128,23 @@ def cmd_run(args: argparse.Namespace) -> int:
     `run_round` has already saved `state.json` and re-raised, so the
     KeyboardInterrupt propagates after the close. 0 with a READY, 2 with none.
 
+    KC-7: after `export_patches` the round's folder is finished — `export.write_entrants`
+    writes the `entrants.json` `contest-bench` reads and `export.write_summary`
+    writes the `SUMMARY.md` the operator reads, and both paths print with the
+    `patch:` lines. A failure to write either is a `warn:` line and never a
+    different exit code: the patches are the round's result, and the two files
+    are how the operator gets them to the next stage.
+
     A worktree left by a crashed attempt is not reset silently (KC-23): the
     refusal is the same `intake:` line as every other `WorkspaceError`, exit 1,
     no server started — `--fresh` discards the work, `--resume` continues it.
+
+    `--dry-run` runs `intake` and `prepare_round`, prints the plan and the exact
+    prompt the first agent would get, and exits 0: no `kilo serve`, no session,
+    no gate call, `intake`'s `dry-run: skipped …` lines naming what was not
+    checked. The worktrees it creates are the round's own, so a later `run`
+    without `--fresh` meets them as KC-23 does today; `--dry-run --fresh` is
+    allowed.
     """
     # `contest-bench/kc6/live_smoke.py` sets the same default: the committed
     # roster's ${CONTEST_GATE_API_KEY} reference must resolve for `load_roster`
@@ -2044,7 +2175,8 @@ def cmd_run(args: argparse.Namespace) -> int:
                     register_missing=args.register_missing,
                     reprobe=getattr(args, "reprobe", False),
                     allow_unprobed=getattr(args, "allow_unprobed", False),
-                    roster_path=_roster_ini_path)
+                    roster_path=_roster_ini_path,
+                    dry_run=getattr(args, "dry_run", False))
     if result is None:
         return EXIT_FAILED
     if result.agents:
@@ -2095,6 +2227,12 @@ def cmd_run(args: argparse.Namespace) -> int:
     if agent_tmp is not None:
         for key in ("TMPDIR", "TEMP", "TMP"):
             env[key] = str(agent_tmp)
+
+    if getattr(args, "dry_run", False):
+        # KC-7: intake has already skipped every server check, so this is the
+        # plan and the prompt — no server is started after here.
+        return _dry_run(repo, result, config, out_dir, args, run_tests=run_tests,
+                        workers=workers, fixed=fixed, agent_tmp=agent_tmp)
 
     _print_plan(result, config, out_dir, run_tests=run_tests, workers=workers,
                 workers_fixed=fixed, agent_tmp=agent_tmp)
@@ -2158,6 +2296,29 @@ def cmd_run(args: argparse.Namespace) -> int:
             shutil.rmtree(agent_tmp, ignore_errors=True)
 
     patches = export_patches(state, workspaces, out_dir)
+    # KC-7: the two files that make `<out>/` the input `contest-bench` reads.
+    # Written here, in the round's own exit path, so the operator never writes
+    # them by hand. A failure to write either is a `warn:` line and nothing else
+    # — the patches are the round's result, and these are only how the next
+    # stage finds them, so the exit code stays the round's own.
+    exports_written: list = []
+    try:
+        target = export.write_entrants(out_dir, state.base_sha, state, patches, repo=repo)
+    except Exception as exc:  # noqa: BLE001 — a failed export never changes the exit
+        print(f"warn: could not write {export.ENTRANTS_FILE}: {exc}", file=sys.stderr)
+    else:
+        if target is not None:
+            exports_written.append((export.ENTRANTS_FILE, target))
+    try:
+        target = export.write_summary(out_dir, state, state.base_sha, patches, repo=repo,
+                                      gate=_gate_plan_label(config))
+    except Exception as exc:  # noqa: BLE001 — as above
+        print(f"warn: could not write {export.SUMMARY_FILE}: {exc}", file=sys.stderr)
+    else:
+        if target is not None:
+            exports_written.append((export.SUMMARY_FILE, target))
+    for label, target in exports_written:
+        print(f"{label}: {target}")
     for row in state.table_rows():
         print(json.dumps(row, ensure_ascii=False))
     # KC-61: one line per provider out of quota, with its reset time — the
@@ -2170,6 +2331,44 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     ready = sum(1 for run in state.agents if run.state is AgentState.READY)
     return EXIT_OK if ready else EXIT_NO_READY
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    """`status --ticket NN [--out DIR]` — the SUMMARY table off `<out>/state.json`.
+
+    Prints `export.render_table` for the round's saved state and touches nothing:
+    no worktree, no server, no file written. That is what makes it safe mid-round,
+    where `state.json` is one transition behind the truth, and after the round,
+    where it is the whole round — the same table `SUMMARY.md` carries, so the two
+    cannot disagree about who ended how.
+
+    `--out` names the round's folder outright; without it the default
+    `<out_dir>/<NN>` is derived from the roster exactly as `run` does. Exit 1 with
+    one line when there is no `state.json` to read: a round that never started has
+    no state to print, and a round number that was never run is the same thing.
+    """
+    repo = Path.cwd().resolve()
+    if args.out:
+        out_dir = Path(args.out).resolve()
+    else:
+        try:
+            config = load_roster(_roster_path(repo, args.roster))
+            out_dir = _round_out_dir(repo, config, args.ticket)
+        except (RosterError, OSError) as exc:
+            print(f"status: cannot find the round's folder: {exc}", file=sys.stderr)
+            return EXIT_FAILED
+    state_path = out_dir / "state.json"
+    if not state_path.is_file():
+        print(f"status: no {state_path} — nothing to report", file=sys.stderr)
+        return EXIT_FAILED
+    try:
+        state = RoundState.from_dict(json.loads(state_path.read_text(encoding="utf-8")))
+    except (ValueError, KeyError, TypeError, OSError) as exc:
+        print(f"status: {state_path} is unreadable: {exc}", file=sys.stderr)
+        return EXIT_FAILED
+    for line in export.render_table(state, export.round_patches(out_dir, state)):
+        print(line)
+    return EXIT_OK
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -2225,12 +2424,30 @@ def _parser() -> argparse.ArgumentParser:
                      help="no gate model: the mechanical layer decides, the rest is gate-failed")
     run.add_argument("--resume", action="store_true",
                      help="resume from <out>/state.json — only the mid-flight agents restart")
+    run.add_argument("--dry-run", action="store_true",
+                     help="intake, prepare the worktrees, print the plan and the first "
+                          "agent's prompt, and stop: no kilo serve, no session, no gate call")
     run.add_argument("--fresh", action="store_true",
                      help="reset the round's worktrees even when they hold uncommitted "
                           "work or commits")
     run.add_argument("--out", default=None, metavar="DIR",
                      help="the round's output directory (default <out_dir>/<NN>)")
     run.set_defaults(func=cmd_run)
+
+    status = sub.add_parser(
+        "status",
+        help="print the round's SUMMARY table off <out>/state.json",
+        description="One table off <out>/state.json — the same table SUMMARY.md carries, "
+                    "safe mid-round as well as after the round, and it touches nothing.",
+    )
+    status.add_argument("--ticket", type=int, required=True, metavar="NN",
+                        help="the round number, NN from epic-tasks/NN-*.md")
+    status.add_argument("--roster", default=DEFAULT_ROSTER,
+                        help="the roster ini the round's <out_dir> comes from "
+                             "(default contest.ini at the repo root)")
+    status.add_argument("--out", default=None, metavar="DIR",
+                        help="the round's output directory (default <out_dir>/<NN>)")
+    status.set_defaults(func=cmd_status)
     return parser
 
 
