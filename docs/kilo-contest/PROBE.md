@@ -6,7 +6,9 @@ an OpenCode-based headless server), provider `kenary`, models
 `laguna-s-2-1:free`, `mistral-medium-3-5:free`, `hy3:free`. Session directory
 `/tmp/kilo-hello`. Raw event log of every run: `/tmp/kilo-hello/events.jsonl`
 (not committed). The script is standard-library only and imports nothing from
-this repository.
+this repository. The contest built on these primitives and its operator's
+reset/run/score page are [`EPIC-KC.md`](EPIC-KC.md) and
+[`RUN-THE-KILO-CONTEST.md`](RUN-THE-KILO-CONTEST.md).
 
 ```bash
 python3 scripts/kilo_hello.py --model kenary/hy3:free --dir /tmp/kilo-hello --file hello-hy3.txt --append-model

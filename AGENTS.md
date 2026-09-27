@@ -25,6 +25,7 @@ backlog) and executes tasks with a Coder, gates and validators. `--dry-run` and
 - `python3 -m tools.contest run --ticket NN` — the round; patches, `entrants.json` and `SUMMARY.md` in `contest-out/NN/`.
 - `python3 -m tools.contest run --ticket NN --dry-run` — intake, the round's worktrees, the plan and the first agent's prompt, then stop: no `kilo serve`, no session, no gate call.
 - `python3 -m tools.contest status --ticket NN [--out DIR]` — the SUMMARY table off `contest-out/NN/state.json`; touches nothing, works mid-round, exits 1 with no `state.json`.
+- `docs/kilo-contest/RUN-THE-KILO-CONTEST.md` — the contest's operator runbook: stage R (`scripts/contest_reset.sh`), the RUN stage, reading the gate's `decisions.jsonl`, the hand-over to the epic runbook's stages 3–5, and the first round on record.
 
 ## Coding Style & Naming Conventions
 

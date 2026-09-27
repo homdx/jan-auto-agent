@@ -66,6 +66,13 @@ per-agent progress files never appear in the diffs you are comparing.
 
 ## Stage 1 — hand out one round
 
+**The Kilo contest replaces this stage and stage 2 with one command:**
+`docs/kilo-contest/RUN-THE-KILO-CONTEST.md` is the operator's page for it —
+its stage R (`scripts/contest_reset.sh`) is the worktree-per-agent below, and
+its RUN stage (`python3 -m tools.contest run`) carries the prompt, the loop
+and the ground rules in the runner's own prompt. Stages 3–5 are unchanged
+either way; the contest's hand-over section points back to this page.
+
 **One worktree per agent, all from the same commit.** Agents committing into one
 checkout collide; that is not a tool problem, it is what worktrees are for.
 
