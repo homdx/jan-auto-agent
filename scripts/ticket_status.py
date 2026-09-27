@@ -64,6 +64,79 @@ def title_id(text: str, fallback: str) -> str:
     return match.group(1) if match else fallback
 
 
+CYCLE = """the round cycle, every step prints the next one:
+  show NN            what the ticket says now
+  round NN           branch <id>-NN-round off the current branch, ticket + INDEX open, commit
+  (run the check and the round it prints)
+  landed NN --sha S  on the base branch, after the winner is merged; prints push + next tickets
+  queued MM          park a lower ticket intake refuses over
+"""
+
+
+def ticket_statuses(tasks_dir: Path) -> dict:
+    """{number: status word} for every NN-*.md in *tasks_dir*."""
+    out = {}
+    for path in sorted(tasks_dir.glob("*.md")):
+        m = TICKET_RE.match(path.name)
+        st = STATUS_RE.search(path.read_text()) if m else None
+        if m:
+            out[int(m.group(1))] = st.group(2).strip("`*").lower() if st else ""
+    return out
+
+
+def remote_of(repo: Path, branch: str) -> str:
+    """The remote *branch* pushes to; the only remote, or `origin` as last guess."""
+    try:
+        return git("config", f"branch.{branch}.remote", cwd=repo)
+    except subprocess.CalledProcessError:
+        remotes = git("remote", cwd=repo).split()
+        return remotes[0] if len(remotes) == 1 else "origin"
+
+
+def next_steps(status: str, number: int, repo: Path, tasks_dir: Path, base: str) -> str:
+    """What the operator runs next, with this repo's own values filled in."""
+    n = number
+    branch = git("branch", "--show-current", cwd=repo)
+    rel = tasks_dir.relative_to(repo)
+    me = Path(__file__).resolve().relative_to(repo) if Path(__file__).resolve().is_relative_to(repo) \
+        else Path(__file__).resolve()
+    remote = remote_of(repo, base)
+    statuses = ticket_statuses(tasks_dir)
+    check = f"python3 scripts/next_task.py --tasks {rel}/ --progress /dev/null"
+    if status == "open":
+        lower = [k for k, v in statuses.items() if k < n and v not in ("landed", "queued")]
+        lines = [f"", f"next, on {branch}:",
+                 f"  1. check (no server) which ticket the agents get:", f"       {check}"]
+        if lower:
+            lines += [f"     lower tickets still on offer, intake will refuse: {lower}",
+                      *[f"       python3 {me} queued {k}" for k in lower]]
+        lines += [f"  2. rewriting the ticket? edit {rel}/ now and commit it yourself",
+                  f"  3. run the round from this branch:",
+                  f"       python3 -m tools.contest run --ticket {n}",
+                  f"  4. after the round: land the winner on {base}, then",
+                  f'       python3 {me} landed {n} --sha <sha> --note "round {n} winner <agent>"',
+                  f"     on another machine first: git switch {base} && git pull {remote} {base}"]
+        return "\n".join(lines)
+    if status == "landed":
+        titles = {int(TICKET_RE.match(p.name).group(1)): title_id(p.read_text(), p.name)
+                  for p in tasks_dir.glob("*.md") if TICKET_RE.match(p.name)}
+        nxt = sorted(k for k, v in statuses.items() if v in ("queued", "open") and k != n)
+        # the landed ticket's own epic first: `KC-9` → `KC-`; old epics' parked
+        # tickets only when this one has nothing left
+        family = re.match(r"[A-Za-z]+-?", titles.get(n, "")).group(0) if titles.get(n) else ""
+        nxt = [k for k in nxt if titles[k].startswith(family)] or nxt
+        lines = [f"", f"next, on {branch}:", f"  1. check the log, then push:",
+                 f"       git push {remote} {branch}"]
+        if nxt:
+            lines += [f"  2. not landed yet: " + ", ".join(f"{titles[k]} ({k})" for k in nxt[:8])
+                      + (" …" if len(nxt) > 8 else ""),
+                      f"     pick one and open its round:",
+                      f"       python3 {me} show NN",
+                      f"       python3 {me} round NN"]
+        return "\n".join(lines)
+    return f"\nnext: re-check which ticket is on offer:\n  {check}"
+
+
 def git(*args: str, cwd: Path) -> str:
     result = subprocess.run(["git", *args], cwd=cwd, check=True,
                             capture_output=True, text=True)
@@ -74,6 +147,8 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="ticket_status.py",
         description="Flip one epic-tasks ticket's **Status:** word and commit it.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=CYCLE,
     )
     parser.add_argument("status", choices=VALID_WRITE + ("show", "round"),
                         help="open | queued | landed | show | round")
@@ -89,13 +164,16 @@ def main(argv=None) -> int:
                         help="default: epic-tasks, relative to --repo")
     parser.add_argument("--repo", default=".",
                         help="repo root (default: current directory)")
-    parser.add_argument("--base", default="kc",
-                        help="round: the ref the round branch starts from (default: kc)")
+    parser.add_argument("--base", default=None,
+                        help="round: the ref the round branch starts from "
+                             "(default: the branch you are on)")
     parser.add_argument("--no-commit", action="store_true",
                         help="edit the file but skip git add/commit")
     args = parser.parse_args(argv)
 
     repo = Path(args.repo).resolve()
+    if args.base is None:
+        args.base = git("branch", "--show-current", cwd=repo) or "HEAD"
     tasks_dir = repo / args.tasks_dir
     path = find_ticket(tasks_dir, args.number)
     text = path.read_text()
@@ -105,6 +183,10 @@ def main(argv=None) -> int:
 
     if args.status == "show":
         print(f"{path.relative_to(repo)}: {match.group(0)}")
+        word = match.group(2).strip("`*").lower()
+        if word != "landed":
+            print(f"\nnext: python3 {Path(__file__).resolve().relative_to(repo) if Path(__file__).resolve().is_relative_to(repo) else Path(__file__).resolve()} round {args.number}"
+                  + ("   (already open: run the round from its branch)" if word == "open" else ""))
         return 0
 
     if args.status == "round":
@@ -154,6 +236,7 @@ def main(argv=None) -> int:
         message += f" — round {args.number}"
     git("commit", "-m", message, "--", *paths, cwd=repo)
     print(f"committed: {message}")
+    print(next_steps(args.status, args.number, repo, tasks_dir, args.base))
     return 0
 
 
