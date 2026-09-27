@@ -958,3 +958,37 @@ def test_the_find_free_line_goes_out_at_intake(monkeypatch, tmp_path, capsys):
     captured = capsys.readouterr()
     assert "kilo: 2 Kilo processes of this user write the same store" in captured.err
     assert "pid 777" in captured.err
+
+
+# ── round 87: Kilo's own shutdown aborts the session ─────────────────────────
+
+_ABORTED = {"name": "MessageAbortedError", "data": {"message": "Aborted"}}
+
+
+def _aborted():
+    return IdleResult(status="error", elapsed=1.0, error=_ABORTED)
+
+
+def test_a_kilo_abort_on_a_dirty_tree_is_resumable_and_not_committed(tmp_path):
+    """Round 87: `kilo serve` shut down under a live agent and its turn ended
+    `MessageAbortedError`. The runner did not ask for that abort, so it is not
+    the agent's end: no deadline commit and no harvest against a server that
+    is gone, the work stays in the tree, and `resumable` is set so `--resume`
+    restarts the agent there."""
+    run, backend, ws, _out = _run(tmp_path, [_aborted()], dirty="x = 1\n")
+
+    assert run.state is AgentState.ERROR
+    assert run.resumable is True
+    assert run.deadline_commit is False and run.commit is None
+    assert "harvest" not in run.turns[-1]
+    assert _git(ws.path, "rev-list", "--count", f"{ws.base_sha}..HEAD") == "0"
+    assert len(backend.prompts) == 1
+
+
+def test_a_kilo_abort_on_a_clean_tree_is_resumable_too(tmp_path):
+    """Nothing written yet is still an agent the shutdown cut off, not one that
+    finished: `--resume` starts it again from the ticket."""
+    run, _backend, _ws, _out = _run(tmp_path, [_aborted()])
+
+    assert run.state is AgentState.ERROR
+    assert run.resumable is True

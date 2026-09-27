@@ -722,6 +722,18 @@ def _is_local_store(error) -> bool:
     return bool(_LOCAL_STORE_RE.search(_error_message(error)))
 
 
+def _is_external_abort(error) -> bool:
+    """Round 87: True when *error* is Kilo's `MessageAbortedError`.
+
+    The runner never ends a turn this way itself. Its own stops come back as
+    `stalled`, or as its own `ProviderQuota` / `ProviderUnavailable`. So an
+    abort that reaches a turn was Kilo's: its server shut down (the Ctrl-C that
+    stops the round reaches `kilo serve` in the same process group) and it
+    aborted every session it held on the way out.
+    """
+    return isinstance(error, dict) and error.get("name") == "MessageAbortedError"
+
+
 def _rejected_request(error) -> bool:
     """KC-45 §2a: *error* is the provider refusing the request itself — the
     one payload whose retry depends on the session's transcript."""
@@ -3858,7 +3870,20 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                 # and KC-29 qualifies who may be promoted: only a session that
                 # ended on its own, not one the runner asked to stop.
                 note = None
-                if state in (AgentState.STALLED, AgentState.ERROR):
+                # Round 87: Kilo shut down under four live agents; each turn
+                # ended ERROR on `MessageAbortedError` before the round's own
+                # Ctrl-C flag was up, and `--resume` 8 minutes later restarted
+                # every agent except those four. An abort the runner did not ask
+                # for is not the agent's end: no deadline commit and no harvest
+                # against a server that is gone, and `resumable` so `_plan`
+                # starts it again in the same worktree.
+                external_abort = (state is AgentState.ERROR and idle.status == "error"
+                                  and _is_external_abort(idle.error))
+                if external_abort:
+                    run.resumable = True
+                    _log.warning("%s: session aborted by Kilo (its server stopped) — "
+                                 "--resume restarts it", spec.name)
+                if state in (AgentState.STALLED, AgentState.ERROR) and not external_abort:
                     above = _commits_above(ws)
                     # KC-41: a turn that ends with the work on disk and nothing
                     # committed scores as though it had produced nothing, and
