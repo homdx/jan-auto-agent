@@ -61,11 +61,13 @@ import shlex
 import shutil
 import sys
 import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from tools.contest import context_memory, gates
+from tools.contest import context_memory, gates, probe_memory
 from tools.contest.backend import KiloBackend, OpenRouterBackend
 from tools.contest.kilo_client import (
     KiloClient,
@@ -109,6 +111,7 @@ from tools.contest.variant import (
     listed_variants,
     needs_login,
     pick_variant,
+    with_retries,
 )
 from tools.contest.think_probe import (
     PROBE_CACHE_FILE,
@@ -334,7 +337,8 @@ def login_hint(kilo_bin: str | None, provider_id: str) -> str:
 
 
 def resolve_variants(providers: dict, agents: tuple, probe_for=None, *,
-                     kilo_bin: str | None = None, quota_re=None) -> tuple:
+                     kilo_bin: str | None = None, quota_re=None,
+                     parallel: int = 1, per_provider: int = 0) -> tuple:
     """KC-49: `(agents, failures, notes)` — every agent's variant made real.
 
     *providers* is `GET /provider`. An agent with no variant is untouched. A
@@ -358,12 +362,22 @@ def resolve_variants(providers: dict, agents: tuple, probe_for=None, *,
     *probe_for*, `highest` on a model that lists variants is a failure: there
     is nothing to ask. A model refused for its credentials on every rung
     (`needs_login`) gets `login_hint(kilo_bin, …)` on its failure line.
+
+    KC-70: *parallel* above 1 asks every probe the loop below would ask up
+    front, that many at once and at most *per_provider* at once against one
+    provider (0 is no provider cap) — `_prefetch`. The loop then reads the
+    answers in roster order, so the agents, the failures and the notes are what
+    the one-at-a-time walk gives, line for line; only the wall clock differs.
     """
     resolved = []
     failures: list = []
     notes: list = []
     picks: dict = {}
     probed: dict = {}
+    noted: set = set()
+    if probe_for is not None and int(parallel or 1) > 1:
+        probed, picks = _prefetch(providers, agents, probe_for,
+                                  parallel=int(parallel), per_provider=int(per_provider or 0))
     for agent in agents:
         wanted = agent.variant
         if not wanted:
@@ -413,10 +427,11 @@ def resolve_variants(providers: dict, agents: tuple, probe_for=None, *,
             resolved.append(agent)
             continue
         if agent.model not in picks:
-            pick = pick_variant(ladder(listed), probe_for(agent))
-            picks[agent.model] = pick
-            notes.append(f"{agent.model}@{HIGHEST} → {pick.describe()}")
+            picks[agent.model] = pick_variant(ladder(listed), probe_for(agent))
         pick = picks[agent.model]
+        if agent.model not in noted:
+            noted.add(agent.model)
+            notes.append(f"{agent.model}@{HIGHEST} → {pick.describe()}")
         if not pick.usable and pick.tried and all(
                 _is_quota(reason, quota_re) for _rung, reason in pick.tried):
             # KC-61: every rung answered a quota — the same dry key, not a
@@ -431,6 +446,74 @@ def resolve_variants(providers: dict, agents: tuple, probe_for=None, *,
             continue
         resolved.append(replace(agent, variant=pick.variant))
     return tuple(resolved), failures, notes
+
+
+def _prefetch(providers: dict, agents: tuple, probe_for, *, parallel: int,
+              per_provider: int) -> tuple[dict, dict]:
+    """KC-70: `(probed, picks)` — every probe `resolve_variants` would ask, asked
+    in a pool of *parallel*.
+
+    One job per `provider/model@variant` a named variant asks and per
+    `provider/model` a `highest` walks — the same dedup as the loop, so no
+    model is asked twice because two agents run it. A job skipped here (a
+    variant that is not listed, a `highest` with no list) is the loop's to
+    refuse. A `highest` ladder stays one job: its rungs go top-down, each only
+    when the one above refused, so they cannot run side by side.
+
+    *per_provider* caps the jobs one provider runs at once — a free tier counts
+    requests per key, and the round's own agents are about to use the same
+    key. The jobs are dealt round-robin over the providers, so a pool slot is
+    rarely held by a job waiting for its provider's turn.
+    """
+    jobs: dict = {}
+    for agent in agents:
+        wanted = agent.variant
+        if not wanted:
+            continue
+        listed = listed_variants(providers, agent.provider_id, agent.model_id)
+        if wanted != HIGHEST:
+            if wanted in listed:
+                jobs.setdefault(("named", (agent.provider_id, agent.model_id, wanted)),
+                                (agent, wanted, listed))
+        elif listed:
+            jobs.setdefault(("highest", agent.model), (agent, wanted, listed))
+    probed: dict = {}
+    picks: dict = {}
+    if not jobs:
+        return probed, picks
+
+    by_provider: dict = {}
+    for job, (agent, _wanted, _listed) in jobs.items():
+        by_provider.setdefault(agent.provider_id, []).append(job)
+    ordered = []
+    queues = list(by_provider.values())
+    while any(queues):
+        for queue in queues:
+            if queue:
+                ordered.append(queue.pop(0))
+
+    caps = {provider: threading.BoundedSemaphore(per_provider) if per_provider > 0 else None
+            for provider in by_provider}
+
+    def run(job):
+        agent, wanted, listed = jobs[job]
+        cap = caps[agent.provider_id]
+        if cap is not None:
+            cap.acquire()
+        try:
+            if job[0] == "named":
+                return _probe_answer(probe_for, agent, wanted)
+            return pick_variant(ladder(listed), probe_for(agent))
+        finally:
+            if cap is not None:
+                cap.release()
+
+    with ThreadPoolExecutor(max_workers=max(1, min(parallel, len(ordered))),
+                            thread_name_prefix="variant-probe") as pool:
+        answers = list(pool.map(run, ordered))
+    for (kind, key), answer in zip(ordered, answers):
+        (probed if kind == "named" else picks)[key] = answer
+    return probed, picks
 
 
 def _quota_skip_line(agent, answer) -> str:
@@ -1141,17 +1224,50 @@ def _check_offer(repo, config: ContestConfig, attached, *, resolve: bool = True,
             _ttl = 7.0
         import time as _time
 
+        # KC-70: the probes run side by side (`probe_parallel`), so the KC-11
+        # cache and the probe memory below are written from several threads
+        _lock = threading.Lock()
+
         def _save_cache():
             if probe_cache_path:
                 save_probe_cache(probe_cache_path, _cache)
 
+        # KC-70: a named variant that answered within `probe_memory_hours` is
+        # not asked again — the memory is read once here and written once
+        # after the probes, with this run's answers in and the stale ones out.
+        # `--reprobe` asks every one anyway and still writes what it saw.
+        _memory_hours = probe_memory.hours_of(config)
+        _memory_path = probe_memory.memory_path(config, repo)
+        _memory = ([] if reprobe or _memory_hours <= 0
+                   else probe_memory.load(_memory_path, hours=_memory_hours))
+        _answered: list = []
+        _refused: list = []
+        _retries = int(getattr(config, "probe_retries", 0) or 0)
+        _retry_wait = float(getattr(config, "probe_retry_wait_sec", 0) or 0)
+
         def probe_for(agent):
-            base_try_one = hello_probe(server, agent.provider_id, agent.model_id,
-                                       **probe_kwargs)
+            # KC-70: a rung refused for a reason a second ask gets past — a
+            # timeout, a 429, an empty reply — is asked `probe_retries` more
+            # times before its refusal counts, `highest`'s rungs included
+            base_try_one = with_retries(
+                hello_probe(server, agent.provider_id, agent.model_id, **probe_kwargs),
+                retries=_retries, wait_sec=_retry_wait, quota_re=quota_re,
+                label=agent.model)
             # Only cache-check for agents whose variant is `highest` — a named
-            # variant goes through the original single-rung path.
+            # variant goes through the single-rung path, with KC-70's memory.
             if agent.variant != HIGHEST:
-                return base_try_one
+                key3 = (agent.provider_id, agent.model_id, agent.variant)
+                if probe_memory.answered(_memory, *key3):
+                    return lambda variant: None
+
+                def _remembering(variant):
+                    reason = base_try_one(variant)
+                    with _lock:
+                        (_answered if reason is None else _refused).append(
+                            (agent.provider_id, agent.model_id, variant))
+                    return reason
+
+                return _remembering
 
             key = f"{agent.provider_id}/{agent.model_id}"
             rungs = ladder(listed_variants(providers, agent.provider_id, agent.model_id))
@@ -1182,6 +1298,11 @@ def _check_offer(repo, config: ContestConfig, attached, *, resolve: bool = True,
 
             def _caching(variant):
                 reason = base_try_one(variant)
+                with _lock:
+                    _record(variant, reason)
+                return reason
+
+            def _record(variant, reason):
                 if reason is None:
                     _cache[key] = {
                         "variant": variant,
@@ -1196,13 +1317,15 @@ def _check_offer(repo, config: ContestConfig, attached, *, resolve: bool = True,
                     tried_box.append([variant, reason])
                     if variant == rungs[-1] and _cache.pop(key, None) is not None:
                         _save_cache()
-                return reason
 
             return _caching
 
-        resolved, failures, notes = resolve_variants(providers, agents, probe_for,
-                                                     kilo_bin=kilo_bin,
-                                                     quota_re=quota_re)
+        resolved, failures, notes = resolve_variants(
+            providers, agents, probe_for, kilo_bin=kilo_bin, quota_re=quota_re,
+            parallel=int(getattr(config, "probe_parallel", 1) or 1),
+            per_provider=int(getattr(config, "probe_per_provider", 0) or 0))
+        if _memory_hours > 0:
+            probe_memory.update(_memory_path, _answered, _refused, hours=_memory_hours)
         # KC-56: the same read's `limit.context`, so the runner can tell a full
         # context window from a spent output budget without asking again
         if allow_unprobed:

@@ -31,14 +31,17 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import shutil
 import tempfile
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
 __all__ = [
     "DEFAULT",
     "HIGHEST",
+    "ProbeReason",
     "VARIANT_RANK",
     "VariantPick",
     "hello_probe",
@@ -46,6 +49,9 @@ __all__ = [
     "listed_variants",
     "needs_login",
     "pick_variant",
+    "retry_wait",
+    "retryable",
+    "with_retries",
 ]
 
 _LOG = logging.getLogger(__name__)
@@ -108,6 +114,98 @@ def needs_login(pick: VariantPick) -> bool:
     return (not pick.usable and bool(pick.tried)
             and all(any(m in reason.lower() for m in LOGIN_MARKERS)
                     for _, reason in pick.tried))
+
+
+class ProbeReason(str):
+    """A rung's refusal text that also says the provider named a far-off retry.
+
+    KC-70: ``wait_idle`` ends a probe whose provider schedules its next try
+    further out than ``provider_retry_max_wait_sec`` as ``ProviderQuota`` —
+    the text alone does not say so when ``quota_patterns`` is empty. The text is
+    what every caller already prints, byte for byte; ``quota`` is only read by
+    :func:`retryable`, so a key that is dry until midnight is not asked again.
+    """
+
+    quota: bool = False
+
+
+#: KC-70: refusals that answer the same way when asked again. KC-45 §2: a
+#: provider that rejects a session's first request rejects it when resent; a
+#: Kilo call that answered 4xx (other than 408 and 429) refused the request
+#: itself — an unknown variant, a malformed body.
+_FINAL_RE = re.compile(
+    r"provider rejected the request|blocked by a gateway or proxy"
+    r"|-> (?!408\b|429\b)4\d\d\b", re.IGNORECASE)
+
+#: KC-70: the words of a rate limit — asked again after twice the wait.
+_RATE_RE = re.compile(r"rate.?limit|too many requests|\b429\b|overloaded", re.IGNORECASE)
+
+
+def retryable(reason, quota_re=None) -> bool:
+    """KC-70: True when a rung's refusal is worth asking again.
+
+    ``None`` answered and needs nothing. A quota (``quota_re`` or a
+    :class:`ProbeReason` that says so), a refusal for credentials
+    (:data:`LOGIN_MARKERS`) and a refusal of the request itself (:data:`_FINAL_RE`)
+    answer the same way the next time; everything else — a timeout, an empty
+    reply, a closed stream, a 429, a 5xx, a provider that is ``temporarily
+    unavailable`` — is the kind a second ask gets past.
+    """
+    if reason is None:
+        return False
+    text = str(reason)
+    if getattr(reason, "quota", False):
+        return False
+    if quota_re is not None and quota_re.search(text):
+        return False
+    lowered = text.lower()
+    if any(marker in lowered for marker in LOGIN_MARKERS):
+        return False
+    return _FINAL_RE.search(text) is None
+
+
+def retry_wait(reason, attempt: int, wait_sec: float) -> float:
+    """KC-70: seconds to wait before ask number *attempt* + 1 (1-based *attempt*).
+
+    ``wait_sec`` times *attempt*, so the waits grow — 15, 30 — and twice that
+    for a rate limit, whose window the first wait may not have outlasted.
+    """
+    base = max(0.0, float(wait_sec)) * max(1, int(attempt))
+    return base * 2 if _RATE_RE.search(str(reason or "")) else base
+
+
+def with_retries(try_one: Callable[[str | None], str | None], *, retries: int,
+                 wait_sec: float, quota_re=None,
+                 sleep: Callable[[float], None] = time.sleep,
+                 label: str = "") -> Callable[[str | None], str | None]:
+    """KC-70: *try_one* asked up to ``1 + retries`` times per rung.
+
+    The first answer that is ``None`` or not :func:`retryable` is the rung's
+    answer; after the last try the last refusal is. An exception from
+    *try_one* is a refusal with the exception as its text, as in
+    :func:`pick_variant`. ``retries`` at or below zero is *try_one* itself —
+    today's single ask. Quiet: a retry is a ``DEBUG`` line, not console output.
+    """
+    retries = max(0, int(retries or 0))
+    if retries == 0:
+        return try_one
+
+    def ask(variant):
+        reason = None
+        for attempt in range(1, retries + 2):
+            try:
+                reason = try_one(variant)
+            except Exception as exc:  # noqa: BLE001 — a rung that blew up is a refusal
+                reason = f"{type(exc).__name__}: {exc}"
+            if attempt > retries or not retryable(reason, quota_re):
+                return reason
+            pause = retry_wait(reason, attempt, wait_sec)
+            _LOG.debug("probe %s@%s: %s — asking again in %.0f s (%d of %d)",
+                       label, variant or "none", reason, pause, attempt, retries)
+            sleep(pause)
+        return reason
+
+    return ask
 
 
 def listed_variants(providers: dict, provider_id: str, model_id: str) -> list:
@@ -224,7 +322,11 @@ def hello_probe(server, provider_id: str, model_id: str, *,
                                     on_question=lambda event: None,
                                     **probe_kwargs)
             if idle.status == "error":
-                return _error_text(idle.error)
+                reason = ProbeReason(_error_text(idle.error))
+                # KC-70: the retry reads this; the text is what it always was
+                reason.quota = (isinstance(idle.error, dict)
+                                and idle.error.get("name") == "ProviderQuota")
+                return reason
             if idle.status != "idle":
                 return f"no answer ({idle.status})"
             if not client.last_assistant_text(session):

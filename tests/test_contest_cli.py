@@ -2780,7 +2780,9 @@ KC35_REGISTERED_VARIANTS_SCENARIO = {
             "capabilities": {"reasoning": True, "toolcall": True},
             "variants": {name: {"reasoningEffort": name} for name in ("low", "medium", "high")}}
             for model_id in ("hy3:free", "agnes-3-0-flash:free")}},),),
-    "turns": [{"on_prompt": work_ready, "events": ["busy", "idle"]}]}
+    # KC-70: the probe gets its hello — an empty reply would be asked again
+    "turns": [{"on_prompt": _work_unless_probe, "events": ["busy", "idle"],
+               "assistant": "hello"}]}
 
 
 def test_register_missing_checks_the_variant_on_the_registered_offer(

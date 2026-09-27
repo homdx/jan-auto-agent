@@ -124,6 +124,12 @@ CONTEST_KEYS = (
     "workspace_kind",
     "variant",
     "probe_ttl_days",
+    "probe_memory_file",
+    "probe_memory_hours",
+    "probe_parallel",
+    "probe_per_provider",
+    "probe_retries",
+    "probe_retry_wait_sec",
     "context_memory_file",
     "context_memory_days",
     "compact_at_percent",
@@ -366,6 +372,22 @@ class ContestConfig:
     variant: str = "highest"
     #: KC-11: how many days a probe result is trusted before re-probing. 0 = always re-probe.
     probe_ttl_days: int = 7
+    #: KC-70: a named variant that answered intake's ``say: hello`` is not asked
+    #: again for ``probe_memory_hours``. A path; ``""`` is
+    #: ``<out_dir>/probe-memory.json``, next to KC-67's memory.
+    probe_memory_file: str = ""
+    #: KC-70: how long a named variant's answer is trusted. 0 = ask every time.
+    probe_memory_hours: float = 24.0
+    #: KC-70: intake's probes asked at once; 1 is one after the other.
+    probe_parallel: int = 8
+    #: KC-70: of those, at most this many against one provider; 0 = no cap.
+    probe_per_provider: int = 3
+    #: KC-70: a probe refused for a passing reason (timeout, 429, empty reply)
+    #: is asked this many more times; 0 = one ask, as before.
+    probe_retries: int = 2
+    #: KC-70: the wait before the first re-ask; the n-th waits n times this,
+    #: and twice that after a rate limit.
+    probe_retry_wait_sec: float = 15.0
     agents: tuple[AgentSpec, ...] = ()
     gate_settings: LlmSettings = field(default_factory=lambda: DEFAULTS_GATE)
     #: The backend the round runs on: one of ``BACKENDS``, one value per round.
@@ -650,6 +672,16 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
     # into a session it cannot size itself. Both fall back to the default, and 0
     # is what either means when it is set to it: no memory, no compact.
     context_memory_days = num("context_memory_days", 7.0)
+    # KC-70: the same fail-open read for the probe memory's age — 0 is off
+    probe_memory_hours = num("probe_memory_hours", 24.0)
+    probe_parallel = limit("probe_parallel", 8)
+    probe_per_provider = limit("probe_per_provider", 3)
+    probe_retries = limit("probe_retries", 2)
+    for key, value in (("probe_parallel", probe_parallel),
+                       ("probe_per_provider", probe_per_provider),
+                       ("probe_retries", probe_retries)):
+        if value < 0:
+            raise RosterError(f"[contest] {key} must be >= 0, got {value}")
     compact_at_percent = num("compact_at_percent", 80.0)
 
     # KC-58: 0 slots is "the queue is off", so a negative count is refused
@@ -726,6 +758,12 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
         workspace_kind=workspace_kind,
         variant=scalar("variant", "highest") or "highest",
         probe_ttl_days=int(scalar("probe_ttl_days", "7") or "7"),
+        probe_memory_file=scalar("probe_memory_file", ""),
+        probe_memory_hours=probe_memory_hours,
+        probe_parallel=max(1, probe_parallel),
+        probe_per_provider=probe_per_provider,
+        probe_retries=probe_retries,
+        probe_retry_wait_sec=seconds("probe_retry_wait_sec", 15.0),
         agents=agents,
         gate_settings=settings,
         backend=backend,

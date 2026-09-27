@@ -1,6 +1,6 @@
 # KC-11 — Each roster model is probed once: the highest thinking variant that answers `hello` is the one the round uses, saved next to the roster
 
-**Status:** queued — **Narrowed 2026-09-23:** KC-49 (`epic-tasks/93-kc49-…`) does the plumbing (`create_session`/`prompt` `variant`, `delete_session`, `model@variant`, `--variant`) and `highest` (`variant.ladder`, `pick_variant`, `hello_probe`, one probe per model at intake, no cache). What stays here is §3's cache, `--reprobe`/`--allow-unprobed` and the reasoning-token report, built on KC-49's `pick_variant`. The operator's live case for the ladder: `glm-4-7-flash:free` lists `max` and its provider answers it with HTTP 400. — after KC-25 (round 64; `KiloClient.providers()` and the `GET /provider` fake come from there) and KC-10 (round 49); runs at `cli.py`'s `intake` (KC-16, landed `1304950` — the intake KC-7 was to own moved there). **Re-verified against the code and a live Kilo 7.6.2 on 2026-09-20:** `AgentSpec.variant` exists (`roster.py`) but `KiloClient.create_session`/`prompt` take no `variant` and the client has no `delete_session` — this ticket adds them (the original text assumed the client already had them; it never did). Live: `GET /provider` lists for **every** openai-compatible model marked `reasoning: true` in `kilo.jsonc` the same `variants: {"low": {"reasoningEffort": "low"}, "medium": …, "high": …}` — no `max`, no `minimal` — so the ladder below runs `high → medium → low → none` in practice; `POST /session` with `model.variant: "high"` is accepted and echoed back in the session's `model`; `DELETE /session/{id}` answers 200.  
+**Status:** landed `78f1482` + `5490b34` (2026-09-26) — `contest-probe.json`, `probe_ttl_days`, `--reprobe`, `--allow-unprobed`, `delete_session`, `create_session(variant=)`; closed 2026-09-27 with KC-70 (116), which adds the retry and the pool to its rungs. Two parts are placeholders, not done: `reasoning_tokens` is always 0 (no report), and intake writes `kilo_version = ""` (no version at that call site), so only the age and the listed variants decide a hit. Was: queued — **Narrowed 2026-09-23:** KC-49 (`epic-tasks/93-kc49-…`) does the plumbing (`create_session`/`prompt` `variant`, `delete_session`, `model@variant`, `--variant`) and `highest` (`variant.ladder`, `pick_variant`, `hello_probe`, one probe per model at intake, no cache). What stays here is §3's cache, `--reprobe`/`--allow-unprobed` and the reasoning-token report, built on KC-49's `pick_variant`. The operator's live case for the ladder: `glm-4-7-flash:free` lists `max` and its provider answers it with HTTP 400. — after KC-25 (round 64; `KiloClient.providers()` and the `GET /provider` fake come from there) and KC-10 (round 49); runs at `cli.py`'s `intake` (KC-16, landed `1304950` — the intake KC-7 was to own moved there). **Re-verified against the code and a live Kilo 7.6.2 on 2026-09-20:** `AgentSpec.variant` exists (`roster.py`) but `KiloClient.create_session`/`prompt` take no `variant` and the client has no `delete_session` — this ticket adds them (the original text assumed the client already had them; it never did). Live: `GET /provider` lists for **every** openai-compatible model marked `reasoning: true` in `kilo.jsonc` the same `variants: {"low": {"reasoningEffort": "low"}, "medium": …, "high": …}` — no `max`, no `minimal` — so the ladder below runs `high → medium → low → none` in practice; `POST /session` with `model.variant: "high"` is accepted and echoed back in the session's `model`; `DELETE /session/{id}` answers 200.  
 **Severity:** MEDIUM  
 **File:** `tools/contest/think_probe.py` (new)  
 **Symbol:** `probe_model`, `ProbeResult`, `load_probe_cache`, `save_probe_cache`, `VARIANT_LADDER`  
@@ -67,7 +67,7 @@ roster.
 
 ## Acceptance
 
-- [ ] `tests/test_contest_think_probe.py` against the fake: a model with
+- [x] `tests/test_contest_think_probe.py` against the fake: a model with
       `variants: {max, high}` whose fake rejects `max` (400) and answers
       `high` with `hello` → `variant == "high"`, `tried == [("max","http 400")]`,
       two sessions created, the winning one deleted; a model with
@@ -76,13 +76,13 @@ roster.
       cache younger than the TTL skips the probe (no `POST /session` in
       the fake's log); `--reprobe` probes anyway; a roster-set
       `variant = low` is checked once and kept.
-- [ ] The round's `POST /session` body (fake log) carries the resolved
+- [x] The round's `POST /session` body (fake log) carries the resolved
       variant in `model.variant`; a `None` variant sends no `variant`
       key at all; the `prompt_async` body is unchanged.
-- [ ] `tests/test_contest_kilo_client.py` gains `delete_session` (200 →
+- [x] `tests/test_contest_kilo_client.py` gains `delete_session` (200 →
       `None`; 404 → `KiloHttpError`) and `create_session(variant=)`;
       no existing line removed.
-- [ ] `python3 -m pytest tests -n 4 -q --timeout=180 && python3 -m pytest tests_bugfix -n 4 -q --timeout=180` green.
+- [x] `python3 -m pytest tests -n 4 -q --timeout=180 && python3 -m pytest tests_bugfix -n 4 -q --timeout=180` green.
 
 ## Out of scope
 
