@@ -9,7 +9,7 @@
 >
 > **Corrected status/dependencies below supersede stale KC-9/KC-36 wording retained in the source history.**
 
-**Status:** open — round 78 running (started 2026-09-27, 8 agents). KC-9, KC-34 and KC-36 have landed; no dependency remains outstanding before this ticket. The repeated-diff detection and bounded fresh-session reset are still unimplemented. Asked by the operator 2026-09-22.
+**Status:** landed `5f3de96` (2026-09-28) — round 78, winner by score agnes-2-5-flash (26/27 on `contest-bench/kc39`); the ideal is built on sensenova-6-7-flash-lite-var2 with §7 dropped and its `git add -A -N -- ':!runs'` fixed (git refuses it whenever the ignored `runs/` exists, so live it never fired). The live-model acceptance item is still open. Asked by the operator 2026-09-22.
 **Severity:** MEDIUM (no work is lost — a commit under the branch is still harvested either way, KC-21 — but a model that repeats itself burns the whole continue budget for nothing and then gets a `HARVESTING`/`REWORK` critique inside the very session that produced the loop, which is the session least likely to break out of it)
 **File:** `tools/contest/runner.py` (`run_agent` — the `idle.status == "idle"` branch, KC-22's `continue_used`/`budget` block), `contest.ini`
 **Symbol:** `run_agent`, `continue_message`, `_dirty_tree`, `_diff_signature` (new), `ContestConfig.max_sessions_per_attempt` (new)
