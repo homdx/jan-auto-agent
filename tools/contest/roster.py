@@ -165,7 +165,7 @@ DEFAULTS_GATE = LlmSettings(
     model="",
     api_format="openai",
     temperature=0.0,
-    max_tokens=256,
+    max_tokens=2048,
     response_format=True,
 )
 

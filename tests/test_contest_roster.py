@@ -677,7 +677,7 @@ def test_gate_profile_reads_the_committed_section(gate_key, tmp_path):
     assert settings.api_format == "openai"
     assert settings.response_format is True
     assert settings.temperature == 0.0
-    assert settings.max_tokens == 256
+    assert settings.max_tokens == 2048
 
 
 def test_gate_profile_without_its_section_names_it(tmp_path):

@@ -24,7 +24,7 @@ answered by silence:
       ``tools.llm_stream.request_completion``'s own loop, with the wait budget
       of ``[contest] gate_retries`` / ``gate_retry_wait_sec`` /
       ``gate_retry_max_wait_sec``; a reply that carries no verdict is asked
-      once more after ``GATE_RETRY_WAIT``; and every wait stops no later than
+      once more after ``GATE_RETRY_WAIT``, with room to finish it; and every wait stops no later than
       ``gate_deadline_sec`` in, because the gate runs synchronously inside
       ``KiloClient.wait_idle``'s loop and every second it spends counts against
       the round's silence clock. A refusal the endpoint never retries — a 401,
@@ -77,6 +77,7 @@ __all__ = [
     "DECISION_KEYS",
     "GATE_PROBE_MESSAGE",
     "GATE_RETRIES",
+    "GATE_RETRY_MIN_TOKENS",
     "GATE_RETRY_WAIT",
     "GATE_SYSTEM_PROMPT",
     "GATE_TIMEOUT",
@@ -105,6 +106,29 @@ GATE_TIMEOUT = 60.0
 #: stands, and a clean verdict is never re-asked.
 GATE_RETRIES = 1
 GATE_RETRY_WAIT = 2.0
+
+#: The reply budget of that one extra call: at least this many tokens, and at
+#: least twice the profile's. A reasoning gate model thinks before it writes,
+#: whatever ``think = false`` asks — ``hy3:free`` spent all of a 256-token
+#: budget thinking on every round-46 ask it failed (``finish_reason: length``,
+#: ``content: ""``, replayed live) and answered in ~450 tokens with 1024 — so
+#: the same request with the same budget fails the same way twice.
+GATE_RETRY_MIN_TOKENS = 2048
+
+
+def _roomier(payload: dict) -> None:
+    """Widen *payload*'s reply budget in place for the retry (``GATE_RETRY_MIN_TOKENS``).
+
+    ``max_tokens`` for an OpenAI or Anthropic body, ``options.num_predict``
+    for an Ollama one; a body with neither is left as it is.
+    """
+    options = payload.get("options")
+    holder = options if isinstance(options, dict) and "num_predict" in options else payload
+    key = "num_predict" if holder is options else "max_tokens"
+    current = holder.get(key)
+    if isinstance(current, int) and not isinstance(current, bool):
+        holder[key] = max(2 * current, GATE_RETRY_MIN_TOKENS)
+
 
 #: KC-55 §5: the probe intake sends the gate once before the round starts — the
 #: same request shape as a real ask, with one attempt and no retries, so a dead
@@ -498,6 +522,34 @@ def _pathlike(text: str) -> bool:
     return text.startswith(("/", "~", "./", "../"))
 
 
+#: The asks whose ``patterns`` name one file, never a command: Kilo's ``edit``
+#: (its write and patch tools ask as ``edit`` too) and ``read``, and the
+#: OpenRouter backend's ``read`` and ``write``. They name the file *relative
+#: to the session's directory* — round 46's asks were ``patterns:
+#: ["AGENTS.md"]`` with the absolute path only in ``metadata.filepath`` — so
+#: ``_pathlike``'s rule for command words would drop every one of them: no
+#: path at all, the "inside the worktree" check never met, and an edit of the
+#: agent's own file went to the gate. There a bare word is a file name.
+_FILE_PERMISSIONS = frozenset({"edit", "read", "write"})
+
+#: Kilo's own configuration inside a worktree: what Kilo marks
+#: ``configProtected`` (``.kilo/``, ``.kilocode/``, ``kilo.json[c]``,
+#: ``opencode.json[c]``) except ``AGENTS.md``, which is this repo's own
+#: document and a file tickets name. An edit of one of these can change what
+#: Kilo lets the agent do — a ``permission`` block in a project ``kilo.json`` —
+#: so it is never settled by geometry: it goes to the gate, as it always has.
+_KILO_CONFIG_FILES = frozenset({"kilo.json", "kilo.jsonc", "opencode.json", "opencode.jsonc"})
+_KILO_CONFIG_DIRS = frozenset({".kilo", ".kilocode"})
+
+
+def _kilo_config(path: Path, worktree: "Path | None") -> bool:
+    """True for a Kilo config file or directory at or under *worktree*."""
+    if worktree is None or not _inside(path, worktree) or path == worktree:
+        return False
+    parts = path.relative_to(worktree).parts
+    return parts[-1] in _KILO_CONFIG_FILES or any(part in _KILO_CONFIG_DIRS for part in parts)
+
+
 #: One token of a ``bash`` command: a quoted string kept whole (so
 #: ``"/tmp/my dir/f"`` is one token, not a path and a bare word), else a
 #: maximal run up to whitespace or a shell operator — ``>``, ``>>``, ``<``,
@@ -737,19 +789,33 @@ def _extract_paths(props: dict, base: "Path | None" = None) -> list:
     unaffected. With no *base* (a direct caller, an old test) behaviour is
     today's: the target resolves against the caller's cwd. A token naming one
     of ``NULL_DEVICES`` is dropped (KC-28).
+
+    For a file ask (``_FILE_PERMISSIONS``) ``metadata.filepath`` is read too,
+    and a pattern is a file name even without a ``/`` or ``./`` in front:
+    ``AGENTS.md`` joins *base* like a ``./…`` token. Only with a *base* — a
+    direct caller without one keeps today's rule, since a bare word resolved
+    against the runner's cwd would name the wrong tree.
     """
     meta = _metadata(props)
+    permission = _as_str(props.get("permission"))
+    file_ask = permission in _FILE_PERMISSIONS and base is not None
     raw = list(_as_list(props.get("patterns")))
     raw.extend(_as_list(meta.get("directories")))
     raw.extend(_as_list(meta.get("patterns")))
-    if _as_str(props.get("permission")) == "bash":
+    if file_ask:
+        raw.append(meta.get("filepath"))
+    if permission == "bash":
         raw.extend(_command_paths(meta.get("command")))
 
     originals: dict = {}
     order: list = []
     for item in raw:
         original = _as_str(item)
-        if not original or not _pathlike(original):
+        if not original:
+            continue
+        if not _pathlike(original) and not (
+            file_ask and not any(ch in original for ch in _NOT_A_PATH)
+        ):
             continue
         # KC-52 follow-up: ``/*`` strips to the root, not to the empty
         # string — "" is not absolute, so it was joined to *base* (KC-51)
@@ -843,13 +909,40 @@ def _deny_match(command: str, deny_commands) -> "str | None":
 # the gate's reply
 # ─────────────────────────────────────────────────────────────────────────────
 
+#: The head of a gate object cut off by ``max_tokens``: ``{"verdict":
+#: "allow", "reason": "AGENTS.md is inside the agent's worktree and is`` —
+#: round 46, sensenova-6-7-flash-lite-var1. The verdict is whole, closing
+#: quote and all; only the reason ran out.
+_TRUNCATED_VERDICT_RE = re.compile(
+    r'^\{\s*"verdict"\s*:\s*"(allow|reject)"\s*(?:,\s*"reason"\s*:\s*"((?:[^"\\]|\\.)*))?',
+    re.IGNORECASE,
+)
+
+
+def _truncated_verdict(cleaned: str) -> "tuple[str, str]":
+    """``(verdict, reason)`` from an object that never closed, else ``('', '')``.
+
+    Only a verdict the model finished writing counts, and only as the first
+    key of the first object: ``{"verdict": "`` alone, or a reason cut before
+    any verdict, is still no verdict and is asked again.
+    """
+    start = cleaned.find("{")
+    match = _TRUNCATED_VERDICT_RE.match(cleaned[start:]) if start >= 0 else None
+    if match is None:
+        return "", ""
+    reason = match.group(2)
+    return match.group(1).lower(), f"{reason.strip()} … (cut)" if reason else "(reason cut)"
+
+
 def _extract_verdict(reply) -> "tuple[str, str]":
     """``(verdict, reason)`` from a gate reply — ``('', '')`` when there is
     no JSON object in it.
 
     ``strip_think`` first, then markdown fences, then the first ``{…}``
     object in whatever is left: the same tolerant extraction Gate 1 uses for
-    its presence verdict, since the same gateways send the same shapes.
+    its presence verdict, since the same gateways send the same shapes. An
+    object that never closed still yields the verdict it finished writing
+    (``_truncated_verdict``).
     """
     if isinstance(reply, dict):
         data = reply
@@ -879,7 +972,7 @@ def _extract_verdict(reply) -> "tuple[str, str]":
                 if isinstance(candidate, dict):
                     data = candidate
         if data is None:
-            return "", ""
+            return _truncated_verdict(cleaned)
 
     verdict = _as_str(data.get("verdict")).lower()
     if verdict not in ("allow", "reject"):
@@ -1056,7 +1149,8 @@ class Policy:
     def _mechanical(self, props: dict, ctx: PolicyContext) -> "Decision | None":
         """Geometry alone: a Decision, or ``None`` when it cannot decide.
 
-        In order: ``doom_loop``; any path at or under a forbidden entry;
+        In order: ``doom_loop``; any path at or under a forbidden entry; a
+        file ask on Kilo's own config in the worktree (``None``: the gate's);
         every path inside the worktree or under a ``tmp_roots`` glob; a
         ``bash`` command matching ``deny_commands``; a ``bash`` ask with no
         path outside the worktree/tmp_roots; otherwise ``None``.
@@ -1074,6 +1168,12 @@ class Policy:
                     "reject", "mechanical",
                     f"forbidden: {', '.join(originals)} is at or under {entry}",
                 )
+
+        if permission in _FILE_PERMISSIONS and any(
+            _kilo_config(resolved, worktree) for resolved, _ in pairs
+        ):
+            # Kilo's own config in the worktree: never geometry's call
+            return None
 
         if _inside_worktree_or_tmp(pairs, worktree, self._tmp_roots(ctx)):
             return Decision("once", "mechanical", "inside worktree/tmp_roots")
@@ -1239,8 +1339,10 @@ class Policy:
                     return Decision("reject", "gate",
                                     f"gate: {reason or 'rejected'}", elapsed, text, attempts)
                 if ask < GATE_RETRIES:
-                    # the same request once more; the last attempt's verdict stands
+                    # the same request once more, with room to finish; the
+                    # last attempt's verdict stands
                     wait(GATE_RETRY_WAIT)
+                    _roomier(payload)
             elapsed = float(self._clock() - start)
             quote = text.strip()[:_GATE_FAIL_QUOTE] or "empty reply"
             return Decision(
