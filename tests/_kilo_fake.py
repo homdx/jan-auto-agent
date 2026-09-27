@@ -48,6 +48,9 @@ Everything here is scripted by one scenario dict, per session:
                     "permission": {...},  # asked after it, blocks until answered
                     "on_work": callable(directory) -> None,  # the loop's work
                     "end": "idle",   # or an error payload: how the loop ends
+                    "then": {...},   # after an error `end`, Kilo compacts and
+                                     # goes on again: another autocompact, the
+                                     # session still busy; an abort stops it
                 },
                 "message_info": {...},  # merged into the assistant message's info
                                      # (KC-56: `finish`, `tokens`)
@@ -693,6 +696,11 @@ class FakeKiloServer:
         try:
             until = time.monotonic() + float(spec.get("compact_sec", 0.5))
             while time.monotonic() < until and not self._stop.is_set():
+                if session.aborted:
+                    # Kilo's answer to an abort: the loop stops, the session idles
+                    self._emit({"type": "session.idle",
+                                "properties": {"sessionID": session.id}})
+                    return
                 self._emit({"type": "session.status",
                             "properties": {"sessionID": session.id,
                                            "status": {"type": "busy"}}})
@@ -737,6 +745,9 @@ class FakeKiloServer:
             else:
                 self._emit({"type": "session.error",
                             "properties": {"sessionID": session.id, "error": end}})
+                if spec.get("then") is not None:
+                    # a second overflow: Kilo compacts and goes on again
+                    self._autocompact(session, dict(spec["then"]))
         finally:
             session.busy.clear()
 

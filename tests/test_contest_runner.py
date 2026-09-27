@@ -3165,6 +3165,30 @@ def test_time_up_while_kilo_still_works_after_an_overflow_is_a_stall_not_a_compa
     assert run.turns[0]["idle_status"] == "stalled"
 
 
+def test_a_second_overflow_in_kilo_s_own_loop_is_aborted_before_the_runner_compacts(tmp_path):
+    """KC-73: the loop Kilo went on with overflows again and Kilo starts over —
+    compact, go on — so the session is busy once more when the wait ends on that
+    `session.error`. The runner aborts it before its own `summarize`, which a
+    busy session would not answer (round 78's 900 s, one error later)."""
+    scenario = {"summary_tokens": 3_000, "summarize_busy_timeout": 20, "turns": [
+        {"events": ["busy"], "error": _OVERFLOW,
+         "autocompact": {"compact_sec": 0.3, "compacted": False, "end": _OVERFLOW,
+                         "then": {"compact_sec": 60}}},
+        {"on_prompt": work_ready, "events": ["busy", "idle"]},
+    ]}
+    started = time.monotonic()
+    sb, fake, _h, run, _ = _run_one(tmp_path, scenario, _stall_config(max_continues_per_attempt=2))
+    assert time.monotonic() - started < 15
+    _assert_ready(run, sb.ws("agent-a"))
+    paths = [r["path"] for r in fake.calls("POST")]
+    sid = fake.sessions()[0].id
+    abort, summarize = f"/session/{sid}/abort", f"/session/{sid}/summarize"
+    assert abort in paths and summarize in paths
+    assert paths.index(abort) < paths.index(summarize)
+    first = run.turns[0]
+    assert first["overflow_settle_status"] == "error" and first["overflow_compacted"] is True
+
+
 def test_a_swap_after_an_overflow_aborts_the_old_session(tmp_path):
     """KC-73: the session a swap leaves behind is aborted — round 78's old
     session sat on an open ask in the worktree the new one edits."""

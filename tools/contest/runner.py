@@ -3454,7 +3454,9 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         away from a session Kilo had already compacted.
 
         So the session is waited on first, asks answered, the turn's budgets
-        and silence clock armed. A session silent for `OVERFLOW_SETTLE_SEC` has
+        and silence clock armed — `turn_timeout_sec` without KC-36's churn
+        extension: this is Kilo finishing what it started, not a turn the
+        runner prompted, and `agent_max_sec` still bounds the agent. A session silent for `OVERFLOW_SETTLE_SEC` has
         nothing running (``quiet``); one that ends in anything but an idle is
         left to the recovery as before. True only when Kilo compacted the
         session itself, it went idle, and what it holds now is under
@@ -3474,6 +3476,14 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
             return False
         turn["overflow_settle_sec"] = round(took, 1)
         turn["overflow_settle_status"] = status
+        if status == "error":
+            # the loop Kilo went on with ended in a session.error of its own —
+            # a second overflow is compacted and gone on with the same way, so
+            # the session may be busy again. Stop it before the runner's own
+            # `summarize`, which Kilo answers only on a free session: that is
+            # round 78's 900 s, one error later. A timeout needs nothing here —
+            # `wait_idle` aborts the session before it returns one.
+            _abort_quietly(backend, session)
         if status != "idle" or not getattr(settled, "compacted", False):
             _log.info("%s: after the overflow Kilo worked on for %.0f s and ended %s%s — "
                       "the runner recovers it", spec.name, took, status,

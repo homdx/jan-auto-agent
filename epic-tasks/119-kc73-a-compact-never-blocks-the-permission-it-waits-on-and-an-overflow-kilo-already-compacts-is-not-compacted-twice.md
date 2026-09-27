@@ -113,7 +113,17 @@ overflow Kilo compacts and goes on with takes the same path.
    `old_session_aborted` in the turn. Round 78's old session was still `busy`
    (`GET /session/status`) twenty minutes after the swap.
 4. `context_before` is `null`, not `0`, when the last message reports no tokens.
-5. **A stall during the wait ends the recovery.** When the agent's hard limit
+5. **A second overflow inside Kilo's own loop is stopped before the runner
+   compacts** (follow-up, review of `3682b6a`). When the wait ends on a
+   `session.error` — the loop Kilo went on with overflowed again, and Kilo
+   compacts and goes on once more — the session is busy again, and the
+   runner's `summarize` would be round 78's 900 s one error later. The runner
+   aborts it first (`_abort_quietly`). A wait that ends in `timeout` needs
+   nothing: `wait_idle` aborts the session before it returns one, so the
+   runner's compact never goes into a busy session after a timeout either.
+   The wait has no KC-36 churn extension (`on_deadline`): it is Kilo finishing
+   what it started, bounded by `turn_timeout_sec` and by `agent_max_sec`.
+6. **A stall during the wait ends the recovery.** When the agent's hard limit
    (`agent_max_sec`) or another stall fires while Kilo is still working, the
    overflow edge neither compacts nor swaps: STALLED with the stall's own reason,
    and the KC-21 harvest as for any overflow stall.
@@ -140,6 +150,7 @@ Kilo's does (`summarize_busy_timeout`, then 504).
 - nothing after the error → `quiet`, the recovery as before;
 - a swap aborts the old session and not the new one.
 - time up while Kilo still compacts → STALLED `time up` in seconds, no `summarize`, no new session.
+- a second overflow in Kilo's own loop → the session aborted before the runner's `summarize`, READY in seconds; without the abort the same test waits the fake's busy timeout out.
 
 ## Out of scope
 
