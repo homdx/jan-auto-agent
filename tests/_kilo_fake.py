@@ -640,12 +640,18 @@ class FakeKiloServer:
             return
 
         parts = [_tool_part(p) for p in (turn.get("tool_parts") or [])]
-        if turn.get("assistant"):
-            parts.append({"type": "text", "text": turn["assistant"]})
+        # KC-9: a turn with no `assistant` key ends the way a live one does —
+        # with a reply — so the runner reads it as FINISHED; `"assistant": ""`
+        # is the reply a free tier cut to nothing, a CUT or a SILENT idle.
+        text = turn.get("assistant", "done")
+        if text:
+            parts.append({"type": "text", "text": text})
         # KC-56: `message_info` goes onto the assistant message's `info` —
         # `finish` and `tokens` the way Kilo reports a reply cut off at a limit
         info = {"role": "assistant", "sessionID": session.id, "time": time.time()}
         info.update(turn.get("message_info") or {})
+        if turn.get("cut"):
+            info.setdefault("finish", "length")
         session.messages.append({"info": info, "parts": parts})
 
         if turn.get("idle", True):

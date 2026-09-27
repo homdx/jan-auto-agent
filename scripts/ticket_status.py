@@ -206,6 +206,8 @@ def main(argv=None) -> int:
 
     if note is None:
         rest = match.group(3)
+    elif args.status == "landed":
+        rest = f" {note}"  # the repo's form: landed `sha` — note
     elif note.startswith((" —", " -")):
         rest = note
     else:

@@ -1187,7 +1187,11 @@ def test_a_stall_with_a_valid_commit_counts_as_ready_and_exits_zero(sandbox, cap
     # through the hook now, but a 1 s window leaves no room for that beat to
     # be *delivered* late on a loaded box.
     ini.write_text(ini.read_text(encoding="utf-8").replace("idle_event_timeout_sec = 900",
-                                                            "idle_event_timeout_sec = 5"),
+                                                            "idle_event_timeout_sec = 5")
+                   # KC-9: a silence under the deadline is a `continue` now; this
+                   # test is about the terminal harvest of a stall, so no budget
+                   .replace("idle_event_timeout_sec = 5",
+                            "idle_event_timeout_sec = 5\nmax_continues_per_attempt = 0"),
                    encoding="utf-8")
     scenario = {"turns": [{"on_prompt": lambda directory, text: work_ready(directory, text)
                                           if Path(directory).name.endswith("agent-a") else None,

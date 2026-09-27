@@ -232,7 +232,10 @@ from tools.git_run import run_git
 __all__ = [
     "AgentRun",
     "AgentState",
+    "IdleKind",
     "RoundState",
+    "classify_idle",
+    "CONTINUE_PROMPT",
     "round_prompt",
     "run_agent",
     "run_round",
@@ -555,6 +558,14 @@ RETRY_PROMPT = (
     "were; do not start over."
 )
 
+#: KC-9: the prompt sent when a turn ended without finishing — cut off mid-stream
+#: or silent past the idle window.  Plain text; no ticket text repeated.
+CONTINUE_PROMPT = (
+    "Your previous reply stopped before the task was finished. Continue exactly "
+    "where you left off in this same worktree: finish the change, make sure it "
+    "is one commit, then record it with `append_task.py`. Do not start over."
+)
+
 _RETRYABLE_CODES = frozenset({
     "ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "EPIPE", "UND_ERR_SOCKET",
 })
@@ -866,6 +877,90 @@ def _cut_off(backend: ContestBackend, session: SessionRef,
             return "context"
         return "output"
     return None
+
+
+def classify_idle(backend: ContestBackend, session: SessionRef,
+                  turn_started_at: float, workspace: Workspace | None = None) -> IdleKind:
+    """KC-9: how the turn that just went idle actually ended.
+
+    Reads the session's messages once and decides, in order:
+
+    * ``FINISHED`` — the last assistant message has non-empty text, or its last
+      part is a ``tool`` part with ``state.status == "completed"`` and the
+      agent's ``PROGRESS.csv`` was modified after *turn_started_at*.
+    * ``CUT`` — the last assistant message has empty text and its last part is
+      a ``tool`` part with ``status`` ``"running"`` or ``"pending"``, or the
+      message ``info.error`` is set, or ``info.finish`` / ``finish_reason`` is
+      ``"length"``.
+    * ``SILENT`` — empty text, no ``tool`` parts in this turn at all.
+    * otherwise ``FINISHED`` — let the harvest decide.
+
+    Every failure degrades to ``FINISHED``: a transcript that cannot be read,
+    a malformed message, or a ``PROGRESS.csv`` that cannot be statted is not
+    an exception into the round.
+    """
+    try:
+        messages = backend.messages(session)
+    except Exception:  # noqa: BLE001 — a broken transcript is not a round
+        return IdleKind.FINISHED
+    if not isinstance(messages, list):
+        return IdleKind.FINISHED
+
+    last_assistant = None
+    for message in reversed(messages):
+        info = message.get("info") if isinstance(message, dict) else None
+        if not isinstance(info, dict) or info.get("role") != "assistant":
+            continue
+        last_assistant = message
+        break
+
+    if last_assistant is None:
+        # no assistant message at all is a transcript this backend does not
+        # keep (an `OpenRouterBackend` agent, a scripted test double), not a
+        # model that said nothing: harvest decides, as for any unreadable read
+        return IdleKind.FINISHED
+
+    info = last_assistant.get("info") or {}
+    parts = last_assistant.get("parts") or []
+
+    text = ""
+    tool_parts = []
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        if part.get("type") == "text":
+            text = part.get("text", "")
+        elif part.get("type") == "tool":
+            tool_parts.append(part)
+
+    if text:
+        return IdleKind.FINISHED
+
+    if info.get("error"):
+        return IdleKind.CUT
+
+    finish = info.get("finish") or info.get("finish_reason")
+    if finish == "length":
+        return IdleKind.CUT
+
+    if tool_parts:
+        last_tool = tool_parts[-1]
+        state = last_tool.get("state") or {}
+        status = state.get("status", "")
+        if status in ("running", "pending"):
+            return IdleKind.CUT
+        if status == "completed":
+            try:
+                if workspace is not None:
+                    mtime = workspace.progress_csv.stat().st_mtime
+                    if mtime > turn_started_at:
+                        return IdleKind.FINISHED
+            except OSError:
+                pass
+            return IdleKind.FINISHED
+        return IdleKind.FINISHED
+
+    return IdleKind.SILENT
 
 
 def _context_budget(spec, records) -> tuple:
@@ -1251,6 +1346,14 @@ class AgentState(str, Enum):
         return self in (AgentState.READY, AgentState.GAVE_UP, AgentState.STALLED, AgentState.ERROR)
 
 
+class IdleKind(Enum):
+    """How a turn that ended idle actually ended."""
+
+    FINISHED = "FINISHED"
+    CUT = "CUT"
+    SILENT = "SILENT"
+
+
 def _counters() -> dict:
     return {"asked": 0, "allowed": 0, "rejected": 0, "gated": 0, "gate_failed": 0}
 
@@ -1300,6 +1403,9 @@ class AgentRun:
     #: worktree at the terminal state, absent from `state.json` when the agent
     #: left nothing running.
     reaped: list | None = None
+    #: KC-9: the per-attempt counter of continues sent into the same session.
+    #: Bounded by `max_continues_per_attempt`; reset on rework and resume.
+    continues: int = 0
 
     @property
     def terminal(self) -> bool:
@@ -1325,7 +1431,7 @@ class AgentRun:
         run = cls(agent=AgentSpec(**data["agent"]), workspace=Workspace(**ws))
         for name in ("session_id", "attempt", "turns", "permissions", "questions",
                      "last_error", "resumable", "commit", "cost", "tokens", "reaped",
-                     "deadline_commit"):
+                     "deadline_commit", "continues"):
             if name in data:
                 setattr(run, name, data[name])
         run.deadline_commit = bool(getattr(run, "deadline_commit", False))
@@ -1699,7 +1805,7 @@ def _write_progress_row(ws: Workspace, ticket_path, sha: str, *, note: str) -> b
     entry it would have scored and never raises into the run.
 
     `runs/` is in the worktree's `.gitignore` (and the deadline commit's
-    `':!runs'` pathspec excludes it again), so this row can never end up inside
+    `git reset -- runs` after the add takes it out again), so this row can never end up inside
     the commit it names.
     """
     path = ws.progress_csv
@@ -1774,7 +1880,7 @@ def _deadline_commit(ws: Workspace, *, reason: str, ticket=None) -> str | None:
     left edits in the tree and no commit — so the turn scored as though it had
     produced nothing, however finished the work was (round 64 held two entries
     that pass all four roots and harvested none). This commits what is there:
-    `git add -A -- ':!runs'`, then a commit on `ws.branch` subject
+    `git add -A` with `runs/` unstaged again, then a commit on `ws.branch` subject
     `WIP (deadline commit, <reason>): <ticket>`, and the new sha back. *ticket*
     is the ticket file the turn worked, named in the subject when the caller
     has it; it is optional so the two-argument form the ticket spells is the one
@@ -1809,10 +1915,21 @@ def _deadline_commit(ws: Workspace, *, reason: str, ticket=None) -> str | None:
         subject += f": {name}"
     body = _deadline_body(reason, who, name)
     try:
-        add = run_git(["git", "add", "-A", "--", ":!runs"], cwd=ws.path)
+        # Round 48: `git add -A -- ':!runs'` exits 1 ("paths are ignored") as
+        # soon as `runs/` exists and is `.gitignore`d — the live shape, where the
+        # agent's own PROGRESS.csv sits there — so every deadline commit of the
+        # round returned None and six STALLED trees were left staged, harvested
+        # by nobody. Any pathspec that names an ignored path fails the same way,
+        # so `runs/` is added with the rest and taken out of the index after.
+        add = run_git(["git", "add", "-A"], cwd=ws.path)
         if add.returncode != 0:
             _log.warning("%s: git add for the deadline commit exited %d: %s",
                          who, add.returncode, _brief(add.stderr or add.stdout))
+            return None
+        unstage = run_git(["git", "reset", "-q", "--", "runs"], cwd=ws.path)
+        if unstage.returncode != 0:
+            _log.warning("%s: could not keep runs/ out of the deadline commit (exit %d): %s",
+                         who, unstage.returncode, _brief(unstage.stderr or unstage.stdout))
             return None
         # -c rather than a config write: the worktree's own identity is the
         # agent's business, and this commit must not need one to exist. --no-verify
@@ -3183,7 +3300,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         and with ``new_session`` once there is one. `run.attempt` is left
         alone; the swap spends one of `max_continues_per_attempt`.
         """
-        nonlocal session, continue_text, continue_used
+        nonlocal session, continue_text
         turn["session_id"] = run.session_id
         try:
             session = backend.create_session(
@@ -3199,7 +3316,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         run.session_id = session.id
         continue_text = round_prompt(spec.name, ticket_path, ws.base_sha, dirty=dirty,
                                      tmp_dir=scratch_arg, tmp_roots=tuple(tmp_roots))
-        continue_used += 1
+        run.continues += 1
         return None
 
     def recover_overflow(turn: dict) -> str | None:
@@ -3215,7 +3332,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         the error line when ``POST /session`` failed; else ``None``, with the
         turn recorded and one of `max_continues_per_attempt` spent.
         """
-        nonlocal continue_text, continue_used
+        nonlocal continue_text
         if not callable(getattr(backend, "compact", None)):
             return "stall"
         before = _context_tokens(backend, session)
@@ -3247,7 +3364,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
             continue_text = (round_prompt(spec.name, ticket_path, ws.base_sha,
                                           tmp_dir=scratch_arg)
                              + "\n\n" + CONTEXT_CONTINUE_NOTE.format(summary=summary))
-        continue_used += 1
+        run.continues += 1
         run.turns.append(turn)
         _append_jsonl(agent_dir / "turns.jsonl", {"agent": spec.name, **turn})
         return None
@@ -3494,7 +3611,6 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         rework_text = None
         retry_text = None
         continue_text = None
-        continue_used = 0
         retries_used = 0
         local_retries = 0
         while True:
@@ -3525,7 +3641,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                                         tmp_roots=tuple(tmp_roots))
             turn = {"kind": kind, "attempt": run.attempt, "sent_at": time.time()}
             if kind == "continue":
-                note = (f"attempt {run.attempt} (continue {continue_used} of "
+                note = (f"attempt {run.attempt} (continue {run.continues} of "
                         f"{int(config.max_continues_per_attempt)})")
             else:
                 note = f"attempt {run.attempt} ({kind})"
@@ -3622,6 +3738,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                 quiet = 0 < silence and idle.elapsed < limit
                 if quiet:
                     turn["idle_status"] = "stalled"
+                    turn["idle_kind"] = "SILENT"
                     open_tool = getattr(idle, "open_tool", None) or {}
                     if open_tool:
                         error = (f"no event for {silence:g}s during "
@@ -3629,9 +3746,31 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                                  f"{open_tool.get('command') or '(no command)'}")
                     else:
                         error = f"no event for {silence:g}s"
+                    budget = int(config.max_continues_per_attempt)
+                    if 0 < budget and run.continues < budget:
+                        continue_text = CONTINUE_PROMPT
+                        run.continues += 1
+                        turn["continues"] = run.continues
+                        backoff = float(getattr(config, "error_retry_backoff_sec", 0) or 0)
+                        if not _wait_backoff(backoff):
+                            if stalled:
+                                turn_r = {"kind": "continue", "attempt": run.attempt,
+                                          "sent_at": time.time(), "idle_at": time.time(),
+                                          "idle_status": "stalled", "idle_kind": "SILENT",
+                                          "continues": run.continues,
+                                          "continues_exhausted": True}
+                                run.turns.append(turn_r)
+                                _append_jsonl(agent_dir / "turns.jsonl",
+                                              {"agent": spec.name, **turn_r})
+                                return finish(AgentState.STALLED, stalled[0])
+                        run.turns.append(turn)
+                        _append_jsonl(agent_dir / "turns.jsonl", {"agent": spec.name, **turn})
+                        continue
+                    turn["continues_exhausted"] = True
+                    state = AgentState.STALLED
                 else:
                     error = _no_idle_error(config, idle.elapsed, clock)
-                state = AgentState.STALLED
+                    state = AgentState.STALLED
             elif idle.status == "error":
                 overflow = _is_overflow(idle.error)
                 if overflow:
@@ -3662,7 +3801,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                         # raising into the round.
                         _log.warning("%s: tree unreadable — %s", spec.name,
                                      _brief(str(exc)))
-                    room = 0 < budget and continue_used < budget
+                    room = 0 < budget and run.continues < budget
                     if not above and dirty and room:
                         failed = fresh_session(turn, dirty)
                         if failed:
@@ -3810,55 +3949,102 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                 # store budget too.
                 retries_used = 0
                 local_retries = 0
-                # KC-22: a turn that ended idle with edits in the tree but no
-                # commit is a model that has not handed in yet, not one that
-                # handed in a wrong entry. Nudge it on in this same session —
-                # do not harvest, which would fail every hard gate by
-                # construction and burn the pytest roots on an unfinished tree.
-                # A clean tree (the model did nothing) is *not* a continue: it
-                # falls through to today's path (HARVESTING → REWORK/GAVE_UP),
-                # which is the right answer for "you did nothing" — unless the
-                # last reply was cut off at a token limit (KC-56). A rework
-                # resets the counter; it is exhausted here only when the branch
-                # still has no commit after the last nudge.
-                budget = int(config.max_continues_per_attempt)
-                if 0 < budget and continue_used < budget:
-                    dirty = ""
-                    if _commits_above(ws) == 0:
-                        try:
-                            dirty = _dirty_tree(ws)
-                        except TreeReadError as exc:
-                            # FL-2: a status that could not be read is not "no
-                            # uncommitted work" — say so, and let the turn fall
-                            # through to the harvest, which reads git itself.
-                            _log.warning("%s: tree unreadable — %s", spec.name,
-                                         _brief(str(exc)))
-                    # KC-56: a reply cut off at `finish: "length"` is a model
-                    # stopped mid-thought, not one that did nothing — clean
-                    # tree or not, it goes on instead of being harvested.
-                    cut = _cut_off(backend, session, spec.context_limit)
+                idle_kind = classify_idle(backend, session, turn["sent_at"], ws)
+                turn["idle_kind"] = idle_kind.value
+                if idle_kind in (IdleKind.CUT, IdleKind.SILENT):
+                    budget = int(config.max_continues_per_attempt)
+                    # KC-56 inside a CUT: a reply stopped at `finish: "length"`
+                    # keeps its own answer — a full window goes to a fresh
+                    # session (a continue into it is round 74's 4-second
+                    # overflow), an output cut gets `CUT_OFF_MESSAGE`.
+                    cut = (_cut_off(backend, session, spec.context_limit)
+                           if idle_kind is IdleKind.CUT else None)
                     if cut is not None:
                         turn["cut_off"] = cut
-                    if cut == "context":
-                        # The window is full, so a continue here is the 4-second
-                        # `ContextOverflowError` of round 74. A deliberate
-                        # exception to KC-54's clean-overflow stall: the provider
-                        # cut a reply off, it did not reject a prompt.
+                    if 0 < budget and run.continues < budget and cut == "context":
+                        dirty = ""
+                        if _commits_above(ws) == 0:
+                            try:
+                                dirty = _dirty_tree(ws)
+                            except TreeReadError as exc:
+                                _log.warning("%s: tree unreadable — %s", spec.name,
+                                             _brief(str(exc)))
                         failed = fresh_session(turn, dirty)
                         if failed:
                             return finish(AgentState.ERROR, failed)
                         continue
-                    if cut == "output" or dirty:
-                        # the current turn keeps its own kind (initial/rework);
-                        # the continue becomes the *next* PROMPTED turn, whose
-                        # PROMPTED transition (with "(continue N of M)") runs at
-                        # the top of the loop. Record this idle turn as it stands.
-                        continue_text = CUT_OFF_MESSAGE if cut else continue_message(dirty)
-                        continue_used += 1
+                    if 0 < budget and run.continues < budget:
+                        continue_text = CUT_OFF_MESSAGE if cut == "output" else CONTINUE_PROMPT
+                        run.continues += 1
+                        turn["continues"] = run.continues
+                        if idle_kind == IdleKind.SILENT:
+                            backoff = float(getattr(config, "error_retry_backoff_sec", 0) or 0)
+                            if not _wait_backoff(backoff):
+                                if stalled:
+                                    turn_r = {"kind": "continue", "attempt": run.attempt,
+                                              "sent_at": time.time(), "idle_at": time.time(),
+                                              "idle_status": "stalled", "idle_kind": "SILENT",
+                                              "continues": run.continues,
+                                              "continues_exhausted": True}
+                                    run.turns.append(turn_r)
+                                    _append_jsonl(agent_dir / "turns.jsonl",
+                                                  {"agent": spec.name, **turn_r})
+                                    return finish(AgentState.STALLED, stalled[0])
                         run.turns.append(turn)
                         _append_jsonl(agent_dir / "turns.jsonl", {"agent": spec.name, **turn})
                         continue
-                error = state = None
+                    turn["continues_exhausted"] = True
+                    error = state = None
+                else:
+                    # KC-22: a turn that ended idle with edits in the tree but no
+                    # commit is a model that has not handed in yet, not one that
+                    # handed in a wrong entry. Nudge it on in this same session —
+                    # do not harvest, which would fail every hard gate by
+                    # construction and burn the pytest roots on an unfinished tree.
+                    # A clean tree (the model did nothing) is *not* a continue: it
+                    # falls through to today's path (HARVESTING → REWORK/GAVE_UP),
+                    # which is the right answer for "you did nothing" — unless the
+                    # last reply was cut off at a token limit (KC-56). A rework
+                    # resets the counter; it is exhausted here only when the branch
+                    # still has no commit after the last nudge.
+                    budget = int(config.max_continues_per_attempt)
+                    if 0 < budget and run.continues < budget:
+                        dirty = ""
+                        if _commits_above(ws) == 0:
+                            try:
+                                dirty = _dirty_tree(ws)
+                            except TreeReadError as exc:
+                                # FL-2: a status that could not be read is not "no
+                                # uncommitted work" — say so, and let the turn fall
+                                # through to the harvest, which reads git itself.
+                                _log.warning("%s: tree unreadable — %s", spec.name,
+                                             _brief(str(exc)))
+                        # KC-56: a reply cut off at `finish: "length"` is a model
+                        # stopped mid-thought, not one that did nothing — clean
+                        # tree or not, it goes on instead of being harvested.
+                        cut = _cut_off(backend, session, spec.context_limit)
+                        if cut is not None:
+                            turn["cut_off"] = cut
+                        if cut == "context":
+                            # The window is full, so a continue here is the 4-second
+                            # `ContextOverflowError` of round 74. A deliberate
+                            # exception to KC-54's clean-overflow stall: the provider
+                            # cut a reply off, it did not reject a prompt.
+                            failed = fresh_session(turn, dirty)
+                            if failed:
+                                return finish(AgentState.ERROR, failed)
+                            continue
+                        if cut == "output" or dirty:
+                            # the current turn keeps its own kind (initial/rework);
+                            # the continue becomes the *next* PROMPTED turn, whose
+                            # PROMPTED transition (with "(continue N of M)") runs at
+                            # the top of the loop. Record this idle turn as it stands.
+                            continue_text = CUT_OFF_MESSAGE if cut else continue_message(dirty)
+                            run.continues += 1
+                            run.turns.append(turn)
+                            _append_jsonl(agent_dir / "turns.jsonl", {"agent": spec.name, **turn})
+                            continue
+                    error = state = None
             else:
                 error = state = None
             if state is not None:
@@ -3986,7 +4172,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
             run.attempt += 1
             # KC-22: a rework resets the per-attempt continue counter; KC-62's local
             # store budget is per turn, not per attempt, so it resets there too.
-            continue_used = 0
+            run.continues = 0
             local_retries = 0
             transition(AgentState.REWORK, note=f"attempt {run.attempt} {elapsed_str} — "
                        + ", ".join(r.code for r in verdict.reasons))
@@ -4057,6 +4243,7 @@ def _plan(config: ContestConfig, workspaces: list, ticket_path: Path,
                 run.state, run.commit = AgentState.READY, verdict.commit
             else:
                 run.state, run.session_id, run.attempt = AgentState.CREATED, None, 0
+                run.continues = 0
                 # KC-22, `--resume` into a worktree that still holds the agent's
                 # uncommitted work: the fresh session learns of it on its first
                 # prompt. A clean tree (or one with a commit under it) carries no

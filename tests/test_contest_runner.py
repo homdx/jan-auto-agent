@@ -57,7 +57,10 @@ from tools.contest.roster import AgentSpec, ContestConfig, load_roster  # noqa: 
 from tools.contest.runner import (  # noqa: E402
     AgentRun,
     AgentState,
+    IdleKind,
     RoundState,
+    CONTINUE_PROMPT,
+    classify_idle,
     CONTEXT_FULL_SHARE,
     CUT_OFF_MESSAGE,
     TreeReadError,
@@ -997,7 +1000,7 @@ def test_unknown_model_is_error_with_the_body(tmp_path):
 
 def test_idle_event_timeout_stalls_a_silent_session(tmp_path):
     # 300 s vs 1 s: the two paths this test tells apart, as far apart as they go
-    cfg = make_config(["agent-a"], turn_timeout_sec=300, idle_event_timeout_sec=1)
+    cfg = make_config(["agent-a"], turn_timeout_sec=300, idle_event_timeout_sec=1, max_continues_per_attempt=0)
     _sb, _fake, _h, run, aborted = _run_one(tmp_path, {"turns": [{"events": [], "idle": False}]}, cfg)
     assert run.state is AgentState.STALLED and aborted
     # took the idle-event path (last_error/idle_status below), not the
@@ -1229,7 +1232,10 @@ def _stall_config(**over) -> ContestConfig:
     # 2.9 s of margin over the 0.1 s hook heartbeat above, where a 1 s window
     # left 0.9 s — and 0.9 s is inside what the operator's 32-worker stress
     # run drifts by.
-    kw = dict(turn_timeout_sec=300, idle_event_timeout_sec=3)
+    # KC-9: a silence under the deadline is a `continue` into the same session
+    # now; these tests are about the STALLED край itself, so no budget — the
+    # KC-9 tests set their own.
+    kw = dict(turn_timeout_sec=300, idle_event_timeout_sec=3, max_continues_per_attempt=0)
     kw.update(over)
     return make_config(["agent-a"], **kw)
 
@@ -1621,6 +1627,24 @@ def test_the_deadline_commit_and_its_row_are_what_the_harvest_scores(tmp_path, c
     assert verdict.verdict == "READY", [r.code for r in verdict.reasons]
     assert verdict.commit == sha
     assert _runner_has(caplog, f"agent-a: deadline commit {sha[:12]}")
+
+
+def test_the_deadline_commit_is_made_when_runs_already_exists(tmp_path):
+    """Round 48: the live worktree already holds `runs/<agent>/PROGRESS.csv`
+    (the agent ran `append_task.py`, or an earlier turn did) and `runs/` is
+    `.gitignore`d, so `git add -A -- ':!runs'` exited 1 on "paths are ignored"
+    and six STALLED entries were left staged and uncommitted. The commit is made
+    anyway, holds the work, and `runs/` stays out of it."""
+    sb = Sandbox(tmp_path)
+    ws = sb.ws("agent-a")
+    work_dirty_ready(str(ws.path), "")
+    _write(Path(ws.path) / "runs" / "agent-a" / "PROGRESS.csv", "ticket,outcome\n")
+    sha = _runner_module._deadline_commit(ws, reason="no idle after 70m",
+                                          ticket=sb.ticket_path)
+    assert sha and sha == _branch_sha(ws)
+    names = set(_git(ws.path, "show", "--name-only", "--pretty=", sha).split())
+    assert names == {"pkg/thing.py", "tests/test_thing.py"}
+    assert _git(ws.path, "status", "--porcelain") == ""
 
 
 def _write_row(ws, ticket_path, sha: str, *, note: str = "deadline commit") -> bool:
@@ -2970,7 +2994,7 @@ def test_a_clean_overflow_is_compacted_and_the_work_goes_on(tmp_path, caplog):
         {"events": ["busy"], "error": _OVERFLOW},
         {"on_prompt": work_ready, "events": ["busy", "idle"]},
     ]}
-    sb, fake, _h, run, _ = _run_one(tmp_path, scenario, _stall_config())
+    sb, fake, _h, run, _ = _run_one(tmp_path, scenario, _stall_config(max_continues_per_attempt=2))
     _assert_ready(run, sb.ws("agent-a"))
     assert len(_session_posts(fake)) == 1
     posts = [r["path"] for r in fake.calls("POST")]
@@ -2998,7 +3022,7 @@ def test_an_overflow_over_commits_and_a_dirty_tree_is_compacted(tmp_path):
         {"events": ["busy"], "error": _OVERFLOW},
         {"on_prompt": work_ready, "events": ["busy", "idle"]},
     ]}
-    sb, fake, _h, run, _ = _run_one(tmp_path, scenario, _stall_config(),
+    sb, fake, _h, run, _ = _run_one(tmp_path, scenario, _stall_config(max_continues_per_attempt=2),
                                     prepare=_committed_then_dirty)
     _assert_ready(run, sb.ws("agent-a"))
     assert len(_session_posts(fake)) == 1
@@ -3203,6 +3227,23 @@ def test_a_context_cut_off_on_a_clean_tree_opens_a_fresh_session(tmp_path, monke
     assert "session_id" not in t1
 
 
+def test_a_cut_idle_keeps_kc56s_answer_for_a_length_finish(tmp_path):
+    """KC-9 on top of KC-56: a reply with no text that stopped at
+    `finish: "length"` is a CUT, and a CUT still takes KC-56's answer — at 91 %
+    of the window a fresh session (a `CONTINUE_PROMPT` into the full one is
+    round 74's 4-second overflow), not the continue prompt."""
+    scenario = {
+        "turns": [{"events": ["busy", "idle"], "assistant": "", "message_info": _CONTEXT_CUT}],
+        "turns_after": [{"on_prompt": work_ready, "events": ["busy", "idle"]}],
+    }
+    sb, fake, _h, run = _run_cut_one(tmp_path, scenario)
+    _assert_ready(run, sb.ws("agent-a"))
+    assert len(_session_posts(fake)) == 2
+    assert all(text != CONTINUE_PROMPT for _sid, text in _prompts(fake))
+    (t0, _t1) = _jsonl(sb.out_dir / "agent-a" / "turns.jsonl")
+    assert t0["idle_kind"] == "CUT" and t0["cut_off"] == "context"
+
+
 def test_a_context_cut_off_on_a_dirty_tree_carries_the_dirty_paragraph(tmp_path):
     """Acceptance 3: the same cut-off with uncommitted work — the new session's
     first prompt is `round_prompt` *with* the dirty paragraph."""
@@ -3341,6 +3382,210 @@ def test_a_failed_post_session_on_a_context_cut_off_is_error(tmp_path, monkeypat
     assert t0["cut_off"] == "context" and t0["session_id"] == fake.sessions()[0].id
     assert "new_session" not in t0
     assert (sb.out_dir / "agent-a.session.json").is_file()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KC-9: a cut or silent idle is nudged with continue into the same session
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_a_cut_turn_with_running_tool_continues_in_the_same_session(tmp_path):
+    """Acceptance 1: a turn whose last assistant message has empty text and a
+    `tool` part with `status: running` is classified `CUT` and continued in the
+    same session with `CONTINUE_PROMPT`. `attempt` stays 0, `run.continues` is
+    1, and the second turn finishing ready ends the run READY."""
+    scenario = {"turns": [
+        {"events": ["busy", "idle"], "assistant": "",
+         "tool_parts": [{"tool": "bash", "status": "running"}]},
+        {"on_prompt": work_ready, "events": ["busy", "idle"], "assistant": "done"},
+    ]}
+    sb, fake, _h, run, _ = _run_one(tmp_path, scenario)
+    ws = sb.ws("agent-a")
+    _assert_ready(run, ws)
+    assert run.attempt == 0 and run.continues == 1
+    assert [t["kind"] for t in run.turns] == ["initial", "continue"]
+    assert len(_session_posts(fake)) == 1
+    (sid0, _first), (sid1, second) = _prompts(fake)
+    assert sid0 == sid1 and second == CONTINUE_PROMPT
+    (t0, t1) = _jsonl(sb.out_dir / "agent-a" / "turns.jsonl")
+    assert t0["idle_kind"] == "CUT" and "harvest" not in t0
+    assert t0["continues"] == 1 and "continues_exhausted" not in t0
+
+
+def test_a_silent_turn_continues_in_the_same_session(tmp_path):
+    """Acceptance 1b: a turn with empty text and no tool parts is classified
+    `SILENT` and continued in the same session with `CONTINUE_PROMPT`. The
+    second turn finishing ready ends the run READY."""
+    scenario = {"turns": [
+        {"events": ["busy", "idle"], "assistant": ""},
+        {"on_prompt": work_ready, "events": ["busy", "idle"], "assistant": "done"},
+    ]}
+    sb, fake, _h, run, _ = _run_one(tmp_path, scenario)
+    ws = sb.ws("agent-a")
+    _assert_ready(run, ws)
+    assert run.attempt == 0 and run.continues == 1
+    assert [t["kind"] for t in run.turns] == ["initial", "continue"]
+    assert len(_session_posts(fake)) == 1
+    (sid0, _first), (sid1, second) = _prompts(fake)
+    assert sid0 == sid1 and second == CONTINUE_PROMPT
+    (t0, t1) = _jsonl(sb.out_dir / "agent-a" / "turns.jsonl")
+    assert t0["idle_kind"] == "SILENT" and "harvest" not in t0
+    assert t0["continues"] == 1 and "continues_exhausted" not in t0
+
+
+def test_cut_turn_with_exhausted_continue_budget_goes_to_harvest(tmp_path):
+    """Acceptance 1c: `max_continues_per_attempt = 1`, two cut turns — the first
+    continues, the second falls through to harvest with `continues_exhausted`."""
+    cfg = make_config(["agent-a"], max_continues_per_attempt=1, max_rework=0)
+    scenario = {"turns": [
+        {"events": ["busy", "idle"], "assistant": "",
+         "tool_parts": [{"tool": "bash", "status": "running"}]},
+        {"events": ["busy", "idle"], "assistant": "",
+         "tool_parts": [{"tool": "bash", "status": "running"}]},
+    ]}
+    sb, fake, _h, run, _ = _run_one(tmp_path, scenario, config=cfg)
+    assert run.state is AgentState.GAVE_UP
+    assert [t["kind"] for t in run.turns] == ["initial", "continue"]
+    assert run.turns[0]["idle_kind"] == "CUT"
+    assert run.turns[0]["continues"] == 1
+    assert run.turns[1]["idle_kind"] == "CUT"
+    assert run.turns[1]["continues_exhausted"] is True
+    assert run.turns[1]["harvest"]["verdict"] == "REWORK"
+    assert len(_session_posts(fake)) == 1
+
+
+def test_a_finished_turn_does_not_send_continue_prompt(tmp_path):
+    """Acceptance 1d: a normal finished turn with non-empty assistant text is
+    `FINISHED` and goes straight to harvest — no `CONTINUE_PROMPT` is sent."""
+    scenario = {"turns": [
+        {"on_prompt": work_ready, "events": ["busy", "idle"], "assistant": "done"},
+    ]}
+    sb, fake, _h, run, _ = _run_one(tmp_path, scenario)
+    _assert_ready(run, sb.ws("agent-a"))
+    assert run.continues == 0
+    assert len(_prompts(fake)) == 1
+    (_sid, first), = _prompts(fake)
+    assert CONTINUE_PROMPT not in first
+
+
+def test_silence_stall_continues_the_same_session(tmp_path):
+    """Acceptance 2: a turn that emits no event until `idle_event_timeout_sec`
+    (elapsed < `turn_timeout_sec`) is classified `SILENT`, continued in the same
+    session with `CONTINUE_PROMPT`, `attempt` stays 0, `run.continues` is 1,
+    and the turn record carries `idle_status: "stalled"` and `idle_kind: SILENT`."""
+    cfg = make_config(["agent-a"], turn_timeout_sec=300, idle_event_timeout_sec=1)
+    scenario = {"turns": [
+        {"events": [], "idle": False},
+        {"on_prompt": work_ready, "events": ["busy", "idle"], "assistant": "done"},
+    ]}
+    sb, fake, _h, run, _ = _run_one(tmp_path, scenario, config=cfg)
+    ws = sb.ws("agent-a")
+    _assert_ready(run, ws)
+    assert run.attempt == 0 and run.continues == 1
+    assert len(_session_posts(fake)) == 1
+    (sid0, _first), (sid1, second) = _prompts(fake)
+    assert sid0 == sid1 and second == CONTINUE_PROMPT
+    (t0, t1) = _jsonl(sb.out_dir / "agent-a" / "turns.jsonl")
+    assert t0["idle_status"] == "stalled" and t0["idle_kind"] == "SILENT"
+    assert t0["continues"] == 1 and "continues_exhausted" not in t0
+
+
+def test_silence_stall_with_exhausted_budget_goes_stalled(tmp_path):
+    """Acceptance 2b: the same silence edge with `max_continues_per_attempt = 1`
+    and a second silent turn → STALLED, `continues_exhausted`."""
+    cfg = make_config(["agent-a"], turn_timeout_sec=300, idle_event_timeout_sec=1,
+                      max_continues_per_attempt=1)
+    scenario = {"turns": [
+        {"events": [], "idle": False},
+        {"events": [], "idle": False},
+    ]}
+    sb, fake, _h, run, aborted = _run_one(tmp_path, scenario, config=cfg)
+    assert run.state is AgentState.STALLED and aborted
+    assert run.continues == 1
+    (t0, t1) = _jsonl(sb.out_dir / "agent-a" / "turns.jsonl")
+    assert t0["idle_status"] == "stalled" and t0["idle_kind"] == "SILENT"
+    assert t0["continues"] == 1
+    assert t1["idle_status"] == "stalled" and t1["idle_kind"] == "SILENT"
+    assert t1["continues_exhausted"] is True
+
+
+def test_a_stalled_turn_with_commit_is_harvested_after_spent_silence(tmp_path, caplog):
+    """Acceptance 2c: a commit on the branch under a spent silence край is
+    harvested (KC-21) — the turn ends STALLED with `continues_exhausted`, but
+    the harvest promotes it to READY."""
+    caplog.set_level(logging.INFO, logger="tools.contest.runner")
+    cfg = make_config(["agent-a"], turn_timeout_sec=300, idle_event_timeout_sec=1,
+                      max_continues_per_attempt=1)
+    scenario = {"turns": [
+        {"events": [], "idle": False},
+        {"events": [], "idle": False},
+    ]}
+    sb, fake, _h, run, aborted = _run_one(tmp_path, scenario, config=cfg,
+                                          prepare=lambda d: work_ready(d, ""))
+    ws = sb.ws("agent-a")
+    assert run.state is AgentState.READY, (run.state, run.last_error)
+    assert run.commit == _branch_sha(ws)
+    assert aborted
+    t0, t1 = run.turns
+    assert t0["idle_status"] == "stalled" and t0["idle_kind"] == "SILENT"
+    assert t0["continues"] == 1
+    assert t1["idle_status"] == "stalled" and t1["idle_kind"] == "SILENT"
+    assert t1["continues_exhausted"] is True
+    assert t1["harvest"]["verdict"] == "READY"
+    lines = _jsonl(sb.out_dir / "agent-a" / "turns.jsonl")
+    assert lines[-1]["idle_status"] == "stalled" and lines[-1]["harvest"]["verdict"] == "READY"
+
+
+def test_turn_timeout_stalls_without_continue(tmp_path):
+    """Acceptance 2d: `no idle after turn_timeout_sec` → STALLED, no continue
+    prompt sent — the overall deadline is not a continue."""
+    cfg = make_config(["agent-a"], turn_timeout_sec=1, idle_event_timeout_sec=60)
+    scenario = {"turns": [{"events": ["busy"], "idle": False}]}
+    with _BenchFake(scenario) as fake:
+        scenario["turns"][0]["on_prompt"] = lambda d, t: fake.pulse(
+            fake.sessions()[-1].id, 0.3, 20)
+        run = Harness(sb := Sandbox(tmp_path), fake, cfg).go()
+        aborted = _aborted(fake)
+    assert run.state is AgentState.STALLED and aborted
+    assert run.turns[0]["idle_status"] == "timeout"
+    assert run.last_error == "no idle after 1s"
+    assert run.continues == 0
+    assert len(_prompts(fake)) == 1
+
+
+def test_classify_idle_on_message_fixtures(tmp_path):
+    """Acceptance 3: `classify_idle` unit-tested on message fixtures, including
+    one with `info.error` set."""
+    fixtures = Path(TESTS_DIR) / "fixtures" / "kilo"
+    backend = _Messages(json.loads((fixtures / "finished_reply.json").read_text()))
+    assert classify_idle(backend, "ses_fake", 0.0) == IdleKind.FINISHED
+
+    backend = _Messages(json.loads((fixtures / "cut_running_tool.json").read_text()))
+    assert classify_idle(backend, "ses_fake", 0.0) == IdleKind.CUT
+
+    backend = _Messages(json.loads((fixtures / "silent_no_parts.json").read_text()))
+    assert classify_idle(backend, "ses_fake", 0.0) == IdleKind.SILENT
+
+    backend = _Messages(json.loads((fixtures / "error_message.json").read_text()))
+    assert classify_idle(backend, "ses_fake", 0.0) == IdleKind.CUT
+
+    backend = _Messages(json.loads((fixtures / "finish_length.json").read_text()))
+    assert classify_idle(backend, "ses_fake", 0.0) == IdleKind.CUT
+
+    # completed tool with no progress modification → FINISHED (fallback)
+    ws = Workspace(agent="agent-a", path=tmp_path / "wt", branch="main",
+                   base_sha="abc", kind="worktree")
+    (tmp_path / "wt" / "runs" / "agent-a").mkdir(parents=True)
+    (tmp_path / "wt" / "runs" / "agent-a" / "PROGRESS.csv").write_text("", encoding="utf-8")
+    import os
+    old_mtime = (tmp_path / "wt" / "runs" / "agent-a" / "PROGRESS.csv").stat().st_mtime
+    time.sleep(0.01)
+    (tmp_path / "wt" / "runs" / "agent-a" / "PROGRESS.csv").write_text("ticket,finding\n", encoding="utf-8")
+    backend = _Messages(json.loads((fixtures / "completed_tool.json").read_text()))
+    assert classify_idle(backend, "ses_fake", old_mtime, ws) == IdleKind.FINISHED
+
+    # transcript that cannot be read → FINISHED (fail-open)
+    backend = _Messages(error=RuntimeError("boom"))
+    assert classify_idle(backend, "ses_fake", 0.0) == IdleKind.FINISHED
 
 
 def test_a_refused_overflow_swap_still_records_the_turn_and_the_session(tmp_path, monkeypatch):
@@ -3568,7 +3813,7 @@ def test_a_silent_agent_stalls_next_to_a_chatty_one(tmp_path):
         fake._run_turn, fake._record_request = run_turn, record
         state = _round(sb, fake, make_config(
             ["agent-a", "agent-b"], max_parallel=2, turn_timeout_sec=120,
-            idle_event_timeout_sec=KEEPALIVE_WINDOW_S))
+            idle_event_timeout_sec=KEEPALIVE_WINDOW_S, max_continues_per_attempt=0))
     runs = _by_name(state)
     assert runs["agent-a"].state is AgentState.STALLED
     assert runs["agent-a"].last_error == f"no event for {KEEPALIVE_WINDOW_S}s"
@@ -4013,7 +4258,7 @@ def test_continue_turns_and_the_resume_nudge_leave_the_json_shape_alone(tmp_path
     (agent,) = saved["agents"]
     assert set(agent) == {"agent", "workspace", "session_id", "state", "attempt", "turns",
                           "permissions", "questions", "last_error", "resumable", "commit",
-                          "cost", "tokens", "deadline_commit"}
+                          "cost", "tokens", "deadline_commit", "continues"}
     # KC-41: the key is present on a run that never used it, and reads `false` —
     # a consumer cannot tell "the model claimed this" from "the key was written
     # before the flag existed" by its presence alone
@@ -5643,7 +5888,7 @@ def test_a_stalled_holder_gives_its_slot_to_the_next_waiter(tmp_path, monkeypatc
     """
     names = ("agent-a", "agent-b")
     sb = Sandbox(tmp_path, names)
-    cfg = make_config(names, agent_suite_slots=1, idle_event_timeout_sec=1)
+    cfg = make_config(names, agent_suite_slots=1, idle_event_timeout_sec=1, max_continues_per_attempt=0)
     path_a = _runner_module._path_of(sb.ws(names[0]).path)
     monkeypatch.setattr(_runner_module, "_suite_pids",
                         lambda worktree, proc_root=None:
@@ -6086,7 +6331,7 @@ def test_the_suite_wait_is_granted_back_and_the_silence_clock_runs_from_the_repl
     the wait as `suite_wait_sec` — the seconds its deadline was moved by."""
     names = ("agent-a",)
     sb = Sandbox(tmp_path, names)
-    cfg = make_config(names, agent_suite_slots=1, idle_event_timeout_sec=1)
+    cfg = make_config(names, agent_suite_slots=1, idle_event_timeout_sec=1, max_continues_per_attempt=0)
     monkeypatch.setattr(_runner_module, "_SUITE_POLL_SEC", 0.02)
     monkeypatch.setattr(_runner_module, "_suite_pids", lambda worktree, proc_root=None: set())
     slots = _runner_module._SUITE_SLOTS
