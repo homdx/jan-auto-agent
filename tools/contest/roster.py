@@ -44,6 +44,7 @@ opens a network connection.
 from __future__ import annotations
 
 import configparser
+import logging
 import math
 import os
 import re
@@ -52,6 +53,11 @@ from pathlib import Path
 
 from tools.auto.llm_profile import LlmSettings, resolve_llm_profile
 from tools.config_safe import safe_getfloat, safe_getint
+
+#: KC-41: a malformed on/off key is reported here and the default stands, so the
+#: round's intake never raises on a key that decides whether uncommitted work is
+#: committed for the model.
+_log = logging.getLogger("tools.contest.roster")
 
 __all__ = [
     "AGENT_KEYS",
@@ -102,6 +108,7 @@ CONTEST_KEYS = (
     "quota_patterns",
     "progress_every_sec",
     "harvest_budget_sec",
+    "deadline_commit",
     "agent_suite_slots",
     "agent_suite_max_sec",
     "pytest_workers_per_agent",
@@ -300,6 +307,11 @@ class ContestConfig:
     #: KC-57: the wall-clock budget for one harvest's pytest roots.
     #: 0 turns it off, which keeps today's unbounded behaviour.
     harvest_budget_sec: int = 900
+    #: KC-41: a turn that ends STALLED/ERROR with a dirty tree and nothing
+    #: committed gets the work committed for it (the deadline commit) and is
+    #: harvested like any other entry. `false` restores the pre-KC-41 path
+    #: byte for byte: no commit, no row, no harvest.
+    deadline_commit: bool = True
     #: KC-58: how many whole pytest roots run at once, round-wide — an agent's
     #: own `pytest tests -n 4` and the runner's harvest alike. 0 turns the
     #: queue off: every reply is immediate and `_TEST_RUNS_LOCK` is the only
@@ -598,6 +610,26 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
     def list_(key: str) -> tuple[str, ...]:
         return _split_list(parser.get("contest", key, fallback=""))
 
+    def flag(key: str, default: bool) -> bool:
+        """KC-41: an on/off key, fail-open in both directions.
+
+        Absent is the default, and a value that is neither `true`/`yes`/`on`/`1`
+        nor `false`/`no`/`off`/`0` is the default too, with a warning: a typo in
+        a key that decides whether a turn's work is thrown away must not raise
+        into the round's intake, and it must not silently invert the switch
+        either — so the default stands and the round says why.
+        """
+        raw = parser.get("contest", key, fallback=None)
+        if raw is None:
+            return default
+        value = raw.strip().lower()
+        if value in ("true", "yes", "on", "1"):
+            return True
+        if value in ("false", "no", "off", "0"):
+            return False
+        _log.warning("[contest] %s is not a boolean: %r — using %s", key, raw.strip(), default)
+        return default
+
     def num(key: str, default: float) -> float:
         """KC-67: the memory's numbers, read where a typo must not fail the
         intake — the round would rather run with the default than refuse to
@@ -734,6 +766,7 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
         quota_patterns=scalar("quota_patterns", ""),
         progress_every_sec=limit("progress_every_sec", 60),
         harvest_budget_sec=max(0, limit("harvest_budget_sec", 900)),
+        deadline_commit=flag("deadline_commit", True),
         agent_suite_slots=agent_suite_slots,
         agent_suite_max_sec=agent_suite_max_sec,
         pytest_workers_per_agent=pytest_workers_per_agent,

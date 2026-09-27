@@ -58,7 +58,23 @@ and `run.commit` set, so `export_patches` names it by the terminal state
 run as READY with the note `<sha12> after <the turn's error>`, and a REWORK
 verdict keeps the state the turn earned — no rework prompt, the session is gone.
 A branch with no commit above the base keeps today's path byte for byte: no
-harvest, no pytest, `commit: null`.
+harvest, no pytest, `commit: null` — unless KC-41 is on.
+
+KC-41 (round 80) removes that last precondition. A turn that ends with the work
+on disk and nothing committed was scored as though it had produced nothing, and
+the round dropped it: round 64 held two entries that pass all four pytest roots
+and harvested none, and round 92's `laguna-s-2-1` worked its whole turn, was
+given three deadline extensions, and left 510 uncommitted lines behind. So when
+`config.deadline_commit` is on (the default; `contest.ini` says so), the
+terminal branch commits what the tree holds — `WIP (deadline commit, <reason>):
+<ticket>`, `runs/` excluded from the add — writes the one
+`runs/<agent>/PROGRESS.csv` row `harvest` asks for, and harvests it exactly as
+it harvests a commit the model made. `run.deadline_commit` and the turn's
+`deadline_commit: true` say which kind of entry it was, so a `READY` from a
+deadline commit is never read as a claim the model finished. Both writes are
+fail-open: a clean tree, a tree that cannot be read and a commit that refuses
+all answer "nothing to commit", and that is the pre-KC-41 path byte for byte.
+`deadline_commit = false` restores it deliberately.
 
 KC-29 (round 68) draws the line KC-21 left open: a stall the runner asked for
 is not a session that finished. `stall()` is the runner's own edge — the
@@ -151,9 +167,10 @@ and a store error in one turn each spend their own counter. The texts are not
 added to `_RETRYABLE_MSG_RE`, because that rule is also the gate's, and the
 provider's transients keep their own budget.
 
-The work of a spent budget is kept rather than dropped (until KC-41 lands the
-deadline commit): an `ERROR` on a store error whose tree is still dirty is
-written to `state.json` with `resumable: true`, and `_plan` restarts such an
+The work of a spent budget is kept rather than dropped, and KC-41 keeps it
+twice over: an `ERROR` on a store error whose tree is still dirty is written to
+`state.json` with `resumable: true`, and the same turn's deadline commit puts
+that work on the branch where the harvest scores it. `_plan` restarts such an
 agent on `--resume` the way it restarts a mid-flight one — harvest when there is
 a commit to score, otherwise a fresh session in the same worktree with
 `dirty_on_resume`. A plain `ERROR` and an old `state.json` that has no key both
@@ -1237,6 +1254,9 @@ class AgentRun:
     once the turn was scored. `permissions` counts what the policy was asked
     and how it answered; `questions` counts the questions over the whole run.
     `reaped` (KC-48) is what the worktree was still running when the run ended.
+    `deadline_commit: true` (KC-41) on a turn means the runner — not the model —
+    committed the work that turn left behind, so the harvest that scored it is
+    not a verdict on a claim the model made.
     """
 
     agent: AgentSpec
@@ -1251,10 +1271,17 @@ class AgentRun:
     #: KC-62: the run ended `ERROR` on Kilo's own store and its worktree still
     #: holds uncommitted work, so `--resume` may restart it. `False` for every
     #: other terminal state, and for a `state.json` written before the key.
-    #: KC-41 supersedes: the deadline commit replaces this with work committed
-    #: on the spot, and the flag goes away with it.
+    #: KC-41 also commits that tree (so the round keeps the work either way) and
+    #: leaves this flag standing: a deadline commit is not a claim that the agent
+    #: finished, and restarting it is a separate decision from keeping its work.
     resumable: bool = False
     commit: str | None = None
+    #: KC-41: this run's entry was committed by the runner at the end of a
+    #: terminal turn, not by the model. `False` for every other run and for a
+    #: `state.json` written before the key. A `READY` reached from here is not the
+    #: same signal as a `READY` the model claimed and finished, so the flag rides
+    #: on the run, on the turn and in `turns.jsonl` for every consumer to read.
+    deadline_commit: bool = False
     cost: float | None = None
     tokens: dict | None = None
     #: KC-48: `[{"pid": int, "cmd": str}]` of what the reap found in the
@@ -1272,6 +1299,11 @@ class AgentRun:
         data["state"] = self.state.value
         if not data.get("reaped"):
             data.pop("reaped", None)
+        # KC-41: `deadline_commit` is written whenever the run has one, `true` or
+        # `false`, so `state.json` says plainly whether the entry was the model's
+        # claim or the runner's commit. Older files without the key read back as
+        # `False` in `from_dict`, which is what they were.
+        data["deadline_commit"] = bool(self.deadline_commit)
         return data
 
     @classmethod
@@ -1280,9 +1312,11 @@ class AgentRun:
         ws["path"] = Path(ws["path"])
         run = cls(agent=AgentSpec(**data["agent"]), workspace=Workspace(**ws))
         for name in ("session_id", "attempt", "turns", "permissions", "questions",
-                     "last_error", "resumable", "commit", "cost", "tokens", "reaped"):
+                     "last_error", "resumable", "commit", "cost", "tokens", "reaped",
+                     "deadline_commit"):
             if name in data:
                 setattr(run, name, data[name])
+        run.deadline_commit = bool(getattr(run, "deadline_commit", False))
         run.state = AgentState(data.get("state", "CREATED"))
         return run
 
@@ -1609,6 +1643,214 @@ def _dirty_tree(ws: Workspace) -> str:
             continue
         lines.append(ln)
     return "\n".join(lines)
+
+
+#: KC-41: the progress columns `scripts/append_task.py` writes, in the same
+#: order. The deadline row is that script's row, written by the runner.
+_PROGRESS_COLUMNS = "ticket,finding,outcome,commit,note"
+
+#: KC-41: what a deadline commit is called in the log and in the commit subject.
+#: The word `WIP` is the model's own: the runner is not claiming the work is
+#: finished, only that it is the work the turn left behind.
+_DEADLINE_PREFIX = "WIP (deadline commit,"
+
+#: KC-41: a sha is a sha, and only a sha may go in the progress row: `HEAD`,
+#: `@`, a branch and a tag all resolve in git, so a name in that cell would
+#: stand for a different commit on every branch it is read from. The same shape
+#: `harvest` checks a claim against, kept in step by hand — it is one regex, and
+#: the two must agree on what "a commit" is written as.
+_SHA_RE = re.compile(r"[0-9a-f]{7,40}", re.IGNORECASE)
+
+#: KC-41: how long the reason in a deadline commit's subject may be. A commit
+#: subject is a header line — long ones are truncated by git itself, silently, so
+#: the runner cuts it to something git will store whole and read back.
+REASON_LIMIT = 120
+
+
+def _write_progress_row(ws: Workspace, ticket_path, sha: str, *, note: str) -> bool:
+    """Append the one `runs/<agent>/PROGRESS.csv` row a deadline commit needs,
+    header included when the file is new. `True` when the row is on disk.
+
+    KC-41: `harvest` wants a row for the ticket whose outcome is DONE/FIXED and
+    whose commit resolves on the branch, and an agent that ran out of clock wrote
+    neither — so the runner writes the row itself. It is a statement of fact, not
+    a claim: the sha is the deadline commit this runner just made, and the note
+    names the reason the clock ran out. The outcome is `FIXED` because the
+    commit exists and the harvest has not contradicted it yet; the *verdict* is
+    still `harvest`'s to give, and it reads the branch, the tests and the
+    ticket's declared files exactly as it would for a row the model wrote.
+
+    Fail-open throughout: a `runs/` path that cannot be created, a row that
+    cannot be appended, a progress file with a header of its own — all leave the
+    tree as it was and answer `False`. The harvest then says `no_progress_row`,
+    which is the pre-KC-41 outcome, so a broken write costs the round the
+    entry it would have scored and never raises into the run.
+
+    `runs/` is in the worktree's `.gitignore` (and the deadline commit's
+    `':!runs'` pathspec excludes it again), so this row can never end up inside
+    the commit it names.
+    """
+    path = ws.progress_csv
+    ticket = Path(ticket_path).name
+    # the same quoting `csv` uses for a field with a comma or a quote in it; a
+    # ticket name has neither, and a note may have either
+    def cell(text: str) -> str:
+        if any(c in text for c in (",", '"', "\n", "\r")):
+            return '"' + text.replace('"', '""') + '"'
+        return text
+    row = ",".join([cell(ticket), "", "FIXED", cell(sha), cell(note)])
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        new = not path.exists() or path.stat().st_size == 0
+        with path.open("a", encoding="utf-8", newline="") as fh:
+            if new:
+                fh.write(_PROGRESS_COLUMNS + "\n")
+            fh.write(row + "\n")
+            fh.flush()
+    except OSError as exc:
+        _log.warning("%s: could not write the deadline progress row %s: %s",
+                     getattr(ws, "agent", "?"), path, _brief(str(exc)))
+        return False
+    return True
+
+
+def _deadline_commit_enabled(config) -> bool:
+    """`config.deadline_commit`, read fail-open: a missing config, a config object
+    without the key and a value that is not a bool at all all answer the default,
+    `True`.
+
+    KC-41: the key decides whether an agent's uncommitted work is committed for
+    it. A caller holding a hand-built config (a test, a script) must get the
+    documented behaviour rather than an `AttributeError` into the terminal
+    branch, and the runner — not the round's intake — is where that is settled:
+    the roster already refuses a malformed value at load time with a warning.
+    """
+    value = getattr(config, "deadline_commit", True)
+    return True if value is None else bool(value)
+
+
+def _deadline_reason(state, error, stalled) -> str:
+    """The one short phrase a deadline commit's subject and its progress note
+    carry: why the turn ended, in the runner's words rather than the model's.
+
+    KC-41: the commit subject is `WIP (deadline commit, <reason>): <ticket>`, and
+    the reason is what tells the operator later which clock ran out. It is
+    derived from the *state* the turn earned and the error text, both of which
+    the runner already holds, so it costs no extra read and never raises. A
+    state with no error text still names the state.
+
+    The reason is cut to `REASON_LIMIT` and stripped of the separators a commit
+    subject may not carry: `_brief` bounds it at 300 characters, which is a
+    `last_error`'s budget and not a subject line's, and a multi-line error text
+    would fold into a header git cannot read back as one line.
+    """
+    text = _brief(str(error or "")).strip()
+    if not text:
+        return state.value.lower() if state is not None else "terminal"
+    text = text.replace("\n", " ").replace("\r", " ")
+    for sep in (";", ",", " — ", " - "):
+        text = text.split(sep, 1)[0]
+    text = " ".join(text.split())
+    return text[:REASON_LIMIT].rstrip(" .") or state.value.lower()
+
+
+def _deadline_commit(ws: Workspace, *, reason: str, ticket=None) -> str | None:
+    """Commit the work a terminal turn left behind, on the agent's own branch.
+    `None` when there is nothing to commit, and on any failure.
+
+    KC-41: `harvest` scores a *commit*, and an agent whose turn the clock ended
+    left edits in the tree and no commit — so the turn scored as though it had
+    produced nothing, however finished the work was (round 64 held two entries
+    that pass all four roots and harvested none). This commits what is there:
+    `git add -A -- ':!runs'`, then a commit on `ws.branch` subject
+    `WIP (deadline commit, <reason>): <ticket>`, and the new sha back. *ticket*
+    is the ticket file the turn worked, named in the subject when the caller
+    has it; it is optional so the two-argument form the ticket spells is the one
+    the tests can call.
+
+    Only when there is genuinely nothing to commit: the count above the base is
+    re-read here, and a tree that is clean (or a status that could not be read —
+    FL-2's `TreeReadError`, never "clean") returns `None` without touching git.
+    `runs/` is excluded from the add, and it is `.gitignore`d as well, so the
+    row `_write_progress_row` writes after this is not inside the commit it
+    names.
+
+    Fail-open on every step: a worktree that is not a repository, an index that
+    stays locked, a commit that refuses (nothing staged after all, no identity,
+    a hook that fails) all return `None` with a warning. `None` is the
+    pre-KC-41 outcome — no commit, no row, no harvest — so a broken deadline
+    commit degrades to today's behaviour rather than raising into the run.
+    """
+    if _commits_above(ws) != 0:
+        return None  # the model committed: that commit is the entry, not a new one
+    try:
+        if not _dirty_tree(ws):
+            return None  # a clean tree is "no uncommitted work", not a commit
+    except TreeReadError as exc:
+        _log.warning("%s: tree unreadable — no deadline commit: %s",
+                     getattr(ws, "agent", "?"), _brief(str(exc)))
+        return None
+    who = getattr(ws, "agent", "contest")
+    name = Path(str(ticket)).name if ticket else ""
+    subject = f"{_DEADLINE_PREFIX} {reason})"
+    if name:
+        subject += f": {name}"
+    body = _deadline_body(reason, who, name)
+    try:
+        add = run_git(["git", "add", "-A", "--", ":!runs"], cwd=ws.path)
+        if add.returncode != 0:
+            _log.warning("%s: git add for the deadline commit exited %d: %s",
+                         who, add.returncode, _brief(add.stderr or add.stdout))
+            return None
+        # -c rather than a config write: the worktree's own identity is the
+        # agent's business, and this commit must not need one to exist. --no-verify
+        # for the same reason in the other direction — a hook the agent's own
+        # work trips must not cost the round the commit that keeps that work.
+        commit = run_git(["git", "-c", "user.name=contest runner",
+                          "-c", "user.email=contest@localhost",
+                          "-c", "commit.gpgsign=false",
+                          "commit", "-q", "--no-verify",
+                          "-m", subject, "-m", body],
+                         cwd=ws.path)
+        if commit.returncode != 0:
+            _log.warning("%s: the deadline commit exited %d: %s",
+                         who, commit.returncode, _brief(commit.stderr or commit.stdout))
+            return None
+        sha = git(str(ws.path), "rev-parse", "HEAD")
+    except (OSError, subprocess.SubprocessError) as exc:
+        _log.warning("%s: the deadline commit did not run: %s", who, _brief(str(exc)))
+        return None
+    sha = (sha or "").strip()
+    if not _SHA_RE.fullmatch(sha):
+        _log.warning("%s: the deadline commit left no sha to name (%r)", who, sha[:40])
+        return None
+    _log.info("%s: deadline commit %s — %s", who, sha[:12], reason)
+    return sha
+
+
+def _deadline_body(reason: str, agent: str, ticket: str) -> str:
+    """The body of a deadline commit, and the note the progress row carries.
+
+    The same sentence in both places, so the operator reading `git log` and the
+    judge reading `runs/<agent>/PROGRESS.csv` read one fact and not two. It says
+    what the commit is — the tree as it stood when the turn ended — and never
+    says the work is finished: the harvest's verdict is what decides that, and
+    it reads the tests, not this note.
+    """
+    return (f"Committed by the round, not by {agent}: the turn ended {reason} with "
+            f"this work uncommitted"
+            + (f" for {ticket}" if ticket else "")
+            + ". The harvest scores it like any other entry and "
+            "`run.deadline_commit` is true for it.")
+
+
+def _deadline_note(reason: str, agent: str, ticket: str) -> str:
+    """The `note` of the deadline commit's progress row — the same fact as
+    `_deadline_body`, in one line and without the second sentence, so a CSV cell
+    holds a sentence and not a paragraph."""
+    return (f"deadline commit: the turn ended {reason}; {agent}'s tree committed "
+            + (f"for {ticket} " if ticket else "")
+            + "by the runner (KC-41), not claimed by the model")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3602,6 +3844,28 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                 note = None
                 if state in (AgentState.STALLED, AgentState.ERROR):
                     above = _commits_above(ws)
+                    # KC-41: a turn that ends with the work on disk and nothing
+                    # committed scores as though it had produced nothing, and
+                    # the round drops it — round 64 held two entries that pass
+                    # all four pytest roots and harvested none. So the runner
+                    # commits it for the model first (`deadline_commit` in
+                    # `contest.ini`), writes the progress row `harvest` asks for,
+                    # and the harvest below runs either way. Both writes are
+                    # fail-open and both answer `None`/`False` on any trouble, so
+                    # a tree that cannot be committed leaves today's behaviour
+                    # exactly: `above` stays 0, no row, no harvest, no verdict.
+                    if above == 0 and _deadline_commit_enabled(config):
+                        reason = _deadline_reason(state, error, stalled)
+                        sha = _deadline_commit(ws, reason=reason, ticket=ticket_path)
+                        if sha:
+                            run.deadline_commit = True
+                            turn["deadline_commit"] = True
+                            _write_progress_row(
+                                ws, ticket_path, sha,
+                                note=_deadline_note(reason, spec.name,
+                                                    Path(ticket_path).name),
+                            )
+                            above = _commits_above(ws)
                     if above:
                         # KC-48: the session is gone, so what its calls left
                         # running goes before the harvest reads the tree and runs
@@ -3642,9 +3906,15 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                     # The flag is what makes `--resume` start the agent again in this
                     # tree instead of leaving the turn dropped.
                     try:
-                        if _dirty_tree(ws):
-                            # KC-41 supersedes: the deadline commit lands the work
-                            # here on the spot, and the flag goes away with it.
+                        # KC-41 against KC-62, where they meet. A deadline commit
+                        # is *why* the tree may be clean here: the runner put the
+                        # work on the branch a moment ago, so `_dirty_tree` alone
+                        # would report the agent as having produced nothing and
+                        # `--resume` would stop restarting every agent whose turn
+                        # the store took down — the case KC-62 was filed for. The
+                        # flag asks "was there work at the end of the turn",
+                        # which a status read after the commit cannot answer.
+                        if run.deadline_commit or _dirty_tree(ws):
                             run.resumable = True
                     except TreeReadError as exc:
                         # FL-2: a status that could not be read is not a clean tree —

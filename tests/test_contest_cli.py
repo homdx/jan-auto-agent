@@ -1071,6 +1071,64 @@ def test_export_patches_writes_a_worktree_diff_for_a_terminal_turn_with_no_commi
     assert not (out / "agent-d.STALLED.diff").exists(), "a commit owns its own patch"
 
 
+def test_export_patches_gives_a_deadline_committed_agent_a_patch_not_a_diff(tmp_path):
+    """KC-41: a terminal turn whose work the runner committed exports as
+    `<agent>.STALLED.patch` — a real `format-patch`, because that work *is* a
+    commit and KC-31's `.diff` is the export for work that is not. The `.diff`
+    stays for the case KC-41 cannot help: a clean zero-commit tree, or a round
+    run with `deadline_commit = false`, where the work is still in the tree.
+
+    The two files are told apart by `run.commit` and the branch, not by the
+    terminal state, so both loops keep their KC-21/KC-31 shapes."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _write(repo / "pkg" / "__init__.py", "")
+    _write(repo / "pkg" / "thing.py", "def thing():\n    return 1\n")
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "user.email", "patch@example.invalid")
+    _git(repo, "config", "user.name", "patch")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "base")
+    base = _git(repo, "rev-parse", "HEAD")
+
+    workspaces: list = []
+    runs: list = []
+    shas: dict = {}
+    for name, deadline in (("agent-a", True), ("agent-b", False), ("agent-c", False)):
+        path = tmp_path / "wt" / name
+        _git(repo, "worktree", "add", "-q", "-b", f"contest/{ROUND:02d}/{name}", str(path), base)
+        if name != "agent-c":          # agent-c stays clean on purpose
+            _write(path / "pkg" / "thing.py", THING_CHANGED)
+        commit = None
+        if deadline:
+            # what `_deadline_commit` leaves: one commit, and `run.commit` set by
+            # the harvest that scored it
+            _git(path, "add", "-A")
+            _git(path, "-c", "user.name=r", "-c", "user.email=r@x.invalid",
+                 "commit", "-q", "-m", "WIP (deadline commit, no event for 3s)")
+            commit = _git(path, "rev-parse", "HEAD")
+            shas[name] = commit
+        ws = Workspace(agent=name, path=path, branch=f"contest/{ROUND:02d}/{name}",
+                       base_sha=base, kind="worktree")
+        workspaces.append(ws)
+        runs.append(AgentRun(agent=AgentSpec(name, "kenary", f"{name}:free"), workspace=ws,
+                             state=AgentState.STALLED, commit=commit,
+                             deadline_commit=deadline))
+    state = RoundState(round_no=ROUND, ticket=TICKET_01, base_sha=base,
+                       started_at=1.0, agents=runs)
+
+    out = tmp_path / "out"
+    written = cli.export_patches(state, workspaces, out)
+    assert [p.name for p in written] == ["agent-a.STALLED.patch", "agent-b.STALLED.diff"]
+    patch = (out / "agent-a.STALLED.patch").read_text(encoding="utf-8")
+    assert patch.startswith(f"From {shas['agent-a']}"), "a real format-patch, from the sha"
+    assert "WIP (deadline commit" in patch
+    assert "+    return 42" in patch
+    assert not (out / "agent-a.STALLED.diff").exists(), "a commit owns its own patch"
+    assert not (out / "agent-c.STALLED.diff").exists(), "a clean tree writes nothing"
+    assert "+    return 42" in (out / "agent-b.STALLED.diff").read_text(encoding="utf-8")
+
+
 def test_export_patches_names_untracked_files_and_survives_a_missing_workspace(tmp_path):
     """KC-31: the diff inlines only the tracked edits — the untracked paths go in
     a trailing comment, and the orchestrator's own `runs/` rows open no file —

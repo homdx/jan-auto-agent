@@ -454,16 +454,27 @@ def _provider_error():
 
 def test_a_spent_budget_on_a_dirty_tree_is_resumable(tmp_path):
     """Acceptance 2: round 107's shape — six store errors, no commit, a dirty
-    tree — ends `ERROR` with `resumable: true` in `state.json`."""
+    tree — ends `ERROR` with `resumable: true` in `state.json`.
+
+    KC-41 (round 80) commits that same tree on the way out, so the tree is clean
+    by the time the flag is decided — and the flag still has to be set, because
+    "clean" is now the *result* of the round keeping the work rather than the
+    agent never having made any. Hence the deadline commit is true here too, and
+    the two flags are read together: the commit says where the work is, the
+    flag says the session never got to claim it."""
     run, _backend, ws, _out = _run(tmp_path, [_store_error() for _ in range(6)],
                                    dirty="x = 1\n")
 
     assert run.state is AgentState.ERROR
+    assert run.deadline_commit is True
+    assert run.commit is not None
     assert run.resumable is True
     data = run.to_dict()
     assert data["resumable"] is True
+    assert data["deadline_commit"] is True
     assert data["state"] == "ERROR"
     assert ws.path.exists()
+    assert _git(ws.path, "rev-list", "--count", f"{ws.base_sha}..HEAD") == "1"
 
 
 def test_a_spent_budget_on_a_clean_tree_is_not_resumable(tmp_path):

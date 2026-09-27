@@ -1530,7 +1530,11 @@ def intake(repo, tasks_dir, round_no, base_ref, config, argv=None,
 #: KC-31: the terminal states whose tree is read for a `.diff` when the turn
 #: ended without a commit. `READY` is never here — the harvest always names its
 #: commit — and `GAVE_UP` is a scored REWORK after the last attempt, not work
-#: that died unclaimed.
+#: that died unclaimed. KC-41 does not join them: a turn whose work the runner
+#: committed for it *has* a commit, so it exports as `<agent>.STALLED.patch`
+#: above and this loop skips it. The `.diff` remains for the case KC-41 cannot
+#: help — a terminal turn whose worktree is genuinely clean, or one whose
+#: deadline commit was refused, or a round run with `deadline_commit = false`.
 _DIFF_STATES = (AgentState.STALLED, AgentState.ERROR)
 
 #: KC-31: the one trailing comment the diff's untracked files go in — `git diff`

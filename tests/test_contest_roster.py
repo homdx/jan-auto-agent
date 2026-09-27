@@ -360,6 +360,35 @@ model = kenary/hy3:free
 """)).harvest_budget_sec == 900
 
 
+def test_deadline_commit_is_on_by_default_and_false_restores_todays_path(tmp_path):
+    """KC-41: `deadline_commit` decides whether the runner commits the work a
+    terminal turn left behind, so it is on unless a round says otherwise. Every
+    spelling of off is off, a malformed value is the default with a warning (the
+    intake must not raise on the key that decides whether work is thrown away,
+    and must not silently invert it either), and the key is in `CONTEST_KEYS` so
+    a round that sets it is not rejected as unknown."""
+    assert "deadline_commit" in CONTEST_KEYS
+    base = """
+[contest]
+deadline_commit = %s
+
+[contest.agent.alpha]
+model = kenary/hy3:free
+"""
+    for value in ("true", "yes", "on", "1", "True", " ON "):
+        assert load_roster(write_ini(tmp_path, base % value)).deadline_commit is True
+    for value in ("false", "no", "off", "0", "FALSE", " Off "):
+        assert load_roster(write_ini(tmp_path, base % value)).deadline_commit is False
+    # a typo is the default, not an inversion: `true` is the safe side here
+    assert load_roster(write_ini(tmp_path, base % "maybe")).deadline_commit is True
+    assert load_roster(write_ini(tmp_path, """
+[contest]
+
+[contest.agent.alpha]
+model = kenary/hy3:free
+""")).deadline_commit is True
+
+
 def test_max_error_retries_and_error_retry_backoff_sec_parse_and_default(tmp_path):
     """KC-19: both keys parse, default, and are in CONTEST_KEYS."""
     assert "max_error_retries" in CONTEST_KEYS

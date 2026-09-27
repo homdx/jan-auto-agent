@@ -1328,8 +1328,16 @@ def test_a_stalled_turn_reads_the_rejected_commit_from_the_harvest(tmp_path, mon
     assert turn["harvest"]["verdict"] == "REWORK"
     assert turn["harvest"]["reasons"] == ["no_progress_row"]
     assert len(_prompts(fake)) == 1
-    # the fallback is gone for good, not just unused: no `rev-parse` in runner.py
-    assert "rev-parse" not in Path(runner_mod.__file__).read_text(encoding="utf-8")
+    # The fallback is gone for good, not just unused. KC-41 (round 80) adds the one
+    # `rev-parse` it is entitled to: a deadline commit is the runner's *own* new
+    # commit, and its sha is the progress row the harvest is about to read — it is
+    # not a fallback for a claim. So the check is that the one call is that one:
+    # inside `_deadline_commit`, reading the commit it just made, and nowhere
+    # else in the module.
+    source = Path(runner_mod.__file__).read_text(encoding="utf-8")
+    assert source.count("rev-parse") == 1
+    body = source.split("def _deadline_commit(", 1)[1].split("\ndef ", 1)[0]
+    assert "rev-parse" in body, "the one rev-parse belongs to the deadline commit"
 
 
 def test_an_error_turn_with_a_valid_commit_is_harvested_to_ready(tmp_path, caplog):
@@ -1551,6 +1559,364 @@ def test_a_session_that_ended_on_its_own_keeps_the_kc21_line_verbatim(tmp_path, 
     lines = _runner_lines(caplog)
     assert f"agent-a: READY — {run.commit[:12]} after no event for 3s" in lines
     assert not any("(harvest:" in line for line in lines)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KC-41: a turn that ends with the work on disk and nothing committed is
+# committed by the runner, claimed by the runner, and harvested like any other
+# entry
+# ─────────────────────────────────────────────────────────────────────────────
+
+def work_dirty_ready(directory, text):
+    """KC-41: a finished entry that never got as far as a commit — a change, the
+    test that goes with it, and no `git commit`, no `append_task.py`. This is
+    what round 64's worktrees held at the end of their turns."""
+    d = Path(directory)
+    _write(d / "pkg" / "thing.py", f"def thing():\n    return 42  # {time.time()}\n")
+    _write(d / "tests" / "test_thing.py",
+           "from pkg.thing import thing\n\n\ndef test_thing():\n    assert thing() == 42\n")
+
+
+def _progress_rows(ws) -> list[dict]:
+    """`runs/<agent>/PROGRESS.csv` as a list of dicts, header included."""
+    import csv
+    path = ws.progress_csv
+    if not path.exists():
+        return []
+    with path.open(encoding="utf-8", newline="") as fh:
+        return list(csv.DictReader(fh))
+
+
+def test_the_deadline_commit_and_its_row_are_what_the_harvest_scores(tmp_path, caplog):
+    """The helper on its own, on the tree round 64 was left in: a finished entry
+    with no commit becomes exactly one commit — subject
+    `WIP (deadline commit, <reason>): <ticket>` — plus one
+    `runs/<agent>/PROGRESS.csv` row naming that sha with outcome FIXED, and the
+    row is *not* inside the commit it names. `harvest` on the result is READY:
+    the deadline commit buys an entry to score, never a better score."""
+    caplog.set_level(logging.INFO, logger="tools.contest.runner")
+    sb = Sandbox(tmp_path)
+    ws = sb.ws("agent-a")
+    work_dirty_ready(str(ws.path), "")
+    assert _git(ws.path, "rev-list", "--count", f"{ws.base_sha}..HEAD") == "0"
+
+    sha = _runner_module._deadline_commit(ws, reason="no event for 3s",
+                                          ticket=sb.ticket_path)
+    assert sha == _branch_sha(ws)
+    assert _git(ws.path, "rev-list", "--count", f"{ws.base_sha}..HEAD") == "1"
+    subject = _git(ws.path, "log", "-1", "--pretty=%s")
+    assert subject == f"WIP (deadline commit, no event for 3s): {Path(sb.ticket_path).name}"
+    # both edited files are in it — the point of the ticket
+    assert set(_git(ws.path, "show", "--name-only", "--pretty=", sha).split()) == {
+        "pkg/thing.py", "tests/test_thing.py"}
+    assert _write_row(ws, sb.ticket_path, sha) is True
+    row = _progress_rows(ws)[-1]
+    assert row["ticket"] == Path(sb.ticket_path).name
+    assert row["outcome"] == "FIXED"
+    assert row["commit"] == sha
+    assert "deadline commit" in row["note"]
+    # the row is the runner's bookkeeping, not the agent's work
+    assert "runs/" not in _git(ws.path, "show", "--name-only", "--pretty=", sha)
+    verdict = _runner_module._harvest(ws, sb.ticket_path, False, _stall_config())
+    assert verdict.verdict == "READY", [r.code for r in verdict.reasons]
+    assert verdict.commit == sha
+    assert _runner_has(caplog, f"agent-a: deadline commit {sha[:12]}")
+
+
+def _write_row(ws, ticket_path, sha: str, *, note: str = "deadline commit") -> bool:
+    """The row write through the runner's own helper, the way the terminal branch
+    calls it — with the note it builds for the agent."""
+    from tools.contest.runner import _deadline_note
+    return _runner_module._write_progress_row(
+        ws, ticket_path, sha, note=_deadline_note(note, ws.agent, Path(ticket_path).name))
+
+
+def test_the_terminal_branch_commits_a_dirty_stall_and_harvests_it(tmp_path):
+    """The same thing end to end, through `run_agent`: a `STALLED` turn whose
+    worktree holds a finished entry and no commit ends `READY` with
+    `deadline_commit: true` on the run and on the turn, one commit on the
+    branch, and the row the harvest scored — with the roots stubbed green, so
+    the promotion is the harvest's and not the runner's.
+
+    This is the test that fails on the pre-KC-41 tree: the branch had nothing,
+    so `run.commit` was `None` and the run ended `STALLED` with no verdict."""
+    import tools.contest.harvest as harvest_module
+    sb = Sandbox(tmp_path)
+    work_dirty_ready(str(sb.ws("agent-a").path), "")
+    orig = harvest_module.run_tests_detail
+    harvest_module.run_tests_detail = lambda cwd, **kw: (ALL_ROOTS_PASS, [])
+    try:
+        with _BenchFake({"turns": [{"events": [], "idle": False}]}) as fake:
+            state = _round(sb, fake, _stall_config())
+    finally:
+        harvest_module.run_tests_detail = orig
+    (run,) = state.agents
+    ws = sb.ws("agent-a")
+    assert run.state is AgentState.READY, (run.state, run.last_error)
+    assert run.deadline_commit is True
+    assert run.commit == _branch_sha(ws)
+    assert _git(ws.path, "rev-list", "--count", f"{ws.base_sha}..HEAD") == "1"
+    (turn,) = run.turns
+    assert turn["idle_status"] == "stalled"
+    assert turn["harvest"]["verdict"] == "READY"
+    assert turn.get("deadline_commit") is True
+    (line,) = _jsonl(sb.out_dir / "agent-a" / "turns.jsonl")
+    assert line["harvest"]["verdict"] == "READY" and line["deadline_commit"] is True
+    data = _state_json(sb)
+    entry = next(r for r in data["agents"] if r["agent"]["name"] == "agent-a")
+    assert entry["state"] == "READY" and entry["deadline_commit"] is True
+    assert entry["commit"] == run.commit
+
+
+def test_a_clean_stall_is_untouched_by_the_deadline_commit(tmp_path, monkeypatch):
+    """A `STALLED` turn with a clean worktree: no commit, no row, no harvest and
+    no `deadline_commit` key anywhere — the pre-KC-41 path byte for byte. A
+    clean tree is "no uncommitted work", and inventing a commit for it would put
+    an empty diff in the round's table."""
+    def boom(*args, **kwargs):
+        raise AssertionError("_harvest must not run for a clean tree with no commit")
+
+    monkeypatch.setattr(_runner_module, "_harvest", boom)
+    sb, _fake, _h, run, aborted = _run_one(tmp_path,
+                                           {"turns": [{"events": [], "idle": False}]},
+                                           _stall_config())
+    ws = sb.ws("agent-a")
+    assert run.state is AgentState.STALLED and aborted
+    assert run.commit is None and run.deadline_commit is False
+    assert _git(ws.path, "rev-list", "--count", f"{ws.base_sha}..HEAD") == "0"
+    assert not ws.progress_csv.exists()
+    (turn,) = run.turns
+    assert "harvest" not in turn and "deadline_commit" not in turn
+    # the flag is in `state.json` either way, so a consumer reading the round
+    # file never has to guess whether the key was forgotten or meant
+    assert run.to_dict()["deadline_commit"] is False
+
+
+def test_a_stall_with_a_commit_gets_no_second_one(tmp_path):
+    """KC-21 unchanged: the model committed and claimed, the turn then stalled.
+    One commit — not two, so `commits_ne_1` cannot come from the deadline path —
+    no `deadline_commit` on the run or the turn, and the READY verdict is the
+    one KC-21 has always produced."""
+    sb, _fake, _h, run, _ = _run_one(tmp_path,
+                                     {"turns": [{"events": [], "idle": False}]},
+                                     _stall_config(),
+                                     prepare=lambda d: work_ready(d, ""))
+    ws = sb.ws("agent-a")
+    assert run.state is AgentState.READY, (run.state, run.last_error)
+    assert run.commit == _branch_sha(ws)
+    assert run.deadline_commit is False
+    assert _git(ws.path, "rev-list", "--count", f"{ws.base_sha}..HEAD") == "1"
+    (turn,) = run.turns
+    assert turn["harvest"]["verdict"] == "READY" and turn["harvest"]["reasons"] == []
+    assert "deadline_commit" not in turn
+    (line,) = _jsonl(sb.out_dir / "agent-a" / "turns.jsonl")
+    assert "deadline_commit" not in line
+
+
+def test_deadline_commit_false_is_the_tree_before_this_ticket(tmp_path, monkeypatch):
+    """`deadline_commit = false` in the config restores today's behaviour exactly:
+    a dirty stall is not committed, not claimed and not harvested, and nothing
+    raises. The regression guard for the whole ticket."""
+    def boom(*args, **kwargs):
+        raise AssertionError("deadline_commit = false must not commit and must not harvest")
+
+    monkeypatch.setattr(_runner_module, "_deadline_commit", boom)
+    monkeypatch.setattr(_runner_module, "_harvest", boom)
+    sb = Sandbox(tmp_path)
+    work_dirty_ready(str(sb.ws("agent-a").path), "")
+    with _BenchFake({"turns": [{"events": [], "idle": False}]}) as fake:
+        state = _round(sb, fake, _stall_config(deadline_commit=False))
+    (run,) = state.agents
+    ws = sb.ws("agent-a")
+    assert run.state is AgentState.STALLED, (run.state, run.last_error)
+    assert run.commit is None and run.deadline_commit is False
+    assert _git(ws.path, "rev-list", "--count", f"{ws.base_sha}..HEAD") == "0"
+    assert not ws.progress_csv.exists()
+    (turn,) = run.turns
+    assert "harvest" not in turn and "deadline_commit" not in turn
+
+
+def test_a_deadline_commit_that_cannot_land_leaves_todays_path(tmp_path, monkeypatch):
+    """A `git commit` that refuses answers `None` with a warning, and the turn
+    then takes the pre-KC-41 path: no commit, no row, no harvest, no raise. A
+    deadline commit is a rescue, never a new way for a round to fail."""
+    def refuse(*args, **kwargs):
+        return subprocess.CompletedProcess(args=["git", "commit"], returncode=1,
+                                           stdout="", stderr="fatal: nothing staged")
+    monkeypatch.setattr(_runner_module, "run_git", refuse)
+    sb = Sandbox(tmp_path)
+    work_dirty_ready(str(sb.ws("agent-a").path), "")
+    ws = sb.ws("agent-a")
+    assert _runner_module._deadline_commit(ws, reason="no event for 3s",
+                                           ticket=sb.ticket_path) is None
+    assert _git(ws.path, "rev-list", "--count", f"{ws.base_sha}..HEAD") == "0"
+
+
+def test_a_tree_that_cannot_be_read_is_never_committed(tmp_path, monkeypatch, caplog):
+    """FL-2, kept under KC-41: a `git status` that exits non-zero is a read
+    error, not a clean tree, and a deadline commit is not made on either
+    reading — there is no knowing what the tree holds. `None` and a warning."""
+    caplog.set_level(logging.WARNING, logger="tools.contest.runner")
+
+    class _R:
+        returncode = 128
+        stdout = ""
+        stderr = "fatal: not a git repository"
+
+    def status(args, **kwargs):
+        if "status" in args:
+            raise _runner_module.TreeReadError("status failed")
+        return _R()
+    monkeypatch.setattr(_runner_module, "run_git", status)
+    sb = Sandbox(tmp_path)
+    ws = sb.ws("agent-a")
+    assert _runner_module._deadline_commit(ws, reason="stalled",
+                                           ticket=sb.ticket_path) is None
+    assert _runner_has(caplog, "tree unreadable — no deadline commit")
+
+
+def test_a_deadline_row_that_cannot_be_written_costs_the_entry_not_the_round(
+        tmp_path, monkeypatch, caplog):
+    """A progress row that cannot be written is `False` and a warning, and the
+    round goes on: the commit is on the branch, the harvest answers
+    `no_progress_row` and the entry is REWORK — today's outcome for that
+    worktree, not an exception into the run."""
+    caplog.set_level(logging.WARNING, logger="tools.contest.runner")
+    sb = Sandbox(tmp_path)
+    ws = sb.ws("agent-a")
+
+    def refuse(*args, **kwargs):
+        raise OSError("read-only file system")
+
+    real_open = _runner_module.Path.open
+
+    def boom(self, *args, **kwargs):
+        if self.name == "PROGRESS.csv":
+            raise OSError("read-only file system")
+        return real_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(_runner_module.Path, "open", boom)
+    assert _write_row(ws, sb.ticket_path, "0" * 40) is False
+    assert _runner_has(caplog, "could not write the deadline progress row")
+
+
+def test_a_deadline_row_keeps_a_header_and_appends_to_an_existing_file(tmp_path):
+    """A worktree whose `PROGRESS.csv` already carries the header (the model ran
+    `append_task.py` for an earlier ticket, or the round handed it one) gets the
+    deadline row *appended*, not a second header — the harvest reads the last
+    row for this ticket, and a file with two headers still parses, but the file
+    the operator reads must not grow one header per stalled turn."""
+    sb = Sandbox(tmp_path)
+    ws = sb.ws("agent-a")
+    path = ws.progress_csv
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("ticket,finding,outcome,commit,note\n", encoding="utf-8")
+    sha = "a" * 40
+    assert _write_row(ws, sb.ticket_path, sha) is True
+    text = path.read_text(encoding="utf-8")
+    assert text.count("ticket,finding,outcome,commit,note") == 1
+    rows = _progress_rows(ws)
+    assert len(rows) == 1 and rows[0]["commit"] == sha
+
+
+def test_a_deadline_row_quotes_a_note_that_holds_a_comma(tmp_path):
+    """A note with a comma in it is one CSV cell, not two — the row the harvest
+    parses has to survive its own writer."""
+    import csv
+    sb = Sandbox(tmp_path)
+    ws = sb.ws("agent-a")
+    assert _runner_module._write_progress_row(
+        ws, sb.ticket_path, "b" * 40, note='deadline commit, turn "stalled"') is True
+    (row,) = list(csv.DictReader(ws.progress_csv.open(encoding="utf-8")))
+    assert row["note"] == 'deadline commit, turn "stalled"'
+
+
+def test_a_deadline_reason_stays_a_commit_subject_one_line(tmp_path):
+    """A reason long enough to be folded into a header git will truncate, cut at
+    its first separator and at `REASON_LIMIT`, and a state with no error text
+    still names the state — the subject is what an operator reads months later in
+    `git log`, so it has to be a line and not a paragraph."""
+    from tools.contest.runner import REASON_LIMIT
+    short = _runner_module._deadline_reason(AgentState.STALLED, "no event for 3s", None)
+    assert short == "no event for 3s"
+    long = _runner_module._deadline_reason(
+        AgentState.ERROR, "session.error: " + "x" * 900 + "; something else", None)
+    assert "\n" not in long and ";" not in long
+    assert len(long) <= REASON_LIMIT
+    multiline = _runner_module._deadline_reason(
+        AgentState.STALLED, "line one\nline two, and more", None)
+    assert "\n" not in multiline and "," not in multiline
+    assert _runner_module._deadline_reason(AgentState.ERROR, "", None) == "error"
+    assert _runner_module._deadline_reason(AgentState.STALLED, None, None) == "stalled"
+    # and the subject the commit actually gets is one line
+    sb = Sandbox(tmp_path)
+    ws = sb.ws("agent-a")
+    work_dirty_ready(str(ws.path), "")
+    _runner_module._deadline_commit(
+        ws, reason=_runner_module._deadline_reason(
+            AgentState.ERROR, "session.error: " + "y" * 900, None),
+        ticket=sb.ticket_path)
+    subject = _git(ws.path, "log", "-1", "--pretty=%s")
+    assert "\n" not in subject and len(subject) < 200
+
+
+def test_a_run_round_trip_keeps_the_deadline_flag(tmp_path):
+    """`state.json` carries `deadline_commit` and reads back, and a file written
+    before the key existed reads as `False` — an old `state.json` must not
+    crash `from_dict` or invent a flag."""
+    from tools.contest.runner import AgentRun, RoundState
+    run = AgentRun(agent=AgentSpec(name="a", provider_id="p", model_id="m"),
+                   workspace=Workspace(agent="a", path=Path("/tmp/x"),
+                                       branch="b", base_sha="c" * 40, kind="worktree"))
+    assert run.deadline_commit is False
+    run.deadline_commit = True
+    again = AgentRun.from_dict(run.to_dict())
+    assert again.deadline_commit is True
+    data = run.to_dict()
+    assert data["deadline_commit"] is True
+    del data["deadline_commit"]
+    assert AgentRun.from_dict(data).deadline_commit is False
+    assert RoundState is not None
+
+
+def test_a_provider_error_turn_with_a_dirty_tree_is_still_committed(tmp_path):
+    """KC-41 against KC-62, where they meet: a run that ends `ERROR` on Kilo's
+    own store with a dirty tree gets the deadline commit *and* `resumable`.
+
+    The two say different things. `deadline_commit` is "the round kept the work,
+    and here is the commit it is on" — the round's own bookkeeping, and it is why
+    the entry scores. `resumable` is "the agent did not finish; `--resume` may
+    start it again" — a claim about the session, which a commit says nothing
+    about. Clearing the second because the first fired would silently stop
+    `--resume` from restarting every agent whose turn the store took down, which
+    is exactly the case KC-62 was filed for.
+
+    The store-error shape lives in `tests/test_contest_runner_local_store.py`,
+    which is where the run is driven; the flag pair is asserted there, next to
+    KC-62's own acceptance. What is pinned here is the half this file owns: an
+    `ERROR` turn with a dirty tree and a `session.error` the store matcher does
+    *not* claim is still committed, and the flag is left alone."""
+    import tools.contest.harvest as harvest_module
+    orig = harvest_module.run_tests_detail
+    harvest_module.run_tests_detail = lambda cwd, **kw: (ALL_ROOTS_PASS, [])
+    try:
+        sb = Sandbox(tmp_path)
+        work_dirty_ready(str(sb.ws("agent-a").path), "")
+        with _BenchFake({"turns": [{"events": ["busy"],
+                                   "error": {"name": "ProviderError",
+                                             "message": "boom-42"}}]}) as fake:
+            h = Harness(sb, fake, _stall_config())
+            run = h.go()
+    finally:
+        harvest_module.run_tests_detail = orig
+    # a provider error is not the store, so the harvest promotes it and KC-62's
+    # flag never applies — but the work is still on the branch, which is KC-41
+    assert run.state is AgentState.READY, (run.state, run.last_error)
+    assert run.deadline_commit is True
+    assert run.to_dict()["deadline_commit"] is True
+    ws = run.workspace
+    assert _git(ws.path, "rev-list", "--count", f"{ws.base_sha}..HEAD") == "1"
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3610,7 +3976,11 @@ def test_continue_turns_and_the_resume_nudge_leave_the_json_shape_alone(tmp_path
     (agent,) = saved["agents"]
     assert set(agent) == {"agent", "workspace", "session_id", "state", "attempt", "turns",
                           "permissions", "questions", "last_error", "resumable", "commit",
-                          "cost", "tokens"}
+                          "cost", "tokens", "deadline_commit"}
+    # KC-41: the key is present on a run that never used it, and reads `false` —
+    # a consumer cannot tell "the model claimed this" from "the key was written
+    # before the flag existed" by its presence alone
+    assert agent["deadline_commit"] is False
     assert [t["kind"] for t in agent["turns"]] == ["initial", "continue"]
     assert RoundState.from_dict(saved) == state
 
