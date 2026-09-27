@@ -1,6 +1,6 @@
 # KC-32 — the contest tests stop failing on the operator's own box: no wall-clock bound under load, and `contest.local.ini` does not redden the roster test
 
-**Status:** queued — after KC-31, last in the queue; found 2026-09-20 scoring round 60 (KC-21) on the judge's own checkout.
+**Status:** landed `ad3c08f` (2026-09-21) — by hand, off-round.  
 **Severity:** MEDIUM (a red `pytest tests` that is nobody's bug reaches every self-check and every harvest that runs the roots)
 **File:** `tests/test_contest_roster.py` (`test_gate_profile_reads_the_committed_section`), `tests/test_contest_runner.py` (the `elapsed <` assertions)
 **Symbol:** `test_gate_profile_reads_the_committed_section`, `test_ctrl_c_aborts_writes_state_and_propagates_then_resume_finishes`, `test_ctrl_c_during_retry_backoff_ends_the_round`

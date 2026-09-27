@@ -1,6 +1,6 @@
 # KC-8 — `docs/kilo-contest/RUN-THE-KILO-CONTEST.md`: reset, run, score — and the first live round on record
 
-**Status:** queued — after KC-7 (round 46). Not a contest: size S, one author, landed by hand.  
+**Status:** landed `377a8fa` (2026-09-27) — round 47 (7 entries, hy3 gate): winner agnes-3-0-flash, its fake-server record replaced by the real round 47 `SUMMARY.md`; step-3-7-flash invented its SUMMARY (DQ), glm gave up on a stale progress sha.  
 **Severity:** MEDIUM  
 **File:** `docs/kilo-contest/RUN-THE-KILO-CONTEST.md` (new)  
 **Symbol:** —  

@@ -1,6 +1,6 @@
 # KC-58 — an agent's own full-suite run waits for a round-wide slot, and a turn that is waiting for its tests is not a turn that stopped
 
-**Status:** queued — found 2026-09-25 reading round 103 (FL-9, `/mnt-fs/jan-auto-agent/contest-out/103/`): four of ten agents `STALLED` at the turn deadline. Each had finished its code 30–45 minutes earlier and spent the rest of its hour waiting for its own `pytest tests -n 4`, which took 20–25 minutes because every other agent was running one too.
+**Status:** landed `dbab165` (2026-09-26) — `agent_suite_slots`; KC-68 `8d0b875` builds on it.  
 **Severity:** HIGH. Four finished entries were lost in one round. They had 131–327 lines of work, uncommitted and not harvested. Rebuilt from their worktrees, they are judged in round 103. The ticket tells every agent to run both roots before handing in, so every round has this shape.
 **File:** `tools/contest/runner.py`, `tools/contest/policy.py`
 **Symbol:** `run_agent` (`on_permission`), `_turn_deadline` (`on_deadline`), `_TEST_RUNS_LOCK`
