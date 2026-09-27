@@ -79,8 +79,6 @@ from tools.contest.runner import (  # noqa: E402
 )
 from tools.contest.workspace import Workspace, agent_tmp_dir  # noqa: E402
 
-# every test binds an ephemeral-port HTTP server: one xdist worker for all of them
-pytestmark = pytest.mark.xdist_group(name="port_bound_http_servers")
 
 ROUND = 45
 TICKET = "45-kc6-test.md"
@@ -396,7 +394,7 @@ def make_config(agents, **over) -> ContestConfig:
     # explicitly.
     # KC-9: a SILENT idle waits `error_retry_backoff_sec` before its continue,
     # and the roster default is 15 s — four silence tests each slept it out for
-    # real (~+70 s on the suite, all on the one port_bound_http_servers worker).
+    # real (~+70 s on the suite).
     # 0 here; the tests that are *about* the backoff set their own.
     kw = dict(agents=specs, max_parallel=1, max_rework=2, turn_timeout_sec=300,
               turn_extend_sec=0, idle_event_timeout_sec=60, max_questions_per_turn=3,
