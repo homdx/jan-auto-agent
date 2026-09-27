@@ -454,14 +454,31 @@ def test_a_memory_the_runner_cannot_write_ends_the_overflow_the_way_it_does_toda
 
 
 def test_a_broken_memory_file_never_raises_into_the_run(tmp_path):
+    """A broken memory is no memory; with the fallback off too, the run is
+    unsized exactly as it was before KC-10."""
     memory = tmp_path / "context-memory.json"
     memory.write_text("{not json", encoding="utf-8")
     scenario = {"turns": [{"on_prompt": tr.work_ready, "events": ["busy", "idle"]}]}
-    sb, _fake, _h, run, _ = _run(tmp_path, scenario, memory=memory)
+    sb, _fake, _h, run, _ = _run(tmp_path, scenario, memory=memory,
+                                  context_limit_fallback=0)
     assert run.state is tr.AgentState.READY
     (turn,) = run.turns
     assert turn["context_source"] == "none" and turn["context_size"] is None
     assert turn["fill"] is None and turn["compacted"] is False
+
+
+def test_a_broken_memory_file_falls_back_to_the_fallback_window(tmp_path):
+    """KC-10: the same broken memory, with the fallback on — the model is sized
+    by ``context_limit_fallback`` instead, the run still never raises."""
+    memory = tmp_path / "context-memory.json"
+    memory.write_text("{not json", encoding="utf-8")
+    scenario = {"turns": [{"on_prompt": tr.work_ready, "events": ["busy", "idle"]}]}
+    sb, _fake, _h, run, _ = _run(tmp_path, scenario, memory=memory,
+                                  context_limit_fallback=32_768)
+    assert run.state is tr.AgentState.READY
+    (turn,) = run.turns
+    assert turn["context_source"] == "fallback" and turn["context_size"] == 32_768
+    assert turn["fill"] == 0.0 and turn["compacted"] is False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -649,8 +666,12 @@ def test_a_compact_that_frees_too_little_goes_on_in_a_new_session(tmp_path, capl
     assert any("the compact left 85.0% — still at or past 80%" in line for line in lines)
 
 
-def test_a_session_with_no_remembered_size_is_prompted_as_today(tmp_path):
-    _sb, fake, _h, run, _ = _run(tmp_path, _rework_scenario(FULL_81))
+def test_a_model_with_no_size_at_all_is_prompted_as_today(tmp_path):
+    """KC-10's ``context_limit_fallback = 0`` is the pre-KC-10 answer: no number
+    at all, so no fill and no compact — this is what KC-67's "no remembered size"
+    case is now, with the fallback turned off."""
+    _sb, fake, _h, run, _ = _run(tmp_path, _rework_scenario(FULL_81),
+                                 context_limit_fallback=0)
     assert not any("/summarize" in path for path, _ in _posts(fake))
     for turn in run.turns:
         assert turn["context_size"] is None and turn["context_source"] == "none"
@@ -698,7 +719,7 @@ def test_zero_percent_turns_the_runners_compact_off(tmp_path):
 def test_zero_days_is_no_memory_at_all(tmp_path):
     memory = _memory(tmp_path, limit=SIZE, last_ok=None)
     _sb, fake, _h, run, _ = _run(tmp_path, _rework_scenario(FULL_81), memory=memory,
-                                  context_memory_days=0)
+                                  context_memory_days=0, context_limit_fallback=0)
     assert not any("/summarize" in path for path, _ in _posts(fake))
     second = run.turns[1]
     assert second["context_source"] == "none" and second["context_size"] is None

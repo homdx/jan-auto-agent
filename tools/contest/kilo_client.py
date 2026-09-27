@@ -1108,6 +1108,28 @@ def _permission_answer(answer) -> "tuple[str, str, float]":
     raise TypeError(f"on_permission returned {answer!r}, not (reply, message)")
 
 
+def _context_limit_of(value) -> int | None:
+    """KC-10: a model's ``limit.context`` as a positive int, else ``None``.
+
+    The offer sends it as a number, but a custom provider may send it as a
+    string, and a limit of ``0`` means "none" the same as an absent one — both
+    are the runner's cue to size the model itself, never a raise and never a
+    zero a division would blow up on.
+    """
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        number = int(value)
+        return number if number > 0 else None
+    if isinstance(value, str):
+        try:
+            number = int(value.strip().replace(",", ""))
+        except (TypeError, ValueError):
+            return None
+        return number if number > 0 else None
+    return None
+
+
 class KiloClient:
     """One session directory on one server.
 
@@ -1120,6 +1142,11 @@ class KiloClient:
         self.server = server
         self.directory = os.path.abspath(str(directory))
         self._query = "?directory=" + urllib.parse.quote(self.directory, safe="")
+        # KC-10: a model's ``limit.context`` by ``(provider_id, model_id)``.
+        # The offer does not change inside a round, so one read of
+        # ``GET /provider`` serves every prompt — the roster asks it once per
+        # agent, and a fill must not pay for it on each of them.
+        self._model_limits: dict = {}
 
     def _url(self, path: str) -> str:
         return f"{self.server.base_url}{path}{self._query}"
@@ -1167,6 +1194,50 @@ class KiloClient:
             raise ValueError(
                 f"GET /provider returned {type(resp).__name__}, expected a dict")
         return resp
+
+    def model_limit(self, provider_id: str, model_id: str) -> int | None:
+        """KC-10: the model's ``limit.context``, else ``None``. Cached per client.
+
+        ``GET /provider`` -> ``all[]`` -> the provider whose ``id`` is *provider_id*
+        -> its ``models`` -> *model_id* -> ``limit.context``. ``None`` for a
+        provider that is absent, for a model that is absent, for a model with no
+        ``limit`` or no ``context`` in it, and for a ``context`` that is not a
+        positive number — the free-tier custom providers declare only a name and
+        their reasoning, and that is the case this number exists for. Every
+        failure is ``None`` too: a body that is not a dict, a non-2xx answer, a
+        closed connection. A ``None`` is the runner's cue to size the model
+        itself, never a raise into a round.
+
+        An answer that came out of the offer is cached by
+        ``(provider_id, model_id)`` — a provider or a model the offer does not
+        have, and a limit it does not declare. An offer that could not be read
+        is not cached: the read was refused or lost, and the next prompt asks
+        again.
+        """
+        key = (str(provider_id), str(model_id))
+        if key in self._model_limits:
+            return self._model_limits[key]
+        try:
+            offer = self.providers()
+        except (KiloHttpError, ValueError, TypeError, OSError):
+            return None
+        if not isinstance(offer, dict):
+            return None
+        provider = None
+        for entry in offer.get("all") or []:
+            if isinstance(entry, dict) and entry.get("id") == str(provider_id):
+                provider = entry
+                break
+        if provider is None:
+            self._model_limits[key] = None
+            return None
+        models = provider.get("models")
+        model = models.get(model_id) if isinstance(models, dict) else None
+        raw = model.get("limit") if isinstance(model, dict) else None
+        limit = raw.get("context") if isinstance(raw, dict) else raw
+        answer = _context_limit_of(limit)
+        self._model_limits[key] = answer
+        return answer
 
     # ── the session ────────────────────────────────────────────────────────
 
@@ -1320,6 +1391,49 @@ class KiloClient:
         status, resp = self._request("GET", path)
         self._check(status, resp, "GET", path)
         return resp if isinstance(resp, dict) else {}
+
+    def session_tokens(self, session: SessionRef) -> dict:
+        """KC-10: the last assistant message's ``tokens``, plus the session total.
+
+        ``GET /session/{id}/message`` -> the last assistant message -> its
+        ``tokens`` — ``total``, ``input``, ``output`` and ``reasoning`` at the
+        top level, and ``cache.read`` / ``cache.write`` under ``cache``. That
+        is the size the next call will carry, so it is what a fill is read
+        from. The session's own ``tokens`` from ``GET /session/{id}`` rides
+        along under ``session`` for the summary.
+
+        ``{}`` when the session has no assistant message, when it has one with
+        no ``tokens``, when a transcript cannot be read or is not a list, and
+        when ``GET /session/{id}`` fails — the session total is simply absent
+        then. A reader of a fill treats ``{}`` as "no number", which never
+        compacts anything: an unreadable transcript is not an error out of a
+        round.
+        """
+        try:
+            messages = self.messages(session)
+        except (KiloHttpError, ValueError, TypeError, OSError):
+            return {}
+        last = None
+        for message in reversed(messages if isinstance(messages, list) else []):
+            info = message.get("info") if isinstance(message, dict) else None
+            if isinstance(info, dict) and info.get("role") == "assistant":
+                last = info.get("tokens")
+                break
+        if not isinstance(last, dict):
+            return {}
+        out = {key: last.get(key) for key in ("total", "input", "output", "reasoning")}
+        cache = last.get("cache")
+        if isinstance(cache, dict):
+            out["cache"] = {key: cache.get(key) for key in ("read", "write")}
+        try:
+            info = self.session_info(session)
+            tokens = info.get("tokens")
+            if isinstance(tokens, dict):
+                out["session"] = {key: tokens.get(key) for key in
+                                  ("total", "input", "output", "reasoning")}
+        except (KiloHttpError, ValueError, TypeError, OSError):
+            pass
+        return out
 
     # ── permissions and questions ──────────────────────────────────────────
 

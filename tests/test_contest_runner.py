@@ -24,6 +24,7 @@ run needs.
 
 from __future__ import annotations
 
+import configparser
 import json
 import logging
 import os
@@ -50,6 +51,7 @@ import _kilo_fake  # noqa: E402
 from _kilo_fake import FakeKiloServer  # noqa: E402
 from tools.auto.llm_profile import LlmSettings  # noqa: E402
 from tools.contest.backend import ContestBackendError, KiloBackend  # noqa: E402
+from tools.contest.export import render_table  # noqa: E402
 from tools.contest.kilo_client import (  # noqa: E402
     AGENT_TEST_TIMEOUT_MS, IdleResult, KiloServer, SessionRef)
 from tools.contest.policy import Policy  # noqa: E402
@@ -4258,11 +4260,12 @@ def test_continue_turns_and_the_resume_nudge_leave_the_json_shape_alone(tmp_path
     (agent,) = saved["agents"]
     assert set(agent) == {"agent", "workspace", "session_id", "state", "attempt", "turns",
                           "permissions", "questions", "last_error", "resumable", "commit",
-                          "cost", "tokens", "deadline_commit", "continues"}
+                          "cost", "tokens", "deadline_commit", "continues", "compactions"}
     # KC-41: the key is present on a run that never used it, and reads `false` —
     # a consumer cannot tell "the model claimed this" from "the key was written
     # before the flag existed" by its presence alone
     assert agent["deadline_commit"] is False
+    assert agent["compactions"] == 0
     assert [t["kind"] for t in agent["turns"]] == ["initial", "continue"]
     assert RoundState.from_dict(saved) == state
 
@@ -6405,3 +6408,182 @@ def test_the_suite_queue_does_not_count_against_agent_max_sec(tmp_path, monkeypa
         assert turns[0]["suite_wait_sec"] >= 3, turns[0]
     finally:
         slots.release("other:harvest")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KC-10 — the fill is read before every prompt, and at 80 % of a model the
+#          provider declares no limit for, the session is compacted
+# ─────────────────────────────────────────────────────────────────────────────
+
+#: The fallback window `contest.ini` ships: a 32k-context free tier.
+FALLBACK = 32768
+#: 82 % of it — crosses `compact_at_percent`, so the rework is compacted first.
+FULL_WINDOW = 27_000
+#: 61 % of it — under the threshold, so the rework goes out as it stands.
+LIGHT_WINDOW = 20_000
+
+
+def _fill_tokens(input_tokens, cache_read=0):
+    """An assistant message's `info`: `input` plus `cache.read` is the fill."""
+    return {"tokens": {"input": input_tokens, "output": 0, "reasoning": 0,
+                       "cache": {"read": cache_read, "write": 0}}}
+
+
+def _rework_scenario(full, cache_read=0):
+    """One commit with no test file, so the harvest sends a rework prompt into the
+    same session — the second prompt of a session that already holds a
+    conversation. ``full`` is the context the first reply reports, so the fill of
+    the rework is that over the fallback window."""
+    return {"turns": [
+        {"on_prompt": work_no_test, "events": ["busy", "idle"],
+         "message_info": _fill_tokens(full, cache_read)},
+        {"on_prompt": work_ready, "events": ["busy", "idle"]},
+    ]}
+
+
+def _kc10_config(tmp_path, *, context_limit_fallback=FALLBACK, **over):
+    """One agent with no limit of its own and no remembered size: the case where
+    only `context_limit_fallback` can size the model."""
+    return make_config(["agent-a"],
+                       context_memory_file=str(tmp_path / "context-memory.json"),
+                       context_limit_fallback=context_limit_fallback, **over)
+
+
+def _compact_posts(fake, session_id):
+    """The paths of every POST the fake saw, in order."""
+    return [record["path"] for record in fake.calls("POST")]
+
+
+def test_a_fallback_window_at_eighty_two_percent_compacts_before_the_rework(tmp_path):
+    """KC-10: a model the provider declares no `limit.context` for is sized by
+    `context_limit_fallback`; its last reply at 27 000 of 32 768 is 82 % — over
+    `compact_at_percent` — so the rework prompt is preceded by exactly one
+    `POST /session/{id}/summarize`, in that order in the request log."""
+    sb, fake, _h, run, _ = _run_one(tmp_path, _rework_scenario(FULL_WINDOW),
+                                     _kc10_config(tmp_path))
+    _assert_ready(run, sb.ws("agent-a"))
+    assert [turn["kind"] for turn in run.turns] == ["initial", "rework"]
+
+    posts = _compact_posts(fake, run.session_id)
+    compact = posts.index(f"/session/{run.session_id}/summarize")
+    prompt = next(i for i in range(compact, len(posts))
+                  if posts[i] == f"/session/{run.session_id}/prompt_async")
+    assert compact < prompt, "the compact is before the prompt that earned it"
+    assert posts.count(f"/session/{run.session_id}/summarize") == 1
+    # POST /session opens the run, and the first prompt is never preceded by one
+    assert posts[0] == "/session" and posts[1] == f"/session/{run.session_id}/prompt_async"
+    body = fake.calls("POST", path="/summarize")[0]["body"]
+    assert body == {"providerID": "kenary", "modelID": "agent-a:free", "auto": False}
+
+    first, second = run.turns
+    assert first["compacted"] is False and second["compacted"] is True
+    assert (first["context_size"], second["context_size"]) == (FALLBACK, FALLBACK)
+    assert first["context_source"] == "fallback" and second["context_source"] == "fallback"
+    assert first["fill"] == 0.0 and second["fill"] == 82.4
+    assert run.compactions == 1
+
+    kinds = [event.get("type") for event in fake.events]
+    compacted = kinds.index("session.compacted")
+    assert kinds[compacted + 1] == "session.idle", "the compacted precedes its idle"
+
+    (t0, t1) = _jsonl(sb.out_dir / "agent-a" / "turns.jsonl")
+    assert (t0["fill"], t0["compacted"]) == (0.0, False)
+    assert (t1["fill"], t1["compacted"]) == (82.4, True)
+
+
+def test_a_fallback_window_below_the_percent_does_not_compact(tmp_path):
+    """KC-10: 20 000 of 32 768 is 61 % — under `compact_at_percent`, so the
+    rework goes out as the session stands: no `summarize`, the fill still
+    written, so the operator sees it growing towards the compact."""
+    sb, fake, _h, run, _ = _run_one(tmp_path, _rework_scenario(LIGHT_WINDOW),
+                                     _kc10_config(tmp_path))
+    _assert_ready(run, sb.ws("agent-a"))
+    assert not any("/summarize" in path for path in _compact_posts(fake, run.session_id))
+    assert run.compactions == 0
+
+    first, second = run.turns
+    assert first["compacted"] is False and second["compacted"] is False
+    assert first["fill"] == 0.0 and second["fill"] == 61.0
+    (t0, t1) = _jsonl(sb.out_dir / "agent-a" / "turns.jsonl")
+    assert (t0["fill"], t0["compacted"]) == (0.0, False)
+    assert (t1["fill"], t1["compacted"]) == (61.0, False)
+
+
+def test_a_zero_fallback_leaves_the_model_unsized(tmp_path):
+    """KC-10: `context_limit_fallback = 0` is the pre-KC-10 answer — no number at
+    all, so no fill and no compact, whatever the last reply reported."""
+    cfg = _kc10_config(tmp_path, context_limit_fallback=0)
+    sb, fake, _h, run, _ = _run_one(tmp_path, _rework_scenario(FULL_WINDOW), cfg)
+    _assert_ready(run, sb.ws("agent-a"))
+    assert not any("/summarize" in path for path in _compact_posts(fake, run.session_id))
+    assert run.compactions == 0
+    for turn in run.turns:
+        assert turn["context_size"] is None and turn["context_source"] == "none"
+        assert turn["fill"] is None and turn["compacted"] is False
+
+
+def test_the_fallback_is_off_unless_the_operator_sets_it(tmp_path):
+    """KC-10, as landed: the default and the committed `contest.ini` leave the
+    fallback at 0. The models without a limit today are ~250k windows (round
+    49: agnes and mimo at 220-284k); 32 768 for them would compact every ~26k
+    tokens, so a model no one sized stays unsized until its own overflow is
+    remembered (KC-67)."""
+    assert ContestConfig(agents=()).context_limit_fallback == 0
+    committed = configparser.ConfigParser(inline_comment_prefixes=("#", ";"))
+    committed.read(REPO_ROOT / "contest.ini", encoding="utf-8")
+    assert committed.getint("contest", "context_limit_fallback") == 0
+    cfg = make_config(["agent-a"], context_memory_file=str(tmp_path / "context-memory.json"))
+    sb, fake, _h, run, _ = _run_one(tmp_path, _rework_scenario(FULL_WINDOW), cfg)
+    _assert_ready(run, sb.ws("agent-a"))
+    assert not any("/summarize" in path for path in _compact_posts(fake, run.session_id))
+    assert all(turn["context_source"] == "none" for turn in run.turns)
+
+
+def test_cache_read_counts_towards_the_fallback_fill(tmp_path):
+    """KC-10: the fill is `input` plus `cache.read` — the size the next call will
+    carry — not `input` alone, so a reply that read its context back from the
+    cache fills the window as one that sent it does."""
+    sb, fake, _h, run, _ = _run_one(
+        tmp_path, _rework_scenario(FULL_WINDOW - 1_000, cache_read=1_000),
+        _kc10_config(tmp_path))
+    _assert_ready(run, sb.ws("agent-a"))
+    assert run.compactions == 1
+    assert run.turns[1]["fill"] == 82.4
+
+
+def test_the_summary_shows_the_last_fill_and_the_compactions(tmp_path):
+    """KC-10: SUMMARY's row carries the last turn's fill and how many compacts
+    the run took, so the operator sees which agent was one prompt from a full
+    window without reading turns.jsonl."""
+    cfg = _kc10_config(tmp_path)
+    sb = Sandbox(tmp_path)
+    with _BenchFake(_rework_scenario(FULL_WINDOW)) as fake:
+        state = _round(sb, fake, cfg)
+    (run,) = state.agents
+    assert run.compactions == 1 and run.last_fill() == 82.4
+
+    lines = render_table(state, [])
+    head, _sep, row = lines
+    columns = [cell.strip() for cell in head.strip("|").split("|")]
+    cells = [cell.strip() for cell in row.strip("|").split("|")]
+    assert len(cells) == len(columns)
+    assert columns[columns.index("fill%") + 1] == "compactions"
+    assert cells[columns.index("fill%")] == "82.4%"
+    assert cells[columns.index("compactions")] == "1"
+
+
+def test_the_summary_shows_a_dash_for_a_run_that_was_never_sized(tmp_path):
+    """KC-10: a run with no size at all gets `-`, never `0.0%` — which would read
+    as an empty session instead of an unknown window."""
+    cfg = _kc10_config(tmp_path, context_limit_fallback=0)
+    sb = Sandbox(tmp_path)
+    with _BenchFake(_rework_scenario(FULL_WINDOW)) as fake:
+        state = _round(sb, fake, cfg)
+    (run,) = state.agents
+    assert run.compactions == 0 and run.last_fill() is None
+
+    lines = render_table(state, [])
+    columns = [cell.strip() for cell in lines[0].strip("|").split("|")]
+    cells = [cell.strip() for cell in lines[2].strip("|").split("|")]
+    assert cells[columns.index("fill%")] == "-"
+    assert cells[columns.index("compactions")] == "0"

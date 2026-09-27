@@ -1542,8 +1542,11 @@ def test_compact_posts_to_summarize_with_the_prompt_async_model_shape(tmp_path):
 
     assert call["body"] == {"providerID": "kenary", "modelID": "hy3:free", "auto": False}
     assert call["query"]["directory"] == h.directory
-    # nothing comes back to the caller: the session compacts, then goes idle
-    assert h.fake.events_of("session.compacted")
+    # nothing comes back to the caller: the session compacts, then goes idle, and
+    # a caller waiting on the tap sees them in that order
+    kinds = [event.get("type") for event in h.fake.events
+             if event.get("type") in ("session.compacted", "session.idle")]
+    assert kinds == ["session.compacted", "session.idle"]
 
 
 def test_compact_raises_when_the_server_refuses_it(tmp_path):
@@ -1709,17 +1712,27 @@ def test_a_turn_hook_that_raises_becomes_a_recorded_error(tmp_path):
 # 9 — GET /provider: the offer, as the server sees it
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _offered(provider_id: str, name: str, model_ids) -> dict:
-    """One entry of a `GET /provider` body, in the shape the live server sends."""
+def _offered(provider_id: str, name: str, model_ids, *, limits=None):
+    """One entry of a `GET /provider` body, in the shape the live server sends.
+
+    ``limits`` maps a model id to its ``limit.context`` — the key a free-tier
+    custom provider often omits altogether, the case KC-10's read has to answer
+    ``None`` for. Without it no model carries a ``limit`` at all, which is what
+    the default offer looks like.
+    """
+    limits = limits or {}
     return {
         "id": provider_id,
         "name": name,
         "source": "static",
         "models": {
-            model_id: {"id": model_id, "providerID": provider_id, "name": model_id,
-                       "status": "active",
-                       "capabilities": {"reasoning": True, "toolcall": True},
-                       "variants": {}}
+            model_id: dict(
+                {"id": model_id, "providerID": provider_id, "name": model_id,
+                 "status": "active",
+                 "capabilities": {"reasoning": True, "toolcall": True},
+                 "variants": {}},
+                **({"limit": {"context": limits[model_id]}} if model_id in limits else {}),
+            )
             for model_id in model_ids
         },
     }
@@ -1788,6 +1801,102 @@ def test_providers_of_a_non_dict_body_is_a_value_error(tmp_path):
                            "turns": [{"events": ["busy", "idle"], "assistant": "done"}]}) as h:
         with pytest.raises(ValueError, match="GET /provider"):
             h.client.providers()
+
+
+# ── KC-10: model_limit and session_tokens, the fill's two reads ────────────
+
+def test_model_limit_reads_the_offered_context(tmp_path):
+    """KC-10: `model_limit` is the model's `limit.context` off `GET /provider`.
+
+    One read serves the whole round — cached per client, so a dozen fills cost
+    one `GET /provider`. A limit sent as a string, with thousands separators, is
+    a number too."""
+    offer = _offer((_offered(
+        "kenary", "kenari",
+        ("hy3:free", "sensenova-6.7:free", "nolimit:free", "zero:free"),
+        limits={"hy3:free": 32768, "sensenova-6.7:free": "262,144", "zero:free": 0}),))
+    with _probe(tmp_path, {"providers": offer,
+                           "turns": [{"events": ["busy", "idle"], "assistant": "done"}]}) as h:
+        assert h.client.model_limit("kenary", "hy3:free") == 32768
+        assert h.client.model_limit("kenary", "sensenova-6.7:free") == 262144
+        # the free tier declares a name and its reasoning, and no limit
+        assert h.client.model_limit("kenary", "nolimit:free") is None
+        # a limit of zero is no limit, and it must not become a zero a division hits
+        assert h.client.model_limit("kenary", "zero:free") is None
+        assert h.client.model_limit("kenary", "not-offered:free") is None
+        assert h.client.model_limit("not-a-provider", "hy3:free") is None
+        # cached per (provider, model): one read per model the round asks about
+        assert len(h.fake.calls(method="GET", path="/provider")) == 6
+        assert h.client.model_limit("kenary", "hy3:free") == 32768
+        assert h.client.model_limit("not-a-provider", "hy3:free") is None
+        assert len(h.fake.calls(method="GET", path="/provider")) == 6
+
+
+def test_model_limit_never_raises_when_the_offer_will_not_answer(tmp_path):
+    """KC-10: a refused offer and an offer that is not a dict are both `None` —
+    no number, never a raise. Neither is cached, so the next prompt asks again."""
+    with _probe(tmp_path, {"providers_status": 500,
+                           "turns": [{"events": ["busy", "idle"], "assistant": "done"}]}) as h:
+        assert h.client.model_limit("kenary", "hy3:free") is None
+        assert h.client.model_limit("kenary", "hy3:free") is None
+        assert len(h.fake.calls(method="GET", path="/provider")) == 2
+
+    with _probe(tmp_path, {"providers": ["not", "a", "dict"],
+                           "turns": [{"events": ["busy", "idle"], "assistant": "done"}]}) as h:
+        assert h.client.model_limit("kenary", "hy3:free") is None
+
+
+def test_session_tokens_reads_the_last_assistant_message_and_the_session_total(tmp_path):
+    """KC-10: `session_tokens` is the *last* assistant message's `tokens` — `input`,
+    `cache.read` and the rest, the size the next call will carry — plus the
+    session's own total from `GET /session/{id}` under `session`, for the
+    summary."""
+    last = {"total": 1_000, "input": 900, "output": 90, "reasoning": 10,
+            "cache": {"read": 128, "write": 7}}
+    scenario = {
+        "session": {"tokens": {"total": 5_000, "input": 4_000, "output": 300,
+                               "reasoning": 100, "cache": {"read": 200, "write": 0}}},
+        "turns": [
+            {"events": ["busy", "idle"], "assistant": "first",
+             "message_info": {"tokens": {"total": 100, "input": 80, "output": 20}}},
+            {"events": ["busy", "idle"], "assistant": "second",
+             "message_info": {"tokens": last}},
+        ],
+    }
+    with _probe(tmp_path, scenario) as h:
+        for text in ("first", "second"):
+            h.client.prompt(h.session, text)
+            h.client.wait_idle(h.tap, h.session, 60.0, on_permission=_reject,
+                               on_question=lambda event: None)
+        tokens = h.client.session_tokens(h.session)
+        assert tokens == {
+            "total": 1_000, "input": 900, "output": 90, "reasoning": 10,
+            "cache": {"read": 128, "write": 7},
+            "session": {"total": 5_000, "input": 4_000, "output": 300, "reasoning": 100},
+        }
+
+
+def test_session_tokens_of_a_session_that_replies_with_no_tokens_is_empty(tmp_path):
+    """KC-10: no assistant message, and an assistant message that reports no
+    tokens, are both `{}` — no number, which never sizes a fill and never
+    compacts anything."""
+    with _probe(tmp_path, {"turns": []}) as h:
+        assert h.client.session_tokens(h.session) == {}
+
+    scenario = {"turns": [{"events": ["busy", "idle"], "assistant": "no tokens"}]}
+    with _probe(tmp_path, scenario) as h:
+        assert h.client.session_tokens(h.session) == {}
+
+
+def test_session_tokens_of_an_unknown_session_is_empty(tmp_path):
+    """KC-10: a transcript that cannot be read is `{}`, not a raise out of a fill.
+
+    The session total is simply absent, so a caller that reads `input` and
+    `cache.read` sees nothing rather than an exception."""
+    with _probe(tmp_path, {"turns": [{"events": ["busy", "idle"], "assistant": "done"}]}) as h:
+        ghost = SessionRef(id="no-such-id", provider_id="kenary", model_id="hy3:free",
+                           directory=h.directory, agent=None, variant=None)
+        assert h.client.session_tokens(ghost) == {}
 
 
 # ── KC-11: delete_session and create_session(variant=) ──────────────────────

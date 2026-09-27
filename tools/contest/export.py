@@ -293,7 +293,7 @@ def write_entrants(out_dir, base_sha, state, paths, *, repo=None) -> Path | None
 _TABLE_COLUMNS = (
     "name", "model", "state", "attempts", "turns", "asked", "allowed", "rejected",
     "gated", "gate-failed", "questions", "cost", "tokens in", "tokens out",
-    "commit", "last reason", "file",
+    "fill%", "compactions", "commit", "last reason", "file",
 )
 
 
@@ -331,6 +331,19 @@ def _token_pair(tokens) -> tuple:
     came_in = _number(tokens.get("input")) + cache_read
     went_out = _number(tokens.get("output")) + _number(tokens.get("reasoning"))
     return came_in, went_out
+
+
+def _fill_cell(fill) -> str:
+    """The run's last fill as SUMMARY's ``fill%`` cell, ``-`` when it was never read.
+
+    KC-10: the percent of the context window the last turn left, the same number
+    its `turns.jsonl` line carries. ``-`` for ``None`` — a run whose model was
+    never sized knows nothing — never ``0%``, which would read as "an empty
+    session" instead of "no size".
+    """
+    if isinstance(fill, (int, float)) and not isinstance(fill, bool):
+        return f"{float(fill):.1f}%"
+    return "-"
 
 
 def _utc(value) -> str:
@@ -398,6 +411,8 @@ def render_table(state, paths) -> list:
             _cell(cost),
             came_in,
             went_out,
+            _fill_cell(row.get("fill")),
+            _number(row.get("compactions")),
             commit[:12] if commit else "-",
             row.get("last_reason") or "-",
             files.get(str(row.get("name") or ""), "-"),

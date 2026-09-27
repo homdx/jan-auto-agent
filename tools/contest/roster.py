@@ -140,6 +140,7 @@ CONTEST_KEYS = (
     "context_memory_file",
     "context_memory_days",
     "compact_at_percent",
+    "context_limit_fallback",
 )
 
 #: Every key an agent section may carry.
@@ -374,6 +375,19 @@ class ContestConfig:
     #: compacts a session whose model has no limit of its own. Kilo compacts
     #: those on its own; 0 turns the runner's compact off.
     compact_at_percent: float = 80.0
+    #: KC-10: the context window the runner assumes for a model the provider
+    #: declares no ``limit.context`` for — the free-tier custom providers, which
+    #: send only a name and their reasoning. The fill divides the last reply's
+    #: ``input`` plus ``cache.read`` by the Kilo limit, else the remembered one,
+    #: else this, so such a model still earns a compact instead of overflowing.
+    #: 0 = no number at all: the pre-KC-10 behaviour, every prompt goes out
+    #: unsized — and the default. The number is a guess the ticket wrote for
+    #: 32k free tiers; the ones without a limit today are ~250k windows (round
+    #: 49: agnes and mimo sessions at 220–284k), which a guess of 32 768 would
+    #: compact every ~26k tokens and whose asks KC-69 would refuse at the same
+    #: point. KC-67's memory sizes those from their own overflow instead; set
+    #: this only for a roster of models known to be that small.
+    context_limit_fallback: int = 0
     #: KC-59: how ``prepare_round`` builds each agent's checkout — one of
     #: ``WORKSPACE_KINDS``. ``clone`` (the default) makes a fresh local clone
     #: per agent, ``worktree`` keeps the pre-KC-59 worktree per agent.
@@ -715,6 +729,11 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
         if value < 0:
             raise RosterError(f"[contest] {key} must be >= 0, got {value}")
     compact_at_percent = num("compact_at_percent", 80.0)
+    # KC-10: the window the runner assumes for a model the provider declares no
+    # `limit.context` for. Read like the memory's numbers: 0 turns it off, and
+    # a typo is 0 too — the rule stands down rather than sizing every prompt
+    # against a nonsense number.
+    context_limit_fallback = int(num("context_limit_fallback", 0))
 
     # KC-58: 0 slots is "the queue is off", so a negative count is refused
     # rather than read as 0; a negative ceiling would unblock every holder at
@@ -788,6 +807,7 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
         context_memory_file=scalar("context_memory_file", ""),
         context_memory_days=context_memory_days,
         compact_at_percent=compact_at_percent,
+        context_limit_fallback=context_limit_fallback,
         workspace_kind=workspace_kind,
         variant=scalar("variant", "highest") or "highest",
         probe_ttl_days=int(scalar("probe_ttl_days", "7") or "7"),

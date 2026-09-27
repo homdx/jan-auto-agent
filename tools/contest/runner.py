@@ -184,10 +184,14 @@ ends those STALLED. Before every prompt that goes into a session that already
 holds a conversation — a rework, a continue, a retry — this module asks for the
 model's size. Kilo's own `limit.context`, when intake has it, ends the question
 there, because Kilo compacts those on its own; otherwise the smallest size
-remembered for that provider and model is the number, and a session that holds
-`compact_at_percent` of it is compacted first — one `POST /session/{id}/summarize`,
-then the prompt. Every failure degrades to "no remembered size", which is today's
-prompt, and every overflow is recorded whether or not the round ends STALLED.
+remembered for that provider and model is the number, and then the round's
+`context_limit_fallback` (KC-10) for the free tiers the provider declares no
+limit for at all; a session that holds `compact_at_percent` of it is compacted
+first — one `POST /session/{id}/summarize`, then the prompt. The fill and
+whether a compact happened go onto every `turns.jsonl` line, the run's compact
+count rides on the run and into SUMMARY. Every failure degrades to "no size",
+which is today's prompt, and every overflow is recorded whether or not the
+round ends STALLED.
 """
 
 from __future__ import annotations
@@ -966,16 +970,36 @@ def classify_idle(backend: ContestBackend, session: SessionRef,
     return IdleKind.SILENT
 
 
-def _context_budget(spec, records) -> tuple:
-    """KC-67: ``(size, source)`` for *spec*'s model, from Kilo's own limit first.
+def _context_limit_fallback(value) -> int:
+    """KC-10: ``context_limit_fallback`` as a positive int, else ``0`` — off.
 
-    ``("N", "kilo")`` when intake put the model's own ``limit.context`` on the
-    spec: then Kilo compacts the session on its own and the runner does nothing
-    more with the number, which is why the two sources are told apart. Otherwise
-    the smallest size remembered for that provider and model, ``"remembered"`` —
-    the models the provider declares no limit for, the ones that overflowed.
-    ``("none", "none")`` when there is nothing at all, which is today's prompt
-    and today's overflow.
+    The round sets it from the ini, where ``roster`` already clamps a typo to 0.
+    A caller that builds a config of its own may not have, so a bool, a missing
+    key, letters or a non-positive number all stand the rule down rather than
+    sizing every prompt against a nonsense window.
+    """
+    if isinstance(value, bool):
+        return 0
+    try:
+        number = int(str(value).strip().replace(",", "") or 0)
+    except (TypeError, ValueError):
+        return 0
+    return number if number > 0 else 0
+
+
+def _context_budget(spec, records, config=None) -> tuple:
+    """KC-67 + KC-10: ``(size, source)`` for *spec*'s model.
+
+    Kilo's own ``limit.context`` first — intake's read, put on the spec: then
+    Kilo compacts the session on its own and the runner does nothing more with
+    the number, which is why the sources are told apart. Otherwise the smallest
+    size remembered for that provider and model, ``"remembered"`` — KC-67's,
+    the provider's own words out of its last overflow, the models the provider
+    declares no limit for. Otherwise the round's ``context_limit_fallback``
+    (KC-10), ``"fallback"``: the window the round assumes for the free tiers,
+    which send only a name and their reasoning and overflow the same way every
+    round. ``("none", "none")`` when there is nothing at all — not even a
+    fallback — which is today's prompt and today's overflow.
     """
     limit = getattr(spec, "context_limit", None)
     if isinstance(limit, int) and not isinstance(limit, bool) and limit > 0:
@@ -983,6 +1007,9 @@ def _context_budget(spec, records) -> tuple:
     size = context_memory.smallest_size(records, spec.provider_id, spec.model_id)
     if size is not None:
         return int(size), "remembered"
+    fallback = _context_limit_fallback(getattr(config, "context_limit_fallback", None))
+    if fallback:
+        return fallback, "fallback"
     return None, "none"
 
 
@@ -1438,6 +1465,11 @@ class AgentRun:
     #: KC-9: the per-attempt counter of continues sent into the same session.
     #: Bounded by `max_continues_per_attempt`; reset on rework and resume.
     continues: int = 0
+    #: KC-10: how many times this run's session was summarised — one per
+    #: ``POST /session/{id}/summarize`` that went idle. ``0`` for every run that
+    #: never filled a window, and for a `state.json` written before the key.
+    #: `turns.jsonl` carries the same fact per turn as `compacted`.
+    compactions: int = 0
 
     @property
     def terminal(self) -> bool:
@@ -1463,7 +1495,7 @@ class AgentRun:
         run = cls(agent=AgentSpec(**data["agent"]), workspace=Workspace(**ws))
         for name in ("session_id", "attempt", "turns", "permissions", "questions",
                      "last_error", "resumable", "commit", "cost", "tokens", "reaped",
-                     "deadline_commit", "continues"):
+                     "deadline_commit", "continues", "compactions"):
             if name in data:
                 setattr(run, name, data[name])
         run.deadline_commit = bool(getattr(run, "deadline_commit", False))
@@ -1479,6 +1511,21 @@ class AgentRun:
             if h:
                 return " ".join([h.get("verdict", "")] + [str(c) for c in h.get("reasons", [])]).strip()
         return ""
+
+    def last_fill(self) -> float | None:
+        """KC-10: the fill of the last recorded turn, as a percent, else ``None``.
+
+        The fill a turn wrote into `turns.jsonl` — ``fill``, a percent of that
+        turn's ``context_size``. Read from the end, because the turns before the
+        last one are the ones a rework or a continue followed; the last one is
+        the context the run ended in. A turn with no size is ``None``, which is
+        the ``-`` SUMMARY prints, never a guess.
+        """
+        for turn in reversed(self.turns):
+            fill = turn.get("fill") if isinstance(turn, dict) else None
+            if isinstance(fill, (int, float)) and not isinstance(fill, bool):
+                return float(fill)
+        return None
 
     def test_wait(self) -> float:
         """KC-57: the seconds this run spent queued for the round's pytest lock.
@@ -1529,6 +1576,9 @@ class RoundState:
             "questions": run.questions,
             "cost": run.cost,
             "tokens": run.tokens,
+            # KC-10: the context the run ended in, and how many compacts it took
+            "fill": run.last_fill(),
+            "compactions": run.compactions,
             "commit": run.commit,
             "last_reason": run.last_reason(),
             "test_wait": run.test_wait(),
@@ -3379,10 +3429,13 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         started = time.monotonic()
         done = _compact_session(backend, session, config, on_permission, on_question)
         took = time.monotonic() - started
-        size, _source = _context_budget(spec, _memory())
+        size, _source = _context_budget(spec, _memory(), config)
         after = _context_tokens(backend, session) if done else None
         percent = context_memory.compact_at_percent(config)
         turn["overflow_compacted"] = bool(done)
+        turn["compacted"] = bool(done)
+        if done:
+            run.compactions += 1
         turn["context_before"] = before
         turn["context_after"] = after
         turn["compact_sec"] = round(took, 1)
@@ -3456,7 +3509,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         read at all: an ask is never held up by the read.
         """
         try:
-            size, source = _context_budget(spec, _memory())
+            size, source = _context_budget(spec, _memory(), config)
             tokens = _context_tokens(backend, session)
         except Exception:  # noqa: BLE001 — no read, no line, never a held ask
             return None
@@ -3511,7 +3564,9 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
 
         The size is Kilo's own ``limit.context`` when the spec has one — intake's,
         or the remembered one KC-69 hands Kilo — else the smallest one remembered
-        for this provider and model, else nothing at all. The fill is the last
+        for this provider and model, else the round's ``context_limit_fallback``
+        (KC-10) for the free tiers the provider declares no limit for, else
+        nothing at all. The fill is the last
         reply that still went through over that size. A compact happens at
         ``compact_at_percent`` of any known size, and always after a permission
         was refused for a full context (KC-69), but only for a prompt that goes
@@ -3529,7 +3584,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         forced, context_full[0] = context_full[0], False
         size, source, fill, tokens = None, "none", None, 0
         try:
-            size, source = _context_budget(spec, _memory())
+            size, source = _context_budget(spec, _memory(), config)
             tokens = _context_tokens(backend, session)
             if size:
                 fill = tokens * 100.0 / float(size)
@@ -3579,6 +3634,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
             return "swap"
         after = _summary_tokens(backend, session)
         turn["compacted"] = True
+        run.compactions += 1
         turn["context_before"] = tokens
         turn["context_after"] = after
         turn["compact_sec"] = round(took, 1)
