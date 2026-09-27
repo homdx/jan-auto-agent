@@ -415,6 +415,26 @@ def test_the_empty_message_kilo_keeps_for_the_refused_reply_is_not_the_last_ok(t
     assert cm.size_of(record) == 110_000
 
 
+def test_the_summary_kilo_starts_on_the_overflow_is_not_the_last_ok(tmp_path):
+    """Round 49's agnes-2-0-flash: on the overflow Kilo starts its own chunked
+    compact at once, and the session's last assistant message is a summary with
+    every count zero by the time the runner reads it. That summary is the fill
+    of a compacted session (KC-69), not the last reply that went through — it
+    left `last_ok: 0`, which is no size, when the reply before it held 247 386."""
+    memory = _memory(tmp_path)
+    scenario = _overflow_scenario(KENARY_OVERFLOW, 110_000)
+    scenario["turns"][1]["message_info"] = {
+        "summary": True,
+        "tokens": {"input": 0, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}}}
+    _sb, _fake, _h, run, _ = _run(tmp_path, scenario, memory=memory,
+                                   max_continues_per_attempt=0)
+    assert run.state is tr.AgentState.STALLED
+
+    (record,) = cm.load(memory)[1:]
+    assert record.last_ok == 110_000
+    assert cm.size_of(record) == 110_000
+
+
 def test_a_memory_the_runner_cannot_write_ends_the_overflow_the_way_it_does_today(tmp_path,
                                                                                    caplog):
     """The memory write fails: the overflow still ends the turn as KC-54 does,
