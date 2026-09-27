@@ -1059,33 +1059,47 @@ def _context_tokens(backend: ContestBackend, session: SessionRef) -> int:
     return 0
 
 
-def _last_reply_tokens(backend: ContestBackend, session: SessionRef) -> int:
-    """KC-67's ``last_ok``: the last *reply* that went through, in tokens.
+def _last_reply(backend: ContestBackend, session: SessionRef) -> tuple[int, int | None]:
+    """``(last_ok, grew)`` for an overflow's record (KC-67, KC-73).
 
-    `_context_tokens` without KC-69's summary rule: a summary is the fill of a
+    ``last_ok`` is the last *reply* that went through, in tokens:
+    `_context_tokens` without KC-69's summary rule — a summary is the fill of a
     compacted session, but it is not a reply the provider accepted. Round 49's
     agnes-2-0-flash: on the overflow Kilo started its own chunked compact at
-    once, and by the time the runner read the session its last assistant
-    message was that summary, every count zero — the overflow was remembered
-    as ``last_ok: 0``, no size, with a 247 386-token reply just before it.
-    Summaries and messages that report no tokens are skipped; ``0`` for every
-    failure, as there.
+    once, and the session's last assistant message was that summary, every
+    count zero — remembered as ``last_ok: 0`` with a 247 386-token reply just
+    before it. Summaries and messages that report no tokens are skipped.
+
+    ``grew`` is what that reply's tool
+    results added before the next request — the one that overflowed — in
+    tokens at `SUMMARY_CHARS_PER_TOKEN` of their text: a reply that asked for
+    twenty `read`s went through at 17 382, and its results were ~269 000 more.
+    ``None`` when there is no such reply or the transcript cannot be read.
     """
     try:
         messages = backend.messages(session)
     except Exception:  # noqa: BLE001 — a transcript that cannot be read is no size
-        return 0
+        return 0, None
     if not isinstance(messages, list):
-        return 0
+        return 0, None
     for message in reversed(messages):
         info = message.get("info") if isinstance(message, dict) else None
         if not isinstance(info, dict) or info.get("role") != "assistant" or info.get("summary"):
             continue
         tokens = info.get("tokens")
         used = _tokens_used(tokens) if isinstance(tokens, dict) else 0
-        if used > 0:
-            return used
-    return 0
+        if used <= 0:
+            continue
+        chars = 0
+        for part in message.get("parts") or ():
+            if not isinstance(part, dict) or part.get("type") != "tool":
+                continue
+            state = part.get("state")
+            output = state.get("output") if isinstance(state, dict) else None
+            if isinstance(output, str):
+                chars += len(output)
+        return used, chars // SUMMARY_CHARS_PER_TOKEN
+    return 0, None
 
 
 def _summary_size(message: dict) -> int | None:
@@ -3893,6 +3907,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         """
         try:
             limit, prompt = context_memory.parse_overflow(_error_message(error))
+            last_ok, grew = _last_reply(backend, session)
             record = context_memory.OverflowRecord(
                 at=time.time(),
                 round=str(out_dir.name or ""),
@@ -3900,9 +3915,10 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                 provider=spec.provider_id,
                 model=spec.model_id,
                 limit=limit,
-                last_ok=_last_reply_tokens(backend, session),
+                last_ok=last_ok,
                 prompt=prompt,
                 output=context_memory.parse_output(_error_message(error)),
+                grew=grew,
             )
             if not context_memory.add(context_memory.memory_path(config, out_dir),
                                       record, days=context_memory.days_of(config)):

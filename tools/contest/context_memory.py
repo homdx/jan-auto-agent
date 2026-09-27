@@ -171,7 +171,9 @@ class OverflowRecord:
     provider counted — any of the three ``None`` when it is not known.
     ``output`` (KC-69) is the output the provider reserved on top of the
     prompt, ``None`` for a record that did not name one — every record written
-    before KC-69.
+    before KC-69. ``grew`` (KC-73) is what the tool results of that last reply
+    added before the request that overflowed, in tokens estimated from their
+    text; ``None`` when it was not measured — every record written before it.
     """
 
     at: float
@@ -183,6 +185,7 @@ class OverflowRecord:
     last_ok: int | None = None
     prompt: int | None = None
     output: int | None = None
+    grew: int | None = None
 
     def to_dict(self) -> dict:
         """The shape it has in the file, keys in order for a stable diff."""
@@ -196,6 +199,7 @@ class OverflowRecord:
             "last_ok": self.last_ok,
             "prompt": self.prompt,
             "output": self.output,
+            "grew": self.grew,
         }
 
     @classmethod
@@ -234,7 +238,13 @@ class OverflowRecord:
             last_ok=_number(data.get("last_ok")),
             prompt=_number(data.get("prompt")),
             output=_number(data.get("output")),
+            grew=_number(data.get("grew")),
         )
+
+
+#: KC-73: a ``last_ok`` sizes a model only when the request that overflowed
+#: grew less than this share on top of it (`size_of`).
+LOOSE_FLOOR_SHARE = 0.25
 
 
 def size_of(record: OverflowRecord) -> int | None:
@@ -246,10 +256,24 @@ def size_of(record: OverflowRecord) -> int | None:
     ``limit - output`` — sensenova's 262 144 with 32 000 requested is a prompt
     budget of 230 144, and a prompt past that overflows. A record without the
     output, or with one that would leave nothing, keeps the limit as before.
+
+    KC-73: a ``last_ok`` the overflow jumped far past is no size. The window
+    lies between ``last_ok`` and ``last_ok + grew``; when ``grew`` is more than
+    `LOOSE_FLOOR_SHARE` of ``last_ok`` that range says nothing a session can
+    compact by. Live, agnes-2-0-flash: 17 382 OK, then one step of reads added
+    ~269 000 and overflowed a ~250 000 window; glm-4-7-flash: 14 179 OK plus
+    ~134 000 past a ~120 000 one. Sized at 80 % of those floors the runner
+    compacted every turn and the agents gave up. Such a record sizes nothing;
+    the next overflow that grows into the window step by step will.
     """
     if record.limit and record.output and record.limit > record.output:
         return record.limit - record.output
-    return record.limit or record.last_ok
+    if record.limit:
+        return record.limit
+    if (record.last_ok and record.grew is not None
+            and record.grew > record.last_ok * LOOSE_FLOOR_SHARE):
+        return None
+    return record.last_ok
 
 
 def _pick(records, provider: str, model: str):

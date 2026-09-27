@@ -145,6 +145,21 @@ still wins, and the smaller of the two is the size — hy3's 104 065 over a name
 262 144 stands. A model the provider sizes (1M named) is untouched: a named
 limit is used as it is.
 
+## Follow-up, 2026-09-28 — a floor the overflow jumped past sizes nothing
+
+The largest `last_ok` still sized a model at a tiny floor when there was only
+one record, or when every record was a jump. Live, the step that overflowed
+was one reply asking for a pile of `read`s: agnes-2-0-flash went through at
+17 382 and its tool results added ~269 000 more (a ~250 000 window);
+glm-4-7-flash went through at 14 179 plus ~134 000 (a ~120 000 window). The
+window lies somewhere in between, and at 80 % of the floor the runner
+compacted every turn. Each record now carries `grew` — the text of that
+reply's tool results at `SUMMARY_CHARS_PER_TOKEN` (`runner._last_reply`) —
+and a `last_ok` the overflow grew more than `LOOSE_FLOOR_SHARE` (25 %) past
+sizes nothing (`context_memory.size_of`). A record that grew into the window
+step by step (round 78's agnes, 247 828) sizes as before; records written
+before `grew` existed read as before.
+
 ## Out of scope
 
 - Counting tokens ourselves: the server's numbers and the provider's words are the only sources.

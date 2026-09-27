@@ -152,6 +152,7 @@ def test_add_writes_one_record_atomically_and_load_reads_it_back(tmp_path):
         "at": pytest.approx(time.time(), abs=60), "round": "113", "agent": "agent-a",
         "provider": "kenary", "model": "agent-a:free",
         "limit": SIZE, "last_ok": FULL_81, "prompt": 200_400, "output": None,
+        "grew": None,
     }
 
     records = cm.load(path)
@@ -414,6 +415,71 @@ def test_an_overflow_that_names_no_limit_is_remembered_with_only_the_last_ok(tmp
     assert record.limit is None and record.prompt is None
     assert record.last_ok == 110_000
     assert cm.size_of(record) == 110_000
+
+
+def test_an_overflow_one_step_jumped_into_is_remembered_but_sizes_nothing(tmp_path):
+    """KC-73's live runs: the last reply went through at 14 179 and asked for a
+    pile of `read`s; their results (~134 000 tokens) overflowed a ~120 000
+    window in one step. `grew` is recorded, and such a floor sizes nothing — at
+    80 % of 14 179 the runner compacted every turn and the agent gave up."""
+    memory = _memory(tmp_path)
+    scenario = _overflow_scenario(KENARY_OVERFLOW, 14_179)
+    scenario["turns"][0]["tool_parts"] = [
+        {"tool": "read", "status": "completed", "input": {"filePath": f"ballast/part{i:02d}.txt"},
+         "output": "w" * 67_000} for i in range(8)]
+    _sb, _fake, _h, run, _ = _run(tmp_path, scenario, memory=memory,
+                                   max_continues_per_attempt=0)
+    assert run.state is tr.AgentState.STALLED
+    (record,) = cm.load(memory)[1:]
+    assert record.last_ok == 14_179
+    assert record.grew == 8 * 67_000 // runner_mod.SUMMARY_CHARS_PER_TOKEN
+    assert cm.size_of(record) is None
+    assert cm.smallest_size([record], "kenary", "agent-a:free") is None
+
+
+def test_a_last_ok_is_a_size_only_when_the_overflow_grew_a_little_past_it():
+    """KC-73: within `LOOSE_FLOOR_SHARE` of `last_ok` the floor is tight and
+    sizes the model as before; far past it, nothing; a record written before
+    `grew` existed, and a named limit, are what they always were."""
+    tight = _record(limit=None, last_ok=247_828, grew=3_000)
+    loose = _record(limit=None, last_ok=17_382, grew=269_086)
+    old = _record(limit=None, last_ok=118_488)
+    named = _record(limit=262_144, last_ok=17_382, grew=269_086)
+    assert cm.size_of(tight) == 247_828
+    assert cm.size_of(loose) is None
+    assert cm.size_of(old) == 118_488
+    assert cm.size_of(named) == 262_144
+    assert cm.smallest_size([loose, tight], "kenary", "agent-a:free") == 247_828
+    assert cm.OverflowRecord.from_dict(loose.to_dict()) == loose
+    assert cm.OverflowRecord.from_dict(old.to_dict()).grew is None
+
+
+class _Transcript:
+    def __init__(self, messages):
+        self._messages = messages
+
+    def messages(self, session):
+        if isinstance(self._messages, Exception):
+            raise self._messages
+        return self._messages
+
+
+def test_last_reply_reads_the_tokens_and_what_its_tool_results_added():
+    reply = {"info": {"role": "assistant", "tokens": {"input": 17_000, "output": 382}},
+             "parts": [{"type": "text", "text": "reading"},
+                       {"type": "tool", "tool": "read", "state": {"status": "completed",
+                                                                  "output": "x" * 400_000}},
+                       {"type": "tool", "tool": "read", "state": {"status": "completed",
+                                                                  "output": "y" * 676_347}}]}
+    refused = {"info": {"role": "assistant", "tokens": {"input": 0, "output": 0}}, "parts": []}
+    summary = {"info": {"role": "assistant", "summary": True, "tokens": {"output": 2_000}},
+               "parts": [{"type": "text", "text": "summary"}]}
+    assert runner_mod._last_reply(_Transcript([reply, refused, summary]), None) == (
+        17_382, 1_076_347 // runner_mod.SUMMARY_CHARS_PER_TOKEN)
+    plain = {"info": {"role": "assistant", "tokens": {"input": 9_000}}, "parts": []}
+    assert runner_mod._last_reply(_Transcript([plain]), None) == (9_000, 0)
+    assert runner_mod._last_reply(_Transcript([refused]), None) == (0, None)
+    assert runner_mod._last_reply(_Transcript(RuntimeError("down")), None) == (0, None)
 
 
 def test_the_empty_message_kilo_keeps_for_the_refused_reply_is_not_the_last_ok(tmp_path):
