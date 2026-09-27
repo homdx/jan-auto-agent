@@ -96,7 +96,10 @@ def _errored(on_prompt):
 
 
 def _cfg_silence():
-    return make_config(["agent-a"], turn_timeout_sec=30, idle_event_timeout_sec=1)
+    # KC-9 made a silence a continue into the same session; these scenarios are
+    # about the stall edge itself, so no continue budget (as `_stall_config`)
+    return make_config(["agent-a"], turn_timeout_sec=30, idle_event_timeout_sec=1,
+                       max_continues_per_attempt=0)
 
 
 def _cfg_plain():

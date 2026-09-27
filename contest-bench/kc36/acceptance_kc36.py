@@ -363,8 +363,9 @@ def test_R7_silence_after_an_extension_is_named_a_silence_stall(tmp_path):
     """Extended at 1 s to 6 s, then the stream goes quiet at ~1.4 s: the silence
     clock ends the turn at ~3.4 s — under the *extended* deadline, so it is a
     silence stall (`no event for 2s`, `stalled`), not `no idle after`."""
+    # KC-9: a silence is a continue now; R7 is about the stall edge, so no budget
     cfg = make_config(["agent-a"], turn_timeout_sec=1, turn_extend_sec=5, turn_max_sec=60,
-                      idle_event_timeout_sec=2)
+                      idle_event_timeout_sec=2, max_continues_per_attempt=0)
     sb = Sandbox(tmp_path)
     scenario = {"turns": [{"events": ["busy"], "idle": False}]}
     with _BenchFake(scenario) as fake:
