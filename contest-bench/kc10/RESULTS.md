@@ -60,7 +60,7 @@ already came from, the count on `AgentRun` and `state.json`, two SUMMARY columns
 sensenova-6-8-flash-lite-var2 ties on the score with a larger refactor and never
 committed (the context-abort bug stopped it).
 
-Changes on the way into `kc` (`ed8be97`, credited to the entry and to Claude):
+Changes on the way into `kc` (`5f439e3`, credited to the entry and to Claude):
 
 - `context_limit_fallback` defaults to 0, in `ContestConfig` and the committed
   `contest.ini`. 32 768 was the ticket's guess for 32k free tiers; the models with

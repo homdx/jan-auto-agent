@@ -1,6 +1,18 @@
 # KC-44 — The ticket's own `Size` field decides how many legs it gets, and an `L` ticket is refused in one
 
-**Status:** queued — after KC-43, which it configures. Asked by the operator on 2026-09-22.
+> ## 🔎 Ticket audit — 2026-09-27 (after the KC-10 patch series, branch head `b5257cf`)
+> **Verdict: still needed, 0% implemented, description fully accurate — no corrections required.**
+>
+> | Checked against real code | Found |
+> |---|---|
+> | `ticket_size`, `ContestConfig.legs_by_size` | **Neither exists anywhere** in `cli.py` or `contest.ini` (repo-wide grep, zero hits). |
+> | Any `KC-44` code/tests | **Zero hits** outside `epic-tasks/`. |
+> | **`KC-43` dependency** (its only one) | **Accurate, no change.** KC-43 is confirmed still `queued` (`INDEX.md` row 82, same batch, audited above) — `--legs` and the whole relay mechanism it configures genuinely do not exist yet. |
+> | Chain position | This is correctly the **last** ticket in the `KC-36→…→KC-44` chain — every other ticket in this batch (KC-42, KC-40, KC-43) still blocks it transitively through KC-43. |
+>
+> **Net effect:** nothing to fix. This ticket's header, "What happens today," "What must change," and "Acceptance" sections all match the current repo state exactly. Reproduced below unchanged, with this audit note as the only addition, so the four-ticket batch is delivered as a consistent set.
+
+**Status:** queued — after KC-43, which it configures (confirmed still queued, `INDEX.md` row 82 — no change). Asked by the operator on 2026-09-22.
 **Severity:** LOW (a convenience on top of KC-43 — but the one that decides whether KC-43 is ever used, since nobody remembers to pass `--legs` by hand)
 **File:** `tools/contest/cli.py` (`cmd_run`, ticket parsing), `contest.ini`
 **Symbol:** `ticket_size` (new), `cmd_run`, `ContestConfig.legs_by_size` (new)

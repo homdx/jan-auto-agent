@@ -1,7 +1,16 @@
 # KC-50 — a harvest that is already `REWORK` on its mechanical facts runs no pytest root and does not hold the round's test lock
 
-**Status:** queued — found live 2026-09-23 in round 86 (run 3, base `4634507`): `hy3` ended its first turn after 41 s with a clean tree and no commit, and its harvest ran the four pytest roots on the untouched base under `_TEST_RUNS_LOCK` for more than five minutes at load 22, while `agnes-2-5-flash`, also clean and with no commit, waited in `HARVESTING` behind it.
-**Severity:** MEDIUM (every model that stops early, and every one whose turn a gate reject ends, holds up the one lock that every finished entry needs, and does it to learn nothing: the verdict was `REWORK` before the first test ran)
+> ## Ticket audit — 2026-09-27 (branch head `b5257cf`)
+> **Verdict: still needed, but partially implemented; the original no-commit example is stale.**
+>
+> - `harvest.py` now skips roots when `facts["commits"] == 0`, so round 86's specific base-tree pytest run no longer occurs. It does not record a `tests_run` skip reason.
+> - A commit-bearing harvest still runs roots even if a blocking mechanical reason is already present (for example, no progress row or a commit count other than one).
+> - `_harvest` still enters `_TEST_RUNS_LOCK` and the suite slot before calling `harvest`, so even a roots-skipped mechanical harvest queues behind tests and keeps the lock around git/judgment work. The intended improvement is narrower: skip roots for any pre-existing blocking reason and hold serialization only while roots execute.
+>
+> **The corrected status and current behavior below supersede the original round-86 description where it says the zero-commit case still runs pytest. No cancellation is warranted.**
+
+**Status:** queued, partially implemented — the no-commit case now skips test roots (`harvest.py`, `facts["commits"] == 0`); remaining work is to skip roots for every pre-existing blocking reason, record the skip, and move the lock to the test call.
+**Severity:** MEDIUM (a commit-bearing harvest that is already mechanically `REWORK` can still spend minutes running roots that cannot change its verdict, while every mechanical harvest can wait behind the round-wide test lock)
 **File:** `tools/contest/harvest.py`, `tools/contest/runner.py`
 **Symbol:** `harvest` (the `if run_tests:` block), `_harvest`, `_TEST_RUNS_LOCK`
 **Round:** 94
@@ -14,18 +23,9 @@
 | `agnes-2-5-flash` | `session.idle` at +92 s, after 3 of 4 `bash` calls came back `gate-failed` / `empty reply` (KC-37) | 0 | clean | `HARVESTING`, waiting on the lock |
 | `mimo-v2-5` | `session.idle` at +212 s | **1** | clean | `HARVESTING` at 21:18, a real entry waiting on the lock behind both |
 
-`harvest` builds its reasons in order. `no_progress_row`, `commits_ne_1`
-(0 commits) and `no_test_file` are already on the list, all `blocking`, when
-`if run_tests:` calls `run_tests_detail`: `tests`, `tests_bugfix`,
-`.smoke_tests` and `.regression_tests` on the base tree, about 9 min on this
-box under load (`tests` 345 s, `bugfix` 199 s idle-ish). Their result cannot
-change the verdict. The only thing it can add is a `tests_failed` tail about
-the *base*, which then goes into the rework prompt as if it were the agent's
-fault. Meanwhile `_harvest` holds `_TEST_RUNS_LOCK` for the whole call, so the
-round's other harvests queue behind it. The runner's own docstring already
-says the zero-commit case needs "no harvest and no pytest" (`_commits_above`,
-KC-21), but only the STALLED/ERROR edge follows that. The idle edge to
-`HARVESTING` does not.
+The original round-86 no-commit case is partly fixed: `harvest.py` now guards the test branch with `facts.get("commits") != 0`, so a base tree with zero commits does not run roots. The skip is not recorded in `facts["tests_run"]`. Other blocking facts can still waste test time: a commit-bearing tree with no progress row, multiple commits, or another blocking reason passes that guard and runs pytest even though the verdict is already `REWORK`.
+
+`_harvest` still enters `_TEST_RUNS_LOCK` (and, when enabled, the suite slot) before `harvest` performs its mechanical git/judgment work. Thus the original multi-minute no-commit test run is gone, but a mechanically doomed commit-bearing harvest still runs or waits for roots and all mechanical-only harvests still queue behind that lock.
 **Depends on:** KC-16 (`run_tests=True`, the four roots, landed `1304950`), KC-21 (`_commits_above`, landed `f5a9f05`).
 **Also touches:** `tests/test_contest_harvest.py`, `tests/test_contest_runner.py`
 

@@ -1,13 +1,29 @@
 # KC-43 — A ticket too large for one turn runs as numbered legs, with a leg record handed from each to the next
 
-**Status:** queued — last, after KC-36, KC-39, KC-40, KC-41 and KC-42, every one of which it composes. Asked by the operator on 2026-09-22 as the frame the other tickets are parts of.
+> ## 🔎 Ticket audit — 2026-09-27 (after the KC-10 patch series, branch head `b5257cf`)
+> **Verdict: still needed, 0% implemented, description accurate on content — two of its five dependency tags were stale.**
+>
+> | Checked against real code | Found |
+> |---|---|
+> | `run_leg`, `leg_record`, `RoundState.leg`, `prepare_round(..., carry_from=…)`, `--legs` flag, `legs = ` in `contest.ini` | **None exist anywhere** in `cli.py`, `runner.py`, `workspace.py`, or `contest.ini` (repo-wide grep, zero hits). This ticket is fully unbuilt, exactly as its `queued` status says. |
+> | `contest-bench/kc43/` | **Does not exist.** No live-round probe started. |
+> | Any `KC-43` code/tests | **Zero hits** outside `epic-tasks/`. |
+> | **`KC-36` dependency** | **STALE.** Ticket says `KC-36 (queued — …)`. KC-36 actually **landed** `5840147` (2026-09-24, round 75, `INDEX.md` row 75). **Corrected below.** |
+> | **`KC-41` dependency** | **STALE.** Ticket says `KC-41 (queued — …)`. KC-41 actually **landed** (2026-09-27, round 80, winner `space-bunny-alpha-bynara`, `INDEX.md` row 80). **Corrected below.** |
+> | **`KC-39` dependency** | Still accurate — confirmed `queued` (`INDEX.md` row 78). |
+> | **`KC-40` dependency** | Still accurate — confirmed `queued` (`INDEX.md` row 79). |
+> | **`KC-42` dependency** | Still accurate — confirmed `queued` (`INDEX.md` row 81, this same batch). |
+>
+> **Net effect:** of the five tickets KC-43 composes, two (`KC-36`, `KC-41`) have since landed and are no longer blockers; three (`KC-39`, `KC-40`, `KC-42`) genuinely still block it, matching the operator's own note. The engineering plan itself (What must change / Acceptance / Out of scope) needed no changes — it correctly assumes none of its own prerequisites exist yet, which is still true. Corrections inlined below.
+
+**Status:** queued — last, after KC-36 **(landed)**, KC-39, KC-40, KC-41 **(landed)** and KC-42, every one of which it composes — **now blocked on KC-39, KC-40 and KC-42 only**. Asked by the operator on 2026-09-22 as the frame the other tickets are parts of.
 **Severity:** MEDIUM (nothing is lost today that KC-41 does not already save; this ticket is about tickets that *cannot* be finished in one turn at all, which the epic has so far avoided by keeping tickets small)
 **File:** `tools/contest/cli.py` (`cmd_run`, `_parser`), `tools/contest/runner.py` (`run_round`), `tools/contest/workspace.py` (`prepare_round` — the "never reuse a previous round's worktree" rule gains one exception), `contest.ini`
 **Symbol:** `cmd_run`, `run_round`, `run_leg` (new), `leg_record` (new), `RoundState.leg` (new), `prepare_round(..., carry_from=...)` (new)
 **Round:** 82
 **Size:** L
 **Source:** the operator, 2026-09-22, describing what they already do by hand: *"сейчас я её делаю вручную — там на третьем ходе уже новый начинаю чат и заставляю модель продолжать работать с начатыми (изменёнными) файлами"*. The manual procedure is: let the model work until its context or the clock gives out, open a **new** session against the **same** worktree, and tell it to continue from the files it has already changed. It works; it is untooled. Round 64 is the supporting evidence from the other direction — four of five working agents were cut mid-flight, two of them a single failing test away from done (`step-3-7-flash`: `tests:1✗`; `hy3`: `tests:3✗`), and a second leg would plainly have closed both.
-**Depends on:** KC-36 (queued — a leg cut by wall clock rather than by idleness multiplies round 64's failure by the number of legs), KC-41 (queued — every leg must end in a captured commit or there is nothing to hand over), KC-40 (queued — the model-written summary is one field of the leg record), KC-39 (queued — the live session-reset path a new leg reuses), KC-42 (queued — a leg must not be spent by an agent that never starts).
+**Depends on:** ~~KC-36 (queued — …)~~ **KC-36 — landed `5840147` (round 75, 2026-09-24); a leg's own wall-clock deadline-extension machinery is now available to reuse.** ~~KC-41 (queued — …)~~ **KC-41 — landed (round 80, 2026-09-27); every turn now ends in a captured deadline commit, so "every leg must end in a captured commit or there is nothing to hand over" is already satisfied at the single-turn level — this ticket only has to carry that guarantee across legs.** KC-40 (queued — confirmed still queued, `INDEX.md` row 79; the model-written summary this ticket wants as one field of the leg record does not exist yet — still blocking). KC-39 (queued — confirmed still queued, `INDEX.md` row 78; the live session-reset path a new leg would reuse does not exist yet — still blocking). KC-42 (queued — confirmed still queued, this same batch; a leg must not be spent by an agent that never starts — still blocking).
 **Also touches:** `tests/test_contest_cli.py`, `tests/test_contest_runner.py`, `tests/_kilo_fake.py`, `docs/collect-epics/RUN-THE-EPIC-COMPETITION.md`, `contest-bench/kc43/`
 
 ---

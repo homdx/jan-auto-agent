@@ -1,13 +1,22 @@
 # KC-39 — A continue whose diff repeats the previous one starts a fresh session, not a same-session harvest
 
-**Status:** queued — after KC-9, KC-34 and KC-36 (see the sequencing below), not merely last in the queue; asked by the operator on 2026-09-22, not from a live round: KC-22's continue mechanism grants the full `max_continues_per_attempt` budget to any turn that still shows a dirty tree, with no check that the dirty tree is any *different* from the one at the last continue. Sequenced with KC-9 (queued, same edge — `classify_idle`'s FINISHED/CUT/SILENT split decides whether a continue is sent at all; this ticket decides, once one is being sent for the third-plus time, whether it goes to the same session or a new one) — land KC-9 first, this ticket is strictly downstream of that decision. Also sequenced after two more tickets that touch the same code, found live 2026-09-21 in round 64: KC-34 (landed `3bc10b8` — the `ContestBackend` protocol — `client.create_session`/`client.abort` calls in `run_agent` move behind it; write this ticket's session-reset against whichever interface is current when it starts) and KC-36 (`_churn` — files/lines changed in the worktree, introduced there to extend `turn_timeout_sec`; if it has landed, `_diff_signature` below should reuse or wrap `_churn` rather than duplicate a second "how much changed" helper measuring the same worktree). Whichever of KC-9/KC-36 lands last relative to this ticket, this one rebases onto it, not the reverse — it is the newest and smallest of the four.
+> ## Ticket audit — 2026-09-27 (after the KC-10 patch series; branch head `b5257cf`)
+> **Verdict: the core ticket remains needed; its sequencing and §7 context clause need correction.**
+>
+> - KC-9 (row 48), KC-34, and KC-36 (row 75; `_churn`) have landed. They are no longer blockers. `_diff_signature`, `last_diff_signature`, and `max_sessions_per_attempt` remain absent; `_churn` measures counts and is not itself the content signature this ticket needs.
+> - The context-focused §7 and its acceptance item are superseded by KC-67/KC-69 plus KC-10 (`5f439e3`): `_context_gate` checks fill before continue/rework prompts, compacts at the configured threshold, and opens a new session if compacting fails to reduce fill. Retire the separate ≥90% rework rule so it does not compete with the shared context path. This retires only §7, not KC-39's repeated-diff reset.
+> - KC-40 (row 79), KC-42 (row 81), and KC-43 (row 82) remain queued and depend on KC-39.
+>
+> **Corrected status/dependencies below supersede stale KC-9/KC-36 wording retained in the source history.**
+
+**Status:** open — round 78 running (started 2026-09-27, 8 agents). KC-9, KC-34 and KC-36 have landed; no dependency remains outstanding before this ticket. The repeated-diff detection and bounded fresh-session reset are still unimplemented. Asked by the operator 2026-09-22.
 **Severity:** MEDIUM (no work is lost — a commit under the branch is still harvested either way, KC-21 — but a model that repeats itself burns the whole continue budget for nothing and then gets a `HARVESTING`/`REWORK` critique inside the very session that produced the loop, which is the session least likely to break out of it)
 **File:** `tools/contest/runner.py` (`run_agent` — the `idle.status == "idle"` branch, KC-22's `continue_used`/`budget` block), `contest.ini`
 **Symbol:** `run_agent`, `continue_message`, `_dirty_tree`, `_diff_signature` (new), `ContestConfig.max_sessions_per_attempt` (new)
 **Round:** 78
 **Size:** M
 **Source:** paraphrased from the operator: "extend the continue criterion — right now three continues are granted by default (`max_continues_per_attempt` in `contest.ini`); if the third one still adds nothing, a new session should start instead." Confirmed against the code: `run_agent`'s continue branch (`tools/contest/runner.py`, the `idle.status == "idle"` case) reads `_dirty_tree(ws)` — `git status --porcelain` file names and status letters only, never the diff's content — and treats any non-empty result as "still working", with no comparison to the previous continue's tree. `max_continues_per_attempt` is 2 in `contest.ini` today (three prompts total counting the initial one), not three; the operator's "three" is presumably a local override and is not itself a bug.
-**Depends on:** KC-22 (landed `286cff9` — the continue loop, `continue_message`, `round_prompt(dirty=...)` this ticket extends). Sequenced after — not a hard code dependency, but land these first to avoid rebasing this ticket's own diff onto theirs: KC-9 (queued — reshapes the decision that this ticket sits downstream of), KC-34 (landed `3bc10b8` — `ContestBackend`; `client.create_session`/`client.abort` below should target whatever this lands as), KC-36 (open — `_churn`; reuse it for `_diff_signature` if it has landed by the time this starts).
+**Depends on:** KC-22 (landed `286cff9`). Sequencing prerequisites KC-9 (landed round 48), KC-34 (landed `3bc10b8`) and KC-36 (landed `5840147`, round 75) are complete; use their current interfaces.
 **Also touches:** `tests/test_contest_runner.py`, `tests/_kilo_fake.py`, `contest-bench/kc39/` (new — the live probe below)
 
 ---
@@ -79,25 +88,7 @@ shown it cannot act on, spending one of `max_rework`'s attempts on it.
    `state.json`/`SUMMARY.md` (KC-7) show the number of sessions used per
    agent.
 
-7. **A rework that would not fit goes to a fresh session too** (addendum
-   2026-09-24, round 74). `sensenova-6-7-flash-lite-var1` ended rework 1 on a
-   `finish: "length"` message at 244 410 input + 17 734 reasoning = 262 144,
-   exactly its `limit.context` (KC-56). The runner then sent rework 2 **into the
-   same session**, and it died 4 s later:
-   `ContextOverflowError … your prompt contains 262514 input tokens` → `ERROR`,
-   three turns and zero lines of work. Before a rework prompt is sent, the
-   runner reads the session's last assistant `tokens` (`KiloClient.messages`,
-   fail-open). When `input + cache.read + reasoning + output` is at or above
-   90 % of the model's `limit.context`, the rework goes to a fresh session
-   exactly as in point 3: `rework_message` plus
-   `round_prompt(..., dirty=_dirty_tree(ws))`. It is counted under
-   `max_sessions_per_attempt`, and `turns.jsonl` records `new_session` with
-   `reason: "context"`. Below 90 %, or with the limit unknown, today's
-   same-session rework stands.
-   The 90 % is one module constant shared with KC-56's `_cut_off`, and the
-   session swap is KC-54's (landed `f383335`), factored into one helper
-   rather than copied a third time.
-
+7. ~~A rework that would not fit goes to a fresh session at 90% of `limit.context` (2026-09-24 addendum).~~ **Retired 2026-09-27:** KC-10/KC-67/KC-69 now run the shared pre-prompt context gate, compact at the configured threshold, and swap sessions when compacting fails. Do not add a second 90% rework-only threshold here.
 ## Acceptance
 
 - [ ] `_diff_signature` unit test: two worktrees with the same file list
@@ -146,11 +137,7 @@ shown it cannot act on, spending one of `max_rework`'s attempts on it.
       suite alone does not close this ticket.
 - [ ] `python3 -m pytest tests -n 4 -q --timeout=180 && python3 -m pytest tests_bugfix -n 4 -q --timeout=180` green.
 
-- [ ] (§7) A rework whose session's last message used ≥ 90 % of
-  `limit.context` is sent to a new session, with `rework_message` and the dirty
-  paragraph, and `run.attempt` incremented as for any rework. At 50 % it is
-  sent into the same session, as today.
-
+> **Retired acceptance item:** the old §7 test for a separate 90% rework swap is covered by the shared KC-10/KC-67/KC-69 context-gate behavior and is removed from KC-39.
 ## Out of scope
 
 - Any change to what makes the *first* continue of an attempt fire — still

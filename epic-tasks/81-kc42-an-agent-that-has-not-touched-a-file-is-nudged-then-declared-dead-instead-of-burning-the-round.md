@@ -1,9 +1,24 @@
 # KC-42 — An agent that has not touched a single file is nudged, then declared DEAD, instead of burning the whole round
 
-**Status:** queued — after KC-9 and KC-39, whose edges it completes from the other side. Found live 2026-09-21 in round 64.
+> ## 🔎 Ticket audit — 2026-09-27 (after the KC-10 patch series, branch head `b5257cf`)
+> **Verdict: still needed, 0% implemented, description mostly current — one dependency line was stale.**
+>
+> | Checked against real code | Found |
+> |---|---|
+> | `AgentState.DEAD` | **Does not exist.** `runner.py` enum still has only `CREATED/PROMPTED/WAITING/HARVESTING/REWORK/READY/GAVE_UP/STALLED/ERROR`. Ticket correctly marks it `(new)`. |
+> | `_first_touch_deadline`, `first_touch_sec`, `first_touch_nudges` | **None exist anywhere** in `contest.ini` or `*.py` (repo-wide grep, zero hits). Ticket correctly marks `_first_touch_deadline` and `first_touch_nudges` `(new)` — **but `ContestConfig.first_touch_sec` was NOT marked `(new)` in the original header, which was a small error; fixed below.** |
+> | `_dirty_tree`, `_commits_above` | **Already exist** (`runner.py`, `runner.py`) — landed for KC-41. Ticket correctly reuses them without an incorrect `(new)` tag. |
+> | `contest-bench/kc42/` (replay64.py, live_probe.py, RESULTS.md) | **Does not exist.** No work started. |
+> | Any `KC-42` code/tests | **Zero hits** outside `epic-tasks/` except one docstring mention in `tests/test_contest_kilo_client.py:1063` describing the *class* of bug — not an implementation. |
+> | **`KC-9` dependency** | **STALE.** The ticket's "Depends on" line says `KC-9 (queued — classify_idle; …)`. KC-9 actually **landed** 2026-09-27 (round 48, winner `step-3-7-flash`, `INDEX.md` row 48). `classify_idle` exists at `runner.py` and `CONTINUE_PROMPT` exists at `runner.py` — both are real and reusable today. **Corrected below.** |
+> | **`KC-39` dependency** | Still accurate. `KC-39` is still `queued` (`INDEX.md` row 78); `_diff_signature` and `max_sessions_per_attempt` do not exist anywhere in the repo. **This ticket is now blocked on KC-39 alone**, not on both KC-9 and KC-39. |
+>
+> **Net effect:** the ticket's engineering content (What must change / Acceptance / Out of scope) needed no changes — nothing described has been built yet, partially or otherwise. Only the header's dependency bookkeeping was out of date. Corrections are inlined below; original wording is struck through, new wording follows.
+
+**Status:** queued — KC-9 has landed (round 48, 2026-09-27); this ticket is now blocked on KC-39 alone (was: after KC-9 and KC-39, whose edges it completes from the other side). Found live 2026-09-21 in round 64.
 **Severity:** HIGH (three of eight slots in round 64 produced nothing and were only found out about after the round ended; a dead slot costs the same wall clock as a working one and silently shrinks the field the round is supposed to compare)
 **File:** `tools/contest/runner.py` (`run_agent` — the `WAITING` loop), `contest.ini`
-**Symbol:** `run_agent`, `_first_touch_deadline` (new), `_dirty_tree`, `AgentState.DEAD` (new), `ContestConfig.first_touch_sec`, `ContestConfig.first_touch_nudges` (new)
+**Symbol:** `run_agent`, `_first_touch_deadline` (new), `_dirty_tree` (exists — `runner.py`), `AgentState.DEAD` (new), `ContestConfig.first_touch_sec` ~~(existing)~~ **(new — corrected 2026-09-27; does not exist in `contest.ini` or `ContestConfig` today)**, `ContestConfig.first_touch_nudges` (new)
 **Round:** 81
 **Size:** M
 **Source:** round 64 (`contest-out/64/`, base `9912b78`). Three of the eight agents finished the round with a worktree byte-identical to the base:
@@ -21,7 +36,7 @@ signature has nothing to compare. It was *busy* and *useless* for 22
 minutes and nothing in the runner is watching for that. KC-9 covers the
 turn that goes quiet, KC-22/KC-39 cover the turn that works and repeats
 itself — this ticket covers the turn that never starts.
-**Depends on:** KC-9 (queued — `classify_idle`; this ticket's nudge reuses its `CONTINUE_PROMPT` shape but fires on a different signal), KC-39 (queued — `max_sessions_per_attempt` and the live session-reset path, reused for the nudge's escalation).
+**Depends on:** ~~KC-9 (queued — `classify_idle`; this ticket's nudge reuses its `CONTINUE_PROMPT` shape but fires on a different signal)~~ **KC-9 — landed (round 48, 2026-09-27). `classify_idle` (`runner.py`) and `CONTINUE_PROMPT` (`runner.py`) both exist and are ready to reuse — no longer a blocker.** KC-39 (queued — confirmed still queued, `INDEX.md` row 78; `max_sessions_per_attempt` and the live session-reset path do not exist in the repo yet — **this is now the only remaining blocking dependency**).
 **Also touches:** `tests/test_contest_runner.py`, `tests/_kilo_fake.py`, `tools/contest/cli.py` (`SUMMARY.md` and the round table grow a `DEAD` row), `contest-bench/kc42/`
 
 

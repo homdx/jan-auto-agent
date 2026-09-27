@@ -1,6 +1,6 @@
 # KC-10 — Context fill is measured after every turn; at 80 % the session is compacted, not abandoned
 
-**Status:** landed `ed8be97` — round 49 winner sensenova-6-7-flash-lite-var2 (15/15 on `contest-bench/kc10`, `c19c8c5`), with `context_limit_fallback` off by default (0: today's models without a limit are ~250k windows, KC-67's memory sizes them). Item 6 not taken as written: KC-54/KC-69 already recover from an overflow, two of them end READY. Round-49 fixes landed with it: `1087584` (KC-69's own abort ended two agents ERROR), `be56cd0` (KC-67's `last_ok` read Kilo's summary as 0).  
+**Status:** landed `5f439e3` — round 49 winner sensenova-6-7-flash-lite-var2 (15/15 on `contest-bench/kc10`, `527cab7`), with `context_limit_fallback` off by default (0: today's models without a limit are ~250k windows, KC-67's memory sizes them). Item 6 not taken as written: KC-54/KC-69 already recover from an overflow, two of them end READY. Round-49 fixes landed with it: `1087584` (KC-69's own abort ended two agents ERROR), `be56cd0` (KC-67's `last_ok` read Kilo's summary as 0).  
 **Severity:** HIGH  
 **File:** `tools/contest/runner.py`, `tools/contest/kilo_client.py`  
 **Symbol:** `KiloClient.model_limit`, `KiloClient.session_tokens`, `KiloClient.compact`, `runner.context_fill`, `runner.maybe_compact`  
