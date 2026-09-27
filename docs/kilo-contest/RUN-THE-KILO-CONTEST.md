@@ -145,6 +145,27 @@ quota — a reset time further out than `provider_retry_max_wait_sec` — ends
 the agent `ERROR provider_quota` at once, with the reset time printed once
 per provider at the round's end.
 
+**The flags of `run`** (`python3 -m tools.contest run --help` is the source):
+
+| flag | what it does |
+|---|---|
+| `--ticket NN` | the ticket, NN from `epic-tasks/NN-*.md` (required) |
+| `--roster PATH` | the roster ini (default `contest.ini`; `contest.local.ini` beside it overrides it) |
+| `--base REF` | the ref the worktrees start from (default `HEAD`) |
+| `--models a:free,b:free` | these models run instead of the roster's agents; `model@variant` names a variant |
+| `--backend kilo\|openrouter` | override the roster's backend |
+| `--provider ID` | the provider behind a `--models` id that names none (default `kenary` / `openrouter`) |
+| `--variant NAME` | the reasoning variant of every agent that names none: `highest` (default), `default`, or a name |
+| `--register-missing` | register a model Kilo does not list, for this round only (needs `server = spawn`) |
+| `--reprobe` / `--allow-unprobed` | re-run the variant probe / start even when a probe failed or is missing (KC-11) |
+| `--max-parallel N` | override `[contest] max_parallel` |
+| `--no-tests` | no pytest roots in the harvest |
+| `--no-gate` | no gate model: the mechanical layer decides, the rest is `gate-failed` |
+| `--resume` | continue from `state.json`; only the mid-flight agents restart |
+| `--dry-run` | intake, the worktrees, the plan and the first prompt, then stop |
+| `--fresh` | reset the round's worktrees even when they hold uncommitted work or commits |
+| `--out DIR` | the round's output directory (default `<out_dir>/<NN>`) |
+
 **Where every file lands** (`EPIC-KC.md` §3, with the live defaults):
 
 ```
