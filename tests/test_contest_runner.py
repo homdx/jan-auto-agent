@@ -3468,6 +3468,24 @@ def test_a_second_overflow_in_kilo_s_own_loop_is_aborted_before_the_runner_compa
     assert first["overflow_settle_status"] == "error" and first["overflow_compacted"] is True
 
 
+def test_a_new_run_does_not_append_to_the_last_runs_transcript(tmp_path):
+    """KC-39 appends every session's messages to `<agent>.session.json`; a
+    `--fresh` re-run of the same round resets the worktrees, not
+    `contest-out/<NN>/`, so the new run starts the file over instead of adding
+    to what the last run left there."""
+    sb = Sandbox(tmp_path)
+    stale = sb.out_dir / "agent-a.session.json"
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_text(json.dumps([{"info": {"role": "user"}, "parts": [
+        {"type": "text", "text": "LAST RUN"}]}]), encoding="utf-8")
+    config = make_config(["agent-a"])
+    with _BenchFake({"turns": [{"on_prompt": work_ready, "events": ["busy", "idle"]}]}) as fake:
+        run = Harness(sb, fake, config).go()
+    _assert_ready(run, sb.ws("agent-a"))
+    assert "LAST RUN" not in stale.read_text(encoding="utf-8")
+    assert json.loads(stale.read_text(encoding="utf-8"))
+
+
 def test_a_swap_after_an_overflow_aborts_the_old_session(tmp_path):
     """KC-73: the session a swap leaves behind is aborted — round 78's old
     session sat on an open ask in the worktree the new one edits."""

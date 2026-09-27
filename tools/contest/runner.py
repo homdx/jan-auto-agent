@@ -3928,6 +3928,17 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
 
     try:
         # ── CREATED: one session, kept for every turn ─────────────────────
+        if not run.sessions:
+            # KC-39 appends each session's transcript to `<agent>.session.json`,
+            # so a run that has opened none must not append to the file an
+            # earlier run of the same round left: `--fresh` resets the worktrees,
+            # not `contest-out/<NN>/`. A `--resume` has sessions and keeps it.
+            try:
+                (out_dir / f"{spec.name}.session.json").unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                _log.warning("%s: stale transcript not removed: %s", spec.name, exc)
         try:
             session = backend.create_session(
                 spec.provider_id, spec.model_id, rules=config.session_rules(),
