@@ -570,6 +570,26 @@ TEST_TIMEOUT_SENTENCE = (
     "give that `bash` call a `timeout` of at least 1200000 ms."
 )
 
+#: KC-53 §4: compared with whitespace collapsed (`_flat`), so rewrapping the
+#: prompt's lines does not break the pin — only rewording does.
+GIT_SEQUENTIAL_SENTENCE = (
+    "Run git commands one after another, never as parallel tool calls: two of them "
+    "at once collide on your worktree's index.lock."
+)
+
+REVIEWER_SENTENCE = "Any command that reaches outside your worktree is decided by a reviewer"
+
+SCRATCH_PARAGRAPH = (
+    "Scratch space outside your worktree that needs no reviewer: /tmp/kilo/*, /tmp/contest/*.\n"
+    "Put your own scratch files under /tmp/contest/zeta-9/"
+    " — anywhere else in /tmp goes to the reviewer."
+)
+
+
+def _flat(text: str) -> str:
+    return " ".join(text.split())
+
+
 RUNBOOK = REPO_ROOT / "docs" / "collect-epics" / "RUN-THE-EPIC-COMPETITION.md"
 
 
@@ -849,6 +869,94 @@ def test_a_round_without_tmp_roots_keeps_the_prompt_and_runs(tmp_path):
         (_sid, text), = _prompts(fake)
         assert text == round_prompt("agent-a", sb.ticket_path, sb.base_sha)
         assert "scratch dir is" not in text
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KC-53: the prompt names the scratch space that needs no reviewer
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_round_prompt_lists_the_scratch_roots_and_offers_its_own_folder(tmp_path):
+    """Acceptance 1: both globs and `/tmp/contest/<agent>/`, as their own paragraph
+    right before the reviewer sentence — take it out and today's text is back."""
+    base = round_prompt("zeta-9", tmp_path / "45-x.md", "abc1234")
+    text = round_prompt("zeta-9", tmp_path / "45-x.md", "abc1234",
+                        tmp_roots=("/tmp/kilo/*", "/tmp/contest/*"))
+    assert "\n\n" + SCRATCH_PARAGRAPH + "\n\n" + REVIEWER_SENTENCE in text
+    assert text.replace("\n" + SCRATCH_PARAGRAPH + "\n\n", "", 1) == base
+
+
+def test_round_prompt_lists_the_roots_alone_without_the_contest_root(tmp_path):
+    """The folder is suggested only when a root is `/tmp/contest/*`; any other root
+    earns only its place in the list, and no half-sentence is left behind."""
+    text = round_prompt("zeta-9", tmp_path / "45-x.md", "abc1234",
+                        tmp_roots=("/tmp/kilo/*", "/home/x/contest/*"))
+    assert ("Scratch space outside your worktree that needs no reviewer: "
+            "/tmp/kilo/*, /home/x/contest/*.\n\n" + REVIEWER_SENTENCE) in text
+    assert "Put your own scratch files" not in text
+    assert "/tmp/contest/" not in text
+
+
+def test_round_prompt_offers_the_kc59_scratch_dir_and_no_second_one(tmp_path):
+    """With KC-59's scratch dir the paragraph names that dir — the one the round
+    created and the note after it names — never a second `/tmp/contest/<agent>/`."""
+    text = round_prompt("zeta-9", tmp_path / "45-x.md", "abc1234", tmp_dir="/tmp/kilo/zeta-9",
+                        tmp_roots=("/tmp/kilo/*", "/tmp/contest/*"))
+    assert ("Put your own scratch files under /tmp/kilo/zeta-9/ — anywhere else in "
+            "/tmp goes to the reviewer.\n\n" + REVIEWER_SENTENCE) in text
+    assert "Your scratch dir is /tmp/kilo/zeta-9 " in text
+    assert "/tmp/contest/zeta-9" not in text
+
+
+def test_round_prompt_without_tmp_roots_keeps_today_text_and_never_raises(tmp_path):
+    """Acceptance 2 fail-open: no `tmp_roots` is byte-identical to today's prompt,
+    and a malformed key — a bare word, a number, `None`, a list of junk — degrades
+    to the same text instead of naming a path the reviewer would refuse."""
+    base = round_prompt("zeta-9", tmp_path / "45-x.md", "abc1234")
+    assert "Scratch space outside your worktree" not in base
+    for roots in ((), None, "not-a-tuple", 42, (None, "", "not-a-path", 42),
+                  ["relative/", 7]):
+        assert round_prompt("zeta-9", tmp_path / "45-x.md", "abc1234", tmp_roots=roots) == base
+    # a bare string is one root, never its characters
+    one = round_prompt("zeta-9", tmp_path / "45-x.md", "abc1234", tmp_roots="/tmp/contest/*")
+    assert "needs no reviewer: /tmp/contest/*.\n" in one
+
+
+def test_round_prompt_says_run_git_commands_one_after_another(tmp_path):
+    """Acceptance 4: the sentence is there once, with and without `tmp_roots` —
+    round 74 lost a commit to two parallel git calls fighting over `index.lock`."""
+    for roots in ((), ("/tmp/kilo/*", "/tmp/contest/*")):
+        text = round_prompt("zeta-9", tmp_path / "45-x.md", "abc1234", tmp_roots=roots)
+        assert _flat(text).count(GIT_SEQUENTIAL_SENTENCE) == 1
+
+
+def test_the_prompt_sent_to_the_agent_lists_the_scratch_roots(tmp_path):
+    """Acceptance 3: `run_agent` passes the round's `tmp_roots`, so the first prompt
+    already says which scratch space is free, names this agent's own dir and never
+    a sibling's."""
+    root = tmp_path / "scratch"
+    cfg = make_config(["agent-a", "agent-b"], tmp_roots=(f"{root}/*",))
+    scenario = {"turns": [{"on_prompt": work_ready, "events": ["busy", "idle"]}]}
+    sb, fake, _h, run, _ = _run_one(tmp_path, scenario, cfg)
+    _assert_ready(run, sb.ws("agent-a"))
+    (_sid, text), = _prompts(fake)
+    assert text == round_prompt("agent-a", sb.ticket_path, sb.base_sha,
+                                tmp_dir=_scratch_arg(cfg), tmp_roots=cfg.tmp_roots)
+    assert (f"Scratch space outside your worktree that needs no reviewer: {root}/*.\n"
+            f"Put your own scratch files under {root}/agent-a/ ") in text
+    assert "agent-b" not in text
+
+
+def test_the_prompt_of_a_resumed_session_lists_the_scratch_roots(tmp_path):
+    """A resumed agent gets a fresh session and a `round_prompt(dirty=)`: the scratch
+    space is named there too, so the resume does not undo the first prompt."""
+    sb = Sandbox(tmp_path)
+    cfg = make_config(["agent-a"], tmp_roots=("/tmp/kilo/*", "/tmp/contest/*"))
+    work_edit_no_commit(str(sb.ws("agent-a").path), "")
+    first = _resumed_first_prompt(sb, cfg)
+    assert ("Scratch space outside your worktree that needs no reviewer: "
+            "/tmp/kilo/*, /tmp/contest/*.") in first
+    assert f"Put your own scratch files under {_scratch_arg(cfg)}/ " in first
+
 
 def test_three_questions_in_one_turn_stall_and_abort(tmp_path):
     scenario = {"turns": [{"on_prompt": work_ready, "events": ["busy"], "questions": 3, "delay": 0.5}]}
@@ -2684,7 +2792,7 @@ def test_a_context_cut_off_on_a_clean_tree_opens_a_fresh_session(tmp_path, monke
     (sid1, _first), (sid2, second) = _prompts(fake)
     assert sid1 == old_session.id and sid2 == fresh_session.id
     assert second == round_prompt("agent-a", sb.ticket_path, ws.base_sha,
-                                  tmp_dir=_scratch_arg(cfg))
+                                  tmp_dir=_scratch_arg(cfg), tmp_roots=cfg.tmp_roots)
     assert len(counts) == 1
     (t0, t1) = _jsonl(sb.out_dir / "agent-a" / "turns.jsonl")
     assert t0["cut_off"] == "context" and "harvest" not in t0
@@ -2707,7 +2815,7 @@ def test_a_context_cut_off_on_a_dirty_tree_carries_the_dirty_paragraph(tmp_path)
     (sid1, _first), (sid2, second) = _prompts(fake)
     assert sid1 != sid2
     assert second.startswith(round_prompt("agent-a", sb.ticket_path, ws.base_sha,
-                                          tmp_dir=_scratch_arg(cfg)))
+                                          tmp_dir=_scratch_arg(cfg), tmp_roots=cfg.tmp_roots))
     assert "pkg/thing.py" in second and "uncommitted" in second
     assert run.turns[0]["cut_off"] == "context"
 
@@ -3434,7 +3542,8 @@ def _plain_prompt(sb, cfg) -> str:
     "No paragraph" means exactly this: nothing between `round_prompt` and the
     worker note, so a `continue_message` block would fail these equalities.
     """
-    return (round_prompt("agent-a", sb.ticket_path, sb.base_sha, tmp_dir=_scratch_arg(cfg))
+    return (round_prompt("agent-a", sb.ticket_path, sb.base_sha, tmp_dir=_scratch_arg(cfg),
+                         tmp_roots=cfg.tmp_roots)
             + _runner_module.prompt_workers_note(sb.out_dir, cfg))
 
 
@@ -3486,7 +3595,7 @@ def test_a_fresh_round_reads_no_tree_and_its_prompt_is_exactly_round_prompt(tmp_
     sb, fake, _h, _run, _ = _run_one(tmp_path, scenario, cfg)
     (_sid, text), = _prompts(fake)
     assert text == round_prompt("agent-a", sb.ticket_path, sb.base_sha,
-                                tmp_dir=_scratch_arg(cfg))
+                                tmp_dir=_scratch_arg(cfg), tmp_roots=cfg.tmp_roots)
     assert tree_reads == []
 
 
@@ -4729,7 +4838,7 @@ def test_no_worker_line_when_the_file_cannot_be_read(tmp_path):
     _assert_ready(run, sb.ws("agent-a"))
     (_sid, text), = _prompts(fake)
     assert text == round_prompt("agent-a", sb.ticket_path, sb.base_sha,
-                                tmp_dir=_scratch_arg(cfg))
+                                tmp_dir=_scratch_arg(cfg), tmp_roots=cfg.tmp_roots)
 
 
 def test_no_worker_line_when_a_fixed_count_equals_every_core(tmp_path, monkeypatch):

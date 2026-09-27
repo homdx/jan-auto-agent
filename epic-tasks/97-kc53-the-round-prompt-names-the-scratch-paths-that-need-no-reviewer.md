@@ -1,6 +1,6 @@
 # KC-53 — the round prompt names the scratch paths that need no reviewer
 
-**Status:** queued — found live 2026-09-23 in round 86 (run 4, base `27adb12`).
+**Status:** landed (2026-09-27) — round 97 ideal patch; was queued — found live 2026-09-23 in round 86 (run 4, base `27adb12`).
 **Severity:** MEDIUM (agents invent their own `/tmp/…` folders, every command there goes to the gate, and a failing gate refuses them)
 **File:** `tools/contest/runner.py`
 **Symbol:** `_PROMPT`, `round_prompt`, `run_agent` (its two `round_prompt` calls)

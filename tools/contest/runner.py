@@ -123,6 +123,21 @@ agents' dirs are on this agent's `forbidden`, so a write into one of them is a
 mechanical reject rather than a gate call — the same geometry rule that keeps a
 sibling worktree forbidden (KC-46).
 
+KC-53 (round 97) tells the agent which scratch space needs no reviewer, because
+the prompt before only said "copy `agents_128k.ini` to a scratch path" and "any
+command that reaches outside your worktree is decided by a reviewer" and never
+which `/tmp` paths were free — round 86 run 4 wrote to `/tmp/scratch_suite`,
+`/tmp/debug_argv.py` and friends, and every one of them went to the gate.
+`round_prompt(tmp_roots=)` lists the round's globs in their own paragraph right
+before the reviewer sentence, and names one folder for the agent's own files:
+KC-59's scratch dir when the round derived one — the dir that exists and that
+the note after it names, so the prompt never offers two different "own" dirs —
+and otherwise `/tmp/contest/<agent>/`, only when the round names that root. No
+`tmp_roots` leaves the prompt byte for byte, and a malformed key degrades to the
+same as none. The same change names one more mechanical rule:
+git commands run one after another, never as parallel tool calls, because two
+collide on the worktree's `index.lock`.
+
 KC-62 (round 107) makes Kilo's own store a retryable error. Four of the five
 live agents ended `ERROR` within two minutes on `Failed to execute statement` —
 the round's `kilo serve` refusing a write in the SQLite every Kilo process of
@@ -1349,7 +1364,9 @@ class RoundState:
 #: `docs/collect-epics/RUN-THE-EPIC-COMPETITION.md` §Stage 1, "PROMPT STARTS …
 #: PROMPT ENDS", with the blockquote markers dropped and `<YOUR NAME>` as
 #: `{name}`. A module string on purpose: the runbook is documentation and may
-#: drift; the text the agents are scored against must not.
+#: drift; the text the agents are scored against must not. `{scratch_note}` is
+#: KC-53's scratch paragraph: `""` when the round names no scratch root, so a
+#: prompt without one is this text unchanged.
 _PROMPT = """\
 You are implementing one ticket from an epic round. Every agent in this round
 is implementing the same ticket against the same starting tree; the best
@@ -1396,6 +1413,9 @@ Two more that are checked by reading your diff:
 Never point any command at a live provider config. If a step needs one, copy
 `agents_128k.ini` to a scratch path and stub every `base_url` first.
 
+Run git commands one after another, never as parallel tool calls: two of them
+at once collide on your worktree's index.lock.
+
 Running the test suite on this machine can take up to 20 minutes under load:
 give that `bash` call a `timeout` of at least {test_timeout_ms} ms.
 
@@ -1406,7 +1426,7 @@ live code — each ticket names the commit it was written against in its
 authority, not the ticket.
 
 Your starting tree is commit {base_sha}; your one commit goes on top of it.
-Any command that reaches outside your worktree is decided by a reviewer, and a
+{scratch_note}Any command that reaches outside your worktree is decided by a reviewer, and a
 rejection is final for that command — do not retry it.
 """
 
@@ -1420,9 +1440,72 @@ _SCRATCH_DIR_NOTE = (
     "allows that dir and not the other agents'."
 )
 
+#: KC-53: the root whose per-agent folder the prompt may name when the round
+#: derived no KC-59 scratch dir. The ticket sends the agents to
+#: `/tmp/contest/<agent>/`, so that is the one root the fallback may come from —
+#: any other root earns only its place in the list. Compared the way
+#: `tmp_root_dirs` reads a root, so `/tmp/contest/` counts as `/tmp/contest/*`.
+_CONTEST_ROOT = "/tmp/contest"
+
+
+def _scratch_roots(tmp_roots) -> tuple[str, ...]:
+    """The scratch globs the prompt may name, in the order the config has them.
+
+    Fail-open, the way the policy reads them (`tmp_root_dirs`): a non-string, an
+    empty one and one that is not an absolute or ``~``-absolute path are all
+    dropped, and a non-iterable *tmp_roots* (``42``, a bare ``None``) is ``()``
+    — a round with a malformed key names no scratch space at all instead of
+    raising into it. A bare string is one root rather than its characters.
+    """
+    if isinstance(tmp_roots, str):
+        tmp_roots = (tmp_roots,)
+    try:
+        items = tuple(tmp_roots or ())
+    except (TypeError, ValueError):
+        return ()
+    roots: list[str] = []
+    for item in items:
+        if not isinstance(item, str):
+            continue
+        root = item.strip()
+        if not root or not root.startswith(("/", "~")):
+            continue
+        if root not in roots:
+            roots.append(root)
+    return tuple(roots)
+
+
+def _scratch_note(agent_name: str, tmp_roots, tmp_dir: str = "") -> str:
+    """KC-53: the paragraph that names the scratch space needing no reviewer.
+
+    ``""`` when the round named no scratch root, so a prompt without one is
+    today's text byte for byte. Otherwise the globs, and one folder for the
+    agent's own files: *tmp_dir* — KC-59's scratch dir, the one that exists and
+    that `_SCRATCH_DIR_NOTE` names — when the round derived it, else
+    `/tmp/contest/<agent>/` when `_CONTEST_ROOT` is one of the roots, else no
+    folder at all. The leading newline splits the start-tree line from the
+    paragraph and the trailing blank line keeps the reviewer sentence its own
+    paragraph.
+    """
+    roots = _scratch_roots(tmp_roots)
+    if not roots:
+        return ""
+    note = ("Scratch space outside your worktree that needs no reviewer: "
+            + ", ".join(roots) + ".")
+    folder = ""
+    if isinstance(tmp_dir, str) and tmp_dir.strip():
+        folder = tmp_dir.strip().rstrip("/") + "/"
+    elif (isinstance(agent_name, str) and agent_name.strip()
+          and any(r.removesuffix("/*").rstrip("/") == _CONTEST_ROOT for r in roots)):
+        folder = f"{_CONTEST_ROOT}/{agent_name.strip()}/"
+    if folder:
+        note += (f"\nPut your own scratch files under {folder} — anywhere else in "
+                 "/tmp goes to the reviewer.")
+    return "\n" + note + "\n\n"
+
 
 def round_prompt(agent_name: str, ticket_path: Path, base_sha: str, *, dirty: str = "",
-                 tmp_dir: str = "") -> str:
+                 tmp_dir: str = "", tmp_roots=()) -> str:
     """The runbook's prompt for *agent_name*, plus the base sha and the permission rule.
 
     The ticket is not repeated: the session reads it from its own worktree via
@@ -1431,12 +1514,16 @@ def round_prompt(agent_name: str, ticket_path: Path, base_sha: str, *, dirty: st
     scratch dir is appended first; when *dirty* is non-empty (a `--resume` into a
     worktree that still holds uncommitted work, KC-22), the `continue_message`
     paragraph is appended after it so the fresh session learns of the work on its
-    first prompt — every existing caller passes neither and gets the unchanged
-    text.
+    first prompt. When *tmp_roots* names at least one root (KC-53), the paragraph
+    that lists them and names the agent's own folder (`_scratch_note`) is
+    inserted right before the reviewer sentence, so the agent stops guessing at a
+    scratch path the reviewer would refuse. Every existing caller passes none of
+    them and gets the unchanged text.
     """
     del ticket_path
     text = _PROMPT.format(name=agent_name, base_sha=base_sha,
-                          test_timeout_ms=AGENT_TEST_TIMEOUT_MS)
+                          test_timeout_ms=AGENT_TEST_TIMEOUT_MS,
+                          scratch_note=_scratch_note(agent_name, tmp_roots, tmp_dir))
     if tmp_dir:
         text = text + _SCRATCH_DIR_NOTE.format(tmp_dir=tmp_dir)
     if dirty:
@@ -2857,7 +2944,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         _append_jsonl(agent_dir / "turns.jsonl", {"agent": spec.name, **turn})
         run.session_id = session.id
         continue_text = round_prompt(spec.name, ticket_path, ws.base_sha, dirty=dirty,
-                                     tmp_dir=scratch_arg)
+                                     tmp_dir=scratch_arg, tmp_roots=tuple(tmp_roots))
         continue_used += 1
         return None
 
@@ -3177,10 +3264,11 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                     # KC-22, `--resume` into a worktree that still holds the
                     # work: the fresh session learns of it on its first prompt.
                     text = round_prompt(spec.name, ticket_path, ws.base_sha, dirty=dirty,
-                                        tmp_dir=scratch_arg)
+                                        tmp_dir=scratch_arg, tmp_roots=tuple(tmp_roots))
                     run.dirty_on_resume = ""  # only the first prompt carries it
                 else:
-                    text = round_prompt(spec.name, ticket_path, ws.base_sha, tmp_dir=scratch_arg)
+                    text = round_prompt(spec.name, ticket_path, ws.base_sha, tmp_dir=scratch_arg,
+                                        tmp_roots=tuple(tmp_roots))
             turn = {"kind": kind, "attempt": run.attempt, "sent_at": time.time()}
             if kind == "continue":
                 note = (f"attempt {run.attempt} (continue {continue_used} of "
