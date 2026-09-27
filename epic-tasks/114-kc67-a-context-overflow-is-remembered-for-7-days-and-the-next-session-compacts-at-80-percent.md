@@ -132,6 +132,19 @@ KC-54 stays as is: an overflow that still happens still ends the same way. The o
 - [ ] Tests use the fake Kilo only, with no live provider and no real memory file outside `tmp_path`.
 - [ ] `python3 -m pytest tests -n 4 -q` and `python3 -m pytest tests_bugfix -n 4 -q` are green.
 
+## Follow-up, 2026-09-27 — a `last_ok` is a floor
+
+Found in KC-73's live run (5 × agnes-2-0-flash, kenary names no limit): three
+overflows remembered `last_ok` 17 382, 254 613 and 26 321. `smallest_size`
+took the smallest, 17 382 — one session whose last step read a pile of files at
+once went from 17 382 OK straight past the window — and every later session was
+compacted at 80 % of it, every turn; one entry gave up. A `last_ok` only proves
+the window is at least that big, so among records that name no limit the
+largest wins now (`context_memory._pick`); among named limits the smallest
+still wins, and the smaller of the two is the size — hy3's 104 065 over a named
+262 144 stands. A model the provider sizes (1M named) is untouched: a named
+limit is used as it is.
+
 ## Out of scope
 
 - Counting tokens ourselves: the server's numbers and the provider's words are the only sources.

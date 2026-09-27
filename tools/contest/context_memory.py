@@ -252,21 +252,45 @@ def size_of(record: OverflowRecord) -> int | None:
     return record.limit or record.last_ok
 
 
-def remembered(records, provider: str, model: str) -> tuple[int | None, int | None]:
-    """KC-69: ``(size, output)`` of the record with the smallest size for
-    ``provider`` / ``model`` — :func:`smallest_size` plus the output that
-    record reserved, ``None`` when it named none. ``(None, None)`` for nothing
-    remembered.
+def _pick(records, provider: str, model: str):
+    """``(size, output)`` for ``provider`` / ``model`` out of *records*, else ``None``.
+
+    A record that names a limit is a wall: the smallest of those wins, as it
+    always did. A record that names none holds only its ``last_ok`` — the last
+    reply that still went through, which proves the window is *at least* that
+    big and says nothing about how much bigger. So of those, the largest wins:
+    one overflow whose last step read a pile of files at once (live, KC-73's
+    agnes-2-0-flash: 17 382 OK, then one step past the window) must not size a
+    model that another session proved at 254 613 — at 80 % of 17 382 the runner
+    compacted every turn and the agent gave up. The two are then combined as
+    before, the smaller wins: hy3's 104 065 over a named 262 144 still stands.
     """
-    best = None
-    if isinstance(records, (list, tuple)):
-        for entry in records:
-            record = entry if isinstance(entry, OverflowRecord) else OverflowRecord.from_dict(entry)
-            if record is None or record.provider != provider or record.model != model:
-                continue
-            size = size_of(record)
-            if size is not None and (best is None or size < best[0]):
-                best = (size, record.output)
+    if not isinstance(records, (list, tuple)):
+        return None
+    wall = floor = None
+    for entry in records:
+        record = entry if isinstance(entry, OverflowRecord) else OverflowRecord.from_dict(entry)
+        if record is None or record.provider != provider or record.model != model:
+            continue
+        size = size_of(record)
+        if size is None:
+            continue
+        if record.limit:
+            if wall is None or size < wall[0]:
+                wall = (size, record.output)
+        elif floor is None or size > floor[0]:
+            floor = (size, record.output)
+    if wall is not None and floor is not None:
+        return wall if wall[0] <= floor[0] else floor
+    return wall or floor
+
+
+def remembered(records, provider: str, model: str) -> tuple[int | None, int | None]:
+    """KC-69: ``(size, output)`` of the record that sizes ``provider`` /
+    ``model`` — :func:`smallest_size` plus the output that record reserved,
+    ``None`` when it named none. ``(None, None)`` for nothing remembered.
+    """
+    best = _pick(records, provider, model)
     return best if best is not None else (None, None)
 
 
@@ -305,26 +329,17 @@ def kilo_limit(size, output, percent: float = DEFAULT_COMPACT_AT_PERCENT) -> dic
 
 
 def smallest_size(records, provider: str, model: str) -> int | None:
-    """The smallest size remembered for ``provider`` / ``model``, else ``None``.
+    """The size remembered for ``provider`` / ``model``, else ``None``.
 
-    Only records of that exact provider and model count — one model's overflow
-    says nothing about its neighbour's — and a record without either a limit or
-    a ``last_ok`` counts for nothing at all. Anything that is not a list of
-    records is ``None``: no size, the way today's session is treated.
+    The smallest named limit, or the largest ``last_ok`` of the records that
+    name none, whichever is smaller (:func:`_pick`). Only records of that exact
+    provider and model count — one model's overflow says nothing about its
+    neighbour's — and a record without either a limit or a ``last_ok`` counts
+    for nothing at all. Anything that is not a list of records is ``None``: no
+    size, the way today's session is treated.
     """
-    if not isinstance(records, (list, tuple)):
-        return None
-    best = None
-    for entry in records:
-        record = entry if isinstance(entry, OverflowRecord) else OverflowRecord.from_dict(entry)
-        if record is None:
-            continue
-        if record.provider != provider or record.model != model:
-            continue
-        size = size_of(record)
-        if size is not None and (best is None or size < best):
-            best = size
-    return best
+    best = _pick(records, provider, model)
+    return best[0] if best is not None else None
 
 
 def load(path, *, days: float = DEFAULT_DAYS, now: float | None = None) -> list[OverflowRecord]:

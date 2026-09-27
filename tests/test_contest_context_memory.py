@@ -236,6 +236,24 @@ def test_smallest_size_is_the_smallest_the_model_has_ever_given(tmp_path):
         assert cm.smallest_size(bad, "kenary", "agent-a:free") is None
 
 
+def test_a_last_ok_is_a_floor_so_the_largest_one_sizes_the_model(tmp_path):
+    """KC-73's live run: three agnes-2-0-flash overflows that named no limit —
+    17 382, 254 613 and 26 321 OK. Each only proves the window is at least that
+    big, so the model is sized at 254 613, not at 17 382 (where the runner
+    compacted every turn and the agent gave up). A named limit still wins when
+    it is smaller, and the smallest named limit wins among named ones."""
+    path = tmp_path / "context-memory.json"
+    for ok in (17_382, 254_613, 26_321):
+        cm.add(path, _record(limit=None, last_ok=ok))
+    records = cm.load(path)
+    assert cm.smallest_size(records, "kenary", "agent-a:free") == 254_613
+    assert cm.remembered(records, "kenary", "agent-a:free") == (254_613, None)
+    cm.add(path, _record(limit=200_000, last_ok=199_000))
+    cm.add(path, _record(limit=300_000, last_ok=299_000))
+    records = cm.load(path)
+    assert cm.smallest_size(records, "kenary", "agent-a:free") == 200_000
+
+
 def test_memory_path_and_the_two_numbers_are_fail_open(tmp_path):
     out_dir = tmp_path / "contest-out" / "114"
     default = tmp_path / "contest-out" / "context-memory.json"
