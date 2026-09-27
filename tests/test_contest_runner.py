@@ -394,8 +394,13 @@ def make_config(agents, **over) -> ContestConfig:
     # at `turn_timeout_sec`, `on_deadline` never passed, and the stall line the
     # turns above compare byte for byte. The turn-deadline tests set it
     # explicitly.
+    # KC-9: a SILENT idle waits `error_retry_backoff_sec` before its continue,
+    # and the roster default is 15 s — four silence tests each slept it out for
+    # real (~+70 s on the suite, all on the one port_bound_http_servers worker).
+    # 0 here; the tests that are *about* the backoff set their own.
     kw = dict(agents=specs, max_parallel=1, max_rework=2, turn_timeout_sec=300,
               turn_extend_sec=0, idle_event_timeout_sec=60, max_questions_per_turn=3,
+              error_retry_backoff_sec=0,
               tmp_roots=("/tmp/*",), gate_max_calls_per_session=20, gate_settings=gate)
     kw.update(over)
     return ContestConfig(**kw)
