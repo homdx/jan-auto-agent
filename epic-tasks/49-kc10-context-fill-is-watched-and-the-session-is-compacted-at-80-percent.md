@@ -1,6 +1,6 @@
 # KC-10 — Context fill is measured after every turn; at 80 % the session is compacted, not abandoned
 
-**Status:** open — after KC-9 (round 48). Written against `docs/kilo-contest/PROBE.md`. Note added 2026-09-22: `compact` here is a session-internal call (`POST /session/{id}/summarize`) that returns no text to the caller — it shrinks the session's own history, it does not preserve the model's account of an in-progress diff anywhere outside the session. KC-40 (queued, depends on this ticket) covers the case this one does not: fill is high **and** a diff already exists, where a plain compact risks discarding the only explanation of unfinished work — KC-40 asks the model for a summary first and copies it out to a file before compacting or falling back to a fresh session.  
+**Status:** landed `ed8be97` — round 49 winner sensenova-6-7-flash-lite-var2 (15/15 on `contest-bench/kc10`, `c19c8c5`), with `context_limit_fallback` off by default (0: today's models without a limit are ~250k windows, KC-67's memory sizes them). Item 6 not taken as written: KC-54/KC-69 already recover from an overflow, two of them end READY. Round-49 fixes landed with it: `1087584` (KC-69's own abort ended two agents ERROR), `be56cd0` (KC-67's `last_ok` read Kilo's summary as 0).  
 **Severity:** HIGH  
 **File:** `tools/contest/runner.py`, `tools/contest/kilo_client.py`  
 **Symbol:** `KiloClient.model_limit`, `KiloClient.session_tokens`, `KiloClient.compact`, `runner.context_fill`, `runner.maybe_compact`  
