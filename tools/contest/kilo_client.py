@@ -291,6 +291,11 @@ class IdleResult:
     stale_skipped: int = 0
     #: KC-73: a ``session.compacted`` of this session was read in this wait
     compacted: bool = False
+    #: KC-75: how many of this session's ``session.status`` ``retry`` events —
+    #: Kilo retrying a provider 4xx/5xx (429 rate limit, 502, 503) — this wait
+    #: read, output or not. A turn that went idle empty after one is the
+    #: provider's doing, not the model's.
+    provider_errors: int = 0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1616,6 +1621,7 @@ class KiloClient:
         saw_busy = False
         # KC-64: retries Kilo reported since this session last produced output
         retries_without_output = 0
+        provider_errors = 0
         started = time.monotonic()
         deadline = started + float(timeout)
         session_id = session.id
@@ -1792,6 +1798,10 @@ class KiloClient:
                 continue
 
             elapsed = time.monotonic() - started
+            if etype == "session.status":
+                _st = props.get("status")
+                if isinstance(_st, dict) and _st.get("type") == "retry":
+                    provider_errors += 1
             if etype == "session.status" and max_retry_wait is not None:
                 # KC-61: Kilo's own retry, and how long before it retries. `next`
                 # is epoch milliseconds, so it is the wall clock the wait is
@@ -1860,4 +1870,5 @@ class KiloClient:
                 _log.warning("%s: idle without busy after %.1fs", session_id, elapsed)
             return IdleResult(status="idle", elapsed=elapsed,
                               permissions=permissions, questions=questions,
-                              stale_skipped=stale, compacted=compacted)
+                              stale_skipped=stale, compacted=compacted,
+                              provider_errors=provider_errors)

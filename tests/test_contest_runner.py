@@ -7704,3 +7704,104 @@ def test_run_round_is_run_leg_with_no_leg_number(tmp_path):
         run_leg(make_config(["agent-a"]), ROUND, sb.ticket_path, list(sb.workspaces),
                 make_backend=lambda ws: None, out_dir=sb.out_dir, leg=2, carry=state,
                 resume=state)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KC-75: an empty turn after a provider 4xx/5xx is retried on its own budget
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_a_silent_turn_after_a_provider_error_does_not_spend_a_continue(tmp_path):
+    """Round 120: a free model rate-limited by the provider ends its turn empty.
+    With `max_silent_retries` the continue goes again without touching
+    `max_continues_per_attempt`, and the turn records the provider errors."""
+    cfg = make_config(["agent-a"], max_continues_per_attempt=1, max_silent_retries=3)
+    scenario = {"turns": [
+        {"retries": 2, "retry_message": "free-model rate limit reached",
+         "events": ["busy", "idle"], "assistant": ""},
+        {"retries": 1, "events": ["busy", "idle"], "assistant": ""},
+        {"on_prompt": work_ready, "events": ["busy", "idle"], "assistant": "done"},
+    ]}
+    sb, fake, _h, run, _ = _run_one(tmp_path, scenario, config=cfg)
+    _assert_ready(run, sb.ws("agent-a"))
+    assert run.continues == 0
+    assert len(_session_posts(fake)) == 1
+    prompts = _prompts(fake)
+    assert len(prompts) == 3 and all(p == CONTINUE_PROMPT for _s, p in prompts[1:])
+    t0, t1 = run.turns[0], run.turns[1]
+    assert t0["idle_kind"] == "SILENT" and t0["silent_retries"] == 1
+    assert t0["provider_errors"] == 2 and "continues" not in t0
+    assert t1["silent_retries"] == 2
+
+
+def test_a_silent_turn_without_a_provider_error_still_spends_a_continue(tmp_path):
+    """KC-75 is only for 4xx/5xx: an empty turn with no Kilo retry in it is the
+    model's own silence and keeps KC-9's continue."""
+    cfg = make_config(["agent-a"], max_silent_retries=3)
+    scenario = {"turns": [
+        {"events": ["busy", "idle"], "assistant": ""},
+        {"on_prompt": work_ready, "events": ["busy", "idle"], "assistant": "done"},
+    ]}
+    sb, _fake, _h, run, _ = _run_one(tmp_path, scenario, config=cfg)
+    _assert_ready(run, sb.ws("agent-a"))
+    assert run.continues == 1
+    assert "silent_retries" not in run.turns[0]
+
+
+def test_the_silent_retry_budget_runs_out_into_the_continue_budget(tmp_path):
+    """`max_silent_retries = 1`: the first provider-empty turn is retried free,
+    the second spends the continue, as before KC-75."""
+    cfg = make_config(["agent-a"], max_continues_per_attempt=2, max_silent_retries=1)
+    scenario = {"turns": [
+        {"retries": 1, "events": ["busy", "idle"], "assistant": ""},
+        {"retries": 1, "events": ["busy", "idle"], "assistant": ""},
+        {"on_prompt": work_ready, "events": ["busy", "idle"], "assistant": "done"},
+    ]}
+    sb, _fake, _h, run, _ = _run_one(tmp_path, scenario, config=cfg)
+    _assert_ready(run, sb.ws("agent-a"))
+    assert run.turns[0]["silent_retries"] == 1
+    assert "silent_retries" not in run.turns[1] and run.turns[1]["continues"] == 1
+    assert run.continues == 1
+
+
+def test_the_silent_retry_wait_doubles_up_to_its_cap():
+    """KC-75's wait: 15, 30, 60, 120, then 120 — never over the cap."""
+    from tools.contest.runner import _retry_backoff
+    assert [_retry_backoff(n, 15, 120) for n in range(1, 7)] == [15, 30, 60, 120, 120, 120]
+
+
+def test_the_roster_reads_the_silent_retry_keys(tmp_path):
+    """`contest.ini` carries the budget and the cap; the defaults are off and 120 s."""
+    assert ContestConfig.__dataclass_fields__["max_silent_retries"].default == 0
+    assert ContestConfig.__dataclass_fields__["silent_retry_max_backoff_sec"].default == 120
+    import configparser
+    ini = configparser.ConfigParser(inline_comment_prefixes=("#",))
+    ini.read(Path(__file__).resolve().parents[1] / "contest.ini")
+    flat = {k: v for sec in ini.sections() for k, v in ini[sec].items()}
+    assert int(flat["max_silent_retries"]) >= 5
+    assert int(flat["silent_retry_max_backoff_sec"]) == 120
+
+
+def test_the_idle_before_a_queued_nudge_is_not_the_nudges_turn(tmp_path, monkeypatch):
+    """KC-75, round 120: the nudge went into a busy session, Kilo queued it, and
+    the idle that closed the *old* turn came first. The runner waits for the
+    nudge's own turn instead of taking that idle — no continue is sent into a
+    running turn, and the run ends on the nudge turn's own ending."""
+    _fast_poll(monkeypatch)
+    scenario = {"turns": [dict(NEVER_TOUCHES)]}
+    sb = Sandbox(tmp_path)
+    cfg = _ft_config(turn_timeout_sec=30, first_touch_nudges=1)
+    with _BenchFake(scenario) as fake:
+        def queued_nudge(directory, text):
+            # Kilo 7.6.2: the running turn closes, the queued prompt opens
+            sid = fake.sessions()[-1].id
+            fake._emit({"type": "session.idle", "properties": {"sessionID": sid}})
+            fake._emit({"type": "session.status",
+                        "properties": {"sessionID": sid, "status": {"type": "busy"}}})
+            work_ready(directory, text)
+        scenario["turns"].append({"on_prompt": queued_nudge, "events": ["busy", "idle"],
+                                  "assistant": "done"})
+        run = Harness(sb, fake, cfg).go()
+    _assert_ready(run, sb.ws("agent-a"))
+    assert run.turns[0]["queued_waits"] == 1
+    assert run.continues == 0
+    assert len(_prompts(fake)) == 2

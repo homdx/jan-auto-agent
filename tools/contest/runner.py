@@ -2532,6 +2532,9 @@ def _turn_deadline(run: AgentRun, config: ContestConfig, working=None) -> _TurnC
 #: loaded box, long enough that an eight-agent round is not running `git status`
 #: for an agent that is already working.
 FIRST_TOUCH_POLL_SEC = 5.0
+#: KC-75: how long a session must stay silent after an idle for no queued
+#: nudge to be behind it — Kilo opens a queued prompt in the same millisecond
+QUEUED_NUDGE_QUIET_SEC = 5.0
 
 
 class _FirstTouch:
@@ -4713,6 +4716,8 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         continue_text = None
         retries_used = 0
         local_retries = 0
+        # KC-75: empty idle turns in a row (a rate-limited free model).
+        silent_retries = 0
         while True:
             if stalled:
                 # the hard limit fired between two turns: no new prompt
@@ -4840,6 +4845,36 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                     touch.stop()
                 while context_stopper:
                     context_stopper.pop().cancel()
+            # KC-75: a nudge is posted into a busy session, and Kilo 7.6.2 queues
+            # it: the running turn closes after its current step (`turn.close`,
+            # `session.idle`) and the queued prompt opens the next one at once.
+            # That first idle is the *old* turn's. Round 120 took it for the
+            # nudge's own, sent its continue into the nudge's running turn, which
+            # queued again — every later turn was cut to one step and read as
+            # SILENT, and eleven agents gave up in five minutes. One more idle is
+            # waited for per nudge the watch sent.
+            queued = int(getattr(touch, "nudged", 0) or 0) if touch is not None else 0
+            while queued > 0 and not escalate[0] and getattr(idle, "status", "") == "idle":
+                queued -= 1
+                # No mark: the cursor stands right after the idle just read, and
+                # the queued turn's `turn.open`/`busy` land in the same
+                # millisecond — a mark taken now could already be past them. A
+                # session with nothing queued sends nothing: KC-73's quiet window
+                # says so, and the idle already read stands.
+                again = _wait_turn(backend, session, config,
+                                   on_permission=on_permission, on_question=on_question,
+                                   on_deadline=clock.on_deadline,
+                                   quiet_after=QUEUED_NUDGE_QUIET_SEC)
+                if getattr(again, "status", "") not in ("idle", "error"):
+                    # quiet: nothing was queued, the idle read stands. A timeout
+                    # or a closed stream is no better an ending than the idle
+                    # already in hand — the turn keeps it, as before KC-75.
+                    break
+                turn["queued_waits"] = int(turn.get("queued_waits", 0)) + 1
+                _log.info("%s: that idle closed the turn before the nudge — the "
+                          "nudge's own turn ran on, and its end is the turn's",
+                          spec.name)
+                idle = again
             if escalate[0]:
                 # KC-42: the watch ended this turn — a fresh session, or DEAD.
                 # Read before anything else: the abort that woke the wait comes
@@ -5168,6 +5203,33 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                 local_retries = 0
                 idle_kind = classify_idle(backend, session, turn["sent_at"], ws)
                 turn["idle_kind"] = idle_kind.value
+                # KC-75: a SILENT turn is an empty reply — round 120's eleven
+                # free models on one key hit `rate limit reached` together, Kilo
+                # ended each turn with an empty assistant message, and 15-second
+                # continues burned both attempts in five minutes. It is the
+                # provider, not the model: when this turn read a provider 4xx/5xx
+                # retry, wait longer each time and send the continue again, on
+                # its own budget, before a continue is spent. An empty turn with
+                # no provider error keeps KC-9's continue.
+                if idle_kind is not IdleKind.SILENT:
+                    silent_retries = 0
+                elif (int(getattr(idle, "provider_errors", 0) or 0) > 0
+                      and silent_retries < int(getattr(config, "max_silent_retries", 0) or 0)):
+                    silent_retries += 1
+                    turn["silent_retries"] = silent_retries
+                    turn["provider_errors"] = int(idle.provider_errors)
+                    backoff = _retry_backoff(silent_retries, config.error_retry_backoff_sec,
+                                             getattr(config, "silent_retry_max_backoff_sec", 0))
+                    _log.info("%s: empty reply after %d provider error(s) (4xx/5xx) — "
+                              "retry %d/%d in %ds, no continue spent", spec.name,
+                              int(idle.provider_errors), silent_retries,
+                              int(config.max_silent_retries), backoff)
+                    continue_text = CONTINUE_PROMPT
+                    run.turns.append(turn)
+                    _append_jsonl(agent_dir / "turns.jsonl", {"agent": spec.name, **turn})
+                    if not _wait_backoff(backoff) and stalled:
+                        return finish(AgentState.STALLED, stalled[0])
+                    continue
                 if idle_kind in (IdleKind.CUT, IdleKind.SILENT):
                     budget = int(config.max_continues_per_attempt)
                     # KC-56 inside a CUT: a reply stopped at `finish: "length"`
@@ -5459,6 +5521,7 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
             # first.
             run.sessions_this_attempt = 1
             local_retries = 0
+            silent_retries = 0
             transition(AgentState.REWORK, note=f"attempt {run.attempt} {elapsed_str} — "
                        + ", ".join(r.code for r in verdict.reasons))
             rework_text = rework_message(verdict, run.attempt, int(config.max_rework))

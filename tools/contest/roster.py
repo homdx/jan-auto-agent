@@ -103,6 +103,8 @@ CONTEST_KEYS = (
     "max_error_retries",
     "error_retry_backoff_sec",
     "error_retry_max_backoff_sec",
+    "max_silent_retries",
+    "silent_retry_max_backoff_sec",
     "agent_max_sec",
     "max_local_store_retries",
     "local_store_retry_backoff_sec",
@@ -303,6 +305,11 @@ class ContestConfig:
     error_retry_backoff_sec: int = 15
     #: the longest wait between two retries; 0 = no cap (the wait keeps doubling)
     error_retry_max_backoff_sec: int = 60
+    #: KC-75: empty replies in a row sent a continue again without spending
+    #: `max_continues_per_attempt`; 0 = off (an empty reply spends a continue)
+    max_silent_retries: int = 0
+    #: KC-75: the longest wait between two of them; 0 = no cap
+    silent_retry_max_backoff_sec: int = 120
     #: one agent's hard limit from its start, whatever the turns add up to; the
     #: session is aborted as a stall and the tree is scored as it stands. 0 = off
     agent_max_sec: int = 0
@@ -816,6 +823,8 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
         max_error_retries=limit("max_error_retries", 2),
         error_retry_backoff_sec=limit("error_retry_backoff_sec", 15),
         error_retry_max_backoff_sec=limit("error_retry_max_backoff_sec", 60),
+        max_silent_retries=limit("max_silent_retries", 0),
+        silent_retry_max_backoff_sec=limit("silent_retry_max_backoff_sec", 120),
         agent_max_sec=limit("agent_max_sec", 0),
         max_local_store_retries=limit("max_local_store_retries", 5),
         local_store_retry_backoff_sec=limit("local_store_retry_backoff_sec", 10),
