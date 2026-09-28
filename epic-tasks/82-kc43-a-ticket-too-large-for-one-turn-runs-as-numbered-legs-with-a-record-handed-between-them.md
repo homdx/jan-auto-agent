@@ -19,7 +19,7 @@
 > ## ✂️ Split — 2026-09-28 (after KC-40 landed `dac85bd`)
 > Size L was too big for one 90-minute turn (round 81 already ran out on KC-42, which is smaller). This ticket is now **the relay frame only**: legs, the carried worktree, a fresh session per leg, a *mechanical* leg record, the "continue" prompt, READY ends the relay. The rich leg record (pytest roots, last message, KC-40 summary, "what is left", the one-minute cap) moved to **KC-74 (120)**. The live 2-leg round is the judge's job after both land, not an entry's checkbox.
 
-**Status:** open — unblocked (KC-39, KC-40, KC-42 landed); was: last, after KC-36 **(landed)**, KC-39, KC-40, KC-41 **(landed)** and KC-42, every one of which it composes — **now blocked on KC-39, KC-40 and KC-42 only**. Asked by the operator on 2026-09-22 as the frame the other tickets are parts of.
+**Status:** landed `4a4c9fa` (round 82, 2026-09-28) — winner agnes-3-0-flash 33/34 on `contest-bench/kc43`; the code is the Sonnet 5 entry (34/34), over KC-50 `e8ed850`.
 **Severity:** MEDIUM (nothing is lost today that KC-41 does not already save; this ticket is about tickets that *cannot* be finished in one turn at all, which the epic has so far avoided by keeping tickets small)
 **File:** `tools/contest/cli.py` (`cmd_run`, `_parser`), `tools/contest/runner.py` (`run_round`), `tools/contest/workspace.py` (`prepare_round` — the "never reuse a previous round's worktree" rule gains one exception), `contest.ini`
 **Symbol:** `cmd_run`, `run_round`, `run_leg` (new), `leg_record` (new), `RoundState.leg` (new), `prepare_round(..., carry_from=...)` (new)

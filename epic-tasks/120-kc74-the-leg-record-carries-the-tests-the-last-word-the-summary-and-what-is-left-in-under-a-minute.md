@@ -1,15 +1,40 @@
 # KC-74 — the leg record carries the tests, the last word, the summary and what is left, in under a minute
 
-**Status:** queued — after KC-43 (82), which writes the mechanical record this ticket completes. Split out of KC-43 on 2026-09-28 so each fits one turn.
+**Status:** open — KC-43 (82) landed `4a4c9fa` on 2026-09-28 (over KC-50 `e8ed850`). Split out of KC-43 on 2026-09-28 so each fits one turn.
 **Severity:** MEDIUM (without it leg 2 knows *what* changed but not whether it passes or what was meant next — the handover the operator writes by hand today)
 **Round:** 120
 **Size:** S
-**File:** `tools/contest/runner.py` (`leg_record`, the next leg's prompt)
+**File:** `tools/contest/runner.py` (`leg_record`, `leg_message`, `run_agent`'s harvest turn)
 **Symbol:** `leg_record`, `LEG_RECORD_MAX_LINES` (new)
-**Depends on:** KC-43 (82 — `leg_record` with diffstat, end commit, harvest verdict; `--legs`), KC-40 (landed `dac85bd` — the model-written summary copied out of the session).
+**Depends on:** KC-43 (82, landed `4a4c9fa` — `leg_record`, `leg_message`, `run_leg`, `--legs`), KC-40 (landed `dac85bd` — the model-written summary copied out of the session).
 **Also touches:** `tests/test_contest_runner.py`
 
 Ground rules, as in every ticket: `CollectBridge._shrink` stays byte-identical, no test starts a real `kilo` or calls a live provider, do not edit `epic-tasks/` other than this ticket, one commit, no push; a test ships with the change and fails without it.
+
+## What is on the base (after KC-43, `4a4c9fa`)
+
+Read these before writing anything — they are the code this ticket extends:
+
+- `runner.leg_record(run, ws, out_dir) -> Path` writes `<out_dir>/<agent>.leg.md`:
+  a first line `leg <NN>.<L> — <agent>`, then `files:` (diffstat of the
+  worktree against `ws.base_sha`, committed and uncommitted, via `_leg_files`),
+  `commit:` and `harvest:` (the newest turn's `harvest` verdict and reason
+  codes). Each says `none` when empty.
+- `runner.leg_message(leg, ticket_path, records)` builds the next leg's
+  paragraph: the instruction to continue, the ticket's declared files, and
+  the records **already newest first**.
+- `cli.cmd_run` runs the legs. It calls `leg_record` **after** `run_leg`
+  returns, when that leg's `kilo serve` is already closed. So the record
+  cannot ask the session for anything. The last message has to be saved
+  while the session is alive, or read back from `<leg dir>/<agent>/events.jsonl`.
+- The turn's saved harvest, `turn["harvest"]` in `run_agent`, keeps only
+  `verdict`, `reasons`, `elapsed` and `waited`. The root counts live in
+  `Harvest.facts["tests_run"]` (`harvest.py`, e.g. `tests:12✓ 1✗` or
+  `skipped: no_commit`) and are **dropped** today. They must be kept on the
+  turn (e.g. `turn["harvest"]["tests_run"]`) for the record to show them.
+- `_last_assistant_text(backend, session)` exists (KC-40). `run.summary`
+  holds KC-40's summary text.
+- `legs = 1` never calls `leg_record` or `leg_message`. That must stay so.
 
 ## What happens after KC-43
 
@@ -36,7 +61,8 @@ do next.
 3. **Size cap.** The whole record stays under `LEG_RECORD_MAX_LINES` (80).
    Over it, **last message** and **summary** are cut first (with a
    `… cut` marker); the mechanical fields are never cut.
-4. The next leg's prompt lists the records newest first.
+4. The next leg's prompt lists the records newest first — KC-43 already
+   does this in `leg_message`; keep it.
 
 ## Acceptance
 

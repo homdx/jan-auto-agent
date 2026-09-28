@@ -9,7 +9,7 @@
 >
 > **The corrected status and current behavior below supersede the original round-86 description where it says the zero-commit case still runs pytest. No cancellation is warranted.**
 
-**Status:** queued, partially implemented — the no-commit case now skips test roots (`harvest.py`, `facts["commits"] == 0`); remaining work is to skip roots for every pre-existing blocking reason, record the skip, and move the lock to the test call.
+**Status:** landed `e8ed850` (2026-09-28, judge's ideal, `contest-bench/kc50`).
 **Severity:** MEDIUM (a commit-bearing harvest that is already mechanically `REWORK` can still spend minutes running roots that cannot change its verdict, while every mechanical harvest can wait behind the round-wide test lock)
 **File:** `tools/contest/harvest.py`, `tools/contest/runner.py`
 **Symbol:** `harvest` (the `if run_tests:` block), `_harvest`, `_TEST_RUNS_LOCK`
