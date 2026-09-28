@@ -629,7 +629,8 @@ def test_harvest_budget_reworks_with_tests_slow(round_, tmp_path):
     rework prompt carries the budget instead of a red test."""
     repo, base, ticket = round_
     wt = _worktree(repo, base, tmp_path)
-    _accepting(wt)
+    _edit(wt, "tools/auto/probe.py", "PROBE = 1\n")
+    _edit(wt, "tests/test_probe.py", "def test_probe():\n    assert True\n")
     _edit(wt, "tests/test_slow_kc57.py", _SLOW)
     _record(wt, ticket.name, outcome="DONE", commit=_commit(wt, "a test that outlives the budget"))
 
@@ -1222,7 +1223,7 @@ def test_harvest_only_runs_tests_when_asked(round_, tmp_path):
 def test_harvest_run_tests_reports_the_failure_tail(round_, tmp_path):
     repo, base, ticket = round_
     wt = _worktree(repo, base, tmp_path)
-    _accepting(wt)
+    _edit(wt, "tools/auto/probe.py", "PROBE = 1\n")
     _edit(wt, "tests/test_probe.py",
           "def test_probe():\n    assert False, 'boom-marker-42'\n")
     _record(wt, ticket.name, outcome="DONE", commit=_commit(wt, "break the test"))
@@ -1251,7 +1252,7 @@ def test_harvest_run_tests_skips_the_roots_with_no_commit(round_, tmp_path, monk
     assert h.verdict == "REWORK"
     assert "commits_ne_1" in _codes(h)
     assert "tests_failed" not in _codes(h)
-    assert h.facts["tests_run"] == "—"
+    assert h.facts["tests_run"] == "skipped: no_progress_row"
 
 
 def test_harvest_last_row_wins(round_, tmp_path):
@@ -1666,9 +1667,10 @@ def test_harvest_reads_the_tree_without_rewriting_its_index(tmp_path):
 
 @pytest.mark.parametrize("kind", ["loose", "absent"])
 def test_harvest_runs_no_roots_outside_a_git_worktree(tmp_path, round_, kind, monkeypatch):
-    """No repo to check out from: no root runs anywhere — not in the loose folder
-    either — and the verdict says the tests could not run, rather than scoring
-    roots that never ran. Nothing is reported that was not learned, nothing raises."""
+    """No repo to check out from: blocking reasons (no_progress_row,
+    commits_ne_1) are already present, so the roots are skipped — not run
+    in the loose folder and not attempted at all. The skip reason records
+    the first blocking code."""
     repo, base, ticket = round_
     path = tmp_path / kind
     if kind == "loose":
@@ -1683,8 +1685,8 @@ def test_harvest_runs_no_roots_outside_a_git_worktree(tmp_path, round_, kind, mo
     h = harvest(ws, ticket, run_tests=True)
     assert h.verdict == "REWORK"
     assert "commits_ne_1" in _codes(h)
-    assert "not a git worktree" in _reason(h, "tests_failed").text
-    assert h.facts["tests_run"] == "checkout✗"
+    assert "tests_failed" not in _codes(h)
+    assert h.facts["tests_run"].startswith("skipped:")
     assert "uncommitted_files" not in _codes(h)
 
 
@@ -1721,3 +1723,146 @@ def test_a_checkout_that_cannot_be_made_is_not_a_pass(tmp_path, monkeypatch):
     assert h.facts["tests_run"] == "checkout✗"
     assert not scratch.exists()
     assert _registered_worktrees(repo) == before
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KC-50: the roots run only for a verdict they can decide
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_harvest_skips_roots_when_blocking_reasons_already_present(
+        round_, tmp_path, monkeypatch):
+    """A worktree at the base, no commit and no PROGRESS row: run_tests=True
+    does not call run_tests_detail, verdict is REWORK, tests_run is the first
+    blocking code, and no tests_failed reason is added."""
+    repo, base, ticket = round_
+    wt = _worktree(repo, base, tmp_path)
+
+    calls: list = []
+    monkeypatch.setattr(harvest_mod, "run_tests_detail",
+                        lambda cwd, **kwargs: calls.append(cwd)
+                        or ("tests:PASS", []))
+
+    h = harvest(wt, ticket, run_tests=True)
+    assert h.verdict == "REWORK"
+    assert calls == []
+    assert h.facts["tests_run"] == "skipped: no_progress_row"
+    assert "tests_failed" not in _codes(h)
+
+
+def test_harvest_runs_roots_when_only_non_blocking_reasons(round_, tmp_path,
+                                                            monkeypatch):
+    """Only a non-blocking off_ticket_files reason: the roots still run."""
+    repo, base, ticket = round_
+    wt = _worktree(repo, base, tmp_path)
+    _stage_probe(wt)
+    _edit(wt, "tools/auto/other.py", "OTHER = 1\n")
+    _record(wt, ticket.name, outcome="DONE",
+            commit=_commit(wt, "probe, plus other"))
+
+    calls: list = []
+    real = harvest_mod.run_tests_detail
+
+    def spy(cwd, **kwargs):
+        calls.append(cwd)
+        return real(cwd, **kwargs)
+
+    monkeypatch.setattr(harvest_mod, "run_tests_detail", spy)
+
+    h = harvest(wt, ticket, run_tests=True)
+    assert len(calls) == 1
+    assert "off_ticket_files" in _codes(h)
+    assert h.facts["tests_run"] != "—"
+    assert not h.facts["tests_run"].startswith("skipped:")
+
+
+def test_harvest_runs_roots_once_for_a_clean_commit(round_, tmp_path,
+                                                     monkeypatch):
+    """One commit, a DONE row, a test file and _shrink the same: run_tests_detail
+    is called once, exactly as today."""
+    repo, base, ticket = round_
+    wt = _worktree(repo, base, tmp_path)
+
+    calls: list = []
+    real = harvest_mod.run_tests_detail
+
+    def spy(cwd, **kwargs):
+        calls.append(cwd)
+        return real(cwd, **kwargs)
+
+    monkeypatch.setattr(harvest_mod, "run_tests_detail", spy)
+
+    sha = _accepting(wt)
+    _record(wt, ticket.name, outcome="DONE", commit=sha)
+
+    h = harvest(wt, ticket, run_tests=True)
+    assert h.verdict == "READY"
+    assert len(calls) == 1
+    assert h.facts["tests_run"].startswith("tests:PASS")
+    assert "tests_failed" not in _codes(h)
+
+
+class _LockRecorder:
+    """A context manager that records enter/exit pairs."""
+
+    def __init__(self):
+        self.entered = 0
+        self.exited = 0
+
+    class _CM:
+        def __init__(self, rec):
+            self._rec = rec
+        def __enter__(self):
+            self._rec.entered += 1
+            return self
+        def __exit__(self, *a):
+            self._rec.exited += 1
+            return False
+
+    def lock(self):
+        return self._CM(self)
+
+
+def test_harvest_lock_entered_only_around_run_tests_detail(
+        round_, tmp_path, monkeypatch):
+    """A lock that records enter/exit sees one pair when the roots run and
+    none when they are skipped."""
+    repo, base, ticket = round_
+    wt = _worktree(repo, base, tmp_path)
+
+    # --- roots run: one enter/exit pair ---
+    sha = _accepting(wt)
+    _record(wt, ticket.name, outcome="DONE", commit=sha)
+    rec = _LockRecorder()
+    h = harvest(wt, ticket, run_tests=True, test_lock=rec.lock())
+    assert h.verdict == "READY"
+    assert rec.entered == 1 and rec.exited == 1
+
+    # --- roots skipped: no enter/exit ---
+    wt2 = _worktree(repo, base, tmp_path, agent="b")
+    rec2 = _LockRecorder()
+    h2 = harvest(wt2, ticket, run_tests=True, test_lock=rec2.lock())
+    assert h2.verdict == "REWORK"
+    assert rec2.entered == 0 and rec2.exited == 0
+
+
+def test_rework_message_skipped_tests_says_not_run(round_, tmp_path):
+    """When roots were skipped, rework_message adds the 'not run' line."""
+    repo, base, ticket = round_
+    wt = _worktree(repo, base, tmp_path)
+    h = harvest(wt, ticket, run_tests=True)
+    assert h.facts["tests_run"].startswith("skipped:")
+    msg = rework_message(h, attempt=1, max_rework=2)
+    assert "The test roots were not run: fix the items above first." in msg
+
+
+def test_rework_message_for_a_run_harvest_has_no_not_run_line(round_, tmp_path):
+    """For a harvest that ran, the text is unchanged — no 'not run' line."""
+    repo, base, ticket = round_
+    wt = _worktree(repo, base, tmp_path)
+    sha = _accepting(wt)
+    _record(wt, ticket.name, outcome="DONE", commit=sha)
+    h = harvest(wt, ticket, run_tests=True)
+    assert h.verdict == "READY"
+    msg = rework_message(h, attempt=1, max_rework=2)
+    assert "not run" not in msg

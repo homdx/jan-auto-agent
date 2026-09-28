@@ -29,6 +29,7 @@ Standard library only.
 
 from __future__ import annotations
 
+import contextlib
 import csv
 import os
 import re
@@ -364,7 +365,8 @@ def _uncommitted_reason(lines: list[str]) -> Reason:
 
 
 def harvest(ws: Workspace, ticket_path: Path, *, run_tests: bool = False,
-            budget_sec: float = 0.0, waited: float = 0.0, ahead: int = 0) -> Harvest:
+            budget_sec: float = 0.0, waited: float = 0.0, ahead: int = 0,
+            test_lock=None) -> Harvest:
     """Score one worktree against its ticket and return the verdict.
 
     *ws* is the agent's checkout (`tools/contest/workspace.py`), *ticket_path*
@@ -374,6 +376,13 @@ def harvest(ws: Workspace, ticket_path: Path, *, run_tests: bool = False,
     that is removed again in `finally`: this tree is never stashed, cleaned or
     checked out, and whatever it holds beyond the commit is reported as the
     non-blocking `uncommitted_files` reason instead of being judged.
+
+    KC-50: the roots run only for a verdict they can still decide. A blocking
+    reason already on the list settles `REWORK`, so they are skipped and
+    `facts["tests_run"]` is `"skipped: <first blocking code>"` — no
+    `tests_failed` for roots that never ran. *test_lock* is the round's
+    serialization as a context manager, held around `run_tests_detail` alone:
+    the git calls and the scorecard never wait behind another agent's roots.
 
     `budget_sec > 0` bounds the roots together (KC-57): past it the suite is
     `tests_slow`, not `tests_failed`, so the rework prompt says to make the
@@ -494,45 +503,55 @@ def harvest(ws: Workspace, ticket_path: Path, *, run_tests: bool = False,
     if commit is None and claim is None:
         commit = _branch_commit(ws.path, facts)
 
-    # No commit above the base: `commits_ne_1` already makes this REWORK, and the
-    # roots would only run the base itself — so they are not run at all.
-    if run_tests and facts.get("commits") != 0:
-        # KC-60: the roots run on the commit this harvest scores, not on this
-        # tree. An untracked file must not make a red commit score `READY`, and
-        # an uncommitted fix must not make a green one score `REWORK`. This tree
-        # is only read, and is left byte for byte as it was — no stash, no
-        # clean, no checkout.
-        outside = _status_lines(ws)
-        if "commits" in facts:
-            # With no resolvable claim there is no scored commit; `HEAD` is the
-            # best commit git has, and a blocking claim reason is already on the
-            # list.
-            target, parent, error = _commit_worktree(ws, resolved or "HEAD")
+    # The roots run only for a verdict they can decide. When at least one
+    # blocking reason is already on the list, the verdict is already REWORK and
+    # the roots cannot change it — so they are not run and no time is wasted.
+    if run_tests:
+        blocking_reasons = [r for r in reasons if r.blocking]
+        if blocking_reasons:
+            facts["tests_run"] = f"skipped: {blocking_reasons[0].code}"
         else:
-            target, parent, error = None, None, f"{ws.path} is not a git worktree"
-        if target is None:
-            # Not run is not passed: the verdict cannot be READY on roots that
-            # never ran, and the reason says why they did not.
-            facts["tests_run"] = "checkout✗"
-            reasons.append(Reason(
-                "tests_failed",
-                f"the tests could not run on commit {(resolved or 'HEAD')[:12]}: {error}",
-            ))
-        else:
-            try:
-                summary, tail = run_tests_detail(target, budget_sec=budget)
-            finally:
-                _drop_worktree(ws, parent)
-            facts["tests_run"] = summary
-            if "budget✗" in summary:
-                reasons.append(_tests_slow_reason(budget, tail))
-            elif "✗" in summary:
+            # KC-60: the roots run on the commit this harvest scores, not on
+            # this tree. An untracked file must not make a red commit score
+            # `READY`, and an uncommitted fix must not make a green one score
+            # `REWORK`. This tree is only read, and is left byte for byte as
+            # it was — no stash, no clean, no checkout.
+            outside = _status_lines(ws)
+            if "commits" in facts:
+                # With no resolvable claim there is no scored commit; `HEAD`
+                # is the best commit git has, and a blocking claim reason is
+                # already on the list.
+                target, parent, error = _commit_worktree(ws, resolved or "HEAD")
+            else:
+                target, parent, error = (None, None,
+                                         f"{ws.path} is not a git worktree")
+            if target is None:
+                # Not run is not passed: the verdict cannot be READY on roots
+                # that never ran, and the reason says why they did not.
+                facts["tests_run"] = "checkout✗"
                 reasons.append(Reason(
                     "tests_failed",
-                    f"the tests do not pass: {summary}\n" + "\n".join(tail),
+                    f"the tests could not run on commit "
+                    f"{(resolved or 'HEAD')[:12]}: {error}",
                 ))
-        if outside:
-            reasons.append(_uncommitted_reason(outside))
+            else:
+                try:
+                    with (test_lock or contextlib.nullcontext()):
+                        summary, tail = run_tests_detail(
+                            target, budget_sec=budget)
+                finally:
+                    _drop_worktree(ws, parent)
+                facts["tests_run"] = summary
+                if "budget✗" in summary:
+                    reasons.append(_tests_slow_reason(budget, tail))
+                elif "✗" in summary:
+                    reasons.append(Reason(
+                        "tests_failed",
+                        f"the tests do not pass: {summary}\n"
+                        + "\n".join(tail),
+                    ))
+            if outside:
+                reasons.append(_uncommitted_reason(outside))
 
     verdict = "REWORK" if any(r.blocking for r in reasons) else "READY"
     return Harvest(
@@ -565,6 +584,10 @@ def rework_message(h: Harvest, attempt: int, max_rework: int) -> str:
         "",
     ]
     lines += [f"- {r.text}" for r in blocking]
+    if str((h.facts or {}).get("tests_run") or "").startswith("skipped:"):
+        lines.append("")
+        lines.append(
+            "The test roots were not run: fix the items above first.")
     if noted:
         lines += ["", "Also noted:"]
         lines += [f"- {r.text}" for r in noted]

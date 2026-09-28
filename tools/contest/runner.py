@@ -209,7 +209,7 @@ import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from typing import Callable
@@ -340,9 +340,9 @@ class _TestRunsLock:
 
 #: The four pytest roots run one worktree at a time. The judge machine takes
 #: about 20 minutes for eight parallel suites and about 105 s for one, so two
-#: agents harvesting at once must not fan the roots out; only the test run is
-#: slow, so the lock is held for the whole `harvest` call — its mechanical part
-#: is a handful of `git` calls and costs nothing next to the roots.
+#: agents harvesting at once must not fan the roots out. KC-50: only the test
+#: run is slow, so the lock is held around `run_tests_detail` alone (see
+#: `_RootsHold`) — a harvest that runs no roots never asks for it.
 _TEST_RUNS_LOCK = _TestRunsLock()
 
 #: KC-27: the heartbeat's git calls per worktree — a short budget, because a
@@ -1291,67 +1291,95 @@ def _budget_left(config) -> float:
         return 0.0
 
 
+class _RootsHold:
+    """The round's serialization for one harvest's roots, as the context
+    manager `harvest` holds around `run_tests_detail` (KC-50).
+
+    On the way in: `_TEST_RUNS_LOCK` under the agent's name — `ahead` and
+    `waited` are read there, for KC-57's turn record — and then, with KC-58's
+    slots armed, one suite slot under `<agent>:harvest`, scoped, with the
+    harvest's own budget as its ceiling. On the way out both go back, slot
+    first. A harvest whose roots are skipped never enters this, so it stands in
+    neither queue. Fail-open throughout: an absent or broken lock or slot is
+    "no queue to stand in", never an exception into a run.
+    """
+
+    def __init__(self, agent: str, ws_path, budget: float, slots: int) -> None:
+        self._agent = agent
+        self._path = ws_path
+        self._budget = budget
+        self._slots = slots
+        self._entered = False
+        self._slot_held = False
+        self.waited: float = 0.0
+        self.ahead: int = 0
+
+    def __enter__(self):
+        lock = _TEST_RUNS_LOCK
+        try:
+            self.ahead = max(0, int(lock.ahead(self._agent)))
+        except (AttributeError, TypeError, ValueError):
+            self.ahead = 0
+        try:
+            self.waited = max(0.0, float(lock.enter(self._agent)))
+            self._entered = True
+        except (AttributeError, TypeError, ValueError):
+            self.waited = 0.0
+        if self._slots > 0:
+            key = f"{self._agent}:harvest"
+            try:
+                held = _SUITE_SLOTS.acquire(key, self._path, ceiling=self._budget, scoped=True)
+                self._slot_held = True
+                # the wait for the slot, not how long it is held — and a wait under
+                # a second is no wait: round 69 printed "held 0s" for every harvest
+                if held >= 1:
+                    _log.info("%s: HARVESTING — waited %s for a suite slot",
+                              self._agent, _age(held))
+            except Exception:  # noqa: BLE001 — the slots never hold up the judge
+                self._slot_held = False
+        return self
+
+    def __exit__(self, *exc):
+        if self._slot_held:
+            self._slot_held = False
+            try:
+                _SUITE_SLOTS.release(f"{self._agent}:harvest")
+            except Exception:  # noqa: BLE001 — the roots are over either way
+                pass
+        if self._entered:
+            self._entered = False
+            try:
+                _TEST_RUNS_LOCK.exit(self._agent)
+            except Exception:  # noqa: BLE001 — the roots are over either way
+                pass
+        return False
+
+
 def _harvest(ws, ticket_path, run_tests, config=None):
     """`harvest` for one worktree, with the pytest roots serialized round-wide.
 
     KC-57: `config.harvest_budget_sec` bounds the roots' wall time, and the lock
     is entered under the agent's name so the turn can carry how long it waited
-    and how many were ahead. Fail-open throughout: an absent or broken lock is
-    "no queue to stand in", so the roots still run and the harvest still ends.
+    and how many were ahead.
 
     KC-58 adds the round's suite slots: the judge's roots take one of them, so
     an agent's own full-suite run never runs beside them. `agent_suite_slots = 0`
-    skips that queue for good — `_TEST_RUNS_LOCK` above stays the only
-    serialization and the call is today's for real. The ceiling here is this
-    harvest's own budget, so the judge is never cut short by an agent's clock,
-    and the slot is released on the way out rather than waited for the judge's
-    last process to exit. It is held under `<agent>:harvest`, scoped to this
-    call and never read off `/proc`.
+    skips that queue for good — `_TEST_RUNS_LOCK` stays the only serialization.
+    The ceiling is this harvest's own budget, so the judge is never cut short
+    by an agent's clock. The slot is held under `<agent>:harvest`, scoped to
+    the roots and never read off `/proc`.
+
+    KC-50: both are taken by `_RootsHold`, which `harvest` holds around
+    `run_tests_detail` alone. The git calls and the scorecard run outside
+    them, and a harvest already `REWORK` on its mechanical facts runs no roots,
+    so it never waits behind another agent's.
     """
     budget = _budget_left(config)
     if not run_tests:
         return harvest(ws, ticket_path, budget_sec=budget)
-    waiter = getattr(ws, "agent", "")
-    ahead = 0
-    waited = 0.0
-    try:
-        ahead = int(_TEST_RUNS_LOCK.ahead(waiter))
-    except (AttributeError, TypeError, ValueError):
-        ahead = 0
-    entered = False
-    try:
-        waited = float(_TEST_RUNS_LOCK.enter(waiter))
-        entered = True
-    except (AttributeError, TypeError, ValueError):
-        waited = 0.0
-    suite_held = False
-    # its own key: the agent may still hold (or be past the ceiling of) a slot
-    # for a background suite, and the judge must neither overwrite nor free it
-    harvest_key = f"{waiter}:harvest"
-    if _suite_slots_armed(config) > 0:
-        try:
-            held = _SUITE_SLOTS.acquire(harvest_key, ws.path, ceiling=budget, scoped=True)
-            suite_held = True
-            # the wait for the slot, not how long it is held — and a wait under
-            # a second is no wait: round 69 printed "held 0s" for every harvest
-            if held >= 1:
-                _log.info("%s: HARVESTING — waited %s for a suite slot", waiter, _age(held))
-        except Exception:  # noqa: BLE001 — the slots never hold up the judge
-            suite_held = False
-    try:
-        return harvest(ws, ticket_path, run_tests=True,
-                       budget_sec=budget, waited=waited, ahead=ahead)
-    finally:
-        if entered:
-            try:
-                _TEST_RUNS_LOCK.exit(waiter)
-            except Exception:  # noqa: BLE001 — the harvest is over either way
-                pass
-        if suite_held:
-            try:
-                _SUITE_SLOTS.release(harvest_key)
-            except Exception:  # noqa: BLE001 — the harvest is over either way
-                pass
+    hold = _RootsHold(getattr(ws, "agent", ""), ws.path, budget, _suite_slots_armed(config))
+    h = harvest(ws, ticket_path, run_tests=True, budget_sec=budget, test_lock=hold)
+    return replace(h, waited=hold.waited, ahead=hold.ahead)
 
 
 def _commits_above(ws: Workspace) -> int:

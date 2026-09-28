@@ -2038,7 +2038,7 @@ def test_harvests_in_series_record_the_wait_and_who_is_ahead(tmp_path, monkeypat
 
     names = ("agent-a", "agent-b", "agent-c")
     sb = Sandbox(tmp_path, names)
-    cfg = make_config(names, harvest_budget_sec=900)
+    cfg = make_config(names, harvest_budget_sec=900, agent_suite_slots=0)
     clock = _FakeClock()
     monkeypatch.setattr(runner_mod, "time", clock)
     lock = runner_mod._TEST_RUNS_LOCK
@@ -2048,13 +2048,17 @@ def test_harvests_in_series_record_the_wait_and_who_is_ahead(tmp_path, monkeypat
     first_inside = threading.Event()
     released = threading.Event()
 
-    def slow(ws, ticket_path, *, run_tests=False, budget_sec=0.0, waited=0.0, ahead=0):
-        seen[ws.agent] = {"waited": waited, "ahead": ahead, "budget": budget_sec}
-        if ws.agent == names[0]:
-            first_inside.set()
-        released.wait(30.0)
+    def slow(ws, ticket_path, *, run_tests=False, budget_sec=0.0, waited=0.0, ahead=0,
+             test_lock=None):
+        with test_lock:
+            w = getattr(test_lock, "waited", waited)
+            a = getattr(test_lock, "ahead", ahead)
+            seen[ws.agent] = {"waited": w, "ahead": a, "budget": budget_sec}
+            if ws.agent == names[0]:
+                first_inside.set()
+            released.wait(30.0)
         return harvest_module.Harvest(verdict="REWORK", reasons=(), commit=None, facts={},
-                                      elapsed=0.01, waited=waited, ahead=ahead)
+                                      elapsed=0.01, waited=w, ahead=a)
 
     monkeypatch.setattr(runner_mod, "harvest", slow)
 
@@ -2099,7 +2103,8 @@ def test_a_missing_lock_is_no_queue_to_stand_in(tmp_path, monkeypatch):
     monkeypatch.setattr(runner_mod, "_TEST_RUNS_LOCK", None)
     got: dict = {}
 
-    def roots(ws, ticket_path, *, run_tests=False, budget_sec=0.0, waited=0.0, ahead=0):
+    def roots(ws, ticket_path, *, run_tests=False, budget_sec=0.0, waited=0.0, ahead=0,
+              test_lock=None):
         got.update(run_tests=run_tests, budget=budget_sec, waited=waited, ahead=ahead)
         return harvest_module.Harvest(verdict="READY", reasons=(), commit=None, facts={},
                                       elapsed=0.01, waited=waited, ahead=ahead)
@@ -6508,8 +6513,12 @@ def test_the_harvest_takes_a_suite_slot_too_and_gives_it_back(tmp_path, monkeypa
     monkeypatch.setattr(_runner_module, "_SUITE_SLOTS", holder)
     got = {}
 
-    def roots(ws, ticket_path, *, run_tests=False, budget_sec=0.0, waited=0.0, ahead=0):
-        got.update(run_tests=run_tests, budget=budget_sec, ahead=ahead)
+    def roots(ws, ticket_path, *, run_tests=False, budget_sec=0.0, waited=0.0, ahead=0,
+              test_lock=None):
+        # KC-50: the real `harvest` takes the slot through `test_lock`, around
+        # the roots it runs
+        with test_lock:
+            got.update(run_tests=run_tests, budget=budget_sec, ahead=ahead)
         return harvest_module.Harvest(verdict="READY", reasons=(), commit=None, facts={},
                                       elapsed=1.0, waited=waited, ahead=ahead)
 
@@ -7463,3 +7472,53 @@ def test_the_nudge_names_the_files_the_ticket_declares():
     assert "idle" not in text and "stalled" not in text.lower()
     bare = first_touch_nudge((), 7)
     assert "- (" in bare and "Nothing has been modified" in bare
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KC-50: a mechanical harvest never waits behind another agent's roots
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("slots", [1, 0])
+def test_kc50_a_mechanical_harvest_does_not_wait_behind_anothers_roots(
+        tmp_path, monkeypatch, slots):
+    """KC-50 acceptance: agent-b's READY commit holds the roots (a fake
+    `run_tests_detail` that blocks on an event); agent-a, at the base with no
+    commit, is harvested meanwhile and finishes without waiting — with the
+    suite slots armed (the shipped default) and off. Before KC-50 it queued
+    on `_TEST_RUNS_LOCK` (and the slot) for the whole of agent-b's roots."""
+    import tools.contest.harvest as harvest_module
+
+    sb = Sandbox(tmp_path, ["agent-a", "agent-b"])
+    cfg = make_config(["agent-a", "agent-b"], agent_suite_slots=slots)
+    _runner_module._SUITE_SLOTS.configure(slots)
+    work_ready(str(sb.ws("agent-b").path), "")
+    inside, release = threading.Event(), threading.Event()
+
+    def blocking(cwd, budget_sec=0.0, **_kw):
+        inside.set()
+        release.wait(60)
+        return ALL_ROOTS_PASS, []
+
+    monkeypatch.setattr(harvest_module, "run_tests_detail", blocking)
+    out: dict = {}
+
+    def go(name):
+        out[name] = _runner_module._harvest(sb.ws(name), sb.ticket_path, True, cfg)
+
+    tb = threading.Thread(target=go, args=("agent-b",), daemon=True)
+    tb.start()
+    try:
+        assert inside.wait(30), "agent-b never reached its roots"
+        ta = threading.Thread(target=go, args=("agent-a",), daemon=True)
+        ta.start()
+        ta.join(15)
+        assert not ta.is_alive(), "agent-a waited behind agent-b's roots"
+    finally:
+        release.set()
+        tb.join(30)
+    assert out["agent-a"].verdict == "REWORK"
+    assert out["agent-a"].facts["tests_run"] == "skipped: no_progress_row"
+    assert out["agent-a"].waited == 0.0 and out["agent-a"].ahead == 0
+    assert out["agent-b"].verdict == "READY"
+    assert _runner_module._TEST_RUNS_LOCK.status("agent-b") is None
