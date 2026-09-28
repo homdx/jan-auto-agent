@@ -970,6 +970,15 @@ class _Handler(BaseHTTPRequestHandler):
             if session is None:
                 return self._not_found(path)
             session.aborted = True
+            # KC-42: opt-in, and off by default so every test that counts an
+            # abort keeps the wait it had. Kilo answers an abort by ending the
+            # turn — a `session.idle`, or a `MessageAbortedError` on the turn
+            # that was already starting — and a scenario that drives the
+            # runner's own abort (a stall, KC-42's session reset) needs the
+            # wait to end on it rather than to sit out the turn deadline.
+            if self.fake.scenario.get("abort_idles"):
+                self.fake._emit({"type": "session.idle",
+                                 "properties": {"sessionID": session.id}})
             return self._json(204)
 
         m = _RE_PERMISSION_REPLY.fullmatch(path)

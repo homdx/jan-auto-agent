@@ -422,6 +422,31 @@ def render_table(state, paths) -> list:
     return lines
 
 
+def _never_started_line(state) -> str:
+    """KC-42: one line naming the agents that never touched a file, or `""`.
+
+    "Three agents never started" is a different finding from "three agents ran
+    out of time", and the table above folds both into a `state` column the
+    operator has to read one row at a time. So the round says it as its own
+    number, with the names, and only when there is at least one: a round with
+    no `DEAD` agent gets the exact summary it got before this ticket.
+    """
+    names = []
+    for run in getattr(state, "agents", None) or ():
+        if str(getattr(getattr(run, "state", None), "value", "")) != "DEAD":
+            continue
+        name = getattr(getattr(run, "agent", None), "name", "")
+        if isinstance(name, str) and name and name not in names:
+            names.append(name)
+    if not names:
+        return ""
+    who = ", ".join(f"`{name}`" for name in names)
+    plural = "s" if len(names) != 1 else ""
+    return (f"> **Never started:** {len(names)} agent{plural} wrote nothing at all — "
+            f"{who}. Nothing on disk to score, so they are not in `entrants.json` "
+            f"and cost no harvest time.")
+
+
 def _gate_lines(out_dir, state) -> list:
     """One markdown bullet per `gate` and `gate-failed` decision of the round.
 
@@ -533,6 +558,9 @@ def write_summary(out_dir, state, base_sha, paths, *, repo=None, gate="") -> Pat
     header.append("")
 
     body = ["## Agents", ""] + render_table(state, paths) + [""]
+    never_started = _never_started_line(state)
+    if never_started:
+        body += [never_started, ""]
     decisions = _gate_lines(out, state)
     decision_part = ["## Decisions worth a look", ""]
     decision_part.extend(decisions if decisions else ["_(no gate decision)_"])

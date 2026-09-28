@@ -1411,7 +1411,7 @@ def _worktree_files(ws: Workspace) -> int:
 
 
 class AgentState(str, Enum):
-    """One agent's position in the loop. The last four are terminal."""
+    """One agent's position in the loop. The last five are terminal."""
 
     CREATED = "CREATED"
     PROMPTED = "PROMPTED"
@@ -1422,10 +1422,17 @@ class AgentState(str, Enum):
     GAVE_UP = "GAVE_UP"
     STALLED = "STALLED"
     ERROR = "ERROR"
+    #: KC-42: the agent never touched a file at all — no edit, no commit, for
+    #: the whole first-touch budget, its nudges and its one session reset.
+    #: Terminal and never harvested: there is nothing to harvest, and the round's
+    #: table shows it apart from the stalls, because "three agents never
+    #: started" is a different failure from "three agents ran out of time".
+    DEAD = "DEAD"
 
     @property
     def terminal(self) -> bool:
-        return self in (AgentState.READY, AgentState.GAVE_UP, AgentState.STALLED, AgentState.ERROR)
+        return self in (AgentState.READY, AgentState.GAVE_UP, AgentState.STALLED,
+                        AgentState.ERROR, AgentState.DEAD)
 
 
 class IdleKind(Enum):
@@ -1505,6 +1512,14 @@ class AgentRun:
     #: the diff's content, not by its file list. Cleared on rework, on a KC-39
     #: reset and on a resume, the way `continues` is; `""` for every other run.
     last_diff_signature: str = ""
+    #: KC-42: the first-touch nudge already spent and the session already reset
+    #: for this attempt — so the budget of `first_touch_nudges` is *per attempt*,
+    #: the way `continues` is, and not per turn. Without that the sequence would
+    #: be nudge, reset, nudge again in the new session, DEAD, and a round that
+    #: asked for one nudge would send two. Cleared on rework, beside
+    #: `continues` and `last_diff_signature`.
+    first_touch_nudges_used: int = 0
+    first_touch_resets: int = 0
     #: KC-10: how many times this run's session was summarised — one per
     #: ``POST /session/{id}/summarize`` that went idle. ``0`` for every run that
     #: never filled a window, and for a `state.json` written before the key.
@@ -1537,6 +1552,7 @@ class AgentRun:
                      "last_error", "resumable", "commit", "cost", "tokens", "reaped",
                       "deadline_commit", "continues", "compactions", "sessions",
                       "sessions_this_attempt",
+                      "first_touch_nudges_used", "first_touch_resets",
                       "last_diff_signature"):
             if name in data:
                 setattr(run, name, data[name])
@@ -2367,6 +2383,277 @@ def _turn_deadline(run: AgentRun, config: ContestConfig, working=None) -> _TurnC
 
     clock.on_deadline = on_deadline
     return clock
+
+
+#: KC-42: how often the first-touch watch asks the worktree whether anything has
+#: happened. Short enough that a deadline is not overshot by a wide margin on a
+#: loaded box, long enough that an eight-agent round is not running `git status`
+#: for an agent that is already working.
+FIRST_TOUCH_POLL_SEC = 5.0
+
+
+class _FirstTouch:
+    """KC-42: the clock on a turn that has not written anything yet.
+
+    Round 64: three of the eight agents finished the round with a worktree
+    byte-identical to the base. One of them spent 22 minutes inside a single
+    `task` call — never silent, so `idle_event_timeout_sec` never fired; busy,
+    so KC-9's continue never ran; and with nothing on disk, so there was no
+    diff to compare. None of the runner's three clocks asks the only question
+    that separates a working agent from a useless one: *has the worktree
+    changed at all?*
+
+    So this one does, and it is measured on the **worktree**, never on the
+    event stream: a provider in an offline/retry loop emits a heartbeat every
+    five minutes and looks, to any clock on events, exactly like an agent at
+    work. The predicate is deliberately the dumbest one available — "touched
+    anything at all" — because anything smarter would start rejecting
+    exploratory work, which is the opposite of the point.
+
+    Armed from a turn's prompt for `first_touch_sec`; at the deadline it sends
+    one nudge into the session, names the ticket's own files and says plainly
+    that nothing has been modified, re-arms, and repeats at most
+    `first_touch_nudges` times. With the budget spent and the tree still
+    untouched it escalates the way KC-39 does for a repeated diff — `abort` and
+    a fresh session with the same model, `run.attempt` unchanged — subject to
+    `max_sessions_per_attempt`. With no session left to open, or with that
+    spent too, the turn is `DEAD`.
+
+    One instance per turn, started by `run_agent` and stopped by it in a
+    `finally`. Every read is fail-open: a worktree that cannot be read (FL-2's
+    `TreeReadError`) is "no news", never a raise and never a reason to declare
+    anything — a tree the runner cannot see must not be able to end a round.
+    """
+
+    def __init__(self, run: "AgentRun", ws: Workspace, spec, config, *, nudge, reset, kill,
+                 budget: float, nudges: int, ceiling: int = 0):
+        self.run, self.ws, self.spec, self.config = run, ws, spec, config
+        self._nudge, self._reset, self._kill = nudge, reset, kill
+        self.budget = float(budget)
+        self.nudges = max(0, int(nudges))
+        #: KC-39's `max_sessions_per_attempt`, the same ceiling the repeated-diff
+        #: reset spends: a first-touch reset is a session like any other, and a
+        #: round that budgeted one session per attempt must not acquire a second
+        #: one here. 0 or already spent → the escalation is unavailable and the
+        #: turn goes straight to `DEAD`.
+        self.ceiling = max(0, int(ceiling))
+        #: What this turn's watch did, in order — `nudged` the prompts, `dead`
+        #: whether it ended the turn. Both are *this turn's*; the attempt's
+        #: running totals are on the run, because the budget is per attempt and
+        #: a fresh session must not be handed a second nudge.
+        self.nudged = 0
+        self.dead = False
+        self._touched = False
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._deadline = time.monotonic() + self.budget
+
+    def touched(self) -> bool:
+        """Has the watch already disarmed — the worktree showed a sign of life?"""
+        return self._touched
+
+    def elapsed(self) -> float:
+        """Seconds this watch has been armed — what the nudge reports as elapsed.
+
+        Measured from the arming, not from the start of the turn, so a watch
+        armed for the second turn of a rework does not claim its predecessor's
+        time. It only ever reaches one `first_touch_sec`, since that is the
+        deadline it fires at.
+        """
+        return max(0.0, time.monotonic() - (self._deadline - self.budget))
+
+    # ── the predicate ─────────────────────────────────────────────────────
+    def _has_touched(self) -> bool:
+        """Has this worktree any sign of the agent's work? Never raises.
+
+        `_commits_above` is asked first because it is a `rev-list --count` off
+        the branch — cheap, and it is the half KC-21's gate is built on. A
+        commit with a clean tree is a touched worktree, so a deadline commit
+        (KC-41) disarms this too, not a false positive. `_dirty_tree` excludes
+        `runs/`, so the runner's own progress row never counts as the agent
+        working.
+        """
+        try:
+            if _commits_above(self.ws) > 0:
+                return True
+            return bool(_dirty_tree(self.ws))
+        except TreeReadError as exc:
+            # FL-2: unreadable is not "clean", and it is certainly not "touched"
+            _log.debug("%s: first-touch: tree unreadable — %s", self.spec.name, _brief(str(exc)))
+            return False
+        except Exception as exc:  # noqa: BLE001 — a read that raises is no news
+            _log.debug("%s: first-touch: %s: %s", self.spec.name, type(exc).__name__, exc)
+            return False
+
+    # ── the loop ──────────────────────────────────────────────────────────
+    def start(self) -> "_FirstTouch":
+        """Watch on a thread of its own.
+
+        The watch has to keep asking the worktree while the turn is in flight,
+        and the turn is one blocking `wait_idle` — the runner's main thread for
+        this agent is inside it and cannot poll anything. The nudge and the
+        escalation go out from here, on this thread, for the same reason: they
+        are the runner's own writes into a session that is busy answering, and
+        the wait has to be woken by something.
+        """
+        if self.budget <= 0:
+            return self
+        self._thread = threading.Thread(
+            target=self._watch, name=f"first-touch-{self.spec.name}", daemon=True)
+        self._thread.start()
+        return self
+
+    def stop(self) -> None:
+        self._stop.set()
+        thread, self._thread = self._thread, None
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=FIRST_TOUCH_POLL_SEC * 2)
+
+    def _watch(self) -> None:
+        while not self._stop.is_set():
+            # the stop wins even when the deadline has just passed, so a turn
+            # that ended on its own never gets a nudge after the fact
+            if self._stop.wait(timeout=max(0.2, FIRST_TOUCH_POLL_SEC)):
+                return
+            if self._has_touched():
+                # disarmed for good: a `git checkout` by the model does not
+                # resurrect the deadline, and a rework starts its own watch
+                self._touched = True
+                return
+            if time.monotonic() < self._deadline:
+                continue
+            if not self._fire():
+                return
+
+    def _fire(self) -> bool:
+        """One deadline passed with an untouched tree. False when the turn ends.
+
+        The nudge first, and the prompt is the runner's own — sent into a
+        session that is still working, which is the point: round 64's
+        `nex-n2-5-pro` was never idle, so nothing else could have said
+        anything to it. After the attempt's budget of nudges, the session is
+        reset (KC-39's escape hatch for a model wedged in a tool loop, which
+        cannot be talked out of it inside the session that is wedged), and after
+        that the turn is `DEAD`.
+
+        The budget is counted on `run`, not here, so the fresh session the reset
+        opens does not start over with a full one: a round that asked for one
+        nudge gets one nudge, one reset and then `DEAD`, whether that is one
+        turn's worth of waiting or two.
+        """
+        spent = int(getattr(self.run, "first_touch_nudges_used", 0) or 0)
+        if spent < self.nudges:
+            self.run.first_touch_nudges_used = spent + 1
+            self.nudged += 1
+            # read before the re-arm below, which moves the origin `elapsed`
+            # measures from: after it, every nudge said "0s into this turn"
+            elapsed = self.elapsed()
+            self._deadline = time.monotonic() + self.budget
+            _log.info("%s: nothing modified after %s (nudge %d of %d)",
+                      self.spec.name, _age(self.budget), spent + 1, self.nudges)
+            try:
+                self._nudge(elapsed)
+            except Exception as exc:  # noqa: BLE001 — a refused nudge is not a reason
+                _log.warning("%s: first-touch nudge: %s: %s", self.spec.name,
+                             type(exc).__name__, _brief(str(exc)))
+            return not self._stop.is_set()
+        self._deadline = time.monotonic() + self.budget
+        if not int(getattr(self.run, "first_touch_resets", 0) or 0):
+            self.run.first_touch_resets = 1
+            if not self.ceiling:
+                _log.info("%s: still nothing modified after %s and %d nudge(s), and "
+                          "the round allows no second session — DEAD", self.spec.name,
+                          _age(self.budget), spent)
+                self._stop.set()
+                self.dead = True
+                self._kill()
+                return False
+            _log.info("%s: still nothing modified after %s and %d nudge(s) — new session",
+                      self.spec.name, _age(self.budget), spent)
+            try:
+                self._reset()
+            except Exception as exc:  # noqa: BLE001 — the kill below is the fallback
+                _log.warning("%s: first-touch reset: %s: %s", self.spec.name,
+                             type(exc).__name__, _brief(str(exc)))
+            return not self._stop.is_set()
+        _log.info("%s: nothing modified in %d rounds of the clock — DEAD",
+                  self.spec.name, spent)
+        self._stop.set()
+        self.dead = True
+        try:
+            self._kill()
+        except Exception as exc:  # noqa: BLE001 — the turn is ended either way
+            _log.warning("%s: first-touch kill: %s: %s", self.spec.name,
+                         type(exc).__name__, _brief(str(exc)))
+        return False
+
+
+#: KC-42: the nudge sent into a turn that has not written anything. Plain text,
+#: no ticket repeated, the same shape as KC-9's `CONTINUE_PROMPT`: the state
+#: named plainly, a list of what the ticket declares, and no critique of how
+#: the agent has spent the time — the runner cannot tell whether it is reading
+#: the ticket, stuck in a sub-agent, or looping on a refused provider, so any
+#: guess would be a guess in the model's face.
+FIRST_TOUCH_NUDGE = (
+    "Nothing has been modified in this worktree yet — {elapsed} into this turn and "
+    "not one file changed and no commit made. This ticket asks for changes to:\n\n"
+    "{files}\n\n"
+    "Open the first of those files and start the change now. Do not re-read the "
+    "ticket, do not re-plan, and do not delegate this to a sub-agent: the turn's "
+    "clock is running, and the next check is against the worktree, not against "
+    "whether you answered."
+)
+
+
+def first_touch_nudge(files, elapsed: float) -> str:
+    """KC-42: the nudge, with the ticket's declared paths and the elapsed time.
+
+    *files* is `declared_files(ticket_path)` — the same tuple `harvest` and the
+    policy's context are built from, so the model is told exactly the paths the
+    gates will read. An empty tuple, or one no longer on disk, degrades to the
+    ticket's own path rather than to a bare paragraph with nothing in it: the
+    nudge is never sent with no list of what to change.
+    """
+    names = [f"- `{name}`" for name in files if name]
+    if not names:
+        names = ["- (the ticket file named by the round prompt)"]
+    return FIRST_TOUCH_NUDGE.format(elapsed=_age(elapsed), files="\n".join(names))
+
+
+def _first_touch_budget(config) -> float:
+    """KC-42: `[contest] first_touch_sec`, read fail-open as seconds.
+
+    A missing config, a config object without the key, and a value that is not
+    a number at all all answer ``0``, which is *off* — the tree before this
+    ticket, byte for byte. So a hand-built config with the key left out cannot
+    acquire a clock the round never asked for. ``roster`` rejects a malformed
+    ini value at load time and clamps a negative one to 0 here.
+    """
+    value = getattr(config, "first_touch_sec", 0)
+    if isinstance(value, bool):
+        return 0.0
+    try:
+        return max(0.0, float(str(value).strip() or 0))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _first_touch_nudges(config) -> int:
+    """KC-42: `[contest] first_touch_nudges`, read fail-open as a count.
+
+    0 is a real setting — a turn that has written nothing by its first deadline
+    goes straight to the escalation — so it is kept, and only a value that is
+    not a number, or a negative one, is refused the way `_sessions_ceiling`
+    refuses it.
+    """
+    value = getattr(config, "first_touch_nudges", 0)
+    if isinstance(value, bool):
+        return 0
+    try:
+        count = int(str(value).strip() or 0)
+    except (TypeError, ValueError):
+        return 0
+    return count if count > 0 else 0
 
 
 def _wait_turn(backend: ContestBackend, session: SessionRef, config: ContestConfig,
@@ -3286,6 +3573,13 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
     # Kilo's shutdown, so the turn ends as a plain idle and the next prompt
     # compacts
     context_aborted = [False]
+    # KC-42: what the first-touch watch has decided for the turn in flight —
+    # "" while the turn is ordinary, `"reset"` when the watch wants a fresh
+    # session, `"dead"` when the turn is over. Set on the watch's thread, read
+    # on this one right after the wait returns: a terminal state and a
+    # `POST /session` are this thread's to make, so the watch only asks, and it
+    # never writes the state of another thread.
+    escalate = [""]
     # KC-58: the round's suite slots, armed once per agent — the queue is shared
     # round-wide, so every agent answers from one semaphore, and a config that
     # names no key arms the ticket's default of one.
@@ -3779,6 +4073,58 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         return (f"context {now['tokens']:,} tokens = {now['fill']:.1f}% of "
                 f"{now['size']:,} ({now['source']}), compact at {now['compact_at']:g}%")
 
+    def first_touch_watch(turn: dict) -> "_FirstTouch | None":
+        """KC-42: the watch on this turn, or None when the ticket is off.
+
+        One per turn, armed from the turn's own `sent_at`, and stopped by the
+        `finally` of the wait below. The three things it can do are all the
+        runner's own writes, and each is done where it belongs:
+
+        * the **nudge** is a `prompt` into a session that is still working, so
+          it goes from the watch's own thread — the main thread is inside
+          `wait_idle` and cannot send anything, which is exactly why round
+          64's worst slot could not be reached at all;
+        * the **reset** and the **DEAD** both need this thread — a replacement
+          session is a new `POST /session` and `run.session_id` with it, and
+          the terminal state is `on_transition`. So the watch asks for them
+          through `escalate` and aborts, and the WAITING loop below carries
+          them out.
+        """
+        budget = _first_touch_budget(config)
+        if budget <= 0:
+            return None
+        if escalate[0]:
+            escalate[0] = ""
+        ceiling = _sessions_ceiling(config)
+        # a session is available only below KC-39's ceiling, which is per
+        # attempt; `0` (the ceiling off) and an attempt that has spent it both
+        # mean the escalation is unavailable, and the turn goes straight to DEAD
+        room = 1 if 0 < ceiling > run.sessions_this_attempt else 0
+        return _FirstTouch(
+            run, ws, spec, config,
+            nudge=lambda since: backend.prompt(
+                session,
+                first_touch_nudge(ticket_files, since)
+                + prompt_workers_note(out_dir, config)),
+            reset=lambda: _wake_for_first_touch(turn, "reset"),
+            kill=lambda: _wake_for_first_touch(turn, "dead"),
+            budget=budget, nudges=_first_touch_nudges(config), ceiling=room).start()
+
+    def _wake_for_first_touch(turn: dict, what: str) -> None:
+        """KC-42: end the wait so the WAITING loop can do *what*.
+
+        The watch has already spent its nudges and cannot ask for a session or
+        a terminal state itself, so it says which one it wants and stops the
+        wait the way `stall` does — an abort. `wait_idle` then comes back on
+        the `session.idle` (or `MessageAbortedError`) the abort brings, and the
+        branch below reads `escalate` before it reads any of that as a model
+        error. `backend.interrupt` is deliberately *not* called: it stops the
+        event tap for good, so a reset could never wait in the new session.
+        """
+        turn["first_touch_wake"] = what
+        escalate[0] = what
+        _abort_quietly(backend, session)
+
     def swap_session(turn: dict) -> str | None:
         """KC-69: go on in a new session after a compact that did not free the
         context; the error line if ``POST /session`` failed.
@@ -4049,14 +4395,69 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
             clock = _turn_deadline(run, config, working)
             run._turn_clock = clock
             context_aborted[0] = False
+            # KC-42: the watch on a turn that has written nothing yet. It is
+            # armed here, from the turn's own prompt, and stopped in the same
+            # `finally` as the wait — so a turn that ends on its own can never
+            # be nudged after the fact, and a nudge is never sent into a
+            # session this turn is not holding.
+            touch = first_touch_watch(turn)
             try:
                 idle = _wait_turn(backend, session, config,
                                   on_permission=on_permission, on_question=on_question,
                                   on_deadline=clock.on_deadline, since=since)
             finally:
                 run._turn_clock = None
+                if touch is not None:
+                    touch.stop()
                 while context_stopper:
                     context_stopper.pop().cancel()
+            if escalate[0]:
+                # KC-42: the watch ended this turn — a fresh session, or DEAD.
+                # Read before anything else: the abort that woke the wait comes
+                # back as `MessageAbortedError` or as an idle, and left alone
+                # both of those would be scored as an ordinary ending.
+                wanted = escalate[0]
+                escalate[0] = ""
+                turn["first_touch_nudges"] = int(run.first_touch_nudges_used or 0)
+                if touch is not None and touch.touched():
+                    # the model wrote something in the window between the watch's
+                    # last read and the abort: the turn is an ordinary one again
+                    turn["first_touch_touched"] = True
+                elif wanted == "dead":
+                    turn["first_touch_reset"] = int(run.first_touch_resets or 0)
+                    turn["first_touch_dead"] = True
+                    run.turns.append(turn)
+                    _append_jsonl(agent_dir / "turns.jsonl", {"agent": spec.name, **turn})
+                    # KC-42: DEAD releases the slot at once. It is never
+                    # harvested and never patched — there is nothing on disk to
+                    # score, which is the whole of the finding — and the round
+                    # does not wait for it any longer than the abort took.
+                    _log.info("%s: DEAD — nothing modified after %d nudge(s) and %d "
+                              "fresh session(s); the slot is released", spec.name,
+                              turn["first_touch_nudges"], turn["first_touch_reset"])
+                    return finish(AgentState.DEAD,
+                                  f"nothing modified in {turn['first_touch_nudges'] + 1} "
+                                  f"rounds of the {_first_touch_budget(config):g}s "
+                                  "first-touch clock")
+                else:
+                    turn["first_touch_reset"] = 1
+                    _log.info("%s: nothing modified — a fresh session, %d of %d",
+                              spec.name, run.sessions_this_attempt + 1,
+                              _sessions_ceiling(config))
+                    failed = _replace_session(turn, reason="first_touch")
+                    if failed is not None:
+                        run.turns.append(turn)
+                        _append_jsonl(agent_dir / "turns.jsonl", {"agent": spec.name, **turn})
+                        run.resumable = True
+                        return finish(AgentState.ERROR, failed)
+                    run.continues = 0
+                    run.last_diff_signature = ""
+                    run.turns.append(turn)
+                    _append_jsonl(agent_dir / "turns.jsonl", {"agent": spec.name, **turn})
+                    continue_text = round_prompt(
+                        spec.name, ticket_path, ws.base_sha, dirty="",
+                        tmp_dir=scratch_arg, tmp_roots=tuple(tmp_roots))
+                    continue
             if (context_aborted[0] and idle.status == "error"
                     and _is_external_abort(idle.error)):
                 # round 49 (sensenova-6-8-flash-lite-var1, at 82.5 %): the
@@ -4619,6 +5020,11 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
             # it resets there too.
             run.continues = 0
             run.last_diff_signature = ""
+            # KC-42: the attempt has just started, so the first-touch budget and
+            # the one reset come back with it — the same reasoning as
+            # `continues` and `last_diff_signature` above.
+            run.first_touch_nudges_used = 0
+            run.first_touch_resets = 0
             # KC-39: the attempt has just started, so the session it holds is its
             # first.
             run.sessions_this_attempt = 1
@@ -4755,6 +5161,11 @@ def _plan(config: ContestConfig, workspaces: list, ticket_path: Path,
                 # restart, which would open a session the ticket did not ask for.
                 run.sessions_this_attempt = 0
                 run.last_diff_signature = ""
+                # KC-42: same reasoning for the first-touch budget — the restart
+                # is a new attempt, and a nudge already spent in the round that
+                # died must not be read as this one's.
+                run.first_touch_nudges_used = 0
+                run.first_touch_resets = 0
                 # KC-22, `--resume` into a worktree that still holds the agent's
                 # uncommitted work: the fresh session learns of it on its first
                 # prompt. A clean tree (or one with a commit under it) carries no

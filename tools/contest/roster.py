@@ -92,6 +92,8 @@ CONTEST_KEYS = (
     "max_rework",
     "max_continues_per_attempt",
     "max_sessions_per_attempt",
+    "first_touch_sec",
+    "first_touch_nudges",
     "turn_timeout_sec",
     "turn_extend_sec",
     "turn_max_sec",
@@ -269,6 +271,16 @@ class ContestConfig:
     #: swaps). The reset only fires below it; per attempt, not per run, so a
     #: rework gets the allowance back. 0 turns the reset off, 1 means none.
     max_sessions_per_attempt: int = 2
+    #: KC-42: seconds from a turn's prompt in which the worktree must show some
+    #: sign of life — a modified file or a commit. Past it the agent is nudged
+    #: once per `first_touch_nudges`; past the last nudge with the tree still
+    #: untouched it is reset into a fresh session, and failing that ends
+    #: `DEAD`. 0 turns the whole ticket off, which is today's behaviour byte for
+    #: byte.
+    first_touch_sec: float = 420.0
+    #: KC-42: how many nudges one attempt may send before the escalation. 0
+    #: means the very first deadline is the last one.
+    first_touch_nudges: int = 1
     turn_timeout_sec: int = 1800
     #: KC-36: seconds a turn's deadline is pushed, per extension, when the
     #: worktree's churn has grown since the last deadline. 0 = the turn clock
@@ -775,6 +787,8 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
         max_rework=limit("max_rework", 2),
         max_continues_per_attempt=limit("max_continues_per_attempt", 2),
         max_sessions_per_attempt=max(0, limit("max_sessions_per_attempt", 2)),
+        first_touch_sec=seconds("first_touch_sec", 420.0),
+        first_touch_nudges=max(0, limit("first_touch_nudges", 1)),
         turn_timeout_sec=turn_timeout,
         turn_extend_sec=turn_extend,
         turn_max_sec=turn_max,

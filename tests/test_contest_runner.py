@@ -50,8 +50,10 @@ for _p in (str(REPO_ROOT), str(TESTS_DIR)):
 import _kilo_fake  # noqa: E402
 from _kilo_fake import FakeKiloServer  # noqa: E402
 from tools.auto.llm_profile import LlmSettings  # noqa: E402
+from tools.contest import export  # noqa: E402
 from tools.contest.backend import ContestBackendError, KiloBackend  # noqa: E402
 from tools.contest.export import render_table  # noqa: E402
+from tools.contest.cli import export_patches  # noqa: E402
 from tools.contest.kilo_client import (  # noqa: E402
     AGENT_TEST_TIMEOUT_MS, IdleResult, KiloServer, SessionRef)
 from tools.contest.policy import Policy  # noqa: E402
@@ -408,9 +410,13 @@ def make_config(agents, **over) -> ContestConfig:
     # and the roster default is 15 s — four silence tests each slept it out for
     # real (~+70 s on the suite).
     # 0 here; the tests that are *about* the backoff set their own.
+    # KC-42: `first_touch_sec = 0` is the ticket's off switch, so every test
+    # here runs without a first-touch clock. The six that are about it set the
+    # key themselves; a default of 420 would put a live watch on every other
+    # turn in this file, which is not what any of them is testing.
     kw = dict(agents=specs, max_parallel=1, max_rework=2, turn_timeout_sec=300,
               turn_extend_sec=0, idle_event_timeout_sec=60, max_questions_per_turn=3,
-              error_retry_backoff_sec=0,
+              error_retry_backoff_sec=0, first_touch_sec=0,
               tmp_roots=("/tmp/*",), gate_max_calls_per_session=20, gate_settings=gate)
     kw.update(over)
     return ContestConfig(**kw)
@@ -568,10 +574,14 @@ def _permission_turn(on_prompt, patterns):
 
 def test_agent_state_is_a_string_enum_whose_last_four_are_terminal():
     names = [s.name for s in AgentState]
+    # KC-42 adds DEAD: the agent never touched a file, so there is nothing to
+    # harvest and nothing to score — the fifth terminal state, and reported
+    # apart from the stalls in the round's own table.
     assert names == ["CREATED", "PROMPTED", "WAITING", "HARVESTING", "REWORK",
-                     "READY", "GAVE_UP", "STALLED", "ERROR"]
+                     "READY", "GAVE_UP", "STALLED", "ERROR", "DEAD"]
     assert AgentState.READY == "READY" and json.dumps(AgentState.READY) == '"READY"'
-    assert [s.terminal for s in AgentState] == [False] * 5 + [True] * 4
+    assert [s.terminal for s in AgentState] == [False] * 5 + [True] * 5
+    assert AgentState.DEAD == "DEAD" and AgentState.DEAD.value == "DEAD"
 
 
 def test_round_prompt_carries_both_commands_the_name_the_base_and_the_rule(tmp_path):
@@ -4700,7 +4710,8 @@ def test_continue_turns_and_the_resume_nudge_leave_the_json_shape_alone(tmp_path
     assert set(agent) == {"agent", "workspace", "session_id", "state", "attempt", "turns",
                           "permissions", "questions", "last_error", "resumable", "commit",
                           "cost", "tokens", "deadline_commit", "continues", "compactions",
-                          "sessions", "sessions_this_attempt", "last_diff_signature"}
+                              "sessions", "sessions_this_attempt", "last_diff_signature",
+                              "first_touch_nudges_used", "first_touch_resets"}
     # KC-41: the key is present on a run that never used it, and reads `false` —
     # a consumer cannot tell "the model claimed this" from "the key was written
     # before the flag existed" by its presence alone
@@ -7115,3 +7126,338 @@ def test_the_state_shows_the_sessions_a_run_has_opened(tmp_path):
     columns = [cell.strip() for cell in lines[0].strip("|").split("|")]
     cells = [cell.strip() for cell in lines[2].strip("|").split("|")]
     assert cells[columns.index("sessions")] == "2"
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# KC-42: an agent that has touched no file is nudged, then reset, then DEAD
+# ═════════════════════════════════════════════════════════════════════════════
+
+#: A turn that emits `busy` forever and writes nothing — round 64's
+#: `nex-n2-5-pro`: never silent, so the silence clock never fires; busy, so
+#: KC-9's continue never runs; and nothing on disk, so there is no diff for
+#: KC-39 to compare. The `idle: False` is what keeps the turn alive past its
+#: scripted events.
+NEVER_TOUCHES = {"events": ["busy"], "idle": False}
+
+
+def _ft_config(**over):
+    """`make_config` with the first-touch clock on and everything else short.
+
+    The poll is shortened too, so a deadline is overshot by a fraction of a
+    second rather than by the production 5 s — the clock itself is unchanged,
+    only how often the watch asks the worktree.
+    """
+    kw = dict(first_touch_sec=2, first_touch_nudges=1, max_sessions_per_attempt=2,
+              turn_timeout_sec=300, idle_event_timeout_sec=60,
+              error_retry_backoff_sec=0)
+    kw.update(over)
+    return make_config(["agent-a"], **kw)
+
+
+def _fast_poll(monkeypatch, seconds: float = 0.1) -> None:
+    import tools.contest.runner as runner_mod
+    monkeypatch.setattr(runner_mod, "FIRST_TOUCH_POLL_SEC", seconds)
+
+
+def test_first_touch_nudge_reset_and_dead(tmp_path, monkeypatch):
+    """Acceptance 1: an agent that emits events continuously and never writes a
+    file is nudged at the first deadline, gets a second session at the second,
+    and is `DEAD` at the third — one nudge, one reset, one dead end, all three
+    recorded in `turns.jsonl`."""
+    _fast_poll(monkeypatch)
+    # `abort_idles` is the live server's answer to an abort: the turn ends and
+    # the wait comes back, which is what lets the reset and the DEAD land
+    # instead of the wait sitting out the turn deadline.
+    scenario = {"abort_idles": True, "turns": [dict(NEVER_TOUCHES)] * 4}
+    sb = Sandbox(tmp_path)
+    cfg = _ft_config()
+    with _BenchFake(scenario) as fake:
+        run = Harness(sb, fake, cfg).go()
+        prompts = _prompts(fake)
+    assert run.state is AgentState.DEAD, (run.state, run.last_error)
+    assert "nothing modified" in (run.last_error or "")
+
+    # the nudge went into the *first* session, which never idles
+    (sid0, nudge) = prompts[1]
+    assert sid0 == fake.sessions()[0].id
+    assert "Nothing has been modified" in nudge
+    assert "pkg/thing.py" in nudge and "tests/test_thing.py" in nudge
+    # the time is the deadline's, read before the re-arm: it said "0s" once
+    assert "0s into this turn" not in nudge and "2s into this turn" in nudge
+
+    # two sessions, and the round prompt is what the second one is opened with
+    assert len(fake.sessions()) == 2 and run.sessions == 2
+    assert prompts[2][0] == fake.sessions()[1].id
+    assert sb.base_sha in prompts[2][1]
+
+    rows = _jsonl(sb.out_dir / "agent-a" / "turns.jsonl")
+    # the attempt's budget is per attempt, so the fresh session does not get a
+    # second nudge: nudge, reset, DEAD — two turns, the second one in the new
+    # session, and the second session is never prompted at all
+    assert len(rows) == 2
+    first, second = rows
+    assert first["first_touch_nudges"] == 1 and first["first_touch_reset"] == 1
+    assert first["new_session"] == fake.sessions()[1].id
+    assert first["session_reason"] == "first_touch"
+    assert second["first_touch_nudges"] == 1 and second["first_touch_reset"] == 1
+    assert second.get("first_touch_dead")
+    assert "new_session" not in second
+    assert run.state is AgentState.DEAD
+    assert run.first_touch_nudges_used == 1 and run.first_touch_resets == 1
+
+
+def test_a_touch_before_the_deadline_never_nudges(tmp_path, monkeypatch):
+    """Acceptance 2: an agent that writes before its first deadline is never
+    nudged, and the clock is not re-armed for the rest of the turn even when the
+    tree goes clean again — a `git checkout` by the model does not resurrect the
+    deadline.
+
+    One turn, and the shape is the whole of the clause: it edits, throws the
+    edit away with `git checkout`, and then says nothing for longer than two
+    first-touch deadlines. A watch that re-armed on a clean tree would nudge
+    there; a watch that is disarmed for good does not. A second turn would prove
+    nothing — the watch is per turn, and its budget is per attempt."""
+    _fast_poll(monkeypatch)
+
+    def write_then_revert_and_hold(directory, text):
+        _write(Path(directory) / "pkg" / "thing.py",
+               f"def thing():\n    return 9  # {time.time()}\n")
+        time.sleep(5)          # past the first deadline, with the edit in place
+        _git(directory, "checkout", "--", "pkg/thing.py")
+        time.sleep(5)          # and past another, with the tree clean again
+
+    scenario = {"turns": [
+        {"on_prompt": write_then_revert_and_hold, "events": ["busy", "idle"]},
+    ]}
+    sb = Sandbox(tmp_path)
+    cfg = _ft_config()
+    with _BenchFake(scenario) as fake:
+        run = Harness(sb, fake, cfg).go()
+        prompts = _prompts(fake)
+    # every prompt is one the runner would have sent anyway: not one is the nudge
+    assert not any("Nothing has been modified" in text for _sid, text in prompts)
+    assert not any(t.get("first_touch_nudges") for t in run.turns)
+    # one session, so the escalation never fired either
+    assert len(fake.sessions()) == 1
+    # the turn went on through the ordinary edges — not DEAD
+    assert run.state is not AgentState.DEAD
+
+
+def test_a_touch_after_a_nudge_ends_the_escalation(tmp_path, monkeypatch):
+    """Acceptance 3: the agent writes after the nudge, so no session is reset
+    and no `DEAD` follows — the turn proceeds through the ordinary edges."""
+    _fast_poll(monkeypatch)
+    sb = Sandbox(tmp_path)
+    cfg = _ft_config()
+    # turn 0 chats and writes nothing, so the nudge is sent into it; the nudge
+    # itself is turn 1, and it is turn 1 that answers by doing the ticket
+    scenario = {"turns": [
+        {"events": ["busy"], "idle": False},
+        {"on_prompt": work_ready, "events": ["busy", "idle"]},
+    ]}
+    with _BenchFake(scenario) as fake:
+        run = Harness(sb, fake, cfg).go()
+        prompts = _prompts(fake)
+        sessions = fake.sessions()
+    # the nudge reached the session and the model answered it by writing
+    assert any("Nothing has been modified" in text for _s, text in prompts)
+    # one session only: the escalation never fired
+    assert len(sessions) == 1
+    assert run.state is not AgentState.DEAD
+    assert not any(t.get("first_touch_reset") or t.get("first_touch_dead")
+                   for t in run.turns)
+    # and the work it did write is committed and scored
+    _assert_ready(run, sb.ws("agent-a"))
+
+
+def test_a_dead_agent_is_not_harvested_and_never_holds_the_round(tmp_path, monkeypatch):
+    """Acceptance 4: a `DEAD` agent is absent from the harvest, has no patch and
+    no `.diff`, is reported as `DEAD` in `SUMMARY.md` beside its own count, and
+    the round returns on its own — no other agent's slot is held up by it."""
+    _fast_poll(monkeypatch)
+
+    class _ByAgentHandler(_BenchHandler):
+        """Pick the script off the session a prompt names, not off the fake.
+
+        `self.fake.scenario` is one global, and a two-agent round interleaves
+        its sessions — so a global is whichever agent posted last. `POST
+        /session` names the worktree in its query and `prompt_async` names the
+        session, and the sandbox puts each agent in `wt/<agent>`: both are
+        enough to keep the assignment for the whole run, including the second
+        session an agent opens for itself mid-round.
+        """
+        def _script_for(self, sid=None, directory=None):
+            name = None
+            if directory is None and sid is not None:
+                session = self.fake._session(sid)
+                directory = getattr(session, "directory", None)
+            if directory is not None:
+                name = Path(directory).name
+            if name in getattr(self.fake, "scripts", {}):
+                self.fake.scenario = self.fake.scripts[name]
+            return self.fake.scenario
+
+        def do_POST(self):
+            if self.path.split("?", 1)[0] == "/session":
+                from urllib.parse import parse_qs, urlparse
+                query = {k: v[0] for k, v in parse_qs(urlparse(self.path).query).items()}
+                self._script_for(directory=query.get("directory") or self.fake.directory)
+                return super().do_POST()
+            m = _kilo_fake._RE_PROMPT.fullmatch(self.path.split("?", 1)[0])
+            if m:
+                self._script_for(sid=m.group(1))
+            return super().do_POST()
+
+    class _ByAgent(_BenchFake):
+        """The one fake that hands each agent its own script (see the handler)."""
+
+        def start(self):
+            if self._httpd is not None:
+                return self
+            httpd = ThreadingHTTPServer((self.host, self._port), _ByAgentHandler)
+            httpd._fake = self
+            httpd.daemon_threads = True
+            self._httpd = httpd
+            self._base = f"http://{self.host}:{httpd.server_address[1]}"
+            self._thread = threading.Thread(target=httpd.serve_forever,
+                                            kwargs={"poll_interval": 0.1}, daemon=True)
+            self._thread.start()
+            return self
+
+    scripts = {
+        "agent-a": {"abort_idles": True, "turns": [dict(NEVER_TOUCHES)] * 4},
+        "agent-b": {"turns": [{"on_prompt": work_ready, "events": ["busy", "idle"]}]},
+    }
+    sb = Sandbox(tmp_path, agents=("agent-a", "agent-b"))
+    cfg = make_config(["agent-a", "agent-b"], max_parallel=2,
+                      first_touch_sec=2, first_touch_nudges=1,
+                      max_sessions_per_attempt=2, turn_timeout_sec=300,
+                      idle_event_timeout_sec=60, error_retry_backoff_sec=0,
+                      max_continues_per_attempt=2)
+    with _ByAgent(scripts) as fake:
+        fake.scripts = scripts
+        state = _round(sb, fake, cfg)
+        patches = export_patches(state, list(sb.workspaces), sb.out_dir)
+    runs = _by_name(state)
+    assert runs["agent-a"].state is AgentState.DEAD
+    _assert_ready(runs["agent-b"], sb.ws("agent-b"))
+
+    # no harvest verdict anywhere on the dead agent's turns, and no commit
+    dead_turns = runs["agent-a"].turns
+    assert dead_turns and not any("harvest" in t for t in dead_turns)
+    assert runs["agent-a"].commit is None
+    # nothing exported for it: no patch (no commit) and no `.diff` (DEAD is not
+    # one of the states whose tree is read for one — there is nothing in it)
+    assert not [p for p in patches if p.name.startswith("agent-a")]
+    assert _commits(sb.ws("agent-a").path) == 0
+
+    # SUMMARY shows the state and says the number in its own words
+    export.write_summary(sb.out_dir, state, sb.base_sha, patches, repo=REPO_ROOT)
+    summary = (sb.out_dir / "SUMMARY.md").read_text(encoding="utf-8")
+    assert "DEAD" in summary
+    assert "**Never started:** 1 agent" in summary and "`agent-a`" in summary
+    # the round's own table row, for the `status` command
+    table = render_table(state, patches)
+    cells = [c.strip() for c in table[2].strip("|").split("|")]
+    assert "DEAD" in cells
+
+
+def test_first_touch_sec_zero_is_the_tree_before_the_ticket(tmp_path, monkeypatch):
+    """Acceptance 5: `first_touch_sec = 0` turns the ticket off. The same
+    never-writing agent runs to the ordinary turn deadline and is `STALLED` with
+    today's reason, one session, and not one nudge."""
+    _fast_poll(monkeypatch)
+    scenario = {"turns": [dict(NEVER_TOUCHES)]}
+    sb = Sandbox(tmp_path)
+    cfg = _ft_config(first_touch_sec=0, turn_timeout_sec=3)
+    with _BenchFake(scenario) as fake:
+        scenario["turns"][0]["on_prompt"] = lambda d, t: fake.pulse(
+            fake.sessions()[-1].id, 0.2, 40)
+        run = Harness(sb, fake, cfg).go()
+        prompts = _prompts(fake)
+    assert run.state is AgentState.STALLED
+    assert run.last_error == "no idle after 3s"
+    assert len(prompts) == 1 and len(fake.sessions()) == 1
+    assert not any("Nothing has been modified" in text for _s, text in prompts)
+    assert not any(t.get("first_touch_nudges") for t in run.turns)
+
+
+def test_first_touch_off_when_the_key_is_missing_or_malformed(tmp_path):
+    """Fail-open: a config without the key, one with a value that is not a
+    number, one with a `bool`, and one with the ceiling off — all degrade to
+    "no first-touch clock" rather than raising into the run."""
+    import tools.contest.runner as runner_mod
+    assert runner_mod._first_touch_budget(make_config(["agent-a"])) == 0.0
+    assert runner_mod._first_touch_budget(_ft_config()) == 2.0
+    assert runner_mod._first_touch_budget(_ft_config(first_touch_sec=-5)) == 0.0
+    assert runner_mod._first_touch_budget(_ft_config(first_touch_sec="soon")) == 0.0
+    assert runner_mod._first_touch_budget(_ft_config(first_touch_sec=True)) == 0.0
+    assert runner_mod._first_touch_nudges(_ft_config()) == 1
+    assert runner_mod._first_touch_nudges(_ft_config(first_touch_nudges="many")) == 0
+    assert runner_mod._first_touch_nudges(_ft_config(first_touch_nudges=-1)) == 0
+
+
+def test_a_tree_that_cannot_be_read_is_not_a_dead_end(tmp_path, monkeypatch):
+    """FL-2, KC-42: git that will not answer is "no news", never a reason to end
+    a turn. With every status read raising, the watch reads the tree as untouched
+    and the run still ends on the ordinary edges — the harvest's own read fails
+    the same way, which is what the pre-KC-42 turn did. Nothing is `DEAD`."""
+    _fast_poll(monkeypatch)
+    import tools.contest.runner as runner_mod
+
+    def broken(ws):
+        raise TreeReadError("git status did not run")
+
+    monkeypatch.setattr(runner_mod, "_dirty_tree", broken)
+    scenario = {"turns": [dict(NEVER_TOUCHES)]}
+    sb = Sandbox(tmp_path)
+    cfg = _ft_config(turn_timeout_sec=4, first_touch_nudges=1)
+    with _BenchFake(scenario) as fake:
+        scenario["turns"][0]["on_prompt"] = lambda d, t: fake.pulse(
+            fake.sessions()[-1].id, 0.2, 60)
+        run = Harness(sb, fake, cfg).go()
+    assert run.state is not AgentState.DEAD, (run.state, run.last_error)
+    # the watch did its work — it read the tree, found nothing, and nudged — and
+    # the turn still ended where the ordinary edges take it, on a harvest whose
+    # own read of the same tree failed the same way
+    assert run.state is AgentState.GAVE_UP
+    assert run.turns[-1]["harvest"]["verdict"] != "READY"
+
+
+def test_no_room_for_a_second_session_goes_straight_to_dead(tmp_path, monkeypatch):
+    """`max_sessions_per_attempt = 1` — the round budgeted one session for the
+    attempt, so the escalation is unavailable: the nudge is still sent, and the
+    deadline after it ends the turn `DEAD` rather than opening a session the
+    round did not pay for."""
+    _fast_poll(monkeypatch)
+    scenario = {"abort_idles": True, "turns": [dict(NEVER_TOUCHES)] * 3}
+    sb = Sandbox(tmp_path)
+    cfg = _ft_config(max_sessions_per_attempt=1)
+    with _BenchFake(scenario) as fake:
+        run = Harness(sb, fake, cfg).go()
+        prompts = _prompts(fake)
+    assert run.state is AgentState.DEAD
+    assert len(fake.sessions()) == 1
+    assert len(prompts) == 2                       # the round prompt and one nudge
+    assert "Nothing has been modified" in prompts[1][1]
+
+
+def test_the_nudge_names_the_files_the_ticket_declares():
+    """The nudge is KC-9's `CONTINUE_PROMPT` in shape: the state named plainly,
+    the ticket's own paths, and no critique of how the model has spent the time.
+    An empty list degrades to a line to read rather than a paragraph with
+    nothing in it."""
+    from tools.contest.runner import first_touch_nudge
+    text = first_touch_nudge(("tools/contest/runner.py", "tests/test_x.py"), 420)
+    assert "- `tools/contest/runner.py`" in text
+    assert "- `tests/test_x.py`" in text
+    assert "Nothing has been modified" in text
+    # the elapsed the watch measured, not the ticket's text
+    assert "7m" in text
+    # no critique: the runner cannot tell a reading agent from a wedged one, so
+    # it says the state and the files and nothing about the effort
+    assert "no commit made" in text
+    assert "the turn's clock is running" in text
+    assert "idle" not in text and "stalled" not in text.lower()
+    bare = first_touch_nudge((), 7)
+    assert "- (" in bare and "Nothing has been modified" in bare
