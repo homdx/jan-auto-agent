@@ -6,17 +6,19 @@ truthful account of the diff it left behind?
 before any `summarize`, the reply is copied to `<agent>.summary.md`, an empty
 reply or a `session.error` falls back to KC-39's fresh session with the worktree
 lines, a captured summary is carried into a later reset, and a second session of
-the same attempt appends rather than overwrites. Whether a real model at 90 % of
-a 4 000-token window can still say *what it changed, why, and what is left* is
-empirical, and this is the probe that answers it:
+the same attempt appends rather than overwrites. Whether a real model past the
+middle of a 20 000-token window can still say *what it changed, why, and what is
+left* is empirical, and this is the probe that answers it:
 
   1. a ticket that makes one small real edit to `pkg/thing.py` and leaves it
      **uncommitted** — the diff the summary is supposed to explain — then asks
      for blocks of about a thousand `a` characters, the operator's own example,
      to burn context fast;
   2. `context_limit_fallback` / `summary_at_percent` / `compact_at_percent`
-     sized down so the edge trips in minutes instead of by waiting on a real
-     32 768 window;
+     sized down (20 000 / 55 / 85) so the edge trips in minutes instead of by
+     waiting on a real 32 768 window. Not lower: the ask is checked when a turn
+     ends, and one Kilo step is already 12–16 k tokens, so at 4 000 the first
+     turn ends past 100 % and the ask is skipped (round 1 of the probe);
   3. the runner over the real `kilo serve`, on the roster of `contest.ini` or on
      the two models of `--models`;
   4. afterwards, one block per agent: the summary the session wrote, the diff it
@@ -24,7 +26,7 @@ empirical, and this is the probe that answers it:
 
     python3 contest-bench/kc40/live_probe.py
     python3 contest-bench/kc40/live_probe.py --models agnes-2-5-flash:free,glm-4-7-flash:free
-    python3 contest-bench/kc40/live_probe.py --budget 4000 --ask 45 --compact 60
+    python3 contest-bench/kc40/live_probe.py --budget 20000 --ask 55 --compact 85
     python3 contest-bench/kc40/live_probe.py --round 2      # reuse the worktrees
 
 The judge reads the summary and the diff side by side and says whether the
@@ -218,12 +220,13 @@ def main() -> int:
     ap.add_argument("--models", default="",
                     help="comma-separated kenary model ids to run INSTEAD of contest.ini's roster")
     ap.add_argument("--max-parallel", type=int, default=2)
-    ap.add_argument("--budget", type=int, default=4_000,
+    ap.add_argument("--budget", type=int, default=20_000,
                     help="`context_limit_fallback`: the window a model with no "
-                         "declared limit is sized against")
-    ap.add_argument("--ask", type=int, default=45,
+                         "declared limit is sized against; below one Kilo step "
+                         "(12-16k) the first turn ends past 100%% and is never asked")
+    ap.add_argument("--ask", type=int, default=55,
                     help="`summary_at_percent`: the fill at which the summary is asked for")
-    ap.add_argument("--compact", type=int, default=60,
+    ap.add_argument("--compact", type=int, default=85,
                     help="`compact_at_percent`: must sit above `--ask`, or the "
                          "compact would take the session first")
     ap.add_argument("--max-rework", type=int, default=4)

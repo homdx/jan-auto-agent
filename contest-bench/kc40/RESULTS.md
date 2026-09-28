@@ -83,19 +83,68 @@ Changes made while landing it:
 Four tests cover these changes (`tests/test_contest_runner_summary.py`, the last
 four). All four are red on the entry.
 
-## Live probe — not run yet
+## Live probe
 
-The ticket's live half has not been run. It asks whether a real, nearly full
-free-tier model can still write a truthful account of its own uncommitted diff:
+The ticket's live half asks whether a real, nearly full free-tier model can
+still write a truthful account of its own uncommitted diff. Two runs, on
+agnes-2-5-flash and glm-4-7-flash, both over `kilo serve`.
+
+### Run 1 — `--budget 4000 --ask 45 --compact 60`: no summary
+
+No ask ever went out. The ask is checked when a turn ends, and one Kilo step
+is already 12–16 k tokens, so the first turn ended past 100 % of the window and
+the edge skipped it (`fill < 100`). Both agents then left the ticket and ended
+GAVE_UP. The probe's old defaults could not answer the question, so they are
+now 20 000 / 55 / 85.
+
+### Run 2 — `--budget 20000 --ask 55 --compact 85`: 4497 s
 
 ```bash
-python3 contest-bench/kc40/live_probe.py --models agnes-2-5-flash:free,glm-4-7-flash:free
+python3 contest-bench/kc40/live_probe.py --round 2 --models agnes-2-5-flash:free,glm-4-7-flash:free
 ```
 
-For each model, read the summary and the diff side by side and record here:
+| entry | state | asks | captured | fill at the ask | commit |
+| --- | --- | --- | --- | --- | --- |
+| agnes-2-5-flash | STALLED (no event for 180 s) | 2 | 1 | 76.6 %, 69.3 % | `8b61a85`, against the ticket |
+| glm-4-7-flash | GAVE_UP (`no_progress_row`, `no_test_file`) | 3 | 3 | 96.4 %, 92.7 %, 92.3 % | `6ea342e`, against the ticket |
 
-- whether a summary was captured at all;
-- whether it is truthful and useful, not only fluent;
-- if the ask failed, what the fresh session did with the partial text.
+**Captured at all: yes, for both.** The plumbing held on every path it met:
 
-A plumbing success with a useless or made-up summary does not close the ticket.
+- The ask went out before any `summarize`.
+- The file got one section per session and was appended to.
+- agnes' first ask ended `error`. Its partial text (1177 chars, including an
+  `aaaa` block) was kept in the file, and the work went on in a new session,
+  which wrote a clean summary on its first ask.
+- A `summarize` of agnes hung for 900 s, and the runner went on in a new
+  session.
+
+**Truthful: what changed and why — yes.** Every section names the real change:
+`sum(values, 0)` in `pkg/thing.py`, `TypeError` for a non-numeric element, and
+the diff left uncommitted. glm named the test file it had written against the
+ticket; it did not hide it. After a `git reset` to base, glm's last section
+says so. No section mentions the docstring, which also changed; that is minor.
+
+**Useful: what is left — no.** That part cannot be trusted:
+
+- Only the first section, agnes' failed ask of attempt 0, got it right: keep
+  replying with the `a` blocks. Every section written after a REWORK repeats
+  the runner's rework prompt instead (add a test, one commit, `append_task`),
+  and the probe's ticket forbids all three. In a real round that list would be
+  right, so this is the probe's ticket against the round's rules, not a
+  runner bug.
+- glm's last section lists tickets 02, 03 and 04 in `epic-tasks/`. Only 01
+  exists. A later session that trusts it would go looking for work that is not
+  there.
+
+**Verdict.** The edge works live and the account of the diff is truthful.
+The "left to do" part is not, and a carried summary should be read for what
+changed, not for what to do next.
+
+Two things were seen but not changed:
+
+- The ask comes at the end of a turn, so the fill it sees overshoots `--ask` by
+  a whole step (glm: 92–96 % against 55 %). On a real 32 768 window a step is a
+  smaller share of the window.
+- The ask prompt could say "only what this ticket still needs" to cut both the
+  rework echo and the made-up tickets. That is a change to the prompt, not to
+  KC-40's edge.
