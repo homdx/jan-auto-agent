@@ -1,6 +1,6 @@
 # KC-74 — the leg record carries the tests, the last word, the summary and what is left, in under a minute
 
-**Status:** open — KC-43 (82) landed `4a4c9fa` on 2026-09-28 (over KC-50 `e8ed850`). Split out of KC-43 on 2026-09-28 so each fits one turn.
+**Status:** landed `3154f15` on 2026-09-28 (round 120, winner sensenova-6-7-flash-lite-var1 31/31 on contest-bench/kc74, taken as-is). Split out of KC-43 (82, `4a4c9fa`).
 **Severity:** MEDIUM (without it leg 2 knows *what* changed but not whether it passes or what was meant next — the handover the operator writes by hand today)
 **Round:** 120
 **Size:** S

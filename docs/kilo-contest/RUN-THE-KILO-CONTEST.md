@@ -128,6 +128,29 @@ agent, the `patch:` lines, the `entrants.json:` / `SUMMARY.md:` lines, and
 the exit code — **0 when at least one agent is READY, 2 when none is, 1 on an
 intake or a server failure.**
 
+**The status line.** While the round runs, one line repeats with every agent
+on it (`runner.py`, `StatusLine.line`):
+
+```
+round 120 41m: sensenova-6-8-flash-lite-var1 READY (tests 5m) · glm-4-7-flash WAITING 12m ▓▓▓░░ 60% 3f ↺1 · mimo-v2-5 HARVESTING 2m (queued 4m, 2 ahead) — 9 live · kilo neighbours 3
+```
+
+Read it left to right. Each agent is shown as follows:
+
+- **Name and state** always come first.
+- **Live agents** then show how long they have been in that state. WAITING and REWORK agents also get a progress bar, a percentage and a file count (`3f`); the percentage is relative to the median of the other working agents, not the ticket.
+- **`↺N`** is the rework attempt.
+- **`+Xm`** is the extra clock a long turn was granted (KC-36).
+- **Harvest note, while HARVESTING.** It is read live off the round's single pytest lock (KC-57):
+  - `(queued Xm, N ahead)` — the agent is waiting for the slot;
+  - `(tests Xm)` — the agent holds the slot and its roots are running.
+- **Harvest note, in any other state** (READY, REWORK, GAVE_UP, …). It shows the **last harvest that finished** as `(tests Xm)`. That number is the harvest's whole `elapsed`, which is measured from before the lock is taken (`harvest.py`: `start` before `with test_lock`), so it is **queue wait + the roots' run + a few seconds of git**. It is not the pytest time alone.
+  - Example: `tests` + `tests_bugfix` take about 3 minutes on this box. An agent showing `(tests 15m)` therefore waited about 12 minutes for the slot, and one showing `(tests 5m)` waited about 2.
+  - The split is only visible while the agent is still HARVESTING.
+- **Suite note, for an agent's own pytest run** inside a WAITING turn (KC-58): `(suite queued Xm, N ahead)`, `(suite Xm)`, or `(suite Xm, over the ceiling)`, the last once it has passed `agent_suite_max_sec` and no longer blocks the next waiter.
+
+After the agents come `N live` (the agents not yet terminal) and, when the Kilo store is shared, `kilo neighbours N` (KC-62). The same table, without the live parts, is printed any time by `python3 -m tools.contest status --ticket NN`.
+
 **`--resume` after a Ctrl-C or a provider outage.** `state.json` is written
 on every transition, so the round's own folder is the resume point:
 
@@ -172,6 +195,65 @@ always was. A relay cannot be `--resume`d as a whole: resume one leg's folder
 with `--out <that folder> --legs 1`. Cross-agent relay — one model finishing
 another's work — is deliberately not built: it removes the independence that
 makes a round a comparison.
+
+**The leg record (KC-43 + KC-74).** At the end of every leg except the last, the
+runner writes `contest-out/<NN>.<leg>/<agent>.leg.md` (`runner.leg_record`). It
+writes the record after that leg's `kilo serve` is closed, so everything in it
+was saved while the session was still alive:
+- the harvest's `tests_run` is kept on the turn as `turn["harvest"]["tests_run"]`;
+- the last reply is kept as `turn["last_message"]`.
+
+The same text is pasted into the next leg's first prompt, newest record first.
+A record from round 120's bench (a leg whose `tests` root went red):
+
+```
+leg 01.1 — agent-a
+files: 2 (+3 -1)
+  pkg/thing.py  +1 -1
+  tests/test_thing.py  +2 -0
+commit: f8d9fb839a68de1a2c3d6d487dc73ff5d43eb364
+harvest: REWORK tests_failed
+tests:
+  tests: 5✓ 1✗
+  tests_bugfix: PASS
+last message:
+  > RED-LEG-1 agent-a: still fails
+summary: none
+what is left: tests/test_thing.py::test_red_marker
+```
+
+The fields, in this order:
+
+| field | source | empty |
+|---|---|---|
+| `files` | `git diff --numstat` of the worktree against the base, committed and not, untracked marked `(new)` | `none` |
+| `commit` | the branch head, when the leg left a commit above the base | `none` |
+| `harvest` | the newest turn's verdict and reason codes | `none` |
+| `tests` | one line per pytest root with its counts. The source is the agent's own `pytest` runs, read from the `bash` parts in `<agent>/events.jsonl` (`5✓ 1✗`, parsed from pytest's stats line). A root the agent did not run itself comes from the harvest's `tests_run` (`PASS`, `1✗`, `absent`). `skipped: …` is not a root and is dropped | `none` |
+| `last message` | the agent's last assistant text, quoted with `> ` on every line so it can never pose as a field. Cut to 20 lines, ending in `… cut` | `none` |
+| `summary` | KC-40's model-written summary (`run.summary`) verbatim, quoted the same way | `none` |
+| `what is left` | the ticket's declared files the leg never touched, plus the failing node ids from `tests` | `none` |
+
+Only `last message` and `summary` come from a model. Every other field comes
+from git and the logs, and an empty mechanical field says `none` rather than
+being filled with prose.
+
+The record is capped at `LEG_RECORD_MAX_LINES = 80`. Over the cap, the summary
+gives ground first, then the message, each ending in `… cut`. The mechanical
+fields are never cut.
+
+With `legs = 1`, the default, no record is written, and the prompts are byte
+for byte what they were before.
+
+How to read one when judging a relay:
+- `harvest: REWORK tests_failed` with `what is left` naming node ids means the
+  next leg's job is exactly those tests.
+- `files: none` plus `last message: none` is a leg that did nothing. That is
+  usually a provider problem, so check `turns.jsonl` before blaming the model.
+
+The acceptance suite is `contest-bench/kc74/acceptance_kc74.py`. It has 31
+checks and runs end to end on the fake Kilo, which emits
+`message.part.updated` the way live Kilo 7.6.2 does.
 
 **The flags of `run`** (`python3 -m tools.contest run --help` is the source):
 
@@ -300,6 +382,61 @@ never a live one.
   scoring side reads code; that is its job.
 - **Nothing is merged, nothing is pushed, nothing is judged inside the
   run.** That is the operator's stage 3–5.
+
+## When a landed ticket makes the suite slower or flaky
+
+The harvest runs `tests` and `tests_bugfix` for every agent, one agent at a time
+behind a single lock. A suite that is 2 minutes slower is therefore 2 minutes
+times N agents of queue in every round: see `(tests Xm)` on the status line. Some
+winning patches are correct but slow the suite down, or leave a test that
+flakes under load. That is fixed **after** the ideal commit, in **separate
+commits of its own**, never folded into the ticket's commit. The ideal commit
+stays the winner's code, so the bench and the ticket still describe it.
+
+**An exercise on record (2026-09-27).** This part is written as a task on
+purpose. It names no slow test and no fix; finding them is the job.
+
+- **Start from `b5257cf`** (`epic-tasks: KC-10 (49) landed`). At `-n 8`,
+  `python3 -m pytest tests` there is roughly **365 s**. Before the slowdown it
+  was under 300 s. After a good fix it is about 130 s, so the slowdown is only
+  part of the story.
+- `b5257cf` is **not** the commit that made it slow. The cause came in
+  **several commits earlier**, and the commits in between are unrelated
+  landings. Walk the history back yourself (`git log`, `git bisect run`
+  with a timing script, timing a single file across commits) and name the
+  commit that brought the slowdown in, with numbers.
+- **How many causes?** As many as you find. There may be one, there may be
+  several, and the reference answer is not guaranteed to have found them
+  all. Your score is how many you find, prove with numbers and fix, and
+  how far below the reference timing you get. Look at the tests, and also at
+  everything around them that decides when and where they run.
+- **The reference answer** is on `kc`, somewhere within the **ten commits
+  after `b5257cf`**. Which of them, and how many, is for you to find:
+  look for the point where the suite got fast again, by timing the commits
+  (not by reading their messages first). Do that only after you have your
+  own cause, your own fix and your own numbers, then compare the approach,
+  not only the timings.
+
+**The method**, for this exercise and for any landing after which the round's
+`(tests Xm)` or a local `python3 -m pytest tests -n 8` jumps:
+
+1. **Measure on the slow head against a commit where the suite was fast.**
+   That commit is usually not the immediate parent, so bisect. Run `tests`,
+   then `tests_bugfix`, one after the other with `-n 8`, never in parallel.
+   Name the base commit in every fix commit's message.
+2. **Find the real sleeps**: `--durations=25`, then ask why each slow test
+   waits. A roster default such as a backoff or a silence window that reaches
+   a test not about it is fixed in the test config, not in the product
+   default.
+3. **Look at the scheduling, not only the tests.** Compare the sum of the
+   durations with the wall clock. A large gap means something serialises the
+   run, for example an `xdist_group` or a fixture pinning a whole file to one
+   worker. Check whether the reason for that pinning is still true.
+4. **Stress the result**: the changed file many times next to a full run at a
+   higher `-n`. A test that turns flaky because of your fix gets its own
+   commit, with the failure rate before and after.
+5. **One concern per commit.** In the message: the base sha, the times before
+   and after, and the stress numbers.
 
 ---
 
