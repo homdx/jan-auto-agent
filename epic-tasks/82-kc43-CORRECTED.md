@@ -16,12 +16,15 @@
 >
 > **Net effect:** of the five tickets KC-43 composes, two (`KC-36`, `KC-41`) have since landed and are no longer blockers; three (`KC-39`, `KC-40`, `KC-42`) genuinely still block it, matching the operator's own note. The engineering plan itself (What must change / Acceptance / Out of scope) needed no changes — it correctly assumes none of its own prerequisites exist yet, which is still true. Corrections inlined below.
 
-**Status:** open — last, after KC-36 **(landed)**, KC-39, KC-40, KC-41 **(landed)** and KC-42, every one of which it composes — **now blocked on KC-39, KC-40 and KC-42 only**. Asked by the operator on 2026-09-22 as the frame the other tickets are parts of.
+> ## ✂️ Split — 2026-09-28 (after KC-40 landed `dac85bd`)
+> Size L was too big for one 90-minute turn (round 81 already ran out on KC-42, which is smaller). This ticket is now **the relay frame only**: legs, the carried worktree, a fresh session per leg, a *mechanical* leg record, the "continue" prompt, READY ends the relay. The rich leg record (pytest roots, last message, KC-40 summary, "what is left", the one-minute cap) moved to **KC-74 (120)**. The live 2-leg round is the judge's job after both land, not an entry's checkbox.
+
+**Status:** open — unblocked (KC-39, KC-40, KC-42 landed); was: last, after KC-36 **(landed)**, KC-39, KC-40, KC-41 **(landed)** and KC-42, every one of which it composes — **now blocked on KC-39, KC-40 and KC-42 only**. Asked by the operator on 2026-09-22 as the frame the other tickets are parts of.
 **Severity:** MEDIUM (nothing is lost today that KC-41 does not already save; this ticket is about tickets that *cannot* be finished in one turn at all, which the epic has so far avoided by keeping tickets small)
 **File:** `tools/contest/cli.py` (`cmd_run`, `_parser`), `tools/contest/runner.py` (`run_round`), `tools/contest/workspace.py` (`prepare_round` — the "never reuse a previous round's worktree" rule gains one exception), `contest.ini`
 **Symbol:** `cmd_run`, `run_round`, `run_leg` (new), `leg_record` (new), `RoundState.leg` (new), `prepare_round(..., carry_from=...)` (new)
 **Round:** 82
-**Size:** L
+**Size:** M (was L; split 2026-09-28, the rich leg record is KC-74)
 **Source:** the operator, 2026-09-22, describing what they already do by hand: *"сейчас я её делаю вручную — там на третьем ходе уже новый начинаю чат и заставляю модель продолжать работать с начатыми (изменёнными) файлами"*. The manual procedure is: let the model work until its context or the clock gives out, open a **new** session against the **same** worktree, and tell it to continue from the files it has already changed. It works; it is untooled. Round 64 is the supporting evidence from the other direction — four of five working agents were cut mid-flight, two of them a single failing test away from done (`step-3-7-flash`: `tests:1✗`; `hy3`: `tests:3✗`), and a second leg would plainly have closed both.
 **Depends on:** ~~KC-36 (queued — …)~~ **KC-36 — landed `5840147` (round 75, 2026-09-24); a leg's own wall-clock deadline-extension machinery is now available to reuse.** ~~KC-41 (queued — …)~~ **KC-41 — landed (round 80, 2026-09-27); every turn now ends in a captured deadline commit, so "every leg must end in a captured commit or there is nothing to hand over" is already satisfied at the single-turn level — this ticket only has to carry that guarantee across legs.** KC-40 (queued — confirmed still queued, `INDEX.md` row 79; the model-written summary this ticket wants as one field of the leg record does not exist yet — still blocking). KC-39 (queued — confirmed still queued, `INDEX.md` row 78; the live session-reset path a new leg would reuse does not exist yet — still blocking). KC-42 (queued — confirmed still queued, this same batch; a leg must not be spent by an agent that never starts — still blocking).
 **Also touches:** `tests/test_contest_cli.py`, `tests/test_contest_runner.py`, `tests/_kilo_fake.py`, `docs/collect-epics/RUN-THE-EPIC-COMPETITION.md`, `contest-bench/kc43/`
@@ -57,20 +60,12 @@ which is what the operator does by hand and what a large ticket needs.
    the same agent. The session is always new. This is the whole point: the
    code survives, the exhausted context does not.
 3. **The leg record** — `leg_record(run, ws, out_dir) -> Path`, written at
-   the end of every leg, **derived from git and the logs, not from prose**:
-   - the files touched, with a diffstat;
-   - the commit the leg ended on (KC-41's deadline commit or the model's);
-   - which pytest roots ran and what they returned;
-   - the harvest verdict and its reason codes, when one ran;
-   - the agent's own last message, quoted, as *one field among many*;
-   - KC-40's model-written summary when it exists;
-   - an explicit "what is left" list.
-
-   Only the last two fields can come from a model. Everything above them is
-   mechanical, and a leg record whose mechanical fields are empty says so
-   rather than letting prose fill the gap. Hard constraint: the record must
-   be readable in under a minute — if it is longer than the diff it
-   describes, it is wrong.
+   the end of every leg, **mechanical only** in this ticket: the files
+   touched with a diffstat, the commit the leg ended on (KC-41's deadline
+   commit or the model's), and the harvest verdict with its reason codes
+   when one ran. A field with nothing in it says `none`, never blank. The
+   rest of the record (pytest roots, the agent's last message, KC-40's
+   summary, "what is left", the size cap) is KC-74.
 4. **The next leg's prompt** is the ticket, the leg records so far (newest
    first — they are short by construction), and an explicit instruction to
    **continue**: the worktree already holds work, it is yours, do not start
@@ -94,7 +89,7 @@ which is what the operator does by hand and what a large ticket needs.
       across legs).
 - [ ] A leg-2 `READY` stops that agent's relay; a leg-2 `REWORK` does not.
 - [ ] `leg_record` on a leg that produced nothing at all writes a record
-      whose mechanical fields are explicitly empty, and the next leg's
+      whose mechanical fields say `none`, and the next leg's
       prompt still names the ticket's declared files.
 - [ ] `prepare_round(carry_from=…)` refuses to carry from anything but the
       immediately preceding leg of the same round and agent — a previous
@@ -102,17 +97,11 @@ which is what the operator does by hand and what a large ticket needs.
 - [ ] `legs = 1` → byte-identical behaviour to the tree before this ticket,
       including the `contest-out/<NN>/` path with no leg suffix
       (regression guard).
-- [ ] **Live round, required.** A relay cannot be validated by a fake: the
-      question it exists to answer is whether a fresh session with a leg
-      record in hand actually *continues* the work rather than rewriting
-      it, and only a real model can answer that. Run one live 2-leg round
-      on a ticket known to be too big for one turn, against at least three
-      roster models, and record in `contest-bench/kc43/RESULTS.md`: per
-      agent, the leg-1 and leg-2 diffstats, how much of leg 1's diff
-      survived into leg 2 (the number that decides whether this ticket
-      works), and the final verdicts. A relay in which leg 2 routinely
-      discards leg 1 is a failed design, not a passing test — say so in
-      RESULTS.md if that is what happens.
+- [ ] `leg_record` fields in this ticket: diffstat, end commit, harvest
+      verdict — each `none` when empty.
+- *Judge, not the entry:* the live 2-leg round (≥3 models, how much of
+  leg 1's diff survives into leg 2, `contest-bench/kc43/RESULTS.md`) is run
+  by hand after KC-74 lands.
 - [ ] `python3 -m pytest tests -n 4 -q --timeout=180 && python3 -m pytest tests_bugfix -n 4 -q --timeout=180` green (sequentially).
 
 ## Out of scope
