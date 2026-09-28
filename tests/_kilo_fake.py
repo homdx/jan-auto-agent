@@ -137,6 +137,8 @@ _EVENTS = {
     "session.diff": ("session.diff", {}),
     "idle": ("session.idle", {}),
     "session.turn.close": ("session.turn.close", {}),
+    # round 83: Kilo's own compact in the middle of a turn that goes on to idle
+    "compacted": ("session.compacted", {}),
 }
 #: emitted only after session.idle — PROBE.md's sequence ends with it
 _POST_IDLE = "session.turn.close"

@@ -4891,6 +4891,17 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                           "nudge's own turn ran on, and its end is the turn's",
                           spec.name)
                 idle = again
+            if getattr(idle, "compacted", False) and getattr(idle, "status", "") == "idle":
+                # Round 83: Kilo compacts a session on its own mid-turn and goes
+                # on, and the turn still ends idle. Only the overflow path counted
+                # that (an error, settled apart), so round 83's status table read
+                # `compactions 0` for all eleven agents over fourteen of Kilo's
+                # `session.compacted`. One per turn: the wait keeps a flag, not a count.
+                run.compactions += 1
+                turn["compacted"] = True
+                turn["compacted_by"] = "kilo"
+                _log.info("%s: Kilo compacted the session itself during the turn",
+                          spec.name)
             if escalate[0]:
                 # KC-42: the watch ended this turn — a fresh session, or DEAD.
                 # Read before anything else: the abort that woke the wait comes

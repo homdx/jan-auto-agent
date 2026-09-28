@@ -6907,6 +6907,23 @@ def test_the_suite_queue_does_not_count_against_agent_max_sec(tmp_path, monkeypa
         slots.release("other:harvest")
 
 
+def test_kilos_own_compact_during_a_turn_is_counted(tmp_path):
+    """Round 83: a `session.compacted` inside a turn that ends idle — Kilo's
+    own compact, not an overflow — counts in `compactions` and marks the turn
+    `compacted_by: kilo`; a turn without one counts nothing."""
+    scenario = {"turns": [{"on_prompt": work_ready,
+                           "events": ["busy", "compacted", "busy", "idle"]}]}
+    sb, fake, h, run, _ = _run_one(tmp_path / "with", scenario)
+    assert run.state is AgentState.READY, run.last_error
+    assert run.compactions == 1
+    assert run.turns[0]["compacted"] is True
+    assert run.turns[0]["compacted_by"] == "kilo"
+    plain = {"turns": [{"on_prompt": work_ready, "events": ["busy", "idle"]}]}
+    sb, fake, h, run, _ = _run_one(tmp_path / "without", plain)
+    assert run.state is AgentState.READY, run.last_error
+    assert run.compactions == 0
+
+
 def test_the_harvest_does_not_count_against_agent_max_sec(tmp_path, monkeypatch):
     """Round 83: a harvest that outlasts the agent's whole limit (its queue for
     the suite slots) does not end the agent — the limit is paused for it, the
