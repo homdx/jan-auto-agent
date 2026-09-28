@@ -15,7 +15,7 @@
 >
 > **Net effect:** the ticket's engineering content (What must change / Acceptance / Out of scope) needed no changes — nothing described has been built yet, partially or otherwise. Only the header's dependency bookkeeping was out of date. Corrections are inlined below; original wording is struck through, new wording follows.
 
-**Status:** queued — KC-9 has landed (round 48, 2026-09-27); this ticket is now blocked on KC-39 alone (was: after KC-9 and KC-39, whose edges it completes from the other side). Found live 2026-09-21 in round 64.
+**Status:** landed `0c60459` (2026-09-28) — round 81, no clean entry (rate limits: sensenova `rpm exhausted`, glm free-tier limit; the ticket with bench + probe did not fit 90 min). Winner by score space-bunny-alpha-bynara (21/22 on `contest-bench/kc42`, READY off_ticket_files for `export.py`, which is where `write_summary` lives); judge fixed the nudge's "0s" elapsed and `replay64.py` (now exact on round 64's bytes). Live probe still open.
 **Severity:** HIGH (three of eight slots in round 64 produced nothing and were only found out about after the round ended; a dead slot costs the same wall clock as a working one and silently shrinks the field the round is supposed to compare)
 **File:** `tools/contest/runner.py` (`run_agent` — the `WAITING` loop), `contest.ini`
 **Symbol:** `run_agent`, `_first_touch_deadline` (new), `_dirty_tree` (exists — `runner.py`), `AgentState.DEAD` (new), `ContestConfig.first_touch_sec` ~~(existing)~~ **(new — corrected 2026-09-27; does not exist in `contest.ini` or `ContestConfig` today)**, `ContestConfig.first_touch_nudges` (new)
