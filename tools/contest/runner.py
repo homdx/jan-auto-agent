@@ -693,6 +693,36 @@ OVERFLOW_CONTINUE = (
     "what you did so far. The task is not finished. Continue it from where you "
     "stopped; do not start over, and read only the parts of files you need now.")
 
+#: KC-40: the prompt the runner sends into a session that is at or past
+#: `summary_at_percent` of a known size and already holds an uncommitted diff —
+#: before a compact shrinks the history that explains the diff. It goes out as a
+#: prompt of its own, in the same session, and it is answered with `session.idle`
+#: like any other prompt: the model's reply is read with `_last_assistant_text`
+#: and copied out to `<agent>.summary.md`. No `{}` placeholders, no note appended:
+#: the runner asks the question and nothing else, so the reply is the answer.
+SUMMARY_PROMPT = (
+    "Your context is nearly full and nothing is committed yet. Before anything "
+    "else, write a short summary here in the chat of exactly what you changed, "
+    "why, and what is left to do. Do not modify any files in this reply.")
+
+#: KC-40: the line the next prompt of a session that just wrote its own summary
+#: carries, so the model does not restate the ticket it was just asked about.
+#: Appended to the prompt that follows the summary turn, instead of repeating the
+#: ticket.
+SUMMARY_CONTINUES_NOTE = (
+    "Your summary above still applies: it is what this conversation is about. "
+    "Carry it on, do not restate it, and do not re-read what it already covers.")
+
+#: KC-40: what a fresh session that replaced one whose summary prompt failed gets
+#: before its round prompt — the partial answer the failed attempt managed to
+#: write, if it wrote any. The session has never seen the ticket or the diff, so
+#: the note is followed by `round_prompt(dirty=)` with the `git status` lines.
+SUMMARY_FELL_BACK_NOTE = (
+    "## A previous attempt at this ticket ran out of context\n\n"
+    "A previous session working this ticket ran out of context and was closed. It "
+    "left this note before it did; it may be incomplete, so treat it as a lead "
+    "and re-read the files it names.\n\n{note}")
+
 #: KC-73: how long a session whose turn ended in a context overflow may stay
 #: silent before the runner takes it that Kilo is not working in it. Kilo
 #: 7.6.2 compacts an overflowed session by itself and goes on with the agent
@@ -1174,6 +1204,34 @@ def _summary_text(backend: ContestBackend, session: SessionRef) -> str:
     return ""
 
 
+def _last_assistant_text(backend: ContestBackend, session: SessionRef) -> str:
+    """KC-40: the text of *session*'s last assistant reply, ``""`` when there is none.
+
+    The summary ask reads its answer this way, because a `ContestBackend` has
+    `messages` and no `last_assistant_text` of its own — the client does, and the
+    backends are the client wrapped in one shape. The last assistant message,
+    its text parts joined — `_summary_text` without the `summary` flag, which
+    marks only Kilo's own compaction and never a reply to a prompt of its own.
+    Fail-open like `_summary_text`: a transcript that cannot be read, or one
+    that is not a list, is no answer.
+    """
+    try:
+        messages = backend.messages(session)
+    except Exception:  # noqa: BLE001 — a transcript that cannot be read is no reply
+        return ""
+    if not isinstance(messages, list):
+        return ""
+    for message in reversed(messages):
+        info = message.get("info") if isinstance(message, dict) else None
+        if not isinstance(info, dict) or info.get("role") != "assistant":
+            continue
+        parts = message.get("parts") if isinstance(message.get("parts"), list) else []
+        return "\n".join(part["text"] for part in parts
+                         if isinstance(part, dict) and part.get("type") == "text"
+                         and isinstance(part.get("text"), str)).strip()
+    return ""
+
+
 def _finished_replies(backend: ContestBackend, session: SessionRef) -> int:
     """KC-45 §2a: how many of *session*'s assistant messages carry a ``finish``.
 
@@ -1525,6 +1583,26 @@ class AgentRun:
     #: never filled a window, and for a `state.json` written before the key.
     #: `turns.jsonl` carries the same fact per turn as `compacted`.
     compactions: int = 0
+    #: KC-40: the latest summary the runner asked for before a compact, the text
+    #: the session wrote in chat. Also in `<out_dir>/<agent>.summary.md`, which
+    #: accumulates the whole chain, so `run.summary` is only the newest of it.
+    #: `""` for every run that was never near a full context, that had a clean
+    #: tree, and for a `state.json` written before the key.
+    summary: str = ""
+    #: KC-40: how many summaries the runner captured for this run — one per ask
+    #: that got a non-empty reply, so a run asked twice shows two, and `summaries`
+    #: and `summary` can be told apart. ``0`` for every run that never earned one.
+    summaries: int = 0
+    #: KC-40: the `run.attempt` that already asked for a summary. ``-1`` means
+    #: never, which is what a new run and a `state.json` written before the key
+    #: both read back as. Cleared on a restart (`_plan`), with `continues`; left
+    #: alone on a rework, which keeps the session and the fill that went with it.
+    summary_attempted_at_attempt: int = -1
+    #: KC-40: the session that last answered the summary ask, ``""`` when none did.
+    #: Remembered so a reset that opens a fresh session may ask again — the new
+    #: session is a new history, and the one ask is per session, not per attempt —
+    #: while a second crossing of the threshold inside one session is not asked.
+    summary_session_id: str = ""
 
     @property
     def terminal(self) -> bool:
@@ -1553,7 +1631,8 @@ class AgentRun:
                       "deadline_commit", "continues", "compactions", "sessions",
                       "sessions_this_attempt",
                       "first_touch_nudges_used", "first_touch_resets",
-                      "last_diff_signature"):
+                      "last_diff_signature", "summary", "summaries",
+                      "summary_attempted_at_attempt", "summary_session_id"):
             if name in data:
                 setattr(run, name, data[name])
         run.deadline_commit = bool(getattr(run, "deadline_commit", False))
@@ -1638,6 +1717,10 @@ class RoundState:
             # KC-10: the context the run ended in, and how many compacts it took
             "fill": run.last_fill(),
             "compactions": run.compactions,
+            # KC-40: the summary the runner asked for before a compact, so the
+            # operator sees which agent wrote one without opening its file
+            "summary": run.summary,
+            "summaries": run.summaries,
             "commit": run.commit,
             "last_reason": run.last_reason(),
             "test_wait": run.test_wait(),
@@ -2747,6 +2830,163 @@ def _compact_session(backend: ContestBackend, session: SessionRef, config: Conte
         return False
 
 
+#: KC-40: `<agent>.summary.md`'s title line, written only when the file is new,
+#: so a second session of the same attempt appends instead of repeating it.
+SUMMARY_FILE_TITLE = (
+    "# The agent's own account of its uncommitted work\n\n"
+    "Written in chat by {agent} before its context was compacted, one section per "
+    "session, in order. The text is the agent's, not the runner's.")
+
+
+def append_summary_text(path: Path, agent: str, text: str, *,
+                        session_id: str = "", attempt: int = 0) -> None:
+    """KC-40: append *text* to *path* — the file's whole reason for being.
+
+    Every session of an attempt appends, never overwrites: the operator opening
+    the file later reads the chain, from the first summary to the last, not just
+    the newest. A section header names the session and the attempt it came from,
+    so the chain can be followed against `state.json`. Fail-open like every
+    artifact write here: a directory that cannot be created or a file that cannot
+    be opened is logged and dropped, because a summary that could not be written
+    is still what the session said, and the run has to go on.
+    """
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        blank = ""
+        if not path.exists():
+            blank = SUMMARY_FILE_TITLE.format(agent=agent) + "\n\n"
+        heading = f"\n## session {session_id or '?'} — attempt {attempt}\n\n"
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(blank + heading + (text or "").rstrip() + "\n")
+    except Exception as exc:  # noqa: BLE001 — a summary file is not a round
+        _log.warning("could not append the summary to %s: %s: %s", path, type(exc).__name__, exc)
+
+
+def _summary_read_tree(ws: Workspace) -> str:
+    """KC-40: the uncommitted diff the summary edge needs, KC-39's way.
+
+    ``""`` only when there is nothing uncommitted against the branch base: with a
+    commit already on the branch the working tree's extra edits are not the diff
+    the ticket asks for, and a status that cannot be read is not a clean tree —
+    the edge stands down, the compact goes on as today, and the tree is never
+    read as clean.
+    """
+    dirty = ""
+    if _commits_above(ws) == 0:
+        try:
+            dirty = _dirty_tree(ws)
+        except TreeReadError as exc:
+            _log.warning("tree of %s unreadable — %s", ws.path, _brief(str(exc)))
+    return dirty
+
+
+def maybe_summarize_before_compact(backend: ContestBackend, session: SessionRef, run: AgentRun,
+                                   ws: Workspace, config: ContestConfig, out_dir: Path, turn: dict,
+                                   *, session_id: str, fill: float, on_permission, on_question) -> tuple:
+    """KC-40: the summary a nearly-full session writes before it is compacted.
+
+    Called by `_context_gate` after the fill is read and before the compact.
+    `fill` and `session_id` are the gate's own read of them — the fill over the
+    size it already decided — so the summary edge and the compact that follows
+    reason about the same number. At or past `summary_at_percent`, once per
+    session in the attempt, on a tree that already holds an uncommitted diff,
+    the session gets `SUMMARY_PROMPT` as a prompt of its own and waits for
+    `session.idle` like any other prompt. Its reply is read with
+    `last_assistant_text`, copied out to `<out_dir>/<agent>.summary.md`, and put
+    on `run.summary` — text that leaves the session before whatever the server
+    does to its history next.
+
+    ``(text, outcome, note)``: `text` is the reply, ``""`` when there was none;
+    `outcome` is ``"captured"`` for an idle turn that answered, ``"empty"`` for
+    an idle turn that said nothing, ``"error"`` or ``"timeout"`` for a turn that
+    ended in a `session.error` or the silence window, and ``""`` when the ask did
+    not happen at all — the threshold was not reached, this session already
+    asked, the tree was clean, or nothing sized the model. `note` is
+    `SUMMARY_FELL_BACK_NOTE` filled with `text` whenever there was any text at
+    all, ``""`` otherwise — the partial answer the attempt managed, ready for the
+    fresh session the caller opens, which is why it is never thrown away.
+
+    `turn` carries `summary_attempted`, `summary_captured`, `summary_outcome`,
+    `summary_fill` and `summary_at` on every attempt, whatever the answer.
+
+    Every read is fail-open: no size, a fill under the threshold, a fill at or
+    past the session's own size, a clean tree, a prompt that refused, a wait that
+    raised, a tree that cannot be read and a file that cannot be written all
+    stand this edge down and never end the run.
+    `run.summary_attempted_at_attempt` is set only once all the guards passed and
+    the ask was actually sent, and cleared again when the ask itself could not be
+    sent, so a session whose ask failed outright is asked of again next time.
+    """
+    percent = context_memory.summary_at_percent(config)
+    if not (isinstance(percent, (int, float)) and percent > 0):
+        return "", "", ""
+    if (getattr(run, "summary_attempted_at_attempt", -1) == run.attempt
+            and getattr(run, "summary_session_id", "") == session_id):
+        # already asked in this session: a second crossing of the threshold in
+        # the same history is not asked twice. A different session in the same
+        # attempt is a different history, and it is asked — the file appends
+        return "", "", ""
+    if not (isinstance(fill, (int, float)) and not isinstance(fill, bool)):
+        return "", "", ""
+    if fill < percent:
+        return "", "", ""
+    if fill >= 100:
+        # already at or past its own size: a prompt into this session overflows
+        # before it can answer, so the ask would only turn the turn's overflow
+        # into a summary failure and hand the work to a fresh session that has
+        # just as little. KC-69's compact is the edge that can still free it —
+        # it runs now, and the ask is left to a session that still fits.
+        return "", "", ""
+    dirty = _summary_read_tree(ws)
+    if not dirty:
+        # nothing uncommitted: KC-10's plain compact is the right answer, and
+        # there is nothing to explain
+        return "", "", ""
+
+    run.summary_attempted_at_attempt = run.attempt
+    run.summary_session_id = session_id
+    turn["summary_attempted"] = True
+    turn["summary_captured"] = False
+    turn["summary_fill"] = round(fill, 1)
+    turn["summary_at"] = round(percent, 1)
+    outcome = "error"
+    text = ""
+    try:
+        mark_fn = getattr(backend, "mark", None)
+        since = mark_fn() if callable(mark_fn) else None
+        started = time.monotonic()
+        backend.prompt(session, SUMMARY_PROMPT)
+        idle = _wait_turn(backend, session, config, on_permission=on_permission,
+                          on_question=on_question, since=since)
+        turn["summary_sec"] = round(time.monotonic() - started, 1)
+        status = getattr(idle, "status", "") or ""
+        text = _last_assistant_text(backend, session)
+        # the reply is what the ask is judged by, the ending only qualifies it:
+        # an idle turn with words is a summary, one without is an empty reply,
+        # and an error or silence keeps whatever it wrote as a partial
+        outcome = "captured" if (status == "idle" and text) else (
+            "empty" if status == "idle" else ("timeout" if status == "timeout" else "error"))
+    except Exception as exc:  # noqa: BLE001 — a summary that cannot be asked is no ask
+        _log.warning("%s: summary ask: %s", run.agent.name, _brief(str(exc)))
+        run.summary_attempted_at_attempt = -1
+        run.summary_session_id = ""
+        turn.pop("summary_attempted", None)
+        return "", "", ""
+    turn["summary_outcome"] = outcome
+    if text:
+        # written out either way: a captured summary and the partial one the
+        # attempt left before it ran out of context both belong in the file, and
+        # both are what a fresh session gets carried into
+        run.summary = text
+        if outcome == "captured":
+            run.summaries += 1
+            turn["summary_captured"] = True
+        append_summary_text(Path(out_dir) / context_memory.summary_file_name(run.agent.name),
+                            run.agent.name, text, session_id=session_id,
+                            attempt=run.attempt)
+    return text, outcome, (SUMMARY_FELL_BACK_NOTE.format(note=text) if text else "")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # KC-48: the reap — an ended agent leaves no process in its worktree
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3565,6 +3805,11 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
     # KC-69: a permission was refused because the context was full — the next
     # prompt compacts first, whatever the size's source
     context_full = [False]
+    # KC-40: the note the captured summary leaves for the next prompt of this
+    # session — `SUMMARY_CONTINUES_NOTE`, set by `_context_gate` when it just
+    # asked the question. Cleared on every prompt, so a note is never carried
+    # twice; `run.summary` carries the text itself into any fresh session.
+    carry_note = [""]
     # KC-69: the pending abort of a turn refused for a full context — cancelled
     # when the turn ends first, so it can never hit the compact that follows
     context_stopper: list = []
@@ -3839,7 +4084,20 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         run.sessions_this_attempt += 1
         return None
 
-    def fresh_session(turn: dict, dirty: str) -> str | None:
+    def _carry_note() -> str:
+        """KC-40: the summary this run already has, ready for a fresh session.
+
+        A session that opened mid-attempt — a reset, a swap, an overflow — has
+        never seen the diff the previous one was working on, so it gets the
+        summary the previous one wrote, alongside the `git status` lines its
+        round prompt carries. `""` when there was never one: the prompt is then
+        exactly what it was before KC-40. Every caller appends it to a prompt, so
+        it leads with its own blank line.
+        """
+        summary = (getattr(run, "summary", "") or "").strip()
+        return "\n\n" + SUMMARY_FELL_BACK_NOTE.format(note=summary) if summary else ""
+
+    def fresh_session(turn: dict, dirty: str, *, note: str = "") -> str | None:
         """Go on in a new session: the error line if ``POST /session`` failed.
 
         KC-54's swap, shared by KC-56's context cut-off. The full session is
@@ -3850,6 +4108,10 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         that session's id, because `finally` records only the last session,
         and with ``new_session`` once there is one. `run.attempt` is left
         alone; the swap spends one of `max_continues_per_attempt`.
+
+        KC-40: *note* is carried in front of the round prompt — the partial
+        answer the summary ask left before it failed, or the summary a reset
+        takes along with it. `""` is today's prompt, unchanged.
         """
         nonlocal continue_text
         failed = _replace_session(turn)
@@ -3859,8 +4121,9 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
             return failed
         run.turns.append(turn)
         _append_jsonl(agent_dir / "turns.jsonl", {"agent": spec.name, **turn})
-        continue_text = round_prompt(spec.name, ticket_path, ws.base_sha, dirty=dirty,
-                                     tmp_dir=scratch_arg, tmp_roots=tuple(tmp_roots))
+        prompt = round_prompt(spec.name, ticket_path, ws.base_sha, dirty=dirty,
+                              tmp_dir=scratch_arg, tmp_roots=tuple(tmp_roots))
+        continue_text = (note + "\n\n" + prompt) if note else prompt
         run.continues += 1
         return None
 
@@ -3995,7 +4258,8 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
             summary = turn.pop("summary_text", "") or "(the previous session wrote no summary)"
             continue_text = (round_prompt(spec.name, ticket_path, ws.base_sha,
                                           tmp_dir=scratch_arg)
-                             + "\n\n" + CONTEXT_CONTINUE_NOTE.format(summary=summary))
+                             + "\n\n" + CONTEXT_CONTINUE_NOTE.format(summary=summary)
+                             + _carry_note())
         run.continues += 1
         run.turns.append(turn)
         _append_jsonl(agent_dir / "turns.jsonl", {"agent": spec.name, **turn})
@@ -4163,6 +4427,13 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
         The four fields are written whether or not there is a size, so a turn
         always says what it knew: ``context_size``, ``context_source``,
         ``fill`` and ``compacted``.
+
+        KC-40: at ``summary_at_percent``, with an uncommitted diff in the
+        worktree, the summary edge fires first — forced or not.
+        ``"summary_fallback"`` when the ask got no answer and the attempt has a
+        session to spare; otherwise the compact goes on as above, and a prompt
+        that needs no compact after the ask is ``"summarized"`` — the ask's idle
+        is on the stream, so the caller needs a fresh mark then too.
         """
         forced, context_full[0] = context_full[0], False
         size, source, fill, tokens = None, "none", None, 0
@@ -4188,16 +4459,87 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                       "%.1f%% of %s now — no compact before %s", spec.name, fill,
                       f"{size:,}", kind)
             forced = False
+        if not forced and (not size or percent <= 0 or fill is None):
+            return ""
+        # KC-40: the summary is its own edge, and it is meant to sit below the
+        # compact's — the tree already holds a diff no one but the model can
+        # describe, and the compact would erase the model's working knowledge
+        # without ever asking it to say it. So it is asked at
+        # `summary_at_percent`, before the compact is due: a fill between the
+        # two gets one ask and no compact at all, and a fill at or past the
+        # compact's gets the ask and the compact right after it. A compact forced
+        # by a refusal for a full context is asked first too — live, that is the
+        # way most sessions reach their compact (round 79: every one of
+        # sensenova-6-8's).
+        asked = ""
+        summary_percent = context_memory.summary_at_percent(config)
+        if (size and fill is not None
+                and isinstance(summary_percent, (int, float)) and summary_percent > 0
+                and fill >= summary_percent):
+            text, outcome, note = maybe_summarize_before_compact(
+                backend, session, run, ws, config, out_dir, turn,
+                session_id=getattr(session, "id", "") or "", fill=fill,
+                on_permission=on_permission, on_question=on_question)
+            # the ask is a turn of its own at a full context: a tool it tried was
+            # refused (KC-69) and armed the stop meant for a working turn. That
+            # stop must not land on the compact or the prompt that follow, and
+            # the refusal is not the next turn's — so both are undone here, the
+            # way the turn loop undoes them after its own wait.
+            while context_stopper:
+                context_stopper.pop().cancel()
+            context_full[0] = False
+            if outcome:
+                # the ask's own idle is on the stream: the caller takes a fresh
+                # mark, so the prompt that follows does not end on it (KC-63)
+                asked = "summarized"
+            if note:
+                turn["summary_note"] = note
+            if outcome == "captured":
+                # the next prompt of this session carries the one line, and a
+                # reset later in the attempt carries the text itself
+                carry_note[0] = SUMMARY_CONTINUES_NOTE
+                _log.info("%s: the summary is out (%s chars) — the compact "
+                          "waits for %g%% before %s", spec.name, len(text),
+                          percent, kind)
+            elif outcome == "":
+                # already asked in this session, or nothing uncommitted: the
+                # prompt gets whatever the compact decides, as before KC-40
+                _log.info("%s: no summary to ask for at %.1f%% of %s", spec.name,
+                          fill, f"{size:,}")
+            else:
+                # no answer — an empty reply, a `session.error`, or silence — so
+                # there is no summary to carry: KC-39's fresh-session edge takes
+                # over, and whatever the attempt wrote goes with it, on
+                # `run.summary`. Only while the attempt has a session to spare
+                # (KC-39's ceiling, 0 = no resets at all): without one the
+                # session is kept and compacted, as it was before KC-40.
+                ceiling = _sessions_ceiling(config)
+                if ceiling > 0 and run.sessions_this_attempt < ceiling:
+                    _log.info("%s: summary ask at %.1f%% of %s ended %s%s — no "
+                              "answer, the work goes on in a new session", spec.name,
+                              fill, f"{size:,}", outcome,
+                              f" ({len(text)} chars written)" if text else "")
+                    return "summary_fallback"
+                _log.info("%s: summary ask at %.1f%% of %s ended %s — no answer, and "
+                          "no session left in the attempt: compacting", spec.name,
+                          fill, f"{size:,}", outcome)
+            # the summary turn added to the session: re-read, so the compact
+            # decision is made of the size the session holds now
+            try:
+                re_tokens = _context_tokens(backend, session)
+                tokens = re_tokens
+                fill = re_tokens * 100.0 / float(size)
+                turn["fill"] = round(fill, 1)
+            except Exception:  # noqa: BLE001 — the read before stands
+                pass
         if not forced:
-            if not size or percent <= 0 or fill is None:
-                return ""
             if fill < percent:
                 # one console line per prompt of a sized model: the operator
                 # sees the fill grow towards the compact, not only the compact
                 _log.info("%s: context %s tokens = %.1f%% of %s (%s), below %g%% — "
                           "no compact before %s", spec.name, f"{tokens:,}", fill,
                           f"{size:,}", source, percent, kind)
-                return ""
+                return asked
             _log.info("%s: context %s tokens = %.1f%% of %s (%s), at %g%% — "
                       "compacting before %s", spec.name, f"{tokens:,}", fill,
                       f"{size:,}", source, percent, kind)
@@ -4354,6 +4696,21 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
             # compact it for us. A mark is re-taken when a compact did happen,
             # so the compact's own idle is not this turn's idle.
             gated = _context_gate(turn, kind)
+            if gated == "summary_fallback":
+                # KC-40: the summary ask got no answer — the same edge KC-39 has
+                # for a continue that adds nothing: the session is aborted, a
+                # fresh one opens, and its first prompt is the round prompt with
+                # the `git status` lines, preceded by whatever the failed ask
+                # wrote. The turn is recorded by `fresh_session`, with the flags
+                # `_context_gate` set on it.
+                carry_note[0] = ""
+                # the partial answer the failed ask managed — written to the
+                # summary file already — goes to the front of the new prompt
+                failed = fresh_session(turn, _summary_read_tree(ws),
+                                       note=turn.pop("summary_note", ""))
+                if failed:
+                    return finish(AgentState.ERROR, failed)
+                continue
             if gated == "swap":
                 # KC-69: the compact did not free the session — the work goes on
                 # in a new one, which has never seen the ticket: the round
@@ -4369,12 +4726,20 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                 except TreeReadError:
                     dirty = ""
                 summary = turn.pop("summary_text", "") or "(the previous session wrote no summary)"
+                carried = _carry_note()
                 text = (round_prompt(spec.name, ticket_path, ws.base_sha, dirty=dirty,
-                                     tmp_dir=scratch_arg)
+                                      tmp_dir=scratch_arg)
                         + "\n\n" + CONTEXT_CONTINUE_NOTE.format(summary=summary)
+                        + carried
                         + "\n\n" + text)
             if gated:
                 since = mark_fn() if callable(mark_fn) else None
+            # KC-40: a captured summary is carried once — the prompt right after
+            # the ask, not every prompt after it
+            carry = carry_note[0]
+            carry_note[0] = ""
+            if carry:
+                text = carry + "\n\n" + text
             try:
                 # KC-65: the worker count of this moment, as the last lines of
                 # the message. This one send carries the first prompt, a
@@ -4877,9 +5242,10 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
                                 run.turns.append(turn)
                                 _append_jsonl(agent_dir / "turns.jsonl",
                                               {"agent": spec.name, **turn})
-                                continue_text = round_prompt(
+                                continue_text = (round_prompt(
                                     spec.name, ticket_path, ws.base_sha, dirty=dirty,
                                     tmp_dir=scratch_arg, tmp_roots=tuple(tmp_roots))
+                                    + _carry_note())
                                 continue
                             continue_text = CUT_OFF_MESSAGE if cut else continue_message(dirty)
                             run.continues += 1
@@ -5153,6 +5519,11 @@ def _plan(config: ContestConfig, workspaces: list, ticket_path: Path,
             else:
                 run.state, run.session_id, run.attempt = AgentState.CREATED, None, 0
                 run.continues = 0
+                # KC-40: the ask is one per session, and the restart opens a new
+                # session — so it is asked again there, and the answer appends to
+                # the summary file rather than overwriting the first.
+                run.summary_attempted_at_attempt = -1
+                run.summary_session_id = ""
                 # KC-39: the restart opens a new session in a new attempt, so the
                 # attempt's allowance comes back with it. The run's total is left
                 # as it is — those sessions were spent by this agent too — and

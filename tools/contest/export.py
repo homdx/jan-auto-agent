@@ -293,7 +293,7 @@ def write_entrants(out_dir, base_sha, state, paths, *, repo=None) -> Path | None
 _TABLE_COLUMNS = (
     "name", "model", "state", "attempts", "sessions", "turns", "asked", "allowed", "rejected",
     "gated", "gate-failed", "questions", "cost", "tokens in", "tokens out",
-    "fill%", "compactions", "commit", "last reason", "file",
+    "fill%", "compactions", "commit", "last reason", "file", "summary",
 )
 
 
@@ -344,6 +344,29 @@ def _fill_cell(fill) -> str:
     if isinstance(fill, (int, float)) and not isinstance(fill, bool):
         return f"{float(fill):.1f}%"
     return "-"
+
+
+#: KC-40: how much of a run's summary a SUMMARY cell holds — one line of it, so
+#: the row says which agent wrote one and what it started with, and the rest
+#: stays in `<agent>.summary.md` where the whole chain is.
+_SUMMARY_CELL_CHARS = 60
+
+
+def _summary_cell(summary) -> str:
+    """KC-40: the run's captured summary as SUMMARY's ``summary`` cell.
+
+    The first line of the text the runner asked for and got back, shortened to
+    ``_SUMMARY_CELL_CHARS`` with an ellipsis when it is longer. ``-`` when there
+    was none — a run that was never near a full context, or one that had a clean
+    tree — never an empty cell, which would read as a missing column.
+    """
+    text = summary if isinstance(summary, str) else ""
+    line = next((part.strip() for part in text.splitlines() if part.strip()), "")
+    if not line:
+        return "-"
+    if len(line) > _SUMMARY_CELL_CHARS:
+        line = line[:_SUMMARY_CELL_CHARS - 1] + "…"
+    return line
 
 
 def _utc(value) -> str:
@@ -417,6 +440,7 @@ def render_table(state, paths) -> list:
             commit[:12] if commit else "-",
             row.get("last_reason") or "-",
             files.get(str(row.get("name") or ""), "-"),
+            _summary_cell(row.get("summary")),
         ]
         lines.append("| " + " | ".join(_cell(cell) for cell in cells) + " |")
     return lines

@@ -52,10 +52,13 @@ __all__ = [
     "DEFAULT_DAYS",
     "DEFAULT_FILENAME",
     "DEFAULT_OUTPUT_RESERVE",
+    "DEFAULT_SUMMARY_AT_PERCENT",
     "KILO_COMPACT_RESERVE",
     "OverflowRecord",
     "add",
     "compact_at_percent",
+    "summary_at_percent",
+    "summary_file_name",
     "days_of",
     "kilo_limit",
     "load",
@@ -83,6 +86,16 @@ KILO_COMPACT_RESERVE = 20000
 #: The default fill, as a percent of the remembered size, at which the runner
 #: compacts a session that has no limit of its own. 0 turns the compact off.
 DEFAULT_COMPACT_AT_PERCENT = 80.0
+#: KC-40: the default fill, as a percent of a known size, at which the runner
+#: asks a session that holds an uncommitted diff for its own account of it,
+#: before a compact shrinks the history that explains the diff. Kept above
+#: `DEFAULT_COMPACT_AT_PERCENT` on purpose: at the default numbers the ask fires
+#: at 90 %, and a fill there has already earned the compact at 80 % — so the
+#: summary is what goes out first of the two. Set it below the compact's percent
+#: to ask earlier, of a session the compact has not reached yet. 0 turns the
+#: summary off, and a value at or above 100 turns it off too — a summary is
+#: asked of a session that still has room to answer it.
+DEFAULT_SUMMARY_AT_PERCENT = 90.0
 _DAY = 86400.0
 
 #: The limit the provider names for itself. The sensenova wording is the one in
@@ -519,6 +532,44 @@ def compact_at_percent(config) -> float:
     if not math.isfinite(value) or value < 0 or value > 100:
         return float(DEFAULT_COMPACT_AT_PERCENT)
     return value
+
+
+def summary_at_percent(config) -> float:
+    """KC-40: ``[contest] summary_at_percent`` — the fill, as a percent of a
+    known size, at which a session that already holds an uncommitted diff is
+    asked for its own summary, before anything is compacted away.
+
+    The default is 90. ``0`` is what it means: the mechanism off, which is how
+    a round turns it down. A missing key, a value that is not a number, one
+    below zero and one above 100 all fall back to the default — a typo must not
+    silently stop the summary, and a percent above 100 could never fire. Nothing
+    here is an exception.
+    """
+    if config is None:
+        return float(DEFAULT_SUMMARY_AT_PERCENT)
+    try:
+        value = float(getattr(config, "summary_at_percent", DEFAULT_SUMMARY_AT_PERCENT))
+    except (TypeError, ValueError):
+        return float(DEFAULT_SUMMARY_AT_PERCENT)
+    if value == 0:
+        return 0.0
+    if not math.isfinite(value) or value < 0 or value > 100:
+        return float(DEFAULT_SUMMARY_AT_PERCENT)
+    return value
+
+
+def summary_file_name(agent) -> str:
+    """KC-40: the summary's file name for *agent* — ``<agent>.summary.md``.
+
+    The operator opens one file per agent to read the chain of summaries the
+    round asked for, whatever the server did to the sessions that wrote them.
+    An agent name that is not a string, or one that would name another path
+    component, gets the ``agent`` prefix and nothing else — the file always
+    lands flat in the round's own directory.
+    """
+    name = agent if isinstance(agent, str) else ""
+    safe = "".join(c for c in name if c.isalnum() or c in "_-.")
+    return f"{safe or 'agent'}.summary.md"
 
 
 def plan_lines(records, agents, *, percent: float = DEFAULT_COMPACT_AT_PERCENT) -> list[str]:

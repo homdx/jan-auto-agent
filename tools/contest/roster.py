@@ -143,6 +143,7 @@ CONTEST_KEYS = (
     "context_memory_file",
     "context_memory_days",
     "compact_at_percent",
+    "summary_at_percent",
     "context_limit_fallback",
 )
 
@@ -393,6 +394,14 @@ class ContestConfig:
     #: compacts a session whose model has no limit of its own. Kilo compacts
     #: those on its own; 0 turns the runner's compact off.
     compact_at_percent: float = 80.0
+    #: KC-40: the fill, as a percent of a known size, at which the runner asks a
+    #: session that already holds an uncommitted diff to write a short summary of
+    #: it, before the compact that shrinks the history explaining the diff. 90 by
+    #: default — above ``compact_at_percent``, so at the default numbers the ask
+    #: only fires of a session the compact would take anyway, and it goes out
+    #: first. Lower it to ask of a session the compact has not reached yet. Read
+    #: from the ini with the same fail-open rule as ``compact_at_percent``.
+    summary_at_percent: float = 90.0
     #: KC-10: the context window the runner assumes for a model the provider
     #: declares no ``limit.context`` for — the free-tier custom providers, which
     #: send only a name and their reasoning. The fill divides the last reply's
@@ -747,6 +756,9 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
         if value < 0:
             raise RosterError(f"[contest] {key} must be >= 0, got {value}")
     compact_at_percent = num("compact_at_percent", 80.0)
+    # KC-40: the summary threshold rides with the compact's — same fail-open
+    # read, same default rule, 0 turns the summary off
+    summary_at_percent = num("summary_at_percent", 90.0)
     # KC-10: the window the runner assumes for a model the provider declares no
     # `limit.context` for. Read like the memory's numbers: 0 turns it off, and
     # a typo is 0 too — the rule stands down rather than sizing every prompt
@@ -828,6 +840,7 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
         context_memory_file=scalar("context_memory_file", ""),
         context_memory_days=context_memory_days,
         compact_at_percent=compact_at_percent,
+        summary_at_percent=summary_at_percent,
         context_limit_fallback=context_limit_fallback,
         workspace_kind=workspace_kind,
         variant=scalar("variant", "highest") or "highest",

@@ -4710,8 +4710,10 @@ def test_continue_turns_and_the_resume_nudge_leave_the_json_shape_alone(tmp_path
     assert set(agent) == {"agent", "workspace", "session_id", "state", "attempt", "turns",
                           "permissions", "questions", "last_error", "resumable", "commit",
                           "cost", "tokens", "deadline_commit", "continues", "compactions",
-                              "sessions", "sessions_this_attempt", "last_diff_signature",
-                              "first_touch_nudges_used", "first_touch_resets"}
+                          "sessions", "sessions_this_attempt", "last_diff_signature",
+                          "first_touch_nudges_used", "first_touch_resets",
+                          "summary", "summaries", "summary_attempted_at_attempt",
+                          "summary_session_id"}
     # KC-41: the key is present on a run that never used it, and reads `false` —
     # a consumer cannot tell "the model claimed this" from "the key was written
     # before the flag existed" by its presence alone
