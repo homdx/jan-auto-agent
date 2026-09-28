@@ -239,11 +239,15 @@ __all__ = [
     "AgentRun",
     "AgentState",
     "IdleKind",
+    "RELAY_STATES",
     "RoundState",
     "classify_idle",
     "CONTINUE_PROMPT",
+    "leg_message",
+    "leg_record",
     "round_prompt",
     "run_agent",
+    "run_leg",
     "run_round",
     "WORKERS_FILE",
     "agent_pytest_workers",
@@ -1631,6 +1635,11 @@ class AgentRun:
     #: session is a new history, and the one ask is per session, not per attempt —
     #: while a second crossing of the threshold inside one session is not asked.
     summary_session_id: str = ""
+    #: KC-43: the paragraph this run's first prompt carries when it is a leg after
+    #: the first — which leg it is, the instruction to continue, the records the
+    #: earlier legs left. `""` for every run of a one-leg round; cleared once the
+    #: first prompt has taken it, and left out of `state.json` when empty.
+    leg_note: str = ""
 
     @property
     def terminal(self) -> bool:
@@ -1642,6 +1651,9 @@ class AgentRun:
         data["state"] = self.state.value
         if not data.get("reaped"):
             data.pop("reaped", None)
+        # KC-43: a round of one leg writes the state.json it always wrote
+        if not data.get("leg_note"):
+            data.pop("leg_note", None)
         # KC-41: `deadline_commit` is written whenever the run has one, `true` or
         # `false`, so `state.json` says plainly whether the entry was the model's
         # claim or the runner's commit. Older files without the key read back as
@@ -1660,7 +1672,8 @@ class AgentRun:
                       "sessions_this_attempt",
                       "first_touch_nudges_used", "first_touch_resets",
                       "last_diff_signature", "summary", "summaries",
-                      "summary_attempted_at_attempt", "summary_session_id"):
+                      "summary_attempted_at_attempt", "summary_session_id",
+                      "leg_note"):
             if name in data:
                 setattr(run, name, data[name])
         run.deadline_commit = bool(getattr(run, "deadline_commit", False))
@@ -1718,16 +1731,30 @@ class RoundState:
     base_sha: str
     started_at: float
     agents: list = field(default_factory=list)
+    #: KC-43: which leg of the round this is (1, 2, ...), or `None` for a round
+    #: that is not a relay — the state.json every round wrote before the ticket.
+    leg: int | None = None
+
+    @property
+    def label(self) -> str:
+        """`65` for a round of one leg, `65.2` for its second leg — the number every
+        log line, `out_dir` and `state.json` of a relay carries."""
+        return str(self.round_no) if self.leg is None else f"{self.round_no}.{self.leg}"
 
     def to_dict(self) -> dict:
-        return {"round_no": self.round_no, "ticket": self.ticket, "base_sha": self.base_sha,
+        data = {"round_no": self.round_no, "ticket": self.ticket, "base_sha": self.base_sha,
                 "started_at": self.started_at, "agents": [run.to_dict() for run in self.agents]}
+        if self.leg is not None:
+            data["leg"] = self.leg
+        return data
 
     @classmethod
     def from_dict(cls, data: dict) -> "RoundState":
+        leg = data.get("leg")
         return cls(round_no=int(data["round_no"]), ticket=str(data["ticket"]),
                    base_sha=str(data["base_sha"]), started_at=float(data["started_at"]),
-                   agents=[AgentRun.from_dict(a) for a in data.get("agents", [])])
+                   agents=[AgentRun.from_dict(a) for a in data.get("agents", [])],
+                   leg=int(leg) if leg is not None else None)
 
     def table_rows(self) -> list:
         """One dict per agent — the SUMMARY's inputs; KC-7 renders them."""
@@ -1909,7 +1936,7 @@ def _scratch_note(agent_name: str, tmp_roots, tmp_dir: str = "") -> str:
 
 
 def round_prompt(agent_name: str, ticket_path: Path, base_sha: str, *, dirty: str = "",
-                 tmp_dir: str = "", tmp_roots=()) -> str:
+                 tmp_dir: str = "", tmp_roots=(), leg_note: str = "") -> str:
     """The runbook's prompt for *agent_name*, plus the base sha and the permission rule.
 
     The ticket is not repeated: the session reads it from its own worktree via
@@ -1921,8 +1948,10 @@ def round_prompt(agent_name: str, ticket_path: Path, base_sha: str, *, dirty: st
     first prompt. When *tmp_roots* names at least one root (KC-53), the paragraph
     that lists them and names the agent's own folder (`_scratch_note`) is
     inserted right before the reviewer sentence, so the agent stops guessing at a
-    scratch path the reviewer would refuse. Every existing caller passes none of
-    them and gets the unchanged text.
+    scratch path the reviewer would refuse. When *leg_note* is non-empty (KC-43,
+    the first prompt of a leg after the first) it goes last, after the `dirty`
+    paragraph: `leg_message`'s account of the relay so far and the instruction to
+    continue. Every existing caller passes none of them and gets the unchanged text.
     """
     del ticket_path
     text = _PROMPT.format(name=agent_name, base_sha=base_sha,
@@ -1932,6 +1961,8 @@ def round_prompt(agent_name: str, ticket_path: Path, base_sha: str, *, dirty: st
         text = text + _SCRATCH_DIR_NOTE.format(tmp_dir=tmp_dir)
     if dirty:
         text = text + "\n\n" + continue_message(dirty)
+    if leg_note:
+        text = text + "\n\n" + leg_note
     return text
 
 
@@ -4699,15 +4730,20 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
             else:
                 kind = "initial"
                 dirty = getattr(run, "dirty_on_resume", "") or ""
+                # KC-43: a leg after the first opens with the relay so far — a
+                # continue, never a rework, so `run.attempt` is not touched
+                leg_note = getattr(run, "leg_note", "") or ""
                 if dirty:
                     # KC-22, `--resume` into a worktree that still holds the
                     # work: the fresh session learns of it on its first prompt.
                     text = round_prompt(spec.name, ticket_path, ws.base_sha, dirty=dirty,
-                                        tmp_dir=scratch_arg, tmp_roots=tuple(tmp_roots))
+                                        tmp_dir=scratch_arg, tmp_roots=tuple(tmp_roots),
+                                        leg_note=leg_note)
                     run.dirty_on_resume = ""  # only the first prompt carries it
                 else:
                     text = round_prompt(spec.name, ticket_path, ws.base_sha, tmp_dir=scratch_arg,
-                                        tmp_roots=tuple(tmp_roots))
+                                        tmp_roots=tuple(tmp_roots), leg_note=leg_note)
+                run.leg_note = ""  # only the first prompt carries it
             turn = {"kind": kind, "attempt": run.attempt, "sent_at": time.time()}
             if kind == "continue":
                 note = (f"attempt {run.attempt} (continue {run.continues} of "
@@ -5588,12 +5624,162 @@ def _plan(config: ContestConfig, workspaces: list, ticket_path: Path,
     return runs
 
 
-def run_round(config: ContestConfig, round_no: int, ticket_path: Path, workspaces: list, *,
+# ─────────────────────────────────────────────────────────────────────────────
+# KC-43: legs — a round that is a relay of whole turns in one worktree
+# ─────────────────────────────────────────────────────────────────────────────
+
+#: The states a leg can end an agent in that hand it to the next leg: it ran out
+#: — of clock, of context, of rework budget — with its work still in the worktree.
+#: Every other end stops the relay for that agent. READY is the entry itself, so a
+#: leg 3 would only be asked to redo it; DEAD (KC-42) never started, so a leg must
+#: not be spent on it; ERROR is the runner's or the provider's failure, and a
+#: fresh session would meet the same one — `--resume` is the way back from that.
+RELAY_STATES = (AgentState.GAVE_UP, AgentState.STALLED)
+
+#: How many touched files a leg record lists before it says "and N more" — the
+#: records are pasted into the next leg's prompt, so they stay short by construction.
+_LEG_FILES_SHOWN = 30
+
+#: Paths the record never lists: the agent's queue and the test-tier links are the
+#: harness's own, not work.
+_LEG_SCRATCH = ("runs/", ".smoke_tests/")
+
+
+def _leg_files(ws: Workspace) -> list:
+    """`(path, added, deleted, untracked)` of everything the leg left in *ws*.
+
+    Committed and uncommitted alike: `git diff --numstat <base_sha>` is the
+    working tree against the base, and `git ls-files --others` adds the files
+    `diff` cannot see. Sorted by path. Never raises — a tree that cannot be read is
+    `[]`, which the record says as `none`, never as a guess.
+    """
+    found: dict = {}
+    try:
+        for raw in git(ws.path, "diff", "--numstat", ws.base_sha).splitlines():
+            added, deleted, path = _split_numstat(raw)
+            if path and not path.startswith(_LEG_SCRATCH):
+                found[path] = (added, deleted, False)
+        for path in git(ws.path, "ls-files", "--others", "--exclude-standard").splitlines():
+            path = path.strip()
+            if path and path not in found and not path.startswith(_LEG_SCRATCH):
+                found[path] = (_line_count(Path(ws.path) / path), 0, True)
+    except Exception as exc:  # noqa: BLE001 — a record must never raise into a round
+        _log.warning("could not read what the leg left in %s: %s", ws.path, _brief(str(exc)))
+        return []
+    return [(path, *found[path]) for path in sorted(found)]
+
+
+def leg_record(run: AgentRun, ws: Workspace, out_dir) -> Path:
+    """KC-43: write `<out_dir>/<agent>.leg.md` — what the leg left, and nothing more.
+
+    Mechanical only: the files touched with a diffstat (committed and not), the
+    commit the leg ended on — KC-41's deadline commit or the model's — and the
+    harvest verdict with its reason codes when one ran. A field with nothing in it
+    says `none`, never blank, so a leg that produced nothing at all still hands the
+    next one a record. The agent's own last message, the pytest roots and "what is
+    left" are KC-74's. Returns the path.
+    """
+    out_dir = Path(out_dir)
+    files = _leg_files(ws)
+    if files:
+        added = sum(f[1] for f in files)
+        deleted = sum(f[2] for f in files)
+        lines = [f"files: {len(files)} (+{added} -{deleted})"]
+        for path, plus, minus, untracked in files[:_LEG_FILES_SHOWN]:
+            lines.append(f"  {path}  +{plus} -{minus}" + (" (new)" if untracked else ""))
+        if len(files) > _LEG_FILES_SHOWN:
+            lines.append(f"  ... and {len(files) - _LEG_FILES_SHOWN} more")
+    else:
+        lines = ["files: none"]
+    # where the branch ended, for the record only — KC-30's rule stands: the runner
+    # never reads a sha to stand in for a claim, and no verdict is built from this one
+    commit = git(ws.path, "log", "-1", "--format=%H") if _commits_above(ws) > 0 else ""
+    verdict = ""
+    for turn in reversed(run.turns):
+        h = turn.get("harvest") if isinstance(turn, dict) else None
+        if h:
+            verdict = " ".join([str(h.get("verdict", ""))]
+                               + [str(c) for c in h.get("reasons", [])]).strip()
+            break
+    lines += [f"commit: {commit or 'none'}", f"harvest: {verdict or 'none'}"]
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / f"{run.agent.name}.leg.md"
+    path.write_text(f"leg {out_dir.name} — {run.agent.name}\n" + "\n".join(lines) + "\n",
+                    encoding="utf-8")
+    return path
+
+
+def leg_message(leg: int, ticket_path, records=()) -> str:
+    """KC-43: the paragraph the first prompt of leg *leg* carries.
+
+    What a fresh session needs to pick the work up: which leg this is, the
+    instruction to *continue* from the files the earlier legs changed rather than
+    start over — a relay is not a rework, so no critique — where the ticket is even
+    when `next_task.py` has nothing left to hand out, the files the ticket declares
+    (so a leg that produced nothing still says where the work belongs), and the
+    leg records so far, *records* being newest first.
+    """
+    ticket = Path(ticket_path).name
+    try:
+        declared = ", ".join(declared_files(ticket_path)) or "none"
+    except OSError:
+        declared = "none"
+    body = "\n\n".join(str(r).strip() for r in records if str(r).strip()) or "nothing recorded"
+    return (
+        f"This is leg {leg} of a relay on ticket {ticket}. The legs before yours worked "
+        f"in this same worktree: their session is gone, their work is not. Your job is "
+        f"to continue from the files they changed — the worktree already holds that "
+        f"work, it is yours; do not start over and do not discard it.\n\n"
+        f"The ticket is epic-tasks/{ticket}; if `next_task.py` hands you nothing because "
+        f"an earlier leg already recorded it, read it there. The files it declares: "
+        f"{declared}.\n\n"
+        f"What the earlier legs left, newest first:\n\n{body}"
+    )
+
+
+def _plan_leg(config: ContestConfig, workspaces: list, ticket_path: Path,
+              prior: RoundState, records: dict, leg: int) -> list:
+    """The `AgentRun` per workspace for leg *leg*, off the leg that just ended.
+
+    An agent whose *prior* run ended outside `RELAY_STATES` keeps that run as it
+    ended, terminal, so the runner skips it and the leg's `state.json` is still the
+    whole round — the last leg's is what gets exported. Every other agent gets a
+    fresh run on the same workspace: state `CREATED`, `attempt` 0, no session — the
+    new session is the point — and its first prompt carries `leg_message` with the
+    agent's *records*, newest first.
+    """
+    specs = {spec.name: spec for spec in config.agents}
+    ended = {run.agent.name: run for run in prior.agents}
+    runs = []
+    for ws in workspaces:
+        before = ended.get(ws.agent)
+        if before is not None and before.state not in RELAY_STATES:
+            runs.append(before)
+            continue
+        spec = before.agent if before is not None else specs.get(ws.agent)
+        run = AgentRun(agent=spec or AgentSpec(ws.agent, "", ""), workspace=ws)
+        run.leg_note = leg_message(leg, ticket_path, records.get(ws.agent, ()))
+        runs.append(run)
+    return runs
+
+
+def run_leg(config: ContestConfig, round_no: int, ticket_path: Path, workspaces: list, *,
               make_backend: Callable[[Workspace], ContestBackend], out_dir: Path,
+              leg: int | None = None, carry: RoundState | None = None,
+              records: dict | None = None,
               resume: RoundState | None = None,
               run_tests: bool = False,
               server_pid: int | None = None) -> RoundState:
-    """One round: a `run_agent` per workspace in a pool of `config.max_parallel`.
+    """One round — or, with *leg*, one leg of it: a `run_agent` per workspace in a
+    pool of `config.max_parallel`.
+
+    KC-43: a leg is today's round body, unmodified. *leg* numbers it (`65.2` in the
+    state, the folder and the log lines); `None` is a round that is not a relay,
+    and every earlier caller. *carry* is the state of the leg just before this one,
+    *records* its per-agent leg records (newest first): together they plan the leg
+    with `_plan_leg` — every agent that ran out gets a fresh session in its own
+    worktree, every agent that finished stays as it ended. *carry* and *resume*
+    are two different ways of starting from an earlier state, and not both.
 
     Each agent gets its own `ContestBackend` for its directory: `make_backend`
     is called once per non-terminal agent and decides which backend that is
@@ -5619,11 +5805,16 @@ def run_round(config: ContestConfig, round_no: int, ticket_path: Path, workspace
     """
     out_dir, ticket_path = Path(out_dir), Path(ticket_path)
     workspaces = list(workspaces)
-    runs = _plan(config, workspaces, ticket_path, resume, run_tests=run_tests)
+    if carry is not None and resume is not None:
+        raise ValueError("a leg starts from the leg before it or from a resumed state, not both")
+    if carry is not None:
+        runs = _plan_leg(config, workspaces, ticket_path, carry, records or {}, int(leg or 2))
+    else:
+        runs = _plan(config, workspaces, ticket_path, resume, run_tests=run_tests)
     state = RoundState(round_no=round_no, ticket=ticket_path.name,
                        base_sha=workspaces[0].base_sha if workspaces else "",
                        started_at=resume.started_at if resume is not None else time.time(),
-                       agents=runs)
+                       agents=runs, leg=leg)
     lock = threading.Lock()
     stop = threading.Event()
     since: dict = {run.agent.name: time.monotonic() for run in runs}   # state entered at
@@ -5714,6 +5905,21 @@ def run_round(config: ContestConfig, round_no: int, ticket_path: Path, workspace
             _reap_round_worktrees(state.agents)
             save()
     return state
+
+
+def run_round(config: ContestConfig, round_no: int, ticket_path: Path, workspaces: list, *,
+              make_backend: Callable[[Workspace], ContestBackend], out_dir: Path,
+              resume: RoundState | None = None,
+              run_tests: bool = False,
+              server_pid: int | None = None) -> RoundState:
+    """One round of one leg — `run_leg` with no leg number, as before KC-43.
+
+    Nothing about the state, the folder or the log lines says "leg": `legs = 1`
+    is this function, byte for byte. See `run_leg` for the pool, `state.json`,
+    *resume*, *run_tests* and *server_pid*.
+    """
+    return run_leg(config, round_no, ticket_path, workspaces, make_backend=make_backend,
+                   out_dir=out_dir, resume=resume, run_tests=run_tests, server_pid=server_pid)
 
 
 def _lock_status(run: AgentRun) -> tuple | None:
@@ -5847,7 +6053,7 @@ class _Heartbeat:
 
         live = sum(1 for run in self.state.agents if not run.terminal)
         age = _age(time.time() - self.state.started_at)
-        text = f"round {self.state.round_no} {age}: " + " · ".join(parts) + f" — {live} live"
+        text = f"round {self.state.label} {age}: " + " · ".join(parts) + f" — {live} live"
         count = self._kilo_neighbours()
         if count is not None:
             # KC-62: a store this busy is what ends agents on `Failed to execute

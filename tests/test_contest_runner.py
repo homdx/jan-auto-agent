@@ -76,8 +76,13 @@ from tools.contest.runner import (  # noqa: E402
     _retry_backoff,
     _retry_reason,
     _retryable,
+    RELAY_STATES,
+    _plan_leg,
+    leg_message,
+    leg_record,
     round_prompt,
     run_agent,
+    run_leg,
     run_round,
 )
 from tools.contest.workspace import Workspace, agent_tmp_dir  # noqa: E402
@@ -7522,3 +7527,180 @@ def test_kc50_a_mechanical_harvest_does_not_wait_behind_anothers_roots(
     assert out["agent-a"].waited == 0.0 and out["agent-a"].ahead == 0
     assert out["agent-b"].verdict == "READY"
     assert _runner_module._TEST_RUNS_LOCK.status("agent-b") is None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KC-43: legs — a relay of whole turns in one worktree
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _leg_run(sb, name="agent-a", **fields) -> AgentRun:
+    ws = sb.ws(name)
+    run = AgentRun(agent=AgentSpec(name, "kenary", f"{name}:free"), workspace=ws)
+    for key, value in fields.items():
+        setattr(run, key, value)
+    return run
+
+
+def test_leg_record_of_a_leg_that_produced_nothing_says_none(tmp_path):
+    """A field with nothing in it says `none`, never blank."""
+    sb = Sandbox(tmp_path)
+    out = tmp_path / "legs" / "45.1"
+    path = leg_record(_leg_run(sb), sb.ws("agent-a"), out)
+
+    assert path == out / "agent-a.leg.md"
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert lines[1:] == ["files: none", "commit: none", "harvest: none"]
+    assert all(line.strip() for line in lines)
+
+
+def test_leg_record_names_files_diffstat_commit_and_verdict(tmp_path):
+    """Committed and uncommitted work, an untracked file, the last harvest —
+    and never the agent's queue or the test-tier links."""
+    sb = Sandbox(tmp_path)
+    ws = sb.ws("agent-a")
+    _work(str(ws.path), test=False, claim=False)                    # one commit, pkg/thing.py
+    _write(ws.path / "notes.txt", "one\ntwo\nthree\n")            # untracked
+    _write(ws.path / ".smoke_tests" / "link.py", "x\n")             # harness, not work
+    _write(ws.path / "runs" / "agent-a" / "PROGRESS.csv", "ticket\n")
+    turns = [{"kind": "initial", "harvest": {"verdict": "REWORK", "reasons": ["no_test"]}},
+             {"kind": "rework", "harvest": {"verdict": "REWORK", "reasons": ["no_progress_row"]}}]
+
+    text = leg_record(_leg_run(sb, turns=turns), ws, tmp_path / "legs" / "45.1").read_text(
+        encoding="utf-8")
+
+    assert "files: 2 (+4 -1)" in text
+    assert "pkg/thing.py  +" in text and "notes.txt  +3 -0 (new)" in text
+    assert ".smoke_tests" not in text and "PROGRESS.csv" not in text
+    assert f"commit: {_git(ws.path, 'rev-parse', 'HEAD')}" in text
+    assert "harvest: REWORK no_progress_row" in text          # the last scored turn's
+
+
+def test_leg_message_asks_to_continue_names_the_files_and_the_records(tmp_path):
+    ticket = tmp_path / TICKET
+    _write(ticket, TICKET_BODY)
+
+    text = leg_message(3, ticket, ["leg 45.2 — a\nfiles: 1", "leg 45.1 — a\nfiles: none"])
+
+    assert "leg 3 of a relay" in text and TICKET in text
+    assert "continue" in text and "do not start over" in text
+    assert "pkg/thing.py" in text and "tests/test_thing.py" in text
+    assert text.index("leg 45.2") < text.index("leg 45.1")          # newest first
+    # a relay is not a rework: no critique, no attempt counter
+    assert "not accepted yet" not in text and "Attempt " not in text
+    assert "nothing recorded" in leg_message(2, ticket, [])
+
+
+def test_round_prompt_carries_the_leg_note_last_and_is_unchanged_without_one(tmp_path):
+    plain = round_prompt("agent-a", tmp_path / TICKET, "abc123")
+    assert round_prompt("agent-a", tmp_path / TICKET, "abc123", leg_note="") == plain
+    with_note = round_prompt("agent-a", tmp_path / TICKET, "abc123", dirty=" M x.py",
+                             leg_note="LEG NOTE")
+    assert with_note.startswith(plain) and with_note.endswith("\n\nLEG NOTE")
+    assert with_note.index("x.py") < with_note.index("LEG NOTE")
+
+
+def test_plan_leg_relays_only_the_agents_that_ran_out(tmp_path):
+    """GAVE_UP and STALLED get a fresh run in the same worktree; READY, DEAD and
+    ERROR stay as they ended, terminal, so the runner skips them."""
+    names = ["ready", "gaveup", "stalled", "dead", "error"]
+    sb = Sandbox(tmp_path, names)
+    ended = {"ready": AgentState.READY, "gaveup": AgentState.GAVE_UP,
+             "stalled": AgentState.STALLED, "dead": AgentState.DEAD,
+             "error": AgentState.ERROR}
+    prior = RoundState(round_no=ROUND, ticket=TICKET, base_sha=sb.base_sha, started_at=1.0,
+                       agents=[_leg_run(sb, n, state=st, attempt=1, session_id=f"ses_{n}")
+                               for n, st in ended.items()], leg=1)
+    config = make_config(names)
+    records = {"gaveup": ["leg 45.1 — gaveup"], "stalled": ["leg 45.1 — stalled"]}
+
+    runs = _plan_leg(config, list(sb.workspaces), sb.ticket_path, prior, records, 2)
+
+    by = {r.agent.name: r for r in runs}
+    for name in ("ready", "dead", "error"):
+        assert by[name] is next(r for r in prior.agents if r.agent.name == name)
+        assert by[name].terminal and by[name].leg_note == ""
+    for name in ("gaveup", "stalled"):
+        run = by[name]
+        assert run is not next(r for r in prior.agents if r.agent.name == name)
+        assert (run.state, run.attempt, run.session_id) == (AgentState.CREATED, 0, None)
+        assert run.workspace is sb.ws(name)                      # the worktree is carried
+        assert f"leg 45.1 — {name}" in run.leg_note and "leg 2 of a relay" in run.leg_note
+    assert set(RELAY_STATES) == {AgentState.GAVE_UP, AgentState.STALLED}
+
+
+def test_a_round_that_is_not_a_relay_writes_the_state_json_it_always_wrote(tmp_path):
+    sb = Sandbox(tmp_path)
+    plain = RoundState(round_no=ROUND, ticket=TICKET, base_sha=sb.base_sha, started_at=1.0,
+                       agents=[_leg_run(sb)])
+    data = plain.to_dict()
+    assert "leg" not in data and "leg_note" not in data["agents"][0]
+    assert plain.label == "45"
+    assert RoundState.from_dict(json.loads(json.dumps(data))).leg is None
+
+    relay = RoundState(round_no=ROUND, ticket=TICKET, base_sha=sb.base_sha, started_at=1.0,
+                       agents=[_leg_run(sb, leg_note="NOTE")], leg=2)
+    back = RoundState.from_dict(json.loads(json.dumps(relay.to_dict())))
+    assert relay.to_dict()["leg"] == 2 and relay.label == "45.2"
+    assert back.leg == 2 and back.agents[0].leg_note == "NOTE"
+
+
+def _leg_two_ready(directory, text):
+    """Leg 1's agent leaves a commit that lacks its test; a prompt that says it is
+    leg 2 is the one turn that finishes the ticket."""
+    (work_ready if "leg 2 of a relay" in text else work_no_test)(directory, text)
+
+
+def test_a_second_leg_continues_in_the_same_worktree_on_a_new_session(tmp_path):
+    """Leg 1 ends GAVE_UP with a commit in the worktree; leg 2 prompts a new
+    session there with leg 1's record and the word continue — no critique, and
+    the attempt counter is where a fresh run starts, not bumped by the hop."""
+    sb = Sandbox(tmp_path)
+    config = make_config(["agent-a"], max_rework=0)
+    ws = sb.ws("agent-a")
+    out2 = tmp_path / "out2"
+    out2.mkdir()
+    with _BenchFake({"turns": [{"on_prompt": _leg_two_ready, "events": ["busy", "idle"]}]}) as fake:
+        one = run_leg(config, ROUND, sb.ticket_path, list(sb.workspaces),
+                      make_backend=_make_backend(fake, sb.out_dir), out_dir=sb.out_dir, leg=1)
+        run1 = _by_name(one)["agent-a"]
+        assert run1.state is AgentState.GAVE_UP and one.leg == 1
+        leg_one_head = _git(ws.path, "rev-parse", "HEAD")
+        record = leg_record(run1, ws, sb.out_dir).read_text(encoding="utf-8")
+        two = run_leg(config, ROUND, sb.ticket_path, list(sb.workspaces),
+                      make_backend=_make_backend(fake, out2), out_dir=out2, leg=2,
+                      carry=one, records={"agent-a": [record]})
+        prompts = _prompts(fake)
+    run2 = _by_name(two)["agent-a"]
+
+    _assert_ready(run2, ws)
+    assert two.leg == 2 and _state_json_of(out2)["leg"] == 2
+    assert run2.workspace.path == run1.workspace.path
+    assert run2.session_id and run2.session_id != run1.session_id
+    assert run2.attempt == run1.attempt == 0
+    assert [sid for sid, _ in prompts] == [run1.session_id, run2.session_id]
+    text = prompts[1][1]
+    assert "leg 2 of a relay" in text and "continue" in text
+    assert "files: 1" in text and leg_one_head in text            # leg 1's record, verbatim
+    assert "not accepted yet" not in text                        # a relay is not a rework
+    assert "relay" not in prompts[0][1]                          # leg 1 is a round's first prompt
+    assert run2.leg_note == ""                                    # only the first prompt carries it
+
+
+def _state_json_of(out: Path) -> dict:
+    return json.loads((out / "state.json").read_text(encoding="utf-8"))
+
+
+def test_run_round_is_run_leg_with_no_leg_number(tmp_path):
+    """`legs = 1`: the round has no leg in its state, and a READY run is left alone
+    by the planner exactly as a resumed one is."""
+    sb = Sandbox(tmp_path)
+    with _BenchFake({"turns": [{"on_prompt": work_ready, "events": ["busy", "idle"]}]}) as fake:
+        state = _round(sb, fake, make_config(["agent-a"]))
+    assert state.leg is None and "leg" not in _state_json(sb)
+    _assert_ready(_by_name(state)["agent-a"], sb.ws("agent-a"))
+    assert all("relay" not in text for _sid, text in _prompts(fake))
+    with pytest.raises(ValueError, match="not both"):
+        run_leg(make_config(["agent-a"]), ROUND, sb.ticket_path, list(sb.workspaces),
+                make_backend=lambda ws: None, out_dir=sb.out_dir, leg=2, carry=state,
+                resume=state)

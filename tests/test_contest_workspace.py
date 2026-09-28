@@ -42,6 +42,7 @@ if str(REPO_ROOT) not in __import__("sys").path:
 from tools.contest.harvest import harvest
 from tools.contest.roster import ContestConfig
 from tools.contest.workspace import (
+    LegCarry,
     Workspace,
     WorkspaceError,
     agent_tmp_dir,
@@ -825,3 +826,92 @@ def test_harvest_and_format_patch_of_a_clone_match_a_worktree_at_the_same_commit
     assert h_clone.commit == sha
     assert _format_patch(clone.path, base) == _format_patch(wt.path, base)
     assert _format_patch(clone.path, base).startswith("From " + sha)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KC-43: a leg carries the previous leg's checkout — and nothing else's
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _leg_one(repo, config, round_no=40):
+    """Leg 1 of *round_no*: its checkouts, each holding a commit and an edit."""
+    base = _base_sha(repo)
+    wss = prepare_round(repo, config, round_no, base)
+    for ws in wss:
+        (ws.path / f"{ws.agent}.txt").write_text("leg one\n")
+        _git(ws.path, "add", "-A")
+        _git(ws.path, "commit", "-q", "-m", f"{ws.agent}: leg 1")
+        (ws.path / "wip.txt").write_text("uncommitted\n")
+    return base, wss
+
+
+def test_prepare_round_carries_the_previous_legs_checkout_untouched(repo, config):
+    """Same path, same branch, the commit and the uncommitted edit still there —
+    the worktree is the hand-over, so nothing is reset, cleaned or emptied."""
+    base, one = _leg_one(repo, config)
+    heads = {ws.agent: _git(ws.path, "rev-parse", "HEAD").strip() for ws in one}
+
+    two = prepare_round(repo, config, 40, base, leg=2,
+                        carry_from=LegCarry(40, 1, tuple(one)))
+
+    assert [ws.agent for ws in two] == ["laguna", "hy3"]
+    for before, after in zip(one, two):
+        assert after.path == before.path
+        assert after.branch == before.branch == f"contest/40/{after.agent}"
+        assert _git(after.path, "rev-parse", "HEAD").strip() == heads[after.agent]
+        assert (after.path / f"{after.agent}.txt").is_file()
+        assert (after.path / "wip.txt").read_text() == "uncommitted\n"
+
+
+def test_carry_from_refuses_a_previous_rounds_checkout(repo, config):
+    """The no-reuse rule stands: round 40's checkouts are not round 41's."""
+    base, one = _leg_one(repo, config, round_no=40)
+    with pytest.raises(WorkspaceError, match="across rounds"):
+        prepare_round(repo, config, 41, base, leg=2,
+                      carry_from=LegCarry(40, 1, tuple(one)))
+
+
+def test_carry_from_refuses_anything_but_the_immediately_preceding_leg(repo, config):
+    base, one = _leg_one(repo, config)
+    with pytest.raises(WorkspaceError, match="only carry from leg 2"):
+        prepare_round(repo, config, 40, base, leg=3,
+                      carry_from=LegCarry(40, 1, tuple(one)))
+    with pytest.raises(WorkspaceError, match="only carry from leg 1"):
+        prepare_round(repo, config, 40, base, leg=2,
+                      carry_from=LegCarry(40, 2, tuple(one)))
+
+
+def test_a_leg_after_the_first_without_carry_from_is_refused(repo, config):
+    base, _one = _leg_one(repo, config)
+    with pytest.raises(WorkspaceError, match="nothing to carry from"):
+        prepare_round(repo, config, 40, base, leg=2)
+
+
+def test_carry_from_refuses_another_agents_checkout(repo, config):
+    """laguna's leg-2 slot handed hy3's checkout: refused, nothing carried."""
+    base, one = _leg_one(repo, config)
+    laguna, hy3 = one
+    swapped = (Workspace(agent="laguna", path=hy3.path, branch=hy3.branch,
+                         base_sha=base, kind=hy3.kind), hy3)
+    with pytest.raises(WorkspaceError, match="not contest/40/laguna"):
+        prepare_round(repo, config, 40, base, leg=2,
+                      carry_from=LegCarry(40, 1, swapped))
+    # and an agent the previous leg left no checkout for
+    with pytest.raises(WorkspaceError, match="left no checkout for hy3"):
+        prepare_round(repo, config, 40, base, leg=2,
+                      carry_from=LegCarry(40, 1, (laguna,)))
+
+
+def test_carry_from_refuses_a_checkout_that_moved_off_its_branch(repo, config):
+    base, one = _leg_one(repo, config)
+    _git(one[0].path, "checkout", "-q", "--detach")
+    with pytest.raises(WorkspaceError, match="refusing to carry it into leg 2"):
+        prepare_round(repo, config, 40, base, leg=2,
+                      carry_from=LegCarry(40, 1, tuple(one)))
+
+
+def test_leg_one_is_prepare_round_as_it_was(repo, config):
+    """`leg=1`, no `carry_from`: the reset path — a dirty checkout is still refused."""
+    base, _one = _leg_one(repo, config)
+    with pytest.raises(WorkspaceError, match="holds work a reset would discard"):
+        prepare_round(repo, config, 40, base)

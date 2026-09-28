@@ -90,6 +90,7 @@ CONTEST_KEYS = (
     "backend",
     "max_parallel",
     "max_rework",
+    "legs",
     "max_continues_per_attempt",
     "max_sessions_per_attempt",
     "first_touch_sec",
@@ -266,6 +267,11 @@ class ContestConfig:
     server: str = "spawn"
     max_parallel: int = 3
     max_rework: int = 2
+    #: KC-43: how many legs one round may run. A leg is one whole turn of the
+    #: round on a fresh session in the *same* worktree; the next leg starts only
+    #: for the agents whose leg ended without a READY entry. 1 is today's round,
+    #: byte for byte — no leg number in any path, log line or `state.json`.
+    legs: int = 1
     max_continues_per_attempt: int = 2
     #: KC-39: how many sessions one attempt may use in total — the first one and
     #: every replacement (KC-39's reset for a repeated diff, KC-54's and KC-69's
@@ -797,6 +803,7 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
         server=scalar("server", "spawn"),
         max_parallel=limit("max_parallel", 3),
         max_rework=limit("max_rework", 2),
+        legs=max(1, limit("legs", 1)),
         max_continues_per_attempt=limit("max_continues_per_attempt", 2),
         max_sessions_per_attempt=max(0, limit("max_sessions_per_attempt", 2)),
         first_touch_sec=seconds("first_touch_sec", 420.0),

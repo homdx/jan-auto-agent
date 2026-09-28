@@ -32,6 +32,13 @@ clone's push URL is cut at the same time, so ``git push origin HEAD`` fails in g
 itself rather than in the LLM gate's prompt. The worktree path is unchanged and
 selectable with ``workspace_kind = worktree``.
 
+KC-43 adds the one sanctioned exception to "never carried across rounds": a
+round may run as numbered legs, and leg *n+1* runs in leg *n*'s checkout on
+leg *n*'s branch — ``prepare_round(..., carry_from=LegCarry(...), leg=n+1)``.
+The exception is guarded so it can only ever carry from the immediately
+preceding leg of the same round and the same agent; anything else, a previous
+round's checkout included, is refused exactly as before.
+
 The round's scratch dir is per agent too: ``tmp_roots`` names the shared roots, and
 each agent gets ``<tmp_root>/<agent>/``, created at round start by
 :func:`ensure_agent_tmp_dirs`. Nothing in the runner names a path — the dir is
@@ -56,6 +63,7 @@ from tools.contest.roster import ContestConfig
 from tools.git_run import run_git
 
 __all__ = [
+    "LegCarry",
     "Workspace",
     "WorkspaceError",
     "agent_tmp_dir",
@@ -121,6 +129,20 @@ class Workspace:
     def progress_csv(self) -> Path:
         """The agent's queue file: ``<path>/runs/<agent>/PROGRESS.csv``."""
         return self.path / "runs" / self.agent / "PROGRESS.csv"
+
+
+@dataclass(frozen=True)
+class LegCarry:
+    """KC-43: the checkouts leg *leg* of round *round_no* ended with.
+
+    What ``prepare_round(carry_from=…)`` accepts: the workspaces of the leg
+    that has just finished, and which round and leg they belong to, so the
+    guard can tell "the leg before this one" from anything else.
+    """
+
+    round_no: int
+    leg: int
+    workspaces: tuple[Workspace, ...]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -681,6 +703,62 @@ def _workspace_kind(config: ContestConfig) -> Literal["clone", "worktree"]:
     return _KIND_WORKTREE if kind == _KIND_WORKTREE else _KIND_CLONE
 
 
+def _carry_workspaces(config: ContestConfig, round_no: int, leg: int,
+                      carry: LegCarry | None) -> list[Workspace]:
+    """KC-43: the checkouts leg *leg* continues in, or a :class:`WorkspaceError`.
+
+    The one exception to "a worktree must never be carried across rounds", and
+    so the strictest check in this module. *carry* must be leg ``leg - 1`` of
+    *round_no* itself; every agent of the roster must have a checkout in it, on
+    the branch ``contest/<NN>/<agent>`` of this round, still there on disk and
+    still on that branch. A previous round's checkout fails the first test, another
+    agent's the second, and a leg two steps back the third. Nothing is reset,
+    cleaned or emptied: the worktree is the hand-over.
+    """
+    if carry is None:
+        raise WorkspaceError(
+            f"leg {leg} of round {round_no} has nothing to carry from — a checkout "
+            f"is only ever reused by the leg right after the one that left it"
+        )
+    if carry.round_no != round_no:
+        raise WorkspaceError(
+            f"cannot carry round {carry.round_no}'s checkouts into round {round_no} — "
+            f"a worktree must never be carried across rounds"
+        )
+    if leg < 2 or carry.leg != leg - 1:
+        raise WorkspaceError(
+            f"leg {leg} of round {round_no} can only carry from leg {leg - 1}, "
+            f"not from leg {carry.leg}"
+        )
+    held = {ws.agent: ws for ws in carry.workspaces}
+    carried: list[Workspace] = []
+    for agent in config.agents:
+        ws = held.get(agent.name)
+        if ws is None:
+            raise WorkspaceError(
+                f"leg {carry.leg} of round {round_no} left no checkout for "
+                f"{agent.name} — nothing to carry into leg {leg}"
+            )
+        branch = _branch_name(round_no, agent.name)
+        if ws.branch != branch:
+            raise WorkspaceError(
+                f"{ws.path} is on {ws.branch}, not {branch} — refusing to carry a "
+                f"checkout that is not this round's and this agent's"
+            )
+        if not Path(ws.path).is_dir():
+            raise WorkspaceError(f"{ws.path} is gone — leg {carry.leg}'s checkout for "
+                                 f"{agent.name} cannot be carried into leg {leg}")
+        head = _git(Path(ws.path), ["rev-parse", "--abbrev-ref", "HEAD"],
+                    check=False).stdout.strip()
+        if head != branch:
+            raise WorkspaceError(
+                f"{ws.path} is on {head or 'no branch'}, not {branch} — refusing to "
+                f"carry it into leg {leg}"
+            )
+        carried.append(ws)
+    return carried
+
+
 def prepare_round(
     repo,
     config: ContestConfig,
@@ -690,6 +768,8 @@ def prepare_round(
     clones: dict[str, Path] | None = None,
     force_clone: bool = False,
     force: bool = False,
+    carry_from: LegCarry | None = None,
+    leg: int = 1,
 ) -> list[Workspace]:
     """Prepare one checkout per roster agent at *base_ref*; return the workspaces.
 
@@ -702,7 +782,16 @@ def prepare_round(
     refused unless *force* (KC-23's ``--fresh``); *force_clone* still governs the
     attached clones alone. Every agent's scratch dir is created first. The repo's
     own checkout is never touched (no ``checkout``/``reset`` in *repo* itself).
+
+    KC-43: *leg* is the leg being prepared (1 is the round's first, and every
+    earlier caller's). With *carry_from* — the previous leg's :class:`LegCarry` —
+    nothing is reset: each roster agent's checkout is handed back as it is, after
+    :func:`_carry_workspaces` has checked that it belongs to this round and this
+    agent and that *carry_from* is leg ``leg - 1``. A *leg* above 1 without a
+    *carry_from* is refused: a checkout from any other round is never reused.
     """
+    if carry_from is not None or leg != 1:
+        return _carry_workspaces(config, round_no, leg, carry_from)
     repo_path = Path(repo).resolve()
     base_sha = _check_base_and_epic_tasks(repo_path, base_ref)
     root = _resolve_rounds_dir(repo_path, config.rounds_dir)

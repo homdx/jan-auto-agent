@@ -3263,3 +3263,169 @@ def test_an_uncreatable_agent_tmpdir_is_a_refusal_naming_the_path(
     assert "cannot create" in lines[0]
     assert str(sandbox.repo / "pkg" / "thing.py" / f"contest-{ROUND}") in lines[0]
     assert calls == [{}], "only the offer check's throwaway; no round server of its own"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KC-43: `--legs N` — a round as numbered legs over one worktree per agent
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _relay_turn(directory, text):
+    """agent-a finishes on the first prompt that says it is leg 2; everything
+    else, agent-b always and agent-a's leg 1 included, is a commit without its test."""
+    if Path(directory).name.endswith("agent-a") and "leg 2 of a relay" in text:
+        work_ready(directory, text)
+    else:
+        work_no_test(directory, text)
+
+
+SCENARIO_RELAY = {"turns": [{"on_prompt": _relay_turn, "events": ["busy", "idle"]},
+                            {"on_prompt": _relay_turn, "events": ["busy", "idle"]}]}
+RELAY_ARGV = ["--ticket", "1", "--no-gate", "--no-tests"]
+
+
+def _leg_dirs(sb, n: int = 3) -> dict:
+    root = sb.out().parent
+    return {leg: root / f"{ROUND:02d}.{leg}" for leg in range(1, n + 1)}
+
+
+def _agents_of(folder: Path) -> dict:
+    data = json.loads((folder / "state.json").read_text(encoding="utf-8"))
+    return {a["agent"]["name"]: a for a in data["agents"]}
+
+
+def test_legs_three_runs_three_leg_folders_over_one_worktree(sandbox, capsys, spawn_holder):
+    """`--legs 3`: `01.1`, `01.2`, `01.3`, each state.json naming its leg; an agent's
+    worktree path is the same in all three and its session_id is new in each."""
+    code, fake = run_fake(sandbox, SCENARIO_RELAY, [*RELAY_ARGV, "--legs", "3"], spawn_holder)
+    captured = capsys.readouterr()
+    legs = _leg_dirs(sandbox)
+
+    assert code == 0, captured.err
+    assert not sandbox.out().exists()                       # no un-suffixed folder in a relay
+    for leg, folder in legs.items():
+        assert json.loads((folder / "state.json").read_text(encoding="utf-8"))["leg"] == leg
+    b = {leg: _agents_of(folder)["agent-b"] for leg, folder in legs.items()}
+    assert len({b[leg]["workspace"]["path"] for leg in b}) == 1
+    assert Path(b[1]["workspace"]["path"]).name == f"{ROUND:02d}-agent-b"
+    assert len({b[leg]["session_id"] for leg in b}) == 3
+    assert [a["state"] for a in b.values()] == ["GAVE_UP"] * 3
+    lines = [ln for ln in captured.err.splitlines() if ln.startswith("leg ")]
+    assert [ln.split(":")[0] for ln in lines] == ["leg 1 of 3", "leg 2 of 3", "leg 3 of 3"]
+    assert "leg 2 continues agent-a, agent-b" in lines[0]
+    assert "leg 3 continues agent-b" in lines[1] and lines[2].endswith("the relay ends")
+    assert any(ln.startswith("legs ") and "01.1" in ln and "01.3" in ln
+               for ln in captured.out.splitlines())
+
+
+def test_a_leg_two_ready_stops_that_agents_relay_and_a_rework_does_not(
+        sandbox, capsys, spawn_holder):
+    """agent-a is READY on leg 2, so leg 3 never opens a session for it; agent-b's
+    leg 2 was a REWORK and a rework, and it goes on to leg 3."""
+    code, fake = run_fake(sandbox, SCENARIO_RELAY, [*RELAY_ARGV, "--legs", "3"], spawn_holder)
+    capsys.readouterr()
+    legs = _leg_dirs(sandbox)
+    a2, a3 = _agents_of(legs[2])["agent-a"], _agents_of(legs[3])["agent-a"]
+    b2, b3 = _agents_of(legs[2])["agent-b"], _agents_of(legs[3])["agent-b"]
+
+    assert code == 0
+    assert a2["state"] == a3["state"] == "READY"
+    assert a3["session_id"] == a2["session_id"]                      # carried, not re-run
+    assert not (legs[3] / "agent-a").exists()                        # no backend was made for it
+    assert [t["kind"] for t in b2["turns"]] == ["initial", "rework"]  # leg 2: a REWORK …
+    assert b3["session_id"] != b2["session_id"] and b3["turns"]       # … and leg 3 still ran
+    by_session = {}
+    for sid, text in _prompts(fake):
+        by_session.setdefault(sid, []).append(text)
+    assert len(by_session[a2["session_id"]]) == 1                    # one turn, then done
+    assert b3["session_id"] in by_session
+
+
+def test_leg_two_prompt_has_leg_ones_record_and_continue_but_no_critique(
+        sandbox, capsys, spawn_holder):
+    code, fake = run_fake(sandbox, SCENARIO_RELAY, [*RELAY_ARGV, "--legs", "3"], spawn_holder)
+    capsys.readouterr()
+    legs = _leg_dirs(sandbox)
+    first = {name: _agents_of(legs[2])[name]["session_id"] for name in ("agent-a", "agent-b")}
+    texts = {sid: [t for s, t in _prompts(fake) if s == sid][0] for sid in first.values()}
+
+    for name, sid in first.items():
+        text = texts[sid]
+        record = (legs[1] / f"{name}.leg.md").read_text(encoding="utf-8")
+        assert record.strip().splitlines()[0] in text                  # leg 1's record, in full
+        assert f"leg 01.1 — {name}" in text and "files: 1" in text
+        assert "leg 2 of a relay" in text and "continue" in text
+        assert "not accepted yet" not in text and "Attempt " not in text
+    # a relay is not a rework: every attempt counter starts over on the new session
+    assert _agents_of(legs[2])["agent-b"]["turns"][0]["attempt"] == 0
+    assert _agents_of(legs[2])["agent-b"]["turns"][0]["kind"] == "initial"
+
+
+def test_intermediate_legs_do_not_export_and_the_last_leg_exports_once(
+        sandbox, capsys, spawn_holder):
+    code, fake = run_fake(sandbox, SCENARIO_RELAY, [*RELAY_ARGV, "--legs", "3"], spawn_holder)
+    captured = capsys.readouterr()
+    legs = _leg_dirs(sandbox)
+
+    for leg in (1, 2):
+        names = {p.name for p in legs[leg].iterdir()}
+        assert not any(n.endswith((".patch", ".diff")) for n in names), names
+        assert "SUMMARY.md" not in names and "entrants.json" not in names
+    # a record for every agent that ran the leg: both in legs 1 and 2, agent-b alone in 3
+    records = {leg: {p.name for p in legs[leg].glob("*.leg.md")} for leg in legs}
+    assert records[1] == records[2] == {"agent-a.leg.md", "agent-b.leg.md"}
+    assert records[3] == {"agent-b.leg.md"}
+    last = {p.name for p in legs[3].iterdir()}
+    assert {"agent-a.patch", "agent-b.GAVE_UP.patch", "SUMMARY.md", "entrants.json"} <= last
+    assert _patches(captured.out) == [str(legs[3] / "agent-a.patch"),
+                                      str(legs[3] / "agent-b.GAVE_UP.patch")]
+    # the last leg's state is the whole round: agent-a, finished on leg 2, is in it
+    assert [row["state"] for row in _table(captured.out)] == ["READY", "GAVE_UP"]
+
+
+def test_a_relay_whose_first_leg_finishes_everyone_runs_one_leg(sandbox, capsys, spawn_holder):
+    scenario = {"turns": [{"on_prompt": work_ready, "events": ["busy", "idle"]}]}
+    code, fake = run_fake(sandbox, scenario, [*RELAY_ARGV, "--legs", "3"], spawn_holder)
+    captured = capsys.readouterr()
+    legs = _leg_dirs(sandbox)
+
+    assert code == 0, captured.err
+    assert legs[1].is_dir() and not legs[2].exists()
+    assert "the relay ends" in captured.err
+    assert (legs[1] / "agent-a.patch").is_file() and (legs[1] / "agent-b.patch").is_file()
+
+
+def test_legs_one_is_the_round_as_it_was(sandbox, capsys, spawn_holder):
+    """`--legs 1` (and no flag, which is the same): the un-suffixed folder, a state
+    with no leg in it, no plan line, no record — the tree before KC-43."""
+    code, fake = run_fake(sandbox, SCENARIO_ONE_READY, [*RELAY_ARGV, "--legs", "1"], spawn_holder)
+    captured = capsys.readouterr()
+    out = sandbox.out()
+
+    assert code == 0
+    assert not (out.parent / f"{ROUND:02d}.1").exists()
+    assert not list(out.parent.glob("**/*.leg.md"))
+    data = json.loads((out / "state.json").read_text(encoding="utf-8"))
+    assert set(data) == {"round_no", "ticket", "base_sha", "started_at", "agents"}
+    assert all("leg_note" not in agent for agent in data["agents"])
+    assert not any(line.startswith("legs ") for line in captured.out.splitlines())
+    assert "leg 1 of" not in captured.err
+    assert (out / "agent-a.patch").is_file() and (out / "SUMMARY.md").is_file()
+    assert load_roster(sandbox.repo / "contest.ini").legs == 1
+
+
+def test_legs_flag_is_checked_at_intake(sandbox, capsys):
+    assert cli.main(["run", *RELAY_ARGV, "--legs", "0"]) == 1
+    assert "intake: --legs must be at least 1, got 0" in capsys.readouterr().err
+    assert cli.main(["run", *RELAY_ARGV, "--legs", "2", "--resume"]) == 1
+    assert "--resume cannot continue a round of 2 legs" in capsys.readouterr().err
+
+
+def test_the_roster_legs_key_is_the_default_and_the_flag_overrides_it(sandbox):
+    ini = sandbox.repo / "contest.ini"
+    ini.write_text(ini.read_text(encoding="utf-8").replace(
+        "max_rework = 1", "max_rework = 1\nlegs = 3"), encoding="utf-8")
+    assert load_roster(ini).legs == 3
+    assert cli._apply_flags(load_roster(ini), argparse.Namespace(
+        models="", variant=None, max_parallel=None, no_gate=False, legs=2)).legs == 2
+    assert cli._apply_flags(load_roster(ini), argparse.Namespace(
+        models="", variant=None, max_parallel=None, no_gate=False, legs=None)).legs == 3

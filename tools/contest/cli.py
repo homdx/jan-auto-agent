@@ -99,6 +99,7 @@ from tools.contest.roster import (
 )
 from tools.contest.runner import (
     WORKERS_FILE,
+    RELAY_STATES,
     AgentState,
     RoundState,
     _is_quota,
@@ -107,7 +108,9 @@ from tools.contest.runner import (
     agent_tmp_path,
     core_count,
     round_live_agents,
+    leg_record,
     round_prompt,
+    run_leg,
     run_round,
     write_pytest_workers,
 )
@@ -127,7 +130,7 @@ from tools.contest.think_probe import (
     probe_model,
     save_probe_cache,
 )
-from tools.contest.workspace import WorkspaceError, agent_tmp_dir, prepare_round
+from tools.contest.workspace import LegCarry, WorkspaceError, agent_tmp_dir, prepare_round
 from tools.git_run import run_git
 
 __all__ = [
@@ -1903,6 +1906,9 @@ def _apply_flags(config: ContestConfig, args: argparse.Namespace) -> ContestConf
         for agent in config.agents))
     if args.max_parallel is not None:
         config = replace(config, max_parallel=int(args.max_parallel))
+    # KC-43: `--legs N` for one command, else `[contest] legs`
+    if getattr(args, "legs", None) is not None:
+        config = replace(config, legs=max(1, int(args.legs)))
     if args.no_gate:
         # the mechanical layer still decides; every ask it cannot decide is the
         # existing `gate-failed` reject, recorded like any decision
@@ -2032,6 +2038,20 @@ def _with_remembered_limits(config: ContestConfig, out_dir: Path,
     return replace(config, agents=tuple(agents)), merged
 
 
+def _legs_of(config: ContestConfig) -> int:
+    """KC-43: how many legs the round runs — 1 for a config without the key."""
+    try:
+        return max(1, int(getattr(config, "legs", 1) or 1))
+    except (TypeError, ValueError):
+        return 1
+
+
+def _leg_out_dir(out_dir: Path, leg: int | None) -> Path:
+    """KC-43: `contest-out/65.2` for leg 2 of round 65; *out_dir* itself for a round
+    that is not a relay (`leg is None`), the folder every earlier round used."""
+    return out_dir if leg is None else out_dir.with_name(f"{out_dir.name}.{leg}")
+
+
 def _print_plan(result: Intake, config: ContestConfig, out_dir: Path, *, run_tests: bool,
                 workers: int | None = None, workers_fixed: bool = False,
                 agent_tmp: Path | None = None) -> None:
@@ -2050,6 +2070,10 @@ def _print_plan(result: Intake, config: ContestConfig, out_dir: Path, *, run_tes
         ("gate", _gate_plan_label(config)),
         ("out", str(out_dir)),
     )
+    legs = _legs_of(config)
+    if legs > 1:
+        # KC-43: only a relay says so — a round of one leg prints the plan it always did
+        facts = facts + (("legs", f"{legs} — {out_dir.name}.1 … {out_dir.name}.{legs}"),)
     width = max(len(key) for key, _ in facts)
     for key, value in facts:
         print(f"{key:<{width}} {value}")
@@ -2166,8 +2190,17 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(f"intake: {exc}", file=sys.stderr)
         return EXIT_FAILED
 
+    if getattr(args, "legs", None) is not None and args.legs < 1:
+        print(f"intake: --legs must be at least 1, got {args.legs}", file=sys.stderr)
+        return EXIT_FAILED
     config = _apply_flags(config, args)
     run_tests = not args.no_tests
+    # KC-43: a relay's legs are not resumable — a round of one leg is
+    legs = _legs_of(config)
+    if args.resume and legs > 1:
+        print(f"intake: --resume cannot continue a round of {legs} legs — resume one "
+              f"leg's folder with `--out <folder> --legs 1`", file=sys.stderr)
+        return EXIT_FAILED
 
     _roster_ini_path = str(_roster_path(repo, args.roster))
     result = intake(repo, tasks_dir, args.ticket, args.base, config,
@@ -2247,55 +2280,116 @@ def cmd_run(args: argparse.Namespace) -> int:
             print(f"intake: {exc}", file=sys.stderr)
             return EXIT_FAILED
 
-    out_dir.mkdir(parents=True, exist_ok=True)
-    # KC-65: the file the agents' pytest reads, written before the server
-    # spawns, so the first prompts already read a sane number. A write that
-    # fails keeps the round going — the env then carries no
-    # CONTEST_PYTEST_WORKERS_FILE, the plugin answers None, and xdist takes its
-    # own answer from PYTEST_XDIST_AUTO_NUM_WORKERS.
-    workers_file = out_dir / WORKERS_FILE
-    try:
-        write_pytest_workers(workers_file, workers)
-        env["CONTEST_PYTEST_WORKERS_FILE"] = str(workers_file)
-    except OSError as exc:
-        print(f"warn: cannot write {workers_file}: {exc} — the agents' pytest "
-              "falls back to xdist's own worker count", file=sys.stderr)
-    if agent_tmp is not None:
+    # KC-43: a round of `legs` legs is a relay of whole turns in the same
+    # worktrees, one `<out>.<leg>` folder each; a round of one leg is the round
+    # this command always ran, in the folder with no suffix. The loop below runs
+    # once in that case, and everything in it is the code that ran before.
+    relay = legs > 1
+    leg = 1 if relay else None
+    prior: RoundState | None = None
+    leg_records: dict = {}          # agent -> the leg records so far, newest first
+    final_out = out_dir
+    while True:
+        leg_out = _leg_out_dir(out_dir, leg)
+        leg_out.mkdir(parents=True, exist_ok=True)
+        # KC-65: the file the agents' pytest reads, written before the server
+        # spawns, so the first prompts already read a sane number. A write that
+        # fails keeps the round going — the env then carries no
+        # CONTEST_PYTEST_WORKERS_FILE, the plugin answers None, and xdist takes its
+        # own answer from PYTEST_XDIST_AUTO_NUM_WORKERS.
+        workers_file = leg_out / WORKERS_FILE
         try:
-            agent_tmp_created = not agent_tmp.exists()
-            agent_tmp.mkdir(parents=True, exist_ok=True)
-            os.chmod(agent_tmp, 0o700)
+            write_pytest_workers(workers_file, workers)
+            env["CONTEST_PYTEST_WORKERS_FILE"] = str(workers_file)
         except OSError as exc:
-            print(f"intake: agent_tmpdir: cannot create {agent_tmp}: {exc}", file=sys.stderr)
-            return EXIT_FAILED
-    try:
-        server, make_backend = _make_backends(config, out_dir, env=env or None)
-    except (KiloServerError, FileNotFoundError, OSError) as exc:
-        print(f"server: {exc}", file=sys.stderr)
-        if agent_tmp_created:
-            shutil.rmtree(agent_tmp, ignore_errors=True)
-        return EXIT_FAILED
+            print(f"warn: cannot write {workers_file}: {exc} — the agents' pytest "
+                  "falls back to xdist's own worker count", file=sys.stderr)
+        if agent_tmp is not None:
+            try:
+                agent_tmp_created = not agent_tmp.exists()
+                agent_tmp.mkdir(parents=True, exist_ok=True)
+                os.chmod(agent_tmp, 0o700)
+            except OSError as exc:
+                print(f"intake: agent_tmpdir: cannot create {agent_tmp}: {exc}", file=sys.stderr)
+                if not relay or leg == 1:
+                    return EXIT_FAILED
+                print(f"warn: leg {leg} was not run — the round is exported as leg "
+                      f"{leg - 1} left it", file=sys.stderr)
+                break
+        try:
+            server, make_backend = _make_backends(config, leg_out, env=env or None)
+        except (KiloServerError, FileNotFoundError, OSError) as exc:
+            print(f"server: {exc}", file=sys.stderr)
+            if agent_tmp_created:
+                shutil.rmtree(agent_tmp, ignore_errors=True)
+            if not relay or leg == 1:
+                return EXIT_FAILED
+            print(f"warn: leg {leg} was not run — the round is exported as leg "
+                  f"{leg - 1} left it", file=sys.stderr)
+            break
 
-    # KC-62: the box decides what the round is likely to lose. One line at
-    # intake, so the operator knows before the first prompt that the store is
-    # shared — the agents' own retries are the recovery, not the notice.
-    note = _kilo_neighbour_note(config, server, proc_root=_PROC_ROOT)
-    if note:
-        print(note, file=sys.stderr)
+        # KC-62: the box decides what the round is likely to lose. One line at
+        # intake, so the operator knows before the first prompt that the store is
+        # shared — the agents' own retries are the recovery, not the notice.
+        note = _kilo_neighbour_note(config, server, proc_root=_PROC_ROOT)
+        if note:
+            print(note, file=sys.stderr)
 
-    try:
-        state = run_round(config, args.ticket, result.ticket_path, workspaces,
-                          make_backend=make_backend, out_dir=out_dir, resume=resume,
-                          run_tests=run_tests, server_pid=server.pid if server else None)
-    finally:
-        if server is not None:
-            server.close()
-        # KC-65: the temp dir is the round's — removed here, with the server,
-        # and only when this round made it. Never the parent.
-        if agent_tmp_created:
-            shutil.rmtree(agent_tmp, ignore_errors=True)
+        # the agents this leg runs: every one on leg 1, then only those that ran out
+        expected = (None if prior is None else
+                    {run.agent.name for run in prior.agents if run.state in RELAY_STATES})
+        try:
+            if relay:
+                state = run_leg(config, args.ticket, result.ticket_path, workspaces,
+                                make_backend=make_backend, out_dir=leg_out, leg=leg,
+                                carry=prior, records=leg_records, run_tests=run_tests,
+                                server_pid=server.pid if server else None)
+            else:
+                state = run_round(config, args.ticket, result.ticket_path, workspaces,
+                                  make_backend=make_backend, out_dir=leg_out, resume=resume,
+                                  run_tests=run_tests, server_pid=server.pid if server else None)
+        finally:
+            if server is not None:
+                server.close()
+            # KC-65: the temp dir is the round's — removed here, with the server,
+            # and only when this round made it. Never the parent.
+            if agent_tmp_created:
+                shutil.rmtree(agent_tmp, ignore_errors=True)
+        final_out = leg_out
+        if not relay:
+            break
 
-    patches = export_patches(state, workspaces, out_dir)
+        # KC-43: what the leg left goes to the next one as a record, written for
+        # every agent that ran — never a reason to stop the round
+        for run in state.agents:
+            if expected is not None and run.agent.name not in expected:
+                continue
+            try:
+                text = leg_record(run, run.workspace, leg_out).read_text(
+                    encoding="utf-8").strip()
+            except Exception as exc:  # noqa: BLE001 — a record failing never fails a round
+                print(f"warn: could not write the leg record of {run.agent.name}: {exc}",
+                      file=sys.stderr)
+                continue
+            leg_records.setdefault(run.agent.name, []).insert(0, text)
+        going = [run.agent.name for run in state.agents if run.state in RELAY_STATES]
+        print(f"leg {leg} of {legs}: "
+              + " · ".join(f"{run.agent.name} {run.state.value}" for run in state.agents)
+              + (f" — leg {leg + 1} continues {', '.join(going)}"
+                 if going and leg < legs else " — the relay ends"), file=sys.stderr)
+        if not going or leg >= legs:
+            break
+        try:
+            workspaces = prepare_round(
+                repo, config, args.ticket, args.base, leg=leg + 1,
+                carry_from=LegCarry(args.ticket, leg,
+                                    tuple(run.workspace for run in state.agents)))
+        except WorkspaceError as exc:
+            print(f"warn: leg {leg + 1} was not run: {exc}", file=sys.stderr)
+            break
+        prior, leg = state, leg + 1
+
+    patches = export_patches(state, workspaces, final_out)
     # KC-7: the two files that make `<out>/` the input `contest-bench` reads.
     # Written here, in the round's own exit path, so the operator never writes
     # them by hand. A failure to write either is a `warn:` line and nothing else
@@ -2303,14 +2397,14 @@ def cmd_run(args: argparse.Namespace) -> int:
     # stage finds them, so the exit code stays the round's own.
     exports_written: list = []
     try:
-        target = export.write_entrants(out_dir, state.base_sha, state, patches, repo=repo)
+        target = export.write_entrants(final_out, state.base_sha, state, patches, repo=repo)
     except Exception as exc:  # noqa: BLE001 — a failed export never changes the exit
         print(f"warn: could not write {export.ENTRANTS_FILE}: {exc}", file=sys.stderr)
     else:
         if target is not None:
             exports_written.append((export.ENTRANTS_FILE, target))
     try:
-        target = export.write_summary(out_dir, state, state.base_sha, patches, repo=repo,
+        target = export.write_summary(final_out, state, state.base_sha, patches, repo=repo,
                                       gate=_gate_plan_label(config))
     except Exception as exc:  # noqa: BLE001 — as above
         print(f"warn: could not write {export.SUMMARY_FILE}: {exc}", file=sys.stderr)
@@ -2418,6 +2512,10 @@ def _parser() -> argparse.ArgumentParser:
                           "the cache has no entry for it (KC-11)")
     run.add_argument("--max-parallel", type=int, default=None, metavar="N",
                      help="override the roster's max_parallel")
+    run.add_argument("--legs", type=int, default=None, metavar="N",
+                     help="run the round as N numbered legs (KC-43): each a whole turn on a "
+                          "new session in the same worktree, handed a record of the legs "
+                          "before it; overrides [contest] legs (default 1)")
     run.add_argument("--no-tests", action="store_true",
                      help="do not run the pytest roots in the harvest (the default is on)")
     run.add_argument("--no-gate", action="store_true",

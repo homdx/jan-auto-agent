@@ -145,6 +145,34 @@ quota — a reset time further out than `provider_retry_max_wait_sec` — ends
 the agent `ERROR provider_quota` at once, with the reset time printed once
 per provider at the round's end.
 
+**`--legs N` for a ticket too large for one turn (KC-43).** A round is one shot:
+one turn, the continues and reworks inside its session, then the harvest. When
+the ticket cannot be finished in one turn — the context or the clock gives out
+with the work half done — run it as a relay:
+
+```bash
+python3 -m tools.contest run --ticket 65 --legs 3
+```
+
+Each leg is today's round body on a **new session in the same worktree**, so the
+code survives and the exhausted context does not. The legs land in
+`contest-out/65.1`, `65.2`, `65.3`, and every log line and `state.json` names
+its leg. An agent whose leg ended `GAVE_UP` or `STALLED` is handed on; one that
+ended `READY` is finished (its state carries to the last leg unchanged), and
+`DEAD` and `ERROR` are not retried — a new session would meet the same failure.
+Leg *n+1*'s first prompt is a **continue**, not a rework: the leg records so far
+(`<agent>.leg.md` — the files touched with a diffstat, the commit the leg ended
+on, the harvest verdict, each `none` when empty; newest first) and the
+instruction to go on from the files already changed. Every leg starts with a
+fresh attempt counter and its own rework budget. Only the **last** leg is
+scored, exported and summarised (`.patch`, `entrants.json`, `SUMMARY.md`);
+intermediate legs only have to end in a captured state. `legs = 1` (the
+default, `[contest] legs`) is one turn with no leg suffix, the round as it
+always was. A relay cannot be `--resume`d as a whole: resume one leg's folder
+with `--out <that folder> --legs 1`. Cross-agent relay — one model finishing
+another's work — is deliberately not built: it removes the independence that
+makes a round a comparison.
+
 **The flags of `run`** (`python3 -m tools.contest run --help` is the source):
 
 | flag | what it does |
@@ -159,6 +187,7 @@ per provider at the round's end.
 | `--register-missing` | register a model Kilo does not list, for this round only (needs `server = spawn`) |
 | `--reprobe` / `--allow-unprobed` | re-run the variant probe / start even when a probe failed or is missing (KC-11) |
 | `--max-parallel N` | override `[contest] max_parallel` |
+| `--legs N` | run the round as N numbered legs over one worktree per agent (KC-43); overrides `[contest] legs` (default 1) |
 | `--no-tests` | no pytest roots in the harvest |
 | `--no-gate` | no gate model: the mechanical layer decides, the rest is `gate-failed` |
 | `--resume` | continue from `state.json`; only the mid-flight agents restart |
@@ -170,7 +199,7 @@ per provider at the round's end.
 
 ```
 contest.ini                              roster + limits + gate profile (committed, no keys)
-contest-out/<NN>/                        one folder per round (git-ignored)
+contest-out/<NN>/                        one folder per round (git-ignored); with `--legs N`, `<NN>.1` … `<NN>.N`, one per leg
   state.json                             every agent's state after every transition — `--resume` reads it
   <agent>/events.jsonl                   every SSE event of that session, wall-clocked
   <agent>/decisions.jsonl                every permission decision: layer, verdict, reason, elapsed, gate model
@@ -178,6 +207,7 @@ contest-out/<NN>/                        one folder per round (git-ignored)
   <agent>.patch                          git format-patch base..branch (READY; GAVE_UP/STALLED/ERROR keep it when a commit exists)
   <agent>.<STATE>.diff                   a STALLED/ERROR tree with edits and no commit (KC-31)
   <agent>.session.json                    the session's own message dump
+  <agent>.leg.md                         what a leg left, handed to the next one (`--legs` only)
   entrants.json                          contest-bench's input, names = agents
   SUMMARY.md                             the table + the gate's own decisions + the next commands
 ../rounds/<NN>-<agent>/                  the checkouts (outside the repo tree), branch contest/<NN>/<agent>
