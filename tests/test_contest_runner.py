@@ -6904,6 +6904,34 @@ def test_the_suite_queue_does_not_count_against_agent_max_sec(tmp_path, monkeypa
         slots.release("other:harvest")
 
 
+def test_the_harvest_does_not_count_against_agent_max_sec(tmp_path, monkeypatch):
+    """Round 83: a harvest that outlasts the agent's whole limit (its queue for
+    the suite slots) does not end the agent — the limit is paused for it, the
+    REWORK it returns goes out, and the agent ends READY, not `time up`."""
+    names = ("agent-a",)
+    sb = Sandbox(tmp_path, names)
+    cfg = make_config(names, agent_max_sec=2, idle_event_timeout_sec=0)
+    real = _runner_module._harvest
+    calls = []
+
+    def slow_first(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            time.sleep(3.0)             # longer than the agent's whole limit
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(_runner_module, "_harvest", slow_first)
+    scenario = {"turns": [
+        {"on_prompt": work_no_test, "events": ["busy", "idle"]},
+        {"on_prompt": work_ready, "events": ["busy", "idle"]},
+    ]}
+    with _BenchFake(scenario) as fake:
+        run = Harness(sb, fake, cfg, agent=names[0]).go()
+    assert run.state is AgentState.READY, run.last_error
+    assert "time up" not in (run.last_error or "")
+    assert len(calls) == 2
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # KC-10 — the fill is read before every prompt, and at 80 % of a model the
 #          provider declares no limit for, the session is compacted

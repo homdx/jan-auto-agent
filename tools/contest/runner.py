@@ -5496,7 +5496,17 @@ def run_agent(run: AgentRun, *, backend: ContestBackend, policy: Policy,
 
             # ── HARVESTING ─────────────────────────────────────────────────
             transition(AgentState.HARVESTING, note="tests on" if run_tests else "tests off")
-            verdict = _harvest(ws, ticket_path, run_tests, config)
+            # Round 83: the harvest is the judge's time, not the agent's — its
+            # queue for the round's suite slots ran 27 min for one agent, and a
+            # limit that fired in there turned a REWORK into `time up`. So the
+            # hard limit is paused for the whole harvest, as it is for the
+            # agent's own queue (KC-58), and resumed with what it had left.
+            paused = pause_time_up()
+            try:
+                verdict = _harvest(ws, ticket_path, run_tests, config)
+            finally:
+                if paused:
+                    resume_time_up()
             turn["harvest"] = {"verdict": verdict.verdict,
                                "reasons": [r.code for r in verdict.reasons],
                                "elapsed": round(verdict.elapsed, 1),
