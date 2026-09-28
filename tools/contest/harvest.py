@@ -160,6 +160,17 @@ def _is_ancestor(path: Path, commit: str) -> bool:
     return r.returncode == 0
 
 
+def _at_or_under_base(ws: Workspace, commit: str) -> bool:
+    """Whether *commit* is the round's base or one of its ancestors — a claim
+    that names no commit of the agent's change. False with no base to compare."""
+    base = getattr(ws, "base_sha", "") or ""
+    if not base:
+        return False
+    r = subprocess.run(["git", "merge-base", "--is-ancestor", commit, base],
+                       cwd=str(ws.path), capture_output=True, text=True)
+    return r.returncode == 0
+
+
 def _resolve_claim(path: Path, claimed: str) -> str | None:
     """The full 40-char sha *claimed* names in *path*, or None.
 
@@ -407,6 +418,7 @@ def harvest(ws: Workspace, ticket_path: Path, *, run_tests: bool = False,
     progress = f"runs/{ws.agent}/PROGRESS.csv"  # ws.progress_csv, for a short reason
     reasons: list[Reason] = []
     resolved: str | None = None  # the full sha the claim names, once it is on the branch
+    claimed_base = False         # the claim names the round's base (round 83)
     if claim is None:
         reasons.append(Reason(
             "no_progress_row",
@@ -439,7 +451,18 @@ def harvest(ws: Workspace, ticket_path: Path, *, run_tests: bool = False,
             ))
         else:
             sha = _resolve_claim(ws.path, claimed_commit)
-            if sha is not None and _is_ancestor(ws.path, sha):
+            claimed_base = sha is not None and _at_or_under_base(ws, sha)
+            if claimed_base and _is_ancestor(ws.path, sha):
+                # Round 83: the base itself is on the branch too, and a row that
+                # claimed it had the roots run on the base — the agent's change
+                # was never tested, and its GAVE_UP named the base as its commit
+                reasons.append(Reason(
+                    "commit_not_on_branch",
+                    f"commit {sha[:12]} is the round's base or under it, not your "
+                    "change — commit once, then append_task.py --commit "
+                    "$(git rev-parse HEAD)",
+                ))
+            elif sha is not None and _is_ancestor(ws.path, sha):
                 resolved = sha
             else:
                 head = git(str(ws.path), "rev-parse", "--short", "HEAD")
@@ -500,7 +523,9 @@ def harvest(ws: Workspace, ticket_path: Path, *, run_tests: bool = False,
     # none, names nothing either way — there is no single sha to point at, and
     # the fallback only reads a branch the scorecard counted one commit on.
     commit = resolved if facts.get("commits") == 1 else None
-    if commit is None and claim is None:
+    if commit is None and (claim is None or claimed_base):
+        # round 83: a claim of the base names no commit of the change either —
+        # the branch's one commit is named, as with no row at all
         commit = _branch_commit(ws.path, facts)
 
     # The roots run only for a verdict they can decide. When at least one

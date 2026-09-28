@@ -980,6 +980,22 @@ def test_harvest_flags_a_commit_off_the_branch(round_, tmp_path):
     assert side[:12] in _reason(h, "commit_not_on_branch").text
 
 
+def test_harvest_refuses_a_claim_of_the_base_and_names_the_branch_commit(round_, tmp_path):
+    """Round 83: a row claiming the round's base — an ancestor of HEAD, so it
+    passed as on the branch, and the roots ran on the base. It is refused, and
+    the verdict names the branch's one commit, not the base."""
+    repo, base, ticket = round_
+    wt = _worktree(repo, base, tmp_path)
+    sha = _accepting(wt)
+    _record(wt, ticket.name, outcome="FIXED", commit=base)
+    h = harvest(wt, ticket, run_tests=True)
+    assert h.verdict == "REWORK"
+    assert "commit_not_on_branch" in _codes(h)
+    assert "base" in _reason(h, "commit_not_on_branch").text
+    assert h.commit == sha
+    assert h.facts["tests_run"].startswith("skipped: ")
+
+
 def test_harvest_flags_a_bogus_commit_sha(round_, tmp_path):
     """An unknown sha is certainly not on the branch."""
     repo, base, ticket = round_
