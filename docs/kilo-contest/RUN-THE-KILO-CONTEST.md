@@ -226,7 +226,7 @@ The fields, in this order:
 
 | field | source | empty |
 |---|---|---|
-| `files` | `git diff --numstat` of the worktree against the base, committed and not, untracked marked `(new)` | `none` |
+| `files` | the added/deleted lines `git diff` counts per file (its numstat) of the worktree against the base, committed and not, untracked marked `(new)` | `none` |
 | `commit` | the branch head, when the leg left a commit above the base | `none` |
 | `harvest` | the newest turn's verdict and reason codes | `none` |
 | `tests` | one line per pytest root with its counts. The source is the agent's own `pytest` runs, read from the `bash` parts in `<agent>/events.jsonl` (`5✓ 1✗`, parsed from pytest's stats line). A root the agent did not run itself comes from the harvest's `tests_run` (`PASS`, `1✗`, `absent`). `skipped: …` is not a root and is dropped | `none` |
@@ -424,7 +424,8 @@ purpose. It names no slow test and no fix; finding them is the job.
    That commit is usually not the immediate parent, so bisect. Run `tests`,
    then `tests_bugfix`, one after the other with `-n 8`, never in parallel.
    Name the base commit in every fix commit's message.
-2. **Find the real sleeps**: `--durations=25`, then ask why each slow test
+2. **Find the real sleeps**: pytest's own slow-test report (its `durations`
+   limit, 25 by this exercise), then ask why each slow test
    waits. A roster default such as a backoff or a silence window that reaches
    a test not about it is fixed in the test config, not in the product
    default.

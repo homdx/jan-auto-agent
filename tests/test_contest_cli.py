@@ -3429,3 +3429,176 @@ def test_the_roster_legs_key_is_the_default_and_the_flag_overrides_it(sandbox):
         models="", variant=None, max_parallel=None, no_gate=False, legs=2)).legs == 2
     assert cli._apply_flags(load_roster(ini), argparse.Namespace(
         models="", variant=None, max_parallel=None, no_gate=False, legs=None)).legs == 3
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KC-44: the ticket's own `**Size:**` field decides how many legs it gets
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _ticket_with_size(size: str | None) -> str:
+    """The sandbox's ticket with its `**Size:**` line set to *size* — or
+    dropped entirely when *size* is `None`."""
+    body = _ticket("01", "first")
+    if size is None:
+        return body.replace("**Size:** S\n", "")
+    return body.replace("**Size:** S\n", f"**Size:** {size}\n")
+
+
+def _ini_with_legs_by_size(sandbox, mapping: str | None) -> None:
+    """The roster's `legs_by_size` set to *mapping*; `None` leaves the key
+    out, which is the code default — no mapping at all."""
+    if mapping is None:
+        return
+    ini = sandbox.repo / "contest.ini"
+    assert "legs_by_size" not in ini.read_text(encoding="utf-8")
+    ini.write_text(ini.read_text(encoding="utf-8").replace(
+        "max_rework = 1", f"max_rework = 1\nlegs_by_size = {mapping}"),
+        encoding="utf-8")
+
+
+def test_ticket_size_is_the_headers_word_upper_cased(tmp_path):
+    """`S (measurement only)` is `S`, lowercase is normalised, the `L` with
+    its own `**Size note:**` line is `L`; a value outside the four is no
+    size, and so is a missing line or an unreadable file."""
+    file = tmp_path / "01-a.md"
+    file.write_text("# 01 — a\n\n**Size:** S (measurement only)\n**Size note:** M\n",
+                    encoding="utf-8")
+    assert cli.ticket_size(file) == "S"
+    file.write_text("**Size:** l\n**Size note:** a separate line\n", encoding="utf-8")
+    assert cli.ticket_size(file) == "L"
+    file.write_text("**Size:** m\n", encoding="utf-8")
+    assert cli.ticket_size(file) == "M"
+    file.write_text("**Size:** xs\n", encoding="utf-8")
+    assert cli.ticket_size(file) == "XS"
+    file.write_text("**Size:** XL\n", encoding="utf-8")
+    assert cli.ticket_size(file) is None
+    file.write_text("# 01 — no size line\n", encoding="utf-8")
+    assert cli.ticket_size(file) is None
+    assert cli.ticket_size(tmp_path / "00-missing.md") is None
+
+
+def test_legs_by_size_is_read_from_the_roster_and_fails_open(tmp_path):
+    """Absent is `{}` — without data a ticket's size decides nothing. A
+    malformed entry is skipped with the ones that parse standing, and a
+    count below 1 is skipped too: a typo must not abort a run."""
+    def roster(legs_by_size: str | None):
+        ini = tmp_path / "roster.ini"
+        lines = ["[contest]", "kilo_bin = /usr/bin/true", "server = attach",
+                 "out_dir = contest-out"]
+        if legs_by_size is not None:
+            lines.append(f"legs_by_size = {legs_by_size}")
+        lines += ["", "[contest.agent.agent-a]", "model = kenary/agent-a:free"]
+        ini.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return load_roster(ini)
+
+    assert roster(None).legs_by_size == {}
+    assert roster("XS=1, S=1, M=1, L=3").legs_by_size == {"XS": 1, "S": 1, "M": 1, "L": 3}
+    assert roster("l=2, S=abc").legs_by_size == {"L": 2}
+    assert roster("L=0").legs_by_size == {}
+    assert roster("no-equals-sign").legs_by_size == {}
+
+
+def test_an_l_ticket_runs_the_legs_its_size_says_without_a_flag(sandbox, capsys, spawn_holder):
+    """`**Size:** L` with `L=3` in `legs_by_size`: three legs, no flag — and
+    each leg's `state.json` says `legs: 3`, `legs_from: "size"`."""
+    sandbox.commit_ticket(TICKET_01, _ticket_with_size("L"))
+    _ini_with_legs_by_size(sandbox, "XS=1, S=1, M=1, L=3")
+    code, fake = run_fake(sandbox, SCENARIO_RELAY, RELAY_ARGV, spawn_holder)
+    captured = capsys.readouterr()
+    assert code == 0, captured.err
+    assert not sandbox.out().exists()                    # a relay has no un-suffixed folder
+    for leg in _leg_dirs(sandbox).values():
+        data = json.loads((leg / "state.json").read_text(encoding="utf-8"))
+        assert data["legs"] == 3 and data["legs_from"] == "size"
+    # the plan's legs line is key-padded like every other fact line
+    assert any(ln.startswith("legs ") and "3 (size)" in ln
+               for ln in captured.out.splitlines())
+
+
+def test_an_s_ticket_runs_one_leg_and_the_round_is_the_one_it_was(sandbox, capsys, spawn_holder):
+    """`**Size:** S (measurement only)` with `S=1`: one leg, no flag — the
+    un-suffixed folder, a `state.json` with no legs keys, no plan line: the
+    tree before KC-44."""
+    sandbox.commit_ticket(TICKET_01, _ticket_with_size("S (measurement only)"))
+    _ini_with_legs_by_size(sandbox, "XS=1, S=1, M=1, L=3")
+    code, fake = run_fake(sandbox, SCENARIO_ONE_READY, RELAY_ARGV, spawn_holder)
+    captured = capsys.readouterr()
+    out = sandbox.out()
+    assert code == 0, captured.err
+    assert not (out.parent / f"{ROUND:02d}.1").exists()
+    data = json.loads((out / "state.json").read_text(encoding="utf-8"))
+    assert set(data) == {"round_no", "ticket", "base_sha", "started_at", "agents"}
+    assert not any(line.startswith("legs ") for line in captured.out.splitlines())
+
+
+def test_a_flag_overrides_the_size_in_both_directions(sandbox, capsys, spawn_holder):
+    """`--legs 2` on an L ticket whose size says 3: two legs, `legs_from`
+    `flag` — the flag wins, in either direction."""
+    sandbox.commit_ticket(TICKET_01, _ticket_with_size("L"))
+    _ini_with_legs_by_size(sandbox, "XS=1, S=1, M=1, L=3")
+    code, fake = run_fake(sandbox, SCENARIO_RELAY, [*RELAY_ARGV, "--legs", "2"], spawn_holder)
+    assert code == 0, capsys.readouterr().err
+    legs = _leg_dirs(sandbox, n=2)
+    assert not (sandbox.out().parent / f"{ROUND:02d}.3").exists()
+    data = json.loads((legs[2] / "state.json").read_text(encoding="utf-8"))
+    assert data["legs"] == 2 and data["legs_from"] == "flag"
+
+
+def test_legs_one_on_an_l_ticket_runs_one_leg_without_a_refusal(
+        sandbox, capsys, spawn_holder):
+    """`--legs 1` on an L ticket whose size says 3 says it out loud: one leg,
+    no refusal, the un-suffixed folder and a `state.json` without legs keys."""
+    sandbox.commit_ticket(TICKET_01, _ticket_with_size("L"))
+    _ini_with_legs_by_size(sandbox, "XS=1, S=1, M=1, L=3")
+    code, fake = run_fake(sandbox, SCENARIO_ONE_READY, [*RELAY_ARGV, "--legs", "1"],
+                          spawn_holder)
+    captured = capsys.readouterr()
+    out = sandbox.out()
+    assert code == 0, captured.err
+    assert not (out.parent / f"{ROUND:02d}.1").exists()
+    data = json.loads((out / "state.json").read_text(encoding="utf-8"))
+    assert set(data) == {"round_no", "ticket", "base_sha", "started_at", "agents"}
+
+
+def test_an_l_ticket_in_one_leg_is_refused_without_a_flag(sandbox, capsys):
+    """No `legs_by_size` at all (the code default): an L ticket would run in
+    one leg — refused, naming the size, the count and the `--legs 1` that
+    overrides it, and without preparing a single worktree."""
+    sandbox.commit_ticket(TICKET_01, _ticket_with_size("L"))
+    code = cli.main(["run", *RELAY_ARGV])
+    captured = capsys.readouterr()
+    assert code == 1
+    lines = [ln for ln in captured.err.splitlines() if ln.startswith("intake:")]
+    assert any("**Size:** L" in ln and "would run in 1 leg" in ln and "--legs 1" in ln
+               for ln in lines), lines
+    assert not (sandbox.rounds / f"{ROUND:02d}-agent-a").exists()
+    assert not sandbox.out().exists()
+
+
+def test_an_l_ticket_whose_size_says_one_leg_is_refused_the_same_way(sandbox, capsys):
+    """`legs_by_size` present but `L=1`: the refusal fires the same way,
+    naming the mapping's own count."""
+    sandbox.commit_ticket(TICKET_01, _ticket_with_size("L"))
+    _ini_with_legs_by_size(sandbox, "XS=1, S=1, M=1, L=1")
+    code = cli.main(["run", *RELAY_ARGV])
+    captured = capsys.readouterr()
+    assert code == 1
+    lines = [ln for ln in captured.err.splitlines() if ln.startswith("intake:")]
+    assert any("**Size:** L" in ln and "L=1" in ln and "--legs 1" in ln
+               for ln in lines), lines
+    assert not (sandbox.rounds / f"{ROUND:02d}-agent-a").exists()
+
+
+def test_a_ticket_without_a_size_line_runs_one_leg_as_today(
+        sandbox, capsys, spawn_holder):
+    """No `**Size:**` line is no size: `None` behaves as today — one leg even
+    with an armed `legs_by_size`, and no refusal for a non-L ticket."""
+    sandbox.commit_ticket(TICKET_01, _ticket_with_size(None))
+    _ini_with_legs_by_size(sandbox, "XS=1, S=1, M=1, L=3")
+    code, fake = run_fake(sandbox, SCENARIO_ONE_READY, RELAY_ARGV, spawn_holder)
+    captured = capsys.readouterr()
+    out = sandbox.out()
+    assert code == 0, captured.err
+    assert not (out.parent / f"{ROUND:02d}.1").exists()
+    data = json.loads((out / "state.json").read_text(encoding="utf-8"))
+    assert set(data) == {"round_no", "ticket", "base_sha", "started_at", "agents"}

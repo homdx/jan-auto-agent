@@ -150,6 +150,7 @@ __all__ = [
     "resolve_variants",
     "roster_on_offer",
     "roster_missing",
+    "ticket_size",
     "registration_overlay",
     "merge_config_content",
 ]
@@ -213,6 +214,14 @@ _REQUIRED_LABELS = ("File", "Symbol")
 
 #: `NN-…md`, `next_task.py`'s `TICKET_RE` with its optional leading zeros.
 _TICKET_RE = re.compile(r"^0*(\d+)-.*\.md$")
+
+#: `**Size:** XS` / `**Size:** S (measurement only)` → `XS` / `S` — the line's first
+#: word; whatever follows it is a parenthetical note, KC-44.
+_SIZE_RE = re.compile(r"^\*\*Size:\*\*\s*(\S+)", re.MULTILINE)
+
+#: KC-44: the four sizes the epic's tickets carry, upper-cased. A `**Size:**` line
+#: that spells anything else is no size, the same as no line at all.
+KNOWN_SIZES = ("XS", "S", "M", "L")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -297,6 +306,27 @@ def _title_id(body: str, name: str) -> str:
 def _label(body: str, name: str, number: int) -> str:
     """`KC-7 (46)` — the id the ticket announces in its H1, plus its number."""
     return _title_id(body, name) + f" ({number})"
+
+
+def ticket_size(ticket_path) -> str | None:
+    """KC-44: the ticket's own `**Size:**` — `XS`, `S`, `M` or `L`, normalised to
+    upper case. `None` when the line is absent, when the value is not one of the
+    four, or when the file cannot be read.
+
+    The line's first word is the size and whatever follows it is a
+    parenthetical note: `S (measurement only)` is `S`, and the `L` that carries
+    its own `**Size note:**` line is still `L`. `None` behaves as today: the
+    ticket's size decides nothing, and the `[contest] legs` is what decides.
+    """
+    try:
+        body = Path(ticket_path).read_text(encoding="utf-8")
+    except OSError:
+        return None
+    match = _SIZE_RE.search(body)
+    if not match:
+        return None
+    size = match.group(1).strip("`*").upper()
+    return size if size in KNOWN_SIZES else None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2046,6 +2076,25 @@ def _legs_of(config: ContestConfig) -> int:
         return 1
 
 
+def _legs_choice(config: ContestConfig, args, size: str | None) -> tuple:
+    """KC-44: `(the legs the round runs, where the number came from)` — `flag`,
+    `size` or `config`.
+
+    The `--legs` flag wins whenever it is passed, `--legs 1` on an L ticket
+    included; then the ticket's own `**Size:**`, when `[contest]
+    legs_by_size` names a count for it — `None` for a size the mapping has no
+    entry for, the fail-open rule, and no mapping at all the same; then
+    `[contest] legs`, as today.
+    """
+    if getattr(args, "legs", None) is not None:
+        return max(1, int(args.legs)), "flag"
+    by_size = getattr(config, "legs_by_size", None) or {}
+    chosen = by_size.get(size) if size else None
+    if chosen is not None:
+        return max(1, int(chosen)), "size"
+    return _legs_of(config), "config"
+
+
 def _leg_out_dir(out_dir: Path, leg: int | None) -> Path:
     """KC-43: `contest-out/65.2` for leg 2 of round 65; *out_dir* itself for a round
     that is not a relay (`leg is None`), the folder every earlier round used."""
@@ -2054,7 +2103,8 @@ def _leg_out_dir(out_dir: Path, leg: int | None) -> Path:
 
 def _print_plan(result: Intake, config: ContestConfig, out_dir: Path, *, run_tests: bool,
                 workers: int | None = None, workers_fixed: bool = False,
-                agent_tmp: Path | None = None) -> None:
+                agent_tmp: Path | None = None, legs: int | None = None,
+                legs_from: str | None = None) -> None:
     """The plan, one line per fact: what the round will do, before it does it."""
     models = ", ".join(agent.model + (f"@{agent.variant}" if agent.variant else "")
                        for agent in config.agents)
@@ -2070,10 +2120,14 @@ def _print_plan(result: Intake, config: ContestConfig, out_dir: Path, *, run_tes
         ("gate", _gate_plan_label(config)),
         ("out", str(out_dir)),
     )
-    legs = _legs_of(config)
+    if legs is None:
+        legs = _legs_of(config)
     if legs > 1:
-        # KC-43: only a relay says so — a round of one leg prints the plan it always did
-        facts = facts + (("legs", f"{legs} — {out_dir.name}.1 … {out_dir.name}.{legs}"),)
+        # KC-43: only a relay says so — a round of one leg prints the plan it always did.
+        # KC-44: where the number came from — flag, size or config — in the round's
+        # first legs line.
+        where = f" ({legs_from})" if legs_from else ""
+        facts = facts + (("legs", f"{legs}{where} — {out_dir.name}.1 … {out_dir.name}.{legs}"),)
     width = max(len(key) for key, _ in facts)
     for key, value in facts:
         print(f"{key:<{width}} {value}")
@@ -2107,7 +2161,8 @@ def _first_prompt(config: ContestConfig, workspace, ticket_path) -> str:
 
 def _dry_run(repo, result: Intake, config: ContestConfig, out_dir: Path, args, *,
              run_tests: bool, workers: int, fixed: bool,
-             agent_tmp: Path | None) -> int:
+             agent_tmp: Path | None,
+             legs: int | None = None, legs_from: str | None = None) -> int:
     """KC-7: `run --dry-run` — the plan and the first prompt, then exit 0.
 
     `intake` has already run with its server checks skipped, so the only things
@@ -2128,7 +2183,7 @@ def _dry_run(repo, result: Intake, config: ContestConfig, out_dir: Path, args, *
         print(f"intake: {exc}", file=sys.stderr)
         return EXIT_FAILED
     _print_plan(result, config, out_dir, run_tests=run_tests, workers=workers,
-                workers_fixed=fixed, agent_tmp=agent_tmp)
+                workers_fixed=fixed, agent_tmp=agent_tmp, legs=legs, legs_from=legs_from)
     if not workspaces:
         print("dry-run: no agent to prompt", file=sys.stderr)
         return EXIT_OK
@@ -2169,6 +2224,15 @@ def cmd_run(args: argparse.Namespace) -> int:
     checked. The worktrees it creates are the round's own, so a later `run`
     without `--fresh` meets them as KC-23 does today; `--dry-run --fresh` is
     allowed.
+
+    KC-44: the ticket's own `**Size:**` line decides the leg count — the
+    `--legs` flag always wins when passed, else `[contest] legs_by_size` says
+    what the size is worth, else `[contest] legs` as today. An L ticket that
+    comes out one leg is refused at intake, naming the size, the count and the
+    `--legs 1` that overrides it, before a worktree is prepared. The chosen
+    count and its source land in the relay's `state.json` and the plan's
+    `legs` line; a round of one leg keeps the state and the plan it always
+    had.
     """
     # `contest-bench/kc6/live_smoke.py` sets the same default: the committed
     # roster's ${CONTEST_GATE_API_KEY} reference must resolve for `load_roster`
@@ -2195,11 +2259,33 @@ def cmd_run(args: argparse.Namespace) -> int:
         return EXIT_FAILED
     config = _apply_flags(config, args)
     run_tests = not args.no_tests
+    # KC-44: the legs the round runs, and where the number came from — the flag
+    # when it was passed, else the ticket's own `**Size:**` when `[contest]
+    # legs_by_size` names a count for it, else `[contest] legs` as today. The
+    # ticket is read from the checkout; an unreadable header is no size, and
+    # no size is the round of today.
+    ticket_name = None
+    try:
+        ticket_name = gates.ticket_for_round(tasks_dir, args.ticket)[0]
+    except OSError:
+        ticket_name = None    # no tasks dir to read is no size, as an unreadable file is
+    size = ticket_size(tasks_dir / ticket_name) if ticket_name else None
+    legs, legs_from = _legs_choice(config, args, size)
     # KC-43: a relay's legs are not resumable — a round of one leg is
-    legs = _legs_of(config)
     if args.resume and legs > 1:
         print(f"intake: --resume cannot continue a round of {legs} legs — resume one "
               f"leg's folder with `--out <folder> --legs 1`", file=sys.stderr)
+        return EXIT_FAILED
+    # KC-44: the refusal this ticket exists for — an L ticket that would run in
+    # one leg, unless `--legs` says so out loud. Names the size, the leg count
+    # it would have used and the flag that overrides it, and stops before a
+    # worktree is prepared.
+    if size == "L" and legs == 1 and getattr(args, "legs", None) is None:
+        detail = (f"legs_by_size says L={legs}" if legs_from == "size"
+                  else f"legs_by_size names no L, so [contest] legs = {legs} stands")
+        print(f"intake: {ticket_name} is **Size:** L and would run in {legs} leg "
+              f"({detail}) — an L ticket is refused in one leg; pass --legs 1 "
+              "to run it in one leg", file=sys.stderr)
         return EXIT_FAILED
 
     _roster_ini_path = str(_roster_path(repo, args.roster))
@@ -2265,10 +2351,12 @@ def cmd_run(args: argparse.Namespace) -> int:
         # KC-7: intake has already skipped every server check, so this is the
         # plan and the prompt — no server is started after here.
         return _dry_run(repo, result, config, out_dir, args, run_tests=run_tests,
-                        workers=workers, fixed=fixed, agent_tmp=agent_tmp)
+                        workers=workers, fixed=fixed, agent_tmp=agent_tmp,
+                        legs=legs, legs_from=legs_from)
 
     _print_plan(result, config, out_dir, run_tests=run_tests, workers=workers,
-                workers_fixed=fixed, agent_tmp=agent_tmp)
+                workers_fixed=fixed, agent_tmp=agent_tmp,
+                legs=legs, legs_from=legs_from)
 
     if args.resume:
         workspaces = [run.workspace for run in resume.agents]
@@ -2343,8 +2431,11 @@ def cmd_run(args: argparse.Namespace) -> int:
                 state = run_leg(config, args.ticket, result.ticket_path, workspaces,
                                 make_backend=make_backend, out_dir=leg_out, leg=leg,
                                 carry=prior, records=leg_records, run_tests=run_tests,
-                                server_pid=server.pid if server else None)
+                                server_pid=server.pid if server else None,
+                                legs=legs, legs_from=legs_from)
             else:
+                # KC-44: a round of one leg is the round `run_round` has always
+                # been — no legs keys in its `state.json`
                 state = run_round(config, args.ticket, result.ticket_path, workspaces,
                                   make_backend=make_backend, out_dir=leg_out, resume=resume,
                                   run_tests=run_tests, server_pid=server.pid if server else None)

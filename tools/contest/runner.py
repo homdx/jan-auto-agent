@@ -1735,6 +1735,12 @@ class RoundState:
     #: KC-43: which leg of the round this is (1, 2, ...), or `None` for a round
     #: that is not a relay — the state.json every round wrote before the ticket.
     leg: int | None = None
+    #: KC-44: how many legs the round was chosen for and where the number came
+    #: from — `flag`, `size` or `config` — on a relay's state only. `None`
+    #: both: a round of one leg is the state KC-43 kept byte for byte, and so
+    #: writes no legs keys, and so does a state.json written before KC-44.
+    legs: int | None = None
+    legs_from: str | None = None
 
     @property
     def label(self) -> str:
@@ -1747,15 +1753,24 @@ class RoundState:
                 "started_at": self.started_at, "agents": [run.to_dict() for run in self.agents]}
         if self.leg is not None:
             data["leg"] = self.leg
+        # KC-44: the chosen leg count and its source, on a relay's state only —
+        # a round of one leg is the state KC-43 kept byte for byte
+        if self.legs is not None:
+            data["legs"] = self.legs
+        if self.legs_from:
+            data["legs_from"] = self.legs_from
         return data
 
     @classmethod
     def from_dict(cls, data: dict) -> "RoundState":
         leg = data.get("leg")
+        legs = data.get("legs")
         return cls(round_no=int(data["round_no"]), ticket=str(data["ticket"]),
                    base_sha=str(data["base_sha"]), started_at=float(data["started_at"]),
                    agents=[AgentRun.from_dict(a) for a in data.get("agents", [])],
-                   leg=int(leg) if leg is not None else None)
+                   leg=int(leg) if leg is not None else None,
+                   legs=int(legs) if legs is not None else None,
+                   legs_from=data.get("legs_from"))
 
     def table_rows(self) -> list:
         """One dict per agent — the SUMMARY's inputs; KC-7 renders them."""
@@ -6193,7 +6208,9 @@ def run_leg(config: ContestConfig, round_no: int, ticket_path: Path, workspaces:
               records: dict | None = None,
               resume: RoundState | None = None,
               run_tests: bool = False,
-              server_pid: int | None = None) -> RoundState:
+              server_pid: int | None = None,
+              legs: int | None = None,
+              legs_from: str | None = None) -> RoundState:
     """One round — or, with *leg*, one leg of it: a `run_agent` per workspace in a
     pool of `config.max_parallel`.
 
@@ -6226,6 +6243,11 @@ def run_leg(config: ContestConfig, round_no: int, ticket_path: Path, workspaces:
     *server_pid* (KC-62) is the round server's pid, so the heartbeat can count the
     other Kilo processes that share its store and say so on the line. `None` is
     every earlier caller: no check, no suffix.
+
+    *legs* and *legs_from* (KC-44) are the round's chosen leg count and where it
+    came from — `flag`, `size` or `config` — which a relay's `state.json`
+    records, alongside the leg number every leg's `state.json` already carries.
+    `None` both is `run_round`, the tree KC-43 kept byte for byte.
     """
     out_dir, ticket_path = Path(out_dir), Path(ticket_path)
     workspaces = list(workspaces)
@@ -6238,7 +6260,7 @@ def run_leg(config: ContestConfig, round_no: int, ticket_path: Path, workspaces:
     state = RoundState(round_no=round_no, ticket=ticket_path.name,
                        base_sha=workspaces[0].base_sha if workspaces else "",
                        started_at=resume.started_at if resume is not None else time.time(),
-                       agents=runs, leg=leg)
+                       agents=runs, leg=leg, legs=legs, legs_from=legs_from)
     lock = threading.Lock()
     stop = threading.Event()
     since: dict = {run.agent.name: time.monotonic() for run in runs}   # state entered at
@@ -6339,8 +6361,10 @@ def run_round(config: ContestConfig, round_no: int, ticket_path: Path, workspace
     """One round of one leg — `run_leg` with no leg number, as before KC-43.
 
     Nothing about the state, the folder or the log lines says "leg": `legs = 1`
-    is this function, byte for byte. See `run_leg` for the pool, `state.json`,
-    *resume*, *run_tests* and *server_pid*.
+    is this function, byte for byte, and KC-44's `legs` / `legs_from` ride on
+    a relay's `state.json` through `run_leg`'s own keywords, not on this one.
+    See `run_leg` for the pool, `state.json`, *resume*, *run_tests* and
+    *server_pid*.
     """
     return run_leg(config, round_no, ticket_path, workspaces, make_backend=make_backend,
                    out_dir=out_dir, resume=resume, run_tests=run_tests, server_pid=server_pid)

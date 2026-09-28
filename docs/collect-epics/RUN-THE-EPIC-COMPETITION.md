@@ -73,6 +73,14 @@ its RUN stage (`python3 -m tools.contest run`) carries the prompt, the loop
 and the ground rules in the runner's own prompt. Stages 3–5 are unchanged
 either way; the contest's hand-over section points back to this page.
 
+**KC-44 — the ticket's own size decides its legs.** The contest's `run` reads
+the ticket's `**Size:**` line and runs `[contest] legs_by_size`'s count for
+it (`XS=1, S=1, M=1, L=3` in the committed `contest.ini`) unless `--legs`
+was passed; an L ticket that comes out one leg is refused at intake unless
+`--legs 1` says it out loud. The chosen count and its source — `flag`,
+`size` or `config` — land in the relay's `state.json` and the plan's `legs`
+line; a round of one leg is the round it always was.
+
 **One worktree per agent, all from the same commit.** Agents committing into one
 checkout collide; that is not a tool problem, it is what worktrees are for.
 

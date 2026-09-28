@@ -4151,7 +4151,10 @@ def test_max_parallel_one_runs_two_agents_sequentially(tmp_path):
 
 def test_max_parallel_two_overlaps_two_agents(tmp_path):
     sb = Sandbox(tmp_path, ["agent-a", "agent-b"])
-    with _BenchFake({"turns": [{"on_prompt": work_ready, "events": ["busy"], "delay": 1.0}]}) as fake:
+    # a 3 s turn: the overlap is proven from the request order, but the box is
+    # shared, and a loaded box must not push the second session's creation
+    # past the first turn's finish
+    with _BenchFake({"turns": [{"on_prompt": work_ready, "events": ["busy"], "delay": 3.0}]}) as fake:
         state = _round(sb, fake, make_config(["agent-a", "agent-b"], max_parallel=2))
         between, finished_first = _creates_and_reads(fake)
     for name in ("agent-a", "agent-b"):

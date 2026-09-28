@@ -91,6 +91,7 @@ CONTEST_KEYS = (
     "max_parallel",
     "max_rework",
     "legs",
+    "legs_by_size",
     "max_continues_per_attempt",
     "max_sessions_per_attempt",
     "first_touch_sec",
@@ -274,6 +275,14 @@ class ContestConfig:
     #: for the agents whose leg ended without a READY entry. 1 is today's round,
     #: byte for byte — no leg number in any path, log line or `state.json`.
     legs: int = 1
+    #: KC-44: the legs a ticket's own `**Size:**` line gets its round, keyed by
+    #: the size upper-cased — `XS`, `S`, `M` or `L`. `{}` when `[contest]
+    #: legs_by_size` is absent or parses nothing, which is the fail-open rule:
+    #: without data a ticket's size decides nothing, and `[contest] legs`
+    #: — or the `--legs` flag — is what decides, as today. The committed
+    #: contest.ini's default, `XS=1, S=1, M=1, L=3`, changes nothing for the
+    #: sizes the epic actually runs: only L gets a relay.
+    legs_by_size: dict = field(default_factory=dict)
     max_continues_per_attempt: int = 2
     #: KC-39: how many sessions one attempt may use in total — the first one and
     #: every replacement (KC-39's reset for a repeated diff, KC-54's and KC-69's
@@ -702,6 +711,35 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
         raise RosterError(
             f"[contest] backend must be one of {' | '.join(BACKENDS)}, got {backend!r}")
 
+    def legs_map() -> dict:
+        """KC-44: ``[contest] legs_by_size``, read ``XS=1, S=1, M=1, L=3``-shaped
+        into a dict keyed by the size upper-cased. Absent is `{}` — without data
+        a ticket's size decides nothing, which is the round of today, not a
+        refusal. A malformed entry is skipped with a warning and the entries that
+        parse stand: a typo must not abort a run, and it must not reset the
+        whole mapping either, the way one bad limit used to reset every other
+        limit.
+        """
+        mapping: dict = {}
+        for entry in _split_list(parser.get("contest", "legs_by_size", fallback="")):
+            key, sep, value = entry.partition("=")
+            if not sep or not key.strip():
+                _log.warning("[contest] legs_by_size entry %r has no SIZE= — skipped", entry)
+                continue
+            try:
+                count = int(value.strip())
+            except ValueError:
+                _log.warning(
+                    "[contest] legs_by_size entry %r is not a number of legs — skipped",
+                    entry)
+                continue
+            if count < 1:
+                _log.warning("[contest] legs_by_size entry %r must be at least 1 — skipped",
+                             entry)
+                continue
+            mapping[key.strip().upper()] = count
+        return mapping
+
     workspace_kind = scalar("workspace_kind", "clone") or "clone"
     if workspace_kind not in WORKSPACE_KINDS:
         raise RosterError(
@@ -811,6 +849,7 @@ def _build(parser: configparser.ConfigParser, backend: str | None = None) -> Con
         max_parallel=limit("max_parallel", 3),
         max_rework=limit("max_rework", 2),
         legs=max(1, limit("legs", 1)),
+        legs_by_size=legs_map(),
         max_continues_per_attempt=limit("max_continues_per_attempt", 2),
         max_sessions_per_attempt=max(0, limit("max_sessions_per_attempt", 2)),
         first_touch_sec=seconds("first_touch_sec", 420.0),
