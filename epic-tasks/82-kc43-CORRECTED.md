@@ -16,7 +16,7 @@
 >
 > **Net effect:** of the five tickets KC-43 composes, two (`KC-36`, `KC-41`) have since landed and are no longer blockers; three (`KC-39`, `KC-40`, `KC-42`) genuinely still block it, matching the operator's own note. The engineering plan itself (What must change / Acceptance / Out of scope) needed no changes — it correctly assumes none of its own prerequisites exist yet, which is still true. Corrections inlined below.
 
-**Status:** queued — last, after KC-36 **(landed)**, KC-39, KC-40, KC-41 **(landed)** and KC-42, every one of which it composes — **now blocked on KC-39, KC-40 and KC-42 only**. Asked by the operator on 2026-09-22 as the frame the other tickets are parts of.
+**Status:** open — last, after KC-36 **(landed)**, KC-39, KC-40, KC-41 **(landed)** and KC-42, every one of which it composes — **now blocked on KC-39, KC-40 and KC-42 only**. Asked by the operator on 2026-09-22 as the frame the other tickets are parts of.
 **Severity:** MEDIUM (nothing is lost today that KC-41 does not already save; this ticket is about tickets that *cannot* be finished in one turn at all, which the epic has so far avoided by keeping tickets small)
 **File:** `tools/contest/cli.py` (`cmd_run`, `_parser`), `tools/contest/runner.py` (`run_round`), `tools/contest/workspace.py` (`prepare_round` — the "never reuse a previous round's worktree" rule gains one exception), `contest.ini`
 **Symbol:** `cmd_run`, `run_round`, `run_leg` (new), `leg_record` (new), `RoundState.leg` (new), `prepare_round(..., carry_from=...)` (new)
