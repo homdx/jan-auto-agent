@@ -12,7 +12,7 @@
 >
 > **Net effect:** nothing to fix. This ticket's header, "What happens today," "What must change," and "Acceptance" sections all match the current repo state exactly. Reproduced below unchanged, with this audit note as the only addition, so the four-ticket batch is delivered as a consistent set.
 
-**Status:** queued — after KC-43, which it configures (confirmed still queued, `INDEX.md` row 82 — no change). Asked by the operator on 2026-09-22.
+**Status:** open — after KC-43, which it configures (confirmed still queued, `INDEX.md` row 82 — no change). Asked by the operator on 2026-09-22.
 **Severity:** LOW (a convenience on top of KC-43 — but the one that decides whether KC-43 is ever used, since nobody remembers to pass `--legs` by hand)
 **File:** `tools/contest/cli.py` (`cmd_run`, ticket parsing), `contest.ini`
 **Symbol:** `ticket_size` (new), `cmd_run`, `ContestConfig.legs_by_size` (new)
